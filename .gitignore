@@ -1,0 +1,6 @@
+/target/
+/.newgit/
+/.jj/
+.DS_Store
+*.swp
+*.swo

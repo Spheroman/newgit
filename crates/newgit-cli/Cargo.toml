@@ -1,0 +1,19 @@
+[package]
+name = "newgit-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "newgit"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow = "1"
+camino = "1.2"
+clap = { version = "4.5", features = ["derive"] }
+newgit-core = { path = "../newgit-core" }
