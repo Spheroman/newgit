@@ -1,10 +1,10 @@
-use anyhow::{Context, Result, bail};
+use anyhow::{Context as _, Result, bail};
 use camino::{Utf8Path, Utf8PathBuf};
 use clap::{Args, Parser, Subcommand};
-use newgit_core::branch::branch_slug;
-use newgit_core::materializer::{Materializer, RealDirMaterializer};
-use newgit_core::store::{MetadataStore, expand_home};
-use newgit_core::{BranchInstance, templates::starter_templates};
+use newgit_core::manager::{BranchManager, InstanceReport};
+use newgit_core::source::find_repo_root;
+use newgit_core::store::Context;
+use newgit_core::{MetadataStore, ProjectConfig};
 
 #[derive(Debug, Parser)]
 #[command(name = "newgit")]
@@ -16,15 +16,19 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Initialize .newgit/ in the current repository
     Init(InitArgs),
-    Tracker {
-        #[command(subcommand)]
-        command: TrackerCommand,
+    /// Create a branch instance: source branch + workspace + binding record
+    Spawn(SpawnArgs),
+    /// Show branch instances
+    Status {
+        /// Instance to show (defaults to all)
+        name: Option<String>,
     },
-    Spawn {
+    /// Delete an instance's workspace and archive its binding record
+    Remove {
         name: String,
     },
-    Status,
     Run(RunArgs),
     Action {
         name: String,
@@ -43,18 +47,17 @@ enum Command {
 
 #[derive(Debug, Args)]
 struct InitArgs {
+    /// Project name (defaults to the repository directory name)
     #[arg(long)]
     name: Option<String>,
 }
 
-#[derive(Debug, Subcommand)]
-enum TrackerCommand {
-    Add {
-        name: String,
-        #[arg(long)]
-        template: String,
-    },
-    Templates,
+#[derive(Debug, Args)]
+struct SpawnArgs {
+    name: String,
+    /// Base revision when creating a new source branch (defaults to HEAD)
+    #[arg(long)]
+    from: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -68,154 +71,187 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Command::Init(args) => init(args),
-        Command::Tracker { command } => tracker(command),
-        Command::Spawn { name } => spawn(&name),
-        Command::Status => status(),
-        Command::Run(args) => run(args),
-        Command::Action { name, action } => run_action(&name, &action),
-        Command::Checkpoint { name, message } => checkpoint(&name, message.as_deref()),
-        Command::Undo { name } => undo(&name),
-        Command::Cleanup => cleanup(),
+        Command::Spawn(args) => spawn(args),
+        Command::Status { name } => status(name.as_deref()),
+        Command::Remove { name } => remove(&name),
+        Command::Run(args) => {
+            if args.command.is_empty() {
+                bail!("provide a command after `--`");
+            }
+            skeleton_notice(
+                "run",
+                &format!(
+                    "would run `{}` inside branch `{}` with exports loaded",
+                    args.command.join(" "),
+                    args.name
+                ),
+            )
+        }
+        Command::Action { name, action } => skeleton_notice(
+            "action",
+            &format!("would run resource action `{action}` for branch `{name}`"),
+        ),
+        Command::Checkpoint { name, message } => {
+            let suffix = message
+                .map(|value| format!(" with message `{value}`"))
+                .unwrap_or_default();
+            skeleton_notice(
+                "checkpoint",
+                &format!("would capture source plus tracker state for `{name}`{suffix}"),
+            )
+        }
+        Command::Undo { name } => skeleton_notice(
+            "undo",
+            &format!("would restore the previous coherent checkpoint for `{name}`"),
+        ),
+        Command::Cleanup => skeleton_notice(
+            "cleanup",
+            "would stop processes and remove stale branch-owned resources",
+        ),
     }
 }
 
 fn init(args: InitArgs) -> Result<()> {
-    let root = current_root()?;
+    let cwd = current_dir()?;
+    let Some((repo_root, source)) = find_repo_root(&cwd) else {
+        bail!(
+            "not inside a Git or jj repository; run `git init` (or `jj git init --colocate`) first"
+        );
+    };
+
     let project_name = args
         .name
-        .or_else(|| root.file_name().map(ToOwned::to_owned))
+        .or_else(|| repo_root.file_name().map(ToOwned::to_owned))
         .unwrap_or_else(|| "newgit-project".to_owned());
-    let store = MetadataStore::init(&root, &project_name)?;
+    let store = MetadataStore::init(&repo_root, &project_name, source)?;
+    let config = store.load_config()?;
 
     println!(
         "Initialized newgit metadata at {}",
         store.paths().metadata_root
     );
-    println!("Project: {project_name}");
+    println!("  project:    {project_name}");
+    println!("  source:     {}", source_label(&config));
+    println!("  workspaces: {}/", config.workspace_root(&repo_root));
     Ok(())
 }
 
-fn tracker(command: TrackerCommand) -> Result<()> {
-    match command {
-        TrackerCommand::Add { name, template } => {
-            let store = MetadataStore::at(current_root()?);
-            let path = store.add_tracker_from_template(&name, &template)?;
-            println!("Added tracker `{name}` from `{template}` at {path}");
-            Ok(())
+fn spawn(args: SpawnArgs) -> Result<()> {
+    let manager = manager_here()?;
+    let outcome = manager.spawn(&args.name, args.from.as_deref())?;
+    let branch = &outcome.branch;
+
+    let branch_note = if outcome.created_source_branch {
+        match &args.from {
+            Some(base) => format!("(new branch from {base})"),
+            None => "(new branch from HEAD)".to_owned(),
         }
-        TrackerCommand::Templates => {
-            for template in starter_templates() {
-                println!("{:<18} {}", template.name, template.description);
-            }
-            Ok(())
-        }
-    }
-}
-
-fn spawn(name: &str) -> Result<()> {
-    let root = current_root()?;
-    let store = MetadataStore::at(&root);
-    store.ensure_initialized()?;
-
-    let config = store.load_config()?;
-    let definitions = store.load_tracker_definitions()?;
-    let workspace_root = expand_home(&config.workspace.root);
-    let workspace_path = workspace_root.join(branch_slug(name));
-    let branch = BranchInstance::new(name, workspace_path, &definitions)?;
-
-    RealDirMaterializer.materialize(&branch)?;
-    let branch_file = store.write_branch(&branch)?;
+    } else {
+        "(existing branch)".to_owned()
+    };
 
     println!("Spawned branch instance `{}`", branch.name);
-    println!("Workspace: {}", branch.workspace_path);
-    println!("Binding record: {branch_file}");
-    if branch.trackers.is_empty() {
-        println!("Trackers: none");
-    } else {
-        println!(
-            "Trackers: {}",
-            branch
-                .trackers
-                .keys()
-                .cloned()
-                .collect::<Vec<_>>()
-                .join(", ")
-        );
-    }
+    println!(
+        "  source:    {} @ {} {branch_note}",
+        branch.source_ref,
+        branch.short_rev()
+    );
+    println!("  workspace: {}", branch.workspace_path);
+    println!("  record:    {}", outcome.record_path);
     Ok(())
 }
 
-fn status() -> Result<()> {
-    let store = MetadataStore::at(current_root()?);
-    store.ensure_initialized()?;
-    let branches = store.load_branches()?;
+fn status(name: Option<&str>) -> Result<()> {
+    let context = context_here()?;
+    let manager = BranchManager::open(context.store)?;
+    let mut reports = manager.statuses()?;
 
-    if branches.is_empty() {
-        println!("No branch instances yet.");
+    if let Some(name) = name {
+        reports.retain(|report| report.branch.name == name || report.branch.slug == name);
+        if reports.is_empty() {
+            bail!("no branch instance named `{name}`");
+        }
+    }
+
+    if reports.is_empty() {
+        println!("No branch instances yet. Create one with `newgit spawn <name>`.");
         return Ok(());
     }
 
-    println!("{:<24} {:<44} TRACKERS", "NAME", "WORKSPACE");
-    for branch in branches {
-        let tracker_status = branch
-            .trackers
-            .values()
-            .map(|binding| format!("{}:{:?}", binding.tracker_name, binding.status))
-            .collect::<Vec<_>>()
-            .join(" ");
+    let name_width = reports
+        .iter()
+        .map(|report| report.branch.name.len() + 2)
+        .chain(["NAME".len() + 2])
+        .max()
+        .unwrap_or(6);
+    let source_width = reports
+        .iter()
+        .map(|report| source_column(report).len())
+        .chain(["SOURCE".len()])
+        .max()
+        .unwrap_or(6);
+
+    println!(
+        "{:<name_width$} {:<source_width$} {:<10} WORKSPACE",
+        "NAME", "SOURCE", "STATUS"
+    );
+    for report in &reports {
+        let marker = if context.current_branch.as_deref() == Some(report.branch.name.as_str()) {
+            "* "
+        } else {
+            "  "
+        };
+        let workspace_status = if report.workspace_exists {
+            "ok"
+        } else {
+            "ws-missing"
+        };
         println!(
-            "{:<24} {:<44} {}",
-            branch.name, branch.workspace_path, tracker_status
+            "{marker}{:<width$} {:<source_width$} {workspace_status:<10} {}",
+            report.branch.name,
+            source_column(report),
+            report.branch.workspace_path,
+            width = name_width - 2,
         );
     }
-
     Ok(())
 }
 
-fn run(args: RunArgs) -> Result<()> {
-    if args.command.is_empty() {
-        bail!("provide a command after `--`");
+fn remove(name: &str) -> Result<()> {
+    let manager = manager_here()?;
+    let outcome = manager.remove(name, &current_dir()?)?;
+
+    println!("Removed branch instance `{}`", outcome.branch.name);
+    println!("  workspace: {} (deleted)", outcome.branch.workspace_path);
+    println!("  record:    archived at {}", outcome.archived_record);
+    println!(
+        "  source branch `{}` kept in the store; delete with `git branch -D {}` if unwanted",
+        outcome.branch.source_ref, outcome.branch.source_ref
+    );
+    Ok(())
+}
+
+fn source_column(report: &InstanceReport) -> String {
+    let rev = report
+        .live_rev
+        .clone()
+        .unwrap_or_else(|| report.branch.short_rev().to_owned());
+    format!("{}@{rev}", report.branch.source_ref)
+}
+
+fn source_label(config: &ProjectConfig) -> &'static str {
+    match config.project.source {
+        newgit_core::SourceSubstrate::Git => "git",
+        newgit_core::SourceSubstrate::Jj => "jj (colocated .git required for v1)",
     }
-
-    skeleton_notice(
-        "run",
-        &format!(
-            "would run `{}` inside branch `{}` with tracker exports",
-            args.command.join(" "),
-            args.name
-        ),
-    )
 }
 
-fn run_action(name: &str, action: &str) -> Result<()> {
-    skeleton_notice(
-        "action",
-        &format!("would run tracker action `{action}` for branch `{name}`"),
-    )
+fn context_here() -> Result<Context> {
+    Ok(MetadataStore::discover(&current_dir()?)?)
 }
 
-fn checkpoint(name: &str, message: Option<&str>) -> Result<()> {
-    let suffix = message
-        .map(|value| format!(" with message `{value}`"))
-        .unwrap_or_default();
-    skeleton_notice(
-        "checkpoint",
-        &format!("would capture source plus tracker state for `{name}`{suffix}"),
-    )
-}
-
-fn undo(name: &str) -> Result<()> {
-    skeleton_notice(
-        "undo",
-        &format!("would restore the previous coherent checkpoint for `{name}`"),
-    )
-}
-
-fn cleanup() -> Result<()> {
-    skeleton_notice(
-        "cleanup",
-        "would stop processes and remove stale branch-owned resources",
-    )
+fn manager_here() -> Result<BranchManager> {
+    Ok(BranchManager::open(context_here()?.store)?)
 }
 
 fn skeleton_notice(command: &str, detail: &str) -> Result<()> {
@@ -223,7 +259,7 @@ fn skeleton_notice(command: &str, detail: &str) -> Result<()> {
     Ok(())
 }
 
-fn current_root() -> Result<Utf8PathBuf> {
+fn current_dir() -> Result<Utf8PathBuf> {
     let cwd = std::env::current_dir().context("could not read current directory")?;
     Utf8PathBuf::from_path_buf(cwd).map_err(|path| {
         anyhow::anyhow!(

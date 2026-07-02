@@ -57,24 +57,39 @@ Repos are an **output** of the store, emitted at push — not the storage unit.
 
 ---
 
-## Trackers
+## Trackers and resources
 
-A tracker is a partition over the single store: by path where privacy/concern separates cleanly, by object/hunk membership where it cuts through shared files. Each tracker carries its own **propagation semantics** — and for most of them "rebase" is the wrong verb:
+The store is partitioned into **trackers**; branch instances are animated by **resources**. The split is load-bearing:
 
-| Tracker   | Propagation semantics                          | Mechanism                              |
-|-----------|------------------------------------------------|----------------------------------------|
-| Source    | `jj`-style auto-rebase of descendants (changes *should* flow downstream) | reuse `jj` wholesale |
-| Env       | Pinned per branch, **no** propagation          | a different `.env` per branch is normal, not a conflict |
-| Install   | Content-addressed, effectively immutable; "rebase" is meaningless | reference a store path, Nix-style |
-| DB        | Migration-gated, manual propagation (propagation here is *dangerous*) | CoW / reflink snapshots |
+> **Trackers hold state that can travel across space and time** — synced to a remote, restored from a checkpoint. **Resources re-establish the state that can't make that trip** — because it is alive, lives in another system, or is only valid where it was built.
 
-The vendored `jj` engine covers exactly **one** tracker (source). The other three are propagation policy you define in the binding layer.
+### Trackers
+
+A tracker is a named, versioned lane of file content — a partition over the single store: by path where privacy/concern separates cleanly, by object/hunk membership where it cuts through shared files. There is no fixed set of trackers; users define as many as they need (`jack-env`, `db-snapshots`, `design-assets`, …). Each tracker carries three settings:
+
+- **audience** — who may read it (public, project-devs, a single user). This is the unit of the privacy model.
+- **propagation** — how content flows across branches: `rebase` (`jj`-style auto-rebase of descendants — changes *should* flow downstream), `pin` (per-branch, no propagation — a different `.env` per branch is normal, not a conflict), or `manual`.
+- **storage** — where synced state lives: local, native remote, or a rented substrate.
+
+`source` is simply the default tracker: audience = everyone, propagation = rebase, mechanism = the vendored `jj` engine. The `jj` engine covers exactly **one** tracker (source); every other tracker's propagation is policy you define in the binding layer.
+
+### Resources
+
+A resource is a lifecycle unit bound to a branch instance. It has no history and never syncs; it consumes tracker content and exports runtime values (ports, URLs, env vars). Resources exist for exactly three irreducible reasons:
+
+- **Liveness.** A running process cannot be copied, only started; a port cannot be snapshotted, only freshly allocated per instance; a daemon's state can only be captured consistently through the daemon.
+- **Externality.** Cloud preview environments, webhook tunnels, mock auth tenants — the state lives in another system, the local filesystem holds at most a handle, and an API call is the only interface.
+- **Path-dependence.** Installed artifacts (venvs, `node_modules`, native builds) hardcode machine and path; the true state is the identity (the lockfile, already in source) and the artifact must be *recomputed* in place, not copied. Recompute is correctness, not optimization — and it keeps derived gigabytes out of the content store.
+
+The two primitives cooperate at exactly one seam: **a resource's checkpoint hook may deposit its output into a tracker** (`pg_dump` → a `db-snapshots` tracker), turning daemon-owned state into carryable, versioned content.
+
+Under this split the four original lanes decompose: source and env are trackers; install is a resource (path-dependence); db is a resource whose checkpoints land in a tracker.
 
 ---
 
 ## The binding layer
 
-The genuinely novel part — nobody has built it. It defines how a source revision references *which* env revision, *which* install store-path, *which* db snapshot, so that materializing a branch yields a **coherent** set rather than a pile of independently-floating tracks.
+The genuinely novel part — nobody has built it. It defines how a source revision references *which* revision of every other tracker and *which* concrete instance of every resource (which env content, which lockfile identity, which db snapshot), so that materializing a branch yields a **coherent** set rather than a pile of independently-floating tracks.
 
 The recurring tension this layer must resolve: source, deps, secrets, and db state are *coupled* (the lockfile pins deps to code; migration state pins schema to code), yet à-la-carte tracker composition treats them as independent dials. Systems that deliver reproducibility (Nix) do so by *removing* that freedom — the lockfile is the source of truth and the environment is derived. The binding layer must either pick a side or build guardrails.
 
@@ -92,6 +107,30 @@ The filesystem stops being authoritative. Tracker state is the source of truth; 
 Both are **lazy**: nothing materializes until touched. This single mechanism dissolves the original complaints — 5-minute installs and full-tree worktree copies — because spinning up branch number ten *mounts a view* rather than copying a tree. "Source control without a real OS" and "instant branch spinup" turn out to be the same problem solved by lazy projection off a content-addressed core.
 
 Honest scope: the filesystem cannot be *eliminated* (every build tool needs POSIX), only made *non-authoritative*. The FUSE/API projection also carries overhead versus raw fs ops, which is why laziness is mandatory rather than optional.
+
+---
+
+## The command surface as projection
+
+The same mediation thesis, applied to the last surface agents touch directly. Filesystem, network, and builds are all intercepted; there is no principled reason `git commit` and `pnpm dev` should be the exception. Because newgit owns the workspace (`spawn` creates it, `run` sets its env), prepending a shim directory to `PATH` intercepts the command surface in any agent harness, with zero agent cooperation.
+
+The design principle is **interpose, don't emulate**. There are two ways to capture a command, and only one of them survives contact with an agent:
+
+- **Passthrough with side effects (correct).** `git commit` runs the real git/jj commit *and* checkpoints the trackers and resources alongside it. `pnpm dev` really starts the dev server — but through the resource definition, with the branch's port injected before the process binds. Nothing the agent observes afterward is false; the command was enriched, not counterfeited.
+- **Emulation (never).** A shim that secretly does something *other* than what the command means must then fake every read path (`git log`, `git status`, `.git` itself) well enough that a suspicious agent never notices. Agents are the worst audience for this: when something looks 95% right, an agent doesn't shrug — it *debugs*, and the moment two answers disagree it concludes the repo is corrupt and starts "fixing" it. A leaky lie is strictly worse than no shim. Every claim the environment makes must be verifiable by the tools in that environment.
+
+Shims are not secret; they **announce themselves in command output** (`[newgit] checkpoint ckpt_018: also captured jack-env, supabase → db-snapshots`). Agents read command output more reliably than any documentation, so each intercepted command is a teaching moment — the shim is simultaneously the compatibility layer and the onboarding. The required agent briefing for a newgit project rounds to zero lines, the strongest reading of "obvious = what agents assume by default."
+
+The interception taxonomy:
+
+| Mode | Example | Rule |
+|------|---------|------|
+| **Enrich** | `git commit`, `npm install` | run the real command, add newgit side effects |
+| **Inject** | `pnpm dev` | run the real command through the resource, with ports/env injected |
+| **Advise** | `git checkout -b` | let it happen, print the better newgit move |
+| **Emulate** | — | never |
+
+`Advise` exists because a few commands *semantically* diverge: `git checkout -b` expects a new branch in *this* directory, while `newgit spawn` creates a workspace elsewhere. Silently redirecting would violate the agent's model of where it is standing. Intercept effects freely; redirect semantics never.
 
 ---
 
@@ -130,7 +169,7 @@ The real open question is *where on the isolation spectrum to land:*
 
 `jj` already auto-snapshots the working copy on every *command* and exposes an operation log ("undo operations one by one"). newgit increases capture *frequency* to every **write** — a filesystem watcher / FUSE layer feeding snapshots into the same backend — so the "agent wrote a change, I hate it, undo N steps" case is a linear revert rather than re-prompting the model to walk it back. Snapshots squash into clean commits at checkpoint boundaries.
 
-This is orthogonal to the object model: snapshot more often into the same store, squash later. Content-addressing keeps it cheap for text (unchanged file = same blob hash). Capture rules are **per-tracker**: source = every-write; db = checkpoint-only (snapshotting a large binary on every write defeats dedup). Keep the write-firehose off the db tracker.
+This is orthogonal to the object model: snapshot more often into the same store, squash later. Content-addressing keeps it cheap for text (unchanged file = same blob hash). Capture rules are **per-tracker**: source = every-write; a `db-snapshots` tracker fills only via a resource's checkpoint hook (snapshotting a large binary on every write defeats dedup). Keep the write-firehose off snapshot-fed trackers.
 
 Linear revert covers the stated use case. *Selective* fine-grained undo (undo edit-40-of-80 in isolation) would need a CRDT/op-model layered on top — explicitly **not** built, because the use case doesn't require it.
 
@@ -247,4 +286,4 @@ Irreducible residuals (no architecture removes these):
 
 ## What the design does *not* do
 
-No part of this reimplements git's object model. The components are: a unified store (gitoxide), `jj`'s model for source, the binding layer, two working-copy projections, the projection engine, three enforcement substrates, embargo as a time policy, the agent as policy-author, CI as coherence oracle, and the tripwire as perceptibility layer. Each piece has exactly one home; nothing does two jobs. The remaining hard work is not architectural — it is operational discipline around the remote as a trust root.
+No part of this reimplements git's object model. The components are: a unified store (gitoxide), `jj`'s model for source, trackers as store partitions, resources as per-branch lifecycle units, the binding layer, two working-copy projections, the projection engine, three enforcement substrates, embargo as a time policy, the agent as policy-author, CI as coherence oracle, and the tripwire as perceptibility layer. Each piece has exactly one home; nothing does two jobs. The remaining hard work is not architectural — it is operational discipline around the remote as a trust root.

@@ -22,9 +22,9 @@ You can also run the CLI through mise:
 
 ```sh
 mise x -- cargo run -p newgit-cli -- init
-mise x -- cargo run -p newgit-cli -- tracker add runtime-env --template env-file
 mise x -- cargo run -p newgit-cli -- spawn auth-refactor
 mise x -- cargo run -p newgit-cli -- status
+mise x -- cargo run -p newgit-cli -- remove auth-refactor
 ```
 
 ## Workspace Layout
@@ -39,9 +39,12 @@ mise x -- cargo run -p newgit-cli -- status
 The current skeleton implements the first usable slice:
 
 - `newgit init`
-- `newgit tracker add <name> --template <template>`
 - `newgit spawn <name>`
 - `newgit status`
+- `newgit remove <name>`
+
+Milestone 2 will add tracker and resource definition management, including
+commands such as `newgit tracker add <name> --template <template>`.
 
 The remaining MVP commands are present as explicit extension points so future
 work can fill them in without changing the command vocabulary.

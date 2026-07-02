@@ -23,23 +23,38 @@ pub enum NewgitError {
         source: toml::ser::Error,
     },
 
-    #[error("newgit metadata has not been initialized at {0}")]
+    #[error(
+        "newgit is not initialized here (no .newgit found from {0} upward); run `newgit init` in the project root"
+    )]
     MissingMetadata(Utf8PathBuf),
 
-    #[error("resource already exists at {0}")]
+    #[error("already exists at {0}")]
     AlreadyExists(Utf8PathBuf),
 
-    #[error("unknown starter template `{0}`")]
-    UnknownTemplate(String),
-
-    #[error("invalid name `{0}`; use letters, numbers, dots, underscores, or hyphens")]
+    #[error(
+        "invalid name `{0}`; use letters, numbers, dots, underscores, hyphens, or slashes, starting with a letter or number"
+    )]
     InvalidName(String),
 
-    #[error("tracker dependency cycle detected: {0:?}")]
-    DependencyCycle(Vec<String>),
+    #[error(
+        "branch instance `{name}` collides with existing record {path}; instance names must be unique after slugging"
+    )]
+    BranchInstanceExists { name: String, path: Utf8PathBuf },
 
-    #[error("tracker `{tracker}` depends on missing tracker `{dependency}`")]
-    MissingDependency { tracker: String, dependency: String },
+    #[error("no branch instance named `{0}`")]
+    UnknownBranchInstance(String),
+
+    #[error("workspace directory already exists at {0}; remove it or pick another name")]
+    WorkspaceExists(Utf8PathBuf),
+
+    #[error("{0} is not a Git repository; newgit v1 drives source through Git")]
+    NotAGitRepo(Utf8PathBuf),
+
+    #[error("`{command}` failed: {stderr}")]
+    SourceCommand { command: String, stderr: String },
+
+    #[error("{0}")]
+    Unsupported(String),
 
     #[error("path is not valid UTF-8: {0}")]
     NonUtf8Path(String),

@@ -1,13 +1,21 @@
 use camino::{Utf8Path, Utf8PathBuf};
+use chrono::Utc;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
-use crate::branch::{BranchInstance, branch_slug};
+use crate::branch::BranchInstance;
 use crate::config::{ProjectConfig, SourceSubstrate};
 use crate::error::{NewgitError, Result};
-use crate::materializer::create_dir_all;
-use crate::templates::{starter_template, starter_templates};
-use crate::tracker::TrackerDefinition;
+use crate::materializer::{WorkspaceMarker, create_dir_all};
+
+const LOCAL_GITIGNORE: &str = "\
+# newgit local state — never committed
+/local/
+/branches/
+/snapshots/
+/logs/
+/state/
+";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MetadataStore {
@@ -20,11 +28,22 @@ pub struct NewgitPaths {
     pub metadata_root: Utf8PathBuf,
     pub config: Utf8PathBuf,
     pub branches: Utf8PathBuf,
+    pub archived_branches: Utf8PathBuf,
     pub trackers: Utf8PathBuf,
+    pub resources: Utf8PathBuf,
     pub templates: Utf8PathBuf,
+    pub local: Utf8PathBuf,
     pub snapshots: Utf8PathBuf,
     pub logs: Utf8PathBuf,
     pub state: Utf8PathBuf,
+}
+
+/// Where a newgit command is standing: which store owns the metadata, and —
+/// when inside a workspace — which branch instance the cwd belongs to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Context {
+    pub store: MetadataStore,
+    pub current_branch: Option<String>,
 }
 
 impl MetadataStore {
@@ -34,18 +53,50 @@ impl MetadataStore {
         }
     }
 
-    pub fn init(project_root: impl Into<Utf8PathBuf>, project_name: &str) -> Result<Self> {
+    pub fn init(
+        project_root: impl Into<Utf8PathBuf>,
+        project_name: &str,
+        source: SourceSubstrate,
+    ) -> Result<Self> {
         let store = Self::at(project_root);
-        store.create_layout()?;
-
-        if !store.paths.config.exists() {
-            let source = detect_source_substrate(&store.paths.project_root);
-            let config = ProjectConfig::new(project_name, source);
-            store.write_toml(&store.paths.config, "project config", &config)?;
+        if store.paths.config.exists() {
+            return Err(NewgitError::AlreadyExists(store.paths.config.clone()));
         }
-
-        store.write_template_files()?;
+        store.create_layout()?;
+        let config = ProjectConfig::new(project_name, source);
+        store.write_toml(&store.paths.config, "project config", &config)?;
         Ok(store)
+    }
+
+    /// Walk upward from `cwd` to find the governing metadata. A workspace is
+    /// recognized by its gitignored marker and resolves to the store it was
+    /// cloned from; a directory with a committed `.newgit/config.toml` and no
+    /// marker is the store itself.
+    pub fn discover(cwd: &Utf8Path) -> Result<Context> {
+        let mut dir = Some(cwd);
+        while let Some(current) = dir {
+            let metadata_root = current.join(".newgit");
+            if metadata_root.is_dir() {
+                let marker_path = metadata_root.join("local/instance.toml");
+                if marker_path.is_file() {
+                    let marker: WorkspaceMarker = read_toml_at(&marker_path)?;
+                    let store = Self::at(marker.store_root);
+                    store.ensure_initialized()?;
+                    return Ok(Context {
+                        store,
+                        current_branch: Some(marker.branch),
+                    });
+                }
+                if metadata_root.join("config.toml").is_file() {
+                    return Ok(Context {
+                        store: Self::at(current),
+                        current_branch: None,
+                    });
+                }
+            }
+            dir = current.parent();
+        }
+        Err(NewgitError::MissingMetadata(cwd.to_path_buf()))
     }
 
     pub fn paths(&self) -> &NewgitPaths {
@@ -63,60 +114,27 @@ impl MetadataStore {
     }
 
     pub fn load_config(&self) -> Result<ProjectConfig> {
-        self.read_toml(&self.paths.config)
+        read_toml_at(&self.paths.config)
     }
 
-    pub fn write_tracker_definition(
-        &self,
-        definition: &TrackerDefinition,
-        overwrite: bool,
-    ) -> Result<Utf8PathBuf> {
-        definition.validate()?;
-        create_dir_all(&self.paths.trackers)?;
-        let path = self
-            .paths
-            .trackers
-            .join(format!("{}.toml", definition.name));
-        if path.exists() && !overwrite {
-            return Err(NewgitError::AlreadyExists(path));
-        }
-        self.write_toml(&path, &format!("tracker `{}`", definition.name), definition)?;
-        Ok(path)
+    pub fn write_config(&self, config: &ProjectConfig) -> Result<()> {
+        self.write_toml(&self.paths.config, "project config", config)
     }
 
-    pub fn add_tracker_from_template(
-        &self,
-        tracker_name: &str,
-        template_name: &str,
-    ) -> Result<Utf8PathBuf> {
-        self.ensure_initialized()?;
-        let definition = starter_template(template_name, tracker_name)?;
-        self.write_tracker_definition(&definition, false)
+    pub fn branch_record_path(&self, slug: &str) -> Utf8PathBuf {
+        self.paths.branches.join(format!("{slug}.toml"))
     }
 
-    pub fn load_tracker_definitions(&self) -> Result<Vec<TrackerDefinition>> {
-        self.ensure_initialized()?;
-        let mut definitions = Vec::new();
-
-        for entry in read_dir_sorted(&self.paths.trackers)? {
-            if entry.extension() != Some("toml") {
-                continue;
-            }
-            definitions.push(self.read_toml(&entry)?);
-        }
-
-        let mut config = self.load_config()?;
-        definitions.append(&mut config.trackers);
-        definitions.sort_by(|left, right| left.name.cmp(&right.name));
-        Ok(definitions)
-    }
-
-    pub fn write_branch(&self, branch: &BranchInstance) -> Result<Utf8PathBuf> {
+    /// Write a brand-new binding record; fails on slug collision.
+    pub fn create_branch_record(&self, branch: &BranchInstance) -> Result<Utf8PathBuf> {
         create_dir_all(&self.paths.branches)?;
-        let path = self
-            .paths
-            .branches
-            .join(format!("{}.toml", branch_slug(&branch.name)));
+        let path = self.branch_record_path(&branch.slug);
+        if path.exists() {
+            return Err(NewgitError::BranchInstanceExists {
+                name: branch.name.clone(),
+                path,
+            });
+        }
         self.write_toml(&path, &format!("branch `{}`", branch.name), branch)?;
         Ok(path)
     }
@@ -127,7 +145,7 @@ impl MetadataStore {
 
         for entry in read_dir_sorted(&self.paths.branches)? {
             if entry.extension() == Some("toml") {
-                branches.push(self.read_toml(&entry)?);
+                branches.push(read_toml_at(&entry)?);
             }
         }
 
@@ -135,49 +153,49 @@ impl MetadataStore {
         Ok(branches)
     }
 
+    /// Look an instance up by name or slug.
+    pub fn find_branch(&self, name: &str) -> Result<BranchInstance> {
+        self.load_branches()?
+            .into_iter()
+            .find(|branch| branch.name == name || branch.slug == name)
+            .ok_or_else(|| NewgitError::UnknownBranchInstance(name.to_owned()))
+    }
+
+    /// The binding record outlives the workspace: removal archives it rather
+    /// than deleting it.
+    pub fn archive_branch_record(&self, branch: &BranchInstance) -> Result<Utf8PathBuf> {
+        create_dir_all(&self.paths.archived_branches)?;
+        let record = self.branch_record_path(&branch.slug);
+        let archived = self.paths.archived_branches.join(format!(
+            "{}-{}.toml",
+            branch.slug,
+            Utc::now().format("%Y%m%dT%H%M%SZ")
+        ));
+        std::fs::rename(&record, &archived).map_err(|source| NewgitError::io(record, source))?;
+        Ok(archived)
+    }
+
     fn create_layout(&self) -> Result<()> {
         for path in [
             &self.paths.metadata_root,
             &self.paths.branches,
             &self.paths.trackers,
+            &self.paths.resources,
             &self.paths.templates,
+            &self.paths.local,
             &self.paths.snapshots,
             &self.paths.logs,
             &self.paths.state,
         ] {
             create_dir_all(path)?;
         }
-        Ok(())
-    }
 
-    fn write_template_files(&self) -> Result<()> {
-        create_dir_all(&self.paths.templates)?;
-        for template in starter_templates() {
-            let path = self.paths.templates.join(format!("{}.toml", template.name));
-            if !path.exists() {
-                std::fs::write(&path, template.contents.trim_start())
-                    .map_err(|source| NewgitError::io(path.clone(), source))?;
-            }
-        }
-
-        let base_env = self.paths.templates.join("base.env");
-        if !base_env.exists() {
-            std::fs::write(&base_env, "# branch-local environment\n")
-                .map_err(|source| NewgitError::io(base_env, source))?;
+        let gitignore = self.paths.metadata_root.join(".gitignore");
+        if !gitignore.exists() {
+            std::fs::write(&gitignore, LOCAL_GITIGNORE)
+                .map_err(|source| NewgitError::io(gitignore, source))?;
         }
         Ok(())
-    }
-
-    fn read_toml<T>(&self, path: &Utf8Path) -> Result<T>
-    where
-        T: DeserializeOwned,
-    {
-        let contents =
-            std::fs::read_to_string(path).map_err(|source| NewgitError::io(path, source))?;
-        toml::from_str(&contents).map_err(|source| NewgitError::TomlRead {
-            path: path.to_path_buf(),
-            source,
-        })
     }
 
     fn write_toml<T>(&self, path: &Utf8Path, label: &str, value: &T) -> Result<()>
@@ -199,8 +217,11 @@ impl NewgitPaths {
             project_root,
             config: metadata_root.join("config.toml"),
             branches: metadata_root.join("branches"),
+            archived_branches: metadata_root.join("branches/archived"),
             trackers: metadata_root.join("trackers"),
+            resources: metadata_root.join("resources"),
             templates: metadata_root.join("templates"),
+            local: metadata_root.join("local"),
             snapshots: metadata_root.join("snapshots"),
             logs: metadata_root.join("logs"),
             state: metadata_root.join("state"),
@@ -219,14 +240,15 @@ pub fn expand_home(path: &Utf8Path) -> Utf8PathBuf {
         .unwrap_or_else(|_| path.to_path_buf())
 }
 
-fn detect_source_substrate(project_root: &Utf8Path) -> SourceSubstrate {
-    if project_root.join(".jj").is_dir() {
-        SourceSubstrate::Jj
-    } else if project_root.join(".git").exists() {
-        SourceSubstrate::Git
-    } else {
-        SourceSubstrate::Unknown
-    }
+fn read_toml_at<T>(path: &Utf8Path) -> Result<T>
+where
+    T: DeserializeOwned,
+{
+    let contents = std::fs::read_to_string(path).map_err(|source| NewgitError::io(path, source))?;
+    toml::from_str(&contents).map_err(|source| NewgitError::TomlRead {
+        path: path.to_path_buf(),
+        source,
+    })
 }
 
 fn read_dir_sorted(path: &Utf8Path) -> Result<Vec<Utf8PathBuf>> {
@@ -239,7 +261,7 @@ fn read_dir_sorted(path: &Utf8Path) -> Result<Vec<Utf8PathBuf>> {
         let entry = entry.map_err(|source| NewgitError::io(path, source))?;
         let path = Utf8PathBuf::from_path_buf(entry.path())
             .map_err(|path| NewgitError::NonUtf8Path(path.display().to_string()))?;
-        if path.file_name() != Some(".DS_Store") {
+        if path.is_file() && path.file_name() != Some(".DS_Store") {
             entries.push(path);
         }
     }
