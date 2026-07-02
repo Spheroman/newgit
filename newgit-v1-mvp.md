@@ -274,9 +274,15 @@ TrackerDefinition {
 
 ### Capture and Restore
 
-Tracker capture is always the same operation: snapshot the tracker's content into the store. In v1 the "store" is `.newgit/snapshots/`, and a capture is a content copy keyed by checkpoint — conceptually a commit, implemented boringly. Restore puts the captured content back into the workspace.
+Tracker capture is always the same operation: snapshot the tracker's content into the store. In v1 the "store" is a content lane per tracker at `.newgit/snapshots/<tracker>/<rev>/`, where `<rev>` is a content hash — identical captures dedupe, and M5's checkpoints simply reference these revs. Each lane keeps a `LATEST` pointer marking the head for `rebase` propagation. Restore puts a captured rev back into the workspace, clearing owned paths first so restore reproduces the captured state exactly; before overwriting, the current content is auto-captured, so restore is always undoable.
 
 Because tracker state is pure content, capture and restore need no per-tracker modes. If a thing needs a command to capture or restore, it is a resource.
+
+Propagation semantics in v1 are pull-based:
+
+- `pin` — every spawn materializes fresh from the definition's `materialize` source; instances never share.
+- `rebase` — capture moves the lane head; new spawns materialize from it, and existing instances show as behind in `newgit status` until `newgit tracker materialize` pulls (with the auto-capture safety net). Automatic push into live workspaces waits for the checkpoint/shim machinery and a conflict story — silently overwriting files an agent is mid-edit on is not acceptable.
+- `manual` — nothing moves except by explicit `tracker restore --rev`.
 
 ### Tracker Paths and Git
 
@@ -650,7 +656,22 @@ newgit resource add app --template process
 newgit resource add postgres-db --template command-snapshot
 ```
 
-The user can then edit the generated TOML.
+The user can then edit the generated TOML. `tracker add` also appends the
+tracker's owned paths to the repo's `.gitignore`, loudly (see *Tracker Paths
+and Git*).
+
+Tracker content moves through plumbing subcommands — the same machinery
+`checkpoint`/`undo` orchestrate in M5, not a second code path:
+
+```sh
+newgit tracker capture <tracker> [instance]      # snapshot content → lane
+newgit tracker restore <tracker> [--rev <rev>]   # put a rev back (auto-saves current first)
+newgit tracker materialize <tracker> [instance]  # pull lane head (rebase) / template (pin)
+newgit tracker list
+newgit tracker templates
+```
+
+`[instance]` is inferred when run inside a workspace.
 
 ### `newgit spawn <name>`
 

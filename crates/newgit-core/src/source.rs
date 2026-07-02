@@ -33,6 +33,17 @@ impl GitSource {
         &self.root
     }
 
+    /// Whether the store repo's gitignore rules cover `path` (which need not
+    /// exist yet) — used to enforce the tracker-path invariant.
+    pub fn is_ignored(&self, path: &str) -> Result<bool> {
+        let args = ["-C", self.root.as_str(), "check-ignore", "-q", "--", path];
+        let output = Command::new("git")
+            .args(args)
+            .output()
+            .map_err(|source| spawn_error(&args, &source))?;
+        Ok(output.status.success())
+    }
+
     pub fn branch_exists(&self, name: &str) -> Result<bool> {
         let args = [
             "-C",

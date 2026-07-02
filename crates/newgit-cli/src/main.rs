@@ -1,9 +1,10 @@
 use anyhow::{Context as _, Result, bail};
 use camino::{Utf8Path, Utf8PathBuf};
 use clap::{Args, Parser, Subcommand};
-use newgit_core::manager::{BranchManager, InstanceReport};
+use newgit_core::manager::{BindOrigin, BranchManager, InstanceReport, TrackerBindOutcome};
 use newgit_core::source::find_repo_root;
 use newgit_core::store::Context;
+use newgit_core::templates::TRACKER_TEMPLATES;
 use newgit_core::{MetadataStore, ProjectConfig};
 
 #[derive(Debug, Parser)]
@@ -29,6 +30,11 @@ enum Command {
     Remove {
         name: String,
     },
+    /// Manage tracker definitions and content
+    Tracker {
+        #[command(subcommand)]
+        command: TrackerCommand,
+    },
     Run(RunArgs),
     Action {
         name: String,
@@ -43,6 +49,41 @@ enum Command {
         name: String,
     },
     Cleanup,
+}
+
+#[derive(Debug, Subcommand)]
+enum TrackerCommand {
+    /// Create a tracker definition from a starter template
+    Add {
+        name: String,
+        #[arg(long)]
+        template: String,
+    },
+    /// List defined trackers
+    List,
+    /// List available starter templates
+    Templates,
+    /// Snapshot a tracker's content from an instance workspace
+    Capture {
+        tracker: String,
+        /// Instance (inferred when run inside a workspace)
+        instance: Option<String>,
+    },
+    /// Put captured tracker content back into an instance workspace
+    Restore {
+        tracker: String,
+        /// Instance (inferred when run inside a workspace)
+        instance: Option<String>,
+        /// Content rev to restore (defaults to the instance's bound rev)
+        #[arg(long)]
+        rev: Option<String>,
+    },
+    /// Pull a tracker's default content into an existing instance
+    Materialize {
+        tracker: String,
+        /// Instance (inferred when run inside a workspace)
+        instance: Option<String>,
+    },
 }
 
 #[derive(Debug, Args)]
@@ -74,6 +115,7 @@ fn main() -> Result<()> {
         Command::Spawn(args) => spawn(args),
         Command::Status { name } => status(name.as_deref()),
         Command::Remove { name } => remove(&name),
+        Command::Tracker { command } => tracker(command),
         Command::Run(args) => {
             if args.command.is_empty() {
                 bail!("provide a command after `--`");
@@ -138,6 +180,7 @@ fn init(args: InitArgs) -> Result<()> {
 
 fn spawn(args: SpawnArgs) -> Result<()> {
     let manager = manager_here()?;
+    warn_gitignore(&manager);
     let outcome = manager.spawn(&args.name, args.from.as_deref())?;
     let branch = &outcome.branch;
 
@@ -158,12 +201,111 @@ fn spawn(args: SpawnArgs) -> Result<()> {
     );
     println!("  workspace: {}", branch.workspace_path);
     println!("  record:    {}", outcome.record_path);
+    for tracker in &outcome.trackers {
+        println!("  tracker:   {}", bind_line(tracker));
+    }
     Ok(())
+}
+
+fn tracker(command: TrackerCommand) -> Result<()> {
+    match command {
+        TrackerCommand::Add { name, template } => {
+            let manager = manager_here()?;
+            let outcome = manager.add_tracker(&name, &template)?;
+            println!(
+                "Added tracker `{name}` from `{template}` at {}",
+                outcome.path
+            );
+            if outcome.ignored_patterns.is_empty() {
+                println!("  .gitignore: owned paths already ignored");
+            } else {
+                println!(
+                    "  .gitignore: added {} (tracker-owned paths stay out of source history)",
+                    outcome.ignored_patterns.join(", ")
+                );
+            }
+            println!("  edit the definition, then `newgit spawn` materializes it per instance");
+            Ok(())
+        }
+        TrackerCommand::List => {
+            let manager = manager_here()?;
+            warn_gitignore(&manager);
+            let definitions = manager.tracker_definitions();
+            if definitions.is_empty() {
+                println!(
+                    "No trackers defined. Add one with `newgit tracker add <name> --template <template>`."
+                );
+                return Ok(());
+            }
+            println!(
+                "{:<18} {:<14} {:<12} {:<9} PATHS",
+                "NAME", "KIND", "PROPAGATION", "AUDIENCE"
+            );
+            for definition in definitions {
+                let paths = definition
+                    .paths
+                    .iter()
+                    .map(|path| path.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                println!(
+                    "{:<18} {:<14} {:<12} {:<9} {}",
+                    definition.name,
+                    definition.kind,
+                    format!("{:?}", definition.propagation).to_lowercase(),
+                    definition.audience,
+                    if paths.is_empty() { "-" } else { &paths }
+                );
+            }
+            Ok(())
+        }
+        TrackerCommand::Templates => {
+            for template in TRACKER_TEMPLATES {
+                println!("{:<16} {}", template.name, template.description);
+            }
+            Ok(())
+        }
+        TrackerCommand::Capture { tracker, instance } => {
+            let (manager, instance) = manager_and_instance(instance)?;
+            let report = manager.capture_tracker(&instance, &tracker)?;
+            let note = if report.changed { "" } else { " (unchanged)" };
+            println!(
+                "Captured `{tracker}` @ {} ({}){note} for `{instance}`",
+                report.rev,
+                files_label(report.files)
+            );
+            Ok(())
+        }
+        TrackerCommand::Restore {
+            tracker,
+            instance,
+            rev,
+        } => {
+            let (manager, instance) = manager_and_instance(instance)?;
+            let report = manager.restore_tracker(&instance, &tracker, rev.as_deref())?;
+            println!(
+                "Restored `{tracker}` @ {} ({}) for `{instance}`",
+                report.rev,
+                files_label(report.files)
+            );
+            if let Some(safety) = report.safety_rev {
+                println!("  previous content saved @ {safety}; restore it with --rev");
+            }
+            Ok(())
+        }
+        TrackerCommand::Materialize { tracker, instance } => {
+            let (manager, instance) = manager_and_instance(instance)?;
+            let outcome = manager.materialize_tracker(&instance, &tracker)?;
+            println!("Materialized {} for `{instance}`", bind_line(&outcome));
+            Ok(())
+        }
+    }
 }
 
 fn status(name: Option<&str>) -> Result<()> {
     let context = context_here()?;
     let manager = BranchManager::open(context.store)?;
+    warn_gitignore(&manager);
     let mut reports = manager.statuses()?;
 
     if let Some(name) = name {
@@ -178,23 +320,15 @@ fn status(name: Option<&str>) -> Result<()> {
         return Ok(());
     }
 
-    let name_width = reports
-        .iter()
-        .map(|report| report.branch.name.len() + 2)
-        .chain(["NAME".len() + 2])
-        .max()
-        .unwrap_or(6);
-    let source_width = reports
-        .iter()
-        .map(|report| source_column(report).len())
-        .chain(["SOURCE".len()])
-        .max()
-        .unwrap_or(6);
+    let name_width = column_width(reports.iter().map(|r| r.branch.name.len() + 2), "NAME");
+    let source_width = column_width(reports.iter().map(|r| source_column(r).len()), "SOURCE");
+    let tracker_width = column_width(reports.iter().map(|r| tracker_column(r).len()), "TRACKERS");
 
     println!(
-        "{:<name_width$} {:<source_width$} {:<10} WORKSPACE",
-        "NAME", "SOURCE", "STATUS"
+        "{:<name_width$} {:<source_width$} {:<10} {:<tracker_width$} WORKSPACE",
+        "NAME", "SOURCE", "STATUS", "TRACKERS"
     );
+    let mut any_behind = false;
     for report in &reports {
         let marker = if context.current_branch.as_deref() == Some(report.branch.name.as_str()) {
             "* "
@@ -206,12 +340,19 @@ fn status(name: Option<&str>) -> Result<()> {
         } else {
             "ws-missing"
         };
+        any_behind |= report.trackers.iter().any(|tracker| tracker.behind);
         println!(
-            "{marker}{:<width$} {:<source_width$} {workspace_status:<10} {}",
+            "{marker}{:<width$} {:<source_width$} {workspace_status:<10} {:<tracker_width$} {}",
             report.branch.name,
             source_column(report),
+            tracker_column(report),
             report.branch.workspace_path,
             width = name_width - 2,
+        );
+    }
+    if any_behind {
+        println!(
+            "\n^ = newer tracker content available; pull with `newgit tracker materialize <tracker> [instance]`"
         );
     }
     Ok(())
@@ -231,12 +372,68 @@ fn remove(name: &str) -> Result<()> {
     Ok(())
 }
 
+fn bind_line(outcome: &TrackerBindOutcome) -> String {
+    match &outcome.origin {
+        BindOrigin::Template => format!(
+            "`{}` @ {} ({}, from template)",
+            outcome.name,
+            outcome.content_rev.as_deref().unwrap_or("-"),
+            files_label(outcome.files)
+        ),
+        BindOrigin::LaneHead => format!(
+            "`{}` @ {} ({}, from lane head)",
+            outcome.name,
+            outcome.content_rev.as_deref().unwrap_or("-"),
+            files_label(outcome.files)
+        ),
+        BindOrigin::Nothing => format!("`{}` bound (nothing to materialize)", outcome.name),
+        BindOrigin::MissingSource(path) => format!(
+            "`{}` bound WITHOUT content: materialize source `{path}` is missing",
+            outcome.name
+        ),
+    }
+}
+
+fn files_label(count: usize) -> String {
+    if count == 1 {
+        "1 file".to_owned()
+    } else {
+        format!("{count} files")
+    }
+}
+
 fn source_column(report: &InstanceReport) -> String {
     let rev = report
         .live_rev
         .clone()
         .unwrap_or_else(|| report.branch.short_rev().to_owned());
     format!("{}@{rev}", report.branch.source_ref)
+}
+
+fn tracker_column(report: &InstanceReport) -> String {
+    if report.trackers.is_empty() {
+        return "-".to_owned();
+    }
+    report
+        .trackers
+        .iter()
+        .map(|tracker| {
+            let rev = tracker.content_rev.as_deref().unwrap_or("—");
+            let behind = if tracker.behind { "^" } else { "" };
+            format!("{}:{rev}{behind}", tracker.name)
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn column_width(lengths: impl Iterator<Item = usize>, header: &str) -> usize {
+    lengths.chain([header.len()]).max().unwrap_or(header.len())
+}
+
+fn warn_gitignore(manager: &BranchManager) {
+    for warning in manager.gitignore_warnings() {
+        eprintln!("warning: {warning}");
+    }
 }
 
 fn source_label(config: &ProjectConfig) -> &'static str {
@@ -252,6 +449,16 @@ fn context_here() -> Result<Context> {
 
 fn manager_here() -> Result<BranchManager> {
     Ok(BranchManager::open(context_here()?.store)?)
+}
+
+fn manager_and_instance(instance: Option<String>) -> Result<(BranchManager, String)> {
+    let context = context_here()?;
+    let instance = instance
+        .or_else(|| context.current_branch.clone())
+        .context("specify a branch instance, or run from inside a workspace")?;
+    let manager = BranchManager::open(context.store)?;
+    warn_gitignore(&manager);
+    Ok((manager, instance))
 }
 
 fn skeleton_notice(command: &str, detail: &str) -> Result<()> {

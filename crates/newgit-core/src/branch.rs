@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use camino::Utf8PathBuf;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -16,8 +18,19 @@ pub struct BranchInstance {
     pub source_rev: String,
     pub workspace_path: Utf8PathBuf,
     pub status: InstanceStatus,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub trackers: BTreeMap<String, TrackerBinding>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+}
+
+/// Which content revision of a tracker this instance is bound to.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TrackerBinding {
+    pub definition_rev: String,
+    /// None when the tracker is bound but no content has been captured yet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_rev: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -44,6 +57,7 @@ impl BranchInstance {
             source_rev: source_rev.into(),
             workspace_path,
             status: InstanceStatus::Active,
+            trackers: BTreeMap::new(),
             created_at: now,
             updated_at: now,
         })

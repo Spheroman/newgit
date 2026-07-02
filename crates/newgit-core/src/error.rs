@@ -53,6 +53,28 @@ pub enum NewgitError {
     #[error("`{command}` failed: {stderr}")]
     SourceCommand { command: String, stderr: String },
 
+    #[error("tracker `{tracker}` is invalid: {reason}")]
+    InvalidDefinition { tracker: String, reason: String },
+
+    #[error("trackers `{left}` and `{right}` both own `{path}`; content lanes must be disjoint")]
+    TrackerPathConflict {
+        left: String,
+        right: String,
+        path: camino::Utf8PathBuf,
+    },
+
+    #[error("no tracker named `{0}` is defined in .newgit/trackers/")]
+    UnknownTracker(String),
+
+    #[error("unknown starter template `{0}`")]
+    UnknownTemplate(String),
+
+    #[error("tracker `{tracker}` has no captured content at rev `{rev}`")]
+    NoSnapshot { tracker: String, rev: String },
+
+    #[error("tracker `{0}` owns no paths; there is nothing to capture from a workspace")]
+    TrackerHasNoPaths(String),
+
     #[error("{0}")]
     Unsupported(String),
 

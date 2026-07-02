@@ -7,6 +7,7 @@ use crate::branch::BranchInstance;
 use crate::config::{ProjectConfig, SourceSubstrate};
 use crate::error::{NewgitError, Result};
 use crate::materializer::{WorkspaceMarker, create_dir_all};
+use crate::tracker::{TrackerDefinition, validate_disjoint};
 
 const LOCAL_GITIGNORE: &str = "\
 # newgit local state — never committed
@@ -137,6 +138,65 @@ impl MetadataStore {
         }
         self.write_toml(&path, &format!("branch `{}`", branch.name), branch)?;
         Ok(path)
+    }
+
+    /// Overwrite an existing binding record (e.g. after a tracker capture).
+    pub fn save_branch_record(&self, branch: &BranchInstance) -> Result<Utf8PathBuf> {
+        create_dir_all(&self.paths.branches)?;
+        let path = self.branch_record_path(&branch.slug);
+        self.write_toml(&path, &format!("branch `{}`", branch.name), branch)?;
+        Ok(path)
+    }
+
+    /// Tracker definitions, one per file in `.newgit/trackers/`; the name
+    /// comes from the filename. Lanes are validated as disjoint.
+    pub fn load_tracker_definitions(&self) -> Result<Vec<TrackerDefinition>> {
+        self.ensure_initialized()?;
+        let mut definitions = Vec::new();
+        for entry in read_dir_sorted(&self.paths.trackers)? {
+            if entry.extension() != Some("toml") {
+                continue;
+            }
+            let Some(name) = entry.file_stem() else {
+                continue;
+            };
+            definitions.push(TrackerDefinition::from_file(name, &entry)?);
+        }
+        validate_disjoint(&definitions)?;
+        Ok(definitions)
+    }
+
+    pub fn write_tracker_file(&self, name: &str, contents: &str) -> Result<Utf8PathBuf> {
+        create_dir_all(&self.paths.trackers)?;
+        let path = self.paths.trackers.join(format!("{name}.toml"));
+        if path.exists() {
+            return Err(NewgitError::AlreadyExists(path));
+        }
+        std::fs::write(&path, contents).map_err(|source| NewgitError::io(&path, source))?;
+        Ok(path)
+    }
+
+    /// Append patterns to the store repo's .gitignore under a labeled block.
+    pub fn append_gitignore(&self, label: &str, patterns: &[String]) -> Result<()> {
+        if patterns.is_empty() {
+            return Ok(());
+        }
+        let path = self.paths.project_root.join(".gitignore");
+        let existing = if path.exists() {
+            std::fs::read_to_string(&path).map_err(|source| NewgitError::io(&path, source))?
+        } else {
+            String::new()
+        };
+        let mut updated = existing.clone();
+        if !updated.is_empty() && !updated.ends_with('\n') {
+            updated.push('\n');
+        }
+        updated.push_str(&format!("\n# newgit tracker: {label}\n"));
+        for pattern in patterns {
+            updated.push_str(pattern);
+            updated.push('\n');
+        }
+        std::fs::write(&path, updated).map_err(|source| NewgitError::io(&path, source))
     }
 
     pub fn load_branches(&self) -> Result<Vec<BranchInstance>> {
