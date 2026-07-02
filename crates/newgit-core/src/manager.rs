@@ -46,8 +46,11 @@ pub struct SpawnOutcome {
 pub struct ResourceBindOutcome {
     pub name: String,
     pub ports: BTreeMap<String, u16>,
+    pub status: ResourceStatus,
     /// Present when a `prepare` action ran: (succeeded, log path).
     pub prepare: Option<(bool, Utf8PathBuf)>,
+    /// Resource dependencies that prevented `prepare` from running.
+    pub blocked_by: Vec<String>,
 }
 
 /// What running an action did.
@@ -139,6 +142,13 @@ pub struct RestoreReport {
 pub struct AddTrackerOutcome {
     pub path: Utf8PathBuf,
     pub ignored_patterns: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AddResourceOutcome {
+    pub path: Utf8PathBuf,
+    /// Companion definitions created because the template depends on them.
+    pub companions_created: Vec<Utf8PathBuf>,
 }
 
 impl BranchManager {
@@ -290,36 +300,48 @@ impl BranchManager {
                 },
             );
 
+            let blocked_by = self.blocked_dependencies(branch, definition);
+
             // Prepare runs with the bindings made so far, so dependents see
-            // their dependencies' exports.
-            let prepare = match definition.actions.get("prepare") {
-                Some(action) if action.command.is_some() && !action.long_running => {
-                    let log = self
-                        .store
-                        .action_log_path(&branch.slug, &format!("{}.prepare", definition.name));
-                    let code = self.run_one_shot(branch, definition, action, &log)?;
-                    let status = if code == 0 {
-                        ResourceStatus::Ready
-                    } else {
-                        ResourceStatus::Failed
-                    };
-                    if let Some(binding) = branch.resources.get_mut(&definition.name) {
-                        binding.status = status;
-                    }
-                    Some((code == 0, log))
+            // their dependencies' exports. Failed dependencies block
+            // dependents; the instance still spawns so logs can be inspected.
+            let (status, prepare) = if !blocked_by.is_empty() {
+                if let Some(binding) = branch.resources.get_mut(&definition.name) {
+                    binding.status = ResourceStatus::Blocked;
                 }
-                _ => {
-                    if let Some(binding) = branch.resources.get_mut(&definition.name) {
-                        binding.status = ResourceStatus::Ready;
+                (ResourceStatus::Blocked, None)
+            } else {
+                match definition.actions.get("prepare") {
+                    Some(action) if action.command.is_some() && !action.long_running => {
+                        let log = self
+                            .store
+                            .action_log_path(&branch.slug, &format!("{}.prepare", definition.name));
+                        let code = self.run_one_shot(branch, definition, action, &log)?;
+                        let status = if code == 0 {
+                            ResourceStatus::Ready
+                        } else {
+                            ResourceStatus::Failed
+                        };
+                        if let Some(binding) = branch.resources.get_mut(&definition.name) {
+                            binding.status = status;
+                        }
+                        (status, Some((code == 0, log)))
                     }
-                    None
+                    _ => {
+                        if let Some(binding) = branch.resources.get_mut(&definition.name) {
+                            binding.status = ResourceStatus::Ready;
+                        }
+                        (ResourceStatus::Ready, None)
+                    }
                 }
             };
 
             outcomes.push(ResourceBindOutcome {
                 name: definition.name.clone(),
                 ports: resolved_ports,
+                status,
                 prepare,
+                blocked_by,
             });
         }
         branch.updated_at = Utc::now();
@@ -353,6 +375,19 @@ impl BranchManager {
             return Ok(ActionOutcome::Stopped(
                 supervisor.stop(&definition.name, &signal)?,
             ));
+        }
+
+        let blocked_by = self.blocked_dependencies(&branch, definition);
+        if !blocked_by.is_empty() {
+            if let Some(binding) = branch.resources.get_mut(&definition.name) {
+                binding.status = ResourceStatus::Blocked;
+                branch.updated_at = Utc::now();
+                self.store.save_branch_record(&branch)?;
+            }
+            return Err(NewgitError::Unsupported(format!(
+                "resource `{resource_name}` is blocked by failed dependency/dependencies: {}",
+                blocked_by.join(", ")
+            )));
         }
 
         let log = self
@@ -516,11 +551,33 @@ impl BranchManager {
         Ok(env.into_iter().collect())
     }
 
-    pub fn add_resource(&self, name: &str, template_name: &str) -> Result<Utf8PathBuf> {
+    pub fn add_resource(&self, name: &str, template_name: &str) -> Result<AddResourceOutcome> {
         validate_name(name)?;
         let template = resource_template(template_name)
             .ok_or_else(|| NewgitError::UnknownTemplate(template_name.to_owned()))?;
-        self.store.write_resource_file(name, template.contents)
+        let path = self.store.write_resource_file(name, template.contents)?;
+
+        // Companions the template depends on, created only when absent so an
+        // existing definition is never overwritten.
+        let mut companions_created = Vec::new();
+        for companion in template.companions {
+            let companion_path = self
+                .store
+                .paths()
+                .resources
+                .join(format!("{}.toml", companion.name));
+            if !companion_path.exists() {
+                companions_created.push(
+                    self.store
+                        .write_resource_file(companion.name, companion.contents)?,
+                );
+            }
+        }
+
+        Ok(AddResourceOutcome {
+            path,
+            companions_created,
+        })
     }
 
     pub fn resource_definitions(&self) -> &[ResourceDefinition] {
@@ -536,6 +593,22 @@ impl BranchManager {
 
     fn supervisor(&self, branch: &BranchInstance) -> Supervisor {
         Supervisor::new(self.store.instance_state_dir(&branch.slug))
+    }
+
+    fn blocked_dependencies(
+        &self,
+        branch: &BranchInstance,
+        definition: &ResourceDefinition,
+    ) -> Vec<String> {
+        definition
+            .depends_on
+            .iter()
+            .filter_map(|dependency| {
+                branch.resources.get(dependency).and_then(|binding| {
+                    (binding.status != ResourceStatus::Ready).then(|| dependency.clone())
+                })
+            })
+            .collect()
     }
 
     /// Materialize a tracker's initial content into an instance workspace
@@ -813,6 +886,7 @@ impl BranchManager {
                                         ResourceStatus::Pending => "pending".to_owned(),
                                         ResourceStatus::Ready => "ready".to_owned(),
                                         ResourceStatus::Failed => "failed".to_owned(),
+                                        ResourceStatus::Blocked => "blocked".to_owned(),
                                     }
                                 }
                             }

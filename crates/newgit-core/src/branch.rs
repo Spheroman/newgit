@@ -45,6 +45,8 @@ pub enum ResourceStatus {
     Pending,
     Ready,
     Failed,
+    /// Not attempted because a resource dependency is failed or blocked.
+    Blocked,
 }
 
 /// Which content revision of a tracker this instance is bound to.

@@ -84,6 +84,33 @@ ownership = "workspace"
 command = "echo prepared-{{branch.slug}} > prepared.txt"
 "#;
 
+const BAD_PREP_RESOURCE: &str = r#"kind = "command"
+ownership = "workspace"
+
+[actions.prepare]
+command = "echo bad-prep-ran > bad-prep.txt; exit 7"
+"#;
+
+const AFTER_BAD_RESOURCE: &str = r#"kind = "command"
+ownership = "workspace"
+depends_on = ["bad-prep"]
+
+[actions.prepare]
+command = "echo should-not-run > after-bad.txt"
+"#;
+
+const BLOCKED_PROCESS_RESOURCE: &str = r#"kind = "process"
+ownership = "branch"
+depends_on = ["bad-prep"]
+
+[actions.start]
+command = "sleep 30"
+long_running = true
+
+[actions.stop]
+signal = "term"
+"#;
+
 #[test]
 fn spawn_allocates_stable_distinct_ports_and_runs_prepare() {
     let (_guard, temp) = tempdir();
@@ -117,6 +144,76 @@ fn spawn_allocates_stable_distinct_ports_and_runs_prepare() {
     // Persisted: reloading the record shows the same port (determinism).
     let reloaded = manager.store().find_branch("feature-a").expect("reload");
     assert_eq!(reloaded.resources["app"].resolved_ports["app"], port_a);
+}
+
+#[test]
+fn failed_prepare_blocks_dependents_but_keeps_instance_spawned() {
+    let (_guard, temp) = tempdir();
+    let store = setup(&temp);
+    write_resource(&store, "bad-prep", BAD_PREP_RESOURCE);
+    write_resource(&store, "after-bad", AFTER_BAD_RESOURCE);
+    write_resource(&store, "blocked-app", BLOCKED_PROCESS_RESOURCE);
+    let repo = store.paths().project_root.clone();
+    let manager = BranchManager::open(MetadataStore::at(repo)).expect("manager");
+
+    let spawned = manager.spawn("feature-a", None).expect("spawn");
+
+    assert!(spawned.branch.workspace_path.is_dir());
+    assert_eq!(
+        spawned.branch.resources["bad-prep"].status,
+        ResourceStatus::Failed
+    );
+    assert_eq!(
+        spawned.branch.resources["after-bad"].status,
+        ResourceStatus::Blocked
+    );
+    assert_eq!(
+        spawned.branch.resources["blocked-app"].status,
+        ResourceStatus::Blocked
+    );
+    assert!(
+        spawned.branch.workspace_path.join("bad-prep.txt").is_file(),
+        "the failing dependency should have run"
+    );
+    assert!(
+        !spawned.branch.workspace_path.join("after-bad.txt").exists(),
+        "blocked dependents should not run prepare"
+    );
+
+    let reports = manager.statuses().expect("statuses");
+    let resources = &reports[0].resources;
+    assert_eq!(
+        resources
+            .iter()
+            .find(|r| r.name == "bad-prep")
+            .expect("bad-prep")
+            .state,
+        "failed"
+    );
+    assert_eq!(
+        resources
+            .iter()
+            .find(|r| r.name == "after-bad")
+            .expect("after-bad")
+            .state,
+        "blocked"
+    );
+    assert_eq!(
+        resources
+            .iter()
+            .find(|r| r.name == "blocked-app")
+            .expect("blocked-app")
+            .state,
+        "blocked"
+    );
+    assert!(matches!(
+        manager.run_action("feature-a", "after-bad.prepare"),
+        Err(NewgitError::Unsupported(_))
+    ));
+    assert!(matches!(
+        manager.run_action("feature-a", "blocked-app.start"),
+        Err(NewgitError::Unsupported(_))
+    ));
 }
 
 #[test]
@@ -249,6 +346,37 @@ fn remove_stops_running_processes() {
         .expect("kill -0")
         .success();
     assert!(!alive, "process group survived remove");
+}
+
+#[test]
+fn pnpm_template_creates_companion_store_and_loads() {
+    let (_guard, temp) = tempdir();
+    let store = setup(&temp);
+    let repo = store.paths().project_root.clone();
+    let manager = BranchManager::open(MetadataStore::at(repo.clone())).expect("manager");
+
+    let outcome = manager.add_resource("deps", "pnpm").expect("add pnpm");
+    assert!(outcome.path.is_file());
+    assert_eq!(outcome.companions_created.len(), 1);
+    assert!(
+        outcome.companions_created[0]
+            .as_str()
+            .ends_with("pnpm-store.toml")
+    );
+
+    // Definitions load and the dependency resolves (no MissingDependency).
+    let manager = BranchManager::open(MetadataStore::at(repo.clone())).expect("reopen");
+    let names: Vec<&str> = manager
+        .resource_definitions()
+        .iter()
+        .map(|d| d.name.as_str())
+        .collect();
+    assert!(names.contains(&"deps"));
+    assert!(names.contains(&"pnpm-store"));
+
+    // Re-adding under another name must not overwrite the existing companion.
+    let again = manager.add_resource("deps2", "pnpm").expect("add again");
+    assert!(again.companions_created.is_empty());
 }
 
 #[test]

@@ -238,7 +238,13 @@ fn spawn(args: SpawnArgs) -> Result<()> {
                     resource.name
                 )
             }
-            None => String::new(),
+            None if !resource.blocked_by.is_empty() => {
+                format!(" prepare: BLOCKED by {}", resource.blocked_by.join(", "))
+            }
+            None => match resource.status {
+                newgit_core::branch::ResourceStatus::Blocked => " prepare: BLOCKED".to_owned(),
+                _ => String::new(),
+            },
         };
         println!("  resource:  `{}`{ports}{prepare}", resource.name);
     }
@@ -249,8 +255,14 @@ fn resource(command: ResourceCommand) -> Result<()> {
     match command {
         ResourceCommand::Add { name, template } => {
             let manager = manager_here()?;
-            let path = manager.add_resource(&name, &template)?;
-            println!("Added resource `{name}` from `{template}` at {path}");
+            let outcome = manager.add_resource(&name, &template)?;
+            println!(
+                "Added resource `{name}` from `{template}` at {}",
+                outcome.path
+            );
+            for companion in &outcome.companions_created {
+                println!("  companion: created {companion} (this template depends on it)");
+            }
             println!("  edit the definition; `newgit spawn` binds it (ports, exports, prepare)");
             Ok(())
         }

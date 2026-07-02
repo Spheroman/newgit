@@ -209,9 +209,11 @@ impl MetadataStore {
 
     /// Timestamped log path for one action run.
     pub fn action_log_path(&self, slug: &str, label: &str) -> Utf8PathBuf {
+        let now = Utc::now();
         self.paths.logs.join(slug).join(format!(
-            "{label}-{}.log",
-            Utc::now().format("%Y%m%dT%H%M%SZ")
+            "{label}-{}-{:09}Z.log",
+            now.format("%Y%m%dT%H%M%S"),
+            now.timestamp_subsec_nanos()
         ))
     }
 

@@ -441,11 +441,19 @@ app-service depends_on ["deps", "runtime-env", "dev-db"]
 v1 can use a simple topological order:
 
 - materialize trackers and prepare resource dependencies first
+- if a resource dependency fails to prepare, leave the branch instance spawned
+  but mark dependents `blocked` rather than running their prepare hooks or
+  other command actions
 - checkpoint dependents first when needed
 - restore dependencies before starting dependents
 - cleanup dependents before dependencies
 
-The exact ordering rules should stay boring and visible.
+The exact ordering rules should stay boring and visible. During `spawn`, a
+prepare failure does not roll back the workspace, tracker bindings, resource
+bindings, allocated ports, or logs; it leaves the instance available for
+inspection and repair. A blocked resource can be prepared after its failed
+dependency is repaired; command actions such as `start` stay blocked until
+then, while signal-only actions such as `stop` remain available.
 
 ---
 
@@ -1371,7 +1379,8 @@ Success criterion:
 - logs per action
 - process resource template (pulled forward from Milestone 4)
 - spawn runs `prepare` hooks in dependency order; failures are loud but
-  leave the instance spawned
+  leave the instance spawned; resources whose dependencies failed are marked
+  `blocked` and are not prepared or started until the dependency is repaired
 
 Success criterion:
 
