@@ -44,6 +44,13 @@ impl GitSource {
         Ok(output.status.success())
     }
 
+    /// Whether `path` is tracked by the store repo — a tracker path that is
+    /// also in Git history is dual-tracked, deliberately or not.
+    pub fn is_tracked(&self, path: &str) -> Result<bool> {
+        self.git(&["ls-files", "--", path])
+            .map(|stdout| !stdout.is_empty())
+    }
+
     pub fn branch_exists(&self, name: &str) -> Result<bool> {
         let args = [
             "-C",

@@ -59,6 +59,10 @@ fn write_workspace_marker(store_root: &Utf8Path, branch: &BranchInstance) -> Res
     let path = workspace_marker_path(&branch.workspace_path);
     if let Some(parent) = path.parent() {
         create_dir_all(parent)?;
+        // Self-ignoring: the marker must never show up in `git status` or be
+        // committable, even when the project has no committed .newgit rules.
+        let gitignore = parent.join(".gitignore");
+        std::fs::write(&gitignore, "*\n").map_err(|source| NewgitError::io(gitignore, source))?;
     }
     let contents = toml::to_string_pretty(&marker).map_err(|source| NewgitError::TomlWrite {
         label: "workspace marker".to_owned(),

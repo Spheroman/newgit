@@ -232,6 +232,47 @@ paths = ["config/shared.json"]
 }
 
 #[test]
+fn workspace_marker_is_invisible_to_git() {
+    let (_guard, temp) = tempdir();
+    let m = manager(setup(&temp));
+    let outcome = m.spawn("feature-a", None).expect("spawn");
+
+    let status = Command::new("git")
+        .args([
+            "-C",
+            outcome.branch.workspace_path.as_str(),
+            "status",
+            "--porcelain",
+        ])
+        .output()
+        .expect("git status");
+    assert!(
+        status.stdout.is_empty(),
+        "workspace not clean: {}",
+        String::from_utf8_lossy(&status.stdout)
+    );
+}
+
+#[test]
+fn dual_tracked_paths_warn_loudly() {
+    let (_guard, temp) = tempdir();
+    let store = setup(&temp);
+    let repo = store.paths().project_root.clone();
+
+    // README.md is committed; a tracker owning it is dual-tracked.
+    std::fs::write(
+        store.paths().trackers.join("readme.toml"),
+        "kind = \"file-snapshot\"\naudience = \"project-devs\"\nstorage = \"local\"\npropagation = \"manual\"\npaths = [\"README.md\"]\n",
+    )
+    .expect("write def");
+
+    let m = manager(MetadataStore::at(repo));
+    let warnings = m.gitignore_warnings();
+    assert_eq!(warnings.len(), 1);
+    assert!(warnings[0].contains("dual-tracked"), "{}", warnings[0]);
+}
+
+#[test]
 fn disjoint_lanes_and_manual_materialize_are_enforced() {
     let (_guard, temp) = tempdir();
     let store = setup(&temp);

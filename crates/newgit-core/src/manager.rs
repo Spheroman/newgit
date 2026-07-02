@@ -124,7 +124,15 @@ impl BranchManager {
         let mut warnings = Vec::new();
         for definition in &self.trackers {
             for path in &definition.paths {
-                if let Ok(false) = self.source.is_ignored(path.as_str()) {
+                if let Ok(true) = self.source.is_tracked(path.as_str()) {
+                    warnings.push(format!(
+                        "tracker `{}` owns `{path}`, which Git also tracks (dual-tracked): \
+                         branch-local content will show as modifications and can be committed \
+                         into source history — untrack it with `git rm --cached {path}` unless \
+                         this is deliberate",
+                        definition.name
+                    ));
+                } else if let Ok(false) = self.source.is_ignored(path.as_str()) {
                     warnings.push(format!(
                         "tracker `{}` owns `{path}` but the store repo does not gitignore it; \
                          agents may commit it into source history (fine only if deliberately \
