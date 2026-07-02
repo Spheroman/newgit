@@ -93,6 +93,12 @@ The genuinely novel part — nobody has built it. It defines how a source revisi
 
 The recurring tension this layer must resolve: source, deps, secrets, and db state are *coupled* (the lockfile pins deps to code; migration state pins schema to code), yet à-la-carte tracker composition treats them as independent dials. Systems that deliver reproducibility (Nix) do so by *removing* that freedom — the lockfile is the source of truth and the environment is derived. The binding layer must either pick a side or build guardrails.
 
+One guardrail is that resource dependency state should tell the truth: if a
+dependency fails to prepare, dependents are blocked rather than prepared or
+started as if the branch were coherent. The branch instance can still exist for
+inspection and repair; what must not happen is a downstream `ready` status or
+running process built on a failed prerequisite.
+
 > **Open decision.** Does a source revision *pin* exact versions of the other trackers (reproducible, rigid) or *name them loosely* and resolve at materialization (flexible, drifty)? Possibly per-tracker. This is unresolved and sizes the coherence guarantee.
 
 ---

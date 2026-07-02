@@ -422,6 +422,14 @@ opaque state refs
 
 This is how a database resource can expose `DATABASE_URL`, a service resource can expose `APP_URL`, and a cloud preview resource can expose `PREVIEW_ID`.
 
+Port allocation is deterministic in the useful sense: **an instance's port
+never changes once allocated.** Ports are allocated at resource-bind time
+(spawn), taking the first port scanning up from the requested `start` that is
+neither recorded in any other instance's binding nor OS-unbindable at that
+moment, and are persisted in the binding record. The binding records are the
+single source of truth — removing an instance frees its ports automatically,
+with no separate ledger to drift.
+
 ### Dependencies
 
 Resources can depend on trackers and other resources:
@@ -433,11 +441,19 @@ app-service depends_on ["deps", "runtime-env", "dev-db"]
 v1 can use a simple topological order:
 
 - materialize trackers and prepare resource dependencies first
+- if a resource dependency fails to prepare, leave the branch instance spawned
+  but mark dependents `blocked` rather than running their prepare hooks or
+  other command actions
 - checkpoint dependents first when needed
 - restore dependencies before starting dependents
 - cleanup dependents before dependencies
 
-The exact ordering rules should stay boring and visible.
+The exact ordering rules should stay boring and visible. During `spawn`, a
+prepare failure does not roll back the workspace, tracker bindings, resource
+bindings, allocated ports, or logs; it leaves the instance available for
+inspection and repair. A blocked resource can be prepared after its failed
+dependency is repaired; command actions such as `start` stay blocked until
+then, while signal-only actions such as `stop` remain available.
 
 ---
 
@@ -693,29 +709,49 @@ This is the flagship command.
 newgit spawn auth-refactor --profile fullstack
 ```
 
-### `newgit run <name> -- <command>`
+### `newgit run [name] -- <command>`
 
-Runs a command inside the branch instance with:
+Runs a command inside the branch instance with the environment assembled in
+layers (later layers win):
 
-- tracker and resource exports loaded
-- assigned ports exposed as env vars
-- workspace as cwd
-- logs captured
+1. parsed `env_file` contents from tracker exports (dotenv semantics, so
+   `psql $DATABASE_URL` works in a shell)
+2. tracker exports
+3. resource exports, in dependency order
+4. port env vars (`PORT=3107`)
+5. `NEWGIT_BRANCH`, `NEWGIT_WORKSPACE` context vars
+
+The workspace is the cwd; output is captured to `.newgit/logs/` as well as
+the terminal.
 
 ```sh
 newgit run feature-a -- pnpm test
 ```
 
-### `newgit action <name> <resource>.<action>`
+Template variables available in exports and action commands are kept
+minimal: `{{ports.<name>}}`, `{{branch.name}}`, `{{branch.slug}}`,
+`{{workspace}}`.
 
-Runs a named resource action.
+### `newgit action <resource>.<action> [instance]`
+
+Runs a named resource action. The instance comes last (and is inferred
+inside a workspace) — an agent standing in its workspace types
+`newgit action app.start`. This deliberately deviates from an earlier
+`action <name> <resource>.<action>` draft for consistency with the
+`tracker` subcommands.
 
 ```sh
-newgit action feature-a deps.prepare
-newgit action feature-a app.start
-newgit action feature-a app.stop
-newgit action feature-a postgres-db.migrate
+newgit action deps.prepare feature-a
+newgit action app.start          # inside a workspace
+newgit action app.stop
+newgit action postgres-db.migrate
 ```
+
+Actions with `long_running = true` run under a minimal PID-file supervisor:
+the process starts detached in its own process group with output to a log
+file under `.newgit/logs/`, the PID is recorded in `.newgit/state/`, `stop`
+sends the action's configured signal (default TERM) to the group, and
+`status` checks liveness. No daemon, no restart policy — boring.
 
 Convenience shorthands can come later, but the primitive should be resource actions.
 
@@ -1337,9 +1373,14 @@ Success criterion:
 
 - parse resource definitions
 - command-based resource actions
+- minimal PID-file process supervision for `long_running` actions
 - tracker and resource exports loaded into `newgit run`
 - deterministic port allocation
 - logs per action
+- process resource template (pulled forward from Milestone 4)
+- spawn runs `prepare` hooks in dependency order; failures are loud but
+  leave the instance spawned; resources whose dependencies failed are marked
+  `blocked` and are not prepared or started until the dependency is repaired
 
 Success criterion:
 

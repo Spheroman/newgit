@@ -7,6 +7,7 @@ use crate::branch::BranchInstance;
 use crate::config::{ProjectConfig, SourceSubstrate};
 use crate::error::{NewgitError, Result};
 use crate::materializer::{WorkspaceMarker, create_dir_all};
+use crate::resource::ResourceDefinition;
 use crate::tracker::{TrackerDefinition, validate_disjoint};
 
 const LOCAL_GITIGNORE: &str = "\
@@ -174,6 +175,46 @@ impl MetadataStore {
         }
         std::fs::write(&path, contents).map_err(|source| NewgitError::io(&path, source))?;
         Ok(path)
+    }
+
+    /// Resource definitions, one per file in `.newgit/resources/`.
+    pub fn load_resource_definitions(&self) -> Result<Vec<ResourceDefinition>> {
+        self.ensure_initialized()?;
+        let mut definitions = Vec::new();
+        for entry in read_dir_sorted(&self.paths.resources)? {
+            if entry.extension() != Some("toml") {
+                continue;
+            }
+            let Some(name) = entry.file_stem() else {
+                continue;
+            };
+            definitions.push(ResourceDefinition::from_file(name, &entry)?);
+        }
+        Ok(definitions)
+    }
+
+    pub fn write_resource_file(&self, name: &str, contents: &str) -> Result<Utf8PathBuf> {
+        create_dir_all(&self.paths.resources)?;
+        let path = self.paths.resources.join(format!("{name}.toml"));
+        if path.exists() {
+            return Err(NewgitError::AlreadyExists(path));
+        }
+        std::fs::write(&path, contents).map_err(|source| NewgitError::io(&path, source))?;
+        Ok(path)
+    }
+
+    pub fn instance_state_dir(&self, slug: &str) -> Utf8PathBuf {
+        self.paths.state.join(slug)
+    }
+
+    /// Timestamped log path for one action run.
+    pub fn action_log_path(&self, slug: &str, label: &str) -> Utf8PathBuf {
+        let now = Utc::now();
+        self.paths.logs.join(slug).join(format!(
+            "{label}-{}-{:09}Z.log",
+            now.format("%Y%m%dT%H%M%S"),
+            now.timestamp_subsec_nanos()
+        ))
     }
 
     /// Append patterns to the store repo's .gitignore under a labeled block.

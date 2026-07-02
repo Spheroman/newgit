@@ -146,3 +146,15 @@ fn remove_refuses_from_inside_the_workspace() {
     ));
     assert!(inside.exists());
 }
+
+#[test]
+fn action_log_paths_do_not_collide_within_one_second() {
+    let (_guard, temp) = tempdir();
+    let store = setup(&temp);
+
+    let first = store.action_log_path("feature-a", "run");
+    let second = store.action_log_path("feature-a", "run");
+
+    assert_ne!(first, second);
+    assert_eq!(first.parent(), second.parent());
+}

@@ -1,15 +1,19 @@
 pub mod branch;
 pub mod config;
 pub mod error;
+pub mod exports;
 pub mod lane;
 pub mod manager;
 pub mod materializer;
+pub mod ports;
+pub mod resource;
 pub mod source;
 pub mod store;
+pub mod supervisor;
 pub mod templates;
 pub mod tracker;
 
-pub use branch::{BranchInstance, InstanceStatus, TrackerBinding};
+pub use branch::{BranchInstance, InstanceStatus, ResourceBinding, TrackerBinding};
 pub use config::{ProjectConfig, SourceSubstrate};
 pub use error::{NewgitError, Result};
 pub use manager::BranchManager;

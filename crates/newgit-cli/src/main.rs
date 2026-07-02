@@ -1,10 +1,13 @@
 use anyhow::{Context as _, Result, bail};
 use camino::{Utf8Path, Utf8PathBuf};
 use clap::{Args, Parser, Subcommand};
-use newgit_core::manager::{BindOrigin, BranchManager, InstanceReport, TrackerBindOutcome};
+use newgit_core::manager::{
+    ActionOutcome, BindOrigin, BranchManager, InstanceReport, TrackerBindOutcome,
+};
 use newgit_core::source::find_repo_root;
 use newgit_core::store::Context;
-use newgit_core::templates::TRACKER_TEMPLATES;
+use newgit_core::supervisor::StopOutcome;
+use newgit_core::templates::{RESOURCE_TEMPLATES, TRACKER_TEMPLATES};
 use newgit_core::{MetadataStore, ProjectConfig};
 
 #[derive(Debug, Parser)]
@@ -35,10 +38,19 @@ enum Command {
         #[command(subcommand)]
         command: TrackerCommand,
     },
+    /// Manage resource definitions
+    Resource {
+        #[command(subcommand)]
+        command: ResourceCommand,
+    },
+    /// Run a command inside an instance with exports and ports loaded
     Run(RunArgs),
+    /// Run a resource action: newgit action <resource>.<action> [instance]
     Action {
-        name: String,
-        action: String,
+        /// <resource>.<action>, e.g. app.start
+        spec: String,
+        /// Instance (inferred when run inside a workspace)
+        instance: Option<String>,
     },
     Checkpoint {
         name: String,
@@ -101,10 +113,26 @@ struct SpawnArgs {
     from: Option<String>,
 }
 
+#[derive(Debug, Subcommand)]
+enum ResourceCommand {
+    /// Create a resource definition from a starter template
+    Add {
+        name: String,
+        #[arg(long)]
+        template: String,
+    },
+    /// List defined resources
+    List,
+    /// List available starter templates
+    Templates,
+}
+
 #[derive(Debug, Args)]
 struct RunArgs {
-    name: String,
-    #[arg(last = true, trailing_var_arg = true)]
+    /// Instance (inferred when run inside a workspace)
+    name: Option<String>,
+    /// Command to run, after `--`
+    #[arg(last = true)]
     command: Vec<String>,
 }
 
@@ -116,23 +144,9 @@ fn main() -> Result<()> {
         Command::Status { name } => status(name.as_deref()),
         Command::Remove { name } => remove(&name),
         Command::Tracker { command } => tracker(command),
-        Command::Run(args) => {
-            if args.command.is_empty() {
-                bail!("provide a command after `--`");
-            }
-            skeleton_notice(
-                "run",
-                &format!(
-                    "would run `{}` inside branch `{}` with exports loaded",
-                    args.command.join(" "),
-                    args.name
-                ),
-            )
-        }
-        Command::Action { name, action } => skeleton_notice(
-            "action",
-            &format!("would run resource action `{action}` for branch `{name}`"),
-        ),
+        Command::Resource { command } => resource(command),
+        Command::Run(args) => run(args),
+        Command::Action { spec, instance } => action(&spec, instance),
         Command::Checkpoint { name, message } => {
             let suffix = message
                 .map(|value| format!(" with message `{value}`"))
@@ -204,7 +218,138 @@ fn spawn(args: SpawnArgs) -> Result<()> {
     for tracker in &outcome.trackers {
         println!("  tracker:   {}", bind_line(tracker));
     }
+    for resource in &outcome.resources {
+        let ports = resource
+            .ports
+            .iter()
+            .map(|(name, port)| format!("{name}={port}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let ports = if ports.is_empty() {
+            String::new()
+        } else {
+            format!(" ports: {ports}")
+        };
+        let prepare = match &resource.prepare {
+            Some((true, _)) => " prepare: ok".to_owned(),
+            Some((false, log)) => {
+                format!(
+                    " prepare: FAILED (log: {log}; re-run with `newgit action {}.prepare`)",
+                    resource.name
+                )
+            }
+            None if !resource.blocked_by.is_empty() => {
+                format!(" prepare: BLOCKED by {}", resource.blocked_by.join(", "))
+            }
+            None => match resource.status {
+                newgit_core::branch::ResourceStatus::Blocked => " prepare: BLOCKED".to_owned(),
+                _ => String::new(),
+            },
+        };
+        println!("  resource:  `{}`{ports}{prepare}", resource.name);
+    }
     Ok(())
+}
+
+fn resource(command: ResourceCommand) -> Result<()> {
+    match command {
+        ResourceCommand::Add { name, template } => {
+            let manager = manager_here()?;
+            let outcome = manager.add_resource(&name, &template)?;
+            println!(
+                "Added resource `{name}` from `{template}` at {}",
+                outcome.path
+            );
+            for companion in &outcome.companions_created {
+                println!("  companion: created {companion} (this template depends on it)");
+            }
+            println!("  edit the definition; `newgit spawn` binds it (ports, exports, prepare)");
+            Ok(())
+        }
+        ResourceCommand::List => {
+            let manager = manager_here()?;
+            let definitions = manager.resource_definitions();
+            if definitions.is_empty() {
+                println!(
+                    "No resources defined. Add one with `newgit resource add <name> --template <template>`."
+                );
+                return Ok(());
+            }
+            println!(
+                "{:<18} {:<14} {:<10} {:<22} ACTIONS",
+                "NAME", "KIND", "OWNERSHIP", "DEPENDS_ON"
+            );
+            for definition in definitions {
+                let deps = definition.depends_on.join(", ");
+                let actions = definition
+                    .actions
+                    .keys()
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                println!(
+                    "{:<18} {:<14} {:<10} {:<22} {}",
+                    definition.name,
+                    definition.kind,
+                    format!("{:?}", definition.ownership).to_lowercase(),
+                    if deps.is_empty() { "-" } else { &deps },
+                    if actions.is_empty() { "-" } else { &actions },
+                );
+            }
+            Ok(())
+        }
+        ResourceCommand::Templates => {
+            for template in RESOURCE_TEMPLATES {
+                println!("{:<16} {}", template.name, template.description);
+            }
+            Ok(())
+        }
+    }
+}
+
+fn run(args: RunArgs) -> Result<()> {
+    if args.command.is_empty() {
+        bail!("provide a command after `--`");
+    }
+    let (manager, instance) = manager_and_instance(args.name)?;
+    let (code, log) = manager.run_command(&instance, &args.command)?;
+    eprintln!("[newgit] exit {code}; log: {log}");
+    if code != 0 {
+        std::process::exit(code);
+    }
+    Ok(())
+}
+
+fn action(spec: &str, instance: Option<String>) -> Result<()> {
+    let (manager, instance) = manager_and_instance(instance)?;
+    match manager.run_action(&instance, spec)? {
+        ActionOutcome::Started { pid, log } => {
+            println!("Started `{spec}` for `{instance}` (pid {pid})");
+            println!("  log: {log}");
+            println!(
+                "  stop with: newgit action {}.stop",
+                spec.split('.').next().unwrap_or(spec)
+            );
+            Ok(())
+        }
+        ActionOutcome::Stopped(outcome) => {
+            match outcome {
+                StopOutcome::Stopped(pid) => println!("Stopped `{spec}` (pid {pid})"),
+                StopOutcome::NotRunning => println!("`{spec}`: nothing was running"),
+                StopOutcome::StillRunning(pid) => println!(
+                    "`{spec}`: pid {pid} ignored the signal; escalate with `kill -9 -- -{pid}` if needed"
+                ),
+            }
+            Ok(())
+        }
+        ActionOutcome::Ran { code, log } => {
+            eprintln!("[newgit] `{spec}` exit {code}; log: {log}");
+            if code != 0 {
+                std::process::exit(code);
+            }
+            Ok(())
+        }
+    }
 }
 
 fn tracker(command: TrackerCommand) -> Result<()> {
@@ -323,10 +468,14 @@ fn status(name: Option<&str>) -> Result<()> {
     let name_width = column_width(reports.iter().map(|r| r.branch.name.len() + 2), "NAME");
     let source_width = column_width(reports.iter().map(|r| source_column(r).len()), "SOURCE");
     let tracker_width = column_width(reports.iter().map(|r| tracker_column(r).len()), "TRACKERS");
+    let resource_width = column_width(
+        reports.iter().map(|r| resource_column(r).len()),
+        "RESOURCES",
+    );
 
     println!(
-        "{:<name_width$} {:<source_width$} {:<10} {:<tracker_width$} WORKSPACE",
-        "NAME", "SOURCE", "STATUS", "TRACKERS"
+        "{:<name_width$} {:<source_width$} {:<10} {:<tracker_width$} {:<resource_width$} WORKSPACE",
+        "NAME", "SOURCE", "STATUS", "TRACKERS", "RESOURCES"
     );
     let mut any_behind = false;
     for report in &reports {
@@ -342,10 +491,11 @@ fn status(name: Option<&str>) -> Result<()> {
         };
         any_behind |= report.trackers.iter().any(|tracker| tracker.behind);
         println!(
-            "{marker}{:<width$} {:<source_width$} {workspace_status:<10} {:<tracker_width$} {}",
+            "{marker}{:<width$} {:<source_width$} {workspace_status:<10} {:<tracker_width$} {:<resource_width$} {}",
             report.branch.name,
             source_column(report),
             tracker_column(report),
+            resource_column(report),
             report.branch.workspace_path,
             width = name_width - 2,
         );
@@ -422,6 +572,18 @@ fn tracker_column(report: &InstanceReport) -> String {
             let behind = if tracker.behind { "^" } else { "" };
             format!("{}:{rev}{behind}", tracker.name)
         })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn resource_column(report: &InstanceReport) -> String {
+    if report.resources.is_empty() {
+        return "-".to_owned();
+    }
+    report
+        .resources
+        .iter()
+        .map(|resource| format!("{}:{}", resource.name, resource.state))
         .collect::<Vec<_>>()
         .join(" ")
 }

@@ -20,8 +20,33 @@ pub struct BranchInstance {
     pub status: InstanceStatus,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub trackers: BTreeMap<String, TrackerBinding>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub resources: BTreeMap<String, ResourceBinding>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+}
+
+/// Which concrete instance of a resource this branch instance is bound to:
+/// its allocated ports and rendered exports.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ResourceBinding {
+    pub definition_rev: String,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub resolved_ports: BTreeMap<String, u16>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub resolved_exports: BTreeMap<String, String>,
+    pub status: ResourceStatus,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum ResourceStatus {
+    /// Bound; prepare has not succeeded yet.
+    Pending,
+    Ready,
+    Failed,
+    /// Not attempted because a resource dependency is failed or blocked.
+    Blocked,
 }
 
 /// Which content revision of a tracker this instance is bound to.
@@ -58,6 +83,7 @@ impl BranchInstance {
             workspace_path,
             status: InstanceStatus::Active,
             trackers: BTreeMap::new(),
+            resources: BTreeMap::new(),
             created_at: now,
             updated_at: now,
         })
