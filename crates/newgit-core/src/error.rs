@@ -75,6 +75,26 @@ pub enum NewgitError {
     #[error("tracker `{0}` owns no paths; there is nothing to capture from a workspace")]
     TrackerHasNoPaths(String),
 
+    #[error("no resource named `{0}` is defined in .newgit/resources/")]
+    UnknownResource(String),
+
+    #[error("resource `{resource}` has no action named `{action}`")]
+    UnknownAction { resource: String, action: String },
+
+    #[error("resource `{resource}` is already running (pid {pid}); stop it first")]
+    AlreadyRunning { resource: String, pid: u32 },
+
+    #[error("resource dependency cycle: {0:?}")]
+    DependencyCycle(Vec<String>),
+
+    #[error(
+        "resource `{resource}` depends on `{dependency}`, which is neither a tracker nor a resource"
+    )]
+    MissingDependency {
+        resource: String,
+        dependency: String,
+    },
+
     #[error("{0}")]
     Unsupported(String),
 

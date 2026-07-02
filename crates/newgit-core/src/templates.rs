@@ -56,3 +56,36 @@ pub fn tracker_template(name: &str) -> Option<&'static TrackerTemplate> {
         .iter()
         .find(|template| template.name == name)
 }
+
+/// Starter resource templates (same shape as tracker templates).
+pub type ResourceTemplate = TrackerTemplate;
+
+pub const RESOURCE_TEMPLATES: &[ResourceTemplate] = &[ResourceTemplate {
+    name: "process",
+    description: "a branch-local long-running process with its own port",
+    contents: r#"kind = "process"
+ownership = "branch"
+# Trackers or resources that must be ready first, e.g. ["deps", "runtime-env"].
+depends_on = []
+
+[ports]
+app = { start = 3100, env = "PORT" }
+
+[actions.start]
+# Edit to your dev command, e.g. "pnpm dev" or "bin/rails server".
+command = "npm run dev"
+long_running = true
+
+[actions.stop]
+signal = "term"
+
+[exports]
+APP_URL = "http://127.0.0.1:{{ports.app}}"
+"#,
+}];
+
+pub fn resource_template(name: &str) -> Option<&'static ResourceTemplate> {
+    RESOURCE_TEMPLATES
+        .iter()
+        .find(|template| template.name == name)
+}

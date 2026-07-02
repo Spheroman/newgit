@@ -1,14 +1,22 @@
+use std::collections::{BTreeMap, BTreeSet};
+
 use camino::{Utf8Path, Utf8PathBuf};
 use chrono::Utc;
 
-use crate::branch::{BranchInstance, TrackerBinding, branch_slug, validate_name};
+use crate::branch::{
+    BranchInstance, ResourceBinding, ResourceStatus, TrackerBinding, branch_slug, validate_name,
+};
 use crate::config::ProjectConfig;
 use crate::error::{NewgitError, Result};
+use crate::exports::{RenderContext, parse_env_file, render};
 use crate::lane::{TrackerLane, copy_tree};
 use crate::materializer::{Materializer, RealDirMaterializer};
+use crate::ports;
+use crate::resource::{ResourceDefinition, topological_order};
 use crate::source::GitSource;
 use crate::store::MetadataStore;
-use crate::templates::tracker_template;
+use crate::supervisor::{StopOutcome, Supervisor, run_foreground};
+use crate::templates::{resource_template, tracker_template};
 use crate::tracker::{Propagation, TrackerDefinition, collect_owned_files};
 
 /// Orchestrates branch-instance lifecycle against one store.
@@ -18,6 +26,9 @@ pub struct BranchManager {
     config: ProjectConfig,
     source: GitSource,
     trackers: Vec<TrackerDefinition>,
+    resources: Vec<ResourceDefinition>,
+    /// Resource names, dependencies before dependents.
+    resource_order: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -27,6 +38,32 @@ pub struct SpawnOutcome {
     /// False when the instance attached to a pre-existing source branch.
     pub created_source_branch: bool,
     pub trackers: Vec<TrackerBindOutcome>,
+    pub resources: Vec<ResourceBindOutcome>,
+}
+
+/// How a resource was bound at spawn.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResourceBindOutcome {
+    pub name: String,
+    pub ports: BTreeMap<String, u16>,
+    /// Present when a `prepare` action ran: (succeeded, log path).
+    pub prepare: Option<(bool, Utf8PathBuf)>,
+}
+
+/// What running an action did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ActionOutcome {
+    /// Long-running action started under supervision.
+    Started {
+        pid: u32,
+        log: Utf8PathBuf,
+    },
+    Stopped(StopOutcome),
+    /// One-shot command finished with this exit code.
+    Ran {
+        code: i32,
+        log: Utf8PathBuf,
+    },
 }
 
 /// How a tracker's content landed in a workspace.
@@ -57,6 +94,14 @@ pub struct InstanceReport {
     /// Live HEAD of the workspace clone, when it can be read.
     pub live_rev: Option<String>,
     pub trackers: Vec<TrackerReport>,
+    pub resources: Vec<ResourceReport>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResourceReport {
+    pub name: String,
+    /// `running`, `stopped`, `ready`, `pending`, `failed`, or `—` (unbound).
+    pub state: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -102,11 +147,16 @@ impl BranchManager {
         let config = store.load_config()?;
         let source = GitSource::open(&store.paths().project_root, config.project.source)?;
         let trackers = store.load_tracker_definitions()?;
+        let resources = store.load_resource_definitions()?;
+        let tracker_names: BTreeSet<String> = trackers.iter().map(|t| t.name.clone()).collect();
+        let resource_order = topological_order(&resources, &tracker_names)?;
         Ok(Self {
             store,
             config,
             source,
             trackers,
+            resources,
+            resource_order,
         })
     }
 
@@ -187,6 +237,8 @@ impl BranchManager {
             tracker_outcomes.push(outcome);
         }
 
+        let resource_outcomes = self.bind_resources(&mut branch)?;
+
         let record_path = self.store.create_branch_record(&branch)?;
 
         Ok(SpawnOutcome {
@@ -194,7 +246,296 @@ impl BranchManager {
             record_path,
             created_source_branch,
             trackers: tracker_outcomes,
+            resources: resource_outcomes,
         })
+    }
+
+    /// Allocate ports, render exports, and run `prepare` hooks in dependency
+    /// order. Prepare failures are loud but leave the instance spawned —
+    /// re-run with `newgit action <resource>.prepare`.
+    fn bind_resources(&self, branch: &mut BranchInstance) -> Result<Vec<ResourceBindOutcome>> {
+        let mut used = ports::used_ports(&self.store.load_branches()?);
+        let mut outcomes = Vec::new();
+
+        for name in &self.resource_order {
+            let definition = self.resource_definition(name)?;
+
+            let mut resolved_ports = BTreeMap::new();
+            for (port_name, request) in &definition.ports {
+                resolved_ports.insert(
+                    port_name.clone(),
+                    ports::allocate(request.start, &mut used)?,
+                );
+            }
+
+            let context = RenderContext {
+                branch_name: &branch.name,
+                branch_slug: &branch.slug,
+                workspace: branch.workspace_path.as_str(),
+                ports: &resolved_ports,
+            };
+            let resolved_exports = definition
+                .exports
+                .iter()
+                .map(|(key, value)| (key.clone(), render(value, &context)))
+                .collect();
+
+            branch.resources.insert(
+                definition.name.clone(),
+                ResourceBinding {
+                    definition_rev: definition.definition_rev.clone(),
+                    resolved_ports: resolved_ports.clone(),
+                    resolved_exports,
+                    status: ResourceStatus::Pending,
+                },
+            );
+
+            // Prepare runs with the bindings made so far, so dependents see
+            // their dependencies' exports.
+            let prepare = match definition.actions.get("prepare") {
+                Some(action) if action.command.is_some() && !action.long_running => {
+                    let log = self
+                        .store
+                        .action_log_path(&branch.slug, &format!("{}.prepare", definition.name));
+                    let code = self.run_one_shot(branch, definition, action, &log)?;
+                    let status = if code == 0 {
+                        ResourceStatus::Ready
+                    } else {
+                        ResourceStatus::Failed
+                    };
+                    if let Some(binding) = branch.resources.get_mut(&definition.name) {
+                        binding.status = status;
+                    }
+                    Some((code == 0, log))
+                }
+                _ => {
+                    if let Some(binding) = branch.resources.get_mut(&definition.name) {
+                        binding.status = ResourceStatus::Ready;
+                    }
+                    None
+                }
+            };
+
+            outcomes.push(ResourceBindOutcome {
+                name: definition.name.clone(),
+                ports: resolved_ports,
+                prepare,
+            });
+        }
+        branch.updated_at = Utc::now();
+        Ok(outcomes)
+    }
+
+    /// Run `<resource>.<action>` for an instance.
+    pub fn run_action(&self, instance: &str, spec: &str) -> Result<ActionOutcome> {
+        let (resource_name, action_name) = spec.split_once('.').ok_or_else(|| {
+            NewgitError::Unsupported(format!("`{spec}` is not of the form <resource>.<action>"))
+        })?;
+        let mut branch = self.store.find_branch(instance)?;
+        self.require_workspace(&branch)?;
+        let definition = self.resource_definition(resource_name)?;
+        let action =
+            definition
+                .actions
+                .get(action_name)
+                .ok_or_else(|| NewgitError::UnknownAction {
+                    resource: resource_name.to_owned(),
+                    action: action_name.to_owned(),
+                })?;
+        let supervisor = self.supervisor(&branch);
+
+        // Signal-only action (e.g. stop): signal the supervised process.
+        if action.command.is_none() {
+            let signal = action
+                .signal
+                .clone()
+                .unwrap_or_else(|| definition.stop_signal());
+            return Ok(ActionOutcome::Stopped(
+                supervisor.stop(&definition.name, &signal)?,
+            ));
+        }
+
+        let log = self
+            .store
+            .action_log_path(&branch.slug, &format!("{}.{action_name}", definition.name));
+
+        if action.long_running {
+            let command = self.rendered_command(&branch, definition, action)?;
+            let env = self.assemble_env(&branch)?;
+            let pid = supervisor.start(
+                &definition.name,
+                &command,
+                &branch.workspace_path,
+                &env,
+                &log,
+            )?;
+            return Ok(ActionOutcome::Started { pid, log });
+        }
+
+        let code = self.run_one_shot(&branch, definition, action, &log)?;
+        if action_name == "prepare"
+            && let Some(binding) = branch.resources.get_mut(&definition.name)
+        {
+            binding.status = if code == 0 {
+                ResourceStatus::Ready
+            } else {
+                ResourceStatus::Failed
+            };
+            branch.updated_at = Utc::now();
+            self.store.save_branch_record(&branch)?;
+        }
+        Ok(ActionOutcome::Ran { code, log })
+    }
+
+    /// Run an arbitrary command inside the instance with the full export
+    /// environment loaded. Returns the exit code.
+    pub fn run_command(
+        &self,
+        instance: &str,
+        command_line: &[String],
+    ) -> Result<(i32, Utf8PathBuf)> {
+        let branch = self.store.find_branch(instance)?;
+        self.require_workspace(&branch)?;
+        let env = self.assemble_env(&branch)?;
+        let log = self.store.action_log_path(&branch.slug, "run");
+        let code = run_foreground(command_line, &branch.workspace_path, &env, &log)?;
+        Ok((code, log))
+    }
+
+    fn run_one_shot(
+        &self,
+        branch: &BranchInstance,
+        definition: &ResourceDefinition,
+        action: &crate::resource::ActionSpec,
+        log: &Utf8Path,
+    ) -> Result<i32> {
+        let command = self.rendered_command(branch, definition, action)?;
+        let env = self.assemble_env(branch)?;
+        run_foreground(
+            &["sh".to_owned(), "-c".to_owned(), command],
+            &branch.workspace_path,
+            &env,
+            log,
+        )
+    }
+
+    fn rendered_command(
+        &self,
+        branch: &BranchInstance,
+        definition: &ResourceDefinition,
+        action: &crate::resource::ActionSpec,
+    ) -> Result<String> {
+        let command = action.command.clone().ok_or_else(|| {
+            NewgitError::Unsupported(format!(
+                "resource `{}` action has no command",
+                definition.name
+            ))
+        })?;
+        let empty = BTreeMap::new();
+        let resource_ports = branch
+            .resources
+            .get(&definition.name)
+            .map(|binding| &binding.resolved_ports)
+            .unwrap_or(&empty);
+        let context = RenderContext {
+            branch_name: &branch.name,
+            branch_slug: &branch.slug,
+            workspace: branch.workspace_path.as_str(),
+            ports: resource_ports,
+        };
+        Ok(render(&command, &context))
+    }
+
+    /// The layered environment `newgit run` and actions see. Later layers
+    /// win: env_file contents → tracker exports → resource exports in
+    /// dependency order → port env vars → newgit context vars.
+    pub fn assemble_env(&self, branch: &BranchInstance) -> Result<Vec<(String, String)>> {
+        let mut env: BTreeMap<String, String> = BTreeMap::new();
+        let empty_ports = BTreeMap::new();
+        let tracker_context = RenderContext {
+            branch_name: &branch.name,
+            branch_slug: &branch.slug,
+            workspace: branch.workspace_path.as_str(),
+            ports: &empty_ports,
+        };
+
+        // Layer 1: parsed env files from tracker exports.
+        for definition in &self.trackers {
+            if let Some(env_file) = definition.exports.get("env_file") {
+                let path = branch.workspace_path.join(env_file);
+                if path.is_file() {
+                    for (key, value) in parse_env_file(&path)? {
+                        env.insert(key, value);
+                    }
+                }
+            }
+        }
+
+        // Layer 2: tracker exports (`env_file` is a mechanism key, not a var).
+        for definition in &self.trackers {
+            for (key, value) in &definition.exports {
+                if key != "env_file" {
+                    env.insert(key.clone(), render(value, &tracker_context));
+                }
+            }
+        }
+
+        // Layer 3: resource exports, dependency order (dependents win).
+        for name in &self.resource_order {
+            if let Some(binding) = branch.resources.get(name) {
+                for (key, value) in &binding.resolved_exports {
+                    env.insert(key.clone(), value.clone());
+                }
+            }
+        }
+
+        // Layer 4: port env vars.
+        for name in &self.resource_order {
+            let Some(binding) = branch.resources.get(name) else {
+                continue;
+            };
+            let Ok(definition) = self.resource_definition(name) else {
+                continue;
+            };
+            for (port_name, request) in &definition.ports {
+                if let (Some(env_name), Some(port)) =
+                    (&request.env, binding.resolved_ports.get(port_name))
+                {
+                    env.insert(env_name.clone(), port.to_string());
+                }
+            }
+        }
+
+        // Layer 5: context vars.
+        env.insert("NEWGIT_BRANCH".to_owned(), branch.name.clone());
+        env.insert(
+            "NEWGIT_WORKSPACE".to_owned(),
+            branch.workspace_path.to_string(),
+        );
+
+        Ok(env.into_iter().collect())
+    }
+
+    pub fn add_resource(&self, name: &str, template_name: &str) -> Result<Utf8PathBuf> {
+        validate_name(name)?;
+        let template = resource_template(template_name)
+            .ok_or_else(|| NewgitError::UnknownTemplate(template_name.to_owned()))?;
+        self.store.write_resource_file(name, template.contents)
+    }
+
+    pub fn resource_definitions(&self) -> &[ResourceDefinition] {
+        &self.resources
+    }
+
+    fn resource_definition(&self, name: &str) -> Result<&ResourceDefinition> {
+        self.resources
+            .iter()
+            .find(|definition| definition.name == name)
+            .ok_or_else(|| NewgitError::UnknownResource(name.to_owned()))
+    }
+
+    fn supervisor(&self, branch: &BranchInstance) -> Supervisor {
+        Supervisor::new(self.store.instance_state_dir(&branch.slug))
     }
 
     /// Materialize a tracker's initial content into an instance workspace
@@ -453,11 +794,41 @@ impl BranchManager {
                         }
                     })
                     .collect();
+                let supervisor = self.supervisor(&branch);
+                let resources = self
+                    .resources
+                    .iter()
+                    .map(|definition| {
+                        let state = match branch.resources.get(&definition.name) {
+                            None => "—".to_owned(),
+                            Some(binding) => {
+                                if supervisor.running_pid(&definition.name).is_some() {
+                                    "running".to_owned()
+                                } else if definition.has_long_running_action()
+                                    && binding.status == ResourceStatus::Ready
+                                {
+                                    "stopped".to_owned()
+                                } else {
+                                    match binding.status {
+                                        ResourceStatus::Pending => "pending".to_owned(),
+                                        ResourceStatus::Ready => "ready".to_owned(),
+                                        ResourceStatus::Failed => "failed".to_owned(),
+                                    }
+                                }
+                            }
+                        };
+                        ResourceReport {
+                            name: definition.name.clone(),
+                            state,
+                        }
+                    })
+                    .collect();
                 Ok(InstanceReport {
                     branch,
                     workspace_exists,
                     live_rev,
                     trackers,
+                    resources,
                 })
             })
             .collect()
@@ -475,6 +846,19 @@ impl BranchManager {
                  removing",
                 branch.name
             )));
+        }
+
+        // Stop anything still running before the workspace disappears.
+        let supervisor = self.supervisor(&branch);
+        for definition in &self.resources {
+            if supervisor.running_pid(&definition.name).is_some() {
+                supervisor.stop(&definition.name, &definition.stop_signal())?;
+            }
+        }
+        let state_dir = self.store.instance_state_dir(&branch.slug);
+        if state_dir.exists() {
+            std::fs::remove_dir_all(&state_dir)
+                .map_err(|source| NewgitError::io(state_dir, source))?;
         }
 
         RealDirMaterializer.remove(&branch)?;
