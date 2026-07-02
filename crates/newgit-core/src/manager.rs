@@ -8,16 +8,16 @@ use crate::branch::{
 };
 use crate::config::ProjectConfig;
 use crate::error::{NewgitError, Result};
-use crate::exports::{RenderContext, parse_env_file, render};
-use crate::lane::{TrackerLane, copy_tree};
+use crate::exports::{RenderContext, render};
+use crate::lane::TrackerLane;
 use crate::materializer::{Materializer, RealDirMaterializer};
 use crate::ports;
 use crate::resource::{ResourceDefinition, topological_order};
 use crate::source::GitSource;
 use crate::store::MetadataStore;
 use crate::supervisor::{StopOutcome, Supervisor, run_foreground};
-use crate::templates::{resource_template, tracker_template};
-use crate::tracker::{Propagation, TrackerDefinition, collect_owned_files};
+use crate::templates::resource_template;
+use crate::tracker::{Storage, TrackerDefinition, collect_owned_files};
 
 /// Orchestrates branch-instance lifecycle against one store.
 #[derive(Debug)]
@@ -80,14 +80,10 @@ pub struct TrackerBindOutcome {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BindOrigin {
-    /// Materialized from `materialize.copy_from`.
-    Template,
-    /// Materialized from the lane head (`rebase` propagation).
+    /// Projected from the lane head.
     LaneHead,
-    /// Bound with nothing to materialize.
+    /// Bound with no captured content yet.
     Nothing,
-    /// The materialize source was missing; bound loudly-unbound.
-    MissingSource(Utf8PathBuf),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -112,8 +108,22 @@ pub struct TrackerReport {
     pub name: String,
     /// None when the tracker is defined but this instance has no binding.
     pub content_rev: Option<String>,
-    /// A `rebase` tracker whose lane head has moved past this binding.
-    pub behind: bool,
+    /// The lane head/default, when one has been merged.
+    pub lane_head: Option<String>,
+}
+
+impl TrackerReport {
+    /// The lane has content this instance never had: pulling is safe advice.
+    pub fn never_pulled(&self) -> bool {
+        self.lane_head.is_some() && self.content_rev.is_none()
+    }
+
+    /// Bound content differs from the lane head. Without rev ancestry the
+    /// direction is unknowable — this instance may be ahead, behind, or
+    /// diverged — so callers must not advise one direction.
+    pub fn diverged(&self) -> bool {
+        self.content_rev.is_some() && self.lane_head.is_some() && self.content_rev != self.lane_head
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -139,8 +149,21 @@ pub struct RestoreReport {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MergeTrackerOutcome {
+    pub tracker: String,
+    pub rev: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AddTrackerOutcome {
     pub path: Utf8PathBuf,
+    pub ignored_patterns: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrackPathsOutcome {
+    pub path: Utf8PathBuf,
+    pub added_paths: Vec<Utf8PathBuf>,
     pub ignored_patterns: Vec<String>,
 }
 
@@ -482,40 +505,13 @@ impl BranchManager {
     }
 
     /// The layered environment `newgit run` and actions see. Later layers
-    /// win: env_file contents → tracker exports → resource exports in
-    /// dependency order → port env vars → newgit context vars.
+    /// win: resource exports in dependency order → port env vars → newgit
+    /// context vars. Trackers own content; command environment wiring lives
+    /// outside the tracker primitive.
     pub fn assemble_env(&self, branch: &BranchInstance) -> Result<Vec<(String, String)>> {
         let mut env: BTreeMap<String, String> = BTreeMap::new();
-        let empty_ports = BTreeMap::new();
-        let tracker_context = RenderContext {
-            branch_name: &branch.name,
-            branch_slug: &branch.slug,
-            workspace: branch.workspace_path.as_str(),
-            ports: &empty_ports,
-        };
 
-        // Layer 1: parsed env files from tracker exports.
-        for definition in &self.trackers {
-            if let Some(env_file) = definition.exports.get("env_file") {
-                let path = branch.workspace_path.join(env_file);
-                if path.is_file() {
-                    for (key, value) in parse_env_file(&path)? {
-                        env.insert(key, value);
-                    }
-                }
-            }
-        }
-
-        // Layer 2: tracker exports (`env_file` is a mechanism key, not a var).
-        for definition in &self.trackers {
-            for (key, value) in &definition.exports {
-                if key != "env_file" {
-                    env.insert(key.clone(), render(value, &tracker_context));
-                }
-            }
-        }
-
-        // Layer 3: resource exports, dependency order (dependents win).
+        // Layer 1: resource exports, dependency order (dependents win).
         for name in &self.resource_order {
             if let Some(binding) = branch.resources.get(name) {
                 for (key, value) in &binding.resolved_exports {
@@ -524,7 +520,7 @@ impl BranchManager {
             }
         }
 
-        // Layer 4: port env vars.
+        // Layer 2: port env vars.
         for name in &self.resource_order {
             let Some(binding) = branch.resources.get(name) else {
                 continue;
@@ -541,7 +537,7 @@ impl BranchManager {
             }
         }
 
-        // Layer 5: context vars.
+        // Layer 3: context vars.
         env.insert("NEWGIT_BRANCH".to_owned(), branch.name.clone());
         env.insert(
             "NEWGIT_WORKSPACE".to_owned(),
@@ -611,9 +607,9 @@ impl BranchManager {
             .collect()
     }
 
-    /// Materialize a tracker's initial content into an instance workspace
-    /// (at spawn, or later via `newgit tracker materialize`) and record the
-    /// binding. `refresh` allows rebinding an already-bound tracker.
+    /// Bind a tracker into an instance workspace. If the lane has captured
+    /// content, project the lane head; otherwise the tracker starts empty.
+    /// `refresh` allows rebinding an already-bound tracker.
     fn bind_tracker(
         &self,
         branch: &mut BranchInstance,
@@ -631,16 +627,12 @@ impl BranchManager {
             }
         }
 
-        let (origin, content_rev, files) = match definition.propagation {
-            Propagation::Manual => (BindOrigin::Nothing, None, 0),
-            Propagation::Rebase => match lane.latest() {
-                Some(rev) => {
-                    let files = lane.restore(&workspace, definition, &rev)?;
-                    (BindOrigin::LaneHead, Some(rev), files)
-                }
-                None => self.materialize_from_template(&lane, definition, &workspace)?,
-            },
-            Propagation::Pin => self.materialize_from_template(&lane, definition, &workspace)?,
+        let (origin, content_rev, files) = match lane.latest() {
+            Some(rev) => {
+                let files = lane.restore(&workspace, definition, &rev)?;
+                (BindOrigin::LaneHead, Some(rev), files)
+            }
+            None => (BindOrigin::Nothing, None, 0),
         };
 
         branch.trackers.insert(
@@ -660,33 +652,6 @@ impl BranchManager {
         })
     }
 
-    fn materialize_from_template(
-        &self,
-        lane: &TrackerLane,
-        definition: &TrackerDefinition,
-        workspace: &Utf8Path,
-    ) -> Result<(BindOrigin, Option<String>, usize)> {
-        let Some(spec) = &definition.materialize else {
-            return Ok((BindOrigin::Nothing, None, 0));
-        };
-        let from = self.store.paths().project_root.join(&spec.copy_from);
-        if !from.exists() {
-            return Ok((BindOrigin::MissingSource(spec.copy_from.clone()), None, 0));
-        }
-        let Some(target) = definition.materialize_target() else {
-            return Ok((BindOrigin::Nothing, None, 0));
-        };
-        copy_tree(&from, &workspace.join(target))?;
-
-        // Baseline capture so the fresh content is immediately restorable;
-        // a rebase lane's first content becomes the lane head.
-        let capture = lane.capture(workspace, definition)?;
-        if definition.propagation == Propagation::Rebase && lane.latest().is_none() {
-            lane.set_latest(&capture.rev)?;
-        }
-        Ok((BindOrigin::Template, Some(capture.rev), capture.files))
-    }
-
     pub fn capture_tracker(&self, instance: &str, tracker: &str) -> Result<CaptureReport> {
         let mut branch = self.store.find_branch(instance)?;
         let definition = self.definition(tracker)?;
@@ -694,9 +659,6 @@ impl BranchManager {
 
         let lane = self.lane(&definition.name);
         let capture = lane.capture(&branch.workspace_path, definition)?;
-        if definition.propagation == Propagation::Rebase {
-            lane.set_latest(&capture.rev)?;
-        }
 
         let previous = branch
             .trackers
@@ -720,7 +682,7 @@ impl BranchManager {
         })
     }
 
-    pub fn restore_tracker(
+    pub fn checkout_tracker(
         &self,
         instance: &str,
         tracker: &str,
@@ -774,18 +736,16 @@ impl BranchManager {
         })
     }
 
-    /// Pull a tracker's default content into an existing instance: lane head
-    /// for `rebase`, template for `pin`. `manual` trackers only move via
-    /// explicit `restore --rev`.
-    pub fn materialize_tracker(&self, instance: &str, tracker: &str) -> Result<TrackerBindOutcome> {
+    /// Pull a tracker's lane head into an existing instance.
+    pub fn pull_tracker(&self, instance: &str, tracker: &str) -> Result<TrackerBindOutcome> {
         let mut branch = self.store.find_branch(instance)?;
         let definition = self.definition(tracker)?;
         self.require_workspace(&branch)?;
 
-        if definition.propagation == Propagation::Manual {
+        if self.lane(&definition.name).latest().is_none() {
             return Err(NewgitError::Unsupported(format!(
-                "tracker `{}` has manual propagation; use `newgit tracker restore {} --rev <rev>`",
-                definition.name, definition.name
+                "tracker `{}` has no merged content to pull",
+                definition.name
             )));
         }
 
@@ -794,33 +754,73 @@ impl BranchManager {
         Ok(outcome)
     }
 
-    pub fn add_tracker(&self, name: &str, template_name: &str) -> Result<AddTrackerOutcome> {
-        validate_name(name)?;
-        let template = tracker_template(template_name)
-            .ok_or_else(|| NewgitError::UnknownTemplate(template_name.to_owned()))?;
-        let path = self.store.write_tracker_file(name, template.contents)?;
-
-        // env-file materializes from a committed template; make sure one exists.
-        if template.name == "env-file" {
-            let base_env = self.store.paths().templates.join("base.env");
-            if !base_env.exists() {
-                std::fs::write(&base_env, "# branch-local environment\n")
-                    .map_err(|source| NewgitError::io(base_env, source))?;
-            }
+    /// Promote this branch instance's bound tracker revision to the lane head.
+    pub fn merge_tracker(&self, instance: &str, tracker: &str) -> Result<MergeTrackerOutcome> {
+        let branch = self.store.find_branch(instance)?;
+        let definition = self.definition(tracker)?;
+        let rev = branch
+            .trackers
+            .get(&definition.name)
+            .and_then(|binding| binding.content_rev.clone())
+            .ok_or_else(|| {
+                NewgitError::Unsupported(format!(
+                    "tracker `{}` has no captured content for `{}`; run `newgit tracker capture {}` first",
+                    definition.name, branch.name, definition.name
+                ))
+            })?;
+        let lane = self.lane(&definition.name);
+        if !lane.has_rev(&rev) {
+            return Err(NewgitError::NoSnapshot {
+                tracker: definition.name.clone(),
+                rev,
+            });
         }
+        lane.set_latest(&rev)?;
+        Ok(MergeTrackerOutcome {
+            tracker: definition.name.clone(),
+            rev,
+        })
+    }
 
-        // Enforce the invariant at the source: owned paths get gitignored now.
-        let definition = TrackerDefinition::from_file(name, &path)?;
+    pub fn create_tracker(
+        &self,
+        name: &str,
+        audience: &str,
+        storage: Storage,
+        merge_with_source: bool,
+    ) -> Result<AddTrackerOutcome> {
+        validate_name(name)?;
+        let definition = TrackerDefinition::new(
+            name,
+            audience.to_owned(),
+            storage,
+            merge_with_source,
+            Vec::new(),
+        )?;
+        let path = self.store.create_tracker_definition(&definition)?;
+        Ok(AddTrackerOutcome {
+            path,
+            ignored_patterns: Vec::new(),
+        })
+    }
+
+    pub fn track_paths(&self, tracker: &str, paths: &[Utf8PathBuf]) -> Result<TrackPathsOutcome> {
+        let definition = self.definition_or_load(tracker)?;
+        let updated = definition.with_added_paths(paths)?;
+        validate_disjoint_with_replacement(&self.trackers, &updated)?;
+        let path = self.store.save_tracker_definition(&updated)?;
+
         let mut patterns = Vec::new();
-        for owned in &definition.paths {
+        for owned in paths {
             if !self.source.is_ignored(owned.as_str())? {
                 patterns.push(format!("/{owned}"));
             }
         }
-        self.store.append_gitignore(name, &patterns)?;
+        self.store.append_gitignore(tracker, &patterns)?;
 
-        Ok(AddTrackerOutcome {
+        Ok(TrackPathsOutcome {
             path,
+            added_paths: paths.to_vec(),
             ignored_patterns: patterns,
         })
     }
@@ -857,13 +857,10 @@ impl BranchManager {
                             .iter()
                             .find(|(name, _)| name == &definition.name)
                             .and_then(|(_, head)| head.clone());
-                        let behind = definition.propagation == Propagation::Rebase
-                            && head.is_some()
-                            && content_rev != head;
                         TrackerReport {
                             name: definition.name.clone(),
                             content_rev,
-                            behind,
+                            lane_head: head,
                         }
                     })
                     .collect();
@@ -951,6 +948,21 @@ impl BranchManager {
             .ok_or_else(|| NewgitError::UnknownTracker(tracker.to_owned()))
     }
 
+    fn definition_or_load(&self, tracker: &str) -> Result<TrackerDefinition> {
+        if let Some(definition) = self
+            .trackers
+            .iter()
+            .find(|definition| definition.name == tracker)
+        {
+            return Ok(definition.clone());
+        }
+        let path = self.store.paths().trackers.join(format!("{tracker}.toml"));
+        if path.is_file() {
+            return TrackerDefinition::from_file(tracker, &path);
+        }
+        Err(NewgitError::UnknownTracker(tracker.to_owned()))
+    }
+
     fn lane(&self, tracker: &str) -> TrackerLane {
         TrackerLane::new(&self.store.paths().snapshots, tracker)
     }
@@ -965,4 +977,24 @@ impl BranchManager {
             )))
         }
     }
+}
+
+fn validate_disjoint_with_replacement(
+    definitions: &[TrackerDefinition],
+    replacement: &TrackerDefinition,
+) -> Result<()> {
+    let mut updated = Vec::with_capacity(definitions.len());
+    let mut replaced = false;
+    for definition in definitions {
+        if definition.name == replacement.name {
+            updated.push(replacement.clone());
+            replaced = true;
+        } else {
+            updated.push(definition.clone());
+        }
+    }
+    if !replaced {
+        updated.push(replacement.clone());
+    }
+    crate::tracker::validate_disjoint(&updated)
 }

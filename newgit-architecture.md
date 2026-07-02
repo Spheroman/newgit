@@ -65,13 +65,13 @@ The store is partitioned into **trackers**; branch instances are animated by **r
 
 ### Trackers
 
-A tracker is a named, versioned lane of file content — a partition over the single store: by path where privacy/concern separates cleanly, by object/hunk membership where it cuts through shared files. There is no fixed set of trackers; users define as many as they need (`jack-env`, `db-snapshots`, `design-assets`, …). Each tracker carries three settings:
+A tracker is a named, versioned lane of file content — a partition over the single store: by path where privacy/concern separates cleanly, by object/hunk membership where it cuts through shared files. The user model is Git tracking with finer lanes: a tracker owns paths, capture records current workspace content into that lane, merge promotes a branch's tracker state to the lane head, pull/checkout projects captured lane content back out. It is not a materialization recipe or an environment export mechanism. There is no fixed set of trackers; users define as many as they need (`jack-env`, `db-snapshots`, `design-assets`, …). Each tracker carries three settings:
 
 - **audience** — who may read it (public, project-devs, a single user). This is the unit of the privacy model.
-- **propagation** — how content flows across branches: `rebase` (`jj`-style auto-rebase of descendants — changes *should* flow downstream), `pin` (per-branch, no propagation — a different `.env` per branch is normal, not a conflict), or `manual`.
+- **merge_with_source** — whether a real source merge should carry this tracker's bound state with it. Env files usually do not; generated code, feature assets, and sub-repo snapshots often do.
 - **storage** — where synced state lives: local, native remote, or a rented substrate.
 
-`source` is simply the default tracker: audience = everyone, propagation = rebase, mechanism = the vendored `jj` engine. The `jj` engine covers exactly **one** tracker (source); every other tracker's propagation is policy you define in the binding layer.
+`source` is simply the default tracker: audience = everyone, mechanism = the vendored `jj` engine. The `jj` engine covers exactly **one** tracker (source); every other tracker's source-merge behavior is policy you define in the binding layer.
 
 ### Resources
 

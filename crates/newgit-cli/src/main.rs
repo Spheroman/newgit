@@ -7,7 +7,8 @@ use newgit_core::manager::{
 use newgit_core::source::find_repo_root;
 use newgit_core::store::Context;
 use newgit_core::supervisor::StopOutcome;
-use newgit_core::templates::{RESOURCE_TEMPLATES, TRACKER_TEMPLATES};
+use newgit_core::templates::RESOURCE_TEMPLATES;
+use newgit_core::tracker::Storage;
 use newgit_core::{MetadataStore, ProjectConfig};
 
 #[derive(Debug, Parser)]
@@ -65,33 +66,49 @@ enum Command {
 
 #[derive(Debug, Subcommand)]
 enum TrackerCommand {
-    /// Create a tracker definition from a starter template
-    Add {
+    /// Create an empty Git-like content lane
+    Create {
         name: String,
+        /// Who may read this lane's content
+        #[arg(long, default_value = "project-devs")]
+        audience: String,
+        /// Carry this tracker when source changes are merged
         #[arg(long)]
-        template: String,
+        merge_with_source: bool,
+        /// Where synced state lives: local or remote
+        #[arg(long, default_value = "local")]
+        storage: String,
+    },
+    /// Add workspace paths to a tracker lane
+    Track {
+        tracker: String,
+        paths: Vec<Utf8PathBuf>,
     },
     /// List defined trackers
     List,
-    /// List available starter templates
-    Templates,
     /// Snapshot a tracker's content from an instance workspace
     Capture {
         tracker: String,
         /// Instance (inferred when run inside a workspace)
         instance: Option<String>,
     },
-    /// Put captured tracker content back into an instance workspace
-    Restore {
+    /// Promote this instance's tracker revision to the lane head/default
+    Merge {
         tracker: String,
         /// Instance (inferred when run inside a workspace)
         instance: Option<String>,
-        /// Content rev to restore (defaults to the instance's bound rev)
+    },
+    /// Check out captured tracker content into an instance workspace
+    Checkout {
+        tracker: String,
+        /// Instance (inferred when run inside a workspace)
+        instance: Option<String>,
+        /// Content rev to check out (defaults to the instance's bound rev)
         #[arg(long)]
         rev: Option<String>,
     },
-    /// Pull a tracker's default content into an existing instance
-    Materialize {
+    /// Pull the latest lane head into an existing tracker binding
+    Pull {
         tracker: String,
         /// Instance (inferred when run inside a workspace)
         instance: Option<String>,
@@ -123,7 +140,7 @@ enum ResourceCommand {
     },
     /// List defined resources
     List,
-    /// List available starter templates
+    /// List available resource starter templates
     Templates,
 }
 
@@ -354,22 +371,44 @@ fn action(spec: &str, instance: Option<String>) -> Result<()> {
 
 fn tracker(command: TrackerCommand) -> Result<()> {
     match command {
-        TrackerCommand::Add { name, template } => {
+        TrackerCommand::Create {
+            name,
+            audience,
+            merge_with_source,
+            storage,
+        } => {
             let manager = manager_here()?;
-            let outcome = manager.add_tracker(&name, &template)?;
+            let storage = parse_storage(&storage)?;
+            let outcome = manager.create_tracker(&name, &audience, storage, merge_with_source)?;
+            println!("Created tracker `{name}` at {}", outcome.path);
+            println!("  add paths with: newgit tracker track {name} <path>...");
+            Ok(())
+        }
+        TrackerCommand::Track { tracker, paths } => {
+            if paths.is_empty() {
+                bail!("provide at least one path to track");
+            }
+            let manager = manager_here()?;
+            let outcome = manager.track_paths(&tracker, &paths)?;
+            println!("Updated tracker `{tracker}` at {}", outcome.path);
             println!(
-                "Added tracker `{name}` from `{template}` at {}",
-                outcome.path
+                "  tracking: {}",
+                outcome
+                    .added_paths
+                    .iter()
+                    .map(|path| path.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
             );
             if outcome.ignored_patterns.is_empty() {
-                println!("  .gitignore: owned paths already ignored");
+                println!("  .gitignore: paths already ignored");
             } else {
                 println!(
                     "  .gitignore: added {} (tracker-owned paths stay out of source history)",
                     outcome.ignored_patterns.join(", ")
                 );
             }
-            println!("  edit the definition, then `newgit spawn` materializes it per instance");
+            println!("  capture content with: newgit tracker capture {tracker}");
             Ok(())
         }
         TrackerCommand::List => {
@@ -377,14 +416,12 @@ fn tracker(command: TrackerCommand) -> Result<()> {
             warn_gitignore(&manager);
             let definitions = manager.tracker_definitions();
             if definitions.is_empty() {
-                println!(
-                    "No trackers defined. Add one with `newgit tracker add <name> --template <template>`."
-                );
+                println!("No trackers defined. Create one with `newgit tracker create <name>`.");
                 return Ok(());
             }
             println!(
-                "{:<18} {:<14} {:<12} {:<9} PATHS",
-                "NAME", "KIND", "PROPAGATION", "AUDIENCE"
+                "{:<18} {:<18} {:<12} {:<9} PATHS",
+                "NAME", "MERGE_WITH_SOURCE", "STORAGE", "AUDIENCE"
             );
             for definition in definitions {
                 let paths = definition
@@ -394,19 +431,13 @@ fn tracker(command: TrackerCommand) -> Result<()> {
                     .collect::<Vec<_>>()
                     .join(", ");
                 println!(
-                    "{:<18} {:<14} {:<12} {:<9} {}",
+                    "{:<18} {:<18} {:<12} {:<9} {}",
                     definition.name,
-                    definition.kind,
-                    format!("{:?}", definition.propagation).to_lowercase(),
+                    definition.merge_with_source,
+                    format!("{:?}", definition.storage).to_lowercase(),
                     definition.audience,
                     if paths.is_empty() { "-" } else { &paths }
                 );
-            }
-            Ok(())
-        }
-        TrackerCommand::Templates => {
-            for template in TRACKER_TEMPLATES {
-                println!("{:<16} {}", template.name, template.description);
             }
             Ok(())
         }
@@ -419,29 +450,39 @@ fn tracker(command: TrackerCommand) -> Result<()> {
                 report.rev,
                 files_label(report.files)
             );
+            println!("  merge with: newgit tracker merge {tracker}");
             Ok(())
         }
-        TrackerCommand::Restore {
+        TrackerCommand::Merge { tracker, instance } => {
+            let (manager, instance) = manager_and_instance(instance)?;
+            let outcome = manager.merge_tracker(&instance, &tracker)?;
+            println!(
+                "Merged `{}` @ {} from `{instance}` into the lane head",
+                outcome.tracker, outcome.rev
+            );
+            Ok(())
+        }
+        TrackerCommand::Checkout {
             tracker,
             instance,
             rev,
         } => {
             let (manager, instance) = manager_and_instance(instance)?;
-            let report = manager.restore_tracker(&instance, &tracker, rev.as_deref())?;
+            let report = manager.checkout_tracker(&instance, &tracker, rev.as_deref())?;
             println!(
-                "Restored `{tracker}` @ {} ({}) for `{instance}`",
+                "Checked out `{tracker}` @ {} ({}) for `{instance}`",
                 report.rev,
                 files_label(report.files)
             );
             if let Some(safety) = report.safety_rev {
-                println!("  previous content saved @ {safety}; restore it with --rev");
+                println!("  previous content saved @ {safety}; check it out with --rev");
             }
             Ok(())
         }
-        TrackerCommand::Materialize { tracker, instance } => {
+        TrackerCommand::Pull { tracker, instance } => {
             let (manager, instance) = manager_and_instance(instance)?;
-            let outcome = manager.materialize_tracker(&instance, &tracker)?;
-            println!("Materialized {} for `{instance}`", bind_line(&outcome));
+            let outcome = manager.pull_tracker(&instance, &tracker)?;
+            println!("Pulled {} for `{instance}`", bind_line(&outcome));
             Ok(())
         }
     }
@@ -477,7 +518,7 @@ fn status(name: Option<&str>) -> Result<()> {
         "{:<name_width$} {:<source_width$} {:<10} {:<tracker_width$} {:<resource_width$} WORKSPACE",
         "NAME", "SOURCE", "STATUS", "TRACKERS", "RESOURCES"
     );
-    let mut any_behind = false;
+    let (mut any_never_pulled, mut any_diverged) = (false, false);
     for report in &reports {
         let marker = if context.current_branch.as_deref() == Some(report.branch.name.as_str()) {
             "* "
@@ -489,7 +530,8 @@ fn status(name: Option<&str>) -> Result<()> {
         } else {
             "ws-missing"
         };
-        any_behind |= report.trackers.iter().any(|tracker| tracker.behind);
+        any_never_pulled |= report.trackers.iter().any(|tracker| tracker.never_pulled());
+        any_diverged |= report.trackers.iter().any(|tracker| tracker.diverged());
         println!(
             "{marker}{:<width$} {:<source_width$} {workspace_status:<10} {:<tracker_width$} {:<resource_width$} {}",
             report.branch.name,
@@ -500,9 +542,14 @@ fn status(name: Option<&str>) -> Result<()> {
             width = name_width - 2,
         );
     }
-    if any_behind {
+    if any_never_pulled {
         println!(
-            "\n^ = newer tracker content available; pull with `newgit tracker materialize <tracker> [instance]`"
+            "\n^ = lane has content this instance never pulled; catch up with `newgit tracker pull <tracker> [instance]`"
+        );
+    }
+    if any_diverged {
+        println!(
+            "\n~ = differs from lane head; `newgit tracker pull` takes the head (auto-saves current), `newgit tracker merge` makes this instance the head"
         );
     }
     Ok(())
@@ -524,23 +571,21 @@ fn remove(name: &str) -> Result<()> {
 
 fn bind_line(outcome: &TrackerBindOutcome) -> String {
     match &outcome.origin {
-        BindOrigin::Template => format!(
-            "`{}` @ {} ({}, from template)",
-            outcome.name,
-            outcome.content_rev.as_deref().unwrap_or("-"),
-            files_label(outcome.files)
-        ),
         BindOrigin::LaneHead => format!(
             "`{}` @ {} ({}, from lane head)",
             outcome.name,
             outcome.content_rev.as_deref().unwrap_or("-"),
             files_label(outcome.files)
         ),
-        BindOrigin::Nothing => format!("`{}` bound (nothing to materialize)", outcome.name),
-        BindOrigin::MissingSource(path) => format!(
-            "`{}` bound WITHOUT content: materialize source `{path}` is missing",
-            outcome.name
-        ),
+        BindOrigin::Nothing => format!("`{}` bound (no captured content)", outcome.name),
+    }
+}
+
+fn parse_storage(value: &str) -> Result<Storage> {
+    match value {
+        "local" => Ok(Storage::Local),
+        "remote" => Ok(Storage::Remote),
+        _ => bail!("invalid storage `{value}`; expected local or remote"),
     }
 }
 
@@ -569,8 +614,14 @@ fn tracker_column(report: &InstanceReport) -> String {
         .iter()
         .map(|tracker| {
             let rev = tracker.content_rev.as_deref().unwrap_or("—");
-            let behind = if tracker.behind { "^" } else { "" };
-            format!("{}:{rev}{behind}", tracker.name)
+            let marker = if tracker.never_pulled() {
+                "^"
+            } else if tracker.diverged() {
+                "~"
+            } else {
+                ""
+            };
+            format!("{}:{rev}{marker}", tracker.name)
         })
         .collect::<Vec<_>>()
         .join(" ")

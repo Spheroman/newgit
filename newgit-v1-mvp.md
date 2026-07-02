@@ -24,7 +24,7 @@ If that feels good, the larger architecture earns the right to exist.
 
 Earlier drafts conflated two different things under the single name "tracker". v1 splits them.
 
-> A **tracker** is a named, versioned lane of file content, with its own audience, propagation, and storage settings.
+> A **tracker** is a named, versioned lane of file content, with its own audience, storage, and source-merge policy.
 >
 > A **resource** is a lifecycle unit that re-establishes the per-branch state that cannot be carried as content.
 
@@ -39,7 +39,7 @@ There is no fixed set of trackers and no limit on how many a project defines. `s
 Every tracker carries three settings:
 
 - **audience** — who may read it (`public`, `project-devs`, a single user). v1 records this but does not enforce it beyond keeping non-public tracker content out of ordinary Git history.
-- **propagation** — how content flows across branches: `rebase` (source-style, changes flow downstream), `pin` (per-branch, no propagation — a different `.env` per branch is normal, not a conflict), or `manual`.
+- **merge_with_source** — whether a real source merge should carry this tracker's bound state with it. Env files usually say no; generated code, feature assets, and sub-repo snapshots often say yes.
 - **storage** — where synced state lives: `local` for v1, `remote` later.
 
 ### Resources
@@ -70,12 +70,9 @@ Real projects have odd branch-bound things:
 
 newgit should not need a new internal subsystem for each one. It needs a tracker definition or a resource definition — and an agent reading the config should know, from the noun alone, whether a thing syncs across machines (tracker) or gets re-established on each one (resource).
 
-v1 should ship starter templates for both:
-
-- **Tracker templates:** env-file, file snapshot, SQLite database
-- **Resource templates:** install/deps, process/service, command-snapshot database, external resource
-
-But the architecture should treat them all as user-defined instances of the two primitives, not as fixed lanes.
+v1 should ship resource templates for common lifecycle units such as
+install/deps and process/service. Trackers should be created through CLI verbs
+instead of templates: create the lane, add paths to it, capture content.
 
 ---
 
@@ -122,7 +119,7 @@ Non-assumptions:
 v1 should include seven things:
 
 1. Branch workspace creation
-2. A user-defined tracker model (content lanes with audience, propagation, storage)
+2. A user-defined tracker model (content lanes with audience, storage, source-merge policy)
 3. A user-defined resource model (lifecycle hooks, ports, exports, dependencies)
 4. Resource lifecycle actions
 5. Exports for env vars, ports, paths, URLs, and opaque state references
@@ -248,41 +245,44 @@ The workspace directory is disposable. The binding record is not.
 
 A tracker is a project-defined content lane. It tells newgit:
 
-- which paths (or rendered files) it owns
+- which workspace paths it owns
 - who may read it (audience)
-- how content flows across branches (propagation)
+- whether content should merge along with source changes (`merge_with_source`)
 - where synced state lives (storage)
-- how to materialize its content into a workspace
-- how to export its content to commands
+
+Trackers deliberately rhyme with Git tracking. They are not copy recipes, env
+systems, database systems, or command-environment providers. A tracker says
+"this lane owns these paths"; capture records the current workspace content in
+that lane; projection/restore puts captured lane content back into a workspace.
 
 ### Tracker Definition
 
 ```text
 TrackerDefinition {
   name
-  kind          # descriptive, for templates and UI
   audience      # public | project-devs | user:<name>
-  propagation   # rebase | pin | manual
   storage       # local | remote (v1: local only)
+  merge_with_source # true | false
   paths         # workspace paths this tracker owns
-  materialize   # how content lands in a workspace
-  exports       # env files, paths
 }
 ```
 
-`kind` is descriptive, not fundamental. The engine cares about paths, materialization, and exports.
+The tracker file is CLI-managed. Users should not need to hand-edit TOML to
+understand or change which paths a tracker owns.
 
-### Capture and Restore
+### Capture, Merge, Pull, And Checkout
 
-Tracker capture is always the same operation: snapshot the tracker's content into the store. In v1 the "store" is a content lane per tracker at `.newgit/snapshots/<tracker>/<rev>/`, where `<rev>` is a content hash — identical captures dedupe, and M5's checkpoints simply reference these revs. Each lane keeps a `LATEST` pointer marking the head for `rebase` propagation. Restore puts a captured rev back into the workspace, clearing owned paths first so restore reproduces the captured state exactly; before overwriting, the current content is auto-captured, so restore is always undoable.
+Tracker capture is always the same operation: snapshot the tracker's content into the store and bind the current branch instance to that rev. In v1 the "store" is a content lane per tracker at `.newgit/snapshots/<tracker>/<rev>/`, where `<rev>` is a content hash — identical captures dedupe, and M5's checkpoints simply reference these revs. Each lane keeps a `LATEST` pointer marking the lane head/default for future instances and explicit pulls.
 
-Because tracker state is pure content, capture and restore need no per-tracker modes. If a thing needs a command to capture or restore, it is a resource.
+Capture alone is branch-local. `newgit tracker merge` promotes the current instance's bound tracker rev to the lane head. `newgit tracker pull` checks the lane head into the current instance. `newgit tracker checkout --rev <rev>` checks out a specific captured rev. Checkout clears owned paths first so it reproduces the captured state exactly; before overwriting, the current content is auto-captured, so checkout is always undoable.
 
-Propagation semantics in v1 are pull-based:
+Because tracker state is pure content, capture and checkout need no per-tracker modes. If a thing needs a command to capture or restore, it is a resource.
 
-- `pin` — every spawn materializes fresh from the definition's `materialize` source; instances never share.
-- `rebase` — capture moves the lane head; new spawns materialize from it, and existing instances show as behind in `newgit status` until `newgit tracker materialize` pulls (with the auto-capture safety net). Automatic push into live workspaces waits for the checkpoint/shim machinery and a conflict story — silently overwriting files an agent is mid-edit on is not acceptable.
-- `manual` — nothing moves except by explicit `tracker restore --rev`.
+`merge_with_source` does not change what capture means. It answers the global merge question: when a real Git/`jj` source merge is accepted, should this tracker binding be merged with it? If true, the merge/checkpoint shim should promote the branch's tracker rev alongside the source merge. If false, the tracker remains branch-local/user-local unless explicitly merged.
+
+If a tracker has never captured content, including it in a branch instance
+projects nothing. This is the same boring rule Git users already know: tracking
+a path does not invent content for it.
 
 ### Tracker Paths and Git
 
@@ -292,9 +292,9 @@ them into source history. The rule:
 > **A path owned by a non-source tracker must be ignored by Git**, unless the
 > path is deliberately followed by two trackers.
 
-`newgit tracker add` checks this and appends to `.gitignore`, loudly. The
+`newgit tracker track` checks this and appends to `.gitignore`, loudly. The
 config loader validates the invariant — content lanes must be disjoint, so no
-two trackers fight over the same path at materialize time.
+two trackers fight over the same path at projection/restore time.
 
 This is "audience keeps content out of Git history by construction" made
 concrete. It is not enforcement against a hostile agent force-adding a file;
@@ -307,7 +307,7 @@ checkpoint.
 
 ### Source Is the Default Tracker
 
-`source` is a tracker with audience = everyone, propagation = rebase, mechanism = Git/`jj`. It is the one tracker whose history engine is external and non-negotiable (see *Source Tracker* below). Every other tracker's propagation is newgit policy.
+`source` is a tracker with audience = everyone, storage = Git/`jj`, mechanism = Git/`jj`. It is the one tracker whose history engine is external and non-negotiable (see *Source Tracker* below). Every other tracker uses newgit's capture/merge/pull/checkout policy.
 
 ---
 
@@ -472,7 +472,6 @@ v1 can use a simple `.newgit/` directory in the project root:
     deps.toml
     app-service.toml
     postgres-db.toml
-  templates/               # committed safe templates
   local/                   # gitignored local overrides
   branches/                # gitignored branch bindings
     feature-a.toml
@@ -521,39 +520,26 @@ Not committed to Git by default:
 
 This means v1 can commit newgit project configuration without committing arbitrary state outside source. The source tree still owns source history; `.newgit` committed files describe how branch trackers and resources are orchestrated. Content of trackers whose audience is narrower than the repo's stays out of Git by construction.
 
-### Per-User Tracker Resolution
+### Per-User Tracker Content
 
-The architecture should support assigning different concrete tracker inputs to different users, but the assignment should usually happen through local overlays rather than committed person-specific state.
+The architecture should support assigning different concrete tracker content to
+different users, but the assignment should happen through tracker storage and
+local branch bindings rather than committed person-specific materialization
+recipes.
 
-For example, a project can commit one abstract env tracker:
+For example, a project can commit one env tracker definition:
 
 ```toml
 # .newgit/trackers/runtime-env.toml
-kind = "env-file"
 audience = "user"
 storage = "local"
-propagation = "pin"
-
-[resolve]
-profile_key = "runtime_env"
-
-[materialize]
-render_to = ".env.local"
+merge_with_source = false
+paths = [".env.local"]
 ```
 
-Each user can resolve that tracker differently in a gitignored local file or user-level config:
-
-```toml
-[profiles.jack.trackers.runtime-env]
-template = "/Users/jack/.config/myapp/env.template"
-secret_ref = "op://Private/myapp-dev-env"
-
-[profiles.teammate.trackers.runtime-env]
-template = "/Users/teammate/.config/myapp/env.template"
-secret_ref = "op://Team/myapp-dev-env"
-```
-
-This gives different users different env materialization without putting their env values, secret handles, or branch-local state into Git.
+Each user can then capture their own `.env.local` content into their local
+tracker lane. A new branch includes the tracker if its profile asks for it; if
+that user has never captured content, the file simply does not appear.
 
 Committed profiles are still useful when they describe roles rather than people:
 
@@ -569,7 +555,8 @@ resources = ["deps", "app", "worker"]
 
 The safe default is:
 
-> Commit tracker and resource definitions and role profiles. Keep user resolution and concrete state local.
+> Commit tracker and resource definitions and role profiles. Keep concrete
+> tracker content local unless it is deliberately pushed to a tracker remote.
 
 ### Future Remote-Backed Trackers
 
@@ -579,24 +566,24 @@ The compatibility rule is:
 
 > v1 keeps concrete tracker content out of Git, not out of newgit forever.
 
-For v1, an env tracker might resolve from a local file or existing secret manager:
+For v1, an env tracker is just a local content lane:
 
 ```toml
 # .newgit/trackers/jack-env.toml
-kind = "env-file"
 audience = "user:jack"
 storage = "local"
-propagation = "pin"
+merge_with_source = false
+paths = [".env.local"]
 ```
 
 A future version can keep the same tracker and change only the state backend:
 
 ```toml
 # .newgit/trackers/jack-env.toml
-kind = "env-file"
 audience = "user:jack"
 storage = "remote"
-propagation = "pin"
+merge_with_source = false
+paths = [".env.local"]
 
 [remote]
 auth = "per-user"
@@ -631,7 +618,8 @@ Two conventions hold across all commands:
 
 - **Grammar:** branch-instance lifecycle commands are top-level verbs
   (`spawn`, `status`, `run`, `checkpoint`, `undo`, `remove`, `cleanup`);
-  definition management uses noun subcommands (`tracker add`, `resource add`).
+  definition management uses noun subcommands (`tracker create`,
+  `tracker track`, `resource add`).
 - **Name inference:** `<name>` is optional when a command runs inside a
   workspace — newgit chose the workspace path, so it can always map cwd →
   branch instance. `<name>` is required only outside a workspace. Agents
@@ -650,16 +638,30 @@ Initializes `.newgit/` and detects project substrates:
 - database hints
 - likely services
 
-It can offer starter templates, but should not pretend detection is certainty.
+It can offer resource templates and suggested tracker paths, but should not
+pretend detection is certainty.
 
-### `newgit tracker add <name> --template <template>`
+### `newgit tracker create <name>`
 
-Creates a tracker definition from a starter template.
+Creates an empty tracker lane. Policy can be supplied with flags; defaults are
+boring (`audience = "project-devs"`, `storage = "local"`,
+`merge_with_source = false`).
 
 ```sh
-newgit tracker add runtime-env --template env-file
-newgit tracker add dev-db --template sqlite
-newgit tracker add db-snapshots --template file-snapshot
+newgit tracker create runtime-env --audience user
+newgit tracker create dev-db --audience project-devs
+newgit tracker create generated-sdk --merge-with-source
+```
+
+### `newgit tracker track <tracker> <path>...`
+
+Adds workspace paths to a tracker lane and appends those paths to `.gitignore`
+loudly, unless they are already ignored or deliberately dual-tracked.
+
+```sh
+newgit tracker track runtime-env .env.local
+newgit tracker track dev-db data/dev.sqlite
+newgit tracker track generated-sdk src/generated
 ```
 
 ### `newgit resource add <name> --template <template>`
@@ -672,19 +674,18 @@ newgit resource add app --template process
 newgit resource add postgres-db --template command-snapshot
 ```
 
-The user can then edit the generated TOML. `tracker add` also appends the
-tracker's owned paths to the repo's `.gitignore`, loudly (see *Tracker Paths
-and Git*).
+The user can then edit the generated resource TOML. Tracker definitions should
+normally be edited through the CLI.
 
 Tracker content moves through plumbing subcommands — the same machinery
 `checkpoint`/`undo` orchestrate in M5, not a second code path:
 
 ```sh
 newgit tracker capture <tracker> [instance]      # snapshot content → lane
-newgit tracker restore <tracker> [--rev <rev>]   # put a rev back (auto-saves current first)
-newgit tracker materialize <tracker> [instance]  # pull lane head (rebase) / template (pin)
+newgit tracker merge <tracker> [instance]        # promote this instance's rev to lane head
+newgit tracker pull <tracker> [instance]         # pull lane head into this instance
+newgit tracker checkout <tracker> [--rev <rev>]  # check out an exact rev (auto-saves current first)
 newgit tracker list
-newgit tracker templates
 ```
 
 `[instance]` is inferred when run inside a workspace.
@@ -697,7 +698,7 @@ Creates a branch instance:
 - rejects a name whose slug collides with an existing instance
 - clones the store repo into a fresh workspace directory (see *Materialization*)
 - resolves the selected user/profile overlay
-- instantiates tracker bindings and materializes tracker content
+- instantiates tracker bindings and projects captured tracker content
 - instantiates resource bindings
 - allocates requested ports
 - runs resource prepare hooks
@@ -714,12 +715,9 @@ newgit spawn auth-refactor --profile fullstack
 Runs a command inside the branch instance with the environment assembled in
 layers (later layers win):
 
-1. parsed `env_file` contents from tracker exports (dotenv semantics, so
-   `psql $DATABASE_URL` works in a shell)
-2. tracker exports
-3. resource exports, in dependency order
-4. port env vars (`PORT=3107`)
-5. `NEWGIT_BRANCH`, `NEWGIT_WORKSPACE` context vars
+1. resource exports, in dependency order
+2. port env vars (`PORT=3107`)
+3. `NEWGIT_BRANCH`, `NEWGIT_WORKSPACE` context vars
 
 The workspace is the cwd; output is captured to `.newgit/logs/` as well as
 the terminal.
@@ -911,9 +909,9 @@ and a workspace advance the same branch, newgit warns loudly rather than
 hard-refusing — the same safety worktree branch-locking provided, as legible
 policy instead of inherited jank.
 
-Clone is only the **source tracker's** materialize step. After it, every
-other tracker materializes its paths into the workspace in dependency order
-(render an env file, copy a snapshot into place).
+Clone is only the **source tracker's** projection step. After it, every
+included tracker projects its captured paths into the workspace. If a tracker
+has no captured content, it projects nothing.
 
 ### The Path To Projection
 
@@ -950,57 +948,46 @@ projection.
 
 ---
 
-## Starter Templates
-
-v1 should ship a few templates, but templates are conveniences over the two primitives.
+## Common Definitions
 
 ### Env File Tracker
 
 A branch-local env file: pure content, so a tracker.
 
-```toml
-# .newgit/trackers/runtime-env.toml
-kind = "env-file"
-audience = "user"
-storage = "local"
-propagation = "pin"
-paths = [".env.local"]
-
-[materialize]
-copy_from = ".newgit/templates/base.env"
-to = ".env.local"
-
-[exports]
-env_file = ".env.local"
+```sh
+newgit tracker create runtime-env --audience user
+newgit tracker track runtime-env .env.local
+newgit tracker capture runtime-env
 ```
 
-This is not a privileged env system. It is a content tracker that exports an env file.
+This is not a privileged env system. It is a content tracker that owns an env
+file. Loading that file into `newgit run` is a separate command-environment
+policy, not part of tracking.
 
-### File Snapshot Tracker
+The resulting tracker file is intentionally small:
+
+```toml
+# .newgit/trackers/runtime-env.toml
+audience = "user"
+storage = "local"
+merge_with_source = false
+paths = [".env.local"]
+```
+
+### File Tracker
 
 Any branch-local file or directory that should checkpoint and restore as content.
 
-```toml
-# .newgit/trackers/generated-sdk.toml
-kind = "file-snapshot"
-audience = "project-devs"
-storage = "local"
-propagation = "manual"
-paths = ["src/generated"]
+```sh
+newgit tracker create generated-sdk --merge-with-source
+newgit tracker track generated-sdk src/generated
 ```
 
 The same shape covers SQLite, because a (stopped) SQLite database is just a file:
 
-```toml
-# .newgit/trackers/dev-db.toml
-kind = "sqlite"
-audience = "project-devs"
-storage = "local"
-propagation = "pin"
-paths = ["data/dev.sqlite"]
-
-[exports]
-DATABASE_URL = "sqlite://data/dev.sqlite"
+```sh
+newgit tracker create dev-db
+newgit tracker track dev-db data/dev.sqlite
 ```
 
 ### Install Resource
@@ -1099,10 +1086,10 @@ A daemon-owned database: state can only be captured consistently through the dae
 
 ```toml
 # .newgit/trackers/db-snapshots.toml
-kind = "file-snapshot"
 audience = "project-devs"
 storage = "local"
-propagation = "manual"
+merge_with_source = false
+paths = []
 ```
 
 ```toml
@@ -1248,10 +1235,9 @@ Definitions live one per file, not inlined in `config.toml`:
 - Each tracker is a file in `.newgit/trackers/`; each resource is a file in
   `.newgit/resources/`. The definition's name comes from the filename.
 
-One definition per file gives clean diffs, matches what `tracker add` and
-`resource add` produce, and avoids the TOML array-of-tables footgun — a
-`[[trackers]]` block followed by `[trackers.materialize]` binds by ordering,
-which both humans and agents get wrong.
+One definition per file gives clean diffs, matches what `tracker create`,
+`tracker track`, and `resource add` produce, and avoids the TOML
+array-of-tables footgun.
 
 The generated `config.toml` is minimal:
 
@@ -1284,19 +1270,14 @@ A project then looks like:
     app.toml
 ```
 
-with each definition file shaped as in *Starter Templates* — top-level keys
-plus subtables, no `[[trackers]]` wrapper:
+with each tracker definition file kept deliberately small:
 
 ```toml
 # .newgit/trackers/dev-db.toml
-kind = "sqlite"
 audience = "project-devs"
 storage = "local"
-propagation = "pin"
+merge_with_source = false
 paths = ["data/dev.sqlite"]
-
-[exports]
-DATABASE_URL = "sqlite://data/dev.sqlite"
 ```
 
 The exact config syntax can change. The important part is that content lanes are declared as trackers, lifecycle units as resources, and neither is a hardcoded subsystem.
@@ -1361,20 +1342,22 @@ Success criterion:
 ### Milestone 2: Tracker Definitions And Bindings
 
 - parse tracker definitions
-- materialize tracker content into workspaces
-- capture and restore tracker content
-- show tracker status
+- project the lane head into new workspaces
+- capture, merge, pull, and checkout tracker content
+- show tracker status, distinguishing never-pulled (`^`) from
+  diverged-from-head (`~`) — direction is unknowable without rev ancestry,
+  so status must not advise one
 
 Success criterion:
 
-> I can define an env-file tracker and see its content materialize per branch instance.
+> I can create a tracker, track a path, capture and merge it, and see later branch instances project that content.
 
 ### Milestone 3: Resources, Actions, Exports, And Ports
 
 - parse resource definitions
 - command-based resource actions
 - minimal PID-file process supervision for `long_running` actions
-- tracker and resource exports loaded into `newgit run`
+- resource exports loaded into `newgit run`
 - deterministic port allocation
 - logs per action
 - process resource template (pulled forward from Milestone 4)
@@ -1386,10 +1369,9 @@ Success criterion:
 
 > A resource can request a port, export it, and run a command that uses it.
 
-### Milestone 4: Starter Templates
+### Milestone 4: Starter Definitions
 
-- env-file tracker template
-- file snapshot tracker template
+- CLI-managed tracker creation and path tracking
 - process resource template
 - pnpm install resource template
 
@@ -1411,7 +1393,7 @@ Success criterion:
 
 ### Milestone 6: Database And External Resources
 
-- SQLite through the file snapshot tracker template
+- SQLite through a normal file tracker
 - Postgres through the command-snapshot resource template depositing into a tracker
 - one external resource template
 
@@ -1439,6 +1421,12 @@ Command shims:
 - start with `git commit` (enrich) and `pnpm dev` / `npm run dev` (inject), the two highest-frequency reflexes
 - `advise` shims for branch-creation commands next
 - never emulate; every shim passes through to the real command and announces itself in output
+
+Command environment policy:
+
+- add `[run] env_files = [".env.local"]` and/or `newgit run --env-file .env.local`
+- keep this outside trackers: trackers own file content; run policy decides which files become process environment
+- this restores the useful `newgit run -- psql $DATABASE_URL` workflow without making tracker definitions export env
 
 FUSE:
 
@@ -1482,8 +1470,10 @@ v1 is successful if this workflow feels normal:
 
 ```sh
 newgit init
-newgit tracker add runtime-env --template env-file
-newgit tracker add dev-db --template sqlite
+newgit tracker create runtime-env --audience user
+newgit tracker track runtime-env .env.local
+newgit tracker create dev-db
+newgit tracker track dev-db data/dev.sqlite
 newgit resource add deps --template pnpm
 newgit resource add app --template process
 

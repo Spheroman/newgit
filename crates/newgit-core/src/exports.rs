@@ -1,9 +1,5 @@
 use std::collections::BTreeMap;
 
-use camino::Utf8Path;
-
-use crate::error::{NewgitError, Result};
-
 /// The minimal template variable set for exports and action commands:
 /// `{{ports.<name>}}`, `{{branch.name}}`, `{{branch.slug}}`, `{{workspace}}`.
 #[derive(Debug, Clone)]
@@ -23,42 +19,6 @@ pub fn render(template: &str, context: &RenderContext) -> String {
         rendered = rendered.replace(&format!("{{{{ports.{name}}}}}"), &port.to_string());
     }
     rendered
-}
-
-/// Dotenv-lite: `KEY=VALUE` lines, `#` comments, optional `export ` prefix,
-/// matching single or double quotes stripped. No interpolation.
-pub fn parse_env_file(path: &Utf8Path) -> Result<Vec<(String, String)>> {
-    let contents = std::fs::read_to_string(path).map_err(|source| NewgitError::io(path, source))?;
-    let mut vars = Vec::new();
-    for line in contents.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        let line = line.strip_prefix("export ").unwrap_or(line);
-        let Some((key, value)) = line.split_once('=') else {
-            continue;
-        };
-        let key = key.trim();
-        if key.is_empty() {
-            continue;
-        }
-        let value = value.trim();
-        let value = strip_quotes(value);
-        vars.push((key.to_owned(), value.to_owned()));
-    }
-    Ok(vars)
-}
-
-fn strip_quotes(value: &str) -> &str {
-    let bytes = value.as_bytes();
-    if bytes.len() >= 2 {
-        let (first, last) = (bytes[0], bytes[bytes.len() - 1]);
-        if (first == b'"' && last == b'"') || (first == b'\'' && last == b'\'') {
-            return &value[1..value.len() - 1];
-        }
-    }
-    value
 }
 
 #[cfg(test)]

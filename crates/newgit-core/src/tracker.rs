@@ -1,5 +1,3 @@
-use std::collections::BTreeMap;
-
 use camino::{Utf8Path, Utf8PathBuf};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -11,26 +9,15 @@ use crate::error::{NewgitError, Result};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TrackerDefinition {
     pub name: String,
-    pub kind: String,
     pub audience: String,
-    pub propagation: Propagation,
     pub storage: Storage,
+    /// Whether a source merge should carry this tracker binding with it.
+    pub merge_with_source: bool,
     /// Workspace-relative paths this tracker owns. May be empty for lanes
     /// that only receive deposits (e.g. `db-snapshots`).
     pub paths: Vec<Utf8PathBuf>,
-    pub materialize: Option<MaterializeSpec>,
-    /// Parsed and recorded in v1; consumed by `newgit run` from M3 on.
-    pub exports: BTreeMap<String, String>,
     /// `sha256:<hex12>` of the definition file contents.
     pub definition_rev: String,
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "kebab-case")]
-pub enum Propagation {
-    Rebase,
-    Pin,
-    Manual,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -40,32 +27,38 @@ pub enum Storage {
     Remote,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct MaterializeSpec {
-    /// Source, relative to the store project root.
-    pub copy_from: Utf8PathBuf,
-    /// Destination in the workspace; defaults to the tracker's single owned
-    /// path when omitted.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub to: Option<Utf8PathBuf>,
-}
-
 /// On-disk shape (everything but the filename-derived name).
-#[derive(Debug, Deserialize)]
-struct TrackerDefinitionFile {
-    kind: String,
+#[derive(Debug, Serialize, Deserialize)]
+pub struct TrackerDefinitionFile {
     audience: String,
-    propagation: Propagation,
     storage: Storage,
     #[serde(default)]
+    merge_with_source: bool,
+    #[serde(default)]
     paths: Vec<Utf8PathBuf>,
-    #[serde(default)]
-    materialize: Option<MaterializeSpec>,
-    #[serde(default)]
-    exports: BTreeMap<String, String>,
 }
 
 impl TrackerDefinition {
+    pub fn new(
+        name: &str,
+        audience: String,
+        storage: Storage,
+        merge_with_source: bool,
+        paths: Vec<Utf8PathBuf>,
+    ) -> Result<Self> {
+        let mut definition = Self {
+            name: name.to_owned(),
+            audience,
+            storage,
+            merge_with_source,
+            paths,
+            definition_rev: String::new(),
+        };
+        definition.validate()?;
+        definition.definition_rev = definition.compute_definition_rev()?;
+        Ok(definition)
+    }
+
     pub fn from_file(name: &str, path: &Utf8Path) -> Result<Self> {
         let contents =
             std::fs::read_to_string(path).map_err(|source| NewgitError::io(path, source))?;
@@ -83,29 +76,14 @@ impl TrackerDefinition {
 
         let definition = Self {
             name: name.to_owned(),
-            kind: file.kind,
             audience: file.audience,
-            propagation: file.propagation,
             storage: file.storage,
+            merge_with_source: file.merge_with_source,
             paths: file.paths,
-            materialize: file.materialize,
-            exports: file.exports,
             definition_rev: format!("sha256:{hex}"),
         };
         definition.validate()?;
         Ok(definition)
-    }
-
-    /// Where materialized content lands when `materialize.to` is omitted.
-    pub fn materialize_target(&self) -> Option<&Utf8Path> {
-        let spec = self.materialize.as_ref()?;
-        if let Some(to) = &spec.to {
-            return Some(to);
-        }
-        match self.paths.as_slice() {
-            [single] => Some(single),
-            _ => None,
-        }
     }
 
     fn validate(&self) -> Result<()> {
@@ -133,17 +111,43 @@ impl TrackerDefinition {
                 )));
             }
         }
-
-        if let Some(spec) = &self.materialize
-            && spec.to.is_none()
-            && self.paths.len() != 1
-        {
-            return Err(self.invalid(
-                "materialize.to is required when the tracker does not own exactly one path"
-                    .to_owned(),
-            ));
-        }
         Ok(())
+    }
+
+    pub fn with_added_paths(&self, paths: &[Utf8PathBuf]) -> Result<Self> {
+        let mut updated = self.clone();
+        for path in paths {
+            if !updated.paths.iter().any(|existing| existing == path) {
+                updated.paths.push(path.clone());
+            }
+        }
+        updated.paths.sort();
+        updated.validate()?;
+        updated.definition_rev = updated.compute_definition_rev()?;
+        Ok(updated)
+    }
+
+    pub fn to_file(&self) -> TrackerDefinitionFile {
+        TrackerDefinitionFile {
+            audience: self.audience.clone(),
+            storage: self.storage,
+            merge_with_source: self.merge_with_source,
+            paths: self.paths.clone(),
+        }
+    }
+
+    fn compute_definition_rev(&self) -> Result<String> {
+        let contents =
+            toml::to_string_pretty(&self.to_file()).map_err(|source| NewgitError::TomlWrite {
+                label: format!("tracker `{}`", self.name),
+                source,
+            })?;
+        let digest = Sha256::digest(contents.as_bytes());
+        let hex: String = digest[..6]
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        Ok(format!("sha256:{hex}"))
     }
 
     fn invalid(&self, reason: String) -> NewgitError {
@@ -155,7 +159,7 @@ impl TrackerDefinition {
 }
 
 /// Content lanes must be disjoint: no two trackers may own the same path or
-/// nest inside each other, or materialization order would matter.
+/// nest inside each other, or projection/restore order would matter.
 pub fn validate_disjoint(definitions: &[TrackerDefinition]) -> Result<()> {
     for (index, left) in definitions.iter().enumerate() {
         for right in &definitions[index + 1..] {
@@ -242,13 +246,10 @@ mod tests {
     fn definition(name: &str, paths: &[&str]) -> TrackerDefinition {
         TrackerDefinition {
             name: name.to_owned(),
-            kind: "file-snapshot".to_owned(),
             audience: "project-devs".to_owned(),
-            propagation: Propagation::Pin,
             storage: Storage::Local,
+            merge_with_source: false,
             paths: paths.iter().map(Utf8PathBuf::from).collect(),
-            materialize: None,
-            exports: BTreeMap::new(),
             definition_rev: "sha256:000000000000".to_owned(),
         }
     }

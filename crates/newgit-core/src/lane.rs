@@ -6,7 +6,7 @@ use crate::tracker::{TrackerDefinition, collect_owned_files, content_rev};
 
 /// A tracker's content lane in the store: content-addressed snapshots under
 /// `.newgit/snapshots/<tracker>/<rev>/`, plus a LATEST pointer that marks the
-/// lane head for `rebase` propagation.
+/// lane head/default for new instances and explicit pulls.
 #[derive(Debug, Clone)]
 pub struct TrackerLane {
     root: Utf8PathBuf,
@@ -125,27 +125,4 @@ pub fn copy_file(from: &Utf8Path, to: &Utf8Path) -> Result<()> {
     std::fs::copy(from, to)
         .map(|_| ())
         .map_err(|source| NewgitError::io(to.to_path_buf(), source))
-}
-
-/// Copy a file or directory tree from an arbitrary source into a workspace
-/// target (used by `materialize.copy_from`).
-pub fn copy_tree(from: &Utf8Path, to: &Utf8Path) -> Result<()> {
-    if from.is_file() {
-        return copy_file(from, to);
-    }
-    if !from.is_dir() {
-        return Err(NewgitError::io(
-            from.to_path_buf(),
-            std::io::Error::new(std::io::ErrorKind::NotFound, "materialize source not found"),
-        ));
-    }
-    for entry in std::fs::read_dir(from).map_err(|source| NewgitError::io(from, source))? {
-        let entry = entry.map_err(|source| NewgitError::io(from, source))?;
-        let name = entry.file_name();
-        let Some(name) = name.to_str() else {
-            return Err(NewgitError::NonUtf8Path(entry.path().display().to_string()));
-        };
-        copy_tree(&from.join(name), &to.join(name))?;
-    }
-    Ok(())
 }

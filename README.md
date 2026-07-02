@@ -31,7 +31,7 @@ mise x -- cargo run -p newgit-cli -- remove auth-refactor
 
 - `crates/newgit-core` holds the MVP domain model: branch instances, tracker
   definitions, bindings, metadata storage, real-directory materialization,
-  starter templates, source tracker boundaries, and checkpoint records.
+  resource templates, source tracker boundaries, and checkpoint records.
 - `crates/newgit-cli` exposes the early CLI surface from the MVP.
 - `.newgit/` is created by `newgit init` and is ignored by Git because it is
   local metadata.
@@ -42,9 +42,13 @@ The current skeleton implements the first usable slice:
 - `newgit spawn <name>`
 - `newgit status`
 - `newgit remove <name>`
-
-Milestone 2 will add tracker and resource definition management, including
-commands such as `newgit tracker add <name> --template <template>`.
+- `newgit tracker create <name>`
+- `newgit tracker track <name> <path>...`
+- `newgit tracker capture <name>`
+- `newgit tracker merge <name>`
+- `newgit tracker pull <name>`
+- `newgit tracker checkout <name>`
+- `newgit resource add <name> --template <template>`
 
 The remaining MVP commands are present as explicit extension points so future
 work can fill them in without changing the command vocabulary.

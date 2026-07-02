@@ -33,7 +33,6 @@ pub struct NewgitPaths {
     pub archived_branches: Utf8PathBuf,
     pub trackers: Utf8PathBuf,
     pub resources: Utf8PathBuf,
-    pub templates: Utf8PathBuf,
     pub local: Utf8PathBuf,
     pub snapshots: Utf8PathBuf,
     pub logs: Utf8PathBuf,
@@ -167,13 +166,34 @@ impl MetadataStore {
         Ok(definitions)
     }
 
-    pub fn write_tracker_file(&self, name: &str, contents: &str) -> Result<Utf8PathBuf> {
+    pub fn create_tracker_definition(&self, definition: &TrackerDefinition) -> Result<Utf8PathBuf> {
         create_dir_all(&self.paths.trackers)?;
-        let path = self.paths.trackers.join(format!("{name}.toml"));
+        let path = self
+            .paths
+            .trackers
+            .join(format!("{}.toml", definition.name));
         if path.exists() {
             return Err(NewgitError::AlreadyExists(path));
         }
-        std::fs::write(&path, contents).map_err(|source| NewgitError::io(&path, source))?;
+        self.write_toml(
+            &path,
+            &format!("tracker `{}`", definition.name),
+            &definition.to_file(),
+        )?;
+        Ok(path)
+    }
+
+    pub fn save_tracker_definition(&self, definition: &TrackerDefinition) -> Result<Utf8PathBuf> {
+        create_dir_all(&self.paths.trackers)?;
+        let path = self
+            .paths
+            .trackers
+            .join(format!("{}.toml", definition.name));
+        self.write_toml(
+            &path,
+            &format!("tracker `{}`", definition.name),
+            &definition.to_file(),
+        )?;
         Ok(path)
     }
 
@@ -282,7 +302,6 @@ impl MetadataStore {
             &self.paths.branches,
             &self.paths.trackers,
             &self.paths.resources,
-            &self.paths.templates,
             &self.paths.local,
             &self.paths.snapshots,
             &self.paths.logs,
@@ -321,7 +340,6 @@ impl NewgitPaths {
             archived_branches: metadata_root.join("branches/archived"),
             trackers: metadata_root.join("trackers"),
             resources: metadata_root.join("resources"),
-            templates: metadata_root.join("templates"),
             local: metadata_root.join("local"),
             snapshots: metadata_root.join("snapshots"),
             logs: metadata_root.join("logs"),

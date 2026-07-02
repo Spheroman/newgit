@@ -222,30 +222,6 @@ fn run_command_sees_layered_env() {
     let store = setup(&temp);
     write_resource(&store, "app", APP_RESOURCE);
     write_resource(&store, "prep", PREP_RESOURCE);
-    // An env-file tracker to exercise layer 1.
-    std::fs::write(
-        store.paths().trackers.join("runtime-env.toml"),
-        r#"kind = "env-file"
-audience = "user"
-storage = "local"
-propagation = "pin"
-paths = [".env"]
-
-[materialize]
-copy_from = ".newgit/templates/base.env"
-to = ".env"
-
-[exports]
-env_file = ".env"
-"#,
-    )
-    .expect("write tracker");
-    std::fs::write(
-        store.paths().templates.join("base.env"),
-        "FROM_ENV_FILE=yes\nDATABASE_URL='postgres://localhost/base'\n",
-    )
-    .expect("write env template");
-    std::fs::write(store.paths().project_root.join(".gitignore"), "/.env\n").expect("gitignore");
 
     let repo = store.paths().project_root.clone();
     let manager = BranchManager::open(MetadataStore::at(repo)).expect("manager");
@@ -258,8 +234,7 @@ env_file = ".env"
             &[
                 "sh".to_owned(),
                 "-c".to_owned(),
-                "echo \"$FROM_ENV_FILE|$DATABASE_URL|$PORT|$APP_URL|$NEWGIT_BRANCH\" > env-probe.txt"
-                    .to_owned(),
+                "echo \"$PORT|$APP_URL|$NEWGIT_BRANCH\" > env-probe.txt".to_owned(),
             ],
         )
         .expect("run");
@@ -269,7 +244,7 @@ env_file = ".env"
         std::fs::read_to_string(spawned.branch.workspace_path.join("env-probe.txt")).expect("read");
     assert_eq!(
         probe.trim(),
-        format!("yes|postgres://localhost/base|{port}|http://127.0.0.1:{port}/feature-a|feature-a")
+        format!("{port}|http://127.0.0.1:{port}/feature-a|feature-a")
     );
 }
 
