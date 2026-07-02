@@ -185,9 +185,33 @@ pub fn collect_owned_files(
     workspace: &Utf8Path,
     definition: &TrackerDefinition,
 ) -> Result<Vec<(Utf8PathBuf, Utf8PathBuf)>> {
+    collect_files(workspace, &definition.paths)
+}
+
+/// Files under the given root-relative paths, as (relative, absolute) pairs,
+/// sorted by relative path. Missing paths are simply absent.
+pub fn collect_files(
+    root: &Utf8Path,
+    paths: &[Utf8PathBuf],
+) -> Result<Vec<(Utf8PathBuf, Utf8PathBuf)>> {
     let mut files = Vec::new();
-    for owned in &definition.paths {
-        walk(workspace, owned, &mut files)?;
+    for relative in paths {
+        walk(root, relative, &mut files)?;
+    }
+    files.sort();
+    Ok(files)
+}
+
+/// Every file under `root`, as (root-relative, absolute) pairs, sorted.
+pub fn collect_all_files(root: &Utf8Path) -> Result<Vec<(Utf8PathBuf, Utf8PathBuf)>> {
+    let mut files = Vec::new();
+    for entry in std::fs::read_dir(root).map_err(|source| NewgitError::io(root, source))? {
+        let entry = entry.map_err(|source| NewgitError::io(root, source))?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            return Err(NewgitError::NonUtf8Path(entry.path().display().to_string()));
+        };
+        walk(root, Utf8Path::new(name), &mut files)?;
     }
     files.sort();
     Ok(files)

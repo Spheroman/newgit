@@ -101,9 +101,146 @@ impl GitSource {
         .map(|_| ())
     }
 
+    /// Fetch a ref from another repository (typically a workspace clone)
+    /// into the store. Fetch, never push: the store pulls commits in when a
+    /// checkpoint blesses them, and workspaces stay passive.
+    pub fn fetch_ref(&self, from: &Utf8Path, remote_ref: &str, local_ref: &str) -> Result<()> {
+        self.git(&[
+            "fetch",
+            "--quiet",
+            "--no-write-fetch-head",
+            "--",
+            from.as_str(),
+            &format!("+{remote_ref}:{local_ref}"),
+        ])
+        .map(|_| ())
+    }
+
+    pub fn update_ref(&self, name: &str, rev: &str) -> Result<()> {
+        self.git(&["update-ref", name, rev]).map(|_| ())
+    }
+
+    /// Resolve a ref to a commit, when it exists.
+    pub fn ref_rev(&self, name: &str) -> Option<String> {
+        self.git(&["rev-parse", "--verify", "--quiet", &format!("{name}^{{commit}}")])
+            .ok()
+            .filter(|rev| !rev.is_empty())
+    }
+
+    pub fn is_ancestor(&self, ancestor: &str, descendant: &str) -> Result<bool> {
+        let args = [
+            "-C",
+            self.root.as_str(),
+            "merge-base",
+            "--is-ancestor",
+            ancestor,
+            descendant,
+        ];
+        let output = Command::new("git")
+            .args(args)
+            .output()
+            .map_err(|source| spawn_error(&args, &source))?;
+        Ok(output.status.success())
+    }
+
     /// Live HEAD of a workspace clone, short form.
     pub fn workspace_short_head(workspace: &Utf8Path) -> Result<String> {
         run_git(&["-C", workspace.as_str(), "rev-parse", "--short", "HEAD"])
+    }
+
+    /// Live HEAD of a workspace clone, full form.
+    pub fn workspace_head(workspace: &Utf8Path) -> Result<String> {
+        run_git(&["-C", workspace.as_str(), "rev-parse", "HEAD"])
+    }
+
+    /// Snapshot uncommitted and untracked (non-ignored) workspace state as a
+    /// dangling commit on top of HEAD, without touching HEAD, the real
+    /// index, or the worktree. Returns `None` when the worktree is clean.
+    ///
+    /// Mechanics: a throwaway `GIT_INDEX_FILE` seeded from HEAD, `git add -A`
+    /// into it, `git write-tree`, and `git commit-tree` — all public
+    /// interface, nothing reaches into `.git` internals.
+    pub fn workspace_dirty_commit(workspace: &Utf8Path, message: &str) -> Result<Option<String>> {
+        let scratch = tempfile::tempdir().map_err(|source| NewgitError::io(workspace, source))?;
+        let index = scratch.path().join("index");
+        let Some(index) = index.to_str() else {
+            return Err(NewgitError::NonUtf8Path(index.display().to_string()));
+        };
+        let env = [("GIT_INDEX_FILE".to_owned(), index.to_owned())];
+
+        let ws = workspace.as_str();
+        run_git_env(&["-C", ws, "read-tree", "HEAD"], &env)?;
+        run_git_env(&["-C", ws, "add", "-A"], &env)?;
+        let tree = run_git_env(&["-C", ws, "write-tree"], &env)?;
+
+        let head_tree = run_git(&["-C", ws, "rev-parse", "HEAD^{tree}"])?;
+        if tree == head_tree {
+            return Ok(None);
+        }
+
+        // A synthetic commit needs an identity even where none is configured.
+        let ident = [
+            ("GIT_AUTHOR_NAME".to_owned(), "newgit".to_owned()),
+            ("GIT_AUTHOR_EMAIL".to_owned(), "newgit@localhost".to_owned()),
+            ("GIT_COMMITTER_NAME".to_owned(), "newgit".to_owned()),
+            (
+                "GIT_COMMITTER_EMAIL".to_owned(),
+                "newgit@localhost".to_owned(),
+            ),
+        ];
+        run_git_env(
+            &["-C", ws, "commit-tree", &tree, "-p", "HEAD", "-m", message],
+            &ident,
+        )
+        .map(Some)
+    }
+
+    pub fn workspace_update_ref(workspace: &Utf8Path, name: &str, rev: &str) -> Result<()> {
+        run_git(&["-C", workspace.as_str(), "update-ref", name, rev]).map(|_| ())
+    }
+
+    pub fn workspace_delete_ref(workspace: &Utf8Path, name: &str) -> Result<()> {
+        run_git(&["-C", workspace.as_str(), "update-ref", "-d", name]).map(|_| ())
+    }
+
+    /// Fetch a store ref into a workspace clone (undo may need objects the
+    /// workspace has since discarded).
+    pub fn workspace_fetch_ref(workspace: &Utf8Path, from: &Utf8Path, remote_ref: &str) -> Result<()> {
+        run_git(&[
+            "-C",
+            workspace.as_str(),
+            "fetch",
+            "--quiet",
+            "--no-write-fetch-head",
+            "--",
+            from.as_str(),
+            remote_ref,
+        ])
+        .map(|_| ())
+    }
+
+    /// Put a workspace back to a checkpointed source state: HEAD hard-reset
+    /// to `head_rev`, untracked (non-ignored) files removed, then — when the
+    /// checkpoint carried uncommitted state — that state reapplied to the
+    /// worktree as uncommitted changes again. Ignored files (tracker paths,
+    /// node_modules) are deliberately left alone; trackers and resources own
+    /// their restoration.
+    pub fn workspace_restore_to(
+        workspace: &Utf8Path,
+        head_rev: &str,
+        dirty_rev: Option<&str>,
+    ) -> Result<()> {
+        let ws = workspace.as_str();
+        run_git(&["-C", ws, "reset", "--quiet", "--hard", head_rev])?;
+        run_git(&["-C", ws, "clean", "-fdq"])?;
+        if let Some(dirty) = dirty_rev {
+            run_git(&["-C", ws, "checkout", "--quiet", dirty, "--", "."])?;
+            // Mixed reset: index back to head_rev, so the dirty snapshot
+            // shows as uncommitted modifications/untracked files — exactly
+            // how it looked when the checkpoint was taken.
+            run_git(&["-C", ws, "reset", "--quiet", head_rev])?;
+        }
+        Ok(())
     }
 
     fn git(&self, args: &[&str]) -> Result<String> {
@@ -130,8 +267,13 @@ pub fn find_repo_root(start: &Utf8Path) -> Option<(Utf8PathBuf, SourceSubstrate)
 }
 
 fn run_git(args: &[&str]) -> Result<String> {
+    run_git_env(args, &[])
+}
+
+fn run_git_env(args: &[&str], env: &[(String, String)]) -> Result<String> {
     let output = Command::new("git")
         .args(args)
+        .envs(env.iter().map(|(key, value)| (key, value)))
         .output()
         .map_err(|source| spawn_error(args, &source))?;
 

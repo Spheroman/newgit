@@ -17,6 +17,7 @@ const LOCAL_GITIGNORE: &str = "\
 /snapshots/
 /logs/
 /state/
+/checkpoints/
 ";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -37,6 +38,7 @@ pub struct NewgitPaths {
     pub snapshots: Utf8PathBuf,
     pub logs: Utf8PathBuf,
     pub state: Utf8PathBuf,
+    pub checkpoints: Utf8PathBuf,
 }
 
 /// Where a newgit command is standing: which store owns the metadata, and —
@@ -227,6 +229,11 @@ impl MetadataStore {
         self.paths.state.join(slug)
     }
 
+    /// Per-instance checkpoint records: `.newgit/checkpoints/<slug>/`.
+    pub fn checkpoint_dir(&self, slug: &str) -> Utf8PathBuf {
+        self.paths.checkpoints.join(slug)
+    }
+
     /// Timestamped log path for one action run.
     pub fn action_log_path(&self, slug: &str, label: &str) -> Utf8PathBuf {
         let now = Utc::now();
@@ -306,6 +313,7 @@ impl MetadataStore {
             &self.paths.snapshots,
             &self.paths.logs,
             &self.paths.state,
+            &self.paths.checkpoints,
         ] {
             create_dir_all(path)?;
         }
@@ -322,11 +330,7 @@ impl MetadataStore {
     where
         T: Serialize,
     {
-        let contents = toml::to_string_pretty(value).map_err(|source| NewgitError::TomlWrite {
-            label: label.to_owned(),
-            source,
-        })?;
-        std::fs::write(path, contents).map_err(|source| NewgitError::io(path, source))
+        write_toml_at(path, label, value)
     }
 }
 
@@ -344,6 +348,7 @@ impl NewgitPaths {
             snapshots: metadata_root.join("snapshots"),
             logs: metadata_root.join("logs"),
             state: metadata_root.join("state"),
+            checkpoints: metadata_root.join("checkpoints"),
             metadata_root,
         }
     }
@@ -359,7 +364,7 @@ pub fn expand_home(path: &Utf8Path) -> Utf8PathBuf {
         .unwrap_or_else(|_| path.to_path_buf())
 }
 
-fn read_toml_at<T>(path: &Utf8Path) -> Result<T>
+pub(crate) fn read_toml_at<T>(path: &Utf8Path) -> Result<T>
 where
     T: DeserializeOwned,
 {
@@ -370,7 +375,18 @@ where
     })
 }
 
-fn read_dir_sorted(path: &Utf8Path) -> Result<Vec<Utf8PathBuf>> {
+pub(crate) fn write_toml_at<T>(path: &Utf8Path, label: &str, value: &T) -> Result<()>
+where
+    T: Serialize,
+{
+    let contents = toml::to_string_pretty(value).map_err(|source| NewgitError::TomlWrite {
+        label: label.to_owned(),
+        source,
+    })?;
+    std::fs::write(path, contents).map_err(|source| NewgitError::io(path, source))
+}
+
+pub(crate) fn read_dir_sorted(path: &Utf8Path) -> Result<Vec<Utf8PathBuf>> {
     if !path.exists() {
         return Ok(Vec::new());
     }

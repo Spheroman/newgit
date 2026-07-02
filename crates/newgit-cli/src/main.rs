@@ -1,6 +1,7 @@
 use anyhow::{Context as _, Result, bail};
 use camino::{Utf8Path, Utf8PathBuf};
 use clap::{Args, Parser, Subcommand};
+use newgit_core::checkpoint::CheckpointReason;
 use newgit_core::manager::{
     ActionOutcome, BindOrigin, BranchManager, InstanceReport, TrackerBindOutcome,
 };
@@ -53,13 +54,25 @@ enum Command {
         /// Instance (inferred when run inside a workspace)
         instance: Option<String>,
     },
+    /// Record one coherent snapshot across source, trackers, and resources
     Checkpoint {
-        name: String,
+        /// Instance (inferred when run inside a workspace)
+        instance: Option<String>,
         #[arg(short, long)]
         message: Option<String>,
     },
+    /// Restore an instance to a checkpoint (the latest unless --to is given)
     Undo {
-        name: String,
+        /// Instance (inferred when run inside a workspace)
+        instance: Option<String>,
+        /// Checkpoint id to restore, e.g. ckpt_003
+        #[arg(long)]
+        to: Option<String>,
+    },
+    /// List an instance's checkpoints
+    Checkpoints {
+        /// Instance (inferred when run inside a workspace)
+        instance: Option<String>,
     },
     Cleanup,
 }
@@ -164,19 +177,9 @@ fn main() -> Result<()> {
         Command::Resource { command } => resource(command),
         Command::Run(args) => run(args),
         Command::Action { spec, instance } => action(&spec, instance),
-        Command::Checkpoint { name, message } => {
-            let suffix = message
-                .map(|value| format!(" with message `{value}`"))
-                .unwrap_or_default();
-            skeleton_notice(
-                "checkpoint",
-                &format!("would capture source plus tracker state for `{name}`{suffix}"),
-            )
-        }
-        Command::Undo { name } => skeleton_notice(
-            "undo",
-            &format!("would restore the previous coherent checkpoint for `{name}`"),
-        ),
+        Command::Checkpoint { instance, message } => checkpoint(instance, message.as_deref()),
+        Command::Undo { instance, to } => undo(instance, to.as_deref()),
+        Command::Checkpoints { instance } => checkpoints(instance),
         Command::Cleanup => skeleton_notice(
             "cleanup",
             "would stop processes and remove stale branch-owned resources",
@@ -553,6 +556,133 @@ fn status(name: Option<&str>) -> Result<()> {
         );
     }
     Ok(())
+}
+
+fn checkpoint(instance: Option<String>, message: Option<&str>) -> Result<()> {
+    let (manager, instance) = manager_and_instance(instance)?;
+    let outcome = manager.checkpoint(&instance, message)?;
+    print_warnings(&outcome.warnings);
+
+    let record = &outcome.record;
+    let quoted = record
+        .message
+        .as_deref()
+        .map(|message| format!(" (\"{message}\")"))
+        .unwrap_or_default();
+    println!("Checkpoint {} for `{instance}`{quoted}", record.id);
+    let dirty = if record.source.dirty_rev.is_some() {
+        " + uncommitted changes"
+    } else {
+        ""
+    };
+    println!("  source:   {}{dirty}", short_rev(&record.source.head_rev));
+    for tracker in &record.tracker_states {
+        println!(
+            "  tracker:  {} @ {}",
+            tracker.name,
+            tracker.content_rev.as_deref().unwrap_or("—")
+        );
+    }
+    for resource in &record.resource_states {
+        let state = resource.state_ref.as_deref().unwrap_or("—");
+        let running = if resource.was_running {
+            " (running)"
+        } else {
+            ""
+        };
+        println!(
+            "  resource: {} [{}] {state}{running}",
+            resource.name, resource.mode
+        );
+    }
+    println!("  undo with: newgit undo {instance}");
+    Ok(())
+}
+
+fn undo(instance: Option<String>, to: Option<&str>) -> Result<()> {
+    let (manager, instance) = manager_and_instance(instance)?;
+    let outcome = manager.undo(&instance, to)?;
+    print_warnings(&outcome.warnings);
+
+    let restored = &outcome.restored;
+    let quoted = restored
+        .message
+        .as_deref()
+        .map(|message| format!(" (\"{message}\")"))
+        .unwrap_or_default();
+    println!("Restored `{instance}` to {}{quoted}", restored.id);
+    let dirty = if restored.source.dirty_rev.is_some() {
+        " + uncommitted changes reapplied"
+    } else {
+        ""
+    };
+    println!("  source:   {}{dirty}", short_rev(&restored.source.head_rev));
+    for tracker in &outcome.trackers {
+        match &tracker.rev {
+            Some(rev) => println!(
+                "  tracker:  {} @ {rev} ({})",
+                tracker.name,
+                files_label(tracker.files)
+            ),
+            None => println!(
+                "  tracker:  {} cleared (no content at checkpoint time)",
+                tracker.name
+            ),
+        }
+    }
+    for resource in &outcome.resources {
+        let verdict = if resource.ok { "ok" } else { "FAILED" };
+        println!("  resource: {} {} {verdict}", resource.name, resource.action);
+    }
+    if let Some(recovery) = &outcome.recovery_record {
+        eprintln!("warning: some resource restores failed; recovery record at {recovery}");
+    }
+    println!(
+        "  pre-undo state saved as {}; redo with: newgit undo {instance}",
+        outcome.safety.id
+    );
+    Ok(())
+}
+
+fn checkpoints(instance: Option<String>) -> Result<()> {
+    let (manager, instance) = manager_and_instance(instance)?;
+    let records = manager.list_checkpoints(&instance)?;
+    if records.is_empty() {
+        println!("No checkpoints for `{instance}`. Create one with `newgit checkpoint {instance}`.");
+        return Ok(());
+    }
+    println!("{:<10} {:<17} {:<12} {:<10} MESSAGE", "ID", "CREATED", "REASON", "SOURCE");
+    for record in &records {
+        let reason = match record.reason {
+            CheckpointReason::Explicit => "explicit",
+            CheckpointReason::BeforeUndo => "before-undo",
+        };
+        let source = format!(
+            "{}{}",
+            short_rev(&record.source.head_rev),
+            if record.source.dirty_rev.is_some() { "+" } else { "" }
+        );
+        println!(
+            "{:<10} {:<17} {:<12} {:<10} {}",
+            record.id,
+            record.created_at.format("%Y-%m-%d %H:%M"),
+            reason,
+            source,
+            record.message.as_deref().unwrap_or("-")
+        );
+    }
+    println!("\n+ = the checkpoint carries uncommitted changes; restore one with `newgit undo {instance} --to <id>`");
+    Ok(())
+}
+
+fn short_rev(rev: &str) -> &str {
+    rev.get(..8).unwrap_or(rev)
+}
+
+fn print_warnings(warnings: &[String]) {
+    for warning in warnings {
+        eprintln!("warning: {warning}");
+    }
 }
 
 fn remove(name: &str) -> Result<()> {

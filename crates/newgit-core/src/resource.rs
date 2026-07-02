@@ -19,10 +19,9 @@ pub struct ResourceDefinition {
     pub ports: BTreeMap<String, PortRequest>,
     pub exports: BTreeMap<String, String>,
     pub actions: BTreeMap<String, ActionSpec>,
-    /// Parsed and recorded now; consumed by checkpoint/undo in M5 and
-    /// cleanup in M6.
-    pub checkpoint: Option<toml::Value>,
-    pub restore: Option<toml::Value>,
+    pub checkpoint: Option<CheckpointSpec>,
+    pub restore: Option<RestoreSpec>,
+    /// Parsed and recorded now; consumed by cleanup in M6.
     pub cleanup: Option<toml::Value>,
     /// `sha256:<hex12>` of the definition file contents.
     pub definition_rev: String,
@@ -66,6 +65,61 @@ pub struct ActionSpec {
     pub captures: Vec<String>,
 }
 
+/// How a resource captures branch-local state at checkpoint time.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct CheckpointSpec {
+    pub mode: CheckpointMode,
+    /// `hash`: identity files whose content hash is the captured state.
+    #[serde(default)]
+    pub paths: Vec<Utf8PathBuf>,
+    /// `command`: emits the state; trimmed stdout becomes the state ref.
+    #[serde(default)]
+    pub command: Option<String>,
+    /// `command`: deposit `{{snapshot.path}}` into this tracker's lane.
+    #[serde(default)]
+    pub into_tracker: Option<String>,
+    /// `external`: template for the opaque ref (may use `{{exports.<name>}}`).
+    #[serde(default)]
+    pub state_ref: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum CheckpointMode {
+    None,
+    Hash,
+    Command,
+    External,
+}
+
+/// How a resource re-establishes checkpointed state during undo.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct RestoreSpec {
+    pub mode: RestoreMode,
+    /// `command`: may use `{{state_ref}}`.
+    #[serde(default)]
+    pub command: Option<String>,
+    /// `recompute`: the action to re-run (default `prepare`).
+    #[serde(default)]
+    pub action: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum RestoreMode {
+    None,
+    Command,
+    Recompute,
+    External,
+}
+
+impl RestoreSpec {
+    /// The action a `recompute` restore re-runs.
+    pub fn recompute_action(&self) -> &str {
+        self.action.as_deref().unwrap_or("prepare")
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct ResourceDefinitionFile {
     kind: String,
@@ -81,9 +135,9 @@ struct ResourceDefinitionFile {
     #[serde(default)]
     actions: BTreeMap<String, ActionSpec>,
     #[serde(default)]
-    checkpoint: Option<toml::Value>,
+    checkpoint: Option<CheckpointSpec>,
     #[serde(default)]
-    restore: Option<toml::Value>,
+    restore: Option<RestoreSpec>,
     #[serde(default)]
     cleanup: Option<toml::Value>,
 }
@@ -135,6 +189,48 @@ impl ResourceDefinition {
     }
 
     fn validate(&self) -> Result<()> {
+        if let Some(checkpoint) = &self.checkpoint {
+            match checkpoint.mode {
+                CheckpointMode::None => {}
+                CheckpointMode::Hash => {
+                    if checkpoint.paths.is_empty() {
+                        return Err(
+                            self.invalid("checkpoint mode `hash` requires `paths`".to_owned())
+                        );
+                    }
+                }
+                CheckpointMode::Command => {
+                    if checkpoint.command.is_none() {
+                        return Err(self.invalid(
+                            "checkpoint mode `command` requires `command`".to_owned(),
+                        ));
+                    }
+                }
+                CheckpointMode::External => {
+                    if checkpoint.state_ref.is_none() {
+                        return Err(self.invalid(
+                            "checkpoint mode `external` requires `state_ref`".to_owned(),
+                        ));
+                    }
+                }
+            }
+        }
+        if let Some(restore) = &self.restore {
+            match restore.mode {
+                RestoreMode::Command if restore.command.is_none() => {
+                    return Err(self.invalid("restore mode `command` requires `command`".to_owned()));
+                }
+                RestoreMode::Recompute
+                    if !self.actions.contains_key(restore.recompute_action()) =>
+                {
+                    return Err(self.invalid(format!(
+                        "restore mode `recompute` re-runs action `{}`, which is not defined",
+                        restore.recompute_action()
+                    )));
+                }
+                _ => {}
+            }
+        }
         for (action_name, action) in &self.actions {
             let is_signal_only = action.command.is_none() && action.signal.is_some();
             if action.command.is_none() && !is_signal_only {

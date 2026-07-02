@@ -728,7 +728,10 @@ newgit run feature-a -- pnpm test
 
 Template variables available in exports and action commands are kept
 minimal: `{{ports.<name>}}`, `{{branch.name}}`, `{{branch.slug}}`,
-`{{workspace}}`.
+`{{workspace}}`. Checkpoint and restore commands additionally see
+`{{exports.<name>}}`, `{{snapshot.path}}` (the staging dir for
+`into_tracker` deposits), and `{{state_ref}}` (the checkpointed state
+reference) — nowhere else.
 
 ### `newgit action <resource>.<action> [instance]`
 
@@ -753,21 +756,47 @@ sends the action's configured signal (default TERM) to the group, and
 
 Convenience shorthands can come later, but the primitive should be resource actions.
 
-### `newgit checkpoint <name>`
+### `newgit checkpoint [instance] [-m <message>]`
 
-Records the current branch state:
+Records the current branch state (instance inferred inside a workspace, like
+the other subcommands):
 
-- source snapshot through `jj` or Git, captured by fetching from the workspace clone into the store repo
+- source snapshot through Git, captured by fetching from the workspace clone
+  into the store repo (`refs/newgit/checkpoints/<slug>/<id>`); the store
+  branch ref is blessed to the workspace head, warning loudly on divergence
+- **uncommitted and untracked state too**, as a dangling commit on top of
+  HEAD (built via a throwaway index — worktree, HEAD, and real index are
+  untouched); a checkpoint protects the worktree as it stands, not just what
+  the agent remembered to commit
 - content snapshot of every tracker, as one coherent record
-- resource checkpoint outputs (identity hashes, external refs, deposits into trackers)
-- resolved exports
-- port allocations
+- resource checkpoint outputs, dependents first (identity hashes, external
+  refs, deposits into trackers); a failed checkpoint command aborts the
+  checkpoint loudly — a checkpoint that silently missed a resource is not
+  coherent
+- resolved exports, port allocations, and which processes were running
 
-### `newgit undo <name>`
+### `newgit undo [instance] [--to <ckpt_id>]`
 
-Restores the branch instance to the previous checkpoint.
+Restores the branch instance to a checkpoint (the latest unless `--to`).
 
-For source, delegate to `jj` where possible. For other trackers, restore captured content. For resources, run each restore rule (copy back from tracker, recompute, or external no-op).
+Before restoring anything, the current state is checkpointed
+(`reason = "before-undo"`), so undo is always undoable and running `undo`
+twice is redo — same shape as `jj undo`. Then: running processes are
+stopped, source is restored through Git (hard reset + clean of non-ignored
+untracked files, then the dirty snapshot reapplied as uncommitted changes),
+tracker content is restored exactly, and resources run their restore rules
+in dependency order, restarting what was running. A resource restore failure
+does not abort the rest: it is collected into a recovery record next to the
+checkpoint (`<id>.recovery.toml`) with logs and a retry command, and the
+resource is marked failed.
+
+Source restore is pure Git in v1; `jj` delegation can come with the jj
+substrate work.
+
+### `newgit checkpoints [instance]`
+
+Lists an instance's checkpoints (id, created, reason, source rev, message) —
+what makes `undo --to` usable.
 
 ### `newgit status`
 
@@ -1159,49 +1188,70 @@ Then let an agent work, and later say:
 newgit undo feature-a
 ```
 
-v1 checkpoints should record:
+v1 checkpoints record:
 
-- source revision
-- one content snapshot per tracker, written as a single coherent record
+- source revision, plus a dirty-state commit when the worktree had
+  uncommitted or untracked changes
+- one content snapshot per tracker (a lane rev — identical content dedupes),
+  written as a single coherent record
 - tracker and resource definition revisions
-- one checkpoint output per resource (identity hash, external ref, or tracker deposit)
-- resolved ports
-- resolved exports
-- action/process status where relevant
+- one checkpoint output per resource (identity hash, external ref, or tracker
+  deposit), captured dependents-first
+- resolved ports and exports, and whether each long-running resource was
+  running
 
-The checkpoint format can be simple:
+The format, as implemented (`.newgit/checkpoints/<slug>/ckpt_NNN.toml`):
 
 ```toml
 id = "ckpt_017"
 branch = "feature-a"
-source_rev = "..."
 created_at = "..."
 message = "before auth refactor"
+reason = "explicit"                  # or "before-undo" (undo's safety checkpoint)
+
+[source]
+head_rev = "..."                     # workspace HEAD
+dirty_rev = "..."                    # optional: dangling commit of uncommitted state
+store_ref = "refs/newgit/checkpoints/feature-a/ckpt_017"
 
 [[tracker_states]]
 name = "runtime-env"
 definition_rev = "sha256:..."
-content_rev = "snapshots/ckpt_017/runtime-env"
-
-[[tracker_states]]
-name = "db-snapshots"
-definition_rev = "sha256:..."
-content_rev = "snapshots/ckpt_017/db-snapshots"
+content_rev = "3bd17e8ba807"         # lane rev under .newgit/snapshots/runtime-env/
 
 [[resource_states]]
 name = "deps"
 definition_rev = "sha256:..."
-state_ref = "lock-hash:..."
+mode = "hash"
+state_ref = "hash:9921aa04d2e1"
+was_running = false
 
 [[resource_states]]
 name = "postgres-db"
 definition_rev = "sha256:..."
-state_ref = "tracker:db-snapshots@ckpt_017"
+mode = "command"
+state_ref = "tracker:db-snapshots@77e10b2c4451"
+state_path = ".../.newgit/snapshots/db-snapshots/77e10b2c4451/db.sql"
+was_running = false
 ```
+
+`state_path` is how the seam closes at restore time: when a checkpoint
+command deposited into a tracker and echoed a path under `{{snapshot.path}}`,
+that path is rebased onto the lane rev directory, and the restore command's
+`{{state_ref}}` renders to it.
+
+Checkpoint refs keep the commits alive and checkpoints reference lane revs,
+so lane pruning (a `cleanup`/M6 concern) must never delete a rev a
+checkpoint still points at.
 
 Do not snapshot every write in v1. Use explicit checkpoints plus source tracker snapshots.
 
-Undo restores in two moves: put every tracker's content back (source via `jj`, others from snapshots), then re-establish resources via their restore rules. Tracker restore is plain content and should not partially fail in interesting ways; if a resource restore hook fails, newgit should report it clearly and leave a recovery record.
+Undo restores in two moves: put every tracker's content back (source through
+Git's public interface, others from lane snapshots), then re-establish
+resources via their restore rules. Tracker restore is plain content and
+should not partially fail in interesting ways; if a resource restore hook
+fails, newgit reports it clearly and leaves a recovery record next to the
+checkpoint.
 
 ---
 

@@ -6,18 +6,22 @@ use chrono::Utc;
 use crate::branch::{
     BranchInstance, ResourceBinding, ResourceStatus, TrackerBinding, branch_slug, validate_name,
 };
+use crate::checkpoint::{
+    CheckpointLog, CheckpointReason, CheckpointRecord, RecoveryRecord, ResourceState,
+    RestoreFailure, SourceState, TrackerState,
+};
 use crate::config::ProjectConfig;
 use crate::error::{NewgitError, Result};
 use crate::exports::{RenderContext, render};
-use crate::lane::TrackerLane;
+use crate::lane::{TrackerLane, clear_owned_paths};
 use crate::materializer::{Materializer, RealDirMaterializer};
 use crate::ports;
-use crate::resource::{ResourceDefinition, topological_order};
+use crate::resource::{CheckpointMode, ResourceDefinition, RestoreMode, topological_order};
 use crate::source::GitSource;
 use crate::store::MetadataStore;
-use crate::supervisor::{StopOutcome, Supervisor, run_foreground};
+use crate::supervisor::{StopOutcome, Supervisor, run_captured, run_foreground};
 use crate::templates::resource_template;
-use crate::tracker::{Storage, TrackerDefinition, collect_owned_files};
+use crate::tracker::{Storage, TrackerDefinition, collect_files, collect_owned_files, content_rev};
 
 /// Orchestrates branch-instance lifecycle against one store.
 #[derive(Debug)]
@@ -130,6 +134,43 @@ impl TrackerReport {
 pub struct RemoveOutcome {
     pub branch: BranchInstance,
     pub archived_record: Utf8PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CheckpointOutcome {
+    pub record: CheckpointRecord,
+    pub record_path: Utf8PathBuf,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UndoOutcome {
+    /// The checkpoint that was restored.
+    pub restored: CheckpointRecord,
+    /// Safety checkpoint taken first — restoring it again is redo.
+    pub safety: CheckpointRecord,
+    pub trackers: Vec<UndoTrackerOutcome>,
+    pub resources: Vec<UndoResourceOutcome>,
+    /// Written when any resource restore failed.
+    pub recovery_record: Option<Utf8PathBuf>,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UndoTrackerOutcome {
+    pub name: String,
+    /// None means the checkpoint had no content: owned paths were cleared.
+    pub rev: Option<String>,
+    pub files: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UndoResourceOutcome {
+    /// What the restore did, for display: `none`, `recompute(prepare)`,
+    /// `command`, `external (no-op)`; `+ restarted` when a process came back.
+    pub action: String,
+    pub name: String,
+    pub ok: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -305,7 +346,8 @@ impl BranchManager {
                 branch_name: &branch.name,
                 branch_slug: &branch.slug,
                 workspace: branch.workspace_path.as_str(),
-                ports: &resolved_ports,
+                ports: Some(&resolved_ports),
+                ..RenderContext::default()
             };
             let resolved_exports = definition
                 .exports
@@ -489,17 +531,15 @@ impl BranchManager {
                 definition.name
             ))
         })?;
-        let empty = BTreeMap::new();
-        let resource_ports = branch
-            .resources
-            .get(&definition.name)
-            .map(|binding| &binding.resolved_ports)
-            .unwrap_or(&empty);
         let context = RenderContext {
             branch_name: &branch.name,
             branch_slug: &branch.slug,
             workspace: branch.workspace_path.as_str(),
-            ports: resource_ports,
+            ports: branch
+                .resources
+                .get(&definition.name)
+                .map(|binding| &binding.resolved_ports),
+            ..RenderContext::default()
         };
         Ok(render(&command, &context))
     }
@@ -941,6 +981,572 @@ impl BranchManager {
         })
     }
 
+    /// Record one coherent snapshot across source, trackers, and resources.
+    pub fn checkpoint(&self, instance: &str, message: Option<&str>) -> Result<CheckpointOutcome> {
+        let mut branch = self.store.find_branch(instance)?;
+        self.checkpoint_branch(&mut branch, message, CheckpointReason::Explicit)
+    }
+
+    pub fn list_checkpoints(&self, instance: &str) -> Result<Vec<CheckpointRecord>> {
+        let branch = self.store.find_branch(instance)?;
+        self.checkpoint_log(&branch).list()
+    }
+
+    fn checkpoint_branch(
+        &self,
+        branch: &mut BranchInstance,
+        message: Option<&str>,
+        reason: CheckpointReason,
+    ) -> Result<CheckpointOutcome> {
+        self.require_workspace(branch)?;
+        let mut warnings = Vec::new();
+        let checkpoint_log = self.checkpoint_log(branch);
+        let id = checkpoint_log.next_id()?;
+        let workspace = branch.workspace_path.clone();
+
+        // Source: the committed state plus a dangling commit for anything
+        // uncommitted, fetched into the store. The store learns about
+        // workspace commits only here — checkpoint is the blessing boundary,
+        // and a checkpoint protects the worktree as it stands, not just what
+        // the agent remembered to commit.
+        let head_rev = GitSource::workspace_head(&workspace)?;
+        let dirty_rev = GitSource::workspace_dirty_commit(
+            &workspace,
+            &format!("newgit {id}: uncommitted state of `{}`", branch.name),
+        )?;
+        let tip = dirty_rev.clone().unwrap_or_else(|| head_rev.clone());
+        let workspace_ref = format!("refs/newgit/checkpoints/{id}");
+        let store_ref = format!("refs/newgit/checkpoints/{}/{id}", branch.slug);
+        GitSource::workspace_update_ref(&workspace, &workspace_ref, &tip)?;
+        let fetched = self.source.fetch_ref(&workspace, &workspace_ref, &store_ref);
+        GitSource::workspace_delete_ref(&workspace, &workspace_ref)?;
+        fetched?;
+        self.bless_store_branch(branch, &head_rev, None, &mut warnings)?;
+
+        // Resources, dependents first: a dependent's state may be derived
+        // from its dependency, so it is captured before the dependency moves.
+        let mut resource_states = Vec::new();
+        let mut deposits: Vec<(String, String)> = Vec::new();
+        for name in self.resource_order.iter().rev() {
+            let Some(binding) = branch.resources.get(name) else {
+                continue;
+            };
+            let definition = self.resource_definition(name)?;
+            let was_running = self.supervisor(branch).running_pid(name).is_some();
+            let captured = self.checkpoint_resource(branch, definition)?;
+            if let Some(deposit) = captured.deposit {
+                deposits.push(deposit);
+            }
+            resource_states.push(ResourceState {
+                name: name.clone(),
+                definition_rev: definition.definition_rev.clone(),
+                mode: captured.mode,
+                state_ref: captured.state_ref,
+                state_path: captured.state_path,
+                was_running,
+                resolved_ports: binding.resolved_ports.clone(),
+                resolved_exports: binding.resolved_exports.clone(),
+            });
+        }
+        // Recorded in dependency order for readability.
+        resource_states.reverse();
+        for (tracker, rev) in deposits {
+            let definition = self.definition(&tracker)?;
+            branch.trackers.insert(
+                tracker,
+                TrackerBinding {
+                    definition_rev: definition.definition_rev.clone(),
+                    content_rev: Some(rev),
+                },
+            );
+        }
+
+        // Trackers: capture every owned path (dedupes in the lane).
+        // Deposit-only lanes record whatever rev the deposit or an earlier
+        // capture bound.
+        let mut tracker_states = Vec::new();
+        for definition in &self.trackers {
+            let content_rev = if definition.paths.is_empty() {
+                branch
+                    .trackers
+                    .get(&definition.name)
+                    .and_then(|binding| binding.content_rev.clone())
+            } else {
+                Some(self.lane(&definition.name).capture(&workspace, definition)?.rev)
+            };
+            branch.trackers.insert(
+                definition.name.clone(),
+                TrackerBinding {
+                    definition_rev: definition.definition_rev.clone(),
+                    content_rev: content_rev.clone(),
+                },
+            );
+            tracker_states.push(TrackerState {
+                name: definition.name.clone(),
+                definition_rev: definition.definition_rev.clone(),
+                content_rev,
+            });
+        }
+
+        let record = CheckpointRecord {
+            id,
+            branch: branch.name.clone(),
+            created_at: Utc::now(),
+            message: message.map(ToOwned::to_owned),
+            reason,
+            source: SourceState {
+                head_rev,
+                dirty_rev,
+                store_ref,
+            },
+            tracker_states,
+            resource_states,
+        };
+        let record_path = checkpoint_log.save(&record)?;
+        branch.updated_at = Utc::now();
+        self.store.save_branch_record(branch)?;
+
+        Ok(CheckpointOutcome {
+            record,
+            record_path,
+            warnings,
+        })
+    }
+
+    fn checkpoint_resource(
+        &self,
+        branch: &BranchInstance,
+        definition: &ResourceDefinition,
+    ) -> Result<CapturedResource> {
+        let Some(spec) = &definition.checkpoint else {
+            return Ok(CapturedResource::none());
+        };
+        let binding = branch.resources.get(&definition.name);
+
+        match spec.mode {
+            CheckpointMode::None => Ok(CapturedResource::none()),
+            CheckpointMode::Hash => {
+                let files = collect_files(&branch.workspace_path, &spec.paths)?;
+                let rev = content_rev(&files)?;
+                Ok(CapturedResource {
+                    mode: "hash".to_owned(),
+                    state_ref: Some(format!("hash:{rev}")),
+                    state_path: None,
+                    deposit: None,
+                })
+            }
+            CheckpointMode::Command => {
+                let template = spec.command.as_deref().expect("validated at parse time");
+
+                // Checked here, not at manager open: erroring at open would
+                // make `newgit tracker create <missing>` — the fix — fail too.
+                if let Some(tracker) = &spec.into_tracker
+                    && !self.trackers.iter().any(|t| &t.name == tracker)
+                {
+                    return Err(NewgitError::InvalidDefinition {
+                        tracker: definition.name.clone(),
+                        reason: format!(
+                            "checkpoint `into_tracker = \"{tracker}\"` names a tracker that is \
+                             not defined; create it with `newgit tracker create {tracker}`"
+                        ),
+                    });
+                }
+
+                // `into_tracker` commands write into a staging dir that is
+                // deposited into the lane afterwards — the one seam between
+                // resources and trackers.
+                let staging = spec
+                    .into_tracker
+                    .as_ref()
+                    .map(|_| {
+                        tempfile::tempdir()
+                            .map_err(|source| NewgitError::io(&branch.workspace_path, source))
+                    })
+                    .transpose()?;
+                let staging_path = staging
+                    .as_ref()
+                    .map(|dir| {
+                        Utf8PathBuf::from_path_buf(dir.path().to_path_buf())
+                            .map_err(|path| NewgitError::NonUtf8Path(path.display().to_string()))
+                    })
+                    .transpose()?;
+
+                let context = RenderContext {
+                    branch_name: &branch.name,
+                    branch_slug: &branch.slug,
+                    workspace: branch.workspace_path.as_str(),
+                    ports: binding.map(|binding| &binding.resolved_ports),
+                    exports: binding.map(|binding| &binding.resolved_exports),
+                    snapshot_path: staging_path.as_deref().map(Utf8Path::as_str),
+                    state_ref: None,
+                };
+                let command = render(template, &context);
+                let log = self
+                    .store
+                    .action_log_path(&branch.slug, &format!("{}.checkpoint", definition.name));
+                let env = self.assemble_env(branch)?;
+                let (code, stdout) = run_captured(&command, &branch.workspace_path, &env, &log)?;
+                if code != 0 {
+                    return Err(NewgitError::CheckpointCommandFailed {
+                        resource: definition.name.clone(),
+                        code,
+                        log,
+                    });
+                }
+
+                match (&spec.into_tracker, &staging_path) {
+                    (Some(tracker), Some(staging_path)) => {
+                        let lane = self.lane(tracker);
+                        let deposit = lane.deposit(staging_path)?;
+                        // A path the command echoed under {{snapshot.path}}
+                        // maps to the same relative location inside the lane.
+                        let state_path = Utf8Path::new(&stdout)
+                            .strip_prefix(staging_path)
+                            .map(|relative| lane.rev_path(&deposit.rev).join(relative))
+                            .unwrap_or_else(|_| lane.rev_path(&deposit.rev));
+                        Ok(CapturedResource {
+                            mode: "command".to_owned(),
+                            state_ref: Some(format!("tracker:{tracker}@{}", deposit.rev)),
+                            state_path: Some(state_path),
+                            deposit: Some((tracker.clone(), deposit.rev)),
+                        })
+                    }
+                    _ => Ok(CapturedResource {
+                        mode: "command".to_owned(),
+                        state_ref: (!stdout.is_empty()).then_some(stdout),
+                        state_path: None,
+                        deposit: None,
+                    }),
+                }
+            }
+            CheckpointMode::External => {
+                let template = spec.state_ref.as_deref().expect("validated at parse time");
+                let context = RenderContext {
+                    branch_name: &branch.name,
+                    branch_slug: &branch.slug,
+                    workspace: branch.workspace_path.as_str(),
+                    ports: binding.map(|binding| &binding.resolved_ports),
+                    exports: binding.map(|binding| &binding.resolved_exports),
+                    ..RenderContext::default()
+                };
+                Ok(CapturedResource {
+                    mode: "external".to_owned(),
+                    state_ref: Some(render(template, &context)),
+                    state_path: None,
+                    deposit: None,
+                })
+            }
+        }
+    }
+
+    /// Restore the branch instance to a checkpoint — the latest, unless
+    /// `to` names one. The current state is checkpointed first, so undo is
+    /// always undoable and running it twice is redo.
+    pub fn undo(&self, instance: &str, to: Option<&str>) -> Result<UndoOutcome> {
+        let mut branch = self.store.find_branch(instance)?;
+        self.require_workspace(&branch)?;
+        let checkpoint_log = self.checkpoint_log(&branch);
+        let restored = match to {
+            Some(id) => checkpoint_log.load(id)?,
+            None => checkpoint_log.latest()?,
+        };
+
+        let safety = self.checkpoint_branch(
+            &mut branch,
+            Some(&format!("state before undo to {}", restored.id)),
+            CheckpointReason::BeforeUndo,
+        )?;
+        let mut warnings = safety.warnings.clone();
+
+        // Nothing may keep running while content changes underneath it.
+        let supervisor = self.supervisor(&branch);
+        for definition in &self.resources {
+            if supervisor.running_pid(&definition.name).is_some() {
+                supervisor.stop(&definition.name, &definition.stop_signal())?;
+            }
+        }
+
+        // Source: content back exactly, uncommitted state uncommitted again.
+        let workspace = branch.workspace_path.clone();
+        GitSource::workspace_fetch_ref(&workspace, self.source.root(), &restored.source.store_ref)?;
+        GitSource::workspace_restore_to(
+            &workspace,
+            &restored.source.head_rev,
+            restored.source.dirty_rev.as_deref(),
+        )?;
+        // The pre-undo tip stays reachable from the safety checkpoint's ref,
+        // so moving the branch back to it is expected, not divergence.
+        self.bless_store_branch(
+            &mut branch,
+            &restored.source.head_rev,
+            Some(&safety.record.source.head_rev),
+            &mut warnings,
+        )?;
+
+        // Trackers: plain content, restored exactly; should not partially
+        // fail in interesting ways, so failures here are hard errors.
+        let mut trackers = Vec::new();
+        for state in &restored.tracker_states {
+            let Some(definition) = self
+                .trackers
+                .iter()
+                .find(|definition| definition.name == state.name)
+            else {
+                warnings.push(format!(
+                    "tracker `{}` from the checkpoint is no longer defined; its content was \
+                     not restored",
+                    state.name
+                ));
+                continue;
+            };
+            if definition.definition_rev != state.definition_rev {
+                warnings.push(format!(
+                    "tracker `{}` definition changed since the checkpoint; content was \
+                     restored against the current definition",
+                    state.name
+                ));
+            }
+            let files = match &state.content_rev {
+                Some(rev) => self.lane(&definition.name).restore(&workspace, definition, rev)?,
+                None => {
+                    clear_owned_paths(&workspace, definition)?;
+                    0
+                }
+            };
+            branch.trackers.insert(
+                state.name.clone(),
+                TrackerBinding {
+                    definition_rev: definition.definition_rev.clone(),
+                    content_rev: state.content_rev.clone(),
+                },
+            );
+            trackers.push(UndoTrackerOutcome {
+                name: state.name.clone(),
+                rev: state.content_rev.clone(),
+                files,
+            });
+        }
+
+        // Resources: dependencies before dependents, restarting what was
+        // running. Failures are collected into a recovery record, not fatal.
+        let mut resources = Vec::new();
+        let mut failures: Vec<RestoreFailure> = Vec::new();
+        for name in &self.resource_order {
+            let Some(state) = restored
+                .resource_states
+                .iter()
+                .find(|state| &state.name == name)
+            else {
+                continue;
+            };
+            if !branch.resources.contains_key(name) {
+                continue;
+            }
+            let definition = self.resource_definition(name)?;
+            if definition.definition_rev != state.definition_rev {
+                warnings.push(format!(
+                    "resource `{name}` definition changed since the checkpoint; restored with \
+                     the current definition"
+                ));
+            }
+
+            let (mut action_label, ok) =
+                self.restore_resource(&branch, definition, state, &mut failures)?;
+            if let Some(binding) = branch.resources.get_mut(name) {
+                binding.status = if ok {
+                    ResourceStatus::Ready
+                } else {
+                    ResourceStatus::Failed
+                };
+            }
+
+            if ok && state.was_running {
+                match self.restart_long_running(&branch, definition) {
+                    Ok(true) => action_label.push_str(" + restarted"),
+                    Ok(false) => warnings.push(format!(
+                        "resource `{name}` was running at checkpoint time but has no \
+                         long-running action to restart"
+                    )),
+                    Err(error) => failures.push(RestoreFailure {
+                        resource: name.clone(),
+                        detail: format!("restart failed: {error}"),
+                        log: None,
+                        retry_with: format!("newgit action {name}.start {}", branch.name),
+                    }),
+                }
+            }
+            resources.push(UndoResourceOutcome {
+                name: name.clone(),
+                action: action_label,
+                ok,
+            });
+        }
+
+        let recovery_record = if failures.is_empty() {
+            None
+        } else {
+            for failure in &failures {
+                if let Some(binding) = branch.resources.get_mut(&failure.resource) {
+                    binding.status = ResourceStatus::Failed;
+                }
+            }
+            Some(checkpoint_log.save_recovery(&RecoveryRecord {
+                checkpoint: restored.id.clone(),
+                branch: branch.name.clone(),
+                created_at: Utc::now(),
+                failures,
+            })?)
+        };
+
+        branch.updated_at = Utc::now();
+        self.store.save_branch_record(&branch)?;
+
+        Ok(UndoOutcome {
+            restored,
+            safety: safety.record,
+            trackers,
+            resources,
+            recovery_record,
+            warnings,
+        })
+    }
+
+    fn restore_resource(
+        &self,
+        branch: &BranchInstance,
+        definition: &ResourceDefinition,
+        state: &ResourceState,
+        failures: &mut Vec<RestoreFailure>,
+    ) -> Result<(String, bool)> {
+        let Some(spec) = &definition.restore else {
+            return Ok(("none".to_owned(), true));
+        };
+        match spec.mode {
+            RestoreMode::None => Ok(("none".to_owned(), true)),
+            RestoreMode::External => Ok(("external (no-op)".to_owned(), true)),
+            RestoreMode::Recompute => {
+                let action_name = spec.recompute_action();
+                let action = definition.actions.get(action_name).ok_or_else(|| {
+                    NewgitError::UnknownAction {
+                        resource: definition.name.clone(),
+                        action: action_name.to_owned(),
+                    }
+                })?;
+                let log = self
+                    .store
+                    .action_log_path(&branch.slug, &format!("{}.restore", definition.name));
+                let code = self.run_one_shot(branch, definition, action, &log)?;
+                let ok = code == 0;
+                if !ok {
+                    failures.push(RestoreFailure {
+                        resource: definition.name.clone(),
+                        detail: format!("recompute action `{action_name}` exited with {code}"),
+                        log: Some(log),
+                        retry_with: format!(
+                            "newgit action {}.{action_name} {}",
+                            definition.name, branch.name
+                        ),
+                    });
+                }
+                Ok((format!("recompute({action_name})"), ok))
+            }
+            RestoreMode::Command => {
+                let template = spec.command.as_deref().expect("validated at parse time");
+                let binding = branch.resources.get(&definition.name);
+                let state_ref = state
+                    .state_path
+                    .as_ref()
+                    .map(ToString::to_string)
+                    .or_else(|| state.state_ref.clone());
+                let context = RenderContext {
+                    branch_name: &branch.name,
+                    branch_slug: &branch.slug,
+                    workspace: branch.workspace_path.as_str(),
+                    ports: binding.map(|binding| &binding.resolved_ports),
+                    exports: binding.map(|binding| &binding.resolved_exports),
+                    snapshot_path: None,
+                    state_ref: state_ref.as_deref(),
+                };
+                let command = render(template, &context);
+                let log = self
+                    .store
+                    .action_log_path(&branch.slug, &format!("{}.restore", definition.name));
+                let env = self.assemble_env(branch)?;
+                let (code, _) = run_captured(&command, &branch.workspace_path, &env, &log)?;
+                let ok = code == 0;
+                if !ok {
+                    failures.push(RestoreFailure {
+                        resource: definition.name.clone(),
+                        detail: format!("restore command exited with {code}"),
+                        log: Some(log),
+                        retry_with: "repair the resource, then `newgit undo` again".to_owned(),
+                    });
+                }
+                Ok(("command".to_owned(), ok))
+            }
+        }
+    }
+
+    /// Start the definition's long-running action again after an undo.
+    /// `Ok(false)` when the definition has none.
+    fn restart_long_running(
+        &self,
+        branch: &BranchInstance,
+        definition: &ResourceDefinition,
+    ) -> Result<bool> {
+        let Some((action_name, action)) = definition
+            .actions
+            .iter()
+            .find(|(_, action)| action.long_running)
+        else {
+            return Ok(false);
+        };
+        let log = self
+            .store
+            .action_log_path(&branch.slug, &format!("{}.{action_name}", definition.name));
+        let command = self.rendered_command(branch, definition, action)?;
+        let env = self.assemble_env(branch)?;
+        self.supervisor(branch)
+            .start(&definition.name, &command, &branch.workspace_path, &env, &log)?;
+        Ok(true)
+    }
+
+    /// Point the store's branch ref at the checkpointed head. The branch is
+    /// owned by this instance — divergence is policy, not mechanism — so a
+    /// store-side advance is warned about loudly, never hard-refused.
+    /// `expected_old` silences the warning when the ref is knowingly moved
+    /// backwards from a rev a checkpoint ref keeps alive (undo).
+    fn bless_store_branch(
+        &self,
+        branch: &mut BranchInstance,
+        head_rev: &str,
+        expected_old: Option<&str>,
+        warnings: &mut Vec<String>,
+    ) -> Result<()> {
+        let branch_ref = format!("refs/heads/{}", branch.source_ref);
+        if let Some(old) = self.source.ref_rev(&branch_ref)
+            && old != head_rev
+            && expected_old != Some(old.as_str())
+            && !self.source.is_ancestor(&old, head_rev)?
+        {
+            warnings.push(format!(
+                "store branch `{}` had commits this workspace does not (was at {}); it now \
+                 points at {} — the old commits remain in the store repository but no branch \
+                 ref reaches them",
+                branch.source_ref,
+                &old[..8.min(old.len())],
+                &head_rev[..8.min(head_rev.len())]
+            ));
+        }
+        self.source.update_ref(&branch_ref, head_rev)?;
+        branch.source_rev = head_rev.to_owned();
+        Ok(())
+    }
+
+    fn checkpoint_log(&self, branch: &BranchInstance) -> CheckpointLog {
+        CheckpointLog::new(self.store.checkpoint_dir(&branch.slug), &branch.name)
+    }
+
     fn definition(&self, tracker: &str) -> Result<&TrackerDefinition> {
         self.trackers
             .iter()
@@ -975,6 +1581,26 @@ impl BranchManager {
                 "the workspace for `{}` is missing at {}; spawn it again or remove the instance",
                 branch.name, branch.workspace_path
             )))
+        }
+    }
+}
+
+/// What one resource's checkpoint mode produced.
+struct CapturedResource {
+    mode: String,
+    state_ref: Option<String>,
+    state_path: Option<Utf8PathBuf>,
+    /// Lane deposit made via `into_tracker`: (tracker, rev).
+    deposit: Option<(String, String)>,
+}
+
+impl CapturedResource {
+    fn none() -> Self {
+        Self {
+            mode: "none".to_owned(),
+            state_ref: None,
+            state_path: None,
+            deposit: None,
         }
     }
 }

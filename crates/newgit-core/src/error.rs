@@ -95,6 +95,22 @@ pub enum NewgitError {
         dependency: String,
     },
 
+    #[error("no checkpoints exist for `{0}`; create one with `newgit checkpoint {0}`")]
+    NoCheckpoints(String),
+
+    #[error("no checkpoint `{id}` for `{instance}`; list them with `newgit checkpoints {instance}`")]
+    UnknownCheckpoint { instance: String, id: String },
+
+    #[error(
+        "checkpoint command for resource `{resource}` exited with {code} (log: {log}); \
+         the checkpoint was aborted — a checkpoint that missed a resource is not coherent"
+    )]
+    CheckpointCommandFailed {
+        resource: String,
+        code: i32,
+        log: Utf8PathBuf,
+    },
+
     #[error("{0}")]
     Unsupported(String),
 

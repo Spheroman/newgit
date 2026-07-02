@@ -1,4 +1,5 @@
 pub mod branch;
+pub mod checkpoint;
 pub mod config;
 pub mod error;
 pub mod exports;

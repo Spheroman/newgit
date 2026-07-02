@@ -13,6 +13,7 @@ camino = { version = "1.2", features = ["serde1"] }
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
 serde = { version = "1", features = ["derive"] }
 sha2 = "0.10"
+tempfile = "3"
 thiserror = "2"
 toml = "0.8"
 

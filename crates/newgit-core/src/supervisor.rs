@@ -203,6 +203,43 @@ pub fn run_foreground(
     Ok(status.code().unwrap_or(-1))
 }
 
+/// Run a one-shot shell command, capturing stdout (for state refs) while
+/// still logging both streams. Unlike `run_foreground`, output does not go
+/// to the terminal — checkpoint machinery consumes it instead.
+pub fn run_captured(
+    command: &str,
+    cwd: &Utf8Path,
+    env: &[(String, String)],
+    log_path: &Utf8Path,
+) -> Result<(i32, String)> {
+    if let Some(parent) = log_path.parent() {
+        create_dir_all(parent)?;
+    }
+    let mut log =
+        std::fs::File::create(log_path).map_err(|source| NewgitError::io(log_path, source))?;
+    writeln!(log, "[newgit] $ {command}").map_err(|source| NewgitError::io(log_path, source))?;
+
+    let output = Command::new("sh")
+        .args(["-c", command])
+        .current_dir(cwd)
+        .envs(env.iter().map(|(key, value)| (key, value)))
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|source| NewgitError::SourceCommand {
+            command: format!("sh -c {command}"),
+            stderr: source.to_string(),
+        })?;
+
+    log.write_all(&output.stdout)
+        .and_then(|()| log.write_all(&output.stderr))
+        .map_err(|source| NewgitError::io(log_path, source))?;
+
+    Ok((
+        output.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&output.stdout).trim().to_owned(),
+    ))
+}
+
 fn tee(
     mut from: impl std::io::Read,
     mut to_terminal: impl std::io::Write,
