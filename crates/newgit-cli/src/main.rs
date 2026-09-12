@@ -2,6 +2,8 @@ use anyhow::{Context as _, Result, bail};
 use camino::{Utf8Path, Utf8PathBuf};
 use clap::{Args, Parser, Subcommand};
 use newgit_core::checkpoint::CheckpointReason;
+use newgit_core::cleanup::{HookDetail, HookOutcome};
+use newgit_core::export::{ExportFilter, Reason};
 use newgit_core::manager::{
     ActionOutcome, BindOrigin, BranchManager, InstanceReport, TrackerBindOutcome,
 };
@@ -32,9 +34,7 @@ enum Command {
         name: Option<String>,
     },
     /// Delete an instance's workspace and archive its binding record
-    Remove {
-        name: String,
-    },
+    Remove { name: String },
     /// Manage tracker definitions and content
     Tracker {
         #[command(subcommand)]
@@ -74,7 +74,15 @@ enum Command {
         /// Instance (inferred when run inside a workspace)
         instance: Option<String>,
     },
-    Cleanup,
+    /// Write an instance out as an ordinary Git repository
+    Export(ExportArgs),
+    /// Garbage-collect across everything: stale workspaces, dead process
+    /// state, and unreferenced tracker snapshots
+    Cleanup {
+        /// Report what would be removed without touching anything
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -158,6 +166,21 @@ enum ResourceCommand {
 }
 
 #[derive(Debug, Args)]
+struct ExportArgs {
+    /// Instance (inferred when run inside a workspace)
+    instance: Option<String>,
+    /// Destination directory; must be empty or nonexistent
+    #[arg(long)]
+    to: Utf8PathBuf,
+    /// Workspace-relative path to include regardless of tracker audience
+    #[arg(long = "include")]
+    includes: Vec<Utf8PathBuf>,
+    /// Workspace-relative path to leave out, whatever its origin
+    #[arg(long = "exclude")]
+    excludes: Vec<Utf8PathBuf>,
+}
+
+#[derive(Debug, Args)]
 struct RunArgs {
     /// Instance (inferred when run inside a workspace)
     name: Option<String>,
@@ -180,10 +203,8 @@ fn main() -> Result<()> {
         Command::Checkpoint { instance, message } => checkpoint(instance, message.as_deref()),
         Command::Undo { instance, to } => undo(instance, to.as_deref()),
         Command::Checkpoints { instance } => checkpoints(instance),
-        Command::Cleanup => skeleton_notice(
-            "cleanup",
-            "would stop processes and remove stale branch-owned resources",
-        ),
+        Command::Export(args) => export(args),
+        Command::Cleanup { dry_run } => cleanup(dry_run),
     }
 }
 
@@ -266,7 +287,12 @@ fn spawn(args: SpawnArgs) -> Result<()> {
                 _ => String::new(),
             },
         };
-        println!("  resource:  `{}`{ports}{prepare}", resource.name);
+        let captured = if resource.captured.is_empty() {
+            String::new()
+        } else {
+            format!(" captured: {}", resource.captured.join(", "))
+        };
+        println!("  resource:  `{}`{ports}{prepare}{captured}", resource.name);
     }
     Ok(())
 }
@@ -282,6 +308,9 @@ fn resource(command: ResourceCommand) -> Result<()> {
             );
             for companion in &outcome.companions_created {
                 println!("  companion: created {companion} (this template depends on it)");
+            }
+            for tracker in &outcome.trackers_created {
+                println!("  tracker:   created {tracker} (this template deposits into it)");
             }
             println!("  edit the definition; `newgit spawn` binds it (ports, exports, prepare)");
             Ok(())
@@ -616,7 +645,10 @@ fn undo(instance: Option<String>, to: Option<&str>) -> Result<()> {
     } else {
         ""
     };
-    println!("  source:   {}{dirty}", short_rev(&restored.source.head_rev));
+    println!(
+        "  source:   {}{dirty}",
+        short_rev(&restored.source.head_rev)
+    );
     for tracker in &outcome.trackers {
         match &tracker.rev {
             Some(rev) => println!(
@@ -632,7 +664,10 @@ fn undo(instance: Option<String>, to: Option<&str>) -> Result<()> {
     }
     for resource in &outcome.resources {
         let verdict = if resource.ok { "ok" } else { "FAILED" };
-        println!("  resource: {} {} {verdict}", resource.name, resource.action);
+        println!(
+            "  resource: {} {} {verdict}",
+            resource.name, resource.action
+        );
     }
     if let Some(recovery) = &outcome.recovery_record {
         eprintln!("warning: some resource restores failed; recovery record at {recovery}");
@@ -648,10 +683,15 @@ fn checkpoints(instance: Option<String>) -> Result<()> {
     let (manager, instance) = manager_and_instance(instance)?;
     let records = manager.list_checkpoints(&instance)?;
     if records.is_empty() {
-        println!("No checkpoints for `{instance}`. Create one with `newgit checkpoint {instance}`.");
+        println!(
+            "No checkpoints for `{instance}`. Create one with `newgit checkpoint {instance}`."
+        );
         return Ok(());
     }
-    println!("{:<10} {:<17} {:<12} {:<10} MESSAGE", "ID", "CREATED", "REASON", "SOURCE");
+    println!(
+        "{:<10} {:<17} {:<12} {:<10} MESSAGE",
+        "ID", "CREATED", "REASON", "SOURCE"
+    );
     for record in &records {
         let reason = match record.reason {
             CheckpointReason::Explicit => "explicit",
@@ -660,7 +700,11 @@ fn checkpoints(instance: Option<String>) -> Result<()> {
         let source = format!(
             "{}{}",
             short_rev(&record.source.head_rev),
-            if record.source.dirty_rev.is_some() { "+" } else { "" }
+            if record.source.dirty_rev.is_some() {
+                "+"
+            } else {
+                ""
+            }
         );
         println!(
             "{:<10} {:<17} {:<12} {:<10} {}",
@@ -671,8 +715,162 @@ fn checkpoints(instance: Option<String>) -> Result<()> {
             record.message.as_deref().unwrap_or("-")
         );
     }
-    println!("\n+ = the checkpoint carries uncommitted changes; restore one with `newgit undo {instance} --to <id>`");
+    println!(
+        "\n+ = the checkpoint carries uncommitted changes; restore one with `newgit undo {instance} --to <id>`"
+    );
     Ok(())
+}
+
+fn export(args: ExportArgs) -> Result<()> {
+    let (manager, instance) = manager_and_instance(args.instance)?;
+    let filter = ExportFilter {
+        includes: args.includes,
+        excludes: args.excludes,
+    };
+    let outcome = manager.export(&instance, &args.to, &filter)?;
+    let plan = &outcome.plan;
+
+    println!(
+        "Exported `{}` → {} (branch {})",
+        outcome.instance, outcome.destination, outcome.branch
+    );
+    println!(
+        "  source:   {} @ {}",
+        files_label(plan.count(Reason::Source)),
+        short_rev(&outcome.source_head)
+    );
+
+    let width = column_width(plan.trackers.iter().map(|t| t.name.len()), "");
+    for tracker in &plan.trackers {
+        if tracker.included > 0 {
+            println!(
+                "  tracker:  {:<width$}  included ({}, {})",
+                tracker.name,
+                tracker.audience,
+                files_label(tracker.included),
+            );
+        }
+        if !tracker.withheld.is_empty() {
+            println!(
+                "  withheld: {:<width$}  (audience {}) {}",
+                tracker.name,
+                tracker.audience,
+                tracker
+                    .withheld
+                    .iter()
+                    .map(|path| path.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
+    }
+    if !plan.excluded.is_empty() {
+        println!(
+            "  excluded: {} (by --exclude)",
+            plan.excluded
+                .iter()
+                .map(|path| path.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    println!("  commit:   {}", short_rev(&outcome.commit));
+
+    // Both of these are load-bearing, not boilerplate: the export is one
+    // commit precisely so excluded content cannot ride along in history, and
+    // a path filter is not a privacy mechanism.
+    println!(
+        "\n  One commit, no history: exporting the branch's commits would carry any file they \
+         contain, including withheld ones."
+    );
+    println!(
+        "  This is a path-level filter, not concealment. Check the result before publishing it."
+    );
+    if plan.trackers.iter().any(|t| !t.withheld.is_empty()) {
+        println!(
+            "  Ship a withheld path with: newgit export {instance} --to <dir> --include <path>"
+        );
+    }
+    Ok(())
+}
+
+fn cleanup(dry_run: bool) -> Result<()> {
+    let manager = manager_here()?;
+    let outcome = manager.cleanup(dry_run)?;
+    print_warnings(&outcome.warnings);
+
+    let verb = if dry_run { "would remove" } else { "removed" };
+    if outcome.is_empty() {
+        println!("Nothing to clean up.");
+    } else if dry_run {
+        println!("Cleanup dry run — nothing was touched.");
+    }
+
+    for instance in &outcome.finalized {
+        println!(
+            "Finalized `{}`: workspace {} is gone",
+            instance.name, instance.workspace
+        );
+        for hook in &instance.hooks {
+            print_hook(hook);
+        }
+        match &instance.archived_record {
+            Some(path) => println!("  record archived at {path}"),
+            None => println!("  record would be archived"),
+        }
+    }
+    for workspace in &outcome.orphan_workspaces {
+        println!("Orphan workspace {verb}: {workspace} (no binding record claims it)");
+    }
+    for path in &outcome.dead_state {
+        println!("Dead process state {verb}: {path}");
+    }
+    for rev in &outcome.pruned {
+        println!("Snapshot {verb}: {} @ {}", rev.tracker, rev.rev);
+    }
+    if outcome.pinned_by_checkpoints > 0 {
+        println!(
+            "\n{} snapshot rev(s) kept: a checkpoint still points at them, and pruning one \
+             would break its undo.",
+            outcome.pinned_by_checkpoints
+        );
+    }
+    Ok(())
+}
+
+/// One cleanup hook's disposition. Skips are printed, not hidden — the
+/// resource newgit declined to touch is exactly what a user needs to know.
+fn print_hook(hook: &HookOutcome) {
+    let ownership = hook.ownership.label();
+    match &hook.detail {
+        HookDetail::Ran { command, ok, log } => {
+            let verdict = if *ok { "ok" } else { "FAILED" };
+            println!("  cleanup:  {} ran `{command}` {verdict}", hook.resource);
+            if !ok {
+                println!("            log: {log}");
+            }
+        }
+        HookDetail::WouldRun(command) => {
+            println!("  cleanup:  {} would run `{command}`", hook.resource);
+        }
+        HookDetail::SkippedOwnership => println!(
+            "  cleanup:  {} skipped (ownership {ownership} — shared beyond this instance, \
+             newgit never tears it down)",
+            hook.resource
+        ),
+        HookDetail::NoHook => println!(
+            "  cleanup:  {} nothing to do (ownership {ownership}, no [cleanup] command)",
+            hook.resource
+        ),
+        HookDetail::SkippedUnresolved {
+            command,
+            placeholder,
+        } => println!(
+            "  cleanup:  {} SKIPPED: `{command}` still has {placeholder}; running it would pass \
+             a literal placeholder to a destructive command",
+            hook.resource
+        ),
+    }
 }
 
 fn short_rev(rev: &str) -> &str {
@@ -690,6 +888,9 @@ fn remove(name: &str) -> Result<()> {
     let outcome = manager.remove(name, &current_dir()?)?;
 
     println!("Removed branch instance `{}`", outcome.branch.name);
+    for hook in &outcome.hooks {
+        print_hook(hook);
+    }
     println!("  workspace: {} (deleted)", outcome.branch.workspace_path);
     println!("  record:    archived at {}", outcome.archived_record);
     println!(
@@ -802,11 +1003,6 @@ fn manager_and_instance(instance: Option<String>) -> Result<(BranchManager, Stri
     let manager = BranchManager::open(context.store)?;
     warn_gitignore(&manager);
     Ok((manager, instance))
-}
-
-fn skeleton_notice(command: &str, detail: &str) -> Result<()> {
-    println!("`newgit {command}` is scaffolded but not implemented yet: {detail}.");
-    Ok(())
 }
 
 fn current_dir() -> Result<Utf8PathBuf> {

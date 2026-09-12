@@ -21,8 +21,7 @@ pub struct ResourceDefinition {
     pub actions: BTreeMap<String, ActionSpec>,
     pub checkpoint: Option<CheckpointSpec>,
     pub restore: Option<RestoreSpec>,
-    /// Parsed and recorded now; consumed by cleanup in M6.
-    pub cleanup: Option<toml::Value>,
+    pub cleanup: Option<CleanupSpec>,
     /// `sha256:<hex12>` of the definition file contents.
     pub definition_rev: String,
 }
@@ -37,6 +36,30 @@ pub enum Ownership {
     Project,
     User,
     External,
+}
+
+impl Ownership {
+    /// Whether tearing down one branch instance may touch the concrete
+    /// resource. `project` is shared by the project's instances and `user`
+    /// is shared beyond it, so per-branch teardown must leave both alone —
+    /// this is the conservative half of the ownership table, and the reason
+    /// a pnpm store survives `newgit remove`.
+    pub fn per_branch_teardown_may_touch(self) -> bool {
+        match self {
+            Self::Branch | Self::Workspace | Self::External => true,
+            Self::Project | Self::User => false,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Branch => "branch",
+            Self::Workspace => "workspace",
+            Self::Project => "project",
+            Self::User => "user",
+            Self::External => "external",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -60,9 +83,21 @@ pub struct ActionSpec {
     /// Signal sent by `stop` for a long-running sibling `start`.
     #[serde(default)]
     pub signal: Option<String>,
-    /// Output values captured from the command (held for M6).
+    /// Names to read out of the command's stdout and merge into this
+    /// resource's binding exports — how a resource that mints an external
+    /// handle (a preview id, a tunnel URL) publishes it. See
+    /// [`parse_captures`] for the accepted output shapes.
     #[serde(default)]
     pub captures: Vec<String>,
+}
+
+/// How a resource tears its concrete instance down. Ownership decides
+/// whether the hook may run at all; this decides what running it means.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct CleanupSpec {
+    /// May use `{{state_ref}}` (from the instance's latest checkpoint) and
+    /// `{{exports.<name>}}` (from the binding).
+    pub command: Option<String>,
 }
 
 /// How a resource captures branch-local state at checkpoint time.
@@ -139,7 +174,7 @@ struct ResourceDefinitionFile {
     #[serde(default)]
     restore: Option<RestoreSpec>,
     #[serde(default)]
-    cleanup: Option<toml::Value>,
+    cleanup: Option<CleanupSpec>,
 }
 
 impl ResourceDefinition {
@@ -201,9 +236,9 @@ impl ResourceDefinition {
                 }
                 CheckpointMode::Command => {
                     if checkpoint.command.is_none() {
-                        return Err(self.invalid(
-                            "checkpoint mode `command` requires `command`".to_owned(),
-                        ));
+                        return Err(
+                            self.invalid("checkpoint mode `command` requires `command`".to_owned())
+                        );
                     }
                 }
                 CheckpointMode::External => {
@@ -218,7 +253,9 @@ impl ResourceDefinition {
         if let Some(restore) = &self.restore {
             match restore.mode {
                 RestoreMode::Command if restore.command.is_none() => {
-                    return Err(self.invalid("restore mode `command` requires `command`".to_owned()));
+                    return Err(
+                        self.invalid("restore mode `command` requires `command`".to_owned())
+                    );
                 }
                 RestoreMode::Recompute
                     if !self.actions.contains_key(restore.recompute_action()) =>
@@ -252,6 +289,57 @@ impl ResourceDefinition {
             tracker: self.name.clone(),
             reason,
         }
+    }
+}
+
+/// Read an action's declared `captures` out of its stdout.
+///
+/// Two shapes are accepted, because both are what a real command already
+/// emits: stdout whose first non-whitespace character is `{` is parsed as a
+/// flat JSON object (`cloudctl ... --json`), and anything else is read as
+/// `KEY=VALUE` lines (`echo PREVIEW_ID=pv_9`). Only declared names are
+/// taken, JSON scalars are stringified, and a name the command did not emit
+/// is simply absent rather than an error — a resource may legitimately
+/// publish a handle only on some runs.
+pub fn parse_captures(stdout: &str, wanted: &[String]) -> BTreeMap<String, String> {
+    if wanted.is_empty() {
+        return BTreeMap::new();
+    }
+    let trimmed = stdout.trim_start();
+
+    let mut found: BTreeMap<String, String> = BTreeMap::new();
+    if trimmed.starts_with('{') {
+        if let Ok(serde_json::Value::Object(object)) =
+            serde_json::from_str::<serde_json::Value>(trimmed)
+        {
+            for (key, value) in object {
+                if let Some(text) = json_scalar(&value) {
+                    found.insert(key, text);
+                }
+            }
+        }
+    } else {
+        for line in stdout.lines() {
+            if let Some((key, value)) = line.split_once('=') {
+                found.insert(key.trim().to_owned(), value.trim().to_owned());
+            }
+        }
+    }
+
+    wanted
+        .iter()
+        .filter_map(|name| found.remove_entry(name))
+        .collect()
+}
+
+/// JSON scalars render as themselves; containers have no obvious env-var
+/// spelling, so they are skipped rather than guessed at.
+fn json_scalar(value: &serde_json::Value) -> Option<String> {
+    match value {
+        serde_json::Value::String(text) => Some(text.clone()),
+        serde_json::Value::Number(number) => Some(number.to_string()),
+        serde_json::Value::Bool(flag) => Some(flag.to_string()),
+        _ => None,
     }
 }
 
@@ -344,6 +432,34 @@ mod tests {
             cleanup: None,
             definition_rev: "sha256:000000000000".to_owned(),
         }
+    }
+
+    #[test]
+    fn captures_read_json_objects_and_key_value_lines() {
+        let wanted = ["PREVIEW_ID".to_owned(), "PREVIEW_URL".to_owned()];
+
+        let json = parse_captures(
+            r#"{"PREVIEW_ID": "pv_9", "PREVIEW_URL": "https://pv9.example", "extra": 1}"#,
+            &wanted,
+        );
+        assert_eq!(json["PREVIEW_ID"], "pv_9");
+        assert_eq!(json["PREVIEW_URL"], "https://pv9.example");
+        assert_eq!(json.len(), 2, "undeclared keys are not captured");
+
+        let lines = parse_captures("noise\nPREVIEW_ID=pv_9\n", &wanted);
+        assert_eq!(lines["PREVIEW_ID"], "pv_9");
+        assert!(
+            !lines.contains_key("PREVIEW_URL"),
+            "a name the command did not emit is absent, not empty"
+        );
+
+        // Non-string scalars stringify; unparseable output captures nothing.
+        assert_eq!(
+            parse_captures(r#"{"PORT": 5432}"#, &["PORT".to_owned()])["PORT"],
+            "5432"
+        );
+        assert!(parse_captures("{not json", &wanted).is_empty());
+        assert!(parse_captures("PREVIEW_ID=pv_9", &[]).is_empty());
     }
 
     #[test]

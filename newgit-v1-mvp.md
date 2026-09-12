@@ -70,9 +70,15 @@ Real projects have odd branch-bound things:
 
 newgit should not need a new internal subsystem for each one. It needs a tracker definition or a resource definition — and an agent reading the config should know, from the noun alone, whether a thing syncs across machines (tracker) or gets re-established on each one (resource).
 
-v1 should ship resource templates for common lifecycle units such as
-install/deps and process/service. Trackers should be created through CLI verbs
-instead of templates: create the lane, add paths to it, capture content.
+v1 ships resource templates for common lifecycle units: `process`, `pnpm`
+(install/deps), `command-snapshot` (a daemon-owned database), and `external`
+(a resource another system owns). A template may bring companions it needs —
+the resource definitions it `depends_on`, and the tracker lanes its
+checkpoint deposits into — created only when absent, so an existing
+definition is never overwritten.
+
+Trackers are created through CLI verbs instead of templates: create the lane,
+add paths to it, capture content.
 
 ---
 
@@ -296,6 +302,21 @@ them into source history. The rule:
 config loader validates the invariant — content lanes must be disjoint, so no
 two trackers fight over the same path at projection/restore time.
 
+The `.gitignore` append is not sufficient on its own: it is an *uncommitted*
+edit in the store worktree, so a workspace clone does not inherit the rule
+until the user commits it. In the gap, a lane's content sits in the workspace
+as ordinary untracked files that `git add -A` sweeps into source history.
+So `spawn` also writes every tracker-owned path into the workspace clone's
+`.git/info/exclude`, before any lane content is projected. Audience only
+keeps content out of Git *by construction* if the construction reaches every
+workspace.
+
+`info/exclude` rather than the workspace's own `.gitignore`: the latter is
+tracked content owned by source, and newgit does not rewrite the user's
+committed files. This is the one place newgit writes a file under `.git`
+instead of going through a Git command, because Git exposes no plumbing that
+writes it.
+
 This is "audience keeps content out of Git history by construction" made
 concrete. It is not enforcement against a hostile agent force-adding a file;
 v1 does not claim that, and a v2 `git commit` shim is the natural place to
@@ -421,6 +442,30 @@ opaque state refs
 ```
 
 This is how a database resource can expose `DATABASE_URL`, a service resource can expose `APP_URL`, and a cloud preview resource can expose `PREVIEW_ID`.
+
+Two ways a value becomes an export:
+
+- **`[exports]`** renders templates at bind time (`APP_URL =
+  "http://127.0.0.1:{{ports.app}}"`). Good for anything newgit can compute.
+- **`captures`** on an action reads names out of its stdout and merges them
+  into the binding's exports. This is how a resource whose handle is minted
+  by another system publishes it — newgit cannot compute a preview id, only
+  ask for one and remember the answer.
+
+```toml
+[actions.prepare]
+command = "cloudctl preview create --branch {{branch.name}} --json"
+captures = ["PREVIEW_ID", "PREVIEW_URL"]
+```
+
+Two output shapes are accepted, because both are what real commands already
+emit: stdout whose first non-whitespace character is `{` is parsed as a flat
+JSON object, and anything else is read as `KEY=VALUE` lines. Only declared
+names are taken; a name the command did not emit is simply absent. Captured
+values land on the binding record, so they survive the process, reach
+`newgit run`, and are available to checkpoint and cleanup hooks. An action
+with `captures` runs captured — its output goes to the log rather than the
+terminal, because newgit has to read stdout.
 
 Port allocation is deterministic in the useful sense: **an instance's port
 never changes once allocated.** Ports are allocated at resource-bind time
@@ -818,7 +863,53 @@ testable without teardown.
 
 ### `newgit cleanup`
 
-Stops resource processes, removes stale workspaces, and prunes unused snapshots according to ownership and cleanup rules. `remove` targets one instance; `cleanup` is garbage collection across everything.
+Garbage collection across everything; `remove` targets one instance. Takes
+`--dry-run`, which reports exactly what a real run would remove. Four jobs:
+
+- **Finalizes instances whose workspace is gone.** Such an instance cannot
+  run, checkpoint, or undo, and its name stays taken — so cleanup runs its
+  resource cleanup hooks, deletes its runtime state, and archives its binding
+  record, which frees the name for `newgit spawn` again.
+- **Deletes unclaimed workspace directories** — a failed spawn, or a record
+  archived while its directory survived. Narrower than "unclaimed": a
+  directory is removed only if it carries a newgit workspace marker (proof
+  newgit created it) or is empty. `[workspace] root` is user-configurable and
+  might point somewhere shared, and "newgit deleted a directory it did not
+  create" is not a failure mode worth risking to reclaim disk. Anything else
+  is reported and left alone.
+- **Clears dead process state**: PID files whose process group has exited,
+  and state directories belonging to no live instance.
+- **Prunes tracker lane revs nothing references**, plus staging directories a
+  crashed capture left behind. Roots are the surviving instances' bindings,
+  every checkpoint record (including archived instances'), and each lane's
+  head. It never deletes a checkpoint record, and never a rev a checkpoint
+  still points at — the count of revs retained for that reason is reported,
+  so kept disk is explained rather than mysterious.
+
+### Resource Cleanup Hooks
+
+A resource's `[cleanup] command` runs during both `newgit remove` and
+`newgit cleanup`, dependents before dependencies, while the workspace still
+exists. Without this, a resource newgit does not own — a cloud preview, a
+database — would outlive every trace of the instance that asked for it.
+
+Ownership decides whether a hook may run at all, not the presence of a
+command:
+
+| Ownership | Per-branch teardown |
+|-----------|---------------------|
+| `branch`, `workspace` | hook runs |
+| `external` | hook runs — exactly the defined command and nothing else |
+| `project`, `user` | **never**; shared beyond this instance, skipped loudly |
+
+A hook's command may use `{{state_ref}}` (the most recent checkpointed state
+reference for that resource, which is how `cloudctl preview delete
+{{state_ref}}` gets its argument) and `{{exports.<name>}}` from the binding.
+If rendering leaves any `{{...}}` unresolved, the hook is **refused, not
+run**: a destructive command with a literal placeholder is not a no-op, it is
+a wrong argument. Rendering elsewhere deliberately leaves unknown variables
+verbatim so misconfiguration is visible; cleanup is the one place that must
+fail closed instead.
 
 ---
 
@@ -1257,21 +1348,40 @@ checkpoint.
 
 ## Export
 
-v1 can include a modest export command:
-
 ```sh
 newgit export feature-a --to ../public-export
+newgit export feature-a --to ../public-export --include data/seed.sql --exclude notes/
 ```
 
-This should produce a normal Git repository or branch from the branch workspace.
+This produces a normal Git repository from the branch workspace. Rules
+unchanged from the original intent: path-level include/exclude only, honoring
+tracker audience as the default filter; no hunk privacy, no AST rewriting, no
+native remote, no concealment claims.
 
-Rules:
+As implemented:
 
-- path-level include/exclude only, honoring tracker audience as the default filter
-- no hunk privacy
-- no AST rewriting
-- no native remote
-- no concealment claims
+- **Source always ships**, because source's audience is everyone. Content is
+  the workspace's Git-tracked files *as they stand on disk*, so uncommitted
+  agent work is included and ignored junk never is.
+- **Tracker audience is the default filter, and it fails closed.** Only
+  `audience = "public"` lanes are included. `project-devs` and `user` lanes
+  are withheld and listed, with the flag that would ship them. A tracker
+  created without `--audience` is `project-devs`, so the boring default is
+  the safe one.
+- **`--include <path>`** overrides audience for exactly that path (it may
+  also name something no tracker owns and Git does not track — a build
+  output). **`--exclude <path>`** is applied last and beats everything,
+  including `--include`.
+- **One commit, never history.** Exporting the branch's commits would carry
+  any file those commits contain, including the content the audience filter
+  just withheld. The export is a single commit on a branch named after the
+  instance, in a fresh repository with no remotes and no `refs/newgit/*`.
+- The destination must be empty or nonexistent, and an export that would
+  contain nothing is an error rather than an empty repository.
+
+The CLI prints both the withheld paths and the two load-bearing caveats (one
+commit; a path filter is not concealment) on every run, because this is the
+one command whose output leaves the machine.
 
 This keeps the "repositories are outputs" idea alive without making it the first hard dependency.
 
@@ -1376,6 +1486,9 @@ Avoid clever generality. The abstractions exist to model ordinary project tracke
 
 ## Suggested Build Order
 
+All seven milestones are implemented. Each success criterion below is covered
+by integration tests in `crates/newgit-core/tests/`.
+
 ### Milestone 1: Branch Instances
 
 - `newgit init`
@@ -1443,9 +1556,17 @@ Success criterion:
 
 ### Milestone 6: Database And External Resources
 
-- SQLite through a normal file tracker
-- Postgres through the command-snapshot resource template depositing into a tracker
-- one external resource template
+- SQLite through a normal file tracker — no special support: a database that
+  is just a file is a tracker, and binary content round-trips byte-for-byte
+  through capture, checkpoint, and undo
+- Postgres through the `command-snapshot` resource template depositing into a
+  tracker; the template brings its `db-snapshots` lane with it, since a
+  checkpoint whose `into_tracker` names a missing tracker fails at checkpoint
+  time
+- the `external` resource template, which needed `captures` to exist: newgit
+  cannot compute a preview id, only ask for one and remember the answer
+- resource `[cleanup]` hooks, so a resource newgit does not own can be torn
+  down (see *Resource Cleanup Hooks*)
 
 Success criterion:
 
@@ -1453,9 +1574,9 @@ Success criterion:
 
 ### Milestone 7: Basic Export
 
-- path-level export honoring tracker audience
-- normal Git output
-- no privacy claims
+- path-level export honoring tracker audience, failing closed at `public`
+- normal Git output: one commit, a branch, no remotes, no newgit refs
+- no privacy claims, stated in the command's own output
 
 Success criterion:
 

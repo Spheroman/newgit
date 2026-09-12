@@ -38,11 +38,25 @@ pub fn render(template: &str, context: &RenderContext) -> String {
     rendered
 }
 
+/// The first `{{...}}` a render left behind, if any.
+///
+/// Rendering deliberately leaves unknown variables verbatim so a
+/// misconfigured template is visible rather than silently emptied. That is
+/// the right default for a command the user watches run, but destructive
+/// hooks (cleanup) must refuse instead: `cloudctl preview delete
+/// {{state_ref}}` with no state ref is not a no-op, it is a wrong argument.
+pub fn unresolved_placeholder(rendered: &str) -> Option<&str> {
+    let start = rendered.find("{{")?;
+    let rest = &rendered[start..];
+    let end = rest.find("}}")? + 2;
+    Some(&rest[..end])
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
 
-    use super::{RenderContext, render};
+    use super::{RenderContext, render, unresolved_placeholder};
 
     #[test]
     fn renders_ports_and_branch_vars() {
@@ -85,5 +99,16 @@ mod tests {
             render("{{state_ref}}", &RenderContext::default()),
             "{{state_ref}}"
         );
+    }
+
+    #[test]
+    fn unresolved_placeholders_are_reported_for_refusal() {
+        assert_eq!(
+            unresolved_placeholder("delete {{state_ref}} --force"),
+            Some("{{state_ref}}")
+        );
+        assert_eq!(unresolved_placeholder("delete pv_9"), None);
+        // An unterminated brace pair is not a placeholder newgit can name.
+        assert_eq!(unresolved_placeholder("echo {{oops"), None);
     }
 }

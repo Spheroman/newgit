@@ -10,13 +10,20 @@ use crate::checkpoint::{
     CheckpointLog, CheckpointReason, CheckpointRecord, RecoveryRecord, ResourceState,
     RestoreFailure, SourceState, TrackerState,
 };
+use crate::cleanup::{
+    CleanupOutcome, FinalizedInstance, HookDetail, HookOutcome, PrunedRev, SnapshotRoots,
+    lane_revs, may_tear_down, orphan_workspaces,
+};
 use crate::config::ProjectConfig;
 use crate::error::{NewgitError, Result};
-use crate::exports::{RenderContext, render};
-use crate::lane::{TrackerLane, clear_owned_paths};
-use crate::materializer::{Materializer, RealDirMaterializer};
+use crate::export::{self, ExportFilter, ExportPlan, prepare_destination};
+use crate::exports::{RenderContext, render, unresolved_placeholder};
+use crate::lane::{TrackerLane, clear_owned_paths, copy_file};
+use crate::materializer::{Materializer, RealDirMaterializer, exclude_tracker_paths};
 use crate::ports;
-use crate::resource::{CheckpointMode, ResourceDefinition, RestoreMode, topological_order};
+use crate::resource::{
+    CheckpointMode, ResourceDefinition, RestoreMode, parse_captures, topological_order,
+};
 use crate::source::GitSource;
 use crate::store::MetadataStore;
 use crate::supervisor::{StopOutcome, Supervisor, run_captured, run_foreground};
@@ -55,6 +62,8 @@ pub struct ResourceBindOutcome {
     pub prepare: Option<(bool, Utf8PathBuf)>,
     /// Resource dependencies that prevented `prepare` from running.
     pub blocked_by: Vec<String>,
+    /// Export names `prepare` published through `captures`.
+    pub captured: Vec<String>,
 }
 
 /// What running an action did.
@@ -134,6 +143,21 @@ impl TrackerReport {
 pub struct RemoveOutcome {
     pub branch: BranchInstance,
     pub archived_record: Utf8PathBuf,
+    /// What each resource's cleanup hook did, dependents first.
+    pub hooks: Vec<HookOutcome>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExportOutcome {
+    pub destination: Utf8PathBuf,
+    /// Branch name in the exported repository (the instance's source ref).
+    pub branch: String,
+    pub instance: String,
+    /// Workspace HEAD the export was taken from.
+    pub source_head: String,
+    /// The single commit the export produced.
+    pub commit: String,
+    pub plan: ExportPlan,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -213,6 +237,8 @@ pub struct AddResourceOutcome {
     pub path: Utf8PathBuf,
     /// Companion definitions created because the template depends on them.
     pub companions_created: Vec<Utf8PathBuf>,
+    /// Tracker lanes created because the template deposits into them.
+    pub trackers_created: Vec<Utf8PathBuf>,
 }
 
 impl BranchManager {
@@ -305,6 +331,16 @@ impl BranchManager {
 
         RealDirMaterializer.materialize(&self.source, &branch)?;
 
+        // Before any lane content lands, make the clone's Git ignore the
+        // paths those lanes own — otherwise projected content arrives as
+        // untracked files an agent can commit into source history.
+        let owned: Vec<Utf8PathBuf> = self
+            .trackers
+            .iter()
+            .flat_map(|definition| definition.paths.iter().cloned())
+            .collect();
+        exclude_tracker_paths(&branch.workspace_path, &owned)?;
+
         let mut tracker_outcomes = Vec::new();
         for definition in &self.trackers {
             let outcome = self.bind_tracker(&mut branch, definition, false)?;
@@ -370,6 +406,7 @@ impl BranchManager {
             // Prepare runs with the bindings made so far, so dependents see
             // their dependencies' exports. Failed dependencies block
             // dependents; the instance still spawns so logs can be inspected.
+            let mut captured_names = Vec::new();
             let (status, prepare) = if !blocked_by.is_empty() {
                 if let Some(binding) = branch.resources.get_mut(&definition.name) {
                     binding.status = ResourceStatus::Blocked;
@@ -381,7 +418,10 @@ impl BranchManager {
                         let log = self
                             .store
                             .action_log_path(&branch.slug, &format!("{}.prepare", definition.name));
-                        let code = self.run_one_shot(branch, definition, action, &log)?;
+                        let (code, captured) =
+                            self.run_one_shot(branch, definition, action, &log)?;
+                        captured_names = captured.keys().cloned().collect();
+                        Self::apply_captures(branch, &definition.name, captured);
                         let status = if code == 0 {
                             ResourceStatus::Ready
                         } else {
@@ -407,6 +447,7 @@ impl BranchManager {
                 status,
                 prepare,
                 blocked_by,
+                captured: captured_names,
             });
         }
         branch.updated_at = Utc::now();
@@ -472,7 +513,8 @@ impl BranchManager {
             return Ok(ActionOutcome::Started { pid, log });
         }
 
-        let code = self.run_one_shot(&branch, definition, action, &log)?;
+        let (code, captured) = self.run_one_shot(&branch, definition, action, &log)?;
+        let mut dirty = Self::apply_captures(&mut branch, &definition.name, captured);
         if action_name == "prepare"
             && let Some(binding) = branch.resources.get_mut(&definition.name)
         {
@@ -481,6 +523,9 @@ impl BranchManager {
             } else {
                 ResourceStatus::Failed
             };
+            dirty = true;
+        }
+        if dirty {
             branch.updated_at = Utc::now();
             self.store.save_branch_record(&branch)?;
         }
@@ -502,21 +547,51 @@ impl BranchManager {
         Ok((code, log))
     }
 
+    /// Run a one-shot action, returning its exit code and whatever values it
+    /// declared in `captures`. An action with captures runs captured (its
+    /// output reaches the log but not the terminal), because newgit has to
+    /// read stdout to find the handle the command just minted.
     fn run_one_shot(
         &self,
         branch: &BranchInstance,
         definition: &ResourceDefinition,
         action: &crate::resource::ActionSpec,
         log: &Utf8Path,
-    ) -> Result<i32> {
+    ) -> Result<(i32, BTreeMap<String, String>)> {
         let command = self.rendered_command(branch, definition, action)?;
         let env = self.assemble_env(branch)?;
-        run_foreground(
-            &["sh".to_owned(), "-c".to_owned(), command],
-            &branch.workspace_path,
-            &env,
-            log,
-        )
+
+        if action.captures.is_empty() {
+            let code = run_foreground(
+                &["sh".to_owned(), "-c".to_owned(), command],
+                &branch.workspace_path,
+                &env,
+                log,
+            )?;
+            return Ok((code, BTreeMap::new()));
+        }
+
+        let (code, stdout) = run_captured(&command, &branch.workspace_path, &env, log)?;
+        Ok((code, parse_captures(&stdout, &action.captures)))
+    }
+
+    /// Merge values an action captured into the resource's binding exports,
+    /// so later commands, hooks, and `newgit run` all see the handle. The
+    /// binding record is the single source of truth for a resource instance,
+    /// including the parts another system named.
+    fn apply_captures(
+        branch: &mut BranchInstance,
+        resource: &str,
+        captured: BTreeMap<String, String>,
+    ) -> bool {
+        if captured.is_empty() {
+            return false;
+        }
+        let Some(binding) = branch.resources.get_mut(resource) else {
+            return false;
+        };
+        binding.resolved_exports.extend(captured);
+        true
     }
 
     fn rendered_command(
@@ -610,9 +685,33 @@ impl BranchManager {
             }
         }
 
+        // Lanes the template deposits into. A checkpoint whose `into_tracker`
+        // names a tracker that does not exist fails at checkpoint time, so a
+        // template that deposits has to bring its lane with it.
+        let mut trackers_created = Vec::new();
+        for companion in template.companion_trackers {
+            let tracker_path = self
+                .store
+                .paths()
+                .trackers
+                .join(format!("{}.toml", companion.name));
+            if !tracker_path.exists() {
+                trackers_created.push(
+                    self.create_tracker(
+                        companion.name,
+                        companion.audience,
+                        Storage::Local,
+                        companion.merge_with_source,
+                    )?
+                    .path,
+                );
+            }
+        }
+
         Ok(AddResourceOutcome {
             path,
             companions_created,
+            trackers_created,
         })
     }
 
@@ -948,6 +1047,11 @@ impl BranchManager {
     /// Deletes the workspace (plain `rm -rf`; clones have no registration)
     /// and archives the binding record. The source branch in the store is
     /// kept — removal disposes of the workspace, not the history.
+    ///
+    /// Resource cleanup hooks run first, dependents before dependencies and
+    /// while the workspace still exists. Without that, a resource newgit
+    /// does not own — a cloud preview, a database — would outlive every
+    /// trace of the instance that asked for it.
     pub fn remove(&self, name: &str, cwd: &Utf8Path) -> Result<RemoveOutcome> {
         let branch = self.store.find_branch(name)?;
 
@@ -966,6 +1070,9 @@ impl BranchManager {
                 supervisor.stop(&definition.name, &definition.stop_signal())?;
             }
         }
+
+        let hooks = self.run_cleanup_hooks(&branch, false)?;
+
         let state_dir = self.store.instance_state_dir(&branch.slug);
         if state_dir.exists() {
             std::fs::remove_dir_all(&state_dir)
@@ -978,6 +1085,286 @@ impl BranchManager {
         Ok(RemoveOutcome {
             branch,
             archived_record,
+            hooks,
+        })
+    }
+
+    /// Run each bound resource's `[cleanup] command`, dependents before
+    /// dependencies. Ownership decides whether a hook may run at all —
+    /// `project` and `user` resources are shared beyond this instance, so
+    /// per-branch teardown leaves them alone even when they define a hook.
+    fn run_cleanup_hooks(
+        &self,
+        branch: &BranchInstance,
+        dry_run: bool,
+    ) -> Result<Vec<HookOutcome>> {
+        // The workspace is usually still here; when cleanup is finishing an
+        // instance whose workspace is already gone, hooks run from the store
+        // root so an external teardown can still reach its own API.
+        let cwd = if branch.workspace_path.is_dir() {
+            branch.workspace_path.clone()
+        } else {
+            self.store.paths().project_root.clone()
+        };
+
+        let mut outcomes = Vec::new();
+        for name in self.resource_order.iter().rev() {
+            if !branch.resources.contains_key(name) {
+                continue;
+            }
+            let definition = self.resource_definition(name)?;
+            let ownership = definition.ownership;
+
+            if !may_tear_down(ownership) {
+                outcomes.push(HookOutcome {
+                    resource: name.clone(),
+                    ownership,
+                    detail: HookDetail::SkippedOwnership,
+                });
+                continue;
+            }
+
+            let Some(template) = definition
+                .cleanup
+                .as_ref()
+                .and_then(|spec| spec.command.as_deref())
+            else {
+                outcomes.push(HookOutcome {
+                    resource: name.clone(),
+                    ownership,
+                    detail: HookDetail::NoHook,
+                });
+                continue;
+            };
+
+            let binding = branch.resources.get(name);
+            let state_ref = self.checkpointed_state_ref(branch, name)?;
+            let context = RenderContext {
+                branch_name: &branch.name,
+                branch_slug: &branch.slug,
+                workspace: branch.workspace_path.as_str(),
+                ports: binding.map(|binding| &binding.resolved_ports),
+                exports: binding.map(|binding| &binding.resolved_exports),
+                snapshot_path: None,
+                state_ref: state_ref.as_deref(),
+            };
+            let command = render(template, &context);
+
+            if let Some(placeholder) = unresolved_placeholder(&command) {
+                outcomes.push(HookOutcome {
+                    resource: name.clone(),
+                    ownership,
+                    detail: HookDetail::SkippedUnresolved {
+                        command: command.clone(),
+                        placeholder: placeholder.to_owned(),
+                    },
+                });
+                continue;
+            }
+
+            if dry_run {
+                outcomes.push(HookOutcome {
+                    resource: name.clone(),
+                    ownership,
+                    detail: HookDetail::WouldRun(command),
+                });
+                continue;
+            }
+
+            let log = self
+                .store
+                .action_log_path(&branch.slug, &format!("{name}.cleanup"));
+            let env = self.assemble_env(branch)?;
+            let (code, _) = run_captured(&command, &cwd, &env, &log)?;
+            outcomes.push(HookOutcome {
+                resource: name.clone(),
+                ownership,
+                detail: HookDetail::Ran {
+                    command,
+                    ok: code == 0,
+                    log,
+                },
+            });
+        }
+        Ok(outcomes)
+    }
+
+    /// The most recent checkpointed state reference for one resource, which
+    /// is what a cleanup hook's `{{state_ref}}` means: the handle newgit last
+    /// recorded. Deposited content resolves to its path, like restore.
+    fn checkpointed_state_ref(
+        &self,
+        branch: &BranchInstance,
+        resource: &str,
+    ) -> Result<Option<String>> {
+        let records = self.checkpoint_log(branch).list()?;
+        for record in records.iter().rev() {
+            if let Some(state) = record
+                .resource_states
+                .iter()
+                .find(|state| state.name == resource)
+            {
+                let resolved = state
+                    .state_path
+                    .as_ref()
+                    .map(ToString::to_string)
+                    .or_else(|| state.state_ref.clone());
+                if resolved.is_some() {
+                    return Ok(resolved);
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    /// Garbage collection across everything: finish instances whose
+    /// workspace is gone, delete unclaimed workspaces and dead process
+    /// state, and prune lane revs nothing references.
+    ///
+    /// `remove` targets one instance; this is the sweep. It never deletes a
+    /// checkpoint record, and never a lane rev a checkpoint still points at.
+    pub fn cleanup(&self, dry_run: bool) -> Result<CleanupOutcome> {
+        let mut outcome = CleanupOutcome {
+            dry_run,
+            ..CleanupOutcome::default()
+        };
+        let branches = self.store.load_branches()?;
+
+        // An instance with no workspace cannot run, checkpoint, or undo, and
+        // its name stays taken — so finishing the teardown is the only move
+        // that helps. Its binding record is archived, not deleted.
+        let (live, stale): (Vec<_>, Vec<_>) = branches
+            .iter()
+            .partition(|branch| branch.workspace_path.is_dir());
+
+        for branch in &stale {
+            let hooks = self.run_cleanup_hooks(branch, dry_run)?;
+            let archived_record = if dry_run {
+                None
+            } else {
+                let state_dir = self.store.instance_state_dir(&branch.slug);
+                if state_dir.exists() {
+                    std::fs::remove_dir_all(&state_dir)
+                        .map_err(|source| NewgitError::io(state_dir, source))?;
+                }
+                Some(self.store.archive_branch_record(branch)?)
+            };
+            outcome.finalized.push(FinalizedInstance {
+                name: branch.name.clone(),
+                workspace: branch.workspace_path.clone(),
+                hooks,
+                archived_record,
+            });
+        }
+
+        // Unclaimed workspace directories: a failed spawn, or a record
+        // archived while its directory survived.
+        let workspace_root = self.config.workspace_root(&self.store.paths().project_root);
+        let (orphans, unrecognized) = orphan_workspaces(&workspace_root, &branches)?;
+        outcome.warnings.extend(unrecognized);
+        for orphan in orphans {
+            if !dry_run {
+                std::fs::remove_dir_all(&orphan)
+                    .map_err(|source| NewgitError::io(&orphan, source))?;
+            }
+            outcome.orphan_workspaces.push(orphan);
+        }
+
+        // Dead process state: PID files whose group exited, and state
+        // directories belonging to no live instance.
+        for branch in &live {
+            outcome
+                .dead_state
+                .extend(self.supervisor(branch).prune_dead_pids(dry_run)?);
+        }
+        let live_state_dirs: BTreeSet<Utf8PathBuf> = live
+            .iter()
+            .map(|branch| self.store.instance_state_dir(&branch.slug))
+            .collect();
+        for state_dir in self.store.state_dirs()? {
+            if live_state_dirs.contains(&state_dir) {
+                continue;
+            }
+            if !dry_run {
+                std::fs::remove_dir_all(&state_dir)
+                    .map_err(|source| NewgitError::io(&state_dir, source))?;
+            }
+            outcome.dead_state.push(state_dir);
+        }
+
+        // Lane pruning. Roots come from the records that survive this pass,
+        // so a dry run reports exactly what a real run would remove.
+        let surviving: Vec<BranchInstance> = live.into_iter().cloned().collect();
+        let roots = SnapshotRoots::collect(&self.store, &surviving)?;
+        for lane_rev in lane_revs(&self.store.paths().snapshots)? {
+            if !lane_rev.is_staging && roots.contains(&lane_rev.tracker, &lane_rev.rev) {
+                continue;
+            }
+            if !dry_run {
+                std::fs::remove_dir_all(&lane_rev.path)
+                    .map_err(|source| NewgitError::io(&lane_rev.path, source))?;
+            }
+            outcome.pruned.push(PrunedRev {
+                tracker: lane_rev.tracker,
+                rev: lane_rev.rev,
+                path: lane_rev.path,
+            });
+        }
+        outcome.pinned_by_checkpoints = roots.pinned_only_by_checkpoints().count();
+
+        Ok(outcome)
+    }
+
+    /// Write a branch instance's content out as an ordinary Git repository.
+    ///
+    /// Tracker audience is the default filter and it fails closed: only
+    /// `public` lanes ship unless `--include` names a path. This is
+    /// path-level filtering and nothing more — no hunk privacy, no
+    /// concealment claim.
+    pub fn export(
+        &self,
+        instance: &str,
+        destination: &Utf8Path,
+        filter: &ExportFilter,
+    ) -> Result<ExportOutcome> {
+        let branch = self.store.find_branch(instance)?;
+        self.require_workspace(&branch)?;
+        prepare_destination(destination)?;
+
+        let workspace = branch.workspace_path.clone();
+        let source_files = GitSource::workspace_tracked_files(&workspace)?;
+        let plan = export::plan(&workspace, &source_files, &self.trackers, filter)?;
+
+        if plan.files.is_empty() {
+            return Err(NewgitError::Unsupported(format!(
+                "nothing to export from `{}`: every candidate path was withheld by audience or \
+                 excluded",
+                branch.name
+            )));
+        }
+
+        for file in &plan.files {
+            copy_file(&workspace.join(&file.path), &destination.join(&file.path))?;
+        }
+
+        let head_rev = GitSource::workspace_head(&workspace)?;
+        let commit = GitSource::init_export_repo(
+            destination,
+            &branch.source_ref,
+            &format!(
+                "Export of `{}` at {}",
+                branch.name,
+                &head_rev[..8.min(head_rev.len())]
+            ),
+        )?;
+
+        Ok(ExportOutcome {
+            destination: destination.to_path_buf(),
+            branch: branch.source_ref.clone(),
+            instance: branch.name.clone(),
+            source_head: head_rev,
+            commit,
+            plan,
         })
     }
 
@@ -1018,7 +1405,9 @@ impl BranchManager {
         let workspace_ref = format!("refs/newgit/checkpoints/{id}");
         let store_ref = format!("refs/newgit/checkpoints/{}/{id}", branch.slug);
         GitSource::workspace_update_ref(&workspace, &workspace_ref, &tip)?;
-        let fetched = self.source.fetch_ref(&workspace, &workspace_ref, &store_ref);
+        let fetched = self
+            .source
+            .fetch_ref(&workspace, &workspace_ref, &store_ref);
         GitSource::workspace_delete_ref(&workspace, &workspace_ref)?;
         fetched?;
         self.bless_store_branch(branch, &head_rev, None, &mut warnings)?;
@@ -1072,7 +1461,11 @@ impl BranchManager {
                     .get(&definition.name)
                     .and_then(|binding| binding.content_rev.clone())
             } else {
-                Some(self.lane(&definition.name).capture(&workspace, definition)?.rev)
+                Some(
+                    self.lane(&definition.name)
+                        .capture(&workspace, definition)?
+                        .rev,
+                )
             };
             branch.trackers.insert(
                 definition.name.clone(),
@@ -1307,7 +1700,9 @@ impl BranchManager {
                 ));
             }
             let files = match &state.content_rev {
-                Some(rev) => self.lane(&definition.name).restore(&workspace, definition, rev)?,
+                Some(rev) => self
+                    .lane(&definition.name)
+                    .restore(&workspace, definition, rev)?,
                 None => {
                     clear_owned_paths(&workspace, definition)?;
                     0
@@ -1351,7 +1746,7 @@ impl BranchManager {
             }
 
             let (mut action_label, ok) =
-                self.restore_resource(&branch, definition, state, &mut failures)?;
+                self.restore_resource(&mut branch, definition, state, &mut failures)?;
             if let Some(binding) = branch.resources.get_mut(name) {
                 binding.status = if ok {
                     ResourceStatus::Ready
@@ -1411,9 +1806,12 @@ impl BranchManager {
         })
     }
 
+    /// `branch` is mutable because a recompute restore re-runs `prepare`,
+    /// which may `capture` a fresh handle — a restored resource must not
+    /// keep publishing the pre-undo one.
     fn restore_resource(
         &self,
-        branch: &BranchInstance,
+        branch: &mut BranchInstance,
         definition: &ResourceDefinition,
         state: &ResourceState,
         failures: &mut Vec<RestoreFailure>,
@@ -1435,7 +1833,8 @@ impl BranchManager {
                 let log = self
                     .store
                     .action_log_path(&branch.slug, &format!("{}.restore", definition.name));
-                let code = self.run_one_shot(branch, definition, action, &log)?;
+                let (code, captured) = self.run_one_shot(branch, definition, action, &log)?;
+                Self::apply_captures(branch, &definition.name, captured);
                 let ok = code == 0;
                 if !ok {
                     failures.push(RestoreFailure {
@@ -1506,8 +1905,13 @@ impl BranchManager {
             .action_log_path(&branch.slug, &format!("{}.{action_name}", definition.name));
         let command = self.rendered_command(branch, definition, action)?;
         let env = self.assemble_env(branch)?;
-        self.supervisor(branch)
-            .start(&definition.name, &command, &branch.workspace_path, &env, &log)?;
+        self.supervisor(branch).start(
+            &definition.name,
+            &command,
+            &branch.workspace_path,
+            &env,
+            &log,
+        )?;
         Ok(true)
     }
 

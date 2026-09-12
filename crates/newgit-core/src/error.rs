@@ -98,7 +98,9 @@ pub enum NewgitError {
     #[error("no checkpoints exist for `{0}`; create one with `newgit checkpoint {0}`")]
     NoCheckpoints(String),
 
-    #[error("no checkpoint `{id}` for `{instance}`; list them with `newgit checkpoints {instance}`")]
+    #[error(
+        "no checkpoint `{id}` for `{instance}`; list them with `newgit checkpoints {instance}`"
+    )]
     UnknownCheckpoint { instance: String, id: String },
 
     #[error(

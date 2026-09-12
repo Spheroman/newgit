@@ -122,9 +122,14 @@ impl GitSource {
 
     /// Resolve a ref to a commit, when it exists.
     pub fn ref_rev(&self, name: &str) -> Option<String> {
-        self.git(&["rev-parse", "--verify", "--quiet", &format!("{name}^{{commit}}")])
-            .ok()
-            .filter(|rev| !rev.is_empty())
+        self.git(&[
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("{name}^{{commit}}"),
+        ])
+        .ok()
+        .filter(|rev| !rev.is_empty())
     }
 
     pub fn is_ancestor(&self, ancestor: &str, descendant: &str) -> Result<bool> {
@@ -205,7 +210,11 @@ impl GitSource {
 
     /// Fetch a store ref into a workspace clone (undo may need objects the
     /// workspace has since discarded).
-    pub fn workspace_fetch_ref(workspace: &Utf8Path, from: &Utf8Path, remote_ref: &str) -> Result<()> {
+    pub fn workspace_fetch_ref(
+        workspace: &Utf8Path,
+        from: &Utf8Path,
+        remote_ref: &str,
+    ) -> Result<()> {
         run_git(&[
             "-C",
             workspace.as_str(),
@@ -243,6 +252,36 @@ impl GitSource {
         Ok(())
     }
 
+    /// Every path the workspace's Git tracks, workspace-relative. This is
+    /// what "the source content of this branch" means for export: tracked
+    /// files as they stand on disk, so uncommitted edits are included and
+    /// ignored junk never is.
+    pub fn workspace_tracked_files(workspace: &Utf8Path) -> Result<Vec<Utf8PathBuf>> {
+        let listing = run_git(&["-C", workspace.as_str(), "ls-files", "-z"])?;
+        Ok(listing
+            .split('\0')
+            .filter(|entry| !entry.is_empty())
+            .map(Utf8PathBuf::from)
+            .collect())
+    }
+
+    /// Turn a directory of already-placed files into an ordinary Git
+    /// repository with one commit on `branch`. Returns the commit.
+    ///
+    /// One commit, never a history rewrite: exporting the workspace's Git
+    /// history would carry every file any past commit contained, which is
+    /// exactly the content the audience filter just excluded.
+    pub fn init_export_repo(destination: &Utf8Path, branch: &str, message: &str) -> Result<String> {
+        let dest = destination.as_str();
+        run_git(&["init", "--quiet", "-b", branch, "--", dest])?;
+        run_git(&["-C", dest, "add", "-A"])?;
+        run_git_env(
+            &["-C", dest, "commit", "--quiet", "-m", message],
+            &export_identity(destination),
+        )?;
+        run_git(&["-C", dest, "rev-parse", "HEAD"])
+    }
+
     fn git(&self, args: &[&str]) -> Result<String> {
         let mut full: Vec<&str> = vec!["-C", self.root.as_str()];
         full.extend_from_slice(args);
@@ -268,6 +307,24 @@ pub fn find_repo_root(start: &Utf8Path) -> Option<(Utf8PathBuf, SourceSubstrate)
 
 fn run_git(args: &[&str]) -> Result<String> {
     run_git_env(args, &[])
+}
+
+/// The user's own Git identity when they have one, so an exported repo looks
+/// like their work; a newgit identity only where Git would otherwise refuse
+/// to commit at all.
+fn export_identity(destination: &Utf8Path) -> Vec<(String, String)> {
+    if run_git(&["-C", destination.as_str(), "var", "GIT_COMMITTER_IDENT"]).is_ok() {
+        return Vec::new();
+    }
+    ["AUTHOR", "COMMITTER"]
+        .iter()
+        .flat_map(|role| {
+            [
+                (format!("GIT_{role}_NAME"), "newgit".to_owned()),
+                (format!("GIT_{role}_EMAIL"), "newgit@localhost".to_owned()),
+            ]
+        })
+        .collect()
 }
 
 fn run_git_env(args: &[&str], env: &[(String, String)]) -> Result<String> {

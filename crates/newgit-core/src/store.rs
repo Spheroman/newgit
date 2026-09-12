@@ -234,6 +234,21 @@ impl MetadataStore {
         self.paths.checkpoints.join(slug)
     }
 
+    /// Every slug with a checkpoint directory, including instances whose
+    /// binding record has been archived. Checkpoints outlive removal, so
+    /// snapshot pruning has to consult all of them, not just live records.
+    pub fn checkpointed_slugs(&self) -> Result<Vec<String>> {
+        Ok(read_subdirs_sorted(&self.paths.checkpoints)?
+            .iter()
+            .filter_map(|dir| dir.file_name().map(ToOwned::to_owned))
+            .collect())
+    }
+
+    /// Per-instance runtime state directories that exist on disk.
+    pub fn state_dirs(&self) -> Result<Vec<Utf8PathBuf>> {
+        read_subdirs_sorted(&self.paths.state)
+    }
+
     /// Timestamped log path for one action run.
     pub fn action_log_path(&self, slug: &str, label: &str) -> Utf8PathBuf {
         let now = Utc::now();
@@ -384,6 +399,27 @@ where
         source,
     })?;
     std::fs::write(path, contents).map_err(|source| NewgitError::io(path, source))
+}
+
+/// Immediate subdirectories, sorted. The dir-shaped counterpart to
+/// [`read_dir_sorted`], for walking per-instance checkpoint dirs and lane
+/// rev dirs.
+pub(crate) fn read_subdirs_sorted(path: &Utf8Path) -> Result<Vec<Utf8PathBuf>> {
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+
+    let mut entries = Vec::new();
+    for entry in std::fs::read_dir(path).map_err(|source| NewgitError::io(path, source))? {
+        let entry = entry.map_err(|source| NewgitError::io(path, source))?;
+        let path = Utf8PathBuf::from_path_buf(entry.path())
+            .map_err(|path| NewgitError::NonUtf8Path(path.display().to_string()))?;
+        if path.is_dir() {
+            entries.push(path);
+        }
+    }
+    entries.sort();
+    Ok(entries)
 }
 
 pub(crate) fn read_dir_sorted(path: &Utf8Path) -> Result<Vec<Utf8PathBuf>> {

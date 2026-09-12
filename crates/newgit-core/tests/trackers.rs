@@ -341,3 +341,105 @@ fn disjoint_lanes_and_empty_pull_are_enforced() {
         Err(NewgitError::Unsupported(_))
     ));
 }
+
+/// M6's SQLite case. The claim is that it needs no special support: a
+/// database that is just a file on disk is a tracker, and binary content has
+/// to survive capture and restore byte-for-byte.
+#[test]
+fn a_binary_database_file_round_trips_through_a_plain_file_tracker() {
+    let (_guard, temp) = tempdir();
+    let store = setup(&temp);
+    let repo = store.paths().project_root.clone();
+    let m = manager(store);
+    m.create_tracker("dev-db", "project-devs", Storage::Local, false)
+        .expect("create");
+    m.track_paths("dev-db", &[Utf8PathBuf::from("data/dev.sqlite")])
+        .expect("track");
+
+    let m = manager(MetadataStore::at(repo));
+    let spawned = m.spawn("feature-a", None).expect("spawn");
+    let db = spawned.branch.workspace_path.join("data/dev.sqlite");
+    std::fs::create_dir_all(db.parent().expect("parent")).expect("mkdir");
+
+    // A SQLite header, a NUL-heavy page, and a high byte: nothing here
+    // survives being treated as text.
+    let mut original = b"SQLite format 3\0".to_vec();
+    original.extend(std::iter::repeat_n(0u8, 200));
+    original.extend([0xff, 0x00, 0x80, b'r', b'o', b'w']);
+    std::fs::write(&db, &original).expect("write db");
+
+    m.capture_tracker("feature-a", "dev-db").expect("capture");
+    let checkpoint = m
+        .checkpoint("feature-a", Some("seeded"))
+        .expect("checkpoint");
+
+    // The agent corrupts the database, as agents do.
+    std::fs::write(&db, b"truncated garbage").expect("clobber");
+    m.undo("feature-a", Some(&checkpoint.record.id))
+        .expect("undo");
+
+    assert_eq!(
+        std::fs::read(&db).expect("read db"),
+        original,
+        "a binary database must come back byte-for-byte"
+    );
+
+    // And a later instance projects the merged lane content the same way.
+    m.merge_tracker("feature-a", "dev-db").expect("merge");
+    let later = m.spawn("feature-b", None).expect("spawn b");
+    assert_eq!(
+        std::fs::read(later.branch.workspace_path.join("data/dev.sqlite")).expect("read"),
+        original
+    );
+}
+
+/// Tracker-owned content must be invisible to the workspace's Git even when
+/// the store's `.gitignore` edit has not been committed yet — otherwise an
+/// agent running `git add -A` commits a lane's content into source history,
+/// which is exactly what audience is supposed to prevent by construction.
+#[test]
+fn tracker_paths_are_ignored_in_a_workspace_before_gitignore_is_committed() {
+    let (_guard, temp) = tempdir();
+    let store = setup(&temp);
+    let repo = store.paths().project_root.clone();
+    let m = manager(store);
+    m.create_tracker("runtime-env", "user", Storage::Local, false)
+        .expect("create");
+    m.track_paths("runtime-env", &[Utf8PathBuf::from(".env.local")])
+        .expect("track");
+    m.create_tracker("generated-sdk", "public", Storage::Local, false)
+        .expect("create");
+    m.track_paths("generated-sdk", &[Utf8PathBuf::from("src/generated")])
+        .expect("track");
+
+    // Deliberately do NOT commit the store's .gitignore: this is the state a
+    // user is in immediately after `newgit tracker track`.
+    let m = manager(MetadataStore::at(repo));
+    let spawned = m.spawn("feature-a", None).expect("spawn");
+    let workspace = spawned.branch.workspace_path.clone();
+
+    std::fs::write(workspace.join(".env.local"), "SECRET=hunter2\n").expect("write");
+    std::fs::create_dir_all(workspace.join("src/generated")).expect("mkdir");
+    std::fs::write(workspace.join("src/generated/api.ts"), "export {};\n").expect("write");
+
+    let status = Command::new("git")
+        .args(["-C", workspace.as_str(), "status", "--porcelain"])
+        .output()
+        .expect("git status");
+    let porcelain = String::from_utf8_lossy(&status.stdout);
+    assert!(
+        porcelain.trim().is_empty(),
+        "tracker-owned content must not appear in git status, got: {porcelain}"
+    );
+
+    // The strong form: even `git add -A` cannot pick it up.
+    git(&workspace, &["add", "-A"]);
+    let staged = Command::new("git")
+        .args(["-C", workspace.as_str(), "diff", "--cached", "--name-only"])
+        .output()
+        .expect("git diff");
+    assert!(
+        String::from_utf8_lossy(&staged.stdout).trim().is_empty(),
+        "a lane's content must not be stageable into source history"
+    );
+}

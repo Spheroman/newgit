@@ -377,3 +377,107 @@ fn unknown_action_and_bad_spec_error_cleanly() {
         Err(NewgitError::Unsupported(_))
     ));
 }
+
+/// Every shipped template has to survive the trip through the parser and the
+/// dependency graph, or `newgit resource add` hands the user a project that
+/// will not open. This is the "model a normal web app without writing TOML
+/// from scratch" claim, checked.
+#[test]
+fn every_template_loads_after_being_added() {
+    let (_guard, temp) = tempdir();
+    let store = setup(&temp);
+    let repo = store.paths().project_root.clone();
+
+    for template in newgit_core::templates::RESOURCE_TEMPLATES {
+        let manager = BranchManager::open(MetadataStore::at(repo.clone())).expect("reopen");
+        manager
+            .add_resource(template.name, template.name)
+            .unwrap_or_else(|error| panic!("add `{}`: {error}", template.name));
+    }
+
+    // One project holding all of them still opens: definitions parse, every
+    // `depends_on` resolves, and no two lanes claim the same path.
+    let manager = BranchManager::open(MetadataStore::at(repo)).expect("open with all templates");
+    let names: Vec<&str> = manager
+        .resource_definitions()
+        .iter()
+        .map(|definition| definition.name.as_str())
+        .collect();
+    for template in newgit_core::templates::RESOURCE_TEMPLATES {
+        assert!(
+            names.contains(&template.name),
+            "{} is missing",
+            template.name
+        );
+    }
+}
+
+#[test]
+fn the_command_snapshot_template_brings_its_deposit_lane() {
+    let (_guard, temp) = tempdir();
+    let store = setup(&temp);
+    let repo = store.paths().project_root.clone();
+    let manager = BranchManager::open(MetadataStore::at(repo.clone())).expect("manager");
+
+    let outcome = manager
+        .add_resource("postgres-db", "command-snapshot")
+        .expect("add");
+    assert_eq!(outcome.trackers_created.len(), 1);
+    assert!(
+        outcome.trackers_created[0]
+            .as_str()
+            .ends_with("db-snapshots.toml"),
+        "a template that deposits must create the lane it deposits into"
+    );
+
+    // The lane exists as a deposit-only tracker: no owned workspace paths.
+    let manager = BranchManager::open(MetadataStore::at(repo)).expect("reopen");
+    let lane = manager
+        .tracker_definitions()
+        .iter()
+        .find(|definition| definition.name == "db-snapshots")
+        .expect("db-snapshots defined");
+    assert!(lane.paths.is_empty());
+    assert_eq!(lane.audience, "project-devs");
+
+    // Adding a second database resource reuses the existing lane.
+    let again = manager
+        .add_resource("other-db", "command-snapshot")
+        .expect("add again");
+    assert!(again.trackers_created.is_empty());
+}
+
+#[test]
+fn captures_publish_a_handle_into_the_binding_and_the_command_env() {
+    let (_guard, temp) = tempdir();
+    let store = setup(&temp);
+    // KEY=VALUE lines, the other accepted capture shape.
+    write_resource(
+        &store,
+        "preview",
+        r#"kind = "external"
+ownership = "external"
+
+[actions.prepare]
+command = "echo PREVIEW_URL=https://pv9.example"
+captures = ["PREVIEW_URL"]
+"#,
+    );
+    let repo = store.paths().project_root.clone();
+    let manager = BranchManager::open(MetadataStore::at(repo)).expect("manager");
+
+    let spawned = manager.spawn("feature-a", None).expect("spawn");
+    assert_eq!(
+        spawned.branch.resources["preview"].resolved_exports["PREVIEW_URL"],
+        "https://pv9.example"
+    );
+
+    // Persisted on the binding record, and layered into the command env.
+    let reloaded = manager.store().find_branch("feature-a").expect("reload");
+    assert_eq!(
+        reloaded.resources["preview"].resolved_exports["PREVIEW_URL"],
+        "https://pv9.example"
+    );
+    let env = manager.assemble_env(&reloaded).expect("env");
+    assert!(env.contains(&("PREVIEW_URL".to_owned(), "https://pv9.example".to_owned())));
+}

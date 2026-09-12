@@ -96,7 +96,11 @@ fn checkpoint_and_undo_restore_source_trackers_and_dirty_state() {
         .expect("track");
     let m = manager(m.store().clone());
 
-    let ws = m.spawn("feature-a", None).expect("spawn").branch.workspace_path;
+    let ws = m
+        .spawn("feature-a", None)
+        .expect("spawn")
+        .branch
+        .workspace_path;
 
     // Committed work, tracker content, and dirty state on top.
     std::fs::write(ws.join("src.txt"), "code\n").expect("write");
@@ -111,11 +115,17 @@ fn checkpoint_and_undo_restore_source_trackers_and_dirty_state() {
         .checkpoint("feature-a", Some("good state"))
         .expect("checkpoint");
     assert_eq!(outcome.record.source.head_rev, good_head);
-    assert!(outcome.record.source.dirty_rev.is_some(), "worktree was dirty");
+    assert!(
+        outcome.record.source.dirty_rev.is_some(),
+        "worktree was dirty"
+    );
     assert!(outcome.record.tracker_states[0].content_rev.is_some());
     // The store branch was blessed to the workspace head.
     let repo = m.store().paths().project_root.clone();
-    assert_eq!(git_stdout(&repo, &["rev-parse", "refs/heads/feature-a"]), good_head);
+    assert_eq!(
+        git_stdout(&repo, &["rev-parse", "refs/heads/feature-a"]),
+        good_head
+    );
 
     // The agent makes a mess: garbage commit, deleted file, mangled content.
     std::fs::write(ws.join("junk.txt"), "junk\n").expect("write");
@@ -137,7 +147,10 @@ fn checkpoint_and_undo_restore_source_trackers_and_dirty_state() {
     assert!(!ws.join("junk.txt").exists(), "junk commit is gone");
     // The dirty state is uncommitted again, not baked into a commit.
     let status = git_stdout(&ws, &["status", "--porcelain"]);
-    assert!(status.contains("README.md"), "README shows as modified: {status}");
+    assert!(
+        status.contains("README.md"),
+        "README shows as modified: {status}"
+    );
     // The workspace marker survived restore (it is self-ignored).
     assert!(ws.join(".newgit/local/instance.toml").is_file());
 
@@ -155,7 +168,11 @@ fn undo_to_targets_an_older_checkpoint() {
     let (_guard, temp) = tempdir();
     let store = setup(&temp);
     let m = manager(store);
-    let ws = m.spawn("feature-b", None).expect("spawn").branch.workspace_path;
+    let ws = m
+        .spawn("feature-b", None)
+        .expect("spawn")
+        .branch
+        .workspace_path;
 
     std::fs::write(ws.join("README.md"), "version one\n").expect("write");
     git(&ws, &["commit", "-qam", "v1"]);
@@ -165,7 +182,8 @@ fn undo_to_targets_an_older_checkpoint() {
     git(&ws, &["commit", "-qam", "v2"]);
     m.checkpoint("feature-b", Some("v2")).expect("checkpoint");
 
-    m.undo("feature-b", Some(&first.record.id)).expect("undo --to");
+    m.undo("feature-b", Some(&first.record.id))
+        .expect("undo --to");
     assert_eq!(read(&ws.join("README.md")), "version one\n");
 
     assert!(matches!(
@@ -197,13 +215,22 @@ fn recompute_restore_reruns_prepare_and_hash_is_recorded() {
     let store = setup(&temp);
     write_resource(&store, "deps", HASH_RECOMPUTE_RESOURCE);
     let m = manager(store);
-    let ws = m.spawn("feature-c", None).expect("spawn").branch.workspace_path;
+    let ws = m
+        .spawn("feature-c", None)
+        .expect("spawn")
+        .branch
+        .workspace_path;
     assert_eq!(read(&ws.join("prep-runs.txt")).lines().count(), 1);
 
     let outcome = m.checkpoint("feature-c", None).expect("checkpoint");
     let state = &outcome.record.resource_states[0];
     assert_eq!(state.mode, "hash");
-    assert!(state.state_ref.as_deref().is_some_and(|r| r.starts_with("hash:")));
+    assert!(
+        state
+            .state_ref
+            .as_deref()
+            .is_some_and(|r| r.starts_with("hash:"))
+    );
 
     let undo = m.undo("feature-c", None).expect("undo");
     assert_eq!(undo.resources[0].action, "recompute(prepare)");
@@ -236,7 +263,11 @@ fn into_tracker_deposits_into_lane_and_restore_reads_it_back() {
     m.create_tracker("db-snapshots", "project-devs", Storage::Local, false)
         .expect("create tracker");
     let m = manager(m.store().clone());
-    let ws = m.spawn("feature-d", None).expect("spawn").branch.workspace_path;
+    let ws = m
+        .spawn("feature-d", None)
+        .expect("spawn")
+        .branch
+        .workspace_path;
 
     let outcome = m.checkpoint("feature-d", None).expect("checkpoint");
     let state = &outcome.record.resource_states[0];
@@ -282,20 +313,35 @@ fn failed_restore_writes_recovery_record_and_restores_the_rest() {
     write_resource(&store, "bad", BAD_RESTORE_RESOURCE);
     write_resource(&store, "deps", HASH_RECOMPUTE_RESOURCE);
     let m = manager(store);
-    let ws = m.spawn("feature-e", None).expect("spawn").branch.workspace_path;
+    let ws = m
+        .spawn("feature-e", None)
+        .expect("spawn")
+        .branch
+        .workspace_path;
 
     m.checkpoint("feature-e", None).expect("checkpoint");
     let undo = m.undo("feature-e", None).expect("undo");
 
-    let bad = undo.resources.iter().find(|r| r.name == "bad").expect("bad");
+    let bad = undo
+        .resources
+        .iter()
+        .find(|r| r.name == "bad")
+        .expect("bad");
     assert!(!bad.ok);
-    let deps = undo.resources.iter().find(|r| r.name == "deps").expect("deps");
+    let deps = undo
+        .resources
+        .iter()
+        .find(|r| r.name == "deps")
+        .expect("deps");
     assert!(deps.ok, "other resources still restored");
     assert_eq!(read(&ws.join("prep-runs.txt")).lines().count(), 2);
 
     let recovery = undo.recovery_record.expect("recovery record");
     let contents = read(&recovery);
-    assert!(contents.contains("bad"), "recovery names the resource: {contents}");
+    assert!(
+        contents.contains("bad"),
+        "recovery names the resource: {contents}"
+    );
     assert!(contents.contains("exited with 3"));
 
     let report = m
@@ -304,12 +350,7 @@ fn failed_restore_writes_recovery_record_and_restores_the_rest() {
         .into_iter()
         .find(|r| r.branch.name == "feature-e")
         .expect("report");
-    let bad_state = &report
-        .branch
-        .resources
-        .get("bad")
-        .expect("binding")
-        .status;
+    let bad_state = &report.branch.resources.get("bad").expect("binding").status;
     assert_eq!(*bad_state, ResourceStatus::Failed);
 }
 
@@ -361,14 +402,17 @@ fn identical_checkpoints_dedupe_lane_revs() {
     m.track_paths("runtime-env", &[Utf8PathBuf::from(".env.local")])
         .expect("track");
     let m = manager(m.store().clone());
-    let ws = m.spawn("feature-g", None).expect("spawn").branch.workspace_path;
+    let ws = m
+        .spawn("feature-g", None)
+        .expect("spawn")
+        .branch
+        .workspace_path;
     std::fs::write(ws.join(".env.local"), "SECRET=1\n").expect("write");
 
     let first = m.checkpoint("feature-g", None).expect("checkpoint");
     let second = m.checkpoint("feature-g", None).expect("checkpoint");
     assert_eq!(
-        first.record.tracker_states[0].content_rev,
-        second.record.tracker_states[0].content_rev,
+        first.record.tracker_states[0].content_rev, second.record.tracker_states[0].content_rev,
         "identical content dedupes to the same lane rev"
     );
     assert_ne!(first.record.id, second.record.id);

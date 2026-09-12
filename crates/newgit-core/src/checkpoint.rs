@@ -169,7 +169,9 @@ impl CheckpointLog {
 
     pub fn save_recovery(&self, record: &RecoveryRecord) -> Result<Utf8PathBuf> {
         create_dir_all(&self.dir)?;
-        let path = self.dir.join(format!("{}.recovery.toml", record.checkpoint));
+        let path = self
+            .dir
+            .join(format!("{}.recovery.toml", record.checkpoint));
         write_toml_at(
             &path,
             &format!("recovery record for `{}`", record.checkpoint),

@@ -51,6 +51,39 @@ pub fn workspace_marker_path(workspace: &Utf8Path) -> Utf8PathBuf {
     workspace.join(".newgit/local/instance.toml")
 }
 
+/// Keep tracker-owned paths out of the workspace clone's Git by writing them
+/// to `.git/info/exclude`.
+///
+/// `newgit tracker track` appends to the store's `.gitignore`, but that edit
+/// is uncommitted until the user commits it — so a clone would not inherit
+/// the rule, and a lane's content would sit in the workspace as ordinary
+/// untracked files that `git add -A` sweeps into source history. Audience
+/// only keeps content out of Git *by construction* if the construction
+/// reaches every workspace.
+///
+/// `info/exclude` rather than the workspace's `.gitignore`: the latter is
+/// tracked content owned by source, and newgit does not rewrite the user's
+/// committed files. This is Git's own per-clone local-ignore mechanism, and
+/// there is no plumbing command that writes it.
+pub fn exclude_tracker_paths(workspace: &Utf8Path, paths: &[Utf8PathBuf]) -> Result<()> {
+    if paths.is_empty() {
+        return Ok(());
+    }
+    let exclude = workspace.join(".git/info/exclude");
+    if let Some(parent) = exclude.parent() {
+        create_dir_all(parent)?;
+    }
+    let mut contents = std::fs::read_to_string(&exclude).unwrap_or_default();
+    if !contents.is_empty() && !contents.ends_with('\n') {
+        contents.push('\n');
+    }
+    contents.push_str("\n# newgit: tracker-owned paths — these lanes own this content\n");
+    for path in paths {
+        contents.push_str(&format!("/{path}\n"));
+    }
+    std::fs::write(&exclude, contents).map_err(|source| NewgitError::io(exclude, source))
+}
+
 fn write_workspace_marker(store_root: &Utf8Path, branch: &BranchInstance) -> Result<()> {
     let marker = WorkspaceMarker {
         branch: branch.name.clone(),

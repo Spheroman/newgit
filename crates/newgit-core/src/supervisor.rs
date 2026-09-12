@@ -112,6 +112,30 @@ impl Supervisor {
         Ok(StopOutcome::StillRunning(pid))
     }
 
+    /// Remove PID files whose process group is gone — a process that died
+    /// on its own, or outlived a reboot. Returns what was removed, or what
+    /// would be under `dry_run`.
+    pub fn prune_dead_pids(&self, dry_run: bool) -> Result<Vec<Utf8PathBuf>> {
+        let mut removed = Vec::new();
+        for path in crate::store::read_dir_sorted(&self.state_dir)? {
+            if path.extension() != Some("pid") {
+                continue;
+            }
+            let alive = std::fs::read_to_string(&path)
+                .ok()
+                .and_then(|text| text.trim().parse::<u32>().ok())
+                .is_some_and(group_alive);
+            if alive {
+                continue;
+            }
+            if !dry_run {
+                std::fs::remove_file(&path).map_err(|source| NewgitError::io(&path, source))?;
+            }
+            removed.push(path);
+        }
+        Ok(removed)
+    }
+
     fn pid_path(&self, resource: &str) -> Utf8PathBuf {
         self.state_dir.join(format!("{resource}.pid"))
     }
