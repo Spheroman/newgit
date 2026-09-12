@@ -4,6 +4,13 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+description = "Branch-bound tracker and resource orchestration for parallel agent development"
+keywords = ["vcs", "git", "workspace", "agents", "orchestration"]
+categories = ["development-tools", "command-line-utilities"]
+readme = "../../README.md"
 
 [[bin]]
 name = "newgit"

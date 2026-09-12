@@ -14,9 +14,13 @@ use newgit_core::templates::RESOURCE_TEMPLATES;
 use newgit_core::tracker::Storage;
 use newgit_core::{MetadataStore, ProjectConfig};
 
+/// `0.1.0 (a1b2c3d4e5f6)` — the release plus the commit it was built from.
+const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), " (", env!("NEWGIT_BUILD"), ")");
+
 #[derive(Debug, Parser)]
 #[command(name = "newgit")]
 #[command(about = "Branch-bound resource orchestration for agentic workflows")]
+#[command(version = VERSION)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -230,6 +234,25 @@ fn init(args: InitArgs) -> Result<()> {
     println!("  project:    {project_name}");
     println!("  source:     {}", source_label(&config));
     println!("  workspaces: {}/", config.workspace_root(&repo_root));
+
+    // Adopting newgit in a real project means knowing which half of
+    // `.newgit/` belongs in Git. Definitions are the control plane and should
+    // be shared; concrete state is local and is already gitignored. Guessing
+    // wrong in either direction is bad — uncommitted definitions mean
+    // teammates and CI see nothing, and committed state means branch
+    // bindings and captured content in source history.
+    println!("\nCommit these — they describe how the project is orchestrated:");
+    println!("  .newgit/config.toml   .newgit/.gitignore");
+    println!("  .newgit/trackers/     .newgit/resources/   (as you create them)");
+    println!(
+        "Everything else under .newgit/ is local state and is already ignored: branches/, \
+         snapshots/, checkpoints/, logs/, state/, local/."
+    );
+    println!("\nNext: newgit tracker create <name> [--audience user]");
+    println!(
+        "      newgit resource add <name> --template <template>   (newgit resource templates)"
+    );
+    println!("      newgit spawn <branch>");
     Ok(())
 }
 

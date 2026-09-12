@@ -1,0 +1,101 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  # A failed build should not also cost a debuginfo write; tests do not read it.
+  CARGO_PROFILE_TEST_DEBUG: 0
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    # newgit drives real `git`, spawns real process groups, and binds real
+    # ports, so its tests are integration tests by nature. They have to run
+    # on both platforms it claims to support — a unit-test-only CI would
+    # prove almost nothing about this codebase.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Identify git
+        # The suite makes real commits; a runner with no identity configured
+        # fails in a way that looks like a newgit bug.
+        run: |
+          git config --global user.name "newgit ci"
+          git config --global user.email "ci@newgit.invalid"
+          git config --global init.defaultBranch main
+          git --version
+
+      - name: Format
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test --workspace --all-targets
+
+      - name: Release build
+        run: cargo build --release --locked
+
+      - name: Smoke test the release binary
+        # Proves the artifact users install actually runs, which a debug-only
+        # test run does not: the release profile strips symbols and the
+        # binary has to work from a clean project.
+        shell: bash
+        run: |
+          set -euo pipefail
+          BIN="$PWD/target/release/newgit"
+          "$BIN" --version
+          WORK="$(mktemp -d)"
+          cd "$WORK"
+          git init -q -b main .
+          echo hello > README.md
+          git add -A
+          git commit -qm "initial"
+          "$BIN" init
+          "$BIN" tracker create runtime-env --audience user
+          "$BIN" tracker track runtime-env .env.local
+          "$BIN" spawn ci-check
+          echo "SECRET=ci" > "$("$BIN" status ci-check | tail -1 | awk '{print $NF}')/.env.local"
+          "$BIN" checkpoint ci-check -m "smoke"
+          "$BIN" undo ci-check
+          "$BIN" export ci-check --to "$WORK/exported"
+          test ! -e "$WORK/exported/.env.local"  # audience filter held
+          "$BIN" remove ci-check
+          "$BIN" cleanup
+
+  minimum-rust:
+    name: minimum supported Rust
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Read rust-version from the workspace manifest
+        id: msrv
+        # Single source of truth: the manifest already declares it, so CI
+        # must not carry a second copy that can drift.
+        run: |
+          version="$(grep -m1 '^rust-version' Cargo.toml | cut -d'"' -f2)"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "MSRV: $version"
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.msrv.outputs.version }}
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --workspace --all-targets --locked

@@ -1,0 +1,137 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  # Dry runs: builds and uploads artifacts to the workflow run, but publishes
+  # no release. The first time you need this workflow to work is the worst
+  # time to find out it does not.
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-latest
+          - target: x86_64-apple-darwin
+            os: macos-latest
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04-arm
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build
+        # The tag is the release identity, so stamp it in rather than letting
+        # build.rs guess from a shallow checkout.
+        env:
+          NEWGIT_BUILD: ${{ github.ref_type == 'tag' && github.ref_name || github.sha }}
+        run: cargo build --release --locked --target ${{ matrix.target }} -p newgit-cli
+
+      - name: Package
+        id: package
+        shell: bash
+        run: |
+          set -euo pipefail
+          name="newgit-${{ matrix.target }}"
+          staging="$(mktemp -d)/$name"
+          mkdir -p "$staging"
+          cp "target/${{ matrix.target }}/release/newgit" "$staging/"
+          cp README.md LICENSE-MIT LICENSE-APACHE "$staging/"
+          tar -czf "$name.tar.gz" -C "$(dirname "$staging")" "$name"
+          # Checksums are generated next to the archive so a user can verify
+          # a download without trusting the release page's rendering.
+          if command -v shasum >/dev/null; then
+            shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256"
+          else
+            sha256sum "$name.tar.gz" > "$name.tar.gz.sha256"
+          fi
+          echo "archive=$name.tar.gz" >> "$GITHUB_OUTPUT"
+
+      - name: Verify the packaged binary runs
+        # Skipped when cross-architecture: this runner cannot execute it.
+        if: matrix.target != 'aarch64-unknown-linux-gnu' || runner.arch == 'ARM64'
+        run: ./target/${{ matrix.target }}/release/newgit --version
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.package.outputs.archive }}
+          path: |
+            ${{ steps.package.outputs.archive }}
+            ${{ steps.package.outputs.archive }}.sha256
+          if-no-files-found: error
+
+  publish:
+    name: publish release
+    needs: build
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Check the tag matches the manifest version
+        # A release whose binary reports a different version than its tag is
+        # a support problem forever; refuse before publishing, not after.
+        run: |
+          set -euo pipefail
+          manifest="$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)"
+          tag="${GITHUB_REF_NAME#v}"
+          if [ "$manifest" != "$tag" ]; then
+            echo "tag v$tag does not match Cargo.toml version $manifest" >&2
+            exit 1
+          fi
+          echo "version $manifest matches tag $GITHUB_REF_NAME"
+
+      - name: Extract release notes
+        # awk rather than sed: `\?` is a GNU extension that silently matches
+        # nothing on BSD sed, and release notes failing open to empty is the
+        # kind of bug you only notice after publishing.
+        run: |
+          set -euo pipefail
+          awk -v ver="${GITHUB_REF_NAME#v}" '
+            $0 ~ "^## \\[?" ver { inside=1; next }
+            inside && /^## / { exit }
+            inside { print }
+          ' CHANGELOG.md > release-notes.md
+          if [ ! -s release-notes.md ]; then
+            echo "CHANGELOG.md has no section for ${GITHUB_REF_NAME}" >&2
+            exit 1
+          fi
+          echo "--- notes ---"
+          cat release-notes.md
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release create "$GITHUB_REF_NAME" \
+            --title "$GITHUB_REF_NAME" \
+            --notes-file release-notes.md \
+            --verify-tag \
+            artifacts/*

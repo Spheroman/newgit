@@ -16,3 +16,21 @@ run = "cargo test --workspace --all-targets"
 [tasks.clippy]
 description = "Run Clippy with warnings denied"
 run = "cargo clippy --workspace --all-targets -- -D warnings"
+
+[tasks.fmt-check]
+description = "Verify formatting without rewriting files"
+run = "cargo fmt --all --check"
+
+# Depends on fmt-check, not fmt: a gate that silently reformats your tree is
+# not the same gate CI runs.
+[tasks.ci]
+description = "Everything CI runs, in the same order"
+depends = ["fmt-check", "clippy", "test"]
+
+[tasks.build-release]
+description = "Build the release binary"
+run = "cargo build --release --locked -p newgit-cli"
+
+[tasks.install]
+description = "Install the newgit binary into ~/.cargo/bin"
+run = "cargo install --path crates/newgit-cli --locked"

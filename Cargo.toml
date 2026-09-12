@@ -10,6 +10,9 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.96.1"
 license = "MIT OR Apache-2.0"
+repository = "https://github.com/Spheroman/newgit"
+homepage = "https://github.com/Spheroman/newgit"
+authors = ["Jack Wen"]
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
@@ -18,3 +21,10 @@ unsafe_code = "forbid"
 dbg_macro = "warn"
 todo = "warn"
 unwrap_used = "warn"
+
+# Release binaries are what people actually install, and newgit sits in the
+# inner loop of every command an agent runs — startup cost is felt.
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
