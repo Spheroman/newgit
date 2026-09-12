@@ -38,7 +38,10 @@ enum Command {
         name: Option<String>,
     },
     /// Delete an instance's workspace and archive its binding record
-    Remove { name: String },
+    Remove {
+        /// Instance to remove; its source branch is kept
+        name: String,
+    },
     /// Manage tracker definitions and content
     Tracker {
         #[command(subcommand)]
@@ -174,13 +177,13 @@ struct ExportArgs {
     /// Instance (inferred when run inside a workspace)
     instance: Option<String>,
     /// Destination directory; must be empty or nonexistent
-    #[arg(long)]
+    #[arg(long, value_name = "DIR")]
     to: Utf8PathBuf,
-    /// Workspace-relative path to include regardless of tracker audience
-    #[arg(long = "include")]
+    /// Include this path regardless of tracker audience; repeatable
+    #[arg(long = "include", value_name = "PATH")]
     includes: Vec<Utf8PathBuf>,
-    /// Workspace-relative path to leave out, whatever its origin
-    #[arg(long = "exclude")]
+    /// Leave this path out whatever its origin; repeatable, and wins over --include
+    #[arg(long = "exclude", value_name = "PATH")]
     excludes: Vec<Utf8PathBuf>,
 }
 
@@ -766,10 +769,18 @@ fn export(args: ExportArgs) -> Result<()> {
     let width = column_width(plan.trackers.iter().map(|t| t.name.len()), "");
     for tracker in &plan.trackers {
         if tracker.included > 0 {
+            // Why a lane shipped matters more than that it did. A non-public
+            // lane can only be here because a flag overrode its audience,
+            // and printing the bare audience next to "included" reads as if
+            // that audience permitted it.
+            let why = if tracker.is_public() {
+                format!("audience {}", tracker.audience)
+            } else {
+                format!("--include overrode audience {}", tracker.audience)
+            };
             println!(
-                "  tracker:  {:<width$}  included ({}, {})",
+                "  tracker:  {:<width$}  included ({why}, {})",
                 tracker.name,
-                tracker.audience,
                 files_label(tracker.included),
             );
         }
