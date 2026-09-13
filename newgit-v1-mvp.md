@@ -500,9 +500,6 @@ with no separate ledger to drift.
 
 ### Render
 
-*Specified, not yet built — see Milestone 8. Every other section of this
-document describes shipped code.*
-
 Ports and exports reach a command two ways: `{{ports.x}}` in its command line
 and an env var in `newgit run`. Both assume the tool takes the value on argv
 or from the environment. Most tools do not. Supabase reads its ports from
@@ -633,8 +630,13 @@ Four places that value must not escape to:
   template cannot be run backwards at all. The inverse needs the same
   guarantee in the other direction — the rendered value must be unique in the
   file too — checked at bind, so the failure surfaces then and not at capture.
-- **Source checkpoint** needs nothing extra: `--skip-worktree` keeps the
-  change uncommitted, so it never reaches the store.
+- **A checkpoint's uncommitted-state capture.** This one looks like it needs
+  nothing — `--skip-worktree` keeps the change uncommitted, so a checkpoint of
+  *committed* state never sees it. But `workspace_dirty_commit` builds its
+  tree in a throwaway `GIT_INDEX_FILE` seeded from `read-tree HEAD`, and a
+  fresh index does not carry the real index's skip-worktree bits. Without
+  re-setting them there, `git add -A` sweeps the rendered ports into the
+  checkpoint. The one place skip-worktree does not protect on its own.
 
 #### What it costs, and saying so
 
@@ -1943,9 +1945,6 @@ Success criterion:
 > A branch instance can produce a clean ordinary Git branch/repo as an output artifact.
 
 ### Milestone 8: Render
-
-The one milestone specified but not yet built. Everything above this line
-describes shipped code; *Render* describes code to write.
 
 - `[[render]]` on resource definitions: literal `find`/`with` substitution
   into a committed path, run at bind before `prepare` and before a

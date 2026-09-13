@@ -8,6 +8,49 @@ of `.newgit/` in a minor release — see *Upgrading* below.
 
 ### Added
 
+- `[[render]]` on a resource substitutes per-instance values into a file the
+  project commits ([#10](https://github.com/Spheroman/newgit/issues/10)).
+
+  `[ports]` reached commands as `{{ports.x}}` and as an env var, which assumes
+  the tool takes its port on argv. Most do not: Supabase reads
+  `supabase/config.toml`, Expo reads `.env`, Compose reads `compose.yaml`.
+  Everyone who hit this wrote the same section-aware config rewriter inside
+  their `prepare` hook.
+
+  ```toml
+  [[render]]
+  path = "supabase/config.toml"
+  replace = [
+    { find = 'project_id = "faretable"', with = 'project_id = "faretable-{{branch.slug}}"' },
+    { find = "port = 54321",             with = "port = {{ports.api}}" },
+  ]
+  ```
+
+  There is no template file. `port = 54321` is the project's working default,
+  so a clone without newgit still starts on it; newgit substitutes into the
+  committed content and writes the result into one workspace. `find` is a
+  literal string, never a regex, and must match **exactly once** — which is
+  also the drift detector: when the default changes upstream, the bind fails
+  naming the file and the string instead of quietly doing nothing. A
+  multi-line `find` disambiguates two sections sharing a value, and `count = N`
+  declares a genuine repeat.
+
+  A render reads *committed* content — `HEAD`, or the bound lane rev for a
+  tracker-owned path — never the working file, so it is idempotent: `undo`
+  and `tracker pull` re-render off the binding record and values never
+  compound.
+
+  Instance values stay out of everything downstream. Source-owned targets are
+  marked `--skip-worktree`, so they never show in `git status` and `git add -A`
+  cannot commit them; `newgit export` and a checkpoint's uncommitted-state
+  capture both take them from `HEAD`; and `newgit tracker capture` **reverses**
+  the substitution for tracker-owned targets, so a key you add to `.env.local`
+  reaches the shared lane and this instance's port does not.
+
+  The cost is printed at bind rather than left in the docs: on a source-owned
+  path, skip-worktree means real edits to that file in this workspace are
+  invisible to newgit and do not survive it.
+
 - `newgit reference` prints the definition format — every tracker and resource
   key with its type and default, the checkpoint/restore/ownership tables, and
   which template variables are in scope for which hook

@@ -175,6 +175,29 @@ reported; `--include <path>` overrides. It writes one commit, not history,
 because exporting the branch's commits would carry any file they contain —
 including withheld ones. This is a path-level filter, not concealment.
 
+**`[[render]]` puts this instance's ports in the config file your tool
+actually reads.** Most tools take a port from a committed config file rather
+than argv, so a resource declares literal substitutions into one:
+
+```toml
+[[render]]
+path = "supabase/config.toml"
+replace = [
+  { find = "port = 54321", with = "port = {{ports.api}}" },
+]
+```
+
+There is no template file — `port = 54321` is your working default, so a
+clone without newgit still starts on it. `find` is literal, never a regex,
+and must match exactly once; that check is also the drift detector, failing
+the bind by name when the default changes upstream rather than quietly doing
+nothing. Rendered source files are marked `--skip-worktree`, so they never
+show in `git status` and `git add -A` cannot commit them — which also means
+**real edits to a rendered file do not survive the workspace.** newgit says
+so at bind. For a tracker-owned file, `tracker capture` reverses the
+substitution, so edits you make beside the rendered value reach the lane and
+your port does not.
+
 **`cleanup` never breaks an undo.** It finalizes instances whose workspace is
 gone, deletes unclaimed workspaces and dead process state, and prunes tracker
 snapshot revs nothing references — but never a rev a checkpoint still points

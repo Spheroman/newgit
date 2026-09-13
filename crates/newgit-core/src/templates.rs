@@ -52,6 +52,20 @@ signal = "term"
 
 [exports]
 APP_URL = "http://127.0.0.1:{{ports.app}}"
+
+# Most tools read their port from a committed config file rather than argv.
+# Uncomment and point this at yours. There is no template file: `find` names
+# the project's working default, so a clone without newgit still starts on it.
+#
+# `find` is literal, never a regex, and must match exactly once — which is
+# also the drift detector. When the default changes upstream, the bind fails
+# naming the file and the string instead of quietly doing nothing.
+#
+# [[render]]
+# path = "vite.config.ts"
+# replace = [
+#   { find = "port: 3000", with = "port: {{ports.app}}" },
+# ]
 "#,
     },
     ResourceTemplate {

@@ -9,6 +9,7 @@ pub mod lane;
 pub mod manager;
 pub mod materializer;
 pub mod ports;
+pub mod render;
 pub mod resource;
 pub mod source;
 pub mod store;

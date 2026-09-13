@@ -21,6 +21,7 @@ use crate::exports::{RenderContext, render, unresolved_placeholder};
 use crate::lane::{TrackerLane, clear_owned_paths, copy_file};
 use crate::materializer::{Materializer, RealDirMaterializer, exclude_tracker_paths};
 use crate::ports;
+use crate::render::{self, RenderRecord};
 use crate::resource::{
     Captures, CheckpointMode, GraphProblem, ResourceDefinition, RestoreMode, parse_captures,
     resolve_order,
@@ -71,6 +72,43 @@ pub struct ResourceBindOutcome {
     pub captured: Vec<String>,
     /// One warning per declared capture `prepare` never emitted.
     pub missing_captures: Vec<String>,
+    /// Files rendered before `prepare`, and what it cost to render them.
+    pub rendered: Vec<RenderOutcome>,
+    /// Why a render failed, when one did. A render failure blocks `prepare`
+    /// the way a failed dependency does: a `prepare` run against unrendered
+    /// config would start a service on the wrong port.
+    pub render_error: Option<String>,
+}
+
+/// Rendered files temporarily reverted to committed values, and the content
+/// to put back. The workspace must end a capture exactly as it started it —
+/// the instance is still running against those rendered values.
+#[derive(Debug, Default)]
+struct RenderedRestore {
+    files: Vec<(Utf8PathBuf, String)>,
+}
+
+impl RenderedRestore {
+    fn restore(self) -> Result<()> {
+        for (path, contents) in self.files {
+            std::fs::write(&path, contents).map_err(|source| NewgitError::io(path, source))?;
+        }
+        Ok(())
+    }
+}
+
+/// One rendered file, and the lossiness it introduced.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RenderOutcome {
+    pub path: Utf8PathBuf,
+    pub replacements: usize,
+    /// The tracker owning the path, if any. `None` means source-owned, which
+    /// is the case that pays the skip-worktree cost below.
+    pub tracker: Option<String>,
+    /// Set for source-owned paths: real edits to this file in this workspace
+    /// are invisible to newgit and die with the workspace. Printed rather
+    /// than left in the docs — it is a real lossiness, and newgit says so.
+    pub warning: Option<String>,
 }
 
 /// What running an action did.
@@ -98,6 +136,9 @@ pub struct TrackerBindOutcome {
     pub content_rev: Option<String>,
     pub files: usize,
     pub origin: BindOrigin,
+    /// Re-renders that failed after the lane head landed. See
+    /// [`RestoreReport::warnings`].
+    pub warnings: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -257,6 +298,10 @@ pub struct RestoreReport {
     pub files: usize,
     /// Where the pre-restore content was saved, when it differed.
     pub safety_rev: Option<String>,
+    /// Re-renders that failed after the content moved. Reported rather than
+    /// swallowed: the workspace is then running on committed defaults, which
+    /// is a different thing from what the instance was bound to.
+    pub warnings: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -477,11 +522,37 @@ impl BranchManager {
                     definition_rev: definition.definition_rev.clone(),
                     resolved_ports: resolved_ports.clone(),
                     resolved_exports,
+                    rendered: Vec::new(),
                     status: ResourceStatus::Pending,
                 },
             );
 
-            let blocked_by = self.blocked_dependencies(branch, definition);
+            // Render before prepare, with ports allocated and every
+            // dependency's exports already bound: the file a tool reads its
+            // port from has to be right before the tool is started.
+            let (rendered, render_error) = match self.render_resource(branch, definition) {
+                Ok(rendered) => (rendered, None),
+                Err(error) => (Vec::new(), Some(error.to_string())),
+            };
+
+            let mut blocked_by = self.blocked_dependencies(branch, definition);
+            if render_error.is_some() {
+                if let Some(binding) = branch.resources.get_mut(&definition.name) {
+                    binding.status = ResourceStatus::Failed;
+                }
+                outcomes.push(ResourceBindOutcome {
+                    name: definition.name.clone(),
+                    ports: resolved_ports,
+                    status: ResourceStatus::Failed,
+                    prepare: None,
+                    blocked_by: std::mem::take(&mut blocked_by),
+                    captured: Vec::new(),
+                    missing_captures: Vec::new(),
+                    rendered: Vec::new(),
+                    render_error,
+                });
+                continue;
+            }
 
             // Prepare runs with the bindings made so far, so dependents see
             // their dependencies' exports. Failed dependencies block
@@ -536,10 +607,226 @@ impl BranchManager {
                 blocked_by,
                 captured: captured_names,
                 missing_captures,
+                rendered,
+                render_error: None,
             });
         }
         branch.updated_at = Utc::now();
         Ok(outcomes)
+    }
+
+    /// Substitute this instance's values into the files a resource declares,
+    /// and record what was done on the binding.
+    ///
+    /// Committed content is the input, never the working file — so this is
+    /// idempotent and safe to re-run after an undo or a tracker pull.
+    fn render_resource(
+        &self,
+        branch: &mut BranchInstance,
+        definition: &ResourceDefinition,
+    ) -> Result<Vec<RenderOutcome>> {
+        if definition.render.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let context_ports = branch
+            .resources
+            .get(&definition.name)
+            .map(|binding| binding.resolved_ports.clone())
+            .unwrap_or_default();
+        // A template sees what a command in this instance would see: its own
+        // ports plus every export bound so far, in dependency order. Anything
+        // narrower and an Expo `.env` needing the database's URL would want a
+        // second mechanism.
+        let context_exports = self.bound_exports(branch);
+
+        let mut records = Vec::new();
+        let mut outcomes = Vec::new();
+        let mut source_owned = Vec::new();
+
+        for spec in &definition.render {
+            let owner = self.tracker_owning(&spec.path);
+            let committed = self.committed_content(branch, &spec.path, owner.as_deref())?;
+            let Some(committed) = committed else {
+                return Err(NewgitError::RenderPathNotCommitted {
+                    resource: definition.name.clone(),
+                    path: spec.path.clone(),
+                });
+            };
+
+            let context = RenderContext {
+                branch_name: &branch.name,
+                branch_slug: &branch.slug,
+                workspace: branch.workspace_path.as_str(),
+                scripts: self.scripts_dir(),
+                ports: Some(&context_ports),
+                exports: Some(&context_exports),
+                ..RenderContext::default()
+            };
+            let (contents, applied) = render::apply(&definition.name, spec, &committed, &context)?;
+
+            let target = branch.workspace_path.join(&spec.path);
+            if let Some(parent) = target.parent() {
+                crate::materializer::create_dir_all(parent)?;
+            }
+            std::fs::write(&target, contents)
+                .map_err(|source| NewgitError::io(target.clone(), source))?;
+
+            if owner.is_none() {
+                source_owned.push(spec.path.clone());
+            }
+            outcomes.push(RenderOutcome {
+                path: spec.path.clone(),
+                replacements: applied.len(),
+                tracker: owner.clone(),
+                warning: owner.is_none().then(|| {
+                    format!(
+                        "`{}` is rendered by resource `{}` and marked skip-worktree: edits you \
+                         make to it in this workspace are invisible to newgit and will not \
+                         survive it — edit it in the store repo instead",
+                        spec.path, definition.name
+                    )
+                }),
+            });
+            records.push(RenderRecord {
+                path: spec.path.clone(),
+                tracker: owner,
+                applied,
+            });
+        }
+
+        // Source-owned targets only: tracker-owned paths are already in
+        // `.git/info/exclude`, and marking an untracked path skip-worktree is
+        // an error rather than a no-op.
+        GitSource::workspace_skip_worktree(&branch.workspace_path, &source_owned)?;
+
+        if let Some(binding) = branch.resources.get_mut(&definition.name) {
+            binding.rendered = records;
+        }
+        Ok(outcomes)
+    }
+
+    /// Put a tracker's rendered files back to their committed values for the
+    /// duration of a capture, so the lane records what every instance should
+    /// see rather than what this one is running on.
+    ///
+    /// The workspace file is written in place and restored afterwards rather
+    /// than captured from a copy, because capture walks the workspace: a
+    /// second tree would be a second thing to keep honest.
+    fn unrender_for_capture(
+        &self,
+        branch: &BranchInstance,
+        tracker: &TrackerDefinition,
+    ) -> Result<RenderedRestore> {
+        let mut restore = RenderedRestore::default();
+        for binding in branch.resources.values() {
+            for record in &binding.rendered {
+                if record.tracker.as_deref() != Some(tracker.name.as_str()) {
+                    continue;
+                }
+                let path = branch.workspace_path.join(&record.path);
+                let Ok(current) = std::fs::read_to_string(&path) else {
+                    continue;
+                };
+                let reversed = render::reverse(&current, &record.applied);
+                if reversed == current {
+                    continue;
+                }
+                std::fs::write(&path, &reversed)
+                    .map_err(|source| NewgitError::io(path.clone(), source))?;
+                restore.files.push((path, current));
+            }
+        }
+        Ok(restore)
+    }
+
+    /// Every export bound so far, in dependency order — dependents win, the
+    /// same layering [`Self::assemble_env`] applies.
+    fn bound_exports(&self, branch: &BranchInstance) -> BTreeMap<String, String> {
+        let mut exports = BTreeMap::new();
+        for name in &self.resource_order {
+            if let Some(binding) = branch.resources.get(name) {
+                for (key, value) in &binding.resolved_exports {
+                    exports.insert(key.clone(), value.clone());
+                }
+            }
+        }
+        exports
+    }
+
+    /// The tracker owning a path, if any. Decides where committed content
+    /// comes from and whether `capture` has to reverse the render.
+    fn tracker_owning(&self, path: &Utf8Path) -> Option<String> {
+        self.trackers
+            .iter()
+            .find(|definition| {
+                definition
+                    .paths
+                    .iter()
+                    .any(|owned| path == owned || path.starts_with(owned))
+            })
+            .map(|definition| definition.name.clone())
+    }
+
+    /// What a render substitutes into: the bound lane rev for a tracker-owned
+    /// path, HEAD for a source-owned one. Never the working file.
+    fn committed_content(
+        &self,
+        branch: &BranchInstance,
+        path: &Utf8Path,
+        tracker: Option<&str>,
+    ) -> Result<Option<String>> {
+        let Some(tracker) = tracker else {
+            return GitSource::workspace_show_head(&branch.workspace_path, path);
+        };
+        let Some(rev) = branch
+            .trackers
+            .get(tracker)
+            .and_then(|binding| binding.content_rev.clone())
+        else {
+            return Ok(None);
+        };
+        let source = self.lane(tracker).rev_path(&rev).join(path);
+        match std::fs::read_to_string(&source) {
+            Ok(contents) => Ok(Some(contents)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(NewgitError::io(source, error)),
+        }
+    }
+
+    /// Rendered paths across every resource — what export must take from HEAD
+    /// and what a checkpoint's dirty commit must leave alone.
+    fn rendered_source_paths(&self, branch: &BranchInstance) -> Vec<Utf8PathBuf> {
+        branch
+            .resources
+            .values()
+            .flat_map(|binding| binding.rendered.iter())
+            .filter(|record| record.tracker.is_none())
+            .map(|record| record.path.clone())
+            .collect()
+    }
+
+    /// Re-render every resource's targets, in dependency order.
+    ///
+    /// Undo restores source and tracker content underneath the rendered
+    /// files, so the values have to be put back. That costs nothing, because
+    /// a render is a pure function of committed content and the binding
+    /// record — both of which undo has just settled.
+    fn rerender_all(&self, branch: &mut BranchInstance) -> Vec<String> {
+        let mut warnings = Vec::new();
+        for name in self.resource_order.clone() {
+            let Ok(definition) = self.resource_definition(&name) else {
+                continue;
+            };
+            if definition.render.is_empty() {
+                continue;
+            }
+            let definition = definition.clone();
+            if let Err(error) = self.render_resource(branch, &definition) {
+                warnings.push(format!("re-render for resource `{name}` failed: {error}"));
+            }
+        }
+        warnings
     }
 
     /// Run `<resource>.<action>` for an instance.
@@ -905,6 +1192,7 @@ impl BranchManager {
         branch.updated_at = Utc::now();
 
         Ok(TrackerBindOutcome {
+            warnings: Vec::new(),
             name: definition.name.clone(),
             content_rev,
             files,
@@ -917,8 +1205,16 @@ impl BranchManager {
         let definition = self.definition(tracker)?;
         self.require_workspace(&branch)?;
 
+        // A lane is shared by every instance, so this instance's rendered
+        // values must not enter it — but the file cannot simply be skipped
+        // either, or a key added beside them would never reach the lane.
+        // Reversing the substitution keeps the edits and drops the values.
+        let reversed = self.unrender_for_capture(&branch, definition)?;
+
         let lane = self.lane(&definition.name);
-        let capture = lane.capture(&branch.workspace_path, definition)?;
+        let capture = lane.capture(&branch.workspace_path, definition);
+        reversed.restore()?;
+        let capture = capture?;
 
         let previous = branch
             .trackers
@@ -1021,8 +1317,13 @@ impl BranchManager {
             });
         }
 
-        // Restoring never loses state: current content is captured first.
-        let safety = lane.capture(&branch.workspace_path, definition)?;
+        // Restoring never loses state: current content is captured first —
+        // with renders reversed, so the safety rev is a lane rev like any
+        // other rather than one instance's ports.
+        let reversed = self.unrender_for_capture(&branch, definition)?;
+        let safety = lane.capture(&branch.workspace_path, definition);
+        reversed.restore()?;
+        let safety = safety?;
         let safety_rev = (safety.rev != target_rev).then_some(safety.rev);
 
         let files = lane.restore(&branch.workspace_path, definition, &target_rev)?;
@@ -1034,6 +1335,9 @@ impl BranchManager {
                 content_rev: Some(target_rev.clone()),
             },
         );
+        // The checked-out content is committed content; this instance's
+        // values go back on top of it.
+        let warnings = self.rerender_all(&mut branch);
         branch.updated_at = Utc::now();
         self.store.save_branch_record(&branch)?;
 
@@ -1041,6 +1345,7 @@ impl BranchManager {
             rev: target_rev,
             files,
             safety_rev,
+            warnings,
         })
     }
 
@@ -1057,7 +1362,8 @@ impl BranchManager {
             )));
         }
 
-        let outcome = self.bind_tracker(&mut branch, definition, true)?;
+        let mut outcome = self.bind_tracker(&mut branch, definition, true)?;
+        outcome.warnings = self.rerender_all(&mut branch);
         self.store.save_branch_record(&branch)?;
         Ok(outcome)
     }
@@ -1599,8 +1905,24 @@ impl BranchManager {
             )));
         }
 
+        // Rendered source paths come from HEAD, not from disk. `--skip-worktree`
+        // does not remove a path from `git ls-files`, and export otherwise
+        // copies tracked files as they stand — which would ship this
+        // instance's ports in a repo whose whole point is being clean.
+        let rendered = self.rendered_source_paths(&branch);
         for file in &plan.files {
-            copy_file(&workspace.join(&file.path), &destination.join(&file.path))?;
+            let target = destination.join(&file.path);
+            if rendered.contains(&file.path) {
+                let committed =
+                    GitSource::workspace_show_head(&workspace, &file.path)?.unwrap_or_default();
+                if let Some(parent) = target.parent() {
+                    crate::materializer::create_dir_all(parent)?;
+                }
+                std::fs::write(&target, committed)
+                    .map_err(|source| NewgitError::io(target, source))?;
+                continue;
+            }
+            copy_file(&workspace.join(&file.path), &target)?;
         }
 
         let head_rev = GitSource::workspace_head(&workspace)?;
@@ -1657,6 +1979,7 @@ impl BranchManager {
         let dirty_rev = GitSource::workspace_dirty_commit(
             &workspace,
             &format!("newgit {id}: uncommitted state of `{}`", branch.name),
+            &self.rendered_source_paths(branch),
         )?;
         let tip = dirty_rev.clone().unwrap_or_else(|| head_rev.clone());
         let workspace_ref = format!("refs/newgit/checkpoints/{id}");
@@ -1982,6 +2305,14 @@ impl BranchManager {
                 files,
             });
         }
+
+        // Source and tracker content have both moved underneath the rendered
+        // files, so the instance's values go back on top before any resource
+        // is restored or restarted — a service must not come back up reading
+        // the committed default port. Cheap, because a render is a pure
+        // function of committed content and the binding record, and undo has
+        // just settled both.
+        warnings.extend(self.rerender_all(&mut branch));
 
         // Resources: dependencies before dependents, restarting what was
         // running. Failures are collected into a recovery record, not fatal.

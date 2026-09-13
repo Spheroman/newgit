@@ -245,6 +245,16 @@ impl MetadataStore {
             };
             definitions.push(ResourceDefinition::from_file(name, &entry)?);
         }
+        let targets: Vec<(&str, &crate::render::RenderSpec)> = definitions
+            .iter()
+            .flat_map(|definition| {
+                definition
+                    .render
+                    .iter()
+                    .map(move |spec| (definition.name.as_str(), spec))
+            })
+            .collect();
+        crate::render::validate_disjoint(&targets)?;
         Ok(definitions)
     }
 
