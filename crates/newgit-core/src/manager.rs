@@ -557,45 +557,62 @@ impl BranchManager {
             // Prepare runs with the bindings made so far, so dependents see
             // their dependencies' exports. Failed dependencies block
             // dependents; the instance still spawns so logs can be inspected.
+            //
+            // A blocker only ever withholds a *command that would otherwise
+            // run*. A resource with no runnable `prepare` has nothing to
+            // withhold — there was never going to be a command here, blocked
+            // dependency or not — so it is `Ready` as soon as it is bound,
+            // exactly as it would be if nothing upstream had failed. Skipping
+            // straight to that determination (instead of parking such a
+            // resource at `Pending` because *something* in its graph is
+            // unready) is what keeps `admin`/`mobile`-style dependents from
+            // getting stuck the moment their one blocker clears: nothing
+            // ever reruns to move them off `Pending`, but nothing needs to.
+            let runnable_prepare = match definition.actions.get("prepare") {
+                Some(action) if action.command.is_some() && !action.long_running => Some(action),
+                _ => None,
+            };
             let mut captured_names = Vec::new();
             let mut missing_captures = Vec::new();
-            let (status, prepare) = if !blocked_by.is_empty() {
-                if let Some(binding) = branch.resources.get_mut(&definition.name) {
-                    binding.status = ResourceStatus::Blocked;
+            let (status, prepare) = match runnable_prepare {
+                None => {
+                    if let Some(binding) = branch.resources.get_mut(&definition.name) {
+                        binding.status = ResourceStatus::Ready;
+                    }
+                    (ResourceStatus::Ready, None)
                 }
-                (ResourceStatus::Blocked, None)
-            } else {
-                match definition.actions.get("prepare") {
-                    Some(action) if action.command.is_some() && !action.long_running => {
-                        let log = self
-                            .store
-                            .action_log_path(&branch.slug, &format!("{}.prepare", definition.name));
-                        let (code, captured) =
-                            self.run_one_shot(branch, definition, action, "prepare", &log)?;
-                        captured_names = captured.found.keys().cloned().collect();
-                        missing_captures = Self::missing_capture_warnings(
-                            &definition.name,
-                            "prepare",
-                            &captured,
-                            &log,
-                        );
-                        Self::apply_captures(branch, &definition.name, captured.found);
-                        let status = if code == 0 {
-                            ResourceStatus::Ready
-                        } else {
-                            ResourceStatus::Failed
-                        };
-                        if let Some(binding) = branch.resources.get_mut(&definition.name) {
-                            binding.status = status;
-                        }
-                        (status, Some((code == 0, log)))
+                Some(_) if !blocked_by.is_empty() => {
+                    // Left at the `Pending` it was bound with: nothing was
+                    // withheld from this resource specifically, its
+                    // dependency just is not ready yet. Whether that is
+                    // still true is a question for read time
+                    // (`blocked_dependencies`), not a fact to freeze into
+                    // the record now.
+                    (ResourceStatus::Pending, None)
+                }
+                Some(action) => {
+                    let log = self
+                        .store
+                        .action_log_path(&branch.slug, &format!("{}.prepare", definition.name));
+                    let (code, captured) =
+                        self.run_one_shot(branch, definition, action, "prepare", &log)?;
+                    captured_names = captured.found.keys().cloned().collect();
+                    missing_captures = Self::missing_capture_warnings(
+                        &definition.name,
+                        "prepare",
+                        &captured,
+                        &log,
+                    );
+                    Self::apply_captures(branch, &definition.name, captured.found);
+                    let status = if code == 0 {
+                        ResourceStatus::Ready
+                    } else {
+                        ResourceStatus::Failed
+                    };
+                    if let Some(binding) = branch.resources.get_mut(&definition.name) {
+                        binding.status = status;
                     }
-                    _ => {
-                        if let Some(binding) = branch.resources.get_mut(&definition.name) {
-                            binding.status = ResourceStatus::Ready;
-                        }
-                        (ResourceStatus::Ready, None)
-                    }
+                    (status, Some((code == 0, log)))
                 }
             };
 
@@ -900,13 +917,11 @@ impl BranchManager {
             ));
         }
 
+        // Refusing to run is the right call, but it is not this resource's own
+        // outcome — it is derived from a dependency, and re-derivable the
+        // moment that dependency changes. Nothing is written to the record.
         let blocked_by = self.blocked_dependencies(&branch, definition);
         if !blocked_by.is_empty() {
-            if let Some(binding) = branch.resources.get_mut(&definition.name) {
-                binding.status = ResourceStatus::Blocked;
-                branch.updated_at = Utc::now();
-                self.store.save_branch_record(&branch)?;
-            }
             return Err(NewgitError::Unsupported(format!(
                 "resource `{resource_name}` is blocked by failed dependency/dependencies: {}",
                 blocked_by.join(", ")
@@ -1541,17 +1556,31 @@ impl BranchManager {
                             None => "—".to_owned(),
                             Some(binding) => {
                                 if supervisor.running_pid(&definition.name).is_some() {
+                                    // Something newgit started is alive right now:
+                                    // the one signal worth trusting over anything
+                                    // in the record.
                                     "running".to_owned()
-                                } else if definition.has_long_running_action()
-                                    && binding.status == ResourceStatus::Ready
-                                {
+                                } else if supervisor.has_ever_started(&definition.name) {
+                                    // A supervised process existed and is not
+                                    // alive now — "stopped" is honest here in a
+                                    // way it is not for an action newgit never
+                                    // ran. Which of possibly several
+                                    // `long_running` actions it was is not
+                                    // something the supervisor records (it
+                                    // tracks one process per resource, not per
+                                    // action), so this can't and doesn't claim
+                                    // more than "it ran, and isn't running now."
                                     "stopped".to_owned()
                                 } else {
-                                    match binding.status {
-                                        ResourceStatus::Pending => "pending".to_owned(),
-                                        ResourceStatus::Ready => "ready".to_owned(),
-                                        ResourceStatus::Failed => "failed".to_owned(),
-                                        ResourceStatus::Blocked => "blocked".to_owned(),
+                                    let blocked_by = self.blocked_dependencies(&branch, definition);
+                                    if !blocked_by.is_empty() {
+                                        format!("blocked({})", blocked_by.join(","))
+                                    } else {
+                                        match binding.status {
+                                            ResourceStatus::Pending => "pending".to_owned(),
+                                            ResourceStatus::Ready => "ready".to_owned(),
+                                            ResourceStatus::Failed => "failed".to_owned(),
+                                        }
                                     }
                                 }
                             }
@@ -1867,13 +1896,17 @@ impl BranchManager {
             outcome.orphan_workspaces.push(orphan);
         }
 
-        // Dead process state: PID files whose group exited, and state
-        // directories belonging to no live instance.
+        // Stale pid numbers: retired to `stopped` in place, not removed —
+        // `status` reads a pid file's mere presence as "newgit started this
+        // once," and deleting it here would erase that the moment gc ran.
         for branch in &live {
             outcome
-                .dead_state
-                .extend(self.supervisor(branch).prune_dead_pids(dry_run)?);
+                .retired_pids
+                .extend(self.supervisor(branch).retire_dead_pids(dry_run)?);
         }
+        // State directories belonging to no live instance at all: these are
+        // actually removed, unlike the pid retirement above — there is no
+        // instance left for a `status` to ask.
         let live_state_dirs: BTreeSet<Utf8PathBuf> = live
             .iter()
             .map(|branch| self.store.instance_state_dir(&branch.slug))

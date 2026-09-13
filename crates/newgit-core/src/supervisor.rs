@@ -34,6 +34,14 @@ impl Supervisor {
         Self { state_dir }
     }
 
+    /// A pid file holds either a decimal pid or the literal `stopped`. Once a
+    /// process is confirmed gone, its number is retired to that literal
+    /// rather than left on disk — an OS recycles pids, and a stale number
+    /// left sitting in the file would eventually belong to some unrelated
+    /// process, making `running_pid` resurrect a resource that has been dead
+    /// for weeks the day its old pid happens to get reused. Parsing fails
+    /// harmlessly on `stopped`, which is exactly the point: that content can
+    /// never again read as "alive."
     pub fn running_pid(&self, resource: &str) -> Option<u32> {
         let pid = std::fs::read_to_string(self.pid_path(resource))
             .ok()?
@@ -41,6 +49,17 @@ impl Supervisor {
             .parse::<u32>()
             .ok()?;
         group_alive(pid).then_some(pid)
+    }
+
+    /// Whether newgit has ever started a supervised process for this
+    /// resource, regardless of whether it is still alive. The pid file is
+    /// left in place once written — `stop` retires it to `stopped` rather
+    /// than deleting it — so its mere presence answers "did we start this,
+    /// ever," a distinct question from `running_pid`'s "is it alive now."
+    /// `status` needs exactly that distinction: a resource newgit never
+    /// started is not "stopped," it is simply whatever its bind status says.
+    pub fn has_ever_started(&self, resource: &str) -> bool {
+        self.pid_path(resource).is_file()
     }
 
     pub fn start(
@@ -100,16 +119,21 @@ impl Supervisor {
     }
 
     /// Signal the process group and wait up to ~5s for it to exit.
+    ///
+    /// The pid file is deliberately left on disk once a process has actually
+    /// exited — retired to `stopped` rather than deleted — because its
+    /// presence is `has_ever_started`'s only signal, and erasing it here
+    /// would make a resource newgit stopped on purpose indistinguishable
+    /// from one it never started at all.
     pub fn stop(&self, resource: &str, signal: &str) -> Result<StopOutcome> {
         let Some(pid) = self.running_pid(resource) else {
-            let _ = std::fs::remove_file(self.pid_path(resource));
             return Ok(StopOutcome::NotRunning);
         };
 
         signal_group(pid, signal)?;
         for _ in 0..50 {
             if !group_alive(pid) {
-                let _ = std::fs::remove_file(self.pid_path(resource));
+                self.mark_stopped(resource)?;
                 return Ok(StopOutcome::Stopped(pid));
             }
             std::thread::sleep(Duration::from_millis(100));
@@ -117,28 +141,42 @@ impl Supervisor {
         Ok(StopOutcome::StillRunning(pid))
     }
 
-    /// Remove PID files whose process group is gone — a process that died
-    /// on its own, or outlived a reboot. Returns what was removed, or what
-    /// would be under `dry_run`.
-    pub fn prune_dead_pids(&self, dry_run: bool) -> Result<Vec<Utf8PathBuf>> {
-        let mut removed = Vec::new();
+    /// Retire pid files whose process group is gone — a process that died on
+    /// its own, or outlived a reboot — to `stopped`, in place. This is not a
+    /// deletion: `newgit cleanup` is the one place a stale pid number is a
+    /// real hazard (an OS can reuse it, and a leftover number would then read
+    /// as alive), but the fact that newgit once started this resource is the
+    /// same fact `status` depends on, so the file itself has to survive.
+    /// Returns what was retired, or what would be under `dry_run`.
+    pub fn retire_dead_pids(&self, dry_run: bool) -> Result<Vec<Utf8PathBuf>> {
+        let mut retired = Vec::new();
         for path in crate::store::read_dir_sorted(&self.state_dir)? {
             if path.extension() != Some("pid") {
                 continue;
             }
-            let alive = std::fs::read_to_string(&path)
+            let Some(pid) = std::fs::read_to_string(&path)
                 .ok()
                 .and_then(|text| text.trim().parse::<u32>().ok())
-                .is_some_and(group_alive);
-            if alive {
+            else {
+                // Already `stopped` (not a raw pid), or unreadable: nothing
+                // new to retire.
+                continue;
+            };
+            if group_alive(pid) {
                 continue;
             }
             if !dry_run {
-                std::fs::remove_file(&path).map_err(|source| NewgitError::io(&path, source))?;
+                std::fs::write(&path, "stopped\n")
+                    .map_err(|source| NewgitError::io(&path, source))?;
             }
-            removed.push(path);
+            retired.push(path);
         }
-        Ok(removed)
+        Ok(retired)
+    }
+
+    fn mark_stopped(&self, resource: &str) -> Result<()> {
+        let path = self.pid_path(resource);
+        std::fs::write(&path, "stopped\n").map_err(|source| NewgitError::io(&path, source))
     }
 
     fn pid_path(&self, resource: &str) -> Utf8PathBuf {
@@ -360,7 +398,7 @@ mod tests {
         );
         assert!(
             supervisor.running_pid("app").is_none(),
-            "the PID file must be cleared so the resource can start again"
+            "the pid must read as not-running so the resource can start again"
         );
 
         // And starting again works, which is what undo depends on.
@@ -369,6 +407,40 @@ mod tests {
             .expect("restart");
         assert_ne!(restarted, pid);
         supervisor.stop("app", "term").expect("stop again");
+    }
+
+    /// Issue #28: `status` tells "newgit started this once" from "never
+    /// started" by whether the pid file exists at all — which only works if
+    /// `stop` keeps the file around. But leaving the raw pid number in it
+    /// forever would reopen a worse problem: an OS reuses pids, so a stale
+    /// number left on disk could eventually belong to some unrelated live
+    /// process and `running_pid` would report a resource dead for weeks as
+    /// running again. `stop` must retire the number to the literal
+    /// `stopped`, not just leave the file untouched.
+    #[test]
+    fn stopping_retires_the_pid_number_so_reuse_cannot_resurrect_it() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let dir = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).expect("utf8");
+        let supervisor = Supervisor::new(dir.clone());
+
+        supervisor
+            .start("app", "sleep 30", &dir, &[], &dir.join("app.log"))
+            .expect("start");
+        supervisor.stop("app", "term").expect("stop");
+
+        let contents = std::fs::read_to_string(dir.join("app.pid")).expect("pid file survives");
+        assert_eq!(
+            contents.trim(),
+            "stopped",
+            "the raw pid must not be left on disk once the process is confirmed gone"
+        );
+        assert!(
+            supervisor.has_ever_started("app"),
+            "the file's presence still says newgit started this resource once"
+        );
+        // No number left to reuse: whatever pid the OS hands out next,
+        // `running_pid` cannot mistake it for this resource being alive.
+        assert!(supervisor.running_pid("app").is_none());
     }
 
     #[test]
@@ -386,5 +458,33 @@ mod tests {
     fn signalling_a_dead_group_is_not_an_error() {
         assert!(signal_group(999_999, "term").is_ok());
         assert!(!group_alive(999_999));
+    }
+
+    /// Issue #28: gc must retire a stale pid in place rather than deleting
+    /// the file — deleting it would make `status` unable to tell "newgit
+    /// started this once" from "never started."
+    #[test]
+    fn retire_dead_pids_rewrites_rather_than_deletes() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let dir = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).expect("utf8");
+        let supervisor = Supervisor::new(dir.clone());
+
+        // A pid file for a process that is definitely not alive.
+        std::fs::write(dir.join("ghost.pid"), "999999\n").expect("write");
+        // An already-retired file: nothing new to do.
+        std::fs::write(dir.join("done.pid"), "stopped\n").expect("write");
+        // A live process: must survive untouched.
+        let alive = supervisor
+            .start("app", "sleep 30", &dir, &[], &dir.join("app.log"))
+            .expect("start");
+
+        let retired = supervisor.retire_dead_pids(false).expect("retire");
+        assert_eq!(retired, [dir.join("ghost.pid")]);
+        assert_eq!(
+            std::fs::read_to_string(dir.join("ghost.pid")).expect("read"),
+            "stopped\n"
+        );
+        assert_eq!(supervisor.running_pid("app"), Some(alive));
+        supervisor.stop("app", "term").expect("stop");
     }
 }

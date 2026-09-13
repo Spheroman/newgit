@@ -19,7 +19,14 @@ pub struct CleanupOutcome {
     pub finalized: Vec<FinalizedInstance>,
     /// Workspace directories with no binding record at all.
     pub orphan_workspaces: Vec<Utf8PathBuf>,
-    /// Dead PID files and state directories for instances that are gone.
+    /// Pid files retired to `stopped` because their process group is gone.
+    /// Retired, not removed: the file's presence is what `status` uses to
+    /// tell "newgit started this once" from "never started," so gc rewrites
+    /// the stale number rather than deleting the record of it.
+    pub retired_pids: Vec<Utf8PathBuf>,
+    /// State directories for instances that are gone entirely — unlike
+    /// `retired_pids`, there is no instance left for anything to ask about
+    /// these, so they are actually removed.
     pub dead_state: Vec<Utf8PathBuf>,
     /// Checkpoint logs discarded because their instance is archived and the
     /// caller asked for it. Empty unless purging was requested.
@@ -39,6 +46,7 @@ impl CleanupOutcome {
     pub fn is_empty(&self) -> bool {
         self.finalized.is_empty()
             && self.orphan_workspaces.is_empty()
+            && self.retired_pids.is_empty()
             && self.dead_state.is_empty()
             && self.purged_checkpoints.is_empty()
             && self.pruned.is_empty()

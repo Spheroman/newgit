@@ -49,12 +49,14 @@ pub struct ResourceBinding {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum ResourceStatus {
-    /// Bound; prepare has not succeeded yet.
+    /// Bound; prepare has not succeeded yet. Also covers a resource that has
+    /// never run prepare because a dependency is not ready — "blocked" is not
+    /// stored, since it is fully derivable from `depends_on` plus the current
+    /// status of each dependency and would otherwise go stale the moment the
+    /// blocker clears without anything left to recompute it.
     Pending,
     Ready,
     Failed,
-    /// Not attempted because a resource dependency is failed or blocked.
-    Blocked,
 }
 
 /// Which content revision of a tracker this instance is bound to.

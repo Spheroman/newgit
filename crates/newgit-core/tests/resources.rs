@@ -170,13 +170,19 @@ fn failed_prepare_blocks_dependents_but_keeps_instance_spawned() {
         spawned.branch.resources["bad-prep"].status,
         ResourceStatus::Failed
     );
+    // Blocked-ness is not stored on the resource itself — it's derived from
+    // the dependency's status. `after-bad` has a real `prepare` that was
+    // withheld, so it stays `Pending`. `blocked-app` has no `prepare` at
+    // all — nothing was ever going to run for it regardless of the
+    // blocker — so there is nothing to withhold and it is `Ready`
+    // immediately, the same as `admin`/`mobile` in the field report.
     assert_eq!(
         spawned.branch.resources["after-bad"].status,
-        ResourceStatus::Blocked
+        ResourceStatus::Pending
     );
     assert_eq!(
         spawned.branch.resources["blocked-app"].status,
-        ResourceStatus::Blocked
+        ResourceStatus::Ready
     );
     assert!(
         spawned.branch.workspace_path.join("bad-prep.txt").is_file(),
@@ -203,24 +209,226 @@ fn failed_prepare_blocks_dependents_but_keeps_instance_spawned() {
             .find(|r| r.name == "after-bad")
             .expect("after-bad")
             .state,
-        "blocked"
+        "blocked(bad-prep)"
     );
+    // `blocked-app`'s own bind status is `Ready` (asserted above) — it has
+    // no `prepare` to withhold — but `status` still shows it blocked here,
+    // because its dependency `bad-prep` is not ready and that is still a
+    // true, useful thing to say about the graph. The stored status and the
+    // displayed status answer different questions.
     assert_eq!(
         resources
             .iter()
             .find(|r| r.name == "blocked-app")
             .expect("blocked-app")
             .state,
-        "blocked"
+        "blocked(bad-prep)"
     );
     assert!(matches!(
         manager.run_action("feature-a", "after-bad.prepare"),
         Err(NewgitError::Unsupported(_))
     ));
+    // And for the same reason, `start` is a command action gated on that
+    // same failed dependency, and correctly still refuses: `blocked-app`
+    // being `Ready` is not the same claim as "safe to run a command that
+    // assumes `bad-prep` succeeded."
     assert!(matches!(
         manager.run_action("feature-a", "blocked-app.start"),
         Err(NewgitError::Unsupported(_))
     ));
+}
+
+/// Issue #28: a resource can declare a `long_running` action that newgit has
+/// never started (a stray `functions` action alongside the one actually
+/// used). `status` must not read "some action here is long_running" as "this
+/// resource is down" — that conflates a declaration with a runtime fact.
+#[test]
+fn status_does_not_claim_stopped_for_a_long_running_action_never_started() {
+    let (_guard, temp) = tempdir();
+    let store = setup(&temp);
+    write_resource(
+        &store,
+        "supabase",
+        r#"ownership = "branch"
+
+[actions.prepare]
+command = "true"
+
+[actions.functions]
+long_running = true
+command = "sleep 30"
+
+[actions.stop]
+signal = "term"
+"#,
+    );
+    let repo = store.paths().project_root.clone();
+    let manager = BranchManager::open(MetadataStore::at(repo)).expect("manager");
+    manager.spawn("feature-a", None).expect("spawn");
+
+    // Prepare succeeded and `functions` was never started: this is "ready",
+    // not "stopped" — nothing newgit started has exited.
+    let reports = manager.statuses().expect("statuses");
+    let state = reports[0]
+        .resources
+        .iter()
+        .find(|r| r.name == "supabase")
+        .expect("supabase report")
+        .state
+        .clone();
+    assert_eq!(state, "ready");
+
+    // Once something is actually started and stopped, `stopped` becomes
+    // honest again.
+    manager
+        .run_action("feature-a", "supabase.functions")
+        .expect("start functions");
+    manager
+        .run_action("feature-a", "supabase.stop")
+        .expect("stop functions");
+    let reports = manager.statuses().expect("statuses");
+    let state = reports[0]
+        .resources
+        .iter()
+        .find(|r| r.name == "supabase")
+        .expect("supabase report")
+        .state
+        .clone();
+    assert_eq!(state, "stopped");
+}
+
+/// Issue #28: `newgit cleanup` must not erase the fact `status` now depends
+/// on. `retire_dead_pids` used to delete a pid file once its process was
+/// confirmed gone — exactly the file whose mere presence means "newgit
+/// started this once" — so gc would silently turn `stopped` back into
+/// whatever the resource's bind status says (`ready`, here). The fix
+/// rewrites the file to `stopped` in place instead of deleting it.
+#[test]
+fn cleanup_does_not_turn_stopped_back_into_ready() {
+    let (_guard, temp) = tempdir();
+    let store = setup(&temp);
+    write_resource(&store, "app", APP_RESOURCE);
+    write_resource(&store, "prep", PREP_RESOURCE);
+    let repo = store.paths().project_root.clone();
+    let manager = BranchManager::open(MetadataStore::at(repo)).expect("manager");
+    manager.spawn("feature-a", None).expect("spawn");
+
+    manager.run_action("feature-a", "app.start").expect("start");
+    manager.run_action("feature-a", "app.stop").expect("stop");
+
+    let state = |manager: &BranchManager| {
+        manager.statuses().expect("statuses")[0]
+            .resources
+            .iter()
+            .find(|r| r.name == "app")
+            .expect("app report")
+            .state
+            .clone()
+    };
+    assert_eq!(state(&manager), "stopped");
+
+    manager
+        .cleanup(false, ArchivedCheckpoints::Keep)
+        .expect("cleanup");
+
+    assert_eq!(
+        state(&manager),
+        "stopped",
+        "gc must not resurrect a stopped resource as ready by deleting its pid file"
+    );
+}
+
+/// Issue #28: `blocked` must not survive the blocker clearing. `admin` here
+/// has no `prepare` of its own — like the real `admin`/`mobile` resources in
+/// the report — so nothing would ever recompute a stored `blocked` status.
+/// Recomputing it at read time instead means it falls out of date the moment
+/// the dependency does, not the moment something happens to touch `admin`.
+#[test]
+fn blocked_status_clears_once_the_blocking_dependency_recovers() {
+    let (_guard, temp) = tempdir();
+    let store = setup(&temp);
+    write_resource(
+        &store,
+        "supabase",
+        r#"ownership = "branch"
+
+[actions.prepare]
+command = "test -f started || (touch started && exit 1)"
+"#,
+    );
+    write_resource(
+        &store,
+        "admin",
+        r#"ownership = "branch"
+depends_on = ["supabase"]
+"#,
+    );
+    // A dependent of `admin` itself, to prove the fix does not just move the
+    // dead end one hop over: if `admin` stayed stuck, `web` would too.
+    write_resource(
+        &store,
+        "web",
+        r#"ownership = "branch"
+depends_on = ["admin"]
+"#,
+    );
+    let repo = store.paths().project_root.clone();
+    let manager = BranchManager::open(MetadataStore::at(repo)).expect("manager");
+    let spawned = manager.spawn("feature-a", None).expect("spawn");
+
+    // Neither `admin` nor `web` has a `prepare` to withhold, so both are
+    // bound `Ready` immediately — there was never a command that could have
+    // been blocked. `status` still reports `admin` as blocked while
+    // `supabase` is down, because that is a true and useful thing to say
+    // about the graph, but the stored fact about `admin` itself is not a
+    // dead end the way `Blocked` used to be.
+    assert_eq!(
+        spawned.branch.resources["admin"].status,
+        ResourceStatus::Ready
+    );
+    assert_eq!(
+        spawned.branch.resources["web"].status,
+        ResourceStatus::Ready
+    );
+
+    let state_of = |manager: &BranchManager, name: &str| {
+        manager.statuses().expect("statuses")[0]
+            .resources
+            .iter()
+            .find(|r| r.name == name)
+            .unwrap_or_else(|| panic!("{name} report"))
+            .state
+            .clone()
+    };
+    assert_eq!(state_of(&manager, "admin"), "blocked(supabase)");
+    // `web` depends on `admin`, not on `supabase` directly. `admin`'s own
+    // bind status is `Ready` throughout — the display-only `blocked(...)`
+    // above is derived for `admin`'s own row, not stored — so `web` was
+    // never blocked by anything and reports `ready` from the start. This is
+    // the concrete "usable as a dependency" claim: a no-`prepare` resource
+    // does not propagate a graph-wide stall just because something behind
+    // it happens to be down.
+    assert_eq!(state_of(&manager, "web"), "ready");
+
+    // The user's exact recovery step: re-running the failed prepare.
+    manager
+        .run_action("feature-a", "supabase.prepare")
+        .expect("prepare succeeds the second time");
+    assert_eq!(
+        manager
+            .store()
+            .find_branch("feature-a")
+            .expect("reload")
+            .resources["supabase"]
+            .status,
+        ResourceStatus::Ready
+    );
+
+    // Once `supabase` is ready, nothing is blocking `admin` either: it now
+    // reports its own bind status, `ready`, not a stale `blocked` and not a
+    // `pending` that nothing would ever clear.
+    assert_eq!(state_of(&manager, "admin"), "ready");
+    assert_eq!(state_of(&manager, "web"), "ready");
 }
 
 #[test]

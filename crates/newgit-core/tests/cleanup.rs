@@ -319,7 +319,7 @@ fn cleanup_finalizes_workspaceless_instances_and_frees_the_name() {
 }
 
 #[test]
-fn cleanup_deletes_unclaimed_workspaces_and_dead_state() {
+fn cleanup_deletes_unclaimed_workspaces_and_retires_dead_pids() {
     let (_guard, temp) = tempdir();
     let store = setup(&temp);
     let manager = manager_at(&store);
@@ -372,7 +372,17 @@ fn cleanup_deletes_unclaimed_workspaces_and_dead_state() {
         outcome.warnings
     );
 
-    assert!(!state_dir.join("app.pid").exists(), "dead PID file removed");
+    assert_eq!(
+        outcome.retired_pids,
+        [state_dir.join("app.pid")],
+        "the stale pid is retired, not deleted"
+    );
+    assert_eq!(
+        std::fs::read_to_string(state_dir.join("app.pid")).expect("read"),
+        "stopped\n",
+        "the file survives so `status` still knows this resource ran once, \
+         but the reusable pid number is gone"
+    );
     assert!(!ghost_state.exists(), "state for a gone instance removed");
     assert!(
         spawned.branch.workspace_path.is_dir(),
