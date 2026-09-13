@@ -186,6 +186,28 @@ What `newgit undo` does with that record.
 | `recompute` | re-runs an action, unless `[identity]` has not moved | reinstall from the restored lockfile |
 | `external` | nothing, deliberately | another system owns it; an undo does not rewind it |
 
+**A checkpoint and a restore have to agree.** They are two halves of one
+mechanism — one records a state ref, the other consumes it — so what cannot
+mean anything is refused when the definition loads, not during the undo you
+are relying on:
+
+| this | is refused because |
+| --- | --- |
+| `{{state_ref}}` in a `[restore]` or `[cleanup]` command under `mode = "hash"` | a content hash identifies *inputs*. `restore-from hash:0fa284b468` is not a no-op, it is a wrong argument. Rebuild from those inputs with `recompute`, or drop the placeholder. |
+| the same under `mode = "none"`, or with no `[checkpoint]` at all | nothing records a ref, so the placeholder can never resolve. |
+| `external` + `recompute` | `recompute` does not ignore the handle, it re-runs `prepare` — which for an external resource mints a *second* instance and orphans the one the handle names. Use `command`, which receives it, or `external`. |
+
+The first two rules are about the placeholder, not the mode: a restore command
+that never asks for a state ref is an ordinary rebuild whatever the checkpoint
+records, and it loads. So do pairings that are merely inert — a `command`
+checkpoint with a `recompute` restore ignores the ref it recorded, but the
+record still reads back in `newgit checkpoints`.
+
+A `[cleanup]` hook is also refused *at teardown* if its `{{state_ref}}` has no
+value — see `[cleanup]`. The load-time rules above cannot catch everything the
+runtime one does: a checkpoint record written under an older definition is not
+something reading the current file can predict.
+
 A `recompute` restore skips when this resource's `[identity]` hash is the same
 now as at the checkpoint: the tree was already built from those inputs, so the
 rebuild would change nothing. It says so rather than passing silently:
@@ -220,7 +242,11 @@ Two rules constrain it, both deliberately:
   hook even when one is defined — and says it skipped it.
 - **An unresolved `{{...}}` refuses.** Everywhere else a placeholder with no
   value renders verbatim so the mistake is visible. A destructive command is
-  the exception: `delete {{state_ref}}` with no state ref is not run.
+  the exception: `delete {{state_ref}}` with no state ref is not run. A `hash`
+  checkpoint counts as no state ref: it records the content hash of
+  `[identity] paths`, which says whether the inputs moved and never names a
+  concrete thing to tear down, so `{{state_ref}}` stays unresolved and the
+  hook is refused rather than handed `hash:0fa284b468`.
 
 ### `[exports]`
 
@@ -244,6 +270,20 @@ depends_on = ["supabase"]
 SUPABASE_FUNCTIONS_URL = "{{exports.SUPABASE_API_URL}}/functions/v1"
 ```
 
+It may compose its own siblings too, in any order. The table is a map, not a
+sequence, so `HEALTH_URL` below is rendered before `BASE_URL` exists on the
+first pass and resolved on the second — you never have to think about which
+line comes first:
+
+```toml
+[exports]
+BASE_URL   = "http://127.0.0.1:{{ports.app}}"
+HEALTH_URL = "{{exports.BASE_URL}}/health"
+```
+
+Two exports that reference each other resolve to nothing and are reported
+like any other placeholder that never resolved.
+
 **An unresolved `{{...}}` refuses.** This is the third place that does, with
 `[cleanup]` and `[[render]]`, and for the same reason: everywhere else a
 placeholder with no value renders verbatim so the mistake is visible to
@@ -253,6 +293,12 @@ variable. The mistake would surface in a different process, hours later, as a
 malformed URL. The resource fails to bind and the value is not stored — an
 absent variable is something downstream can detect; `http://127.0.0.1:{{ports.db.api}}`
 is not.
+
+It withholds *every* export of that resource, not just the bad one, and names
+every export that failed rather than the first. A binding that publishes half
+an environment is the same failure one variable further down: `newgit run` and
+every dependent's actions read a binding's exports without asking what status
+it holds.
 
 There is no syntax for another resource's *ports*: `{{ports.<name>}}` is
 scoped to the resource's own. Publish the value as an export and compose that.
@@ -394,9 +440,10 @@ instances whose workspaces are gone.
 
 Every command and export value is rendered before it runs. An unknown or
 out-of-scope variable is left in the text verbatim — visible rather than
-silently empty — except in `[cleanup]` and `[[render]]`, which refuse instead.
-Both write something durable: a destructive command, and a file that would
-otherwise gain committed-looking text nobody wrote.
+silently empty — except in `[cleanup]`, `[[render]]`, and `[exports]`, which
+refuse instead. All three write something durable: a destructive command, a
+file that would otherwise gain committed-looking text nobody wrote, and an
+environment variable handed to every later process.
 
 | variable | is |
 | --- | --- |
@@ -407,13 +454,13 @@ otherwise gain committed-looking text nobody wrote.
 | `{{ports.<name>}}` | an allocated port |
 | `{{exports.<name>}}` | a rendered export from this resource's binding |
 | `{{snapshot.path}}` | directory to write checkpoint output into |
-| `{{state_ref}}` | the handle the last checkpoint recorded, or the path of the snapshot it deposited |
+| `{{state_ref}}` | the handle the last checkpoint recorded, or the path of the snapshot it deposited. A `hash` checkpoint records neither, so it has no value |
 
 Scope — which of them have a value where:
 
 | rendered in | branch/workspace/scripts | `ports.*` | `exports.*` | `snapshot.path` | `state_ref` |
 | --- | --- | --- | --- | --- | --- |
-| `[exports]` values | yes | yes | — | — | — |
+| `[exports]` values | yes | yes | yes | — | — |
 | `[[render]]` `with` | yes | yes | yes | — | — |
 | action `command` | yes | yes | — | — | — |
 | `[checkpoint] command` | yes | yes | yes | yes | — |

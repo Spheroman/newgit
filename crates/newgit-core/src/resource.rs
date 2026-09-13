@@ -6,6 +6,7 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
 use crate::error::{NewgitError, Result};
+use crate::exports::STATE_REF_PLACEHOLDER;
 use crate::render::RenderSpec;
 
 /// A lifecycle unit that re-establishes per-branch state that can't travel
@@ -324,6 +325,7 @@ impl ResourceDefinition {
                 _ => {}
             }
         }
+        self.check_checkpoint_restore_pairing()?;
         if let Some(workdir) = &self.workdir {
             self.check_workdir_is_workspace_relative(workdir)?;
         }
@@ -411,6 +413,96 @@ impl ResourceDefinition {
                 return Err(self.invalid(format!(
                     "identity path `{path}` may not reach into `{}`",
                     first.unwrap_or_default()
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// `[checkpoint]` and `[restore]` are two halves of one mechanism: the
+    /// checkpoint records a state ref and the restore is what consumes it.
+    /// Checked only per section, all sixteen pairings load, and three of them
+    /// cannot mean anything — the worst hands a restore command a content
+    /// hash where it expected a handle, which is not a no-op, it is a wrong
+    /// argument. They are refused here, when the definition is written,
+    /// rather than during the undo someone is relying on.
+    ///
+    /// The rest are left alone. A `command` checkpoint with a `recompute`
+    /// restore ignores the ref it recorded, and a `hash` checkpoint with an
+    /// `external` restore rewinds nothing, but both are inert rather than
+    /// wrong: the record still reads back in `newgit checkpoints`.
+    fn check_checkpoint_restore_pairing(&self) -> Result<()> {
+        if matches!(self.checkpoint_mode(), CheckpointMode::External)
+            && self
+                .restore
+                .as_ref()
+                .is_some_and(|restore| restore.mode == RestoreMode::Recompute)
+        {
+            return Err(self.invalid(
+                "checkpoint mode `external` records a handle to state another system owns, and \
+                 restore mode `recompute` does not restore it — it re-runs an action locally, \
+                 which for an external resource mints a *second* instance and orphans the one \
+                 the handle names. Pair `external` with `command`, which receives the handle as \
+                 `{{state_ref}}`, or with `external`, which leaves the other system alone."
+                    .to_owned(),
+            ));
+        }
+        self.check_state_ref_is_recordable()
+    }
+
+    /// An absent `[checkpoint]` records exactly what `mode = "none"` does.
+    fn checkpoint_mode(&self) -> CheckpointMode {
+        self.checkpoint
+            .as_ref()
+            .map_or(CheckpointMode::None, |spec| spec.mode)
+    }
+
+    /// `{{state_ref}}` in a restore or cleanup command, under a checkpoint
+    /// that can never record one for it.
+    ///
+    /// Two modes never produce a ref a command can be handed. `none` records
+    /// nothing at all. `hash` records the content hash of `[identity] paths`,
+    /// which answers whether the inputs moved and never names a concrete
+    /// thing to restore or tear down — `restore-from hash:0fa284b468` is not
+    /// a no-op, it is a wrong argument.
+    ///
+    /// Both are decidable from the definition alone, so both are refused
+    /// where the mistake was made. The guard that refuses a cleanup hook with
+    /// an unresolved placeholder still stands behind this: it catches the
+    /// same mistake in a record written under an older definition, which no
+    /// amount of reading the current one can predict.
+    fn check_state_ref_is_recordable(&self) -> Result<()> {
+        let hint = match self.checkpoint_mode() {
+            CheckpointMode::None if self.checkpoint.is_some() => {
+                "checkpoint mode `none` records nothing — there is never a ref to interpolate. \
+                 Record one with a `command` or `external` checkpoint, or drop the placeholder."
+            }
+            CheckpointMode::None => {
+                "this resource declares no `[checkpoint]` — there is never a ref to interpolate. \
+                 Record one with a `command` or `external` checkpoint, or drop the placeholder."
+            }
+            CheckpointMode::Hash => {
+                "checkpoint mode `hash` records a content hash of `[identity] paths`, which \
+                 identifies inputs and never a thing to act on. Rebuild from those inputs with \
+                 restore mode `recompute`, or drop the placeholder."
+            }
+            CheckpointMode::Command | CheckpointMode::External => return Ok(()),
+        };
+
+        let restore_command = self
+            .restore
+            .as_ref()
+            .filter(|restore| restore.mode == RestoreMode::Command)
+            .and_then(|restore| restore.command.as_deref());
+        let cleanup_command = self
+            .cleanup
+            .as_ref()
+            .and_then(|cleanup| cleanup.command.as_deref());
+
+        for (section, command) in [("restore", restore_command), ("cleanup", cleanup_command)] {
+            if command.is_some_and(|command| command.contains(STATE_REF_PLACEHOLDER)) {
+                return Err(self.invalid(format!(
+                    "{section} command uses `{STATE_REF_PLACEHOLDER}`, but {hint}"
                 )));
             }
         }
@@ -844,5 +936,143 @@ workdir = "../outside"
             matches!(result, Err(NewgitError::InvalidDefinition { .. })),
             "an action-level workdir is held to the same rule: {result:?}"
         );
+    }
+
+    /// The case that matters: this loaded, and then handed the restore
+    /// command `hash:0fa284b46875` — a content hash where it expected
+    /// something to restore.
+    #[test]
+    fn a_state_ref_no_checkpoint_can_record_is_refused() {
+        let hash_definition = |section: &str, command: &str| {
+            format!(
+                r#"ownership = "branch"
+
+[identity]
+paths = ["package-lock.json"]
+
+[actions.prepare]
+command = "npm ci"
+
+[checkpoint]
+mode = "hash"
+
+[{section}]
+{command}
+"#
+            )
+        };
+
+        let error = write_and_load(&hash_definition(
+            "restore",
+            "mode = \"command\"\ncommand = \"restore-from {{state_ref}}\"",
+        ))
+        .expect_err("a hash ref is not something a command can restore from");
+        let message = error.to_string();
+        assert!(message.contains("restore command"), "{message}");
+        assert!(message.contains("recompute"), "names the fix: {message}");
+
+        // The same mistake in a teardown command, which is the one that does
+        // damage: `delete-environment hash:0fa284b468` is a wrong argument,
+        // and the runtime guard only ever saw a placeholder that had resolved.
+        let error = write_and_load(&hash_definition(
+            "cleanup",
+            "command = \"delete-environment {{state_ref}}\"",
+        ))
+        .expect_err("a hash ref is not something a command can tear down");
+        assert!(error.to_string().contains("cleanup command"));
+
+        // Nothing records a ref at all, so the placeholder can never resolve —
+        // in either section.
+        for section in [
+            "[restore]\nmode = \"command\"\ncommand",
+            "[cleanup]\ncommand",
+        ] {
+            let error = write_and_load(&format!(
+                r#"ownership = "branch"
+
+[actions.prepare]
+command = "true"
+
+{section} = "act-on {{{{state_ref}}}}"
+"#
+            ))
+            .expect_err("no checkpoint records a ref to interpolate");
+            assert!(error.to_string().contains("[checkpoint]"));
+        }
+    }
+
+    /// `recompute` does not *ignore* an external handle, which would be inert
+    /// and allowed — it re-runs `prepare`, which mints a second external
+    /// instance and orphans the one the handle names.
+    #[test]
+    fn an_external_checkpoint_with_a_recompute_restore_is_refused() {
+        let error = write_and_load(
+            r#"ownership = "external"
+
+[actions.prepare]
+command = "cloudctl preview create"
+
+[checkpoint]
+mode = "external"
+state_ref = "{{exports.PREVIEW_ID}}"
+
+[restore]
+mode = "recompute"
+"#,
+        )
+        .expect_err("recompute would mint a second preview");
+        assert!(error.to_string().contains("external"));
+    }
+
+    /// The pairings that do mean something keep loading — including the inert
+    /// ones, which record a ref nobody reads but are not wrong.
+    #[test]
+    fn the_checkpoint_and_restore_pairings_that_mean_something_still_load() {
+        let ok = |checkpoint: &str, restore: &str| {
+            let contents = format!(
+                r#"ownership = "branch"
+
+[identity]
+paths = ["package-lock.json"]
+
+[actions.prepare]
+command = "true"
+
+[checkpoint]
+{checkpoint}
+
+[restore]
+{restore}
+"#
+            );
+            let result = write_and_load(&contents);
+            assert!(result.is_ok(), "{checkpoint} + {restore}: {result:?}");
+        };
+
+        ok("mode = \"hash\"", "mode = \"recompute\"");
+        ok("mode = \"hash\"", "mode = \"none\"");
+        ok("mode = \"hash\"", "mode = \"external\"");
+        ok(
+            "mode = \"command\"\ncommand = \"pg_dump\"",
+            "mode = \"command\"\ncommand = \"psql < {{state_ref}}\"",
+        );
+        ok(
+            "mode = \"command\"\ncommand = \"pg_dump\"",
+            "mode = \"recompute\"",
+        );
+        ok(
+            "mode = \"external\"\nstate_ref = \"pv_9\"",
+            "mode = \"command\"\ncommand = \"cloudctl restore {{state_ref}}\"",
+        );
+
+        // The refusal is about the *placeholder*, not the mode. A restore
+        // command that never asks for a state ref is an ordinary rebuild,
+        // whatever the checkpoint records — refusing it would force a
+        // working definition to be rewritten to satisfy the validator.
+        ok(
+            "mode = \"hash\"",
+            "mode = \"command\"\ncommand = \"npm ci\"",
+        );
+        ok("mode = \"none\"", "mode = \"command\"\ncommand = \"true\"");
     }
 }

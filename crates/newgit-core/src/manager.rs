@@ -7,8 +7,8 @@ use crate::branch::{
     BranchInstance, ResourceBinding, ResourceStatus, TrackerBinding, branch_slug, validate_name,
 };
 use crate::checkpoint::{
-    CheckpointLog, CheckpointReason, CheckpointRecord, RecoveryRecord, ResourceState,
-    RestoreFailure, SourceState, TrackerState,
+    CheckpointLog, CheckpointReason, CheckpointRecord, HASH_STATE_REF_PREFIX, RecoveryRecord,
+    ResourceState, RestoreFailure, SourceState, TrackerState,
 };
 use crate::cleanup::{
     ArchivedCheckpoints, CleanupOutcome, FinalizedInstance, HookDetail, HookOutcome, PrunedRev,
@@ -560,15 +560,6 @@ impl BranchManager {
             // the resource itself could not publish one, which is the wrong
             // way round: `[exports]` is what produces those values.
             let bound = self.bound_exports(branch);
-            let context = RenderContext {
-                branch_name: &branch.name,
-                branch_slug: &branch.slug,
-                workspace: branch.workspace_path.as_str(),
-                scripts: self.scripts_dir(),
-                ports: Some(&resolved_ports),
-                exports: Some(&bound),
-                ..RenderContext::default()
-            };
 
             // Everywhere else an unknown `{{...}}` renders verbatim, so the
             // mistake is visible to whoever typed it. An export is the
@@ -579,27 +570,31 @@ impl BranchManager {
             // malformed URL. The unresolved value is dropped rather than
             // stored — an absent variable is a failure something downstream
             // can detect; `http://127.0.0.1:{{ports.db.api}}` is not.
-            let mut resolved_exports = BTreeMap::new();
-            let mut export_error = None;
-            for (key, value) in &definition.exports {
-                let rendered = render(value, &context);
-                match unresolved_placeholder(&rendered) {
-                    Some(placeholder) => {
-                        export_error = Some(
-                            NewgitError::ExportUnresolved {
-                                resource: definition.name.clone(),
-                                export: key.clone(),
-                                placeholder: placeholder.to_owned(),
-                            }
-                            .to_string(),
-                        );
-                        break;
-                    }
-                    None => {
-                        resolved_exports.insert(key.clone(), rendered);
-                    }
+            let (resolved_exports, unresolved) =
+                self.resolve_exports(branch, definition, &resolved_ports, &bound);
+
+            // Nothing this resource exports is stored when any of it fails.
+            // A binding that publishes half an environment is the case the
+            // refusal exists to prevent: `assemble_env` hands bindings to
+            // `newgit run` and to every dependent's actions without asking
+            // what status they hold, so a surviving `BASE_URL` beside a
+            // dropped `HEALTH_URL` is exactly the malformed-environment
+            // failure, one variable further down.
+            let export_error = (!unresolved.is_empty()).then(|| {
+                NewgitError::ExportUnresolved {
+                    resource: definition.name.clone(),
+                    exports: unresolved
+                        .iter()
+                        .map(|(export, placeholder)| format!("`{export}` ({placeholder})"))
+                        .collect::<Vec<_>>()
+                        .join(", "),
                 }
-            }
+                .to_string()
+            });
+            let resolved_exports = match export_error {
+                Some(_) => BTreeMap::new(),
+                None => resolved_exports,
+            };
 
             branch.resources.insert(
                 definition.name.clone(),
@@ -838,6 +833,102 @@ impl BranchManager {
             }
         }
         Ok(restore)
+    }
+
+    /// Render one resource's `[exports]` against its ports, its dependencies'
+    /// exports, and each other. Returns what resolved, and every export that
+    /// did not with the placeholder that stopped it.
+    ///
+    /// Composing a sibling is the obvious thing to write — `HEALTH_URL =
+    /// "{{exports.BASE_URL}}/health"` two lines under `BASE_URL` — and
+    /// refusing it while accepting the same line pointed at a *dependency*
+    /// would be a rule nobody could guess. There is no declaration order to
+    /// lean on, though: the table is a map, sorted by key, so `HEALTH_URL`
+    /// renders before `BASE_URL` exists no matter how the file is written.
+    /// So this resolves to a fixed point instead — each pass renders what it
+    /// can, and a pass that resolves nothing new is the end. A definition's
+    /// exports are a handful of short strings; the passes are not a cost.
+    ///
+    /// What survives that is unresolvable by construction: a typo, or a cycle
+    /// (`A = "{{exports.B}}"`, `B = "{{exports.A}}"`), which stalls rather
+    /// than looping forever and is reported like any other unresolved
+    /// placeholder.
+    fn resolve_exports(
+        &self,
+        branch: &BranchInstance,
+        definition: &ResourceDefinition,
+        resolved_ports: &BTreeMap<String, u16>,
+        bound: &BTreeMap<String, String>,
+    ) -> (BTreeMap<String, String>, Vec<(String, String)>) {
+        let mut resolved: BTreeMap<String, String> = BTreeMap::new();
+        let mut pending: Vec<(&String, &String)> = definition.exports.iter().collect();
+
+        loop {
+            // This resource's own exports layer over its dependencies', the
+            // same way a dependent's binding wins in `assemble_env`.
+            let mut visible = bound.clone();
+            visible.extend(
+                resolved
+                    .iter()
+                    .map(|(key, value)| (key.clone(), value.clone())),
+            );
+            let context = RenderContext {
+                branch_name: &branch.name,
+                branch_slug: &branch.slug,
+                workspace: branch.workspace_path.as_str(),
+                scripts: self.scripts_dir(),
+                ports: Some(resolved_ports),
+                exports: Some(&visible),
+                ..RenderContext::default()
+            };
+
+            let mut still_pending = Vec::new();
+            let mut progressed = false;
+            for (key, template) in pending {
+                let rendered = render(template, &context);
+                if unresolved_placeholder(&rendered).is_some() {
+                    still_pending.push((key, template));
+                } else {
+                    resolved.insert(key.clone(), rendered);
+                    progressed = true;
+                }
+            }
+            pending = still_pending;
+            if pending.is_empty() || !progressed {
+                break;
+            }
+        }
+
+        // Reported all at once, and against everything that did resolve, so
+        // each one names what actually stopped it — a typo'd port, or the
+        // sibling that stalled first. Reporting only the first would mean
+        // fixing it, re-spawning, and meeting the next.
+        let mut visible = bound.clone();
+        visible.extend(
+            resolved
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone())),
+        );
+        let context = RenderContext {
+            branch_name: &branch.name,
+            branch_slug: &branch.slug,
+            workspace: branch.workspace_path.as_str(),
+            scripts: self.scripts_dir(),
+            ports: Some(resolved_ports),
+            exports: Some(&visible),
+            ..RenderContext::default()
+        };
+        let unresolved = pending
+            .into_iter()
+            .map(|(key, template)| {
+                let rendered = render(template, &context);
+                let placeholder = unresolved_placeholder(&rendered)
+                    .unwrap_or(template.as_str())
+                    .to_owned();
+                (key.clone(), placeholder)
+            })
+            .collect();
+        (resolved, unresolved)
     }
 
     /// Every export bound so far, in dependency order — dependents win, the
@@ -2069,7 +2160,9 @@ impl BranchManager {
 
     /// The most recent checkpointed state reference for one resource, which
     /// is what a cleanup hook's `{{state_ref}}` means: the handle newgit last
-    /// recorded. Deposited content resolves to its path, like restore.
+    /// recorded. Deposited content resolves to its path, like restore, and a
+    /// `hash:` ref resolves to nothing — see
+    /// [`ResourceState::consumable_state_ref`].
     fn checkpointed_state_ref(
         &self,
         branch: &BranchInstance,
@@ -2081,15 +2174,9 @@ impl BranchManager {
                 .resource_states
                 .iter()
                 .find(|state| state.name == resource)
+                && let Some(resolved) = state.consumable_state_ref()
             {
-                let resolved = state
-                    .state_path
-                    .as_ref()
-                    .map(ToString::to_string)
-                    .or_else(|| state.state_ref.clone());
-                if resolved.is_some() {
-                    return Ok(resolved);
-                }
+                return Ok(Some(resolved));
             }
         }
         Ok(None)
@@ -2451,7 +2538,7 @@ impl BranchManager {
                 let rev = content_rev(&files)?;
                 Ok(CapturedResource {
                     mode: "hash".to_owned(),
-                    state_ref: Some(format!("hash:{rev}")),
+                    state_ref: Some(format!("{HASH_STATE_REF_PREFIX}{rev}")),
                     state_path: None,
                     deposit: None,
                 })
@@ -2849,7 +2936,7 @@ impl BranchManager {
                 // passing silently.
                 if !undo.force_recompute
                     && let Some(recorded) = state.state_ref.as_deref()
-                    && recorded.starts_with("hash:")
+                    && recorded.starts_with(HASH_STATE_REF_PREFIX)
                     && undo
                         .pre_undo_state_ref
                         .is_some_and(|current| current == recorded)
@@ -2889,11 +2976,7 @@ impl BranchManager {
             RestoreMode::Command => {
                 let template = spec.command.as_deref().expect("validated at parse time");
                 let binding = branch.resources.get(&definition.name);
-                let state_ref = state
-                    .state_path
-                    .as_ref()
-                    .map(ToString::to_string)
-                    .or_else(|| state.state_ref.clone());
+                let state_ref = state.consumable_state_ref();
                 let context = RenderContext {
                     branch_name: &branch.name,
                     branch_slug: &branch.slug,

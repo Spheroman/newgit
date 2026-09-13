@@ -23,6 +23,10 @@ pub struct RenderContext<'a> {
     pub state_ref: Option<&'a str>,
 }
 
+/// The placeholder a checkpointed state reference renders into. Named because
+/// definition validation has to look for it in a template it will not render.
+pub const STATE_REF_PLACEHOLDER: &str = "{{state_ref}}";
+
 pub fn render(template: &str, context: &RenderContext) -> String {
     let mut rendered = template
         .replace("{{branch.name}}", context.branch_name)
@@ -39,7 +43,7 @@ pub fn render(template: &str, context: &RenderContext) -> String {
         rendered = rendered.replace("{{snapshot.path}}", path);
     }
     if let Some(state_ref) = context.state_ref {
-        rendered = rendered.replace("{{state_ref}}", state_ref);
+        rendered = rendered.replace(STATE_REF_PLACEHOLDER, state_ref);
     }
     rendered
 }

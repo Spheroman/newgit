@@ -90,6 +90,34 @@ pub struct ResourceState {
     pub resolved_exports: BTreeMap<String, String>,
 }
 
+/// The prefix a `hash` checkpoint writes its state ref with.
+pub const HASH_STATE_REF_PREFIX: &str = "hash:";
+
+impl ResourceState {
+    /// What `{{state_ref}}` means for this record, or `None` when the record
+    /// holds nothing a command could be handed.
+    ///
+    /// Deposited content resolves to its path — a restore command wants the
+    /// dump, not the `tracker:<name>@<rev>` that located it. A `hash:` ref
+    /// resolves to nothing at all: it is the content hash of `[identity]
+    /// paths`, which says whether the inputs moved and never identifies a
+    /// concrete thing to restore or tear down. Leaving `{{state_ref}}`
+    /// unresolved is what makes that visible — verbatim in a restore command,
+    /// and a refusal in a cleanup hook, which is where handing over a
+    /// meaningless argument would do damage.
+    pub fn consumable_state_ref(&self) -> Option<String> {
+        if let Some(path) = &self.state_path {
+            return Some(path.to_string());
+        }
+        match self.state_ref.as_deref() {
+            Some(state_ref) if !state_ref.starts_with(HASH_STATE_REF_PREFIX) => {
+                Some(state_ref.to_owned())
+            }
+            _ => None,
+        }
+    }
+}
+
 /// Written next to the checkpoint when resource restores fail during undo,
 /// so the failure survives the terminal: what failed, where the logs are,
 /// and how to re-run.
@@ -240,5 +268,38 @@ mod tests {
             log.load("ckpt_009"),
             Err(NewgitError::UnknownCheckpoint { .. })
         ));
+    }
+    /// What `{{state_ref}}` is allowed to become. A hash is the case worth
+    /// pinning: it is a recorded ref, so "there is no ref" is not why it
+    /// resolves to nothing — it is the wrong kind of thing to hand a command.
+    #[test]
+    fn a_hash_ref_is_not_something_a_command_can_be_handed() {
+        let state = |state_ref: Option<&str>, state_path: Option<&str>| ResourceState {
+            name: "deps".to_owned(),
+            definition_rev: "sha256:000000000000".to_owned(),
+            mode: "hash".to_owned(),
+            state_ref: state_ref.map(ToOwned::to_owned),
+            state_path: state_path.map(Utf8PathBuf::from),
+            was_running: false,
+            resolved_ports: BTreeMap::new(),
+            resolved_exports: BTreeMap::new(),
+        };
+
+        assert_eq!(
+            state(Some("hash:0fa284b46875"), None).consumable_state_ref(),
+            None
+        );
+        assert_eq!(
+            state(Some("pv_9"), None).consumable_state_ref(),
+            Some("pv_9".to_owned()),
+            "an opaque handle is exactly what a command wants"
+        );
+        assert_eq!(
+            state(Some("tracker:db-snapshots@a1b2"), Some("/lane/a1b2/db.sql"))
+                .consumable_state_ref(),
+            Some("/lane/a1b2/db.sql".to_owned()),
+            "deposited content resolves to the path, not the ref that located it"
+        );
+        assert_eq!(state(None, None).consumable_state_ref(), None);
     }
 }
