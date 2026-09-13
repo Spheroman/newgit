@@ -78,7 +78,7 @@ other ledger: a port is free the moment nothing claims it).
 | key | type | required | default | meaning |
 | --- | --- | --- | --- | --- |
 | `ownership` | string | yes | — | `branch`, `workspace`, `project`, `user`, or `external`. See *Ownership*. |
-| `depends_on` | array of strings | no | `[]` | resource or tracker names that must be ready first. Orders `prepare` at spawn and cleanup hooks in reverse. A name that is neither is an error the graph reports. |
+| `depends_on` | array of strings | no | `[]` | resource or tracker names whose *lifecycle* this one depends on. Orders `prepare` at spawn and cleanup hooks in reverse. A name that is neither is an error the graph reports. Needing another resource's *value* is not this — see *Data edges*. |
 | `workdir` | string | no | workspace root | where every command this resource runs is spawned, relative to the workspace root. Overridable per action — see `[actions.<name>]`. |
 
 `workdir` is applied as the spawned process's working directory, never as a
@@ -303,6 +303,74 @@ it holds.
 There is no syntax for another resource's *ports*: `{{ports.<name>}}` is
 scoped to the resource's own. Publish the value as an export and compose that.
 
+Export names are global to the project and may only be claimed once — see
+*Command environment*. Two resources that both want `APP_URL` must pick two
+names; that is the same constraint the shell they end up in has.
+
+### Data edges
+
+`{{exports.<name>}}` in an `[exports]` value or a `[[render]]` replacement is
+itself the declaration that you need another resource's value. newgit reads
+the edge out of the template; you do not write it in `depends_on`:
+
+```toml
+# supabase.toml — no depends_on. The template already said it.
+[[render]]
+path = "packages/db/supabase/config.toml"
+replace = [
+  { find = 'additional_redirect_urls = ["exp://127.0.0.1:8081"]',
+    with = 'additional_redirect_urls = ["{{exports.EXPO_URL}}"]' },
+]
+```
+
+`web` exports `EXPO_URL`, so `web` binds before `supabase` and the value is
+there when the file renders. `newgit resource list` prints what was inferred,
+since an edge nobody wrote down still has to be legible:
+
+```
+Reads exports from (inferred from `{{exports.*}}`):
+  supabase reads web (EXPO_URL)
+  these order binding only — they say nothing about teardown
+```
+
+**A data edge orders binding and nothing else.** It does not claim that
+`supabase` needs `web` running, started, or ever used, and teardown ignores
+it completely — `[cleanup]` hooks reverse the `depends_on` graph alone. That
+separation is the point: needing one string out of a resource used to require
+declaring a lifecycle dependency that did not exist, which then quietly
+reversed into teardown order.
+
+Two rules follow from reading the edge rather than being told it:
+
+- A name no resource exports is not an edge. It is a template that will not
+  resolve, and `[exports]` and `[[render]]` already refuse it at bind time
+  with a better message than a graph error could give.
+- A resource referring to *its own* exports is the sibling case above, not an
+  edge to itself.
+
+`[cleanup]` and `[checkpoint]` may use `{{exports.*}}` too, but they read a
+binding record that is already complete, so they create no edge — there is
+nothing left to order.
+
+A cycle through data edges alone (`A = "{{exports.B}}"` in one resource,
+`B = "{{exports.A}}"` in another) is a real cycle and is reported like any
+other: the two cannot be bound in either order.
+
+**A data edge does not block.** If the resource owning an export fails to
+`prepare`, its readers are not held back the way a `depends_on` dependent is
+— and they do not need to be, because of what a static `[exports]` value can
+be made of: ports, branch vars, `{{workspace}}`, `{{scripts}}`, and other
+exports. None of those depend on `prepare` succeeding. A port is allocated to
+the instance whether or not the process ever came up, so the value is
+correct, not stale.
+
+Anything that genuinely depends on `prepare` has to arrive through
+`captures`, and a capture that never arrived leaves `{{exports.<name>}}`
+unresolved — which `[exports]` and `[[render]]` already refuse, stopping the
+reader without any blocking rule. Blocking on a data edge would instead
+withhold a correct render because an unrelated process failed to start, which
+is the over-claiming this section exists to remove.
+
 Resources export runtime values — ports, URLs, handles. Trackers do not
 export anything; they own file content.
 
@@ -502,8 +570,7 @@ command never emitted is a warning, not an error.
 
 ## Command environment
 
-`newgit run [instance] -- <command>` and every action see, in this order
-(later wins):
+`newgit run [instance] -- <command>` and every action see:
 
 1. each resource's rendered `[exports]`, in dependency order;
 2. `[ports.<name>] env` variables;
@@ -511,6 +578,35 @@ command never emitted is a warning, not an error.
 
 Trackers contribute no environment; they place files. Loading `.env`-style
 files is command-run policy, not a tracker feature.
+
+**A name has exactly one owner.** Three things declare an environment
+variable — an `[exports]` key, an action's `captures` entry, and a port's
+`env` — and the same name appearing in two of them is a graph problem,
+reported by `newgit resource list` and refused by `spawn`, `run`, `action`,
+`checkpoint`, and `undo`, like a missing dependency or a cycle:
+
+```
+environment variable `EXPO_URL` is declared more than once (`metro` [exports],
+`supabase` [exports]); a name may have only one owner — rename all but one,
+and compose it elsewhere with `{{exports.EXPO_URL}}`
+```
+
+There is no shadowing rule to learn because there is nothing to shadow. The
+one deliberate overlap is a `captures` entry naming its *own* resource's
+`[exports]` key: the export holds the value the definition can state up
+front, and the action overwrites it with the one that did not exist until it
+ran. The owner is the same resource either way.
+
+`NEWGIT_BRANCH` and `NEWGIT_WORKSPACE` are reserved. newgit sets them for
+every command it runs, so a resource declaring one is reported too — a
+declaration that could never reach the process is a mistake worth naming,
+not a silent no-op.
+
+This is why the starter templates do not ship conventional names like `PORT`
+or `DATABASE_URL`. Two services in one project cannot both publish `PORT`,
+so `newgit resource add web --template process` writes `WEB_PORT` and
+`WEB_URL`, naming them after the resource. Rename them if you have one
+service and your tool insists on `PORT` — the generated file says so.
 
 ---
 

@@ -709,9 +709,21 @@ Resources can depend on trackers and other resources:
 app-service depends_on ["deps", "runtime-env", "dev-db"]
 ```
 
-v1 can use a simple topological order:
+`depends_on` is a *lifecycle* claim. Needing another resource's value is a
+separate, weaker thing, and it is not declared at all: a `{{exports.<name>}}`
+in an `[exports]` value or a `[[render]]` replacement already names what it
+needs, so newgit reads the edge out of the template. That gives two orders:
 
-- materialize trackers and prepare resource dependencies first
+- **bind order** — `depends_on` plus the inferred data edges. Materializing
+  trackers, preparing resources, rendering, assembling the environment, and
+  restoring all walk this, because a value has to exist before the template
+  that reads it renders.
+- **lifecycle order** — `depends_on` alone. Checkpoint and cleanup walk it in
+  reverse, so needing one string out of a resource never claims anything
+  about the order the two are torn down in.
+
+Within that:
+
 - if a resource dependency fails to prepare, leave the branch instance spawned
   but mark dependents `blocked` rather than running their prepare hooks or
   other command actions
@@ -1013,12 +1025,16 @@ newgit spawn auth-refactor --profile fullstack
 
 ### `newgit run [name] -- <command>`
 
-Runs a command inside the branch instance with the environment assembled in
-layers (later layers win):
+Runs a command inside the branch instance with the environment assembled
+from:
 
 1. resource exports, in dependency order
 2. port env vars (`PORT=3107`)
 3. `NEWGIT_BRANCH`, `NEWGIT_WORKSPACE` context vars
+
+A name belongs to exactly one declaration. Two resources claiming one name
+is a graph problem reported when the graph loads, not a last-one-wins
+resolution discovered as a missing variable in a subprocess.
 
 The workspace is the cwd; output is captured to `.newgit/logs/` as well as
 the terminal.

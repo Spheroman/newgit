@@ -823,6 +823,191 @@ command = "true"
     assert_eq!(manager.resource_definitions().len(), 2);
 }
 
+/// A data edge does not block its reader when the export's owner fails to
+/// prepare, and it does not need to. The two halves below are the whole
+/// argument, and they are worth pinning because a regression in either would
+/// be silent.
+///
+/// The distinction is what a static `[exports]` value can be made of: ports,
+/// branch vars, workspace, scripts, and other exports — none of which depend
+/// on `prepare` succeeding. Anything that *does* must arrive through
+/// `captures`, which are absent when prepare fails, and absence refuses.
+///
+/// So blocking on a data edge would be actively wrong: it would withhold a
+/// correct render because an unrelated process failed to start, which is the
+/// over-claiming #43 exists to remove.
+#[test]
+fn a_failed_export_owner_refuses_its_reader_only_when_the_value_is_actually_missing() {
+    let (_guard, temp) = tempdir();
+    let store = setup(&temp);
+    let repo = store.paths().project_root.clone();
+
+    // The owner's prepare fails. `TUNNEL_URL` is captured, so it never
+    // exists; `WEB_URL` is static, so it exists regardless.
+    write_resource(
+        &store,
+        "owner",
+        r#"ownership = "branch"
+
+[ports]
+app = { start = 4100 }
+
+[exports]
+WEB_URL = "http://127.0.0.1:{{ports.app}}"
+
+[actions.prepare]
+command = "exit 1"
+captures = ["TUNNEL_URL"]
+"#,
+    );
+    // Reads the value that does exist. Declares no dependency.
+    write_resource(
+        &store,
+        "reads-static",
+        r#"ownership = "branch"
+
+[exports]
+HEALTH_URL = "{{exports.WEB_URL}}/health"
+
+[actions.prepare]
+command = "touch reads-static.txt"
+"#,
+    );
+    // Reads the value that does not.
+    write_resource(
+        &store,
+        "reads-captured",
+        r#"ownership = "branch"
+
+[exports]
+PROBE_URL = "{{exports.TUNNEL_URL}}/health"
+
+[actions.prepare]
+command = "touch reads-captured.txt"
+"#,
+    );
+
+    let manager = BranchManager::open(MetadataStore::at(repo)).expect("manager");
+    let spawned = manager.spawn("feature-a", None).expect("spawn");
+    let resources = &spawned.branch.resources;
+    assert_eq!(resources["owner"].status, ResourceStatus::Failed);
+
+    // The port was allocated to this instance whether or not the process
+    // came up, so the value is correct, not stale. The reader proceeds.
+    assert_eq!(
+        resources["reads-static"].resolved_exports["HEALTH_URL"],
+        format!(
+            "http://127.0.0.1:{}/health",
+            resources["owner"].resolved_ports["app"]
+        )
+    );
+    assert_eq!(resources["reads-static"].status, ResourceStatus::Ready);
+    assert!(
+        spawned
+            .branch
+            .workspace_path
+            .join("reads-static.txt")
+            .is_file(),
+        "a correct value is not withheld because an unrelated process failed"
+    );
+
+    // The captured value never arrived, so the reader refuses loudly and its
+    // prepare never runs — without any blocking rule saying so.
+    assert_eq!(resources["reads-captured"].status, ResourceStatus::Failed);
+    assert!(
+        resources["reads-captured"].resolved_exports.is_empty(),
+        "nothing half-resolved is stored"
+    );
+    assert!(
+        !spawned
+            .branch
+            .workspace_path
+            .join("reads-captured.txt")
+            .exists(),
+        "a missing value stops the reader on its own"
+    );
+}
+
+/// Adding the same template twice — a web and an api — is the canonical
+/// setup, and the one-owner rule turns a template that ships conventional
+/// names into a graph that refuses on the second `resource add`. The names
+/// are derived from the resource instead, so the obvious first thing a user
+/// does keeps working.
+#[test]
+fn adding_one_template_twice_leaves_a_graph_that_still_spawns() {
+    let (_guard, temp) = tempdir();
+    let store = setup(&temp);
+    let repo = store.paths().project_root.clone();
+
+    for name in ["api", "web"] {
+        BranchManager::open(MetadataStore::at(repo.clone()))
+            .expect("manager")
+            .add_resource(name, "process")
+            .expect("add");
+    }
+
+    let manager = BranchManager::open(MetadataStore::at(repo)).expect("manager");
+    assert!(
+        manager.graph_problems().is_empty(),
+        "no collision: {:?}",
+        manager.graph_problems()
+    );
+
+    let spawned = manager.spawn("feature-a", None).expect("spawn");
+    let env: std::collections::BTreeMap<_, _> = manager
+        .assemble_env(&spawned.branch)
+        .expect("env")
+        .into_iter()
+        .collect();
+
+    // Both services reach the same environment with their own names, which is
+    // the thing a single `PORT` could never express.
+    assert_ne!(env["WEB_PORT"], env["API_PORT"]);
+    assert!(env["WEB_URL"].ends_with(&env["WEB_PORT"]));
+    assert!(env["API_URL"].ends_with(&env["API_PORT"]));
+}
+
+/// Two resources exporting one name used to resolve to whichever bound last,
+/// so the loser was absent from `newgit run` with nothing anywhere saying
+/// why. It is now a graph problem, reported and gated like any other.
+#[test]
+fn two_resources_exporting_one_name_block_graph_commands() {
+    let (_guard, temp) = tempdir();
+    let store = setup(&temp);
+    let repo = store.paths().project_root.clone();
+
+    for name in ["metro", "supabase"] {
+        write_resource(
+            &store,
+            name,
+            r#"ownership = "branch"
+
+[exports]
+EXPO_URL = "exp://127.0.0.1:8081"
+"#,
+        );
+    }
+
+    let manager = BranchManager::open(MetadataStore::at(repo)).expect("open still works");
+    assert!(matches!(
+        manager.graph_problems(),
+        [newgit_core::resource::GraphProblem::EnvNameCollision { name, .. }]
+            if name == "EXPO_URL"
+    ));
+
+    let error = manager.spawn("blocked", None).expect_err("spawn refuses");
+    let message = error.to_string();
+    // The message has to name both claimants: either one alone is a rename
+    // you cannot evaluate without knowing what it is colliding with.
+    assert!(
+        message.contains("`metro` [exports]") && message.contains("`supabase` [exports]"),
+        "both claimants named: {message}"
+    );
+
+    // Listing definitions is how you find the collision, so it must not refuse.
+    assert_eq!(manager.resource_definitions().len(), 2);
+}
+
 /// A resource definition is read from the store, but anything it shelled out
 /// to was read from the workspace — so iterating on a `prepare` script meant
 /// committing every attempt or copying it into the workspace by hand.

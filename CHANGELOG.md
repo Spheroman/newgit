@@ -280,6 +280,114 @@ of `.newgit/` in a minor release — see *Upgrading* below.
 
 ### Changed
 
+- `depends_on` means lifecycle again. Needing another resource's *value* is
+  inferred from `{{exports.<name>}}` instead of declared, and orders binding
+  without touching teardown
+  ([#43](https://github.com/Spheroman/newgit/issues/43)).
+
+  One key was driving two different claims. A `[[render]]` substituting
+  another resource's URL into a config file needs that resource *bound*
+  before it renders and nothing more — but the only key that produced that
+  ordering also reversed into cleanup, so a pure data edge had to be written
+  as a lifecycle edge and silently acquired teardown semantics it never asked
+  for. The Supabase stack does not need the Expo dev server running, started,
+  or ever used; it needs one string out of it. The graph asserted otherwise
+  because there was no way to say the weaker thing.
+
+  There still isn't a way to *say* it, and that is the fix: the template is
+  already the statement. `{{exports.EXPO_URL}}` names what it needs, so the
+  edge is read from it rather than restated:
+
+  ```toml
+  # supabase.toml — no depends_on
+  [[render]]
+  path = "packages/db/supabase/config.toml"
+  replace = [
+    { find = 'additional_redirect_urls = ["exp://127.0.0.1:8081"]',
+      with = 'additional_redirect_urls = ["{{exports.EXPO_URL}}"]' },
+  ]
+  ```
+
+  `web` binds first and the file renders correctly, with nothing declared in
+  either direction. The graph now keeps two orders: bind order (`depends_on`
+  plus data edges) for preparing, rendering, env assembly, and restore;
+  lifecycle order (`depends_on` alone) reversed for checkpoint and cleanup.
+
+  Inference costs legibility, so `newgit resource list` prints what it found,
+  naming the export that caused each edge — an edge nobody wrote down has to
+  be able to explain itself:
+
+  ```
+  Reads exports from (inferred from `{{exports.*}}`):
+    supabase reads web (EXPO_URL)
+    these order binding only — they say nothing about teardown
+  ```
+
+  Only bind-time consumers count: `[exports]` values and `[[render]]`
+  replacements. `[cleanup]` and `[checkpoint]` may use `{{exports.*}}` too,
+  but they read a binding record that is already complete, so there is
+  nothing left to order. A name no resource exports is not an edge — it is a
+  template that will not resolve, which `[exports]` and `[[render]]` already
+  refuse with a better message. A resource referring to its own exports is
+  the documented sibling case, not an edge to itself. A cycle through data
+  edges alone is a real cycle and is reported like any other.
+
+  This is what made the export-name rule below worth having first: reading an
+  edge out of `{{exports.EXPO_URL}}` only works if exactly one resource can
+  own that name.
+
+- An environment variable name may be declared only once across the project;
+  a second claim is a graph problem
+  ([#43](https://github.com/Spheroman/newgit/issues/43)).
+
+  Three things declare a name — an `[exports]` key, an action's `captures`
+  entry, and a port's `env` — and the command environment used to be
+  assembled by layering them, exports in dependency order with port `env`
+  vars over the top. So a name claimed twice resolved to whichever
+  declaration happened to come last, and the loser was simply *absent* from
+  the process that needed it, with nothing anywhere saying why. Both
+  declarations look correct in their own file; the fault only exists in the
+  union, which is not a thing you can read.
+
+  Nothing wanted that behavior. It was never an override feature, just what
+  fell out of building a map — and it was not even consistent, since port
+  `env` vars beat exports regardless of dependency order while exports beat
+  each other according to it. The set of names is fully known from the
+  definitions, so the collision is now reported when the graph loads:
+
+  ```
+  environment variable `EXPO_URL` is declared more than once (`metro`
+  [exports], `supabase` [exports]); a name may have only one owner — rename
+  all but one, and compose it elsewhere with `{{exports.EXPO_URL}}`
+  ```
+
+  It is gated like any other graph problem — warned by the commands that
+  *build* the graph, refused by `spawn`, `run`, `action`, `checkpoint`, and
+  `undo` — so a project cannot be bricked by one, and `newgit resource list`
+  still tells you where it is.
+
+  The starter templates had to change with it. Adding the same template twice
+  — a web and an api — is the canonical setup, and shipping conventional
+  names meant the second `newgit resource add --template process` claimed the
+  `PORT` and `APP_URL` the first already owned and refused the whole graph.
+  That is newgit's own template breaking the project, not a user mistake, so
+  templates now name their variables after the resource: `resource add web
+  --template process` writes `WEB_PORT` and `WEB_URL`. The generated file
+  says to rename them if you have one service and your tool insists on
+  `PORT`. Two services in one project never could both publish it — every
+  resource's environment lands in one process environment — so the
+  conventional name was a promise templates could not keep.
+
+  One overlap is still allowed, because it has one owner: a `captures` entry
+  naming its own resource's `[exports]` key. The export states the value the
+  definition knows up front and the action overwrites it with the one that
+  did not exist until it ran.
+
+  `NEWGIT_BRANCH` and `NEWGIT_WORKSPACE` are reserved for the same reason.
+  newgit sets them last for every command it runs, so a resource declaring
+  one could never reach the process — reported against the single claimant
+  rather than passed over in silence.
+
 - Definitions reject keys newgit does not recognize, instead of ignoring them
   ([#35](https://github.com/Spheroman/newgit/issues/35)).
 
