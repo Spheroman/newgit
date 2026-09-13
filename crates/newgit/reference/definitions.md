@@ -47,7 +47,9 @@ lane content never lands in source history.
 
 A lifecycle unit that re-establishes per-branch state that cannot travel as
 file content. Start from `newgit resource add <name> --template <template>`
-(`newgit resource templates` lists them).
+(`newgit resource templates` lists them; `newgit resource templates --show
+<name>` prints one in full, including any companion resource or tracker it
+creates alongside it, without instantiating anything).
 
 ### Top level
 
@@ -337,13 +339,10 @@ resource's config file carry another's URL.
 
 An action with `captures` publishes values its command printed as this
 resource's exports — how a resource that mints an external handle (a preview
-id, a tunnel URL) hands it to everything downstream.
-
-```toml
-[actions.prepare]
-command = "cloudctl preview create --branch {{branch.name}} --json"
-captures = ["PREVIEW_ID", "PREVIEW_URL"]
-```
+id, a tunnel URL) hands it to everything downstream. The `external` template
+(`newgit resource templates --show external`) is built around this: its
+`prepare` action captures `PREVIEW_ID` and `PREVIEW_URL` from a provisioning
+command's JSON output.
 
 Two stdout shapes are accepted, because they are what real commands already
 emit:
