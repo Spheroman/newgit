@@ -80,9 +80,11 @@ APP_URL = "http://127.0.0.1:{{ports.app}}"
             name: "pnpm-store",
             contents: r#"ownership = "user"
 
+[identity]
+paths = ["pnpm-lock.yaml"]
+
 [checkpoint]
 mode = "hash"
-paths = ["pnpm-lock.yaml"]
 
 [restore]
 mode = "none"
@@ -103,9 +105,10 @@ paths = ["package.json", "pnpm-lock.yaml"]
 [actions.prepare]
 command = "pnpm install --frozen-lockfile"
 
+# Hashes `[identity] paths` above: what the install is derived from is
+# declared once, and a `recompute` restore skips when it has not moved.
 [checkpoint]
 mode = "hash"
-paths = ["package.json", "pnpm-lock.yaml"]
 
 [restore]
 mode = "recompute"

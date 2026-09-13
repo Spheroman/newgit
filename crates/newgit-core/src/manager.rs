@@ -224,8 +224,36 @@ pub struct CheckpointOutcome {
     pub warnings: Vec<String>,
 }
 
+/// What this undo knows about a resource beyond the checkpoint being
+/// restored — the facts a `recompute` needs to decide whether to run at all.
+#[derive(Debug, Clone, Copy)]
+struct RestoreContext<'a> {
+    /// This resource's state ref in the safety checkpoint taken moments ago:
+    /// the workspace as it stood before this undo touched anything.
+    pre_undo_state_ref: Option<&'a str>,
+    force_recompute: bool,
+}
+
+/// What one `newgit undo` should touch.
+#[derive(Debug, Default, Clone)]
+pub struct UndoOptions {
+    /// Checkpoint id to restore; the latest when absent.
+    pub to: Option<String>,
+    /// Restore only these resources, leaving source, trackers, and every
+    /// other resource untouched. Empty means the whole snapshot.
+    pub only: Vec<String>,
+    /// Re-run `recompute` restores even when identity is unchanged — for a
+    /// tree that has been damaged out from under its lockfile, which the
+    /// identity hash cannot see.
+    pub force_recompute: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UndoOutcome {
+    /// Whether `--only` narrowed this undo. A partial undo restores no source
+    /// and no tracker content, so it is not a snapshot the instance was ever
+    /// in — callers report it differently on purpose.
+    pub partial: bool,
     /// The checkpoint that was restored.
     pub restored: CheckpointRecord,
     /// Safety checkpoint taken first — restoring it again is redo.
@@ -2375,7 +2403,7 @@ impl BranchManager {
         match spec.mode {
             CheckpointMode::None => Ok(CapturedResource::none()),
             CheckpointMode::Hash => {
-                let files = collect_files(&branch.workspace_path, &spec.paths)?;
+                let files = collect_files(&branch.workspace_path, definition.identity_paths())?;
                 let rev = content_rev(&files)?;
                 Ok(CapturedResource {
                     mode: "hash".to_owned(),
@@ -2499,15 +2527,24 @@ impl BranchManager {
     /// Restore the branch instance to a checkpoint — the latest, unless
     /// `to` names one. The current state is checkpointed first, so undo is
     /// always undoable and running it twice is redo.
-    pub fn undo(&self, instance: &str, to: Option<&str>) -> Result<UndoOutcome> {
+    pub fn undo(&self, instance: &str, options: &UndoOptions) -> Result<UndoOutcome> {
         self.require_resolvable_graph()?;
         let mut branch = self.store.find_branch(instance)?;
         self.require_workspace(&branch)?;
         let checkpoint_log = self.checkpoint_log(&branch);
-        let restored = match to {
+        let restored = match options.to.as_deref() {
             Some(id) => checkpoint_log.load(id)?,
             None => checkpoint_log.latest()?,
         };
+
+        // `--only` names resources that must exist, or the undo silently does
+        // nothing at all — the worst possible answer for a command someone
+        // reaches for while already debugging.
+        for name in &options.only {
+            self.resource_definition(name)?;
+        }
+        let partial = !options.only.is_empty();
+        let wanted = |name: &String| !partial || options.only.contains(name);
 
         let safety = self.checkpoint_branch(
             &mut branch,
@@ -2516,35 +2553,48 @@ impl BranchManager {
         )?;
         let mut warnings = safety.warnings.clone();
 
-        // Nothing may keep running while content changes underneath it.
+        // Nothing may keep running while content changes underneath it. A
+        // partial undo leaves every other resource alone, so it must not stop
+        // them either.
         let supervisor = self.supervisor(&branch);
         for definition in &self.resources {
-            if supervisor.running_pid(&definition.name).is_some() {
+            if wanted(&definition.name) && supervisor.running_pid(&definition.name).is_some() {
                 supervisor.stop(&definition.name, &definition.stop_signal())?;
             }
         }
 
         // Source: content back exactly, uncommitted state uncommitted again.
+        //
+        // A partial undo does not touch it. `--only` exists for iterating on
+        // one resource's restore command, where rewinding the working tree is
+        // the cost being avoided — and a source rewind paired with a
+        // restore of one resource is not a state this instance was ever in.
         let workspace = branch.workspace_path.clone();
-        GitSource::workspace_fetch_ref(&workspace, self.source.root(), &restored.source.store_ref)?;
-        GitSource::workspace_restore_to(
-            &workspace,
-            &restored.source.head_rev,
-            restored.source.dirty_rev.as_deref(),
-        )?;
-        // The pre-undo tip stays reachable from the safety checkpoint's ref,
-        // so moving the branch back to it is expected, not divergence.
-        self.bless_store_branch(
-            &mut branch,
-            &restored.source.head_rev,
-            Some(&safety.record.source.head_rev),
-            &mut warnings,
-        )?;
+        if !partial {
+            GitSource::workspace_fetch_ref(
+                &workspace,
+                self.source.root(),
+                &restored.source.store_ref,
+            )?;
+            GitSource::workspace_restore_to(
+                &workspace,
+                &restored.source.head_rev,
+                restored.source.dirty_rev.as_deref(),
+            )?;
+            // The pre-undo tip stays reachable from the safety checkpoint's
+            // ref, so moving the branch back to it is expected, not divergence.
+            self.bless_store_branch(
+                &mut branch,
+                &restored.source.head_rev,
+                Some(&safety.record.source.head_rev),
+                &mut warnings,
+            )?;
+        }
 
         // Trackers: plain content, restored exactly; should not partially
         // fail in interesting ways, so failures here are hard errors.
         let mut trackers = Vec::new();
-        for state in &restored.tracker_states {
+        for state in restored.tracker_states.iter().filter(|_| !partial) {
             let Some(definition) = self
                 .trackers
                 .iter()
@@ -2593,7 +2643,9 @@ impl BranchManager {
         // the committed default port. Cheap, because a render is a pure
         // function of committed content and the binding record, and undo has
         // just settled both.
-        warnings.extend(self.rerender_all(&mut branch));
+        if !partial {
+            warnings.extend(self.rerender_all(&mut branch));
+        }
 
         // Resources: dependencies before dependents, restarting what was
         // running. Failures are collected into a recovery record, not fatal.
@@ -2607,7 +2659,7 @@ impl BranchManager {
             else {
                 continue;
             };
-            if !branch.resources.contains_key(name) {
+            if !branch.resources.contains_key(name) || !wanted(name) {
                 continue;
             }
             let definition = self.resource_definition(name)?;
@@ -2618,10 +2670,20 @@ impl BranchManager {
                 ));
             }
 
+            let pre_undo = safety
+                .record
+                .resource_states
+                .iter()
+                .find(|pre| &pre.name == name)
+                .and_then(|pre| pre.state_ref.as_deref());
             let (mut action_label, ok) = self.restore_resource(
                 &mut branch,
                 definition,
                 state,
+                RestoreContext {
+                    pre_undo_state_ref: pre_undo,
+                    force_recompute: options.force_recompute,
+                },
                 &mut failures,
                 &mut warnings,
             )?;
@@ -2684,6 +2746,7 @@ impl BranchManager {
         checkpoint_log.save(&safety_record)?;
 
         Ok(UndoOutcome {
+            partial,
             restored,
             safety: safety_record,
             trackers,
@@ -2701,6 +2764,7 @@ impl BranchManager {
         branch: &mut BranchInstance,
         definition: &ResourceDefinition,
         state: &ResourceState,
+        undo: RestoreContext<'_>,
         failures: &mut Vec<RestoreFailure>,
         warnings: &mut Vec<String>,
     ) -> Result<(String, bool)> {
@@ -2718,6 +2782,40 @@ impl BranchManager {
                         action: action_name.to_owned(),
                     }
                 })?;
+
+                // The whole premise of pointing `[identity]` at a lockfile is
+                // that the same inputs rebuild the same tree. So when the
+                // inputs have not moved between the checkpoint and now, the
+                // tree already is what the checkpoint describes and the
+                // rebuild is a no-op by construction — an expensive one,
+                // since this is where a full dependency install lives.
+                //
+                // Both hashes are read from records rather than computed
+                // here, and that is load-bearing: undo restores source before
+                // resources, so hashing the workspace at this point would
+                // compare the checkpoint against itself and skip every time,
+                // including the case that matters — a lockfile that moved
+                // after the checkpoint and has just been rewound under a
+                // `node_modules` built from the newer one.
+                //
+                // Identity describes the inputs, not the tree: someone can
+                // delete half of `node_modules` without touching the lockfile,
+                // and then the skip is wrong. That is what `--force-recompute`
+                // is for, and why the skip says so on the line rather than
+                // passing silently.
+                if !undo.force_recompute
+                    && let Some(recorded) = state.state_ref.as_deref()
+                    && recorded.starts_with("hash:")
+                    && undo
+                        .pre_undo_state_ref
+                        .is_some_and(|current| current == recorded)
+                {
+                    return Ok((
+                        format!("recompute({action_name}) skipped: identity unchanged"),
+                        true,
+                    ));
+                }
+
                 let log = self
                     .store
                     .action_log_path(&branch.slug, &format!("{}.restore", definition.name));

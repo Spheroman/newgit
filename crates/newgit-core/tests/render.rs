@@ -9,7 +9,7 @@ use std::process::Command;
 
 use camino::{Utf8Path, Utf8PathBuf};
 use newgit_core::config::WorkspaceSection;
-use newgit_core::manager::BranchManager;
+use newgit_core::manager::{BranchManager, UndoOptions};
 use newgit_core::store::MetadataStore;
 use newgit_core::tracker::Storage;
 use newgit_core::{NewgitError, SourceSubstrate};
@@ -194,7 +194,7 @@ fn an_undo_re_render_reports_the_edit_it_is_about_to_overwrite() {
     let edited = std::fs::read_to_string(&config).expect("read") + "\n[auth]\nenabled = true\n";
     std::fs::write(&config, edited).expect("edit");
 
-    let undone = m.undo("feature-a", None).expect("undo");
+    let undone = m.undo("feature-a", &UndoOptions::default()).expect("undo");
     assert!(
         undone
             .warnings
@@ -511,7 +511,7 @@ fn undo_re_renders_this_instances_values() {
     m.checkpoint("feature-a", Some("before"))
         .expect("checkpoint");
     std::fs::write(workspace.join("README.md"), "agent wrecked it\n").expect("write");
-    let undone = m.undo("feature-a", None).expect("undo");
+    let undone = m.undo("feature-a", &UndoOptions::default()).expect("undo");
     assert!(undone.is_complete(), "{:?}", undone.warnings);
 
     let rendered =

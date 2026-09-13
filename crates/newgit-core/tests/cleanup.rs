@@ -3,7 +3,7 @@ use std::process::Command;
 use camino::{Utf8Path, Utf8PathBuf};
 use newgit_core::SourceSubstrate;
 use newgit_core::cleanup::{ArchivedCheckpoints, HookDetail, SnapshotRoots};
-use newgit_core::manager::BranchManager;
+use newgit_core::manager::{BranchManager, UndoOptions};
 use newgit_core::resource::Ownership;
 use newgit_core::store::MetadataStore;
 use newgit_core::tracker::Storage;
@@ -471,7 +471,13 @@ fn pruning_never_drops_a_rev_a_checkpoint_still_points_at() {
 
     // Undo still works against the checkpoint whose content survived.
     let undone = manager
-        .undo("feature-a", Some("ckpt_002"))
+        .undo(
+            "feature-a",
+            &UndoOptions {
+                to: Some("ckpt_002".to_owned()),
+                ..Default::default()
+            },
+        )
         .expect("undo to the checkpointed rev");
     assert_eq!(
         std::fs::read_to_string(a.branch.workspace_path.join(".env.local")).expect("read"),
@@ -605,7 +611,15 @@ fn purging_an_archived_instance_releases_what_its_checkpoints_pinned() {
         "a live instance's checkpoint is never purged, whatever the flag says"
     );
     assert!(
-        manager.undo("feature-a", Some("ckpt_001")).is_ok(),
+        manager
+            .undo(
+                "feature-a",
+                &UndoOptions {
+                    to: Some("ckpt_001".to_owned()),
+                    ..Default::default()
+                }
+            )
+            .is_ok(),
         "and its undo still works"
     );
 }

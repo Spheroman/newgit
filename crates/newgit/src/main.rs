@@ -6,7 +6,7 @@ use newgit_core::checkpoint::CheckpointReason;
 use newgit_core::cleanup::{ArchivedCheckpoints, HookDetail, HookOutcome};
 use newgit_core::export::{ExportFilter, Reason};
 use newgit_core::manager::{
-    ActionOutcome, BindOrigin, BranchManager, InstanceReport, TrackerBindOutcome,
+    ActionOutcome, BindOrigin, BranchManager, InstanceReport, TrackerBindOutcome, UndoOptions,
 };
 use newgit_core::resource::{CheckpointMode, ResourceDefinition};
 use newgit_core::source::find_repo_root;
@@ -84,6 +84,13 @@ enum Command {
         /// Checkpoint id to restore, e.g. ckpt_003
         #[arg(long)]
         to: Option<String>,
+        /// Restore only this resource, leaving source, trackers, and every
+        /// other resource alone; repeatable
+        #[arg(long = "only", value_name = "RESOURCE")]
+        only: Vec<String>,
+        /// Re-run recompute restores even when identity is unchanged
+        #[arg(long)]
+        force_recompute: bool,
     },
     /// List an instance's checkpoints
     Checkpoints {
@@ -246,7 +253,19 @@ fn main() -> Result<()> {
         Command::Run(args) => run(args),
         Command::Action { spec, instance } => action(&spec, instance),
         Command::Checkpoint { instance, message } => checkpoint(instance, message.as_deref()),
-        Command::Undo { instance, to } => undo(instance, to.as_deref()),
+        Command::Undo {
+            instance,
+            to,
+            only,
+            force_recompute,
+        } => undo(
+            instance,
+            UndoOptions {
+                to,
+                only,
+                force_recompute,
+            },
+        ),
         Command::Checkpoints { instance } => checkpoints(instance),
         Command::Export(args) => export(args),
         Command::Cleanup {
@@ -589,7 +608,14 @@ fn resource_profile(definition: &ResourceDefinition) -> String {
     if !definition.ports.is_empty() {
         traits.push("ports".to_owned());
     }
-    if definition.identity.is_some() {
+    // A `hash` checkpoint already implies identity — saying both would list
+    // one fact twice, in the column that exists to replace a label that could
+    // disagree with the sections it described.
+    let hashes_identity = definition
+        .checkpoint
+        .as_ref()
+        .is_some_and(|checkpoint| checkpoint.mode == CheckpointMode::Hash);
+    if definition.identity.is_some() && !hashes_identity {
         traits.push("identity".to_owned());
     }
     if !definition.render.is_empty() {
@@ -1115,9 +1141,9 @@ fn checkpoint(instance: Option<String>, message: Option<&str>) -> Result<()> {
     Ok(())
 }
 
-fn undo(instance: Option<String>, to: Option<&str>) -> Result<()> {
+fn undo(instance: Option<String>, options: UndoOptions) -> Result<()> {
     let (manager, instance) = manager_and_instance(instance)?;
-    let outcome = manager.undo(&instance, to)?;
+    let outcome = manager.undo(&instance, &options)?;
     print_warnings(&outcome.warnings);
 
     let restored = &outcome.restored;
@@ -1131,7 +1157,22 @@ fn undo(instance: Option<String>, to: Option<&str>) -> Result<()> {
     // the checkpoint state — saying "Restored" and "FAILED" about the same
     // operation sends you looking at your script instead of at the resource.
     let failed = outcome.failed_resources();
-    if outcome.is_complete() {
+    if outcome.partial && outcome.is_complete() {
+        // Never says "Restored `<instance>`": no source and no tracker content
+        // moved, so the instance as a whole is not at this checkpoint and
+        // must not read as though it is.
+        println!(
+            "Restored {} of `{instance}` from {}{quoted}",
+            outcome
+                .resources
+                .iter()
+                .map(|resource| format!("`{}`", resource.name))
+                .collect::<Vec<_>>()
+                .join(", "),
+            restored.id
+        );
+        println!("  source and tracker content left as they were (--only)");
+    } else if outcome.is_complete() {
         println!("Restored `{instance}` to {}{quoted}", restored.id);
     } else {
         println!(
@@ -1149,15 +1190,17 @@ fn undo(instance: Option<String>, to: Option<&str>) -> Result<()> {
                 .join(", ")
         );
     }
-    let dirty = if restored.source.dirty_rev.is_some() {
-        " + uncommitted changes reapplied"
-    } else {
-        ""
-    };
-    println!(
-        "  source:   {}{dirty}",
-        short_rev(&restored.source.head_rev)
-    );
+    if !outcome.partial {
+        let dirty = if restored.source.dirty_rev.is_some() {
+            " + uncommitted changes reapplied"
+        } else {
+            ""
+        };
+        println!(
+            "  source:   {}{dirty}",
+            short_rev(&restored.source.head_rev)
+        );
+    }
     for tracker in &outcome.trackers {
         match &tracker.rev {
             Some(rev) => println!(

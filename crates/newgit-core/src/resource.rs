@@ -20,8 +20,8 @@ pub struct ResourceDefinition {
     /// Where every command this resource runs is spawned, relative to the
     /// workspace root. Applied as the child process's `current_dir`, never
     /// as a shell prefix — see [`ActionSpec::workdir`] for the per-action
-    /// override. Content paths (`[identity].paths`, `[checkpoint].paths`,
-    /// `[[render]].path`) are unaffected: they stay workspace-root-relative
+    /// override. Content paths (`[identity].paths`, `[[render]].path`) are
+    /// unaffected: they stay workspace-root-relative
     /// regardless of `workdir`, so a definition never has to reason about
     /// two roots at once.
     pub workdir: Option<Utf8PathBuf>,
@@ -125,9 +125,6 @@ pub struct CleanupSpec {
 #[serde(deny_unknown_fields)]
 pub struct CheckpointSpec {
     pub mode: CheckpointMode,
-    /// `hash`: identity files whose content hash is the captured state.
-    #[serde(default)]
-    pub paths: Vec<Utf8PathBuf>,
     /// `command`: emits the state; trimmed stdout becomes the state ref.
     #[serde(default)]
     pub command: Option<String>,
@@ -260,15 +257,37 @@ impl ResourceDefinition {
             .or(self.workdir.as_deref())
     }
 
+    /// The paths whose content this resource is derived from — the single
+    /// declaration a `hash` checkpoint captures and a `recompute` restore
+    /// compares against.
+    pub fn identity_paths(&self) -> &[Utf8PathBuf] {
+        self.identity
+            .as_ref()
+            .map(|spec| spec.paths.as_slice())
+            .unwrap_or(&[])
+    }
+
     fn validate(&self) -> Result<()> {
+        self.check_identity_paths()?;
         if let Some(checkpoint) = &self.checkpoint {
             match checkpoint.mode {
                 CheckpointMode::None => {}
+                // `hash` captures what the resource is derived *from*, which
+                // is what `[identity]` declares. It has no path list of its
+                // own: two places stating the same fact is how they come to
+                // disagree, and a checkpoint describing different inputs than
+                // identity claims would be wrong in the direction nobody
+                // checks.
                 CheckpointMode::Hash => {
-                    if checkpoint.paths.is_empty() {
-                        return Err(
-                            self.invalid("checkpoint mode `hash` requires `paths`".to_owned())
-                        );
+                    if self
+                        .identity
+                        .as_ref()
+                        .is_none_or(|spec| spec.paths.is_empty())
+                    {
+                        return Err(self.invalid(
+                            "checkpoint mode `hash` records a hash of `[identity] paths`, which this resource does not declare"
+                                .to_owned(),
+                        ));
                     }
                 }
                 CheckpointMode::Command => {
@@ -367,6 +386,37 @@ impl ResourceDefinition {
     /// ([`crate::manager`]), never against the store; an absolute path or a
     /// `..` component would silently escape that root, so both are refused
     /// here rather than left to whatever the shell does with them.
+    /// Identity paths name content inside the workspace, so they carry the
+    /// same restrictions tracker paths do. Without this an `[identity]`
+    /// could hash `/etc/passwd` or climb out with `..`, which a checkpoint
+    /// would then faithfully record.
+    fn check_identity_paths(&self) -> Result<()> {
+        let Some(identity) = &self.identity else {
+            return Ok(());
+        };
+        for path in &identity.paths {
+            if path.is_absolute()
+                || path.as_str().is_empty()
+                || path.components().any(|part| part.as_str() == "..")
+            {
+                return Err(
+                    self.invalid(format!("identity path `{path}` must be workspace-relative"))
+                );
+            }
+            let first = path
+                .components()
+                .next()
+                .map(|part| part.as_str().to_owned());
+            if matches!(first.as_deref(), Some(".git" | ".newgit")) {
+                return Err(self.invalid(format!(
+                    "identity path `{path}` may not reach into `{}`",
+                    first.unwrap_or_default()
+                )));
+            }
+        }
+        Ok(())
+    }
+
     fn check_workdir_is_workspace_relative(&self, workdir: &Utf8Path) -> Result<()> {
         if workdir.is_absolute() || workdir.components().any(|part| part.as_str() == "..") {
             return Err(self.invalid(format!(
