@@ -1,7 +1,8 @@
 use std::collections::BTreeMap;
 
 /// The minimal template variable set for exports and action commands:
-/// `{{ports.<name>}}`, `{{branch.name}}`, `{{branch.slug}}`, `{{workspace}}`.
+/// `{{ports.<name>}}`, `{{branch.name}}`, `{{branch.slug}}`, `{{workspace}}`,
+/// `{{scripts}}`.
 ///
 /// Checkpoint and restore commands additionally see `{{exports.<name>}}`,
 /// `{{snapshot.path}}` (the staging dir for `into_tracker` deposits), and
@@ -12,6 +13,10 @@ pub struct RenderContext<'a> {
     pub branch_name: &'a str,
     pub branch_slug: &'a str,
     pub workspace: &'a str,
+    /// The store's `.newgit/scripts/`, so a command can shell out to a script
+    /// that lives beside the definition calling it instead of in the
+    /// workspace, where it would be subject to source materialization.
+    pub scripts: &'a str,
     pub ports: Option<&'a BTreeMap<String, u16>>,
     pub exports: Option<&'a BTreeMap<String, String>>,
     pub snapshot_path: Option<&'a str>,
@@ -22,7 +27,8 @@ pub fn render(template: &str, context: &RenderContext) -> String {
     let mut rendered = template
         .replace("{{branch.name}}", context.branch_name)
         .replace("{{branch.slug}}", context.branch_slug)
-        .replace("{{workspace}}", context.workspace);
+        .replace("{{workspace}}", context.workspace)
+        .replace("{{scripts}}", context.scripts);
     for (name, port) in context.ports.into_iter().flatten() {
         rendered = rendered.replace(&format!("{{{{ports.{name}}}}}"), &port.to_string());
     }

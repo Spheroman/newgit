@@ -300,6 +300,18 @@ impl BranchManager {
         &self.store
     }
 
+    /// `{{scripts}}` — the store's `.newgit/scripts/`.
+    ///
+    /// A resource definition is read from the store, but anything it shells
+    /// out to used to be read from the workspace, where it is subject to
+    /// source materialization: the two halves of one definition lived under
+    /// different rules, and only the TOML half was editable in place. A
+    /// script here resolves like the definition that calls it, so iterating on
+    /// a `prepare` does not mean committing every attempt.
+    fn scripts_dir(&self) -> &str {
+        self.store.paths().scripts.as_str()
+    }
+
     pub fn tracker_definitions(&self) -> &[TrackerDefinition] {
         &self.trackers
     }
@@ -419,6 +431,7 @@ impl BranchManager {
                 branch_name: &branch.name,
                 branch_slug: &branch.slug,
                 workspace: branch.workspace_path.as_str(),
+                scripts: self.scripts_dir(),
                 ports: Some(&resolved_ports),
                 ..RenderContext::default()
             };
@@ -648,6 +661,7 @@ impl BranchManager {
             branch_name: &branch.name,
             branch_slug: &branch.slug,
             workspace: branch.workspace_path.as_str(),
+            scripts: self.scripts_dir(),
             ports: branch
                 .resources
                 .get(&definition.name)
@@ -1240,6 +1254,7 @@ impl BranchManager {
                 branch_name: &branch.name,
                 branch_slug: &branch.slug,
                 workspace: branch.workspace_path.as_str(),
+                scripts: self.scripts_dir(),
                 ports: binding.map(|binding| &binding.resolved_ports),
                 exports: binding.map(|binding| &binding.resolved_exports),
                 snapshot_path: None,
@@ -1666,6 +1681,7 @@ impl BranchManager {
                     branch_name: &branch.name,
                     branch_slug: &branch.slug,
                     workspace: branch.workspace_path.as_str(),
+                    scripts: self.scripts_dir(),
                     ports: binding.map(|binding| &binding.resolved_ports),
                     exports: binding.map(|binding| &binding.resolved_exports),
                     snapshot_path: staging_path.as_deref().map(Utf8Path::as_str),
@@ -1716,6 +1732,7 @@ impl BranchManager {
                     branch_name: &branch.name,
                     branch_slug: &branch.slug,
                     workspace: branch.workspace_path.as_str(),
+                    scripts: self.scripts_dir(),
                     ports: binding.map(|binding| &binding.resolved_ports),
                     exports: binding.map(|binding| &binding.resolved_exports),
                     ..RenderContext::default()
@@ -1960,6 +1977,7 @@ impl BranchManager {
                     branch_name: &branch.name,
                     branch_slug: &branch.slug,
                     workspace: branch.workspace_path.as_str(),
+                    scripts: self.scripts_dir(),
                     ports: binding.map(|binding| &binding.resolved_ports),
                     exports: binding.map(|binding| &binding.resolved_exports),
                     snapshot_path: None,

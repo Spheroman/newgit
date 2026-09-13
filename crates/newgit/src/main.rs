@@ -251,6 +251,7 @@ fn init(args: InitArgs) -> Result<()> {
     println!("\nCommit these — they describe how the project is orchestrated:");
     println!("  .newgit/config.toml   .newgit/.gitignore");
     println!("  .newgit/trackers/     .newgit/resources/   (as you create them)");
+    println!("  .newgit/scripts/      scripts your resources call, as {{{{scripts}}}}/<name>");
     println!(
         "Everything else under .newgit/ is local state and is already ignored: branches/, \
          snapshots/, checkpoints/, logs/, state/, local/."

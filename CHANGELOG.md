@@ -37,7 +37,26 @@ of `.newgit/` in a minor release — see *Upgrading* below.
   silently seeding a partial lane; a tracker with nothing at all on disk is an
   error, not an empty lane head. `newgit tracker track` now suggests
   `--from-store` when the paths it just added already have content.
-  
+
+- `.newgit/scripts/` and a `{{scripts}}` template variable, so a resource's
+  script lives under the same rule as the definition that calls it
+  ([#8](https://github.com/Spheroman/newgit/issues/8)).
+
+  A resource definition is read from the store, but anything its commands
+  shelled out to was read from the workspace, where it is subject to source
+  materialization. The two halves of one definition lived under different
+  rules and only the TOML half was editable in place, so iterating on a
+  `prepare` meant committing every attempt or copying the script into the
+  workspace by hand between runs.
+
+  `{{scripts}}` resolves to `.newgit/scripts/` in the store. Edit a script
+  and the next `newgit action` runs it — nothing to commit, nothing to copy,
+  and it works on the first spawn. The directory is control plane and is
+  listed in `init`'s "commit these" output; `init` writes a `README.md` there
+  because Git will not track an empty directory. Project-owned scripts are
+  unaffected: they stay in the project tree, are read from the workspace, and
+  must still be committed before a spawn that calls them.
+
 ### Fixed
 
 - A resource whose `depends_on` named something that did not exist yet made
