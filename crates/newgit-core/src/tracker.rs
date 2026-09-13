@@ -29,6 +29,7 @@ pub enum Storage {
 
 /// On-disk shape (everything but the filename-derived name).
 #[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TrackerDefinitionFile {
     audience: String,
     storage: Storage,
@@ -293,5 +294,31 @@ mod tests {
             definition("b", &[".env.local"]),
         ];
         assert!(validate_disjoint(&ok).is_ok());
+    }
+
+    /// `merge_with_source` decides whether a lane's bound state travels with
+    /// a real source merge. Misspelled, it defaults to false and the tracker
+    /// quietly stops making that trip.
+    #[test]
+    fn a_misspelled_key_is_rejected_rather_than_ignored() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = Utf8PathBuf::from_path_buf(temp.path().join("env.toml")).expect("utf8 path");
+        std::fs::write(
+            &path,
+            r#"audience = "project-devs"
+storage = "local"
+merge_with_sauce = true
+"#,
+        )
+        .expect("write definition");
+
+        let error = TrackerDefinition::from_file("env", &path)
+            .expect_err("a key newgit does not understand is an error");
+        let message = error.to_string() + &format!("{error:?}");
+        assert!(message.contains("merge_with_sauce"), "names the bad key");
+        assert!(
+            message.contains("merge_with_source"),
+            "names the valid keys"
+        );
     }
 }

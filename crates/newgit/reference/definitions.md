@@ -14,6 +14,12 @@ primitives, what each one is for — lives in `newgit-v1-mvp.md` at
 Definitions are TOML. The name of a tracker or resource comes from its
 filename, never from a key inside the file.
 
+Every key below is the complete list for its table: a key newgit does not
+recognize is an error naming the file, the key, and what was expected, never
+a line quietly skipped. A misspelled `ownership` would otherwise decide what
+`newgit remove` may delete, and a misspelled `merge_with_source` would decide
+whether a lane travels with a merge — both by defaulting, silently.
+
 ```
 .newgit/
   config.toml            project settings          committed

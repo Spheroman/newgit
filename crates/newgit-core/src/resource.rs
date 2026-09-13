@@ -75,11 +75,13 @@ impl Ownership {
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct IdentitySpec {
     pub paths: Vec<Utf8PathBuf>,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct PortRequest {
     pub start: u16,
     #[serde(default)]
@@ -87,6 +89,7 @@ pub struct PortRequest {
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct ActionSpec {
     #[serde(default)]
     pub command: Option<String>,
@@ -110,6 +113,7 @@ pub struct ActionSpec {
 /// How a resource tears its concrete instance down. Ownership decides
 /// whether the hook may run at all; this decides what running it means.
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct CleanupSpec {
     /// May use `{{state_ref}}` (from the instance's latest checkpoint) and
     /// `{{exports.<name>}}` (from the binding).
@@ -118,6 +122,7 @@ pub struct CleanupSpec {
 
 /// How a resource captures branch-local state at checkpoint time.
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct CheckpointSpec {
     pub mode: CheckpointMode,
     /// `hash`: identity files whose content hash is the captured state.
@@ -145,6 +150,7 @@ pub enum CheckpointMode {
 
 /// How a resource re-establishes checkpointed state during undo.
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct RestoreSpec {
     pub mode: RestoreMode,
     /// `command`: may use `{{state_ref}}`.
@@ -172,6 +178,7 @@ impl RestoreSpec {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ResourceDefinitionFile {
     ownership: Ownership,
     #[serde(default)]
@@ -673,6 +680,56 @@ mod tests {
         let path = Utf8PathBuf::from_path_buf(temp.path().join("db.toml")).expect("utf8 path");
         std::fs::write(&path, contents).expect("write definition");
         ResourceDefinition::from_file("db", &path)
+    }
+
+    /// A misspelling is the case that matters: `ownership` decides whether
+    /// per-branch teardown may delete the concrete resource, so a silently
+    /// ignored `owneship` is the difference between `newgit remove` tearing
+    /// down a dev server and it reaching a shared store.
+    #[test]
+    fn a_misspelled_top_level_key_is_rejected_rather_than_ignored() {
+        let error = write_and_load(
+            r#"owneship = "branch"
+
+[actions.start]
+command = "npm run dev"
+"#,
+        )
+        .expect_err("a key newgit does not understand is an error");
+        let message = error.to_string() + &format!("{:?}", error);
+        assert!(message.contains("owneship"), "names the offending key");
+        assert!(message.contains("ownership"), "names the valid keys");
+    }
+
+    /// Nested sections deny too, not just the top level: `long_runing` on an
+    /// action would otherwise leave a supervised process silently unsupervised.
+    #[test]
+    fn a_misspelled_key_inside_a_section_is_rejected() {
+        let error = write_and_load(
+            r#"ownership = "branch"
+
+[actions.start]
+command = "npm run dev"
+long_runing = true
+"#,
+        )
+        .expect_err("an unknown key in an action is an error");
+        let message = error.to_string() + &format!("{:?}", error);
+        assert!(message.contains("long_runing"));
+        assert!(message.contains("long_running"));
+    }
+
+    /// The removal of `kind` (#27) left stale definitions parsing happily,
+    /// which is how it survived two rebases unnoticed. It is now loud.
+    #[test]
+    fn a_key_newgit_no_longer_understands_is_rejected() {
+        let error = write_and_load(
+            r#"kind = "process"
+ownership = "branch"
+"#,
+        )
+        .expect_err("a removed key is an error, not a no-op");
+        assert!((error.to_string() + &format!("{:?}", error)).contains("kind"));
     }
 
     #[test]

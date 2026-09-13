@@ -5,6 +5,7 @@ use sha2::{Digest, Sha256};
 use crate::store::expand_home;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct ProjectConfig {
     pub project: ProjectSection,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -12,6 +13,7 @@ pub struct ProjectConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct ProjectSection {
     pub name: String,
     pub source: SourceSubstrate,
@@ -27,6 +29,7 @@ pub enum SourceSubstrate {
 /// Optional overrides; omitted from the generated config so a committed
 /// file never bakes in one user's absolute paths.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct WorkspaceSection {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub root: Option<Utf8PathBuf>,
