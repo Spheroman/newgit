@@ -6,6 +6,7 @@ use newgit_core::config::WorkspaceSection;
 use newgit_core::manager::{ActionOutcome, BranchManager};
 use newgit_core::store::MetadataStore;
 use newgit_core::supervisor::StopOutcome;
+use newgit_core::tracker::Storage;
 use newgit_core::{NewgitError, SourceSubstrate};
 
 fn git(dir: &Utf8Path, args: &[&str]) {
@@ -480,4 +481,90 @@ captures = ["PREVIEW_URL"]
     );
     let env = manager.assemble_env(&reloaded).expect("env");
     assert!(env.contains(&("PREVIEW_URL".to_owned(), "https://pv9.example".to_owned())));
+}
+
+/// A resource that names a tracker before the tracker exists used to break
+/// `BranchManager::open`, so every command failed — including the ones that
+/// create the missing name. Definition-building commands must stay reachable.
+#[test]
+fn an_unresolved_dependency_does_not_block_the_commands_that_fix_it() {
+    let (_guard, temp) = tempdir();
+    let store = setup(&temp);
+    let repo = store.paths().project_root.clone();
+
+    write_resource(
+        &store,
+        "db",
+        r#"kind = "command"
+ownership = "branch"
+depends_on = ["runtime-env"]
+
+[actions.prepare]
+command = "true"
+"#,
+    );
+
+    let manager = BranchManager::open(MetadataStore::at(repo.clone())).expect("open still works");
+    assert_eq!(
+        manager.graph_problems(),
+        &[newgit_core::resource::GraphProblem::MissingDependency {
+            resource: "db".to_owned(),
+            dependency: "runtime-env".to_owned(),
+        }]
+    );
+
+    // Graph-acting commands refuse, and say which name is missing.
+    assert!(matches!(
+        manager.spawn("blocked", None),
+        Err(NewgitError::MissingDependency { .. })
+    ));
+
+    // Definition-building commands run, and creating the tracker resolves it.
+    manager
+        .create_tracker("runtime-env", "user", Storage::Local, false)
+        .expect("create tracker against an incomplete graph");
+    manager
+        .track_paths("runtime-env", &[Utf8PathBuf::from("packages/db/.env")])
+        .expect("track paths against an incomplete graph");
+
+    let manager = BranchManager::open(MetadataStore::at(repo)).expect("reopen");
+    assert!(manager.graph_problems().is_empty());
+    manager.spawn("unblocked", None).expect("spawn now works");
+}
+
+/// A cycle is reported the same way: `open` succeeds, graph-acting commands
+/// refuse. Otherwise a typo in `depends_on` bricks the project.
+#[test]
+fn a_dependency_cycle_is_reported_rather_than_raised_at_open() {
+    let (_guard, temp) = tempdir();
+    let store = setup(&temp);
+    let repo = store.paths().project_root.clone();
+
+    for (name, dependency) in [("a", "b"), ("b", "a")] {
+        write_resource(
+            &store,
+            name,
+            &format!(
+                r#"kind = "command"
+ownership = "branch"
+depends_on = ["{dependency}"]
+
+[actions.prepare]
+command = "true"
+"#
+            ),
+        );
+    }
+
+    let manager = BranchManager::open(MetadataStore::at(repo)).expect("open still works");
+    assert!(matches!(
+        manager.graph_problems(),
+        [newgit_core::resource::GraphProblem::Cycle(_)]
+    ));
+    assert!(matches!(
+        manager.spawn("blocked", None),
+        Err(NewgitError::DependencyCycle(_))
+    ));
+    // Listing definitions is how you find the cycle, so it must not refuse.
+    assert_eq!(manager.resource_definitions().len(), 2);
 }

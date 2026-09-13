@@ -75,6 +75,12 @@ pub enum NewgitError {
     #[error("tracker `{0}` owns no paths; there is nothing to capture from a workspace")]
     TrackerHasNoPaths(String),
 
+    #[error(
+        "tracker `{tracker}` owns nothing on disk in the store repo, so there is nothing to \
+         seed from: {paths}"
+    )]
+    NothingToSeed { tracker: String, paths: String },
+
     #[error("no resource named `{0}` is defined in .newgit/resources/")]
     UnknownResource(String),
 

@@ -13,6 +13,7 @@ feel normal now runs end to end:
 newgit init
 newgit tracker create runtime-env --audience user
 newgit tracker track runtime-env .env.local
+newgit tracker capture runtime-env --from-store   # seed the lane from the file you already have
 newgit resource add deps --template pnpm
 newgit resource add app --template process
 
@@ -144,6 +145,8 @@ Definition management (noun subcommands):
   [--merge-with-source]`
 - `newgit tracker track <tracker> <path>...`
 - `newgit tracker capture|merge|pull|checkout <tracker> [instance]`
+- `newgit tracker capture <tracker> --from-store` — seed a lane from the store
+  repo's working tree, so the first `spawn` comes up with the content
 - `newgit tracker list`
 - `newgit resource add <name> --template <template>` / `list` / `templates`
 

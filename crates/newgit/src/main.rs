@@ -119,6 +119,10 @@ enum TrackerCommand {
         tracker: String,
         /// Instance (inferred when run inside a workspace)
         instance: Option<String>,
+        /// Seed the lane from the store repo's working tree instead, and make
+        /// it the lane head — how you carry existing files into a new lane
+        #[arg(long, conflicts_with = "instance")]
+        from_store: bool,
     },
     /// Promote this instance's tracker revision to the lane head/default
     Merge {
@@ -339,10 +343,12 @@ fn resource(command: ResourceCommand) -> Result<()> {
                 println!("  tracker:   created {tracker} (this template deposits into it)");
             }
             println!("  edit the definition; `newgit spawn` binds it (ports, exports, prepare)");
+            warn_graph(&manager_here()?);
             Ok(())
         }
         ResourceCommand::List => {
             let manager = manager_here()?;
+            warn_graph(&manager);
             let definitions = manager.resource_definitions();
             if definitions.is_empty() {
                 println!(
@@ -440,6 +446,7 @@ fn tracker(command: TrackerCommand) -> Result<()> {
             let outcome = manager.create_tracker(&name, &audience, storage, merge_with_source)?;
             println!("Created tracker `{name}` at {}", outcome.path);
             println!("  add paths with: newgit tracker track {name} <path>...");
+            warn_graph(&manager_here()?);
             Ok(())
         }
         TrackerCommand::Track { tracker, paths } => {
@@ -466,12 +473,20 @@ fn tracker(command: TrackerCommand) -> Result<()> {
                     outcome.ignored_patterns.join(", ")
                 );
             }
-            println!("  capture content with: newgit tracker capture {tracker}");
+            if outcome.seedable {
+                println!(
+                    "  seed the lane from what is already here: \
+                     newgit tracker capture {tracker} --from-store"
+                );
+            } else {
+                println!("  capture content with: newgit tracker capture {tracker}");
+            }
             Ok(())
         }
         TrackerCommand::List => {
             let manager = manager_here()?;
             warn_gitignore(&manager);
+            warn_graph(&manager);
             let definitions = manager.tracker_definitions();
             if definitions.is_empty() {
                 println!("No trackers defined. Create one with `newgit tracker create <name>`.");
@@ -499,7 +514,33 @@ fn tracker(command: TrackerCommand) -> Result<()> {
             }
             Ok(())
         }
-        TrackerCommand::Capture { tracker, instance } => {
+        // `conflicts_with` guarantees no instance was given here.
+        TrackerCommand::Capture {
+            tracker,
+            from_store: true,
+            ..
+        } => {
+            let manager = manager_here()?;
+            let report = manager.seed_tracker_from_store(&tracker)?;
+            let note = if report.changed {
+                ""
+            } else {
+                " (lane head unchanged)"
+            };
+            println!(
+                "Seeded `{tracker}` @ {} ({}) from the store repo{note}",
+                report.rev,
+                files_label(report.files)
+            );
+            for path in &report.missing_paths {
+                eprintln!("warning: tracker `{tracker}` owns `{path}`, which is not on disk here");
+            }
+            println!("  new instances get this content: newgit spawn <name>");
+            Ok(())
+        }
+        TrackerCommand::Capture {
+            tracker, instance, ..
+        } => {
             let (manager, instance) = manager_and_instance(instance)?;
             let report = manager.capture_tracker(&instance, &tracker)?;
             let note = if report.changed { "" } else { " (unchanged)" };
@@ -550,6 +591,7 @@ fn status(name: Option<&str>) -> Result<()> {
     let context = context_here()?;
     let manager = BranchManager::open(context.store)?;
     warn_gitignore(&manager);
+    warn_graph(&manager);
     let mut reports = manager.statuses()?;
 
     if let Some(name) = name {
@@ -1006,6 +1048,23 @@ fn resource_column(report: &InstanceReport) -> String {
 
 fn column_width(lengths: impl Iterator<Item = usize>, header: &str) -> usize {
     lengths.chain([header.len()]).max().unwrap_or(header.len())
+}
+
+/// Report an incomplete resource graph without refusing to run. The commands
+/// that build the graph are the ones most likely to meet it half-built, so they
+/// warn here; `spawn`, `run`, `action`, `checkpoint`, and `undo` still refuse.
+fn warn_graph(manager: &BranchManager) {
+    let problems = manager.graph_problems();
+    if problems.is_empty() {
+        return;
+    }
+    for problem in problems {
+        eprintln!("warning: {problem}");
+    }
+    eprintln!(
+        "warning: the resource graph is incomplete; `spawn`, `run`, `action`, `checkpoint`, \
+         and `undo` will refuse until it resolves"
+    );
 }
 
 fn warn_gitignore(manager: &BranchManager) {

@@ -18,6 +18,42 @@ of `.newgit/` in a minor release — see *Upgrading* below.
   adoption section, next to the install resource in `newgit-v1-mvp.md`, and
   in the `pnpm` template's own comments, since that is what someone reads
   when they hand-edit the definition.
+  
+### Added
+
+- `newgit tracker capture <tracker> --from-store` seeds a lane from the store
+  repo's working tree and sets the lane head, so the first `spawn` comes up
+  with the content ([#9](https://github.com/Spheroman/newgit/issues/9)).
+
+  A lane starts empty and `capture` reads from an instance workspace, so
+  adopting newgit for a tracker carrying `.env` files meant spawning an
+  instance guaranteed to come up without them, copying the files in, capturing,
+  merging, and re-running the resource action that had already failed. The
+  content was in the store repo at the same relative paths the whole time.
+  That bootstrap is now two commands: `tracker track`, then
+  `tracker capture --from-store`.
+
+  Declared paths with nothing behind them are reported as warnings rather than
+  silently seeding a partial lane; a tracker with nothing at all on disk is an
+  error, not an empty lane head. `newgit tracker track` now suggests
+  `--from-store` when the paths it just added already have content.
+  
+### Fixed
+
+- A resource whose `depends_on` named something that did not exist yet made
+  *every* newgit command fail, including `tracker create` and `tracker track`
+  — the commands that create the missing name. The only way out was to hand-
+  edit the `depends_on` line, run the command, and put the line back
+  ([#6](https://github.com/Spheroman/newgit/issues/6)).
+
+  The dependency graph is now resolved leniently at load and its problems
+  reported rather than raised. Commands that *act* on the graph — `spawn`,
+  `run`, `action`, `checkpoint`, `undo` — still refuse, with the same error
+  naming the missing dependency. Commands that *build* it (`tracker create`,
+  `tracker track`, `resource add`) and commands that inspect it (`status`,
+  `tracker list`, `resource list`) now run and print the problem as a warning.
+  `remove` stays reachable too, so teardown never depends on the graph holding
+  together. Dependency cycles are handled the same way.
 
 ## [0.1.1] — 2026-09-12
 
