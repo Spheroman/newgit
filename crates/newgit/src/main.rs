@@ -339,10 +339,12 @@ fn resource(command: ResourceCommand) -> Result<()> {
                 println!("  tracker:   created {tracker} (this template deposits into it)");
             }
             println!("  edit the definition; `newgit spawn` binds it (ports, exports, prepare)");
+            warn_graph(&manager_here()?);
             Ok(())
         }
         ResourceCommand::List => {
             let manager = manager_here()?;
+            warn_graph(&manager);
             let definitions = manager.resource_definitions();
             if definitions.is_empty() {
                 println!(
@@ -440,6 +442,7 @@ fn tracker(command: TrackerCommand) -> Result<()> {
             let outcome = manager.create_tracker(&name, &audience, storage, merge_with_source)?;
             println!("Created tracker `{name}` at {}", outcome.path);
             println!("  add paths with: newgit tracker track {name} <path>...");
+            warn_graph(&manager_here()?);
             Ok(())
         }
         TrackerCommand::Track { tracker, paths } => {
@@ -472,6 +475,7 @@ fn tracker(command: TrackerCommand) -> Result<()> {
         TrackerCommand::List => {
             let manager = manager_here()?;
             warn_gitignore(&manager);
+            warn_graph(&manager);
             let definitions = manager.tracker_definitions();
             if definitions.is_empty() {
                 println!("No trackers defined. Create one with `newgit tracker create <name>`.");
@@ -550,6 +554,7 @@ fn status(name: Option<&str>) -> Result<()> {
     let context = context_here()?;
     let manager = BranchManager::open(context.store)?;
     warn_gitignore(&manager);
+    warn_graph(&manager);
     let mut reports = manager.statuses()?;
 
     if let Some(name) = name {
@@ -1006,6 +1011,23 @@ fn resource_column(report: &InstanceReport) -> String {
 
 fn column_width(lengths: impl Iterator<Item = usize>, header: &str) -> usize {
     lengths.chain([header.len()]).max().unwrap_or(header.len())
+}
+
+/// Report an incomplete resource graph without refusing to run. The commands
+/// that build the graph are the ones most likely to meet it half-built, so they
+/// warn here; `spawn`, `run`, `action`, `checkpoint`, and `undo` still refuse.
+fn warn_graph(manager: &BranchManager) {
+    let problems = manager.graph_problems();
+    if problems.is_empty() {
+        return;
+    }
+    for problem in problems {
+        eprintln!("warning: {problem}");
+    }
+    eprintln!(
+        "warning: the resource graph is incomplete; `spawn`, `run`, `action`, `checkpoint`, \
+         and `undo` will refuse until it resolves"
+    );
 }
 
 fn warn_gitignore(manager: &BranchManager) {
