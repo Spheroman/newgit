@@ -3,7 +3,7 @@ use std::process::Command;
 use camino::{Utf8Path, Utf8PathBuf};
 use newgit_core::cleanup::ArchivedCheckpoints;
 use newgit_core::config::WorkspaceSection;
-use newgit_core::manager::{BindOrigin, BranchManager};
+use newgit_core::manager::{BindOrigin, BranchManager, UndoOptions};
 use newgit_core::store::MetadataStore;
 use newgit_core::tracker::Storage;
 use newgit_core::{NewgitError, SourceSubstrate};
@@ -376,8 +376,14 @@ fn a_binary_database_file_round_trips_through_a_plain_file_tracker() {
 
     // The agent corrupts the database, as agents do.
     std::fs::write(&db, b"truncated garbage").expect("clobber");
-    m.undo("feature-a", Some(&checkpoint.record.id))
-        .expect("undo");
+    m.undo(
+        "feature-a",
+        &UndoOptions {
+            to: Some(checkpoint.record.id.clone()),
+            ..Default::default()
+        },
+    )
+    .expect("undo");
 
     assert_eq!(
         std::fs::read(&db).expect("read db"),

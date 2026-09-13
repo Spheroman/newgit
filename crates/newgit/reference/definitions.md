@@ -106,7 +106,17 @@ require it to exist up front.
 
 | key | type | required | default | meaning |
 | --- | --- | --- | --- | --- |
-| `paths` | array of strings | yes if the section is present | — | the files whose content *is* this resource's identity (a lockfile, a manifest). Path-dependent state is recomputed from its identity, not copied. |
+| `paths` | array of strings | yes if the section is present | — | the files whose content *is* this resource's identity (a lockfile, a manifest). Path-dependent state is recomputed from its identity, not copied. Workspace-relative, no `..`, and may not reach into `.git` or `.newgit`. |
+
+This is the single declaration of what the resource is derived from, and the
+other two keys read it rather than repeating it:
+
+- `[checkpoint] mode = "hash"` records the content hash of these paths. It has
+  no `paths` of its own — two places stating the same fact is how they come to
+  disagree.
+- `[restore] mode = "recompute"` compares that hash against the workspace as it
+  was before the undo, and **skips the rebuild when they match**. Same inputs,
+  same tree; re-running would be an expensive no-op.
 
 Installs are the usual reason for this section, and they are the one place
 newgit multiplies a cost rather than absorbing it — see *Installs: use a
@@ -147,8 +157,7 @@ What this resource records when `newgit checkpoint` runs.
 
 | key | type | required | default | meaning |
 | --- | --- | --- | --- | --- |
-| `mode` | string | yes | — | `none`, `hash`, `command`, or `external`. |
-| `paths` | array of strings | required for `hash` | `[]` | identity files whose content hash is the captured state. |
+| `mode` | string | yes | — | `none`, `hash`, `command`, or `external`. `hash` requires `[identity]`, whose paths it hashes. |
 | `command` | string | required for `command` | — | emits the state. Its trimmed stdout is the state ref. |
 | `into_tracker` | string | no | none | `command` only: deposit what the command wrote under `{{snapshot.path}}` into this tracker's lane, recording the state ref as `tracker:<name>@<rev>`. This is the one seam between resources and trackers. |
 | `state_ref` | string | required for `external` | — | template for the opaque handle to record (usually `{{exports.<name>}}`). |
@@ -156,7 +165,7 @@ What this resource records when `newgit checkpoint` runs.
 | mode | what a checkpoint stores | typical use |
 | --- | --- | --- |
 | `none` | nothing | a resource whose state is uninteresting |
-| `hash` | content hash of `paths` | installs — the lockfile is the truth |
+| `hash` | content hash of `[identity] paths` | installs — the lockfile is the truth |
 | `command` | the command's stdout, plus optionally a lane deposit | a database dump |
 | `external` | a rendered handle | a cloud preview, a tunnel |
 
@@ -174,8 +183,26 @@ What `newgit undo` does with that record.
 | --- | --- | --- |
 | `none` | nothing | state that does not need rewinding |
 | `command` | runs `command` | restore a dump |
-| `recompute` | re-runs an action | reinstall from the restored lockfile |
+| `recompute` | re-runs an action, unless `[identity]` has not moved | reinstall from the restored lockfile |
 | `external` | nothing, deliberately | another system owns it; an undo does not rewind it |
+
+A `recompute` restore skips when this resource's `[identity]` hash is the same
+now as at the checkpoint: the tree was already built from those inputs, so the
+rebuild would change nothing. It says so rather than passing silently:
+
+```
+resource: deps recompute(prepare) skipped: identity unchanged
+```
+
+Identity describes the *inputs*, not the tree. Delete half of `node_modules`
+without touching the lockfile and the hash still matches while the tree is
+wrong — `newgit undo --force-recompute` rebuilds anyway.
+
+`newgit undo --only <resource>` restores one resource and leaves source,
+tracker content, and every other resource untouched. That is not a snapshot
+the instance was ever in, so it is reported as a partial restore and never as
+"restored to <checkpoint>". It exists for iterating on a restore command,
+where rewinding the whole workspace each cycle is the cost.
 
 A restore command is not transactional. If one fails, `newgit undo` says the
 undo was incomplete and names the resource, rather than reporting success.

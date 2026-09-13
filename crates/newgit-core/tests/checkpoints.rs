@@ -4,7 +4,7 @@ use camino::{Utf8Path, Utf8PathBuf};
 use newgit_core::branch::ResourceStatus;
 use newgit_core::checkpoint::CheckpointReason;
 use newgit_core::config::WorkspaceSection;
-use newgit_core::manager::BranchManager;
+use newgit_core::manager::{BranchManager, UndoOptions};
 use newgit_core::store::MetadataStore;
 use newgit_core::supervisor::Supervisor;
 use newgit_core::tracker::Storage;
@@ -135,7 +135,7 @@ fn checkpoint_and_undo_restore_source_trackers_and_dirty_state() {
     std::fs::write(ws.join("README.md"), "mangled\n").expect("write");
     std::fs::write(ws.join(".env.local"), "SECRET=evil\n").expect("write");
 
-    let undo = m.undo("feature-a", None).expect("undo");
+    let undo = m.undo("feature-a", &UndoOptions::default()).expect("undo");
     assert_eq!(undo.restored.id, outcome.record.id);
     assert_eq!(undo.safety.reason, CheckpointReason::BeforeUndo);
 
@@ -155,7 +155,7 @@ fn checkpoint_and_undo_restore_source_trackers_and_dirty_state() {
     assert!(ws.join(".newgit/local/instance.toml").is_file());
 
     // Undo twice is redo: the safety checkpoint brings the mess back.
-    let redo = m.undo("feature-a", None).expect("redo");
+    let redo = m.undo("feature-a", &UndoOptions::default()).expect("redo");
     assert_eq!(redo.restored.id, undo.safety.id);
     assert_eq!(read(&ws.join("README.md")), "mangled\n");
     assert_eq!(read(&ws.join(".env.local")), "SECRET=evil\n");
@@ -182,12 +182,24 @@ fn undo_to_targets_an_older_checkpoint() {
     git(&ws, &["commit", "-qam", "v2"]);
     m.checkpoint("feature-b", Some("v2")).expect("checkpoint");
 
-    m.undo("feature-b", Some(&first.record.id))
-        .expect("undo --to");
+    m.undo(
+        "feature-b",
+        &UndoOptions {
+            to: Some(first.record.id.clone()),
+            ..Default::default()
+        },
+    )
+    .expect("undo --to");
     assert_eq!(read(&ws.join("README.md")), "version one\n");
 
     assert!(matches!(
-        m.undo("feature-b", Some("ckpt_099")),
+        m.undo(
+            "feature-b",
+            &UndoOptions {
+                to: Some("ckpt_099".to_owned()),
+                ..Default::default()
+            }
+        ),
         Err(NewgitError::UnknownCheckpoint { .. })
     ));
     // Explicit + explicit + before-undo safety.
@@ -196,12 +208,14 @@ fn undo_to_targets_an_older_checkpoint() {
 
 const HASH_RECOMPUTE_RESOURCE: &str = r#"ownership = "workspace"
 
+[identity]
+paths = ["README.md"]
+
 [actions.prepare]
 command = "echo run >> prep-runs.txt"
 
 [checkpoint]
 mode = "hash"
-paths = ["README.md"]
 
 [restore]
 mode = "recompute"
@@ -209,7 +223,7 @@ action = "prepare"
 "#;
 
 #[test]
-fn recompute_restore_reruns_prepare_and_hash_is_recorded() {
+fn recompute_restore_skips_when_identity_is_unchanged() {
     let (_guard, temp) = tempdir();
     let store = setup(&temp);
     write_resource(&store, "deps", HASH_RECOMPUTE_RESOURCE);
@@ -231,11 +245,57 @@ fn recompute_restore_reruns_prepare_and_hash_is_recorded() {
             .is_some_and(|r| r.starts_with("hash:"))
     );
 
-    let undo = m.undo("feature-c", None).expect("undo");
-    assert_eq!(undo.resources[0].action, "recompute(prepare)");
+    // `README.md` is untouched across the checkpoint, so the recorded hash
+    // still describes the workspace and the rebuild is a no-op by
+    // construction — which is the whole point of pointing `[identity]` at
+    // the inputs.
+    let undo = m.undo("feature-c", &UndoOptions::default()).expect("undo");
+    assert_eq!(
+        undo.resources[0].action,
+        "recompute(prepare) skipped: identity unchanged"
+    );
     assert!(undo.resources[0].ok);
     assert!(undo.recovery_record.is_none());
-    // Restored to 1 captured line, then prepare re-ran and appended one.
+    assert_eq!(
+        read(&ws.join("prep-runs.txt")).lines().count(),
+        1,
+        "prepare did not re-run"
+    );
+
+    // Move an identity path and the rebuild happens: the hash is what
+    // decides, not the fact that a restore was requested.
+    std::fs::write(ws.join("README.md"), "changed").expect("write");
+    let undo = m.undo("feature-c", &UndoOptions::default()).expect("undo");
+    assert_eq!(undo.resources[0].action, "recompute(prepare)");
+    assert_eq!(read(&ws.join("prep-runs.txt")).lines().count(), 2);
+}
+
+/// The identity hash describes the inputs, not the tree: deleting half of
+/// `node_modules` without touching the lockfile leaves the hash correct and
+/// the tree wrong, so the repair path has to stay reachable.
+#[test]
+fn force_recompute_rebuilds_even_when_identity_is_unchanged() {
+    let (_guard, temp) = tempdir();
+    let store = setup(&temp);
+    write_resource(&store, "deps", HASH_RECOMPUTE_RESOURCE);
+    let m = manager(store);
+    let ws = m
+        .spawn("feature-h", None)
+        .expect("spawn")
+        .branch
+        .workspace_path;
+    m.checkpoint("feature-h", None).expect("checkpoint");
+
+    let undo = m
+        .undo(
+            "feature-h",
+            &UndoOptions {
+                force_recompute: true,
+                ..Default::default()
+            },
+        )
+        .expect("undo");
+    assert_eq!(undo.resources[0].action, "recompute(prepare)");
     assert_eq!(read(&ws.join("prep-runs.txt")).lines().count(), 2);
 }
 
@@ -288,7 +348,7 @@ fn into_tracker_deposits_into_lane_and_restore_reads_it_back() {
         .expect("tracker state");
     assert!(tracker_state.content_rev.is_some());
 
-    let undo = m.undo("feature-d", None).expect("undo");
+    let undo = m.undo("feature-d", &UndoOptions::default()).expect("undo");
     assert!(undo.resources[0].ok);
     assert_eq!(read(&ws.join("restored.sql")), "dump-data\n");
 }
@@ -332,7 +392,7 @@ fn checkpoint_and_restore_commands_honor_workdir() {
         format!("{}\n", ws.join("packages/db"))
     );
 
-    m.undo("feature-a", None).expect("undo");
+    m.undo("feature-a", &UndoOptions::default()).expect("undo");
     assert_eq!(
         read(&ws.join("packages/db/restore-cwd.txt")),
         format!("{}\n", ws.join("packages/db"))
@@ -363,7 +423,7 @@ fn failed_restore_writes_recovery_record_and_restores_the_rest() {
         .workspace_path;
 
     m.checkpoint("feature-e", None).expect("checkpoint");
-    let undo = m.undo("feature-e", None).expect("undo");
+    let undo = m.undo("feature-e", &UndoOptions::default()).expect("undo");
 
     let bad = undo
         .resources
@@ -377,7 +437,11 @@ fn failed_restore_writes_recovery_record_and_restores_the_rest() {
         .find(|r| r.name == "deps")
         .expect("deps");
     assert!(deps.ok, "other resources still restored");
-    assert_eq!(read(&ws.join("prep-runs.txt")).lines().count(), 2);
+    assert_eq!(
+        read(&ws.join("prep-runs.txt")).lines().count(),
+        1,
+        "deps skipped: its identity did not move"
+    );
 
     let recovery = undo.recovery_record.expect("recovery record");
     let contents = read(&recovery);
@@ -426,7 +490,7 @@ fn undo_stops_running_processes_and_restarts_what_was_running() {
     let outcome = m.checkpoint("feature-f", None).expect("checkpoint");
     assert!(outcome.record.resource_states[0].was_running);
 
-    let undo = m.undo("feature-f", None).expect("undo");
+    let undo = m.undo("feature-f", &UndoOptions::default()).expect("undo");
     assert!(undo.resources[0].action.ends_with("+ restarted"));
     let pid_after = supervisor.running_pid("app").expect("restarted");
     assert_ne!(pid_before, pid_after, "a fresh process was started");
@@ -475,7 +539,7 @@ fn an_incomplete_undo_says_so_and_marks_its_safety_checkpoint() {
     m.checkpoint("feature-f", Some("good state"))
         .expect("checkpoint");
 
-    let undo = m.undo("feature-f", None).expect("undo");
+    let undo = m.undo("feature-f", &UndoOptions::default()).expect("undo");
     assert!(!undo.is_complete(), "one resource did not restore");
     assert_eq!(undo.failed_resources(), vec!["bad"]);
     assert_eq!(
@@ -512,7 +576,7 @@ fn a_complete_undo_marks_its_safety_checkpoint_as_a_redo_point() {
     m.spawn("feature-g", None).expect("spawn");
     m.checkpoint("feature-g", None).expect("checkpoint");
 
-    let undo = m.undo("feature-g", None).expect("undo");
+    let undo = m.undo("feature-g", &UndoOptions::default()).expect("undo");
     assert!(undo.is_complete());
     assert!(undo.failed_resources().is_empty());
     assert_eq!(undo.safety.undo_completed, Some(true));
