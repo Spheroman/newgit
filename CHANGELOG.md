@@ -6,6 +6,8 @@ of `.newgit/` in a minor release — see *Upgrading* below.
 
 ## [Unreleased]
 
+## [0.2.0] — 2026-09-12
+
 ### Added
 
 - `[[render]]` on a resource substitutes per-instance values into a file the
@@ -47,9 +49,18 @@ of `.newgit/` in a minor release — see *Upgrading* below.
   the substitution for tracker-owned targets, so a key you add to `.env.local`
   reaches the shared lane and this instance's port does not.
 
-  The cost is printed at bind rather than left in the docs: on a source-owned
-  path, skip-worktree means real edits to that file in this workspace are
-  invisible to newgit and do not survive it.
+  On a source-owned path, skip-worktree also means real edits to that file in
+  this workspace do not survive it. newgit reports that **precisely rather
+  than as a caveat**: a render is a pure function of committed content and the
+  binding record, so the expected bytes are recomputable, and newgit compares
+  against them at checkpoint and before every re-render — naming the file and
+  how many lines a re-render will discard, and saying nothing when the file is
+  what the render produced.
+
+  Replacements are **simultaneous**: every `find` is located in the committed
+  content and the whole batch applies in one pass, so a replacement's output
+  is never a match target and reordering the `replace` array cannot change the
+  result. Two rules claiming overlapping text are refused by name.
 
 - `newgit reference` prints the definition format — every tracker and resource
   key with its type and default, the checkpoint/restore/ownership tables, and
@@ -288,6 +299,21 @@ agent.
 An instance whose workspace is deleted cannot be re-spawned under the same
 name until `newgit cleanup` finalizes it.
 
+### On-disk format
+
+Binding records (`.newgit/branches/<name>.toml`) gained a `rendered` list on
+each resource binding, recording the substitutions a render applied. It is
+optional on read, so records written by `0.1.x` load unchanged and behave
+exactly as before — an instance with no `[[render]]` in its resources has no
+`rendered` list to write. Nothing else in `.newgit/` changed shape, and no
+`cleanup` or re-spawn is required to upgrade.
+
+Rolling *back* to `0.1.x` with records `0.2.0` wrote does not error — the
+field is simply unknown to it — but it is lossy: the old binary drops
+`rendered` the next time it saves that record, and with it the substitutions
+`tracker capture` needs in order to reverse a render. Re-spawning the
+instance under `0.2.0` restores it.
+
 ## Upgrading
 
 `.newgit/` holds two kinds of thing, and they upgrade differently:
@@ -303,6 +329,7 @@ Binding records and checkpoints are the exception worth caring about: they
 are the only local state that is not reconstructible. A release that changes
 their format will say so here explicitly.
 
-[Unreleased]: https://github.com/Spheroman/newgit/compare/v0.1.1...HEAD
+[Unreleased]: https://github.com/Spheroman/newgit/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/Spheroman/newgit/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/Spheroman/newgit/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/Spheroman/newgit/releases/tag/v0.1.0

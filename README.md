@@ -12,7 +12,7 @@ shape: branch instances bind source state to user-defined trackers and
 resources, instead of baking env files, installs, processes, databases, or
 external resources into special internal lanes.
 
-All seven v1 milestones are implemented. The workflow the MVP set out to make
+All eight v1 milestones are implemented. The workflow the MVP set out to make
 feel normal now runs end to end:
 
 ```sh
@@ -41,7 +41,7 @@ put `newgit` on your `PATH`:
 
 ```sh
 TARGET=aarch64-apple-darwin   # or x86_64-apple-darwin, {x86_64,aarch64}-unknown-linux-gnu
-VERSION=v0.1.0
+VERSION=v0.2.0
 BASE=https://github.com/Spheroman/newgit/releases/download/$VERSION
 curl -fsSLO $BASE/newgit-$TARGET.tar.gz -O $BASE/newgit-$TARGET.tar.gz.sha256
 shasum -a 256 -c newgit-$TARGET.tar.gz.sha256
@@ -63,7 +63,7 @@ Check what you installed. The commit is part of the version because `0.x`
 moves fast, and `-dirty` means the binary does not match any commit:
 
 ```sh
-newgit --version   # newgit 0.1.0 (15e4d0da0e51)
+newgit --version   # newgit 0.2.0 (15e4d0da0e51)
 ```
 
 ## Adopting it in a project
