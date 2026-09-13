@@ -155,6 +155,68 @@ APP_URL = "http://127.0.0.1:{{ports.app}}"
 Resources export runtime values — ports, URLs, handles. Trackers do not
 export anything; they own file content.
 
+### `[[render]]`
+
+Substitutes this instance's values into a file the project commits — for the
+common case where a tool reads its port from a config file rather than argv.
+Repeatable: one `[[render]]` per file.
+
+| key | type | required | default | meaning |
+| --- | --- | --- | --- | --- |
+| `path` | string | yes | — | workspace-relative path to the file. Must be tracked by Git or owned by a tracker: a render substitutes into committed content, so there has to be some. Two resources rendering one path is refused at load. |
+| `replace` | array of tables | yes | — | the substitutions, below. |
+
+| key | type | required | default | meaning |
+| --- | --- | --- | --- | --- |
+| `find` | string | yes | — | **a literal string, never a regex.** May span lines. |
+| `with` | string | yes | — | what to put there; rendered with the variables below. |
+| `count` | integer | no | `1` | how many times `find` is expected to occur. |
+
+```toml
+[[render]]
+path = "supabase/config.toml"
+replace = [
+  { find = 'project_id = "faretable"', with = 'project_id = "faretable-{{branch.slug}}"' },
+  { find = "port = 54321",             with = "port = {{ports.api}}" },
+]
+```
+
+**There is no template file.** `port = 54321` is not a placeholder — it is
+your project's working default, so a clone without newgit still starts on it.
+newgit substitutes into the committed content and writes the result into one
+workspace.
+
+Four rules carry the rest:
+
+- **A `find` must occur exactly `count` times, or the render refuses**, naming
+  the file and the string. That is also the drift detector: when the default
+  changes upstream, you hear about it at `spawn` instead of getting a file
+  that quietly went unrendered. Where a value is genuinely repeated, declare
+  `count = 2` rather than reaching for an "all" flag — a declared number keeps
+  failing when the file changes from two occurrences to three. Where two
+  sections share a default, make `find` multi-line.
+- **Replacements are simultaneous.** Every `find` is located in the committed
+  content and the whole batch applies at once, so a replacement's output is
+  never a match target and reordering `replace` cannot change the result. Two
+  rules claiming overlapping text are refused.
+- **Committed content is the input, never the working file** — `HEAD`, or the
+  bound lane rev for a tracker-owned path. So a render is idempotent: `undo`,
+  `tracker pull`, and `tracker checkout` re-render off the binding record, and
+  values never compound.
+- **Your values stay in this workspace.** A rendered source path is marked
+  `--skip-worktree`, so it never shows in `git status` and `git add -A` cannot
+  commit it; `newgit export` and a checkpoint's uncommitted-state capture take
+  it from `HEAD`; and for a tracker-owned path `newgit tracker capture`
+  reverses the substitution, so a key you add to `.env.local` reaches the lane
+  and your port does not.
+
+The cost, on a source path: **hand edits to a rendered file do not survive the
+workspace.** newgit does not restate that every spawn — it recomputes what the
+render should produce and compares, at `checkpoint` and before each re-render,
+naming the file and how many lines are about to go. Silence means there is
+nothing to lose. To change a rendered file for real, change it in the store
+repo.
+
 ---
 
 ## Ownership
@@ -176,7 +238,9 @@ a security label.
 
 Every command and export value is rendered before it runs. An unknown or
 out-of-scope variable is left in the text verbatim — visible rather than
-silently empty — except in `[cleanup]`, which refuses to run instead.
+silently empty — except in `[cleanup]` and `[[render]]`, which refuse instead.
+Both write something durable: a destructive command, and a file that would
+otherwise gain committed-looking text nobody wrote.
 
 | variable | is |
 | --- | --- |
@@ -194,6 +258,7 @@ Scope — which of them have a value where:
 | rendered in | branch/workspace/scripts | `ports.*` | `exports.*` | `snapshot.path` | `state_ref` |
 | --- | --- | --- | --- | --- | --- |
 | `[exports]` values | yes | yes | — | — | — |
+| `[[render]]` `with` | yes | yes | yes | — | — |
 | action `command` | yes | yes | — | — | — |
 | `[checkpoint] command` | yes | yes | yes | yes | — |
 | `[checkpoint] state_ref` | yes | yes | yes | — | — |
@@ -201,7 +266,11 @@ Scope — which of them have a value where:
 | `[cleanup] command` | yes | yes | yes | — | yes |
 
 Action commands do not get `{{exports.*}}`: exports reach them as environment
-variables, which is what a command already knows how to read.
+variables, which is what a command already knows how to read. A `[[render]]`
+does get them, because a file is not a process — nothing hands it an
+environment. It sees what a command in this instance would see: its own ports,
+plus every export bound so far in dependency order, which is what lets one
+resource's config file carry another's URL.
 
 ---
 
