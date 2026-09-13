@@ -369,6 +369,7 @@ ResourceDefinition {
   identity
   ports
   exports
+  render
   actions
   checkpoint
   restore
@@ -496,6 +497,169 @@ neither recorded in any other instance's binding nor OS-unbindable at that
 moment, and are persisted in the binding record. The binding records are the
 single source of truth — removing an instance frees its ports automatically,
 with no separate ledger to drift.
+
+### Render
+
+*Specified, not yet built — see Milestone 8. Every other section of this
+document describes shipped code.*
+
+Ports and exports reach a command two ways: `{{ports.x}}` in its command line
+and an env var in `newgit run`. Both assume the tool takes the value on argv
+or from the environment. Most tools do not. Supabase reads its ports from
+`supabase/config.toml`, Expo from `.env`, Compose from `compose.yaml`, Rails
+from `database.yml`, Vite from `vite.config.ts` — a file the project commits
+and reviews. Without a first-class answer, every project that hits this writes
+the same section-aware config rewriter inside its `prepare` hook, and the
+interesting part of the resource stops being `supabase start`.
+
+`[[render]]` is that answer, declared on the resource that owns the values:
+
+```toml
+# .newgit/resources/supabase.toml
+[[render]]
+path = "packages/db/supabase/config.toml"
+replace = [
+  { find = 'project_id = "faretable"', with = 'project_id = "faretable-{{branch.slug}}"' },
+  { find = "port = 54321",             with = "port = {{ports.api}}" },
+  { find = "port = 54322",             with = "port = {{ports.db}}" },
+  { find = "shadow_port = 54320",      with = "shadow_port = {{ports.shadow}}" },
+]
+```
+
+#### The committed file is the template
+
+There is no template file. `port = 54321` is not a placeholder, it is
+Supabase's working default: someone who clones the repo without newgit and
+runs `supabase start` gets a working stack on 54321. Under newgit the same
+file gets `54321` → `54400` in this workspace and nowhere else.
+
+This is the whole design, and the reason it is find/replace rather than
+rendering a template over the target. A template means a second copy of
+`config.toml` under `.newgit/`, kept in sync with upstream's defaults forever,
+and a base repo whose real config has been hollowed out into placeholders.
+Substituting into the committed file has neither problem: nothing is
+duplicated, nothing is degraded, and there is no template-versus-file diff to
+reconcile when the branch merges back.
+
+`find` is a **literal string, never a regex.** Regex reintroduces exactly the
+"did it match what I meant" doubt that the uniqueness rule below exists to
+remove, and it would make the inverse (below) undefined.
+
+#### A find must match exactly once
+
+> **Each `find` must match exactly once in the file, or the render refuses and
+> names the file and the string.**
+
+One rule, doing four jobs:
+
+- **Ambiguity is impossible.** A bare `54321` that also appears in a comment
+  or an unrelated key is caught before anything runs, rather than producing a
+  file that is wrong in a second place.
+- **Drift is loud.** Upstream bumps its default port, or a teammate edits the
+  committed config — the `find` stops matching and bind fails with `no match
+  for "port = 54321" in packages/db/supabase/config.toml`. This is what
+  replaces diffing a template against a file: the check *is* the drift
+  detector, it runs on every bind, and it costs nothing.
+- **Disambiguation needs no parser.** When two sections share a default value,
+  `find` goes multi-line and regains its uniqueness:
+
+  ```toml
+  find = """
+  [api]
+  port = 54321"""
+  ```
+
+  newgit never learns what TOML is, which is what lets the same mechanism
+  serve `.env`, YAML, and `vite.config.ts`.
+- **The inverse stays well-defined** — see below.
+
+For a value that is genuinely repeated (Compose publishing `"3000:3000"`
+twice), `count = 2` opts into a declared number of matches. Not `all`: a
+declared count keeps failing when the file changes from two occurrences to
+three, which is the property worth protecting.
+
+#### Render is a function of committed content, not of the working file
+
+> **A render reads the *committed* content of the path, substitutes, and
+> writes the result. It never reads what is currently on disk.**
+
+For a source-owned path that is the blob at `HEAD`; for a tracker-owned path
+it is the bound lane rev. Without this rule the second render looks for
+`port = 54321`, finds `port = 54400`, and fails — so re-running would have
+needed its own state tracking. With it, render is idempotent and pure:
+`undo` re-renders from the binding record with no extra machinery, a `pull`
+that moves the lane head re-renders from the new content, and the rendered
+values can never compound.
+
+Render runs during resource bind, after ports are allocated and after
+dependencies are bound, immediately before `prepare` — and again before any
+`recompute` restore. Trackers project before resources bind, so a render may
+target a tracker-owned path.
+
+#### Available variables
+
+A render template sees **exactly what a command in this instance would see in
+its environment**: this resource's `{{ports.*}}`, `{{branch.name}}`,
+`{{branch.slug}}`, `{{workspace}}`, and `{{exports.*}}` from every resource
+bound so far, in dependency order. Anything narrower and the common
+cross-resource case — an Expo `.env` that needs the Supabase resource's URL —
+would need a second mechanism.
+
+#### Keeping instance values out of everything downstream
+
+A render writes per-instance values into a path the project otherwise owns.
+Four places that value must not escape to:
+
+- **`git status` and `git commit`, for source-owned paths.** newgit marks
+  rendered source paths `--skip-worktree` in the workspace clone. Not a
+  per-render flag: a render target that shows up as a modification is simply
+  broken, and an agent running `git add -A` must not be able to commit this
+  instance's port. This is the same job `.git/info/exclude` does for
+  tracker-owned paths (*Tracker Paths and Git*), and the same v1 stand-in for
+  the projection a v2 FUSE layer does properly — the declaration outlives the
+  mechanism.
+- **`newgit export`.** `--skip-worktree` does not remove a path from
+  `git ls-files`, and export copies the workspace's tracked files *as they
+  stand on disk*. Export must therefore take rendered paths from `HEAD`
+  rather than from the working tree, or an exported repo ships `port = 54400`.
+- **`newgit capture`, for tracker-owned paths.** Here the file cannot simply
+  be skipped: the lane is how the `.env` reaches other instances, and the user
+  may have legitimately added a key to it. Instead capture **reverses the
+  substitution** — rewrites `54400` back to `54321` — and records that. The
+  user's real edits survive; the instance's values never enter the lane.
+
+  This is available only because the substitution is literal, and it is the
+  strongest argument for this design over a template file: a whole-file
+  template cannot be run backwards at all. The inverse needs the same
+  guarantee in the other direction — the rendered value must be unique in the
+  file too — checked at bind, so the failure surfaces then and not at capture.
+- **Source checkpoint** needs nothing extra: `--skip-worktree` keeps the
+  change uncommitted, so it never reaches the store.
+
+#### What it costs, and saying so
+
+On a source-owned path, `--skip-worktree` means **real edits to that file in
+this workspace are invisible to newgit and die with the workspace.** That is
+correct for values newgit generates and wrong for the `[auth]` block someone
+adds by hand. newgit prints this at bind, naming the path — it is a real
+lossiness, and *Report missing captures and incomplete undos honestly* applies
+to it. To edit a rendered file for real, edit it in the store repo.
+
+Tracker-owned render targets do not pay this cost: they are already outside
+Git, capture reverses the substitution, and hand edits round-trip.
+
+#### Rules
+
+- A render path must lie inside the workspace. v1 does not render into
+  user-level or system config.
+- A render path that no tracker owns must be tracked by Git. A path that is
+  neither tracked nor tracker-owned has no committed content to render *from*,
+  which the purity rule above makes a contradiction, not an edge case.
+- Two resources rendering the same path is a config error, refused at load —
+  the same disjointness check tracker paths get.
+- A `find` that matches zero times, or more times than `count` declares, fails
+  the bind rather than rendering partially. The resource is marked `failed`
+  and its dependents `blocked`, exactly as a failed `prepare` would.
 
 ### Dependencies
 
@@ -1233,6 +1397,23 @@ This is not a privileged env system. It is a content tracker that owns an env
 file. Loading that file into `newgit run` is a separate command-environment
 policy, not part of tracking.
 
+One lane, one file, but each instance needs its own port inside it. That is
+`[[render]]`, declared on the resource that owns the port:
+
+```toml
+# .newgit/resources/supabase.toml
+[[render]]
+path = ".env.local"
+replace = [
+  { find = "SUPABASE_URL=http://127.0.0.1:54321",
+    with = "SUPABASE_URL=http://127.0.0.1:{{ports.api}}" },
+]
+```
+
+The lane keeps `54321`, the instance gets its own, and `newgit capture`
+reverses the substitution before recording — so a key you add to `.env.local`
+reaches the lane and this instance's port does not.
+
 The resulting tracker file is intentionally small:
 
 ```toml
@@ -1538,7 +1719,10 @@ As implemented:
 
 - **Source always ships**, because source's audience is everyone. Content is
   the workspace's Git-tracked files *as they stand on disk*, so uncommitted
-  agent work is included and ignored junk never is.
+  agent work is included and ignored junk never is. The one exception is
+  rendered paths (*Render*), which are taken from `HEAD`: on disk they hold
+  this instance's ports, and `--skip-worktree` does not keep them out of
+  `git ls-files`.
 - **Tracker audience is the default filter, and it fails closed.** Only
   `audience = "public"` lanes are included. `project-devs` and `user` lanes
   are withheld and listed, with the flag that would ship them. A tracker
@@ -1757,6 +1941,28 @@ Success criterion:
 Success criterion:
 
 > A branch instance can produce a clean ordinary Git branch/repo as an output artifact.
+
+### Milestone 8: Render
+
+The one milestone specified but not yet built. Everything above this line
+describes shipped code; *Render* describes code to write.
+
+- `[[render]]` on resource definitions: literal `find`/`with` substitution
+  into a committed path, run at bind before `prepare` and before a
+  `recompute` restore
+- the exactly-once match rule, `count = N`, and multi-line `find`; a
+  zero-match or wrong-count render fails the resource and blocks dependents
+- render reads the committed blob (`HEAD`, or the bound lane rev), never the
+  working file
+- `--skip-worktree` for source-owned targets; export takes rendered paths
+  from `HEAD`
+- reverse substitution on `newgit capture` for tracker-owned targets, with
+  the rendered value's uniqueness checked at bind
+
+Success criterion:
+
+> A per-instance Supabase stack needs no config-rewriting code in its `prepare`
+> hook, and the un-rendered repo still starts on its own defaults.
 
 ---
 
