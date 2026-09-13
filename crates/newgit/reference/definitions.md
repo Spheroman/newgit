@@ -186,6 +186,21 @@ What `newgit undo` does with that record.
 | `recompute` | re-runs an action, unless `[identity]` has not moved | reinstall from the restored lockfile |
 | `external` | nothing, deliberately | another system owns it; an undo does not rewind it |
 
+**A checkpoint and a restore have to agree.** They are two halves of one
+mechanism — one records a state ref, the other consumes it — so the pairings
+that cannot mean anything are refused when the definition loads, not during
+the undo you are relying on:
+
+| this pairing | is refused because |
+| --- | --- |
+| `hash` + `command` | a content hash identifies *inputs*; there is nothing a restore command can do with `hash:0fa284b468`. Use `recompute` (rebuild from those inputs) or `none`. |
+| `external` + `recompute` | `recompute` re-runs an action locally and never reads the handle. Use `command`, which receives it, or `external`. |
+| `none` (or no `[checkpoint]`) + a `command` using `{{state_ref}}` | nothing records a ref, so the placeholder can never resolve. |
+
+Pairings that are merely inert still load: a `command` checkpoint with a
+`recompute` restore ignores the ref it recorded, but the record still reads
+back in `newgit checkpoints`.
+
 A `recompute` restore skips when this resource's `[identity]` hash is the same
 now as at the checkpoint: the tree was already built from those inputs, so the
 rebuild would change nothing. It says so rather than passing silently:
@@ -220,7 +235,11 @@ Two rules constrain it, both deliberately:
   hook even when one is defined — and says it skipped it.
 - **An unresolved `{{...}}` refuses.** Everywhere else a placeholder with no
   value renders verbatim so the mistake is visible. A destructive command is
-  the exception: `delete {{state_ref}}` with no state ref is not run.
+  the exception: `delete {{state_ref}}` with no state ref is not run. A `hash`
+  checkpoint counts as no state ref: it records the content hash of
+  `[identity] paths`, which says whether the inputs moved and never names a
+  concrete thing to tear down, so `{{state_ref}}` stays unresolved and the
+  hook is refused rather than handed `hash:0fa284b468`.
 
 ### `[exports]`
 
@@ -407,7 +426,7 @@ otherwise gain committed-looking text nobody wrote.
 | `{{ports.<name>}}` | an allocated port |
 | `{{exports.<name>}}` | a rendered export from this resource's binding |
 | `{{snapshot.path}}` | directory to write checkpoint output into |
-| `{{state_ref}}` | the handle the last checkpoint recorded, or the path of the snapshot it deposited |
+| `{{state_ref}}` | the handle the last checkpoint recorded, or the path of the snapshot it deposited. A `hash` checkpoint records neither, so it has no value |
 
 Scope — which of them have a value where:
 

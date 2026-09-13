@@ -90,6 +90,34 @@ pub struct ResourceState {
     pub resolved_exports: BTreeMap<String, String>,
 }
 
+/// The prefix a `hash` checkpoint writes its state ref with.
+pub const HASH_STATE_REF_PREFIX: &str = "hash:";
+
+impl ResourceState {
+    /// What `{{state_ref}}` means for this record, or `None` when the record
+    /// holds nothing a command could be handed.
+    ///
+    /// Deposited content resolves to its path — a restore command wants the
+    /// dump, not the `tracker:<name>@<rev>` that located it. A `hash:` ref
+    /// resolves to nothing at all: it is the content hash of `[identity]
+    /// paths`, which says whether the inputs moved and never identifies a
+    /// concrete thing to restore or tear down. Leaving `{{state_ref}}`
+    /// unresolved is what makes that visible — verbatim in a restore command,
+    /// and a refusal in a cleanup hook, which is where handing over a
+    /// meaningless argument would do damage.
+    pub fn consumable_state_ref(&self) -> Option<String> {
+        if let Some(path) = &self.state_path {
+            return Some(path.to_string());
+        }
+        match self.state_ref.as_deref() {
+            Some(state_ref) if !state_ref.starts_with(HASH_STATE_REF_PREFIX) => {
+                Some(state_ref.to_owned())
+            }
+            _ => None,
+        }
+    }
+}
+
 /// Written next to the checkpoint when resource restores fail during undo,
 /// so the failure survives the terminal: what failed, where the logs are,
 /// and how to re-run.

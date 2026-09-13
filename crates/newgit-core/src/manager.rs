@@ -7,8 +7,8 @@ use crate::branch::{
     BranchInstance, ResourceBinding, ResourceStatus, TrackerBinding, branch_slug, validate_name,
 };
 use crate::checkpoint::{
-    CheckpointLog, CheckpointReason, CheckpointRecord, RecoveryRecord, ResourceState,
-    RestoreFailure, SourceState, TrackerState,
+    CheckpointLog, CheckpointReason, CheckpointRecord, HASH_STATE_REF_PREFIX, RecoveryRecord,
+    ResourceState, RestoreFailure, SourceState, TrackerState,
 };
 use crate::cleanup::{
     ArchivedCheckpoints, CleanupOutcome, FinalizedInstance, HookDetail, HookOutcome, PrunedRev,
@@ -2069,7 +2069,9 @@ impl BranchManager {
 
     /// The most recent checkpointed state reference for one resource, which
     /// is what a cleanup hook's `{{state_ref}}` means: the handle newgit last
-    /// recorded. Deposited content resolves to its path, like restore.
+    /// recorded. Deposited content resolves to its path, like restore, and a
+    /// `hash:` ref resolves to nothing — see
+    /// [`ResourceState::consumable_state_ref`].
     fn checkpointed_state_ref(
         &self,
         branch: &BranchInstance,
@@ -2081,15 +2083,9 @@ impl BranchManager {
                 .resource_states
                 .iter()
                 .find(|state| state.name == resource)
+                && let Some(resolved) = state.consumable_state_ref()
             {
-                let resolved = state
-                    .state_path
-                    .as_ref()
-                    .map(ToString::to_string)
-                    .or_else(|| state.state_ref.clone());
-                if resolved.is_some() {
-                    return Ok(resolved);
-                }
+                return Ok(Some(resolved));
             }
         }
         Ok(None)
@@ -2451,7 +2447,7 @@ impl BranchManager {
                 let rev = content_rev(&files)?;
                 Ok(CapturedResource {
                     mode: "hash".to_owned(),
-                    state_ref: Some(format!("hash:{rev}")),
+                    state_ref: Some(format!("{HASH_STATE_REF_PREFIX}{rev}")),
                     state_path: None,
                     deposit: None,
                 })
@@ -2849,7 +2845,7 @@ impl BranchManager {
                 // passing silently.
                 if !undo.force_recompute
                     && let Some(recorded) = state.state_ref.as_deref()
-                    && recorded.starts_with("hash:")
+                    && recorded.starts_with(HASH_STATE_REF_PREFIX)
                     && undo
                         .pre_undo_state_ref
                         .is_some_and(|current| current == recorded)
@@ -2889,11 +2885,7 @@ impl BranchManager {
             RestoreMode::Command => {
                 let template = spec.command.as_deref().expect("validated at parse time");
                 let binding = branch.resources.get(&definition.name);
-                let state_ref = state
-                    .state_path
-                    .as_ref()
-                    .map(ToString::to_string)
-                    .or_else(|| state.state_ref.clone());
+                let state_ref = state.consumable_state_ref();
                 let context = RenderContext {
                     branch_name: &branch.name,
                     branch_slug: &branch.slug,

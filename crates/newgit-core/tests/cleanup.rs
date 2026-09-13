@@ -281,6 +281,76 @@ command = "echo {{{{state_ref}}}} >> {witness}/deleted.txt"
 }
 
 #[test]
+fn a_hash_state_ref_never_reaches_the_cleanup_hook() {
+    let (_guard, temp) = tempdir();
+    let store = setup(&temp);
+    let witness = temp.join("witness");
+    std::fs::create_dir_all(&witness).expect("mkdir");
+
+    // A `hash` checkpoint records the content hash of the identity files.
+    // That is a real recorded ref, so the refusal cannot come from absence:
+    // it has to come from the ref being the wrong kind of thing to hand a
+    // teardown command.
+    write_resource(
+        &store,
+        "deps",
+        &format!(
+            r#"ownership = "branch"
+
+[identity]
+paths = ["package-lock.json"]
+
+[actions.prepare]
+command = "true"
+
+[checkpoint]
+mode = "hash"
+
+[cleanup]
+command = "echo deleting {{{{state_ref}}}} >> {witness}/deleted.txt"
+"#
+        ),
+    );
+
+    let manager = manager_at(&store);
+    let spawned = manager.spawn("feature-a", None).expect("spawn");
+    std::fs::write(
+        spawned.branch.workspace_path.join("package-lock.json"),
+        "{}\n",
+    )
+    .expect("write lockfile");
+
+    let checkpoint = manager.checkpoint("feature-a", None).expect("checkpoint");
+    let recorded = checkpoint.record.resource_states[0]
+        .state_ref
+        .as_deref()
+        .expect("a hash checkpoint records a ref");
+    assert!(recorded.starts_with("hash:"), "recorded {recorded}");
+
+    let outcome = manager
+        .remove("feature-a", &temp, ArchivedCheckpoints::Keep)
+        .expect("remove");
+    let hook = outcome
+        .hooks
+        .iter()
+        .find(|hook| hook.resource == "deps")
+        .expect("deps hook");
+    match &hook.detail {
+        HookDetail::SkippedUnresolved { command, .. } => {
+            assert!(
+                !command.contains("hash:"),
+                "the hash must not reach the command at all: {command}"
+            );
+        }
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+    assert!(
+        !witness.join("deleted.txt").exists(),
+        "`delete <content hash>` is a wrong argument, not a teardown"
+    );
+}
+
+#[test]
 fn cleanup_finalizes_workspaceless_instances_and_frees_the_name() {
     let (_guard, temp) = tempdir();
     let store = setup(&temp);

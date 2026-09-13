@@ -106,6 +106,35 @@ of `.newgit/` in a minor release — see *Upgrading* below.
   Export failures are reported apart from render failures, because they are
   different mistakes in different parts of the definition.
 
+- A `hash` checkpoint's state ref can no longer reach a command as an
+  argument ([#47](https://github.com/Spheroman/newgit/issues/47),
+  [#48](https://github.com/Spheroman/newgit/issues/48)).
+
+  `hash` records the content hash of `[identity] paths`. That answers one
+  question — did the inputs move — and it never names a concrete thing to
+  restore or tear down. But both places that resolve `{{state_ref}}` fell back
+  to the recorded ref whatever it was, so a restore command got
+  `restore-from hash:0fa284b468` and, worse, a cleanup hook got
+  `delete-environment hash:0fa284b468` and *ran* it. The refusal that exists
+  for exactly this case only asked whether a placeholder was still
+  unresolved, so it caught the argument that was missing and not the one that
+  was wrong.
+
+  A hash ref now resolves to nothing at all. `{{state_ref}}` stays verbatim in
+  a restore command, where an unresolved placeholder is already how a mistake
+  is made visible, and the cleanup guard fires unchanged — one rule about what
+  a state ref *is*, rather than a second check bolted beside the first.
+
+  The pairing that produced it is also refused when the definition loads.
+  `[checkpoint]` and `[restore]` are two halves of one mechanism, but were
+  validated one section at a time, so all sixteen pairings loaded. Three
+  cannot mean anything — `hash` + `command` (a hash is not something to
+  restore from), `external` + `recompute` (a local rebuild never reads the
+  handle), and a `command` restore interpolating `{{state_ref}}` under a
+  checkpoint that records none — and each now fails at load, naming the mode
+  that pairs correctly instead of surfacing during the undo someone is
+  relying on. Pairings that are merely inert still load.
+
 ### Added
 
 - `newgit undo --only <resource>` restores one resource and leaves source,
