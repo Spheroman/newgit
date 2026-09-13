@@ -12,6 +12,7 @@ fn main() {
     // stale until something else forced a rebuild.
     println!("cargo:rerun-if-changed=../../.git/HEAD");
     println!("cargo:rerun-if-changed=../../.git/refs/heads");
+    println!("cargo:rerun-if-changed=.cargo_vcs_info.json");
     println!("cargo:rerun-if-env-changed=NEWGIT_BUILD");
 }
 
@@ -21,6 +22,15 @@ fn build_stamp() -> String {
         && !stamp.trim().is_empty()
     {
         return stamp;
+    }
+
+    // A crates.io install builds from a tarball with no .git, which is how
+    // most people get this binary. `cargo publish` records the commit here,
+    // and it outranks `git` below: when this file exists we are building a
+    // packaged crate, so a surrounding repo (a vendor/ directory, say) would
+    // otherwise stamp the wrong project's HEAD.
+    if let Some(commit) = packaged_commit() {
+        return commit;
     }
 
     let Some(commit) = git(&["rev-parse", "--short=12", "HEAD"]) else {
@@ -33,6 +43,31 @@ fn build_stamp() -> String {
         format!("{commit}-dirty")
     } else {
         commit
+    }
+}
+
+/// The commit `cargo publish` stamped into `.cargo_vcs_info.json`, if this is
+/// a packaged crate. Hand-parsed because a build dependency for one field of
+/// one file cargo generates itself is not worth the compile time.
+fn packaged_commit() -> Option<String> {
+    let raw = std::fs::read_to_string(".cargo_vcs_info.json").ok()?;
+    let after = raw.split_once("\"sha1\"")?.1.split_once(':')?.1;
+    let sha = after.split('"').nth(1)?;
+    // Anything else means the file is not what we think it is, and a wrong
+    // commit is worse than an honest "unknown".
+    if sha.len() != 40 || !sha.chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    // `cargo package --allow-dirty` records this, and it means the same thing
+    // the git path's suffix does: the tarball matches no commit.
+    let dirty = raw
+        .split_once("\"dirty\"")
+        .and_then(|(_, rest)| rest.split_once(':'))
+        .is_some_and(|(_, value)| value.trim_start().starts_with("true"));
+    if dirty {
+        Some(format!("{}-dirty", &sha[..12]))
+    } else {
+        Some(sha[..12].to_owned())
     }
 }
 

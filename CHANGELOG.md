@@ -6,6 +6,19 @@ of `.newgit/` in a minor release — see *Upgrading* below.
 
 ## [Unreleased]
 
+## [0.1.1] — 2026-09-12
+
+### Fixed
+
+- `newgit --version` reported `(unknown)` instead of the commit for every
+  binary installed from crates.io. The build stamp was derived by running
+  `git rev-parse`, but a published `.crate` tarball ships no `.git`, so the
+  stamp only ever worked when building from a clone — the one case where you
+  can already see the commit. It now reads the `sha1` that `cargo publish`
+  records in `.cargo_vcs_info.json`, falling back to `git` for repo builds.
+  A tarball packaged with `--allow-dirty` gets the same `-dirty` suffix a
+  dirty clone does.
+
 ## [0.1.0] — 2026-09-12
 
 First release. All seven milestones of the v1 MVP are implemented, and the
@@ -92,5 +105,6 @@ Binding records and checkpoints are the exception worth caring about: they
 are the only local state that is not reconstructible. A release that changes
 their format will say so here explicitly.
 
-[Unreleased]: https://github.com/Spheroman/newgit/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/Spheroman/newgit/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/Spheroman/newgit/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/Spheroman/newgit/releases/tag/v0.1.0
