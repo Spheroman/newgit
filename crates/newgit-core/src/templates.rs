@@ -200,3 +200,39 @@ pub fn resource_template(name: &str) -> Option<&'static ResourceTemplate> {
         .iter()
         .find(|template| template.name == name)
 }
+
+/// Names of every starter template, in listing order — for error messages
+/// that need to name the valid options (e.g. `resource templates --show`
+/// given a name that doesn't exist).
+pub fn resource_template_names() -> Vec<&'static str> {
+    RESOURCE_TEMPLATES
+        .iter()
+        .map(|template| template.name)
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resource_template_finds_every_listed_name() {
+        for name in resource_template_names() {
+            assert!(
+                resource_template(name).is_some(),
+                "`{name}` is listed but resource_template() can't find it"
+            );
+        }
+    }
+
+    #[test]
+    fn resource_template_rejects_unknown_names() {
+        assert!(resource_template("does-not-exist").is_none());
+    }
+
+    #[test]
+    fn resource_template_names_matches_listing_order() {
+        let expected: Vec<&str> = RESOURCE_TEMPLATES.iter().map(|t| t.name).collect();
+        assert_eq!(resource_template_names(), expected);
+    }
+}

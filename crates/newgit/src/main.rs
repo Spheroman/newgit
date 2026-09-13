@@ -11,7 +11,7 @@ use newgit_core::manager::{
 use newgit_core::source::find_repo_root;
 use newgit_core::store::Context;
 use newgit_core::supervisor::StopOutcome;
-use newgit_core::templates::RESOURCE_TEMPLATES;
+use newgit_core::templates::{RESOURCE_TEMPLATES, resource_template, resource_template_names};
 use newgit_core::tracker::Storage;
 use newgit_core::{MetadataStore, ProjectConfig};
 
@@ -192,7 +192,11 @@ enum ResourceCommand {
     /// List defined resources
     List,
     /// List available resource starter templates
-    Templates,
+    Templates {
+        /// Print one template's TOML in full, instead of instantiating it
+        #[arg(long, value_name = "NAME")]
+        show: Option<String>,
+    },
 }
 
 #[derive(Debug, Args)]
@@ -607,10 +611,35 @@ fn resource(command: ResourceCommand) -> Result<()> {
             }
             Ok(())
         }
-        ResourceCommand::Templates => {
+        ResourceCommand::Templates { show: None } => {
             for template in RESOURCE_TEMPLATES {
                 println!("{:<16} {}", template.name, template.description);
             }
+            println!("\nnewgit resource templates --show <name>   print one in full");
+            Ok(())
+        }
+        ResourceCommand::Templates { show: Some(name) } => {
+            let template = resource_template(&name).ok_or_else(|| {
+                let names = resource_template_names().join(", ");
+                anyhow::anyhow!("no template named `{name}`; valid templates are: {names}")
+            })?;
+            if !template.companions.is_empty() || !template.companion_trackers.is_empty() {
+                println!("# instantiating `{name}` also creates:");
+                for companion in template.companions {
+                    println!(
+                        "#   resource `{}` (this template depends on it)",
+                        companion.name
+                    );
+                }
+                for tracker in template.companion_trackers {
+                    println!(
+                        "#   tracker  `{}` (this template deposits into it)",
+                        tracker.name
+                    );
+                }
+                println!("#");
+            }
+            print!("{}", template.contents);
             Ok(())
         }
     }
