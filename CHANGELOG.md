@@ -6,19 +6,6 @@ of `.newgit/` in a minor release — see *Upgrading* below.
 
 ## [Unreleased]
 
-### Documentation
-
-- Say what a package manager costs under newgit. Every instance installs its
-  own dependencies — that independence is the point, and a shared installed
-  tree across branches with different lockfiles is the thing that would be
-  wrong — but the size of that cost is the package manager's call, and
-  nothing said so. pnpm hardlinks from one content-addressed store, so
-  instance ten adds directory entries; `npm ci` expands a full copy per
-  instance, which on a monorepo is gigabytes each. Documented in the README's
-  adoption section, next to the install resource in `newgit-v1-mvp.md`, and
-  in the `pnpm` template's own comments, since that is what someone reads
-  when they hand-edit the definition.
-  
 ### Added
 
 - `newgit tracker capture <tracker> --from-store` seeds a lane from the store
@@ -59,6 +46,47 @@ of `.newgit/` in a minor release — see *Upgrading* below.
 
 ### Fixed
 
+- A declared `captures` name that never appeared in an action's stdout failed
+  in total silence: the command exited 0, newgit reported `prepare: ok`,
+  marked the resource `ready`, and published an empty handle that went
+  unnoticed until an API call returned 401
+  ([#7](https://github.com/Spheroman/newgit/issues/7)).
+
+  Each missing capture is now warned for by name, with the log to look in and
+  the convention that explains nearly every occurrence — when `captures` is
+  set, stdout belongs to newgit, so everything else the command prints should
+  go to stderr. Warnings appear at `spawn`, on `newgit action`, and during a
+  recompute restore. A missing name is still not an error: a resource may
+  legitimately publish a handle only on some runs. The `external` template's
+  comments now state the stdout convention too.
+
+- An undo where a resource restore failed reported `Restored` on its first
+  line and `FAILED` on its fourth, describing one operation two ways
+  ([#11](https://github.com/Spheroman/newgit/issues/11)). A restore command
+  is not transactional — one that rebuilds a schema and then fails to load
+  the rows leaves its resource in neither the pre-undo state nor the
+  checkpoint state — so the summary no longer implies the instance is in a
+  known state:
+
+  ```
+  Undo of `smoke` to ckpt_001 ("before agent") INCOMPLETE: 0 of 1 resources restored
+    `db` may be in a partial state — a failed restore command is not rolled back
+  ```
+
+  `newgit undo` now exits non-zero when the undo was incomplete.
+
+- A failed undo left a pre-undo checkpoint indistinguishable from one a human
+  named, so three failed attempts left three of them, each pinning its
+  tracker revs. The safety checkpoint now records `undo_completed` once the
+  undo it preceded finishes, and `newgit checkpoints` shows those entries as
+  `failed-undo` rather than `before-undo` — they are not redo points. The
+  record is annotated rather than deleted: newgit cannot know at save time
+  whether the undo will succeed, and discarding the only record of a state is
+  what checkpoints exist to prevent. Releasing the revs those entries pin is
+  a `cleanup` concern, tracked in
+  [#12](https://github.com/Spheroman/newgit/issues/12).
+
+
 - A resource whose `depends_on` named something that did not exist yet made
   *every* newgit command fail, including `tracker create` and `tracker track`
   — the commands that create the missing name. The only way out was to hand-
@@ -73,6 +101,19 @@ of `.newgit/` in a minor release — see *Upgrading* below.
   `tracker list`, `resource list`) now run and print the problem as a warning.
   `remove` stays reachable too, so teardown never depends on the graph holding
   together. Dependency cycles are handled the same way.
+
+### Documentation
+
+- Say what a package manager costs under newgit. Every instance installs its
+  own dependencies — that independence is the point, and a shared installed
+  tree across branches with different lockfiles is the thing that would be
+  wrong — but the size of that cost is the package manager's call, and
+  nothing said so. pnpm hardlinks from one content-addressed store, so
+  instance ten adds directory entries; `npm ci` expands a full copy per
+  instance, which on a monorepo is gigabytes each. Documented in the README's
+  adoption section, next to the install resource in `newgit-v1-mvp.md`, and
+  in the `pnpm` template's own comments, since that is what someone reads
+  when they hand-edit the definition.
 
 ## [0.1.1] — 2026-09-12
 

@@ -324,6 +324,7 @@ fn spawn(args: SpawnArgs) -> Result<()> {
             format!(" captured: {}", resource.captured.join(", "))
         };
         println!("  resource:  `{}`{ports}{prepare}{captured}", resource.name);
+        print_warnings(&resource.missing_captures);
     }
     Ok(())
 }
@@ -424,7 +425,12 @@ fn action(spec: &str, instance: Option<String>) -> Result<()> {
             }
             Ok(())
         }
-        ActionOutcome::Ran { code, log } => {
+        ActionOutcome::Ran {
+            code,
+            log,
+            missing_captures,
+        } => {
+            print_warnings(&missing_captures);
             eprintln!("[newgit] `{spec}` exit {code}; log: {log}");
             if code != 0 {
                 std::process::exit(code);
@@ -708,7 +714,29 @@ fn undo(instance: Option<String>, to: Option<&str>) -> Result<()> {
         .as_deref()
         .map(|message| format!(" (\"{message}\")"))
         .unwrap_or_default();
-    println!("Restored `{instance}` to {}{quoted}", restored.id);
+    // Lead with the verdict. A restore command is not transactional, so a
+    // half-failed undo leaves its resource in neither the pre-undo state nor
+    // the checkpoint state — saying "Restored" and "FAILED" about the same
+    // operation sends you looking at your script instead of at the resource.
+    let failed = outcome.failed_resources();
+    if outcome.is_complete() {
+        println!("Restored `{instance}` to {}{quoted}", restored.id);
+    } else {
+        println!(
+            "Undo of `{instance}` to {}{quoted} INCOMPLETE: {} of {} resources restored",
+            restored.id,
+            outcome.resources.len() - failed.len(),
+            outcome.resources.len()
+        );
+        println!(
+            "  {} may be in a partial state — a failed restore command is not rolled back",
+            failed
+                .iter()
+                .map(|name| format!("`{name}`"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
     let dirty = if restored.source.dirty_rev.is_some() {
         " + uncommitted changes reapplied"
     } else {
@@ -741,10 +769,20 @@ fn undo(instance: Option<String>, to: Option<&str>) -> Result<()> {
     if let Some(recovery) = &outcome.recovery_record {
         eprintln!("warning: some resource restores failed; recovery record at {recovery}");
     }
-    println!(
-        "  pre-undo state saved as {}; redo with: newgit undo {instance}",
-        outcome.safety.id
-    );
+    if outcome.is_complete() {
+        println!(
+            "  pre-undo state saved as {}; redo with: newgit undo {instance}",
+            outcome.safety.id
+        );
+    } else {
+        // Redo means "return to the state before this undo", which is only
+        // meaningful if the undo actually moved the instance somewhere.
+        println!(
+            "  pre-undo state saved as {} (marked incomplete-undo; not a redo point)",
+            outcome.safety.id
+        );
+        std::process::exit(1);
+    }
     Ok(())
 }
 
@@ -762,9 +800,12 @@ fn checkpoints(instance: Option<String>) -> Result<()> {
         "ID", "CREATED", "REASON", "SOURCE"
     );
     for record in &records {
-        let reason = match record.reason {
-            CheckpointReason::Explicit => "explicit",
-            CheckpointReason::BeforeUndo => "before-undo",
+        // A before-undo entry nobody chose is worth distinguishing from one a
+        // human named, and one whose undo failed is not a state to return to.
+        let reason = match (record.reason, record.undo_completed) {
+            (CheckpointReason::Explicit, _) => "explicit",
+            (CheckpointReason::BeforeUndo, Some(false)) => "failed-undo",
+            (CheckpointReason::BeforeUndo, _) => "before-undo",
         };
         let source = format!(
             "{}{}",

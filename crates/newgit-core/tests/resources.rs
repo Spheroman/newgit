@@ -633,3 +633,62 @@ command = "{{scripts}}/prepare.sh {{branch.slug}}"
         "the edited script should run, not the one from spawn time"
     );
 }
+
+/// A declared capture that never appears in stdout used to pass in total
+/// silence: exit 0, `prepare: ok`, resource `ready`, and an empty handle
+/// nobody noticed until an API call 401'd. The usual cause is the command's
+/// own noise on stdout, which `captures` reserves for newgit.
+#[test]
+fn a_declared_capture_that_never_appears_is_reported() {
+    let (_guard, temp) = tempdir();
+    let store = setup(&temp);
+    // Emits one of the two declared names, with progress noise around it —
+    // exactly the shape that bit in the field.
+    write_resource(
+        &store,
+        "db",
+        r#"kind = "external"
+ownership = "external"
+
+[actions.prepare]
+command = "echo 'Starting containers...'; echo ANON_KEY=abc; echo 'done.'"
+captures = ["ANON_KEY", "SERVICE_ROLE_KEY"]
+"#,
+    );
+    let repo = store.paths().project_root.clone();
+    let manager = BranchManager::open(MetadataStore::at(repo)).expect("manager");
+
+    let spawned = manager.spawn("feature-a", None).expect("spawn");
+    let resource = spawned
+        .resources
+        .iter()
+        .find(|r| r.name == "db")
+        .expect("db bound");
+
+    // What did arrive still arrives, and the action still succeeded.
+    assert_eq!(
+        spawned.branch.resources["db"].resolved_exports["ANON_KEY"],
+        "abc"
+    );
+    assert_eq!(spawned.branch.resources["db"].status, ResourceStatus::Ready);
+
+    // What did not arrive is named, once, with the log to look in.
+    assert_eq!(resource.missing_captures.len(), 1);
+    let warning = &resource.missing_captures[0];
+    assert!(warning.contains("SERVICE_ROLE_KEY"), "names the capture");
+    assert!(!warning.contains("ANON_KEY"), "not the one that arrived");
+    assert!(warning.contains("db.prepare"), "points at the log");
+
+    // And on a later `newgit action`, not just at spawn.
+    let outcome = manager
+        .run_action("feature-a", "db.prepare")
+        .expect("re-run");
+    let ActionOutcome::Ran {
+        missing_captures, ..
+    } = outcome
+    else {
+        panic!("expected a one-shot run");
+    };
+    assert_eq!(missing_captures.len(), 1);
+    assert!(missing_captures[0].contains("SERVICE_ROLE_KEY"));
+}

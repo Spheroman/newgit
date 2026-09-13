@@ -293,44 +293,62 @@ impl ResourceDefinition {
     }
 }
 
+/// What an action's stdout yielded against the names it declared.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Captures {
+    pub found: BTreeMap<String, String>,
+    /// Declared names that stdout did not contain. Reported rather than
+    /// silently dropped: a capture that never appears is almost always a bug
+    /// in the command — most often noisy output on stdout, which belongs to
+    /// newgit when `captures` is set — and the resource is otherwise marked
+    /// ready with an empty handle nobody notices until something 401s.
+    pub missing: Vec<String>,
+}
+
 /// Read an action's declared `captures` out of its stdout.
 ///
 /// Two shapes are accepted, because both are what a real command already
 /// emits: stdout whose first non-whitespace character is `{` is parsed as a
 /// flat JSON object (`cloudctl ... --json`), and anything else is read as
 /// `KEY=VALUE` lines (`echo PREVIEW_ID=pv_9`). Only declared names are
-/// taken, JSON scalars are stringified, and a name the command did not emit
-/// is simply absent rather than an error — a resource may legitimately
-/// publish a handle only on some runs.
-pub fn parse_captures(stdout: &str, wanted: &[String]) -> BTreeMap<String, String> {
+/// taken and JSON scalars are stringified. A name the command did not emit
+/// is not an error — a resource may legitimately publish a handle only on
+/// some runs — but it is always reported in `missing`.
+pub fn parse_captures(stdout: &str, wanted: &[String]) -> Captures {
     if wanted.is_empty() {
-        return BTreeMap::new();
+        return Captures::default();
     }
     let trimmed = stdout.trim_start();
 
-    let mut found: BTreeMap<String, String> = BTreeMap::new();
+    let mut seen: BTreeMap<String, String> = BTreeMap::new();
     if trimmed.starts_with('{') {
         if let Ok(serde_json::Value::Object(object)) =
             serde_json::from_str::<serde_json::Value>(trimmed)
         {
             for (key, value) in object {
                 if let Some(text) = json_scalar(&value) {
-                    found.insert(key, text);
+                    seen.insert(key, text);
                 }
             }
         }
     } else {
         for line in stdout.lines() {
             if let Some((key, value)) = line.split_once('=') {
-                found.insert(key.trim().to_owned(), value.trim().to_owned());
+                seen.insert(key.trim().to_owned(), value.trim().to_owned());
             }
         }
     }
 
-    wanted
-        .iter()
-        .filter_map(|name| found.remove_entry(name))
-        .collect()
+    let mut captures = Captures::default();
+    for name in wanted {
+        match seen.remove_entry(name) {
+            Some((key, value)) => {
+                captures.found.insert(key, value);
+            }
+            None => captures.missing.push(name.clone()),
+        }
+    }
+    captures
 }
 
 /// JSON scalars render as themselves; containers have no obvious env-var
@@ -508,24 +526,38 @@ mod tests {
             r#"{"PREVIEW_ID": "pv_9", "PREVIEW_URL": "https://pv9.example", "extra": 1}"#,
             &wanted,
         );
-        assert_eq!(json["PREVIEW_ID"], "pv_9");
-        assert_eq!(json["PREVIEW_URL"], "https://pv9.example");
-        assert_eq!(json.len(), 2, "undeclared keys are not captured");
+        assert_eq!(json.found["PREVIEW_ID"], "pv_9");
+        assert_eq!(json.found["PREVIEW_URL"], "https://pv9.example");
+        assert_eq!(json.found.len(), 2, "undeclared keys are not captured");
+        assert!(json.missing.is_empty());
 
         let lines = parse_captures("noise\nPREVIEW_ID=pv_9\n", &wanted);
-        assert_eq!(lines["PREVIEW_ID"], "pv_9");
+        assert_eq!(lines.found["PREVIEW_ID"], "pv_9");
         assert!(
-            !lines.contains_key("PREVIEW_URL"),
+            !lines.found.contains_key("PREVIEW_URL"),
             "a name the command did not emit is absent, not empty"
+        );
+        assert_eq!(
+            lines.missing,
+            vec!["PREVIEW_URL".to_owned()],
+            "and it is reported, not silently dropped"
         );
 
         // Non-string scalars stringify; unparseable output captures nothing.
         assert_eq!(
-            parse_captures(r#"{"PORT": 5432}"#, &["PORT".to_owned()])["PORT"],
+            parse_captures(r#"{"PORT": 5432}"#, &["PORT".to_owned()]).found["PORT"],
             "5432"
         );
-        assert!(parse_captures("{not json", &wanted).is_empty());
-        assert!(parse_captures("PREVIEW_ID=pv_9", &[]).is_empty());
+        let unparseable = parse_captures("{not json", &wanted);
+        assert!(unparseable.found.is_empty());
+        assert_eq!(
+            unparseable.missing, wanted,
+            "every declared name is missing"
+        );
+
+        // Nothing declared means nothing wanted, so nothing is missing either.
+        let undeclared = parse_captures("PREVIEW_ID=pv_9", &[]);
+        assert!(undeclared.found.is_empty() && undeclared.missing.is_empty());
     }
 
     #[test]

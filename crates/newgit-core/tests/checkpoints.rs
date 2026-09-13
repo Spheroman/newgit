@@ -417,3 +417,61 @@ fn identical_checkpoints_dedupe_lane_revs() {
     );
     assert_ne!(first.record.id, second.record.id);
 }
+
+/// A half-failed undo used to print `Restored` and `FAILED` about the same
+/// operation, and left a pre-undo checkpoint indistinguishable from one a
+/// human named — three failed attempts meant three of them, each pinning
+/// tracker revs.
+#[test]
+fn an_incomplete_undo_says_so_and_marks_its_safety_checkpoint() {
+    let (_guard, temp) = tempdir();
+    let store = setup(&temp);
+    write_resource(&store, "bad", BAD_RESTORE_RESOURCE);
+    write_resource(&store, "deps", HASH_RECOMPUTE_RESOURCE);
+    let m = manager(store);
+    m.spawn("feature-f", None).expect("spawn");
+    m.checkpoint("feature-f", Some("good state"))
+        .expect("checkpoint");
+
+    let undo = m.undo("feature-f", None).expect("undo");
+    assert!(!undo.is_complete(), "one resource did not restore");
+    assert_eq!(undo.failed_resources(), vec!["bad"]);
+    assert_eq!(
+        undo.safety.undo_completed,
+        Some(false),
+        "the safety checkpoint records that the undo it preceded failed"
+    );
+
+    // Recorded on disk, not just in the returned outcome, and visible in the
+    // log so it can be told apart from a checkpoint a human chose.
+    let listed = m.list_checkpoints("feature-f").expect("list");
+    let safety = listed
+        .iter()
+        .find(|record| record.id == undo.safety.id)
+        .expect("safety checkpoint listed");
+    assert_eq!(safety.reason, CheckpointReason::BeforeUndo);
+    assert_eq!(safety.undo_completed, Some(false));
+
+    // The explicit checkpoint is never annotated — only pre-undo ones are.
+    let explicit = listed
+        .iter()
+        .find(|record| record.reason == CheckpointReason::Explicit)
+        .expect("explicit checkpoint");
+    assert_eq!(explicit.undo_completed, None);
+}
+
+/// The complete case is the control: a clean undo is a redo point, and says so.
+#[test]
+fn a_complete_undo_marks_its_safety_checkpoint_as_a_redo_point() {
+    let (_guard, temp) = tempdir();
+    let store = setup(&temp);
+    write_resource(&store, "deps", HASH_RECOMPUTE_RESOURCE);
+    let m = manager(store);
+    m.spawn("feature-g", None).expect("spawn");
+    m.checkpoint("feature-g", None).expect("checkpoint");
+
+    let undo = m.undo("feature-g", None).expect("undo");
+    assert!(undo.is_complete());
+    assert!(undo.failed_resources().is_empty());
+    assert_eq!(undo.safety.undo_completed, Some(true));
+}
