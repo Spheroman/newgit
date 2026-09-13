@@ -153,6 +153,11 @@ ownership = "external"
 # `captures` reads names out of the prepare command's stdout — either a flat
 # JSON object or KEY=VALUE lines — and publishes them as this resource's
 # exports, so `newgit run` and the hooks below can use them.
+#
+# When `captures` is set, stdout belongs to newgit: send anything else the
+# command prints to stderr, or a chatty CLI's progress output will be
+# interleaved with the values and they will not parse. A declared name that
+# never turns up is reported as a warning, not an error.
 
 [actions.prepare]
 # Edit to your provisioning command.

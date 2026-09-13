@@ -472,7 +472,18 @@ captures = ["PREVIEW_ID", "PREVIEW_URL"]
 Two output shapes are accepted, because both are what real commands already
 emit: stdout whose first non-whitespace character is `{` is parsed as a flat
 JSON object, and anything else is read as `KEY=VALUE` lines. Only declared
-names are taken; a name the command did not emit is simply absent. Captured
+names are taken.
+
+**When `captures` is set, stdout belongs to newgit.** Send anything else the
+command prints to stderr: a chatty CLI's progress output interleaved with the
+values will not parse, and the result is an action that exits 0, reports
+`prepare: ok`, marks the resource ready, and publishes an empty handle that
+nobody notices until an API call returns 401. A declared name the command did
+not emit stays absent rather than becoming an error — a resource may
+legitimately publish a handle only on some runs — but newgit warns for each
+one, naming the capture and the log to look in. Silence there costs a
+debugging cycle, and newgit already knows both the names it wanted and the
+stdout it scanned. Captured
 values land on the binding record, so they survive the process, reach
 `newgit run`, and are available to checkpoint and cleanup hooks. An action
 with `captures` runs captured — its output goes to the log rather than the
@@ -898,10 +909,36 @@ resource is marked failed.
 Source restore is pure Git in v1; `jj` delegation can come with the jj
 substrate work.
 
+#### An Incomplete Undo Must Say So
+
+A restore command is not transactional. One that does two things — rebuild a
+schema, then load the captured rows — and fails on the second leaves its
+resource in neither the pre-undo state nor the checkpoint state. newgit
+cannot fix that; non-transactional resources are inherent. What it must not
+do is describe the instance as restored anyway.
+
+So the summary leads with the verdict. A clean undo reports `Restored`; one
+with any failed resource reports `Undo of <instance> ... INCOMPLETE: N of M
+resources restored`, names the resources that may be in a partial state, and
+exits non-zero. Saying `Restored` on the first line and `FAILED` on the
+fourth sends the reader to look at their script instead of at the resource.
+
+The safety checkpoint is annotated once the undo finishes, with
+`undo_completed = true|false`. A pre-undo snapshot taken before an undo that
+failed captures a state the instance never cleanly left: it is not a redo
+point, and three failed attempts otherwise leave three entries
+indistinguishable from checkpoints a human chose to keep, each pinning its
+tracker revs. It is recorded rather than acted on — newgit cannot know at
+save time whether the undo will succeed, and deleting the only record of a
+state is the one thing checkpoints exist to prevent. Releasing those revs is
+a `cleanup` concern.
+
 ### `newgit checkpoints [instance]`
 
 Lists an instance's checkpoints (id, created, reason, source rev, message) —
-what makes `undo --to` usable.
+what makes `undo --to` usable. The reason distinguishes `explicit` (a human
+named it), `before-undo` (auto-saved, and a real redo point), and
+`failed-undo` (auto-saved before an undo that did not complete).
 
 ### `newgit status`
 
@@ -1389,6 +1426,7 @@ branch = "feature-a"
 created_at = "..."
 message = "before auth refactor"
 reason = "explicit"                  # or "before-undo" (undo's safety checkpoint)
+undo_completed = true                # before-undo only: was that undo complete?
 
 [source]
 head_rev = "..."                     # workspace HEAD

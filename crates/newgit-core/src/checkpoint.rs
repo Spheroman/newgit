@@ -19,6 +19,17 @@ pub struct CheckpointRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
     pub reason: CheckpointReason,
+    /// Set on a `before-undo` checkpoint once the undo it preceded finished.
+    /// `false` means that undo left at least one resource unrestored, so this
+    /// snapshot is of a state the instance never cleanly left — it is not a
+    /// redo point, and a later prune can treat it as droppable where an
+    /// explicit checkpoint never could be.
+    ///
+    /// Recorded rather than acted on: newgit cannot know at save time whether
+    /// the undo will succeed, and deleting the only record of a state is the
+    /// one thing checkpoints exist to prevent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub undo_completed: Option<bool>,
     pub source: SourceState,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tracker_states: Vec<TrackerState>,
@@ -211,6 +222,7 @@ mod tests {
             created_at: Utc::now(),
             message: Some("before auth refactor".to_owned()),
             reason: CheckpointReason::Explicit,
+            undo_completed: None,
             source: SourceState {
                 head_rev: "abc".to_owned(),
                 dirty_rev: None,

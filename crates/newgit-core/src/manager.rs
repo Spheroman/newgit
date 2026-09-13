@@ -22,7 +22,8 @@ use crate::lane::{TrackerLane, clear_owned_paths, copy_file};
 use crate::materializer::{Materializer, RealDirMaterializer, exclude_tracker_paths};
 use crate::ports;
 use crate::resource::{
-    CheckpointMode, GraphProblem, ResourceDefinition, RestoreMode, parse_captures, resolve_order,
+    Captures, CheckpointMode, GraphProblem, ResourceDefinition, RestoreMode, parse_captures,
+    resolve_order,
 };
 use crate::source::GitSource;
 use crate::store::MetadataStore;
@@ -68,6 +69,8 @@ pub struct ResourceBindOutcome {
     pub blocked_by: Vec<String>,
     /// Export names `prepare` published through `captures`.
     pub captured: Vec<String>,
+    /// One warning per declared capture `prepare` never emitted.
+    pub missing_captures: Vec<String>,
 }
 
 /// What running an action did.
@@ -83,6 +86,8 @@ pub enum ActionOutcome {
     Ran {
         code: i32,
         log: Utf8PathBuf,
+        /// One warning per declared capture the command never emitted.
+        missing_captures: Vec<String>,
     },
 }
 
@@ -182,6 +187,26 @@ pub struct UndoOutcome {
     /// Written when any resource restore failed.
     pub recovery_record: Option<Utf8PathBuf>,
     pub warnings: Vec<String>,
+}
+
+impl UndoOutcome {
+    /// Resources whose restore failed.
+    ///
+    /// A restore command is not transactional: one that fails halfway (reset
+    /// the schema, then fail to load the rows) leaves its resource in neither
+    /// the pre-undo state nor the checkpoint state. newgit cannot fix that,
+    /// but it must not describe the instance as restored when it happened.
+    pub fn failed_resources(&self) -> Vec<&str> {
+        self.resources
+            .iter()
+            .filter(|resource| !resource.ok)
+            .map(|resource| resource.name.as_str())
+            .collect()
+    }
+
+    pub fn is_complete(&self) -> bool {
+        self.recovery_record.is_none() && self.failed_resources().is_empty()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -457,6 +482,7 @@ impl BranchManager {
             // their dependencies' exports. Failed dependencies block
             // dependents; the instance still spawns so logs can be inspected.
             let mut captured_names = Vec::new();
+            let mut missing_captures = Vec::new();
             let (status, prepare) = if !blocked_by.is_empty() {
                 if let Some(binding) = branch.resources.get_mut(&definition.name) {
                     binding.status = ResourceStatus::Blocked;
@@ -470,8 +496,14 @@ impl BranchManager {
                             .action_log_path(&branch.slug, &format!("{}.prepare", definition.name));
                         let (code, captured) =
                             self.run_one_shot(branch, definition, action, &log)?;
-                        captured_names = captured.keys().cloned().collect();
-                        Self::apply_captures(branch, &definition.name, captured);
+                        captured_names = captured.found.keys().cloned().collect();
+                        missing_captures = Self::missing_capture_warnings(
+                            &definition.name,
+                            "prepare",
+                            &captured,
+                            &log,
+                        );
+                        Self::apply_captures(branch, &definition.name, captured.found);
                         let status = if code == 0 {
                             ResourceStatus::Ready
                         } else {
@@ -498,6 +530,7 @@ impl BranchManager {
                 prepare,
                 blocked_by,
                 captured: captured_names,
+                missing_captures,
             });
         }
         branch.updated_at = Utc::now();
@@ -565,7 +598,9 @@ impl BranchManager {
         }
 
         let (code, captured) = self.run_one_shot(&branch, definition, action, &log)?;
-        let mut dirty = Self::apply_captures(&mut branch, &definition.name, captured);
+        let missing_captures =
+            Self::missing_capture_warnings(&definition.name, action_name, &captured, &log);
+        let mut dirty = Self::apply_captures(&mut branch, &definition.name, captured.found);
         if action_name == "prepare"
             && let Some(binding) = branch.resources.get_mut(&definition.name)
         {
@@ -580,7 +615,11 @@ impl BranchManager {
             branch.updated_at = Utc::now();
             self.store.save_branch_record(&branch)?;
         }
-        Ok(ActionOutcome::Ran { code, log })
+        Ok(ActionOutcome::Ran {
+            code,
+            log,
+            missing_captures,
+        })
     }
 
     /// Run an arbitrary command inside the instance with the full export
@@ -608,7 +647,7 @@ impl BranchManager {
         definition: &ResourceDefinition,
         action: &crate::resource::ActionSpec,
         log: &Utf8Path,
-    ) -> Result<(i32, BTreeMap<String, String>)> {
+    ) -> Result<(i32, Captures)> {
         let command = self.rendered_command(branch, definition, action)?;
         let env = self.assemble_env(branch)?;
 
@@ -619,11 +658,34 @@ impl BranchManager {
                 &env,
                 log,
             )?;
-            return Ok((code, BTreeMap::new()));
+            return Ok((code, Captures::default()));
         }
 
         let (code, stdout) = run_captured(&command, &branch.workspace_path, &env, log)?;
         Ok((code, parse_captures(&stdout, &action.captures)))
+    }
+
+    /// One warning per declared capture the command never emitted. The log
+    /// path is included because the answer is nearly always in the command's
+    /// own output — typically its stdout carrying something other than the
+    /// captures.
+    fn missing_capture_warnings(
+        resource: &str,
+        action: &str,
+        captures: &Captures,
+        log: &Utf8Path,
+    ) -> Vec<String> {
+        captures
+            .missing
+            .iter()
+            .map(|name| {
+                format!(
+                    "resource `{resource}` declared capture `{name}` on `{action}`, not found \
+                     in stdout (log: {log}); when `captures` is set, stdout belongs to newgit — \
+                     send everything else to stderr"
+                )
+            })
+            .collect()
     }
 
     /// Merge values an action captured into the resource's binding exports,
@@ -1600,6 +1662,7 @@ impl BranchManager {
             created_at: Utc::now(),
             message: message.map(ToOwned::to_owned),
             reason,
+            undo_completed: None,
             source: SourceState {
                 head_rev,
                 dirty_rev,
@@ -1861,8 +1924,13 @@ impl BranchManager {
                 ));
             }
 
-            let (mut action_label, ok) =
-                self.restore_resource(&mut branch, definition, state, &mut failures)?;
+            let (mut action_label, ok) = self.restore_resource(
+                &mut branch,
+                definition,
+                state,
+                &mut failures,
+                &mut warnings,
+            )?;
             if let Some(binding) = branch.resources.get_mut(name) {
                 binding.status = if ok {
                     ResourceStatus::Ready
@@ -1912,9 +1980,18 @@ impl BranchManager {
         branch.updated_at = Utc::now();
         self.store.save_branch_record(&branch)?;
 
+        // Now that the undo has finished, the safety checkpoint can say
+        // whether it is a redo point. A pre-undo snapshot taken before an
+        // undo that failed captures a state the instance never cleanly left,
+        // and three failed attempts otherwise leave three of them looking
+        // exactly like states a human chose to keep.
+        let mut safety_record = safety.record;
+        safety_record.undo_completed = Some(recovery_record.is_none());
+        checkpoint_log.save(&safety_record)?;
+
         Ok(UndoOutcome {
             restored,
-            safety: safety.record,
+            safety: safety_record,
             trackers,
             resources,
             recovery_record,
@@ -1931,6 +2008,7 @@ impl BranchManager {
         definition: &ResourceDefinition,
         state: &ResourceState,
         failures: &mut Vec<RestoreFailure>,
+        warnings: &mut Vec<String>,
     ) -> Result<(String, bool)> {
         let Some(spec) = &definition.restore else {
             return Ok(("none".to_owned(), true));
@@ -1950,7 +2028,13 @@ impl BranchManager {
                     .store
                     .action_log_path(&branch.slug, &format!("{}.restore", definition.name));
                 let (code, captured) = self.run_one_shot(branch, definition, action, &log)?;
-                Self::apply_captures(branch, &definition.name, captured);
+                warnings.extend(Self::missing_capture_warnings(
+                    &definition.name,
+                    action_name,
+                    &captured,
+                    &log,
+                ));
+                Self::apply_captures(branch, &definition.name, captured.found);
                 let ok = code == 0;
                 if !ok {
                     failures.push(RestoreFailure {
