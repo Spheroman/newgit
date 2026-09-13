@@ -59,6 +59,10 @@ file content. Start from `newgit resource add <name> --template <template>`
 | --- | --- | --- | --- | --- |
 | `paths` | array of strings | yes if the section is present | — | the files whose content *is* this resource's identity (a lockfile, a manifest). Path-dependent state is recomputed from its identity, not copied. |
 
+Installs are the usual reason for this section, and they are the one place
+newgit multiplies a cost rather than absorbing it — see *Installs: use a
+content-addressed store*.
+
 ### `[ports.<name>]`
 
 One entry per port the resource needs. `<name>` is yours (`app`, `db`).
@@ -231,6 +235,57 @@ a security label.
 | `project` | shared by every instance of this project | no |
 | `user` | shared beyond this project (a pnpm store) | no |
 | `external` | another system owns it; newgit holds a handle | yes — exactly the `[cleanup] command`, nothing else |
+
+---
+
+## Installs: use a content-addressed store
+
+> **Strongly recommended: choose a package manager that installs from a shared
+> content-addressed store.** It is the single choice that most affects what
+> running many instances costs you, and it is not one newgit can make for you.
+
+Every branch instance installs its own dependencies. That is not a default to
+turn off and it is not newgit being wasteful: two branches with different
+lockfiles must not share a dependency tree, or one branch's install silently
+rewrites the other's. It is why installs are resources with `[identity]` and a
+`recompute` restore rather than trackers — the lockfile is the truth, and the
+tree is rebuilt from it.
+
+What that independence costs is set by your package manager, not by newgit:
+
+| tool | per-instance cost | why |
+| --- | --- | --- |
+| pnpm | directory entries | hardlinks packages from one global store |
+| Yarn PnP | ~nothing | no install tree at all |
+| uv, bun | directory entries | hardlink from a shared cache |
+| Cargo | a `target/` each | the registry is shared; build output is not |
+| npm, Yarn classic | a **full copy** each | the cache holds tarballs, so `npm ci` re-expands every time |
+| pip into a venv | a **full copy** each | same shape |
+
+Ten instances of a monorepo is roughly one `node_modules` worth of disk under
+pnpm and ten under npm. The difference is not a tuning detail; it is whether
+keeping eight branches alive at once feels free or feels like something you
+ration.
+
+There is no lever on newgit's side, because the thing that would save the
+space — one installed tree shared between instances — is exactly the bug this
+design exists to prevent. So if you are adopting newgit and have a choice,
+make it here first.
+
+Two keys matter when you wire the store up:
+
+- Give the shared store its own resource with **`ownership = "user"`**, and
+  have the install `depends_on` it. `user` is the one ownership newgit never
+  deletes, at `remove` or at `cleanup` — correct, because that store is shared
+  with every other project on the machine. The `pnpm` template ships this pair
+  already.
+- Point the install's **`[identity] paths`** at the lockfile *and* the
+  manifest, so a `recompute` restore reinstalls exactly what the checkpoint
+  described.
+
+If you cannot switch package managers, nothing breaks — it costs disk. Run
+fewer concurrent instances, and let `newgit cleanup` reclaim the trees of
+instances whose workspaces are gone.
 
 ---
 
