@@ -115,6 +115,22 @@ pub enum NewgitError {
         dependency: String,
     },
 
+    #[error(
+        "environment variable `{name}` is declared more than once ({claimants}); a name may \
+         have only one owner — {remedy}"
+    )]
+    EnvNameCollision {
+        name: String,
+        claimants: String,
+        remedy: String,
+    },
+
+    #[error(
+        "environment variable `{name}` is declared by {claimant}, but newgit sets `{name}` for \
+         every command it runs and would shadow it; rename it"
+    )]
+    ReservedEnvName { name: String, claimant: String },
+
     #[error("no checkpoints exist for `{0}`; create one with `newgit checkpoint {0}`")]
     NoCheckpoints(String),
 

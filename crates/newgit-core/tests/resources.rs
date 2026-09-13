@@ -823,6 +823,47 @@ command = "true"
     assert_eq!(manager.resource_definitions().len(), 2);
 }
 
+/// Two resources exporting one name used to resolve to whichever bound last,
+/// so the loser was absent from `newgit run` with nothing anywhere saying
+/// why. It is now a graph problem, reported and gated like any other.
+#[test]
+fn two_resources_exporting_one_name_block_graph_commands() {
+    let (_guard, temp) = tempdir();
+    let store = setup(&temp);
+    let repo = store.paths().project_root.clone();
+
+    for name in ["metro", "supabase"] {
+        write_resource(
+            &store,
+            name,
+            r#"ownership = "branch"
+
+[exports]
+EXPO_URL = "exp://127.0.0.1:8081"
+"#,
+        );
+    }
+
+    let manager = BranchManager::open(MetadataStore::at(repo)).expect("open still works");
+    assert!(matches!(
+        manager.graph_problems(),
+        [newgit_core::resource::GraphProblem::EnvNameCollision { name, .. }]
+            if name == "EXPO_URL"
+    ));
+
+    let error = manager.spawn("blocked", None).expect_err("spawn refuses");
+    let message = error.to_string();
+    // The message has to name both claimants: either one alone is a rename
+    // you cannot evaluate without knowing what it is colliding with.
+    assert!(
+        message.contains("`metro` [exports]") && message.contains("`supabase` [exports]"),
+        "both claimants named: {message}"
+    );
+
+    // Listing definitions is how you find the collision, so it must not refuse.
+    assert_eq!(manager.resource_definitions().len(), 2);
+}
+
 /// A resource definition is read from the store, but anything it shelled out
 /// to was read from the workspace — so iterating on a `prepare` script meant
 /// committing every attempt or copying it into the workspace by hand.

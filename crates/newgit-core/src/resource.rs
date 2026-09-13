@@ -605,6 +605,23 @@ pub enum GraphProblem {
         dependency: String,
     },
     Cycle(Vec<String>),
+    /// One environment variable name claimed by two or more declarations.
+    /// Claimants are pre-formatted and already sorted — see
+    /// [`check_env_names`].
+    EnvNameCollision {
+        name: String,
+        claimants: Vec<String>,
+        /// Whether an `[exports]` or `captures` declaration claims this name,
+        /// and so whether `{{exports.<name>}}` is a remedy worth suggesting.
+        /// Ports are resource-scoped: two colliding port `env` vars have
+        /// nothing to compose, only to rename.
+        composable: bool,
+    },
+    /// A declaration claiming a name newgit itself sets for every command.
+    ReservedEnvName {
+        name: String,
+        claimant: String,
+    },
 }
 
 impl GraphProblem {
@@ -619,6 +636,26 @@ impl GraphProblem {
                 dependency,
             },
             Self::Cycle(stack) => NewgitError::DependencyCycle(stack),
+            Self::EnvNameCollision {
+                name,
+                claimants,
+                composable,
+            } => NewgitError::EnvNameCollision {
+                remedy: if composable {
+                    format!(
+                        "rename all but one, and compose it elsewhere with `{{{{exports.{name}}}}}`"
+                    )
+                } else {
+                    // A port's value reaches another resource only by being
+                    // exported, so there is no composition to point at here.
+                    "rename all but one".to_owned()
+                },
+                name,
+                claimants: claimants.join(", "),
+            },
+            Self::ReservedEnvName { name, claimant } => {
+                NewgitError::ReservedEnvName { name, claimant }
+            }
         }
     }
 }
@@ -714,6 +751,90 @@ pub fn resolve_order(
         );
     }
     (ordered, problems)
+}
+
+/// Names newgit sets on every command it runs, after every resource's. A
+/// declaration claiming one of these is dead on arrival.
+const RESERVED_ENV_NAMES: [&str; 2] = ["NEWGIT_BRANCH", "NEWGIT_WORKSPACE"];
+
+/// Check that no environment variable name is claimed by two declarations.
+///
+/// The command environment is assembled by layering exports in dependency
+/// order and port `env` vars over those, so a name claimed twice used to
+/// resolve silently to whichever declaration happened to come last. That is
+/// never something a definition wants, and it is unreadable when it bites:
+/// the losing declaration is not wrong anywhere you can see, it is simply
+/// absent from the process that needed it. The set of names is fully known
+/// from the definitions, so the collision is reported when the graph loads
+/// rather than discovered in a subprocess.
+///
+/// Three kinds of declaration claim a name: an `[exports]` key, an action's
+/// `captures` entry, and a port's `env`. Exports and captures *within one
+/// resource* may share a name — a capture is how an action refines its own
+/// resource's export once the value exists, and the owner is unambiguous
+/// either way. Everything else is a collision, including a port `env` that
+/// shadows its own resource's export.
+pub fn check_env_names(resources: &[ResourceDefinition]) -> Vec<GraphProblem> {
+    // name -> claimants. One entry per (resource, name) for exports and
+    // captures together; port env vars always claim separately.
+    let mut claims: BTreeMap<&str, Vec<String>> = BTreeMap::new();
+    // Names at least one *export* claims, which decides the remedy: a value
+    // only travels between resources as an export, so a collision among port
+    // `env` vars alone has nothing to compose and is a rename either way.
+    let mut exported_anywhere: BTreeSet<&str> = BTreeSet::new();
+
+    for resource in resources {
+        let mut exported: BTreeMap<&str, String> = BTreeMap::new();
+        for name in resource.exports.keys() {
+            exported.insert(name, format!("`{}` [exports]", resource.name));
+        }
+        for (action, spec) in &resource.actions {
+            for name in &spec.captures {
+                // An `[exports]` key already names this resource as the
+                // owner; the capture is the same owner, so it adds nothing.
+                exported
+                    .entry(name)
+                    .or_insert_with(|| format!("`{}` [actions.{action}] captures", resource.name));
+            }
+        }
+        for (name, claimant) in exported {
+            claims.entry(name).or_default().push(claimant);
+            exported_anywhere.insert(name);
+        }
+
+        for (port, request) in &resource.ports {
+            if let Some(name) = &request.env {
+                claims
+                    .entry(name)
+                    .or_default()
+                    .push(format!("`{}` [ports.{port}] env", resource.name));
+            }
+        }
+    }
+
+    let mut problems = Vec::new();
+    for (name, mut claimants) in claims {
+        claimants.sort();
+        if RESERVED_ENV_NAMES.contains(&name) {
+            // Reported per claimant: each one has to be renamed, and a
+            // collision between two dead declarations is not the point.
+            for claimant in claimants {
+                problems.push(GraphProblem::ReservedEnvName {
+                    name: name.to_owned(),
+                    claimant,
+                });
+            }
+            continue;
+        }
+        if claimants.len() > 1 {
+            problems.push(GraphProblem::EnvNameCollision {
+                name: name.to_owned(),
+                claimants,
+                composable: exported_anywhere.contains(name),
+            });
+        }
+    }
+    problems
 }
 
 /// [`resolve_order`] for callers that require a whole graph.
@@ -815,6 +936,161 @@ mod tests {
             topological_order(&missing, &trackers),
             Err(NewgitError::MissingDependency { .. })
         ));
+    }
+
+    fn exporting(name: &str, exports: &[&str]) -> ResourceDefinition {
+        let mut definition = resource(name, &[]);
+        definition.exports = exports
+            .iter()
+            .map(|export| ((*export).to_owned(), "value".to_owned()))
+            .collect();
+        definition
+    }
+
+    fn with_port_env(
+        mut definition: ResourceDefinition,
+        port: &str,
+        env: &str,
+    ) -> ResourceDefinition {
+        definition.ports.insert(
+            port.to_owned(),
+            PortRequest {
+                start: 3000,
+                env: Some(env.to_owned()),
+            },
+        );
+        definition
+    }
+
+    fn with_captures(
+        mut definition: ResourceDefinition,
+        action: &str,
+        captures: &[&str],
+    ) -> ResourceDefinition {
+        definition.actions.insert(
+            action.to_owned(),
+            ActionSpec {
+                command: Some("true".to_owned()),
+                workdir: None,
+                long_running: false,
+                signal: None,
+                captures: captures.iter().map(ToString::to_string).collect(),
+            },
+        );
+        definition
+    }
+
+    /// The whole point of the check: before it, the loser was simply absent
+    /// from the environment with nothing anywhere saying why.
+    #[test]
+    fn two_resources_may_not_export_the_same_name() {
+        let problems = check_env_names(&[
+            exporting("metro", &["EXPO_URL"]),
+            exporting("supabase", &["EXPO_URL", "SUPABASE_URL"]),
+        ]);
+        assert_eq!(
+            problems,
+            vec![GraphProblem::EnvNameCollision {
+                name: "EXPO_URL".to_owned(),
+                claimants: vec![
+                    "`metro` [exports]".to_owned(),
+                    "`supabase` [exports]".to_owned(),
+                ],
+                composable: true,
+            }],
+            "SUPABASE_URL is claimed once and is not a problem"
+        );
+    }
+
+    /// Port env vars are layered *over* exports unconditionally, so this
+    /// shadowing does not even depend on dependency order to bite.
+    #[test]
+    fn a_port_env_var_may_not_shadow_an_export() {
+        let problems = check_env_names(&[
+            exporting("metro", &["PORT"]),
+            with_port_env(resource("app", &[]), "web", "PORT"),
+        ]);
+        assert_eq!(
+            problems,
+            vec![GraphProblem::EnvNameCollision {
+                name: "PORT".to_owned(),
+                claimants: vec![
+                    "`app` [ports.web] env".to_owned(),
+                    "`metro` [exports]".to_owned(),
+                ],
+                composable: true,
+            }]
+        );
+
+        // Including within one resource, where it is just as silent.
+        let own = with_port_env(exporting("app", &["PORT"]), "web", "PORT");
+        assert_eq!(check_env_names(&[own]).len(), 1);
+    }
+
+    /// Two `service`-shaped resources both claiming `PORT` is the common way
+    /// to meet this. Suggesting `{{exports.PORT}}` there would be advice that
+    /// does not work: ports are scoped to their own resource, so there is no
+    /// export to compose until someone publishes one.
+    #[test]
+    fn colliding_port_env_vars_are_a_rename_not_a_composition() {
+        let problems = check_env_names(&[
+            with_port_env(resource("api", &[]), "app", "PORT"),
+            with_port_env(resource("web", &[]), "app", "PORT"),
+        ]);
+        assert_eq!(problems.len(), 1);
+        assert!(matches!(
+            &problems[0],
+            GraphProblem::EnvNameCollision {
+                composable: false,
+                ..
+            }
+        ));
+        let message = problems[0].clone().into_error().to_string();
+        assert!(
+            message.ends_with("rename all but one"),
+            "no unusable compose hint: {message}"
+        );
+    }
+
+    /// A capture is how an action publishes a value that does not exist until
+    /// it runs, so it names its own resource's export on purpose.
+    #[test]
+    fn a_capture_shares_a_name_with_its_own_resource_but_not_another() {
+        let refines_own = with_captures(
+            exporting("preview", &["PREVIEW_URL"]),
+            "prepare",
+            &["PREVIEW_URL"],
+        );
+        assert!(check_env_names(&[refines_own]).is_empty());
+
+        let two_owners = vec![
+            with_captures(resource("preview", &[]), "prepare", &["PREVIEW_URL"]),
+            exporting("tunnel", &["PREVIEW_URL"]),
+        ];
+        assert_eq!(
+            check_env_names(&two_owners),
+            vec![GraphProblem::EnvNameCollision {
+                name: "PREVIEW_URL".to_owned(),
+                claimants: vec![
+                    "`preview` [actions.prepare] captures".to_owned(),
+                    "`tunnel` [exports]".to_owned(),
+                ],
+                composable: true,
+            }]
+        );
+    }
+
+    /// Reported even though only one declaration claims it: newgit's own
+    /// layer wins regardless, so the declaration is dead either way.
+    #[test]
+    fn a_reserved_name_is_reported_against_its_single_claimant() {
+        assert_eq!(
+            check_env_names(&[exporting("app", &["NEWGIT_BRANCH"])]),
+            vec![GraphProblem::ReservedEnvName {
+                name: "NEWGIT_BRANCH".to_owned(),
+                claimant: "`app` [exports]".to_owned(),
+            }]
+        );
     }
 
     fn write_and_load(contents: &str) -> Result<ResourceDefinition> {

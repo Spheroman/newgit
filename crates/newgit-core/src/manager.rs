@@ -25,8 +25,8 @@ use crate::materializer::{
 use crate::ports;
 use crate::render::{self, RenderRecord};
 use crate::resource::{
-    Captures, CheckpointMode, GraphProblem, ResourceDefinition, RestoreMode, parse_captures,
-    resolve_order,
+    Captures, CheckpointMode, GraphProblem, ResourceDefinition, RestoreMode, check_env_names,
+    parse_captures, resolve_order,
 };
 use crate::source::GitSource;
 use crate::store::MetadataStore;
@@ -394,7 +394,11 @@ impl BranchManager {
         let trackers = store.load_tracker_definitions()?;
         let resources = store.load_resource_definitions()?;
         let tracker_names: BTreeSet<String> = trackers.iter().map(|t| t.name.clone()).collect();
-        let (resource_order, graph_problems) = resolve_order(&resources, &tracker_names);
+        let (resource_order, mut graph_problems) = resolve_order(&resources, &tracker_names);
+        // A name collision is not an ordering fault, but it is the same kind
+        // of whole-graph defect: detectable from the definitions alone, and
+        // fatal to anything that assembles an environment.
+        graph_problems.extend(check_env_names(&resources));
         Ok(Self {
             store,
             config,

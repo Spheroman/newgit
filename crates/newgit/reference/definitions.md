@@ -303,6 +303,10 @@ it holds.
 There is no syntax for another resource's *ports*: `{{ports.<name>}}` is
 scoped to the resource's own. Publish the value as an export and compose that.
 
+Export names are global to the project and may only be claimed once — see
+*Command environment*. Two resources that both want `APP_URL` must pick two
+names; that is the same constraint the shell they end up in has.
+
 Resources export runtime values — ports, URLs, handles. Trackers do not
 export anything; they own file content.
 
@@ -502,8 +506,7 @@ command never emitted is a warning, not an error.
 
 ## Command environment
 
-`newgit run [instance] -- <command>` and every action see, in this order
-(later wins):
+`newgit run [instance] -- <command>` and every action see:
 
 1. each resource's rendered `[exports]`, in dependency order;
 2. `[ports.<name>] env` variables;
@@ -511,6 +514,29 @@ command never emitted is a warning, not an error.
 
 Trackers contribute no environment; they place files. Loading `.env`-style
 files is command-run policy, not a tracker feature.
+
+**A name has exactly one owner.** Three things declare an environment
+variable — an `[exports]` key, an action's `captures` entry, and a port's
+`env` — and the same name appearing in two of them is a graph problem,
+reported by `newgit resource list` and refused by `spawn`, `run`, `action`,
+`checkpoint`, and `undo`, like a missing dependency or a cycle:
+
+```
+environment variable `EXPO_URL` is declared more than once (`metro` [exports],
+`supabase` [exports]); a name may have only one owner — rename all but one,
+and compose it elsewhere with `{{exports.EXPO_URL}}`
+```
+
+There is no shadowing rule to learn because there is nothing to shadow. The
+one deliberate overlap is a `captures` entry naming its *own* resource's
+`[exports]` key: the export holds the value the definition can state up
+front, and the action overwrites it with the one that did not exist until it
+ran. The owner is the same resource either way.
+
+`NEWGIT_BRANCH` and `NEWGIT_WORKSPACE` are reserved. newgit sets them for
+every command it runs, so a resource declaring one is reported too — a
+declaration that could never reach the process is a mistake worth naming,
+not a silent no-op.
 
 ---
 

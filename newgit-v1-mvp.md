@@ -1013,12 +1013,16 @@ newgit spawn auth-refactor --profile fullstack
 
 ### `newgit run [name] -- <command>`
 
-Runs a command inside the branch instance with the environment assembled in
-layers (later layers win):
+Runs a command inside the branch instance with the environment assembled
+from:
 
 1. resource exports, in dependency order
 2. port env vars (`PORT=3107`)
 3. `NEWGIT_BRANCH`, `NEWGIT_WORKSPACE` context vars
+
+A name belongs to exactly one declaration. Two resources claiming one name
+is a graph problem reported when the graph loads, not a last-one-wins
+resolution discovered as a missing variable in a subprocess.
 
 The workspace is the cwd; output is captured to `.newgit/logs/` as well as
 the terminal.
