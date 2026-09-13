@@ -6,6 +6,25 @@ of `.newgit/` in a minor release — see *Upgrading* below.
 
 ## [Unreleased]
 
+### Added
+
+- `newgit tracker capture <tracker> --from-store` seeds a lane from the store
+  repo's working tree and sets the lane head, so the first `spawn` comes up
+  with the content ([#9](https://github.com/Spheroman/newgit/issues/9)).
+
+  A lane starts empty and `capture` reads from an instance workspace, so
+  adopting newgit for a tracker carrying `.env` files meant spawning an
+  instance guaranteed to come up without them, copying the files in, capturing,
+  merging, and re-running the resource action that had already failed. The
+  content was in the store repo at the same relative paths the whole time.
+  That bootstrap is now two commands: `tracker track`, then
+  `tracker capture --from-store`.
+
+  Declared paths with nothing behind them are reported as warnings rather than
+  silently seeding a partial lane; a tracker with nothing at all on disk is an
+  error, not an empty lane head. `newgit tracker track` now suggests
+  `--from-store` when the paths it just added already have content.
+
 ## [0.1.1] — 2026-09-12
 
 ### Fixed
