@@ -126,9 +126,85 @@ fn render_substitutes_this_instances_values_into_the_committed_file() {
         .expect("outcome");
     assert_eq!(outcome.rendered.len(), 1);
     assert_eq!(outcome.rendered[0].replacements, 3);
-    // A source-owned render is lossy, and newgit says so rather than leaving
-    // it to the docs.
-    assert!(outcome.rendered[0].warning.is_some());
+}
+
+/// The lossiness is reported when it is real, not as a caveat at bind. A
+/// clean instance has nothing to say about it.
+#[test]
+fn a_checkpoint_is_silent_about_a_rendered_file_nobody_touched() {
+    let (_guard, temp) = tempdir();
+    let store = setup(&temp);
+    write_resource(&store, "supabase", SUPABASE_RESOURCE);
+    let m = manager(store);
+
+    m.spawn("feature-a", None).expect("spawn");
+    let outcome = m
+        .checkpoint("feature-a", Some("clean"))
+        .expect("checkpoint");
+    assert!(
+        !outcome
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("supabase/config.toml")),
+        "warned with nothing to warn about: {:?}",
+        outcome.warnings
+    );
+}
+
+/// ...and speaks at the moment the edit is about to be discarded, naming the
+/// file rather than restating the general rule.
+#[test]
+fn a_checkpoint_names_hand_edits_a_render_will_discard() {
+    let (_guard, temp) = tempdir();
+    let store = setup(&temp);
+    write_resource(&store, "supabase", SUPABASE_RESOURCE);
+    let m = manager(store);
+
+    let spawned = m.spawn("feature-a", None).expect("spawn");
+    let config = spawned.branch.workspace_path.join("supabase/config.toml");
+
+    // The edit the warning exists for: a real change to a rendered file,
+    // which the checkpoint cannot carry.
+    let edited = std::fs::read_to_string(&config).expect("read") + "\n[auth]\nenabled = true\n";
+    std::fs::write(&config, edited).expect("edit");
+
+    let outcome = m.checkpoint("feature-a", Some("work")).expect("checkpoint");
+    let warning = outcome
+        .warnings
+        .iter()
+        .find(|warning| warning.contains("supabase/config.toml"))
+        .expect("drift warning");
+    assert!(warning.contains("render will discard"), "{warning}");
+    assert!(warning.contains("line(s) differ"), "{warning}");
+}
+
+/// Drift is detected against the recomputed render, not against committed
+/// content — the instance's own rendered values must not read as an edit.
+#[test]
+fn an_undo_re_render_reports_the_edit_it_is_about_to_overwrite() {
+    let (_guard, temp) = tempdir();
+    let store = setup(&temp);
+    write_resource(&store, "supabase", SUPABASE_RESOURCE);
+    let m = manager(store);
+
+    let spawned = m.spawn("feature-a", None).expect("spawn");
+    let config = spawned.branch.workspace_path.join("supabase/config.toml");
+    m.checkpoint("feature-a", Some("before"))
+        .expect("checkpoint");
+
+    let edited = std::fs::read_to_string(&config).expect("read") + "\n[auth]\nenabled = true\n";
+    std::fs::write(&config, edited).expect("edit");
+
+    let undone = m.undo("feature-a", None).expect("undo");
+    assert!(
+        undone
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("supabase/config.toml")
+                && warning.contains("render will discard")),
+        "undo overwrote a hand edit silently: {:?}",
+        undone.warnings
+    );
 }
 
 #[test]

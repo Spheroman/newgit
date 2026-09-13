@@ -10,7 +10,7 @@
 //! newgit substitutes into the committed content and writes the result into
 //! one workspace. See *Render* in newgit-v1-mvp.md.
 
-use camino::Utf8PathBuf;
+use camino::{Utf8Path, Utf8PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{NewgitError, Result};
@@ -66,6 +66,35 @@ pub struct AppliedReplacement {
     pub count: usize,
 }
 
+/// Where one rule matched in the committed content.
+struct Located {
+    start: usize,
+    end: usize,
+    rule: usize,
+}
+
+/// Every occurrence of every `find`, located in one pass over the *same*
+/// string. Returned sorted by position.
+fn locate(content: &str, finds: &[&str]) -> Vec<Located> {
+    let mut found = Vec::new();
+    for (rule, find) in finds.iter().enumerate() {
+        let mut from = 0;
+        while let Some(offset) = content[from..].find(find) {
+            let start = from + offset;
+            found.push(Located {
+                start,
+                end: start + find.len(),
+                rule,
+            });
+            // Overlapping occurrences of one `find` are not matches Git or a
+            // human would count; advance past this one.
+            from = start + find.len();
+        }
+    }
+    found.sort_by_key(|located| (located.start, located.end));
+    found
+}
+
 /// Substitute into `committed`, the file's committed content — never what is
 /// currently on disk.
 ///
@@ -75,17 +104,21 @@ pub struct AppliedReplacement {
 /// record with no extra machinery, a `pull` that moves a lane head re-renders
 /// from the new content, and values can never compound.
 ///
-/// Replacements apply in declaration order, each checked against the content
-/// as it stands at that step.
+/// **Every `find` is located in the committed content, and all replacements
+/// apply as one batch. A replacement's output is never a match target.**
+/// Rewriting in declaration order, re-matching each rule against the
+/// partially-rewritten text, would make a rule mean different things
+/// depending on what ran before it: a `find` that happens to equal an earlier
+/// rule's output would either report a spurious second match or silently
+/// rewrite that output. Declaration order then stops being cosmetic, which is
+/// not a property a config file should have.
 pub fn apply(
     resource: &str,
     spec: &RenderSpec,
     committed: &str,
     context: &RenderContext,
 ) -> Result<(String, Vec<AppliedReplacement>)> {
-    let mut content = committed.to_owned();
     let mut applied = Vec::with_capacity(spec.replace.len());
-
     for replacement in &spec.replace {
         let value = render_template(&replacement.with, context);
         if let Some(unresolved) = crate::exports::unresolved_placeholder(&value) {
@@ -95,35 +128,6 @@ pub fn apply(
                 placeholder: unresolved.to_owned(),
             });
         }
-
-        let found = content.matches(&replacement.find).count();
-        if found != replacement.count {
-            return Err(NewgitError::RenderMatchCount {
-                resource: resource.to_owned(),
-                path: spec.path.clone(),
-                find: replacement.find.clone(),
-                expected: replacement.count,
-                found,
-            });
-        }
-
-        content = content.replace(&replacement.find, &value);
-
-        // The inverse has to be as unambiguous as the forward pass, or
-        // `newgit capture` on a tracker-owned file would rewrite the wrong
-        // occurrence. Checked here so the failure lands at bind, where the
-        // definition is in front of you, rather than at capture.
-        let back = content.matches(value.as_str()).count();
-        if back != replacement.count {
-            return Err(NewgitError::RenderNotInvertible {
-                resource: resource.to_owned(),
-                path: spec.path.clone(),
-                value,
-                expected: replacement.count,
-                found: back,
-            });
-        }
-
         applied.push(AppliedReplacement {
             find: replacement.find.clone(),
             value,
@@ -131,7 +135,84 @@ pub fn apply(
         });
     }
 
+    let content = substitute(resource, &spec.path, committed, &applied)?;
+
+    // The inverse has to be as unambiguous as the forward pass, or
+    // `newgit capture` on a tracker-owned file would rewrite the wrong
+    // occurrence. Checked against the finished render, and here rather than
+    // at capture, so the failure lands where the definition is in front of
+    // you.
+    for replacement in &applied {
+        let back = content.matches(replacement.value.as_str()).count();
+        if back != replacement.count {
+            return Err(NewgitError::RenderNotInvertible {
+                resource: resource.to_owned(),
+                path: spec.path.clone(),
+                value: replacement.value.clone(),
+                expected: replacement.count,
+                found: back,
+            });
+        }
+    }
+
     Ok((content, applied))
+}
+
+/// Apply already-resolved replacements as one simultaneous batch, enforcing
+/// each rule's declared match count against the input.
+///
+/// Also the recomputation behind drift detection: the expected on-disk
+/// content of a rendered file is exactly this, run over the same committed
+/// content with the replacements the binding record remembers.
+pub fn substitute(
+    resource: &str,
+    path: &Utf8Path,
+    committed: &str,
+    applied: &[AppliedReplacement],
+) -> Result<String> {
+    let finds: Vec<&str> = applied
+        .iter()
+        .map(|replacement| replacement.find.as_str())
+        .collect();
+    let located = locate(committed, &finds);
+
+    for (rule, replacement) in applied.iter().enumerate() {
+        let found = located.iter().filter(|hit| hit.rule == rule).count();
+        if found != replacement.count {
+            return Err(NewgitError::RenderMatchCount {
+                resource: resource.to_owned(),
+                path: path.to_path_buf(),
+                find: replacement.find.clone(),
+                expected: replacement.count,
+                found,
+            });
+        }
+    }
+
+    // Two rules claiming overlapping text have no batch answer — whichever
+    // won would be an accident of declaration order, the thing simultaneous
+    // application exists to remove.
+    let mut output = String::with_capacity(committed.len());
+    let mut cursor = 0;
+    for hit in &located {
+        if hit.start < cursor {
+            return Err(NewgitError::RenderOverlappingFinds {
+                resource: resource.to_owned(),
+                path: path.to_path_buf(),
+                left: applied[hit.rule].find.clone(),
+                right: located
+                    .iter()
+                    .find(|other| other.end > hit.start && other.rule != hit.rule)
+                    .map(|other| applied[other.rule].find.clone())
+                    .unwrap_or_else(|| applied[hit.rule].find.clone()),
+            });
+        }
+        output.push_str(&committed[cursor..hit.start]);
+        output.push_str(&applied[hit.rule].value);
+        cursor = hit.end;
+    }
+    output.push_str(&committed[cursor..]);
+    Ok(output)
 }
 
 /// Undo a render: rewrite this instance's values back to the committed ones.
@@ -142,14 +223,32 @@ pub fn apply(
 /// instance's port does not. Only literal substitution can be run backwards;
 /// a whole-file template could not.
 ///
-/// Reverses in the opposite order to [`apply`], so a chain of replacements
-/// unwinds the way it was built.
+/// Simultaneous for the same reason [`apply`] is, and lenient where `apply`
+/// is strict: this runs against a file someone may have edited, so a value
+/// that no longer appears the declared number of times is not an error here.
+/// Whether those edits survive is [`crate::manager`]'s question, not this
+/// function's.
 pub fn reverse(rendered: &str, applied: &[AppliedReplacement]) -> String {
-    let mut content = rendered.to_owned();
-    for replacement in applied.iter().rev() {
-        content = content.replace(&replacement.value, &replacement.find);
+    let values: Vec<&str> = applied
+        .iter()
+        .map(|replacement| replacement.value.as_str())
+        .collect();
+    let located = locate(rendered, &values);
+
+    let mut output = String::with_capacity(rendered.len());
+    let mut cursor = 0;
+    for hit in &located {
+        // Leftmost wins where two values overlap; nothing to decide between
+        // them, and the alternative is dropping text.
+        if hit.start < cursor {
+            continue;
+        }
+        output.push_str(&rendered[cursor..hit.start]);
+        output.push_str(&applied[hit.rule].find);
+        cursor = hit.end;
     }
-    content
+    output.push_str(&rendered[cursor..]);
+    output
 }
 
 /// Two resources rendering the same path is a config error, not a merge:
@@ -328,6 +427,74 @@ mod tests {
 
         let (rendered, _) = apply("supabase", &spec, committed, &context).expect("renders");
         assert_eq!(rendered, "[api]\nport = 54400\n\n[studio]\nport = 54321\n");
+    }
+
+    /// The collision case. Sequential rewriting would locate rule two
+    /// against text rule one had already produced: `port = 54400` would occur
+    /// twice, and the exactly-once check would report a match count the
+    /// committed file does not have. Locating everything up front makes
+    /// declaration order cosmetic, which is what a config file should be.
+    #[test]
+    fn a_find_that_equals_an_earlier_rules_output_is_not_a_match_target() {
+        let ports = ports();
+        let context = RenderContext {
+            ports: Some(&ports),
+            ..RenderContext::default()
+        };
+        // The second rule's `find` is exactly what the first rule renders.
+        // Sequentially, rule two would see two occurrences of it — one of
+        // them rule one's own output — and fail the exactly-once check.
+        let committed = "port = 54321\nport = 54400\n";
+        let spec = spec(vec![
+            replacement("port = 54321", "port = {{ports.api}}"),
+            replacement("port = 54400", "port = {{ports.db}}"),
+        ]);
+
+        let (rendered, _) = apply("supabase", &spec, committed, &context).expect("renders");
+        assert_eq!(rendered, "port = 54400\nport = 54500\n");
+    }
+
+    /// The same property stated the other way: reordering the rules cannot
+    /// change the result.
+    #[test]
+    fn declaration_order_does_not_change_the_render() {
+        let ports = ports();
+        let context = RenderContext {
+            ports: Some(&ports),
+            ..RenderContext::default()
+        };
+        let committed = "port = 54321\nport = 54400\n";
+        let forwards = spec(vec![
+            replacement("port = 54321", "port = {{ports.api}}"),
+            replacement("port = 54400", "port = {{ports.db}}"),
+        ]);
+        let backwards = spec(vec![
+            replacement("port = 54400", "port = {{ports.db}}"),
+            replacement("port = 54321", "port = {{ports.api}}"),
+        ]);
+
+        let (one, _) = apply("supabase", &forwards, committed, &context).expect("renders");
+        let (two, _) = apply("supabase", &backwards, committed, &context).expect("renders");
+        assert_eq!(one, two);
+    }
+
+    #[test]
+    fn two_finds_claiming_overlapping_text_are_refused() {
+        let ports = ports();
+        let context = RenderContext {
+            ports: Some(&ports),
+            ..RenderContext::default()
+        };
+        let committed = "port = 54321\n";
+        let spec = spec(vec![
+            replacement("port = 54321", "port = {{ports.api}}"),
+            replacement("= 54321", "= {{ports.db}}"),
+        ]);
+
+        assert!(matches!(
+            apply("supabase", &spec, committed, &context),
+            Err(NewgitError::RenderOverlappingFinds { .. })
+        ));
     }
 
     #[test]

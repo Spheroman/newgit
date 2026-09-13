@@ -157,6 +157,18 @@ pub enum NewgitError {
     },
 
     #[error(
+        "resource `{resource}` renders into `{path}`, where `{left}` and `{right}` claim \
+         overlapping text; all finds are located in the committed content and applied at once, \
+         so there is no order in which one of them wins"
+    )]
+    RenderOverlappingFinds {
+        resource: String,
+        path: Utf8PathBuf,
+        left: String,
+        right: String,
+    },
+
+    #[error(
         "resources `{left}` and `{right}` both render into `{path}`; render targets must be disjoint"
     )]
     RenderPathConflict {

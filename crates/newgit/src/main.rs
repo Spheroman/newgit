@@ -383,15 +383,6 @@ fn spawn(args: SpawnArgs) -> Result<()> {
             resource.name
         );
         print_warnings(&resource.missing_captures);
-        // Rendering a source-owned file makes edits to it unrecoverable. That
-        // is the cost of the feature, so it is printed, not documented.
-        print_warnings(
-            &resource
-                .rendered
-                .iter()
-                .filter_map(|file| file.warning.clone())
-                .collect::<Vec<_>>(),
-        );
     }
     Ok(())
 }

@@ -97,18 +97,18 @@ impl RenderedRestore {
     }
 }
 
-/// One rendered file, and the lossiness it introduced.
+/// One rendered file.
+///
+/// Carries no warning about lost hand edits: at bind there are none, and a
+/// caveat printed when nothing is wrong is silent at the moment something
+/// is. That report lives in `render_drift`, which speaks at checkpoint and
+/// before a re-render, naming the file and how much of it is about to go.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RenderOutcome {
     pub path: Utf8PathBuf,
     pub replacements: usize,
-    /// The tracker owning the path, if any. `None` means source-owned, which
-    /// is the case that pays the skip-worktree cost below.
+    /// The tracker owning the path, if any. `None` means source-owned.
     pub tracker: Option<String>,
-    /// Set for source-owned paths: real edits to this file in this workspace
-    /// are invisible to newgit and die with the workspace. Printed rather
-    /// than left in the docs — it is a real lossiness, and newgit says so.
-    pub warning: Option<String>,
 }
 
 /// What running an action did.
@@ -679,14 +679,6 @@ impl BranchManager {
                 path: spec.path.clone(),
                 replacements: applied.len(),
                 tracker: owner.clone(),
-                warning: owner.is_none().then(|| {
-                    format!(
-                        "`{}` is rendered by resource `{}` and marked skip-worktree: edits you \
-                         make to it in this workspace are invisible to newgit and will not \
-                         survive it — edit it in the store repo instead",
-                        spec.path, definition.name
-                    )
-                }),
             });
             records.push(RenderRecord {
                 path: spec.path.clone(),
@@ -812,8 +804,57 @@ impl BranchManager {
     /// files, so the values have to be put back. That costs nothing, because
     /// a render is a pure function of committed content and the binding
     /// record — both of which undo has just settled.
+    /// Rendered files whose content on disk is not what this instance's
+    /// render produces — that is, hand edits a re-render will discard.
+    ///
+    /// A render is a pure function of committed content and the binding
+    /// record, so the expected bytes are recomputable at any time. Comparing
+    /// against them turns the generic caveat "edits to a rendered file do not
+    /// survive" into the specific one: *this file has changes, and this is
+    /// the moment they are about to go.* It is silent when there is nothing
+    /// to say, which a bind-time warning cannot be — at bind the edit does
+    /// not exist yet.
+    ///
+    /// A recompute that fails (the committed content moved under the
+    /// definition) is not drift and is not reported here; the re-render that
+    /// follows reports it.
+    fn render_drift(&self, branch: &BranchInstance) -> Vec<String> {
+        let mut drifted = Vec::new();
+        for (resource, binding) in &branch.resources {
+            for record in &binding.rendered {
+                let Ok(Some(committed)) =
+                    self.committed_content(branch, &record.path, record.tracker.as_deref())
+                else {
+                    continue;
+                };
+                let Ok(expected) =
+                    render::substitute(resource, &record.path, &committed, &record.applied)
+                else {
+                    continue;
+                };
+                let Ok(actual) = std::fs::read_to_string(branch.workspace_path.join(&record.path))
+                else {
+                    continue;
+                };
+                if actual != expected {
+                    drifted.push(format!(
+                        "`{}` has changes that render will discard: it is rendered by resource \
+                         `{resource}`, so newgit rewrites it from committed content and this \
+                         instance's values ({} line(s) differ). Move the edit into the \
+                         committed file in the store repo to keep it.",
+                        record.path,
+                        differing_lines(&expected, &actual)
+                    ));
+                }
+            }
+        }
+        drifted
+    }
+
     fn rerender_all(&self, branch: &mut BranchInstance) -> Vec<String> {
-        let mut warnings = Vec::new();
+        // Checked before the re-render, not after: afterwards the edit is
+        // already gone and there is nothing left to name.
+        let mut warnings = self.render_drift(branch);
         for name in self.resource_order.clone() {
             let Ok(definition) = self.resource_definition(&name) else {
                 continue;
@@ -1965,7 +2006,11 @@ impl BranchManager {
         reason: CheckpointReason,
     ) -> Result<CheckpointOutcome> {
         self.require_workspace(branch)?;
-        let mut warnings = Vec::new();
+        // A checkpoint is the promise that this state can be returned to.
+        // Hand edits to a rendered file are the one thing it cannot carry —
+        // they are excluded from the capture by design — so this is exactly
+        // the moment to name them, while they still exist.
+        let mut warnings = self.render_drift(branch);
         let checkpoint_log = self.checkpoint_log(branch);
         let id = checkpoint_log.next_id()?;
         let workspace = branch.workspace_path.clone();
@@ -2621,6 +2666,19 @@ impl CapturedResource {
             deposit: None,
         }
     }
+}
+
+/// How many lines differ between the expected render and what is on disk —
+/// enough to say how big the discarded edit is without printing a diff.
+fn differing_lines(expected: &str, actual: &str) -> usize {
+    let expected: Vec<&str> = expected.lines().collect();
+    let actual: Vec<&str> = actual.lines().collect();
+    let common = expected
+        .iter()
+        .zip(actual.iter())
+        .filter(|(left, right)| left != right)
+        .count();
+    common + expected.len().abs_diff(actual.len())
 }
 
 fn validate_disjoint_with_replacement(
