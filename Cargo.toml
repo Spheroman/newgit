@@ -1,6 +1,6 @@
 [workspace]
 members = [
-    "crates/newgit-cli",
+    "crates/newgit",
     "crates/newgit-core",
 ]
 resolver = "2"

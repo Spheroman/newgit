@@ -46,7 +46,7 @@ jobs:
         # build.rs guess from a shallow checkout.
         env:
           NEWGIT_BUILD: ${{ github.ref_type == 'tag' && github.ref_name || github.sha }}
-        run: cargo build --release --locked --target ${{ matrix.target }} -p newgit-cli
+        run: cargo build --release --locked --target ${{ matrix.target }} -p newgit
 
       - name: Package
         id: package
@@ -135,3 +135,34 @@ jobs:
             --notes-file release-notes.md \
             --verify-tag \
             artifacts/*
+
+  crates-io:
+    name: publish to crates.io
+    # Deliberately last. A GitHub release can be deleted and a tag can be
+    # moved; a crates.io version can only be yanked, never replaced or
+    # removed. So it goes after the binaries have built on every target, the
+    # version and changelog checks have passed, and the release exists.
+    needs: [build, publish]
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Publish
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          # The tag identifies the release; build.rs must not guess.
+          NEWGIT_BUILD: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          if [ -z "${CARGO_REGISTRY_TOKEN:-}" ]; then
+            echo "CARGO_REGISTRY_TOKEN is not set; skipping crates.io." >&2
+            echo "Set it with: gh secret set CARGO_REGISTRY_TOKEN" >&2
+            exit 1
+          fi
+          # --workspace publishes newgit-core before newgit and resolves the
+          # dependency through a temporary registry, so the two do not need
+          # separate runs with an index wait between them.
+          cargo publish --workspace --locked

@@ -1,5 +1,5 @@
 [package]
-name = "newgit-cli"
+name = "newgit"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -23,4 +23,6 @@ workspace = true
 anyhow = "1"
 camino = "1.2"
 clap = { version = "4.5", features = ["derive"] }
-newgit-core = { path = "../newgit-core" }
+# The version is required to publish: crates.io resolves it from the
+# registry and drops the path, so the two must be released together.
+newgit-core = { path = "../newgit-core", version = "0.1.0" }

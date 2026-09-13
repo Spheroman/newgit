@@ -6,6 +6,13 @@ on:
   pull_request:
   workflow_dispatch:
 
+# Pushing twice to a branch should not run the first commit to completion.
+# Only for pull requests: a run on main is the record of whether that commit
+# was green, and cancelling it would leave the answer unknown.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 env:
   CARGO_TERM_COLOR: always
   # A failed build should not also cost a debuginfo write; tests do not read it.

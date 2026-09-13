@@ -29,8 +29,22 @@ depends = ["fmt-check", "clippy", "test"]
 
 [tasks.build-release]
 description = "Build the release binary"
-run = "cargo build --release --locked -p newgit-cli"
+run = "cargo build --release --locked -p newgit"
 
 [tasks.install]
 description = "Install the newgit binary into ~/.cargo/bin"
-run = "cargo install --path crates/newgit-cli --locked"
+run = "cargo install --path crates/newgit --locked"
+
+# Normally CI publishes on a tag. This is the manual path: a first release,
+# or recovery when a tagged run fails partway. `--workspace` publishes
+# newgit-core before newgit and resolves the dependency through a temporary
+# registry, so ordering and index waits are cargo's problem, not yours.
+#
+# crates.io versions can be yanked but never replaced or deleted, so the dry
+# run is not optional.
+[tasks.publish]
+description = "Publish both crates to crates.io (dry run first)"
+run = [
+    "cargo publish --workspace --locked --dry-run",
+    "cargo publish --workspace --locked",
+]

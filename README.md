@@ -45,7 +45,7 @@ install -m755 newgit-$TARGET/newgit ~/.local/bin/newgit
 From source, which needs the Rust toolchain in `.mise.toml`:
 
 ```sh
-cargo install --git https://github.com/Spheroman/newgit newgit-cli --locked
+cargo install newgit --locked
 ```
 
 Requirements: a `git` binary on `PATH` (newgit drives source through Git's
@@ -99,7 +99,7 @@ tests by nature.
   definitions and content lanes, resource definitions and lifecycle hooks,
   metadata storage, real-directory materialization, source tracker
   boundaries, checkpoints and undo, export, and cleanup.
-- `crates/newgit-cli` exposes the CLI surface.
+- `crates/newgit` is the CLI, published as the `newgit` crate.
 - `.newgit/` is created by `newgit init`. Committed: `config.toml`,
   `trackers/`, `resources/`. Gitignored local state: `branches/`,
   `snapshots/`, `checkpoints/`, `logs/`, `state/`, `local/`.
