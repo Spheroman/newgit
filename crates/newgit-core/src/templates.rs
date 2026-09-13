@@ -118,8 +118,10 @@ ownership = "branch"
 [actions.prepare]
 command = "createdb {{branch.slug}} || true"
 
+# A convenience command, not a lifecycle hook: no stage runs `migrate`, and
+# nothing but you ever will — `newgit action <this resource>.migrate`. Only
+# `prepare` is run for you (by `spawn`, and by a `recompute` restore).
 [actions.migrate]
-# Edit to your migration command.
 command = "npm run db:migrate"
 
 [checkpoint]

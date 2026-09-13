@@ -706,6 +706,22 @@ Two conventions hold across all commands:
   inside a workspace will reflexively type `newgit status`, not
   `newgit status feature-a`; both must work.
 
+### `newgit reference`
+
+Prints the definition format: every key in a tracker or resource definition
+with its type and default, the checkpoint/restore/ownership tables, and which
+template variables are in scope for which hook. It is `crates/newgit/reference/
+definitions.md`, compiled into the binary.
+
+This document is a design narrative and does not substitute for a lookup
+table. More to the point, it does not travel: `cargo install newgit` puts a
+binary and a README on disk and nothing else, so a relative link from the
+README to a repository file resolves to nothing on crates.io, on docs.rs, and
+in the registry directory. The reference ships inside the thing that reads the
+definitions, which is the only copy guaranteed to be wherever the definitions
+are. `init`, `tracker create`, and `resource add` each name it, since handing
+someone a file to hand-edit is exactly the moment the legal values matter.
+
 ### `newgit init`
 
 Initializes `.newgit/` and detects project substrates:
@@ -812,7 +828,7 @@ minimal: `{{ports.<name>}}`, `{{branch.name}}`, `{{branch.slug}}`,
 `{{workspace}}`, `{{scripts}}`. Checkpoint and restore commands additionally
 see `{{exports.<name>}}`, `{{snapshot.path}}` (the staging dir for
 `into_tracker` deposits), and `{{state_ref}}` (the checkpointed state
-reference) — nowhere else.
+reference) — nowhere else. `newgit reference` prints the full scope table.
 
 ### Where A Resource's Script Lives
 
@@ -950,6 +966,13 @@ feature-a   abc123        env:r3 db:s17           deps:ready app:running    ok
 feature-b   def456        env:r1 db:s18           deps:ready app:stopped    ok
 ```
 
+`newgit status <instance> --path` prints that instance's workspace path on
+stdout and nothing else. A workspace path is the one piece of newgit state
+that scripts, editor integrations, and READMEs actually need
+(`W=$(newgit status auth-refactor --path)`), and the alternatives — parsing
+the table or reading `.newgit/branches/<name>.toml` — make the store layout
+someone else's API. Warnings still go to stderr, so stdout stays a path.
+
 ### `newgit remove <name>`
 
 Deletes a single branch instance: stops its resources, deletes the workspace
@@ -957,6 +980,12 @@ Deletes a single branch instance: stops its resources, deletes the workspace
 record. Workspaces are disposable; this is the command that proves it, and it
 belongs in Milestone 1 — the two-branch success criterion is not really
 testable without teardown.
+
+Checkpoints outlive removal: they pin the tracker revs their undo would need,
+and newgit never breaks an undo on its own initiative. That leaves retained
+disk for an instance nobody can undo any more, so removal reports how many
+checkpoints it kept, and `--purge` discards them instead — the one flag that
+says the undo will never be wanted.
 
 ### `newgit cleanup`
 
@@ -982,6 +1011,25 @@ Garbage collection across everything; `remove` targets one instance. Takes
   head. It never deletes a checkpoint record, and never a rev a checkpoint
   still points at — the count of revs retained for that reason is reported,
   so kept disk is explained rather than mysterious.
+
+#### Releasing an Archived Instance's History
+
+That conservatism is right for a live instance and a dead end for an archived
+one: once the binding record is gone, `newgit undo` cannot reach those
+checkpoints at all, yet they keep pinning revs forever. `newgit cleanup
+--purge-archived` discards the checkpoint logs of instances that have no
+binding record — and their `refs/newgit/checkpoints/<slug>/*` store refs, so
+the source commits stop being rooted too — which lets the same pass prune what
+those logs were the only claim on. A purging `--dry-run` reports exactly what
+the real run would remove, including those revs.
+
+It stays opt-in, and it never touches a live instance's checkpoints whatever
+the flag says. Deleting the only record of a state is the one thing
+checkpoints exist to prevent, so it happens when the user says so and not
+because a garbage collector inferred it. To make that reachable rather than
+folklore, the ordinary `cleanup` report says how many of the pinned revs are
+held only by archived instances, and `remove` names the flag when it keeps
+checkpoints behind.
 
 ### Resource Cleanup Hooks
 

@@ -1,7 +1,13 @@
 # newgit
 
 `newgit` is a Rust CLI implementing the v1 MVP described in
-[`newgit-v1-mvp.md`](newgit-v1-mvp.md). The central idea shows up in the code
+[`newgit-v1-mvp.md`](https://github.com/Spheroman/newgit/blob/main/newgit-v1-mvp.md)
+— that design document and
+[`newgit-architecture.md`](https://github.com/Spheroman/newgit/blob/main/newgit-architecture.md)
+live on GitHub, not in the published crate. The definition format travels
+with the binary instead: `newgit reference` prints every tracker and resource
+key, its default, and which template variables each hook sees. The central
+idea shows up in the code
 shape: branch instances bind source state to user-defined trackers and
 resources, instead of baking env files, installs, processes, databases, or
 external resources into special internal lanes.
@@ -138,13 +144,15 @@ tests by nature.
 Branch-instance lifecycle (top-level verbs; `[instance]` is inferred when run
 inside a workspace):
 
-- `newgit init` / `spawn <name>` / `status [name]` / `remove <name>`
+- `newgit init` / `spawn <name>` / `status [name]` / `remove <name> [--purge]`
+- `newgit status <instance> --path` — just the workspace path, for scripts
+- `newgit reference` — the definition format, every key and default
 - `newgit run [instance] -- <command>` — run with exports and ports loaded
 - `newgit action <resource>.<action> [instance]`
 - `newgit checkpoint [instance] [-m <msg>]` / `undo [instance] [--to <id>]` /
   `checkpoints [instance]`
 - `newgit export [instance] --to <dir> [--include <path>] [--exclude <path>]`
-- `newgit cleanup [--dry-run]`
+- `newgit cleanup [--dry-run] [--purge-archived]`
 
 Definition management (noun subcommands):
 
@@ -172,3 +180,9 @@ gone, deletes unclaimed workspaces and dead process state, and prunes tracker
 snapshot revs nothing references — but never a rev a checkpoint still points
 at, and never a checkpoint record. `project`- and `user`-owned resources are
 never torn down by per-branch cleanup.
+
+The one exception is one you ask for. An archived instance's checkpoints are
+unreachable — `undo` needs a binding record — yet they go on pinning revs, so
+`newgit remove <name> --purge` and `newgit cleanup --purge-archived` discard
+that history and release what it held. Live instances are never affected, and
+ordinary `cleanup` says how many of its retained revs the flag would free.

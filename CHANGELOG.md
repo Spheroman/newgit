@@ -8,6 +8,44 @@ of `.newgit/` in a minor release — see *Upgrading* below.
 
 ### Added
 
+- `newgit reference` prints the definition format — every tracker and resource
+  key with its type and default, the checkpoint/restore/ownership tables, and
+  which template variables are in scope for which hook
+  ([#13](https://github.com/Spheroman/newgit/issues/13)).
+
+  All of it was documented in `newgit-v1-mvp.md`, and none of it travelled:
+  `cargo install newgit` leaves a binary and a README on disk, and the
+  README's relative link to that file resolved to nothing on crates.io,
+  docs.rs, or in the registry directory. Reading the crate source — or running
+  `strings` on the binary to enumerate `{{...}}` variables — was the only way
+  to answer what `checkpoint.mode` accepts. The reference now ships inside the
+  binary, which is the one copy guaranteed to be wherever the definitions are,
+  and `init`, `tracker create`, and `resource add` each name it. The README's
+  links to the design documents are absolute, and say they live on GitHub.
+
+- `newgit status <instance> --path` prints that instance's workspace path and
+  nothing else ([#12](https://github.com/Spheroman/newgit/issues/12)).
+
+  A bootstrap script, a README snippet, or an editor integration wanting the
+  path had to parse table output or read `.newgit/branches/<name>.toml`, which
+  makes the store layout someone else's API. Now:
+  `W=$(newgit status auth-refactor --path)`. The instance is inferred inside a
+  workspace, and warnings stay on stderr so stdout is a path.
+
+- `newgit remove <name> --purge` and `newgit cleanup --purge-archived` release
+  the snapshot revs an archived instance's checkpoints were pinning
+  ([#12](https://github.com/Spheroman/newgit/issues/12)).
+
+  Cleanup never prunes a rev a checkpoint points at, which is right for a live
+  instance and a dead end for a removed one: `undo` needs a binding record, so
+  those checkpoints are unreachable while their revs are permanent. Purging
+  drops the checkpoint log and its `refs/newgit/checkpoints/<slug>/*` store
+  refs, and the same pass reclaims what they held; a purging `--dry-run`
+  reports exactly that. It stays opt-in and never touches a live instance's
+  checkpoints. Ordinary `cleanup` now reports how many of its retained revs
+  are held only by archived instances, and `remove` says how many checkpoints
+  it kept.
+
 - `newgit tracker capture <tracker> --from-store` seeds a lane from the store
   repo's working tree and sets the lane head, so the first `spawn` comes up
   with the content ([#9](https://github.com/Spheroman/newgit/issues/9)).
@@ -43,6 +81,14 @@ of `.newgit/` in a minor release — see *Upgrading* below.
   because Git will not track an empty directory. Project-owned scripts are
   unaffected: they stay in the project tree, are read from the workspace, and
   must still be committed before a spawn that calls them.
+
+### Changed
+
+- The `command-snapshot` template's `[actions.migrate]` says what it is: a
+  convenience command you invoke with `newgit action <resource>.migrate`, not
+  a lifecycle hook. No stage ever ran it, and sitting beside `prepare` — which
+  `spawn` and a `recompute` restore do run — it read like one
+  ([#12](https://github.com/Spheroman/newgit/issues/12)).
 
 ### Fixed
 

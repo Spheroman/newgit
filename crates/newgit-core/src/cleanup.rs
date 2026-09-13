@@ -21,11 +21,17 @@ pub struct CleanupOutcome {
     pub orphan_workspaces: Vec<Utf8PathBuf>,
     /// Dead PID files and state directories for instances that are gone.
     pub dead_state: Vec<Utf8PathBuf>,
+    /// Checkpoint logs discarded because their instance is archived and the
+    /// caller asked for it. Empty unless purging was requested.
+    pub purged_checkpoints: Vec<PurgedCheckpoints>,
     pub pruned: Vec<PrunedRev>,
     /// Lane revs kept alive solely because a checkpoint still points at
     /// them — the constraint pruning must never violate, surfaced so the
     /// retained disk is explained rather than mysterious.
     pub pinned_by_checkpoints: usize,
+    /// How many of those belong to instances that are already archived — the
+    /// ones `--purge-archived` can release.
+    pub pinned_by_archived: usize,
     pub warnings: Vec<String>,
 }
 
@@ -34,8 +40,31 @@ impl CleanupOutcome {
         self.finalized.is_empty()
             && self.orphan_workspaces.is_empty()
             && self.dead_state.is_empty()
+            && self.purged_checkpoints.is_empty()
             && self.pruned.is_empty()
     }
+}
+
+/// Whether an operation that archives an instance also discards the
+/// checkpoints it leaves behind. Keeping them is the default: a checkpoint
+/// pins the lane revs its undo would need, and newgit never breaks an undo
+/// on its own initiative. Purging says the undo will never be wanted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArchivedCheckpoints {
+    Keep,
+    Purge,
+}
+
+/// One instance's discarded checkpoint history.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PurgedCheckpoints {
+    /// The instance's slug — its binding record is already archived, so this
+    /// is the only name that still exists on disk.
+    pub slug: String,
+    pub checkpoints: usize,
+    /// Store refs the checkpoints held (`refs/newgit/checkpoints/<slug>/*`).
+    pub source_refs: usize,
+    pub dir: Utf8PathBuf,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -113,6 +142,10 @@ pub struct SnapshotRoots {
     pub bindings: BTreeSet<(String, String)>,
     /// Claimed by any checkpoint record, live or archived.
     pub checkpoints: BTreeSet<(String, String)>,
+    /// The subset of `checkpoints` claimed only by instances whose binding
+    /// record is gone. These are the claims a purge can release, so cleanup
+    /// can say so instead of reporting retained disk with no way out.
+    pub archived_checkpoints: BTreeSet<(String, String)>,
     /// Claimed by a lane's own head (`LATEST`), which new instances project.
     pub lane_heads: BTreeSet<(String, String)>,
 }
@@ -121,7 +154,17 @@ impl SnapshotRoots {
     /// `branches` is the set of instances that survive the cleanup pass, not
     /// everything on disk — a record about to be archived must not keep its
     /// unreferenced captures alive.
-    pub fn collect(store: &MetadataStore, branches: &[BranchInstance]) -> Result<Self> {
+    ///
+    /// `archived` says what to do with the checkpoint logs of instances that
+    /// have no surviving record: `Keep` (the default) treats them as roots
+    /// like any other checkpoint, `Purge` ignores them, because the caller is
+    /// discarding them in the same pass — which is what makes a purging dry
+    /// run report exactly what the real run would remove.
+    pub fn collect(
+        store: &MetadataStore,
+        branches: &[BranchInstance],
+        archived: ArchivedCheckpoints,
+    ) -> Result<Self> {
         let mut roots = Self::default();
 
         for branch in branches {
@@ -132,25 +175,38 @@ impl SnapshotRoots {
             }
         }
 
+        let live_slugs: BTreeSet<&str> =
+            branches.iter().map(|branch| branch.slug.as_str()).collect();
+        let mut live_claims: BTreeSet<(String, String)> = BTreeSet::new();
+        let mut archived_claims: BTreeSet<(String, String)> = BTreeSet::new();
         for slug in store.checkpointed_slugs()? {
+            let claims = if live_slugs.contains(slug.as_str()) {
+                &mut live_claims
+            } else if archived == ArchivedCheckpoints::Purge {
+                continue;
+            } else {
+                &mut archived_claims
+            };
             let log = CheckpointLog::new(store.checkpoint_dir(&slug), &slug);
             for record in log.list()? {
                 for state in &record.tracker_states {
                     if let Some(rev) = &state.content_rev {
-                        roots.checkpoints.insert((state.name.clone(), rev.clone()));
+                        claims.insert((state.name.clone(), rev.clone()));
                     }
                 }
                 for state in &record.resource_states {
                     if let Some((tracker, rev)) =
                         state.state_ref.as_deref().and_then(parse_tracker_state_ref)
                     {
-                        roots
-                            .checkpoints
-                            .insert((tracker.to_owned(), rev.to_owned()));
+                        claims.insert((tracker.to_owned(), rev.to_owned()));
                     }
                 }
             }
         }
+        // A rev a live instance's checkpoint also claims is not something a
+        // purge could release, so it does not count as archived-held.
+        roots.archived_checkpoints = archived_claims.difference(&live_claims).cloned().collect();
+        roots.checkpoints = live_claims.union(&archived_claims).cloned().collect();
 
         for lane in lane_names(&store.paths().snapshots)? {
             if let Some(head) =
@@ -176,6 +232,13 @@ impl SnapshotRoots {
         self.checkpoints
             .iter()
             .filter(|key| !self.bindings.contains(*key) && !self.lane_heads.contains(*key))
+    }
+
+    /// Of those, the ones no live instance's checkpoint also claims: purging
+    /// the archived logs would release exactly these.
+    pub fn pinned_only_by_archived_checkpoints(&self) -> impl Iterator<Item = &(String, String)> {
+        self.pinned_only_by_checkpoints()
+            .filter(|key| self.archived_checkpoints.contains(*key))
     }
 }
 

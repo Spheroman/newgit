@@ -2,7 +2,7 @@ use std::process::Command;
 
 use camino::{Utf8Path, Utf8PathBuf};
 use newgit_core::SourceSubstrate;
-use newgit_core::cleanup::{HookDetail, SnapshotRoots};
+use newgit_core::cleanup::{ArchivedCheckpoints, HookDetail, SnapshotRoots};
 use newgit_core::manager::BranchManager;
 use newgit_core::resource::Ownership;
 use newgit_core::store::MetadataStore;
@@ -104,7 +104,9 @@ command = "echo store-WRONGLY-TORN-DOWN >> {witness}/order.txt"
 
     let manager = manager_at(&store);
     manager.spawn("feature-a", None).expect("spawn");
-    let outcome = manager.remove("feature-a", &temp).expect("remove");
+    let outcome = manager
+        .remove("feature-a", &temp, ArchivedCheckpoints::Keep)
+        .expect("remove");
 
     let db = outcome
         .hooks
@@ -156,7 +158,9 @@ command = "echo deleting {{{{state_ref}}}} >> {witness}/deleted.txt"
 
     let manager = manager_at(&store);
     manager.spawn("feature-a", None).expect("spawn");
-    let outcome = manager.remove("feature-a", &temp).expect("remove");
+    let outcome = manager
+        .remove("feature-a", &temp, ArchivedCheckpoints::Keep)
+        .expect("remove");
 
     let hook = outcome
         .hooks
@@ -221,7 +225,9 @@ command = "echo {{{{state_ref}}}} >> {witness}/deleted.txt"
         Some("pv_9")
     );
 
-    manager.remove("feature-a", &temp).expect("remove");
+    manager
+        .remove("feature-a", &temp, ArchivedCheckpoints::Keep)
+        .expect("remove");
     assert_eq!(
         std::fs::read_to_string(witness.join("deleted.txt")).expect("read"),
         "pv_9\n"
@@ -239,7 +245,9 @@ fn cleanup_finalizes_workspaceless_instances_and_frees_the_name() {
     // Workspaces are disposable: someone deleted one directly.
     std::fs::remove_dir_all(&b.branch.workspace_path).expect("rm -rf workspace");
 
-    let dry = manager.cleanup(true).expect("dry run");
+    let dry = manager
+        .cleanup(true, ArchivedCheckpoints::Keep)
+        .expect("dry run");
     assert_eq!(dry.finalized.len(), 1);
     assert_eq!(dry.finalized[0].name, "feature-b");
     assert!(dry.finalized[0].archived_record.is_none());
@@ -248,7 +256,9 @@ fn cleanup_finalizes_workspaceless_instances_and_frees_the_name() {
         "a dry run must not archive anything"
     );
 
-    let outcome = manager.cleanup(false).expect("cleanup");
+    let outcome = manager
+        .cleanup(false, ArchivedCheckpoints::Keep)
+        .expect("cleanup");
     assert_eq!(outcome.finalized.len(), 1);
     assert!(outcome.finalized[0].archived_record.is_some());
     assert!(manager.store().find_branch("feature-b").is_err());
@@ -296,7 +306,9 @@ fn cleanup_deletes_unclaimed_workspaces_and_dead_state() {
     let ghost_state = store.instance_state_dir("ghost");
     std::fs::create_dir_all(&ghost_state).expect("mkdir");
 
-    let outcome = manager.cleanup(false).expect("cleanup");
+    let outcome = manager
+        .cleanup(false, ArchivedCheckpoints::Keep)
+        .expect("cleanup");
 
     assert_eq!(outcome.orphan_workspaces, [empty.clone(), marked.clone()]);
     assert!(!marked.exists(), "a marked workspace is newgit's to delete");
@@ -380,12 +392,16 @@ fn pruning_never_drops_a_rev_a_checkpoint_still_points_at() {
     );
     let lane = store.paths().snapshots.join("runtime-env");
 
-    let dry = manager.cleanup(true).expect("dry run");
+    let dry = manager
+        .cleanup(true, ArchivedCheckpoints::Keep)
+        .expect("dry run");
     let would_prune: Vec<&str> = dry.pruned.iter().map(|rev| rev.rev.as_str()).collect();
     assert_eq!(would_prune, [orphaned.as_str()]);
     assert!(lane.join(&orphaned).is_dir(), "a dry run removes nothing");
 
-    let outcome = manager.cleanup(false).expect("cleanup");
+    let outcome = manager
+        .cleanup(false, ArchivedCheckpoints::Keep)
+        .expect("cleanup");
     let pruned: Vec<&str> = outcome.pruned.iter().map(|rev| rev.rev.as_str()).collect();
     assert_eq!(pruned, [orphaned.as_str()]);
     assert!(!lane.join(&orphaned).exists(), "unreferenced rev pruned");
@@ -432,7 +448,8 @@ fn snapshot_roots_separate_bindings_from_checkpoint_pins() {
     manager.checkpoint("feature-a", None).expect("checkpoint");
 
     let branches = store.load_branches().expect("branches");
-    let roots = SnapshotRoots::collect(&store, &branches).expect("roots");
+    let roots =
+        SnapshotRoots::collect(&store, &branches, ArchivedCheckpoints::Keep).expect("roots");
     assert!(!roots.bindings.is_empty());
     assert!(!roots.checkpoints.is_empty());
     assert_eq!(
@@ -442,7 +459,157 @@ fn snapshot_roots_separate_bindings_from_checkpoint_pins() {
     );
 
     // With no surviving instance, the same rev is held only by a checkpoint.
-    let roots = SnapshotRoots::collect(&store, &[]).expect("roots");
+    let roots = SnapshotRoots::collect(&store, &[], ArchivedCheckpoints::Keep).expect("roots");
     assert!(roots.bindings.is_empty());
     assert_eq!(roots.pinned_only_by_checkpoints().count(), 1);
+}
+
+#[test]
+fn purging_an_archived_instance_releases_what_its_checkpoints_pinned() {
+    let (_guard, temp) = tempdir();
+    let store = setup(&temp);
+    let manager = manager_at(&store);
+    manager
+        .create_tracker("env", "user", Storage::Local, false)
+        .expect("create tracker");
+    manager
+        .track_paths("env", &[Utf8PathBuf::from(".env.local")])
+        .expect("track");
+
+    // One throwaway instance that captured content and checkpointed it, and
+    // one live instance that did the same — the live one's history must
+    // survive everything the throwaway's does not.
+    let manager = manager_at(&store);
+    let doomed = manager.spawn("throwaway", None).expect("spawn throwaway");
+    std::fs::write(doomed.branch.workspace_path.join(".env.local"), "T=1\n").expect("write");
+    let doomed_rev = manager
+        .capture_tracker("throwaway", "env")
+        .expect("capture")
+        .rev;
+    manager.checkpoint("throwaway", None).expect("checkpoint");
+
+    let live = manager.spawn("feature-a", None).expect("spawn live");
+    std::fs::write(live.branch.workspace_path.join(".env.local"), "A=1\n").expect("write");
+    let live_rev = manager
+        .capture_tracker("feature-a", "env")
+        .expect("capture")
+        .rev;
+    manager.checkpoint("feature-a", None).expect("checkpoint");
+    // Move the live instance off its checkpointed rev, so that rev is held by
+    // its checkpoint alone — the same shape as the throwaway's, but live.
+    std::fs::write(live.branch.workspace_path.join(".env.local"), "A=2\n").expect("write");
+    manager
+        .capture_tracker("feature-a", "env")
+        .expect("recapture");
+
+    manager
+        .remove("throwaway", &temp, ArchivedCheckpoints::Keep)
+        .expect("remove");
+
+    let lane = store.paths().snapshots.join("env");
+    let checkpoints = store.checkpoint_dir(&doomed.branch.slug);
+
+    // Removal alone keeps the history, and says how much is pinned by it.
+    let kept = manager
+        .cleanup(false, ArchivedCheckpoints::Keep)
+        .expect("cleanup");
+    assert!(lane.join(&doomed_rev).is_dir(), "kept for a possible undo");
+    assert!(checkpoints.is_dir());
+    assert_eq!(kept.pinned_by_checkpoints, 2, "one per instance");
+    assert_eq!(
+        kept.pinned_by_archived, 1,
+        "only the archived instance's pin can be released"
+    );
+
+    // A purging dry run reports exactly what the real run will do.
+    let dry = manager
+        .cleanup(true, ArchivedCheckpoints::Purge)
+        .expect("dry run");
+    assert_eq!(dry.purged_checkpoints.len(), 1);
+    assert_eq!(dry.purged_checkpoints[0].slug, doomed.branch.slug);
+    assert_eq!(dry.purged_checkpoints[0].checkpoints, 1);
+    assert_eq!(
+        dry.pruned
+            .iter()
+            .map(|rev| rev.rev.as_str())
+            .collect::<Vec<_>>(),
+        [doomed_rev.as_str()]
+    );
+    assert!(checkpoints.is_dir(), "a dry run touches nothing");
+    assert!(lane.join(&doomed_rev).is_dir());
+
+    let purged = manager
+        .cleanup(false, ArchivedCheckpoints::Purge)
+        .expect("purge");
+    assert_eq!(purged.purged_checkpoints.len(), 1);
+    assert!(!checkpoints.exists(), "the archived instance's log is gone");
+    assert!(!lane.join(&doomed_rev).exists(), "and so is what it pinned");
+    assert!(
+        lane.join(&live_rev).is_dir(),
+        "a live instance's checkpoint is never purged, whatever the flag says"
+    );
+    assert!(
+        manager.undo("feature-a", Some("ckpt_001")).is_ok(),
+        "and its undo still works"
+    );
+}
+
+#[test]
+fn remove_purge_drops_the_instance_history_in_one_step() {
+    let (_guard, temp) = tempdir();
+    let store = setup(&temp);
+    let manager = manager_at(&store);
+    manager
+        .create_tracker("env", "user", Storage::Local, false)
+        .expect("create tracker");
+    manager
+        .track_paths("env", &[Utf8PathBuf::from(".env.local")])
+        .expect("track");
+
+    let manager = manager_at(&store);
+    let spawned = manager.spawn("throwaway", None).expect("spawn");
+    std::fs::write(spawned.branch.workspace_path.join(".env.local"), "T=1\n").expect("write");
+    let rev = manager
+        .capture_tracker("throwaway", "env")
+        .expect("capture")
+        .rev;
+    manager.checkpoint("throwaway", None).expect("checkpoint");
+
+    let outcome = manager
+        .remove("throwaway", &temp, ArchivedCheckpoints::Purge)
+        .expect("remove --purge");
+    let purged = outcome.purged_checkpoints.expect("purged");
+    assert_eq!(purged.checkpoints, 1);
+    assert_eq!(purged.source_refs, 1, "the checkpoint's store ref goes too");
+    assert_eq!(outcome.kept_checkpoints, 0);
+    assert!(!store.checkpoint_dir(&spawned.branch.slug).exists());
+
+    // Nothing claims the rev now, so the ordinary sweep reclaims it.
+    let cleaned = manager
+        .cleanup(false, ArchivedCheckpoints::Keep)
+        .expect("cleanup");
+    assert_eq!(cleaned.pinned_by_checkpoints, 0);
+    assert!(
+        !store.paths().snapshots.join("env").join(&rev).exists(),
+        "the rev its checkpoint pinned is reclaimed"
+    );
+}
+
+#[test]
+fn remove_reports_the_history_it_keeps() {
+    let (_guard, temp) = tempdir();
+    let store = setup(&temp);
+    let manager = manager_at(&store);
+    let spawned = manager.spawn("feature-a", None).expect("spawn");
+    manager.checkpoint("feature-a", None).expect("checkpoint");
+
+    let outcome = manager
+        .remove("feature-a", &temp, ArchivedCheckpoints::Keep)
+        .expect("remove");
+    assert!(outcome.purged_checkpoints.is_none());
+    assert_eq!(outcome.kept_checkpoints, 1);
+    assert!(
+        store.checkpoint_dir(&spawned.branch.slug).is_dir(),
+        "keeping is the default: nothing breaks an undo unasked"
+    );
 }
