@@ -128,6 +128,56 @@ command = "echo store-WRONGLY-TORN-DOWN >> {witness}/order.txt"
 }
 
 #[test]
+fn a_cleanup_hook_honors_workdir() {
+    let (_guard, temp) = tempdir();
+    let store = setup(&temp);
+    let repo = store.paths().project_root.clone();
+    std::fs::create_dir_all(repo.join("packages/db")).expect("mkdir");
+    std::fs::write(repo.join("packages/db/.keep"), "").expect("write");
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-q", "-m", "add packages/db"]);
+
+    write_resource(
+        &store,
+        "db",
+        r#"ownership = "branch"
+workdir = "packages/db"
+
+[actions.prepare]
+command = "true"
+
+[cleanup]
+command = "pwd"
+"#,
+    );
+
+    let manager = manager_at(&store);
+    let spawned = manager.spawn("feature-a", None).expect("spawn");
+    let ws = spawned.branch.workspace_path.clone();
+
+    // `remove` deletes the workspace once cleanup hooks finish, so the
+    // command's own cwd is read from its log rather than a file it wrote —
+    // a file it wrote inside the (about to be deleted) workspace would not
+    // survive to be checked anyway.
+    let outcome = manager
+        .remove("feature-a", &temp, ArchivedCheckpoints::Keep)
+        .expect("remove");
+    let db = outcome
+        .hooks
+        .iter()
+        .find(|hook| hook.resource == "db")
+        .expect("db hook");
+    let HookDetail::Ran { log, ok: true, .. } = &db.detail else {
+        panic!("expected the cleanup hook to run, got {:?}", db.detail);
+    };
+    let logged = std::fs::read_to_string(log).expect("read log");
+    assert!(
+        logged.contains(ws.join("packages/db").as_str()),
+        "cleanup ran with cwd = workspace/packages/db, not the workspace root: {logged}"
+    );
+}
+
+#[test]
 fn a_cleanup_hook_with_an_unresolved_placeholder_is_refused() {
     let (_guard, temp) = tempdir();
     let store = setup(&temp);

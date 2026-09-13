@@ -17,6 +17,14 @@ pub struct ResourceDefinition {
     pub ownership: Ownership,
     pub depends_on: Vec<String>,
     pub identity: Option<IdentitySpec>,
+    /// Where every command this resource runs is spawned, relative to the
+    /// workspace root. Applied as the child process's `current_dir`, never
+    /// as a shell prefix — see [`ActionSpec::workdir`] for the per-action
+    /// override. Content paths (`[identity].paths`, `[checkpoint].paths`,
+    /// `[[render]].path`) are unaffected: they stay workspace-root-relative
+    /// regardless of `workdir`, so a definition never has to reason about
+    /// two roots at once.
+    pub workdir: Option<Utf8PathBuf>,
     pub ports: BTreeMap<String, PortRequest>,
     pub exports: BTreeMap<String, String>,
     /// Files this resource substitutes per-instance values into, before
@@ -82,6 +90,10 @@ pub struct PortRequest {
 pub struct ActionSpec {
     #[serde(default)]
     pub command: Option<String>,
+    /// Replaces (does not append to) the resource-level `workdir` for this
+    /// action only.
+    #[serde(default)]
+    pub workdir: Option<Utf8PathBuf>,
     #[serde(default)]
     pub long_running: bool,
     /// Signal sent by `stop` for a long-running sibling `start`.
@@ -167,6 +179,8 @@ struct ResourceDefinitionFile {
     #[serde(default)]
     identity: Option<IdentitySpec>,
     #[serde(default)]
+    workdir: Option<Utf8PathBuf>,
+    #[serde(default)]
     ports: BTreeMap<String, PortRequest>,
     #[serde(default)]
     exports: BTreeMap<String, String>,
@@ -203,6 +217,7 @@ impl ResourceDefinition {
             ownership: file.ownership,
             depends_on: file.depends_on,
             identity: file.identity,
+            workdir: file.workdir,
             ports: file.ports,
             exports: file.exports,
             render: file.render,
@@ -226,6 +241,16 @@ impl ResourceDefinition {
 
     pub fn has_long_running_action(&self) -> bool {
         self.actions.values().any(|action| action.long_running)
+    }
+
+    /// The `workdir` in effect for one command: an action's own `workdir`
+    /// replaces the resource-level one entirely rather than nesting under
+    /// it. `action` is `None` for hooks that are not actions (`checkpoint`,
+    /// `restore`, `cleanup`), which only ever see the resource-level value.
+    pub fn workdir_for<'a>(&'a self, action: Option<&'a ActionSpec>) -> Option<&'a Utf8Path> {
+        action
+            .and_then(|action| action.workdir.as_deref())
+            .or(self.workdir.as_deref())
     }
 
     fn validate(&self) -> Result<()> {
@@ -273,6 +298,9 @@ impl ResourceDefinition {
                 _ => {}
             }
         }
+        if let Some(workdir) = &self.workdir {
+            self.check_workdir_is_workspace_relative(workdir)?;
+        }
         for (action_name, action) in &self.actions {
             let is_signal_only = action.command.is_none() && action.signal.is_some();
             if action.command.is_none() && !is_signal_only {
@@ -284,6 +312,9 @@ impl ResourceDefinition {
                 return Err(self.invalid(format!(
                     "action `{action_name}` is long_running but has no command"
                 )));
+            }
+            if let Some(workdir) = &action.workdir {
+                self.check_workdir_is_workspace_relative(workdir)?;
             }
         }
         for spec in &self.render {
@@ -321,6 +352,19 @@ impl ResourceDefinition {
                     )));
                 }
             }
+        }
+        Ok(())
+    }
+
+    /// `workdir` is resolved against the workspace root at run time
+    /// ([`crate::manager`]), never against the store; an absolute path or a
+    /// `..` component would silently escape that root, so both are refused
+    /// here rather than left to whatever the shell does with them.
+    fn check_workdir_is_workspace_relative(&self, workdir: &Utf8Path) -> Result<()> {
+        if workdir.is_absolute() || workdir.components().any(|part| part.as_str() == "..") {
+            return Err(self.invalid(format!(
+                "workdir `{workdir}` must be a workspace-relative path with no `..`"
+            )));
         }
         Ok(())
     }
@@ -547,6 +591,7 @@ mod tests {
             ownership: Ownership::Branch,
             depends_on: deps.iter().map(ToString::to_string).collect(),
             identity: None,
+            workdir: None,
             ports: BTreeMap::new(),
             exports: BTreeMap::new(),
             render: Vec::new(),
@@ -621,5 +666,76 @@ mod tests {
             topological_order(&missing, &trackers),
             Err(NewgitError::MissingDependency { .. })
         ));
+    }
+
+    fn write_and_load(contents: &str) -> Result<ResourceDefinition> {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = Utf8PathBuf::from_path_buf(temp.path().join("db.toml")).expect("utf8 path");
+        std::fs::write(&path, contents).expect("write definition");
+        ResourceDefinition::from_file("db", &path)
+    }
+
+    #[test]
+    fn an_action_workdir_replaces_rather_than_nests_under_the_resource_level_one() {
+        let definition = write_and_load(
+            r#"ownership = "workspace"
+workdir = "packages/db"
+
+[actions.prepare]
+command = "true"
+
+[actions.migrate]
+workdir = "packages/db/supabase"
+command = "true"
+"#,
+        )
+        .expect("valid definition");
+
+        assert_eq!(
+            definition.workdir_for(definition.actions.get("prepare")),
+            Some(Utf8Path::new("packages/db")),
+            "an action with no workdir of its own falls back to the resource-level one"
+        );
+        assert_eq!(
+            definition.workdir_for(definition.actions.get("migrate")),
+            Some(Utf8Path::new("packages/db/supabase")),
+            "an action's own workdir replaces the resource-level one, not nests under it"
+        );
+        assert_eq!(
+            definition.workdir_for(None),
+            Some(Utf8Path::new("packages/db")),
+            "hooks that are not actions (checkpoint/restore/cleanup) see only the resource-level workdir"
+        );
+    }
+
+    #[test]
+    fn a_workdir_escaping_the_workspace_is_refused() {
+        for workdir in ["../outside", "/etc"] {
+            let result = write_and_load(&format!(
+                r#"ownership = "workspace"
+workdir = "{workdir}"
+
+[actions.prepare]
+command = "true"
+"#
+            ));
+            assert!(
+                matches!(result, Err(NewgitError::InvalidDefinition { .. })),
+                "workdir `{workdir}` should have been refused, got {result:?}"
+            );
+        }
+
+        let result = write_and_load(
+            r#"ownership = "workspace"
+
+[actions.prepare]
+command = "true"
+workdir = "../outside"
+"#,
+        );
+        assert!(
+            matches!(result, Err(NewgitError::InvalidDefinition { .. })),
+            "an action-level workdir is held to the same rule: {result:?}"
+        );
     }
 }

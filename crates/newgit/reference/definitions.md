@@ -57,6 +57,28 @@ creates alongside it, without instantiating anything).
 | --- | --- | --- | --- | --- |
 | `ownership` | string | yes | — | `branch`, `workspace`, `project`, `user`, or `external`. See *Ownership*. |
 | `depends_on` | array of strings | no | `[]` | resource or tracker names that must be ready first. Orders `prepare` at spawn and cleanup hooks in reverse. A name that is neither is an error the graph reports. |
+| `workdir` | string | no | workspace root | where every command this resource runs is spawned, relative to the workspace root. Overridable per action — see `[actions.<name>]`. |
+
+`workdir` is applied as the spawned process's working directory, never as a
+`cd` prefix on the command string — so it cannot silently change what `&&`
+binds, and a command that fails to `cd` can no longer look like it ran.
+It governs one thing: where a *command* runs. It does **not** touch content
+paths — `[identity].paths`, `[checkpoint].paths`, and `[[render]].path` are
+always resolved against the workspace root, `workdir` or no. Mixing two
+roots in one file, where some keys mean "relative to workdir" and others
+mean "relative to the workspace," is exactly the confusion this is trying to
+avoid — content paths keep the one meaning they have always had.
+
+`[checkpoint]`, `[restore]`, and `[cleanup]` are not actions and have no
+override of their own; their commands always run in the resource-level
+`workdir`.
+
+A `workdir` that does not exist when the command runs fails naming the
+resource, the action, and the resolved path, rather than a bare shell error.
+This is checked right before each command runs, not when the resource is
+bound — a `workdir` may legitimately be created by an earlier action (a
+`prepare` that clones a submodule into it, say), so it would be wrong to
+require it to exist up front.
 
 ### `[identity]`
 
@@ -85,7 +107,8 @@ Use it in templates as `{{ports.<name>}}`.
 
 | key | type | required | default | meaning |
 | --- | --- | --- | --- | --- |
-| `command` | string | yes, unless `signal` is set | — | shell command, run in the workspace. |
+| `command` | string | yes, unless `signal` is set | — | shell command, run in the workspace (or `workdir`, below). |
+| `workdir` | string | no | the resource's `workdir` | replaces — does not nest under — the resource-level `workdir` for this action only. |
 | `long_running` | bool | no | `false` | supervise it: `newgit action` returns once started, output goes to a log, and the process group is tracked. Requires `command`. |
 | `signal` | string | no | `term` for a `stop` action | makes an action signal-only. An action with `signal` and no `command` stops this resource's supervised process. |
 | `captures` | array of strings | no | `[]` | names to read out of the command's stdout and publish as this resource's exports. See *Captures*. |

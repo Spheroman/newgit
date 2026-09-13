@@ -571,7 +571,7 @@ impl BranchManager {
                             .store
                             .action_log_path(&branch.slug, &format!("{}.prepare", definition.name));
                         let (code, captured) =
-                            self.run_one_shot(branch, definition, action, &log)?;
+                            self.run_one_shot(branch, definition, action, "prepare", &log)?;
                         captured_names = captured.found.keys().cloned().collect();
                         missing_captures = Self::missing_capture_warnings(
                             &definition.name,
@@ -920,17 +920,17 @@ impl BranchManager {
         if action.long_running {
             let command = self.rendered_command(&branch, definition, action)?;
             let env = self.assemble_env(&branch)?;
-            let pid = supervisor.start(
-                &definition.name,
-                &command,
+            let cwd = resource_cwd(
                 &branch.workspace_path,
-                &env,
-                &log,
+                &definition.name,
+                action_name,
+                definition.workdir_for(Some(action)),
             )?;
+            let pid = supervisor.start(&definition.name, &command, &cwd, &env, &log)?;
             return Ok(ActionOutcome::Started { pid, log });
         }
 
-        let (code, captured) = self.run_one_shot(&branch, definition, action, &log)?;
+        let (code, captured) = self.run_one_shot(&branch, definition, action, action_name, &log)?;
         let missing_captures =
             Self::missing_capture_warnings(&definition.name, action_name, &captured, &log);
         let mut dirty = Self::apply_captures(&mut branch, &definition.name, captured.found);
@@ -979,22 +979,29 @@ impl BranchManager {
         branch: &BranchInstance,
         definition: &ResourceDefinition,
         action: &crate::resource::ActionSpec,
+        action_name: &str,
         log: &Utf8Path,
     ) -> Result<(i32, Captures)> {
         let command = self.rendered_command(branch, definition, action)?;
         let env = self.assemble_env(branch)?;
+        let cwd = resource_cwd(
+            &branch.workspace_path,
+            &definition.name,
+            action_name,
+            definition.workdir_for(Some(action)),
+        )?;
 
         if action.captures.is_empty() {
             let code = run_foreground(
                 &["sh".to_owned(), "-c".to_owned(), command],
-                &branch.workspace_path,
+                &cwd,
                 &env,
                 log,
             )?;
             return Ok((code, Captures::default()));
         }
 
-        let (code, stdout) = run_captured(&command, &branch.workspace_path, &env, log)?;
+        let (code, stdout) = run_captured(&command, &cwd, &env, log)?;
         Ok((code, parse_captures(&stdout, &action.captures)))
     }
 
@@ -1677,15 +1684,6 @@ impl BranchManager {
         branch: &BranchInstance,
         dry_run: bool,
     ) -> Result<Vec<HookOutcome>> {
-        // The workspace is usually still here; when cleanup is finishing an
-        // instance whose workspace is already gone, hooks run from the store
-        // root so an external teardown can still reach its own API.
-        let cwd = if branch.workspace_path.is_dir() {
-            branch.workspace_path.clone()
-        } else {
-            self.store.paths().project_root.clone()
-        };
-
         let mut outcomes = Vec::new();
         for name in self.resource_order.iter().rev() {
             if !branch.resources.contains_key(name) {
@@ -1750,6 +1748,22 @@ impl BranchManager {
                 });
                 continue;
             }
+
+            // The workspace is usually still here; when cleanup is finishing
+            // an instance whose workspace is already gone, the hook runs
+            // from the store root so an external teardown can still reach
+            // its own API. `workdir` is workspace-relative, so it has
+            // nothing to resolve against once the workspace itself is gone.
+            let cwd = if branch.workspace_path.is_dir() {
+                resource_cwd(
+                    &branch.workspace_path,
+                    name,
+                    "cleanup",
+                    definition.workdir_for(None),
+                )?
+            } else {
+                self.store.paths().project_root.clone()
+            };
 
             let log = self
                 .store
@@ -2205,7 +2219,13 @@ impl BranchManager {
                     .store
                     .action_log_path(&branch.slug, &format!("{}.checkpoint", definition.name));
                 let env = self.assemble_env(branch)?;
-                let (code, stdout) = run_captured(&command, &branch.workspace_path, &env, &log)?;
+                let cwd = resource_cwd(
+                    &branch.workspace_path,
+                    &definition.name,
+                    "checkpoint",
+                    definition.workdir_for(None),
+                )?;
+                let (code, stdout) = run_captured(&command, &cwd, &env, &log)?;
                 if code != 0 {
                     return Err(NewgitError::CheckpointCommandFailed {
                         resource: definition.name.clone(),
@@ -2485,7 +2505,8 @@ impl BranchManager {
                 let log = self
                     .store
                     .action_log_path(&branch.slug, &format!("{}.restore", definition.name));
-                let (code, captured) = self.run_one_shot(branch, definition, action, &log)?;
+                let (code, captured) =
+                    self.run_one_shot(branch, definition, action, action_name, &log)?;
                 warnings.extend(Self::missing_capture_warnings(
                     &definition.name,
                     action_name,
@@ -2530,7 +2551,13 @@ impl BranchManager {
                     .store
                     .action_log_path(&branch.slug, &format!("{}.restore", definition.name));
                 let env = self.assemble_env(branch)?;
-                let (code, _) = run_captured(&command, &branch.workspace_path, &env, &log)?;
+                let cwd = resource_cwd(
+                    &branch.workspace_path,
+                    &definition.name,
+                    "restore",
+                    definition.workdir_for(None),
+                )?;
+                let (code, _) = run_captured(&command, &cwd, &env, &log)?;
                 let ok = code == 0;
                 if !ok {
                     failures.push(RestoreFailure {
@@ -2666,6 +2693,33 @@ impl CapturedResource {
             deposit: None,
         }
     }
+}
+
+/// Resolve the working directory one resource command runs in: `workdir`
+/// joined onto the workspace root, or the workspace root itself when none is
+/// set. Checked here rather than at bind time — a `workdir` may legitimately
+/// be created by an earlier action (e.g. `prepare` cloning a submodule into
+/// it) — so every command site calls this right before it spawns, and a
+/// missing directory names the resource, the action, and the resolved path
+/// instead of surfacing as a bare "No such file or directory" from the shell.
+fn resource_cwd(
+    workspace_root: &Utf8Path,
+    resource: &str,
+    action: &str,
+    workdir: Option<&Utf8Path>,
+) -> Result<Utf8PathBuf> {
+    let Some(workdir) = workdir else {
+        return Ok(workspace_root.to_owned());
+    };
+    let resolved = workspace_root.join(workdir);
+    if !resolved.is_dir() {
+        return Err(NewgitError::MissingWorkdir {
+            resource: resource.to_owned(),
+            action: action.to_owned(),
+            path: resolved,
+        });
+    }
+    Ok(resolved)
 }
 
 /// How many lines differ between the expected render and what is on disk —

@@ -90,6 +90,16 @@ pub enum NewgitError {
     #[error("resource `{resource}` is already running (pid {pid}); stop it first")]
     AlreadyRunning { resource: String, pid: u32 },
 
+    #[error(
+        "resource `{resource}` action `{action}` has workdir `{path}`, which does not exist; \
+         if an earlier action creates it, run that first"
+    )]
+    MissingWorkdir {
+        resource: String,
+        action: String,
+        path: Utf8PathBuf,
+    },
+
     #[error("resource dependency cycle: {0:?}")]
     DependencyCycle(Vec<String>),
 
