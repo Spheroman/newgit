@@ -1,8 +1,13 @@
 use std::io::Write as _;
 use std::process::{Command, Stdio};
+use std::str::FromStr as _;
 use std::time::Duration;
 
 use camino::{Utf8Path, Utf8PathBuf};
+use nix::errno::Errno;
+use nix::sys::signal::{self, Signal};
+use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
+use nix::unistd::Pid;
 
 use crate::error::{NewgitError, Result};
 use crate::materializer::create_dir_all;
@@ -141,33 +146,77 @@ impl Supervisor {
     }
 }
 
+/// Whether any live process remains in the group led by `pid`.
+///
+/// Two things make this harder than `kill(pgid, 0)`:
+///
+/// A killed child that nobody reaps becomes a zombie, and a zombie still
+/// answers signal 0 — on Linux, though not on macOS, which is why this was
+/// a platform-specific failure. Whenever the caller is the process that
+/// started the supervised command (a test harness, or anything embedding
+/// newgit-core in a long-lived process), a stopped process would otherwise
+/// look alive forever: `stop` would poll until it timed out, leave the PID
+/// file in place, and the next `start` would refuse as already running.
+/// The CLI hid this, because it exits immediately and its orphans get
+/// reparented to init, which reaps them.
+///
+/// So reap first, then ask. Reaping only ever touches this process's own
+/// children; a process group inherited from an earlier CLI invocation has
+/// no children here and `waitpid` simply reports `ECHILD`.
 fn group_alive(pid: u32) -> bool {
-    Command::new("kill")
-        .args(["-0", "--", &format!("-{pid}")])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|status| status.success())
-        .unwrap_or(false)
+    reap_group(pid);
+    // `killpg` takes the group id positively and negates it itself; passing
+    // an already-negative value is EINVAL on Linux and, worse, silently
+    // signals the single process on macOS.
+    let group = Pid::from_raw(pid as i32);
+    // ESRCH means nothing is left; EPERM means something is alive but not
+    // ours to signal, which still counts as alive.
+    !matches!(signal::killpg(group, None), Err(Errno::ESRCH))
+}
+
+/// Clear any of our own finished children in this group, so they stop
+/// answering signals. Best-effort by design: every outcome other than
+/// "reaped something" means there is nothing more to collect.
+fn reap_group(pid: u32) {
+    // `waitpid` is the mirror image of `killpg`: here the negative form is
+    // what means "any child in this process group".
+    let group = Pid::from_raw(-(pid as i32));
+    // Bounded so a pathological stream of exiting children cannot spin here.
+    for _ in 0..64 {
+        match waitpid(group, Some(WaitPidFlag::WNOHANG)) {
+            Ok(WaitStatus::StillAlive) | Err(_) => return,
+            Ok(_) => continue,
+        }
+    }
 }
 
 fn signal_group(pid: u32, signal: &str) -> Result<()> {
-    let flag = signal.trim_start_matches('-').to_uppercase();
-    let status = Command::new("kill")
-        .args(["-s", &flag, "--", &format!("-{pid}")])
-        .status()
-        .map_err(|source| NewgitError::SourceCommand {
-            command: format!("kill -s {flag} -- -{pid}"),
-            stderr: source.to_string(),
-        })?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(NewgitError::SourceCommand {
-            command: format!("kill -s {flag} -- -{pid}"),
-            stderr: "kill failed".to_owned(),
-        })
+    let parsed = parse_signal(signal)?;
+    let group = Pid::from_raw(pid as i32);
+    match signal::killpg(group, parsed) {
+        // Already gone is the outcome `stop` wanted, not a failure.
+        Ok(()) | Err(Errno::ESRCH) => Ok(()),
+        Err(errno) => Err(NewgitError::SourceCommand {
+            command: format!("killpg(-{pid}, {parsed})"),
+            stderr: errno.to_string(),
+        }),
     }
+}
+
+/// Accept what a user would write in a resource definition: `term`, `TERM`,
+/// `-TERM`, or `SIGTERM` all mean the same signal.
+fn parse_signal(signal: &str) -> Result<Signal> {
+    let name = signal.trim().trim_start_matches('-').to_uppercase();
+    let name = if name.starts_with("SIG") {
+        name
+    } else {
+        format!("SIG{name}")
+    };
+    Signal::from_str(&name).map_err(|_| {
+        NewgitError::Unsupported(format!(
+            "`{signal}` is not a signal name; use term, kill, int, hup, or another SIG name"
+        ))
+    })
 }
 
 /// Run a one-shot command in the workspace, teeing output to the terminal
@@ -279,5 +328,63 @@ fn tee(
                 let _ = to_log.write_all(&buffer[..read]);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Stopping a process this very process started must actually report it
+    /// stopped. The supervised child is nobody's job to reap but ours, and a
+    /// zombie keeps answering signals on Linux — so before this was fixed,
+    /// `stop` timed out, kept the PID file, and the next `start` refused as
+    /// already running. The CLI never saw it, because it exits and lets init
+    /// reap; anything long-lived did.
+    #[test]
+    fn stopping_an_unreaped_child_reports_stopped_not_still_running() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let dir = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).expect("utf8");
+        let supervisor = Supervisor::new(dir.clone());
+
+        let pid = supervisor
+            .start("app", "sleep 30", &dir, &[], &dir.join("app.log"))
+            .expect("start");
+        assert_eq!(supervisor.running_pid("app"), Some(pid));
+
+        let outcome = supervisor.stop("app", "term").expect("stop");
+        assert_eq!(
+            outcome,
+            StopOutcome::Stopped(pid),
+            "a killed child must not linger as a zombie that still answers signals"
+        );
+        assert!(
+            supervisor.running_pid("app").is_none(),
+            "the PID file must be cleared so the resource can start again"
+        );
+
+        // And starting again works, which is what undo depends on.
+        let restarted = supervisor
+            .start("app", "sleep 30", &dir, &[], &dir.join("app.log"))
+            .expect("restart");
+        assert_ne!(restarted, pid);
+        supervisor.stop("app", "term").expect("stop again");
+    }
+
+    #[test]
+    fn signal_names_are_accepted_in_the_forms_people_write_them() {
+        for name in ["term", "TERM", "-TERM", "SIGTERM", "sigterm"] {
+            assert_eq!(parse_signal(name).expect(name), Signal::SIGTERM);
+        }
+        assert_eq!(parse_signal("kill").expect("kill"), Signal::SIGKILL);
+        assert_eq!(parse_signal("int").expect("int"), Signal::SIGINT);
+        assert!(parse_signal("banana").is_err());
+    }
+
+    /// Signalling a group that is already gone is the outcome `stop` wanted.
+    #[test]
+    fn signalling_a_dead_group_is_not_an_error() {
+        assert!(signal_group(999_999, "term").is_ok());
+        assert!(!group_alive(999_999));
     }
 }
