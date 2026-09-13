@@ -8,6 +8,7 @@ use newgit_core::export::{ExportFilter, Reason};
 use newgit_core::manager::{
     ActionOutcome, BindOrigin, BranchManager, InstanceReport, TrackerBindOutcome,
 };
+use newgit_core::resource::{CheckpointMode, ResourceDefinition};
 use newgit_core::source::find_repo_root;
 use newgit_core::store::Context;
 use newgit_core::supervisor::StopOutcome;
@@ -569,6 +570,42 @@ fn spawn(args: SpawnArgs) -> Result<()> {
     Ok(())
 }
 
+/// What a resource does, told from what it declares. Every trait here is
+/// recomputed from the TOML, so unlike a stored label it cannot come to
+/// disagree with the sections it describes. `newgit resource list` shows it
+/// so a reader can tell resources apart without opening each file.
+fn resource_profile(definition: &ResourceDefinition) -> String {
+    let mut traits = Vec::new();
+    if definition.has_long_running_action() {
+        traits.push("long-running".to_owned());
+    }
+    if !definition.ports.is_empty() {
+        traits.push("ports".to_owned());
+    }
+    if definition.identity.is_some() {
+        traits.push("identity".to_owned());
+    }
+    if !definition.render.is_empty() {
+        traits.push("render".to_owned());
+    }
+    if let Some(checkpoint) = &definition.checkpoint {
+        let mode = match checkpoint.mode {
+            CheckpointMode::None => None,
+            CheckpointMode::Hash => Some("hash"),
+            CheckpointMode::Command => Some("command"),
+            CheckpointMode::External => Some("external"),
+        };
+        if let Some(mode) = mode {
+            traits.push(format!("checkpoint:{mode}"));
+        }
+    }
+    if traits.is_empty() {
+        "-".to_owned()
+    } else {
+        traits.join(", ")
+    }
+}
+
 fn resource(command: ResourceCommand) -> Result<()> {
     match command {
         ResourceCommand::Add { name, template } => {
@@ -618,8 +655,8 @@ fn resource(command: ResourceCommand) -> Result<()> {
                 return Ok(());
             }
             println!(
-                "{:<18} {:<14} {:<10} {:<22} ACTIONS",
-                "NAME", "KIND", "OWNERSHIP", "DEPENDS_ON"
+                "{:<18} {:<27} {:<10} {:<22} ACTIONS",
+                "NAME", "PROFILE", "OWNERSHIP", "DEPENDS_ON"
             );
             for definition in definitions {
                 let deps = definition.depends_on.join(", ");
@@ -629,10 +666,11 @@ fn resource(command: ResourceCommand) -> Result<()> {
                     .cloned()
                     .collect::<Vec<_>>()
                     .join(", ");
+                let profile = resource_profile(definition);
                 println!(
-                    "{:<18} {:<14} {:<10} {:<22} {}",
+                    "{:<18} {:<27} {:<10} {:<22} {}",
                     definition.name,
-                    definition.kind,
+                    profile,
                     format!("{:?}", definition.ownership).to_lowercase(),
                     if deps.is_empty() { "-" } else { &deps },
                     if actions.is_empty() { "-" } else { &actions },

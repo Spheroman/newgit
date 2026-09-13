@@ -34,8 +34,7 @@ pub const RESOURCE_TEMPLATES: &[ResourceTemplate] = &[
         description: "a branch-local long-running process with its own port",
         companions: &[],
         companion_trackers: &[],
-        contents: r#"kind = "process"
-ownership = "branch"
+        contents: r#"ownership = "branch"
 # Trackers or resources that must be ready first, e.g. ["deps", "runtime-env"].
 depends_on = []
 
@@ -75,8 +74,7 @@ APP_URL = "http://127.0.0.1:{{ports.app}}"
         // or rewrite it. Created alongside so `depends_on` resolves.
         companions: &[CompanionFile {
             name: "pnpm-store",
-            contents: r#"kind = "external-store"
-ownership = "user"
+            contents: r#"ownership = "user"
 
 [checkpoint]
 mode = "hash"
@@ -92,7 +90,6 @@ mode = "none"
 # rewrites the other's. What that costs is your package manager's call.
 # pnpm hardlinks from one shared store, so instance ten adds directory
 # entries, not gigabytes; `npm ci` expands a full copy every time.
-kind = "command"
 ownership = "workspace"
 depends_on = ["pnpm-store"]
 
@@ -122,8 +119,7 @@ action = "prepare"
             audience: "project-devs",
             merge_with_source: false,
         }],
-        contents: r#"kind = "command-snapshot"
-ownership = "branch"
+        contents: r#"ownership = "branch"
 
 # A branch-local database, named after the instance so instances never share
 # one. Edit the commands for your database; the shape is what matters:
@@ -159,8 +155,7 @@ DATABASE_URL = "postgres://localhost/{{branch.slug}}"
         description: "a resource another system owns; newgit holds only a handle",
         companions: &[],
         companion_trackers: &[],
-        contents: r#"kind = "external"
-ownership = "external"
+        contents: r#"ownership = "external"
 
 # newgit does not own this resource, so it never assumes deletion semantics
 # it did not author: `ownership = "external"` means cleanup runs exactly the

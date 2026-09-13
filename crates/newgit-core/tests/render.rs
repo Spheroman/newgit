@@ -74,8 +74,7 @@ fn manager(store: MetadataStore) -> BranchManager {
 
 /// The shape from issue #10: ports and a project id, straight into the
 /// committed Supabase config.
-const SUPABASE_RESOURCE: &str = r#"kind = "command"
-ownership = "branch"
+const SUPABASE_RESOURCE: &str = r#"ownership = "branch"
 
 [ports]
 api = { start = 54400 }
@@ -324,8 +323,7 @@ fn a_find_that_stopped_matching_fails_the_resource_loudly() {
     write_resource(
         &store,
         "supabase",
-        r#"kind = "command"
-ownership = "branch"
+        r#"ownership = "branch"
 
 [ports]
 api = { start = 54400 }
@@ -362,8 +360,7 @@ fn rendering_into_a_path_with_no_committed_content_is_refused() {
     write_resource(
         &store,
         "app",
-        r#"kind = "command"
-ownership = "branch"
+        r#"ownership = "branch"
 
 [ports]
 api = { start = 54400 }
@@ -394,8 +391,7 @@ replace = [
 fn two_resources_rendering_one_path_is_refused_at_load() {
     let (_guard, temp) = tempdir();
     let store = setup(&temp);
-    let definition = r#"kind = "command"
-ownership = "branch"
+    let definition = r#"ownership = "branch"
 
 [[render]]
 path = "supabase/config.toml"
@@ -414,8 +410,7 @@ replace = [
 
 // -- tracker-owned renders: the case a template file could not serve --------
 
-const ENV_RESOURCE: &str = r#"kind = "command"
-ownership = "branch"
+const ENV_RESOURCE: &str = r#"ownership = "branch"
 depends_on = ["runtime-env"]
 
 [ports]

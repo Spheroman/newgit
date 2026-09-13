@@ -75,8 +75,7 @@ fn cleanup_hooks_respect_ownership_and_run_dependents_first() {
         &store,
         "db",
         &format!(
-            r#"kind = "command-snapshot"
-ownership = "branch"
+            r#"ownership = "branch"
 depends_on = ["store"]
 
 [actions.prepare]
@@ -93,8 +92,7 @@ command = "echo db >> {witness}/order.txt"
         &store,
         "store",
         &format!(
-            r#"kind = "external-store"
-ownership = "user"
+            r#"ownership = "user"
 
 [cleanup]
 command = "echo store-WRONGLY-TORN-DOWN >> {witness}/order.txt"
@@ -143,8 +141,7 @@ fn a_cleanup_hook_with_an_unresolved_placeholder_is_refused() {
         &store,
         "preview",
         &format!(
-            r#"kind = "external"
-ownership = "external"
+            r#"ownership = "external"
 
 [checkpoint]
 mode = "external"
@@ -192,8 +189,7 @@ fn a_checkpointed_state_ref_reaches_the_cleanup_hook() {
         &store,
         "preview",
         &format!(
-            r#"kind = "external"
-ownership = "external"
+            r#"ownership = "external"
 
 [actions.prepare]
 command = "echo '{{\"PREVIEW_ID\": \"pv_9\"}}'"

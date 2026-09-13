@@ -71,8 +71,7 @@ fn write_resource(store: &MetadataStore, name: &str, contents: &str) {
     .expect("write resource");
 }
 
-const APP_RESOURCE: &str = r#"kind = "process"
-ownership = "branch"
+const APP_RESOURCE: &str = r#"ownership = "branch"
 depends_on = ["prep"]
 
 [ports]
@@ -89,30 +88,26 @@ signal = "term"
 APP_URL = "http://127.0.0.1:{{ports.app}}/{{branch.slug}}"
 "#;
 
-const PREP_RESOURCE: &str = r#"kind = "command"
-ownership = "workspace"
+const PREP_RESOURCE: &str = r#"ownership = "workspace"
 
 [actions.prepare]
 command = "echo prepared-{{branch.slug}} > prepared.txt"
 "#;
 
-const BAD_PREP_RESOURCE: &str = r#"kind = "command"
-ownership = "workspace"
+const BAD_PREP_RESOURCE: &str = r#"ownership = "workspace"
 
 [actions.prepare]
 command = "echo bad-prep-ran > bad-prep.txt; exit 7"
 "#;
 
-const AFTER_BAD_RESOURCE: &str = r#"kind = "command"
-ownership = "workspace"
+const AFTER_BAD_RESOURCE: &str = r#"ownership = "workspace"
 depends_on = ["bad-prep"]
 
 [actions.prepare]
 command = "echo should-not-run > after-bad.txt"
 "#;
 
-const BLOCKED_PROCESS_RESOURCE: &str = r#"kind = "process"
-ownership = "branch"
+const BLOCKED_PROCESS_RESOURCE: &str = r#"ownership = "branch"
 depends_on = ["bad-prep"]
 
 [actions.start]
@@ -469,8 +464,7 @@ fn captures_publish_a_handle_into_the_binding_and_the_command_env() {
     write_resource(
         &store,
         "preview",
-        r#"kind = "external"
-ownership = "external"
+        r#"ownership = "external"
 
 [actions.prepare]
 command = "echo PREVIEW_URL=https://pv9.example"
@@ -508,8 +502,7 @@ fn an_unresolved_dependency_does_not_block_the_commands_that_fix_it() {
     write_resource(
         &store,
         "db",
-        r#"kind = "command"
-ownership = "branch"
+        r#"ownership = "branch"
 depends_on = ["runtime-env"]
 
 [actions.prepare]
@@ -558,8 +551,7 @@ fn a_dependency_cycle_is_reported_rather_than_raised_at_open() {
             &store,
             name,
             &format!(
-                r#"kind = "command"
-ownership = "branch"
+                r#"ownership = "branch"
 depends_on = ["{dependency}"]
 
 [actions.prepare]
@@ -596,8 +588,7 @@ fn a_scripts_command_picks_up_edits_without_a_commit() {
     write_resource(
         &store,
         "db",
-        r#"kind = "command"
-ownership = "workspace"
+        r#"ownership = "workspace"
 
 [actions.prepare]
 command = "{{scripts}}/prepare.sh {{branch.slug}}"
@@ -650,8 +641,7 @@ fn a_declared_capture_that_never_appears_is_reported() {
     write_resource(
         &store,
         "db",
-        r#"kind = "external"
-ownership = "external"
+        r#"ownership = "external"
 
 [actions.prepare]
 command = "echo 'Starting containers...'; echo ANON_KEY=abc; echo 'done.'"
