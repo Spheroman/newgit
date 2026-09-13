@@ -77,6 +77,27 @@ Nothing about your repository changes until you ask for it. `init` writes
 source history, and `remove`/`cleanup` never touch the store repository's
 branches.
 
+### What your package manager will cost you
+
+Every branch instance gets its own installed dependencies. That is what makes
+instances independent — two branches with different lockfiles must not share
+a dependency tree, or one branch's install silently rewrites the other's —
+and it is why installs are resources rather than trackers.
+
+How much that costs is set by your package manager, not by newgit. **pnpm**
+hardlinks packages from one shared store into each tree, so a tenth instance
+adds directory entries rather than gigabytes; Yarn PnP skips the tree
+entirely, and `uv` does the same for Python. **npm** expands a full copy per
+instance — its cache holds tarballs, so `npm ci` re-expands every time, and
+ten instances of a monorepo means ten full copies of `node_modules`. `pip`
+into a per-instance venv behaves the same way.
+
+This is the one place where newgit multiplies a cost you already had instead
+of absorbing it, and there is no lever on newgit's side: a shared installed
+tree is the thing that would be wrong. If you run many instances of a large
+repository, a package manager with a content-addressed store is worth more
+here than it is on plain Git.
+
 ## Development
 
 This repository uses [`mise`](https://mise.jdx.dev/) to pin Rust.

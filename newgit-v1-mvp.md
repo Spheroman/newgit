@@ -1114,6 +1114,32 @@ newgit tracker track dev-db data/dev.sqlite
 
 Dependency preparation through an existing package manager. This is a resource, not a tracker: the installed artifacts are path-dependent and must be recomputed, not copied, and the shared package store is user-owned — newgit must never delete or rewrite it.
 
+#### What Independence Costs
+
+Every branch instance gets its own installed artifacts. That is what makes
+instances independent — two branches with different lockfiles must not share
+a dependency tree, or one branch's install silently rewrites the other's
+dependencies — and it is why installs are resources rather than trackers.
+
+What that independence *costs* is set by the package manager, not by newgit,
+and the right unit to share is the package store rather than the installed
+tree:
+
+- **pnpm** hardlinks each package from one content-addressed store into every
+  tree that needs it, so a tenth instance adds directory entries rather than
+  gigabytes. (Hardlinks cannot cross filesystems: if `[workspace] root` is on
+  a different volume from the store, pnpm falls back to copying.) Yarn PnP
+  avoids the tree entirely. `uv` does the same for Python.
+- **npm** expands a full copy per instance. Its cache holds tarballs, so
+  `npm ci` re-expands every time; ten instances of a monorepo means ten full
+  copies of `node_modules`. `pip` into a per-instance venv behaves the same
+  way.
+
+This is the one place where newgit multiplies an existing cost instead of
+absorbing it, so it is worth stating plainly rather than leaving for an
+adopter to discover by watching a disk fill. newgit has no lever here — a
+shared installed tree is the thing that would be wrong.
+
 ```toml
 # .newgit/resources/pnpm-store.toml
 kind = "external-store"
