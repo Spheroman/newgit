@@ -356,6 +356,21 @@ A cycle through data edges alone (`A = "{{exports.B}}"` in one resource,
 `B = "{{exports.A}}"` in another) is a real cycle and is reported like any
 other: the two cannot be bound in either order.
 
+**A data edge does not block.** If the resource owning an export fails to
+`prepare`, its readers are not held back the way a `depends_on` dependent is
+— and they do not need to be, because of what a static `[exports]` value can
+be made of: ports, branch vars, `{{workspace}}`, `{{scripts}}`, and other
+exports. None of those depend on `prepare` succeeding. A port is allocated to
+the instance whether or not the process ever came up, so the value is
+correct, not stale.
+
+Anything that genuinely depends on `prepare` has to arrive through
+`captures`, and a capture that never arrived leaves `{{exports.<name>}}`
+unresolved — which `[exports]` and `[[render]]` already refuse, stopping the
+reader without any blocking rule. Blocking on a data edge would instead
+withhold a correct render because an unrelated process failed to start, which
+is the over-claiming this section exists to remove.
+
 Resources export runtime values — ports, URLs, handles. Trackers do not
 export anything; they own file content.
 

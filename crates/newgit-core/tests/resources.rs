@@ -823,6 +823,111 @@ command = "true"
     assert_eq!(manager.resource_definitions().len(), 2);
 }
 
+/// A data edge does not block its reader when the export's owner fails to
+/// prepare, and it does not need to. The two halves below are the whole
+/// argument, and they are worth pinning because a regression in either would
+/// be silent.
+///
+/// The distinction is what a static `[exports]` value can be made of: ports,
+/// branch vars, workspace, scripts, and other exports — none of which depend
+/// on `prepare` succeeding. Anything that *does* must arrive through
+/// `captures`, which are absent when prepare fails, and absence refuses.
+///
+/// So blocking on a data edge would be actively wrong: it would withhold a
+/// correct render because an unrelated process failed to start, which is the
+/// over-claiming #43 exists to remove.
+#[test]
+fn a_failed_export_owner_refuses_its_reader_only_when_the_value_is_actually_missing() {
+    let (_guard, temp) = tempdir();
+    let store = setup(&temp);
+    let repo = store.paths().project_root.clone();
+
+    // The owner's prepare fails. `TUNNEL_URL` is captured, so it never
+    // exists; `WEB_URL` is static, so it exists regardless.
+    write_resource(
+        &store,
+        "owner",
+        r#"ownership = "branch"
+
+[ports]
+app = { start = 4100 }
+
+[exports]
+WEB_URL = "http://127.0.0.1:{{ports.app}}"
+
+[actions.prepare]
+command = "exit 1"
+captures = ["TUNNEL_URL"]
+"#,
+    );
+    // Reads the value that does exist. Declares no dependency.
+    write_resource(
+        &store,
+        "reads-static",
+        r#"ownership = "branch"
+
+[exports]
+HEALTH_URL = "{{exports.WEB_URL}}/health"
+
+[actions.prepare]
+command = "touch reads-static.txt"
+"#,
+    );
+    // Reads the value that does not.
+    write_resource(
+        &store,
+        "reads-captured",
+        r#"ownership = "branch"
+
+[exports]
+PROBE_URL = "{{exports.TUNNEL_URL}}/health"
+
+[actions.prepare]
+command = "touch reads-captured.txt"
+"#,
+    );
+
+    let manager = BranchManager::open(MetadataStore::at(repo)).expect("manager");
+    let spawned = manager.spawn("feature-a", None).expect("spawn");
+    let resources = &spawned.branch.resources;
+    assert_eq!(resources["owner"].status, ResourceStatus::Failed);
+
+    // The port was allocated to this instance whether or not the process
+    // came up, so the value is correct, not stale. The reader proceeds.
+    assert_eq!(
+        resources["reads-static"].resolved_exports["HEALTH_URL"],
+        format!(
+            "http://127.0.0.1:{}/health",
+            resources["owner"].resolved_ports["app"]
+        )
+    );
+    assert_eq!(resources["reads-static"].status, ResourceStatus::Ready);
+    assert!(
+        spawned
+            .branch
+            .workspace_path
+            .join("reads-static.txt")
+            .is_file(),
+        "a correct value is not withheld because an unrelated process failed"
+    );
+
+    // The captured value never arrived, so the reader refuses loudly and its
+    // prepare never runs — without any blocking rule saying so.
+    assert_eq!(resources["reads-captured"].status, ResourceStatus::Failed);
+    assert!(
+        resources["reads-captured"].resolved_exports.is_empty(),
+        "nothing half-resolved is stored"
+    );
+    assert!(
+        !spawned
+            .branch
+            .workspace_path
+            .join("reads-captured.txt")
+            .exists(),
+        "a missing value stops the reader on its own"
+    );
+}
+
 /// Adding the same template twice — a web and an api — is the canonical
 /// setup, and the one-owner rule turns a template that ships conventional
 /// names into a graph that refuses on the second `resource add`. The names
