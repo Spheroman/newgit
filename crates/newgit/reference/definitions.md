@@ -41,6 +41,15 @@ A tracker owns its paths outright: `newgit tracker track` adds them to the
 store's `.gitignore`, and each workspace's Git is told to ignore them too, so
 lane content never lands in source history.
 
+`newgit tracker remove <name>` deletes the definition and reverses both of
+those: the `.gitignore` block and each live workspace's ignore entries. It
+refuses while any live instance still has the tracker bound (`newgit remove
+<instance>` first) and refuses outright for `source`, the default tracker,
+which Git/jj owns and has no definition file. Captured content under
+`.newgit/snapshots/<name>/` is left in place — it becomes unreferenced, and
+`newgit cleanup` reclaims it once nothing else (a checkpoint that captured
+it) still pins a rev.
+
 ---
 
 ## Resource — `.newgit/resources/<name>.toml`
@@ -50,6 +59,13 @@ file content. Start from `newgit resource add <name> --template <template>`
 (`newgit resource templates` lists them; `newgit resource templates --show
 <name>` prints one in full, including any companion resource or tracker it
 creates alongside it, without instantiating anything).
+
+`newgit resource remove <name>` deletes the definition. It refuses if another
+resource still names it in `depends_on` — always, `--force` included, since
+that would leave the graph pointing at nothing — and refuses if a live
+instance still has it bound unless `--force` is given, in which case it drops
+the binding from that instance's record and releases its ports (there is no
+other ledger: a port is free the moment nothing claims it).
 
 ### Top level
 

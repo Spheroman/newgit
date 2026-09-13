@@ -132,6 +132,8 @@ enum TrackerCommand {
         tracker: String,
         paths: Vec<Utf8PathBuf>,
     },
+    /// Delete a tracker definition
+    Remove { name: String },
     /// List defined trackers
     List,
     /// Snapshot a tracker's content from an instance workspace
@@ -189,6 +191,14 @@ enum ResourceCommand {
         name: String,
         #[arg(long)]
         template: String,
+    },
+    /// Delete a resource definition
+    Remove {
+        name: String,
+        /// Drop the binding from any live instance and release its ports,
+        /// instead of refusing while one exists
+        #[arg(long)]
+        force: bool,
     },
     /// List defined resources
     List,
@@ -644,6 +654,18 @@ fn resource(command: ResourceCommand) -> Result<()> {
             warn_graph(&manager_here()?);
             Ok(())
         }
+        ResourceCommand::Remove { name, force } => {
+            let manager = manager_here()?;
+            let outcome = manager.remove_resource(&name, force)?;
+            println!(
+                "Removed resource `{name}`: {} deleted",
+                manager.store().relative_to_root(&outcome.path)
+            );
+            for instance in &outcome.unbound_instances {
+                println!("  dropped binding: `{instance}` (its allocated ports are released)");
+            }
+            Ok(())
+        }
         ResourceCommand::List => {
             let manager = manager_here()?;
             warn_graph(&manager);
@@ -825,6 +847,39 @@ fn tracker(command: TrackerCommand) -> Result<()> {
             } else {
                 println!("  capture content with: newgit tracker capture {tracker}");
             }
+            Ok(())
+        }
+        TrackerCommand::Remove { name } => {
+            let manager = manager_here()?;
+            let outcome = manager.remove_tracker(&name)?;
+            println!(
+                "Removed tracker `{name}`: {} deleted",
+                manager.store().relative_to_root(&outcome.path)
+            );
+            if outcome.gitignore_removed.is_empty() {
+                println!("  .gitignore: nothing to remove (no paths were ever tracked)");
+            } else {
+                println!(
+                    "  .gitignore: removed {}",
+                    outcome.gitignore_removed.join(", ")
+                );
+            }
+            if !outcome.workspaces_cleared.is_empty() {
+                println!(
+                    "  .git/info/exclude: cleared in {}",
+                    outcome
+                        .workspaces_cleared
+                        .iter()
+                        .map(|name| format!("`{name}`"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+            }
+            println!(
+                "  snapshots: content under .newgit/snapshots/{name}/ is left in place and is \
+                 now unreferenced; `newgit cleanup` reclaims it once nothing else (a checkpoint \
+                 that captured it) still pins a rev"
+            );
             Ok(())
         }
         TrackerCommand::List => {

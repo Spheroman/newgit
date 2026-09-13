@@ -268,6 +268,31 @@ impl MetadataStore {
         Ok(path)
     }
 
+    /// Delete a resource definition file. `newgit resource remove`'s caller is
+    /// responsible for the dependents/bound-instance checks; this is the
+    /// mechanical last step once those have cleared.
+    pub fn delete_resource_definition(&self, name: &str) -> Result<Utf8PathBuf> {
+        let path = self.paths.resources.join(format!("{name}.toml"));
+        std::fs::remove_file(&path).map_err(|source| NewgitError::io(&path, source))?;
+        Ok(path)
+    }
+
+    /// Delete a tracker definition file. See [`Self::delete_resource_definition`].
+    pub fn delete_tracker_definition(&self, name: &str) -> Result<Utf8PathBuf> {
+        let path = self.paths.trackers.join(format!("{name}.toml"));
+        std::fs::remove_file(&path).map_err(|source| NewgitError::io(&path, source))?;
+        Ok(path)
+    }
+
+    /// `path` relative to the repository root, for display. Falls back to the
+    /// absolute path when `path` does not live under the root at all — better
+    /// to print something true than to fail a report over it.
+    pub fn relative_to_root(&self, path: &Utf8Path) -> Utf8PathBuf {
+        path.strip_prefix(&self.paths.project_root)
+            .map(Utf8Path::to_path_buf)
+            .unwrap_or_else(|_| path.to_path_buf())
+    }
+
     pub fn instance_state_dir(&self, slug: &str) -> Utf8PathBuf {
         self.paths.state.join(slug)
     }
@@ -323,6 +348,59 @@ impl MetadataStore {
             updated.push('\n');
         }
         std::fs::write(&path, updated).map_err(|source| NewgitError::io(&path, source))
+    }
+
+    /// Reverse [`Self::append_gitignore`]: drop every `# newgit tracker:
+    /// <label>` block from the store repo's `.gitignore`, plus the blank
+    /// separator line `append_gitignore` puts in front of each one.
+    ///
+    /// `tracker track` can be called more than once for the same tracker, and
+    /// each call appends its own block — so this removes every occurrence,
+    /// not just the first. Returns the pattern lines removed, for reporting.
+    pub fn remove_gitignore_block(&self, label: &str) -> Result<Vec<String>> {
+        let path = self.paths.project_root.join(".gitignore");
+        if !path.exists() {
+            return Ok(Vec::new());
+        }
+        let contents =
+            std::fs::read_to_string(&path).map_err(|source| NewgitError::io(&path, source))?;
+        let header = format!("# newgit tracker: {label}");
+
+        let mut kept: Vec<&str> = Vec::new();
+        let mut removed = Vec::new();
+        let mut lines = contents.lines().peekable();
+        while let Some(line) = lines.next() {
+            if line == header {
+                // The block runs until the next blank line, comment, or EOF —
+                // exactly the shape `append_gitignore` writes: a header
+                // followed by nothing but pattern lines.
+                while let Some(next) = lines.peek() {
+                    if next.is_empty() || next.starts_with('#') {
+                        break;
+                    }
+                    removed.push((*next).to_owned());
+                    lines.next();
+                }
+                // Drop the blank separator `append_gitignore` put in front of
+                // the header, so removing every block leaves no extra gaps.
+                if kept.last() == Some(&"") {
+                    kept.pop();
+                }
+                continue;
+            }
+            kept.push(line);
+        }
+
+        if removed.is_empty() {
+            return Ok(removed);
+        }
+
+        let mut updated = kept.join("\n");
+        if !updated.is_empty() {
+            updated.push('\n');
+        }
+        std::fs::write(&path, updated).map_err(|source| NewgitError::io(&path, source))?;
+        Ok(removed)
     }
 
     pub fn load_branches(&self) -> Result<Vec<BranchInstance>> {
@@ -491,4 +569,76 @@ pub(crate) fn read_dir_sorted(path: &Utf8Path) -> Result<Vec<Utf8PathBuf>> {
     }
     entries.sort();
     Ok(entries)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn store() -> (tempfile::TempDir, MetadataStore) {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).expect("utf8");
+        let store = MetadataStore::init(&root, "proj", SourceSubstrate::Git).expect("init");
+        (temp, store)
+    }
+
+    #[test]
+    fn remove_gitignore_block_drops_every_occurrence_and_nothing_else() {
+        let (_temp, store) = store();
+        store
+            .append_gitignore("env", &["/.env.local".to_owned()])
+            .expect("append 1");
+        // `tracker track` called again later appends a second block under the
+        // same label.
+        store
+            .append_gitignore("env", &["/.env.production".to_owned()])
+            .expect("append 2");
+        store
+            .append_gitignore("other", &["/other.secret".to_owned()])
+            .expect("append other");
+
+        let removed = store.remove_gitignore_block("env").expect("remove");
+        assert_eq!(
+            removed,
+            vec!["/.env.local".to_owned(), "/.env.production".to_owned()]
+        );
+
+        let gitignore =
+            std::fs::read_to_string(store.paths().project_root.join(".gitignore")).expect("read");
+        assert!(
+            !gitignore.contains("env"),
+            "no trace of the env block: {gitignore}"
+        );
+        assert!(gitignore.contains("# newgit tracker: other"));
+        assert!(gitignore.contains("/other.secret"));
+
+        // Removing again is a no-op, not an error.
+        assert!(
+            store
+                .remove_gitignore_block("env")
+                .expect("remove again")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn remove_gitignore_block_is_a_no_op_without_a_gitignore() {
+        let (_temp, store) = store();
+        assert!(
+            store
+                .remove_gitignore_block("env")
+                .expect("no file")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn relative_to_root_strips_the_project_root() {
+        let (_temp, store) = store();
+        let path = store.paths().trackers.join("env.toml");
+        assert_eq!(store.relative_to_root(&path), ".newgit/trackers/env.toml");
+
+        let outside = Utf8PathBuf::from("/somewhere/else.toml");
+        assert_eq!(store.relative_to_root(&outside), outside);
+    }
 }

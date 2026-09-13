@@ -830,3 +830,69 @@ fn a_workdir_that_does_not_exist_fails_with_a_clear_error() {
         other => panic!("expected MissingWorkdir, got {other:?}"),
     }
 }
+
+#[test]
+fn remove_resource_names_the_valid_ones_when_asked_for_an_unknown_name() {
+    let (_guard, temp) = tempdir();
+    let store = setup(&temp);
+    write_resource(&store, "prep", PREP_RESOURCE);
+    let manager = BranchManager::open(MetadataStore::at(store.paths().project_root.clone()))
+        .expect("manager");
+
+    let err = manager
+        .remove_resource("nope", false)
+        .expect_err("unknown resource");
+    assert!(err.to_string().contains("prep"));
+}
+
+#[test]
+fn remove_resource_refuses_a_dependent_even_with_force() {
+    let (_guard, temp) = tempdir();
+    let store = setup(&temp);
+    write_resource(&store, "app", APP_RESOURCE);
+    write_resource(&store, "prep", PREP_RESOURCE);
+    let manager = BranchManager::open(MetadataStore::at(store.paths().project_root.clone()))
+        .expect("manager");
+
+    // `app` depends on `prep`; `--force` only answers "what about a bound
+    // instance", never "what about the rest of the graph".
+    for force in [false, true] {
+        let err = manager
+            .remove_resource("prep", force)
+            .expect_err("still depended on");
+        assert!(err.to_string().contains("app"), "{err}");
+    }
+    assert_eq!(manager.resource_definitions().len(), 2);
+}
+
+#[test]
+fn remove_resource_refuses_a_bound_instance_without_force_and_drops_it_with() {
+    let (_guard, temp) = tempdir();
+    let store = setup(&temp);
+    write_resource(&store, "prep", PREP_RESOURCE);
+    let repo = store.paths().project_root.clone();
+    let manager = BranchManager::open(MetadataStore::at(repo.clone())).expect("manager");
+    manager.spawn("feature-a", None).expect("spawn");
+
+    let err = manager
+        .remove_resource("prep", false)
+        .expect_err("bound instance");
+    assert!(err.to_string().contains("feature-a"));
+    assert_eq!(manager.resource_definitions().len(), 1);
+
+    let outcome = manager.remove_resource("prep", true).expect("force remove");
+    assert!(!outcome.path.exists(), "definition file deleted");
+    assert_eq!(outcome.unbound_instances, vec!["feature-a".to_owned()]);
+
+    let branch = manager
+        .store()
+        .find_branch("feature-a")
+        .expect("reload branch");
+    assert!(
+        !branch.resources.contains_key("prep"),
+        "the binding is dropped, which is how a port is \"released\": there is no other ledger"
+    );
+
+    let manager = BranchManager::open(MetadataStore::at(repo)).expect("manager");
+    assert!(manager.resource_definitions().is_empty());
+}
