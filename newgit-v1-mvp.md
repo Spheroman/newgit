@@ -493,6 +493,16 @@ v1 can use a simple topological order:
 - restore dependencies before starting dependents
 - cleanup dependents before dependencies
 
+An unresolvable graph — a `depends_on` naming something that is neither a
+tracker nor a resource, or a cycle — is reported, not raised at load. Commands
+that *act* on the graph (`spawn`, `run`, `action`, `checkpoint`, `undo`) refuse
+with the offending name. Commands that *build* it (`tracker create`,
+`tracker track`, `resource add`) and commands that inspect it (`tracker list`,
+`resource list`, `status`) run anyway and print the problem as a warning: they
+are how an incomplete graph gets completed, so they must not be the first
+casualty of one. `remove` also stays reachable, because teardown must never
+depend on the graph holding together.
+
 The exact ordering rules should stay boring and visible. During `spawn`, a
 prepare failure does not roll back the workspace, tracker bindings, resource
 bindings, allocated ports, or logs; it leaves the instance available for

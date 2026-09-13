@@ -22,7 +22,7 @@ use crate::lane::{TrackerLane, clear_owned_paths, copy_file};
 use crate::materializer::{Materializer, RealDirMaterializer, exclude_tracker_paths};
 use crate::ports;
 use crate::resource::{
-    CheckpointMode, ResourceDefinition, RestoreMode, parse_captures, topological_order,
+    CheckpointMode, GraphProblem, ResourceDefinition, RestoreMode, parse_captures, resolve_order,
 };
 use crate::source::GitSource;
 use crate::store::MetadataStore;
@@ -38,8 +38,12 @@ pub struct BranchManager {
     source: GitSource,
     trackers: Vec<TrackerDefinition>,
     resources: Vec<ResourceDefinition>,
-    /// Resource names, dependencies before dependents.
+    /// Resource names, dependencies before dependents. Resources whose
+    /// dependencies are unresolved are still ordered; see `graph_problems`.
     resource_order: Vec<String>,
+    /// Why the dependency graph does not hold together, if it doesn't.
+    /// Commands that build the graph warn; commands that act on it refuse.
+    graph_problems: Vec<GraphProblem>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -249,7 +253,7 @@ impl BranchManager {
         let trackers = store.load_tracker_definitions()?;
         let resources = store.load_resource_definitions()?;
         let tracker_names: BTreeSet<String> = trackers.iter().map(|t| t.name.clone()).collect();
-        let resource_order = topological_order(&resources, &tracker_names)?;
+        let (resource_order, graph_problems) = resolve_order(&resources, &tracker_names);
         Ok(Self {
             store,
             config,
@@ -257,7 +261,24 @@ impl BranchManager {
             trackers,
             resources,
             resource_order,
+            graph_problems,
         })
+    }
+
+    /// Ways the resource graph is incomplete. An empty slice means it resolves.
+    pub fn graph_problems(&self) -> &[GraphProblem] {
+        &self.graph_problems
+    }
+
+    /// The gate for commands that act on the graph — `spawn`, `run`, `action`,
+    /// `checkpoint`, `undo`, `remove`. Commands that *build* the graph
+    /// (`tracker create`, `tracker track`, `resource add`) must not call this:
+    /// they are how an incomplete graph gets completed.
+    pub fn require_resolvable_graph(&self) -> Result<()> {
+        match self.graph_problems.first() {
+            Some(problem) => Err(problem.clone().into_error()),
+            None => Ok(()),
+        }
     }
 
     pub fn store(&self) -> &MetadataStore {
@@ -296,6 +317,7 @@ impl BranchManager {
     }
 
     pub fn spawn(&self, name: &str, from: Option<&str>) -> Result<SpawnOutcome> {
+        self.require_resolvable_graph()?;
         validate_name(name)?;
 
         let slug = branch_slug(name);
@@ -456,6 +478,7 @@ impl BranchManager {
 
     /// Run `<resource>.<action>` for an instance.
     pub fn run_action(&self, instance: &str, spec: &str) -> Result<ActionOutcome> {
+        self.require_resolvable_graph()?;
         let (resource_name, action_name) = spec.split_once('.').ok_or_else(|| {
             NewgitError::Unsupported(format!("`{spec}` is not of the form <resource>.<action>"))
         })?;
@@ -624,6 +647,8 @@ impl BranchManager {
     /// context vars. Trackers own content; command environment wiring lives
     /// outside the tracker primitive.
     pub fn assemble_env(&self, branch: &BranchInstance) -> Result<Vec<(String, String)>> {
+        // Layering depends on dependency order, so the order has to be real.
+        self.require_resolvable_graph()?;
         let mut env: BTreeMap<String, String> = BTreeMap::new();
 
         // Layer 1: resource exports, dependency order (dependents win).
@@ -1052,6 +1077,9 @@ impl BranchManager {
     /// while the workspace still exists. Without that, a resource newgit
     /// does not own — a cloud preview, a database — would outlive every
     /// trace of the instance that asked for it.
+    /// Deliberately not gated on [`Self::require_resolvable_graph`]: teardown
+    /// must stay reachable from a broken graph, and cleanup hooks run for every
+    /// bound resource regardless of how they are ordered relative to each other.
     pub fn remove(&self, name: &str, cwd: &Utf8Path) -> Result<RemoveOutcome> {
         let branch = self.store.find_branch(name)?;
 
@@ -1370,6 +1398,7 @@ impl BranchManager {
 
     /// Record one coherent snapshot across source, trackers, and resources.
     pub fn checkpoint(&self, instance: &str, message: Option<&str>) -> Result<CheckpointOutcome> {
+        self.require_resolvable_graph()?;
         let mut branch = self.store.find_branch(instance)?;
         self.checkpoint_branch(&mut branch, message, CheckpointReason::Explicit)
     }
@@ -1636,6 +1665,7 @@ impl BranchManager {
     /// `to` names one. The current state is checkpointed first, so undo is
     /// always undoable and running it twice is redo.
     pub fn undo(&self, instance: &str, to: Option<&str>) -> Result<UndoOutcome> {
+        self.require_resolvable_graph()?;
         let mut branch = self.store.find_branch(instance)?;
         self.require_workspace(&branch)?;
         let checkpoint_log = self.checkpoint_log(&branch);

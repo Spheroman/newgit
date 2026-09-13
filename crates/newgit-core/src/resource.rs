@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
 
 use camino::{Utf8Path, Utf8PathBuf};
 use serde::Deserialize;
@@ -343,13 +344,52 @@ fn json_scalar(value: &serde_json::Value) -> Option<String> {
     }
 }
 
+/// A dependency graph that does not hold together. Reported rather than
+/// raised, because the commands that build the graph are the ones most likely
+/// to run while it is still incomplete.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GraphProblem {
+    MissingDependency {
+        resource: String,
+        dependency: String,
+    },
+    Cycle(Vec<String>),
+}
+
+impl GraphProblem {
+    /// The error a graph-acting command raises when it meets this problem.
+    pub fn into_error(self) -> NewgitError {
+        match self {
+            Self::MissingDependency {
+                resource,
+                dependency,
+            } => NewgitError::MissingDependency {
+                resource,
+                dependency,
+            },
+            Self::Cycle(stack) => NewgitError::DependencyCycle(stack),
+        }
+    }
+}
+
+impl fmt::Display for GraphProblem {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.clone().into_error())
+    }
+}
+
 /// Order resources so dependencies come before dependents. Dependencies may
 /// name trackers (which only need to exist) or other resources.
-pub fn topological_order(
+///
+/// Never fails: an unresolvable dependency is skipped and reported, so a
+/// half-built graph still loads. Commands that act on the graph must check the
+/// reported problems first; commands that build it may proceed and warn.
+pub fn resolve_order(
     resources: &[ResourceDefinition],
     tracker_names: &BTreeSet<String>,
-) -> Result<Vec<String>> {
+) -> (Vec<String>, Vec<GraphProblem>) {
     let mut ordered = Vec::new();
+    let mut problems = Vec::new();
     let mut state: BTreeMap<&str, Visit> = BTreeMap::new();
 
     fn visit<'a>(
@@ -358,19 +398,24 @@ pub fn topological_order(
         tracker_names: &BTreeSet<String>,
         state: &mut BTreeMap<&'a str, Visit>,
         ordered: &mut Vec<String>,
+        problems: &mut Vec<GraphProblem>,
         stack: &mut Vec<String>,
-    ) -> Result<()> {
+    ) {
         match state.get(name) {
-            Some(Visit::Done) => return Ok(()),
+            Some(Visit::Done) => return,
             Some(Visit::InProgress) => {
-                stack.push(name.to_owned());
-                return Err(NewgitError::DependencyCycle(stack.clone()));
+                // Report the back-edge and stop descending; the resource is
+                // already on the stack and will still be ordered by its caller.
+                let mut cycle = stack.clone();
+                cycle.push(name.to_owned());
+                problems.push(GraphProblem::Cycle(cycle));
+                return;
             }
             None => {}
         }
         let Some(resource) = resources.iter().find(|r| r.name == name) else {
             // Caller verified membership; only reachable for dependencies.
-            return Ok(());
+            return;
         };
         state.insert(&resource.name, Visit::InProgress);
         stack.push(name.to_owned());
@@ -379,17 +424,25 @@ pub fn topological_order(
                 continue;
             }
             if !resources.iter().any(|r| &r.name == dependency) {
-                return Err(NewgitError::MissingDependency {
+                problems.push(GraphProblem::MissingDependency {
                     resource: resource.name.clone(),
                     dependency: dependency.clone(),
                 });
+                continue;
             }
-            visit(dependency, resources, tracker_names, state, ordered, stack)?;
+            visit(
+                dependency,
+                resources,
+                tracker_names,
+                state,
+                ordered,
+                problems,
+                stack,
+            );
         }
         stack.pop();
         state.insert(&resource.name, Visit::Done);
         ordered.push(resource.name.clone());
-        Ok(())
     }
 
     #[derive(Clone, Copy)]
@@ -405,10 +458,23 @@ pub fn topological_order(
             tracker_names,
             &mut state,
             &mut ordered,
+            &mut problems,
             &mut Vec::new(),
-        )?;
+        );
     }
-    Ok(ordered)
+    (ordered, problems)
+}
+
+/// [`resolve_order`] for callers that require a whole graph.
+pub fn topological_order(
+    resources: &[ResourceDefinition],
+    tracker_names: &BTreeSet<String>,
+) -> Result<Vec<String>> {
+    let (ordered, problems) = resolve_order(resources, tracker_names);
+    match problems.into_iter().next() {
+        Some(problem) => Err(problem.into_error()),
+        None => Ok(ordered),
+    }
 }
 
 #[cfg(test)]
