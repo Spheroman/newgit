@@ -18,6 +18,7 @@ use crate::exports::{RenderContext, render as render_template};
 
 /// One file a resource renders per-instance values into.
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct RenderSpec {
     /// Workspace-relative path to the committed file.
     pub path: Utf8PathBuf,
@@ -29,6 +30,7 @@ pub struct RenderSpec {
 /// reintroduces the "did it match what I meant" doubt that [`Replacement::count`]
 /// exists to remove, and it would leave the inverse undefined.
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct Replacement {
     pub find: String,
     pub with: String,

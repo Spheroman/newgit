@@ -11,7 +11,11 @@ pub enum NewgitError {
         source: std::io::Error,
     },
 
-    #[error("could not parse TOML at {path}: {source}")]
+    // The source is not interpolated here: toml renders a multi-line snippet
+    // with the offending span, and anyhow already prints it as the cause.
+    // Naming it twice turns every parse error into the same paragraph read
+    // back to you.
+    #[error("could not parse TOML at {path}")]
     TomlRead {
         path: Utf8PathBuf,
         source: toml::de::Error,
