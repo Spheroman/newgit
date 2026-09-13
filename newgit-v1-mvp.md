@@ -282,6 +282,17 @@ Tracker capture is always the same operation: snapshot the tracker's content int
 
 Capture alone is branch-local. `newgit tracker merge` promotes the current instance's bound tracker rev to the lane head. `newgit tracker pull` checks the lane head into the current instance. `newgit tracker checkout --rev <rev>` checks out a specific captured rev. Checkout clears owned paths first so it reproduces the captured state exactly; before overwriting, the current content is auto-captured, so checkout is always undoable.
 
+A lane starts empty, so a project adopting newgit would otherwise have to
+spawn an instance that comes up *without* its env files, copy them in, capture,
+and merge — round-tripping content that already sits in the store repo at the
+same relative paths. `newgit tracker capture <tracker> --from-store` reads the
+tracker's owned paths from the store repo's working tree instead, and sets the
+lane head directly: there is no binding record to promote from, and the point
+is that the next `spawn` works. Declared paths with nothing behind them are
+reported; a tracker with nothing at all on disk is an error rather than an
+empty lane head. `newgit tracker track` points at this when the paths it just
+added already have content.
+
 Because tracker state is pure content, capture and checkout need no per-tracker modes. If a thing needs a command to capture or restore, it is a resource.
 
 `merge_with_source` does not change what capture means. It answers the global merge question: when a real Git/`jj` source merge is accepted, should this tracker binding be merged with it? If true, the merge/checkpoint shim should promote the branch's tracker rev alongside the source merge. If false, the tracker remains branch-local/user-local unless explicitly merged.
@@ -737,6 +748,7 @@ Tracker content moves through plumbing subcommands — the same machinery
 
 ```sh
 newgit tracker capture <tracker> [instance]      # snapshot content → lane
+newgit tracker capture <tracker> --from-store    # seed the lane from the store repo, and set the lane head
 newgit tracker merge <tracker> [instance]        # promote this instance's rev to lane head
 newgit tracker pull <tracker> [instance]         # pull lane head into this instance
 newgit tracker checkout <tracker> [--rev <rev>]  # check out an exact rev (auto-saves current first)
@@ -1087,8 +1099,12 @@ A branch-local env file: pure content, so a tracker.
 ```sh
 newgit tracker create runtime-env --audience user
 newgit tracker track runtime-env .env.local
-newgit tracker capture runtime-env
+newgit tracker capture runtime-env --from-store   # the file is already here
 ```
+
+`--from-store` is the adoption path: it seeds the lane from the env file the
+project already has, so the first `spawn` comes up with it. Without existing
+content, capture from an instance workspace once you have written one there.
 
 This is not a privileged env system. It is a content tracker that owns an env
 file. Loading that file into `newgit run` is a separate command-environment

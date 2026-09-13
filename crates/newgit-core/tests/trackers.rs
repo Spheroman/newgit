@@ -443,3 +443,102 @@ fn tracker_paths_are_ignored_in_a_workspace_before_gitignore_is_committed() {
         "a lane's content must not be stageable into source history"
     );
 }
+
+/// A lane starts empty and `capture` reads from an instance workspace, so the
+/// first spawn of an env-carrying tracker used to come up without its files:
+/// you had to spawn, `cp` the content in, capture, merge, and re-run prepare.
+/// Seeding from the store repo makes the first spawn work instead.
+#[test]
+fn a_lane_seeded_from_the_store_repo_reaches_the_first_instance() {
+    let (_guard, temp) = tempdir();
+    let store = setup(&temp);
+    let repo = store.paths().project_root.clone();
+
+    // The content an adopting project already has on disk.
+    std::fs::create_dir_all(repo.join("packages/db")).expect("mkdir");
+    std::fs::write(repo.join("packages/db/.env"), "DB=local\n").expect("write");
+    std::fs::write(repo.join(".env.local"), "API=local\n").expect("write");
+
+    let m = manager(store);
+    m.create_tracker("runtime-env", "user", Storage::Local, false)
+        .expect("create");
+    let tracked = m
+        .track_paths(
+            "runtime-env",
+            &[
+                Utf8PathBuf::from("packages/db/.env"),
+                Utf8PathBuf::from(".env.local"),
+            ],
+        )
+        .expect("track");
+    assert!(
+        tracked.seedable,
+        "content is on disk, so the lane can be seeded without an instance"
+    );
+
+    let seeded = m.seed_tracker_from_store("runtime-env").expect("seed");
+    assert_eq!(seeded.files, 2);
+    assert!(seeded.changed);
+    assert!(seeded.missing_paths.is_empty());
+
+    // The whole point: the first instance comes up with the content.
+    // Reopened because each CLI invocation loads definitions fresh.
+    let m = manager(MetadataStore::at(repo));
+    let spawned = m.spawn("bootstrap", None).expect("spawn");
+    let workspace = &spawned.branch.workspace_path;
+    assert_eq!(
+        std::fs::read_to_string(workspace.join("packages/db/.env")).expect("read"),
+        "DB=local\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(workspace.join(".env.local")).expect("read"),
+        "API=local\n"
+    );
+    assert_eq!(
+        spawned.branch.trackers["runtime-env"]
+            .content_rev
+            .as_deref(),
+        Some(seeded.rev.as_str())
+    );
+
+    // Re-seeding unchanged content is a no-op against the lane head.
+    let again = m.seed_tracker_from_store("runtime-env").expect("reseed");
+    assert_eq!(again.rev, seeded.rev);
+    assert!(!again.changed);
+}
+
+/// Seeding reports declared paths with nothing behind them rather than
+/// quietly capturing a partial lane, and refuses outright when none exist.
+#[test]
+fn seeding_reports_paths_that_are_not_on_disk() {
+    let (_guard, temp) = tempdir();
+    let store = setup(&temp);
+    let repo = store.paths().project_root.clone();
+    let m = manager(store);
+
+    m.create_tracker("runtime-env", "user", Storage::Local, false)
+        .expect("create");
+    let tracked = m
+        .track_paths(
+            "runtime-env",
+            &[
+                Utf8PathBuf::from(".env.local"),
+                Utf8PathBuf::from(".env.ci"),
+            ],
+        )
+        .expect("track");
+    assert!(
+        !tracked.seedable,
+        "nothing on disk yet, so do not advertise seeding"
+    );
+
+    assert!(matches!(
+        m.seed_tracker_from_store("runtime-env"),
+        Err(NewgitError::NothingToSeed { .. })
+    ));
+
+    std::fs::write(repo.join(".env.local"), "API=local\n").expect("write");
+    let seeded = m.seed_tracker_from_store("runtime-env").expect("seed");
+    assert_eq!(seeded.files, 1);
+    assert_eq!(seeded.missing_paths, vec![Utf8PathBuf::from(".env.ci")]);
+}

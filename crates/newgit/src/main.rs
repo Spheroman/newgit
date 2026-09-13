@@ -119,6 +119,10 @@ enum TrackerCommand {
         tracker: String,
         /// Instance (inferred when run inside a workspace)
         instance: Option<String>,
+        /// Seed the lane from the store repo's working tree instead, and make
+        /// it the lane head — how you carry existing files into a new lane
+        #[arg(long, conflicts_with = "instance")]
+        from_store: bool,
     },
     /// Promote this instance's tracker revision to the lane head/default
     Merge {
@@ -469,7 +473,14 @@ fn tracker(command: TrackerCommand) -> Result<()> {
                     outcome.ignored_patterns.join(", ")
                 );
             }
-            println!("  capture content with: newgit tracker capture {tracker}");
+            if outcome.seedable {
+                println!(
+                    "  seed the lane from what is already here: \
+                     newgit tracker capture {tracker} --from-store"
+                );
+            } else {
+                println!("  capture content with: newgit tracker capture {tracker}");
+            }
             Ok(())
         }
         TrackerCommand::List => {
@@ -503,7 +514,33 @@ fn tracker(command: TrackerCommand) -> Result<()> {
             }
             Ok(())
         }
-        TrackerCommand::Capture { tracker, instance } => {
+        // `conflicts_with` guarantees no instance was given here.
+        TrackerCommand::Capture {
+            tracker,
+            from_store: true,
+            ..
+        } => {
+            let manager = manager_here()?;
+            let report = manager.seed_tracker_from_store(&tracker)?;
+            let note = if report.changed {
+                ""
+            } else {
+                " (lane head unchanged)"
+            };
+            println!(
+                "Seeded `{tracker}` @ {} ({}) from the store repo{note}",
+                report.rev,
+                files_label(report.files)
+            );
+            for path in &report.missing_paths {
+                eprintln!("warning: tracker `{tracker}` owns `{path}`, which is not on disk here");
+            }
+            println!("  new instances get this content: newgit spawn <name>");
+            Ok(())
+        }
+        TrackerCommand::Capture {
+            tracker, instance, ..
+        } => {
             let (manager, instance) = manager_and_instance(instance)?;
             let report = manager.capture_tracker(&instance, &tracker)?;
             let note = if report.changed { "" } else { " (unchanged)" };
