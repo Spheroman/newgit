@@ -338,20 +338,26 @@ fn spawn(args: SpawnArgs) -> Result<()> {
         } else {
             format!(" ports: {ports}")
         };
-        let prepare = match &resource.prepare {
-            Some((true, _)) => " prepare: ok".to_owned(),
-            Some((false, log)) => {
-                format!(
-                    " prepare: FAILED (log: {log}; re-run with `newgit action {}.prepare`)",
-                    resource.name
-                )
-            }
-            None if !resource.blocked_by.is_empty() => {
-                format!(" prepare: BLOCKED by {}", resource.blocked_by.join(", "))
-            }
-            None => match resource.status {
-                newgit_core::branch::ResourceStatus::Blocked => " prepare: BLOCKED".to_owned(),
-                _ => String::new(),
+        let prepare = match &resource.render_error {
+            // A render failure is reported where prepare would be, because
+            // that is what it prevented: a prepare run against unrendered
+            // config would start a service on the committed default port.
+            Some(error) => format!(" render: FAILED — {error}"),
+            None => match &resource.prepare {
+                Some((true, _)) => " prepare: ok".to_owned(),
+                Some((false, log)) => {
+                    format!(
+                        " prepare: FAILED (log: {log}; re-run with `newgit action {}.prepare`)",
+                        resource.name
+                    )
+                }
+                None if !resource.blocked_by.is_empty() => {
+                    format!(" prepare: BLOCKED by {}", resource.blocked_by.join(", "))
+                }
+                None => match resource.status {
+                    newgit_core::branch::ResourceStatus::Blocked => " prepare: BLOCKED".to_owned(),
+                    _ => String::new(),
+                },
             },
         };
         let captured = if resource.captured.is_empty() {
@@ -359,7 +365,23 @@ fn spawn(args: SpawnArgs) -> Result<()> {
         } else {
             format!(" captured: {}", resource.captured.join(", "))
         };
-        println!("  resource:  `{}`{ports}{prepare}{captured}", resource.name);
+        let rendered = if resource.rendered.is_empty() {
+            String::new()
+        } else {
+            format!(
+                " rendered: {}",
+                resource
+                    .rendered
+                    .iter()
+                    .map(|file| format!("{} ({})", file.path, file.replacements))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        };
+        println!(
+            "  resource:  `{}`{ports}{prepare}{captured}{rendered}",
+            resource.name
+        );
         print_warnings(&resource.missing_captures);
     }
     Ok(())

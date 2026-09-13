@@ -6,6 +6,7 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
 use crate::error::{NewgitError, Result};
+use crate::render::RenderSpec;
 
 /// A lifecycle unit that re-establishes per-branch state that can't travel
 /// as content. Parsed from `.newgit/resources/<name>.toml`; the name comes
@@ -19,6 +20,9 @@ pub struct ResourceDefinition {
     pub identity: Option<IdentitySpec>,
     pub ports: BTreeMap<String, PortRequest>,
     pub exports: BTreeMap<String, String>,
+    /// Files this resource substitutes per-instance values into, before
+    /// `prepare`. See [`crate::render`].
+    pub render: Vec<RenderSpec>,
     pub actions: BTreeMap<String, ActionSpec>,
     pub checkpoint: Option<CheckpointSpec>,
     pub restore: Option<RestoreSpec>,
@@ -169,6 +173,8 @@ struct ResourceDefinitionFile {
     #[serde(default)]
     exports: BTreeMap<String, String>,
     #[serde(default)]
+    render: Vec<RenderSpec>,
+    #[serde(default)]
     actions: BTreeMap<String, ActionSpec>,
     #[serde(default)]
     checkpoint: Option<CheckpointSpec>,
@@ -202,6 +208,7 @@ impl ResourceDefinition {
             identity: file.identity,
             ports: file.ports,
             exports: file.exports,
+            render: file.render,
             actions: file.actions,
             checkpoint: file.checkpoint,
             restore: file.restore,
@@ -280,6 +287,42 @@ impl ResourceDefinition {
                 return Err(self.invalid(format!(
                     "action `{action_name}` is long_running but has no command"
                 )));
+            }
+        }
+        for spec in &self.render {
+            if spec.replace.is_empty() {
+                return Err(self.invalid(format!(
+                    "render into `{}` declares no replacements",
+                    spec.path
+                )));
+            }
+            // A render target is workspace-relative. v1 does not render into
+            // user-level or system config: the skip-worktree and
+            // reverse-on-capture story only holds inside a workspace.
+            if spec.path.is_absolute()
+                || spec
+                    .path
+                    .components()
+                    .any(|part| part.as_str() == ".." || part.as_str() == ".newgit")
+            {
+                return Err(self.invalid(format!(
+                    "render path `{}` must be workspace-relative and outside `.newgit/`",
+                    spec.path
+                )));
+            }
+            for replacement in &spec.replace {
+                if replacement.find.is_empty() {
+                    return Err(
+                        self.invalid(format!("render into `{}` has an empty `find`", spec.path))
+                    );
+                }
+                if replacement.count == 0 {
+                    return Err(self.invalid(format!(
+                        "render into `{}` declares `count = 0` for `{}`; a replacement that \
+                         matches nothing is a definition that does nothing",
+                        spec.path, replacement.find
+                    )));
+                }
             }
         }
         Ok(())
@@ -510,6 +553,7 @@ mod tests {
             identity: None,
             ports: BTreeMap::new(),
             exports: BTreeMap::new(),
+            render: Vec::new(),
             actions: BTreeMap::new(),
             checkpoint: None,
             restore: None,

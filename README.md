@@ -12,7 +12,7 @@ shape: branch instances bind source state to user-defined trackers and
 resources, instead of baking env files, installs, processes, databases, or
 external resources into special internal lanes.
 
-All seven v1 milestones are implemented. The workflow the MVP set out to make
+All eight v1 milestones are implemented. The workflow the MVP set out to make
 feel normal now runs end to end:
 
 ```sh
@@ -41,7 +41,7 @@ put `newgit` on your `PATH`:
 
 ```sh
 TARGET=aarch64-apple-darwin   # or x86_64-apple-darwin, {x86_64,aarch64}-unknown-linux-gnu
-VERSION=v0.1.0
+VERSION=v0.2.0
 BASE=https://github.com/Spheroman/newgit/releases/download/$VERSION
 curl -fsSLO $BASE/newgit-$TARGET.tar.gz -O $BASE/newgit-$TARGET.tar.gz.sha256
 shasum -a 256 -c newgit-$TARGET.tar.gz.sha256
@@ -63,7 +63,7 @@ Check what you installed. The commit is part of the version because `0.x`
 moves fast, and `-dirty` means the binary does not match any commit:
 
 ```sh
-newgit --version   # newgit 0.1.0 (15e4d0da0e51)
+newgit --version   # newgit 0.2.0 (15e4d0da0e51)
 ```
 
 ## Adopting it in a project
@@ -174,6 +174,29 @@ trackers whose audience is `public`. Anything narrower is withheld and
 reported; `--include <path>` overrides. It writes one commit, not history,
 because exporting the branch's commits would carry any file they contain —
 including withheld ones. This is a path-level filter, not concealment.
+
+**`[[render]]` puts this instance's ports in the config file your tool
+actually reads.** Most tools take a port from a committed config file rather
+than argv, so a resource declares literal substitutions into one:
+
+```toml
+[[render]]
+path = "supabase/config.toml"
+replace = [
+  { find = "port = 54321", with = "port = {{ports.api}}" },
+]
+```
+
+There is no template file — `port = 54321` is your working default, so a
+clone without newgit still starts on it. `find` is literal, never a regex,
+and must match exactly once; that check is also the drift detector, failing
+the bind by name when the default changes upstream rather than quietly doing
+nothing. Rendered source files are marked `--skip-worktree`, so they never
+show in `git status` and `git add -A` cannot commit them — which also means
+**real edits to a rendered file do not survive the workspace.** newgit says
+so at bind. For a tracker-owned file, `tracker capture` reverses the
+substitution, so edits you make beside the rendered value reach the lane and
+your port does not.
 
 **`cleanup` never breaks an undo.** It finalizes instances whose workspace is
 gone, deletes unclaimed workspaces and dead process state, and prunes tracker

@@ -173,6 +173,58 @@ impl GitSource {
         run_git(&["-C", workspace.as_str(), "rev-parse", "HEAD"])
     }
 
+    /// Committed content of one path in a workspace clone: the blob at HEAD,
+    /// not what is on disk. `None` when HEAD has no such path.
+    ///
+    /// This is what a render substitutes into — see [`crate::render::apply`].
+    /// Read raw, never through [`run_git`]: that trims, which is right for a
+    /// rev and silently destructive for file content — it would drop the
+    /// file's trailing newline on every render.
+    pub fn workspace_show_head(workspace: &Utf8Path, path: &Utf8Path) -> Result<Option<String>> {
+        let args = ["-C", workspace.as_str(), "show", &format!("HEAD:{path}")];
+        let output = Command::new("git")
+            .args(args)
+            .output()
+            .map_err(|source| spawn_error(&args, &source))?;
+        // `git show` fails the same way for "no such path at HEAD" as for a
+        // broken repo; the caller has already established the latter is not
+        // the case, and treats absence as "nothing committed to render from".
+        if !output.status.success() {
+            return Ok(None);
+        }
+        // Strict rather than lossy: rendering into a file newgit cannot read
+        // as text would write back mojibake where the project's bytes were.
+        match String::from_utf8(output.stdout) {
+            Ok(contents) => Ok(Some(contents)),
+            Err(_) => Err(NewgitError::Unsupported(format!(
+                "`{path}` is not valid UTF-8 at HEAD; a render substitutes text"
+            ))),
+        }
+    }
+
+    /// Mark paths `--skip-worktree` in a workspace clone, so this instance's
+    /// rendered values never show as a modification and cannot be committed
+    /// by an agent running `git add -A`.
+    ///
+    /// The counterpart of `.git/info/exclude` for tracker paths: newgit does
+    /// not control the Git an agent runs, so what must not be committable has
+    /// to be made so by construction. v1's stand-in for the projection a v2
+    /// materializer does properly.
+    pub fn workspace_skip_worktree(workspace: &Utf8Path, paths: &[Utf8PathBuf]) -> Result<()> {
+        if paths.is_empty() {
+            return Ok(());
+        }
+        let mut args: Vec<&str> = vec![
+            "-C",
+            workspace.as_str(),
+            "update-index",
+            "--skip-worktree",
+            "--",
+        ];
+        args.extend(paths.iter().map(|path| path.as_str()));
+        run_git(&args).map(|_| ())
+    }
+
     /// Snapshot uncommitted and untracked (non-ignored) workspace state as a
     /// dangling commit on top of HEAD, without touching HEAD, the real
     /// index, or the worktree. Returns `None` when the worktree is clean.
@@ -180,7 +232,17 @@ impl GitSource {
     /// Mechanics: a throwaway `GIT_INDEX_FILE` seeded from HEAD, `git add -A`
     /// into it, `git write-tree`, and `git commit-tree` — all public
     /// interface, nothing reaches into `.git` internals.
-    pub fn workspace_dirty_commit(workspace: &Utf8Path, message: &str) -> Result<Option<String>> {
+    ///
+    /// `rendered` paths are marked skip-worktree *in the throwaway index*.
+    /// The real index carries that bit already, but a fresh index seeded from
+    /// HEAD does not, so without this `git add -A` would sweep the instance's
+    /// rendered ports into the checkpoint — the one place skip-worktree does
+    /// not protect on its own.
+    pub fn workspace_dirty_commit(
+        workspace: &Utf8Path,
+        message: &str,
+        rendered: &[Utf8PathBuf],
+    ) -> Result<Option<String>> {
         let scratch = tempfile::tempdir().map_err(|source| NewgitError::io(workspace, source))?;
         let index = scratch.path().join("index");
         let Some(index) = index.to_str() else {
@@ -190,6 +252,11 @@ impl GitSource {
 
         let ws = workspace.as_str();
         run_git_env(&["-C", ws, "read-tree", "HEAD"], &env)?;
+        if !rendered.is_empty() {
+            let mut args: Vec<&str> = vec!["-C", ws, "update-index", "--skip-worktree", "--"];
+            args.extend(rendered.iter().map(|path| path.as_str()));
+            run_git_env(&args, &env)?;
+        }
         run_git_env(&["-C", ws, "add", "-A"], &env)?;
         let tree = run_git_env(&["-C", ws, "write-tree"], &env)?;
 

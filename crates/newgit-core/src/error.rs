@@ -119,6 +119,70 @@ pub enum NewgitError {
         log: Utf8PathBuf,
     },
 
+    #[error(
+        "resource `{resource}` renders into `{path}`, but `{find}` occurs {found} time(s) there, \
+         not {expected}; the committed file changed under the definition, or the string is not \
+         unique — a multi-line `find` disambiguates, and `count` declares a repeat"
+    )]
+    RenderMatchCount {
+        resource: String,
+        path: Utf8PathBuf,
+        find: String,
+        expected: usize,
+        found: usize,
+    },
+
+    #[error(
+        "resource `{resource}` renders `{value}` into `{path}`, which would then occur {found} \
+         time(s) there, not {expected}; `newgit capture` could not reverse that unambiguously, \
+         so include more context in `find` and `with`"
+    )]
+    RenderNotInvertible {
+        resource: String,
+        path: Utf8PathBuf,
+        value: String,
+        expected: usize,
+        found: usize,
+    },
+
+    #[error(
+        "resource `{resource}` renders into `{path}` with unresolved `{placeholder}`; a render \
+         writes a file rather than a command line, so an unrendered placeholder would be \
+         committed-looking content nobody wrote"
+    )]
+    RenderUnresolved {
+        resource: String,
+        path: Utf8PathBuf,
+        placeholder: String,
+    },
+
+    #[error(
+        "resource `{resource}` renders into `{path}`, where `{left}` and `{right}` claim \
+         overlapping text; all finds are located in the committed content and applied at once, \
+         so there is no order in which one of them wins"
+    )]
+    RenderOverlappingFinds {
+        resource: String,
+        path: Utf8PathBuf,
+        left: String,
+        right: String,
+    },
+
+    #[error(
+        "resources `{left}` and `{right}` both render into `{path}`; render targets must be disjoint"
+    )]
+    RenderPathConflict {
+        left: String,
+        right: String,
+        path: Utf8PathBuf,
+    },
+
+    #[error(
+        "resource `{resource}` renders into `{path}`, which is neither tracked by Git nor owned \
+         by a tracker; a render substitutes into committed content, so there has to be some"
+    )]
+    RenderPathNotCommitted { resource: String, path: Utf8PathBuf },
+
     #[error("{0}")]
     Unsupported(String),
 

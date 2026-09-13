@@ -500,9 +500,6 @@ with no separate ledger to drift.
 
 ### Render
 
-*Specified, not yet built — see Milestone 8. Every other section of this
-document describes shipped code.*
-
 Ports and exports reach a command two ways: `{{ports.x}}` in its command line
 and an env var in `newgit run`. Both assume the tool takes the value on argv
 or from the environment. Most tools do not. Supabase reads its ports from
@@ -545,10 +542,30 @@ reconcile when the branch merges back.
 "did it match what I meant" doubt that the uniqueness rule below exists to
 remove, and it would make the inverse (below) undefined.
 
+#### Replacements are simultaneous, not sequential
+
+> **Every `find` is located in the committed content, and all replacements
+> then apply as one batch. A replacement's output is never a match target.**
+
+Rewriting in declaration order — re-matching each rule against the
+partially-rewritten text — would make a rule mean different things depending
+on what ran before it. A `find` that happens to equal an earlier rule's output
+would either report a spurious second match, failing the exactly-once check
+below for a duplicate the committed file does not contain, or silently rewrite
+that output. Neither is a thing the definition says.
+
+The property to hold onto: **declaration order is cosmetic.** Reordering the
+`replace` array cannot change the result, so a reader does not have to
+simulate the list to know what it does.
+
+Two rules claiming overlapping text have no batch answer — whichever won would
+be an accident of order — so that is refused at render time, naming both
+strings.
+
 #### A find must match exactly once
 
-> **Each `find` must match exactly once in the file, or the render refuses and
-> names the file and the string.**
+> **Each `find` must match exactly once in the committed content, or the
+> render refuses and names the file and the string.**
 
 One rule, doing four jobs:
 
@@ -633,17 +650,41 @@ Four places that value must not escape to:
   template cannot be run backwards at all. The inverse needs the same
   guarantee in the other direction — the rendered value must be unique in the
   file too — checked at bind, so the failure surfaces then and not at capture.
-- **Source checkpoint** needs nothing extra: `--skip-worktree` keeps the
-  change uncommitted, so it never reaches the store.
+- **A checkpoint's uncommitted-state capture.** This one looks like it needs
+  nothing — `--skip-worktree` keeps the change uncommitted, so a checkpoint of
+  *committed* state never sees it. But `workspace_dirty_commit` builds its
+  tree in a throwaway `GIT_INDEX_FILE` seeded from `read-tree HEAD`, and a
+  fresh index does not carry the real index's skip-worktree bits. Without
+  re-setting them there, `git add -A` sweeps the rendered ports into the
+  checkpoint. The one place skip-worktree does not protect on its own.
 
 #### What it costs, and saying so
 
 On a source-owned path, `--skip-worktree` means **real edits to that file in
 this workspace are invisible to newgit and die with the workspace.** That is
 correct for values newgit generates and wrong for the `[auth]` block someone
-adds by hand. newgit prints this at bind, naming the path — it is a real
-lossiness, and *Report missing captures and incomplete undos honestly* applies
-to it. To edit a rendered file for real, edit it in the store repo.
+adds by hand.
+
+newgit reports this **precisely, not as a caveat.** A warning at bind time
+would fire when nothing is wrong yet — at bind the edit does not exist — and
+then stay silent at the moment the work is actually lost. Since a render is a
+pure function of committed content and the binding record, the expected bytes
+of a rendered file are recomputable at any time. So newgit recomputes them and
+compares, at the two moments that matter:
+
+- **at checkpoint**, because a checkpoint is the promise that this state can
+  be returned to, and a hand edit to a rendered file is the one thing it
+  cannot carry;
+- **before a re-render** (undo, `tracker pull`, `tracker checkout`), because
+  that is the moment the edit is overwritten.
+
+The report names the file and the size of the change —
+`packages/db/supabase/config.toml has changes that render will discard (4
+line(s) differ)` — and says nothing at all when the file is what the render
+produced. *Report missing captures and incomplete undos honestly* applies
+here: the generic version of this warning is not honesty, it is noise that
+trains people to ignore the specific one. To edit a rendered file for real,
+edit it in the store repo.
 
 Tracker-owned render targets do not pay this cost: they are already outside
 Git, capture reverses the substitution, and hand edits round-trip.
@@ -1944,9 +1985,6 @@ Success criterion:
 
 ### Milestone 8: Render
 
-The one milestone specified but not yet built. Everything above this line
-describes shipped code; *Render* describes code to write.
-
 - `[[render]]` on resource definitions: literal `find`/`with` substitution
   into a committed path, run at bind before `prepare` and before a
   `recompute` restore
@@ -1954,8 +1992,13 @@ describes shipped code; *Render* describes code to write.
   zero-match or wrong-count render fails the resource and blocks dependents
 - render reads the committed blob (`HEAD`, or the bound lane rev), never the
   working file
+- simultaneous location and batch application, so declaration order is
+  cosmetic; overlapping finds refused
 - `--skip-worktree` for source-owned targets; export takes rendered paths
   from `HEAD`
+- drift detection: the expected render recomputed and compared at checkpoint
+  and before every re-render, naming the file and how much of it a re-render
+  will discard
 - reverse substitution on `newgit capture` for tracker-owned targets, with
   the rendered value's uniqueness checked at bind
 

@@ -5,6 +5,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{NewgitError, Result};
+use crate::render::RenderRecord;
 
 /// The binding record. The workspace directory is disposable; this is not.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -35,6 +36,13 @@ pub struct ResourceBinding {
     pub resolved_ports: BTreeMap<String, u16>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub resolved_exports: BTreeMap<String, String>,
+    /// Files this resource rendered per-instance values into, with the
+    /// substitutions as actually applied. Recorded rather than re-derived so
+    /// `newgit capture` can reverse a render whose definition has since been
+    /// edited — the binding record is the source of truth for what this
+    /// instance is, including what was written into its files.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rendered: Vec<RenderRecord>,
     pub status: ResourceStatus,
 }
 
