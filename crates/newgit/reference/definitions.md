@@ -3,6 +3,10 @@
 Every key in a newgit definition file, what it accepts, and what it defaults
 to. Printed by `newgit reference`, so it is on disk wherever the binary is.
 
+`newgit reference` lists the sections; `newgit reference <name>` prints one
+(`resource` brings its subsections with it); `newgit reference all` prints the
+whole document.
+
 The design narrative — why trackers and resources are the only two
 primitives, what each one is for — lives in `newgit-v1-mvp.md` at
 <https://github.com/Spheroman/newgit>. This page is the lookup table.
