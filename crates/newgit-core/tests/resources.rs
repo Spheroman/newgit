@@ -1104,3 +1104,96 @@ fn remove_resource_refuses_a_bound_instance_without_force_and_drops_it_with() {
     let manager = BranchManager::open(MetadataStore::at(repo)).expect("manager");
     assert!(manager.resource_definitions().is_empty());
 }
+
+const API_RESOURCE: &str = r#"ownership = "branch"
+
+[ports]
+api = { start = 54321 }
+
+[exports]
+API_URL = "http://127.0.0.1:{{ports.api}}"
+"#;
+
+const COMPOSED_EXPORT_RESOURCE: &str = r#"ownership = "branch"
+depends_on = ["api"]
+
+[exports]
+FUNCTIONS_URL = "{{exports.API_URL}}/functions/v1"
+"#;
+
+/// A `[[render]]` could already compose a dependency's export, so a *file*
+/// could carry another resource's URL while the resource that produces those
+/// values could not. Bindings run in dependency order, so the value is there.
+#[test]
+fn an_export_may_compose_a_dependencys_export() {
+    let (_guard, temp) = tempdir();
+    let store = setup(&temp);
+    write_resource(&store, "api", API_RESOURCE);
+    write_resource(&store, "functions", COMPOSED_EXPORT_RESOURCE);
+    let repo = store.paths().project_root.clone();
+    let manager = BranchManager::open(MetadataStore::at(repo)).expect("manager");
+
+    let outcome = manager.spawn("feature-a", None).expect("spawn");
+    let functions = outcome
+        .branch
+        .resources
+        .get("functions")
+        .expect("functions bound");
+    assert_eq!(
+        functions
+            .resolved_exports
+            .get("FUNCTIONS_URL")
+            .map(String::as_str),
+        Some("http://127.0.0.1:54321/functions/v1")
+    );
+}
+
+const UNRESOLVED_EXPORT_RESOURCE: &str = r#"ownership = "branch"
+depends_on = ["api"]
+
+[exports]
+FUNCTIONS_URL = "http://127.0.0.1:{{ports.api.nope}}/functions/v1"
+"#;
+
+/// Verbatim is right where the mistake surfaces in front of whoever typed it.
+/// An export is written to the record once and handed to every later process,
+/// so it refuses instead — and the bad value is never stored, because an
+/// absent variable is detectable and a malformed URL is not.
+#[test]
+fn an_unresolved_export_refuses_and_is_not_stored() {
+    let (_guard, temp) = tempdir();
+    let store = setup(&temp);
+    write_resource(&store, "api", API_RESOURCE);
+    write_resource(&store, "functions", UNRESOLVED_EXPORT_RESOURCE);
+    let repo = store.paths().project_root.clone();
+    let manager = BranchManager::open(MetadataStore::at(repo)).expect("manager");
+
+    let outcome = manager.spawn("feature-b", None).expect("spawn");
+    let report = outcome
+        .resources
+        .iter()
+        .find(|resource| resource.name == "functions")
+        .expect("functions reported");
+    assert_eq!(report.status, ResourceStatus::Failed);
+    let error = report.export_error.as_deref().expect("export error");
+    assert!(error.contains("FUNCTIONS_URL"), "names the export: {error}");
+    assert!(
+        error.contains("{{ports.api.nope}}"),
+        "names the placeholder: {error}"
+    );
+    assert!(
+        report.render_error.is_none(),
+        "an unresolved export is not a render failure"
+    );
+
+    let binding = outcome
+        .branch
+        .resources
+        .get("functions")
+        .expect("functions bound");
+    assert!(
+        !binding.resolved_exports.contains_key("FUNCTIONS_URL"),
+        "the literal is not stored: {:?}",
+        binding.resolved_exports
+    );
+}

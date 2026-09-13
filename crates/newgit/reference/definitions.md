@@ -233,6 +233,30 @@ resource's actions, and are readable in later hooks as `{{exports.NAME}}`.
 APP_URL = "http://127.0.0.1:{{ports.app}}"
 ```
 
+An export may compose a dependency's export, the same way a `[[render]]` can —
+bindings happen in dependency order, so everything upstream is already
+resolved:
+
+```toml
+depends_on = ["supabase"]
+
+[exports]
+SUPABASE_FUNCTIONS_URL = "{{exports.SUPABASE_API_URL}}/functions/v1"
+```
+
+**An unresolved `{{...}}` refuses.** This is the third place that does, with
+`[cleanup]` and `[[render]]`, and for the same reason: everywhere else a
+placeholder with no value renders verbatim so the mistake is visible to
+whoever typed it, but an export is rendered once, written to the binding
+record, and handed to every later action and `newgit run` as an environment
+variable. The mistake would surface in a different process, hours later, as a
+malformed URL. The resource fails to bind and the value is not stored — an
+absent variable is something downstream can detect; `http://127.0.0.1:{{ports.db.api}}`
+is not.
+
+There is no syntax for another resource's *ports*: `{{ports.<name>}}` is
+scoped to the resource's own. Publish the value as an export and compose that.
+
 Resources export runtime values — ports, URLs, handles. Trackers do not
 export anything; they own file content.
 

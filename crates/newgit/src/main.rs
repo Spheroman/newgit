@@ -550,12 +550,16 @@ fn spawn(args: SpawnArgs) -> Result<()> {
         } else {
             format!(" ports: {ports}")
         };
-        let prepare = match &resource.render_error {
-            // A render failure is reported where prepare would be, because
-            // that is what it prevented: a prepare run against unrendered
-            // config would start a service on the committed default port.
-            Some(error) => format!(" render: FAILED — {error}"),
-            None => match &resource.prepare {
+        let prepare = match (&resource.export_error, &resource.render_error) {
+            // Both are reported where prepare would be, because that is what
+            // they prevented: a prepare run against unrendered config would
+            // start a service on the committed default port, and one against
+            // a half-resolved environment would start it pointed at a
+            // placeholder. They are named apart because they are different
+            // mistakes in different parts of the definition.
+            (Some(error), _) => format!(" export: FAILED — {error}"),
+            (None, Some(error)) => format!(" render: FAILED — {error}"),
+            (None, None) => match &resource.prepare {
                 Some((true, _)) => " prepare: ok".to_owned(),
                 Some((false, log)) => {
                     format!(

@@ -160,6 +160,17 @@ pub enum NewgitError {
     },
 
     #[error(
+        "resource `{resource}` exports `{export}` with unresolved `{placeholder}`; an export is \
+         rendered once and handed to every later command as an environment variable, so a \
+         placeholder left verbatim would surface in another process rather than here"
+    )]
+    ExportUnresolved {
+        resource: String,
+        export: String,
+        placeholder: String,
+    },
+
+    #[error(
         "resource `{resource}` renders into `{path}` with unresolved `{placeholder}`; a render \
          writes a file rather than a command line, so an unrendered placeholder would be \
          committed-looking content nobody wrote"
