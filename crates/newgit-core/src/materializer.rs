@@ -84,6 +84,41 @@ pub fn exclude_tracker_paths(workspace: &Utf8Path, paths: &[Utf8PathBuf]) -> Res
     std::fs::write(&exclude, contents).map_err(|source| NewgitError::io(exclude, source))
 }
 
+/// Reverse [`exclude_tracker_paths`] for one workspace: drop this tracker's
+/// paths from `.git/info/exclude`, leaving every other tracker's lines (and
+/// the shared header comment) alone. Returns whether anything changed, so a
+/// caller iterating many workspaces can report only the ones it touched.
+pub fn unexclude_tracker_paths(workspace: &Utf8Path, paths: &[Utf8PathBuf]) -> Result<bool> {
+    if paths.is_empty() {
+        return Ok(false);
+    }
+    let exclude = workspace.join(".git/info/exclude");
+    let Ok(contents) = std::fs::read_to_string(&exclude) else {
+        return Ok(false);
+    };
+    let wanted: Vec<String> = paths.iter().map(|path| format!("/{path}")).collect();
+
+    let mut changed = false;
+    let kept: Vec<&str> = contents
+        .lines()
+        .filter(|line| {
+            let drop = wanted.iter().any(|pattern| pattern == line);
+            changed |= drop;
+            !drop
+        })
+        .collect();
+    if !changed {
+        return Ok(false);
+    }
+
+    let mut updated = kept.join("\n");
+    if !updated.is_empty() {
+        updated.push('\n');
+    }
+    std::fs::write(&exclude, updated).map_err(|source| NewgitError::io(exclude, source))?;
+    Ok(true)
+}
+
 fn write_workspace_marker(store_root: &Utf8Path, branch: &BranchInstance) -> Result<()> {
     let marker = WorkspaceMarker {
         branch: branch.name.clone(),
@@ -106,4 +141,45 @@ fn write_workspace_marker(store_root: &Utf8Path, branch: &BranchInstance) -> Res
 
 pub fn create_dir_all(path: &Utf8Path) -> Result<()> {
     std::fs::create_dir_all(path).map_err(|source| NewgitError::io(path.to_path_buf(), source))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unexclude_removes_only_the_named_trackers_lines() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let workspace = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).expect("utf8");
+        let env = Utf8PathBuf::from(".env.local");
+        let secret = Utf8PathBuf::from("secrets/token");
+        exclude_tracker_paths(&workspace, &[env.clone(), secret.clone()]).expect("exclude");
+
+        let changed =
+            unexclude_tracker_paths(&workspace, std::slice::from_ref(&env)).expect("unexclude");
+        assert!(changed);
+
+        let contents =
+            std::fs::read_to_string(workspace.join(".git/info/exclude")).expect("read exclude");
+        assert!(
+            !contents.contains("/.env.local"),
+            "the removed tracker's path must be gone"
+        );
+        assert!(
+            contents.contains("/secrets/token"),
+            "another tracker's path in the same shared block must survive"
+        );
+
+        // Nothing left to remove the second time.
+        assert!(!unexclude_tracker_paths(&workspace, &[env]).expect("unexclude again"));
+    }
+
+    #[test]
+    fn unexclude_is_a_no_op_when_there_is_no_exclude_file() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let workspace = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).expect("utf8");
+        let changed = unexclude_tracker_paths(&workspace, &[Utf8PathBuf::from(".env")])
+            .expect("no exclude file yet");
+        assert!(!changed);
+    }
 }

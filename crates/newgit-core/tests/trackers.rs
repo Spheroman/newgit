@@ -1,6 +1,7 @@
 use std::process::Command;
 
 use camino::{Utf8Path, Utf8PathBuf};
+use newgit_core::cleanup::ArchivedCheckpoints;
 use newgit_core::config::WorkspaceSection;
 use newgit_core::manager::{BindOrigin, BranchManager};
 use newgit_core::store::MetadataStore;
@@ -541,4 +542,117 @@ fn seeding_reports_paths_that_are_not_on_disk() {
     let seeded = m.seed_tracker_from_store("runtime-env").expect("seed");
     assert_eq!(seeded.files, 1);
     assert_eq!(seeded.missing_paths, vec![Utf8PathBuf::from(".env.ci")]);
+}
+
+#[test]
+fn remove_tracker_refuses_the_default_source_tracker() {
+    let (_guard, temp) = tempdir();
+    let m = manager(setup(&temp));
+    assert!(matches!(
+        m.remove_tracker("source"),
+        Err(NewgitError::Unsupported(_))
+    ));
+}
+
+#[test]
+fn remove_tracker_names_the_valid_ones_when_asked_for_an_unknown_name() {
+    let (_guard, temp) = tempdir();
+    let store = setup(&temp);
+    let repo = store.paths().project_root.clone();
+    let m = manager(store);
+    m.create_tracker("runtime-env", "user", Storage::Local, false)
+        .expect("create");
+
+    // Definitions load at `BranchManager::open`, like every CLI invocation.
+    let m = manager(MetadataStore::at(repo));
+    let err = m.remove_tracker("nope").expect_err("unknown tracker");
+    let message = err.to_string();
+    assert!(message.contains("runtime-env"), "{message}");
+}
+
+#[test]
+fn remove_tracker_refuses_while_a_live_instance_is_bound() {
+    let (_guard, temp) = tempdir();
+    let store = setup(&temp);
+    let repo = store.paths().project_root.clone();
+    let m = manager(store);
+    m.create_tracker("runtime-env", "user", Storage::Local, false)
+        .expect("create");
+    m.track_paths("runtime-env", &[Utf8PathBuf::from(".env.local")])
+        .expect("track");
+
+    let m = manager(MetadataStore::at(repo));
+    m.spawn("feature-a", None).expect("spawn");
+
+    let err = m
+        .remove_tracker("runtime-env")
+        .expect_err("bound to a live instance");
+    assert!(matches!(err, NewgitError::Unsupported(_)));
+    assert!(err.to_string().contains("feature-a"));
+
+    // Definition and content survive the refusal.
+    assert_eq!(m.tracker_definitions().len(), 1);
+}
+
+/// `tracker remove` undoes exactly what `tracker create`/`tracker track` did
+/// — the definition file and the store's `.gitignore` block — and leaves
+/// captured content for `newgit cleanup` to reclaim once it is unreferenced.
+#[test]
+fn remove_tracker_reverses_the_definition_and_gitignore_and_leaves_snapshots_for_cleanup() {
+    let (_guard, temp) = tempdir();
+    let store = setup(&temp);
+    let repo = store.paths().project_root.clone();
+    let m = manager(store);
+    m.create_tracker("runtime-env", "user", Storage::Local, false)
+        .expect("create");
+    m.track_paths("runtime-env", &[Utf8PathBuf::from(".env.local")])
+        .expect("track");
+
+    let m = manager(MetadataStore::at(&repo));
+    let spawned = m.spawn("feature-a", None).expect("spawn");
+    std::fs::write(spawned.branch.workspace_path.join(".env.local"), "A=1\n").expect("write");
+    let captured = m
+        .capture_tracker("feature-a", "runtime-env")
+        .expect("capture");
+    m.merge_tracker("feature-a", "runtime-env").expect("merge");
+    let snapshot_dir = m
+        .store()
+        .paths()
+        .snapshots
+        .join("runtime-env")
+        .join(&captured.rev);
+    assert!(snapshot_dir.is_dir(), "captured content exists on disk");
+
+    // Not removable while the instance is still bound to it.
+    assert!(m.remove_tracker("runtime-env").is_err());
+    m.remove("feature-a", &repo, ArchivedCheckpoints::Keep)
+        .expect("remove instance");
+
+    let definition_path = m.tracker_definitions()[0].name.clone();
+    assert_eq!(definition_path, "runtime-env");
+    let outcome = m.remove_tracker("runtime-env").expect("remove tracker");
+    assert!(!outcome.path.exists(), "definition file deleted");
+    assert_eq!(outcome.gitignore_removed, vec!["/.env.local".to_owned()]);
+
+    let gitignore = std::fs::read_to_string(repo.join(".gitignore")).expect("gitignore");
+    assert!(
+        !gitignore.contains("runtime-env"),
+        "the labeled block is gone: {gitignore}"
+    );
+
+    let m = manager(MetadataStore::at(&repo));
+    assert!(m.tracker_definitions().is_empty());
+
+    // The captured content is untouched — it is `newgit cleanup`'s job, not
+    // `tracker remove`'s, to reclaim it once nothing pins it.
+    assert!(snapshot_dir.is_dir());
+    let cleaned = m
+        .cleanup(false, ArchivedCheckpoints::Keep)
+        .expect("cleanup");
+    assert_eq!(cleaned.pruned.len(), 1);
+    assert_eq!(cleaned.pruned[0].tracker, "runtime-env");
+    assert!(
+        !snapshot_dir.is_dir(),
+        "a removed tracker's head is no longer pinned once nothing else claims it"
+    );
 }

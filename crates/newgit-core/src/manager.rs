@@ -19,7 +19,9 @@ use crate::error::{NewgitError, Result};
 use crate::export::{self, ExportFilter, ExportPlan, prepare_destination};
 use crate::exports::{RenderContext, render, unresolved_placeholder};
 use crate::lane::{TrackerLane, clear_owned_paths, copy_file};
-use crate::materializer::{Materializer, RealDirMaterializer, exclude_tracker_paths};
+use crate::materializer::{
+    Materializer, RealDirMaterializer, exclude_tracker_paths, unexclude_tracker_paths,
+};
 use crate::ports;
 use crate::render::{self, RenderRecord};
 use crate::resource::{
@@ -333,6 +335,23 @@ pub struct AddResourceOutcome {
     pub companions_created: Vec<Utf8PathBuf>,
     /// Tracker lanes created because the template deposits into them.
     pub trackers_created: Vec<Utf8PathBuf>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoveTrackerOutcome {
+    pub path: Utf8PathBuf,
+    /// Pattern lines dropped from the store repo's `.gitignore`.
+    pub gitignore_removed: Vec<String>,
+    /// Live instances whose workspace had this tracker's paths cleared from
+    /// `.git/info/exclude`.
+    pub workspaces_cleared: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoveResourceOutcome {
+    pub path: Utf8PathBuf,
+    /// `--force` only: instances whose binding was dropped and ports released.
+    pub unbound_instances: Vec<String>,
 }
 
 impl BranchManager {
@@ -1190,6 +1209,98 @@ impl BranchManager {
         &self.resources
     }
 
+    /// The inverse of `resource add`: delete a resource definition.
+    ///
+    /// Refuses rather than leaving a broken graph or an orphaned binding
+    /// behind — `rm .newgit/resources/<name>.toml` already does the deletion;
+    /// what it cannot do is notice a dependent or a live instance.
+    pub fn remove_resource(&self, name: &str, force: bool) -> Result<RemoveResourceOutcome> {
+        let definition = self
+            .resources
+            .iter()
+            .find(|r| r.name == name)
+            .ok_or_else(|| {
+                NewgitError::Unsupported(format!(
+                    "no resource named `{name}`; defined resources: {}",
+                    self.resource_names_label()
+                ))
+            })?;
+
+        // Refused unconditionally: `--force` answers "what about a bound
+        // instance", not "what about the rest of the graph". Removing a
+        // dependency out from under a resource that still names it leaves
+        // `depends_on` pointing at nothing, which is exactly the graph damage
+        // this command exists to prevent.
+        let dependents: Vec<&str> = self
+            .resources
+            .iter()
+            .filter(|other| other.depends_on.iter().any(|dep| dep == name))
+            .map(|other| other.name.as_str())
+            .collect();
+        if !dependents.is_empty() {
+            return Err(NewgitError::Unsupported(format!(
+                "resource `{name}` is still depended on by {}; remove {} first, or edit its \
+                 `depends_on`",
+                dependents.join(", "),
+                if dependents.len() == 1 { "it" } else { "them" }
+            )));
+        }
+
+        let branches = self.store.load_branches()?;
+        let bound: Vec<BranchInstance> = branches
+            .into_iter()
+            .filter(|branch| branch.resources.contains_key(name))
+            .collect();
+
+        if !bound.is_empty() && !force {
+            return Err(NewgitError::Unsupported(format!(
+                "resource `{name}` is bound to {}; remove {} first with `newgit remove \
+                 <instance>`, or pass --force to drop the binding and release its ports",
+                bound
+                    .iter()
+                    .map(|branch| branch.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                if bound.len() == 1 { "it" } else { "them" }
+            )));
+        }
+
+        let mut unbound_instances = Vec::new();
+        for mut branch in bound {
+            let supervisor = self.supervisor(&branch);
+            if supervisor.running_pid(name).is_some() {
+                // Best-effort: a `--force` remove should not leave a process
+                // running that nothing can reach any more (its definition is
+                // about to disappear too), but a failed stop must not block
+                // the removal — the definition file going away is the part
+                // the caller actually asked for.
+                let _ = supervisor.stop(name, &definition.stop_signal());
+            }
+            branch.resources.remove(name);
+            branch.updated_at = Utc::now();
+            self.store.save_branch_record(&branch)?;
+            unbound_instances.push(branch.name);
+        }
+
+        let path = self.store.delete_resource_definition(name)?;
+        Ok(RemoveResourceOutcome {
+            path,
+            unbound_instances,
+        })
+    }
+
+    fn resource_names_label(&self) -> String {
+        if self.resources.is_empty() {
+            "none defined".to_owned()
+        } else {
+            self.resources
+                .iter()
+                .map(|r| r.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        }
+    }
+
     fn resource_definition(&self, name: &str) -> Result<&ResourceDefinition> {
         self.resources
             .iter()
@@ -1505,6 +1616,78 @@ impl BranchManager {
             added_paths: paths.to_vec(),
             ignored_patterns: patterns,
             seedable,
+        })
+    }
+
+    /// The inverse of `tracker create` — undoes exactly what `tracker
+    /// create`/`tracker track` did: the definition file, the store
+    /// `.gitignore` block, and each live workspace's `.git/info/exclude`
+    /// entries. Captured lane content under `.newgit/snapshots/<name>/` is
+    /// left in place; see the caller for why that is safe to leave to
+    /// `newgit cleanup`.
+    pub fn remove_tracker(&self, name: &str) -> Result<RemoveTrackerOutcome> {
+        if name == "source" {
+            return Err(NewgitError::Unsupported(
+                "`source` is the default tracker: Git/jj owns its history, and there is no \
+                 `.newgit/trackers/source.toml` to remove"
+                    .to_owned(),
+            ));
+        }
+
+        let definition = self
+            .trackers
+            .iter()
+            .find(|t| t.name == name)
+            .ok_or_else(|| {
+                NewgitError::Unsupported(format!(
+                    "no tracker named `{name}`; defined trackers: {}",
+                    if self.trackers.is_empty() {
+                        "none defined".to_owned()
+                    } else {
+                        self.trackers
+                            .iter()
+                            .map(|t| t.name.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    }
+                ))
+            })?;
+
+        let branches = self.store.load_branches()?;
+        let bound: Vec<&str> = branches
+            .iter()
+            .filter(|branch| branch.trackers.contains_key(name))
+            .map(|branch| branch.name.as_str())
+            .collect();
+        if !bound.is_empty() {
+            return Err(NewgitError::Unsupported(format!(
+                "tracker `{name}` is bound to {}; remove {} first with `newgit remove <instance>`",
+                bound.join(", "),
+                if bound.len() == 1 { "it" } else { "them" }
+            )));
+        }
+
+        // Reverse `tracker track` in every live workspace, not just the ones
+        // currently bound to this tracker: a tracker created after a
+        // workspace was spawned never reached that workspace's
+        // `.git/info/exclude`, so this is a no-op there, but it is the
+        // mechanical inverse of what `spawn` writes rather than a guess at
+        // which workspaces need it.
+        let mut workspaces_cleared = Vec::new();
+        for branch in &branches {
+            if branch.workspace_path.is_dir()
+                && unexclude_tracker_paths(&branch.workspace_path, &definition.paths)?
+            {
+                workspaces_cleared.push(branch.name.clone());
+            }
+        }
+        let gitignore_removed = self.store.remove_gitignore_block(name)?;
+
+        let path = self.store.delete_tracker_definition(name)?;
+        Ok(RemoveTrackerOutcome {
+            path,
+            gitignore_removed,
+            workspaces_cleared,
         })
     }
 

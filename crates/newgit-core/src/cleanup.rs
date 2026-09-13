@@ -216,7 +216,19 @@ impl SnapshotRoots {
         roots.archived_checkpoints = archived_claims.difference(&live_claims).cloned().collect();
         roots.checkpoints = live_claims.union(&archived_claims).cloned().collect();
 
+        // Only a tracker that still has a definition gets to call its head "the
+        // thing new instances project" — otherwise `tracker remove` could
+        // delete a definition and its lane's head would stay pinned forever,
+        // since a directory under `snapshots/` outlives the file that named it.
+        let defined: BTreeSet<String> = store
+            .load_tracker_definitions()?
+            .into_iter()
+            .map(|tracker| tracker.name)
+            .collect();
         for lane in lane_names(&store.paths().snapshots)? {
+            if !defined.contains(&lane) {
+                continue;
+            }
             if let Some(head) =
                 crate::lane::TrackerLane::new(&store.paths().snapshots, &lane).latest()
             {
