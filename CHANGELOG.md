@@ -34,6 +34,23 @@ of `.newgit/` in a minor release — see *Upgrading* below.
   `prepare` action verbatim; it now points at `--show external` instead, so
   that example can't drift from the template either.
 
+- Resources can set `workdir`, overridable per action, so a monorepo
+  definition does not have to start every command with the same `cd`.
+
+  A resource whose real work lives at `packages/db/supabase` used to repeat
+  `cd packages/db/supabase && ...` on `prepare`, `stop`, `checkpoint`,
+  `restore`, and `cleanup` alike — seven lines, one prefix, and a `&&` that
+  silently swallows a failed `cd` because the command after it still runs.
+  `workdir = "packages/db/supabase"` at the top of the resource says it once;
+  newgit spawns the command there directly (`Command::current_dir`, not a
+  shell prefix), so there is no `&&` left to bind wrong. An action can set
+  its own `workdir` to replace it for just that one command.
+
+  It only ever changes where a *command* runs. `[identity].paths`,
+  `[checkpoint].paths`, and `[[render]].path` stay workspace-root-relative
+  regardless — those are content paths, and a definition that had to track
+  two roots at once would be worse than the `cd` it replaces.
+
 - `newgit reference [section]` prints one section instead of all 380 lines,
   and bare `newgit reference` now prints a table of contents.
 
@@ -80,11 +97,13 @@ of `.newgit/` in a minor release — see *Upgrading* below.
   another resource, because `into_tracker` needs somewhere to deposit; that
   asymmetry was buried behind identical-looking `companion:`/`tracker:`
   prefixes. The line now leads with the created thing's name and kind, names
-  the key that pulled it in, and says it can be edited or deleted:
+  the key that pulled it in, and says it can be edited or deleted — keeping
+  the path, since "delete the file" is only actionable if it says which file:
 
   ```
   Added resource `deps` from `pnpm` at .newgit/resources/deps.toml
-    also created resource `pnpm-store` (required by deps.depends_on) — edit it, or delete the file if this project doesn't need it
+    also created resource `pnpm-store` at .newgit/resources/pnpm-store.toml
+      required by deps.depends_on — edit it, or delete the file if this project doesn't need it
   ```
 
   Someone who ran `newgit tracker create db-snapshots` by hand and hit

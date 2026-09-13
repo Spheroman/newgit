@@ -38,6 +38,10 @@ pub const RESOURCE_TEMPLATES: &[ResourceTemplate] = &[
 # Trackers or resources that must be ready first, e.g. ["deps", "runtime-env"].
 depends_on = []
 
+# In a monorepo, every action below likely runs from one package, not the
+# workspace root; uncomment and every command runs from there instead.
+# workdir = "packages/app"
+
 [ports]
 app = { start = 3100, env = "PORT" }
 

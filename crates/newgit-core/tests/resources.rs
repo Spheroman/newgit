@@ -332,6 +332,47 @@ fn remove_stops_running_processes() {
     assert!(!alive, "process group survived remove");
 }
 
+const WORKDIR_LONG_RUNNING_RESOURCE: &str = r#"ownership = "branch"
+workdir = "packages/app"
+
+[actions.start]
+command = "pwd; sleep 30"
+long_running = true
+
+[actions.stop]
+signal = "term"
+"#;
+
+#[test]
+fn long_running_actions_honor_workdir() {
+    let (_guard, temp) = tempdir();
+    let store = setup(&temp);
+    let repo = store.paths().project_root.clone();
+    std::fs::create_dir_all(repo.join("packages/app")).expect("mkdir");
+    std::fs::write(repo.join("packages/app/.keep"), "").expect("write");
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-q", "-m", "add packages/app"]);
+
+    write_resource(&store, "app", WORKDIR_LONG_RUNNING_RESOURCE);
+    let manager = BranchManager::open(MetadataStore::at(repo)).expect("manager");
+    let spawned = manager.spawn("feature-a", None).expect("spawn");
+    let ws = spawned.branch.workspace_path.clone();
+
+    let ActionOutcome::Started { log, .. } =
+        manager.run_action("feature-a", "app.start").expect("start")
+    else {
+        panic!("expected Started");
+    };
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    let logged = std::fs::read_to_string(&log).expect("read log");
+    assert!(
+        logged.contains(ws.join("packages/app").as_str()),
+        "the supervised process should start with cwd = workspace/packages/app: {logged}"
+    );
+
+    manager.run_action("feature-a", "app.stop").expect("stop");
+}
+
 #[test]
 fn pnpm_template_creates_companion_store_and_loads() {
     let (_guard, temp) = tempdir();
@@ -684,4 +725,108 @@ captures = ["ANON_KEY", "SERVICE_ROLE_KEY"]
     };
     assert_eq!(missing_captures.len(), 1);
     assert!(missing_captures[0].contains("SERVICE_ROLE_KEY"));
+}
+
+const WORKDIR_RESOURCE: &str = r#"ownership = "workspace"
+workdir = "packages/db"
+
+[identity]
+paths = ["packages/db/marker.txt"]
+
+[actions.prepare]
+command = "pwd > prepare-cwd.txt"
+
+[actions.migrate]
+workdir = "packages/db/supabase"
+command = "pwd > migrate-cwd.txt"
+"#;
+
+/// Both directories a `workdir` might point at have to exist in the
+/// workspace before the command that uses them runs; committing them into
+/// the store repo means the clone that becomes the workspace already has
+/// them, without newgit having to create them itself.
+fn commit_dir(repo: &Utf8Path, path: &str) {
+    let dir = repo.join(path);
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    std::fs::write(dir.join(".keep"), "").expect("write");
+    git(repo, &["add", "."]);
+    git(repo, &["commit", "-q", "-m", &format!("add {path}")]);
+}
+
+#[test]
+fn workdir_runs_the_command_there_instead_of_a_cd_prefix() {
+    let (_guard, temp) = tempdir();
+    let store = setup(&temp);
+    let repo = store.paths().project_root.clone();
+    commit_dir(&repo, "packages/db/supabase");
+    std::fs::write(repo.join("packages/db/marker.txt"), "v1\n").expect("write");
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-q", "-m", "add marker"]);
+
+    write_resource(&store, "db", WORKDIR_RESOURCE);
+    let manager = BranchManager::open(MetadataStore::at(repo)).expect("manager");
+    let spawned = manager.spawn("feature-a", None).expect("spawn");
+    let ws = spawned.branch.workspace_path.clone();
+
+    // `prepare` has no workdir of its own, so it inherits the resource-level
+    // one: it ran from `packages/db`, not the workspace root.
+    assert_eq!(
+        std::fs::read_to_string(ws.join("packages/db/prepare-cwd.txt")).expect("read"),
+        format!("{}\n", ws.join("packages/db"))
+    );
+
+    // `migrate` declares its own workdir, which replaces the resource-level
+    // one rather than nesting under it.
+    manager
+        .run_action("feature-a", "db.migrate")
+        .expect("run migrate");
+    assert_eq!(
+        std::fs::read_to_string(ws.join("packages/db/supabase/migrate-cwd.txt")).expect("read"),
+        format!("{}\n", ws.join("packages/db/supabase"))
+    );
+
+    // `[identity].paths` stayed workspace-root-relative: `newgit` found the
+    // file at `packages/db/marker.txt`, not `packages/db/packages/db/marker.txt`.
+    let outcome = manager.checkpoint("feature-a", None);
+    assert!(
+        outcome.is_ok(),
+        "checkpoint should resolve identity paths against the workspace root: {outcome:?}"
+    );
+}
+
+const MISSING_WORKDIR_RESOURCE: &str = r#"ownership = "workspace"
+workdir = "packages/db"
+
+[actions.prepare]
+command = "true"
+"#;
+
+#[test]
+fn a_workdir_that_does_not_exist_fails_with_a_clear_error() {
+    let (_guard, temp) = tempdir();
+    let store = setup(&temp);
+    write_resource(&store, "db", MISSING_WORKDIR_RESOURCE);
+    let repo = store.paths().project_root.clone();
+    let manager = BranchManager::open(MetadataStore::at(repo)).expect("manager");
+
+    // `packages/db` was never created or committed, so `prepare` cannot run
+    // there. The whole spawn aborts, the same way a missing binary would.
+    let err = manager
+        .spawn("feature-a", None)
+        .expect_err("spawn should fail");
+    match err {
+        NewgitError::MissingWorkdir {
+            resource,
+            action,
+            path,
+        } => {
+            assert_eq!(resource, "db");
+            assert_eq!(action, "prepare");
+            assert!(
+                path.ends_with("packages/db"),
+                "path should name the resolved workdir, was {path}"
+            );
+        }
+        other => panic!("expected MissingWorkdir, got {other:?}"),
+    }
 }

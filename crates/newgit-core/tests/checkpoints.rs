@@ -293,6 +293,52 @@ fn into_tracker_deposits_into_lane_and_restore_reads_it_back() {
     assert_eq!(read(&ws.join("restored.sql")), "dump-data\n");
 }
 
+const WORKDIR_CHECKPOINT_RESOURCE: &str = r#"ownership = "branch"
+workdir = "packages/db"
+
+[actions.prepare]
+command = "true"
+
+[checkpoint]
+mode = "command"
+command = "pwd > checkpoint-cwd.txt && pwd"
+
+[restore]
+mode = "command"
+command = "pwd > restore-cwd.txt"
+"#;
+
+#[test]
+fn checkpoint_and_restore_commands_honor_workdir() {
+    let (_guard, temp) = tempdir();
+    let store = setup(&temp);
+    let repo = store.paths().project_root.clone();
+    std::fs::create_dir_all(repo.join("packages/db")).expect("mkdir");
+    std::fs::write(repo.join("packages/db/.keep"), "").expect("write");
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-q", "-m", "add packages/db"]);
+
+    write_resource(&store, "db", WORKDIR_CHECKPOINT_RESOURCE);
+    let m = manager(store);
+    let ws = m
+        .spawn("feature-a", None)
+        .expect("spawn")
+        .branch
+        .workspace_path;
+
+    m.checkpoint("feature-a", None).expect("checkpoint");
+    assert_eq!(
+        read(&ws.join("packages/db/checkpoint-cwd.txt")),
+        format!("{}\n", ws.join("packages/db"))
+    );
+
+    m.undo("feature-a", None).expect("undo");
+    assert_eq!(
+        read(&ws.join("packages/db/restore-cwd.txt")),
+        format!("{}\n", ws.join("packages/db"))
+    );
+}
+
 const BAD_RESTORE_RESOURCE: &str = r#"ownership = "branch"
 
 [checkpoint]
