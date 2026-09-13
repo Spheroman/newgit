@@ -538,6 +538,8 @@ v1 can use a simple `.newgit/` directory in the project root:
     deps.toml
     app-service.toml
     postgres-db.toml
+  scripts/                 # committed scripts resource commands call
+    db-up.sh               #   as {{scripts}}/db-up.sh
   local/                   # gitignored local overrides
   branches/                # gitignored branch bindings
     feature-a.toml
@@ -568,6 +570,7 @@ Committed to Git:
 
 - tracker and resource definitions
 - action names and commands
+- scripts those commands call (`.newgit/scripts/`)
 - non-secret defaults
 - templates that contain no private values
 - documentation of expected trackers and resources
@@ -795,10 +798,45 @@ newgit run feature-a -- pnpm test
 
 Template variables available in exports and action commands are kept
 minimal: `{{ports.<name>}}`, `{{branch.name}}`, `{{branch.slug}}`,
-`{{workspace}}`. Checkpoint and restore commands additionally see
-`{{exports.<name>}}`, `{{snapshot.path}}` (the staging dir for
+`{{workspace}}`, `{{scripts}}`. Checkpoint and restore commands additionally
+see `{{exports.<name>}}`, `{{snapshot.path}}` (the staging dir for
 `into_tracker` deposits), and `{{state_ref}}` (the checkpointed state
 reference) — nowhere else.
+
+### Where A Resource's Script Lives
+
+A resource definition is read from the store, but anything its commands shell
+out to is read from the workspace, where it is subject to source
+materialization. That split the two halves of one definition across different
+rules: the TOML was editable in place, while the script it called had to be
+committed before the first spawn could see it. Iterating on a `prepare` meant
+committing every attempt, or copying the script into the workspace by hand
+between runs.
+
+`{{scripts}}` resolves to `.newgit/scripts/` **in the store**, the same rule
+the definitions in `.newgit/resources/` already follow:
+
+```toml
+[actions.prepare]
+command = "{{scripts}}/db-up.sh {{branch.slug}}"
+```
+
+Both halves of the definition now live under one rule — edit either and the
+next `newgit action` picks it up, with nothing to commit first. The directory
+is control plane and belongs in Git alongside `config.toml`, `trackers/`, and
+`resources/`; a teammate or CI without it cannot bind the resource. `init`
+writes a `README.md` there, both because Git will not track an empty
+directory and because that is where someone looks first.
+
+Scripts run with the workspace as their working directory, so relative paths
+inside one address the instance being prepared. Nothing is copied into the
+workspace — the script executes from the store.
+
+This does not change where a *project's* own scripts live. Something the
+application itself runs stays in the project tree, is read from the
+workspace, and must be committed before a spawn that calls it. The rule is
+about ownership: `.newgit/scripts/` is for scripts that exist to serve a
+resource definition.
 
 ### `newgit action <resource>.<action> [instance]`
 

@@ -68,10 +68,17 @@ newgit init
 ```
 
 `init` prints what to commit. The split matters: `.newgit/config.toml`,
-`trackers/`, and `resources/` are the control plane and belong in Git, so
-teammates and CI see the same orchestration. Everything else under `.newgit/`
-— branch bindings, captured content, checkpoints, logs, runtime state — is
-local and is gitignored for you.
+`trackers/`, `resources/`, and `scripts/` are the control plane and belong in
+Git, so teammates and CI see the same orchestration. Everything else under
+`.newgit/` — branch bindings, captured content, checkpoints, logs, runtime
+state — is local and is gitignored for you.
+
+Scripts your resources shell out to go in `.newgit/scripts/` and are
+referenced as `{{scripts}}/<name>`. They resolve from the store, not from the
+workspace, which is the same rule the resource definitions follow — so you can
+edit a `prepare` script and re-run `newgit action` without committing the
+attempt first. A script your *project* owns still lives in the project tree
+and must be committed before a spawn that calls it.
 
 Nothing about your repository changes until you ask for it. `init` writes
 `.newgit/`, and `tracker track` appends to `.gitignore`; no command rewrites
@@ -102,7 +109,7 @@ tests by nature.
   boundaries, checkpoints and undo, export, and cleanup.
 - `crates/newgit` is the CLI, published as the `newgit` crate.
 - `.newgit/` is created by `newgit init`. Committed: `config.toml`,
-  `trackers/`, `resources/`. Gitignored local state: `branches/`,
+  `trackers/`, `resources/`, `scripts/`. Gitignored local state: `branches/`,
   `snapshots/`, `checkpoints/`, `logs/`, `state/`, `local/`.
 
 ## Commands

@@ -52,6 +52,16 @@ fn tempdir() -> (tempfile::TempDir, Utf8PathBuf) {
     (temp, path)
 }
 
+/// An executable script under the store's `.newgit/scripts/`.
+fn write_script(path: &Utf8Path, body: &str) {
+    std::fs::write(path, format!("#!/bin/sh\n{body}")).expect("write script");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    }
+}
+
 fn write_resource(store: &MetadataStore, name: &str, contents: &str) {
     std::fs::write(
         store.paths().resources.join(format!("{name}.toml")),
@@ -567,4 +577,59 @@ command = "true"
     ));
     // Listing definitions is how you find the cycle, so it must not refuse.
     assert_eq!(manager.resource_definitions().len(), 2);
+}
+
+/// A resource definition is read from the store, but anything it shelled out
+/// to was read from the workspace — so iterating on a `prepare` script meant
+/// committing every attempt or copying it into the workspace by hand.
+/// `{{scripts}}` puts both halves of a definition under one rule.
+#[test]
+fn a_scripts_command_picks_up_edits_without_a_commit() {
+    let (_guard, temp) = tempdir();
+    let store = setup(&temp);
+    let repo = store.paths().project_root.clone();
+    let script = store.paths().scripts.join("prepare.sh");
+
+    write_resource(
+        &store,
+        "db",
+        r#"kind = "command"
+ownership = "workspace"
+
+[actions.prepare]
+command = "{{scripts}}/prepare.sh {{branch.slug}}"
+"#,
+    );
+    write_script(&script, "echo first-$1 > prepared.txt\n");
+
+    // Never committed: the script is not in the source history the workspace
+    // clone is made from.
+    let manager = BranchManager::open(MetadataStore::at(repo.clone())).expect("manager");
+    let spawned = manager.spawn("feature-a", None).expect("spawn");
+    let workspace = spawned.branch.workspace_path.clone();
+    assert_eq!(
+        spawned.branch.resources["db"].status,
+        ResourceStatus::Ready,
+        "prepare should find the script in the store"
+    );
+    assert_eq!(
+        std::fs::read_to_string(workspace.join("prepared.txt")).expect("read"),
+        "first-feature-a\n"
+    );
+    assert!(
+        !workspace.join(".newgit/scripts/prepare.sh").exists(),
+        "the script runs from the store, it is not copied into the workspace"
+    );
+
+    // The loop the issue described: edit in place, re-run, no commit, no copy.
+    write_script(&script, "echo second-$1 > prepared.txt\n");
+    let outcome = manager
+        .run_action("feature-a", "db.prepare")
+        .expect("re-run prepare");
+    assert!(matches!(outcome, ActionOutcome::Ran { code: 0, .. }));
+    assert_eq!(
+        std::fs::read_to_string(workspace.join("prepared.txt")).expect("read"),
+        "second-feature-a\n",
+        "the edited script should run, not the one from spawn time"
+    );
 }

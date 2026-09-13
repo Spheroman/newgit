@@ -20,6 +20,36 @@ const LOCAL_GITIGNORE: &str = "\
 /checkpoints/
 ";
 
+const SCRIPTS_README: &str = "\
+# .newgit/scripts/
+
+Scripts that resource definitions shell out to. Reference one as
+`{{scripts}}/<name>` in any resource command:
+
+```toml
+[actions.prepare]
+command = \"{{scripts}}/db-up.sh {{branch.slug}}\"
+```
+
+`{{scripts}}` resolves to this directory in the **store** — the repository
+you ran `newgit init` in — not to a copy inside the workspace. That is the
+same rule the resource definitions in `../resources/` already follow, so both
+halves of a definition live under one rule: edit either one and the next
+`newgit action` picks it up, with nothing to commit first.
+
+Commit this directory. It is control plane, like `config.toml`, `trackers/`,
+and `resources/`, and a teammate or CI without these scripts cannot bind
+your resources.
+
+Scripts run with the workspace as their working directory, so a relative
+path inside one refers to the instance being prepared. Mark them executable
+(`chmod +x`), or invoke them through an interpreter in the command.
+
+A script your *project* owns — something the app itself runs — belongs in the
+project tree as usual, not here. Those are read from the workspace and must
+be committed before the first spawn that calls them.
+";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MetadataStore {
     paths: NewgitPaths,
@@ -34,6 +64,9 @@ pub struct NewgitPaths {
     pub archived_branches: Utf8PathBuf,
     pub trackers: Utf8PathBuf,
     pub resources: Utf8PathBuf,
+    /// Scripts a resource's commands shell out to, resolved from the store
+    /// rather than a workspace. Part of the committed control plane.
+    pub scripts: Utf8PathBuf,
     pub local: Utf8PathBuf,
     pub snapshots: Utf8PathBuf,
     pub logs: Utf8PathBuf,
@@ -324,6 +357,7 @@ impl MetadataStore {
             &self.paths.branches,
             &self.paths.trackers,
             &self.paths.resources,
+            &self.paths.scripts,
             &self.paths.local,
             &self.paths.snapshots,
             &self.paths.logs,
@@ -337,6 +371,14 @@ impl MetadataStore {
         if !gitignore.exists() {
             std::fs::write(&gitignore, LOCAL_GITIGNORE)
                 .map_err(|source| NewgitError::io(gitignore, source))?;
+        }
+
+        // Git does not track empty directories, so `scripts/` needs a file to
+        // survive a commit and reach a clone. Make that file explain itself.
+        let scripts_readme = self.paths.scripts.join("README.md");
+        if !scripts_readme.exists() {
+            std::fs::write(&scripts_readme, SCRIPTS_README)
+                .map_err(|source| NewgitError::io(scripts_readme, source))?;
         }
         Ok(())
     }
@@ -359,6 +401,7 @@ impl NewgitPaths {
             archived_branches: metadata_root.join("branches/archived"),
             trackers: metadata_root.join("trackers"),
             resources: metadata_root.join("resources"),
+            scripts: metadata_root.join("scripts"),
             local: metadata_root.join("local"),
             snapshots: metadata_root.join("snapshots"),
             logs: metadata_root.join("logs"),
