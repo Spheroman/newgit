@@ -97,11 +97,13 @@ of `.newgit/` in a minor release — see *Upgrading* below.
   another resource, because `into_tracker` needs somewhere to deposit; that
   asymmetry was buried behind identical-looking `companion:`/`tracker:`
   prefixes. The line now leads with the created thing's name and kind, names
-  the key that pulled it in, and says it can be edited or deleted:
+  the key that pulled it in, and says it can be edited or deleted — keeping
+  the path, since "delete the file" is only actionable if it says which file:
 
   ```
   Added resource `deps` from `pnpm` at .newgit/resources/deps.toml
-    also created resource `pnpm-store` (required by deps.depends_on) — edit it, or delete the file if this project doesn't need it
+    also created resource `pnpm-store` at .newgit/resources/pnpm-store.toml
+      required by deps.depends_on — edit it, or delete the file if this project doesn't need it
   ```
 
   Someone who ran `newgit tracker create db-snapshots` by hand and hit
