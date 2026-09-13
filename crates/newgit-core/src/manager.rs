@@ -11,8 +11,8 @@ use crate::checkpoint::{
     RestoreFailure, SourceState, TrackerState,
 };
 use crate::cleanup::{
-    CleanupOutcome, FinalizedInstance, HookDetail, HookOutcome, PrunedRev, SnapshotRoots,
-    lane_revs, may_tear_down, orphan_workspaces,
+    ArchivedCheckpoints, CleanupOutcome, FinalizedInstance, HookDetail, HookOutcome, PrunedRev,
+    PurgedCheckpoints, SnapshotRoots, lane_revs, may_tear_down, orphan_workspaces,
 };
 use crate::config::ProjectConfig;
 use crate::error::{NewgitError, Result};
@@ -154,6 +154,11 @@ pub struct RemoveOutcome {
     pub archived_record: Utf8PathBuf,
     /// What each resource's cleanup hook did, dependents first.
     pub hooks: Vec<HookOutcome>,
+    /// The checkpoint history discarded, when removal was asked to purge it.
+    pub purged_checkpoints: Option<PurgedCheckpoints>,
+    /// How many checkpoints removal left behind instead — retained disk the
+    /// caller should be told about, since nothing reaches them any more.
+    pub kept_checkpoints: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1225,7 +1230,17 @@ impl BranchManager {
     /// Deliberately not gated on [`Self::require_resolvable_graph`]: teardown
     /// must stay reachable from a broken graph, and cleanup hooks run for every
     /// bound resource regardless of how they are ordered relative to each other.
-    pub fn remove(&self, name: &str, cwd: &Utf8Path) -> Result<RemoveOutcome> {
+    ///
+    /// Checkpoints outlive removal by default — they pin the lane revs their
+    /// undo would need, and the instance may be re-created. `checkpoints =
+    /// Purge` says that undo will never be wanted, and drops them so the next
+    /// `cleanup` can reclaim what they held.
+    pub fn remove(
+        &self,
+        name: &str,
+        cwd: &Utf8Path,
+        checkpoints: ArchivedCheckpoints,
+    ) -> Result<RemoveOutcome> {
         let branch = self.store.find_branch(name)?;
 
         if cwd.starts_with(&branch.workspace_path) {
@@ -1254,12 +1269,56 @@ impl BranchManager {
 
         RealDirMaterializer.remove(&branch)?;
         let archived_record = self.store.archive_branch_record(&branch)?;
+        // Either way, count what the instance leaves behind: checkpoints kept
+        // for an unreachable instance are disk nobody will reclaim by accident.
+        let keeping = checkpoints == ArchivedCheckpoints::Keep;
+        let found = self.purge_checkpoints(&branch.slug, keeping)?;
+        let (purged_checkpoints, kept_checkpoints) = match (keeping, found) {
+            (true, found) => (None, found.map_or(0, |plan| plan.checkpoints)),
+            (false, purged) => (purged, 0),
+        };
 
         Ok(RemoveOutcome {
             branch,
             archived_record,
             hooks,
+            purged_checkpoints,
+            kept_checkpoints,
         })
+    }
+
+    /// Drop one instance's checkpoint log and the store refs it held.
+    ///
+    /// This is the only operation that can break an undo, so nothing calls it
+    /// implicitly: a checkpoint is what `newgit undo` restores, and the lane
+    /// revs it names are pinned for exactly that reason. Once the binding
+    /// record is archived the undo is unreachable anyway — but "unreachable"
+    /// is still the user's call to make, not a garbage collector's.
+    ///
+    /// Returns `None` when the instance has no checkpoints at all.
+    fn purge_checkpoints(&self, slug: &str, dry_run: bool) -> Result<Option<PurgedCheckpoints>> {
+        let dir = self.store.checkpoint_dir(slug);
+        if !dir.is_dir() {
+            return Ok(None);
+        }
+        let checkpoints = CheckpointLog::new(dir.clone(), slug).list()?.len();
+        let refs = self
+            .source
+            .refs_under(&format!("refs/newgit/checkpoints/{slug}"))?;
+
+        if !dry_run {
+            for name in &refs {
+                self.source.delete_ref(name)?;
+            }
+            std::fs::remove_dir_all(&dir).map_err(|source| NewgitError::io(&dir, source))?;
+        }
+
+        Ok(Some(PurgedCheckpoints {
+            slug: slug.to_owned(),
+            checkpoints,
+            source_refs: refs.len(),
+            dir,
+        }))
     }
 
     /// Run each bound resource's `[cleanup] command`, dependents before
@@ -1396,8 +1455,11 @@ impl BranchManager {
     /// state, and prune lane revs nothing references.
     ///
     /// `remove` targets one instance; this is the sweep. It never deletes a
-    /// checkpoint record, and never a lane rev a checkpoint still points at.
-    pub fn cleanup(&self, dry_run: bool) -> Result<CleanupOutcome> {
+    /// checkpoint record, and never a lane rev a checkpoint still points at —
+    /// unless `archived = Purge`, which discards the checkpoint logs of
+    /// instances whose binding record is already gone, and so releases the
+    /// revs those logs were the only claim on.
+    pub fn cleanup(&self, dry_run: bool, archived: ArchivedCheckpoints) -> Result<CleanupOutcome> {
         let mut outcome = CleanupOutcome {
             dry_run,
             ..CleanupOutcome::default()
@@ -1466,10 +1528,29 @@ impl BranchManager {
             outcome.dead_state.push(state_dir);
         }
 
+        let surviving: Vec<BranchInstance> = live.into_iter().cloned().collect();
+
+        // Checkpoint logs of instances that no longer have a binding record —
+        // including any this pass just finalized. Only when asked: these are
+        // undo history, not garbage.
+        if archived == ArchivedCheckpoints::Purge {
+            let live_slugs: BTreeSet<&str> = surviving
+                .iter()
+                .map(|branch| branch.slug.as_str())
+                .collect();
+            for slug in self.store.checkpointed_slugs()? {
+                if live_slugs.contains(slug.as_str()) {
+                    continue;
+                }
+                if let Some(purged) = self.purge_checkpoints(&slug, dry_run)? {
+                    outcome.purged_checkpoints.push(purged);
+                }
+            }
+        }
+
         // Lane pruning. Roots come from the records that survive this pass,
         // so a dry run reports exactly what a real run would remove.
-        let surviving: Vec<BranchInstance> = live.into_iter().cloned().collect();
-        let roots = SnapshotRoots::collect(&self.store, &surviving)?;
+        let roots = SnapshotRoots::collect(&self.store, &surviving, archived)?;
         for lane_rev in lane_revs(&self.store.paths().snapshots)? {
             if !lane_rev.is_staging && roots.contains(&lane_rev.tracker, &lane_rev.rev) {
                 continue;
@@ -1485,6 +1566,7 @@ impl BranchManager {
             });
         }
         outcome.pinned_by_checkpoints = roots.pinned_only_by_checkpoints().count();
+        outcome.pinned_by_archived = roots.pinned_only_by_archived_checkpoints().count();
 
         Ok(outcome)
     }

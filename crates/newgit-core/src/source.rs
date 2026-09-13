@@ -120,6 +120,21 @@ impl GitSource {
         self.git(&["update-ref", name, rev]).map(|_| ())
     }
 
+    /// Every ref under a namespace, e.g. `refs/newgit/checkpoints/<slug>`.
+    pub fn refs_under(&self, prefix: &str) -> Result<Vec<String>> {
+        let listing = self.git(&["for-each-ref", "--format=%(refname)", prefix])?;
+        Ok(listing
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(ToOwned::to_owned)
+            .collect())
+    }
+
+    pub fn delete_ref(&self, name: &str) -> Result<()> {
+        self.git(&["update-ref", "-d", name]).map(|_| ())
+    }
+
     /// Resolve a ref to a commit, when it exists.
     pub fn ref_rev(&self, name: &str) -> Option<String> {
         self.git(&[

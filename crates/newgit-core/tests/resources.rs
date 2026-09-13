@@ -2,6 +2,7 @@ use std::process::Command;
 
 use camino::{Utf8Path, Utf8PathBuf};
 use newgit_core::branch::ResourceStatus;
+use newgit_core::cleanup::ArchivedCheckpoints;
 use newgit_core::config::WorkspaceSection;
 use newgit_core::manager::{ActionOutcome, BranchManager};
 use newgit_core::store::MetadataStore;
@@ -323,7 +324,9 @@ fn remove_stops_running_processes() {
         panic!("expected Started");
     };
 
-    manager.remove("feature-a", &temp).expect("remove");
+    manager
+        .remove("feature-a", &temp, ArchivedCheckpoints::Keep)
+        .expect("remove");
 
     // The process group is gone.
     let alive = Command::new("kill")

@@ -2,7 +2,7 @@ use anyhow::{Context as _, Result, bail};
 use camino::{Utf8Path, Utf8PathBuf};
 use clap::{Args, Parser, Subcommand};
 use newgit_core::checkpoint::CheckpointReason;
-use newgit_core::cleanup::{HookDetail, HookOutcome};
+use newgit_core::cleanup::{ArchivedCheckpoints, HookDetail, HookOutcome};
 use newgit_core::export::{ExportFilter, Reason};
 use newgit_core::manager::{
     ActionOutcome, BindOrigin, BranchManager, InstanceReport, TrackerBindOutcome,
@@ -36,11 +36,18 @@ enum Command {
     Status {
         /// Instance to show (defaults to all)
         name: Option<String>,
+        /// Print only that instance's workspace path, for scripts
+        #[arg(long)]
+        path: bool,
     },
     /// Delete an instance's workspace and archive its binding record
     Remove {
         /// Instance to remove; its source branch is kept
         name: String,
+        /// Also discard its checkpoints, giving up undo to reclaim what they
+        /// pin; the revs come back on the next `newgit cleanup`
+        #[arg(long)]
+        purge: bool,
     },
     /// Manage tracker definitions and content
     Tracker {
@@ -89,7 +96,14 @@ enum Command {
         /// Report what would be removed without touching anything
         #[arg(long)]
         dry_run: bool,
+        /// Also discard the checkpoints of instances that are already
+        /// archived, releasing the snapshot revs they pin
+        #[arg(long)]
+        purge_archived: bool,
     },
+    /// Print the definition format reference: every key in a tracker or
+    /// resource definition, and the template variables each hook may use
+    Reference,
 }
 
 #[derive(Debug, Subcommand)]
@@ -205,8 +219,8 @@ fn main() -> Result<()> {
     match cli.command {
         Command::Init(args) => init(args),
         Command::Spawn(args) => spawn(args),
-        Command::Status { name } => status(name.as_deref()),
-        Command::Remove { name } => remove(&name),
+        Command::Status { name, path } => status(name.as_deref(), path),
+        Command::Remove { name, purge } => remove(&name, purge),
         Command::Tracker { command } => tracker(command),
         Command::Resource { command } => resource(command),
         Command::Run(args) => run(args),
@@ -215,8 +229,29 @@ fn main() -> Result<()> {
         Command::Undo { instance, to } => undo(instance, to.as_deref()),
         Command::Checkpoints { instance } => checkpoints(instance),
         Command::Export(args) => export(args),
-        Command::Cleanup { dry_run } => cleanup(dry_run),
+        Command::Cleanup {
+            dry_run,
+            purge_archived,
+        } => cleanup(dry_run, purge_archived),
+        Command::Reference => reference(),
     }
+}
+
+/// The definition format, shipped inside the binary. An installed crate has
+/// no repository next to it, so the reference has to travel with the thing
+/// that reads the definitions — otherwise the only ground truth on disk is
+/// the source.
+const DEFINITION_REFERENCE: &str = include_str!("../reference/definitions.md");
+
+/// Printed wherever newgit hands someone a definition to hand-edit. That is
+/// the moment the space of legal values matters, and the generated comments
+/// are examples, not a spec.
+const REFERENCE_POINTER: &str =
+    "Definition format (every key, and which template variables each hook sees): newgit reference";
+
+fn reference() -> Result<()> {
+    print!("{DEFINITION_REFERENCE}");
+    Ok(())
 }
 
 fn init(args: InitArgs) -> Result<()> {
@@ -261,6 +296,7 @@ fn init(args: InitArgs) -> Result<()> {
         "      newgit resource add <name> --template <template>   (newgit resource templates)"
     );
     println!("      newgit spawn <branch>");
+    println!("\n{REFERENCE_POINTER}");
     Ok(())
 }
 
@@ -345,6 +381,7 @@ fn resource(command: ResourceCommand) -> Result<()> {
                 println!("  tracker:   created {tracker} (this template deposits into it)");
             }
             println!("  edit the definition; `newgit spawn` binds it (ports, exports, prepare)");
+            println!("  {REFERENCE_POINTER}");
             warn_graph(&manager_here()?);
             Ok(())
         }
@@ -453,6 +490,7 @@ fn tracker(command: TrackerCommand) -> Result<()> {
             let outcome = manager.create_tracker(&name, &audience, storage, merge_with_source)?;
             println!("Created tracker `{name}` at {}", outcome.path);
             println!("  add paths with: newgit tracker track {name} <path>...");
+            println!("  {REFERENCE_POINTER}");
             warn_graph(&manager_here()?);
             Ok(())
         }
@@ -594,8 +632,11 @@ fn tracker(command: TrackerCommand) -> Result<()> {
     }
 }
 
-fn status(name: Option<&str>) -> Result<()> {
+fn status(name: Option<&str>, path_only: bool) -> Result<()> {
     let context = context_here()?;
+    if path_only {
+        return workspace_path(context, name);
+    }
     let manager = BranchManager::open(context.store)?;
     warn_gitignore(&manager);
     warn_graph(&manager);
@@ -659,6 +700,26 @@ fn status(name: Option<&str>) -> Result<()> {
             "\n~ = differs from lane head; `newgit tracker pull` takes the head (auto-saves current), `newgit tracker merge` makes this instance the head"
         );
     }
+    Ok(())
+}
+
+/// One instance's workspace path on stdout and nothing else, so a script can
+/// say `W=$(newgit status auth-refactor --path)` instead of parsing a table
+/// or reading the binding record. Warnings still go to stderr.
+fn workspace_path(context: Context, name: Option<&str>) -> Result<()> {
+    let name = name
+        .map(ToOwned::to_owned)
+        .or_else(|| context.current_branch.clone())
+        .context("--path needs an instance: name one, or run from inside a workspace")?;
+    let branch = context.store.find_branch(&name)?;
+    if !branch.workspace_path.is_dir() {
+        eprintln!(
+            "warning: `{}` has no workspace at {}; re-create it with `newgit spawn {}` after \
+             `newgit cleanup`",
+            branch.name, branch.workspace_path, branch.name
+        );
+    }
+    println!("{}", branch.workspace_path);
     Ok(())
 }
 
@@ -912,9 +973,14 @@ fn export(args: ExportArgs) -> Result<()> {
     Ok(())
 }
 
-fn cleanup(dry_run: bool) -> Result<()> {
+fn cleanup(dry_run: bool, purge_archived: bool) -> Result<()> {
     let manager = manager_here()?;
-    let outcome = manager.cleanup(dry_run)?;
+    let archived = if purge_archived {
+        ArchivedCheckpoints::Purge
+    } else {
+        ArchivedCheckpoints::Keep
+    };
+    let outcome = manager.cleanup(dry_run, archived)?;
     print_warnings(&outcome.warnings);
 
     let verb = if dry_run { "would remove" } else { "removed" };
@@ -943,6 +1009,15 @@ fn cleanup(dry_run: bool) -> Result<()> {
     for path in &outcome.dead_state {
         println!("Dead process state {verb}: {path}");
     }
+    let dropped = if dry_run { "Would drop" } else { "Dropped" };
+    for purged in &outcome.purged_checkpoints {
+        println!(
+            "{dropped} `{}`'s checkpoint history: {}, {} — that instance's undo is gone",
+            purged.slug,
+            plural(purged.checkpoints, "checkpoint"),
+            plural(purged.source_refs, "store ref"),
+        );
+    }
     for rev in &outcome.pruned {
         println!("Snapshot {verb}: {} @ {}", rev.tracker, rev.rev);
     }
@@ -952,6 +1027,15 @@ fn cleanup(dry_run: bool) -> Result<()> {
              would break its undo.",
             outcome.pinned_by_checkpoints
         );
+        // The conservatism is right for a live instance and pointless for an
+        // archived one, whose undo nothing can reach — so name the way out.
+        if outcome.pinned_by_archived > 0 {
+            println!(
+                "{} of them are held only by instances that are already archived; release those \
+                 with `newgit cleanup --purge-archived`.",
+                outcome.pinned_by_archived
+            );
+        }
     }
     Ok(())
 }
@@ -1001,9 +1085,14 @@ fn print_warnings(warnings: &[String]) {
     }
 }
 
-fn remove(name: &str) -> Result<()> {
+fn remove(name: &str, purge: bool) -> Result<()> {
     let manager = manager_here()?;
-    let outcome = manager.remove(name, &current_dir()?)?;
+    let checkpoints = if purge {
+        ArchivedCheckpoints::Purge
+    } else {
+        ArchivedCheckpoints::Keep
+    };
+    let outcome = manager.remove(name, &current_dir()?, checkpoints)?;
 
     println!("Removed branch instance `{}`", outcome.branch.name);
     for hook in &outcome.hooks {
@@ -1011,6 +1100,25 @@ fn remove(name: &str) -> Result<()> {
     }
     println!("  workspace: {} (deleted)", outcome.branch.workspace_path);
     println!("  record:    archived at {}", outcome.archived_record);
+    match &outcome.purged_checkpoints {
+        Some(purged) => {
+            println!(
+                "  purged:    {} and {}; the snapshot revs they held come back on the next \
+                 `newgit cleanup`",
+                plural(purged.checkpoints, "checkpoint"),
+                plural(purged.source_refs, "store ref"),
+            );
+        }
+        // Say what the retained history costs, and how to drop it later: an
+        // instance you will never undo still pins every rev it captured, and
+        // nothing reaches those checkpoints now that the record is archived.
+        None if outcome.kept_checkpoints > 0 => println!(
+            "  kept:      {}, still pinning their snapshot revs; drop them with \
+             `newgit cleanup --purge-archived`",
+            plural(outcome.kept_checkpoints, "checkpoint")
+        ),
+        None => {}
+    }
     println!(
         "  source branch `{}` kept in the store; delete with `git branch -D {}` if unwanted",
         outcome.branch.source_ref, outcome.branch.source_ref
@@ -1039,10 +1147,14 @@ fn parse_storage(value: &str) -> Result<Storage> {
 }
 
 fn files_label(count: usize) -> String {
+    plural(count, "file")
+}
+
+fn plural(count: usize, noun: &str) -> String {
     if count == 1 {
-        "1 file".to_owned()
+        format!("1 {noun}")
     } else {
-        format!("{count} files")
+        format!("{count} {noun}s")
     }
 }
 

@@ -2,6 +2,7 @@ use std::process::Command;
 
 use camino::{Utf8Path, Utf8PathBuf};
 use newgit_core::branch::InstanceStatus;
+use newgit_core::cleanup::ArchivedCheckpoints;
 use newgit_core::config::WorkspaceSection;
 use newgit_core::manager::BranchManager;
 use newgit_core::store::MetadataStore;
@@ -122,7 +123,9 @@ fn two_instances_then_remove_one() {
     manager.spawn("feature-b", None).expect("spawn b");
     assert_eq!(manager.statuses().expect("statuses").len(), 2);
 
-    let removed = manager.remove("feature-a", &temp).expect("remove");
+    let removed = manager
+        .remove("feature-a", &temp, ArchivedCheckpoints::Keep)
+        .expect("remove");
     assert!(!a.branch.workspace_path.exists());
     assert!(removed.archived_record.is_file());
 
@@ -141,7 +144,7 @@ fn remove_refuses_from_inside_the_workspace() {
     let outcome = manager.spawn("feature-a", None).expect("spawn");
     let inside = outcome.branch.workspace_path.clone();
     assert!(matches!(
-        manager.remove("feature-a", &inside),
+        manager.remove("feature-a", &inside, ArchivedCheckpoints::Keep),
         Err(NewgitError::Unsupported(_))
     ));
     assert!(inside.exists());
