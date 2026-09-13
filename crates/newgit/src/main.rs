@@ -1,6 +1,7 @@
 use anyhow::{Context as _, Result, bail};
 use camino::{Utf8Path, Utf8PathBuf};
 use clap::{Args, Parser, Subcommand};
+use newgit_core::branch::branch_slug;
 use newgit_core::checkpoint::CheckpointReason;
 use newgit_core::cleanup::{ArchivedCheckpoints, HookDetail, HookOutcome};
 use newgit_core::export::{ExportFilter, Reason};
@@ -103,7 +104,11 @@ enum Command {
     },
     /// Print the definition format reference: every key in a tracker or
     /// resource definition, and the template variables each hook may use
-    Reference,
+    Reference {
+        /// Section to print, e.g. `tracker`, `resource`, `render`, `ports`.
+        /// Omit for a table of contents; `all` for the whole document.
+        section: Option<String>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -233,7 +238,7 @@ fn main() -> Result<()> {
             dry_run,
             purge_archived,
         } => cleanup(dry_run, purge_archived),
-        Command::Reference => reference(),
+        Command::Reference { section } => reference(section.as_deref()),
     }
 }
 
@@ -249,8 +254,170 @@ const DEFINITION_REFERENCE: &str = include_str!("../reference/definitions.md");
 const REFERENCE_POINTER: &str =
     "Definition format (every key, and which template variables each hook sees): newgit reference";
 
-fn reference() -> Result<()> {
-    print!("{DEFINITION_REFERENCE}");
+/// One addressable chunk of the reference: a `##` section or one of its
+/// `###` subsections, with the line range it covers.
+struct ReferenceSection {
+    level: usize,
+    /// Heading text with Markdown backticks stripped, for display.
+    title: String,
+    /// What you type to ask for it.
+    slug: String,
+    start: usize,
+    end: usize,
+}
+
+/// Split the reference on its own headings.
+///
+/// Derived rather than listed: a section added to `definitions.md` becomes
+/// addressable without touching this file, so the two cannot drift. That is
+/// the whole reason the reference is one Markdown document and not a set of
+/// string constants.
+fn reference_sections() -> Vec<ReferenceSection> {
+    let lines: Vec<&str> = DEFINITION_REFERENCE.lines().collect();
+    let mut headings: Vec<(usize, usize, String)> = Vec::new();
+    for (index, line) in lines.iter().enumerate() {
+        let level = match line {
+            _ if line.starts_with("### ") => 3,
+            _ if line.starts_with("## ") => 2,
+            _ => continue,
+        };
+        headings.push((index, level, line[level + 1..].trim().replace('`', "")));
+    }
+
+    headings
+        .iter()
+        .enumerate()
+        .map(|(position, (start, level, title))| {
+            // A section runs until the next heading at the same depth or
+            // shallower, so asking for `resource` gets its subsections too.
+            let end = headings[position + 1..]
+                .iter()
+                .find(|(_, other, _)| other <= level)
+                .map_or(lines.len(), |(line, _, _)| *line);
+            ReferenceSection {
+                level: *level,
+                title: title.clone(),
+                slug: reference_slug(title),
+                start: *start,
+                end,
+            }
+        })
+        .collect()
+}
+
+/// The name a heading answers to. `[ports.<name>]` is `ports`;
+/// `Installs: use a content-addressed store` is `installs`.
+fn reference_slug(title: &str) -> String {
+    let head = title
+        .split(" — ")
+        .next()
+        .unwrap_or(title)
+        .split(':')
+        .next()
+        .unwrap_or(title);
+    let bare = head.trim().trim_matches(['[', ']']);
+    let bare = bare.split(['.', '<']).next().unwrap_or(bare);
+    branch_slug(bare)
+}
+
+fn reference(section: Option<&str>) -> Result<()> {
+    let sections = reference_sections();
+    let Some(wanted) = section else {
+        return print_reference_contents(&sections);
+    };
+    if wanted == "all" {
+        print!("{DEFINITION_REFERENCE}");
+        return Ok(());
+    }
+
+    let asked = branch_slug(wanted);
+    // Exact, then singular/plural, then an unambiguous prefix — `newgit
+    // reference trackers` and `newgit reference track` should both work
+    // rather than teach someone the exact spelling.
+    let singular = asked.strip_suffix('s').unwrap_or(&asked);
+    let exact = sections
+        .iter()
+        .find(|entry| entry.slug == asked || entry.slug == singular);
+
+    let prefixed: Vec<&ReferenceSection> = sections
+        .iter()
+        .filter(|entry| !singular.is_empty() && entry.slug.starts_with(singular))
+        .collect();
+
+    let matched = match exact {
+        Some(entry) => entry,
+        None => {
+            match prefixed.as_slice() {
+                [only] => only,
+                // Ambiguity gets its own message: listing every section here
+                // would bury the two that actually matched.
+                [_, ..] => bail!(
+                    "`{wanted}` matches {} reference sections: {}. Be more specific.",
+                    prefixed.len(),
+                    prefixed
+                        .iter()
+                        .map(|entry| entry.slug.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+                [] => {
+                    let names: Vec<&str> =
+                        sections.iter().map(|entry| entry.slug.as_str()).collect();
+                    bail!(
+                        "no reference section `{wanted}`. Available: {}, all.\nRun `newgit \
+                         reference` for the contents.",
+                        names.join(", ")
+                    );
+                }
+            }
+        }
+    };
+
+    let body: Vec<&str> = DEFINITION_REFERENCE.lines().collect();
+    // Trim the `---` rules that separate top-level sections: they are
+    // document furniture, and a single section printed alone does not need
+    // to end in one.
+    let mut slice = &body[matched.start..matched.end];
+    while slice
+        .last()
+        .is_some_and(|line| line.trim().is_empty() || line.trim() == "---")
+    {
+        slice = &slice[..slice.len() - 1];
+    }
+    for line in slice {
+        println!("{line}");
+    }
+    Ok(())
+}
+
+fn print_reference_contents(sections: &[ReferenceSection]) -> Result<()> {
+    // The preamble states what the document is; repeating it here would be
+    // the only thing a reader sees twice.
+    let intro: Vec<&str> = DEFINITION_REFERENCE
+        .lines()
+        .take_while(|line| !line.starts_with("## "))
+        .collect();
+    for line in intro.iter().take_while(|line| !line.starts_with("```")) {
+        println!("{line}");
+    }
+
+    println!("Sections — `newgit reference <name>`, or `all` for the whole document:\n");
+    let width = sections
+        .iter()
+        .map(|entry| entry.slug.len() + if entry.level == 3 { 2 } else { 0 })
+        .max()
+        .unwrap_or(0);
+    for entry in sections {
+        let indent = if entry.level == 3 { "  " } else { "" };
+        let pad = width - entry.slug.len() - indent.len();
+        println!(
+            "  {indent}{}{:pad$}  {}",
+            entry.slug,
+            "",
+            entry.title,
+            pad = pad
+        );
+    }
     Ok(())
 }
 
@@ -1284,4 +1451,99 @@ fn current_dir() -> Result<Utf8PathBuf> {
                 .unwrap_or_else(|| path.display().to_string())
         )
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DEFINITION_REFERENCE, reference_sections, reference_slug};
+
+    #[test]
+    fn slugs_drop_the_toml_punctuation_a_heading_carries() {
+        assert_eq!(reference_slug("[identity]"), "identity");
+        assert_eq!(reference_slug("[[render]]"), "render");
+        assert_eq!(reference_slug("[ports.<name>]"), "ports");
+        assert_eq!(reference_slug("[actions.<name>]"), "actions");
+        assert_eq!(
+            reference_slug("Tracker — .newgit/trackers/<name>.toml"),
+            "tracker"
+        );
+        assert_eq!(
+            reference_slug("Installs: use a content-addressed store"),
+            "installs"
+        );
+        assert_eq!(reference_slug("Template variables"), "template-variables");
+    }
+
+    /// The lookup resolves by slug, so a collision would silently shadow one
+    /// section with another — and the sections are derived from headings
+    /// someone will add to without thinking about this file.
+    #[test]
+    fn every_section_has_a_unique_non_empty_slug() {
+        let sections = reference_sections();
+        assert!(!sections.is_empty());
+        for section in &sections {
+            assert!(
+                !section.slug.is_empty(),
+                "empty slug for `{}`",
+                section.title
+            );
+            assert_ne!(
+                section.slug, "all",
+                "`all` is reserved for the whole document"
+            );
+        }
+        let mut slugs: Vec<&str> = sections.iter().map(|s| s.slug.as_str()).collect();
+        slugs.sort_unstable();
+        let count = slugs.len();
+        slugs.dedup();
+        assert_eq!(count, slugs.len(), "duplicate reference slugs: {slugs:?}");
+    }
+
+    /// Asking for a `##` section brings its `###` subsections with it —
+    /// `newgit reference resource` that stopped at `### [identity]` would be
+    /// worse than useless.
+    #[test]
+    fn a_top_level_section_spans_its_subsections() {
+        let sections = reference_sections();
+        let resource = sections
+            .iter()
+            .find(|section| section.slug == "resource")
+            .expect("resource section");
+        let render = sections
+            .iter()
+            .find(|section| section.slug == "render")
+            .expect("render section");
+
+        assert_eq!(resource.level, 2);
+        assert_eq!(render.level, 3);
+        assert!(
+            render.start > resource.start && render.end <= resource.end,
+            "`[[render]]` is not inside the resource section"
+        );
+    }
+
+    /// The sections tile the document: everything after the preamble belongs
+    /// to exactly one of them, so no key is unreachable by section.
+    #[test]
+    fn sections_cover_the_document_without_gaps() {
+        let sections = reference_sections();
+        let total = DEFINITION_REFERENCE.lines().count();
+        let top: Vec<_> = sections
+            .iter()
+            .filter(|section| section.level == 2)
+            .collect();
+
+        for pair in top.windows(2) {
+            assert_eq!(
+                pair[0].end, pair[1].start,
+                "gap between `{}` and `{}`",
+                pair[0].slug, pair[1].slug
+            );
+        }
+        assert_eq!(
+            top.last().expect("at least one section").end,
+            total,
+            "the last section does not reach the end of the document"
+        );
+    }
 }

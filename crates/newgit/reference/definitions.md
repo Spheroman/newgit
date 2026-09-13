@@ -3,6 +3,10 @@
 Every key in a newgit definition file, what it accepts, and what it defaults
 to. Printed by `newgit reference`, so it is on disk wherever the binary is.
 
+`newgit reference` lists the sections; `newgit reference <name>` prints one
+(`resource` brings its subsections with it); `newgit reference all` prints the
+whole document.
+
 The design narrative — why trackers and resources are the only two
 primitives, what each one is for — lives in `newgit-v1-mvp.md` at
 <https://github.com/Spheroman/newgit>. This page is the lookup table.
@@ -58,6 +62,10 @@ file content. Start from `newgit resource add <name> --template <template>`
 | key | type | required | default | meaning |
 | --- | --- | --- | --- | --- |
 | `paths` | array of strings | yes if the section is present | — | the files whose content *is* this resource's identity (a lockfile, a manifest). Path-dependent state is recomputed from its identity, not copied. |
+
+Installs are the usual reason for this section, and they are the one place
+newgit multiplies a cost rather than absorbing it — see *Installs: use a
+content-addressed store*.
 
 ### `[ports.<name>]`
 
@@ -155,6 +163,68 @@ APP_URL = "http://127.0.0.1:{{ports.app}}"
 Resources export runtime values — ports, URLs, handles. Trackers do not
 export anything; they own file content.
 
+### `[[render]]`
+
+Substitutes this instance's values into a file the project commits — for the
+common case where a tool reads its port from a config file rather than argv.
+Repeatable: one `[[render]]` per file.
+
+| key | type | required | default | meaning |
+| --- | --- | --- | --- | --- |
+| `path` | string | yes | — | workspace-relative path to the file. Must be tracked by Git or owned by a tracker: a render substitutes into committed content, so there has to be some. Two resources rendering one path is refused at load. |
+| `replace` | array of tables | yes | — | the substitutions, below. |
+
+| key | type | required | default | meaning |
+| --- | --- | --- | --- | --- |
+| `find` | string | yes | — | **a literal string, never a regex.** May span lines. |
+| `with` | string | yes | — | what to put there; rendered with the variables below. |
+| `count` | integer | no | `1` | how many times `find` is expected to occur. |
+
+```toml
+[[render]]
+path = "supabase/config.toml"
+replace = [
+  { find = 'project_id = "faretable"', with = 'project_id = "faretable-{{branch.slug}}"' },
+  { find = "port = 54321",             with = "port = {{ports.api}}" },
+]
+```
+
+**There is no template file.** `port = 54321` is not a placeholder — it is
+your project's working default, so a clone without newgit still starts on it.
+newgit substitutes into the committed content and writes the result into one
+workspace.
+
+Four rules carry the rest:
+
+- **A `find` must occur exactly `count` times, or the render refuses**, naming
+  the file and the string. That is also the drift detector: when the default
+  changes upstream, you hear about it at `spawn` instead of getting a file
+  that quietly went unrendered. Where a value is genuinely repeated, declare
+  `count = 2` rather than reaching for an "all" flag — a declared number keeps
+  failing when the file changes from two occurrences to three. Where two
+  sections share a default, make `find` multi-line.
+- **Replacements are simultaneous.** Every `find` is located in the committed
+  content and the whole batch applies at once, so a replacement's output is
+  never a match target and reordering `replace` cannot change the result. Two
+  rules claiming overlapping text are refused.
+- **Committed content is the input, never the working file** — `HEAD`, or the
+  bound lane rev for a tracker-owned path. So a render is idempotent: `undo`,
+  `tracker pull`, and `tracker checkout` re-render off the binding record, and
+  values never compound.
+- **Your values stay in this workspace.** A rendered source path is marked
+  `--skip-worktree`, so it never shows in `git status` and `git add -A` cannot
+  commit it; `newgit export` and a checkpoint's uncommitted-state capture take
+  it from `HEAD`; and for a tracker-owned path `newgit tracker capture`
+  reverses the substitution, so a key you add to `.env.local` reaches the lane
+  and your port does not.
+
+The cost, on a source path: **hand edits to a rendered file do not survive the
+workspace.** newgit does not restate that every spawn — it recomputes what the
+render should produce and compares, at `checkpoint` and before each re-render,
+naming the file and how many lines are about to go. Silence means there is
+nothing to lose. To change a rendered file for real, change it in the store
+repo.
+
 ---
 
 ## Ownership
@@ -172,11 +242,64 @@ a security label.
 
 ---
 
+## Installs: use a content-addressed store
+
+> **Strongly recommended: choose a package manager that installs from a shared
+> content-addressed store.** It is the single choice that most affects what
+> running many instances costs you, and it is not one newgit can make for you.
+
+Every branch instance installs its own dependencies. That is not a default to
+turn off and it is not newgit being wasteful: two branches with different
+lockfiles must not share a dependency tree, or one branch's install silently
+rewrites the other's. It is why installs are resources with `[identity]` and a
+`recompute` restore rather than trackers — the lockfile is the truth, and the
+tree is rebuilt from it.
+
+What that independence costs is set by your package manager, not by newgit:
+
+| tool | per-instance cost | why |
+| --- | --- | --- |
+| pnpm | directory entries | hardlinks packages from one global store |
+| Yarn PnP | ~nothing | no install tree at all |
+| uv, bun | directory entries | hardlink from a shared cache |
+| Cargo | a `target/` each | the registry is shared; build output is not |
+| npm, Yarn classic | a **full copy** each | the cache holds tarballs, so `npm ci` re-expands every time |
+| pip into a venv | a **full copy** each | same shape |
+
+Ten instances of a monorepo is roughly one `node_modules` worth of disk under
+pnpm and ten under npm. The difference is not a tuning detail; it is whether
+keeping eight branches alive at once feels free or feels like something you
+ration.
+
+There is no lever on newgit's side, because the thing that would save the
+space — one installed tree shared between instances — is exactly the bug this
+design exists to prevent. So if you are adopting newgit and have a choice,
+make it here first.
+
+Two keys matter when you wire the store up:
+
+- Give the shared store its own resource with **`ownership = "user"`**, and
+  have the install `depends_on` it. `user` is the one ownership newgit never
+  deletes, at `remove` or at `cleanup` — correct, because that store is shared
+  with every other project on the machine. The `pnpm` template ships this pair
+  already.
+- Point the install's **`[identity] paths`** at the lockfile *and* the
+  manifest, so a `recompute` restore reinstalls exactly what the checkpoint
+  described.
+
+If you cannot switch package managers, nothing breaks — it costs disk. Run
+fewer concurrent instances, and let `newgit cleanup` reclaim the trees of
+instances whose workspaces are gone.
+
+---
+
 ## Template variables
 
 Every command and export value is rendered before it runs. An unknown or
 out-of-scope variable is left in the text verbatim — visible rather than
-silently empty — except in `[cleanup]`, which refuses to run instead.
+silently empty — except in `[cleanup]` and `[[render]]`, which refuse instead.
+Both write something durable: a destructive command, and a file that would
+otherwise gain committed-looking text nobody wrote.
 
 | variable | is |
 | --- | --- |
@@ -194,6 +317,7 @@ Scope — which of them have a value where:
 | rendered in | branch/workspace/scripts | `ports.*` | `exports.*` | `snapshot.path` | `state_ref` |
 | --- | --- | --- | --- | --- | --- |
 | `[exports]` values | yes | yes | — | — | — |
+| `[[render]]` `with` | yes | yes | yes | — | — |
 | action `command` | yes | yes | — | — | — |
 | `[checkpoint] command` | yes | yes | yes | yes | — |
 | `[checkpoint] state_ref` | yes | yes | yes | — | — |
@@ -201,7 +325,11 @@ Scope — which of them have a value where:
 | `[cleanup] command` | yes | yes | yes | — | yes |
 
 Action commands do not get `{{exports.*}}`: exports reach them as environment
-variables, which is what a command already knows how to read.
+variables, which is what a command already knows how to read. A `[[render]]`
+does get them, because a file is not a process — nothing hands it an
+environment. It sees what a command in this instance would see: its own ports,
+plus every export bound so far in dependency order, which is what lets one
+resource's config file carry another's URL.
 
 ---
 
