@@ -55,7 +55,6 @@ creates alongside it, without instantiating anything).
 
 | key | type | required | default | meaning |
 | --- | --- | --- | --- | --- |
-| `kind` | string | yes | — | a label for you, **not** a behavior switch. newgit never branches on it; what a resource does comes from the sections below. The templates use `process`, `command`, `command-snapshot`, `external`, `external-store`. |
 | `ownership` | string | yes | — | `branch`, `workspace`, `project`, `user`, or `external`. See *Ownership*. |
 | `depends_on` | array of strings | no | `[]` | resource or tracker names that must be ready first. Orders `prepare` at spawn and cleanup hooks in reverse. A name that is neither is an error the graph reports. |
 

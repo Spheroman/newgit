@@ -14,7 +14,6 @@ use crate::render::RenderSpec;
 #[derive(Debug, Clone, PartialEq)]
 pub struct ResourceDefinition {
     pub name: String,
-    pub kind: String,
     pub ownership: Ownership,
     pub depends_on: Vec<String>,
     pub identity: Option<IdentitySpec>,
@@ -162,7 +161,6 @@ impl RestoreSpec {
 
 #[derive(Debug, Deserialize)]
 struct ResourceDefinitionFile {
-    kind: String,
     ownership: Ownership,
     #[serde(default)]
     depends_on: Vec<String>,
@@ -202,7 +200,6 @@ impl ResourceDefinition {
 
         let definition = Self {
             name: name.to_owned(),
-            kind: file.kind,
             ownership: file.ownership,
             depends_on: file.depends_on,
             identity: file.identity,
@@ -547,7 +544,6 @@ mod tests {
     fn resource(name: &str, deps: &[&str]) -> ResourceDefinition {
         ResourceDefinition {
             name: name.to_owned(),
-            kind: "command".to_owned(),
             ownership: Ownership::Branch,
             depends_on: deps.iter().map(ToString::to_string).collect(),
             identity: None,

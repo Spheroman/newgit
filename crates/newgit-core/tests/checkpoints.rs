@@ -194,8 +194,7 @@ fn undo_to_targets_an_older_checkpoint() {
     assert_eq!(m.list_checkpoints("feature-b").expect("list").len(), 3);
 }
 
-const HASH_RECOMPUTE_RESOURCE: &str = r#"kind = "command"
-ownership = "workspace"
+const HASH_RECOMPUTE_RESOURCE: &str = r#"ownership = "workspace"
 
 [actions.prepare]
 command = "echo run >> prep-runs.txt"
@@ -240,8 +239,7 @@ fn recompute_restore_reruns_prepare_and_hash_is_recorded() {
     assert_eq!(read(&ws.join("prep-runs.txt")).lines().count(), 2);
 }
 
-const DB_TRACKER_DEPOSIT_RESOURCE: &str = r#"kind = "command-snapshot"
-ownership = "branch"
+const DB_TRACKER_DEPOSIT_RESOURCE: &str = r#"ownership = "branch"
 
 [checkpoint]
 mode = "command"
@@ -295,8 +293,7 @@ fn into_tracker_deposits_into_lane_and_restore_reads_it_back() {
     assert_eq!(read(&ws.join("restored.sql")), "dump-data\n");
 }
 
-const BAD_RESTORE_RESOURCE: &str = r#"kind = "command"
-ownership = "branch"
+const BAD_RESTORE_RESOURCE: &str = r#"ownership = "branch"
 
 [checkpoint]
 mode = "none"
@@ -354,8 +351,7 @@ fn failed_restore_writes_recovery_record_and_restores_the_rest() {
     assert_eq!(*bad_state, ResourceStatus::Failed);
 }
 
-const RUNNING_APP_RESOURCE: &str = r#"kind = "process"
-ownership = "branch"
+const RUNNING_APP_RESOURCE: &str = r#"ownership = "branch"
 
 [ports]
 app = { start = 4210, env = "PORT" }

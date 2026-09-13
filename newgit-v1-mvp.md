@@ -363,7 +363,6 @@ Not every resource implements every hook.
 ```text
 ResourceDefinition {
   name
-  kind
   ownership
   depends_on
   identity
@@ -1513,7 +1512,6 @@ shared installed tree is the thing that would be wrong.
 
 ```toml
 # .newgit/resources/pnpm-store.toml
-kind = "external-store"
 ownership = "user"
 
 [checkpoint]
@@ -1526,7 +1524,6 @@ mode = "none"
 
 ```toml
 # .newgit/resources/deps.toml
-kind = "command"
 ownership = "workspace"
 depends_on = ["pnpm-store"]
 
@@ -1549,7 +1546,6 @@ For Nix projects, this template should call Nix rather than imitate it:
 
 ```toml
 # .newgit/resources/dev-shell.toml
-kind = "command"
 ownership = "workspace"
 
 [identity]
@@ -1570,7 +1566,6 @@ A branch-local long-running process: alive, so a resource.
 
 ```toml
 # .newgit/resources/app.toml
-kind = "process"
 ownership = "branch"
 depends_on = ["deps", "runtime-env"]
 
@@ -1611,7 +1606,6 @@ paths = []
 
 ```toml
 # .newgit/resources/postgres-db.toml
-kind = "command-snapshot"
 ownership = "branch"
 
 [actions.prepare]
@@ -1641,7 +1635,6 @@ A resource newgit does not own.
 
 ```toml
 # .newgit/resources/preview.toml
-kind = "external"
 ownership = "external"
 
 [actions.prepare]
