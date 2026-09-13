@@ -823,6 +823,45 @@ command = "true"
     assert_eq!(manager.resource_definitions().len(), 2);
 }
 
+/// Adding the same template twice — a web and an api — is the canonical
+/// setup, and the one-owner rule turns a template that ships conventional
+/// names into a graph that refuses on the second `resource add`. The names
+/// are derived from the resource instead, so the obvious first thing a user
+/// does keeps working.
+#[test]
+fn adding_one_template_twice_leaves_a_graph_that_still_spawns() {
+    let (_guard, temp) = tempdir();
+    let store = setup(&temp);
+    let repo = store.paths().project_root.clone();
+
+    for name in ["api", "web"] {
+        BranchManager::open(MetadataStore::at(repo.clone()))
+            .expect("manager")
+            .add_resource(name, "process")
+            .expect("add");
+    }
+
+    let manager = BranchManager::open(MetadataStore::at(repo)).expect("manager");
+    assert!(
+        manager.graph_problems().is_empty(),
+        "no collision: {:?}",
+        manager.graph_problems()
+    );
+
+    let spawned = manager.spawn("feature-a", None).expect("spawn");
+    let env: std::collections::BTreeMap<_, _> = manager
+        .assemble_env(&spawned.branch)
+        .expect("env")
+        .into_iter()
+        .collect();
+
+    // Both services reach the same environment with their own names, which is
+    // the thing a single `PORT` could never express.
+    assert_ne!(env["WEB_PORT"], env["API_PORT"]);
+    assert!(env["WEB_URL"].ends_with(&env["WEB_PORT"]));
+    assert!(env["API_URL"].ends_with(&env["API_PORT"]));
+}
+
 /// Two resources exporting one name used to resolve to whichever bound last,
 /// so the loser was absent from `newgit run` with nothing anywhere saying
 /// why. It is now a graph problem, reported and gated like any other.

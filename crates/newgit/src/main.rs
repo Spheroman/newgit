@@ -772,6 +772,14 @@ fn resource(command: ResourceCommand) -> Result<()> {
                 }
                 println!("#");
             }
+            // Shown as stored, so `RESOURCE_` is still a token here. Saying
+            // so beats printing a name that no `resource add` would produce.
+            if template.contents.contains("RESOURCE_") {
+                println!(
+                    "# `RESOURCE_` becomes this resource's name on `resource add`:\n\
+                     #   newgit resource add web --template {name}   ->  WEB_PORT, WEB_URL\n#"
+                );
+            }
             print!("{}", template.contents);
             Ok(())
         }

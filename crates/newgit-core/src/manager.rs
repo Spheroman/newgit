@@ -31,7 +31,7 @@ use crate::resource::{
 use crate::source::GitSource;
 use crate::store::MetadataStore;
 use crate::supervisor::{StopOutcome, Supervisor, run_captured, run_foreground};
-use crate::templates::resource_template;
+use crate::templates::{instantiate, resource_template};
 use crate::tracker::{Storage, TrackerDefinition, collect_files, collect_owned_files, content_rev};
 
 /// Orchestrates branch-instance lifecycle against one store.
@@ -1322,7 +1322,9 @@ impl BranchManager {
         validate_name(name)?;
         let template = resource_template(template_name)
             .ok_or_else(|| NewgitError::UnknownTemplate(template_name.to_owned()))?;
-        let path = self.store.write_resource_file(name, template.contents)?;
+        let path = self
+            .store
+            .write_resource_file(name, &instantiate(template.contents, name))?;
 
         // Companions the template depends on, created only when absent so an
         // existing definition is never overwritten.
@@ -1334,10 +1336,10 @@ impl BranchManager {
                 .resources
                 .join(format!("{}.toml", companion.name));
             if !companion_path.exists() {
-                companions_created.push(
-                    self.store
-                        .write_resource_file(companion.name, companion.contents)?,
-                );
+                companions_created.push(self.store.write_resource_file(
+                    companion.name,
+                    &instantiate(companion.contents, companion.name),
+                )?);
             }
         }
 

@@ -43,7 +43,11 @@ depends_on = []
 # workdir = "packages/app"
 
 [ports]
-app = { start = 3100, env = "PORT" }
+# `env` is the variable your dev server reads its port from. Every resource's
+# environment lands in one process environment, so the name has to be unique
+# across the project — it is named after this resource for that reason. If
+# this is your only service and your tool insists on plain `PORT`, rename it.
+app = { start = 3100, env = "RESOURCE_PORT" }
 
 [actions.start]
 # Edit to your dev command, e.g. "pnpm dev" or "bin/rails server".
@@ -54,7 +58,7 @@ long_running = true
 signal = "term"
 
 [exports]
-APP_URL = "http://127.0.0.1:{{ports.app}}"
+RESOURCE_URL = "http://127.0.0.1:{{ports.app}}"
 
 # Most tools read their port from a committed config file rather than argv.
 # Uncomment and point this at yours. There is no template file: `find` names
@@ -154,7 +158,7 @@ command = "dropdb {{branch.slug}} --if-exists && createdb {{branch.slug}} && psq
 command = "dropdb {{branch.slug}} --if-exists"
 
 [exports]
-DATABASE_URL = "postgres://localhost/{{branch.slug}}"
+RESOURCE_URL = "postgres://localhost/{{branch.slug}}"
 "#,
     },
     ResourceTemplate {
@@ -180,11 +184,11 @@ DATABASE_URL = "postgres://localhost/{{branch.slug}}"
 [actions.prepare]
 # Edit to your provisioning command.
 command = "cloudctl preview create --branch {{branch.name}} --json"
-captures = ["PREVIEW_ID", "PREVIEW_URL"]
+captures = ["RESOURCE_ID", "RESOURCE_URL"]
 
 [checkpoint]
 mode = "external"
-state_ref = "{{exports.PREVIEW_ID}}"
+state_ref = "{{exports.RESOURCE_ID}}"
 
 [restore]
 # The handle is recorded, not re-created: an undo does not rewind another
@@ -196,6 +200,30 @@ command = "cloudctl preview delete {{state_ref}}"
 "#,
     },
 ];
+
+/// The token every template uses where an environment variable name has to be
+/// unique across the project. Replaced with the resource's own name when the
+/// template is instantiated.
+///
+/// Templates cannot ship conventional names like `PORT` or `DATABASE_URL`:
+/// every resource's environment lands in one process environment, so the
+/// second `newgit resource add --template process` would claim a name the
+/// first already owns and refuse the whole graph. The one thing newgit knows
+/// is unique is the resource name, which is the file it is writing.
+const NAME_TOKEN: &str = "RESOURCE_";
+
+/// Instantiate a template for a resource of this name: `RESOURCE_PORT`
+/// becomes `WEB_PORT` for a resource called `web`.
+pub fn instantiate(contents: &str, resource_name: &str) -> String {
+    contents.replace(NAME_TOKEN, &format!("{}_", env_prefix(resource_name)))
+}
+
+/// A resource name as an environment variable name fragment: `dev-db` ->
+/// `DEV_DB`. Resource names are already validated to a conservative
+/// character set, so uppercasing and swapping `-` is enough.
+fn env_prefix(resource_name: &str) -> String {
+    resource_name.to_uppercase().replace('-', "_")
+}
 
 pub fn resource_template(name: &str) -> Option<&'static ResourceTemplate> {
     RESOURCE_TEMPLATES
@@ -216,6 +244,49 @@ pub fn resource_template_names() -> Vec<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Two of the same template is the canonical setup (a web and an api),
+    /// and it must not produce two resources fighting over one name.
+    #[test]
+    fn instantiating_one_template_twice_yields_disjoint_env_names() {
+        let process = resource_template("process").expect("process template");
+        let web = instantiate(process.contents, "web");
+        let api = instantiate(process.contents, "api");
+
+        assert!(web.contains(r#"env = "WEB_PORT""#) && web.contains("WEB_URL ="));
+        assert!(api.contains(r#"env = "API_PORT""#) && api.contains("API_URL ="));
+        assert!(
+            !web.contains(NAME_TOKEN) && !api.contains(NAME_TOKEN),
+            "no token survives instantiation"
+        );
+    }
+
+    /// A hyphen is legal in a resource name and illegal in most shells'
+    /// variable names.
+    #[test]
+    fn a_hyphenated_resource_name_becomes_a_usable_variable_name() {
+        assert_eq!(
+            instantiate("env = \"RESOURCE_PORT\"", "dev-db"),
+            "env = \"DEV_DB_PORT\""
+        );
+    }
+
+    /// Every shipped template has to survive its own instantiation, or
+    /// `resource add` writes a file that will not parse.
+    #[test]
+    fn every_template_still_parses_after_instantiation() {
+        for template in RESOURCE_TEMPLATES {
+            let contents = instantiate(template.contents, "sample");
+            toml::from_str::<toml::Table>(&contents)
+                .unwrap_or_else(|e| panic!("template `{}` does not parse: {e}", template.name));
+            for companion in template.companions {
+                let contents = instantiate(companion.contents, companion.name);
+                toml::from_str::<toml::Table>(&contents).unwrap_or_else(|e| {
+                    panic!("companion `{}` does not parse: {e}", companion.name)
+                });
+            }
+        }
+    }
 
     #[test]
     fn resource_template_finds_every_listed_name() {

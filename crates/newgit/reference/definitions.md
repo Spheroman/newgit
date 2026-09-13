@@ -587,6 +587,12 @@ every command it runs, so a resource declaring one is reported too — a
 declaration that could never reach the process is a mistake worth naming,
 not a silent no-op.
 
+This is why the starter templates do not ship conventional names like `PORT`
+or `DATABASE_URL`. Two services in one project cannot both publish `PORT`,
+so `newgit resource add web --template process` writes `WEB_PORT` and
+`WEB_URL`, naming them after the resource. Rename them if you have one
+service and your tool insists on `PORT` — the generated file says so.
+
 ---
 
 ## Project — `.newgit/config.toml`

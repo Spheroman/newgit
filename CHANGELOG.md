@@ -364,10 +364,19 @@ of `.newgit/` in a minor release — see *Upgrading* below.
   It is gated like any other graph problem — warned by the commands that
   *build* the graph, refused by `spawn`, `run`, `action`, `checkpoint`, and
   `undo` — so a project cannot be bricked by one, and `newgit resource list`
-  still tells you where it is. The practical bite is adding the same template
-  twice: two `service` resources both export `APP_URL` and both claim `PORT`.
-  That was always broken; now it says so at `resource add` instead of at the
-  first missing variable.
+  still tells you where it is.
+
+  The starter templates had to change with it. Adding the same template twice
+  — a web and an api — is the canonical setup, and shipping conventional
+  names meant the second `newgit resource add --template process` claimed the
+  `PORT` and `APP_URL` the first already owned and refused the whole graph.
+  That is newgit's own template breaking the project, not a user mistake, so
+  templates now name their variables after the resource: `resource add web
+  --template process` writes `WEB_PORT` and `WEB_URL`. The generated file
+  says to rename them if you have one service and your tool insists on
+  `PORT`. Two services in one project never could both publish it — every
+  resource's environment lands in one process environment — so the
+  conventional name was a promise templates could not keep.
 
   One overlap is still allowed, because it has one owner: a `captures` entry
   naming its own resource's `[exports]` key. The export states the value the

@@ -48,13 +48,6 @@ pub fn render(template: &str, context: &RenderContext) -> String {
     rendered
 }
 
-/// The first `{{...}}` a render left behind, if any.
-///
-/// Rendering deliberately leaves unknown variables verbatim so a
-/// misconfigured template is visible rather than silently emptied. That is
-/// the right default for a command the user watches run, but destructive
-/// hooks (cleanup) must refuse instead: `cloudctl preview delete
-/// {{state_ref}}` with no state ref is not a no-op, it is a wrong argument.
 /// Every `{{exports.<name>}}` a template refers to, in order of appearance.
 ///
 /// Rendering replaces these; the graph reads them instead, to learn which
@@ -83,6 +76,13 @@ pub fn export_placeholders(template: &str) -> Vec<&str> {
     names
 }
 
+/// The first `{{...}}` a render left behind, if any.
+///
+/// Rendering deliberately leaves unknown variables verbatim so a
+/// misconfigured template is visible rather than silently emptied. That is
+/// the right default for a command the user watches run, but destructive
+/// hooks (cleanup) must refuse instead: `cloudctl preview delete
+/// {{state_ref}}` with no state ref is not a no-op, it is a wrong argument.
 pub fn unresolved_placeholder(rendered: &str) -> Option<&str> {
     let start = rendered.find("{{")?;
     let rest = &rendered[start..];
