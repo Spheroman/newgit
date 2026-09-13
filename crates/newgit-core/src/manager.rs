@@ -80,6 +80,10 @@ pub struct ResourceBindOutcome {
     /// the way a failed dependency does: a `prepare` run against unrendered
     /// config would start a service on the wrong port.
     pub render_error: Option<String>,
+    /// Why an export refused to resolve, when one did. Separate from
+    /// `render_error` so the report names what actually went wrong: an
+    /// export that never resolved is not a file that failed to render.
+    pub export_error: Option<String>,
 }
 
 /// Rendered files temporarily reverted to committed values, and the content
@@ -549,19 +553,53 @@ impl BranchManager {
                 );
             }
 
+            // An export may compose a dependency's export, the same way a
+            // `[[render]]` already can. Bindings happen in dependency order,
+            // so everything upstream is resolved by the time this runs —
+            // without it a *file* could carry another resource's URL while
+            // the resource itself could not publish one, which is the wrong
+            // way round: `[exports]` is what produces those values.
+            let bound = self.bound_exports(branch);
             let context = RenderContext {
                 branch_name: &branch.name,
                 branch_slug: &branch.slug,
                 workspace: branch.workspace_path.as_str(),
                 scripts: self.scripts_dir(),
                 ports: Some(&resolved_ports),
+                exports: Some(&bound),
                 ..RenderContext::default()
             };
-            let resolved_exports = definition
-                .exports
-                .iter()
-                .map(|(key, value)| (key.clone(), render(value, &context)))
-                .collect();
+
+            // Everywhere else an unknown `{{...}}` renders verbatim, so the
+            // mistake is visible to whoever typed it. An export is the
+            // exception for the same reason `[cleanup]` and `[[render]]` are:
+            // it is written into the binding record once and handed to every
+            // later action and `newgit run` as an environment variable, so
+            // the mistake surfaces in a different process, hours later, as a
+            // malformed URL. The unresolved value is dropped rather than
+            // stored — an absent variable is a failure something downstream
+            // can detect; `http://127.0.0.1:{{ports.db.api}}` is not.
+            let mut resolved_exports = BTreeMap::new();
+            let mut export_error = None;
+            for (key, value) in &definition.exports {
+                let rendered = render(value, &context);
+                match unresolved_placeholder(&rendered) {
+                    Some(placeholder) => {
+                        export_error = Some(
+                            NewgitError::ExportUnresolved {
+                                resource: definition.name.clone(),
+                                export: key.clone(),
+                                placeholder: placeholder.to_owned(),
+                            }
+                            .to_string(),
+                        );
+                        break;
+                    }
+                    None => {
+                        resolved_exports.insert(key.clone(), rendered);
+                    }
+                }
+            }
 
             branch.resources.insert(
                 definition.name.clone(),
@@ -577,13 +615,17 @@ impl BranchManager {
             // Render before prepare, with ports allocated and every
             // dependency's exports already bound: the file a tool reads its
             // port from has to be right before the tool is started.
-            let (rendered, render_error) = match self.render_resource(branch, definition) {
-                Ok(rendered) => (rendered, None),
-                Err(error) => (Vec::new(), Some(error.to_string())),
+            let (rendered, render_error) = if export_error.is_some() {
+                (Vec::new(), None)
+            } else {
+                match self.render_resource(branch, definition) {
+                    Ok(rendered) => (rendered, None),
+                    Err(error) => (Vec::new(), Some(error.to_string())),
+                }
             };
 
             let mut blocked_by = self.blocked_dependencies(branch, definition);
-            if render_error.is_some() {
+            if render_error.is_some() || export_error.is_some() {
                 if let Some(binding) = branch.resources.get_mut(&definition.name) {
                     binding.status = ResourceStatus::Failed;
                 }
@@ -597,6 +639,7 @@ impl BranchManager {
                     missing_captures: Vec::new(),
                     rendered: Vec::new(),
                     render_error,
+                    export_error,
                 });
                 continue;
             }
@@ -673,6 +716,7 @@ impl BranchManager {
                 missing_captures,
                 rendered,
                 render_error: None,
+                export_error: None,
             });
         }
         branch.updated_at = Utc::now();

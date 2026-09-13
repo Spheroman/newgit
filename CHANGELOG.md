@@ -6,96 +6,105 @@ of `.newgit/` in a minor release — see *Upgrading* below.
 
 ## [Unreleased]
 
-### Changed
+### Fixed
 
-- Definitions reject keys newgit does not recognize, instead of ignoring them
-  ([#35](https://github.com/Spheroman/newgit/issues/35)).
+- `status` no longer reports states that are not true (#28), in three ways.
 
-  The serious case is a misspelling. `owneship = "branch"` used to parse
-  cleanly and leave `ownership` at its default — and `ownership` is what
-  decides whether per-branch teardown may touch the concrete resource, the
-  difference between `newgit remove` stopping a dev server and it reaching a
-  store shared with every other project on the machine. The same held for
-  `merge_with_source`, `long_running`, `into_tracker`: every key whose
-  safe-looking default is not what you meant.
+  A resource with an unrelated `long_running` action it never started — say,
+  a stray `functions` action beside the `prepare` a Supabase resource
+  actually uses — showed up as `stopped` on the strength of the declaration
+  alone; the column now asks the supervisor whether *something it started*
+  has since died, which is a fact newgit can actually know, rather than "does
+  this resource's definition mention a long-running action at all." Telling
+  those apart means a pid file has to survive being stopped — but leaving a
+  raw pid sitting on disk indefinitely would reopen a worse lie once the OS
+  recycles that number onto some unrelated process, so a stopped process now
+  retires its file to the literal `stopped` instead of leaving the number
+  behind, and `newgit cleanup`'s pid housekeeping does the same to a pid file
+  whose process died on its own — rewriting it in place rather than deleting
+  it, since deleting it is exactly what would have made `newgit cleanup`
+  itself erase the fact `status` depends on.
 
-  ```
-  Error: could not parse TOML at .newgit/resources/app.toml
+  `blocked` used to be written into the binding record, which meant a
+  resource with no `prepare` of its own — like an `admin`/`mobile` dev server
+  waiting on a Supabase stack — stayed `blocked` forever once its dependency
+  recovered, because nothing ever ran to recompute it. Blocked-ness is
+  derived at read time from `depends_on` instead, so it clears the moment the
+  blocker does, and `status` names what's blocking (`admin:blocked(supabase)`)
+  rather than just saying so. A resource with no `prepare` at all goes
+  further: it is `ready` from the moment it is bound, blocked dependency or
+  not, because there was never a command to withhold from it in the first
+  place — the same rule that makes a resource with a real `prepare` correctly
+  stay `pending` while it waits.
 
-  Caused by:
-      TOML parse error at line 1, column 1
-        |
-      1 | owneship = "branch"
-        | ^^^^^^^^
-      unknown field `owneship`, expected one of `ownership`, `depends_on`,
-      `identity`, `workdir`, `ports`, `exports`, `render`, `actions`,
-      `checkpoint`, `restore`, `cleanup`
-  ```
+  `status` is the command you run when you're already confused about what
+  newgit thinks is true; it should not make that worse.
 
-  Leniency was a deliberate call when `kind` was dropped — a stale `kind =`
-  line would simply be ignored, so no migration was needed. That reasoning was
-  backwards: silently accepting a key the tool no longer understands *is* a
-  backwards-compatibility affordance, and this project does not carry those.
-  It also cost something immediately. Landing six issues as parallel branch
-  instances, two of them kept writing `kind` into new test fixtures while the
-  branch removing it was in flight; Git merged those without conflict, because
-  new lines have nothing to conflict against, and everything compiled and
-  passed. A grep caught it, not the tool.
+- `newgit reference` documents `[[render]]`. The feature shipped in 0.2.0 but
+  the reference did not learn about it, so the one copy of the definition
+  format guaranteed to be wherever the binary is was the one place it was
+  missing — exactly the gap `newgit reference` exists to close. The section
+  covers `path`, `replace`, `find`/`with`/`count`, and the four rules; the
+  template-variable scope table gains a `[[render]] with` row, and the note on
+  unresolved placeholders now names `[[render]]` alongside `[cleanup]` as the
+  other place they refuse rather than render verbatim.
 
-  A definition carrying a key newgit dropped now fails to load. That is the
-  intended outcome — the fix is deleting one line, and the error says which.
+- `newgit reference` recommends a content-addressed package manager, in the
+  one document that travels with the binary. Per-instance installs are the
+  single place newgit multiplies a cost instead of absorbing it, and the
+  choice that decides how much — pnpm or npm — is made once, early, by someone
+  who has usually not read the README's section on it by then. The reference
+  had a parenthetical `(a pnpm store)` in the ownership table and nothing
+  else. It now says it plainly, with the per-tool costs and the two keys that
+  wire a shared store up (`ownership = "user"`, `[identity] paths`).
 
-  Parse errors also stopped printing themselves twice: `could not parse TOML
-  at <path>` interpolated the full toml snippet that anyhow then repeated as
-  the cause.
+- `resource add --template` says why its extra output exists and how to
+  undo it, and prints paths relative to the project instead of absolute
+  ([#23](https://github.com/Spheroman/newgit/issues/23)).
 
-- `[identity]` is now the single declaration of what a resource is derived
-  from, and `[checkpoint] paths` is gone
-  ([#45](https://github.com/Spheroman/newgit/issues/45),
-  [#46](https://github.com/Spheroman/newgit/issues/46),
-  [#41](https://github.com/Spheroman/newgit/issues/41)).
-
-  The reference described these three keys as one mechanism — identity feeds
-  the checkpoint, the checkpoint feeds the restore — and the mechanism did not
-  exist. `[identity].paths` was read in exactly one place, to put the word
-  `identity` in a column of `newgit resource list`. `hash:<rev>` was written at
-  checkpoint and parsed back nowhere. `recompute` re-ran its action without
-  consulting either. Definitions worked only because their authors dutifully
-  typed the same path list into two blocks; diverge them and nothing said so.
-  The shipped `pnpm` template duplicated the list too.
-
-  ```diff
-  [identity]
-  paths = ["package.json", "pnpm-lock.yaml"]
-
-  [checkpoint]
-  mode = "hash"
-  -paths = ["package.json", "pnpm-lock.yaml"]
-  ```
-
-  `mode = "hash"` now hashes `[identity] paths` and has no path list of its
-  own; it fails to load without an `[identity]` to hash. Identity paths are
-  validated the way tracker paths always were — workspace-relative, no `..`,
-  no reaching into `.git` or `.newgit`. Previously `paths = ["/etc/passwd",
-  "../../escape"]` loaded clean.
-
-  And `recompute` consults the hash, which is the point of recording it:
+  `--template pnpm` on a project that already uses npm creates
+  `pnpm-store.toml` alongside `deps.toml` because `pnpm` depends on it — debris
+  the user has to notice on their own, since `depends_on` is a graph edge, not
+  a file on disk. `--template command-snapshot` creates a *tracker*, not
+  another resource, because `into_tracker` needs somewhere to deposit; that
+  asymmetry was buried behind identical-looking `companion:`/`tracker:`
+  prefixes. The line now leads with the created thing's name and kind, names
+  the key that pulled it in, and says it can be edited or deleted — keeping
+  the path, since "delete the file" is only actionable if it says which file:
 
   ```
-  resource: deps recompute(prepare) skipped: identity unchanged
+  Added resource `deps` from `pnpm` at .newgit/resources/deps.toml
+    also created resource `pnpm-store` at .newgit/resources/pnpm-store.toml
+      required by deps.depends_on — edit it, or delete the file if this project doesn't need it
   ```
 
-  A monorepo `npm ci` is around ninety seconds, and three debugging cycles on
-  an unrelated resource's restore command used to cost three of them. The
-  comparison is between the checkpoint and the *pre-undo* state, not the
-  workspace as it stands when the resource is reached — undo restores source
-  first, so hashing at that point would compare the checkpoint against itself
-  and skip every time, including the one case that matters: a lockfile that
-  moved after the checkpoint and has just been rewound underneath a tree built
-  from the newer one.
+  Someone who ran `newgit tracker create db-snapshots` by hand and hit
+  `already exists at ...` had no way to know a `resource add --template
+  command-snapshot` had created it — the error read like a bug in their own
+  script. It now says so in one clause.
 
-  Identity describes the inputs, not the tree, so the repair path stays
-  reachable: `newgit undo --force-recompute` rebuilds regardless.
+
+- An unresolved `{{...}}` in `[exports]` refuses at spawn instead of being
+  stored and shipped as a literal
+  ([#40](https://github.com/Spheroman/newgit/issues/40)).
+
+  Everywhere else an unknown placeholder renders verbatim, so the mistake is
+  visible to whoever typed it. An export is the exception, for the same reason
+  `[cleanup]` and `[[render]]` already refuse: it is rendered once, written
+  into the binding record, and handed to every later action and `newgit run`
+  as an environment variable. A bad command fails in front of the person who
+  wrote it; a bad export surfaces in a different process, at whatever hour
+  something first dials a host named `{{ports`.
+
+  ```
+  resource:  `functions` export: FAILED — resource `functions` exports
+  `SUPABASE_FUNCTIONS_URL` with unresolved `{{ports.supabase.api}}`
+  ```
+
+  The unresolved value is dropped rather than stored: an absent environment
+  variable is something downstream can detect, and a malformed URL is not.
+  Export failures are reported apart from render failures, because they are
+  different mistakes in different parts of the definition.
 
 ### Added
 
@@ -197,82 +206,117 @@ of `.newgit/` in a minor release — see *Upgrading* below.
   touching Rust and the two cannot drift. Asking for a `##` section brings its
   `###` subsections with it, so `resource` is the whole resource format.
 
-### Fixed
 
-- `status` no longer reports states that are not true (#28), in three ways.
+- `[exports]` may compose a dependency's exports
+  ([#40](https://github.com/Spheroman/newgit/issues/40)).
 
-  A resource with an unrelated `long_running` action it never started — say,
-  a stray `functions` action beside the `prepare` a Supabase resource
-  actually uses — showed up as `stopped` on the strength of the declaration
-  alone; the column now asks the supervisor whether *something it started*
-  has since died, which is a fact newgit can actually know, rather than "does
-  this resource's definition mention a long-running action at all." Telling
-  those apart means a pid file has to survive being stopped — but leaving a
-  raw pid sitting on disk indefinitely would reopen a worse lie once the OS
-  recycles that number onto some unrelated process, so a stopped process now
-  retires its file to the literal `stopped` instead of leaving the number
-  behind, and `newgit cleanup`'s pid housekeeping does the same to a pid file
-  whose process died on its own — rewriting it in place rather than deleting
-  it, since deleting it is exactly what would have made `newgit cleanup`
-  itself erase the fact `status` depends on.
+  A `[[render]]` could already see every export bound so far, so a *file*
+  could carry another resource's URL while the resource itself could not
+  publish one — the wrong way round, since `[exports]` is what produces those
+  values in the first place. Bindings happen in dependency order, so the
+  values were already there; nothing passed them.
 
-  `blocked` used to be written into the binding record, which meant a
-  resource with no `prepare` of its own — like an `admin`/`mobile` dev server
-  waiting on a Supabase stack — stayed `blocked` forever once its dependency
-  recovered, because nothing ever ran to recompute it. Blocked-ness is
-  derived at read time from `depends_on` instead, so it clears the moment the
-  blocker does, and `status` names what's blocking (`admin:blocked(supabase)`)
-  rather than just saying so. A resource with no `prepare` at all goes
-  further: it is `ready` from the moment it is bound, blocked dependency or
-  not, because there was never a command to withhold from it in the first
-  place — the same rule that makes a resource with a real `prepare` correctly
-  stay `pending` while it waits.
+  ```toml
+  depends_on = ["supabase"]
 
-  `status` is the command you run when you're already confused about what
-  newgit thinks is true; it should not make that worse.
-
-- `newgit reference` documents `[[render]]`. The feature shipped in 0.2.0 but
-  the reference did not learn about it, so the one copy of the definition
-  format guaranteed to be wherever the binary is was the one place it was
-  missing — exactly the gap `newgit reference` exists to close. The section
-  covers `path`, `replace`, `find`/`with`/`count`, and the four rules; the
-  template-variable scope table gains a `[[render]] with` row, and the note on
-  unresolved placeholders now names `[[render]]` alongside `[cleanup]` as the
-  other place they refuse rather than render verbatim.
-
-- `newgit reference` recommends a content-addressed package manager, in the
-  one document that travels with the binary. Per-instance installs are the
-  single place newgit multiplies a cost instead of absorbing it, and the
-  choice that decides how much — pnpm or npm — is made once, early, by someone
-  who has usually not read the README's section on it by then. The reference
-  had a parenthetical `(a pnpm store)` in the ownership table and nothing
-  else. It now says it plainly, with the per-tool costs and the two keys that
-  wire a shared store up (`ownership = "user"`, `[identity] paths`).
-
-- `resource add --template` says why its extra output exists and how to
-  undo it, and prints paths relative to the project instead of absolute
-  ([#23](https://github.com/Spheroman/newgit/issues/23)).
-
-  `--template pnpm` on a project that already uses npm creates
-  `pnpm-store.toml` alongside `deps.toml` because `pnpm` depends on it — debris
-  the user has to notice on their own, since `depends_on` is a graph edge, not
-  a file on disk. `--template command-snapshot` creates a *tracker*, not
-  another resource, because `into_tracker` needs somewhere to deposit; that
-  asymmetry was buried behind identical-looking `companion:`/`tracker:`
-  prefixes. The line now leads with the created thing's name and kind, names
-  the key that pulled it in, and says it can be edited or deleted — keeping
-  the path, since "delete the file" is only actionable if it says which file:
-
-  ```
-  Added resource `deps` from `pnpm` at .newgit/resources/deps.toml
-    also created resource `pnpm-store` at .newgit/resources/pnpm-store.toml
-      required by deps.depends_on — edit it, or delete the file if this project doesn't need it
+  [exports]
+  SUPABASE_FUNCTIONS_URL = "{{exports.SUPABASE_API_URL}}/functions/v1"
   ```
 
-  Someone who ran `newgit tracker create db-snapshots` by hand and hit
-  `already exists at ...` had no way to know a `resource add --template
-  command-snapshot` had created it — the error read like a bug in their own
-  script. It now says so in one clause.
+  This is the expressible form of what #40 tried to write as
+  `{{ports.supabase.api}}`: there is no syntax for another resource's ports,
+  and now there does not need to be.
+
+### Changed
+
+- Definitions reject keys newgit does not recognize, instead of ignoring them
+  ([#35](https://github.com/Spheroman/newgit/issues/35)).
+
+  The serious case is a misspelling. `owneship = "branch"` used to parse
+  cleanly and leave `ownership` at its default — and `ownership` is what
+  decides whether per-branch teardown may touch the concrete resource, the
+  difference between `newgit remove` stopping a dev server and it reaching a
+  store shared with every other project on the machine. The same held for
+  `merge_with_source`, `long_running`, `into_tracker`: every key whose
+  safe-looking default is not what you meant.
+
+  ```
+  Error: could not parse TOML at .newgit/resources/app.toml
+
+  Caused by:
+      TOML parse error at line 1, column 1
+        |
+      1 | owneship = "branch"
+        | ^^^^^^^^
+      unknown field `owneship`, expected one of `ownership`, `depends_on`,
+      `identity`, `workdir`, `ports`, `exports`, `render`, `actions`,
+      `checkpoint`, `restore`, `cleanup`
+  ```
+
+  Leniency was a deliberate call when `kind` was dropped — a stale `kind =`
+  line would simply be ignored, so no migration was needed. That reasoning was
+  backwards: silently accepting a key the tool no longer understands *is* a
+  backwards-compatibility affordance, and this project does not carry those.
+  It also cost something immediately. Landing six issues as parallel branch
+  instances, two of them kept writing `kind` into new test fixtures while the
+  branch removing it was in flight; Git merged those without conflict, because
+  new lines have nothing to conflict against, and everything compiled and
+  passed. A grep caught it, not the tool.
+
+  A definition carrying a key newgit dropped now fails to load. That is the
+  intended outcome — the fix is deleting one line, and the error says which.
+
+  Parse errors also stopped printing themselves twice: `could not parse TOML
+  at <path>` interpolated the full toml snippet that anyhow then repeated as
+  the cause.
+
+- `[identity]` is now the single declaration of what a resource is derived
+  from, and `[checkpoint] paths` is gone
+  ([#45](https://github.com/Spheroman/newgit/issues/45),
+  [#46](https://github.com/Spheroman/newgit/issues/46),
+  [#41](https://github.com/Spheroman/newgit/issues/41)).
+
+  The reference described these three keys as one mechanism — identity feeds
+  the checkpoint, the checkpoint feeds the restore — and the mechanism did not
+  exist. `[identity].paths` was read in exactly one place, to put the word
+  `identity` in a column of `newgit resource list`. `hash:<rev>` was written at
+  checkpoint and parsed back nowhere. `recompute` re-ran its action without
+  consulting either. Definitions worked only because their authors dutifully
+  typed the same path list into two blocks; diverge them and nothing said so.
+  The shipped `pnpm` template duplicated the list too.
+
+  ```diff
+  [identity]
+  paths = ["package.json", "pnpm-lock.yaml"]
+
+  [checkpoint]
+  mode = "hash"
+  -paths = ["package.json", "pnpm-lock.yaml"]
+  ```
+
+  `mode = "hash"` now hashes `[identity] paths` and has no path list of its
+  own; it fails to load without an `[identity]` to hash. Identity paths are
+  validated the way tracker paths always were — workspace-relative, no `..`,
+  no reaching into `.git` or `.newgit`. Previously `paths = ["/etc/passwd",
+  "../../escape"]` loaded clean.
+
+  And `recompute` consults the hash, which is the point of recording it:
+
+  ```
+  resource: deps recompute(prepare) skipped: identity unchanged
+  ```
+
+  A monorepo `npm ci` is around ninety seconds, and three debugging cycles on
+  an unrelated resource's restore command used to cost three of them. The
+  comparison is between the checkpoint and the *pre-undo* state, not the
+  workspace as it stands when the resource is reached — undo restores source
+  first, so hashing at that point would compare the checkpoint against itself
+  and skip every time, including the one case that matters: a lockfile that
+  moved after the checkpoint and has just been rewound underneath a tree built
+  from the newer one.
+
+  Identity describes the inputs, not the tree, so the repair path stays
+  reachable: `newgit undo --force-recompute` rebuilds regardless.
 
 ### Removed
 
