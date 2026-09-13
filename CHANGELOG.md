@@ -6,6 +6,19 @@ of `.newgit/` in a minor release — see *Upgrading* below.
 
 ## [Unreleased]
 
+### Documentation
+
+- Say what a package manager costs under newgit. Every instance installs its
+  own dependencies — that independence is the point, and a shared installed
+  tree across branches with different lockfiles is the thing that would be
+  wrong — but the size of that cost is the package manager's call, and
+  nothing said so. pnpm hardlinks from one content-addressed store, so
+  instance ten adds directory entries; `npm ci` expands a full copy per
+  instance, which on a monorepo is gigabytes each. Documented in the README's
+  adoption section, next to the install resource in `newgit-v1-mvp.md`, and
+  in the `pnpm` template's own comments, since that is what someone reads
+  when they hand-edit the definition.
+  
 ### Added
 
 - `newgit tracker capture <tracker> --from-store` seeds a lane from the store

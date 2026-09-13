@@ -56,7 +56,7 @@ APP_URL = "http://127.0.0.1:{{ports.app}}"
     },
     ResourceTemplate {
         name: "pnpm",
-        description: "dependency install via pnpm; recomputed, never copied",
+        description: "dependency install via pnpm; recomputed per instance, hardlinked from one store",
         // The shared package store is user-owned: newgit must never delete
         // or rewrite it. Created alongside so `depends_on` resolves.
         companions: &[CompanionFile {
@@ -73,7 +73,12 @@ mode = "none"
 "#,
         }],
         companion_trackers: &[],
-        contents: r#"kind = "command"
+        contents: r#"# Every instance installs its own dependencies: two branches with
+# different lockfiles must not share a tree, or one branch's install
+# rewrites the other's. What that costs is your package manager's call.
+# pnpm hardlinks from one shared store, so instance ten adds directory
+# entries, not gigabytes; `npm ci` expands a full copy every time.
+kind = "command"
 ownership = "workspace"
 depends_on = ["pnpm-store"]
 
