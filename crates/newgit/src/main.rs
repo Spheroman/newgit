@@ -537,10 +537,7 @@ fn spawn(args: SpawnArgs) -> Result<()> {
                 None if !resource.blocked_by.is_empty() => {
                     format!(" prepare: BLOCKED by {}", resource.blocked_by.join(", "))
                 }
-                None => match resource.status {
-                    newgit_core::branch::ResourceStatus::Blocked => " prepare: BLOCKED".to_owned(),
-                    _ => String::new(),
-                },
+                None => String::new(),
             },
         };
         let captured = if resource.captured.is_empty() {
@@ -1304,6 +1301,13 @@ fn cleanup(dry_run: bool, purge_archived: bool) -> Result<()> {
     }
     for workspace in &outcome.orphan_workspaces {
         println!("Orphan workspace {verb}: {workspace} (no binding record claims it)");
+    }
+    let retire_verb = if dry_run { "would retire" } else { "retired" };
+    for path in &outcome.retired_pids {
+        println!(
+            "Stale pid {retire_verb} to `stopped`: {path} (process is gone; \
+             `status` still remembers it ran)"
+        );
     }
     for path in &outcome.dead_state {
         println!("Dead process state {verb}: {path}");
