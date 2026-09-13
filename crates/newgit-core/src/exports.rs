@@ -55,6 +55,34 @@ pub fn render(template: &str, context: &RenderContext) -> String {
 /// the right default for a command the user watches run, but destructive
 /// hooks (cleanup) must refuse instead: `cloudctl preview delete
 /// {{state_ref}}` with no state ref is not a no-op, it is a wrong argument.
+/// Every `{{exports.<name>}}` a template refers to, in order of appearance.
+///
+/// Rendering replaces these; the graph reads them instead, to learn which
+/// resource a template needs a value *from*. A name is bounded by the closing
+/// `}}` and never spans one, so `{{exports.A}}/{{exports.B}}` is two names and
+/// a stray `{{exports.` with no close is none.
+pub fn export_placeholders(template: &str) -> Vec<&str> {
+    const OPEN: &str = "{{exports.";
+    let mut names = Vec::new();
+    // Every opener is considered, rather than resuming after each closer: in
+    // `{{exports.{{exports.A}}` the first opener is not a placeholder and the
+    // second one is, and skipping past the `}}` would lose the real
+    // reference along with the false one.
+    for (start, _) in template.match_indices(OPEN) {
+        let rest = &template[start + OPEN.len()..];
+        let Some(end) = rest.find("}}") else {
+            continue;
+        };
+        let name = &rest[..end];
+        // `{{exports.}}` names nothing, and a `{{` inside means this opener
+        // was never a placeholder — the one nested in it may still be.
+        if !name.is_empty() && !name.contains("{{") {
+            names.push(name);
+        }
+    }
+    names
+}
+
 pub fn unresolved_placeholder(rendered: &str) -> Option<&str> {
     let start = rendered.find("{{")?;
     let rest = &rendered[start..];
@@ -66,7 +94,24 @@ pub fn unresolved_placeholder(rendered: &str) -> Option<&str> {
 mod tests {
     use std::collections::BTreeMap;
 
-    use super::{RenderContext, render, unresolved_placeholder};
+    use super::{RenderContext, export_placeholders, render, unresolved_placeholder};
+
+    #[test]
+    fn export_placeholders_names_every_reference_and_nothing_else() {
+        assert_eq!(
+            export_placeholders("{{exports.A}}/x/{{exports.B}}"),
+            vec!["A", "B"]
+        );
+        // Other placeholders are not export references.
+        assert_eq!(
+            export_placeholders("http://127.0.0.1:{{ports.app}}/{{branch.slug}}"),
+            Vec::<&str>::new()
+        );
+        // Malformed references name nothing rather than half a name.
+        assert_eq!(export_placeholders("{{exports.}}"), Vec::<&str>::new());
+        assert_eq!(export_placeholders("{{exports.A"), Vec::<&str>::new());
+        assert_eq!(export_placeholders("{{exports.{{exports.A}}"), vec!["A"]);
+    }
 
     #[test]
     fn renders_ports_and_branch_vars() {

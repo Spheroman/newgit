@@ -25,8 +25,8 @@ use crate::materializer::{
 use crate::ports;
 use crate::render::{self, RenderRecord};
 use crate::resource::{
-    Captures, CheckpointMode, GraphProblem, ResourceDefinition, RestoreMode, check_env_names,
-    parse_captures, resolve_order,
+    Captures, CheckpointMode, DataEdges, GraphProblem, ResourceDefinition, ResourceGraph,
+    RestoreMode, parse_captures, resolve_graph,
 };
 use crate::source::GitSource;
 use crate::store::MetadataStore;
@@ -42,12 +42,10 @@ pub struct BranchManager {
     source: GitSource,
     trackers: Vec<TrackerDefinition>,
     resources: Vec<ResourceDefinition>,
-    /// Resource names, dependencies before dependents. Resources whose
+    /// The resolved graph: bind order, lifecycle order, inferred data edges,
+    /// and why it does not hold together if it doesn't. Resources whose
     /// dependencies are unresolved are still ordered; see `graph_problems`.
-    resource_order: Vec<String>,
-    /// Why the dependency graph does not hold together, if it doesn't.
-    /// Commands that build the graph warn; commands that act on it refuse.
-    graph_problems: Vec<GraphProblem>,
+    graph: ResourceGraph,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -394,25 +392,26 @@ impl BranchManager {
         let trackers = store.load_tracker_definitions()?;
         let resources = store.load_resource_definitions()?;
         let tracker_names: BTreeSet<String> = trackers.iter().map(|t| t.name.clone()).collect();
-        let (resource_order, mut graph_problems) = resolve_order(&resources, &tracker_names);
-        // A name collision is not an ordering fault, but it is the same kind
-        // of whole-graph defect: detectable from the definitions alone, and
-        // fatal to anything that assembles an environment.
-        graph_problems.extend(check_env_names(&resources));
+        let graph = resolve_graph(&resources, &tracker_names);
         Ok(Self {
             store,
             config,
             source,
             trackers,
             resources,
-            resource_order,
-            graph_problems,
+            graph,
         })
     }
 
     /// Ways the resource graph is incomplete. An empty slice means it resolves.
     pub fn graph_problems(&self) -> &[GraphProblem] {
-        &self.graph_problems
+        &self.graph.problems
+    }
+
+    /// Edges read out of `{{exports.*}}` rather than declared in
+    /// `depends_on`, so `newgit resource list` can show them.
+    pub fn data_edges(&self) -> &DataEdges {
+        &self.graph.data_edges
     }
 
     /// The gate for commands that act on the graph — `spawn`, `run`, `action`,
@@ -420,7 +419,7 @@ impl BranchManager {
     /// (`tracker create`, `tracker track`, `resource add`) must not call this:
     /// they are how an incomplete graph gets completed.
     pub fn require_resolvable_graph(&self) -> Result<()> {
-        match self.graph_problems.first() {
+        match self.graph.problems.first() {
             Some(problem) => Err(problem.clone().into_error()),
             None => Ok(()),
         }
@@ -546,7 +545,7 @@ impl BranchManager {
         let mut used = ports::used_ports(&self.store.load_branches()?);
         let mut outcomes = Vec::new();
 
-        for name in &self.resource_order {
+        for name in &self.graph.bind_order {
             let definition = self.resource_definition(name)?;
 
             let mut resolved_ports = BTreeMap::new();
@@ -939,7 +938,7 @@ impl BranchManager {
     /// same layering [`Self::assemble_env`] applies.
     fn bound_exports(&self, branch: &BranchInstance) -> BTreeMap<String, String> {
         let mut exports = BTreeMap::new();
-        for name in &self.resource_order {
+        for name in &self.graph.bind_order {
             if let Some(binding) = branch.resources.get(name) {
                 for (key, value) in &binding.resolved_exports {
                     exports.insert(key.clone(), value.clone());
@@ -1058,7 +1057,7 @@ impl BranchManager {
         // Checked before the re-render, not after: afterwards the edit is
         // already gone and there is nothing left to name.
         let mut warnings = self.render_drift(branch);
-        for name in self.resource_order.clone() {
+        for name in self.graph.bind_order.clone() {
             let Ok(definition) = self.resource_definition(&name) else {
                 continue;
             };
@@ -1284,7 +1283,7 @@ impl BranchManager {
         let mut env: BTreeMap<String, String> = BTreeMap::new();
 
         // Layer 1: resource exports, dependency order (dependents win).
-        for name in &self.resource_order {
+        for name in &self.graph.bind_order {
             if let Some(binding) = branch.resources.get(name) {
                 for (key, value) in &binding.resolved_exports {
                     env.insert(key.clone(), value.clone());
@@ -1293,7 +1292,7 @@ impl BranchManager {
         }
 
         // Layer 2: port env vars.
-        for name in &self.resource_order {
+        for name in &self.graph.bind_order {
             let Some(binding) = branch.resources.get(name) else {
                 continue;
             };
@@ -2058,13 +2057,17 @@ impl BranchManager {
     /// dependencies. Ownership decides whether a hook may run at all —
     /// `project` and `user` resources are shared beyond this instance, so
     /// per-branch teardown leaves them alone even when they define a hook.
+    ///
+    /// Reverses the *lifecycle* order, not the bind order: reading one string
+    /// out of a resource says nothing about what has to be torn down first
+    /// (#43). Only `depends_on` claims that.
     fn run_cleanup_hooks(
         &self,
         branch: &BranchInstance,
         dry_run: bool,
     ) -> Result<Vec<HookOutcome>> {
         let mut outcomes = Vec::new();
-        for name in self.resource_order.iter().rev() {
+        for name in self.graph.lifecycle_order.iter().rev() {
             if !branch.resources.contains_key(name) {
                 continue;
             }
@@ -2432,9 +2435,11 @@ impl BranchManager {
 
         // Resources, dependents first: a dependent's state may be derived
         // from its dependency, so it is captured before the dependency moves.
+        // Lifecycle order, for the same reason cleanup uses it — a template
+        // that reads an export is not a claim about capture order (#43).
         let mut resource_states = Vec::new();
         let mut deposits: Vec<(String, String)> = Vec::new();
-        for name in self.resource_order.iter().rev() {
+        for name in self.graph.lifecycle_order.iter().rev() {
             let Some(binding) = branch.resources.get(name) else {
                 continue;
             };
@@ -2786,7 +2791,7 @@ impl BranchManager {
         // running. Failures are collected into a recovery record, not fatal.
         let mut resources = Vec::new();
         let mut failures: Vec<RestoreFailure> = Vec::new();
-        for name in &self.resource_order {
+        for name in &self.graph.bind_order {
             let Some(state) = restored
                 .resource_states
                 .iter()

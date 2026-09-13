@@ -127,6 +127,74 @@ command = "echo store-WRONGLY-TORN-DOWN >> {witness}/order.txt"
     assert_eq!(order, "db\n");
 }
 
+/// The #43 case end to end. `supabase` needs one string out of the Expo dev
+/// server and nothing else: it must bind second so the value exists, but it
+/// holds no claim on teardown order. Before, the only way to get the value
+/// was `depends_on`, which forced `supabase` to tear down first as well.
+///
+/// The names matter. Definitions load sorted, so `supabase` reading from
+/// `web` is the case where the two orders disagree: binding has to put `web`
+/// first, and teardown must not. A reader that already sorted last would
+/// prove nothing.
+#[test]
+fn a_data_edge_orders_binding_without_reordering_teardown() {
+    let (_guard, temp) = tempdir();
+    let store = setup(&temp);
+    let witness = temp.join("witness");
+    std::fs::create_dir_all(&witness).expect("mkdir");
+
+    // Nothing declares a dependency in either direction.
+    write_resource(
+        &store,
+        "supabase",
+        &format!(
+            r#"ownership = "branch"
+
+[exports]
+REDIRECT_URL = "{{{{exports.EXPO_URL}}}}"
+
+[cleanup]
+command = "echo supabase >> {witness}/order.txt"
+"#
+        ),
+    );
+    write_resource(
+        &store,
+        "web",
+        &format!(
+            r#"ownership = "branch"
+
+[exports]
+EXPO_URL = "exp://127.0.0.1:8081"
+
+[cleanup]
+command = "echo web >> {witness}/order.txt"
+"#
+        ),
+    );
+
+    let manager = manager_at(&store);
+    assert!(manager.graph_problems().is_empty());
+    let spawned = manager.spawn("feature-a", None).expect("spawn");
+
+    // Binding was reordered by the inferred edge: `web` bound first despite
+    // sorting last, so the value resolved.
+    assert_eq!(
+        spawned.branch.resources["supabase"].resolved_exports["REDIRECT_URL"],
+        "exp://127.0.0.1:8081",
+    );
+
+    manager
+        .remove("feature-a", &temp, ArchivedCheckpoints::Keep)
+        .expect("remove");
+
+    // Teardown ignored the data edge entirely: reversing the *lifecycle*
+    // order, which has no edges here, leaves `web` first. Reversing the bind
+    // order would have put `supabase` first on the strength of one string.
+    let order = std::fs::read_to_string(witness.join("order.txt")).expect("read order");
+    assert_eq!(order, "web\nsupabase\n");
+}
+
 #[test]
 fn a_cleanup_hook_honors_workdir() {
     let (_guard, temp) = tempdir();

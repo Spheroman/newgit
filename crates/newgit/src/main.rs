@@ -725,6 +725,23 @@ fn resource(command: ResourceCommand) -> Result<()> {
                     if actions.is_empty() { "-" } else { &actions },
                 );
             }
+            // The DEPENDS_ON column is what someone wrote. These edges were
+            // read out of the templates instead, so the graph would be a lie
+            // by omission without them — and naming the export that caused
+            // each one is the difference between a fact and a mystery.
+            let inferred = manager.data_edges();
+            if !inferred.is_empty() {
+                println!("\nReads exports from (inferred from `{{{{exports.*}}}}`):");
+                for (resource, sources) in inferred {
+                    for (owner, names) in sources {
+                        println!(
+                            "  {resource} reads {owner} ({})",
+                            names.iter().cloned().collect::<Vec<_>>().join(", ")
+                        );
+                    }
+                }
+                println!("  these order binding only — they say nothing about teardown");
+            }
             Ok(())
         }
         ResourceCommand::Templates { show: None } => {

@@ -709,9 +709,21 @@ Resources can depend on trackers and other resources:
 app-service depends_on ["deps", "runtime-env", "dev-db"]
 ```
 
-v1 can use a simple topological order:
+`depends_on` is a *lifecycle* claim. Needing another resource's value is a
+separate, weaker thing, and it is not declared at all: a `{{exports.<name>}}`
+in an `[exports]` value or a `[[render]]` replacement already names what it
+needs, so newgit reads the edge out of the template. That gives two orders:
 
-- materialize trackers and prepare resource dependencies first
+- **bind order** — `depends_on` plus the inferred data edges. Materializing
+  trackers, preparing resources, rendering, assembling the environment, and
+  restoring all walk this, because a value has to exist before the template
+  that reads it renders.
+- **lifecycle order** — `depends_on` alone. Checkpoint and cleanup walk it in
+  reverse, so needing one string out of a resource never claims anything
+  about the order the two are torn down in.
+
+Within that:
+
 - if a resource dependency fails to prepare, leave the branch instance spawned
   but mark dependents `blocked` rather than running their prepare hooks or
   other command actions

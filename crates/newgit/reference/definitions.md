@@ -78,7 +78,7 @@ other ledger: a port is free the moment nothing claims it).
 | key | type | required | default | meaning |
 | --- | --- | --- | --- | --- |
 | `ownership` | string | yes | — | `branch`, `workspace`, `project`, `user`, or `external`. See *Ownership*. |
-| `depends_on` | array of strings | no | `[]` | resource or tracker names that must be ready first. Orders `prepare` at spawn and cleanup hooks in reverse. A name that is neither is an error the graph reports. |
+| `depends_on` | array of strings | no | `[]` | resource or tracker names whose *lifecycle* this one depends on. Orders `prepare` at spawn and cleanup hooks in reverse. A name that is neither is an error the graph reports. Needing another resource's *value* is not this — see *Data edges*. |
 | `workdir` | string | no | workspace root | where every command this resource runs is spawned, relative to the workspace root. Overridable per action — see `[actions.<name>]`. |
 
 `workdir` is applied as the spawned process's working directory, never as a
@@ -306,6 +306,55 @@ scoped to the resource's own. Publish the value as an export and compose that.
 Export names are global to the project and may only be claimed once — see
 *Command environment*. Two resources that both want `APP_URL` must pick two
 names; that is the same constraint the shell they end up in has.
+
+### Data edges
+
+`{{exports.<name>}}` in an `[exports]` value or a `[[render]]` replacement is
+itself the declaration that you need another resource's value. newgit reads
+the edge out of the template; you do not write it in `depends_on`:
+
+```toml
+# supabase.toml — no depends_on. The template already said it.
+[[render]]
+path = "packages/db/supabase/config.toml"
+replace = [
+  { find = 'additional_redirect_urls = ["exp://127.0.0.1:8081"]',
+    with = 'additional_redirect_urls = ["{{exports.EXPO_URL}}"]' },
+]
+```
+
+`web` exports `EXPO_URL`, so `web` binds before `supabase` and the value is
+there when the file renders. `newgit resource list` prints what was inferred,
+since an edge nobody wrote down still has to be legible:
+
+```
+Reads exports from (inferred from `{{exports.*}}`):
+  supabase reads web (EXPO_URL)
+  these order binding only — they say nothing about teardown
+```
+
+**A data edge orders binding and nothing else.** It does not claim that
+`supabase` needs `web` running, started, or ever used, and teardown ignores
+it completely — `[cleanup]` hooks reverse the `depends_on` graph alone. That
+separation is the point: needing one string out of a resource used to require
+declaring a lifecycle dependency that did not exist, which then quietly
+reversed into teardown order.
+
+Two rules follow from reading the edge rather than being told it:
+
+- A name no resource exports is not an edge. It is a template that will not
+  resolve, and `[exports]` and `[[render]]` already refuse it at bind time
+  with a better message than a graph error could give.
+- A resource referring to *its own* exports is the sibling case above, not an
+  edge to itself.
+
+`[cleanup]` and `[checkpoint]` may use `{{exports.*}}` too, but they read a
+binding record that is already complete, so they create no edge — there is
+nothing left to order.
+
+A cycle through data edges alone (`A = "{{exports.B}}"` in one resource,
+`B = "{{exports.A}}"` in another) is a real cycle and is reported like any
+other: the two cannot be bound in either order.
 
 Resources export runtime values — ports, URLs, handles. Trackers do not
 export anything; they own file content.

@@ -666,71 +666,158 @@ impl fmt::Display for GraphProblem {
     }
 }
 
-/// Order resources so dependencies come before dependents. Dependencies may
-/// name trackers (which only need to exist) or other resources.
+/// Resource -> the resources its templates read exports from, each mapped to
+/// the export names that caused the edge. The names are kept because an edge
+/// nobody wrote down has to be able to explain itself.
+pub type DataEdges = BTreeMap<String, BTreeMap<String, BTreeSet<String>>>;
+
+/// Which resource owns each name reachable as `{{exports.<name>}}`.
 ///
-/// Never fails: an unresolvable dependency is skipped and reported, so a
-/// half-built graph still loads. Commands that act on the graph must check the
-/// reported problems first; commands that build it may proceed and warn.
-pub fn resolve_order(
+/// [`check_env_names`] guarantees one owner per name, so this is a function
+/// rather than a guess. When the graph has a collision the map is arbitrary
+/// between the claimants — but a collision is already a refusal, so no
+/// command that acts on the order ever sees it.
+fn export_owners(resources: &[ResourceDefinition]) -> BTreeMap<&str, &str> {
+    let mut owners = BTreeMap::new();
+    for resource in resources {
+        for name in resource.exports.keys() {
+            owners.insert(name.as_str(), resource.name.as_str());
+        }
+        for spec in resource.actions.values() {
+            for name in &spec.captures {
+                owners.insert(name.as_str(), resource.name.as_str());
+            }
+        }
+    }
+    owners
+}
+
+/// Edges inferred from `{{exports.<name>}}` — "I need your value," not "I
+/// need your lifecycle."
+///
+/// `depends_on` used to be the only way to say either one. A `[[render]]`
+/// substituting another resource's URL into a config file needs that
+/// resource *bound* before it renders, and nothing more — but the only key
+/// that produced that ordering also reversed into teardown, so a pure data
+/// edge had to be declared as a lifecycle edge and silently acquired an
+/// ordering claim it never asked for (#43).
+///
+/// The template is already the statement. `{{exports.EXPO_URL}}` names what
+/// it needs, so the edge is read from it rather than restated in
+/// `depends_on`, and it orders binding only.
+///
+/// Only bind-time consumers count: `[exports]` values and `[[render]]`
+/// replacements, both rendered while the graph is being bound. `[cleanup]`
+/// and `[checkpoint]` may use `{{exports.*}}` too, but they read a binding
+/// record that is already complete — there is nothing left to order.
+pub fn data_edges(resources: &[ResourceDefinition]) -> DataEdges {
+    let owners = export_owners(resources);
+    let mut edges: DataEdges = BTreeMap::new();
+
+    for resource in resources {
+        let templates = resource.exports.values().chain(
+            resource
+                .render
+                .iter()
+                .flat_map(|spec| spec.replace.iter().map(|replacement| &replacement.with)),
+        );
+        for template in templates {
+            for name in crate::exports::export_placeholders(template) {
+                let Some(owner) = owners.get(name) else {
+                    // An unowned name is not an edge. It is a template that
+                    // will not resolve, which `[exports]` and `[[render]]`
+                    // already refuse at bind time with a better message than
+                    // a graph error could give.
+                    continue;
+                };
+                // A resource composing its own exports is the documented
+                // sibling case, not an edge to itself.
+                if *owner != resource.name {
+                    edges
+                        .entry(resource.name.clone())
+                        .or_default()
+                        .entry((*owner).to_owned())
+                        .or_default()
+                        .insert(name.to_owned());
+                }
+            }
+        }
+    }
+    edges
+}
+
+/// The resolved resource graph: the two orders commands need, the edges that
+/// were inferred rather than declared, and everything wrong with it.
+///
+/// Two orders because `depends_on` was being asked to mean two things at once
+/// (#43). Ordering `prepare` at spawn and ordering teardown in reverse are
+/// separate claims, and a data edge only ever makes the first one.
+#[derive(Debug, Clone, Default)]
+pub struct ResourceGraph {
+    /// Dependencies before dependents, over `depends_on` *and* the inferred
+    /// data edges. Binding, rendering, and environment assembly use this: a
+    /// value has to exist before the template that reads it renders.
+    pub bind_order: Vec<String>,
+    /// Dependencies before dependents, over `depends_on` alone. Teardown and
+    /// checkpoint walk it in reverse, so needing one string from a resource
+    /// never claims anything about the order the two are torn down in.
+    pub lifecycle_order: Vec<String>,
+    /// Resource -> the resources whose exports its templates read. Reported
+    /// by `newgit resource list`, since an edge nobody declared still has to
+    /// be legible.
+    pub data_edges: DataEdges,
+    pub problems: Vec<GraphProblem>,
+}
+
+/// Resolve the whole graph. Never fails: an unresolvable dependency is
+/// skipped and reported, so a half-built graph still loads. Commands that act
+/// on the graph must check `problems` first; commands that build it may
+/// proceed and warn.
+pub fn resolve_graph(
     resources: &[ResourceDefinition],
     tracker_names: &BTreeSet<String>,
-) -> (Vec<String>, Vec<GraphProblem>) {
-    let mut ordered = Vec::new();
-    let mut problems = Vec::new();
-    let mut state: BTreeMap<&str, Visit> = BTreeMap::new();
+) -> ResourceGraph {
+    let data_edges = data_edges(resources);
+    let (bind_order, mut problems) = resolve_order(resources, tracker_names, &data_edges);
 
-    fn visit<'a>(
-        name: &'a str,
+    // The lifecycle pass re-reports whatever the bind pass already found over
+    // the `depends_on` subset, so its problems are dropped rather than
+    // duplicated. A cycle that exists only through a data edge is real and is
+    // reported by the bind pass alone.
+    let (lifecycle_order, _) = resolve_order(resources, tracker_names, &BTreeMap::new());
+
+    problems.extend(check_env_names(resources));
+    ResourceGraph {
+        bind_order,
+        lifecycle_order,
+        data_edges,
+        problems,
+    }
+}
+
+/// Order resources so dependencies come before dependents. Dependencies may
+/// name trackers (which only need to exist) or other resources; `data` adds
+/// edges no one declared. See [`resolve_graph`].
+fn resolve_order(
+    resources: &[ResourceDefinition],
+    tracker_names: &BTreeSet<String>,
+    data: &DataEdges,
+) -> (Vec<String>, Vec<GraphProblem>) {
+    /// What the walk reads. Split from what it writes so the recursion takes
+    /// two arguments instead of eight.
+    struct Edges<'a> {
         resources: &'a [ResourceDefinition],
-        tracker_names: &BTreeSet<String>,
-        state: &mut BTreeMap<&'a str, Visit>,
-        ordered: &mut Vec<String>,
-        problems: &mut Vec<GraphProblem>,
-        stack: &mut Vec<String>,
-    ) {
-        match state.get(name) {
-            Some(Visit::Done) => return,
-            Some(Visit::InProgress) => {
-                // Report the back-edge and stop descending; the resource is
-                // already on the stack and will still be ordered by its caller.
-                let mut cycle = stack.clone();
-                cycle.push(name.to_owned());
-                problems.push(GraphProblem::Cycle(cycle));
-                return;
-            }
-            None => {}
-        }
-        let Some(resource) = resources.iter().find(|r| r.name == name) else {
-            // Caller verified membership; only reachable for dependencies.
-            return;
-        };
-        state.insert(&resource.name, Visit::InProgress);
-        stack.push(name.to_owned());
-        for dependency in &resource.depends_on {
-            if tracker_names.contains(dependency) {
-                continue;
-            }
-            if !resources.iter().any(|r| &r.name == dependency) {
-                problems.push(GraphProblem::MissingDependency {
-                    resource: resource.name.clone(),
-                    dependency: dependency.clone(),
-                });
-                continue;
-            }
-            visit(
-                dependency,
-                resources,
-                tracker_names,
-                state,
-                ordered,
-                problems,
-                stack,
-            );
-        }
-        stack.pop();
-        state.insert(&resource.name, Visit::Done);
-        ordered.push(resource.name.clone());
+        tracker_names: &'a BTreeSet<String>,
+        data: &'a DataEdges,
+    }
+
+    /// What the walk writes.
+    #[derive(Default)]
+    struct Walk<'a> {
+        state: BTreeMap<&'a str, Visit>,
+        ordered: Vec<String>,
+        problems: Vec<GraphProblem>,
+        stack: Vec<String>,
     }
 
     #[derive(Clone, Copy)]
@@ -739,18 +826,72 @@ pub fn resolve_order(
         Done,
     }
 
-    for resource in resources {
-        visit(
-            &resource.name,
-            resources,
-            tracker_names,
-            &mut state,
-            &mut ordered,
-            &mut problems,
-            &mut Vec::new(),
-        );
+    // `name` is not tied to `'a`: the visit state is keyed by names borrowed
+    // from `resources`, but a name may also arrive from the inferred edges,
+    // which are owned elsewhere.
+    fn visit<'a>(name: &str, edges: &Edges<'a>, walk: &mut Walk<'a>) {
+        match walk.state.get(name) {
+            Some(Visit::Done) => return,
+            Some(Visit::InProgress) => {
+                // Report the back-edge and stop descending; the resource is
+                // already on the stack and will still be ordered by its caller.
+                let mut cycle = walk.stack.clone();
+                cycle.push(name.to_owned());
+                walk.problems.push(GraphProblem::Cycle(cycle));
+                return;
+            }
+            None => {}
+        }
+        let Some(resource) = edges.resources.iter().find(|r| r.name == name) else {
+            // Caller verified membership; only reachable for dependencies.
+            return;
+        };
+        walk.state.insert(&resource.name, Visit::InProgress);
+        walk.stack.push(name.to_owned());
+        for dependency in &resource.depends_on {
+            if edges.tracker_names.contains(dependency) {
+                continue;
+            }
+            if !edges.resources.iter().any(|r| &r.name == dependency) {
+                walk.problems.push(GraphProblem::MissingDependency {
+                    resource: resource.name.clone(),
+                    dependency: dependency.clone(),
+                });
+                continue;
+            }
+            visit(dependency, edges, walk);
+        }
+        // Inferred edges are visited after declared ones so a graph with no
+        // data edges orders exactly as it did before, and every resource
+        // they name exists by construction — they were derived from it.
+        for dependency in edges
+            .data
+            .get(name)
+            .into_iter()
+            .flatten()
+            .map(|(owner, _)| owner)
+        {
+            visit(dependency, edges, walk);
+        }
+        walk.stack.pop();
+        walk.state.insert(&resource.name, Visit::Done);
+        walk.ordered.push(resource.name.clone());
     }
-    (ordered, problems)
+
+    let edges = Edges {
+        resources,
+        tracker_names,
+        data,
+    };
+    let mut walk = Walk::default();
+
+    for resource in resources {
+        visit(&resource.name, &edges, &mut walk);
+        // Each root starts from an empty stack; a cycle is named by the path
+        // that reached it, not by everything visited before it.
+        walk.stack.clear();
+    }
+    (walk.ordered, walk.problems)
 }
 
 /// Names newgit sets on every command it runs, after every resource's. A
@@ -837,18 +978,6 @@ pub fn check_env_names(resources: &[ResourceDefinition]) -> Vec<GraphProblem> {
     problems
 }
 
-/// [`resolve_order`] for callers that require a whole graph.
-pub fn topological_order(
-    resources: &[ResourceDefinition],
-    tracker_names: &BTreeSet<String>,
-) -> Result<Vec<String>> {
-    let (ordered, problems) = resolve_order(resources, tracker_names);
-    match problems.into_iter().next() {
-        Some(problem) => Err(problem.into_error()),
-        None => Ok(ordered),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::collections::{BTreeMap, BTreeSet};
@@ -922,19 +1051,22 @@ mod tests {
             resource("app", &["deps", "runtime-env"]),
             resource("deps", &[]),
         ];
-        let order = topological_order(&resources, &trackers).expect("order");
-        assert_eq!(order, vec!["deps".to_owned(), "app".to_owned()]);
+        let graph = resolve_graph(&resources, &trackers);
+        assert!(graph.problems.is_empty());
+        assert_eq!(graph.bind_order, vec!["deps".to_owned(), "app".to_owned()]);
+        // With no data edges the two orders are the same graph walked twice.
+        assert_eq!(graph.lifecycle_order, graph.bind_order);
 
         let cyclic = vec![resource("a", &["b"]), resource("b", &["a"])];
         assert!(matches!(
-            topological_order(&cyclic, &trackers),
-            Err(NewgitError::DependencyCycle(_))
+            resolve_graph(&cyclic, &trackers).problems.first(),
+            Some(GraphProblem::Cycle(_))
         ));
 
         let missing = vec![resource("app", &["nope"])];
         assert!(matches!(
-            topological_order(&missing, &trackers),
-            Err(NewgitError::MissingDependency { .. })
+            resolve_graph(&missing, &trackers).problems.first(),
+            Some(GraphProblem::MissingDependency { .. })
         ));
     }
 
@@ -1091,6 +1223,121 @@ mod tests {
                 claimant: "`app` [exports]".to_owned(),
             }]
         );
+    }
+
+    fn rendering(name: &str, with: &str) -> ResourceDefinition {
+        let mut definition = resource(name, &[]);
+        definition.render = vec![RenderSpec {
+            path: Utf8PathBuf::from("config.toml"),
+            replace: vec![crate::render::Replacement {
+                find: "placeholder".to_owned(),
+                with: with.to_owned(),
+                count: 1,
+            }],
+        }];
+        definition
+    }
+
+    /// The case from #43: Supabase's config needs Metro's URL and nothing
+    /// else. Before, the only way to get the value was `depends_on`, which
+    /// also asserted a lifecycle relationship that does not exist.
+    #[test]
+    fn a_render_reading_an_export_orders_binding_without_declaring_a_dependency() {
+        let trackers = BTreeSet::new();
+        let resources = vec![
+            rendering("supabase", "{{exports.EXPO_URL}}"),
+            exporting("metro", &["EXPO_URL"]),
+        ];
+        let graph = resolve_graph(&resources, &trackers);
+        assert!(graph.problems.is_empty());
+
+        // Bind order respects the inferred edge, even though `supabase` comes
+        // first in definition order and declares no dependency at all.
+        assert_eq!(
+            graph.bind_order,
+            vec!["metro".to_owned(), "supabase".to_owned()]
+        );
+        assert_eq!(
+            graph.data_edges["supabase"]["metro"],
+            BTreeSet::from(["EXPO_URL".to_owned()]),
+            "the edge names the export that caused it"
+        );
+
+        // Teardown is the whole point: neither resource is torn down on the
+        // strength of the other, so the lifecycle order keeps them in the
+        // order they were defined.
+        assert_eq!(
+            graph.lifecycle_order,
+            vec!["supabase".to_owned(), "metro".to_owned()]
+        );
+        assert!(
+            supabase_declares_nothing(&resources),
+            "the fix is that no `depends_on` was needed"
+        );
+    }
+
+    fn supabase_declares_nothing(resources: &[ResourceDefinition]) -> bool {
+        resources
+            .iter()
+            .all(|resource| resource.depends_on.is_empty())
+    }
+
+    /// An `[exports]` value composing another resource's export is the same
+    /// edge; a resource composing its *own* is the documented sibling case
+    /// and must not become a self-edge that reads as a cycle.
+    #[test]
+    fn exports_compose_across_resources_but_a_self_reference_is_not_an_edge() {
+        let trackers = BTreeSet::new();
+        let mut api = resource("api", &[]);
+        api.exports = BTreeMap::from([
+            ("BASE_URL".to_owned(), "http://127.0.0.1".to_owned()),
+            (
+                "HEALTH_URL".to_owned(),
+                "{{exports.BASE_URL}}/health".to_owned(),
+            ),
+            ("DB".to_owned(), "{{exports.PG_URL}}".to_owned()),
+        ]);
+        let resources = vec![api, exporting("db", &["PG_URL"])];
+
+        let graph = resolve_graph(&resources, &trackers);
+        assert!(graph.problems.is_empty());
+        assert_eq!(
+            graph.data_edges["api"],
+            BTreeMap::from([("db".to_owned(), BTreeSet::from(["PG_URL".to_owned()]))]),
+            "BASE_URL is api's own and is not an edge to itself"
+        );
+        assert_eq!(graph.bind_order, vec!["db".to_owned(), "api".to_owned()]);
+    }
+
+    /// Two resources each needing a value the other publishes cannot be bound
+    /// in any order. A data edge is a weaker claim than `depends_on`, but it
+    /// is still an ordering claim, so this is a real cycle.
+    #[test]
+    fn a_cycle_through_data_edges_alone_is_still_a_cycle() {
+        let trackers = BTreeSet::new();
+        let mut a = resource("a", &[]);
+        a.exports = BTreeMap::from([("A".to_owned(), "{{exports.B}}".to_owned())]);
+        let mut b = resource("b", &[]);
+        b.exports = BTreeMap::from([("B".to_owned(), "{{exports.A}}".to_owned())]);
+
+        let graph = resolve_graph(&[a, b], &trackers);
+        assert!(matches!(
+            graph.problems.first(),
+            Some(GraphProblem::Cycle(_))
+        ));
+        // The lifecycle graph has no edges at all, so it still resolves —
+        // which is why the cycle has to be reported from the bind pass.
+        assert_eq!(graph.lifecycle_order, vec!["a".to_owned(), "b".to_owned()]);
+    }
+
+    /// A name no resource exports is a template that will not resolve, which
+    /// `[exports]` and `[[render]]` already refuse at bind time with a better
+    /// message. The graph stays quiet rather than inventing an edge.
+    #[test]
+    fn an_unowned_export_name_is_not_an_edge() {
+        let graph = resolve_graph(&[rendering("app", "{{exports.NOPE}}")], &BTreeSet::new());
+        assert!(graph.data_edges.is_empty());
+        assert!(graph.problems.is_empty());
     }
 
     fn write_and_load(contents: &str) -> Result<ResourceDefinition> {
