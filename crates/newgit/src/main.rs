@@ -258,6 +258,17 @@ const DEFINITION_REFERENCE: &str = include_str!("../reference/definitions.md");
 const REFERENCE_POINTER: &str =
     "Definition format (every key, and which template variables each hook sees): newgit reference";
 
+/// Newly written definitions live under the project root; printing that
+/// absolute prefix on every line just repeats what the user already knows
+/// from their shell. Relative to root reads as "a file in your project",
+/// which is the point when the file in question is one the user didn't ask
+/// for by name.
+fn display_path(root: &Utf8Path, path: &Utf8Path) -> String {
+    path.strip_prefix(root)
+        .map(|relative| relative.to_string())
+        .unwrap_or_else(|_| path.to_string())
+}
+
 /// One addressable chunk of the reference: a `##` section or one of its
 /// `###` subsections, with the line range it covers.
 struct ReferenceSection {
@@ -562,16 +573,34 @@ fn resource(command: ResourceCommand) -> Result<()> {
     match command {
         ResourceCommand::Add { name, template } => {
             let manager = manager_here()?;
+            let root = manager.store().paths().project_root.clone();
             let outcome = manager.add_resource(&name, &template)?;
             println!(
                 "Added resource `{name}` from `{template}` at {}",
-                outcome.path
+                display_path(&root, &outcome.path)
             );
+            // The path stays on the line: "delete the file" is only
+            // actionable if it says which file, and the whole point of these
+            // two lines is a definition the user did not ask for by name.
             for companion in &outcome.companions_created {
-                println!("  companion: created {companion} (this template depends on it)");
+                let companion_name = companion.file_stem().unwrap_or(companion.as_str());
+                println!(
+                    "  also created resource `{companion_name}` at {}",
+                    display_path(&root, companion)
+                );
+                println!(
+                    "    required by {name}.depends_on — edit it, or delete the file if this project doesn't need it"
+                );
             }
             for tracker in &outcome.trackers_created {
-                println!("  tracker:   created {tracker} (this template deposits into it)");
+                let tracker_name = tracker.file_stem().unwrap_or(tracker.as_str());
+                println!(
+                    "  also created tracker `{tracker_name}` at {}",
+                    display_path(&root, tracker)
+                );
+                println!(
+                    "    required by {name}.into_tracker — edit it, or delete the file if this project doesn't need it"
+                );
             }
             println!("  edit the definition; `newgit spawn` binds it (ports, exports, prepare)");
             println!("  {REFERENCE_POINTER}");
@@ -704,9 +733,23 @@ fn tracker(command: TrackerCommand) -> Result<()> {
             storage,
         } => {
             let manager = manager_here()?;
+            let root = manager.store().paths().project_root.clone();
             let storage = parse_storage(&storage)?;
-            let outcome = manager.create_tracker(&name, &audience, storage, merge_with_source)?;
-            println!("Created tracker `{name}` at {}", outcome.path);
+            let outcome = match manager.create_tracker(&name, &audience, storage, merge_with_source)
+            {
+                Ok(outcome) => outcome,
+                Err(newgit_core::NewgitError::AlreadyExists(path)) => {
+                    bail!(
+                        "already exists at {} (resource templates can create the trackers they deposit into)",
+                        display_path(&root, &path)
+                    );
+                }
+                Err(err) => return Err(err.into()),
+            };
+            println!(
+                "Created tracker `{name}` at {}",
+                display_path(&root, &outcome.path)
+            );
             println!("  add paths with: newgit tracker track {name} <path>...");
             println!("  {REFERENCE_POINTER}");
             warn_graph(&manager_here()?);
