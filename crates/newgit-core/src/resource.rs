@@ -6,6 +6,7 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
 use crate::error::{NewgitError, Result};
+use crate::exports::STATE_REF_PLACEHOLDER;
 use crate::render::RenderSpec;
 
 /// A lifecycle unit that re-establishes per-branch state that can't travel
@@ -431,48 +432,81 @@ impl ResourceDefinition {
     /// `external` restore rewinds nothing, but both are inert rather than
     /// wrong: the record still reads back in `newgit checkpoints`.
     fn check_checkpoint_restore_pairing(&self) -> Result<()> {
-        let Some(restore) = &self.restore else {
-            return Ok(());
-        };
-        // An absent `[checkpoint]` records exactly what `mode = "none"` does.
-        let checkpoint = self
-            .checkpoint
-            .as_ref()
-            .map_or(CheckpointMode::None, |spec| spec.mode);
-
-        match (checkpoint, restore.mode) {
-            (CheckpointMode::Hash, RestoreMode::Command) => Err(self.invalid(
-                "checkpoint mode `hash` records a content hash of `[identity] paths`, which \
-                 restore mode `command` cannot use as an argument — a hash identifies inputs, \
-                 never a thing to restore. Pair `hash` with `recompute`, which rebuilds from \
-                 those inputs, or with `none`."
-                    .to_owned(),
-            )),
-            (CheckpointMode::External, RestoreMode::Recompute) => Err(self.invalid(
+        if matches!(self.checkpoint_mode(), CheckpointMode::External)
+            && self
+                .restore
+                .as_ref()
+                .is_some_and(|restore| restore.mode == RestoreMode::Recompute)
+        {
+            return Err(self.invalid(
                 "checkpoint mode `external` records a handle to state another system owns, and \
-                 restore mode `recompute` never reads it — it re-runs an action locally. Pair \
-                 `external` with `command`, which receives the handle as `{{state_ref}}`, or \
-                 with `external`, which leaves the other system alone."
+                 restore mode `recompute` does not restore it — it re-runs an action locally, \
+                 which for an external resource mints a *second* instance and orphans the one \
+                 the handle names. Pair `external` with `command`, which receives the handle as \
+                 `{{state_ref}}`, or with `external`, which leaves the other system alone."
                     .to_owned(),
-            )),
-            (CheckpointMode::None, RestoreMode::Command)
-                if restore
-                    .command
-                    .as_deref()
-                    .is_some_and(|command| command.contains("{{state_ref}}")) =>
-            {
-                Err(self.invalid(format!(
-                    "restore command uses `{{{{state_ref}}}}`, but {} — there is never a ref to \
-                     interpolate. Record one with a `command` or `external` checkpoint, or drop \
-                     the placeholder.",
-                    match &self.checkpoint {
-                        Some(_) => "checkpoint mode `none` records nothing",
-                        None => "this resource declares no `[checkpoint]`",
-                    }
-                )))
-            }
-            _ => Ok(()),
+            ));
         }
+        self.check_state_ref_is_recordable()
+    }
+
+    /// An absent `[checkpoint]` records exactly what `mode = "none"` does.
+    fn checkpoint_mode(&self) -> CheckpointMode {
+        self.checkpoint
+            .as_ref()
+            .map_or(CheckpointMode::None, |spec| spec.mode)
+    }
+
+    /// `{{state_ref}}` in a restore or cleanup command, under a checkpoint
+    /// that can never record one for it.
+    ///
+    /// Two modes never produce a ref a command can be handed. `none` records
+    /// nothing at all. `hash` records the content hash of `[identity] paths`,
+    /// which answers whether the inputs moved and never names a concrete
+    /// thing to restore or tear down — `restore-from hash:0fa284b468` is not
+    /// a no-op, it is a wrong argument.
+    ///
+    /// Both are decidable from the definition alone, so both are refused
+    /// where the mistake was made. The guard that refuses a cleanup hook with
+    /// an unresolved placeholder still stands behind this: it catches the
+    /// same mistake in a record written under an older definition, which no
+    /// amount of reading the current one can predict.
+    fn check_state_ref_is_recordable(&self) -> Result<()> {
+        let hint = match self.checkpoint_mode() {
+            CheckpointMode::None if self.checkpoint.is_some() => {
+                "checkpoint mode `none` records nothing — there is never a ref to interpolate. \
+                 Record one with a `command` or `external` checkpoint, or drop the placeholder."
+            }
+            CheckpointMode::None => {
+                "this resource declares no `[checkpoint]` — there is never a ref to interpolate. \
+                 Record one with a `command` or `external` checkpoint, or drop the placeholder."
+            }
+            CheckpointMode::Hash => {
+                "checkpoint mode `hash` records a content hash of `[identity] paths`, which \
+                 identifies inputs and never a thing to act on. Rebuild from those inputs with \
+                 restore mode `recompute`, or drop the placeholder."
+            }
+            CheckpointMode::Command | CheckpointMode::External => return Ok(()),
+        };
+
+        let restore_command = self
+            .restore
+            .as_ref()
+            .filter(|restore| restore.mode == RestoreMode::Command)
+            .and_then(|restore| restore.command.as_deref());
+        let cleanup_command = self
+            .cleanup
+            .as_ref()
+            .and_then(|cleanup| cleanup.command.as_deref());
+
+        for (section, command) in [("restore", restore_command), ("cleanup", cleanup_command)] {
+            if command.is_some_and(|command| command.contains(STATE_REF_PLACEHOLDER)) {
+                return Err(self.invalid(format!(
+                    "{section} command uses `{STATE_REF_PLACEHOLDER}`, but {hint}"
+                )));
+            }
+        }
+        Ok(())
     }
 
     fn check_workdir_is_workspace_relative(&self, workdir: &Utf8Path) -> Result<()> {
@@ -904,13 +938,14 @@ workdir = "../outside"
         );
     }
 
-    /// The pairing that matters: `hash` + `command` used to load, and then
-    /// handed the restore command `hash:0fa284b46875` — a content hash where
-    /// it expected something to restore.
+    /// The case that matters: this loaded, and then handed the restore
+    /// command `hash:0fa284b46875` — a content hash where it expected
+    /// something to restore.
     #[test]
-    fn a_checkpoint_mode_a_restore_cannot_consume_is_refused() {
-        let error = write_and_load(
-            r#"ownership = "branch"
+    fn a_state_ref_no_checkpoint_can_record_is_refused() {
+        let hash_definition = |section: &str, command: &str| {
+            format!(
+                r#"ownership = "branch"
 
 [identity]
 paths = ["package-lock.json"]
@@ -921,18 +956,56 @@ command = "npm ci"
 [checkpoint]
 mode = "hash"
 
-[restore]
-mode = "command"
-command = "restore-from {{state_ref}}"
-"#,
-        )
+[{section}]
+{command}
+"#
+            )
+        };
+
+        let error = write_and_load(&hash_definition(
+            "restore",
+            "mode = \"command\"\ncommand = \"restore-from {{state_ref}}\"",
+        ))
         .expect_err("a hash ref is not something a command can restore from");
         let message = error.to_string();
-        assert!(message.contains("hash"), "names the checkpoint mode");
+        assert!(message.contains("restore command"), "{message}");
         assert!(message.contains("recompute"), "names the fix: {message}");
 
-        // `recompute` re-runs an action locally and never looks at the handle,
-        // so an `external` checkpoint has nothing to say to it.
+        // The same mistake in a teardown command, which is the one that does
+        // damage: `delete-environment hash:0fa284b468` is a wrong argument,
+        // and the runtime guard only ever saw a placeholder that had resolved.
+        let error = write_and_load(&hash_definition(
+            "cleanup",
+            "command = \"delete-environment {{state_ref}}\"",
+        ))
+        .expect_err("a hash ref is not something a command can tear down");
+        assert!(error.to_string().contains("cleanup command"));
+
+        // Nothing records a ref at all, so the placeholder can never resolve —
+        // in either section.
+        for section in [
+            "[restore]\nmode = \"command\"\ncommand",
+            "[cleanup]\ncommand",
+        ] {
+            let error = write_and_load(&format!(
+                r#"ownership = "branch"
+
+[actions.prepare]
+command = "true"
+
+{section} = "act-on {{{{state_ref}}}}"
+"#
+            ))
+            .expect_err("no checkpoint records a ref to interpolate");
+            assert!(error.to_string().contains("[checkpoint]"));
+        }
+    }
+
+    /// `recompute` does not *ignore* an external handle, which would be inert
+    /// and allowed — it re-runs `prepare`, which mints a second external
+    /// instance and orphans the one the handle names.
+    #[test]
+    fn an_external_checkpoint_with_a_recompute_restore_is_refused() {
         let error = write_and_load(
             r#"ownership = "external"
 
@@ -947,23 +1020,8 @@ state_ref = "{{exports.PREVIEW_ID}}"
 mode = "recompute"
 "#,
         )
-        .expect_err("recompute ignores an external handle");
+        .expect_err("recompute would mint a second preview");
         assert!(error.to_string().contains("external"));
-
-        // Nothing records a ref, so `{{state_ref}}` can never resolve.
-        let error = write_and_load(
-            r#"ownership = "branch"
-
-[actions.prepare]
-command = "true"
-
-[restore]
-mode = "command"
-command = "restore-from {{state_ref}}"
-"#,
-        )
-        .expect_err("a restore command cannot interpolate a ref nothing records");
-        assert!(error.to_string().contains("[checkpoint]"));
     }
 
     /// The pairings that do mean something keep loading — including the inert
@@ -1007,8 +1065,14 @@ command = "true"
             "mode = \"command\"\ncommand = \"cloudctl restore {{state_ref}}\"",
         );
 
-        // A `none` checkpoint only refuses a restore command that asks for a
-        // ref; one that does not is a perfectly ordinary rebuild.
+        // The refusal is about the *placeholder*, not the mode. A restore
+        // command that never asks for a state ref is an ordinary rebuild,
+        // whatever the checkpoint records — refusing it would force a
+        // working definition to be rewritten to satisfy the validator.
+        ok(
+            "mode = \"hash\"",
+            "mode = \"command\"\ncommand = \"npm ci\"",
+        );
         ok("mode = \"none\"", "mode = \"command\"\ncommand = \"true\"");
     }
 }

@@ -269,4 +269,37 @@ mod tests {
             Err(NewgitError::UnknownCheckpoint { .. })
         ));
     }
+    /// What `{{state_ref}}` is allowed to become. A hash is the case worth
+    /// pinning: it is a recorded ref, so "there is no ref" is not why it
+    /// resolves to nothing — it is the wrong kind of thing to hand a command.
+    #[test]
+    fn a_hash_ref_is_not_something_a_command_can_be_handed() {
+        let state = |state_ref: Option<&str>, state_path: Option<&str>| ResourceState {
+            name: "deps".to_owned(),
+            definition_rev: "sha256:000000000000".to_owned(),
+            mode: "hash".to_owned(),
+            state_ref: state_ref.map(ToOwned::to_owned),
+            state_path: state_path.map(Utf8PathBuf::from),
+            was_running: false,
+            resolved_ports: BTreeMap::new(),
+            resolved_exports: BTreeMap::new(),
+        };
+
+        assert_eq!(
+            state(Some("hash:0fa284b46875"), None).consumable_state_ref(),
+            None
+        );
+        assert_eq!(
+            state(Some("pv_9"), None).consumable_state_ref(),
+            Some("pv_9".to_owned()),
+            "an opaque handle is exactly what a command wants"
+        );
+        assert_eq!(
+            state(Some("tracker:db-snapshots@a1b2"), Some("/lane/a1b2/db.sql"))
+                .consumable_state_ref(),
+            Some("/lane/a1b2/db.sql".to_owned()),
+            "deposited content resolves to the path, not the ref that located it"
+        );
+        assert_eq!(state(None, None).consumable_state_ref(), None);
+    }
 }

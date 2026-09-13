@@ -287,15 +287,16 @@ fn a_hash_state_ref_never_reaches_the_cleanup_hook() {
     let witness = temp.join("witness");
     std::fs::create_dir_all(&witness).expect("mkdir");
 
-    // A `hash` checkpoint records the content hash of the identity files.
-    // That is a real recorded ref, so the refusal cannot come from absence:
-    // it has to come from the ref being the wrong kind of thing to hand a
-    // teardown command.
+    // Writing `mode = "hash"` beside a cleanup hook that wants
+    // `{{state_ref}}` no longer loads — that pairing is refused when the
+    // definition is written. What still reaches this code is a *record*
+    // written under an older definition, which no amount of reading the
+    // current one can predict: this resource checkpointed as `hash`, and was
+    // later rewritten to mint an external handle instead.
     write_resource(
         &store,
         "deps",
-        &format!(
-            r#"ownership = "branch"
+        r#"ownership = "branch"
 
 [identity]
 paths = ["package-lock.json"]
@@ -305,11 +306,7 @@ command = "true"
 
 [checkpoint]
 mode = "hash"
-
-[cleanup]
-command = "echo deleting {{{{state_ref}}}} >> {witness}/deleted.txt"
-"#
-        ),
+"#,
     );
 
     let manager = manager_at(&store);
@@ -327,6 +324,29 @@ command = "echo deleting {{{{state_ref}}}} >> {witness}/deleted.txt"
         .expect("a hash checkpoint records a ref");
     assert!(recorded.starts_with("hash:"), "recorded {recorded}");
 
+    // The definition changes; the record does not. The hash is still the
+    // latest thing recorded for `deps`, and it is still not something
+    // `delete-environment` can be handed.
+    write_resource(
+        &store,
+        "deps",
+        &format!(
+            r#"ownership = "branch"
+
+[actions.prepare]
+command = "true"
+
+[checkpoint]
+mode = "external"
+state_ref = "{{{{exports.PREVIEW_ID}}}}"
+
+[cleanup]
+command = "echo deleting {{{{state_ref}}}} >> {witness}/deleted.txt"
+"#
+        ),
+    );
+
+    let manager = manager_at(&store);
     let outcome = manager
         .remove("feature-a", &temp, ArchivedCheckpoints::Keep)
         .expect("remove");

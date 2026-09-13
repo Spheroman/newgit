@@ -1148,6 +1148,109 @@ fn an_export_may_compose_a_dependencys_export() {
     );
 }
 
+/// `HEALTH_URL` sorts *before* `BASE_URL`, so nothing about declaration order
+/// could have saved this one: the table is a map.
+const SIBLING_EXPORT_RESOURCE: &str = r#"ownership = "branch"
+
+[ports]
+app = { start = 4100 }
+
+[exports]
+BASE_URL = "http://127.0.0.1:{{ports.app}}"
+HEALTH_URL = "{{exports.BASE_URL}}/health"
+"#;
+
+/// Composing a sibling is the obvious thing to write, and refusing it while
+/// accepting the identical line pointed at a *dependency* would be a rule
+/// nobody could guess — worse, the error named a key defined two lines above.
+#[test]
+fn an_export_may_compose_a_sibling_whatever_the_key_order() {
+    let (_guard, temp) = tempdir();
+    let store = setup(&temp);
+    write_resource(&store, "app", SIBLING_EXPORT_RESOURCE);
+    let repo = store.paths().project_root.clone();
+    let manager = BranchManager::open(MetadataStore::at(repo)).expect("manager");
+
+    let outcome = manager.spawn("feature-a", None).expect("spawn");
+    let app = outcome.branch.resources.get("app").expect("app bound");
+    assert_eq!(
+        app.resolved_exports.get("HEALTH_URL").map(String::as_str),
+        Some("http://127.0.0.1:4100/health")
+    );
+}
+
+const CYCLIC_EXPORT_RESOURCE: &str = r#"ownership = "branch"
+
+[exports]
+A = "{{exports.B}}"
+B = "{{exports.A}}"
+"#;
+
+/// Resolving to a fixed point must stall on a cycle rather than spin, and
+/// report it like any other placeholder that never resolved.
+#[test]
+fn exports_that_reference_each_other_stall_rather_than_loop() {
+    let (_guard, temp) = tempdir();
+    let store = setup(&temp);
+    write_resource(&store, "loop", CYCLIC_EXPORT_RESOURCE);
+    let repo = store.paths().project_root.clone();
+    let manager = BranchManager::open(MetadataStore::at(repo)).expect("manager");
+
+    let outcome = manager.spawn("feature-a", None).expect("spawn");
+    let report = outcome
+        .resources
+        .iter()
+        .find(|resource| resource.name == "loop")
+        .expect("loop reported");
+    assert_eq!(report.status, ResourceStatus::Failed);
+    let error = report.export_error.as_deref().expect("export error");
+    assert!(error.contains("`A`") && error.contains("`B`"), "{error}");
+}
+
+const PARTIAL_EXPORT_RESOURCE: &str = r#"ownership = "branch"
+
+[ports]
+app = { start = 4200 }
+
+[exports]
+GOOD_URL = "http://127.0.0.1:{{ports.app}}"
+BAD_URL = "http://127.0.0.1:{{ports.nope}}"
+ALSO_BAD = "{{ports.also_nope}}"
+"#;
+
+/// A binding that publishes half an environment is the case the refusal
+/// exists to prevent: `newgit run` and every dependent's actions read a
+/// binding's exports without asking what status it holds.
+#[test]
+fn one_unresolved_export_withholds_every_export_of_that_resource() {
+    let (_guard, temp) = tempdir();
+    let store = setup(&temp);
+    write_resource(&store, "app", PARTIAL_EXPORT_RESOURCE);
+    let repo = store.paths().project_root.clone();
+    let manager = BranchManager::open(MetadataStore::at(repo)).expect("manager");
+
+    let outcome = manager.spawn("feature-a", None).expect("spawn");
+    let report = outcome
+        .resources
+        .iter()
+        .find(|resource| resource.name == "app")
+        .expect("app reported");
+    assert_eq!(report.status, ResourceStatus::Failed);
+
+    let error = report.export_error.as_deref().expect("export error");
+    assert!(
+        error.contains("BAD_URL") && error.contains("ALSO_BAD"),
+        "every unresolved export is named, not just the first: {error}"
+    );
+
+    let binding = outcome.branch.resources.get("app").expect("app bound");
+    assert!(
+        binding.resolved_exports.is_empty(),
+        "a resolved sibling is still half an environment: {:?}",
+        binding.resolved_exports
+    );
+}
+
 const UNRESOLVED_EXPORT_RESOURCE: &str = r#"ownership = "branch"
 depends_on = ["api"]
 

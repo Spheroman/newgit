@@ -1257,8 +1257,9 @@ reference for that resource, which is how `cloudctl preview delete
 If rendering leaves any `{{...}}` unresolved, the hook is **refused, not
 run**: a destructive command with a literal placeholder is not a no-op, it is
 a wrong argument. Rendering elsewhere deliberately leaves unknown variables
-verbatim so misconfiguration is visible; cleanup is the one place that must
-fail closed instead.
+verbatim so misconfiguration is visible; cleanup, `[[render]]`, and
+`[exports]` are the places that must fail closed instead — each writes
+something durable that outlives the command that got it wrong.
 
 ---
 

@@ -160,14 +160,16 @@ pub enum NewgitError {
     },
 
     #[error(
-        "resource `{resource}` exports `{export}` with unresolved `{placeholder}`; an export is \
-         rendered once and handed to every later command as an environment variable, so a \
-         placeholder left verbatim would surface in another process rather than here"
+        "resource `{resource}` leaves exports unresolved: {exports}; an export is rendered once \
+         and handed to every later command as an environment variable, so a placeholder left \
+         verbatim would surface in another process rather than here. None of this resource's \
+         exports are stored"
     )]
     ExportUnresolved {
         resource: String,
-        export: String,
-        placeholder: String,
+        /// Every export that did not resolve, as ``` `NAME` ({{placeholder}}) ```
+        /// — all of them, so fixing one does not just reveal the next.
+        exports: String,
     },
 
     #[error(

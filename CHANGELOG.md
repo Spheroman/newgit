@@ -97,14 +97,28 @@ of `.newgit/` in a minor release — see *Upgrading* below.
   something first dials a host named `{{ports`.
 
   ```
-  resource:  `functions` export: FAILED — resource `functions` exports
-  `SUPABASE_FUNCTIONS_URL` with unresolved `{{ports.supabase.api}}`
+  resource:  `functions` export: FAILED — resource `functions` leaves exports
+  unresolved: `SUPABASE_FUNCTIONS_URL` ({{ports.supabase.api}}); ...
   ```
 
-  The unresolved value is dropped rather than stored: an absent environment
-  variable is something downstream can detect, and a malformed URL is not.
-  Export failures are reported apart from render failures, because they are
-  different mistakes in different parts of the definition.
+  Nothing that resource exports is stored, not just the value that failed: an
+  absent environment variable is something downstream can detect, a malformed
+  URL is not, and a binding that publishes half an environment is the same
+  failure one variable further down — `newgit run` and every dependent's
+  actions read a binding's exports without asking what status it holds. Every
+  unresolved export is named at once, so fixing the first does not just reveal
+  the second on the next spawn. Export failures are reported apart from render
+  failures, because they are different mistakes in different parts of the
+  definition.
+
+  An export may compose a *sibling* as well as a dependency's export
+  (`HEALTH_URL = "{{exports.BASE_URL}}/health"`). Composing the resource next
+  door while the key two lines up was refused would have been a rule nobody
+  could guess — and the refusal named a key that was defined right there. The
+  table is a map with no declaration order to lean on (`HEALTH_URL` sorts
+  first), so exports resolve to a fixed point instead: each pass renders what
+  it can, and a pass that resolves nothing new ends it. A cycle stalls and is
+  reported like any other placeholder that never resolved.
 
 - A `hash` checkpoint's state ref can no longer reach a command as an
   argument ([#47](https://github.com/Spheroman/newgit/issues/47),
@@ -125,15 +139,23 @@ of `.newgit/` in a minor release — see *Upgrading* below.
   is made visible, and the cleanup guard fires unchanged — one rule about what
   a state ref *is*, rather than a second check bolted beside the first.
 
-  The pairing that produced it is also refused when the definition loads.
-  `[checkpoint]` and `[restore]` are two halves of one mechanism, but were
-  validated one section at a time, so all sixteen pairings loaded. Three
-  cannot mean anything — `hash` + `command` (a hash is not something to
-  restore from), `external` + `recompute` (a local rebuild never reads the
-  handle), and a `command` restore interpolating `{{state_ref}}` under a
-  checkpoint that records none — and each now fails at load, naming the mode
-  that pairs correctly instead of surfacing during the undo someone is
-  relying on. Pairings that are merely inert still load.
+  What the current definition *can* decide is refused when it loads.
+  `[checkpoint]` and `[restore]` are two halves of one mechanism but were
+  validated one section at a time, so every pairing loaded. Now a
+  `{{state_ref}}` under a checkpoint that can never record one — `hash`, or
+  `none`, or no `[checkpoint]` at all — fails at load, in a `[cleanup]`
+  command as well as a `[restore]` one, since learning at teardown that the
+  hook never ran is the worse half of the same mistake. The runtime guard
+  still stands behind it, for the case reading the current file cannot
+  predict: a record written under an older definition.
+
+  These refusals are about the *placeholder*, not the mode. A restore command
+  that never asks for a state ref is an ordinary rebuild whatever the
+  checkpoint records, and still loads; so do pairings that are merely inert,
+  like a `command` checkpoint under a `recompute` restore. The one mode
+  pairing refused outright is `external` + `recompute`, which is not inert:
+  `recompute` re-runs `prepare`, which for an external resource mints a
+  second instance and orphans the one the handle names.
 
 ### Added
 
