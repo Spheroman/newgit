@@ -57,8 +57,12 @@ pub enum NewgitError {
     #[error("`{command}` failed: {stderr}")]
     SourceCommand { command: String, stderr: String },
 
-    #[error("tracker `{tracker}` is invalid: {reason}")]
-    InvalidDefinition { tracker: String, reason: String },
+    #[error("{kind} `{name}` is invalid: {reason}")]
+    InvalidDefinition {
+        kind: &'static str,
+        name: String,
+        reason: String,
+    },
 
     #[error("trackers `{left}` and `{right}` both own `{path}`; content lanes must be disjoint")]
     TrackerPathConflict {

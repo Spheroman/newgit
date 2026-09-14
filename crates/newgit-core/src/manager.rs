@@ -2563,7 +2563,8 @@ impl BranchManager {
                     && !self.trackers.iter().any(|t| &t.name == tracker)
                 {
                     return Err(NewgitError::InvalidDefinition {
-                        tracker: definition.name.clone(),
+                        kind: "resource",
+                        name: definition.name.clone(),
                         reason: format!(
                             "checkpoint `into_tracker = \"{tracker}\"` names a tracker that is \
                              not defined; create it with `newgit tracker create {tracker}`"
