@@ -18,7 +18,7 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "serd
 # Process-group signalling and reaping. Shelling out to `kill` made liveness
 # depend on which `kill` was on PATH and could not distinguish a zombie from
 # a live process; see supervisor.rs.
-nix = { version = "0.30", features = ["signal", "process"] }
+nix = { version = "0.31", features = ["signal", "process"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.11"
