@@ -290,6 +290,10 @@ where rewinding the whole workspace each cycle is the cost.
 A restore command is not transactional. If one fails, `newgit undo` says the
 undo was incomplete and names the resource, rather than reporting success.
 
+A restore command runs against whatever state its own reset left behind,
+including rows a migration step already inserted — it is not a fresh
+database unless the command made one.
+
 ### `[cleanup]`
 
 | key | type | required | default | meaning |
