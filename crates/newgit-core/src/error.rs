@@ -120,6 +120,34 @@ pub enum NewgitError {
     },
 
     #[error(
+        "resource `{resource}` start_after `{dependency}`, but `{dependency}` has no \
+         `long_running` `start` action — there is nothing for `newgit start` to wait on"
+    )]
+    StartAfterNotOrchestrated {
+        resource: String,
+        dependency: String,
+    },
+
+    #[error(
+        "resource `{resource}` start_after `{dependency}`, but `{dependency}` is not running; \
+         start it first — `newgit start` does this for you in dependency order"
+    )]
+    StartDependencyNotRunning {
+        resource: String,
+        dependency: String,
+    },
+
+    #[error(
+        "resource `{resource}` did not become ready within {timeout_secs}s (probe: {probe}); \
+         see .newgit/logs for its output"
+    )]
+    NotReady {
+        resource: String,
+        probe: String,
+        timeout_secs: u64,
+    },
+
+    #[error(
         "environment variable `{name}` is declared more than once ({claimants}); a name may \
          have only one owner — {remedy}"
     )]

@@ -17,6 +17,15 @@ pub struct ResourceDefinition {
     pub name: String,
     pub ownership: Ownership,
     pub depends_on: Vec<String>,
+    /// Subset of `depends_on`: before this resource's `start` action runs,
+    /// each of these must already be **running** — and ready, if it
+    /// declares `[ready]`. `depends_on` orders `prepare`; it has no opinion
+    /// on whether a process is actually serving, which is the runtime edge
+    /// #54 asked for. Validated to be a subset of `depends_on` — a start
+    /// dependency with no lifecycle ordering behind it is never what was
+    /// meant, and `depends_on` already gives `start_after` its bind/lifecycle
+    /// order for free.
+    pub start_after: Vec<String>,
     pub identity: Option<IdentitySpec>,
     /// Where every command this resource runs is spawned, relative to the
     /// workspace root. Applied as the child process's `current_dir`, never
@@ -32,6 +41,11 @@ pub struct ResourceDefinition {
     /// `prepare`. See [`crate::render`].
     pub render: Vec<RenderSpec>,
     pub actions: BTreeMap<String, ActionSpec>,
+    /// How `newgit start` decides this resource's `start` is actually
+    /// serving, not merely alive. Optional: with no `[ready]`, `newgit
+    /// start` confirms only that the process exists, and says exactly that
+    /// rather than calling it "ready".
+    pub ready: Option<ReadySpec>,
     pub checkpoint: Option<CheckpointSpec>,
     pub restore: Option<RestoreSpec>,
     pub cleanup: Option<CleanupSpec>,
@@ -127,6 +141,71 @@ pub struct ActionSpec {
     pub captures: Vec<String>,
 }
 
+/// How `newgit start` decides a `start` action is actually serving,
+/// declared rather than assumed. "The process is alive" is a different,
+/// weaker fact — a Supabase stack that has been exec'd is not the same as
+/// one answering on its port — so an absent `[ready]` is reported as
+/// "alive", never silently upgraded to "ready".
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ReadySpec {
+    pub probe: ReadyProbe,
+    /// Required for `probe = "command"`. Exit 0 means ready; anything else
+    /// means "not yet" and is retried until the timeout. May use
+    /// `{{ports.<name>}}`, the same as an action command.
+    #[serde(default)]
+    pub command: Option<String>,
+    /// Required for `probe = "tcp"` or `"http"`: a `[ports.<name>]` name.
+    /// Probed on `127.0.0.1`.
+    #[serde(default)]
+    pub port: Option<String>,
+    /// `http` only: the path requested.
+    #[serde(default = "default_ready_path")]
+    pub path: String,
+    /// How long `newgit start` waits for this resource before giving up.
+    #[serde(default = "default_ready_timeout_secs")]
+    pub timeout_secs: u64,
+    /// How long between probe attempts.
+    #[serde(default = "default_ready_interval_ms")]
+    pub interval_ms: u64,
+}
+
+fn default_ready_path() -> String {
+    "/".to_owned()
+}
+
+fn default_ready_timeout_secs() -> u64 {
+    60
+}
+
+fn default_ready_interval_ms() -> u64 {
+    500
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum ReadyProbe {
+    Command,
+    Tcp,
+    Http,
+}
+
+impl ReadyProbe {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Command => "command",
+            Self::Tcp => "tcp",
+            Self::Http => "http",
+        }
+    }
+}
+
+impl fmt::Display for ReadyProbe {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
+
 /// How a resource tears its concrete instance down. Ownership decides
 /// whether the hook may run at all; this decides what running it means.
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -198,6 +277,8 @@ struct ResourceDefinitionFile {
     #[serde(default)]
     depends_on: Vec<String>,
     #[serde(default)]
+    start_after: Vec<String>,
+    #[serde(default)]
     identity: Option<IdentitySpec>,
     #[serde(default)]
     workdir: Option<Utf8PathBuf>,
@@ -209,6 +290,8 @@ struct ResourceDefinitionFile {
     render: Vec<RenderSpec>,
     #[serde(default)]
     actions: BTreeMap<String, ActionSpec>,
+    #[serde(default)]
+    ready: Option<ReadySpec>,
     #[serde(default)]
     checkpoint: Option<CheckpointSpec>,
     #[serde(default)]
@@ -237,12 +320,14 @@ impl ResourceDefinition {
             name: name.to_owned(),
             ownership: file.ownership,
             depends_on: file.depends_on,
+            start_after: file.start_after,
             identity: file.identity,
             workdir: file.workdir,
             ports: file.ports,
             exports: file.exports,
             render: file.render,
             actions: file.actions,
+            ready: file.ready,
             checkpoint: file.checkpoint,
             restore: file.restore,
             cleanup: file.cleanup,
@@ -262,6 +347,15 @@ impl ResourceDefinition {
 
     pub fn has_long_running_action(&self) -> bool {
         self.actions.values().any(|action| action.long_running)
+    }
+
+    /// Whether this resource has a supervised `start`: the only kind
+    /// `newgit start` and `start_after` can order against. A `start` action
+    /// that runs and finishes has nothing for either to wait on.
+    pub fn has_long_running_start(&self) -> bool {
+        self.actions
+            .get("start")
+            .is_some_and(|action| action.long_running)
     }
 
     /// The `workdir` in effect for one command: an action's own `workdir`
@@ -314,6 +408,8 @@ impl ResourceDefinition {
     }
 
     fn validate(&self) -> Result<()> {
+        self.check_start_after()?;
+        self.check_ready()?;
         self.check_identity_paths()?;
         if let Some(checkpoint) = &self.checkpoint {
             match checkpoint.mode {
@@ -428,6 +524,79 @@ impl ResourceDefinition {
                     )));
                 }
             }
+        }
+        Ok(())
+    }
+
+    /// `start_after` is checked here, self-contained: every name in it must
+    /// also be in `depends_on`. This is what lets `start_after` reuse
+    /// `depends_on`'s bind/lifecycle order instead of needing an order of
+    /// its own — see the field doc on [`Self::start_after`]. Cross-resource
+    /// checks (does the name exist, is it orchestrable) belong to the graph,
+    /// which is the only place that can see other definitions.
+    fn check_start_after(&self) -> Result<()> {
+        for name in &self.start_after {
+            if !self.depends_on.contains(name) {
+                return Err(self.invalid(format!(
+                    "start_after names `{name}`, which is not in depends_on; a start-order \
+                     dependency with no lifecycle ordering behind it is never what was meant — \
+                     add `{name}` to depends_on too"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn check_ready(&self) -> Result<()> {
+        let Some(ready) = &self.ready else {
+            return Ok(());
+        };
+        match ready.probe {
+            ReadyProbe::Command => {
+                if ready.command.is_none() {
+                    return Err(
+                        self.invalid("`[ready] probe = \"command\"` requires `command`".to_owned())
+                    );
+                }
+                if ready.port.is_some() {
+                    return Err(self.invalid(
+                        "`[ready] probe = \"command\"` does not use `port`; a command probe \
+                         reaches the port itself, with `{{ports.<name>}}`"
+                            .to_owned(),
+                    ));
+                }
+            }
+            ReadyProbe::Tcp | ReadyProbe::Http => {
+                let Some(port) = &ready.port else {
+                    return Err(self.invalid(format!(
+                        "`[ready] probe = \"{}\"` requires `port`, naming a `[ports.<name>]`",
+                        ready.probe
+                    )));
+                };
+                if !self.ports.contains_key(port) {
+                    return Err(self.invalid(format!(
+                        "`[ready] port = \"{port}\"` is not declared in `[ports.{port}]`"
+                    )));
+                }
+                if ready.command.is_some() {
+                    return Err(self.invalid(format!(
+                        "`[ready] probe = \"{}\"` does not use `command`",
+                        ready.probe
+                    )));
+                }
+            }
+        }
+        if ready.probe != ReadyProbe::Http && ready.path != default_ready_path() {
+            return Err(self.invalid(format!(
+                "`[ready] path` only applies to `probe = \"http\"`, not `{}`",
+                ready.probe
+            )));
+        }
+        if ready.timeout_secs == 0 {
+            return Err(self.invalid("`[ready] timeout_secs` must be greater than 0".to_owned()));
+        }
+        if ready.interval_ms == 0 {
+            return Err(self.invalid("`[ready] interval_ms` must be greater than 0".to_owned()));
         }
         Ok(())
     }
@@ -815,6 +984,15 @@ pub enum GraphProblem {
         name: String,
         claimant: String,
     },
+    /// `start_after` names a resource with no supervised `start` — nothing
+    /// for `newgit start` to wait on. Checked here rather than at
+    /// definition load because it is cross-resource: the referenced
+    /// definition has to exist to be asked whether its `start` is
+    /// `long_running`.
+    StartAfterNotOrchestrated {
+        resource: String,
+        dependency: String,
+    },
 }
 
 impl GraphProblem {
@@ -849,6 +1027,13 @@ impl GraphProblem {
             Self::ReservedEnvName { name, claimant } => {
                 NewgitError::ReservedEnvName { name, claimant }
             }
+            Self::StartAfterNotOrchestrated {
+                resource,
+                dependency,
+            } => NewgitError::StartAfterNotOrchestrated {
+                resource,
+                dependency,
+            },
         }
     }
 }
@@ -980,12 +1165,36 @@ pub fn resolve_graph(
     let (lifecycle_order, _) = resolve_order(resources, tracker_names, &BTreeMap::new());
 
     problems.extend(check_env_names(resources));
+    problems.extend(check_start_after(resources));
     ResourceGraph {
         bind_order,
         lifecycle_order,
         data_edges,
         problems,
     }
+}
+
+/// Every `start_after` name a resource has to be orchestrable, or there is
+/// nothing for `newgit start` to wait on. `check_start_after` on the
+/// definition itself already refused a name outside `depends_on`; this is
+/// the cross-resource half, which needs the other definition in hand.
+fn check_start_after(resources: &[ResourceDefinition]) -> Vec<GraphProblem> {
+    let mut problems = Vec::new();
+    for resource in resources {
+        for dependency in &resource.start_after {
+            let orchestrated = resources
+                .iter()
+                .find(|candidate| &candidate.name == dependency)
+                .is_some_and(ResourceDefinition::has_long_running_start);
+            if !orchestrated {
+                problems.push(GraphProblem::StartAfterNotOrchestrated {
+                    resource: resource.name.clone(),
+                    dependency: dependency.clone(),
+                });
+            }
+        }
+    }
+    problems
 }
 
 /// Order resources so dependencies come before dependents. Dependencies may
@@ -1182,12 +1391,14 @@ mod tests {
             name: name.to_owned(),
             ownership: Ownership::Branch,
             depends_on: deps.iter().map(ToString::to_string).collect(),
+            start_after: Vec::new(),
             identity: None,
             workdir: None,
             ports: BTreeMap::new(),
             exports: BTreeMap::new(),
             render: Vec::new(),
             actions: BTreeMap::new(),
+            ready: None,
             checkpoint: None,
             restore: None,
             cleanup: None,

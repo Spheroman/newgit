@@ -80,6 +80,7 @@ other ledger: a port is free the moment nothing claims it).
 | --- | --- | --- | --- | --- |
 | `ownership` | string | yes | — | `branch`, `workspace`, `project`, `user`, or `external`. See *Ownership*. |
 | `depends_on` | array of strings | no | `[]` | resource or tracker names whose *lifecycle* this one depends on. Orders `prepare` at spawn and cleanup hooks in reverse. A name that is neither is an error the graph reports. Needing another resource's *value* is not this — see *Data edges*. |
+| `start_after` | array of strings | no | `[]` | subset of `depends_on`: before `newgit start` runs this resource's `start`, each of these must already be **running** — and ready, if it declares `[ready]`. `depends_on` orders `prepare`; it has no opinion on whether a process is actually *serving*, which is what this closes (#54). Every name here must already be in `depends_on` — refused otherwise, and refused separately if the name has no `long_running` `start` of its own, since there would be nothing to wait on. |
 | `workdir` | string | no | workspace root | where every command this resource runs is spawned, relative to the workspace root. Overridable per action — see `[actions.<name>]`. |
 
 `workdir` is applied as the spawned process's working directory, never as a
@@ -211,6 +212,46 @@ allocate. Do not rely on declaration order in the file; it is not read.
 you invoke: `newgit action <resource>.<action> [instance]`. Name them whatever
 you like; `start`/`stop` are a convention, made real by `long_running` and
 `signal`, not by the names.
+
+### `[ready]`
+
+How `newgit start` decides this resource's `start` is actually **serving**,
+not merely alive — see #54. Optional. With no `[ready]`, `newgit start`
+confirms only that the process exists and reports it as "alive", never as
+"ready" for a check it never ran.
+
+| key | type | required | default | meaning |
+| --- | --- | --- | --- | --- |
+| `probe` | string | yes | — | `command`, `tcp`, or `http`. |
+| `command` | string | required for `probe = "command"` | — | exit `0` means ready; anything else is retried until the timeout. May use `{{ports.<name>}}`, the same as an action command. |
+| `port` | string | required for `probe = "tcp"` or `"http"` | — | a `[ports.<name>]` this same resource declares. Probed on `127.0.0.1`. |
+| `path` | string | no, `http` only | `/` | the HTTP path requested. |
+| `timeout_secs` | integer | no | `60` | how long `newgit start` waits for this resource before giving up. |
+| `interval_ms` | integer | no | `500` | how long between probe attempts. |
+
+```toml
+[ports.api]
+start = 5400
+
+[actions.start]
+command = "supabase start"
+long_running = true
+
+[ready]
+probe = "http"
+port  = "api"
+path  = "/health"
+```
+
+A `tcp` probe only checks that a connection opens; `http` additionally sends
+a bare `GET` and requires a `2xx`/`3xx`/`4xx` status line — anything that
+answers on purpose, as opposed to a `5xx` or a connection nothing is
+listening on yet. Neither pulls in an HTTP client: a hand-rolled request is
+the same shape as the `curl -sf` a `command` probe would otherwise reach for.
+
+`command`, `tcp`, and `http` are mutually exclusive with each other's
+fields — a `command` probe does not take `port`, and `tcp`/`http` do not
+take `command`. `path` only applies to `http`.
 
 ### `[checkpoint]`
 
