@@ -1,4 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::io::{Read as _, Write as _};
+use std::net::TcpStream;
+use std::time::{Duration, Instant};
 
 use camino::{Utf8Path, Utf8PathBuf};
 use chrono::Utc;
@@ -27,8 +30,8 @@ use crate::materializer::{
 use crate::ports;
 use crate::render::{self, RenderRecord};
 use crate::resource::{
-    Captures, CheckpointMode, DataEdges, GraphProblem, ResourceDefinition, ResourceGraph,
-    RestoreMode, parse_captures, resolve_graph,
+    Captures, CheckpointMode, DataEdges, GraphProblem, ReadyProbe, ReadySpec, ResourceDefinition,
+    ResourceGraph, RestoreMode, parse_captures, resolve_graph,
 };
 use crate::source::GitSource;
 use crate::store::MetadataStore;
@@ -143,6 +146,65 @@ pub enum ActionOutcome {
         /// produces`, and so had a tree worth publishing.
         install: Option<InstallReport>,
     },
+}
+
+/// What `newgit start` did with one resource, walking `lifecycle_order`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StartResult {
+    /// No `long_running` `start` action — nothing for `newgit start` to do.
+    NotOrchestrated { name: String },
+    /// Already running from an earlier `newgit start` or `newgit action`;
+    /// still checked for readiness, since "running" and "ready" differ.
+    AlreadyRunning { name: String, readiness: Readiness },
+    /// Started just now, and how it answered its own `[ready]` (or didn't
+    /// declare one).
+    Started {
+        name: String,
+        pid: u32,
+        log: Utf8PathBuf,
+        readiness: Readiness,
+    },
+    /// A `depends_on` dependency has not prepared successfully.
+    Blocked {
+        name: String,
+        blocked_by: Vec<String>,
+    },
+    /// Starting the process, or waiting on a `start_after` dependency, failed.
+    Failed { name: String, reason: String },
+}
+
+impl StartResult {
+    pub fn name(&self) -> &str {
+        match self {
+            Self::NotOrchestrated { name }
+            | Self::AlreadyRunning { name, .. }
+            | Self::Started { name, .. }
+            | Self::Blocked { name, .. }
+            | Self::Failed { name, .. } => name,
+        }
+    }
+
+    /// Whether this resource ended the walk running (whatever its readiness).
+    pub fn is_up(&self) -> bool {
+        matches!(self, Self::AlreadyRunning { .. } | Self::Started { .. })
+    }
+}
+
+/// What confirming a resource came up actually established. Kept distinct
+/// on purpose — see #54: "started is not serving," and collapsing this into
+/// a bool would be exactly that lie.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Readiness {
+    /// Its `[ready]` probe passed.
+    Ready,
+    /// No `[ready]` is declared; only the process's existence was checked.
+    AliveOnly,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StartOutcome {
+    pub instance: String,
+    pub results: Vec<StartResult>,
 }
 
 /// How a tracker's content landed in a workspace.
@@ -1423,6 +1485,254 @@ impl BranchManager {
             missing_captures,
             install,
         })
+    }
+
+    /// Bring an instance's long-running resources up in dependency order.
+    ///
+    /// Walks `lifecycle_order` (`depends_on` alone — the same order teardown
+    /// walks in reverse). A resource with no `long_running` `start` is
+    /// nothing to orchestrate and is reported, not skipped silently. Before
+    /// starting one, every name in its `start_after` must already be
+    /// running — and if it declares `[ready]`, ready — or this resource is
+    /// reported `Failed` and the walk continues, so one dependency stuck
+    /// waiting does not hide every other resource's outcome.
+    ///
+    /// This does not stop on the first failure: `newgit start` is meant to
+    /// be re-run after fixing whatever it reports, the same way `spawn`
+    /// leaves a blocked instance inspectable instead of unwinding it.
+    pub fn start(&self, instance: &str) -> Result<StartOutcome> {
+        self.require_resolvable_graph()?;
+        let branch = self.store.find_branch(instance)?;
+        self.require_workspace(&branch)?;
+        let supervisor = self.supervisor(&branch);
+
+        let mut results = Vec::new();
+        for name in &self.graph.lifecycle_order {
+            let definition = self.resource_definition(name)?;
+            if !definition.has_long_running_start() {
+                results.push(StartResult::NotOrchestrated { name: name.clone() });
+                continue;
+            }
+
+            let blocked_by = self.blocked_dependencies(&branch, definition);
+            if !blocked_by.is_empty() {
+                results.push(StartResult::Blocked {
+                    name: name.clone(),
+                    blocked_by,
+                });
+                continue;
+            }
+
+            if let Err(error) = self.ensure_started_after(&branch, &supervisor, definition) {
+                results.push(StartResult::Failed {
+                    name: name.clone(),
+                    reason: error.to_string(),
+                });
+                continue;
+            }
+
+            if supervisor.running_pid(name).is_some() {
+                let readiness = match self.wait_ready(&branch, definition) {
+                    Ok(readiness) => readiness,
+                    Err(error) => {
+                        results.push(StartResult::Failed {
+                            name: name.clone(),
+                            reason: error.to_string(),
+                        });
+                        continue;
+                    }
+                };
+                results.push(StartResult::AlreadyRunning {
+                    name: name.clone(),
+                    readiness,
+                });
+                continue;
+            }
+
+            let action = definition
+                .actions
+                .get("start")
+                .expect("has_long_running_start confirmed this exists");
+            let command = match self.rendered_command(&branch, definition, action) {
+                Ok(command) => command,
+                Err(error) => {
+                    results.push(StartResult::Failed {
+                        name: name.clone(),
+                        reason: error.to_string(),
+                    });
+                    continue;
+                }
+            };
+            let env = match self.assemble_env(&branch) {
+                Ok(env) => env,
+                Err(error) => {
+                    results.push(StartResult::Failed {
+                        name: name.clone(),
+                        reason: error.to_string(),
+                    });
+                    continue;
+                }
+            };
+            let cwd = match resource_cwd(
+                &branch.workspace_path,
+                &definition.name,
+                "start",
+                definition.workdir_for(Some(action)),
+            ) {
+                Ok(cwd) => cwd,
+                Err(error) => {
+                    results.push(StartResult::Failed {
+                        name: name.clone(),
+                        reason: error.to_string(),
+                    });
+                    continue;
+                }
+            };
+            let log = self
+                .store
+                .action_log_path(&branch.slug, &format!("{name}.start"));
+
+            match supervisor.start(&definition.name, &command, &cwd, &env, &log) {
+                Ok(pid) => match self.wait_ready(&branch, definition) {
+                    Ok(readiness) => results.push(StartResult::Started {
+                        name: name.clone(),
+                        pid,
+                        log,
+                        readiness,
+                    }),
+                    Err(error) => results.push(StartResult::Failed {
+                        name: name.clone(),
+                        reason: error.to_string(),
+                    }),
+                },
+                Err(error) => results.push(StartResult::Failed {
+                    name: name.clone(),
+                    reason: error.to_string(),
+                }),
+            }
+        }
+
+        Ok(StartOutcome {
+            instance: branch.name,
+            results,
+        })
+    }
+
+    /// Every `start_after` name must already be running, and ready if it
+    /// declares `[ready]`, before this resource's own `start` runs.
+    fn ensure_started_after(
+        &self,
+        branch: &BranchInstance,
+        supervisor: &Supervisor,
+        definition: &ResourceDefinition,
+    ) -> Result<()> {
+        for dependency in &definition.start_after {
+            if supervisor.running_pid(dependency).is_none() {
+                return Err(NewgitError::StartDependencyNotRunning {
+                    resource: definition.name.clone(),
+                    dependency: dependency.clone(),
+                });
+            }
+            let dependency_definition = self.resource_definition(dependency)?;
+            self.wait_ready(branch, dependency_definition)?;
+        }
+        Ok(())
+    }
+
+    /// Poll a resource's `[ready]` probe until it passes or the timeout
+    /// elapses. No `[ready]` means there is nothing to poll: the process
+    /// existing is all `newgit start` ever checked, and that was already
+    /// true by the time this is called — so it returns immediately, and
+    /// says which fact it is standing on.
+    fn wait_ready(
+        &self,
+        branch: &BranchInstance,
+        definition: &ResourceDefinition,
+    ) -> Result<Readiness> {
+        let Some(ready) = &definition.ready else {
+            return Ok(Readiness::AliveOnly);
+        };
+        let deadline = Instant::now() + Duration::from_secs(ready.timeout_secs);
+        let interval = Duration::from_millis(ready.interval_ms);
+        loop {
+            if self.probe_ready(branch, definition, ready)? {
+                return Ok(Readiness::Ready);
+            }
+            if Instant::now() >= deadline {
+                return Err(NewgitError::NotReady {
+                    resource: definition.name.clone(),
+                    probe: ready.probe.to_string(),
+                    timeout_secs: ready.timeout_secs,
+                });
+            }
+            std::thread::sleep(interval);
+        }
+    }
+
+    fn probe_ready(
+        &self,
+        branch: &BranchInstance,
+        definition: &ResourceDefinition,
+        ready: &ReadySpec,
+    ) -> Result<bool> {
+        match ready.probe {
+            ReadyProbe::Command => {
+                let command = ready
+                    .command
+                    .clone()
+                    .expect("validated: `command` probe always has `command`");
+                let context = RenderContext {
+                    branch_name: &branch.name,
+                    branch_slug: &branch.slug,
+                    workspace: branch.workspace_path.as_str(),
+                    scripts: self.scripts_dir(),
+                    ports: branch
+                        .resources
+                        .get(&definition.name)
+                        .map(|binding| &binding.resolved_ports),
+                    ..RenderContext::default()
+                };
+                let rendered = render(&command, &context);
+                let env = self.assemble_env(branch)?;
+                let log = self
+                    .store
+                    .action_log_path(&branch.slug, &format!("{}.ready", definition.name));
+                let (code, _) = run_captured(&rendered, &branch.workspace_path, &env, &log)?;
+                Ok(code == 0)
+            }
+            ReadyProbe::Tcp => Ok(tcp_connect(&self.resolved_port(branch, definition, ready)?)),
+            ReadyProbe::Http => {
+                let port = self.resolved_port(branch, definition, ready)?;
+                Ok(http_ok(port, &ready.path))
+            }
+        }
+    }
+
+    /// The allocated port a `tcp`/`http` `[ready]` probe reaches, resolved
+    /// from this resource's own binding — validated at load time to name a
+    /// `[ports.<name>]` this same resource declares.
+    fn resolved_port(
+        &self,
+        branch: &BranchInstance,
+        definition: &ResourceDefinition,
+        ready: &ReadySpec,
+    ) -> Result<u16> {
+        let port_name = ready
+            .port
+            .as_deref()
+            .expect("validated: tcp/http probes always have `port`");
+        branch
+            .resources
+            .get(&definition.name)
+            .and_then(|binding| binding.resolved_ports.get(port_name))
+            .copied()
+            .ok_or_else(|| {
+                NewgitError::Unsupported(format!(
+                    "resource `{}` `[ready] port = \"{port_name}\"` has no allocated port; \
+                     re-spawn or check `[ports.{port_name}]`",
+                    definition.name
+                ))
+            })
     }
 
     /// Run an arbitrary command inside the instance with the full export
@@ -3620,6 +3930,48 @@ fn resource_cwd(
         });
     }
     Ok(resolved)
+}
+
+/// One `[ready] probe = "tcp"` attempt: can a connection be opened at all.
+/// A short per-attempt timeout, not the resource's whole `[ready] timeout`
+/// — `wait_ready` is what owns the overall budget and retries this.
+fn tcp_connect(port: &u16) -> bool {
+    TcpStream::connect_timeout(
+        &std::net::SocketAddr::from(([127, 0, 0, 1], *port)),
+        Duration::from_millis(500),
+    )
+    .is_ok()
+}
+
+/// One `[ready] probe = "http"` attempt: connect, send a bare `GET`, and
+/// read enough of the response to check the status line. No HTTP client
+/// dependency for this — a probe only ever needs the first line, and a
+/// hand-rolled `GET` is the same shape as the `curl -sf` most `command`
+/// probes would otherwise be reaching for.
+fn http_ok(port: u16, path: &str) -> bool {
+    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+    let Ok(mut stream) = TcpStream::connect_timeout(&addr, Duration::from_millis(500)) else {
+        return false;
+    };
+    let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
+    let request = format!("GET {path} HTTP/1.0\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n");
+    if stream.write_all(request.as_bytes()).is_err() {
+        return false;
+    }
+    let mut buffer = [0u8; 32];
+    let Ok(read) = stream.read(&mut buffer) else {
+        return false;
+    };
+    let head = String::from_utf8_lossy(&buffer[..read]);
+    // "HTTP/1.x 2xx" or "3xx"/"4xx" all mean something answered on purpose;
+    // only a connection that never speaks HTTP, or a 5xx, means "not yet".
+    let Some(status) = head.split_whitespace().nth(1) else {
+        return false;
+    };
+    status
+        .as_bytes()
+        .first()
+        .is_some_and(|digit| matches!(digit, b'2' | b'3' | b'4'))
 }
 
 /// How many lines differ between the expected render and what is on disk —

@@ -7,7 +7,8 @@ use newgit_core::cleanup::{ArchivedCheckpoints, HookDetail, HookOutcome};
 use newgit_core::export::{ExportFilter, Reason};
 use newgit_core::installs::InstallReport;
 use newgit_core::manager::{
-    ActionOutcome, BindOrigin, BranchManager, InstanceReport, TrackerBindOutcome, UndoOptions,
+    ActionOutcome, BindOrigin, BranchManager, InstanceReport, StartResult, TrackerBindOutcome,
+    UndoOptions,
 };
 use newgit_core::resource::{CheckpointMode, ResourceDefinition};
 use newgit_core::source::find_repo_root;
@@ -68,6 +69,13 @@ enum Command {
     Action {
         /// <resource>.<action>, e.g. app.start
         spec: String,
+        /// Instance (inferred when run inside a workspace)
+        instance: Option<String>,
+    },
+    /// Bring an instance's long-running resources up, in dependency order,
+    /// waiting on each one's `[ready]` probe (or its process existing, if it
+    /// declares none)
+    Start {
         /// Instance (inferred when run inside a workspace)
         instance: Option<String>,
     },
@@ -253,6 +261,7 @@ fn main() -> Result<()> {
         Command::Resource { command } => resource(command),
         Command::Run(args) => run(args),
         Command::Action { spec, instance } => action(&spec, instance),
+        Command::Start { instance } => start(instance),
         Command::Checkpoint { instance, message } => checkpoint(instance, message.as_deref()),
         Command::Undo {
             instance,
@@ -847,6 +856,60 @@ fn action(spec: &str, instance: Option<String>) -> Result<()> {
             }
             Ok(())
         }
+    }
+}
+
+fn start(instance: Option<String>) -> Result<()> {
+    let (manager, instance) = manager_and_instance(instance)?;
+    let outcome = manager.start(&instance)?;
+    let mut failed = false;
+    for result in &outcome.results {
+        match result {
+            StartResult::NotOrchestrated { name } => {
+                println!("{name}: no long_running `start` action, nothing to orchestrate");
+            }
+            StartResult::AlreadyRunning { name, readiness } => {
+                println!("{name}: already running ({})", readiness_label(*readiness));
+            }
+            StartResult::Started {
+                name,
+                pid,
+                log,
+                readiness,
+            } => {
+                println!(
+                    "{name}: started (pid {pid}, {})",
+                    readiness_label(*readiness)
+                );
+                println!("  log: {log}");
+            }
+            StartResult::Blocked { name, blocked_by } => {
+                failed = true;
+                println!(
+                    "{name}: blocked by failed dependency/dependencies: {}",
+                    blocked_by.join(", ")
+                );
+            }
+            StartResult::Failed { name, reason } => {
+                failed = true;
+                println!("{name}: failed — {reason}");
+            }
+        }
+    }
+    if failed {
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
+/// "ready" only ever means the declared `[ready]` probe passed. Anything
+/// else is "alive" — the process exists, and that is the whole claim: the
+/// project's stance is that reporting more than that would be exactly the
+/// lie #54 was filed to stop making.
+fn readiness_label(readiness: newgit_core::manager::Readiness) -> &'static str {
+    match readiness {
+        newgit_core::manager::Readiness::Ready => "ready",
+        newgit_core::manager::Readiness::AliveOnly => "alive, no [ready] probe declared",
     }
 }
 

@@ -741,6 +741,33 @@ are how an incomplete graph gets completed, so they must not be the first
 casualty of one. `remove` also stays reachable, because teardown must never
 depend on the graph holding together.
 
+#### A Third Order For Runtime Dependencies (#54)
+
+Neither order above says anything about whether a `start` has actually run.
+`depends_on` orders `prepare`; a resource whose `prepare` succeeded may still
+have a `start` nobody has invoked, and two resources can both be spawned
+and `Ready` while one's process is not serving the other at all — `newgit
+run feature-a -- pnpm test` against a Supabase stack that was never
+`supabase.start`ed just fails once it happens to touch the network, with
+nothing in the graph having anything to say about why.
+
+`start_after` is the runtime edge: a resource-level key, a subset of
+`depends_on`, naming the resources that must already be **running** — not
+merely prepared — before this one's own `start` runs. It reuses
+`depends_on`'s bind/lifecycle order rather than inventing a third one:
+`start_after` never orders anything `depends_on` did not already order, it
+narrows *which* of those edges also gate `start`, so the two are kept in
+sync by construction (validated: a name in `start_after` not in
+`depends_on` is refused at load) instead of by two lists someone has to
+remember to update together.
+
+`newgit start [instance]` walks the lifecycle order and, for every resource
+with a `long_running` `start`, waits on each `start_after` name before
+running its own. "Waits on" means running *and*, if the dependency declares
+`[ready]`, **ready** — a resource with no `[ready]` is only ever confirmed
+alive, which `newgit start` says in those words rather than calling it
+ready for a check it never made. See `[ready]` and `newgit start` below.
+
 The exact ordering rules should stay boring and visible. During `spawn`, a
 prepare failure does not roll back the workspace, tracker bindings, resource
 bindings, allocated ports, or logs; it leaves the instance available for
@@ -1108,6 +1135,38 @@ sends the action's configured signal (default TERM) to the group, and
 `status` checks liveness. No daemon, no restart policy — boring.
 
 Convenience shorthands can come later, but the primitive should be resource actions.
+
+### `newgit start [instance]` (#54)
+
+Brings every `long_running` `start` in an instance up, in dependency order,
+instead of leaving that to whoever remembers the sequence:
+
+```sh
+newgit start feature-a
+newgit start          # inside a workspace
+```
+
+Walks the lifecycle order (`depends_on` alone — the same order teardown
+walks in reverse). For each resource:
+
+- **no `long_running` `start`** — reported, not skipped silently (`newgit
+  reference` naming a typo, like a forgotten `long_running = true`, only
+  works if the report says so).
+- **a `depends_on` dependency has not prepared** — reported `blocked`, same
+  as `newgit action` already refuses a blocked resource's command actions.
+- **a `start_after` dependency is not running** — reported failed, naming
+  the dependency; `newgit start` does not start it out of order on your
+  behalf, since the whole point is one predictable order, not a solver.
+- **already running** — reported, and its readiness is still checked: a
+  resource can be running and not yet ready.
+- **otherwise** — started under the same supervisor `newgit action` uses,
+  then its own `[ready]` is waited on (or, absent one, reported alive) before
+  the walk moves to whatever depends on it.
+
+One resource's `[ready]` timing out does not stop the walk — every other
+resource is still attempted and reported, the same way a `spawn` with a
+failed `prepare` leaves the rest of the instance inspectable rather than
+unwinding it. Re-run `newgit start` after fixing whatever it named.
 
 ### `newgit checkpoint [instance] [-m <message>]`
 
