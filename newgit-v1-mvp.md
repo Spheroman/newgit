@@ -701,6 +701,34 @@ Git, capture reverses the substitution, and hand edits round-trip.
   the bind rather than rendering partially. The resource is marked `failed`
   and its dependents `blocked`, exactly as a failed `prepare` would.
 
+#### `render --check`: the adoption dry run
+
+*Render is a function of committed content, not of the working file* is
+correct and does not change. But it has a cost at exactly one moment: the
+first hour of adopting a `[[render]]`, when the `find` strings being written
+do not exist in the content newgit would render, because they have not been
+committed yet. The loop without any other tool is edit the committed
+default, commit it, spawn, read the failure, edit again, commit again.
+
+`newgit render --check` resolves every `[[render]]` against the *working
+tree* instead — no instance, no spawn, no commit — and reports, per file,
+which `find` matched and which did not, naming the file and the string on
+any mismatch. It changes nothing and substitutes nothing; `with` is not even
+resolved, because whether a `find` matches does not depend on what it would
+be replaced with. Run outside adoption, it is a drift detector: a project's
+own CI can run `render --check` and fail the build the moment an upstream
+tool's default moves, instead of failing the next `spawn`.
+
+A narrower, spawn-time affordance (`spawn --render-from-worktree`, rendering
+against the workspace's on-disk content instead of `HEAD` for one spawn) was
+considered and not built for v1. It costs a full spawn to learn one string is
+wrong, where `--check` costs nothing, and it would be a second rule for when
+render reads committed content versus the working tree — one more thing to
+hold in your head for a narrower win. The adoption-docs fix (*commit the
+defaults you are introducing before the first spawn that renders them*, in
+the `[[render]]` reference) covers the same case at zero implementation cost.
+Revisit only if `--check` proves not enough in practice.
+
 ### Dependencies
 
 Resources can depend on trackers and other resources:
