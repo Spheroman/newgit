@@ -1170,6 +1170,24 @@ save time whether the undo will succeed, and deleting the only record of a
 state is the one thing checkpoints exist to prevent. Releasing those revs is
 a `cleanup` concern.
 
+The annotation alone is not enough, because it lands on the *wrong*
+checkpoint to warn a reader off. `undo_completed` marks the pre-undo
+snapshot that an undo attempt *preceded*; the state a failed undo actually
+leaves behind is captured by the *next* undo's safety checkpoint, which by
+construction is a legitimate redo point (the undo it preceded succeeded) and
+so is never marked. Its message — `state before undo to ckpt_001` —
+describes when it was taken, which a reader takes as a description of what
+is in it. When the instance's last operation was an incomplete undo, that
+message says so: `state before undo to ckpt_001 (captured after an
+incomplete undo; contents may be partial)`. The same reasoning applies per
+resource: a safety checkpoint does not re-run a resource's checkpoint
+command against a resource whose own last restore already failed — it is
+known-broken, not merely unobserved, and dumping it produces exactly the
+rubble the message warns about, for a redo point nobody is likely to want.
+That resource's entry records `mode = "none"` instead, and a warning names
+it. Explicit checkpoints are unaffected either way: a person asked for that
+one on purpose.
+
 ### `newgit checkpoints [instance]`
 
 Lists an instance's checkpoints (id, created, reason, source rev, message) —
