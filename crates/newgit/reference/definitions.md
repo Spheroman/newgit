@@ -188,6 +188,14 @@ A port is allocated once, at `spawn`, and recorded in the binding record. It
 never changes for the life of the instance; removing the instance frees it.
 Use it in templates as `{{ports.<name>}}`.
 
+Unlike `[exports]`, order here does matter: `[ports]` is also a map, not a
+sequence, but two ports whose ranges can reach each other (the normal case
+for a tool with consecutive defaults) get different assignments depending on
+which is allocated first. Ports within one resource are allocated in name
+order, not declaration order — the same order `newgit resource list` and
+spawn output already display them in, so what you see is what was used to
+allocate. Do not rely on declaration order in the file; it is not read.
+
 ### `[actions.<name>]`
 
 | key | type | required | default | meaning |
