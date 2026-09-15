@@ -658,6 +658,12 @@ miss. Run fewer concurrent instances, and let `newgit cleanup` reclaim both
 the trees of instances whose workspaces are gone and the store entries nothing
 keys to any more.
 
+`newgit resource templates --show pnpm` is the worked example above, wired
+for pnpm specifically. For anything else — npm, uv, Cargo, or a package
+manager not listed here — start from `newgit resource templates --show
+install` instead: the same shape with no `depends_on` and no store, and its
+lockfile and install command marked `EDIT ME` rather than guessed wrong.
+
 ---
 
 ## Template variables

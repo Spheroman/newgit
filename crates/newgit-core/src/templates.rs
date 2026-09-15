@@ -126,6 +126,43 @@ action = "prepare"
 "#,
     },
     ResourceTemplate {
+        name: "install",
+        description: "dependency install via any package manager; lockfile and command are EDIT ME",
+        companions: &[],
+        companion_trackers: &[],
+        contents: r#"# A generic starter: every package manager needs the same shape (install
+# from a lockfile into a tree), so this template parameterizes nothing and
+# marks the two lines that are actually yours to fill in. `pnpm` is the
+# worked example — `newgit resource templates --show pnpm` — and also wires
+# up a shared, content-addressed store; see "Installs: use a
+# content-addressed store" in the reference for what that saves and what it
+# costs to skip.
+ownership = "workspace"
+depends_on = []
+
+[identity]
+paths = ["EDIT ME: your lockfile, e.g. package-lock.json, uv.lock, Cargo.lock"]
+# The tree `prepare` builds. A monorepo installing into several places
+# names each one: paths are literal, and a directory means all of it.
+produces = ["EDIT ME: what prepare installs, e.g. node_modules"]
+# What the lockfile cannot see. Its hash says what was asked for, not what
+# gets built — install scripts compile against this platform and this Node.
+key_command = "node -v && uname -sm"
+
+[actions.prepare]
+command = "EDIT ME: your install command, e.g. npm ci, uv sync --frozen, cargo fetch"
+
+# Hashes `[identity] paths` above: what the install is derived from is
+# declared once, and a `recompute` restore skips when it has not moved.
+[checkpoint]
+mode = "hash"
+
+[restore]
+mode = "recompute"
+action = "prepare"
+"#,
+    },
+    ResourceTemplate {
         name: "command-snapshot",
         description: "a daemon-owned database captured through the daemon into a tracker",
         companions: &[],

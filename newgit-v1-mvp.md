@@ -71,7 +71,9 @@ Real projects have odd branch-bound things:
 newgit should not need a new internal subsystem for each one. It needs a tracker definition or a resource definition — and an agent reading the config should know, from the noun alone, whether a thing syncs across machines (tracker) or gets re-established on each one (resource).
 
 v1 ships resource templates for common lifecycle units: `process`, `pnpm`
-(install/deps), `command-snapshot` (a daemon-owned database), and `external`
+(install/deps, wired to a shared content-addressed store), `install` (the
+same shape for any other package manager, with the lockfile and command left
+as `EDIT ME`), `command-snapshot` (a daemon-owned database), and `external`
 (a resource another system owns). A template may bring companions it needs —
 the resource definitions it `depends_on`, and the tracker lanes its
 checkpoint deposits into — created only when absent, so an existing

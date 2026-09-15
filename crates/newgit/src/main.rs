@@ -675,6 +675,9 @@ fn resource(command: ResourceCommand) -> Result<()> {
                 println!(
                     "    required by {name}.depends_on — edit it, or delete the file if this project doesn't need it"
                 );
+                println!(
+                    "    `resource remove` refuses out of order — remove `{name}` before `{companion_name}`"
+                );
             }
             for tracker in &outcome.trackers_created {
                 let tracker_name = tracker.file_stem().unwrap_or(tracker.as_str());
