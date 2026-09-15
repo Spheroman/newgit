@@ -153,7 +153,8 @@ impl TrackerDefinition {
 
     fn invalid(&self, reason: String) -> NewgitError {
         NewgitError::InvalidDefinition {
-            tracker: self.name.clone(),
+            kind: "tracker",
+            name: self.name.clone(),
             reason,
         }
     }
@@ -294,6 +295,23 @@ mod tests {
             definition("b", &[".env.local"]),
         ];
         assert!(validate_disjoint(&ok).is_ok());
+    }
+
+    #[test]
+    fn invalid_definition_error_names_tracker() {
+        let error = TrackerDefinition::new(
+            "runtime-env",
+            "project-devs".to_owned(),
+            Storage::Local,
+            false,
+            vec![Utf8PathBuf::from("../.env")],
+        )
+        .expect_err("a tracker path outside the workspace is invalid");
+
+        assert_eq!(
+            error.to_string(),
+            "tracker `runtime-env` is invalid: path `../.env` must be workspace-relative"
+        );
     }
 
     /// `merge_with_source` decides whether a lane's bound state travels with

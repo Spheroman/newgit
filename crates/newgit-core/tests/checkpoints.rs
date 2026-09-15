@@ -312,6 +312,23 @@ command = "cp {{state_ref}} restored.sql"
 "#;
 
 #[test]
+fn invalid_definition_error_names_resource_for_missing_target_tracker() {
+    let (_guard, temp) = tempdir();
+    let store = setup(&temp);
+    write_resource(&store, "db", DB_TRACKER_DEPOSIT_RESOURCE);
+    let m = manager(store);
+    m.spawn("feature-d", None).expect("spawn");
+
+    let error = m
+        .checkpoint("feature-d", None)
+        .expect_err("the checkpoint target tracker is not defined");
+    assert_eq!(
+        error.to_string(),
+        "resource `db` is invalid: checkpoint `into_tracker = \"db-snapshots\"` names a tracker that is not defined; create it with `newgit tracker create db-snapshots`"
+    );
+}
+
+#[test]
 fn into_tracker_deposits_into_lane_and_restore_reads_it_back() {
     let (_guard, temp) = tempdir();
     let store = setup(&temp);

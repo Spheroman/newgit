@@ -518,9 +518,10 @@ impl ResourceDefinition {
         Ok(())
     }
 
-    fn invalid(&self, reason: String) -> NewgitError {
+    pub(crate) fn invalid(&self, reason: String) -> NewgitError {
         NewgitError::InvalidDefinition {
-            tracker: self.name.clone(),
+            kind: "resource",
+            name: self.name.clone(),
             reason,
         }
     }
@@ -1458,6 +1459,21 @@ workdir = "../outside"
         assert!(
             matches!(result, Err(NewgitError::InvalidDefinition { .. })),
             "an action-level workdir is held to the same rule: {result:?}"
+        );
+    }
+
+    #[test]
+    fn invalid_definition_error_names_resource() {
+        let error = write_and_load(
+            r#"ownership = "workspace"
+workdir = "../outside"
+"#,
+        )
+        .expect_err("a resource workdir outside the workspace is invalid");
+
+        assert_eq!(
+            error.to_string(),
+            "resource `db` is invalid: workdir `../outside` must be a workspace-relative path with no `..`"
         );
     }
 
