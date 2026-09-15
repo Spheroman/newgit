@@ -4,6 +4,7 @@ use camino::{Utf8Path, Utf8PathBuf};
 use newgit_core::branch::ResourceStatus;
 use newgit_core::cleanup::ArchivedCheckpoints;
 use newgit_core::config::WorkspaceSection;
+use newgit_core::installs::{CopyMethod, InstallReport};
 use newgit_core::manager::{ActionOutcome, BranchManager};
 use newgit_core::store::MetadataStore;
 use newgit_core::supervisor::StopOutcome;
@@ -1483,5 +1484,449 @@ fn an_unresolved_export_refuses_and_is_not_stored() {
         !binding.resolved_exports.contains_key("FUNCTIONS_URL"),
         "the literal is not stored: {:?}",
         binding.resolved_exports
+    );
+}
+
+/// The point of the install store, end to end: the second instance of the
+/// same lockfile does not install.
+#[test]
+fn a_second_instance_of_the_same_identity_is_filled_rather_than_installed() {
+    let (_guard, temp) = tempdir();
+    let store = setup(&temp);
+    let repo = store.paths().project_root.clone();
+    let runs = temp.join("runs.txt");
+
+    // The identity has to be committed: a workspace is a fresh clone, so an
+    // uncommitted lockfile never reaches the instance that keys on it.
+    std::fs::write(repo.join("lock.txt"), "v1\n").expect("write lock");
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-q", "-m", "lockfile"]);
+
+    write_resource(
+        &store,
+        "deps",
+        &format!(
+            r#"ownership = "workspace"
+
+[identity]
+paths = ["lock.txt"]
+produces = ["node_modules"]
+
+[actions.prepare]
+command = "mkdir -p node_modules && echo built > node_modules/marker && echo ran >> {runs}"
+"#
+        ),
+    );
+    let manager = BranchManager::open(MetadataStore::at(&repo)).expect("manager");
+
+    let first = manager.spawn("one", None).expect("spawn one");
+    let report = first
+        .resources
+        .iter()
+        .find(|resource| resource.name == "deps")
+        .expect("deps reported");
+    assert_eq!(report.status, ResourceStatus::Ready);
+    assert!(
+        report.prepare.is_some(),
+        "the first instance of an identity installs"
+    );
+    let key = match report.install.as_ref().expect("an install report") {
+        InstallReport::Stored { key, .. } => key.clone(),
+        other => panic!("the first install should be published: {other:?}"),
+    };
+    assert_eq!(
+        std::fs::read_to_string(&runs).expect("runs"),
+        "ran\n",
+        "installed exactly once"
+    );
+
+    let second = manager.spawn("two", None).expect("spawn two");
+    let report = second
+        .resources
+        .iter()
+        .find(|resource| resource.name == "deps")
+        .expect("deps reported");
+    assert_eq!(report.status, ResourceStatus::Ready);
+    assert!(
+        report.prepare.is_none(),
+        "the second instance must not run the install at all"
+    );
+    // The copy method is whatever this filesystem can do — asserting
+    // `Reflink` would pass on APFS and fail in a container on overlayfs,
+    // where the behaviour is identical and only the cost differs.
+    match report.install.as_ref().expect("an install report") {
+        InstallReport::Filled {
+            key: filled,
+            method,
+        } => {
+            assert_eq!(filled, &key, "from the entry the first instance stored");
+            assert!(matches!(method, CopyMethod::Reflink | CopyMethod::Full));
+        }
+        other => panic!("the second instance should be filled: {other:?}"),
+    }
+    assert_eq!(
+        std::fs::read_to_string(&runs).expect("runs"),
+        "ran\n",
+        "and the install command is not run a second time"
+    );
+    assert_eq!(
+        std::fs::read_to_string(second.branch.workspace_path.join("node_modules/marker"))
+            .expect("filled tree"),
+        "built\n",
+        "but the tree is there all the same"
+    );
+
+    // A moved lockfile is a different key, and the whole premise is that it
+    // rebuilds rather than reusing a tree built from the old one.
+    std::fs::write(repo.join("lock.txt"), "v2\n").expect("bump lock");
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-q", "-m", "bump"]);
+
+    let third = manager.spawn("three", None).expect("spawn three");
+    let report = third
+        .resources
+        .iter()
+        .find(|resource| resource.name == "deps")
+        .expect("deps reported");
+    assert!(
+        report.prepare.is_some(),
+        "a different lockfile must install, not reuse"
+    );
+    match report.install.as_ref().expect("an install report") {
+        InstallReport::Stored { key: bumped, .. } => {
+            assert_ne!(bumped, &key, "and is stored under its own key")
+        }
+        other => panic!("expected a second entry: {other:?}"),
+    }
+    assert_eq!(
+        std::fs::read_to_string(&runs).expect("runs"),
+        "ran\nran\n",
+        "exactly one more install"
+    );
+}
+
+/// `key_command` is the escape hatch for what a lockfile cannot describe:
+/// same inputs, different toolchain, different tree.
+#[test]
+fn key_command_output_separates_two_trees_built_from_one_lockfile() {
+    let (_guard, temp) = tempdir();
+    let store = setup(&temp);
+    let repo = store.paths().project_root.clone();
+    let toolchain = temp.join("toolchain.txt");
+    std::fs::write(&toolchain, "v24\n").expect("write toolchain");
+
+    std::fs::write(repo.join("lock.txt"), "v1\n").expect("write lock");
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-q", "-m", "lockfile"]);
+
+    write_resource(
+        &store,
+        "deps",
+        &format!(
+            r#"ownership = "workspace"
+
+[identity]
+paths = ["lock.txt"]
+produces = ["node_modules"]
+key_command = "cat {toolchain}"
+
+[actions.prepare]
+command = "mkdir -p node_modules && echo built > node_modules/marker"
+"#
+        ),
+    );
+    let manager = BranchManager::open(MetadataStore::at(&repo)).expect("manager");
+
+    let first = manager.spawn("one", None).expect("spawn one");
+    let first_key = install_key(&first.resources);
+
+    // Same lockfile, different toolchain: the tree from the first is not
+    // interchangeable with what this one needs, so the key has to move.
+    std::fs::write(&toolchain, "v22\n").expect("bump toolchain");
+    let second = manager.spawn("two", None).expect("spawn two");
+    let report = second
+        .resources
+        .iter()
+        .find(|resource| resource.name == "deps")
+        .expect("deps reported");
+    assert!(
+        report.prepare.is_some(),
+        "a toolchain bump must rebuild even though the lockfile did not move"
+    );
+    assert_ne!(install_key(&second.resources), first_key);
+}
+
+fn install_key(resources: &[newgit_core::manager::ResourceBindOutcome]) -> String {
+    match resources
+        .iter()
+        .find(|resource| resource.name == "deps")
+        .and_then(|resource| resource.install.as_ref())
+        .expect("an install report")
+    {
+        InstallReport::Stored { key, .. } | InstallReport::Filled { key, .. } => key.clone(),
+        other => panic!("expected a keyed report: {other:?}"),
+    }
+}
+
+/// The store is a cache, and a cache that only grows is a disk leak. An
+/// entry survives exactly as long as some instance still keys to it.
+#[test]
+fn cleanup_drops_install_trees_no_instance_keys_to_any_more() {
+    let (_guard, temp) = tempdir();
+    let store = setup(&temp);
+    let repo = store.paths().project_root.clone();
+
+    std::fs::write(repo.join("lock.txt"), "v1\n").expect("write lock");
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-q", "-m", "lockfile"]);
+
+    write_resource(
+        &store,
+        "deps",
+        r#"ownership = "workspace"
+
+[identity]
+paths = ["lock.txt"]
+produces = ["node_modules"]
+
+[actions.prepare]
+command = "mkdir -p node_modules && echo built > node_modules/marker"
+"#,
+    );
+    let manager = BranchManager::open(MetadataStore::at(&repo)).expect("manager");
+    let first = manager.spawn("one", None).expect("spawn one");
+    let old_key = install_key(&first.resources);
+
+    // The lockfile moves on, and a new instance builds a new tree. The old
+    // entry now belongs to nobody: `one` is still live, but it keys to the
+    // lockfile in *its* workspace, which is the one it was spawned with.
+    std::fs::write(repo.join("lock.txt"), "v2\n").expect("bump lock");
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-q", "-m", "bump"]);
+    let second = manager.spawn("two", None).expect("spawn two");
+    let new_key = install_key(&second.resources);
+    assert_ne!(old_key, new_key);
+
+    // Both instances are live and each keys to its own entry, so a cleanup
+    // here must remove neither.
+    let untouched = manager
+        .cleanup(true, ArchivedCheckpoints::Keep)
+        .expect("dry run");
+    assert!(
+        untouched.pruned_installs.is_empty(),
+        "an entry a live instance keys to is not garbage: {:?}",
+        untouched.pruned_installs
+    );
+
+    // Retire the instance holding the old key, and it becomes unreachable.
+    manager
+        .remove("one", &repo, ArchivedCheckpoints::Keep)
+        .expect("remove one");
+    let outcome = manager
+        .cleanup(false, ArchivedCheckpoints::Keep)
+        .expect("cleanup");
+    let pruned: Vec<&str> = outcome
+        .pruned_installs
+        .iter()
+        .map(|entry| entry.key.as_str())
+        .collect();
+    assert_eq!(
+        pruned,
+        vec![old_key.as_str()],
+        "exactly the entry nothing keys to"
+    );
+    assert!(
+        !outcome.pruned_installs[0].path.exists(),
+        "and it is actually gone from disk"
+    );
+
+    // The surviving instance's tree is untouched, so it still spawns free.
+    let third = manager.spawn("three", None).expect("spawn three");
+    let report = third
+        .resources
+        .iter()
+        .find(|resource| resource.name == "deps")
+        .expect("deps reported");
+    assert!(
+        report.prepare.is_none(),
+        "the surviving entry still fills a new instance"
+    );
+}
+
+/// The command that builds a tree is as much an input as the lockfile it
+/// reads. Without the definition in the key, editing `prepare` would leave
+/// the next instance filled from the tree the *old* command built.
+#[test]
+fn editing_the_producing_command_invalidates_the_stored_tree() {
+    let (_guard, temp) = tempdir();
+    let store = setup(&temp);
+    let repo = store.paths().project_root.clone();
+
+    std::fs::write(repo.join("lock.txt"), "v1\n").expect("write lock");
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-q", "-m", "lockfile"]);
+
+    let definition = |flavour: &str| {
+        format!(
+            r#"ownership = "workspace"
+
+[identity]
+paths = ["lock.txt"]
+produces = ["node_modules"]
+
+[actions.prepare]
+command = "mkdir -p node_modules && echo {flavour} > node_modules/flavour"
+"#
+        )
+    };
+    write_resource(&store, "deps", &definition("full"));
+    let manager = BranchManager::open(MetadataStore::at(&repo)).expect("manager");
+    let first = manager.spawn("one", None).expect("spawn one");
+    let full_key = install_key(&first.resources);
+
+    // Same lockfile, different command. The tree it builds is different, so
+    // the key has to be.
+    write_resource(&store, "deps", &definition("slim"));
+    let manager = BranchManager::open(MetadataStore::at(&repo)).expect("reopen");
+    let second = manager.spawn("two", None).expect("spawn two");
+    let report = second
+        .resources
+        .iter()
+        .find(|resource| resource.name == "deps")
+        .expect("deps reported");
+    assert!(
+        report.prepare.is_some(),
+        "an edited producing command must run, not be served from the old tree"
+    );
+    assert_ne!(install_key(&second.resources), full_key);
+    assert_eq!(
+        std::fs::read_to_string(second.branch.workspace_path.join("node_modules/flavour"))
+            .expect("read"),
+        "slim\n"
+    );
+}
+
+/// `--dry-run` is the command people reach for because it observes without
+/// acting. Spawning a user-supplied shell is acting.
+#[test]
+fn a_dry_run_cleanup_never_runs_a_key_command() {
+    let (_guard, temp) = tempdir();
+    let store = setup(&temp);
+    let repo = store.paths().project_root.clone();
+    let ran = temp.join("key-command-ran.txt");
+
+    std::fs::write(repo.join("lock.txt"), "v1\n").expect("write lock");
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-q", "-m", "lockfile"]);
+
+    write_resource(
+        &store,
+        "deps",
+        &format!(
+            r#"ownership = "workspace"
+
+[identity]
+paths = ["lock.txt"]
+produces = ["node_modules"]
+key_command = "echo ran >> {ran}; echo v24"
+
+[actions.prepare]
+command = "mkdir -p node_modules && echo built > node_modules/marker"
+"#
+        ),
+    );
+    let manager = BranchManager::open(MetadataStore::at(&repo)).expect("manager");
+    manager.spawn("one", None).expect("spawn one");
+    let before = std::fs::read_to_string(&ran).expect("ran").lines().count();
+
+    let outcome = manager
+        .cleanup(true, ArchivedCheckpoints::Keep)
+        .expect("dry run");
+    assert_eq!(
+        std::fs::read_to_string(&ran).expect("ran").lines().count(),
+        before,
+        "a dry run must not spawn the resource's key_command"
+    );
+    assert!(
+        outcome.pruned_installs.is_empty(),
+        "and must not claim it would prune what it could not key"
+    );
+    assert!(
+        outcome
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("--dry-run runs no key_command")),
+        "it says so instead: {:?}",
+        outcome.warnings
+    );
+}
+
+/// One instance that cannot be keyed must not disable pruning for every
+/// other resource — that turns a cache into an unbounded disk leak.
+#[test]
+fn an_unkeyable_resource_withholds_only_its_own_entries() {
+    let (_guard, temp) = tempdir();
+    let store = setup(&temp);
+    let repo = store.paths().project_root.clone();
+
+    std::fs::write(repo.join("lock.txt"), "v1\n").expect("write lock");
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-q", "-m", "lockfile"]);
+
+    write_resource(
+        &store,
+        "deps",
+        r#"ownership = "workspace"
+
+[identity]
+paths = ["lock.txt"]
+produces = ["node_modules"]
+
+[actions.prepare]
+command = "mkdir -p node_modules && echo built > node_modules/marker"
+"#,
+    );
+    write_resource(
+        &store,
+        "vendor",
+        r#"ownership = "workspace"
+
+[identity]
+paths = ["lock.txt"]
+produces = ["vendor"]
+key_command = "exit 3"
+
+[actions.prepare]
+command = "mkdir -p vendor && echo built > vendor/marker"
+"#,
+    );
+    let manager = BranchManager::open(MetadataStore::at(&repo)).expect("manager");
+    let spawned = manager.spawn("one", None).expect("spawn one");
+
+    // `deps` has an entry nothing keys to once its lockfile moves on;
+    // `vendor` cannot be keyed at all.
+    std::fs::write(spawned.branch.workspace_path.join("lock.txt"), "v9\n").expect("bump lock");
+
+    let outcome = manager
+        .cleanup(false, ArchivedCheckpoints::Keep)
+        .expect("cleanup");
+    let pruned: Vec<&str> = outcome
+        .pruned_installs
+        .iter()
+        .map(|entry| entry.resource.as_str())
+        .collect();
+    assert_eq!(
+        pruned,
+        vec!["deps"],
+        "the keyable resource is still swept: {:?}",
+        outcome.pruned_installs
+    );
+    assert!(
+        outcome
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("`vendor`")),
+        "and the one that was left alone is named: {:?}",
+        outcome.warnings
     );
 }

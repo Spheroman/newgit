@@ -32,6 +32,9 @@ pub struct CleanupOutcome {
     /// caller asked for it. Empty unless purging was requested.
     pub purged_checkpoints: Vec<PurgedCheckpoints>,
     pub pruned: Vec<PrunedRev>,
+    /// Install-store entries no live instance keys to any more — the trees
+    /// of lockfiles that have since moved on.
+    pub pruned_installs: Vec<PrunedInstall>,
     /// Lane revs kept alive solely because a checkpoint still points at
     /// them — the constraint pruning must never violate, surfaced so the
     /// retained disk is explained rather than mysterious.
@@ -50,7 +53,17 @@ impl CleanupOutcome {
             && self.dead_state.is_empty()
             && self.purged_checkpoints.is_empty()
             && self.pruned.is_empty()
+            && self.pruned_installs.is_empty()
     }
+}
+
+/// One dropped install-store entry. Entries are a cache keyed on inputs
+/// that are still on disk, so dropping one costs a reinstall, never data.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrunedInstall {
+    pub resource: String,
+    pub key: String,
+    pub path: Utf8PathBuf,
 }
 
 /// Whether an operation that archives an instance also discards the

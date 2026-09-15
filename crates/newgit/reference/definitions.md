@@ -27,6 +27,7 @@ whether a lane travels with a merge — both by defaulting, silently.
   resources/<name>.toml  resource definitions      committed
   scripts/<name>         scripts hooks call        committed
   branches/ snapshots/ checkpoints/ logs/ state/ local/   local, gitignored
+  installs/              built trees, shared       local, gitignored
 ```
 
 ---
@@ -107,6 +108,12 @@ require it to exist up front.
 | key | type | required | default | meaning |
 | --- | --- | --- | --- | --- |
 | `paths` | array of strings | yes if the section is present | — | the files whose content *is* this resource's identity (a lockfile, a manifest). Path-dependent state is recomputed from its identity, not copied. Workspace-relative, no `..`, and may not reach into `.git` or `.newgit`. |
+| `produces` | array of strings | no | `[]` | the tree those inputs build — `node_modules` for an install. Same path rules as `paths`. |
+| `key_command` | string | no | — | a command whose stdout is mixed into the identity key, for what `paths` cannot see. |
+
+Paths in both lists are workspace-relative with **no `.` or `..` components**
+— one spelling per path, because every check here reads the first one.
+`./.git` would otherwise lead with `.` and slip past the `.git` guard.
 
 This is the single declaration of what the resource is derived from, and the
 other two keys read it rather than repeating it:
@@ -118,8 +125,54 @@ other two keys read it rather than repeating it:
   was before the undo, and **skips the rebuild when they match**. Same inputs,
   same tree; re-running would be an expensive no-op.
 
-Installs are the usual reason for this section, and they are the one place
-newgit multiplies a cost rather than absorbing it — see *Installs: use a
+`paths` says what the resource is derived *from*. `produces` says what that
+derivation yields, which is what lets the same tree be filled from a store
+keyed on the inputs instead of rebuilt once per instance:
+
+```toml
+[identity]
+paths       = ["package-lock.json", "package.json"]
+produces    = ["node_modules"]
+key_command = "node -v && uname -sm"
+
+[actions.prepare]
+command = "npm ci"
+```
+
+Paths are literal, here as everywhere in a definition — there is no globbing,
+and a directory means everything under it. A monorepo that installs into
+several places names each one.
+
+Declaring `produces` is what puts a resource in the **install store**: at
+spawn, an instance whose key already has a tree gets a copy-on-write clone of
+it and the producing action does not run at all. See *Installs: use a
+content-addressed store*.
+
+`key_command` exists because the content hash of a lockfile describes what was
+*asked for*, not what gets *built*. Install scripts bake in the platform and
+the toolchain version, so two trees from one lockfile are not interchangeable
+across an architecture or a Node bump. newgit does not guess at that list:
+what a tree depends on beyond its lockfile is ecosystem knowledge the
+definition has and newgit does not.
+
+These are refused when you declare `produces`, all the same shape — a
+declaration that could never key or fill an entry:
+
+- **`produces` or `key_command` without `paths`.** A key over no content is
+  the same key everywhere, so every instance would be handed an unrelated tree.
+- **A `produces` that contains one of the `paths`**, or one that contains
+  another. The first makes the key a function of the tree it keys; the second
+  stores the same bytes twice.
+- **Anything but a runnable `prepare` building it.** A spawn runs `prepare`
+  and nothing else, so `prepare` is the only command an entry can stand in
+  for: a `[restore] action` naming something else, a missing or command-less
+  `prepare`, or a `long_running` one are all refused rather than left to
+  silently never fill.
+- **A `prepare` that declares `captures`.** Filling means the command does not
+  run, so anything else it publishes would go missing with no warning
+  anywhere. The tree has to be its whole output.
+
+Installs are the usual reason for this section — see *Installs: use a
 content-addressed store*.
 
 ### `[ports.<name>]`
@@ -455,18 +508,124 @@ a security label.
 
 ## Installs: use a content-addressed store
 
-> **Strongly recommended: choose a package manager that installs from a shared
-> content-addressed store.** It is the single choice that most affects what
-> running many instances costs you, and it is not one newgit can make for you.
+Every branch instance gets its own dependency tree. That is not newgit being
+wasteful: two branches with different lockfiles must not share one, or one
+branch's install silently rewrites the other's. It is why installs are
+resources with `[identity]` rather than trackers — the lockfile is the truth,
+and the tree is derived from it.
 
-Every branch instance installs its own dependencies. That is not a default to
-turn off and it is not newgit being wasteful: two branches with different
-lockfiles must not share a dependency tree, or one branch's install silently
-rewrites the other's. It is why installs are resources with `[identity]` and a
-`recompute` restore rather than trackers — the lockfile is the truth, and the
-tree is rebuilt from it.
+But two instances at the **same** lockfile are not two derivations. They are
+one tree, built twice. Declare what your install produces and newgit builds it
+once:
 
-What that independence costs is set by your package manager, not by newgit:
+```toml
+[identity]
+paths       = ["package-lock.json", "package.json"]
+produces    = ["node_modules"]
+key_command = "node -v && uname -sm"
+
+[actions.prepare]
+command = "npm ci"
+```
+
+The first instance of a given key installs normally and its tree is published
+to `.newgit/installs/`. Every later instance of that key is filled from it and
+**does not run the install at all**:
+
+```
+  resource:  `deps` prepare: ok
+             install store: stored as 1264badb0621 (copy-on-write)
+
+  resource:  `deps` prepare: not needed
+             install store: filled from 1264badb0621 (copy-on-write)
+```
+
+Nothing about the hard rule changes: a different lockfile is a different key
+is a different tree. The store only ever hands an instance a tree built from
+inputs that hash the same as its own.
+
+### What it costs, and what it cannot do
+
+**Copies are copy-on-write, not hardlinks.** This matters more than it looks.
+A `node_modules` is not read-only after install — native builds write into it
+(`.cxx` caches, compiled artifacts), and under hardlinks one instance's
+Android build would rewrite every other instance's tree. Under copy-on-write
+that write forks and nobody notices. Where the filesystem cannot clone (APFS
+and btrfs/XFS can; many cannot) newgit takes a **full copy** and says so on
+the line. Same behaviour everywhere, worse performance — and on such a
+filesystem an entry costs a whole tree on disk rather than almost nothing.
+
+**A tree that names its own workspace is never shared.** Some postinstall
+scripts bake their absolute location into a file. Copy-on-write cannot fix
+that — the wrong path is already in the content before anyone writes to it —
+so newgit scans a tree before publishing it and declines the ones that are not
+relocatable, naming the file:
+
+```
+  install store: not stored — the built tree names its own workspace in
+  `.../node_modules/sharp/config.json`, so it cannot be shared (key 3ec46aa385bb)
+```
+
+That resource just keeps installing per instance, exactly as it did before.
+Nothing fails.
+
+**`key_command` is not optional in practice.** A lockfile hash describes what
+was asked for, not what gets built: install scripts compile against the local
+platform and toolchain. Point it at whatever actually varies — `node -v &&
+uname -sm` is the usual answer for JS.
+
+**The definition file is part of the key.** The command that builds a tree is
+as much an input as the lockfile it reads, so editing `npm ci` to `npm ci
+--omit=dev` moves the key and the next instance rebuilds. The cost is that
+*any* edit to the file moves it — a comment, an unrelated port — orphaning the
+entries built before it. That is the right way to be wrong: a stale entry
+costs one reinstall and `newgit cleanup` reclaims it.
+
+**An undo is filled from it too.** The rebuild a `recompute` restore triggers
+is the expensive one — a full reinstall in the middle of an operation someone
+is waiting on. Undo restores source first, so by the time the resource is
+restored the workspace holds the checkpoint's lockfile, and anything the store
+has under that key *is* the tree the rebuild would produce:
+
+```
+resource: deps recompute(prepare) filled from install store 3ec46aa385bb (copy-on-write) ok
+```
+
+The existing tree is moved aside rather than deleted, and discarded only once
+the clone has landed: a copy that fails partway through leaves the instance
+with the stale tree it started with, never with none.
+
+`newgit undo --force-recompute` bypasses all of it. That flag means "do not
+trust that the identity describes the tree" — usually because the tree is
+damaged in a way the lockfile cannot show — and a cache keyed on that identity
+is under exactly the same suspicion, so the flag **drops the entry** and the
+rebuild republishes it. That is the way out if an entry is ever wrong.
+
+**The store is a cache, and `newgit cleanup` prunes it.** An entry survives as
+long as some live instance's identity still keys to it; the trees of lockfiles
+everyone has moved past are dropped, along with anything a killed `newgit
+spawn` left half-copied. Nothing in the store is data — dropping an entry costs
+a reinstall.
+
+Pruning is per resource. An instance whose key cannot be computed withholds
+that resource's entries and says so, rather than disabling the sweep for the
+whole project. `newgit cleanup --dry-run` will not run a `key_command` at all
+— a dry run observes, and spawning a user-supplied shell is acting — so
+resources that need one are reported as unevaluated instead of guessed at.
+
+**Produced trees are kept out of source.** A workspace's Git is told to ignore
+every declared `produces` path (`.git/info/exclude`, per clone), the same way
+tracker-owned paths are. Without it, a project with no `node_modules` rule of
+its own would have its whole install swept into source history by the `git add
+-A` a checkpoint runs. The rules are written at spawn and re-synced at
+checkpoint, so an instance that predates the declaration is covered too.
+
+**It is not a security boundary and not a sandbox.** An install script that
+writes outside its own tree is doing that on every instance anyway.
+
+### Your package manager still matters
+
+What a *miss* costs is set by your package manager, not by newgit:
 
 | tool | per-instance cost | why |
 | --- | --- | --- |
@@ -477,17 +636,13 @@ What that independence costs is set by your package manager, not by newgit:
 | npm, Yarn classic | a **full copy** each | the cache holds tarballs, so `npm ci` re-expands every time |
 | pip into a venv | a **full copy** each | same shape |
 
-Ten instances of a monorepo is roughly one `node_modules` worth of disk under
-pnpm and ten under npm. The difference is not a tuning detail; it is whether
-keeping eight branches alive at once feels free or feels like something you
-ration.
+The install store flattens most of this — ten instances of one lockfile is
+one tree under any of them — but it only helps on a hit. Ten instances of ten
+*different* lockfiles still pays ten installs, and there the package manager
+is the whole story. If you are adopting newgit and have the choice, it is
+still worth making here.
 
-There is no lever on newgit's side, because the thing that would save the
-space — one installed tree shared between instances — is exactly the bug this
-design exists to prevent. So if you are adopting newgit and have a choice,
-make it here first.
-
-Two keys matter when you wire the store up:
+Two more things matter when you wire an install up:
 
 - Give the shared store its own resource with **`ownership = "user"`**, and
   have the install `depends_on` it. `user` is the one ownership newgit never
@@ -498,9 +653,10 @@ Two keys matter when you wire the store up:
   manifest, so a `recompute` restore reinstalls exactly what the checkpoint
   described.
 
-If you cannot switch package managers, nothing breaks — it costs disk. Run
-fewer concurrent instances, and let `newgit cleanup` reclaim the trees of
-instances whose workspaces are gone.
+If you cannot switch package managers, nothing breaks — it costs disk on a
+miss. Run fewer concurrent instances, and let `newgit cleanup` reclaim both
+the trees of instances whose workspaces are gone and the store entries nothing
+keys to any more.
 
 ---
 

@@ -79,7 +79,7 @@ A resource is a lifecycle unit bound to a branch instance. It has no history and
 
 - **Liveness.** A running process cannot be copied, only started; a port cannot be snapshotted, only freshly allocated per instance; a daemon's state can only be captured consistently through the daemon.
 - **Externality.** Cloud preview environments, webhook tunnels, mock auth tenants — the state lives in another system, the local filesystem holds at most a handle, and an API call is the only interface.
-- **Path-dependence.** Installed artifacts (venvs, `node_modules`, native builds) hardcode machine and path; the true state is the identity (the lockfile, already in source) and the artifact must be *recomputed* in place, not copied. Recompute is correctness, not optimization — and it keeps derived gigabytes out of the content store.
+- **Path-dependence.** Installed artifacts (venvs, `node_modules`, native builds) hardcode machine and path; the true state is the identity (the lockfile, already in source) and the artifact is *recomputed* from it, never copied across identities. Recompute is correctness, not optimization — and it keeps derived gigabytes out of the content store. Two instances at the *same* identity are not two derivations: their tree is cloned copy-on-write from the install store, which is keyed on exactly that identity.
 
 The two primitives cooperate at exactly one seam: **a resource's checkpoint hook may deposit its output into a tracker** (`pg_dump` → a `db-snapshots` tracker), turning daemon-owned state into carryable, versioned content.
 

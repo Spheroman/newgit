@@ -581,3 +581,125 @@ fn a_complete_undo_marks_its_safety_checkpoint_as_a_redo_point() {
     assert!(undo.failed_resources().is_empty());
     assert_eq!(undo.safety.undo_completed, Some(true));
 }
+
+/// The run counter lives *outside* the workspace on purpose: a checkpoint's
+/// `git add -A` sweeps up untracked workspace files, so a counter kept
+/// inside would be rewound by the very undo being measured.
+fn stored_install_resource(runs: &Utf8Path) -> String {
+    format!(
+        r#"ownership = "workspace"
+
+[identity]
+paths = ["README.md"]
+produces = ["node_modules"]
+
+[actions.prepare]
+command = "mkdir -p node_modules && cp README.md node_modules/version && echo run >> {runs}"
+
+[checkpoint]
+mode = "hash"
+
+[restore]
+mode = "recompute"
+action = "prepare"
+"#
+    )
+}
+
+/// The rebuild an undo triggers is the expensive one — a full reinstall in
+/// the middle of an operation someone is waiting on. If the store already
+/// holds the tree for the identity being restored *to*, it is the same tree.
+#[test]
+fn undo_fills_a_rewound_tree_from_the_store_instead_of_rebuilding() {
+    let (_guard, temp) = tempdir();
+    let store = setup(&temp);
+    let runs = temp.join("prep-runs.txt");
+    write_resource(&store, "deps", &stored_install_resource(&runs));
+    let m = manager(store);
+    let ws = m
+        .spawn("feature-d", None)
+        .expect("spawn")
+        .branch
+        .workspace_path;
+    assert_eq!(read(&ws.join("node_modules/version")), "hello\n");
+    assert_eq!(read(&runs).lines().count(), 1);
+
+    m.checkpoint("feature-d", Some("v1")).expect("checkpoint");
+
+    // Move the identity and rebuild against it, the way a lockfile bump
+    // would: two entries in the store now, and the workspace holds the
+    // newer tree.
+    std::fs::write(ws.join("README.md"), "goodbye\n").expect("write");
+    m.run_action("feature-d", "deps.prepare").expect("rebuild");
+    assert_eq!(read(&ws.join("node_modules/version")), "goodbye\n");
+    assert_eq!(read(&runs).lines().count(), 2);
+
+    // Undo restores source first, so by the time the resource is restored
+    // the workspace holds the checkpoint's README — and the store has the
+    // tree built from exactly that.
+    let undo = m.undo("feature-d", &UndoOptions::default()).expect("undo");
+    assert!(
+        undo.resources[0]
+            .action
+            .starts_with("recompute(prepare) filled from install store"),
+        "expected a fill, got: {}",
+        undo.resources[0].action
+    );
+    assert!(undo.resources[0].ok);
+    assert_eq!(
+        read(&ws.join("node_modules/version")),
+        "hello\n",
+        "and the rewound tree is the one the checkpoint described"
+    );
+    assert_eq!(read(&runs).lines().count(), 2, "with no reinstall at all");
+}
+
+/// `--force-recompute` means "do not trust that the identity describes the
+/// tree". A cache keyed on that identity is under the same suspicion, so the
+/// flag has to reach it too — otherwise the one thing the store can get
+/// wrong has no way out but deleting a directory by hand.
+#[test]
+fn force_recompute_rebuilds_past_the_store_and_republishes() {
+    let (_guard, temp) = tempdir();
+    let store = setup(&temp);
+    let runs = temp.join("prep-runs.txt");
+    write_resource(&store, "deps", &stored_install_resource(&runs));
+    let m = manager(store);
+    let ws = m
+        .spawn("feature-e", None)
+        .expect("spawn")
+        .branch
+        .workspace_path;
+    m.checkpoint("feature-e", Some("v1")).expect("checkpoint");
+
+    std::fs::write(ws.join("README.md"), "goodbye\n").expect("write");
+    m.run_action("feature-e", "deps.prepare").expect("rebuild");
+    assert_eq!(read(&runs).lines().count(), 2);
+
+    let undo = m
+        .undo(
+            "feature-e",
+            &UndoOptions {
+                force_recompute: true,
+                ..Default::default()
+            },
+        )
+        .expect("undo --force-recompute");
+    assert!(
+        undo.resources[0].action.starts_with("recompute(prepare)"),
+        "the rebuild must actually run: {}",
+        undo.resources[0].action
+    );
+    assert!(
+        !undo.resources[0].action.contains("filled from"),
+        "and must not be served from the cache it is distrusting"
+    );
+    assert_eq!(read(&runs).lines().count(), 3, "the install ran");
+    assert!(
+        undo.resources[0]
+            .action
+            .contains("install store: stored as"),
+        "and the fresh tree replaces the entry that was dropped: {}",
+        undo.resources[0].action
+    );
+}

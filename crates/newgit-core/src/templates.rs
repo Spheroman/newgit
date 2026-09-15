@@ -97,14 +97,20 @@ mode = "none"
         companion_trackers: &[],
         contents: r#"# Every instance installs its own dependencies: two branches with
 # different lockfiles must not share a tree, or one branch's install
-# rewrites the other's. What that costs is your package manager's call.
-# pnpm hardlinks from one shared store, so instance ten adds directory
-# entries, not gigabytes; `npm ci` expands a full copy every time.
+# rewrites the other's. Two instances at the *same* lockfile are a
+# different case — that is one tree built twice, so `produces` lets the
+# second be cloned from the first instead of installed.
 ownership = "workspace"
 depends_on = ["pnpm-store"]
 
 [identity]
 paths = ["package.json", "pnpm-lock.yaml"]
+# The tree `prepare` builds. A monorepo installing into several places
+# names each one: paths are literal, and a directory means all of it.
+produces = ["node_modules"]
+# What the lockfile cannot see. Its hash says what was asked for, not what
+# gets built — install scripts compile against this platform and this Node.
+key_command = "node -v && uname -sm"
 
 [actions.prepare]
 command = "pnpm install --frozen-lockfile"

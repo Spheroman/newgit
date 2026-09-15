@@ -11,16 +11,18 @@ use crate::checkpoint::{
     ResourceState, RestoreFailure, SourceState, TrackerState,
 };
 use crate::cleanup::{
-    ArchivedCheckpoints, CleanupOutcome, FinalizedInstance, HookDetail, HookOutcome, PrunedRev,
-    PurgedCheckpoints, SnapshotRoots, lane_revs, may_tear_down, orphan_workspaces,
+    ArchivedCheckpoints, CleanupOutcome, FinalizedInstance, HookDetail, HookOutcome, PrunedInstall,
+    PrunedRev, PurgedCheckpoints, SnapshotRoots, lane_revs, may_tear_down, orphan_workspaces,
 };
 use crate::config::ProjectConfig;
 use crate::error::{NewgitError, Result};
 use crate::export::{self, ExportFilter, ExportPlan, prepare_destination};
 use crate::exports::{RenderContext, render, unresolved_placeholder};
+use crate::installs::{Admission, InstallReport, InstallStore};
 use crate::lane::{TrackerLane, clear_owned_paths, copy_file};
 use crate::materializer::{
-    Materializer, RealDirMaterializer, exclude_tracker_paths, unexclude_tracker_paths,
+    Materializer, RealDirMaterializer, exclude_produced_paths, exclude_tracker_paths,
+    unexclude_tracker_paths,
 };
 use crate::ports;
 use crate::render::{self, RenderRecord};
@@ -38,6 +40,10 @@ use crate::tracker::{Storage, TrackerDefinition, collect_files, collect_owned_fi
 #[derive(Debug)]
 pub struct BranchManager {
     store: MetadataStore,
+    /// Held rather than built per call: constructing one probes the
+    /// filesystem for copy-on-write support, which is two file writes and a
+    /// `cp`. Once per manager, not once per lookup.
+    installs: InstallStore,
     config: ProjectConfig,
     source: GitSource,
     trackers: Vec<TrackerDefinition>,
@@ -82,6 +88,9 @@ pub struct ResourceBindOutcome {
     /// `render_error` so the report names what actually went wrong: an
     /// export that never resolved is not a file that failed to render.
     pub export_error: Option<String>,
+    /// What the install store did, when this resource declares a tree it
+    /// produces. `None` means the resource is not eligible for it.
+    pub install: Option<InstallReport>,
 }
 
 /// Rendered files temporarily reverted to committed values, and the content
@@ -130,6 +139,9 @@ pub enum ActionOutcome {
         log: Utf8PathBuf,
         /// One warning per declared capture the command never emitted.
         missing_captures: Vec<String>,
+        /// Present when this was the action that builds `[identity]
+        /// produces`, and so had a tree worth publishing.
+        install: Option<InstallReport>,
     },
 }
 
@@ -393,14 +405,31 @@ impl BranchManager {
         let resources = store.load_resource_definitions()?;
         let tracker_names: BTreeSet<String> = trackers.iter().map(|t| t.name.clone()).collect();
         let graph = resolve_graph(&resources, &tracker_names);
+        // Only built when some resource could actually use it: constructing
+        // it ensures the local-ignore rule, and a project with no install to
+        // share has no business gaining an `installs/` line.
+        let installs = if resources
+            .iter()
+            .any(|definition| !definition.identity_produces().is_empty())
+        {
+            store.install_store()
+        } else {
+            InstallStore::at(store.paths().installs.clone())
+        };
         Ok(Self {
             store,
+            installs,
             config,
             source,
             trackers,
             resources,
             graph,
         })
+    }
+
+    /// The shared store of built trees. One per manager — see the field.
+    fn installs(&self) -> &InstallStore {
+        &self.installs
     }
 
     /// Ways the resource graph is incomplete. An empty slice means it resolves.
@@ -510,14 +539,10 @@ impl BranchManager {
         RealDirMaterializer.materialize(&self.source, &branch)?;
 
         // Before any lane content lands, make the clone's Git ignore the
-        // paths those lanes own — otherwise projected content arrives as
-        // untracked files an agent can commit into source history.
-        let owned: Vec<Utf8PathBuf> = self
-            .trackers
-            .iter()
-            .flat_map(|definition| definition.paths.iter().cloned())
-            .collect();
-        exclude_tracker_paths(&branch.workspace_path, &owned)?;
+        // paths trackers own and the trees resources build — otherwise both
+        // arrive as untracked files an agent, or a checkpoint's `git add
+        // -A`, can commit into source history.
+        self.ensure_workspace_excludes(&branch)?;
 
         let mut tracker_outcomes = Vec::new();
         for definition in &self.trackers {
@@ -638,6 +663,7 @@ impl BranchManager {
                     rendered: Vec::new(),
                     render_error,
                     export_error,
+                    install: None,
                 });
                 continue;
             }
@@ -662,7 +688,40 @@ impl BranchManager {
             };
             let mut captured_names = Vec::new();
             let mut missing_captures = Vec::new();
+            let mut install = None;
+
+            // The install store stands in front of the producing action, and
+            // only here. `newgit spawn` asks for an instance, so how its tree
+            // comes to exist is newgit's business; `newgit action deps.prepare`
+            // asks for a *command*, and quietly not running it would be a lie
+            // about what just happened.
+            //
+            // Computed once and reused by the publish below, because deriving
+            // it runs the resource's `key_command`.
+            let install_key = match runnable_prepare {
+                Some(_) if blocked_by.is_empty() => match self.install_key(branch, definition) {
+                    Some(Ok(key)) => Some(key),
+                    Some(Err(report)) => {
+                        install = Some(report);
+                        None
+                    }
+                    None => None,
+                },
+                _ => None,
+            };
+            let filled = match &install_key {
+                Some(key) => {
+                    install = self.fill_from_install_store(branch, definition, key);
+                    matches!(install, Some(InstallReport::Filled { .. }))
+                }
+                None => false,
+            };
+            if filled && let Some(binding) = branch.resources.get_mut(&definition.name) {
+                binding.status = ResourceStatus::Ready;
+            }
+
             let (status, prepare) = match runnable_prepare {
+                _ if filled => (ResourceStatus::Ready, None),
                 None => {
                     if let Some(binding) = branch.resources.get_mut(&definition.name) {
                         binding.status = ResourceStatus::Ready;
@@ -700,6 +759,11 @@ impl BranchManager {
                     if let Some(binding) = branch.resources.get_mut(&definition.name) {
                         binding.status = status;
                     }
+                    if code == 0
+                        && let Some(key) = &install_key
+                    {
+                        install = self.admit_to_install_store(branch, definition, key);
+                    }
                     (status, Some((code == 0, log)))
                 }
             };
@@ -715,10 +779,205 @@ impl BranchManager {
                 rendered,
                 render_error: None,
                 export_error: None,
+                install,
             });
         }
         branch.updated_at = Utc::now();
         Ok(outcomes)
+    }
+
+    /// Write this workspace's local-ignore rules: tracker-owned paths and
+    /// the trees resources declare they produce. Idempotent, so it doubles as
+    /// the re-sync for a workspace that predates a definition change.
+    fn ensure_workspace_excludes(&self, branch: &BranchInstance) -> Result<()> {
+        let owned: Vec<Utf8PathBuf> = self
+            .trackers
+            .iter()
+            .flat_map(|definition| definition.paths.iter().cloned())
+            .collect();
+        exclude_tracker_paths(&branch.workspace_path, &owned)?;
+
+        let produced: Vec<Utf8PathBuf> = self
+            .resources
+            .iter()
+            .flat_map(|definition| definition.identity_produces().iter().cloned())
+            .collect();
+        exclude_produced_paths(&branch.workspace_path, &produced)
+    }
+
+    /// The key this instance's tree would be stored under, and the paths that
+    /// tree covers. `None` means the resource declares no `[identity]
+    /// produces` and is simply not a store participant.
+    ///
+    /// Every failure below returns [`InstallReport::Unavailable`] rather than
+    /// an error, and that is deliberate: the store sits in front of a command
+    /// that still works. A broken `key_command` or an unreadable lockfile
+    /// must cost an install, never a spawn.
+    fn install_key(
+        &self,
+        branch: &BranchInstance,
+        definition: &ResourceDefinition,
+    ) -> Option<std::result::Result<String, InstallReport>> {
+        if definition.identity_produces().is_empty() {
+            return None;
+        }
+        let inputs = match collect_files(&branch.workspace_path, definition.identity_paths()) {
+            Ok(inputs) => inputs,
+            Err(error) => {
+                return Some(Err(InstallReport::Unavailable {
+                    reason: format!("identity paths could not be read: {error}"),
+                }));
+            }
+        };
+        // No inputs on disk is not an empty key, it is no key: the lockfile
+        // has not been written yet, and every instance in that state would
+        // otherwise hash the same and share a tree built from nothing.
+        if inputs.is_empty() {
+            return Some(Err(InstallReport::Unavailable {
+                reason: "no `[identity] paths` are present in the workspace yet".to_owned(),
+            }));
+        }
+        let rev = match content_rev(&inputs) {
+            Ok(rev) => rev,
+            Err(error) => {
+                return Some(Err(InstallReport::Unavailable {
+                    reason: format!("identity paths could not be hashed: {error}"),
+                }));
+            }
+        };
+
+        let material = match definition.identity_key_command() {
+            None => None,
+            Some(command) => {
+                let log = self
+                    .store
+                    .action_log_path(&branch.slug, &format!("{}.key", definition.name));
+                let env = match self.assemble_env(branch) {
+                    Ok(env) => env,
+                    Err(error) => {
+                        return Some(Err(InstallReport::Unavailable {
+                            reason: format!("environment could not be assembled: {error}"),
+                        }));
+                    }
+                };
+                match run_captured(command, &branch.workspace_path, &env, &log) {
+                    Ok((0, stdout)) => Some(stdout),
+                    Ok((code, _)) => {
+                        return Some(Err(InstallReport::Unavailable {
+                            reason: format!("`key_command` exited with {code} (see {log})"),
+                        }));
+                    }
+                    Err(error) => {
+                        return Some(Err(InstallReport::Unavailable {
+                            reason: format!("`key_command` could not be run: {error}"),
+                        }));
+                    }
+                }
+            }
+        };
+        Some(Ok(crate::installs::identity_key(
+            &rev,
+            material.as_deref(),
+            &definition.definition_rev,
+        )))
+    }
+
+    /// Clone a stored tree in instead of building one, when the key hits.
+    ///
+    /// `key` is passed in rather than recomputed: the caller needs it again
+    /// to publish on a miss, and deriving it runs the resource's
+    /// `key_command`. Once per operation, not once per lookup.
+    fn fill_from_install_store(
+        &self,
+        branch: &BranchInstance,
+        definition: &ResourceDefinition,
+        key: &str,
+    ) -> Option<InstallReport> {
+        let key = key.to_owned();
+        let store = self.installs();
+        let entry = store.lookup(&definition.name, &key)?;
+        match store.fill(
+            &entry,
+            &branch.workspace_path,
+            definition.identity_produces(),
+        ) {
+            Ok(Some(method)) => Some(InstallReport::Filled { key, method }),
+            // The workspace already has the tree, so there is nothing to
+            // fill and the real install is the right answer.
+            Ok(None) => None,
+            Err(error) => Some(InstallReport::Unavailable {
+                reason: format!("entry {key} could not be cloned in: {error}"),
+            }),
+        }
+    }
+
+    /// Clone a stored tree over the one an undo is rewinding away from.
+    ///
+    /// Distinct from [`Self::fill_from_install_store`] only in that the
+    /// workspace already has a tree: at spawn there is nothing to replace,
+    /// and here there always is. It is the same guarantee either way — the
+    /// entry was built from inputs that hash to what the workspace now
+    /// holds, which after a source restore is the checkpoint's lockfile.
+    fn refill_from_install_store(
+        &self,
+        branch: &BranchInstance,
+        definition: &ResourceDefinition,
+        key: &str,
+    ) -> Option<InstallReport> {
+        let key = key.to_owned();
+        let store = self.installs();
+        let entry = store.lookup(&definition.name, &key)?;
+        match store.replace(
+            &entry,
+            &branch.workspace_path,
+            definition.identity_produces(),
+        ) {
+            Ok(method) => Some(InstallReport::Filled { key, method }),
+            Err(error) => Some(InstallReport::Unavailable {
+                reason: format!("entry {key} could not be cloned in: {error}"),
+            }),
+        }
+    }
+
+    /// Drop this resource's entry for the identity the workspace now holds.
+    ///
+    /// `--force-recompute` means "do not trust that identity describes the
+    /// tree" — usually because the tree is damaged in a way the lockfile
+    /// cannot show. A cache keyed on that identity is under exactly the same
+    /// suspicion, so the flag drops the entry too and the rebuild republishes
+    /// it. Without this, the one failure the store can have — a bad entry —
+    /// would have no way out but deleting the directory by hand.
+    fn forget_install_entry(&self, definition: &ResourceDefinition, key: &str) {
+        let _ = self.installs().remove(&definition.name, key);
+    }
+
+    /// Publish what the producing action just built, for the next instance.
+    fn admit_to_install_store(
+        &self,
+        branch: &BranchInstance,
+        definition: &ResourceDefinition,
+        key: &str,
+    ) -> Option<InstallReport> {
+        let key = key.to_owned();
+        let store = self.installs();
+        match store.admit(
+            &definition.name,
+            &key,
+            &branch.workspace_path,
+            definition.identity_produces(),
+        ) {
+            Ok(Admission::Stored(method)) => Some(InstallReport::Stored { key, method }),
+            Ok(Admission::AlreadyStored) => Some(InstallReport::AlreadyStored { key }),
+            Ok(Admission::Declined { path }) => Some(InstallReport::Declined { key, path }),
+            // The action reported success without building what it declared.
+            // Worth saying, because the declaration and the command disagree.
+            Ok(Admission::Incomplete { path }) => Some(InstallReport::Unavailable {
+                reason: format!("`{path}` was not built, so there was nothing to store"),
+            }),
+            Err(error) => Some(InstallReport::Unavailable {
+                reason: format!("entry {key} could not be stored: {error}"),
+            }),
+        }
     }
 
     /// Substitute this instance's values into the files a resource declares,
@@ -1148,10 +1407,21 @@ impl BranchManager {
             branch.updated_at = Utc::now();
             self.store.save_branch_record(&branch)?;
         }
+        // An explicit run of the producing action always runs — the store
+        // never stands in for a command someone asked for by name — but what
+        // it built is worth publishing for the next instance.
+        let install = (code == 0 && action_name == definition.producing_action())
+            .then(|| match self.install_key(&branch, definition) {
+                Some(Ok(key)) => self.admit_to_install_store(&branch, definition, &key),
+                Some(Err(report)) => Some(report),
+                None => None,
+            })
+            .flatten();
         Ok(ActionOutcome::Ran {
             code,
             log,
             missing_captures,
+            install,
         })
     }
 
@@ -2313,7 +2583,113 @@ impl BranchManager {
         outcome.pinned_by_checkpoints = roots.pinned_only_by_checkpoints().count();
         outcome.pinned_by_archived = roots.pinned_only_by_archived_checkpoints().count();
 
+        self.prune_install_store(&surviving, dry_run, &mut outcome)?;
+
         Ok(outcome)
+    }
+
+    /// Drop install-store entries no surviving instance keys to.
+    ///
+    /// Reachability is recomputed rather than recorded: an entry is live if
+    /// some instance's identity hashes to it *right now*. A recorded
+    /// reference would be one more thing to keep in sync, and this is the
+    /// same computation a spawn already does — so an entry is kept exactly
+    /// when a spawn of that instance would have found it.
+    ///
+    /// The cost is real: one `key_command` per store-eligible resource per
+    /// surviving instance. That is why it runs here, in the command whose
+    /// whole job is to be thorough, and nowhere else.
+    ///
+    /// `--dry-run` will not run a `key_command`. A dry run is the thing
+    /// people reach for precisely because it observes without acting, and
+    /// spawning a user-supplied shell command is acting. Resources that need
+    /// one are reported as unevaluated instead; resources keyed on file
+    /// content alone are still reported exactly.
+    fn prune_install_store(
+        &self,
+        surviving: &[BranchInstance],
+        dry_run: bool,
+        outcome: &mut CleanupOutcome,
+    ) -> Result<()> {
+        let store = self.installs();
+
+        // A staging directory is a tree an interrupted `admit` was still
+        // copying. Nothing will ever adopt it — the publish it belonged to is
+        // gone — and at several gigabytes it is the single largest thing gc
+        // can reclaim, so it is garbage unconditionally rather than by
+        // reachability.
+        for (resource, name, path) in store.staging_entries()? {
+            if !dry_run {
+                store.remove(&resource, &name)?;
+            }
+            outcome.pruned_installs.push(PrunedInstall {
+                resource,
+                key: format!("{name} (interrupted publish)"),
+                path,
+            });
+        }
+
+        let entries = store.entries()?;
+        if entries.is_empty() {
+            return Ok(());
+        }
+
+        // Reachability is per (resource, instance): a key that cannot be
+        // computed for one resource says nothing about any other, so it
+        // withholds that resource's entries and nothing else. Making one
+        // unkeyable instance disable pruning for the whole project would turn
+        // a cache into an unbounded disk leak with no way out.
+        let mut reachable: BTreeSet<(String, String)> = BTreeSet::new();
+        let mut unkeyed: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for branch in surviving {
+            for definition in &self.resources {
+                if definition.identity_produces().is_empty() {
+                    continue;
+                }
+                if dry_run && definition.identity_key_command().is_some() {
+                    unkeyed
+                        .entry(definition.name.clone())
+                        .or_default()
+                        .push(format!("`{}` (--dry-run runs no key_command)", branch.name));
+                    continue;
+                }
+                match self.install_key(branch, definition) {
+                    None => {}
+                    Some(Ok(key)) => {
+                        reachable.insert((definition.name.clone(), key));
+                    }
+                    Some(Err(report)) => unkeyed
+                        .entry(definition.name.clone())
+                        .or_default()
+                        .push(format!("`{}`: {}", branch.name, report.summary())),
+                }
+            }
+        }
+
+        for (resource, reasons) in &unkeyed {
+            outcome.warnings.push(format!(
+                "install store entries for `{resource}` left alone — {}",
+                reasons.join("; ")
+            ));
+        }
+
+        for (resource, key) in entries {
+            if unkeyed.contains_key(&resource)
+                || reachable.contains(&(resource.clone(), key.clone()))
+            {
+                continue;
+            }
+            let path = store.root().join(&resource).join(&key);
+            if !dry_run {
+                store.remove(&resource, &key)?;
+            }
+            outcome.pruned_installs.push(PrunedInstall {
+                resource,
+                key,
+                path,
+            });
+        }
+        Ok(())
     }
 
     /// Write a branch instance's content out as an ordinary Git repository.
@@ -2418,6 +2794,15 @@ impl BranchManager {
         // workspace commits only here — checkpoint is the blessing boundary,
         // and a checkpoint protects the worktree as it stands, not just what
         // the agent remembered to commit.
+        // Re-sync the workspace's local-ignore rules first. `spawn` writes
+        // them, but a definition that gains a tracker path or an `[identity]
+        // produces` afterwards leaves every instance that already exists
+        // without the rule — and the `git add -A` below is exactly where
+        // that costs something, sweeping a whole install into source. Cheap
+        // and idempotent, so the re-sync belongs on the path that depends
+        // on it rather than only at spawn.
+        self.ensure_workspace_excludes(branch)?;
+
         let head_rev = GitSource::workspace_head(&workspace)?;
         let dirty_rev = GitSource::workspace_dirty_commit(
             &workspace,
@@ -2958,6 +3343,53 @@ impl BranchManager {
                     ));
                 }
 
+                // Past the skip, the rebuild is really needed — source has
+                // been restored, so the workspace holds the checkpoint's
+                // inputs and anything the store has under that key is the
+                // tree this rebuild would produce. Cloning it is the same
+                // trade as at spawn, one step further along: the rebuild
+                // here is the expensive one, a full reinstall in the middle
+                // of an undo somebody is waiting on.
+                let install_key = match self.install_key(branch, definition) {
+                    Some(Ok(key)) => Some(key),
+                    Some(Err(report)) => {
+                        warnings.push(format!(
+                            "resource `{}`: {}; rebuilding instead",
+                            definition.name,
+                            report.summary()
+                        ));
+                        None
+                    }
+                    None => None,
+                };
+                if undo.force_recompute {
+                    if let Some(key) = &install_key {
+                        self.forget_install_entry(definition, key);
+                    }
+                } else if let Some(report) = install_key
+                    .as_deref()
+                    .and_then(|key| self.refill_from_install_store(branch, definition, key))
+                {
+                    if let InstallReport::Filled { key, method } = &report {
+                        // Phrased like the `skipped:` case above, because it
+                        // is the same fact: the rebuild did not run, and here
+                        // is why it did not need to.
+                        return Ok((
+                            format!(
+                                "recompute({action_name}) filled from install store {key} ({})",
+                                method.label()
+                            ),
+                            true,
+                        ));
+                    }
+                    if let InstallReport::Unavailable { reason } = &report {
+                        warnings.push(format!(
+                            "resource `{}`: {reason}; rebuilding instead",
+                            definition.name
+                        ));
+                    }
+                }
+
                 let log = self
                     .store
                     .action_log_path(&branch.slug, &format!("{}.restore", definition.name));
@@ -2982,7 +3414,26 @@ impl BranchManager {
                         ),
                     });
                 }
-                Ok((format!("recompute({action_name})"), ok))
+                // A rebuild during an undo produces the same tree a spawn
+                // would have, so it is worth the same to the next instance.
+                let mut label = format!("recompute({action_name})");
+                if ok && let Some(key) = &install_key {
+                    match self.admit_to_install_store(branch, definition, key) {
+                        Some(InstallReport::Stored { key, method }) => {
+                            label.push_str(&format!(
+                                "; install store: stored as {key} ({})",
+                                method.label()
+                            ));
+                        }
+                        Some(InstallReport::Unavailable { .. }) | None => {}
+                        Some(report) => warnings.push(format!(
+                            "resource `{}`: {}",
+                            definition.name,
+                            report.summary()
+                        )),
+                    }
+                }
+                Ok((label, ok))
             }
             RestoreMode::Command => {
                 let template = spec.command.as_deref().expect("validated at parse time");

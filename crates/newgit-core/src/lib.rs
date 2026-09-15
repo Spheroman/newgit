@@ -5,6 +5,7 @@ pub mod config;
 pub mod error;
 pub mod export;
 pub mod exports;
+pub mod installs;
 pub mod lane;
 pub mod manager;
 pub mod materializer;
