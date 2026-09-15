@@ -2562,14 +2562,10 @@ impl BranchManager {
                 if let Some(tracker) = &spec.into_tracker
                     && !self.trackers.iter().any(|t| &t.name == tracker)
                 {
-                    return Err(NewgitError::InvalidDefinition {
-                        kind: "resource",
-                        name: definition.name.clone(),
-                        reason: format!(
-                            "checkpoint `into_tracker = \"{tracker}\"` names a tracker that is \
-                             not defined; create it with `newgit tracker create {tracker}`"
-                        ),
-                    });
+                    return Err(definition.invalid(format!(
+                        "checkpoint `into_tracker = \"{tracker}\"` names a tracker that is \
+                         not defined; create it with `newgit tracker create {tracker}`"
+                    )));
                 }
 
                 // `into_tracker` commands write into a staging dir that is

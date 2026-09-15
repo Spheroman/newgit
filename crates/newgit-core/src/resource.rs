@@ -518,7 +518,7 @@ impl ResourceDefinition {
         Ok(())
     }
 
-    fn invalid(&self, reason: String) -> NewgitError {
+    pub(crate) fn invalid(&self, reason: String) -> NewgitError {
         NewgitError::InvalidDefinition {
             kind: "resource",
             name: self.name.clone(),
