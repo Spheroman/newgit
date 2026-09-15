@@ -173,6 +173,19 @@ pub struct InstanceReport {
     pub live_rev: Option<String>,
     pub trackers: Vec<TrackerReport>,
     pub resources: Vec<ResourceReport>,
+    /// How far `branch.base_ref` has moved since this instance branched,
+    /// computed fresh from the store's own refs on every call. `None` when
+    /// the instance has no recorded base, or its base branch no longer
+    /// exists in the store to compare against.
+    pub base: Option<BaseReport>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BaseReport {
+    pub base_ref: String,
+    /// Commits `base_ref`'s current tip has that this instance's spawn
+    /// point did not.
+    pub ahead: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -514,6 +527,7 @@ impl BranchManager {
             });
         }
 
+        let mut base = None;
         let created_source_branch = if self.source.branch_exists(name)? {
             if let Some(base) = from {
                 return Err(NewgitError::Unsupported(format!(
@@ -523,9 +537,16 @@ impl BranchManager {
             }
             false
         } else {
-            let base = from.unwrap_or("HEAD");
-            let base_rev = self.source.rev_parse(base)?;
+            let requested = from.unwrap_or("HEAD");
+            let base_rev = self.source.rev_parse(requested)?;
             self.source.create_branch(name, &base_rev)?;
+            // Prefer a branch name over the literal request ("HEAD") so
+            // `status` has something readable to report drift against; a
+            // bare SHA or tag names a fixed point, so there is nothing to
+            // compare a moving base to and `resolve_branch_name` says so.
+            if let Some(base_ref) = self.source.resolve_branch_name(requested)? {
+                base = Some((base_ref, base_rev));
+            }
             true
         };
 
@@ -535,6 +556,9 @@ impl BranchManager {
             .workspace_root(&self.store.paths().project_root)
             .join(&slug);
         let mut branch = BranchInstance::new(name, name, source_rev, workspace_path)?;
+        if let Some((base_ref, base_rev)) = base {
+            branch = branch.with_base(base_ref, base_rev);
+        }
 
         RealDirMaterializer.materialize(&self.source, &branch)?;
 
@@ -2129,6 +2153,27 @@ impl BranchManager {
         })
     }
 
+    /// How far `branch`'s recorded base has moved, read fresh from the
+    /// store repo's own refs — never cached, so the answer is exactly as
+    /// current as the store's last fetch of upstream. `None` when the
+    /// instance has no recorded base (its source branch already existed at
+    /// spawn time) or the base branch has since been deleted in the store —
+    /// in either case there is nothing left to compare against, so `status`
+    /// says nothing rather than guess.
+    fn base_report(&self, branch: &BranchInstance) -> Option<BaseReport> {
+        let base_ref = branch.base_ref.as_ref()?;
+        let base_rev = branch.base_rev.as_ref()?;
+        let current_tip = self.source.ref_rev(&format!("refs/heads/{base_ref}"))?;
+        let ahead = self
+            .source
+            .commit_count(&format!("{base_rev}..{current_tip}"))
+            .ok()?;
+        Some(BaseReport {
+            base_ref: base_ref.clone(),
+            ahead,
+        })
+    }
+
     pub fn statuses(&self) -> Result<Vec<InstanceReport>> {
         let lane_heads: Vec<(String, Option<String>)> = self
             .trackers
@@ -2212,12 +2257,14 @@ impl BranchManager {
                         }
                     })
                     .collect();
+                let base = self.base_report(&branch);
                 Ok(InstanceReport {
                     branch,
                     workspace_exists,
                     live_rev,
                     trackers,
                     resources,
+                    base,
                 })
             })
             .collect()

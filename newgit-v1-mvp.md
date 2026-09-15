@@ -1182,10 +1182,24 @@ named it), `before-undo` (auto-saved, and a real redo point), and
 Shows branch instances with tracker and resource status:
 
 ```text
-NAME        SOURCE        TRACKERS                RESOURCES                 STATUS
-feature-a   abc123        env:r3 db:s17           deps:ready app:running    ok
-feature-b   def456        env:r1 db:s18           deps:ready app:stopped    ok
+NAME        SOURCE        STATUS        TRACKERS                RESOURCES
+feature-a   abc123        ok, main +2   env:r3 db:s17           deps:ready app:running
+feature-b   def456        ok            env:r1 db:s18           deps:ready app:stopped
 ```
+
+`STATUS` also reports when an instance's base has moved: `ok, main +2` means
+`main` — the branch `spawn --from` named, or whatever `HEAD` pointed at when
+`--from` was omitted — has gained 2 commits since this instance branched.
+That comparison is the one fact nothing else in the stack can make: the
+binding record keeps the base branch's name and the revision it pointed at
+when this instance was spawned (fixed then, never touched again — v1 has no
+rebase, so the branch point does not move even as `source_rev` does at
+`checkpoint`), and the store knows where that branch sits now. `status`
+computes the gap fresh from the store's own refs on every call rather than
+caching it, so the number is exactly as current as the store's last fetch of
+upstream and never a stale comparison presented as a live one. An instance
+spawned onto a branch that already existed has no recorded base and reports
+none — newgit never chose a base for it, so there is nothing to compare.
 
 `newgit status <instance> --path` prints that instance's workspace path on
 stdout and nothing else. A workspace path is the one piece of newgit state
