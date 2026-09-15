@@ -537,7 +537,8 @@ fn spawn(args: SpawnArgs) -> Result<()> {
     println!("  workspace: {}", branch.workspace_path);
     println!("  record:    {}", outcome.record_path);
     for tracker in &outcome.trackers {
-        println!("  tracker:   {}", bind_line(tracker));
+        let deposit_only = tracker_is_deposit_only(&manager, &tracker.name);
+        println!("  tracker:   {}", bind_line(tracker, deposit_only));
     }
     for resource in &outcome.resources {
         let ports = resource
@@ -716,26 +717,47 @@ fn resource(command: ResourceCommand) -> Result<()> {
                 );
                 return Ok(());
             }
+            // Widths are computed from every row plus the header, not a
+            // hardcoded guess — a long `PROFILE` (or any other column) must
+            // not push the columns after it out of alignment.
+            let rows: Vec<_> = definitions
+                .iter()
+                .map(|definition| {
+                    let deps = definition.depends_on.join(", ");
+                    let actions = definition
+                        .actions
+                        .keys()
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    (
+                        definition.name.clone(),
+                        resource_profile(definition),
+                        format!("{:?}", definition.ownership).to_lowercase(),
+                        if deps.is_empty() {
+                            "-".to_owned()
+                        } else {
+                            deps
+                        },
+                        if actions.is_empty() {
+                            "-".to_owned()
+                        } else {
+                            actions
+                        },
+                    )
+                })
+                .collect();
+            let name_width = column_width(rows.iter().map(|r| r.0.len()), "NAME");
+            let profile_width = column_width(rows.iter().map(|r| r.1.len()), "PROFILE");
+            let ownership_width = column_width(rows.iter().map(|r| r.2.len()), "OWNERSHIP");
+            let depends_width = column_width(rows.iter().map(|r| r.3.len()), "DEPENDS_ON");
             println!(
-                "{:<18} {:<27} {:<10} {:<22} ACTIONS",
+                "{:<name_width$} {:<profile_width$} {:<ownership_width$} {:<depends_width$} ACTIONS",
                 "NAME", "PROFILE", "OWNERSHIP", "DEPENDS_ON"
             );
-            for definition in definitions {
-                let deps = definition.depends_on.join(", ");
-                let actions = definition
-                    .actions
-                    .keys()
-                    .cloned()
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                let profile = resource_profile(definition);
+            for (name, profile, ownership, deps, actions) in &rows {
                 println!(
-                    "{:<18} {:<27} {:<10} {:<22} {}",
-                    definition.name,
-                    profile,
-                    format!("{:?}", definition.ownership).to_lowercase(),
-                    if deps.is_empty() { "-" } else { &deps },
-                    if actions.is_empty() { "-" } else { &actions },
+                    "{name:<name_width$} {profile:<profile_width$} {ownership:<ownership_width$} {deps:<depends_width$} {actions}"
                 );
             }
             // The DEPENDS_ON column is what someone wrote. These edges were
@@ -960,24 +982,42 @@ fn tracker(command: TrackerCommand) -> Result<()> {
                 println!("No trackers defined. Create one with `newgit tracker create <name>`.");
                 return Ok(());
             }
+            // Same reasoning as `resource list`: compute widths from every
+            // row plus the header, so a long AUDIENCE value can't push PATHS
+            // out of alignment.
+            let rows: Vec<_> = definitions
+                .iter()
+                .map(|definition| {
+                    let paths = definition
+                        .paths
+                        .iter()
+                        .map(|path| path.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    (
+                        definition.name.clone(),
+                        definition.merge_with_source.to_string(),
+                        format!("{:?}", definition.storage).to_lowercase(),
+                        definition.audience.clone(),
+                        if paths.is_empty() {
+                            "-".to_owned()
+                        } else {
+                            paths
+                        },
+                    )
+                })
+                .collect();
+            let name_width = column_width(rows.iter().map(|r| r.0.len()), "NAME");
+            let merge_width = column_width(rows.iter().map(|r| r.1.len()), "MERGE_WITH_SOURCE");
+            let storage_width = column_width(rows.iter().map(|r| r.2.len()), "STORAGE");
+            let audience_width = column_width(rows.iter().map(|r| r.3.len()), "AUDIENCE");
             println!(
-                "{:<18} {:<18} {:<12} {:<9} PATHS",
+                "{:<name_width$} {:<merge_width$} {:<storage_width$} {:<audience_width$} PATHS",
                 "NAME", "MERGE_WITH_SOURCE", "STORAGE", "AUDIENCE"
             );
-            for definition in definitions {
-                let paths = definition
-                    .paths
-                    .iter()
-                    .map(|path| path.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ");
+            for (name, merge_with_source, storage, audience, paths) in &rows {
                 println!(
-                    "{:<18} {:<18} {:<12} {:<9} {}",
-                    definition.name,
-                    definition.merge_with_source,
-                    format!("{:?}", definition.storage).to_lowercase(),
-                    definition.audience,
-                    if paths.is_empty() { "-" } else { &paths }
+                    "{name:<name_width$} {merge_with_source:<merge_width$} {storage:<storage_width$} {audience:<audience_width$} {paths}"
                 );
             }
             Ok(())
@@ -1049,7 +1089,11 @@ fn tracker(command: TrackerCommand) -> Result<()> {
         TrackerCommand::Pull { tracker, instance } => {
             let (manager, instance) = manager_and_instance(instance)?;
             let outcome = manager.pull_tracker(&instance, &tracker)?;
-            println!("Pulled {} for `{instance}`", bind_line(&outcome));
+            let deposit_only = tracker_is_deposit_only(&manager, &outcome.name);
+            println!(
+                "Pulled {} for `{instance}`",
+                bind_line(&outcome, deposit_only)
+            );
             Ok(())
         }
     }
@@ -1249,11 +1293,14 @@ fn undo(instance: Option<String>, options: UndoOptions) -> Result<()> {
     }
     for tracker in &outcome.trackers {
         match &tracker.rev {
-            Some(rev) => println!(
-                "  tracker:  {} @ {rev} ({})",
-                tracker.name,
-                files_label(tracker.files)
-            ),
+            Some(rev) => {
+                let count = if tracker_is_deposit_only(&manager, &tracker.name) {
+                    "deposit-only".to_owned()
+                } else {
+                    files_label(tracker.files)
+                };
+                println!("  tracker:  {} @ {rev} ({count})", tracker.name);
+            }
             None => println!(
                 "  tracker:  {} cleared (no content at checkpoint time)",
                 tracker.name
@@ -1579,16 +1626,33 @@ fn remove(name: &str, purge: bool) -> Result<()> {
     Ok(())
 }
 
-fn bind_line(outcome: &TrackerBindOutcome) -> String {
+fn bind_line(outcome: &TrackerBindOutcome, deposit_only: bool) -> String {
     match &outcome.origin {
-        BindOrigin::LaneHead => format!(
-            "`{}` @ {} ({}, from lane head)",
-            outcome.name,
-            outcome.content_rev.as_deref().unwrap_or("-"),
-            files_label(outcome.files)
-        ),
+        BindOrigin::LaneHead => {
+            // A deposit-only tracker (no `paths` of its own) always binds
+            // `(0 files)` — that's correct, but next to a real rev it reads
+            // like a checkout that silently failed. Naming the reason beats
+            // a zero the reader has to double-take on.
+            let count = if deposit_only {
+                "deposit-only".to_owned()
+            } else {
+                files_label(outcome.files)
+            };
+            format!(
+                "`{}` @ {} ({count}, from lane head)",
+                outcome.name,
+                outcome.content_rev.as_deref().unwrap_or("-"),
+            )
+        }
         BindOrigin::Nothing => format!("`{}` bound (no captured content)", outcome.name),
     }
+}
+
+fn tracker_is_deposit_only(manager: &BranchManager, name: &str) -> bool {
+    manager
+        .tracker_definitions()
+        .iter()
+        .any(|definition| definition.name == name && definition.paths.is_empty())
 }
 
 fn parse_storage(value: &str) -> Result<Storage> {
