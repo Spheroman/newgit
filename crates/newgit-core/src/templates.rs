@@ -141,6 +141,17 @@ action = "prepare"
 # A branch-local database, named after the instance so instances never share
 # one. Edit the commands for your database; the shape is what matters:
 # checkpoint emits a dump into the lane, restore reads it back.
+#
+# That shape assumes one thing: a FULL dump loaded into a database dropped
+# and recreated fresh, so there is nothing for the load to collide with.
+# That assumption breaks the moment the schema comes from migrations
+# instead (Rails, Prisma, Supabase) — you cannot drop the database, because
+# recreating it means replaying every migration. The restore is then reset,
+# then load data over what the migrations already inserted, and the load
+# needs a data-only dump plus an empty target or it dies on duplicate keys.
+# Use the `command-snapshot-migrations` template for that shape instead of
+# bending this one; the two are different strategies, not variations on one
+# command.
 
 [actions.prepare]
 command = "createdb {{branch.slug}} || true"
@@ -159,6 +170,74 @@ into_tracker = "db-snapshots"
 [restore]
 mode = "command"
 command = "dropdb {{branch.slug}} --if-exists && createdb {{branch.slug}} && psql --quiet {{branch.slug}} < {{state_ref}}"
+
+[cleanup]
+command = "dropdb {{branch.slug}} --if-exists"
+
+[exports]
+RESOURCE_URL = "postgres://localhost/{{branch.slug}}"
+"#,
+    },
+    ResourceTemplate {
+        name: "command-snapshot-migrations",
+        description: "a migration-managed database, restored by reset-empty-load instead of dropdb/createdb",
+        companions: &[],
+        // Shares the lane with `command-snapshot`: both deposit a Postgres
+        // dump, and a lane is per-database, not per-template.
+        companion_trackers: &[CompanionTracker {
+            name: "db-snapshots",
+            audience: "project-devs",
+            merge_with_source: false,
+        }],
+        contents: r#"ownership = "branch"
+
+# For a database whose schema comes from migrations, not from the dump —
+# Rails, Prisma, Supabase, and anything else that runs `migrate` to build
+# the schema. `command-snapshot`'s restore is dropdb/createdb, which only
+# works when the dump is the whole database; here the schema has to come
+# from replaying migrations, so the restore is reset, then load, and:
+#
+#   - the checkpoint is `--data-only`, since the schema isn't the dump's job
+#   - reset re-runs the migrations, which insert their own seed rows, so the
+#     database the load runs against is not empty
+#   - the load has to empty it first, and only what this role may actually
+#     truncate — a table the dump could not read (a stricter role owns it,
+#     e.g. Supabase's storage internals) is not one the restore has any
+#     business emptying either, and trying fails on a permission error
+#     before the load ever runs
+#
+# Edit `reset` for your migration tool (`rails db:schema:load`, `prisma
+# migrate reset --force`, `supabase db reset`, ...) and the `where` clause
+# below for whichever schemas your dump actually covers.
+
+[actions.prepare]
+command = "createdb {{branch.slug}} || true"
+
+[actions.reset]
+command = "npm run db:migrate:reset"
+
+[checkpoint]
+mode = "command"
+command = "pg_dump --data-only {{branch.slug}} > {{snapshot.path}}/db.sql && echo {{snapshot.path}}/db.sql"
+into_tracker = "db-snapshots"
+
+[restore]
+mode = "command"
+command = """
+npm run db:migrate:reset && psql --quiet {{branch.slug}} <<'SQL' && psql --quiet {{branch.slug}} < {{state_ref}}
+do $$
+declare t record;
+begin
+  for t in
+    select schemaname, tablename from pg_tables
+     where schemaname = 'public'
+       and has_table_privilege(format('%I.%I', schemaname, tablename), 'truncate')
+  loop
+    execute format('truncate table %I.%I restart identity cascade', t.schemaname, t.tablename);
+  end loop;
+end $$;
+SQL
+"""
 
 [cleanup]
 command = "dropdb {{branch.slug}} --if-exists"
