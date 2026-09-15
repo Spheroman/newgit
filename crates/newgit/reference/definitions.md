@@ -501,6 +501,26 @@ naming the file and how many lines are about to go. Silence means there is
 nothing to lose. To change a rendered file for real, change it in the store
 repo.
 
+**Adopting a `[[render]]` means committing the default it substitutes into
+before anything can test it.** The rule above — committed content is the
+input — means a `find` you just typed does not exist in the content newgit
+would render until you commit it. `newgit render --check` is the fix: it
+resolves every `[[render]]` against the working tree instead, with no
+instance, no spawn, and no commit, and reports per file which `find` matched
+and which did not:
+
+```
+$ newgit render --check
+ok    supabase: `packages/db/supabase/config.toml` — `port = 54321` (1)
+FAIL  supabase: `packages/db/supabase/config.toml` — `port = 54324` expected 1, found 0
+```
+
+A failing check exits non-zero, so it also runs as a drift detector in CI: a
+default the upstream tool changed fails the build there instead of the next
+`spawn`. It never writes or substitutes anything — `with` is not even
+resolved, since a `find` that fails to match fails whether or not there is a
+port to put in its place yet.
+
 ---
 
 ## Ownership
