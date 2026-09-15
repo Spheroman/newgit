@@ -107,6 +107,20 @@ jobs:
           fi
           echo "version $manifest matches tag $GITHUB_REF_NAME"
 
+      - name: Check the changelog fragments were folded in
+        # `scripts/release-changelog.sh <version>` consumes changelog.d/ and
+        # deletes it clean. A leftover fragment means the tag was cut without
+        # running it, and the entry it holds is about to miss its release.
+        run: |
+          set -euo pipefail
+          left="$(ls changelog.d/*-*.md 2>/dev/null || true)"
+          if [ -n "$left" ]; then
+            echo "unreleased changelog fragments still present:" >&2
+            echo "$left" >&2
+            echo "run scripts/release-changelog.sh ${GITHUB_REF_NAME#v} before tagging" >&2
+            exit 1
+          fi
+
       - name: Extract release notes
         # awk rather than sed: `\?` is a GNU extension that silently matches
         # nothing on BSD sed, and release notes failing open to empty is the

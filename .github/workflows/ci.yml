@@ -40,6 +40,14 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      - name: Check changelog fragments
+        # A misnamed fragment is not picked up by the release script's
+        # category globs, so the entry would go missing from the release
+        # rather than fail anything. Catch it on the PR that wrote it.
+        # Running on both runners also keeps the script honest about BSD vs
+        # GNU userland, which is the same trap the release workflow hit.
+        run: ./scripts/release-changelog.sh --check
+
       - name: Identify git
         # The suite makes real commits; a runner with no identity configured
         # fails in a way that looks like a newgit bug.
