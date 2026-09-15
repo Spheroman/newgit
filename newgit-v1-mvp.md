@@ -1128,6 +1128,39 @@ the other subcommands):
   coherent
 - resolved exports, port allocations, and which processes were running
 
+#### An Unproven Restore Must Say So
+
+`[checkpoint]` runs the day it is written; `[restore]` runs the day it is
+needed — by definition the day the instance is already in trouble. A
+checkpoint record looks identical whether or not the restore behind it has
+ever actually worked, and a checkpoint wrongly trusted is worse than no
+checkpoint, because the trust is what licenses the risky change taken
+behind it.
+
+Each resource line therefore names its own proof: when the resource's
+`[restore]` is `command` or `recompute` — the modes that run something that
+can fail — and it has never completed successfully on this instance, the
+line ends `— restore never exercised`. `none` and `external` restores run
+nothing, so nothing needs proving. The record is per branch instance
+(`ResourceBinding.restore_proven`), sticky once true: it answers "has this
+ever completed", not "would it complete right now", so a later failed
+restore does not erase an earlier proof. A `recompute` restore that
+*skips* because `[identity]` is unchanged does not count either — the
+command that could fail never ran.
+
+`newgit checkpoint --verify <instance>` proves it on demand instead of
+waiting for the day of a real rollback: checkpoint, restore that checkpoint
+with a real `undo`, checkpoint again, and compare the two checkpoints'
+resource state refs. Agreement across every resource whose restore could
+fail is what "verified" means; disagreement is reported even when every
+restore command exited `0`, because exiting `0` and reproducing the
+checkpointed state are different claims — the whole reason a byte-level
+comparison is worth running at all. Destructive and expensive on purpose:
+it is a real `undo`, stopping and restarting whatever the instance's
+resources run, so it is a separate, explicitly named command rather than
+something `checkpoint` runs on its own, and it prints what it is about to
+do — restore-over-live-state, no simulated safety net — before it does it.
+
 ### `newgit undo [instance] [--to <ckpt_id>]`
 
 Restores the branch instance to a checkpoint (the latest unless `--to`).

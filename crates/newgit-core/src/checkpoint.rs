@@ -88,6 +88,17 @@ pub struct ResourceState {
     pub resolved_ports: BTreeMap<String, u16>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub resolved_exports: BTreeMap<String, String>,
+    /// This resource's `[restore]` runs a command that can fail: `command`
+    /// or `recompute`. `none` and `external` do not — there is nothing to
+    /// prove, so `restore_proven` is meaningless for them.
+    #[serde(default)]
+    pub restore_exercisable: bool,
+    /// `[restore]` has completed successfully at least once on this
+    /// instance, as of this checkpoint. False on a checkpoint record written
+    /// before this field existed — that predates the tracking, not a known
+    /// failure, but "unproven" is the honest default until re-proven.
+    #[serde(default)]
+    pub restore_proven: bool,
 }
 
 /// The prefix a `hash` checkpoint writes its state ref with.
@@ -283,6 +294,8 @@ mod tests {
             was_running: false,
             resolved_ports: BTreeMap::new(),
             resolved_exports: BTreeMap::new(),
+            restore_exercisable: false,
+            restore_proven: false,
         };
 
         assert_eq!(

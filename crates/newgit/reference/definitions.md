@@ -282,6 +282,24 @@ where rewinding the whole workspace each cycle is the cost.
 A restore command is not transactional. If one fails, `newgit undo` says the
 undo was incomplete and names the resource, rather than reporting success.
 
+**Restore is unproven until it has actually run.** `[checkpoint]` runs the
+day it is written; `[restore]` runs the day it is needed. A `command` or
+`recompute` restore that has never completed successfully on this branch
+instance gets `— restore never exercised` on its `newgit checkpoint` line;
+`none` and `external` run nothing, so there is nothing to prove. A real
+`undo` — not a `recompute` skip, which never touches the command — is what
+clears it, and it stays cleared even if a later restore fails: the claim is
+"has this ever completed", not "would it complete right now".
+
+`newgit checkpoint --verify <instance>` proves it without waiting for a
+real rollback: checkpoint, `undo` back to that checkpoint, checkpoint
+again, and diff the two runs' resource state refs. Agreement is a stronger
+claim than "the command exited 0" — a restore can exit clean and still
+land on the wrong state, which `--verify` is what catches. It is
+destructive (a real `undo`, stopping and restarting whatever the instance's
+resources run) and prints what it is about to do before doing it; run it
+against an instance you can afford to spend, not one you are mid-task on.
+
 ### `[cleanup]`
 
 | key | type | required | default | meaning |

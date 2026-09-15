@@ -238,6 +238,42 @@ pub struct CheckpointOutcome {
     pub warnings: Vec<String>,
 }
 
+/// What `checkpoint --verify` found: a checkpoint, a real restore of it, a
+/// second checkpoint, and whether the two agree.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifyOutcome {
+    pub before: CheckpointRecord,
+    pub undo: UndoOutcome,
+    pub after: CheckpointRecord,
+    pub resources: Vec<VerifyResource>,
+}
+
+impl VerifyOutcome {
+    /// The restore is proven when the middle `undo` completed cleanly and
+    /// every resource whose restore could fail landed on the state ref it
+    /// started from.
+    pub fn is_proven(&self) -> bool {
+        self.undo.is_complete()
+            && self
+                .resources
+                .iter()
+                .filter(|resource| resource.exercised)
+                .all(|resource| resource.agree)
+    }
+}
+
+/// One resource's before/after comparison from a verify run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifyResource {
+    pub name: String,
+    /// False for `[restore] mode = "none"` or `"external"` — nothing ran
+    /// that could prove or disprove anything, so agreement here is trivial.
+    pub exercised: bool,
+    pub before_state_ref: Option<String>,
+    pub after_state_ref: Option<String>,
+    pub agree: bool,
+}
+
 /// What this undo knows about a resource beyond the checkpoint being
 /// restored — the facts a `recompute` needs to decide whether to run at all.
 #[derive(Debug, Clone, Copy)]
@@ -632,6 +668,7 @@ impl BranchManager {
                     resolved_exports,
                     rendered: Vec::new(),
                     status: ResourceStatus::Pending,
+                    restore_proven: false,
                 },
             );
 
@@ -2773,6 +2810,73 @@ impl BranchManager {
         self.checkpoint_log(&branch).list()
     }
 
+    /// Prove a restore actually works instead of trusting it: checkpoint the
+    /// current state, restore it with a real `undo`, checkpoint again, and
+    /// compare the two checkpoints' resource state refs. Agreement across
+    /// every exercised resource is the difference between a checkpoint that
+    /// looks like a backup and one that has actually been one.
+    ///
+    /// Destructive and expensive on purpose, which is why it is a separate,
+    /// explicitly named entry point rather than something `checkpoint` does
+    /// on its own: the middle step is a real `undo`, stopping and
+    /// restarting whatever each resource runs, and if `[restore]` really is
+    /// broken, this is where that gets discovered — on an instance someone
+    /// chose to spend, not the one they actually needed to roll back.
+    pub fn checkpoint_verify(
+        &self,
+        instance: &str,
+        message: Option<&str>,
+    ) -> Result<VerifyOutcome> {
+        self.require_resolvable_graph()?;
+        let mut branch = self.store.find_branch(instance)?;
+        let before = self.checkpoint_branch(&mut branch, message, CheckpointReason::Explicit)?;
+
+        let undo = self.undo(
+            instance,
+            &UndoOptions {
+                to: Some(before.record.id.clone()),
+                ..UndoOptions::default()
+            },
+        )?;
+
+        // `undo` reloaded and saved its own copy of the branch record;
+        // `branch` above is stale past this point.
+        let mut branch = self.store.find_branch(instance)?;
+        let after = self.checkpoint_branch(
+            &mut branch,
+            Some(&format!("verify: restored from {}", before.record.id)),
+            CheckpointReason::Explicit,
+        )?;
+
+        let resources = before
+            .record
+            .resource_states
+            .iter()
+            .map(|before_state| {
+                let after_ref = after
+                    .record
+                    .resource_states
+                    .iter()
+                    .find(|state| state.name == before_state.name)
+                    .and_then(|state| state.state_ref.clone());
+                VerifyResource {
+                    name: before_state.name.clone(),
+                    exercised: before_state.restore_exercisable,
+                    before_state_ref: before_state.state_ref.clone(),
+                    after_state_ref: after_ref.clone(),
+                    agree: before_state.state_ref == after_ref,
+                }
+            })
+            .collect();
+
+        Ok(VerifyOutcome {
+            before: before.record,
+            undo,
+            after: after.record,
+            resources,
+        })
+    }
+
     fn checkpoint_branch(
         &self,
         branch: &mut BranchInstance,
@@ -2836,6 +2940,10 @@ impl BranchManager {
             if let Some(deposit) = captured.deposit {
                 deposits.push(deposit);
             }
+            let restore_exercisable = matches!(
+                definition.restore.as_ref().map(|spec| spec.mode),
+                Some(RestoreMode::Command | RestoreMode::Recompute)
+            );
             resource_states.push(ResourceState {
                 name: name.clone(),
                 definition_rev: definition.definition_rev.clone(),
@@ -2845,6 +2953,8 @@ impl BranchManager {
                 was_running,
                 resolved_ports: binding.resolved_ports.clone(),
                 resolved_exports: binding.resolved_exports.clone(),
+                restore_exercisable,
+                restore_proven: binding.restore_proven,
             });
         }
         // Recorded in dependency order for readability.
@@ -3200,7 +3310,7 @@ impl BranchManager {
                 .iter()
                 .find(|pre| &pre.name == name)
                 .and_then(|pre| pre.state_ref.as_deref());
-            let (mut action_label, ok) = self.restore_resource(
+            let (mut action_label, ok, exercised) = self.restore_resource(
                 &mut branch,
                 definition,
                 state,
@@ -3217,6 +3327,13 @@ impl BranchManager {
                 } else {
                     ResourceStatus::Failed
                 };
+                // Sticky once true: this answers "has restore ever
+                // completed", not "would it complete right now". A skip (no
+                // command ran) or a later failure must not erase a proof
+                // that already happened.
+                if ok && exercised {
+                    binding.restore_proven = true;
+                }
             }
 
             if ok && state.was_running {
@@ -3283,6 +3400,12 @@ impl BranchManager {
     /// `branch` is mutable because a recompute restore re-runs `prepare`,
     /// which may `capture` a fresh handle — a restored resource must not
     /// keep publishing the pre-undo one.
+    ///
+    /// Returns `(label, ok, exercised)`. `exercised` is true only when a
+    /// command actually ran and could have failed — `none`/`external` never
+    /// run anything, and a `recompute` skipped because identity is
+    /// unchanged never touched the tree either, so neither proves the
+    /// restore path works. `ok` without `exercised` is not proof.
     fn restore_resource(
         &self,
         branch: &mut BranchInstance,
@@ -3291,13 +3414,13 @@ impl BranchManager {
         undo: RestoreContext<'_>,
         failures: &mut Vec<RestoreFailure>,
         warnings: &mut Vec<String>,
-    ) -> Result<(String, bool)> {
+    ) -> Result<(String, bool, bool)> {
         let Some(spec) = &definition.restore else {
-            return Ok(("none".to_owned(), true));
+            return Ok(("none".to_owned(), true, false));
         };
         match spec.mode {
-            RestoreMode::None => Ok(("none".to_owned(), true)),
-            RestoreMode::External => Ok(("external (no-op)".to_owned(), true)),
+            RestoreMode::None => Ok(("none".to_owned(), true, false)),
+            RestoreMode::External => Ok(("external (no-op)".to_owned(), true, false)),
             RestoreMode::Recompute => {
                 let action_name = spec.recompute_action();
                 let action = definition.actions.get(action_name).ok_or_else(|| {
@@ -3337,6 +3460,7 @@ impl BranchManager {
                     return Ok((
                         format!("recompute({action_name}) skipped: identity unchanged"),
                         true,
+                        false,
                     ));
                 }
 
@@ -3376,6 +3500,7 @@ impl BranchManager {
                                 "recompute({action_name}) filled from install store {key} ({})",
                                 method.label()
                             ),
+                            true,
                             true,
                         ));
                     }
@@ -3430,7 +3555,7 @@ impl BranchManager {
                         )),
                     }
                 }
-                Ok((label, ok))
+                Ok((label, ok, true))
             }
             RestoreMode::Command => {
                 let template = spec.command.as_deref().expect("validated at parse time");
@@ -3467,7 +3592,7 @@ impl BranchManager {
                         retry_with: "repair the resource, then `newgit undo` again".to_owned(),
                     });
                 }
-                Ok(("command".to_owned(), ok))
+                Ok(("command".to_owned(), ok, true))
             }
         }
     }

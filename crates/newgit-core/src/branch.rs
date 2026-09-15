@@ -44,6 +44,17 @@ pub struct ResourceBinding {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub rendered: Vec<RenderRecord>,
     pub status: ResourceStatus,
+    /// Whether `[restore]` has completed successfully on this instance at
+    /// least once. `[checkpoint]` runs the day it is written; `[restore]`
+    /// runs the day it is needed, which is by definition the day this
+    /// instance is already in trouble — so this is the one honest way to
+    /// know whether it works before that day arrives. Sticky once true: a
+    /// later failed restore does not unset it, because the question this
+    /// answers is "has this ever completed", not "would it complete now".
+    /// Meaningless for a resource whose `[restore]` is `none` or `external`
+    /// — neither runs a command that can fail.
+    #[serde(default)]
+    pub restore_proven: bool,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
