@@ -5,6 +5,7 @@ use newgit_core::branch::branch_slug;
 use newgit_core::checkpoint::CheckpointReason;
 use newgit_core::cleanup::{ArchivedCheckpoints, HookDetail, HookOutcome};
 use newgit_core::export::{ExportFilter, Reason};
+use newgit_core::installs::InstallReport;
 use newgit_core::manager::{
     ActionOutcome, BindOrigin, BranchManager, InstanceReport, TrackerBindOutcome, UndoOptions,
 };
@@ -570,6 +571,12 @@ fn spawn(args: SpawnArgs) -> Result<()> {
                 None if !resource.blocked_by.is_empty() => {
                     format!(" prepare: BLOCKED by {}", resource.blocked_by.join(", "))
                 }
+                // Said where prepare's result would be, because it is the
+                // answer to the same question — the tree is there. What put
+                // it there, and from which key, is on the line below.
+                None if matches!(&resource.install, Some(InstallReport::Filled { .. })) => {
+                    " prepare: not needed".to_owned()
+                }
                 None => String::new(),
             },
         };
@@ -595,6 +602,9 @@ fn spawn(args: SpawnArgs) -> Result<()> {
             "  resource:  `{}`{ports}{prepare}{captured}{rendered}",
             resource.name
         );
+        if let Some(install) = &resource.install {
+            println!("             {}", install.summary());
+        }
         print_warnings(&resource.missing_captures);
     }
     Ok(())
@@ -825,8 +835,12 @@ fn action(spec: &str, instance: Option<String>) -> Result<()> {
             code,
             log,
             missing_captures,
+            install,
         } => {
             print_warnings(&missing_captures);
+            if let Some(install) = &install {
+                println!("  {}", install.summary());
+            }
             eprintln!("[newgit] `{spec}` exit {code}; log: {log}");
             if code != 0 {
                 std::process::exit(code);
@@ -1450,6 +1464,12 @@ fn cleanup(dry_run: bool, purge_archived: bool) -> Result<()> {
     }
     for rev in &outcome.pruned {
         println!("Snapshot {verb}: {} @ {}", rev.tracker, rev.rev);
+    }
+    for entry in &outcome.pruned_installs {
+        println!(
+            "Install tree {verb}: {} @ {} — no instance's identity keys to it any more",
+            entry.resource, entry.key
+        );
     }
     if outcome.pinned_by_checkpoints > 0 {
         println!(

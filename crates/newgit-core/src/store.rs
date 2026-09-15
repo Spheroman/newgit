@@ -6,6 +6,7 @@ use serde::de::DeserializeOwned;
 use crate::branch::BranchInstance;
 use crate::config::{ProjectConfig, SourceSubstrate};
 use crate::error::{NewgitError, Result};
+use crate::installs::InstallStore;
 use crate::materializer::{WorkspaceMarker, create_dir_all};
 use crate::resource::ResourceDefinition;
 use crate::tracker::{TrackerDefinition, validate_disjoint};
@@ -18,6 +19,7 @@ const LOCAL_GITIGNORE: &str = "\
 /logs/
 /state/
 /checkpoints/
+/installs/
 ";
 
 const SCRIPTS_README: &str = "\
@@ -72,6 +74,9 @@ pub struct NewgitPaths {
     pub logs: Utf8PathBuf,
     pub state: Utf8PathBuf,
     pub checkpoints: Utf8PathBuf,
+    /// Built trees shared between instances, keyed by resource identity.
+    /// Local and rebuildable — never committed, and safe to delete.
+    pub installs: Utf8PathBuf,
 }
 
 /// Where a newgit command is standing: which store owns the metadata, and —
@@ -297,6 +302,31 @@ impl MetadataStore {
         self.paths.state.join(slug)
     }
 
+    /// The shared store of built trees, at `.newgit/installs/`.
+    ///
+    /// The local-ignore rule is ensured here rather than only at `init`,
+    /// because this is the moment the directory can first come to exist: a
+    /// store written under an `.newgit/.gitignore` that predates it would
+    /// put several gigabytes of `node_modules` into `git status`.
+    pub fn install_store(&self) -> InstallStore {
+        let _ = self.ensure_installs_ignored();
+        InstallStore::at(self.paths.installs.clone())
+    }
+
+    fn ensure_installs_ignored(&self) -> Result<()> {
+        let path = self.paths.metadata_root.join(".gitignore");
+        let contents = std::fs::read_to_string(&path).unwrap_or_default();
+        if contents.lines().any(|line| line.trim() == "/installs/") {
+            return Ok(());
+        }
+        let mut updated = contents;
+        if !updated.is_empty() && !updated.ends_with('\n') {
+            updated.push('\n');
+        }
+        updated.push_str("/installs/\n");
+        std::fs::write(&path, updated).map_err(|source| NewgitError::io(path, source))
+    }
+
     /// Per-instance checkpoint records: `.newgit/checkpoints/<slug>/`.
     pub fn checkpoint_dir(&self, slug: &str) -> Utf8PathBuf {
         self.paths.checkpoints.join(slug)
@@ -451,6 +481,7 @@ impl MetadataStore {
             &self.paths.logs,
             &self.paths.state,
             &self.paths.checkpoints,
+            &self.paths.installs,
         ] {
             create_dir_all(path)?;
         }
@@ -495,6 +526,7 @@ impl NewgitPaths {
             logs: metadata_root.join("logs"),
             state: metadata_root.join("state"),
             checkpoints: metadata_root.join("checkpoints"),
+            installs: metadata_root.join("installs"),
             metadata_root,
         }
     }

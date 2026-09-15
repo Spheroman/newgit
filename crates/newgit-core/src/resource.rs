@@ -79,6 +79,22 @@ impl Ownership {
 #[serde(deny_unknown_fields)]
 pub struct IdentitySpec {
     pub paths: Vec<Utf8PathBuf>,
+    /// The tree the producing action builds *from* `paths` — `node_modules`
+    /// for an install. `paths` says what the resource is derived from;
+    /// this says what that derivation produces, so the same tree can be
+    /// filled from a store keyed on the inputs instead of rebuilt per
+    /// instance. Workspace-relative, same restrictions as `paths`.
+    #[serde(default)]
+    pub produces: Vec<Utf8PathBuf>,
+    /// Key material `paths` cannot see. The content hash of a lockfile
+    /// describes what was asked for, not what gets built: install scripts
+    /// bake in the platform and the toolchain version, so two trees from one
+    /// lockfile are not interchangeable across an arch or a Node bump. This
+    /// command's stdout is mixed into the key. newgit does not guess at the
+    /// list — what a tree depends on is ecosystem knowledge the definition
+    /// has and newgit does not.
+    #[serde(default)]
+    pub key_command: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -268,6 +284,35 @@ impl ResourceDefinition {
             .unwrap_or(&[])
     }
 
+    /// The tree `[identity] produces`, if this resource declares one. A
+    /// non-empty list is what makes the resource eligible for the install
+    /// store; everything else about it is inferred from `[identity]`.
+    pub fn identity_produces(&self) -> &[Utf8PathBuf] {
+        self.identity
+            .as_ref()
+            .map(|spec| spec.produces.as_slice())
+            .unwrap_or(&[])
+    }
+
+    pub fn identity_key_command(&self) -> Option<&str> {
+        self.identity
+            .as_ref()
+            .and_then(|spec| spec.key_command.as_deref())
+    }
+
+    /// The action that builds `[identity] produces`. A store entry is filled
+    /// from whatever a `recompute` restore would re-run to rebuild the same
+    /// tree — those are the same job, and letting them name different actions
+    /// is how a store ends up caching the output of one command and handing
+    /// it to another. Validation refuses any resource declaring `produces`
+    /// where this is not [`PRODUCING_ACTION`], so callers may rely on it.
+    pub fn producing_action(&self) -> &str {
+        self.restore
+            .as_ref()
+            .filter(|restore| restore.mode == RestoreMode::Recompute)
+            .map_or("prepare", |restore| restore.recompute_action())
+    }
+
     fn validate(&self) -> Result<()> {
         self.check_identity_paths()?;
         if let Some(checkpoint) = &self.checkpoint {
@@ -326,6 +371,9 @@ impl ResourceDefinition {
             }
         }
         self.check_checkpoint_restore_pairing()?;
+        // After the restore block: a `recompute` naming an action that does
+        // not exist is that block's error to report, and it says so better.
+        self.check_identity_store()?;
         if let Some(workdir) = &self.workdir {
             self.check_workdir_is_workspace_relative(workdir)?;
         }
@@ -397,22 +445,148 @@ impl ResourceDefinition {
             return Ok(());
         };
         for path in &identity.paths {
-            if path.is_absolute()
-                || path.as_str().is_empty()
-                || path.components().any(|part| part.as_str() == "..")
-            {
-                return Err(
-                    self.invalid(format!("identity path `{path}` must be workspace-relative"))
-                );
-            }
-            let first = path
+            self.check_identity_path(path, "identity path")?;
+        }
+        for path in &identity.produces {
+            self.check_identity_path(path, "identity `produces` path")?;
+        }
+        Ok(())
+    }
+
+    fn check_identity_path(&self, path: &Utf8Path, label: &str) -> Result<()> {
+        // `.` is refused rather than normalized away, because every other
+        // check here reads the *first* component: `./.git` would otherwise
+        // lead with `.`, sail past the `.git` guard below, and let a
+        // `produces` copy — and on undo overwrite — a workspace's own Git
+        // directory. One spelling per path is also simply what the rest of
+        // the file assumes when it compares them.
+        if path.is_absolute()
+            || path.as_str().is_empty()
+            || path
                 .components()
-                .next()
-                .map(|part| part.as_str().to_owned());
-            if matches!(first.as_deref(), Some(".git" | ".newgit")) {
+                .any(|part| matches!(part.as_str(), ".." | "."))
+        {
+            return Err(self.invalid(format!(
+                "{label} `{path}` must be workspace-relative, with no `.` or `..` components"
+            )));
+        }
+        let first = path
+            .components()
+            .next()
+            .map(|part| part.as_str().to_owned());
+        if matches!(first.as_deref(), Some(".git" | ".newgit")) {
+            return Err(self.invalid(format!(
+                "{label} `{path}` may not reach into `{}`",
+                first.unwrap_or_default()
+            )));
+        }
+        Ok(())
+    }
+
+    /// `[identity] produces` is what makes a resource eligible for the
+    /// install store: the key is the content of `paths` (plus `key_command`),
+    /// and the entry is the tree at `produces`. The refusals here are all the
+    /// same shape — a declaration that could never key or fill an entry, said
+    /// now rather than discovered as a store that silently never hits.
+    fn check_identity_store(&self) -> Result<()> {
+        let Some(identity) = &self.identity else {
+            return Ok(());
+        };
+        // A key over no content is not a key: every instance would hash the
+        // empty set, collide, and hand each other an unrelated tree.
+        if identity.paths.is_empty() {
+            if !identity.produces.is_empty() {
+                return Err(self.invalid(
+                    "`[identity] produces` names a tree to key on `paths`, which this resource \
+                     does not declare"
+                        .to_owned(),
+                ));
+            }
+            if identity.key_command.is_some() {
+                return Err(self.invalid(
+                    "`[identity] key_command` adds to a key built from `paths`, which this \
+                     resource does not declare"
+                        .to_owned(),
+                ));
+            }
+        }
+        if identity.produces.is_empty() {
+            return Ok(());
+        }
+
+        // Nothing fills the store if the action that builds the tree is not
+        // the one that actually runs. A spawn runs `prepare` and nothing
+        // else, so `prepare` is what a store entry can stand in for — and a
+        // `recompute` restore naming a *different* action would rebuild one
+        // tree while the store caches another.
+        let action = self.producing_action();
+        if action != PRODUCING_ACTION {
+            return Err(self.invalid(format!(
+                "`[identity] produces` is built at spawn by `{PRODUCING_ACTION}`, but `[restore] \
+                 action = \"{action}\"` rebuilds it with something else; the store cannot stand in \
+                 for two different commands"
+            )));
+        }
+        // A blocked, long-running, or command-less `prepare` is not a
+        // command the store can stand in for either — and silently never
+        // filling is exactly the "declaration that could never fill an
+        // entry" this function exists to refuse.
+        match self.actions.get(action) {
+            None => {
                 return Err(self.invalid(format!(
-                    "identity path `{path}` may not reach into `{}`",
-                    first.unwrap_or_default()
+                    "`[identity] produces` is built by action `{action}`, which is not defined"
+                )));
+            }
+            Some(spec) if spec.command.is_none() => {
+                return Err(self.invalid(format!(
+                    "`[identity] produces` is built by action `{action}`, which has no command"
+                )));
+            }
+            Some(spec) if spec.long_running => {
+                return Err(self.invalid(format!(
+                    "`[identity] produces` is built by action `{action}`, which is \
+                     `long_running`; a tree is built by a command that finishes"
+                )));
+            }
+            // Filling from the store means the action does not run, so
+            // anything it publishes besides the tree would silently go
+            // missing — a dependent would get an environment with a hole in
+            // it and no warning anywhere. The tree has to be the whole
+            // output for the store to be able to stand in for the command.
+            Some(spec) if !spec.captures.is_empty() => {
+                return Err(self.invalid(format!(
+                    "action `{action}` declares `captures` ({}) and also builds `[identity] \
+                     produces`; a filled tree cannot republish them, so the store cannot stand in \
+                     for it",
+                    spec.captures.join(", ")
+                )));
+            }
+            Some(_) => {}
+        }
+
+        for produced in &identity.produces {
+            // A `produces` that contains an input makes the key a function of
+            // the tree it keys, so no two runs agree and the store never hits.
+            if let Some(input) = identity
+                .paths
+                .iter()
+                .find(|input| contains_path(produced, input))
+            {
+                return Err(self.invalid(format!(
+                    "identity `produces` path `{produced}` contains identity path `{input}`: the \
+                     key would describe the tree it keys"
+                )));
+            }
+            // Two entries where one nests inside the other store the same
+            // bytes twice and disagree the moment only one is refreshed.
+            if let Some(other) = identity
+                .produces
+                .iter()
+                .find(|other| *other != produced && contains_path(produced, other))
+            {
+                return Err(self.invalid(format!(
+                    "identity `produces` path `{produced}` contains `{other}`: name the outer path \
+                     only"
                 )));
             }
         }
@@ -525,6 +699,24 @@ impl ResourceDefinition {
             reason,
         }
     }
+}
+
+/// The one action a spawn runs, and so the only one an install-store entry
+/// can stand in for.
+pub const PRODUCING_ACTION: &str = "prepare";
+
+/// Whether `outer` is `inner` or a directory containing it, compared by
+/// path component so `node_modules` does not appear to contain
+/// `node_modules_backup`.
+fn contains_path(outer: &Utf8Path, inner: &Utf8Path) -> bool {
+    let mut inner_parts = inner.components();
+    for part in outer.components() {
+        match inner_parts.next() {
+            Some(candidate) if candidate == part => {}
+            _ => return false,
+        }
+    }
+    true
 }
 
 /// What an action's stdout yielded against the names it declared.
@@ -1613,5 +1805,318 @@ command = "true"
             "mode = \"command\"\ncommand = \"npm ci\"",
         );
         ok("mode = \"none\"", "mode = \"command\"\ncommand = \"true\"");
+    }
+
+    /// The shape the install store keys on: inputs, the tree they build, and
+    /// the key material the inputs cannot see.
+    #[test]
+    fn identity_declares_the_tree_it_produces_and_what_else_keys_it() {
+        let definition = write_and_load(
+            r#"ownership = "branch"
+
+[identity]
+paths = ["package-lock.json", "package.json"]
+produces = ["node_modules"]
+key_command = "node -v && uname -sm"
+
+[actions.prepare]
+command = "npm ci"
+"#,
+        )
+        .expect("a full identity should load");
+
+        assert_eq!(
+            definition.identity_produces(),
+            [Utf8PathBuf::from("node_modules")]
+        );
+        assert_eq!(
+            definition.identity_key_command(),
+            Some("node -v && uname -sm")
+        );
+        assert_eq!(
+            definition.producing_action(),
+            "prepare",
+            "the tree is built by prepare unless a recompute restore says otherwise"
+        );
+
+        // Both new keys are optional: every definition written before the
+        // store existed still declares only what it is derived from.
+        let inputs_only = write_and_load(
+            r#"ownership = "branch"
+
+[identity]
+paths = ["package-lock.json"]
+
+[actions.prepare]
+command = "npm ci"
+"#,
+        )
+        .expect("identity without produces should load");
+        assert!(inputs_only.identity_produces().is_empty());
+        assert!(inputs_only.identity_key_command().is_none());
+    }
+
+    /// A spawn runs `prepare` and nothing else, so `prepare` is the only
+    /// action a store entry can stand in for. A `recompute` restore naming a
+    /// different one would rebuild a tree the store did not cache.
+    #[test]
+    fn produces_requires_a_prepare_that_can_actually_be_stood_in_for() {
+        let refused = |contents: &str, expected: &str| {
+            let error = write_and_load(contents).expect_err("should have been refused");
+            assert!(
+                error.to_string().contains(expected),
+                "expected `{expected}` in: {error}"
+            );
+        };
+
+        // A recompute restore rebuilding with something other than prepare.
+        refused(
+            r#"ownership = "branch"
+
+[identity]
+paths = ["package-lock.json"]
+produces = ["node_modules"]
+
+[actions.prepare]
+command = "npm ci"
+
+[actions.install]
+command = "npm ci --omit=dev"
+
+[restore]
+mode = "recompute"
+action = "install"
+"#,
+            "cannot stand in for two different commands",
+        );
+
+        // No prepare at all.
+        refused(
+            r#"ownership = "branch"
+
+[identity]
+paths = ["package-lock.json"]
+produces = ["node_modules"]
+
+[actions.build]
+command = "npm ci"
+"#,
+            "which is not defined",
+        );
+
+        // A prepare that never finishes is not a tree-building command, and
+        // `bind_resources` would not run it as one — so the store would
+        // silently never fill.
+        refused(
+            r#"ownership = "branch"
+
+[identity]
+paths = ["package-lock.json"]
+produces = ["node_modules"]
+
+[actions.prepare]
+command = "npm start"
+long_running = true
+"#,
+            "`long_running`",
+        );
+
+        // Filling means prepare does not run, so anything else it publishes
+        // would go missing with no warning anywhere.
+        refused(
+            r#"ownership = "branch"
+
+[identity]
+paths = ["package-lock.json"]
+produces = ["node_modules"]
+
+[actions.prepare]
+command = "npm ci && echo DATABASE_URL=postgres://x"
+captures = ["DATABASE_URL"]
+"#,
+            "cannot republish them",
+        );
+
+        // And a `recompute` naming `prepare` explicitly is the same thing
+        // the default already means, so it loads.
+        let ok = write_and_load(
+            r#"ownership = "branch"
+
+[identity]
+paths = ["package-lock.json"]
+produces = ["node_modules"]
+
+[actions.prepare]
+command = "npm ci"
+
+[restore]
+mode = "recompute"
+action = "prepare"
+"#,
+        )
+        .expect("an explicit `prepare` recompute should load");
+        assert_eq!(ok.producing_action(), PRODUCING_ACTION);
+
+        // None of this constrains a resource that does not use the store: a
+        // recompute may still name whatever action it likes.
+        write_and_load(
+            r#"ownership = "branch"
+
+[identity]
+paths = ["package-lock.json"]
+
+[actions.install]
+command = "npm ci"
+
+[restore]
+mode = "recompute"
+action = "install"
+"#,
+        )
+        .expect("without `produces` the store rule does not apply");
+    }
+
+    #[test]
+    fn a_produces_that_could_never_key_or_fill_an_entry_is_refused() {
+        let refused = |contents: &str, expected: &str| {
+            let error = write_and_load(contents).expect_err("should have been refused");
+            assert!(
+                error.to_string().contains(expected),
+                "expected `{expected}` in: {error}"
+            );
+        };
+
+        // A key over no content collides across every instance.
+        refused(
+            r#"ownership = "branch"
+
+[identity]
+paths = []
+produces = ["node_modules"]
+
+[actions.prepare]
+command = "npm ci"
+"#,
+            "which this resource does not declare",
+        );
+        refused(
+            r#"ownership = "branch"
+
+[identity]
+paths = []
+key_command = "node -v"
+
+[actions.prepare]
+command = "npm ci"
+"#,
+            "which this resource does not declare",
+        );
+
+        // The tree may not contain its own key inputs.
+        refused(
+            r#"ownership = "branch"
+
+[identity]
+paths = ["deps/package-lock.json"]
+produces = ["deps"]
+
+[actions.prepare]
+command = "npm ci"
+"#,
+            "the key would describe the tree it keys",
+        );
+
+        // And the containment checks read components too, so a `./` spelling
+        // must not slip past them either.
+        refused(
+            r#"ownership = "branch"
+
+[identity]
+paths = ["deps/package-lock.json"]
+produces = ["./deps"]
+
+[actions.prepare]
+command = "npm ci"
+"#,
+            "identity `produces` path",
+        );
+
+        // Nor may one entry nest inside another.
+        refused(
+            r#"ownership = "branch"
+
+[identity]
+paths = ["package-lock.json"]
+produces = ["node_modules", "node_modules/.bin"]
+
+[actions.prepare]
+command = "npm ci"
+"#,
+            "name the outer path only",
+        );
+
+        // `./` is the case that mattered: every other check reads the first
+        // component, so `./.git` would sail past the `.git` guard and let a
+        // `produces` copy — and on undo overwrite — a workspace's own Git.
+        for bad in [
+            "/opt/node_modules",
+            "../node_modules",
+            ".git/objects",
+            "./.git",
+            "./node_modules",
+        ] {
+            refused(
+                &format!(
+                    r#"ownership = "branch"
+
+[identity]
+paths = ["package-lock.json"]
+produces = ["{bad}"]
+
+[actions.prepare]
+command = "npm ci"
+"#
+                ),
+                "identity `produces` path",
+            );
+        }
+    }
+
+    /// Containment is compared by path component, so a sibling whose name
+    /// merely starts the same is not nested.
+    #[test]
+    fn a_sibling_sharing_a_name_prefix_is_not_contained() {
+        assert!(contains_path(
+            Utf8Path::new("node_modules"),
+            Utf8Path::new("node_modules/.bin")
+        ));
+        assert!(contains_path(
+            Utf8Path::new("node_modules"),
+            Utf8Path::new("node_modules")
+        ));
+        assert!(!contains_path(
+            Utf8Path::new("node_modules"),
+            Utf8Path::new("node_modules_backup")
+        ));
+        assert!(!contains_path(
+            Utf8Path::new("node_modules/.bin"),
+            Utf8Path::new("node_modules")
+        ));
+
+        let definition = write_and_load(
+            r#"ownership = "branch"
+
+[identity]
+paths = ["package-lock.json"]
+produces = ["node_modules", "node_modules_backup"]
+
+[actions.prepare]
+command = "npm ci"
+"#,
+        );
+        assert!(
+            definition.is_ok(),
+            "siblings sharing a prefix should load: {definition:?}"
+        );
     }
 }

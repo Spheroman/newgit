@@ -1,3 +1,5 @@
+use std::collections::BTreeSet;
+
 use camino::{Utf8Path, Utf8PathBuf};
 use serde::{Deserialize, Serialize};
 
@@ -66,6 +68,33 @@ pub fn workspace_marker_path(workspace: &Utf8Path) -> Utf8PathBuf {
 /// committed files. This is Git's own per-clone local-ignore mechanism, and
 /// there is no plumbing command that writes it.
 pub fn exclude_tracker_paths(workspace: &Utf8Path, paths: &[Utf8PathBuf]) -> Result<()> {
+    exclude_paths(
+        workspace,
+        "tracker-owned paths — these lanes own this content",
+        paths,
+    )
+}
+
+/// The same, for the trees resources build (`[identity] produces`).
+///
+/// Derived content is not source, and a produced tree is the largest thing
+/// in a workspace by orders of magnitude. Without this, an instance whose
+/// project has no `node_modules` rule of its own would have its whole
+/// install swept into source history by the `git add -A` a checkpoint runs —
+/// and unlike a tracker lane, nothing else keeps it out.
+pub fn exclude_produced_paths(workspace: &Utf8Path, paths: &[Utf8PathBuf]) -> Result<()> {
+    exclude_paths(
+        workspace,
+        "resource-produced trees — derived from an identity, never source",
+        paths,
+    )
+}
+
+/// Idempotent: paths already excluded are skipped, and nothing is written
+/// when they all are. Callers re-run this to re-sync a workspace that
+/// predates a definition change, and an append-always version would grow the
+/// file a block at a time on every checkpoint.
+fn exclude_paths(workspace: &Utf8Path, note: &str, paths: &[Utf8PathBuf]) -> Result<()> {
     if paths.is_empty() {
         return Ok(());
     }
@@ -74,12 +103,21 @@ pub fn exclude_tracker_paths(workspace: &Utf8Path, paths: &[Utf8PathBuf]) -> Res
         create_dir_all(parent)?;
     }
     let mut contents = std::fs::read_to_string(&exclude).unwrap_or_default();
+    let existing: BTreeSet<&str> = contents.lines().map(str::trim).collect();
+    let wanted: Vec<String> = paths
+        .iter()
+        .map(|path| format!("/{path}"))
+        .filter(|pattern| !existing.contains(pattern.as_str()))
+        .collect();
+    if wanted.is_empty() {
+        return Ok(());
+    }
     if !contents.is_empty() && !contents.ends_with('\n') {
         contents.push('\n');
     }
-    contents.push_str("\n# newgit: tracker-owned paths — these lanes own this content\n");
-    for path in paths {
-        contents.push_str(&format!("/{path}\n"));
+    contents.push_str(&format!("\n# newgit: {note}\n"));
+    for pattern in wanted {
+        contents.push_str(&format!("{pattern}\n"));
     }
     std::fs::write(&exclude, contents).map_err(|source| NewgitError::io(exclude, source))
 }

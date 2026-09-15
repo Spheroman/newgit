@@ -48,7 +48,7 @@ Resources exist for exactly three irreducible reasons:
 
 - **Liveness.** A running process cannot be copied, only started. A port cannot be snapshotted, only freshly allocated per instance. A daemon's state can only be captured consistently through the daemon.
 - **Externality.** The state lives in another system; the local filesystem holds at most a handle, and an API call is the only interface.
-- **Path-dependence.** Installed artifacts (`node_modules`, venvs, native builds) hardcode machine and path. The true state is the identity (the lockfile), and the artifact must be recomputed in place, not copied.
+- **Path-dependence.** Installed artifacts (`node_modules`, venvs, native builds) hardcode machine and path. The true state is the identity (the lockfile), and the artifact is recomputed from it — never copied from an instance whose identity differs. Instances whose identity *agrees* are a different case: the tree is the same by construction, so it is cloned copy-on-write from the install store rather than rebuilt. See *Installs: use a content-addressed store*.
 
 If a thing is purely files that copy correctly, it is a tracker, not a resource.
 
@@ -772,6 +772,7 @@ v1 can use a simple `.newgit/` directory in the project root:
     feature-a.toml
     feature-b.toml
   snapshots/               # gitignored captured tracker content
+  installs/                # gitignored built trees, keyed by identity
   logs/                    # gitignored action logs
   state/                   # gitignored runtime state
 ```
@@ -1546,18 +1547,73 @@ depends_on = ["pnpm-store"]
 
 [identity]
 paths = ["package.json", "pnpm-lock.yaml"]
+produces = ["node_modules"]
+key_command = "node -v && uname -sm"
 
 [actions.prepare]
 command = "pnpm install --frozen-lockfile"
 
 [checkpoint]
 mode = "hash"
-paths = ["package.json", "pnpm-lock.yaml"]
 
 [restore]
 mode = "recompute"
 action = "prepare"
 ```
+
+`produces` names the tree `prepare` builds, which puts this resource in the
+**install store**: the first instance at a given identity installs and its
+tree is published to `.newgit/installs/<resource>/<key>/`; every later
+instance at that key is filled from it with a copy-on-write clone and does not
+run `prepare` at all.
+
+The key is the content of `paths`, the stdout of `key_command`, and the
+definition file itself. The first is what the resource declares it is derived
+from. The second is what that cannot see — a lockfile hash describes what was
+*asked for*, and install scripts compile against a platform and a toolchain it
+never names. The third is because the *command* is an input to the tree as
+much as its inputs are: edit `prepare` and the next instance must rebuild
+rather than be handed what the old command built.
+
+Three properties make this safe rather than the shared-tree bug the design
+exists to prevent:
+
+- **Copies fork on write.** Clones are copy-on-write (`clonefile` on APFS,
+  `--reflink` on btrfs/XFS), never hardlinks. `node_modules` is not read-only
+  after install — native builds write into it — and under hardlinks one
+  instance's build would rewrite every other instance's tree. Where the
+  filesystem cannot clone, newgit takes a full copy and says which it did:
+  same behaviour everywhere, worse performance.
+- **A tree that names its own workspace is never shared.** A postinstall that
+  bakes in its absolute location produces a tree copy-on-write cannot fix, so
+  admission scans for it and declines, naming the file. That resource simply
+  keeps installing per instance.
+- **Entries are a cache, not data.** `newgit cleanup` drops any entry no live
+  instance's identity still keys to, per resource, along with anything an
+  interrupted publish left behind. The tree is rebuildable from the inputs
+  that key it, so the cost of being wrong is an install.
+- **`prepare` is the only command an entry stands in for.** A spawn runs
+  `prepare` and nothing else, so a definition where something else builds the
+  tree — a `[restore] action` naming another action, a `long_running` or
+  command-less `prepare`, or one declaring `captures` it would no longer
+  publish — is refused rather than left to silently never fill.
+
+A `recompute` restore consults it too. Undo restores source before resources,
+so the workspace already holds the checkpoint's inputs by then and the store's
+entry under that key is the tree the rebuild would produce — the existing tree
+is moved aside, the clone lands, and only then is the old one discarded.
+`newgit undo --force-recompute` bypasses the store *and drops the entry*: that
+flag means the identity is not to be trusted to describe the tree, and a cache
+keyed on the identity is under the same suspicion.
+
+`newgit action <resource>.prepare` always runs the command — the store stands
+in for a *spawn*, never for a command someone asked for by name — but
+publishes what it built.
+
+Declared `produces` paths are added to each workspace's `.git/info/exclude`
+alongside tracker-owned paths. Derived content is not source, and without the
+rule a checkpoint's `git add -A` would sweep an entire install into source
+history.
 
 For Nix projects, this template should call Nix rather than imitate it:
 
