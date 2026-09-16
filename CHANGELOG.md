@@ -12,6 +12,784 @@ time by `scripts/release-changelog.sh`, which then deletes the fragments.
 Two changes never touch the same lines, so nothing queues behind whichever
 branch landed first.
 
+## [0.3.0] — 2026-09-15
+
+### Added
+
+- `newgit resource remove <name>` and `newgit tracker remove <name>` — the
+  inverse of `resource add`/`tracker create` that only existed as `rm
+  .newgit/resources/<name>.toml` before. Deletion by hand was predictable —
+  definitions are plain TOML named by filename — but it was the one place in
+  the tool where you had to reach around the CLI, and it turned up in the
+  first session cleaning up a definition `resource add --template pnpm` had
+  created on its own.
+
+  Both refuse rather than leave damage behind, in the voice `newgit remove`
+  already set: `resource remove` refuses if another resource still names it
+  in `depends_on` (naming every dependent, and `--force` does not override
+  this — a broken graph is never what you wanted) and refuses if a live
+  instance still has it bound unless `--force` is given, in which case it
+  drops the binding and releases the ports (there is no other ledger; a port
+  is free the moment nothing claims it). `tracker remove` refuses the same
+  way for a bound instance, refuses outright for `source` (Git/jj owns that
+  history, there is no file to remove), and undoes exactly what `tracker
+  track` did — the store's `.gitignore` block and each workspace's
+  `.git/info/exclude` entries. Captured content under `.newgit/snapshots/`
+  is left in place; it is now unreferenced, and a `newgit cleanup` bug fix
+  alongside this (lane heads were pinned as roots forever, even after their
+  tracker's definition was deleted) means that cleanup now actually reclaims
+  it once nothing else — a checkpoint that captured it — still pins a rev.
+
+- `newgit resource templates --show <name>` prints one starter template's
+  TOML in full ([#25](https://github.com/Spheroman/newgit/issues/25)).
+
+  The one-line descriptions in `newgit resource templates` can't say which
+  sections a template carries, whether it declares `[identity]`, or what
+  `checkpoint.mode` it picks — and the template bodies are written as
+  documentation in their own right (the `process` template's comment on why
+  `[[render]]`'s `find` is literal and must match exactly once is a small
+  tutorial on the feature). The only way to read one used to be
+  create-cat-delete: `newgit resource add`, `cat` the file, `rm` it, times
+  four, in a repo that had nothing else in it yet. `--show` prints the same
+  `&'static str` the binary already carries for `add`, so there is one copy
+  of the text and it can't drift — needs no `.newgit/` and creates nothing.
+
+  A template that brings a companion resource or tracker along (`pnpm` →
+  the `pnpm-store` resource it depends on, `command-snapshot` → the
+  `db-snapshots` lane it deposits into) says so above the TOML, as `#`
+  comments naming which kind each companion is — a resource and a tracker
+  are instantiated differently, and confusing the two was the seed of
+  [#23](https://github.com/Spheroman/newgit/issues/23). Comments keep the
+  whole output pasteable straight into a `.newgit/resources/<name>.toml`.
+
+  `definitions.md`'s `[captures]` section quoted the `external` template's
+  `prepare` action verbatim; it now points at `--show external` instead, so
+  that example can't drift from the template either.
+
+- Resources can set `workdir`, overridable per action, so a monorepo
+  definition does not have to start every command with the same `cd`.
+
+  A resource whose real work lives at `packages/db/supabase` used to repeat
+  `cd packages/db/supabase && ...` on `prepare`, `stop`, `checkpoint`,
+  `restore`, and `cleanup` alike — seven lines, one prefix, and a `&&` that
+  silently swallows a failed `cd` because the command after it still runs.
+  `workdir = "packages/db/supabase"` at the top of the resource says it once;
+  newgit spawns the command there directly (`Command::current_dir`, not a
+  shell prefix), so there is no `&&` left to bind wrong. An action can set
+  its own `workdir` to replace it for just that one command.
+
+  It only ever changes where a *command* runs. `[identity].paths`,
+  `[checkpoint].paths`, and `[[render]].path` stay workspace-root-relative
+  regardless — those are content paths, and a definition that had to track
+  two roots at once would be worse than the `cd` it replaces.
+
+- `newgit status` reports when an instance's base has moved —
+  `ok, main +2` — instead of staying silent while a rebase gets
+  cheaper to do by the day
+  ([#38](https://github.com/Spheroman/newgit/issues/38)).
+
+  The binding record now keeps the branch `spawn --from` used (or
+  whatever `HEAD` named when `--from` was omitted) alongside the
+  revision it pointed at, fixed at spawn time and never touched by
+  `checkpoint`. `status` compares that fixed point against the base
+  branch's current tip in the store repo, computed fresh — never
+  cached — on every call, so the count is exactly as current as the
+  store's last fetch of upstream and never a stale answer dressed up
+  as a fresh one. An instance spawned onto a branch that already
+  existed has no recorded base and reports none, rather than guessing
+  one; same when the base branch has since been deleted.
+
+- `[exports]` may compose a dependency's exports
+  ([#40](https://github.com/Spheroman/newgit/issues/40)).
+
+  A `[[render]]` could already see every export bound so far, so a *file*
+  could carry another resource's URL while the resource itself could not
+  publish one — the wrong way round, since `[exports]` is what produces those
+  values in the first place. Bindings happen in dependency order, so the
+  values were already there; nothing passed them.
+
+  ```toml
+  depends_on = ["supabase"]
+
+  [exports]
+  SUPABASE_FUNCTIONS_URL = "{{exports.SUPABASE_API_URL}}/functions/v1"
+  ```
+
+  This is the expressible form of what #40 tried to write as
+  `{{ports.supabase.api}}`: there is no syntax for another resource's ports,
+  and now there does not need to be.
+
+- `newgit undo --only <resource>` restores one resource and leaves source,
+  tracker content, and every other resource alone
+  ([#41](https://github.com/Spheroman/newgit/issues/41)).
+
+  Getting one resource's restore command right takes a few attempts, and
+  rewinding six other resources each cycle is pure cost. A partial undo is not
+  a snapshot the instance was ever in, so it never claims to be one:
+
+  ```
+  Restored `supabase` of `newgit-smoke` from ckpt_004
+    source and tracker content left as they were (--only)
+  ```
+
+  It still takes a safety checkpoint first — it is still destructive — and it
+  still stops and restarts the resources it touches, but only those.
+
+- Checkpoint output says when a resource's `[restore]` has never completed
+  on the instance, and `newgit checkpoint --verify <instance>` can prove it
+  on demand
+  ([#42](https://github.com/Spheroman/newgit/issues/42)).
+
+  `[checkpoint]` runs the day it is written; `[restore]` runs the day it is
+  needed, which by definition is the day the instance is already in
+  trouble. Every checkpoint in between looked identical whether or not the
+  restore behind it had ever actually worked. A resource whose `[restore]`
+  is `command` or `recompute` and has never completed successfully on this
+  instance now gets `— restore never exercised` on its checkpoint line.
+
+  `newgit checkpoint --verify <instance>` proves it early instead of
+  leaving that for the day of the real rollback: checkpoint, restore with a
+  real `undo`, checkpoint again, and compare the two runs' state refs.
+  Destructive and expensive on purpose — it stops and restarts whatever the
+  instance's resources run, which is exactly why it is a separate,
+  explicitly named command rather than something `checkpoint` does on its
+  own, and why it prints what it is about to do before doing it.
+
+  "Completed" and "verified" are deliberately different claims: an ordinary
+  undo marks `[restore]` as proven the moment its command exits `0`, even
+  though that alone does not confirm the resource landed on the state the
+  checkpoint recorded. `--verify`'s state-ref comparison is the stronger
+  check, and it can fail even when the weaker one would have passed.
+
+- The **install store**: `[identity] produces` names the tree an install
+  builds, and the second instance of a given lockfile is cloned from the
+  first instead of installing
+  ([#50](https://github.com/Spheroman/newgit/issues/50)).
+
+  Every instance already got its own `node_modules`, and instances at
+  *different* lockfiles still must. But instances at the *same* lockfile were
+  rebuilding a tree byte-identical to one already on the machine — on a real
+  Expo monorepo, ~90 s and 9.0 GB, every time. Declaring what the install
+  produces makes that a clone:
+
+  ```toml
+  [identity]
+  paths       = ["package-lock.json", "package.json"]
+  produces    = ["node_modules"]
+  key_command = "node -v && uname -sm"
+  ```
+
+  ```
+  resource:  `deps` prepare: ok
+             install store: stored as 1264badb0621 (copy-on-write)
+
+  resource:  `deps` prepare: not needed
+             install store: filled from 1264badb0621 (copy-on-write)
+  ```
+
+  The key is the content of `paths`, `key_command`'s stdout, and the
+  definition file itself — the command that builds a tree is as much an input
+  as the lockfile it reads, so editing `prepare` rebuilds rather than reusing
+  what the old command built.
+
+  `key_command` is the half a lockfile cannot supply: its hash describes what
+  was asked for, not what gets built, and install scripts compile against a
+  platform and toolchain it never sees. newgit does not guess at that list —
+  what a tree depends on beyond its lockfile is ecosystem knowledge the
+  definition has and newgit does not.
+
+  Clones are **copy-on-write, never hardlinks**, and that is correctness
+  rather than performance. `node_modules` is not read-only after install:
+  native builds write into it (693 files of CMake output under
+  `react-native-reanimated/android/.cxx/` on the project this came from), so
+  under hardlinks one instance's Android build would rewrite every other
+  instance's tree — the exact corruption the design exists to prevent,
+  arriving by a route hash-keying alone does not cover. Where the filesystem
+  cannot clone, newgit takes a full copy and says so: same behaviour
+  everywhere, worse performance, and on such a filesystem an entry costs a
+  whole tree on disk rather than almost nothing.
+
+  Copy-on-write does not help if the poison is already in the shared content,
+  so a tree is scanned before it is published and declined if it names the
+  workspace it was built in, with the file named. That resource keeps
+  installing per instance; nothing fails. The store never fails a spawn at
+  all — every way it can go wrong degrades to the install that would have
+  happened anyway, and says which.
+
+  An undo is filled from the store as well — that rebuild is the expensive
+  one, a full reinstall in the middle of an operation someone is waiting on.
+  The tree being rewound away from is moved aside and discarded only once the
+  clone lands, so a copy that fails partway through leaves the instance with
+  the stale tree rather than none. `newgit undo --force-recompute` bypasses
+  the store and **drops the entry**: that flag means the identity is not to be
+  trusted to describe the tree, a cache keyed on the identity is under the
+  same suspicion, and this is the way out if an entry is ever wrong.
+
+  Declared `produces` paths join tracker-owned paths in each workspace's
+  `.git/info/exclude`. Derived content is not source, and without the rule a
+  project with no `node_modules` entry of its own would have its whole install
+  swept into source history by the `git add -A` a checkpoint runs.
+
+  `newgit cleanup` prunes entries no live instance's identity keys to, plus
+  anything an interrupted publish left half-copied. The tree is rebuildable
+  from the inputs that key it, so the worst a wrong eviction costs is an
+  install. Reachability is recomputed rather than recorded — an entry is kept
+  exactly when a spawn of that instance would have found it — and gating is
+  per resource, so one instance that cannot be keyed does not disable the
+  sweep for the whole project. `--dry-run` does not run a `key_command` at
+  all: a dry run observes, and spawning a user-supplied shell is acting.
+
+  `newgit action <resource>.prepare` always runs the command. The store
+  stands in for a *spawn*, never for a command someone asked for by name —
+  but it publishes what that command built.
+
+- `newgit render --check` resolves every `[[render]]` against the working
+  tree and reports, per file, which `find` matched and which did not — no
+  instance, no spawn, no commit
+  ([#56](https://github.com/Spheroman/newgit/issues/56)).
+
+  A render's input is committed content, and that has to stay true: it is
+  what makes `undo`, `tracker pull`, and re-renders idempotent. But it means
+  the `find` strings you just wrote while adopting a `[[render]]` are
+  invisible to the tool that would validate them until you commit — the
+  adoption loop was edit, commit, spawn, read the failure, edit again.
+  `render --check` reads the working tree instead, so that loop is edit,
+  check, edit. It doubles as a drift detector outside adoption too: run it
+  in CI and a default that moved upstream fails the build instead of the
+  next `spawn`. Exits non-zero and names the file and the string on any
+  mismatch.
+
+- Added a `command-snapshot-migrations` resource template, and named the
+  assumption `command-snapshot` was quietly making
+  ([#57](https://github.com/Spheroman/newgit/issues/57)).
+
+  `command-snapshot`'s restore is `dropdb`/`createdb` then load, which only
+  works when the dump is the whole database — a full dump loaded into a
+  target with nothing in it to collide with. That shape is unavailable the
+  moment the schema comes from migrations instead (Rails, Prisma,
+  Supabase): the database can't be dropped, because recreating it means
+  replaying every migration, so the restore becomes reset, then load data
+  over rows the migrations already inserted. The dump has to be
+  `--data-only`, and the target has to be emptied first — but only of what
+  the role running the restore can actually truncate, since the app role is
+  rarely the superuser and a table the dump could not read is not one the
+  restore has any business emptying either.
+
+  These are two restore strategies, not two settings on one command, so
+  they're two templates: `command-snapshot` now says what it assumes in a
+  comment and points at the new one, and `command-snapshot-migrations`
+  ships the reset-empty-load shape, privilege filter included. Both deposit
+  into the same `db-snapshots` lane.
+
+  `definitions.md`'s `[restore]` section also gained one sentence: a
+  restore command runs against whatever state its own reset left behind,
+  including rows a migration step already inserted, so it is not a fresh
+  database unless the command made one.
+
+- Added an `install` resource template: a generic dependency-install
+  starter with no package manager assumed
+  ([#60](https://github.com/Spheroman/newgit/issues/60)).
+
+  `pnpm` was the only install starter, so an npm (or uv, or Cargo) project
+  had to begin from a file that was wrong line by line: `depends_on`, the
+  lockfile name, and the install command all needed changing, and
+  instantiating it also created a `pnpm-store` resource the user then had
+  to delete in a specific order. What survived unedited was exactly the
+  three things a user could not have guessed — `ownership`, `[checkpoint]
+  mode = "hash"`, `[restore] mode = "recompute"` — which was the whole
+  reason to start from a template at all.
+
+  Rather than one more named template per package manager (`npm`, `uv`,
+  `cargo`, ...), `install` parameterizes nothing: no `depends_on`, no
+  companion resource, and its two variable lines — `[identity] paths` and
+  the `prepare` command — are `EDIT ME` placeholders instead of a guess
+  that happens to be wrong for whichever manager it wasn't written for.
+  `pnpm` remains the worked example, since it is also the one that wires up
+  a shared, content-addressed store; the reference's *Installs* section now
+  points newcomers at `install` when pnpm isn't their package manager.
+
+  `resource add --template pnpm` also now says that its companion
+  `pnpm-store` must be removed *after* the resource that depends on it,
+  since `resource remove` enforces the order but previously only explained
+  why when it refused.
+
+- `newgit reference [section]` prints one section instead of all 380 lines,
+  and bare `newgit reference` now prints a table of contents.
+
+  The reference grew past the point where paging the whole thing to find
+  `[ports]` was reasonable. `newgit reference render`, `newgit reference
+  ownership`, `newgit reference tracker` — plural forms and unambiguous
+  prefixes resolve too, so `trackers` and `template` land where you meant. An
+  ambiguous prefix says which sections it matched rather than dumping the
+  list. `newgit reference all` is the old behavior, byte for byte.
+
+  Sections are derived from the document's own headings rather than listed in
+  the CLI, so a section added to `definitions.md` becomes addressable without
+  touching Rust and the two cannot drift. Asking for a `##` section brings its
+  `###` subsections with it, so `resource` is the whole resource format.
+
+
+### Changed
+
+- Definitions reject keys newgit does not recognize, instead of ignoring them
+  ([#35](https://github.com/Spheroman/newgit/issues/35)).
+
+  The serious case is a misspelling. `owneship = "branch"` used to parse
+  cleanly and leave `ownership` at its default — and `ownership` is what
+  decides whether per-branch teardown may touch the concrete resource, the
+  difference between `newgit remove` stopping a dev server and it reaching a
+  store shared with every other project on the machine. The same held for
+  `merge_with_source`, `long_running`, `into_tracker`: every key whose
+  safe-looking default is not what you meant.
+
+  ```
+  Error: could not parse TOML at .newgit/resources/app.toml
+
+  Caused by:
+      TOML parse error at line 1, column 1
+        |
+      1 | owneship = "branch"
+        | ^^^^^^^^
+      unknown field `owneship`, expected one of `ownership`, `depends_on`,
+      `identity`, `workdir`, `ports`, `exports`, `render`, `actions`,
+      `checkpoint`, `restore`, `cleanup`
+  ```
+
+  Leniency was a deliberate call when `kind` was dropped — a stale `kind =`
+  line would simply be ignored, so no migration was needed. That reasoning was
+  backwards: silently accepting a key the tool no longer understands *is* a
+  backwards-compatibility affordance, and this project does not carry those.
+  It also cost something immediately. Landing six issues as parallel branch
+  instances, two of them kept writing `kind` into new test fixtures while the
+  branch removing it was in flight; Git merged those without conflict, because
+  new lines have nothing to conflict against, and everything compiled and
+  passed. A grep caught it, not the tool.
+
+  A definition carrying a key newgit dropped now fails to load. That is the
+  intended outcome — the fix is deleting one line, and the error says which.
+
+  Parse errors also stopped printing themselves twice: `could not parse TOML
+  at <path>` interpolated the full toml snippet that anyhow then repeated as
+  the cause.
+
+- `depends_on` means lifecycle again. Needing another resource's *value* is
+  inferred from `{{exports.<name>}}` instead of declared, and orders binding
+  without touching teardown
+  ([#43](https://github.com/Spheroman/newgit/issues/43)).
+
+  One key was driving two different claims. A `[[render]]` substituting
+  another resource's URL into a config file needs that resource *bound*
+  before it renders and nothing more — but the only key that produced that
+  ordering also reversed into cleanup, so a pure data edge had to be written
+  as a lifecycle edge and silently acquired teardown semantics it never asked
+  for. The Supabase stack does not need the Expo dev server running, started,
+  or ever used; it needs one string out of it. The graph asserted otherwise
+  because there was no way to say the weaker thing.
+
+  There still isn't a way to *say* it, and that is the fix: the template is
+  already the statement. `{{exports.EXPO_URL}}` names what it needs, so the
+  edge is read from it rather than restated:
+
+  ```toml
+  # supabase.toml — no depends_on
+  [[render]]
+  path = "packages/db/supabase/config.toml"
+  replace = [
+    { find = 'additional_redirect_urls = ["exp://127.0.0.1:8081"]',
+      with = 'additional_redirect_urls = ["{{exports.EXPO_URL}}"]' },
+  ]
+  ```
+
+  `web` binds first and the file renders correctly, with nothing declared in
+  either direction. The graph now keeps two orders: bind order (`depends_on`
+  plus data edges) for preparing, rendering, env assembly, and restore;
+  lifecycle order (`depends_on` alone) reversed for checkpoint and cleanup.
+
+  Inference costs legibility, so `newgit resource list` prints what it found,
+  naming the export that caused each edge — an edge nobody wrote down has to
+  be able to explain itself:
+
+  ```
+  Reads exports from (inferred from `{{exports.*}}`):
+    supabase reads web (EXPO_URL)
+    these order binding only — they say nothing about teardown
+  ```
+
+  Only bind-time consumers count: `[exports]` values and `[[render]]`
+  replacements. `[cleanup]` and `[checkpoint]` may use `{{exports.*}}` too,
+  but they read a binding record that is already complete, so there is
+  nothing left to order. A name no resource exports is not an edge — it is a
+  template that will not resolve, which `[exports]` and `[[render]]` already
+  refuse with a better message. A resource referring to its own exports is
+  the documented sibling case, not an edge to itself. A cycle through data
+  edges alone is a real cycle and is reported like any other.
+
+  This is what made the export-name rule below worth having first: reading an
+  edge out of `{{exports.EXPO_URL}}` only works if exactly one resource can
+  own that name.
+
+- An environment variable name may be declared only once across the project;
+  a second claim is a graph problem
+  ([#43](https://github.com/Spheroman/newgit/issues/43)).
+
+  Three things declare a name — an `[exports]` key, an action's `captures`
+  entry, and a port's `env` — and the command environment used to be
+  assembled by layering them, exports in dependency order with port `env`
+  vars over the top. So a name claimed twice resolved to whichever
+  declaration happened to come last, and the loser was simply *absent* from
+  the process that needed it, with nothing anywhere saying why. Both
+  declarations look correct in their own file; the fault only exists in the
+  union, which is not a thing you can read.
+
+  Nothing wanted that behavior. It was never an override feature, just what
+  fell out of building a map — and it was not even consistent, since port
+  `env` vars beat exports regardless of dependency order while exports beat
+  each other according to it. The set of names is fully known from the
+  definitions, so the collision is now reported when the graph loads:
+
+  ```
+  environment variable `EXPO_URL` is declared more than once (`metro`
+  [exports], `supabase` [exports]); a name may have only one owner — rename
+  all but one, and compose it elsewhere with `{{exports.EXPO_URL}}`
+  ```
+
+  It is gated like any other graph problem — warned by the commands that
+  *build* the graph, refused by `spawn`, `run`, `action`, `checkpoint`, and
+  `undo` — so a project cannot be bricked by one, and `newgit resource list`
+  still tells you where it is.
+
+  The starter templates had to change with it. Adding the same template twice
+  — a web and an api — is the canonical setup, and shipping conventional
+  names meant the second `newgit resource add --template process` claimed the
+  `PORT` and `APP_URL` the first already owned and refused the whole graph.
+  That is newgit's own template breaking the project, not a user mistake, so
+  templates now name their variables after the resource: `resource add web
+  --template process` writes `WEB_PORT` and `WEB_URL`. The generated file
+  says to rename them if you have one service and your tool insists on
+  `PORT`. Two services in one project never could both publish it — every
+  resource's environment lands in one process environment — so the
+  conventional name was a promise templates could not keep.
+
+  One overlap is still allowed, because it has one owner: a `captures` entry
+  naming its own resource's `[exports]` key. The export states the value the
+  definition knows up front and the action overwrites it with the one that
+  did not exist until it ran.
+
+  `NEWGIT_BRANCH` and `NEWGIT_WORKSPACE` are reserved for the same reason.
+  newgit sets them last for every command it runs, so a resource declaring
+  one could never reach the process — reported against the single claimant
+  rather than passed over in silence.
+
+- `[identity]` is now the single declaration of what a resource is derived
+  from, and `[checkpoint] paths` is gone
+  ([#45](https://github.com/Spheroman/newgit/issues/45),
+  [#46](https://github.com/Spheroman/newgit/issues/46),
+  [#41](https://github.com/Spheroman/newgit/issues/41)).
+
+  The reference described these three keys as one mechanism — identity feeds
+  the checkpoint, the checkpoint feeds the restore — and the mechanism did not
+  exist. `[identity].paths` was read in exactly one place, to put the word
+  `identity` in a column of `newgit resource list`. `hash:<rev>` was written at
+  checkpoint and parsed back nowhere. `recompute` re-ran its action without
+  consulting either. Definitions worked only because their authors dutifully
+  typed the same path list into two blocks; diverge them and nothing said so.
+  The shipped `pnpm` template duplicated the list too.
+
+  ```diff
+  [identity]
+  paths = ["package.json", "pnpm-lock.yaml"]
+
+  [checkpoint]
+  mode = "hash"
+  -paths = ["package.json", "pnpm-lock.yaml"]
+  ```
+
+  `mode = "hash"` now hashes `[identity] paths` and has no path list of its
+  own; it fails to load without an `[identity]` to hash. Identity paths are
+  validated the way tracker paths always were — workspace-relative, no `..`,
+  no reaching into `.git` or `.newgit`. Previously `paths = ["/etc/passwd",
+  "../../escape"]` loaded clean.
+
+  And `recompute` consults the hash, which is the point of recording it:
+
+  ```
+  resource: deps recompute(prepare) skipped: identity unchanged
+  ```
+
+  A monorepo `npm ci` is around ninety seconds, and three debugging cycles on
+  an unrelated resource's restore command used to cost three of them. The
+  comparison is between the checkpoint and the *pre-undo* state, not the
+  workspace as it stands when the resource is reached — undo restores source
+  first, so hashing at that point would compare the checkpoint against itself
+  and skip every time, including the one case that matters: a lockfile that
+  moved after the checkpoint and has just been rewound underneath a tree built
+  from the newer one.
+
+  Identity describes the inputs, not the tree, so the repair path stays
+  reachable: `newgit undo --force-recompute` rebuilds regardless.
+
+
+### Removed
+
+- `kind` is gone from resource definitions
+  ([#27](https://github.com/Spheroman/newgit/issues/27)). It was required on
+  every resource and read nowhere — the only code that touched it was the
+  parser, the struct, and the `KIND` column in `newgit resource list`. A
+  required field with no behavior still reads as if it has one: a Supabase
+  stack got `kind = "process"` because it runs a long-lived service, while
+  two genuinely supervised resources in the same project also said
+  `process` — one string, two meanings, and no rule to pick it by. Making
+  `kind` real (defaults keyed off its value) was considered and rejected: that
+  would let the field and the sections below it disagree, which is exactly
+  how the Supabase resource got mislabelled. What a resource does was always
+  fully described by its sections; `kind` never added anything to check
+  against. A leftover `kind = "..."` line in an existing definition is
+  silently ignored — the TOML parser already ignores unknown fields, so
+  nothing had to change to make old files keep loading.
+
+  `newgit resource list`'s `KIND` column is replaced with `PROFILE`, built
+  from facts newgit can recompute from the TOML rather than a label someone
+  wrote down once: `long-running` (a start action that doesn't exit),
+  `ports`, `identity`, `render`, and `checkpoint:hash`/`command`/`external`.
+  Unlike `kind`, this cannot drift from what the resource actually does,
+  because it isn't stored anywhere to drift from.
+
+
+### Fixed
+
+- `resource add --template` says why its extra output exists and how to
+  undo it, and prints paths relative to the project instead of absolute
+  ([#23](https://github.com/Spheroman/newgit/issues/23)).
+
+  `--template pnpm` on a project that already uses npm creates
+  `pnpm-store.toml` alongside `deps.toml` because `pnpm` depends on it — debris
+  the user has to notice on their own, since `depends_on` is a graph edge, not
+  a file on disk. `--template command-snapshot` creates a *tracker*, not
+  another resource, because `into_tracker` needs somewhere to deposit; that
+  asymmetry was buried behind identical-looking `companion:`/`tracker:`
+  prefixes. The line now leads with the created thing's name and kind, names
+  the key that pulled it in, and says it can be edited or deleted — keeping
+  the path, since "delete the file" is only actionable if it says which file:
+
+  ```
+  Added resource `deps` from `pnpm` at .newgit/resources/deps.toml
+    also created resource `pnpm-store` at .newgit/resources/pnpm-store.toml
+      required by deps.depends_on — edit it, or delete the file if this project doesn't need it
+  ```
+
+  Someone who ran `newgit tracker create db-snapshots` by hand and hit
+  `already exists at ...` had no way to know a `resource add --template
+  command-snapshot` had created it — the error read like a bug in their own
+  script. It now says so in one clause.
+
+- `status` no longer reports states that are not true (#28), in three ways.
+
+  A resource with an unrelated `long_running` action it never started — say,
+  a stray `functions` action beside the `prepare` a Supabase resource
+  actually uses — showed up as `stopped` on the strength of the declaration
+  alone; the column now asks the supervisor whether *something it started*
+  has since died, which is a fact newgit can actually know, rather than "does
+  this resource's definition mention a long-running action at all." Telling
+  those apart means a pid file has to survive being stopped — but leaving a
+  raw pid sitting on disk indefinitely would reopen a worse lie once the OS
+  recycles that number onto some unrelated process, so a stopped process now
+  retires its file to the literal `stopped` instead of leaving the number
+  behind, and `newgit cleanup`'s pid housekeeping does the same to a pid file
+  whose process died on its own — rewriting it in place rather than deleting
+  it, since deleting it is exactly what would have made `newgit cleanup`
+  itself erase the fact `status` depends on.
+
+  `blocked` used to be written into the binding record, which meant a
+  resource with no `prepare` of its own — like an `admin`/`mobile` dev server
+  waiting on a Supabase stack — stayed `blocked` forever once its dependency
+  recovered, because nothing ever ran to recompute it. Blocked-ness is
+  derived at read time from `depends_on` instead, so it clears the moment the
+  blocker does, and `status` names what's blocking (`admin:blocked(supabase)`)
+  rather than just saying so. A resource with no `prepare` at all goes
+  further: it is `ready` from the moment it is bound, blocked dependency or
+  not, because there was never a command to withhold from it in the first
+  place — the same rule that makes a resource with a real `prepare` correctly
+  stay `pending` while it waits.
+
+  `status` is the command you run when you're already confused about what
+  newgit thinks is true; it should not make that worse.
+
+- An unresolved `{{...}}` in `[exports]` refuses at spawn instead of being
+  stored and shipped as a literal
+  ([#40](https://github.com/Spheroman/newgit/issues/40)).
+
+  Everywhere else an unknown placeholder renders verbatim, so the mistake is
+  visible to whoever typed it. An export is the exception, for the same reason
+  `[cleanup]` and `[[render]]` already refuse: it is rendered once, written
+  into the binding record, and handed to every later action and `newgit run`
+  as an environment variable. A bad command fails in front of the person who
+  wrote it; a bad export surfaces in a different process, at whatever hour
+  something first dials a host named `{{ports`.
+
+  ```
+  resource:  `functions` export: FAILED — resource `functions` leaves exports
+  unresolved: `SUPABASE_FUNCTIONS_URL` ({{ports.supabase.api}}); ...
+  ```
+
+  Nothing that resource exports is stored, not just the value that failed: an
+  absent environment variable is something downstream can detect, a malformed
+  URL is not, and a binding that publishes half an environment is the same
+  failure one variable further down — `newgit run` and every dependent's
+  actions read a binding's exports without asking what status it holds. Every
+  unresolved export is named at once, so fixing the first does not just reveal
+  the second on the next spawn. Export failures are reported apart from render
+  failures, because they are different mistakes in different parts of the
+  definition.
+
+  An export may compose a *sibling* as well as a dependency's export
+  (`HEALTH_URL = "{{exports.BASE_URL}}/health"`). Composing the resource next
+  door while the key two lines up was refused would have been a rule nobody
+  could guess — and the refusal named a key that was defined right there. The
+  table is a map with no declaration order to lean on (`HEALTH_URL` sorts
+  first), so exports resolve to a fixed point instead: each pass renders what
+  it can, and a pass that resolves nothing new ends it. A cycle stalls and is
+  reported like any other placeholder that never resolved.
+
+- `resource list` and `tracker list` no longer drift once one row's value is
+  long (#44).
+
+  Both tables sized their columns from a hardcoded literal (`PROFILE` at 27,
+  `AUDIENCE` at 9) rather than the row content actually being printed, so a
+  resource with several profile traits, or a tracker whose audience string
+  ran past the default width, pushed every column after it out of alignment
+  for every row — not just its own. They now compute each column's width
+  from every row plus the header, the way the branch-list table already
+  does, so the table degrades to a wider column instead of to misalignment.
+
+- A deposit-only tracker's bind line says `(deposit-only)` instead of
+  `(0 files)` on `spawn`, `tracker pull`, and `undo` (#44).
+
+  A tracker with no `paths` of its own exists only to receive `into_tracker`
+  deposits, so it correctly has zero owned files to place in the workspace
+  — but a real rev followed by `(0 files)` reads like a checkout that
+  silently failed, right above the resources whose restore someone is
+  usually there to debug. Naming the reason it's zero, rather than either
+  printing the number or hiding it outright, is what actually removes the
+  double-take: a bare omission still reads as a table with a value missing.
+
+- A `hash` checkpoint's state ref can no longer reach a command as an
+  argument ([#47](https://github.com/Spheroman/newgit/issues/47),
+  [#48](https://github.com/Spheroman/newgit/issues/48)).
+
+  `hash` records the content hash of `[identity] paths`. That answers one
+  question — did the inputs move — and it never names a concrete thing to
+  restore or tear down. But both places that resolve `{{state_ref}}` fell back
+  to the recorded ref whatever it was, so a restore command got
+  `restore-from hash:0fa284b468` and, worse, a cleanup hook got
+  `delete-environment hash:0fa284b468` and *ran* it. The refusal that exists
+  for exactly this case only asked whether a placeholder was still
+  unresolved, so it caught the argument that was missing and not the one that
+  was wrong.
+
+  A hash ref now resolves to nothing at all. `{{state_ref}}` stays verbatim in
+  a restore command, where an unresolved placeholder is already how a mistake
+  is made visible, and the cleanup guard fires unchanged — one rule about what
+  a state ref *is*, rather than a second check bolted beside the first.
+
+  What the current definition *can* decide is refused when it loads.
+  `[checkpoint]` and `[restore]` are two halves of one mechanism but were
+  validated one section at a time, so every pairing loaded. Now a
+  `{{state_ref}}` under a checkpoint that can never record one — `hash`, or
+  `none`, or no `[checkpoint]` at all — fails at load, in a `[cleanup]`
+  command as well as a `[restore]` one, since learning at teardown that the
+  hook never ran is the worse half of the same mistake. The runtime guard
+  still stands behind it, for the case reading the current file cannot
+  predict: a record written under an older definition.
+
+  These refusals are about the *placeholder*, not the mode. A restore command
+  that never asks for a state ref is an ordinary rebuild whatever the
+  checkpoint records, and still loads; so do pairings that are merely inert,
+  like a `command` checkpoint under a `recompute` restore. The one mode
+  pairing refused outright is `external` + `recompute`, which is not inert:
+  `recompute` re-runs `prepare`, which for an external resource mints a
+  second instance and orphans the one the handle names.
+
+- A pre-undo checkpoint now says when its own contents are suspect, and no
+  longer wastes a real capture command on a resource already known to be
+  broken (#58).
+
+  The message on a safety checkpoint — `state before undo to ckpt_001` —
+  describes *when* it was taken, and a reader takes that as a description
+  of what is in it. Those come apart precisely when the instance's last
+  operation was an undo that did not finish: the workspace the next undo
+  is about to capture is whatever that failed restore left behind, not a
+  state anyone chose to be in. That checkpoint's message now says so:
+  `state before undo to ckpt_001 (captured after an incomplete undo;
+  contents may be partial)`.
+
+  `newgit checkpoints`' `REASON` column already told a successful undo's
+  safety checkpoint (`before-undo`) apart from a failed one's
+  (`failed-undo`) and from a named one (`explicit`) — that distinction
+  existed but was never covered by a test naming it directly, so a new
+  test locks in the `(reason, undo_completed)` pair the column switches
+  on.
+
+  A safety checkpoint also no longer runs a resource's real checkpoint
+  command — a `pg_dump`, say — against a resource whose own last restore
+  already failed. That resource is known-broken, not merely unobserved,
+  and spending the time to dump it produces the same rubble the message
+  above now warns about, for a redo point nobody is likely to want. The
+  skip is scoped to the automatic pre-undo path only: an explicit `newgit
+  checkpoint` still runs the command, because a person asked for that one
+  on purpose.
+
+- `newgit reference` recommends a content-addressed package manager, in the
+  one document that travels with the binary. Per-instance installs are the
+  single place newgit multiplies a cost instead of absorbing it, and the
+  choice that decides how much — pnpm or npm — is made once, early, by someone
+  who has usually not read the README's section on it by then. The reference
+  had a parenthetical `(a pnpm store)` in the ownership table and nothing
+  else. It now says it plainly, with the per-tool costs and the two keys that
+  wire a shared store up (`ownership = "user"`, `[identity] paths`).
+
+- `newgit reference` documents `[[render]]`. The feature shipped in 0.2.0 but
+  the reference did not learn about it, so the one copy of the definition
+  format guaranteed to be wherever the binary is was the one place it was
+  missing — exactly the gap `newgit reference` exists to close. The section
+  covers `path`, `replace`, `find`/`with`/`count`, and the four rules; the
+  template-variable scope table gains a `[[render]] with` row, and the note on
+  unresolved placeholders now names `[[render]]` alongside `[cleanup]` as the
+  other place they refuse rather than render verbatim.
+
+
+### Documentation
+
+- Changelog entries are written as one file per change in `changelog.d/`
+  and folded into `CHANGELOG.md` at release time
+  ([#36](https://github.com/Spheroman/newgit/issues/36)), and AGENTS.md
+  records the two other conventions that keep parallel branches from
+  queueing behind each other
+  ([#37](https://github.com/Spheroman/newgit/issues/37)).
+
+  Nothing about the entries themselves changes: they are still written when
+  the change is made, still explain why rather than what, and are still the
+  reason release notes are not generated from PR titles. Only where they are
+  parked until release moved. Six branches appending prose to one
+  `## [Unreleased]` section meant every branch conflicted with every branch
+  that landed before it — four of seven rebases during the #23–#28 series
+  hit `CHANGELOG.md`, and for three of them it was the only conflict, each
+  resolved by the same mechanical act of keeping both entries in either
+  order. Different filenames cannot conflict, so that queue is gone by
+  construction rather than by being handled well.
+
+- `[ports.<name>]` now says what order a resource's own ports are allocated
+  in ([#59](https://github.com/Spheroman/newgit/issues/59)).
+
+  `[ports]` is a map, not a sequence, and the reference only said how *one*
+  port is chosen, not how a resource's several ports are ordered against
+  each other. That matters as soon as two ports in one resource have ranges
+  that can reach each other, which is the normal case for a tool whose
+  defaults are consecutive. The allocation was already deterministic — a
+  `BTreeMap`, iterated by key — and already matched display order, but
+  nothing said so. The reference now states it, and a new test
+  (`tests/port_alloc_order.rs`) pins name order against declaration order
+  with two ports that share a start.
+
 ## [0.2.0] — 2026-09-12
 
 ### Added
@@ -335,7 +1113,22 @@ Binding records and checkpoints are the exception worth caring about: they
 are the only local state that is not reconstructible. A release that changes
 their format will say so here explicitly.
 
-[Unreleased]: https://github.com/Spheroman/newgit/compare/v0.2.0...HEAD
+**0.3.0 adds fields to the binding record.** They all default, so a record
+written by 0.2.0 loads unchanged and no migration is needed. Two things read
+differently on an instance spawned before the upgrade, both of which correct
+themselves and neither of which is a reason to re-spawn:
+
+- `status` reports no base drift for it. The base it was spawned from was
+  never recorded, and inferring one after the fact would be a guess — which
+  is the failure this feature exists to remove, not reproduce.
+- Every resource with a `command` or `recompute` restore reads `restore
+  never exercised` on its next checkpoint, even if its restore has worked
+  for you before. The claim is "newgit has watched this complete", and on a
+  fresh field it has not. One successful `undo`, or one `newgit checkpoint
+  --verify`, clears it for good.
+
+[Unreleased]: https://github.com/Spheroman/newgit/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/Spheroman/newgit/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/Spheroman/newgit/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/Spheroman/newgit/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/Spheroman/newgit/releases/tag/v0.1.0
