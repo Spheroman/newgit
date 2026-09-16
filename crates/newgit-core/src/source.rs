@@ -71,6 +71,51 @@ impl GitSource {
         self.git(&["branch", "--", name, base]).map(|_| ())
     }
 
+    /// The branch name `revision` names, when it names one at all: the
+    /// literal name if `revision` already is an existing local branch, or
+    /// whatever `HEAD` currently points at when `revision` is `"HEAD"`.
+    /// `None` for a bare SHA, a tag, or a detached `HEAD` — those name a
+    /// fixed point, not a moving line `status` could later compare a base
+    /// against.
+    pub fn resolve_branch_name(&self, revision: &str) -> Result<Option<String>> {
+        if revision == "HEAD" {
+            let args = [
+                "-C",
+                self.root.as_str(),
+                "symbolic-ref",
+                "--short",
+                "-q",
+                "HEAD",
+            ];
+            let output = Command::new("git")
+                .args(args)
+                .output()
+                .map_err(|source| spawn_error(&args, &source))?;
+            return Ok(output
+                .status
+                .success()
+                .then(|| String::from_utf8_lossy(&output.stdout).trim().to_owned()));
+        }
+        if self.branch_exists(revision)? {
+            return Ok(Some(revision.to_owned()));
+        }
+        Ok(None)
+    }
+
+    /// How many commits `range`'s right side has that its left side lacks —
+    /// `status`'s "base has moved N commits" count. Computed fresh on every
+    /// call against the store repo's own refs; it is never cached, so the
+    /// number is exactly as current as the store's last fetch of upstream
+    /// and never silently stale.
+    pub fn commit_count(&self, range: &str) -> Result<u32> {
+        let count = self.git(&["rev-list", "--count", range])?;
+        count.parse().map_err(|_| {
+            NewgitError::Unsupported(format!(
+                "unexpected output from `git rev-list --count {range}`: {count}"
+            ))
+        })
+    }
+
     pub fn rev_parse(&self, revision: &str) -> Result<String> {
         self.git(&["rev-parse", "--verify", &format!("{revision}^{{commit}}")])
             .map_err(|error| {

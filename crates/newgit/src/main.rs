@@ -7,7 +7,8 @@ use newgit_core::cleanup::{ArchivedCheckpoints, HookDetail, HookOutcome};
 use newgit_core::export::{ExportFilter, Reason};
 use newgit_core::installs::InstallReport;
 use newgit_core::manager::{
-    ActionOutcome, BindOrigin, BranchManager, InstanceReport, TrackerBindOutcome, UndoOptions,
+    ActionOutcome, BaseReport, BindOrigin, BranchManager, InstanceReport, TrackerBindOutcome,
+    UndoOptions,
 };
 use newgit_core::resource::{CheckpointMode, ResourceDefinition};
 use newgit_core::source::find_repo_root;
@@ -1123,6 +1124,8 @@ fn status(name: Option<&str>, path_only: bool) -> Result<()> {
 
     let name_width = column_width(reports.iter().map(|r| r.branch.name.len() + 2), "NAME");
     let source_width = column_width(reports.iter().map(|r| source_column(r).len()), "SOURCE");
+    let statuses_col: Vec<String> = reports.iter().map(status_column).collect();
+    let status_width = column_width(statuses_col.iter().map(String::len), "STATUS");
     let tracker_width = column_width(reports.iter().map(|r| tracker_column(r).len()), "TRACKERS");
     let resource_width = column_width(
         reports.iter().map(|r| resource_column(r).len()),
@@ -1130,25 +1133,21 @@ fn status(name: Option<&str>, path_only: bool) -> Result<()> {
     );
 
     println!(
-        "{:<name_width$} {:<source_width$} {:<10} {:<tracker_width$} {:<resource_width$} WORKSPACE",
+        "{:<name_width$} {:<source_width$} {:<status_width$} {:<tracker_width$} {:<resource_width$} WORKSPACE",
         "NAME", "SOURCE", "STATUS", "TRACKERS", "RESOURCES"
     );
-    let (mut any_never_pulled, mut any_diverged) = (false, false);
-    for report in &reports {
+    let (mut any_never_pulled, mut any_diverged, mut any_base_drift) = (false, false, false);
+    for (report, workspace_status) in reports.iter().zip(&statuses_col) {
         let marker = if context.current_branch.as_deref() == Some(report.branch.name.as_str()) {
             "* "
         } else {
             "  "
         };
-        let workspace_status = if report.workspace_exists {
-            "ok"
-        } else {
-            "ws-missing"
-        };
         any_never_pulled |= report.trackers.iter().any(|tracker| tracker.never_pulled());
         any_diverged |= report.trackers.iter().any(|tracker| tracker.diverged());
+        any_base_drift |= report.base.as_ref().is_some_and(|base| base.ahead > 0);
         println!(
-            "{marker}{:<width$} {:<source_width$} {workspace_status:<10} {:<tracker_width$} {:<resource_width$} {}",
+            "{marker}{:<width$} {:<source_width$} {workspace_status:<status_width$} {:<tracker_width$} {:<resource_width$} {}",
             report.branch.name,
             source_column(report),
             tracker_column(report),
@@ -1167,7 +1166,25 @@ fn status(name: Option<&str>, path_only: bool) -> Result<()> {
             "\n~ = differs from lane head; `newgit tracker pull` takes the head (auto-saves current), `newgit tracker merge` makes this instance the head"
         );
     }
+    if any_base_drift {
+        println!(
+            "\n`main +N` = the base has N commits this instance branched before; read fresh \
+             from the store's own branches on every `status`, so it is only as current as the \
+             store's last `git -C {} fetch` of upstream",
+            manager.store().paths().project_root
+        );
+    }
     Ok(())
+}
+
+fn status_column(report: &InstanceReport) -> String {
+    if !report.workspace_exists {
+        return "ws-missing".to_owned();
+    }
+    match &report.base {
+        Some(BaseReport { base_ref, ahead }) if *ahead > 0 => format!("ok, {base_ref} +{ahead}"),
+        _ => "ok".to_owned(),
+    }
 }
 
 /// One instance's workspace path on stdout and nothing else, so a script can
