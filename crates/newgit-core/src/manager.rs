@@ -124,6 +124,29 @@ pub struct RenderOutcome {
     pub tracker: Option<String>,
 }
 
+/// One `[[render]]` target checked against the working tree. What
+/// `BranchManager::render_check` reports, one per `path` across every
+/// resource — `render --check`'s per-file line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RenderCheckTarget {
+    pub resource: String,
+    pub path: Utf8PathBuf,
+    /// The tracker owning the path, if any. `None` means source-owned.
+    pub tracker: Option<String>,
+    /// `None` when `path` could not be read from the working tree at all —
+    /// distinct from every `find` failing to match inside it.
+    pub checks: Option<Vec<render::FindCheck>>,
+}
+
+impl RenderCheckTarget {
+    /// The path was readable and every `find` matched its declared count.
+    pub fn ok(&self) -> bool {
+        self.checks
+            .as_ref()
+            .is_some_and(|checks| checks.iter().all(render::FindCheck::ok))
+    }
+}
+
 /// What running an action did.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ActionOutcome {
@@ -1669,6 +1692,40 @@ impl BranchManager {
 
     pub fn resource_definitions(&self) -> &[ResourceDefinition] {
         &self.resources
+    }
+
+    /// Resolve every `[[render]]` against the project's *working tree*
+    /// instead of committed content — the dry run `render --check` is built
+    /// for.
+    ///
+    /// Every other render reads `HEAD`, or a tracker's bound rev, on
+    /// purpose: that is what makes `undo`, `tracker pull`, and re-renders
+    /// idempotent, and it must not change. But it also means a `find` you
+    /// just wrote is invisible to the tool that would validate it until you
+    /// commit it — the adoption loop was edit, commit, spawn, read the
+    /// failure, edit again. This is the one place that deliberately reads
+    /// whatever is on disk, because it exists only to shorten that loop and
+    /// never substitutes or writes anything.
+    pub fn render_check(&self) -> Vec<RenderCheckTarget> {
+        let root = &self.store().paths().project_root;
+        let mut targets = Vec::new();
+        for definition in &self.resources {
+            for spec in &definition.render {
+                let tracker = self.tracker_owning(&spec.path);
+                let full = root.join(&spec.path);
+                let checks = match std::fs::read_to_string(&full) {
+                    Ok(content) => Some(render::check(spec, &content)),
+                    Err(_) => None,
+                };
+                targets.push(RenderCheckTarget {
+                    resource: definition.name.clone(),
+                    path: spec.path.clone(),
+                    tracker,
+                    checks,
+                });
+            }
+        }
+        targets
     }
 
     /// The inverse of `resource add`: delete a resource definition.

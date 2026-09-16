@@ -112,6 +112,15 @@ enum Command {
         #[arg(long)]
         purge_archived: bool,
     },
+    /// Resolve every `[[render]]` and report the result
+    Render {
+        /// Check every `find` against the working tree instead of spawning:
+        /// no instance, no commit required. Non-zero exit, naming the file
+        /// and the string, on any `find` that does not match its declared
+        /// count — the adoption dry run and a CI drift detector in one.
+        #[arg(long)]
+        check: bool,
+    },
     /// Print the definition format reference: every key in a tracker or
     /// resource definition, and the template variables each hook may use
     Reference {
@@ -274,6 +283,7 @@ fn main() -> Result<()> {
             dry_run,
             purge_archived,
         } => cleanup(dry_run, purge_archived),
+        Command::Render { check } => render_command(check),
         Command::Reference { section } => reference(section.as_deref()),
     }
 }
@@ -1475,6 +1485,74 @@ fn export(args: ExportArgs) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// `newgit render --check`: every `[[render]]` resolved against the working
+/// tree, no instance and no commit required.
+///
+/// `--check` is not optional yet because there is nothing else for this
+/// command to do — a render otherwise only happens as a side effect of
+/// `spawn`, `checkpoint`, `undo`, and `tracker pull`, and none of those need
+/// a standalone entry point. This exists for the one thing those cannot do:
+/// answer "does this `find` match" before there is an instance to spawn or a
+/// commit to make.
+fn render_command(check: bool) -> Result<()> {
+    if !check {
+        bail!(
+            "render only supports `--check` right now: a render otherwise happens automatically \
+             on spawn, checkpoint, undo, and tracker pull. `newgit render --check` resolves every \
+             `[[render]]` against the working tree without spawning or committing anything."
+        );
+    }
+    let manager = manager_here()?;
+    let targets = manager.render_check();
+    if targets.is_empty() {
+        println!("No `[[render]]` targets defined.");
+        return Ok(());
+    }
+
+    let mut failed = 0usize;
+    for target in &targets {
+        let path = &target.path;
+        let owner = match &target.tracker {
+            Some(tracker) => format!(" (tracker `{tracker}`)"),
+            None => String::new(),
+        };
+        let Some(checks) = &target.checks else {
+            failed += 1;
+            println!(
+                "FAIL  {}: `{path}`{owner} — not found in the working tree",
+                target.resource
+            );
+            continue;
+        };
+        for result in checks {
+            if result.ok() {
+                println!(
+                    "ok    {}: `{path}`{owner} — `{}` ({})",
+                    target.resource, result.find, result.found
+                );
+            } else {
+                failed += 1;
+                println!(
+                    "FAIL  {}: `{path}`{owner} — `{}` expected {}, found {}",
+                    target.resource, result.find, result.expected, result.found
+                );
+            }
+        }
+    }
+
+    let total: usize = targets
+        .iter()
+        .map(|target| target.checks.as_ref().map_or(1, Vec::len))
+        .sum();
+    if failed == 0 {
+        println!("\n{total} check(s) passed.");
+        Ok(())
+    } else {
+        println!("\n{failed} of {total} check(s) failed.");
+        std::process::exit(1);
+    }
 }
 
 fn cleanup(dry_run: bool, purge_archived: bool) -> Result<()> {

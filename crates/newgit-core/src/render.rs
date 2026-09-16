@@ -253,6 +253,53 @@ pub fn reverse(rendered: &str, applied: &[AppliedReplacement]) -> String {
     output
 }
 
+/// One `find`'s result against a file's current content, independent of any
+/// instance. What `render --check` reports, and nothing more: `with` is
+/// never resolved here, because a `find` that fails to match fails whether
+/// or not there is a port to substitute in yet.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FindCheck {
+    pub find: String,
+    pub expected: usize,
+    pub found: usize,
+}
+
+impl FindCheck {
+    pub fn ok(&self) -> bool {
+        self.found == self.expected
+    }
+}
+
+/// Locate every `find` in `content` and report how many times each occurred
+/// against how many the definition declares.
+///
+/// The dry-run counterpart of [`substitute`]'s match-count check: same
+/// [`locate`] pass, same per-rule count, but run over whatever `content` is
+/// handed rather than committed content, and without resolving `with` or
+/// writing anything. That is the whole point — a render's input is always
+/// `HEAD` or a tracker's bound rev (see [`apply`]), which is exactly right
+/// for idempotence and exactly wrong for the moment you are editing the
+/// defaults a `find` targets and have not committed yet. `render --check`
+/// calls this against the working tree so that moment has a feedback loop
+/// that costs neither a commit nor a spawn.
+pub fn check(spec: &RenderSpec, content: &str) -> Vec<FindCheck> {
+    let finds: Vec<&str> = spec
+        .replace
+        .iter()
+        .map(|replacement| replacement.find.as_str())
+        .collect();
+    let located = locate(content, &finds);
+    spec.replace
+        .iter()
+        .enumerate()
+        .map(|(rule, replacement)| FindCheck {
+            find: replacement.find.clone(),
+            expected: replacement.count,
+            found: located.iter().filter(|hit| hit.rule == rule).count(),
+        })
+        .collect()
+}
+
 /// Two resources rendering the same path is a config error, not a merge:
 /// they would race, and the second would render over the first's output and
 /// fail its own match check for reasons nothing in the definition explains.
@@ -275,7 +322,7 @@ pub fn validate_disjoint(specs: &[(&str, &RenderSpec)]) -> Result<()> {
 mod tests {
     use std::collections::BTreeMap;
 
-    use super::{RenderSpec, Replacement, apply, reverse, validate_disjoint};
+    use super::{RenderSpec, Replacement, apply, check, reverse, validate_disjoint};
     use crate::error::NewgitError;
     use crate::exports::RenderContext;
 
@@ -567,6 +614,49 @@ mod tests {
             apply("supabase", &spec, "port = 54321\n", &context),
             Err(NewgitError::RenderUnresolved { .. })
         ));
+    }
+
+    /// The case the dry run exists for: a `find` just added to the working
+    /// tree, not yet committed, is still visible to `check`.
+    #[test]
+    fn check_reports_a_find_that_matches_in_the_given_content() {
+        let spec = spec(vec![replacement("port = 54321", "port = {{ports.api}}")]);
+        let results = check(&spec, "port = 54321\n");
+        assert_eq!(results.len(), 1);
+        assert!(results[0].ok());
+        assert_eq!(results[0].found, 1);
+        assert_eq!(results[0].expected, 1);
+    }
+
+    #[test]
+    fn check_reports_a_find_that_does_not_match() {
+        let spec = spec(vec![replacement("port = 54321", "port = {{ports.api}}")]);
+        let results = check(&spec, "port = 55555\n");
+        assert!(!results[0].ok());
+        assert_eq!(results[0].found, 0);
+    }
+
+    #[test]
+    fn check_reports_a_declared_count_that_does_not_match() {
+        let spec = spec(vec![Replacement {
+            find: "x".to_owned(),
+            with: "{{ports.api}}".to_owned(),
+            count: 2,
+        }]);
+        let results = check(&spec, "x\nx\nx\n");
+        assert!(!results[0].ok());
+        assert_eq!(results[0].found, 3);
+        assert_eq!(results[0].expected, 2);
+    }
+
+    #[test]
+    fn check_never_needs_a_render_context() {
+        // No ports, no exports: `with` is never resolved by `check`, so a
+        // placeholder that would fail `apply` does not stop the dry run from
+        // reporting whether `find` matched.
+        let spec = spec(vec![replacement("port = 54321", "port = {{ports.api}}")]);
+        let results = check(&spec, "port = 54321\n");
+        assert!(results[0].ok());
     }
 
     #[test]
