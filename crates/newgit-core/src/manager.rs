@@ -2936,7 +2936,25 @@ impl BranchManager {
             };
             let definition = self.resource_definition(name)?;
             let was_running = self.supervisor(branch).running_pid(name).is_some();
-            let captured = self.checkpoint_resource(branch, definition)?;
+            // A safety checkpoint minted ahead of an undo captures whatever
+            // is there so redo has something to restore to. But a resource
+            // whose last restore already failed is known-broken, not merely
+            // unobserved — running its checkpoint command (a `pg_dump`, say)
+            // against it spends real time and I/O dumping rubble nobody is
+            // likely to ask to go back to. Explicit checkpoints still run
+            // it: a person asked for that one on purpose (#58).
+            let captured = if reason == CheckpointReason::BeforeUndo
+                && binding.status == ResourceStatus::Failed
+            {
+                warnings.push(format!(
+                    "resource `{name}` is in a failed state from its last restore; skipped its \
+                     checkpoint capture rather than run an expensive command against \
+                     known-broken state"
+                ));
+                CapturedResource::none()
+            } else {
+                self.checkpoint_resource(branch, definition)?
+            };
             if let Some(deposit) = captured.deposit {
                 deposits.push(deposit);
             }
@@ -3174,9 +3192,29 @@ impl BranchManager {
         let partial = !options.only.is_empty();
         let wanted = |name: &String| !partial || options.only.contains(name);
 
+        // The message describes *when* this checkpoint was taken, and a
+        // reader takes that as a description of *what is in it*. Those come
+        // apart precisely when the last thing that happened to this instance
+        // was an undo that did not finish — the workspace it is about to
+        // capture is whatever that failed restore left behind, not a state
+        // anyone chose to be in. Say so, rather than let the timestamp imply
+        // otherwise (#58).
+        let last_operation_was_incomplete_undo = checkpoint_log
+            .latest()
+            .map(|record| {
+                record.reason == CheckpointReason::BeforeUndo
+                    && record.undo_completed == Some(false)
+            })
+            .unwrap_or(false);
+        let mut safety_message = format!("state before undo to {}", restored.id);
+        if last_operation_was_incomplete_undo {
+            safety_message
+                .push_str(" (captured after an incomplete undo; contents may be partial)");
+        }
+
         let safety = self.checkpoint_branch(
             &mut branch,
-            Some(&format!("state before undo to {}", restored.id)),
+            Some(&safety_message),
             CheckpointReason::BeforeUndo,
         )?;
         let mut warnings = safety.warnings.clone();
