@@ -7,7 +7,8 @@ use newgit_core::cleanup::{ArchivedCheckpoints, HookDetail, HookOutcome};
 use newgit_core::export::{ExportFilter, Reason};
 use newgit_core::installs::InstallReport;
 use newgit_core::manager::{
-    ActionOutcome, BindOrigin, BranchManager, InstanceReport, TrackerBindOutcome, UndoOptions,
+    ActionOutcome, BaseReport, BindOrigin, BranchManager, InstanceReport, TrackerBindOutcome,
+    UndoOptions,
 };
 use newgit_core::resource::{CheckpointMode, ResourceDefinition};
 use newgit_core::source::find_repo_root;
@@ -116,6 +117,15 @@ enum Command {
         /// archived, releasing the snapshot revs they pin
         #[arg(long)]
         purge_archived: bool,
+    },
+    /// Resolve every `[[render]]` and report the result
+    Render {
+        /// Check every `find` against the working tree instead of spawning:
+        /// no instance, no commit required. Non-zero exit, naming the file
+        /// and the string, on any `find` that does not match its declared
+        /// count — the adoption dry run and a CI drift detector in one.
+        #[arg(long)]
+        check: bool,
     },
     /// Print the definition format reference: every key in a tracker or
     /// resource definition, and the template variables each hook may use
@@ -289,6 +299,7 @@ fn main() -> Result<()> {
             dry_run,
             purge_archived,
         } => cleanup(dry_run, purge_archived),
+        Command::Render { check } => render_command(check),
         Command::Reference { section } => reference(section.as_deref()),
     }
 }
@@ -553,7 +564,8 @@ fn spawn(args: SpawnArgs) -> Result<()> {
     println!("  workspace: {}", branch.workspace_path);
     println!("  record:    {}", outcome.record_path);
     for tracker in &outcome.trackers {
-        println!("  tracker:   {}", bind_line(tracker));
+        let deposit_only = tracker_is_deposit_only(&manager, &tracker.name);
+        println!("  tracker:   {}", bind_line(tracker, deposit_only));
     }
     for resource in &outcome.resources {
         let ports = resource
@@ -691,6 +703,9 @@ fn resource(command: ResourceCommand) -> Result<()> {
                 println!(
                     "    required by {name}.depends_on — edit it, or delete the file if this project doesn't need it"
                 );
+                println!(
+                    "    `resource remove` refuses out of order — remove `{name}` before `{companion_name}`"
+                );
             }
             for tracker in &outcome.trackers_created {
                 let tracker_name = tracker.file_stem().unwrap_or(tracker.as_str());
@@ -729,26 +744,47 @@ fn resource(command: ResourceCommand) -> Result<()> {
                 );
                 return Ok(());
             }
+            // Widths are computed from every row plus the header, not a
+            // hardcoded guess — a long `PROFILE` (or any other column) must
+            // not push the columns after it out of alignment.
+            let rows: Vec<_> = definitions
+                .iter()
+                .map(|definition| {
+                    let deps = definition.depends_on.join(", ");
+                    let actions = definition
+                        .actions
+                        .keys()
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    (
+                        definition.name.clone(),
+                        resource_profile(definition),
+                        format!("{:?}", definition.ownership).to_lowercase(),
+                        if deps.is_empty() {
+                            "-".to_owned()
+                        } else {
+                            deps
+                        },
+                        if actions.is_empty() {
+                            "-".to_owned()
+                        } else {
+                            actions
+                        },
+                    )
+                })
+                .collect();
+            let name_width = column_width(rows.iter().map(|r| r.0.len()), "NAME");
+            let profile_width = column_width(rows.iter().map(|r| r.1.len()), "PROFILE");
+            let ownership_width = column_width(rows.iter().map(|r| r.2.len()), "OWNERSHIP");
+            let depends_width = column_width(rows.iter().map(|r| r.3.len()), "DEPENDS_ON");
             println!(
-                "{:<18} {:<27} {:<10} {:<22} ACTIONS",
+                "{:<name_width$} {:<profile_width$} {:<ownership_width$} {:<depends_width$} ACTIONS",
                 "NAME", "PROFILE", "OWNERSHIP", "DEPENDS_ON"
             );
-            for definition in definitions {
-                let deps = definition.depends_on.join(", ");
-                let actions = definition
-                    .actions
-                    .keys()
-                    .cloned()
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                let profile = resource_profile(definition);
+            for (name, profile, ownership, deps, actions) in &rows {
                 println!(
-                    "{:<18} {:<27} {:<10} {:<22} {}",
-                    definition.name,
-                    profile,
-                    format!("{:?}", definition.ownership).to_lowercase(),
-                    if deps.is_empty() { "-" } else { &deps },
-                    if actions.is_empty() { "-" } else { &actions },
+                    "{name:<name_width$} {profile:<profile_width$} {ownership:<ownership_width$} {deps:<depends_width$} {actions}"
                 );
             }
             // The DEPENDS_ON column is what someone wrote. These edges were
@@ -973,24 +1009,42 @@ fn tracker(command: TrackerCommand) -> Result<()> {
                 println!("No trackers defined. Create one with `newgit tracker create <name>`.");
                 return Ok(());
             }
+            // Same reasoning as `resource list`: compute widths from every
+            // row plus the header, so a long AUDIENCE value can't push PATHS
+            // out of alignment.
+            let rows: Vec<_> = definitions
+                .iter()
+                .map(|definition| {
+                    let paths = definition
+                        .paths
+                        .iter()
+                        .map(|path| path.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    (
+                        definition.name.clone(),
+                        definition.merge_with_source.to_string(),
+                        format!("{:?}", definition.storage).to_lowercase(),
+                        definition.audience.clone(),
+                        if paths.is_empty() {
+                            "-".to_owned()
+                        } else {
+                            paths
+                        },
+                    )
+                })
+                .collect();
+            let name_width = column_width(rows.iter().map(|r| r.0.len()), "NAME");
+            let merge_width = column_width(rows.iter().map(|r| r.1.len()), "MERGE_WITH_SOURCE");
+            let storage_width = column_width(rows.iter().map(|r| r.2.len()), "STORAGE");
+            let audience_width = column_width(rows.iter().map(|r| r.3.len()), "AUDIENCE");
             println!(
-                "{:<18} {:<18} {:<12} {:<9} PATHS",
+                "{:<name_width$} {:<merge_width$} {:<storage_width$} {:<audience_width$} PATHS",
                 "NAME", "MERGE_WITH_SOURCE", "STORAGE", "AUDIENCE"
             );
-            for definition in definitions {
-                let paths = definition
-                    .paths
-                    .iter()
-                    .map(|path| path.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ");
+            for (name, merge_with_source, storage, audience, paths) in &rows {
                 println!(
-                    "{:<18} {:<18} {:<12} {:<9} {}",
-                    definition.name,
-                    definition.merge_with_source,
-                    format!("{:?}", definition.storage).to_lowercase(),
-                    definition.audience,
-                    if paths.is_empty() { "-" } else { &paths }
+                    "{name:<name_width$} {merge_with_source:<merge_width$} {storage:<storage_width$} {audience:<audience_width$} {paths}"
                 );
             }
             Ok(())
@@ -1062,7 +1116,11 @@ fn tracker(command: TrackerCommand) -> Result<()> {
         TrackerCommand::Pull { tracker, instance } => {
             let (manager, instance) = manager_and_instance(instance)?;
             let outcome = manager.pull_tracker(&instance, &tracker)?;
-            println!("Pulled {} for `{instance}`", bind_line(&outcome));
+            let deposit_only = tracker_is_deposit_only(&manager, &outcome.name);
+            println!(
+                "Pulled {} for `{instance}`",
+                bind_line(&outcome, deposit_only)
+            );
             Ok(())
         }
     }
@@ -1092,6 +1150,8 @@ fn status(name: Option<&str>, path_only: bool) -> Result<()> {
 
     let name_width = column_width(reports.iter().map(|r| r.branch.name.len() + 2), "NAME");
     let source_width = column_width(reports.iter().map(|r| source_column(r).len()), "SOURCE");
+    let statuses_col: Vec<String> = reports.iter().map(status_column).collect();
+    let status_width = column_width(statuses_col.iter().map(String::len), "STATUS");
     let tracker_width = column_width(reports.iter().map(|r| tracker_column(r).len()), "TRACKERS");
     let resource_width = column_width(
         reports.iter().map(|r| resource_column(r).len()),
@@ -1099,25 +1159,21 @@ fn status(name: Option<&str>, path_only: bool) -> Result<()> {
     );
 
     println!(
-        "{:<name_width$} {:<source_width$} {:<10} {:<tracker_width$} {:<resource_width$} WORKSPACE",
+        "{:<name_width$} {:<source_width$} {:<status_width$} {:<tracker_width$} {:<resource_width$} WORKSPACE",
         "NAME", "SOURCE", "STATUS", "TRACKERS", "RESOURCES"
     );
-    let (mut any_never_pulled, mut any_diverged) = (false, false);
-    for report in &reports {
+    let (mut any_never_pulled, mut any_diverged, mut any_base_drift) = (false, false, false);
+    for (report, workspace_status) in reports.iter().zip(&statuses_col) {
         let marker = if context.current_branch.as_deref() == Some(report.branch.name.as_str()) {
             "* "
         } else {
             "  "
         };
-        let workspace_status = if report.workspace_exists {
-            "ok"
-        } else {
-            "ws-missing"
-        };
         any_never_pulled |= report.trackers.iter().any(|tracker| tracker.never_pulled());
         any_diverged |= report.trackers.iter().any(|tracker| tracker.diverged());
+        any_base_drift |= report.base.as_ref().is_some_and(|base| base.ahead > 0);
         println!(
-            "{marker}{:<width$} {:<source_width$} {workspace_status:<10} {:<tracker_width$} {:<resource_width$} {}",
+            "{marker}{:<width$} {:<source_width$} {workspace_status:<status_width$} {:<tracker_width$} {:<resource_width$} {}",
             report.branch.name,
             source_column(report),
             tracker_column(report),
@@ -1136,7 +1192,25 @@ fn status(name: Option<&str>, path_only: bool) -> Result<()> {
             "\n~ = differs from lane head; `newgit tracker pull` takes the head (auto-saves current), `newgit tracker merge` makes this instance the head"
         );
     }
+    if any_base_drift {
+        println!(
+            "\n`main +N` = the base has N commits this instance branched before; read fresh \
+             from the store's own branches on every `status`, so it is only as current as the \
+             store's last `git -C {} fetch` of upstream",
+            manager.store().paths().project_root
+        );
+    }
     Ok(())
+}
+
+fn status_column(report: &InstanceReport) -> String {
+    if !report.workspace_exists {
+        return "ws-missing".to_owned();
+    }
+    match &report.base {
+        Some(BaseReport { base_ref, ahead }) if *ahead > 0 => format!("ok, {base_ref} +{ahead}"),
+        _ => "ok".to_owned(),
+    }
 }
 
 /// One instance's workspace path on stdout and nothing else, so a script can
@@ -1313,11 +1387,14 @@ fn undo(instance: Option<String>, options: UndoOptions) -> Result<()> {
     }
     for tracker in &outcome.trackers {
         match &tracker.rev {
-            Some(rev) => println!(
-                "  tracker:  {} @ {rev} ({})",
-                tracker.name,
-                files_label(tracker.files)
-            ),
+            Some(rev) => {
+                let count = if tracker_is_deposit_only(&manager, &tracker.name) {
+                    "deposit-only".to_owned()
+                } else {
+                    files_label(tracker.files)
+                };
+                println!("  tracker:  {} @ {rev} ({count})", tracker.name);
+            }
             None => println!(
                 "  tracker:  {} cleared (no content at checkpoint time)",
                 tracker.name
@@ -1475,6 +1552,74 @@ fn export(args: ExportArgs) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// `newgit render --check`: every `[[render]]` resolved against the working
+/// tree, no instance and no commit required.
+///
+/// `--check` is not optional yet because there is nothing else for this
+/// command to do — a render otherwise only happens as a side effect of
+/// `spawn`, `checkpoint`, `undo`, and `tracker pull`, and none of those need
+/// a standalone entry point. This exists for the one thing those cannot do:
+/// answer "does this `find` match" before there is an instance to spawn or a
+/// commit to make.
+fn render_command(check: bool) -> Result<()> {
+    if !check {
+        bail!(
+            "render only supports `--check` right now: a render otherwise happens automatically \
+             on spawn, checkpoint, undo, and tracker pull. `newgit render --check` resolves every \
+             `[[render]]` against the working tree without spawning or committing anything."
+        );
+    }
+    let manager = manager_here()?;
+    let targets = manager.render_check();
+    if targets.is_empty() {
+        println!("No `[[render]]` targets defined.");
+        return Ok(());
+    }
+
+    let mut failed = 0usize;
+    for target in &targets {
+        let path = &target.path;
+        let owner = match &target.tracker {
+            Some(tracker) => format!(" (tracker `{tracker}`)"),
+            None => String::new(),
+        };
+        let Some(checks) = &target.checks else {
+            failed += 1;
+            println!(
+                "FAIL  {}: `{path}`{owner} — not found in the working tree",
+                target.resource
+            );
+            continue;
+        };
+        for result in checks {
+            if result.ok() {
+                println!(
+                    "ok    {}: `{path}`{owner} — `{}` ({})",
+                    target.resource, result.find, result.found
+                );
+            } else {
+                failed += 1;
+                println!(
+                    "FAIL  {}: `{path}`{owner} — `{}` expected {}, found {}",
+                    target.resource, result.find, result.expected, result.found
+                );
+            }
+        }
+    }
+
+    let total: usize = targets
+        .iter()
+        .map(|target| target.checks.as_ref().map_or(1, Vec::len))
+        .sum();
+    if failed == 0 {
+        println!("\n{total} check(s) passed.");
+        Ok(())
+    } else {
+        println!("\n{failed} of {total} check(s) failed.");
+        std::process::exit(1);
+    }
 }
 
 fn cleanup(dry_run: bool, purge_archived: bool) -> Result<()> {
@@ -1643,16 +1788,33 @@ fn remove(name: &str, purge: bool) -> Result<()> {
     Ok(())
 }
 
-fn bind_line(outcome: &TrackerBindOutcome) -> String {
+fn bind_line(outcome: &TrackerBindOutcome, deposit_only: bool) -> String {
     match &outcome.origin {
-        BindOrigin::LaneHead => format!(
-            "`{}` @ {} ({}, from lane head)",
-            outcome.name,
-            outcome.content_rev.as_deref().unwrap_or("-"),
-            files_label(outcome.files)
-        ),
+        BindOrigin::LaneHead => {
+            // A deposit-only tracker (no `paths` of its own) always binds
+            // `(0 files)` — that's correct, but next to a real rev it reads
+            // like a checkout that silently failed. Naming the reason beats
+            // a zero the reader has to double-take on.
+            let count = if deposit_only {
+                "deposit-only".to_owned()
+            } else {
+                files_label(outcome.files)
+            };
+            format!(
+                "`{}` @ {} ({count}, from lane head)",
+                outcome.name,
+                outcome.content_rev.as_deref().unwrap_or("-"),
+            )
+        }
         BindOrigin::Nothing => format!("`{}` bound (no captured content)", outcome.name),
     }
+}
+
+fn tracker_is_deposit_only(manager: &BranchManager, name: &str) -> bool {
+    manager
+        .tracker_definitions()
+        .iter()
+        .any(|definition| definition.name == name && definition.paths.is_empty())
 }
 
 fn parse_storage(value: &str) -> Result<Storage> {

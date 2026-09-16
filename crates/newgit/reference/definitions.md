@@ -188,6 +188,14 @@ A port is allocated once, at `spawn`, and recorded in the binding record. It
 never changes for the life of the instance; removing the instance frees it.
 Use it in templates as `{{ports.<name>}}`.
 
+Unlike `[exports]`, order here does matter: `[ports]` is also a map, not a
+sequence, but two ports whose ranges can reach each other (the normal case
+for a tool with consecutive defaults) get different assignments depending on
+which is allocated first. Ports within one resource are allocated in name
+order, not declaration order — the same order `newgit resource list` and
+spawn output already display them in, so what you see is what was used to
+allocate. Do not rely on declaration order in the file; it is not read.
+
 ### `[actions.<name>]`
 
 | key | type | required | default | meaning |
@@ -281,6 +289,10 @@ where rewinding the whole workspace each cycle is the cost.
 
 A restore command is not transactional. If one fails, `newgit undo` says the
 undo was incomplete and names the resource, rather than reporting success.
+
+A restore command runs against whatever state its own reset left behind,
+including rows a migration step already inserted — it is not a fresh
+database unless the command made one.
 
 **Restore is unproven until it has actually run.** `[checkpoint]` runs the
 day it is written; `[restore]` runs the day it is needed. A `command` or
@@ -507,6 +519,26 @@ naming the file and how many lines are about to go. Silence means there is
 nothing to lose. To change a rendered file for real, change it in the store
 repo.
 
+**Adopting a `[[render]]` means committing the default it substitutes into
+before anything can test it.** The rule above — committed content is the
+input — means a `find` you just typed does not exist in the content newgit
+would render until you commit it. `newgit render --check` is the fix: it
+resolves every `[[render]]` against the working tree instead, with no
+instance, no spawn, and no commit, and reports per file which `find` matched
+and which did not:
+
+```
+$ newgit render --check
+ok    supabase: `packages/db/supabase/config.toml` — `port = 54321` (1)
+FAIL  supabase: `packages/db/supabase/config.toml` — `port = 54324` expected 1, found 0
+```
+
+A failing check exits non-zero, so it also runs as a drift detector in CI: a
+default the upstream tool changed fails the build there instead of the next
+`spawn`. It never writes or substitutes anything — `with` is not even
+resolved, since a `find` that fails to match fails whether or not there is a
+port to put in its place yet.
+
 ---
 
 ## Ownership
@@ -675,6 +707,12 @@ If you cannot switch package managers, nothing breaks — it costs disk on a
 miss. Run fewer concurrent instances, and let `newgit cleanup` reclaim both
 the trees of instances whose workspaces are gone and the store entries nothing
 keys to any more.
+
+`newgit resource templates --show pnpm` is the worked example above, wired
+for pnpm specifically. For anything else — npm, uv, Cargo, or a package
+manager not listed here — start from `newgit resource templates --show
+install` instead: the same shape with no `depends_on` and no store, and its
+lockfile and install command marked `EDIT ME` rather than guessed wrong.
 
 ---
 

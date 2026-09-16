@@ -124,6 +124,29 @@ pub struct RenderOutcome {
     pub tracker: Option<String>,
 }
 
+/// One `[[render]]` target checked against the working tree. What
+/// `BranchManager::render_check` reports, one per `path` across every
+/// resource — `render --check`'s per-file line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RenderCheckTarget {
+    pub resource: String,
+    pub path: Utf8PathBuf,
+    /// The tracker owning the path, if any. `None` means source-owned.
+    pub tracker: Option<String>,
+    /// `None` when `path` could not be read from the working tree at all —
+    /// distinct from every `find` failing to match inside it.
+    pub checks: Option<Vec<render::FindCheck>>,
+}
+
+impl RenderCheckTarget {
+    /// The path was readable and every `find` matched its declared count.
+    pub fn ok(&self) -> bool {
+        self.checks
+            .as_ref()
+            .is_some_and(|checks| checks.iter().all(render::FindCheck::ok))
+    }
+}
+
 /// What running an action did.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ActionOutcome {
@@ -173,6 +196,19 @@ pub struct InstanceReport {
     pub live_rev: Option<String>,
     pub trackers: Vec<TrackerReport>,
     pub resources: Vec<ResourceReport>,
+    /// How far `branch.base_ref` has moved since this instance branched,
+    /// computed fresh from the store's own refs on every call. `None` when
+    /// the instance has no recorded base, or its base branch no longer
+    /// exists in the store to compare against.
+    pub base: Option<BaseReport>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BaseReport {
+    pub base_ref: String,
+    /// Commits `base_ref`'s current tip has that this instance's spawn
+    /// point did not.
+    pub ahead: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -550,6 +586,7 @@ impl BranchManager {
             });
         }
 
+        let mut base = None;
         let created_source_branch = if self.source.branch_exists(name)? {
             if let Some(base) = from {
                 return Err(NewgitError::Unsupported(format!(
@@ -559,9 +596,16 @@ impl BranchManager {
             }
             false
         } else {
-            let base = from.unwrap_or("HEAD");
-            let base_rev = self.source.rev_parse(base)?;
+            let requested = from.unwrap_or("HEAD");
+            let base_rev = self.source.rev_parse(requested)?;
             self.source.create_branch(name, &base_rev)?;
+            // Prefer a branch name over the literal request ("HEAD") so
+            // `status` has something readable to report drift against; a
+            // bare SHA or tag names a fixed point, so there is nothing to
+            // compare a moving base to and `resolve_branch_name` says so.
+            if let Some(base_ref) = self.source.resolve_branch_name(requested)? {
+                base = Some((base_ref, base_rev));
+            }
             true
         };
 
@@ -571,6 +615,9 @@ impl BranchManager {
             .workspace_root(&self.store.paths().project_root)
             .join(&slug);
         let mut branch = BranchInstance::new(name, name, source_rev, workspace_path)?;
+        if let Some((base_ref, base_rev)) = base {
+            branch = branch.with_base(base_ref, base_rev);
+        }
 
         RealDirMaterializer.materialize(&self.source, &branch)?;
 
@@ -1684,6 +1731,40 @@ impl BranchManager {
         &self.resources
     }
 
+    /// Resolve every `[[render]]` against the project's *working tree*
+    /// instead of committed content — the dry run `render --check` is built
+    /// for.
+    ///
+    /// Every other render reads `HEAD`, or a tracker's bound rev, on
+    /// purpose: that is what makes `undo`, `tracker pull`, and re-renders
+    /// idempotent, and it must not change. But it also means a `find` you
+    /// just wrote is invisible to the tool that would validate it until you
+    /// commit it — the adoption loop was edit, commit, spawn, read the
+    /// failure, edit again. This is the one place that deliberately reads
+    /// whatever is on disk, because it exists only to shorten that loop and
+    /// never substitutes or writes anything.
+    pub fn render_check(&self) -> Vec<RenderCheckTarget> {
+        let root = &self.store().paths().project_root;
+        let mut targets = Vec::new();
+        for definition in &self.resources {
+            for spec in &definition.render {
+                let tracker = self.tracker_owning(&spec.path);
+                let full = root.join(&spec.path);
+                let checks = match std::fs::read_to_string(&full) {
+                    Ok(content) => Some(render::check(spec, &content)),
+                    Err(_) => None,
+                };
+                targets.push(RenderCheckTarget {
+                    resource: definition.name.clone(),
+                    path: spec.path.clone(),
+                    tracker,
+                    checks,
+                });
+            }
+        }
+        targets
+    }
+
     /// The inverse of `resource add`: delete a resource definition.
     ///
     /// Refuses rather than leaving a broken graph or an orphaned binding
@@ -2166,6 +2247,27 @@ impl BranchManager {
         })
     }
 
+    /// How far `branch`'s recorded base has moved, read fresh from the
+    /// store repo's own refs — never cached, so the answer is exactly as
+    /// current as the store's last fetch of upstream. `None` when the
+    /// instance has no recorded base (its source branch already existed at
+    /// spawn time) or the base branch has since been deleted in the store —
+    /// in either case there is nothing left to compare against, so `status`
+    /// says nothing rather than guess.
+    fn base_report(&self, branch: &BranchInstance) -> Option<BaseReport> {
+        let base_ref = branch.base_ref.as_ref()?;
+        let base_rev = branch.base_rev.as_ref()?;
+        let current_tip = self.source.ref_rev(&format!("refs/heads/{base_ref}"))?;
+        let ahead = self
+            .source
+            .commit_count(&format!("{base_rev}..{current_tip}"))
+            .ok()?;
+        Some(BaseReport {
+            base_ref: base_ref.clone(),
+            ahead,
+        })
+    }
+
     pub fn statuses(&self) -> Result<Vec<InstanceReport>> {
         let lane_heads: Vec<(String, Option<String>)> = self
             .trackers
@@ -2249,12 +2351,14 @@ impl BranchManager {
                         }
                     })
                     .collect();
+                let base = self.base_report(&branch);
                 Ok(InstanceReport {
                     branch,
                     workspace_exists,
                     live_rev,
                     trackers,
                     resources,
+                    base,
                 })
             })
             .collect()
@@ -2936,7 +3040,25 @@ impl BranchManager {
             };
             let definition = self.resource_definition(name)?;
             let was_running = self.supervisor(branch).running_pid(name).is_some();
-            let captured = self.checkpoint_resource(branch, definition)?;
+            // A safety checkpoint minted ahead of an undo captures whatever
+            // is there so redo has something to restore to. But a resource
+            // whose last restore already failed is known-broken, not merely
+            // unobserved — running its checkpoint command (a `pg_dump`, say)
+            // against it spends real time and I/O dumping rubble nobody is
+            // likely to ask to go back to. Explicit checkpoints still run
+            // it: a person asked for that one on purpose (#58).
+            let captured = if reason == CheckpointReason::BeforeUndo
+                && binding.status == ResourceStatus::Failed
+            {
+                warnings.push(format!(
+                    "resource `{name}` is in a failed state from its last restore; skipped its \
+                     checkpoint capture rather than run an expensive command against \
+                     known-broken state"
+                ));
+                CapturedResource::none()
+            } else {
+                self.checkpoint_resource(branch, definition)?
+            };
             if let Some(deposit) = captured.deposit {
                 deposits.push(deposit);
             }
@@ -3180,9 +3302,29 @@ impl BranchManager {
         let partial = !options.only.is_empty();
         let wanted = |name: &String| !partial || options.only.contains(name);
 
+        // The message describes *when* this checkpoint was taken, and a
+        // reader takes that as a description of *what is in it*. Those come
+        // apart precisely when the last thing that happened to this instance
+        // was an undo that did not finish — the workspace it is about to
+        // capture is whatever that failed restore left behind, not a state
+        // anyone chose to be in. Say so, rather than let the timestamp imply
+        // otherwise (#58).
+        let last_operation_was_incomplete_undo = checkpoint_log
+            .latest()
+            .map(|record| {
+                record.reason == CheckpointReason::BeforeUndo
+                    && record.undo_completed == Some(false)
+            })
+            .unwrap_or(false);
+        let mut safety_message = format!("state before undo to {}", restored.id);
+        if last_operation_was_incomplete_undo {
+            safety_message
+                .push_str(" (captured after an incomplete undo; contents may be partial)");
+        }
+
         let safety = self.checkpoint_branch(
             &mut branch,
-            Some(&format!("state before undo to {}", restored.id)),
+            Some(&safety_message),
             CheckpointReason::BeforeUndo,
         )?;
         let mut warnings = safety.warnings.clone();

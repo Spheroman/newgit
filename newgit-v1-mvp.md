@@ -71,7 +71,9 @@ Real projects have odd branch-bound things:
 newgit should not need a new internal subsystem for each one. It needs a tracker definition or a resource definition — and an agent reading the config should know, from the noun alone, whether a thing syncs across machines (tracker) or gets re-established on each one (resource).
 
 v1 ships resource templates for common lifecycle units: `process`, `pnpm`
-(install/deps), `command-snapshot` (a daemon-owned database), and `external`
+(install/deps, wired to a shared content-addressed store), `install` (the
+same shape for any other package manager, with the lockfile and command left
+as `EDIT ME`), `command-snapshot` (a daemon-owned database), and `external`
 (a resource another system owns). A template may bring companions it needs —
 the resource definitions it `depends_on`, and the tracker lanes its
 checkpoint deposits into — created only when absent, so an existing
@@ -701,6 +703,34 @@ Git, capture reverses the substitution, and hand edits round-trip.
   the bind rather than rendering partially. The resource is marked `failed`
   and its dependents `blocked`, exactly as a failed `prepare` would.
 
+#### `render --check`: the adoption dry run
+
+*Render is a function of committed content, not of the working file* is
+correct and does not change. But it has a cost at exactly one moment: the
+first hour of adopting a `[[render]]`, when the `find` strings being written
+do not exist in the content newgit would render, because they have not been
+committed yet. The loop without any other tool is edit the committed
+default, commit it, spawn, read the failure, edit again, commit again.
+
+`newgit render --check` resolves every `[[render]]` against the *working
+tree* instead — no instance, no spawn, no commit — and reports, per file,
+which `find` matched and which did not, naming the file and the string on
+any mismatch. It changes nothing and substitutes nothing; `with` is not even
+resolved, because whether a `find` matches does not depend on what it would
+be replaced with. Run outside adoption, it is a drift detector: a project's
+own CI can run `render --check` and fail the build the moment an upstream
+tool's default moves, instead of failing the next `spawn`.
+
+A narrower, spawn-time affordance (`spawn --render-from-worktree`, rendering
+against the workspace's on-disk content instead of `HEAD` for one spawn) was
+considered and not built for v1. It costs a full spawn to learn one string is
+wrong, where `--check` costs nothing, and it would be a second rule for when
+render reads committed content versus the working tree — one more thing to
+hold in your head for a narrower win. The adoption-docs fix (*commit the
+defaults you are introducing before the first spawn that renders them*, in
+the `[[render]]` reference) covers the same case at zero implementation cost.
+Revisit only if `--check` proves not enough in practice.
+
 ### Dependencies
 
 Resources can depend on trackers and other resources:
@@ -1203,6 +1233,24 @@ save time whether the undo will succeed, and deleting the only record of a
 state is the one thing checkpoints exist to prevent. Releasing those revs is
 a `cleanup` concern.
 
+The annotation alone is not enough, because it lands on the *wrong*
+checkpoint to warn a reader off. `undo_completed` marks the pre-undo
+snapshot that an undo attempt *preceded*; the state a failed undo actually
+leaves behind is captured by the *next* undo's safety checkpoint, which by
+construction is a legitimate redo point (the undo it preceded succeeded) and
+so is never marked. Its message — `state before undo to ckpt_001` —
+describes when it was taken, which a reader takes as a description of what
+is in it. When the instance's last operation was an incomplete undo, that
+message says so: `state before undo to ckpt_001 (captured after an
+incomplete undo; contents may be partial)`. The same reasoning applies per
+resource: a safety checkpoint does not re-run a resource's checkpoint
+command against a resource whose own last restore already failed — it is
+known-broken, not merely unobserved, and dumping it produces exactly the
+rubble the message warns about, for a redo point nobody is likely to want.
+That resource's entry records `mode = "none"` instead, and a warning names
+it. Explicit checkpoints are unaffected either way: a person asked for that
+one on purpose.
+
 ### `newgit checkpoints [instance]`
 
 Lists an instance's checkpoints (id, created, reason, source rev, message) —
@@ -1215,10 +1263,24 @@ named it), `before-undo` (auto-saved, and a real redo point), and
 Shows branch instances with tracker and resource status:
 
 ```text
-NAME        SOURCE        TRACKERS                RESOURCES                 STATUS
-feature-a   abc123        env:r3 db:s17           deps:ready app:running    ok
-feature-b   def456        env:r1 db:s18           deps:ready app:stopped    ok
+NAME        SOURCE        STATUS        TRACKERS                RESOURCES
+feature-a   abc123        ok, main +2   env:r3 db:s17           deps:ready app:running
+feature-b   def456        ok            env:r1 db:s18           deps:ready app:stopped
 ```
+
+`STATUS` also reports when an instance's base has moved: `ok, main +2` means
+`main` — the branch `spawn --from` named, or whatever `HEAD` pointed at when
+`--from` was omitted — has gained 2 commits since this instance branched.
+That comparison is the one fact nothing else in the stack can make: the
+binding record keeps the base branch's name and the revision it pointed at
+when this instance was spawned (fixed then, never touched again — v1 has no
+rebase, so the branch point does not move even as `source_rev` does at
+`checkpoint`), and the store knows where that branch sits now. `status`
+computes the gap fresh from the store's own refs on every call rather than
+caching it, so the number is exactly as current as the store's last fetch of
+upstream and never a stale comparison presented as a live one. An instance
+spawned onto a branch that already existed has no recorded base and reports
+none — newgit never chose a base for it, so there is nothing to compare.
 
 `newgit status <instance> --path` prints that instance's workspace path on
 stdout and nothing else. A workspace path is the one piece of newgit state

@@ -17,6 +17,18 @@ pub struct BranchInstance {
     pub source_ref: String,
     /// Revision the workspace was materialized at.
     pub source_rev: String,
+    /// The branch this instance was spawned from (`--from`, or whatever
+    /// `HEAD` named at the time when it was not given), so `status` can
+    /// later ask "has that branch moved since." `None` when the source
+    /// branch already existed at spawn time — newgit never chose a base for
+    /// it, so there is nothing to compare against. Fixed at spawn and never
+    /// updated: newgit has no rebase, so the point this instance branched
+    /// from does not move even as `source_rev` does at `checkpoint`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_ref: Option<String>,
+    /// `base_ref`'s tip at the moment this instance was spawned.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_rev: Option<String>,
     pub workspace_path: Utf8PathBuf,
     pub status: InstanceStatus,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -101,6 +113,8 @@ impl BranchInstance {
             slug,
             source_ref: source_ref.into(),
             source_rev: source_rev.into(),
+            base_ref: None,
+            base_rev: None,
             workspace_path,
             status: InstanceStatus::Active,
             trackers: BTreeMap::new(),
@@ -108,6 +122,14 @@ impl BranchInstance {
             created_at: now,
             updated_at: now,
         })
+    }
+
+    /// Record the branch this instance was spawned from, when `spawn`
+    /// created a new source branch and could name one.
+    pub fn with_base(mut self, base_ref: String, base_rev: String) -> Self {
+        self.base_ref = Some(base_ref);
+        self.base_rev = Some(base_rev);
+        self
     }
 
     pub fn short_rev(&self) -> &str {
