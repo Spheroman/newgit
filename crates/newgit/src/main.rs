@@ -78,6 +78,12 @@ enum Command {
         instance: Option<String>,
         #[arg(short, long)]
         message: Option<String>,
+        /// Prove this checkpoint's restore actually works: checkpoint,
+        /// restore it, checkpoint again, and compare. Destructive and
+        /// expensive — it runs a real `undo` against this instance,
+        /// stopping and restarting whatever its resources run.
+        #[arg(long)]
+        verify: bool,
     },
     /// Restore an instance to a checkpoint (the latest unless --to is given)
     Undo {
@@ -263,7 +269,17 @@ fn main() -> Result<()> {
         Command::Resource { command } => resource(command),
         Command::Run(args) => run(args),
         Command::Action { spec, instance } => action(&spec, instance),
-        Command::Checkpoint { instance, message } => checkpoint(instance, message.as_deref()),
+        Command::Checkpoint {
+            instance,
+            message,
+            verify,
+        } => {
+            if verify {
+                checkpoint_verify(instance, message.as_deref())
+            } else {
+                checkpoint(instance, message.as_deref())
+            }
+        }
         Command::Undo {
             instance,
             to,
@@ -1249,12 +1265,63 @@ fn checkpoint(instance: Option<String>, message: Option<&str>) -> Result<()> {
         } else {
             ""
         };
+        // The checkpoint half of this pair just ran; the restore half has
+        // not, and won't until someone needs it or asks `--verify` to prove
+        // it early. Say so on the line it would otherwise look identical to
+        // a proven one.
+        let unproven = if resource.restore_exercisable && !resource.restore_proven {
+            " — restore never exercised"
+        } else {
+            ""
+        };
         println!(
-            "  resource: {} [{}] {state}{running}",
+            "  resource: {} [{}] {state}{running}{unproven}",
             resource.name, resource.mode
         );
     }
     println!("  undo with: newgit undo {instance}");
+    Ok(())
+}
+
+fn checkpoint_verify(instance: Option<String>, message: Option<&str>) -> Result<()> {
+    let (manager, instance) = manager_and_instance(instance)?;
+    println!(
+        "Verifying restore for `{instance}`: this checkpoints, restores that checkpoint with a \
+         real `newgit undo` (stopping and restarting whatever its resources run), checkpoints \
+         again, and compares. Destructive and expensive — run it on an instance you can spend."
+    );
+    let outcome = manager.checkpoint_verify(&instance, message)?;
+    print_warnings(&outcome.undo.warnings);
+
+    println!(
+        "  before: {} → restored → after: {}",
+        outcome.before.id, outcome.after.id
+    );
+    for resource in &outcome.resources {
+        if !resource.exercised {
+            println!(
+                "  resource: {} — not exercised (no restore to prove)",
+                resource.name
+            );
+            continue;
+        }
+        let verdict = if resource.agree { "MATCH" } else { "MISMATCH" };
+        println!(
+            "  resource: {} {verdict}  before: {}  after: {}",
+            resource.name,
+            resource.before_state_ref.as_deref().unwrap_or("—"),
+            resource.after_state_ref.as_deref().unwrap_or("—"),
+        );
+    }
+    if outcome.is_proven() {
+        println!("Verified: `{instance}`'s restore ran cleanly and every state ref agreed.");
+    } else {
+        println!(
+            "NOT verified: `{instance}`'s restore either failed or landed on a different state \
+             ref. See the resource lines above, and the recovery record if one was written."
+        );
+        std::process::exit(1);
+    }
     Ok(())
 }
 

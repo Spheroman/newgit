@@ -294,6 +294,24 @@ A restore command runs against whatever state its own reset left behind,
 including rows a migration step already inserted — it is not a fresh
 database unless the command made one.
 
+**Restore is unproven until it has actually run.** `[checkpoint]` runs the
+day it is written; `[restore]` runs the day it is needed. A `command` or
+`recompute` restore that has never completed successfully on this branch
+instance gets `— restore never exercised` on its `newgit checkpoint` line;
+`none` and `external` run nothing, so there is nothing to prove. A real
+`undo` — not a `recompute` skip, which never touches the command — is what
+clears it, and it stays cleared even if a later restore fails: the claim is
+"has this ever completed", not "would it complete right now".
+
+`newgit checkpoint --verify <instance>` proves it without waiting for a
+real rollback: checkpoint, `undo` back to that checkpoint, checkpoint
+again, and diff the two runs' resource state refs. Agreement is a stronger
+claim than "the command exited 0" — a restore can exit clean and still
+land on the wrong state, which `--verify` is what catches. It is
+destructive (a real `undo`, stopping and restarting whatever the instance's
+resources run) and prints what it is about to do before doing it; run it
+against an instance you can afford to spend, not one you are mid-task on.
+
 ### `[cleanup]`
 
 | key | type | required | default | meaning |
