@@ -62,6 +62,30 @@ pub struct SpawnOutcome {
     pub created_source_branch: bool,
     pub trackers: Vec<TrackerBindOutcome>,
     pub resources: Vec<ResourceBindOutcome>,
+    /// Set when this name's checkpoint directory already held records from a
+    /// previous, archived instance, so numbering continues rather than
+    /// restarting. See [`InheritedCheckpoints`].
+    pub inherited_checkpoints: Option<InheritedCheckpoints>,
+}
+
+/// Checkpoint numbering is per name, and `remove` archives the binding record
+/// without deleting the checkpoint files — so spawning a fresh instance under
+/// a name that has been removed before continues the old numbering, and its
+/// first checkpoint comes back as `ckpt_004` on an instance thirty seconds
+/// old (#84).
+///
+/// Restarting at `ckpt_001` is not available: the old `ckpt_001.toml` is
+/// still on disk (that is what `newgit cleanup --purge-archived` exists to
+/// release), and reusing the id would make it ambiguous which of two
+/// checkpoints `newgit undo ckpt_001` meant. So `spawn` says it instead, at
+/// the moment it becomes true, rather than leaving the number to be
+/// explained after the fact.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InheritedCheckpoints {
+    /// How many records the name already carries.
+    pub existing: usize,
+    /// The id the first checkpoint on this instance will get.
+    pub next_id: String,
 }
 
 impl SpawnOutcome {
@@ -657,6 +681,20 @@ impl BranchManager {
 
         let resource_outcomes = self.bind_resources(&mut branch)?;
 
+        // Read before the record is written, so this reflects what was on
+        // disk *before* this instance existed: anything found here was left
+        // by a previous instance of the same name.
+        let log = CheckpointLog::new(self.store.checkpoint_dir(&branch.slug), &branch.name);
+        let existing = log.list()?.len();
+        let inherited_checkpoints = if existing > 0 {
+            Some(InheritedCheckpoints {
+                existing,
+                next_id: log.next_id()?,
+            })
+        } else {
+            None
+        };
+
         let record_path = self.store.create_branch_record(&branch)?;
 
         Ok(SpawnOutcome {
@@ -665,6 +703,7 @@ impl BranchManager {
             created_source_branch,
             trackers: tracker_outcomes,
             resources: resource_outcomes,
+            inherited_checkpoints,
         })
     }
 
