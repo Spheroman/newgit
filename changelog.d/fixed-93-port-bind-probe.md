@@ -15,3 +15,10 @@
   rather than counted against the port. If the probe can't positively
   confirm an address is free, it now declines to promise the port rather
   than claim it.
+
+  A side effect worth knowing about: the old loopback-only probe, with
+  `SO_REUSEADDR` on, could not see another process's simultaneous probe of
+  the same port either — so two `newgit spawn` runs racing each other could
+  both be handed the same port. The stricter probe closes that gap too:
+  concurrent allocators now correctly see each other's in-flight claims and
+  scan past them instead of colliding.
