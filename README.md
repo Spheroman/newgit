@@ -167,7 +167,9 @@ Definition management (noun subcommands):
 - `newgit tracker list`
 - `newgit resource add <name> --template <template>` / `list` / `templates`
 
-Resource templates: `process`, `pnpm`, `command-snapshot`, `external`.
+Resource templates: `process`, `pnpm`, `install`, `command-snapshot`,
+`command-snapshot-migrations`, `supabase`, `external`. `newgit resource
+templates --show <name>` prints one in full without creating anything.
 
 ## Two things worth knowing
 
