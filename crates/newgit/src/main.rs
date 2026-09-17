@@ -127,6 +127,16 @@ enum Command {
         #[arg(long)]
         check: bool,
     },
+    /// Show ports claimed by binding records, or detect ones that are not
+    Ports {
+        /// Compare what is actually listening (`lsof`) against every
+        /// binding record: the inverse of `render --check`. Non-zero exit,
+        /// naming the port and — only when honestly attributable — the
+        /// instance, on any listening port inside a declared range that no
+        /// binding record claims.
+        #[arg(long)]
+        check: bool,
+    },
     /// Print the definition format reference: every key in a tracker or
     /// resource definition, and the template variables each hook may use
     Reference {
@@ -300,6 +310,7 @@ fn main() -> Result<()> {
             purge_archived,
         } => cleanup(dry_run, purge_archived),
         Command::Render { check } => render_command(check),
+        Command::Ports { check } => ports_command(check),
         Command::Reference { section } => reference(section.as_deref()),
     }
 }
@@ -1620,6 +1631,136 @@ fn render_command(check: bool) -> Result<()> {
         println!("\n{failed} of {total} check(s) failed.");
         std::process::exit(1);
     }
+}
+
+/// `newgit ports` / `newgit ports --check`.
+///
+/// Bare `newgit ports` lists what every binding record already claims — the
+/// ledger newgit itself keeps, no probing involved. That is useful on its
+/// own (which instance owns which port, without reading every binding
+/// record by hand) and costs nothing, so it is the default rather than a
+/// refusal: unlike `render`, which only does one thing and explains why,
+/// `ports` has a second, cheaper thing worth doing without `--check`.
+///
+/// `--check` is the inverse of `render --check` (#56): it compares what is
+/// actually listening on the host against that same ledger, and reports any
+/// listening port inside a declared range that nothing claims — the drift
+/// `render --check` cannot see because it never asks the OS anything. See
+/// the comment above `check_ports` in `newgit-core/src/ports.rs` for why
+/// attribution is honest-but-partial rather than complete.
+fn ports_command(check: bool) -> Result<()> {
+    let manager = manager_here()?;
+    let branches = manager.store().load_branches()?;
+
+    if !check {
+        return list_claimed_ports(&branches);
+    }
+
+    let resources = manager.resource_definitions();
+    let listening = match newgit_core::ports::probe_listening_ports() {
+        Ok(listening) => listening,
+        Err(err) => {
+            println!("could not check: {err}");
+            std::process::exit(1);
+        }
+    };
+
+    let checks = newgit_core::ports::check_ports(&branches, resources, &listening);
+    if checks.is_empty() {
+        println!("No listening ports fall inside any resource's declared range.");
+        return Ok(());
+    }
+
+    let mut failed = 0usize;
+    // Unclaimed ports are grouped by attribution, matching the issue's
+    // sample output: one FAIL line per instance honestly implicated, naming
+    // every port it publishes, plus one line for ports that are real but
+    // could not be attributed to anything — never a guess.
+    let mut unclaimed_attributed: std::collections::BTreeMap<String, Vec<u16>> =
+        std::collections::BTreeMap::new();
+    let mut unclaimed_unattributed: Vec<u16> = Vec::new();
+
+    for result in &checks {
+        if result.claimed {
+            let owner = result
+                .claimed_by
+                .as_deref()
+                .map(|name| format!(" — claimed by `{name}`"))
+                .unwrap_or_default();
+            println!("ok    {}{owner}", result.port);
+        } else {
+            failed += 1;
+            match &result.attributed_to {
+                Some(name) => unclaimed_attributed
+                    .entry(name.clone())
+                    .or_default()
+                    .push(result.port),
+                None => unclaimed_unattributed.push(result.port),
+            }
+        }
+    }
+    for (name, mut ports) in unclaimed_attributed {
+        ports.sort_unstable();
+        let ports = ports
+            .iter()
+            .map(u16::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        println!("FAIL  `{name}` publishes {ports} — claimed by no binding record");
+        println!(
+            "      undeclared ports are not allocated, so another instance may be handed them"
+        );
+    }
+    if !unclaimed_unattributed.is_empty() {
+        unclaimed_unattributed.sort_unstable();
+        let ports = unclaimed_unattributed
+            .iter()
+            .map(u16::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        println!(
+            "FAIL  {ports} — claimed by no binding record; could not attribute to an instance"
+        );
+        println!(
+            "      undeclared ports are not allocated, so another instance may be handed them"
+        );
+    }
+
+    let total = checks.len();
+    if failed == 0 {
+        println!("\n{total} check(s) passed.");
+        Ok(())
+    } else {
+        println!("\n{failed} of {total} check(s) failed.");
+        std::process::exit(1);
+    }
+}
+
+/// Bare `newgit ports`: every instance's claimed ports, read straight off
+/// its binding record.
+fn list_claimed_ports(branches: &[newgit_core::BranchInstance]) -> Result<()> {
+    if branches.is_empty() {
+        println!("No branch instances yet. Create one with `newgit spawn <name>`.");
+        return Ok(());
+    }
+    for branch in branches {
+        let entries: Vec<String> = branch
+            .resources
+            .iter()
+            .flat_map(|(resource, binding)| {
+                binding
+                    .resolved_ports
+                    .iter()
+                    .map(move |(port_name, port)| format!("{resource}.{port_name}:{port}"))
+            })
+            .collect();
+        if entries.is_empty() {
+            println!("{}  -", branch.name);
+        } else {
+            println!("{}  {}", branch.name, entries.join(" "));
+        }
+    }
+    Ok(())
 }
 
 fn cleanup(dry_run: bool, purge_archived: bool) -> Result<()> {

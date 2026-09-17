@@ -499,6 +499,68 @@ moment, and are persisted in the binding record. The binding records are the
 single source of truth — removing an instance frees its ports automatically,
 with no separate ledger to drift.
 
+#### `newgit ports --check`: the inverse of `render --check`
+
+*An instance's ports live in its binding record* is correct and does not
+change. But that record can only ever be as complete as `spawn`'s own bind
+probe, and a container a resource brought up can end up publishing a host
+port the record never learned about — the 54324/54327 case that motivated
+this command (#92). `render --check` catches "my definition claims something
+the file no longer has"; `newgit ports --check` catches the mirror drift:
+"something publishes a port nothing in my records claims."
+
+It runs `lsof -nP -iTCP -sTCP:LISTEN`, keeps only the ports that fall inside
+some resource's allocatable range (`start` up through the same 1000-port
+window `allocate` itself scans before giving up), and reports every one of
+those that no binding record claims:
+
+```
+$ newgit ports --check
+ok    54321 — claimed by `newgit-trial`
+FAIL  `newgit-trial` publishes 54324, 54327 — claimed by no binding record
+      undeclared ports are not allocated, so another instance may be handed them
+
+1 of 3 check(s) failed.
+```
+
+This is deliberately the *cheap* mitigation, not a fix for the allocator.
+`bindable` — the check `allocate` uses at `spawn` to decide whether a port is
+free — only tries binding `127.0.0.1`, so a port Docker Desktop has published
+on `0.0.0.0` looks free to it and `spawn` hands it out anyway. Getting that
+probe right for Docker on macOS is its own, harder problem. `--check` does
+not touch `bindable` at all; it reads the real socket table `lsof` reports,
+regardless of which address a listener chose, so it catches the drift after
+the fact — later than a correct bind probe would, but without needing one.
+
+Attribution — naming *which* instance publishes an unclaimed port — is
+honest rather than complete, on purpose. An instance is named only when its
+name or workspace path genuinely appears in the listening process's command
+line. That bar is not always clearable: on macOS, a Docker Desktop
+container's published port is fronted by Docker's own VM proxy, and that
+proxy's command line says nothing about the instance whose container it is
+fronting. Most Docker-caused conflicts — exactly the case this command
+exists to catch — therefore come back unattributed:
+
+```
+FAIL  54330 — claimed by no binding record; could not attribute to an instance
+      undeclared ports are not allocated, so another instance may be handed them
+```
+
+An unattributed conflict is still the useful finding. A confidently wrong
+instance name would not be, and newgit does not do that: see *We will be
+lying to agents* in AGENTS.md — the filesystem and the network are fair game
+to project, never a fact about what actually holds a port.
+
+If `lsof` is missing, or exits with anything other than the exit code it
+itself uses for "nothing was listening," `--check` says it could not check
+rather than silently reporting every port free — a clean pass here is
+exactly the false confidence #93 was filed over.
+
+Bare `newgit ports` (no `--check`) lists every instance's claimed ports read
+straight off its binding record. Unlike `render`, which refuses without
+`--check` because there is nothing else for it to do, `ports` has a second
+thing worth doing that costs no probing at all: showing the ledger itself.
+
 ### Render
 
 Ports and exports reach a command two ways: `{{ports.x}}` in its command line

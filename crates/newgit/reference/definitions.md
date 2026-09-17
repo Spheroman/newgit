@@ -196,6 +196,48 @@ order, not declaration order — the same order `newgit resource list` and
 spawn output already display them in, so what you see is what was used to
 allocate. Do not rely on declaration order in the file; it is not read.
 
+#### `newgit ports` / `newgit ports --check`
+
+Bare `newgit ports` lists every instance's claimed ports straight off its
+binding record — no probing, nothing to go stale, just the ledger newgit
+already keeps.
+
+`newgit ports --check` is the inverse of `render --check`: instead of asking
+whether committed content matches a definition, it asks whether every
+listening host port is claimed. It runs `lsof -nP -iTCP -sTCP:LISTEN`,
+keeps only the ports inside some resource's allocatable range (`start` up to
+the same 1000-port window `allocate` itself scans), and reports any of those
+that no binding record claims:
+
+```
+$ newgit ports --check
+ok    54321 — claimed by `newgit-trial`
+FAIL  `newgit-trial` publishes 54324, 54327 — claimed by no binding record
+      undeclared ports are not allocated, so another instance may be handed them
+```
+
+This is a cheaper mitigation than fixing the bind probe: `bindable` (the
+check `allocate` uses to decide whether a port is free) only tries binding
+`127.0.0.1`, so a container Docker Desktop has published on `0.0.0.0` is
+invisible to it — that is a separate bug in the allocator itself. `lsof`
+sees the real socket table regardless of which address a listener chose, so
+`--check` catches the drift after the fact even when `spawn` could not have
+caught it in the moment.
+
+Naming *which* instance publishes an unclaimed port is done honestly, not
+confidently: an instance is named only when its name or workspace path
+genuinely appears in the listening process's command line. On macOS, a
+Docker Desktop container's published port is fronted by Docker's own VM
+proxy, whose command line says nothing about the instance that owns the
+container — most Docker-caused conflicts therefore come back unattributed
+(`FAIL 54330 — claimed by no binding record; could not attribute to an
+instance`) rather than naming a guess. An unattributed conflict is still the
+useful finding; a confidently wrong instance name would not be.
+
+If `lsof` is missing, or exits with anything other than its own "nothing
+found" code, `--check` says it could not check rather than reporting a
+clean pass.
+
 ### `[actions.<name>]`
 
 | key | type | required | default | meaning |
