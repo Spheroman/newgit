@@ -247,14 +247,33 @@ clean pass.
 | `command` | string | yes, unless `signal` is set | — | shell command, run in the workspace (or `workdir`, below). |
 | `workdir` | string | no | the resource's `workdir` | replaces — does not nest under — the resource-level `workdir` for this action only. |
 | `long_running` | bool | no | `false` | supervise it: `newgit action` returns once started, output goes to a log, and the process group is tracked. Requires `command`. |
-| `signal` | string | no | `term` for a `stop` action | makes an action signal-only. An action with `signal` and no `command` stops this resource's supervised process. |
+| `signal` | string | no | `term` for a `stop` action | makes an action signal-only. An action with `signal` and no `command` stops this resource's supervised process. The default applies to the literal name `stop` — see below, where that name is the one thing newgit reads. |
 | `captures` | array of strings | no | `[]` | names to read out of the command's stdout and publish as this resource's exports. See *Captures*. |
 
 **Actions are not lifecycle hooks.** Only `prepare` runs on its own — at
 `spawn`, and again for a `recompute` restore. Every other action is something
-you invoke: `newgit action <resource>.<action> [instance]`. Name them whatever
-you like; `start`/`stop` are a convention, made real by `long_running` and
-`signal`, not by the names.
+you invoke: `newgit action <resource>.<action> [instance]`.
+
+**`stop` is the one name newgit reads.** Names are otherwise inert —
+`start` is pure convention, made real by `long_running` and not by the name —
+but when newgit needs to stop this resource's supervised process on its own
+(during `remove`, `undo`, and `resource remove --force`) it signals, and it
+looks up `[actions.stop] signal` to decide which signal to send, defaulting
+to `term`. Precisely:
+
+- An action named `stop` **with no `command`** is the signal-only case the
+  `signal` default is written for. Its `signal` is what newgit sends, both
+  when you invoke it and when newgit stops the resource itself.
+- An action named `stop` **with a `command`** is an ordinary action. It is
+  accepted, and invoking it runs the command like any other. But newgit's
+  own stops always signal — they never run an action's command — so such an
+  action is never reached that way, and the resource gets a bare `term`
+  because no `signal` was set. If your teardown is a command rather than a
+  signal (`docker compose stop`), it belongs in `[cleanup]`, which newgit
+  does run, or under any other name you invoke yourself.
+- Any other name is inert unless you invoke it. An action named `halt` with
+  `signal = "term"` is a perfectly good signal-only action; it just is not
+  what newgit looks up when it stops things by itself.
 
 ### `[checkpoint]`
 
@@ -414,6 +433,19 @@ HEALTH_URL = "{{exports.BASE_URL}}/health"
 
 Two exports that reference each other resolve to nothing and are reported
 like any other placeholder that never resolved.
+
+**Exports are bound before this resource's own `prepare` runs.** `spawn`
+binds one resource at a time in dependency order, and within one resource the
+order is: allocate `[ports]`, render `[exports]`, apply `[[render]]`, then
+run `prepare`. So a `prepare` may consume its own resource's exports as
+environment variables, and a dependency's exports were bound earlier still,
+in the previous iteration. Both "at `spawn`", with no order stated between
+them, is not enough to write a `prepare` against: a `prepare` that brings up a
+Compose stack named by its own `{{branch.slug}}` export would otherwise have
+to guess, and guessing wrong brings up the *shared* stack under the committed
+default name — no error, correct-looking output, wrong cluster. Restating the
+value inline in every hook to avoid the question is the duplication this
+reference warns against elsewhere; you do not have to.
 
 **An unresolved `{{...}}` refuses.** This is the third place that does, with
 `[cleanup]` and `[[render]]`, and for the same reason: everywhere else a
