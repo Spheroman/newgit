@@ -153,6 +153,8 @@ inside a workspace):
   `checkpoints [instance]`
 - `newgit export [instance] --to <dir> [--include <path>] [--exclude <path>]`
 - `newgit cleanup [--dry-run] [--purge-archived]`
+- `newgit ports [--check]` — claimed ports, or detect a listening one nothing
+  claims
 
 Definition management (noun subcommands):
 
