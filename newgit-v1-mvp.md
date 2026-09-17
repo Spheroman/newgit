@@ -494,10 +494,15 @@ terminal, because newgit has to read stdout.
 Port allocation is deterministic in the useful sense: **an instance's port
 never changes once allocated.** Ports are allocated at resource-bind time
 (spawn), taking the first port scanning up from the requested `start` that is
-neither recorded in any other instance's binding nor OS-unbindable at that
-moment, and are persisted in the binding record. The binding records are the
-single source of truth — removing an instance frees its ports automatically,
-with no separate ledger to drift.
+neither recorded in any other instance's binding nor claimed, right now, on
+any of 127.0.0.1, 0.0.0.0, ::1, or :: — probed with `SO_REUSEADDR` off so a
+wildcard bind (e.g. a Docker-published container port on macOS) can't hide
+behind a loopback-only check (#93) — and are persisted in the binding
+record. The binding records are the single source of truth — removing an
+instance frees its ports automatically, with no separate ledger to drift.
+The probe only covers TCP and is a point-in-time check like any bind probe;
+see `crates/newgit-core/src/ports.rs` for exactly what it does and does not
+guarantee.
 
 #### `newgit ports --check`: the inverse of `render --check`
 
