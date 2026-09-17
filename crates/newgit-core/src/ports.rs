@@ -1,7 +1,14 @@
 use std::collections::BTreeSet;
-use std::net::TcpListener;
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6};
 use std::ops::RangeInclusive;
+use std::os::fd::AsRawFd;
 use std::process::Command;
+
+use nix::errno::Errno;
+use nix::sys::socket::{
+    AddressFamily, Backlog, SockFlag, SockType, SockaddrIn, SockaddrIn6, bind, listen, setsockopt,
+    socket, sockopt,
+};
 
 use crate::branch::BranchInstance;
 use crate::error::{NewgitError, Result};
@@ -38,8 +45,85 @@ pub fn allocate(start: u16, used: &mut BTreeSet<u16>) -> Result<u16> {
     }
 }
 
-fn bindable(port: u16) -> bool {
-    TcpListener::bind(("127.0.0.1", port)).is_ok()
+/// Whether `port` can currently be claimed on this host.
+///
+/// This binds (and immediately drops) a dedicated socket on every address a
+/// listener could plausibly occupy: IPv4 loopback (127.0.0.1), IPv4
+/// wildcard (0.0.0.0), IPv6 loopback (::1), and IPv6 wildcard (::). A port
+/// held on only one of these is still a real conflict for the process that
+/// tries to bind it later, so all four must be free before this reports
+/// `true`.
+///
+/// Crucially, `SO_REUSEADDR` is turned off on every probe socket. Rust's
+/// `std::net::TcpListener::bind` sets it on by default on Unix, and that is
+/// exactly how newgit#93 happened: a Docker Desktop container had published
+/// a port on 0.0.0.0, and `TcpListener::bind(("127.0.0.1", port))` still
+/// reported success, because SO_REUSEADDR lets a loopback bind coexist with
+/// an existing wildcard bind on BSD-derived stacks (which is what macOS is).
+/// With it off, the kernel enforces the ordinary "a wildcard bind and a
+/// specific-address bind on the same port conflict" rule, so the wildcard
+/// bind becomes visible to this probe. `std::net` has no way to clear that
+/// flag before bind, hence going around it via raw sockets here.
+///
+/// A family the OS doesn't support at all (no IPv6 stack, or IPv6 disabled
+/// on the loopback/wildcard address) is skipped rather than counted against
+/// the port: nothing can be listening on a protocol the kernel won't speak,
+/// so skipping it cannot cause an over-claim. Any other failure -- the port
+/// already bound, permission denied, out of file descriptors, whatever --
+/// makes this return `false`. Per #93, when the probe cannot positively
+/// confirm an address is free, allocation should decline to promise it
+/// rather than claim it.
+///
+/// What this does NOT detect: newgit only allocates TCP ports, so a port
+/// that is free for TCP but held by a UDP listener is reported bindable
+/// here (and always was); and this is inherently a point-in-time check --
+/// nothing stops another process from claiming the port in the gap between
+/// this probe returning `true` and the caller actually using it. Neither
+/// gap is new; both existed before this fix as well.
+pub fn bindable(port: u16) -> bool {
+    probe(
+        AddressFamily::Inet,
+        &SockaddrIn::from(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port)),
+    ) && probe(
+        AddressFamily::Inet,
+        &SockaddrIn::from(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port)),
+    ) && probe(
+        AddressFamily::Inet6,
+        &SockaddrIn6::from(SocketAddrV6::new(Ipv6Addr::LOCALHOST, port, 0, 0)),
+    ) && probe(
+        AddressFamily::Inet6,
+        &SockaddrIn6::from(SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, port, 0, 0)),
+    )
+}
+
+/// Bind (and immediately drop) one probe socket at `family`/`addr` with
+/// `SO_REUSEADDR` off. See `bindable` for why. Returns `true` when the
+/// address is free or the family/address isn't usable on this host at all
+/// (nothing to conflict with); `false` for everything else, including
+/// errors that leave the port's real state unverified.
+fn probe(family: AddressFamily, addr: &dyn nix::sys::socket::SockaddrLike) -> bool {
+    let fd = match socket(family, SockType::Stream, SockFlag::empty(), None) {
+        Ok(fd) => fd,
+        // No IPv6 stack (or similar): nothing could be listening on a
+        // family the kernel itself does not support, so this address never
+        // hides a conflict. Not evidence of a taken port.
+        Err(Errno::EAFNOSUPPORT | Errno::EPROTONOSUPPORT) => return true,
+        // Anything else (e.g. out of file descriptors) leaves the port
+        // unverified; decline rather than claim it.
+        Err(_) => return false,
+    };
+    if setsockopt(&fd, sockopt::ReuseAddr, &false).is_err() {
+        return false;
+    }
+    if let Err(err) = bind(fd.as_raw_fd(), addr) {
+        return matches!(err, Errno::EADDRNOTAVAIL);
+    }
+    // Binding claims the port; listening matches what a real caller (e.g.
+    // std's TcpListener, which always binds+listens together) would do, so
+    // this probe rejects anything a real listener would also reject.
+    let listened = listen(&fd, Backlog::new(1).expect("1 is a valid backlog")).is_ok();
+    // `fd` drops here, closing the socket and releasing the port.
+    listened
 }
 
 // --- `newgit ports --check`: detect a listening port no binding record claims ---

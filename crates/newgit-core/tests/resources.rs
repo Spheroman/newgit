@@ -1320,17 +1320,23 @@ fn an_export_may_compose_a_dependencys_export() {
     let manager = BranchManager::open(MetadataStore::at(repo)).expect("manager");
 
     let outcome = manager.spawn("feature-a", None).expect("spawn");
+    let api_port = outcome.branch.resources["api"].resolved_ports["api"];
     let functions = outcome
         .branch
         .resources
         .get("functions")
         .expect("functions bound");
+    // The allocator may not hand out `start` verbatim (e.g. a concurrent
+    // test in the same binary can already hold it), so assert against the
+    // port this instance actually resolved rather than a literal — the
+    // claim under test is that the export composes the dependency's export,
+    // not which port the allocator picked.
     assert_eq!(
         functions
             .resolved_exports
             .get("FUNCTIONS_URL")
             .map(String::as_str),
-        Some("http://127.0.0.1:54321/functions/v1")
+        Some(format!("http://127.0.0.1:{api_port}/functions/v1").as_str())
     );
 }
 
@@ -1359,9 +1365,13 @@ fn an_export_may_compose_a_sibling_whatever_the_key_order() {
 
     let outcome = manager.spawn("feature-a", None).expect("spawn");
     let app = outcome.branch.resources.get("app").expect("app bound");
+    let app_port = app.resolved_ports["app"];
+    // See the comment on `an_export_may_compose_a_dependencys_export`: the
+    // allocator's actual pick, not the literal `start`, since what's under
+    // test here is composition, not the number itself.
     assert_eq!(
         app.resolved_exports.get("HEALTH_URL").map(String::as_str),
-        Some("http://127.0.0.1:4100/health")
+        Some(format!("http://127.0.0.1:{app_port}/health").as_str())
     );
 }
 
