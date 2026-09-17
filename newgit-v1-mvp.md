@@ -1054,6 +1054,37 @@ This is the flagship command.
 newgit spawn auth-refactor --profile fullstack
 ```
 
+#### An Incomplete Spawn Must Say So
+
+`prepare` failures are loud but do not abort the spawn — the instance is
+still created, with a record on disk, so its logs can be inspected and the
+action re-run. That is the right default: a half-bound instance is more
+useful than none. But it means the printed summary can carry a `FAILED` or
+`BLOCKED` line for a resource that never came up, the same shape #11 fixed
+for `undo` — "a failed undo reports as Restored" — and the same argument
+applies here: a caller that only checks the exit code cannot tell "ready"
+from "spawned but broken."
+
+So `spawn` exits non-zero whenever any resource did not bind cleanly, and
+the closing line says so in the reporter's terms rather than leaving the
+verdict implicit in the `FAILED` lines above:
+
+```
+spawned with failures: 1 of 4 resources did not bind.
+  `perf-a` exists but is not ready. See the FAILED/BLOCKED lines above.
+```
+
+A resource counts as not bound whenever its line would read `export:
+FAILED`, `render: FAILED`, `prepare: FAILED`, or `prepare: BLOCKED by ...`.
+The blocked case is included on purpose: a blocked `prepare` never ran, so
+the resource is no more usable than one whose `prepare` ran and failed —
+only *where* the failure originated differs. The instance is not rolled
+back on exit 1; the record and workspace from the successful part of the
+spawn are exactly as printed, matching the plain `exit 1` `undo` and
+`checkpoint --verify` already use for the same "spawned/restored with
+failures" shape (not a distinct code) — a caller can `if newgit spawn x;
+then ...` and branch on it directly.
+
 ### `newgit run [name] -- <command>`
 
 Runs a command inside the branch instance with the environment assembled

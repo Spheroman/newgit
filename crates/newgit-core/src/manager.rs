@@ -64,6 +64,28 @@ pub struct SpawnOutcome {
     pub resources: Vec<ResourceBindOutcome>,
 }
 
+impl SpawnOutcome {
+    /// Resources that did not come up ready: `Failed` (export, render, or
+    /// prepare itself failed) and `Pending` (prepare never ran because a
+    /// dependency blocked it) both count. A blocked prepare is not a milder
+    /// case than a failed one — the resource is equally unusable either way,
+    /// it just failed for a reason one step upstream.
+    pub fn failed_resources(&self) -> Vec<&str> {
+        self.resources
+            .iter()
+            .filter(|resource| resource.status != ResourceStatus::Ready)
+            .map(|resource| resource.name.as_str())
+            .collect()
+    }
+
+    /// The instance is complete when every resource bound cleanly. Mirrors
+    /// `UndoOutcome::is_complete` — same question, asked at spawn instead of
+    /// restore.
+    pub fn is_complete(&self) -> bool {
+        self.failed_resources().is_empty()
+    }
+}
+
 /// How a resource was bound at spawn.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResourceBindOutcome {

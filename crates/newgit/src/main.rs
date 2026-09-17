@@ -635,6 +635,25 @@ fn spawn(args: SpawnArgs) -> Result<()> {
         }
         print_warnings(&resource.missing_captures);
     }
+    if !outcome.is_complete() {
+        let failed = outcome.failed_resources();
+        // The instance is not rolled back — it exists, with a record on
+        // disk, exactly as printed above. Exit 1 reports that state; it does
+        // not undo it. A blocked prepare is named alongside a failed one:
+        // both mean the resource never came up, and printing only "FAILED"
+        // here would let a blocked resource read as fine when its own line
+        // above said otherwise.
+        println!(
+            "spawned with failures: {} of {} resources did not bind.",
+            failed.len(),
+            outcome.resources.len()
+        );
+        println!(
+            "  `{}` exists but is not ready. See the FAILED/BLOCKED lines above.",
+            branch.name
+        );
+        std::process::exit(1);
+    }
     Ok(())
 }
 
