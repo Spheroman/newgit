@@ -12,6 +12,225 @@ time by `scripts/release-changelog.sh`, which then deletes the fragments.
 Two changes never touch the same lines, so nothing queues behind whichever
 branch landed first.
 
+## [0.4.0] — 2026-09-16
+
+### Added
+
+- A `supabase` resource template, and every template now states the host
+  tools it assumes
+  ([#90](https://github.com/Spheroman/newgit/issues/90)).
+
+  `command-snapshot-migrations` named its audience in its own opening
+  comment — "Rails, Prisma, **Supabase**, and anything else that runs
+  `migrate`" — and then handed out `createdb`, `pg_dump` and `psql`. A
+  Supabase user has none of those against their database by construction:
+  it lives in a container the CLI manages. Same for a Prisma user on Docker
+  Compose, which is most of them. The template read as "ready to adapt"
+  when it was really "ready to adapt *if your database is on the host*".
+
+  `newgit resource add db --template supabase` now writes the shape that
+  actually works: `supabase start` for `prepare`, `supabase db dump --local
+  --data-only` into the `db-snapshots` lane for `checkpoint`, reset →
+  truncate-what-this-role-may-truncate → load for `restore`, and `supabase
+  stop --no-backup` for `cleanup` — every database command through the CLI
+  or `docker exec`, never a host binary. It renders `project_id` and all six
+  published ports out of the committed `supabase/config.toml`, and carries a
+  commented-out `additional_redirect_urls` render for the Expo case, which
+  is a data edge rather than a `depends_on`.
+
+  `project_id` is the load-bearing line: it scopes every container name and
+  Docker volume, so without a per-instance value the second instance's
+  `supabase start` adopts the first instance's stack. It ships as an
+  explicit `EDIT_ME_PROJECT`, so an unedited template refuses at spawn
+  naming the file and the string rather than quietly sharing a database
+  between branches.
+
+  The smaller half of the same report: all seven templates now open with a
+  `HOST TOOLS:` line. The two host-Postgres ones say so and point at
+  `supabase` or at putting `docker exec` in front; `install` admits that its
+  `key_command` ships as `node -v` and is wrong for a uv or Cargo project;
+  `external` says `cloudctl` is not a real program. A test asserts every
+  template carries the line, and another renders `supabase` against the
+  config `supabase init` actually writes, so the `find` strings cannot ship
+  broken.
+
+- Add `newgit ports --check`: detect a host port that is listening but that
+  no binding record claims
+  ([#92](https://github.com/Spheroman/newgit/issues/92)).
+
+  The inverse of `render --check`: it runs `lsof -nP -iTCP -sTCP:LISTEN`
+  and compares what is actually listening against every binding record,
+  flagging a listening port inside any resource's allocatable range that
+  nothing claims. It deliberately does not fix the allocator's own bind
+  probe (`bindable` still only tries `127.0.0.1`, the root cause of #93)
+  — it is a cheap, inspectable mitigation that would have caught #93's
+  port collision after the fact, without requiring the probe to get
+  Docker-published ports right.
+
+  Attribution to an instance is honest rather than complete: a listening
+  port is named to an instance only when that instance's name or
+  workspace path genuinely appears in the owning process's command line.
+  On macOS, a Docker Desktop container's published port is fronted by
+  Docker's own VM proxy, whose command line says nothing about the
+  instance that owns the container, so most Docker-caused conflicts come
+  back unattributed rather than guessed — an honest "something claims
+  this port and it isn't newgit" is still the useful finding.
+
+  Bare `newgit ports` (no `--check`) lists every instance's claimed ports
+  straight from its binding record — no probing, no `lsof` dependency —
+  since that ledger is useful on its own and costs nothing to print.
+
+  If `lsof` is missing or exits with anything other than "nothing
+  found", `--check` says it could not check rather than silently
+  reporting a clean pass.
+
+
+### Fixed
+
+- Two papercuts from one integration session
+  ([#84](https://github.com/Spheroman/newgit/issues/84)).
+
+  `cleanup` said `Nothing to clean up.` and then, immediately below,
+  described eleven snapshot revs it had kept and why. The retention report
+  is the useful part — it is what sends you to `--purge-archived` — but the
+  line above it made the whole output read as self-contradictory, and the
+  first reaction is to reread it working out which half is wrong. It now
+  says `Nothing to remove.`, which is the true and narrower claim and
+  leaves the retention report free to explain what was kept.
+
+  `spawn` now says when it is continuing checkpoint numbering left behind
+  by a previous instance of the same name. Numbering is per name and
+  `remove` archives the binding record without deleting the checkpoint
+  files, so a name that has been removed and spawned again takes its first
+  checkpoint as `ckpt_004` on an instance thirty seconds old — the one
+  thing that carried over when the workspace, containers and volumes were
+  all destroyed and rebuilt, which is the opposite of what the rest of
+  `remove` implies.
+
+  Restarting at `ckpt_001` was the other option and is not available: the
+  old `ckpt_001.toml` is still on disk — releasing it is exactly what
+  `newgit cleanup --purge-archived` is for — and reusing the id would make
+  it ambiguous which of two checkpoints `newgit undo ckpt_001` meant. So
+  `spawn` states it at the moment it becomes true instead, on a `history:`
+  line naming the count, the id the first checkpoint here will get, and the
+  command that releases them.
+
+- `spawn` now exits non-zero when any resource fails to bind
+  ([#86](https://github.com/Spheroman/newgit/issues/86)).
+
+  A resource that printed `export: FAILED`, `render: FAILED`, `prepare:
+  FAILED`, or `prepare: BLOCKED by ...` left `spawn` exiting 0 anyway, so a
+  script, CI job, or agent driving newgit could not tell "instance ready"
+  from "instance spawned but broken" without parsing the human-readable
+  summary. `BLOCKED` counts alongside `FAILED`: a blocked `prepare` never
+  ran, so that resource is no more usable than one whose `prepare` ran and
+  failed. This mirrors #11's fix for `undo` ("a failed undo reports as
+  Restored") and uses the same plain `exit 1` `undo` and `checkpoint
+  --verify` already use, rather than a distinct code, so `if newgit spawn
+  x; then ...` keeps working. The instance and its record are still
+  created — exit 1 reports the state, it does not roll the spawn back —
+  and the closing line now says so explicitly: `spawned with failures: 1
+  of 4 resources did not bind.`
+
+- The port allocator's bind probe no longer reports a port bindable when a
+  Docker-published container port already holds it
+  ([#93](https://github.com/Spheroman/newgit/issues/93)).
+
+  It checked only `127.0.0.1`, using `std::net::TcpListener::bind`, which
+  sets `SO_REUSEADDR` on by default on Unix. That let a loopback bind
+  succeed even when something else — a Docker Desktop container publishing
+  to `0.0.0.0`, in the reported case — already held the port on the
+  wildcard address, so `spawn` allocated a port it could not actually use.
+  Since allocation is permanent for the life of an instance, the bad value
+  did not get retried; it just failed later, inside a resource's prepare
+  log. The probe now binds, with `SO_REUSEADDR` off, on `127.0.0.1`,
+  `0.0.0.0`, `::1`, and `::`, and only reports a port bindable if all four
+  are free. An address family the OS doesn't support at all is skipped
+  rather than counted against the port. If the probe can't positively
+  confirm an address is free, it now declines to promise the port rather
+  than claim it.
+
+  A side effect worth knowing about: the old loopback-only probe, with
+  `SO_REUSEADDR` on, could not see another process's simultaneous probe of
+  the same port either — so two `newgit spawn` runs racing each other could
+  both be handed the same port. The stricter probe closes that gap too:
+  concurrent allocators now correctly see each other's in-flight claims and
+  scan past them instead of colliding.
+
+
+### Documentation
+
+- The reference now states that `[checkpoint]`, `[restore]` and `[cleanup]`
+  receive the full command environment
+  ([#77](https://github.com/Spheroman/newgit/issues/77)).
+
+  They always did — all three call the same `assemble_env` an action does —
+  but every mention of the environment was scoped to "`newgit run` and
+  actions", and the same section states plainly that those three hooks *are
+  not actions*. Between those two facts the reference could not answer
+  whether a `[restore]` sees `[exports]` and `[ports.<name>] env`, and the
+  omission read as deliberate because the neighbouring template-variable
+  scope table resolves the same question for `{{...}}`.
+
+  That is the worst hook to leave unanswered. A `[restore]` that resets a
+  database picks *which* database from the port newgit allocated; without
+  that variable it falls back to the committed default, which is usually the
+  developer's shared local database. Discovering the contract empirically
+  means running a destructive command against live state to see what
+  survives.
+
+  There is now an environment scope table beside the template-variable one,
+  `[exports]` and `[ports.<name>] env` say "every command newgit runs"
+  instead of naming actions, and the "not actions" sentence says what it is
+  and is not a claim about — `workdir` and invocability, not the
+  environment. Unlike `{{...}}`, the environment does not vary by site:
+  there is one environment and every command gets all of it. A new test
+  (`tests/hook_env.rs`) asserts all three hooks see another resource's
+  export, a port `env`, and `NEWGIT_*`, so the documented claim cannot drift
+  from the code.
+
+- The reference now states that a resource's ports and `[exports]` are bound
+  before its own `prepare` runs
+  ([#78](https://github.com/Spheroman/newgit/issues/78)).
+
+  `[exports]` was "rendered once at `spawn`" and `prepare` "runs on its own —
+  at `spawn`". Both at `spawn`, with no order between them, which is not
+  enough to write a `prepare` against. The within-resource order is now
+  written down — allocate `[ports]`, render `[exports]`, apply `[[render]]`,
+  then run `prepare` — along with the fact that a dependency's exports were
+  bound an iteration earlier, in dependency order.
+
+  The failure from guessing wrong is quiet: a `prepare` that brings up a
+  Compose stack named by its own `{{branch.slug}}` export, run before that
+  export existed, brings up the *shared* stack under the committed default
+  name. No error, correct-looking output, wrong cluster. The workaround —
+  restating the value inline in every hook that needs it — is the
+  duplication this reference warns against elsewhere, and is no longer
+  necessary. `tests/bind_order_and_stop_name.rs` pins both halves.
+
+- The reference no longer contradicts itself about whether `stop` is a
+  reserved action name
+  ([#81](https://github.com/Spheroman/newgit/issues/81)).
+
+  The `signal` row documented a default of "`term` for a `stop` action", and
+  three paragraphs later the same section said action names carry no
+  meaning — "`start`/`stop` are a convention, made real by `long_running`
+  and `signal`, not by the names". The code agrees with the first one:
+  `stop_signal()` is a literal `actions.get("stop")`.
+
+  `stop` is now documented as the one name newgit reads, and for exactly one
+  purpose: when newgit stops a supervised process on its own — during
+  `remove`, `undo`, and `resource remove --force` — it signals, and reads
+  `[actions.stop] signal` to choose which signal, defaulting to `term`.
+
+  The part the issue could not determine from outside is now stated and
+  tested. An action named `stop` **with a `command`** is accepted and is an
+  ordinary action: invoking it runs the command like any other. But newgit's
+  own stops always signal and never run an action's command, so such an
+  action is never reached that way and the resource gets a bare `term`. A
+  teardown that is a command rather than a signal (`docker compose stop`)
+  belongs in `[cleanup]`, which newgit does run.
+
 ## [0.3.0] — 2026-09-15
 
 ### Added
@@ -1113,6 +1332,25 @@ Binding records and checkpoints are the exception worth caring about: they
 are the only local state that is not reconstructible. A release that changes
 their format will say so here explicitly.
 
+**0.4.0 changes no formats.** Nothing was added to the binding record or to
+a checkpoint, so there is no migration and no reason to re-spawn. Two things
+behave differently, both on purpose:
+
+- **Port allocation got stricter, so a fresh `spawn` may pick different
+  numbers than 0.3.0 would have.** The bind probe now checks `0.0.0.0` and
+  `::` as well as loopback, which is what makes it see a Docker-published
+  container port. A port that 0.3.0 would have handed out because it only
+  looked at `127.0.0.1` is now correctly skipped. Ports already recorded in
+  a binding record are untouched — allocation is permanent for the life of
+  an instance — so an instance spawned by 0.3.0 may still be holding a
+  number that was never really free. `newgit ports --check` is how you find
+  out; the fix is to re-spawn that instance.
+- **`spawn` exits 1 when a resource fails to bind**, where it previously
+  exited 0 and said so only in the summary. A script or CI job that treated
+  `newgit spawn` as infallible will now notice failures it was ignoring.
+  The instance and its record are still created; the exit code reports the
+  state, it does not roll the spawn back.
+
 **0.3.0 adds fields to the binding record.** They all default, so a record
 written by 0.2.0 loads unchanged and no migration is needed. Two things read
 differently on an instance spawned before the upgrade, both of which correct
@@ -1127,7 +1365,8 @@ themselves and neither of which is a reason to re-spawn:
   fresh field it has not. One successful `undo`, or one `newgit checkpoint
   --verify`, clears it for good.
 
-[Unreleased]: https://github.com/Spheroman/newgit/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/Spheroman/newgit/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/Spheroman/newgit/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/Spheroman/newgit/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/Spheroman/newgit/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/Spheroman/newgit/compare/v0.1.0...v0.1.1
