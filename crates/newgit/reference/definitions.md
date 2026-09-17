@@ -94,7 +94,9 @@ avoid — content paths keep the one meaning they have always had.
 
 `[checkpoint]`, `[restore]`, and `[cleanup]` are not actions and have no
 override of their own; their commands always run in the resource-level
-`workdir`.
+`workdir`. "Not an action" is a statement about `workdir` and about being
+invocable by name — it is not a statement about the environment. They receive
+the full command environment, same as an action; see *Command environment*.
 
 A `workdir` that does not exist when the command runs fails naming the
 resource, the action, and the resolved path, rather than a bare shell error.
@@ -182,7 +184,7 @@ One entry per port the resource needs. `<name>` is yours (`app`, `db`).
 | key | type | required | default | meaning |
 | --- | --- | --- | --- | --- |
 | `start` | integer | yes | — | where to start scanning. The allocated port is the first one from `start` upward that is neither promised to another instance nor claimed on 127.0.0.1, 0.0.0.0, ::1, or :: right now (checked with `SO_REUSEADDR` off, so a wildcard bind — e.g. a Docker-published container port — can't hide behind a loopback-only check; see #93). A family the OS doesn't support at all is skipped, not counted as free. This does not see a UDP-only listener on the same port number, and is a point-in-time check like any bind probe: nothing stops another process from claiming the port in the gap before it's actually used. |
-| `env` | string | no | none | environment variable the port is published as to `newgit run` and actions (e.g. `PORT`). |
+| `env` | string | no | none | environment variable the port is published as to every command newgit runs — `newgit run`, actions, and the `[checkpoint]`, `[restore]` and `[cleanup]` hooks (e.g. `PORT`). |
 
 A port is allocated once, at `spawn`, and recorded in the binding record. It
 never changes for the life of the instance; removing the instance frees it.
@@ -376,8 +378,12 @@ Two rules constrain it, both deliberately:
 ### `[exports]`
 
 `NAME = "value"` pairs, rendered once at `spawn` and stored in the binding
-record. They become environment variables for `newgit run` and for this
-resource's actions, and are readable in later hooks as `{{exports.NAME}}`.
+record. They become environment variables for every command newgit runs in
+this instance — `newgit run`, every resource's actions, and the
+`[checkpoint]`, `[restore]` and `[cleanup]` hooks, which are not actions but
+are commands — and are readable in later hooks as `{{exports.NAME}}`. The
+environment is per instance, not per resource: one name has one owner (see
+*Command environment*), so there is nothing to scope.
 
 ```toml
 [exports]
@@ -824,14 +830,41 @@ command never emitted is a warning, not an error.
 
 ## Command environment
 
-`newgit run [instance] -- <command>` and every action see:
+Every command newgit runs sees:
 
 1. each resource's rendered `[exports]`, in dependency order;
 2. `[ports.<name>] env` variables;
 3. `NEWGIT_BRANCH` and `NEWGIT_WORKSPACE`.
 
+"Every command" means every command, not just actions. `[checkpoint]`,
+`[restore]`, and `[cleanup]` are not actions — they have no `workdir`
+override of their own and you cannot invoke them by name — but they are
+commands, and they get the same environment an action gets:
+
+| rendered in | `[exports]` | port `env` | `NEWGIT_*` |
+| --- | --- | --- | --- |
+| `newgit run` | yes | yes | yes |
+| action `command` | yes | yes | yes |
+| `[checkpoint] command` | yes | yes | yes |
+| `[restore] command` | yes | yes | yes |
+| `[cleanup] command` | yes | yes | yes |
+
+This is worth stating rather than leaving to inference, because the hook it
+matters most for is the one you least want to guess at. A `[restore]` that
+resets a database picks *which* database from the port newgit allocated; if
+it did not receive that variable it would fall back to whatever its committed
+default names — usually the developer's shared local database — and destroy
+the wrong state, quietly and plausibly. Every variable a `[restore]` needs is
+there.
+
+Note that this is the opposite shape to `{{...}}` substitution, where scope
+genuinely differs per site (see *Template variables*). The environment does
+not vary: there is one environment, and every command gets all of it.
+
 Trackers contribute no environment; they place files. Loading `.env`-style
-files is command-run policy, not a tracker feature.
+files is command-run policy, not a tracker feature. A `[[render]]` gets no
+environment either — it writes a file, and nothing hands a file an
+environment; it reads the same values through `{{...}}` instead.
 
 **A name has exactly one owner.** Three things declare an environment
 variable — an `[exports]` key, an action's `captures` entry, and a port's
