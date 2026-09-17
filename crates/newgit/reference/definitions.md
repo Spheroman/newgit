@@ -181,7 +181,7 @@ One entry per port the resource needs. `<name>` is yours (`app`, `db`).
 
 | key | type | required | default | meaning |
 | --- | --- | --- | --- | --- |
-| `start` | integer | yes | — | where to start scanning. The allocated port is the first one from `start` upward that is neither promised to another instance nor unbindable right now. |
+| `start` | integer | yes | — | where to start scanning. The allocated port is the first one from `start` upward that is neither promised to another instance nor claimed on 127.0.0.1, 0.0.0.0, ::1, or :: right now (checked with `SO_REUSEADDR` off, so a wildcard bind — e.g. a Docker-published container port — can't hide behind a loopback-only check; see #93). A family the OS doesn't support at all is skipped, not counted as free. This does not see a UDP-only listener on the same port number, and is a point-in-time check like any bind probe: nothing stops another process from claiming the port in the gap before it's actually used. |
 | `env` | string | no | none | environment variable the port is published as to `newgit run` and actions (e.g. `PORT`). |
 
 A port is allocated once, at `spawn`, and recorded in the binding record. It
