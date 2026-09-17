@@ -73,8 +73,14 @@ newgit should not need a new internal subsystem for each one. It needs a tracker
 v1 ships resource templates for common lifecycle units: `process`, `pnpm`
 (install/deps, wired to a shared content-addressed store), `install` (the
 same shape for any other package manager, with the lockfile and command left
-as `EDIT ME`), `command-snapshot` (a daemon-owned database), and `external`
-(a resource another system owns). A template may bring companions it needs —
+as `EDIT ME`), `command-snapshot` (a daemon-owned database on the host),
+`command-snapshot-migrations` (the same, where the schema comes from
+migrations rather than from the dump), `supabase` (a per-instance Supabase
+stack, driven through the CLI and `docker exec` rather than host Postgres
+binaries), and `external` (a resource another system owns). Every template
+states the host tools it assumes, since "ready to adapt" and "ready to adapt
+*if your database is on the host*" are different claims. A template may
+bring companions it needs —
 the resource definitions it `depends_on`, and the tracker lanes its
 checkpoint deposits into — created only when absent, so an existing
 definition is never overwritten.
