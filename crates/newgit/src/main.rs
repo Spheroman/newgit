@@ -574,6 +574,20 @@ fn spawn(args: SpawnArgs) -> Result<()> {
     );
     println!("  workspace: {}", branch.workspace_path);
     println!("  record:    {}", outcome.record_path);
+    // Everything else `remove` touched — workspace, containers, volumes — was
+    // destroyed and rebuilt, so checkpoint numbering carrying over is the one
+    // thing that did not, which is the opposite of what the rest of `remove`
+    // implies. Say it here rather than let `ckpt_004` on a brand-new instance
+    // explain itself (#84).
+    if let Some(inherited) = &outcome.inherited_checkpoints {
+        println!(
+            "  history:   continuing checkpoint numbering from {} left by a previous \
+             instance of this name; the first checkpoint here is `{}` (release them with \
+             `newgit cleanup --purge-archived`)",
+            plural(inherited.existing, "archived checkpoint"),
+            inherited.next_id,
+        );
+    }
     for tracker in &outcome.trackers {
         let deposit_only = tracker_is_deposit_only(&manager, &tracker.name);
         println!("  tracker:   {}", bind_line(tracker, deposit_only));
@@ -1794,7 +1808,11 @@ fn cleanup(dry_run: bool, purge_archived: bool) -> Result<()> {
 
     let verb = if dry_run { "would remove" } else { "removed" };
     if outcome.is_empty() {
-        println!("Nothing to clean up.");
+        // "Nothing to clean up." read as a contradiction when a retention
+        // report followed it describing eleven kept revs (#84). Nothing was
+        // *removed* is the true and narrower claim, and it leaves the
+        // retention report below free to explain what was kept and why.
+        println!("Nothing to remove.");
     } else if dry_run {
         println!("Cleanup dry run — nothing was touched.");
     }
