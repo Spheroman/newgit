@@ -204,12 +204,10 @@ so at bind. For a tracker-owned file, `tracker capture` reverses the
 substitution, so edits you make beside the rendered value reach the lane and
 your port does not.
 
-**`git push` from a workspace publishes.** A workspace's `origin` is the
-store, but a push there checkpoints the instance and forwards to the store's
-own `origin`, succeeding only if that remote accepted it. `newgit run` sets
-`GH_REPO`, so `newgit run -- gh pr create --head <branch>` works from the
-workspace (`gh` needs the `--head`). Fetches are not
-routed: `git pull` in a workspace still reads the store.
+**A workspace's `origin` is the real remote.** `git pull` and `gh` see the
+project's repository, and `git push` checkpoints the instance before
+forwarding the push there — succeeding only if that remote accepted it.
+`gh pr create` works from the workspace with no flags.
 
 **`cleanup` never breaks an undo.** It finalizes instances whose workspace is
 gone, deletes unclaimed workspaces and dead process state, and prunes tracker

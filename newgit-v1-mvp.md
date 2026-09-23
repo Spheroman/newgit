@@ -1165,8 +1165,7 @@ from:
 
 1. resource exports, in dependency order
 2. port env vars (`PORT=3107`)
-3. `NEWGIT_BRANCH`, `NEWGIT_WORKSPACE` context vars, and `GH_REPO` when the
-   store's `origin` is a hosted URL (unless a resource exports its own)
+3. `NEWGIT_BRANCH`, `NEWGIT_WORKSPACE` context vars
 
 A name belongs to exactly one declaration. Two resources claiming one name
 is a graph problem reported when the graph loads, not a last-one-wins
@@ -1593,56 +1592,62 @@ checkpoint blesses it.
 
 #### `git push` Publishes
 
-An agent that finishes work in a workspace reaches for `git push`, and a
-workspace's `origin` is the store — a local path. Left alone, that push
-lands in the store: it moves the branch ref behind checkpoint's back, reaches
-nothing anyone else can see, and reports success. So a push from a workspace
-does what the agent meant instead:
+A workspace is cloned from the store, so its `origin` starts as a local
+path. Left that way, everything an agent does with `origin` goes subtly
+wrong: `git push` lands in the store — moving the branch ref behind
+checkpoint's back, reaching nothing anyone else can see, and reporting
+success — `git pull` reads the store instead of the remote, and `gh` cannot
+map a path to a repository at all. So `spawn` makes the workspace's `origin`
+behave like the project's real remote, which the store already has because
+`newgit init` runs in place:
 
-1. **Checkpoint the instance.** `undo` cannot take back a push, so the push
-   is the one moment a checkpoint has to exist. It is listed with reason
-   `push`. Uncommitted work is captured too, as with any checkpoint.
-2. **Forward the push to the store's `origin`** — the project's real remote,
-   which the store already has because `newgit init` runs in place. Branches,
-   tags, and deletions go through as pushed; a non-fast-forward is forwarded
-   as the force it was. Deleting the instance's own branch is refused
-   (`newgit remove` is how an instance ends).
-3. **Succeed exactly when the real remote accepted it.** A rejection there —
-   non-fast-forward, branch protection, auth — refuses the push to the store
-   too, and the agent sees the remote's own message. A store with no `origin`
-   refuses every workspace push rather than keeping it: nothing was
-   published, so nothing may look published.
+- **Fetching reads the real remote.** `remote.origin.url` is the store's
+  `origin`, as Git would resolve it (`insteadOf` applied). `git pull`, `git
+  fetch`, and `gh`'s repository detection all see the real repository.
+- **Pushing goes to newgit's outbox**, `remote.origin.pushurl`: a bare
+  repository in `.newgit/local/publish/outbox.git` that borrows the store's
+  objects. Before Git advertises anything to the pusher, newgit brings the
+  outbox's branches and tags up to date with the real remote — so the
+  pushing Git decides fast-forward, checks `--force-with-lease`, and refuses
+  an existing tag against what that remote has *now*. Then the outbox's
+  `pre-receive` hook:
+  1. **checkpoints the instance.** `undo` cannot take back a push, so the
+     push is the one moment a checkpoint has to exist. It is listed with
+     reason `push`, and captures uncommitted work like any checkpoint.
+  2. **forwards the push to the real remote**, each ref as a force guarded
+     by a lease on the value the outbox advertised — the push the agent's
+     Git would have made there directly. Deleting the instance's own branch
+     is refused (`newgit remove` is how an instance ends).
+  3. **succeeds exactly when the real remote accepted it.** A rejection
+     there refuses the push, and the agent sees the remote's own message. A
+     store with no `origin` refuses every workspace push rather than keep
+     it: nothing was published, so nothing may look published.
 
-The mechanism is Git's own receiving side, not a shim. `spawn` sets the
-workspace's `remote.origin.receivepack` to run `git receive-pack` with
-`-c core.hooksPath` pointing at a `pre-receive` hook in the store's
-`.newgit/local/hooks/`, which calls back into `newgit`. Nothing is written to
-the developer's `.git/hooks`, a `core.hooksPath` owned by husky or lefthook
-cannot switch it off, and pushes into the store from anywhere other than a
-workspace behave as they always did. The route is per-clone config, so
-`checkpoint` re-installs it — a workspace spawned before it existed picks it
-up at its next checkpoint.
+Why an outbox rather than the store: the store's branch ref belongs to
+checkpoint and undo, which move it to the workspace's head. A push into the
+store would be judged against that — so after any checkpoint,
+`--force-with-lease` would fail as stale, because the store no longer holds
+what the workspace last saw on the real remote. The outbox holds exactly
+what the real remote holds.
 
-Two details the hook has to get right. Git runs a receiving hook with
-`GIT_DIR` set and the push's objects in a quarantine that forbids ref
-updates; the hook clears both before newgit runs (a checkpoint updates refs),
-and hands the quarantine directory to the forwarded push as an alternate,
-since the pushed objects are not in the store yet. And the checkpoint does
-not bless the store branch when that branch is the one being pushed — Git
-applies the push only if the ref still holds the value it advertised, so the
-push moves it instead.
+Why not let the workspace push to the real remote directly: then nothing
+would checkpoint first, and nothing could make it — a workspace's own hooks
+are skipped by `--no-verify` and replaced by husky's `core.hooksPath`. The
+outbox is where the push has to pass through.
 
-`newgit run` exports `GH_REPO` (`host/owner/repo`, parsed from the store's
-`origin`) so `gh` finds the real repository from a workspace whose `origin`
-is a path. That is not yet enough on its own: `gh pr create` also resolves
-the head branch through its tracking remote, which is the store, so it needs
-`--head <branch>` — `newgit run -- gh pr create --head <branch>` works, and
-a plain-shell `gh` does not see `GH_REPO` at all. Not a push rewrite: pushes go through the store because
-that is where the checkpoint happens — pointing the workspace's `origin` at
-GitHub would publish work newgit never saw.
+The mechanism is Git's own receiving side, not a shim: the workspace's
+`remote.origin.receivepack` runs `newgit push-receive-pack`, which updates
+the outbox and hands over to `git receive-pack` with `-c core.hooksPath`
+selecting the outbox's hook. Nothing is written to the developer's hooks,
+and a global `core.hooksPath` cannot switch it off. The route is per-clone
+config, so `checkpoint` re-installs it; a workspace spawned before it
+existed picks it up at its next checkpoint.
 
-Fetching is not routed: `git fetch`/`git pull` in a workspace still read the
-store, which only knows what the real remote had when the store last fetched.
+Git runs a receiving hook with `GIT_DIR` set and the push's objects in a
+quarantine that forbids ref updates in any repository; the hook clears both
+before newgit runs (a checkpoint updates the store's refs), and hands the
+quarantine directory to the forwarded push as an alternate, since the pushed
+objects are not in the outbox yet.
 
 Divergence is policy, not mechanism: a branch bound to an instance is owned
 by that instance, and the store treats it as read-mostly. If both the store

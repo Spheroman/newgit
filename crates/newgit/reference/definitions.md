@@ -866,10 +866,7 @@ Every command newgit runs sees:
 
 1. each resource's rendered `[exports]`, in dependency order;
 2. `[ports.<name>] env` variables;
-3. `NEWGIT_BRANCH` and `NEWGIT_WORKSPACE`, and `GH_REPO` — the store's
-   `origin` as `host/owner/repo`, so `gh` finds the real repository from a
-   workspace whose own `origin` is the store. Set only when that URL has the
-   hosted shape, and never over a `GH_REPO` a resource exports.
+3. `NEWGIT_BRANCH` and `NEWGIT_WORKSPACE`.
 
 "Every command" means every command, not just actions. `[checkpoint]`,
 `[restore]`, and `[cleanup]` are not actions — they have no `workdir`

@@ -144,12 +144,25 @@ enum Command {
         /// Omit for a table of contents; `all` for the whole document.
         section: Option<String>,
     },
-    /// The store's side of a `git push` from a workspace. Run by the
-    /// `pre-receive` hook newgit installs, never by hand: reads the ref
+    /// Receiving side of a `git push` from a workspace, run by Git as that
+    /// workspace's `remote.origin.receivepack`, never by hand: brings the
+    /// outbox up to date with the real remote, then hands over to `git
+    /// receive-pack`
+    #[command(hide = true)]
+    PushReceivePack {
+        /// The store the workspace belongs to
+        #[arg(long)]
+        store: Utf8PathBuf,
+        /// The instance whose workspace is pushing
+        instance: String,
+        /// The repository Git asked to receive into (the outbox)
+        repository: Utf8PathBuf,
+    },
+    /// The outbox's `pre-receive` hook, never run by hand: reads the ref
     /// updates on stdin, checkpoints the instance, and forwards the push to
     /// the store's `origin`
     #[command(hide = true)]
-    ReceivePush {
+    PushPreReceive {
         /// The instance whose workspace is pushing
         instance: String,
     },
@@ -321,7 +334,12 @@ fn main() -> Result<()> {
         Command::Render { check } => render_command(check),
         Command::Ports { check } => ports_command(check),
         Command::Reference { section } => reference(section.as_deref()),
-        Command::ReceivePush { instance } => receive_push(&instance),
+        Command::PushReceivePack {
+            store,
+            instance,
+            repository,
+        } => push_receive_pack(&store, &instance, &repository),
+        Command::PushPreReceive { instance } => push_pre_receive(&instance),
     }
 }
 
@@ -1346,7 +1364,26 @@ fn checkpoint(instance: Option<String>, message: Option<&str>) -> Result<()> {
     Ok(())
 }
 
-fn receive_push(instance: &str) -> Result<()> {
+/// Whatever this prints to stdout would reach the pushing Git as protocol,
+/// so everything here goes to stderr, which Git shows the pusher as is.
+fn push_receive_pack(store: &Utf8Path, instance: &str, repository: &Utf8Path) -> Result<()> {
+    use std::os::unix::process::CommandExt as _;
+
+    let manager = BranchManager::open(MetadataStore::at(store))?;
+    let outbox = manager.serve_push()?;
+    if outbox != repository {
+        bail!("asked to receive into {repository}, but this workspace's outbox is {outbox}");
+    }
+    let hooks = outbox.join("hooks");
+    let error = std::process::Command::new("git")
+        .args(["-c", &format!("core.hooksPath={hooks}"), "receive-pack"])
+        .arg(outbox.as_str())
+        .env("NEWGIT_PUSH_INSTANCE", instance)
+        .exec();
+    Err(error).context("could not run `git receive-pack`")
+}
+
+fn push_pre_receive(instance: &str) -> Result<()> {
     let mut updates = Vec::new();
     for line in std::io::stdin().lines() {
         let line = line.context("could not read the pushed refs")?;

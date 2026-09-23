@@ -1,11 +1,12 @@
-//! #96: a plain `git push` from a workspace publishes. The workspace's
-//! `origin` is the store; the store's side of the push checkpoints the
-//! instance and forwards the push to the store's own `origin`, and the push
-//! succeeds exactly when it reached that remote.
+//! #96: a workspace's `origin` behaves like the project's real remote. It
+//! fetches from the store's `origin` directly, and a plain `git push` goes
+//! to newgit's outbox, which checkpoints the instance and forwards the push,
+//! succeeding exactly when the real remote accepted it.
 //!
 //! The "real remote" here is a bare repository standing in for GitHub: the
-//! store's `origin` is a GitHub URL (so `GH_REPO` has something to read),
-//! rewritten to the bare repository with `url.<path>.insteadOf`.
+//! store's `origin` is a GitHub URL, rewritten to the bare repository with
+//! `url.<path>.insteadOf` in the store's config — so what the workspace is
+//! given is the URL Git would really use, the bare repository's path.
 
 use std::process::{Command, Output};
 
@@ -145,7 +146,8 @@ fn git_push_checkpoints_then_publishes_to_the_real_remote() {
     let (workspace, spawn_output) = spawn(&fixture, "feature/push");
     assert!(
         spawn_output.contains(&format!(
-            "`git push` checkpoints, then publishes to {GITHUB_URL}"
+            "`git push` checkpoints, then publishes to {}",
+            fixture.remote
         )),
         "{spawn_output}"
     );
@@ -189,8 +191,9 @@ fn a_rejection_from_the_real_remote_refuses_the_push() {
     assert!(!push.status.success(), "push should fail:\n{stderr}");
     assert!(stderr.contains("protected branch"), "{stderr}");
 
-    assert_eq!(rev(&fixture.store, "refs/heads/feature/rejected"), base);
     assert_eq!(rev(&fixture.remote, "refs/heads/feature/rejected"), None);
+    // The checkpoint still happened — it comes first, and is harmless.
+    assert_ne!(rev(&fixture.store, "refs/heads/feature/rejected"), base);
 }
 
 #[test]
@@ -264,6 +267,12 @@ fn deleting_the_instance_branch_from_its_workspace_is_refused() {
     let (_guard, temp) = tempdir();
     let fixture = setup(&temp);
     let (workspace, _) = spawn(&fixture, "feature/keep");
+    let first = git_output(&workspace, &["push", "origin", "feature/keep"]);
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
 
     let push = git_output(&workspace, &["push", "origin", "--delete", "feature/keep"]);
     let stderr = String::from_utf8_lossy(&push.stderr);
@@ -273,26 +282,115 @@ fn deleting_the_instance_branch_from_its_workspace_is_refused() {
     );
     assert!(stderr.contains("newgit remove feature/keep"), "{stderr}");
     assert!(rev(&fixture.store, "refs/heads/feature/keep").is_some());
+    assert!(rev(&fixture.remote, "refs/heads/feature/keep").is_some());
 }
 
 #[test]
-fn run_exposes_the_real_remote_to_gh() {
+fn origin_reads_as_the_real_remote_so_gh_can_resolve_it() {
     let (_guard, temp) = tempdir();
     let fixture = setup(&temp);
     let (workspace, _) = spawn(&fixture, "feature/gh");
 
-    let output = newgit(
+    // `gh` reads `git remote -v` and takes the fetch URL; it must name the
+    // real repository, not a local path.
+    let remotes = git(&workspace, &["remote", "-v"]);
+    assert!(
+        remotes.contains(&format!("origin\t{} (fetch)", fixture.remote)),
+        "{remotes}"
+    );
+}
+
+#[test]
+fn git_pull_reads_the_real_remote() {
+    let (_guard, temp) = tempdir();
+    let fixture = setup(&temp);
+    let (workspace, _) = spawn(&fixture, "feature/pull");
+    commit(&workspace, "a.txt", "a\n");
+    let push = git_output(&workspace, &["push", "-u", "origin", "feature/pull"]);
+    assert!(
+        push.status.success(),
+        "{}",
+        String::from_utf8_lossy(&push.stderr)
+    );
+
+    // Someone else pushes to the real remote — a reviewer's suggestion.
+    let other = temp.join("other");
+    git(
+        &temp,
+        &[
+            "clone",
+            "-q",
+            "--branch",
+            "feature/pull",
+            fixture.remote.as_str(),
+            other.as_str(),
+        ],
+    );
+    let theirs = commit(&other, "b.txt", "b\n");
+    git(&other, &["push", "-q", "origin", "feature/pull"]);
+
+    // A push without their commit is refused, as the real remote would...
+    commit(&workspace, "c.txt", "c\n");
+    let stale = git_output(&workspace, &["push", "origin", "feature/pull"]);
+    assert!(
+        !stale.status.success(),
+        "{}",
+        String::from_utf8_lossy(&stale.stderr)
+    );
+    assert_ne!(rev(&fixture.remote, "refs/heads/feature/pull"), None);
+
+    // ...and `git pull` gets it, as it would from any clone.
+    git(&workspace, &["pull", "-q", "--no-rebase", "--no-edit"]);
+    let merged = git_output(
         &workspace,
-        &["run", "--", "sh", "-c", "printf %s \"$GH_REPO\""],
+        &["merge-base", "--is-ancestor", &theirs, "HEAD"],
+    );
+    assert!(merged.status.success());
+    let push = git_output(&workspace, &["push", "origin", "feature/pull"]);
+    assert!(
+        push.status.success(),
+        "{}",
+        String::from_utf8_lossy(&push.stderr)
+    );
+}
+
+#[test]
+fn force_with_lease_holds_across_a_checkpoint() {
+    let (_guard, temp) = tempdir();
+    let fixture = setup(&temp);
+    let (workspace, _) = spawn(&fixture, "feature/lease");
+    commit(&workspace, "a.txt", "a\n");
+    let push = git_output(&workspace, &["push", "-u", "origin", "feature/lease"]);
+    assert!(
+        push.status.success(),
+        "{}",
+        String::from_utf8_lossy(&push.stderr)
+    );
+
+    // A checkpoint moves the store's branch. The lease is about the real
+    // remote's, which that must not disturb.
+    commit(&workspace, "b.txt", "b\n");
+    let checkpoint = newgit(&workspace, &["checkpoint"]);
+    assert!(
+        checkpoint.status.success(),
+        "{}",
+        String::from_utf8_lossy(&checkpoint.stderr)
+    );
+
+    git(&workspace, &["commit", "-q", "--amend", "-m", "rewritten"]);
+    let rewritten = git(&workspace, &["rev-parse", "HEAD"]);
+    let leased = git_output(
+        &workspace,
+        &["push", "--force-with-lease", "origin", "feature/lease"],
     );
     assert!(
-        output.status.success(),
+        leased.status.success(),
         "{}",
-        String::from_utf8_lossy(&output.stderr)
+        String::from_utf8_lossy(&leased.stderr)
     );
     assert_eq!(
-        String::from_utf8_lossy(&output.stdout),
-        "github.com/acme/widget"
+        rev(&fixture.remote, "refs/heads/feature/lease"),
+        Some(rewritten)
     );
 }
 
@@ -301,9 +399,15 @@ fn a_workspace_that_predates_the_push_route_gets_it_at_its_next_checkpoint() {
     let (_guard, temp) = tempdir();
     let fixture = setup(&temp);
     let (workspace, _) = spawn(&fixture, "feature/old");
+    // What `spawn` did before the route existed: `origin` is the store.
     git(
         &workspace,
         &["config", "--unset", "remote.origin.receivepack"],
+    );
+    git(&workspace, &["config", "--unset", "remote.origin.pushurl"]);
+    git(
+        &workspace,
+        &["remote", "set-url", "origin", fixture.store.as_str()],
     );
 
     let checkpoint = newgit(&workspace, &["checkpoint"]);

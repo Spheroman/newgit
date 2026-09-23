@@ -30,7 +30,7 @@ use crate::resource::{
     Captures, CheckpointMode, DataEdges, GraphProblem, ResourceDefinition, ResourceGraph,
     RestoreMode, parse_captures, resolve_graph,
 };
-use crate::source::{GitSource, RefUpdate, host_owner_repo};
+use crate::source::{GitSource, RefUpdate};
 use crate::store::MetadataStore;
 use crate::supervisor::{StopOutcome, Supervisor, run_captured, run_foreground};
 use crate::templates::{instantiate, resource_template};
@@ -963,40 +963,52 @@ impl BranchManager {
         exclude_produced_paths(&branch.workspace_path, &produced)
     }
 
-    /// Make a plain `git push` from this workspace publish.
+    /// Make this workspace's `origin` behave like the project's real remote.
     ///
-    /// The workspace's `origin` is the store, so without this a push lands
-    /// silently in the store — a branch ref moved behind checkpoint's back,
-    /// and nothing on the real remote. Instead the workspace names the
-    /// command Git runs on the store's side of its pushes, and that command
-    /// points Git at newgit's own `pre-receive` hook: checkpoint, then
-    /// forward to the store's `origin` (see [`Self::receive_push`]).
+    /// A workspace is cloned from the store, so its `origin` starts as a
+    /// local path: `gh` cannot map it to a repository, `git pull` reads the
+    /// store rather than the remote, and a push lands silently in the store.
+    /// Instead `origin` fetches from the store's own `origin` directly, and
+    /// pushes to newgit's outbox (see [`Self::serve_push`]), whose hook
+    /// checkpoints and forwards (see [`Self::receive_push`]). To the agent,
+    /// and to `gh`, it is an ordinary clone of the real repository.
     ///
-    /// The hook lives in newgit's local state, not the store's
-    /// `.git/hooks`, and is selected per push with `-c core.hooksPath`: the
-    /// developer's own hooks are never touched, and a store whose
-    /// `core.hooksPath` belongs to husky or lefthook cannot quietly switch
-    /// it off. Only pushes from workspaces carry that `-c`; anything else
-    /// pushing into the store behaves as it always did. Idempotent, like
-    /// the excludes, so it doubles as the re-sync.
+    /// The hook is selected per push with `-c core.hooksPath`, so a global
+    /// `core.hooksPath` (husky, lefthook) cannot switch it off. Idempotent,
+    /// like the excludes, so it doubles as the re-sync — and follows the
+    /// store if its `origin` changes.
     fn ensure_workspace_push(&self, branch: &BranchInstance) -> Result<()> {
-        let hooks = self.store.paths().local.join("hooks");
-        let hook = hooks.join("pre-receive");
+        let outbox = self.outbox();
+        self.source.ensure_outbox(&outbox)?;
+        let hook = outbox.join("hooks/pre-receive");
         let script = pre_receive_script(&self.store.paths().project_root, &newgit_program());
         if std::fs::read_to_string(&hook).ok().as_deref() != Some(script.as_str()) {
             use std::os::unix::fs::PermissionsExt;
-            std::fs::create_dir_all(&hooks).map_err(|error| NewgitError::io(&hooks, error))?;
             std::fs::write(&hook, &script).map_err(|error| NewgitError::io(&hook, error))?;
             std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755))
                 .map_err(|error| NewgitError::io(&hook, error))?;
         }
 
+        // Git runs this with the outbox's path appended.
         let receive_pack = format!(
-            "NEWGIT_PUSH_INSTANCE={} git -c core.hooksPath={} receive-pack",
+            "{} push-receive-pack --store {} -- {}",
+            sh_quote(&newgit_program()),
+            sh_quote(self.store.paths().project_root.as_str()),
             sh_quote(&branch.name),
-            sh_quote(hooks.as_str())
         );
-        GitSource::workspace_set_receive_pack(&branch.workspace_path, &receive_pack)
+        GitSource::workspace_route_origin(
+            &branch.workspace_path,
+            self.source.remote_url(PUBLISH_REMOTE, false)?.as_deref(),
+            &outbox,
+            &receive_pack,
+        )
+    }
+
+    /// Where workspace pushes land: a bare repository in newgit's local
+    /// state, never the store itself. The store's branch refs belong to
+    /// checkpoint and undo; the outbox's belong to the real remote.
+    fn outbox(&self) -> Utf8PathBuf {
+        self.store.paths().local.join("publish/outbox.git")
     }
 
     /// The key this instance's tree would be stored under, and the paths that
@@ -1778,14 +1790,6 @@ impl BranchManager {
             "NEWGIT_WORKSPACE".to_owned(),
             branch.workspace_path.to_string(),
         );
-        // A workspace's `origin` is the store, a local path `gh` cannot map
-        // to a repository. `git push` there publishes to the store's own
-        // `origin`, so that is the repository `gh` should be talking to. A
-        // default, not a reservation: a resource exporting its own `GH_REPO`
-        // (a fork workflow, say) keeps it.
-        if let Some(repo) = self.publish_url()?.as_deref().and_then(host_owner_repo) {
-            env.entry("GH_REPO".to_owned()).or_insert(repo);
-        }
 
         Ok(env.into_iter().collect())
     }
@@ -3024,17 +3028,30 @@ impl BranchManager {
     pub fn checkpoint(&self, instance: &str, message: Option<&str>) -> Result<CheckpointOutcome> {
         self.require_resolvable_graph()?;
         let mut branch = self.store.find_branch(instance)?;
-        self.checkpoint_branch(&mut branch, message, CheckpointReason::Explicit, None)
+        self.checkpoint_branch(&mut branch, message, CheckpointReason::Explicit)
     }
 
     /// Where a `git push` from a workspace publishes: the store's own
     /// `origin`, the project's real remote. `None` when there is none.
     pub fn publish_url(&self) -> Result<Option<String>> {
-        self.source.remote_url(PUBLISH_REMOTE)
+        self.source.remote_url(PUBLISH_REMOTE, true)
     }
 
-    /// Publish a `git push` a workspace made: the store's side of it, run
-    /// from newgit's `pre-receive` hook while the push waits.
+    /// The first half of a `git push` from a workspace, run before Git
+    /// advertises anything to the pusher: bring the outbox up to date with
+    /// the real remote, so the pushing Git decides fast-forward, and checks
+    /// `--force-with-lease`, against what that remote has right now.
+    /// Returns the outbox, for `git receive-pack` to serve.
+    pub fn serve_push(&self) -> Result<Utf8PathBuf> {
+        let url = self.require_publish_url()?;
+        let outbox = self.outbox();
+        self.source.ensure_outbox(&outbox)?;
+        GitSource::sync_outbox(&outbox, &url)?;
+        Ok(outbox)
+    }
+
+    /// The second half, run from the outbox's `pre-receive` hook while the
+    /// push waits.
     ///
     /// Checkpoint first, so what reaches the real remote is always something
     /// `undo` can return to — `undo` cannot take back a push, so the push is
@@ -3052,20 +3069,13 @@ impl BranchManager {
     ) -> Result<PushOutcome> {
         self.require_resolvable_graph()?;
         let mut branch = self.store.find_branch(instance)?;
-
-        let remote = PUBLISH_REMOTE;
-        let url = self.publish_url()?.ok_or_else(|| {
-            NewgitError::Unsupported(format!(
-                "the store has no `{remote}` remote, so this push has nowhere to go: a push \
-                 from a workspace publishes to the store's `{remote}`. Add one with `git -C {} \
-                 remote add {remote} <url>`",
-                self.store.paths().project_root
-            ))
-        })?;
+        let url = self.require_publish_url()?;
 
         let own_ref = format!("refs/heads/{}", branch.source_ref);
-        let own = updates.iter().find(|update| update.name == own_ref);
-        if own.is_some_and(|update| update.new.is_none()) {
+        if updates
+            .iter()
+            .any(|update| update.name == own_ref && update.new.is_none())
+        {
             return Err(NewgitError::Unsupported(format!(
                 "refusing to delete `{}`: it is the source branch instance `{}` is bound to. \
                  Remove the instance with `newgit remove {}`",
@@ -3075,16 +3085,26 @@ impl BranchManager {
 
         let checkpoint = self.checkpoint_branch(
             &mut branch,
-            Some(&format!("before `git push` to {remote}")),
+            Some(&format!("before `git push` to {PUBLISH_REMOTE}")),
             CheckpointReason::Push,
-            own.and_then(|update| update.new.as_deref()),
         )?;
-        self.source.forward_push(remote, updates, admitting)?;
+        GitSource::forward_push(&self.outbox(), &url, updates, admitting)?;
 
         Ok(PushOutcome {
             checkpoint,
-            remote: remote.to_owned(),
+            remote: PUBLISH_REMOTE.to_owned(),
             url,
+        })
+    }
+
+    fn require_publish_url(&self) -> Result<String> {
+        self.publish_url()?.ok_or_else(|| {
+            NewgitError::Unsupported(format!(
+                "the store has no `{PUBLISH_REMOTE}` remote, so this push has nowhere to go: a \
+                 push from a workspace publishes to the store's `{PUBLISH_REMOTE}`. Add one \
+                 with `git -C {} remote add {PUBLISH_REMOTE} <url>`",
+                self.store.paths().project_root
+            ))
         })
     }
 
@@ -3112,8 +3132,7 @@ impl BranchManager {
     ) -> Result<VerifyOutcome> {
         self.require_resolvable_graph()?;
         let mut branch = self.store.find_branch(instance)?;
-        let before =
-            self.checkpoint_branch(&mut branch, message, CheckpointReason::Explicit, None)?;
+        let before = self.checkpoint_branch(&mut branch, message, CheckpointReason::Explicit)?;
 
         let undo = self.undo(
             instance,
@@ -3130,7 +3149,6 @@ impl BranchManager {
             &mut branch,
             Some(&format!("verify: restored from {}", before.record.id)),
             CheckpointReason::Explicit,
-            None,
         )?;
 
         let resources = before
@@ -3167,7 +3185,6 @@ impl BranchManager {
         branch: &mut BranchInstance,
         message: Option<&str>,
         reason: CheckpointReason,
-        pushed_tip: Option<&str>,
     ) -> Result<CheckpointOutcome> {
         self.require_workspace(branch)?;
         // A checkpoint is the promise that this state can be returned to.
@@ -3211,14 +3228,7 @@ impl BranchManager {
             .fetch_ref(&workspace, &workspace_ref, &store_ref);
         GitSource::workspace_delete_ref(&workspace, &workspace_ref)?;
         fetched?;
-        match pushed_tip {
-            // The store is mid-way through receiving a push to this very
-            // branch, and Git will only apply it if the ref still holds the
-            // value it advertised to the pusher. Moving it here would make
-            // the push we are publishing fail; the push moves it instead.
-            Some(tip) => branch.source_rev = tip.to_owned(),
-            None => self.bless_store_branch(branch, &head_rev, None, &mut warnings)?,
-        }
+        self.bless_store_branch(branch, &head_rev, None, &mut warnings)?;
 
         // Resources, dependents first: a dependent's state may be derived
         // from its dependency, so it is captured before the dependency moves.
@@ -3518,7 +3528,6 @@ impl BranchManager {
             &mut branch,
             Some(&safety_message),
             CheckpointReason::BeforeUndo,
-            None,
         )?;
         let mut warnings = safety.warnings.clone();
 
@@ -4082,13 +4091,13 @@ fn resource_cwd(
     Ok(resolved)
 }
 
-/// The `pre-receive` hook a workspace's pushes run in the store.
+/// The `pre-receive` hook a workspace's pushes run in the outbox.
 ///
 /// It only prepares the environment and hands over. Git runs a receiving
 /// hook with `GIT_DIR` and a quarantined object directory set, and every
 /// `git` newgit spawns would inherit them: `GIT_DIR` would point every
-/// workspace command at the store, and the quarantine forbids the ref
-/// updates a checkpoint makes. The quarantine directory is passed on by name
+/// store and workspace command at the outbox, and the quarantine forbids
+/// ref updates in any repository — including the ones a checkpoint makes. The quarantine directory is passed on by name
 /// instead, for the forwarded push to read. `GIT_CONFIG_PARAMETERS` carries
 /// the `-c core.hooksPath` that selected this hook, and must not reach a
 /// push to a remote that is itself a local path.
@@ -4097,14 +4106,14 @@ fn pre_receive_script(project_root: &Utf8Path, program: &str) -> String {
         "#!/bin/sh\n\
          # Written by newgit; rewritten on spawn and checkpoint, so edits do not last.\n\
          # A `git push` from a branch instance's workspace arrives here: newgit\n\
-         # checkpoints the instance, then forwards the push to the store's origin.\n\
+         # checkpoints the instance, then forwards the push to the real remote.\n\
          NEWGIT_ADMITTING=\"$GIT_OBJECT_DIRECTORY\"\n\
          export NEWGIT_ADMITTING\n\
          instance=\"$NEWGIT_PUSH_INSTANCE\"\n\
          unset GIT_DIR GIT_QUARANTINE_PATH GIT_OBJECT_DIRECTORY\n\
          unset GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_CONFIG_PARAMETERS NEWGIT_PUSH_INSTANCE\n\
          cd {} || exit 1\n\
-         exec {} receive-push -- \"$instance\"\n",
+         exec {} push-pre-receive -- \"$instance\"\n",
         sh_quote(project_root.as_str()),
         sh_quote(program)
     )
