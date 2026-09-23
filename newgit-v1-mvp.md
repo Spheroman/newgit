@@ -1633,8 +1633,11 @@ applies the push only if the ref still holds the value it advertised, so the
 push moves it instead.
 
 `newgit run` exports `GH_REPO` (`host/owner/repo`, parsed from the store's
-`origin`) so `gh pr create` finds the real repository from a workspace whose
-`origin` is a path. Not a push rewrite: pushes go through the store because
+`origin`) so `gh` finds the real repository from a workspace whose `origin`
+is a path. That is not yet enough on its own: `gh pr create` also resolves
+the head branch through its tracking remote, which is the store, so it needs
+`--head <branch>` — `newgit run -- gh pr create --head <branch>` works, and
+a plain-shell `gh` does not see `GH_REPO` at all. Not a push rewrite: pushes go through the store because
 that is where the checkpoint happens — pointing the workspace's `origin` at
 GitHub would publish work newgit never saw.
 

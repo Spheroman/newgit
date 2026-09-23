@@ -12,5 +12,7 @@
   refuses it. The route is per-workspace Git config pointing at a hook in
   `.newgit/local/hooks/`, so the store's own hooks are untouched. Existing
   workspaces pick it up at their next `newgit checkpoint`. `newgit run` also
-  sets `GH_REPO` from the store's `origin`, so `gh pr create` finds the real
-  repository. `git fetch`/`git pull` in a workspace still read the store.
+  sets `GH_REPO` from the store's `origin`, so `newgit run -- gh pr create
+  --head <branch>` reaches the real repository (without `--head`, `gh` still
+  resolves the branch through the store and fails). `git fetch`/`git pull`
+  in a workspace still read the store.

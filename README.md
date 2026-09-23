@@ -207,7 +207,8 @@ your port does not.
 **`git push` from a workspace publishes.** A workspace's `origin` is the
 store, but a push there checkpoints the instance and forwards to the store's
 own `origin`, succeeding only if that remote accepted it. `newgit run` sets
-`GH_REPO` so `gh pr create` works from the workspace too. Fetches are not
+`GH_REPO`, so `newgit run -- gh pr create --head <branch>` works from the
+workspace (`gh` needs the `--head`). Fetches are not
 routed: `git pull` in a workspace still reads the store.
 
 **`cleanup` never breaks an undo.** It finalizes instances whose workspace is
