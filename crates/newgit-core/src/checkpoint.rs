@@ -44,6 +44,10 @@ pub enum CheckpointReason {
     /// Safety checkpoint taken automatically before an undo — restoring it
     /// is redo.
     BeforeUndo,
+    /// Taken automatically when a `git push` from the workspace publishes
+    /// to the project's remote — a push `undo` cannot take back, so it is
+    /// the one moment a checkpoint has to exist.
+    Push,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

@@ -28,6 +28,8 @@ newgit action app.start auth-refactor
 newgit checkpoint auth-refactor -m "before agent"
 # an agent works in the branch workspace, and you dislike the result
 newgit undo auth-refactor
+# ...or you like it: from the workspace, a plain `git push` checkpoints and
+# publishes to the project's real remote
 
 newgit export auth-refactor --to ../public-export
 newgit cleanup
@@ -201,6 +203,12 @@ show in `git status` and `git add -A` cannot commit them — which also means
 so at bind. For a tracker-owned file, `tracker capture` reverses the
 substitution, so edits you make beside the rendered value reach the lane and
 your port does not.
+
+**`git push` from a workspace publishes.** A workspace's `origin` is the
+store, but a push there checkpoints the instance and forwards to the store's
+own `origin`, succeeding only if that remote accepted it. `newgit run` sets
+`GH_REPO` so `gh pr create` works from the workspace too. Fetches are not
+routed: `git pull` in a workspace still reads the store.
 
 **`cleanup` never breaks an undo.** It finalizes instances whose workspace is
 gone, deletes unclaimed workspaces and dead process state, and prunes tracker
