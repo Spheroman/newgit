@@ -425,3 +425,53 @@ fn a_workspace_that_predates_the_push_route_gets_it_at_its_next_checkpoint() {
     );
     assert_eq!(rev(&fixture.remote, "refs/heads/feature/old"), Some(tip));
 }
+
+#[test]
+fn the_route_names_newgit_bare_when_path_finds_this_binary() {
+    let (_guard, temp) = tempdir();
+    let fixture = setup(&temp);
+    let exe = Utf8Path::new(env!("CARGO_BIN_EXE_newgit"));
+    let path = format!(
+        "{}:{}",
+        exe.parent().expect("bin dir"),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let output = Command::new(exe)
+        .current_dir(fixture.store.as_str())
+        .args(["spawn", "feature/on-path"])
+        .env("PATH", &path)
+        .output()
+        .expect("newgit runs");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let workspace = temp.join("workspaces/feature-on-path");
+
+    let route = git(&workspace, &["config", "remote.origin.receivepack"]);
+    assert!(route.starts_with("'newgit' push-receive-pack"), "{route}");
+
+    // And the push works through it, as long as the pusher's PATH has it.
+    let tip = commit(&workspace, "a.txt", "a\n");
+    let push = Command::new("git")
+        .args([
+            "-C",
+            workspace.as_str(),
+            "push",
+            "origin",
+            "feature/on-path",
+        ])
+        .env("PATH", &path)
+        .output()
+        .expect("git runs");
+    assert!(
+        push.status.success(),
+        "{}",
+        String::from_utf8_lossy(&push.stderr)
+    );
+    assert_eq!(
+        rev(&fixture.remote, "refs/heads/feature/on-path"),
+        Some(tip)
+    );
+}

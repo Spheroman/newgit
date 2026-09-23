@@ -1641,7 +1641,11 @@ the outbox and hands over to `git receive-pack` with `-c core.hooksPath`
 selecting the outbox's hook. Nothing is written to the developer's hooks,
 and a global `core.hooksPath` cannot switch it off. The route is per-clone
 config, so `checkpoint` re-installs it; a workspace spawned before it
-existed picks it up at its next checkpoint.
+existed picks it up at its next checkpoint. The route names the bare
+`newgit` when that finds the running binary on `PATH`, so an upgrade that
+moves the binary is found by the next push; a build that is not on `PATH`
+(a `cargo run`, a checkout under test) is named by its full path instead,
+so its pushes call that same build.
 
 Git runs a receiving hook with `GIT_DIR` set and the push's objects in a
 quarantine that forbids ref updates in any repository; the hook clears both

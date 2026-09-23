@@ -4119,15 +4119,42 @@ fn pre_receive_script(project_root: &Utf8Path, program: &str) -> String {
     )
 }
 
-/// The binary a hook should call back into: this one, when this process is
-/// newgit, so a hook written by a build that is not on `PATH` calls that
-/// same build. Otherwise (a library caller, a test harness) `newgit`.
+/// How the push route calls back into newgit: the bare name `newgit`
+/// whenever that finds this very binary on `PATH`, and this binary's full
+/// path otherwise. See [`hook_program`].
 fn newgit_program() -> String {
-    std::env::current_exe()
-        .ok()
-        .filter(|path| path.file_stem().is_some_and(|stem| stem == "newgit"))
-        .and_then(|path| path.to_str().map(ToOwned::to_owned))
-        .unwrap_or_else(|| "newgit".to_owned())
+    hook_program(
+        std::env::current_exe().ok().as_deref(),
+        std::env::var_os("PATH").as_deref(),
+    )
+}
+
+/// The bare name survives an upgrade that moves the binary — a new install
+/// anywhere on `PATH` is found by the next push, where a baked-in path
+/// would break every workspace's push until its next checkpoint rewrote
+/// it. The full path is for a build that is not on `PATH` (a `cargo run`,
+/// a checkout under test): the hook must call that same build, not
+/// whatever older `newgit` happens to be installed. A process that is not
+/// newgit at all (a library caller, a test harness) can only name it.
+fn hook_program(exe: Option<&std::path::Path>, path_var: Option<&std::ffi::OsStr>) -> String {
+    let Some(exe) = exe.filter(|exe| exe.file_stem().is_some_and(|stem| stem == "newgit")) else {
+        return "newgit".to_owned();
+    };
+    let same_file =
+        |candidate: &std::path::Path| match (candidate.canonicalize(), exe.canonicalize()) {
+            (Ok(candidate), Ok(exe)) => candidate == exe,
+            _ => false,
+        };
+    let on_path = path_var
+        .into_iter()
+        .flat_map(std::env::split_paths)
+        .map(|dir| dir.join("newgit"))
+        .find(|candidate| candidate.is_file());
+    match (on_path, exe.to_str()) {
+        (Some(found), _) if same_file(&found) => "newgit".to_owned(),
+        (_, Some(exe)) => exe.to_owned(),
+        (_, None) => "newgit".to_owned(),
+    }
 }
 
 /// Quote `value` as one POSIX shell word.
@@ -4166,4 +4193,70 @@ fn validate_disjoint_with_replacement(
         updated.push(replacement.clone());
     }
     crate::tracker::validate_disjoint(&updated)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::ffi::OsString;
+    use std::path::{Path, PathBuf};
+
+    use super::hook_program;
+
+    fn binary(dir: &Path, name: &str) -> PathBuf {
+        std::fs::create_dir_all(dir).expect("mkdir");
+        let path = dir.join(name);
+        std::fs::write(&path, "").expect("write");
+        path
+    }
+
+    fn path_var(dirs: &[&Path]) -> OsString {
+        std::env::join_paths(dirs).expect("join PATH")
+    }
+
+    #[test]
+    fn the_installed_binary_is_named_so_an_upgrade_is_found() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let bin = temp.path().join("bin");
+        let exe = binary(&bin, "newgit");
+        let path = path_var(&[&temp.path().join("empty"), &bin]);
+        assert_eq!(hook_program(Some(&exe), Some(&path)), "newgit");
+    }
+
+    #[test]
+    fn a_symlink_on_path_to_this_binary_counts_as_this_binary() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let exe = binary(&temp.path().join("cellar/newgit/0.5.0"), "newgit");
+        let bin = temp.path().join("bin");
+        std::fs::create_dir_all(&bin).expect("mkdir");
+        std::os::unix::fs::symlink(&exe, bin.join("newgit")).expect("symlink");
+        assert_eq!(hook_program(Some(&exe), Some(&path_var(&[&bin]))), "newgit");
+    }
+
+    #[test]
+    fn a_build_off_path_is_called_by_its_full_path() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let installed = temp.path().join("bin");
+        binary(&installed, "newgit");
+        let exe = binary(&temp.path().join("target/debug"), "newgit");
+        let program = hook_program(Some(&exe), Some(&path_var(&[&installed])));
+        assert_eq!(program, exe.to_str().expect("utf8"));
+    }
+
+    #[test]
+    fn only_the_first_newgit_on_path_is_what_the_bare_name_finds() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let shadowing = temp.path().join("shadow");
+        binary(&shadowing, "newgit");
+        let bin = temp.path().join("bin");
+        let exe = binary(&bin, "newgit");
+        let program = hook_program(Some(&exe), Some(&path_var(&[&shadowing, &bin])));
+        assert_eq!(program, exe.to_str().expect("utf8"));
+    }
+
+    #[test]
+    fn a_process_that_is_not_newgit_can_only_name_it() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let exe = binary(temp.path(), "manager-tests");
+        assert_eq!(hook_program(Some(&exe), None), "newgit");
+    }
 }
