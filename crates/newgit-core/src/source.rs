@@ -148,11 +148,19 @@ impl GitSource {
 
     /// Fetch a ref from another repository (typically a workspace clone)
     /// into the store. Fetch, never push: the store pulls commits in when a
-    /// checkpoint blesses them, and workspaces stay passive.
+    /// checkpoint blesses them, and workspaces stay passive. (A workspace's
+    /// own `git push` never lands here: it goes to the publish outbox,
+    /// whose hook checkpoints through this same fetch.)
+    ///
+    /// `--no-tags`: by default a fetch also copies every tag pointing into
+    /// what it fetched, so a checkpoint would import the workspace's tags
+    /// into the store as a side effect — and a push of that tag, later,
+    /// would then be refused because the store already has it.
     pub fn fetch_ref(&self, from: &Utf8Path, remote_ref: &str, local_ref: &str) -> Result<()> {
         self.git(&[
             "fetch",
             "--quiet",
+            "--no-tags",
             "--no-write-fetch-head",
             "--",
             from.as_str(),
@@ -206,6 +214,150 @@ impl GitSource {
             .output()
             .map_err(|source| spawn_error(&args, &source))?;
         Ok(output.status.success())
+    }
+
+    /// The URL Git would use for `remote` in the store — `insteadOf` and,
+    /// with `push`, `pushurl` applied — or `None` when there is no such
+    /// remote. Effective rather than as written, because it is used from
+    /// repositories that do not share the store's config.
+    pub fn remote_url(&self, remote: &str, push: bool) -> Result<Option<String>> {
+        let mut args = vec!["-C", self.root.as_str(), "remote", "get-url"];
+        if push {
+            args.push("--push");
+        }
+        args.extend(["--", remote]);
+        let output = Command::new("git")
+            .args(&args)
+            .output()
+            .map_err(|source| spawn_error(&args, &source))?;
+        Ok(output
+            .status
+            .success()
+            .then(|| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+            .filter(|url| !url.is_empty()))
+    }
+
+    /// The store's object directory, absolute — for a repository that
+    /// borrows its objects as an alternate.
+    pub fn objects_dir(&self) -> Result<Utf8PathBuf> {
+        self.git(&[
+            "rev-parse",
+            "--path-format=absolute",
+            "--git-path",
+            "objects",
+        ])
+        .map(Utf8PathBuf::from)
+    }
+
+    /// Create the outbox a workspace's pushes land in, if it is missing: a
+    /// bare repository borrowing the store's objects, so neither bringing it
+    /// up to date nor receiving a push copies history the store already
+    /// has.
+    pub fn ensure_outbox(&self, outbox: &Utf8Path) -> Result<()> {
+        if !outbox.join("HEAD").is_file() {
+            run_git(&["init", "--quiet", "--bare", "--", outbox.as_str()])?;
+        }
+        let alternates = outbox.join("objects/info/alternates");
+        let objects = format!("{}\n", self.objects_dir()?);
+        if std::fs::read_to_string(&alternates).ok().as_deref() != Some(objects.as_str()) {
+            std::fs::write(&alternates, objects)
+                .map_err(|error| NewgitError::io(&alternates, error))?;
+        }
+        Ok(())
+    }
+
+    /// Make the outbox's branches and tags exactly what `url` has now.
+    pub fn sync_outbox(outbox: &Utf8Path, url: &str) -> Result<()> {
+        run_git(&[
+            "-C",
+            outbox.as_str(),
+            "fetch",
+            "--quiet",
+            "--prune",
+            "--no-write-fetch-head",
+            "--",
+            url,
+            "+refs/heads/*:refs/heads/*",
+            "+refs/tags/*:refs/tags/*",
+        ])
+        .map(|_| ())
+    }
+
+    /// Forward a push the outbox is in the middle of receiving to `url`.
+    ///
+    /// Every update goes as a force guarded by a lease on the value the
+    /// outbox advertised — which was the real remote's own value, fetched
+    /// moments before. The pushing Git already made its fast-forward (or
+    /// `--force-with-lease`) decision against that value, so this is the
+    /// same push it would have made to the real remote directly, and a
+    /// remote that moved in between still rejects it.
+    ///
+    /// `admitting` is the quarantine directory Git holds a push's objects in
+    /// until the `pre-receive` hook accepts it; they are not in the outbox
+    /// yet, so the forwarded push reads it as an alternate. Output is
+    /// inherited rather than captured: from inside a hook it reaches the
+    /// pusher as `remote:` lines, which is where the real remote's
+    /// acceptance or rejection belongs.
+    pub fn forward_push(
+        outbox: &Utf8Path,
+        url: &str,
+        updates: &[RefUpdate],
+        admitting: Option<&Utf8Path>,
+    ) -> Result<()> {
+        let mut args: Vec<String> = ["-C", outbox.as_str(), "push"]
+            .map(ToOwned::to_owned)
+            .to_vec();
+        let mut refspecs = Vec::new();
+        for update in updates {
+            let expected = update.old.as_deref().unwrap_or("");
+            args.push(format!("--force-with-lease={}:{expected}", update.name));
+            refspecs.push(match &update.new {
+                Some(new) => format!("+{new}:{}", update.name),
+                None => format!(":{}", update.name),
+            });
+        }
+        args.extend(["--".to_owned(), url.to_owned()]);
+        args.extend(refspecs);
+
+        let status = Command::new("git")
+            .args(&args)
+            .envs(admitting.map(|dir| ("GIT_ALTERNATE_OBJECT_DIRECTORIES", dir.as_str())))
+            .status()
+            .map_err(|source| {
+                spawn_error(
+                    &args.iter().map(String::as_str).collect::<Vec<_>>(),
+                    &source,
+                )
+            })?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(NewgitError::SourceCommand {
+                command: format!("git {}", args.join(" ")),
+                stderr: format!("{url} did not accept the push (its output is above)"),
+            })
+        }
+    }
+
+    /// Point a workspace's `origin` at the real remote for everything but
+    /// pushing, and send its pushes to `outbox` through `receive_pack` —
+    /// the command Git runs on the receiving side. `fetch_url` is `None`
+    /// when the store has no remote to point at, and `origin` then stays
+    /// the store. Per-clone config, so nothing lands in the repository.
+    pub fn workspace_route_origin(
+        workspace: &Utf8Path,
+        fetch_url: Option<&str>,
+        outbox: &Utf8Path,
+        receive_pack: &str,
+    ) -> Result<()> {
+        let config = |key: &str, value: &str| {
+            run_git(&["-C", workspace.as_str(), "config", key, value]).map(|_| ())
+        };
+        if let Some(url) = fetch_url {
+            config("remote.origin.url", url)?;
+        }
+        config("remote.origin.pushurl", outbox.as_str())?;
+        config("remote.origin.receivepack", receive_pack)
     }
 
     /// Live HEAD of a workspace clone, short form.
@@ -432,6 +584,29 @@ pub fn find_repo_root(start: &Utf8Path) -> Option<(Utf8PathBuf, SourceSubstrate)
     None
 }
 
+/// One ref a push is updating, as a `pre-receive` hook reads it: `None` for
+/// the all-zeros id Git uses for "did not exist" (`old`) or "delete" (`new`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RefUpdate {
+    pub old: Option<String>,
+    pub new: Option<String>,
+    pub name: String,
+}
+
+impl RefUpdate {
+    /// Parse one `<old> <new> <ref>` line of `pre-receive` input.
+    pub fn parse(line: &str) -> Option<Self> {
+        let mut fields = line.split_whitespace();
+        let (old, new, name) = (fields.next()?, fields.next()?, fields.next()?);
+        let id = |value: &str| (!value.bytes().all(|byte| byte == b'0')).then(|| value.to_owned());
+        Some(Self {
+            old: id(old),
+            new: id(new),
+            name: name.to_owned(),
+        })
+    }
+}
+
 fn run_git(args: &[&str]) -> Result<String> {
     run_git_env(args, &[])
 }
@@ -475,5 +650,19 @@ fn spawn_error(args: &[&str], source: &std::io::Error) -> NewgitError {
     NewgitError::SourceCommand {
         command: format!("git {}", args.join(" ")),
         stderr: source.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::RefUpdate;
+
+    #[test]
+    fn ref_update_reads_zero_ids_as_absent() {
+        let zeros = "0".repeat(40);
+        let created = RefUpdate::parse(&format!("{zeros} abc refs/heads/x")).expect("parses");
+        assert_eq!((created.old, created.new.as_deref()), (None, Some("abc")));
+        let deleted = RefUpdate::parse(&format!("abc {zeros} refs/heads/x")).expect("parses");
+        assert_eq!((deleted.old.as_deref(), deleted.new), (Some("abc"), None));
     }
 }

@@ -11,7 +11,7 @@ use newgit_core::manager::{
     UndoOptions,
 };
 use newgit_core::resource::{CheckpointMode, ResourceDefinition};
-use newgit_core::source::find_repo_root;
+use newgit_core::source::{RefUpdate, find_repo_root};
 use newgit_core::store::Context;
 use newgit_core::supervisor::StopOutcome;
 use newgit_core::templates::{RESOURCE_TEMPLATES, resource_template, resource_template_names};
@@ -143,6 +143,28 @@ enum Command {
         /// Section to print, e.g. `tracker`, `resource`, `render`, `ports`.
         /// Omit for a table of contents; `all` for the whole document.
         section: Option<String>,
+    },
+    /// Receiving side of a `git push` from a workspace, run by Git as that
+    /// workspace's `remote.origin.receivepack`, never by hand: brings the
+    /// outbox up to date with the real remote, then hands over to `git
+    /// receive-pack`
+    #[command(hide = true)]
+    PushReceivePack {
+        /// The store the workspace belongs to
+        #[arg(long)]
+        store: Utf8PathBuf,
+        /// The instance whose workspace is pushing
+        instance: String,
+        /// The repository Git asked to receive into (the outbox)
+        repository: Utf8PathBuf,
+    },
+    /// The outbox's `pre-receive` hook, never run by hand: reads the ref
+    /// updates on stdin, checkpoints the instance, and forwards the push to
+    /// the store's `origin`
+    #[command(hide = true)]
+    PushPreReceive {
+        /// The instance whose workspace is pushing
+        instance: String,
     },
 }
 
@@ -312,6 +334,12 @@ fn main() -> Result<()> {
         Command::Render { check } => render_command(check),
         Command::Ports { check } => ports_command(check),
         Command::Reference { section } => reference(section.as_deref()),
+        Command::PushReceivePack {
+            store,
+            instance,
+            repository,
+        } => push_receive_pack(&store, &instance, &repository),
+        Command::PushPreReceive { instance } => push_pre_receive(&instance),
     }
 }
 
@@ -574,6 +602,15 @@ fn spawn(args: SpawnArgs) -> Result<()> {
     );
     println!("  workspace: {}", branch.workspace_path);
     println!("  record:    {}", outcome.record_path);
+    // The workspace's `origin` is the store, a local path. An agent reaching
+    // for `git push` should know before it does where that push will go.
+    match manager.publish_url()? {
+        Some(url) => println!("  push:      `git push` checkpoints, then publishes to {url}"),
+        None => println!(
+            "  push:      the store has no `origin` remote, so `git push` from this workspace \
+             will be refused"
+        ),
+    }
     // Everything else `remove` touched — workspace, containers, volumes — was
     // destroyed and rebuilt, so checkpoint numbering carrying over is the one
     // thing that did not, which is the opposite of what the rest of `remove`
@@ -1327,6 +1364,50 @@ fn checkpoint(instance: Option<String>, message: Option<&str>) -> Result<()> {
     Ok(())
 }
 
+/// Whatever this prints to stdout would reach the pushing Git as protocol,
+/// so everything here goes to stderr, which Git shows the pusher as is.
+fn push_receive_pack(store: &Utf8Path, instance: &str, repository: &Utf8Path) -> Result<()> {
+    use std::os::unix::process::CommandExt as _;
+
+    let manager = BranchManager::open(MetadataStore::at(store))?;
+    let outbox = manager.serve_push()?;
+    if outbox != repository {
+        bail!("asked to receive into {repository}, but this workspace's outbox is {outbox}");
+    }
+    let hooks = outbox.join("hooks");
+    let error = std::process::Command::new("git")
+        .args(["-c", &format!("core.hooksPath={hooks}"), "receive-pack"])
+        .arg(outbox.as_str())
+        .env("NEWGIT_PUSH_INSTANCE", instance)
+        .exec();
+    Err(error).context("could not run `git receive-pack`")
+}
+
+fn push_pre_receive(instance: &str) -> Result<()> {
+    let mut updates = Vec::new();
+    for line in std::io::stdin().lines() {
+        let line = line.context("could not read the pushed refs")?;
+        if let Some(update) = RefUpdate::parse(&line) {
+            updates.push(update);
+        }
+    }
+    let admitting = std::env::var("NEWGIT_ADMITTING")
+        .ok()
+        .filter(|dir| !dir.is_empty())
+        .map(Utf8PathBuf::from);
+
+    let manager = manager_here()?;
+    println!("newgit: checkpointing `{instance}` before publishing this push");
+    let outcome = manager.receive_push(instance, &updates, admitting.as_deref())?;
+    print_warnings(&outcome.checkpoint.warnings);
+    println!(
+        "newgit: checkpoint {} taken; published to {} ({})",
+        outcome.checkpoint.record.id, outcome.remote, outcome.url
+    );
+    println!("newgit: undo the workspace with `newgit undo {instance}` (a push cannot be undone)");
+    Ok(())
+}
+
 fn checkpoint_verify(instance: Option<String>, message: Option<&str>) -> Result<()> {
     let (manager, instance) = manager_and_instance(instance)?;
     println!(
@@ -1492,6 +1573,7 @@ fn checkpoints(instance: Option<String>) -> Result<()> {
             (CheckpointReason::Explicit, _) => "explicit",
             (CheckpointReason::BeforeUndo, Some(false)) => "failed-undo",
             (CheckpointReason::BeforeUndo, _) => "before-undo",
+            (CheckpointReason::Push, _) => "push",
         };
         let source = format!(
             "{}{}",

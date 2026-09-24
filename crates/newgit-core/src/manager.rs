@@ -30,11 +30,14 @@ use crate::resource::{
     Captures, CheckpointMode, DataEdges, GraphProblem, ResourceDefinition, ResourceGraph,
     RestoreMode, parse_captures, resolve_graph,
 };
-use crate::source::GitSource;
+use crate::source::{GitSource, RefUpdate};
 use crate::store::MetadataStore;
 use crate::supervisor::{StopOutcome, Supervisor, run_captured, run_foreground};
 use crate::templates::{instantiate, resource_template};
 use crate::tracker::{Storage, TrackerDefinition, collect_files, collect_owned_files, content_rev};
+
+/// The store remote a workspace's `git push` is forwarded to.
+const PUBLISH_REMOTE: &str = "origin";
 
 /// Orchestrates branch-instance lifecycle against one store.
 #[derive(Debug)]
@@ -318,6 +321,15 @@ pub struct CheckpointOutcome {
     pub record: CheckpointRecord,
     pub record_path: Utf8PathBuf,
     pub warnings: Vec<String>,
+}
+
+/// A `git push` from a workspace, published: the checkpoint taken first, and
+/// the remote it was forwarded to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PushOutcome {
+    pub checkpoint: CheckpointOutcome,
+    pub remote: String,
+    pub url: String,
 }
 
 /// What `checkpoint --verify` found: a checkpoint, a real restore of it, a
@@ -672,6 +684,7 @@ impl BranchManager {
         // arrive as untracked files an agent, or a checkpoint's `git add
         // -A`, can commit into source history.
         self.ensure_workspace_excludes(&branch)?;
+        self.ensure_workspace_push(&branch)?;
 
         let mut tracker_outcomes = Vec::new();
         for definition in &self.trackers {
@@ -948,6 +961,54 @@ impl BranchManager {
             .flat_map(|definition| definition.identity_produces().iter().cloned())
             .collect();
         exclude_produced_paths(&branch.workspace_path, &produced)
+    }
+
+    /// Make this workspace's `origin` behave like the project's real remote.
+    ///
+    /// A workspace is cloned from the store, so its `origin` starts as a
+    /// local path: `gh` cannot map it to a repository, `git pull` reads the
+    /// store rather than the remote, and a push lands silently in the store.
+    /// Instead `origin` fetches from the store's own `origin` directly, and
+    /// pushes to newgit's outbox (see [`Self::serve_push`]), whose hook
+    /// checkpoints and forwards (see [`Self::receive_push`]). To the agent,
+    /// and to `gh`, it is an ordinary clone of the real repository.
+    ///
+    /// The hook is selected per push with `-c core.hooksPath`, so a global
+    /// `core.hooksPath` (husky, lefthook) cannot switch it off. Idempotent,
+    /// like the excludes, so it doubles as the re-sync — and follows the
+    /// store if its `origin` changes.
+    fn ensure_workspace_push(&self, branch: &BranchInstance) -> Result<()> {
+        let outbox = self.outbox();
+        self.source.ensure_outbox(&outbox)?;
+        let hook = outbox.join("hooks/pre-receive");
+        let script = pre_receive_script(&self.store.paths().project_root, &newgit_program());
+        if std::fs::read_to_string(&hook).ok().as_deref() != Some(script.as_str()) {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::write(&hook, &script).map_err(|error| NewgitError::io(&hook, error))?;
+            std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755))
+                .map_err(|error| NewgitError::io(&hook, error))?;
+        }
+
+        // Git runs this with the outbox's path appended.
+        let receive_pack = format!(
+            "{} push-receive-pack --store {} -- {}",
+            sh_quote(&newgit_program()),
+            sh_quote(self.store.paths().project_root.as_str()),
+            sh_quote(&branch.name),
+        );
+        GitSource::workspace_route_origin(
+            &branch.workspace_path,
+            self.source.remote_url(PUBLISH_REMOTE, false)?.as_deref(),
+            &outbox,
+            &receive_pack,
+        )
+    }
+
+    /// Where workspace pushes land: a bare repository in newgit's local
+    /// state, never the store itself. The store's branch refs belong to
+    /// checkpoint and undo; the outbox's belong to the real remote.
+    fn outbox(&self) -> Utf8PathBuf {
+        self.store.paths().local.join("publish/outbox.git")
     }
 
     /// The key this instance's tree would be stored under, and the paths that
@@ -2970,6 +3031,83 @@ impl BranchManager {
         self.checkpoint_branch(&mut branch, message, CheckpointReason::Explicit)
     }
 
+    /// Where a `git push` from a workspace publishes: the store's own
+    /// `origin`, the project's real remote. `None` when there is none.
+    pub fn publish_url(&self) -> Result<Option<String>> {
+        self.source.remote_url(PUBLISH_REMOTE, true)
+    }
+
+    /// The first half of a `git push` from a workspace, run before Git
+    /// advertises anything to the pusher: bring the outbox up to date with
+    /// the real remote, so the pushing Git decides fast-forward, and checks
+    /// `--force-with-lease`, against what that remote has right now.
+    /// Returns the outbox, for `git receive-pack` to serve.
+    pub fn serve_push(&self) -> Result<Utf8PathBuf> {
+        let url = self.require_publish_url()?;
+        let outbox = self.outbox();
+        self.source.ensure_outbox(&outbox)?;
+        GitSource::sync_outbox(&outbox, &url)?;
+        Ok(outbox)
+    }
+
+    /// The second half, run from the outbox's `pre-receive` hook while the
+    /// push waits.
+    ///
+    /// Checkpoint first, so what reaches the real remote is always something
+    /// `undo` can return to — `undo` cannot take back a push, so the push is
+    /// the one moment a checkpoint has to exist. Then forward to the store's
+    /// `origin`. Any error refuses the push, and the pusher sees why: a push
+    /// succeeds exactly when it reached the real remote.
+    ///
+    /// `admitting` is the directory Git is holding the push's objects in
+    /// until this returns; see [`GitSource::forward_push`].
+    pub fn receive_push(
+        &self,
+        instance: &str,
+        updates: &[RefUpdate],
+        admitting: Option<&Utf8Path>,
+    ) -> Result<PushOutcome> {
+        self.require_resolvable_graph()?;
+        let mut branch = self.store.find_branch(instance)?;
+        let url = self.require_publish_url()?;
+
+        let own_ref = format!("refs/heads/{}", branch.source_ref);
+        if updates
+            .iter()
+            .any(|update| update.name == own_ref && update.new.is_none())
+        {
+            return Err(NewgitError::Unsupported(format!(
+                "refusing to delete `{}`: it is the source branch instance `{}` is bound to. \
+                 Remove the instance with `newgit remove {}`",
+                branch.source_ref, branch.name, branch.name
+            )));
+        }
+
+        let checkpoint = self.checkpoint_branch(
+            &mut branch,
+            Some(&format!("before `git push` to {PUBLISH_REMOTE}")),
+            CheckpointReason::Push,
+        )?;
+        GitSource::forward_push(&self.outbox(), &url, updates, admitting)?;
+
+        Ok(PushOutcome {
+            checkpoint,
+            remote: PUBLISH_REMOTE.to_owned(),
+            url,
+        })
+    }
+
+    fn require_publish_url(&self) -> Result<String> {
+        self.publish_url()?.ok_or_else(|| {
+            NewgitError::Unsupported(format!(
+                "the store has no `{PUBLISH_REMOTE}` remote, so this push has nowhere to go: a \
+                 push from a workspace publishes to the store's `{PUBLISH_REMOTE}`. Add one \
+                 with `git -C {} remote add {PUBLISH_REMOTE} <url>`",
+                self.store.paths().project_root
+            ))
+        })
+    }
+
     pub fn list_checkpoints(&self, instance: &str) -> Result<Vec<CheckpointRecord>> {
         let branch = self.store.find_branch(instance)?;
         self.checkpoint_log(&branch).list()
@@ -3071,6 +3209,9 @@ impl BranchManager {
         // and idempotent, so the re-sync belongs on the path that depends
         // on it rather than only at spawn.
         self.ensure_workspace_excludes(branch)?;
+        // Same reasoning for the push route: a workspace spawned before it
+        // existed would otherwise push silently into the store forever.
+        self.ensure_workspace_push(branch)?;
 
         let head_rev = GitSource::workspace_head(&workspace)?;
         let dirty_rev = GitSource::workspace_dirty_commit(
@@ -3950,6 +4091,77 @@ fn resource_cwd(
     Ok(resolved)
 }
 
+/// The `pre-receive` hook a workspace's pushes run in the outbox.
+///
+/// It only prepares the environment and hands over. Git runs a receiving
+/// hook with `GIT_DIR` and a quarantined object directory set, and every
+/// `git` newgit spawns would inherit them: `GIT_DIR` would point every
+/// store and workspace command at the outbox, and the quarantine forbids
+/// ref updates in any repository — including the ones a checkpoint makes. The quarantine directory is passed on by name
+/// instead, for the forwarded push to read. `GIT_CONFIG_PARAMETERS` carries
+/// the `-c core.hooksPath` that selected this hook, and must not reach a
+/// push to a remote that is itself a local path.
+fn pre_receive_script(project_root: &Utf8Path, program: &str) -> String {
+    format!(
+        "#!/bin/sh\n\
+         # Written by newgit; rewritten on spawn and checkpoint, so edits do not last.\n\
+         # A `git push` from a branch instance's workspace arrives here: newgit\n\
+         # checkpoints the instance, then forwards the push to the real remote.\n\
+         NEWGIT_ADMITTING=\"$GIT_OBJECT_DIRECTORY\"\n\
+         export NEWGIT_ADMITTING\n\
+         instance=\"$NEWGIT_PUSH_INSTANCE\"\n\
+         unset GIT_DIR GIT_QUARANTINE_PATH GIT_OBJECT_DIRECTORY\n\
+         unset GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_CONFIG_PARAMETERS NEWGIT_PUSH_INSTANCE\n\
+         cd {} || exit 1\n\
+         exec {} push-pre-receive -- \"$instance\"\n",
+        sh_quote(project_root.as_str()),
+        sh_quote(program)
+    )
+}
+
+/// How the push route calls back into newgit: the bare name `newgit`
+/// whenever that finds this very binary on `PATH`, and this binary's full
+/// path otherwise. See [`hook_program`].
+fn newgit_program() -> String {
+    hook_program(
+        std::env::current_exe().ok().as_deref(),
+        std::env::var_os("PATH").as_deref(),
+    )
+}
+
+/// The bare name survives an upgrade that moves the binary — a new install
+/// anywhere on `PATH` is found by the next push, where a baked-in path
+/// would break every workspace's push until its next checkpoint rewrote
+/// it. The full path is for a build that is not on `PATH` (a `cargo run`,
+/// a checkout under test): the hook must call that same build, not
+/// whatever older `newgit` happens to be installed. A process that is not
+/// newgit at all (a library caller, a test harness) can only name it.
+fn hook_program(exe: Option<&std::path::Path>, path_var: Option<&std::ffi::OsStr>) -> String {
+    let Some(exe) = exe.filter(|exe| exe.file_stem().is_some_and(|stem| stem == "newgit")) else {
+        return "newgit".to_owned();
+    };
+    let same_file =
+        |candidate: &std::path::Path| match (candidate.canonicalize(), exe.canonicalize()) {
+            (Ok(candidate), Ok(exe)) => candidate == exe,
+            _ => false,
+        };
+    let on_path = path_var
+        .into_iter()
+        .flat_map(std::env::split_paths)
+        .map(|dir| dir.join("newgit"))
+        .find(|candidate| candidate.is_file());
+    match (on_path, exe.to_str()) {
+        (Some(found), _) if same_file(&found) => "newgit".to_owned(),
+        (_, Some(exe)) => exe.to_owned(),
+        (_, None) => "newgit".to_owned(),
+    }
+}
+
+/// Quote `value` as one POSIX shell word.
+fn sh_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
 /// How many lines differ between the expected render and what is on disk —
 /// enough to say how big the discarded edit is without printing a diff.
 fn differing_lines(expected: &str, actual: &str) -> usize {
@@ -3981,4 +4193,70 @@ fn validate_disjoint_with_replacement(
         updated.push(replacement.clone());
     }
     crate::tracker::validate_disjoint(&updated)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::ffi::OsString;
+    use std::path::{Path, PathBuf};
+
+    use super::hook_program;
+
+    fn binary(dir: &Path, name: &str) -> PathBuf {
+        std::fs::create_dir_all(dir).expect("mkdir");
+        let path = dir.join(name);
+        std::fs::write(&path, "").expect("write");
+        path
+    }
+
+    fn path_var(dirs: &[&Path]) -> OsString {
+        std::env::join_paths(dirs).expect("join PATH")
+    }
+
+    #[test]
+    fn the_installed_binary_is_named_so_an_upgrade_is_found() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let bin = temp.path().join("bin");
+        let exe = binary(&bin, "newgit");
+        let path = path_var(&[&temp.path().join("empty"), &bin]);
+        assert_eq!(hook_program(Some(&exe), Some(&path)), "newgit");
+    }
+
+    #[test]
+    fn a_symlink_on_path_to_this_binary_counts_as_this_binary() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let exe = binary(&temp.path().join("cellar/newgit/0.5.0"), "newgit");
+        let bin = temp.path().join("bin");
+        std::fs::create_dir_all(&bin).expect("mkdir");
+        std::os::unix::fs::symlink(&exe, bin.join("newgit")).expect("symlink");
+        assert_eq!(hook_program(Some(&exe), Some(&path_var(&[&bin]))), "newgit");
+    }
+
+    #[test]
+    fn a_build_off_path_is_called_by_its_full_path() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let installed = temp.path().join("bin");
+        binary(&installed, "newgit");
+        let exe = binary(&temp.path().join("target/debug"), "newgit");
+        let program = hook_program(Some(&exe), Some(&path_var(&[&installed])));
+        assert_eq!(program, exe.to_str().expect("utf8"));
+    }
+
+    #[test]
+    fn only_the_first_newgit_on_path_is_what_the_bare_name_finds() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let shadowing = temp.path().join("shadow");
+        binary(&shadowing, "newgit");
+        let bin = temp.path().join("bin");
+        let exe = binary(&bin, "newgit");
+        let program = hook_program(Some(&exe), Some(&path_var(&[&shadowing, &bin])));
+        assert_eq!(program, exe.to_str().expect("utf8"));
+    }
+
+    #[test]
+    fn a_process_that_is_not_newgit_can_only_name_it() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let exe = binary(temp.path(), "manager-tests");
+        assert_eq!(hook_program(Some(&exe), None), "newgit");
+    }
 }
