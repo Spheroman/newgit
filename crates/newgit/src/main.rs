@@ -1687,6 +1687,20 @@ fn export(args: ExportArgs) -> Result<()> {
         );
     }
     println!("  commit:   {}", short_rev(&outcome.commit));
+    if !outcome.still_gitignored.is_empty() {
+        // Committed and tracked, so nothing is hidden — but the export's
+        // `.gitignore` (a source file, shipped as it is) still names these,
+        // and a new file next to one would not be picked up by `git add`.
+        println!(
+            "  gitignored but committed: {}",
+            outcome
+                .still_gitignored
+                .iter()
+                .map(|path| path.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
 
     // Both of these are load-bearing, not boilerplate: the export is one
     // commit precisely so excluded content cannot ride along in history, and
