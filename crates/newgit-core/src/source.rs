@@ -561,6 +561,42 @@ impl GitSource {
         run_git(&["-C", dest, "rev-parse", "HEAD"])
     }
 
+    /// Every branch, tag, and remote-tracking ref in the store whose history
+    /// contains `rev` — "does this commit exist anywhere but here". Symbolic
+    /// `refs/remotes/<remote>/HEAD` aliases are left out; they only repeat
+    /// the branch they point at.
+    pub fn refs_containing(&self, rev: &str) -> Result<Vec<String>> {
+        refs_containing_in(
+            &self.root,
+            rev,
+            &["refs/heads", "refs/remotes", "refs/tags"],
+        )
+    }
+
+    /// Where `branch` is checked out in the store — its main worktree or any
+    /// linked one — if anywhere. Deleting a branch out from under a worktree
+    /// leaves that worktree on an unborn branch, which is why `git branch -D`
+    /// refuses it too.
+    pub fn checked_out_at(&self, branch: &str) -> Result<Option<Utf8PathBuf>> {
+        let listing = self.git(&["worktree", "list", "--porcelain"])?;
+        let wanted = format!("branch refs/heads/{branch}");
+        let mut current: Option<&str> = None;
+        for line in listing.lines() {
+            if let Some(path) = line.strip_prefix("worktree ") {
+                current = Some(path);
+            } else if line == wanted {
+                return Ok(current.map(Utf8PathBuf::from));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Delete `refs/heads/<name>`, only if it still points at `expected`.
+    pub fn delete_branch(&self, name: &str, expected: &str) -> Result<()> {
+        self.git(&["update-ref", "-d", &format!("refs/heads/{name}"), expected])
+            .map(|_| ())
+    }
+
     fn git(&self, args: &[&str]) -> Result<String> {
         let mut full: Vec<&str> = vec!["-C", self.root.as_str()];
         full.extend_from_slice(args);
@@ -609,6 +645,26 @@ impl RefUpdate {
 
 fn run_git(args: &[&str]) -> Result<String> {
     run_git_env(args, &[])
+}
+
+/// The refs under `namespaces` in `repo` whose history contains `rev`.
+pub fn refs_containing_in(repo: &Utf8Path, rev: &str, namespaces: &[&str]) -> Result<Vec<String>> {
+    let mut args = vec![
+        "-C",
+        repo.as_str(),
+        "for-each-ref",
+        "--format=%(refname)",
+        "--contains",
+        rev,
+    ];
+    args.extend_from_slice(namespaces);
+    Ok(run_git(&args)?
+        .lines()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .filter(|name| !(name.starts_with("refs/remotes/") && name.ends_with("/HEAD")))
+        .map(ToOwned::to_owned)
+        .collect())
 }
 
 /// The user's own Git identity when they have one, so an exported repo looks

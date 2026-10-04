@@ -301,6 +301,51 @@ pub struct RemoveOutcome {
     /// How many checkpoints removal left behind instead — retained disk the
     /// caller should be told about, since nothing reaches them any more.
     pub kept_checkpoints: usize,
+    /// What happened to the instance's source branch in the store, and why.
+    pub source_branch: SourceBranchOutcome,
+}
+
+/// What `remove` should do with the instance's source branch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SourceBranchPolicy {
+    /// Delete it when it holds nothing unique — newgit created it, nothing
+    /// has it checked out, and its tip is already on another branch, a tag,
+    /// or the remote. Otherwise keep it and say which of those failed.
+    #[default]
+    Auto,
+    /// Keep it whatever it holds.
+    Keep,
+    /// Delete it whatever it holds. Still refuses a branch checked out in
+    /// the store, before anything is torn down.
+    Delete,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SourceBranchOutcome {
+    /// Deleted at `tip`. `found_on` names one other ref whose history holds
+    /// the tip (`main`, `origin/feature-a`, `tag v1.2`) — `None` only when
+    /// the deletion was forced past commits that existed nowhere else.
+    Deleted {
+        tip: String,
+        found_on: Option<String>,
+    },
+    Kept(KeptBranch),
+    /// The branch was already gone from the store.
+    Missing,
+}
+
+/// Why `remove` left the source branch in place.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum KeptBranch {
+    /// `--keep-branch`.
+    Asked,
+    /// It existed before `spawn`; newgit adopted it and does not own it.
+    Adopted,
+    /// Checked out in the store at this path.
+    CheckedOut(Utf8PathBuf),
+    /// Its tip is on no other branch, tag, or remote ref — deleting it is
+    /// the only way these commits stop being a branch.
+    Unique { tip: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -673,6 +718,7 @@ impl BranchManager {
             .workspace_root(&self.store.paths().project_root)
             .join(&slug);
         let mut branch = BranchInstance::new(name, name, source_rev, workspace_path)?;
+        branch.created_source_branch = created_source_branch;
         if let Some((base_ref, base_rev)) = base {
             branch = branch.with_base(base_ref, base_rev);
         }
@@ -2502,11 +2548,17 @@ impl BranchManager {
     /// undo would need, and the instance may be re-created. `checkpoints =
     /// Purge` says that undo will never be wanted, and drops them so the next
     /// `cleanup` can reclaim what they held.
+    ///
+    /// The source branch goes too when it holds nothing unique (see
+    /// [`SourceBranchPolicy::Auto`]); the decision is made before anything
+    /// is torn down, so a `Delete` that cannot be honoured refuses the whole
+    /// removal rather than half of it.
     pub fn remove(
         &self,
         name: &str,
         cwd: &Utf8Path,
         checkpoints: ArchivedCheckpoints,
+        source_branch: SourceBranchPolicy,
     ) -> Result<RemoveOutcome> {
         let branch = self.store.find_branch(name)?;
 
@@ -2517,6 +2569,8 @@ impl BranchManager {
                 branch.name
             )));
         }
+
+        let source_branch = self.decide_source_branch(&branch, source_branch)?;
 
         // Stop anything still running before the workspace disappears.
         let supervisor = self.supervisor(&branch);
@@ -2545,13 +2599,100 @@ impl BranchManager {
             (false, purged) => (purged, 0),
         };
 
+        // Last, after everything that could fail: a removal that errors
+        // halfway should leave the branch for the retry to decide about.
+        if let SourceBranchOutcome::Deleted { tip, .. } = &source_branch {
+            self.source.delete_branch(&branch.source_ref, tip)?;
+        }
+
         Ok(RemoveOutcome {
             branch,
             archived_record,
             hooks,
             purged_checkpoints,
             kept_checkpoints,
+            source_branch,
         })
+    }
+
+    /// Decide what `remove` does with the source branch, without doing it.
+    ///
+    /// "Nothing unique" means the tip is in the history of some other
+    /// branch, tag, or remote-tracking ref in the store, or of a branch the
+    /// publish remote had as of the last `git push` through the outbox —
+    /// which is where a workspace's pushes land, and which the store's own
+    /// `refs/remotes` never hears about. newgit's checkpoint refs do not
+    /// count: they are undo history, not a place a person would look for
+    /// their work.
+    fn decide_source_branch(
+        &self,
+        branch: &BranchInstance,
+        policy: SourceBranchPolicy,
+    ) -> Result<SourceBranchOutcome> {
+        let own = format!("refs/heads/{}", branch.source_ref);
+        let Some(tip) = self.source.ref_rev(&own) else {
+            return Ok(SourceBranchOutcome::Missing);
+        };
+        if policy == SourceBranchPolicy::Keep {
+            return Ok(SourceBranchOutcome::Kept(KeptBranch::Asked));
+        }
+        if let Some(path) = self.source.checked_out_at(&branch.source_ref)? {
+            if policy == SourceBranchPolicy::Delete {
+                return Err(NewgitError::Unsupported(format!(
+                    "cannot delete source branch `{}`: it is checked out in the store at {path}. \
+                     Switch that checkout to another branch first, or remove with \
+                     `--keep-branch`",
+                    branch.source_ref
+                )));
+            }
+            return Ok(SourceBranchOutcome::Kept(KeptBranch::CheckedOut(path)));
+        }
+        if policy == SourceBranchPolicy::Auto && !branch.created_source_branch {
+            return Ok(SourceBranchOutcome::Kept(KeptBranch::Adopted));
+        }
+
+        let found_on = self.ref_holding(&tip, &own)?;
+        match (policy, found_on) {
+            (SourceBranchPolicy::Auto, None) => {
+                Ok(SourceBranchOutcome::Kept(KeptBranch::Unique { tip }))
+            }
+            (_, found_on) => Ok(SourceBranchOutcome::Deleted { tip, found_on }),
+        }
+    }
+
+    /// One ref other than `own` whose history contains `tip`, named for a
+    /// reader: local branches first, then remotes, then tags.
+    fn ref_holding(&self, tip: &str, own: &str) -> Result<Option<String>> {
+        let mut store = self.source.refs_containing(tip)?;
+        store.retain(|name| name != own);
+        // The outbox mirrors the publish remote as of the last push. It
+        // borrows the store's objects, so `tip` resolves there; if it cannot
+        // be read for any reason, that only means one fewer place to find
+        // the tip, which errs toward keeping the branch.
+        let outbox = self.outbox();
+        let pushed = if outbox.join("HEAD").is_file() {
+            crate::source::refs_containing_in(&outbox, tip, &["refs/heads"]).unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+
+        let local = store
+            .iter()
+            .find_map(|name| name.strip_prefix("refs/heads/"))
+            .map(|name| format!("`{name}`"));
+        let remote = store
+            .iter()
+            .find_map(|name| name.strip_prefix("refs/remotes/"))
+            .map(|name| format!("`{name}`"));
+        let pushed = pushed
+            .iter()
+            .find_map(|name| name.strip_prefix("refs/heads/"))
+            .map(|name| format!("`{PUBLISH_REMOTE}/{name}` (as of the last push)"));
+        let tag = store
+            .iter()
+            .find_map(|name| name.strip_prefix("refs/tags/"))
+            .map(|name| format!("tag `{name}`"));
+        Ok(local.or(remote).or(pushed).or(tag))
     }
 
     /// Drop one instance's checkpoint log and the store refs it held.

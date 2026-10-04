@@ -90,8 +90,10 @@ and must be committed before a spawn that calls it.
 
 Nothing about your repository changes until you ask for it. `init` writes
 `.newgit/`, and `tracker track` appends to `.gitignore`; no command rewrites
-source history, and `remove`/`cleanup` never touch the store repository's
-branches.
+source history, and the one branch newgit ever deletes is an instance's own:
+`remove` deletes the source branch `spawn` created for it, and only when its
+commits are already on another branch, a tag, or the remote. Otherwise it is
+kept, and `remove` says why (`--keep-branch` / `--delete-branch` override).
 
 ### What your package manager will cost you
 
@@ -146,7 +148,8 @@ tests by nature.
 Branch-instance lifecycle (top-level verbs; `[instance]` is inferred when run
 inside a workspace):
 
-- `newgit init` / `spawn <name>` / `status [name]` / `remove <name> [--purge]`
+- `newgit init` / `spawn <name>` / `status [name]` / `remove <name> [--purge]
+  [--keep-branch | --delete-branch]`
 - `newgit status <instance> --path` — just the workspace path, for scripts
 - `newgit reference` — the definition format, every key and default
 - `newgit run [instance] -- <command>` — run with exports and ports loaded

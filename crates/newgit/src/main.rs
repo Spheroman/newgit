@@ -7,8 +7,8 @@ use newgit_core::cleanup::{ArchivedCheckpoints, HookDetail, HookOutcome};
 use newgit_core::export::{ExportFilter, Reason};
 use newgit_core::installs::InstallReport;
 use newgit_core::manager::{
-    ActionOutcome, BaseReport, BindOrigin, BranchManager, InstanceReport, TrackerBindOutcome,
-    UndoOptions,
+    ActionOutcome, BaseReport, BindOrigin, BranchManager, InstanceReport, KeptBranch,
+    RemoveOutcome, SourceBranchOutcome, SourceBranchPolicy, TrackerBindOutcome, UndoOptions,
 };
 use newgit_core::resource::{CheckpointMode, ResourceDefinition};
 use newgit_core::source::{RefUpdate, find_repo_root};
@@ -45,13 +45,25 @@ enum Command {
         path: bool,
     },
     /// Delete an instance's workspace and archive its binding record
+    ///
+    /// The source branch goes too when it holds nothing unique: spawn
+    /// created it, nothing has it checked out, and its tip is already on
+    /// another branch, a tag, or the remote. Otherwise it is kept, and
+    /// removal says why.
     Remove {
-        /// Instance to remove; its source branch is kept
+        /// Instance to remove
         name: String,
         /// Also discard its checkpoints, giving up undo to reclaim what they
         /// pin; the revs come back on the next `newgit cleanup`
         #[arg(long)]
         purge: bool,
+        /// Keep the source branch even when it holds nothing unique
+        #[arg(long, conflicts_with = "delete_branch")]
+        keep_branch: bool,
+        /// Delete the source branch even when its commits are on no other
+        /// branch; removal prints the tip to recover it from
+        #[arg(long)]
+        delete_branch: bool,
     },
     /// Manage tracker definitions and content
     Tracker {
@@ -296,7 +308,21 @@ fn main() -> Result<()> {
         Command::Init(args) => init(args),
         Command::Spawn(args) => spawn(args),
         Command::Status { name, path } => status(name.as_deref(), path),
-        Command::Remove { name, purge } => remove(&name, purge),
+        Command::Remove {
+            name,
+            purge,
+            keep_branch,
+            delete_branch,
+        } => {
+            let source_branch = if keep_branch {
+                SourceBranchPolicy::Keep
+            } else if delete_branch {
+                SourceBranchPolicy::Delete
+            } else {
+                SourceBranchPolicy::Auto
+            };
+            remove(&name, purge, source_branch)
+        }
         Command::Tracker { command } => tracker(command),
         Command::Resource { command } => resource(command),
         Command::Run(args) => run(args),
@@ -2007,14 +2033,14 @@ fn print_warnings(warnings: &[String]) {
     }
 }
 
-fn remove(name: &str, purge: bool) -> Result<()> {
+fn remove(name: &str, purge: bool, source_branch: SourceBranchPolicy) -> Result<()> {
     let manager = manager_here()?;
     let checkpoints = if purge {
         ArchivedCheckpoints::Purge
     } else {
         ArchivedCheckpoints::Keep
     };
-    let outcome = manager.remove(name, &current_dir()?, checkpoints)?;
+    let outcome = manager.remove(name, &current_dir()?, checkpoints, source_branch)?;
 
     println!("Removed branch instance `{}`", outcome.branch.name);
     for hook in &outcome.hooks {
@@ -2041,11 +2067,55 @@ fn remove(name: &str, purge: bool) -> Result<()> {
         ),
         None => {}
     }
-    println!(
-        "  source branch `{}` kept in the store; delete with `git branch -D {}` if unwanted",
-        outcome.branch.source_ref, outcome.branch.source_ref
-    );
+    println!("  branch:    {}", source_branch_line(&outcome));
     Ok(())
+}
+
+/// One line on what happened to the source branch, and always the reason —
+/// the reader should never have to go and look to learn which case applied.
+fn source_branch_line(outcome: &RemoveOutcome) -> String {
+    let name = &outcome.branch.source_ref;
+    let delete_hint = format!("delete with `git branch -D {name}` if unwanted");
+    match &outcome.source_branch {
+        SourceBranchOutcome::Missing => format!("`{name}` was already gone from the store"),
+        SourceBranchOutcome::Deleted {
+            tip,
+            found_on: Some(found_on),
+        } => format!(
+            "`{name}` deleted (was {}; nothing unique — its tip is on {found_on})",
+            short_rev(tip)
+        ),
+        SourceBranchOutcome::Deleted {
+            tip,
+            found_on: None,
+        } => {
+            // Forced past commits that are on no other branch. Say exactly
+            // how to get them back, and for how long that works.
+            let pinned = if outcome.kept_checkpoints > 0 {
+                "this instance's checkpoints still pin them"
+            } else {
+                "only until the store's next `git gc` prunes them"
+            };
+            format!(
+                "`{name}` deleted at {} (--delete-branch); its commits were on no other branch. \
+                 Recover with `git branch {name} {tip}` — {pinned}",
+                short_rev(tip)
+            )
+        }
+        SourceBranchOutcome::Kept(KeptBranch::Asked) => format!("`{name}` kept (--keep-branch)"),
+        SourceBranchOutcome::Kept(KeptBranch::Adopted) => format!(
+            "`{name}` kept: it existed before `newgit spawn`, so it is not newgit's to delete; \
+             {delete_hint}"
+        ),
+        SourceBranchOutcome::Kept(KeptBranch::CheckedOut(path)) => {
+            format!("`{name}` kept: it is checked out at {path}")
+        }
+        SourceBranchOutcome::Kept(KeptBranch::Unique { tip }) => format!(
+            "`{name}` kept: its tip {} is on no other branch, tag, or remote, so deleting it \
+             could lose work; {delete_hint}",
+            short_rev(tip)
+        ),
+    }
 }
 
 fn bind_line(outcome: &TrackerBindOutcome, deposit_only: bool) -> String {

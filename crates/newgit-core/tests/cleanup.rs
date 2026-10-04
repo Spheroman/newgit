@@ -3,7 +3,7 @@ use std::process::Command;
 use camino::{Utf8Path, Utf8PathBuf};
 use newgit_core::SourceSubstrate;
 use newgit_core::cleanup::{ArchivedCheckpoints, HookDetail, SnapshotRoots};
-use newgit_core::manager::{BranchManager, UndoOptions};
+use newgit_core::manager::{BranchManager, SourceBranchPolicy, UndoOptions};
 use newgit_core::resource::Ownership;
 use newgit_core::store::MetadataStore;
 use newgit_core::tracker::Storage;
@@ -103,7 +103,12 @@ command = "echo store-WRONGLY-TORN-DOWN >> {witness}/order.txt"
     let manager = manager_at(&store);
     manager.spawn("feature-a", None).expect("spawn");
     let outcome = manager
-        .remove("feature-a", &temp, ArchivedCheckpoints::Keep)
+        .remove(
+            "feature-a",
+            &temp,
+            ArchivedCheckpoints::Keep,
+            SourceBranchPolicy::Auto,
+        )
         .expect("remove");
 
     let db = outcome
@@ -185,7 +190,12 @@ command = "echo web >> {witness}/order.txt"
     );
 
     manager
-        .remove("feature-a", &temp, ArchivedCheckpoints::Keep)
+        .remove(
+            "feature-a",
+            &temp,
+            ArchivedCheckpoints::Keep,
+            SourceBranchPolicy::Auto,
+        )
         .expect("remove");
 
     // Teardown ignored the data edge entirely: reversing the *lifecycle*
@@ -228,7 +238,12 @@ command = "pwd"
     // a file it wrote inside the (about to be deleted) workspace would not
     // survive to be checked anyway.
     let outcome = manager
-        .remove("feature-a", &temp, ArchivedCheckpoints::Keep)
+        .remove(
+            "feature-a",
+            &temp,
+            ArchivedCheckpoints::Keep,
+            SourceBranchPolicy::Auto,
+        )
         .expect("remove");
     let db = outcome
         .hooks
@@ -274,7 +289,12 @@ command = "echo deleting {{{{state_ref}}}} >> {witness}/deleted.txt"
     let manager = manager_at(&store);
     manager.spawn("feature-a", None).expect("spawn");
     let outcome = manager
-        .remove("feature-a", &temp, ArchivedCheckpoints::Keep)
+        .remove(
+            "feature-a",
+            &temp,
+            ArchivedCheckpoints::Keep,
+            SourceBranchPolicy::Auto,
+        )
         .expect("remove");
 
     let hook = outcome
@@ -340,7 +360,12 @@ command = "echo {{{{state_ref}}}} >> {witness}/deleted.txt"
     );
 
     manager
-        .remove("feature-a", &temp, ArchivedCheckpoints::Keep)
+        .remove(
+            "feature-a",
+            &temp,
+            ArchivedCheckpoints::Keep,
+            SourceBranchPolicy::Auto,
+        )
         .expect("remove");
     assert_eq!(
         std::fs::read_to_string(witness.join("deleted.txt")).expect("read"),
@@ -416,7 +441,12 @@ command = "echo deleting {{{{state_ref}}}} >> {witness}/deleted.txt"
 
     let manager = manager_at(&store);
     let outcome = manager
-        .remove("feature-a", &temp, ArchivedCheckpoints::Keep)
+        .remove(
+            "feature-a",
+            &temp,
+            ArchivedCheckpoints::Keep,
+            SourceBranchPolicy::Auto,
+        )
         .expect("remove");
     let hook = outcome
         .hooks
@@ -723,7 +753,12 @@ fn purging_an_archived_instance_releases_what_its_checkpoints_pinned() {
         .expect("recapture");
 
     manager
-        .remove("throwaway", &temp, ArchivedCheckpoints::Keep)
+        .remove(
+            "throwaway",
+            &temp,
+            ArchivedCheckpoints::Keep,
+            SourceBranchPolicy::Auto,
+        )
         .expect("remove");
 
     let lane = store.paths().snapshots.join("env");
@@ -804,7 +839,12 @@ fn remove_purge_drops_the_instance_history_in_one_step() {
     manager.checkpoint("throwaway", None).expect("checkpoint");
 
     let outcome = manager
-        .remove("throwaway", &temp, ArchivedCheckpoints::Purge)
+        .remove(
+            "throwaway",
+            &temp,
+            ArchivedCheckpoints::Purge,
+            SourceBranchPolicy::Auto,
+        )
         .expect("remove --purge");
     let purged = outcome.purged_checkpoints.expect("purged");
     assert_eq!(purged.checkpoints, 1);
@@ -832,7 +872,12 @@ fn remove_reports_the_history_it_keeps() {
     manager.checkpoint("feature-a", None).expect("checkpoint");
 
     let outcome = manager
-        .remove("feature-a", &temp, ArchivedCheckpoints::Keep)
+        .remove(
+            "feature-a",
+            &temp,
+            ArchivedCheckpoints::Keep,
+            SourceBranchPolicy::Auto,
+        )
         .expect("remove");
     assert!(outcome.purged_checkpoints.is_none());
     assert_eq!(outcome.kept_checkpoints, 1);

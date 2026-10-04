@@ -1402,6 +1402,54 @@ record. Workspaces are disposable; this is the command that proves it, and it
 belongs in Milestone 1 — the two-branch success criterion is not really
 testable without teardown.
 
+#### The Source Branch
+
+`remove` deletes the source branch too when it holds nothing unique, and
+otherwise keeps it and says which reason applied. The branch goes only when
+all of these hold:
+
+- **`spawn` created it.** A branch that already existed (`newgit spawn
+  develop`) was adopted, and stays the user's. The binding record carries
+  `created_source_branch` for exactly this.
+- **Nothing has it checked out** in the store, in its main checkout or any
+  `git worktree` — deleting it would leave that checkout on an unborn
+  branch.
+- **Its tip is on some other ref**: another local branch (merged, or the
+  instance never committed), a remote-tracking ref, a tag, or a branch the
+  real remote had as of the last workspace `git push`. That last one is read
+  from the outbox, because a push from a workspace never updates the store's
+  own `refs/remotes`. newgit's checkpoint refs do not count: they are undo
+  history, not a place anyone looks for their work.
+
+`--keep-branch` keeps it regardless; `--delete-branch` deletes it
+regardless, and then prints the tip and the `git branch <name> <tip>` that
+brings it back. A `--delete-branch` that cannot be honoured (the branch is
+checked out) refuses before anything is torn down, not after.
+
+The default deletes because the alternative inverted the asymmetry: removal
+already destroys the workspace and every resource it can tear down, and the
+branch is the one artifact that is both cheap to keep and certain to change
+the next `spawn` of the same name — which silently adopts a leftover branch
+instead of starting from `HEAD`. Deleting nothing unique cannot lose work,
+and the checks run against what Git can prove, not a guess at intent. A
+squash-merged branch whose remote branch was then deleted looks unique and
+is kept — the safe miss, named in the output with the command to finish
+the job.
+
+Deleting the branch breaks no undo and no archived record. A checkpoint
+pins its source commits through `refs/newgit/checkpoints/<slug>/*`, not the
+branch, and `undo` re-points the branch from the checkpoint; a re-spawned
+instance of the same name recreates it. The archived record only names the
+branch. What `remove` does not protect is work in the workspace since its
+last checkpoint, branch or no branch — that is the workspace being
+disposable, and is unchanged.
+
+`newgit cleanup`, when it finalizes an instance whose workspace is gone,
+leaves the source branch alone: a garbage collector deleting branches is a
+surprise in a way that an explicit `remove` is not.
+
+#### Checkpoints
+
 Checkpoints outlive removal: they pin the tracker revs their undo would need,
 and newgit never breaks an undo on its own initiative. That leaves retained
 disk for an instance nobody can undo any more, so removal reports how many

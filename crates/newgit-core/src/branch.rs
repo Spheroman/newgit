@@ -29,6 +29,12 @@ pub struct BranchInstance {
     /// `base_ref`'s tip at the moment this instance was spawned.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_rev: Option<String>,
+    /// Whether `spawn` created `source_ref` rather than adopting a branch
+    /// that already existed. `remove` only ever deletes a branch newgit
+    /// made: an adopted branch (`newgit spawn develop`) was the user's before
+    /// this instance and stays theirs after it.
+    #[serde(default)]
+    pub created_source_branch: bool,
     pub workspace_path: Utf8PathBuf,
     pub status: InstanceStatus,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -115,6 +121,7 @@ impl BranchInstance {
             source_rev: source_rev.into(),
             base_ref: None,
             base_rev: None,
+            created_source_branch: false,
             workspace_path,
             status: InstanceStatus::Active,
             trackers: BTreeMap::new(),

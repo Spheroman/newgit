@@ -5,7 +5,7 @@ use newgit_core::branch::ResourceStatus;
 use newgit_core::cleanup::ArchivedCheckpoints;
 use newgit_core::config::WorkspaceSection;
 use newgit_core::installs::{CopyMethod, InstallReport};
-use newgit_core::manager::{ActionOutcome, BranchManager};
+use newgit_core::manager::{ActionOutcome, BranchManager, SourceBranchPolicy};
 use newgit_core::store::MetadataStore;
 use newgit_core::supervisor::StopOutcome;
 use newgit_core::tracker::Storage;
@@ -529,7 +529,12 @@ fn remove_stops_running_processes() {
     };
 
     manager
-        .remove("feature-a", &temp, ArchivedCheckpoints::Keep)
+        .remove(
+            "feature-a",
+            &temp,
+            ArchivedCheckpoints::Keep,
+            SourceBranchPolicy::Auto,
+        )
         .expect("remove");
 
     // The process group is gone.
@@ -1730,7 +1735,12 @@ command = "mkdir -p node_modules && echo built > node_modules/marker"
 
     // Retire the instance holding the old key, and it becomes unreachable.
     manager
-        .remove("one", &repo, ArchivedCheckpoints::Keep)
+        .remove(
+            "one",
+            &repo,
+            ArchivedCheckpoints::Keep,
+            SourceBranchPolicy::Auto,
+        )
         .expect("remove one");
     let outcome = manager
         .cleanup(false, ArchivedCheckpoints::Keep)

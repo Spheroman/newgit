@@ -3,7 +3,7 @@ use std::process::Command;
 use camino::{Utf8Path, Utf8PathBuf};
 use newgit_core::cleanup::ArchivedCheckpoints;
 use newgit_core::config::WorkspaceSection;
-use newgit_core::manager::{BindOrigin, BranchManager, UndoOptions};
+use newgit_core::manager::{BindOrigin, BranchManager, SourceBranchPolicy, UndoOptions};
 use newgit_core::store::MetadataStore;
 use newgit_core::tracker::Storage;
 use newgit_core::{NewgitError, SourceSubstrate};
@@ -631,8 +631,13 @@ fn remove_tracker_reverses_the_definition_and_gitignore_and_leaves_snapshots_for
 
     // Not removable while the instance is still bound to it.
     assert!(m.remove_tracker("runtime-env").is_err());
-    m.remove("feature-a", &repo, ArchivedCheckpoints::Keep)
-        .expect("remove instance");
+    m.remove(
+        "feature-a",
+        &repo,
+        ArchivedCheckpoints::Keep,
+        SourceBranchPolicy::Auto,
+    )
+    .expect("remove instance");
 
     let definition_path = m.tracker_definitions()[0].name.clone();
     assert_eq!(definition_path, "runtime-env");
