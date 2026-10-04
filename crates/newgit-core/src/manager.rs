@@ -13,8 +13,10 @@ use crate::checkpoint::{
 use crate::cleanup::{
     ArchivedCheckpoints, CleanupOutcome, FinalizedInstance, HookDetail, HookOutcome, PrunedInstall,
     PrunedRev, PurgedCheckpoints, SnapshotRoots, lane_revs, may_tear_down, orphan_workspaces,
+    parse_tracker_state_ref,
 };
 use crate::config::ProjectConfig;
+use crate::deposit_diff::{DepositDiff, diff_deposits};
 use crate::error::{NewgitError, Result};
 use crate::export::{self, ExportFilter, ExportPlan, prepare_destination};
 use crate::exports::{RenderContext, render, unresolved_placeholder};
@@ -540,6 +542,34 @@ pub struct VerifyResource {
     pub before_state_ref: Option<String>,
     pub after_state_ref: Option<String>,
     pub agree: bool,
+    /// On an exercised mismatch only: which half of the round trip broke.
+    pub cause: Option<MismatchCause>,
+    /// On a mismatch between two `into_tracker` deposits only: what differs
+    /// between them, and where both live.
+    pub diff: Option<std::result::Result<DepositDiff, String>>,
+}
+
+/// Why `before` and `after` disagree. A mismatch has two opposite fixes —
+/// a `[restore]` that lands on the wrong state, or a `[checkpoint]` that
+/// never produces the same ref twice — and the two refs alone cannot say
+/// which. A control checkpoint can: the resource checkpointed once more
+/// straight after `after`, with nothing restored in between. Either way the
+/// verify still fails; this is evidence for the person fixing it, never a
+/// reason to call a mismatch verified.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MismatchCause {
+    /// The restore command itself failed during the undo, so of course the
+    /// state moved. No control was taken.
+    RestoreFailed,
+    /// The control reproduced `after`: the checkpoint is stable, so the
+    /// restore landed on a different state than the one checkpointed.
+    RestoreLandedElsewhere,
+    /// The control differed from `after` with nothing restored between
+    /// them: the checkpoint command does not produce the same ref for the
+    /// same state, so this run could not judge the restore at all.
+    CheckpointUnstable { control_state_ref: Option<String> },
+    /// The control checkpoint could not be taken.
+    ControlFailed(String),
 }
 
 /// What this undo knows about a resource beyond the checkpoint being
@@ -3638,26 +3668,39 @@ impl BranchManager {
             CheckpointReason::Explicit,
         )?;
 
-        let resources = before
-            .record
-            .resource_states
-            .iter()
-            .map(|before_state| {
-                let after_ref = after
-                    .record
-                    .resource_states
-                    .iter()
-                    .find(|state| state.name == before_state.name)
-                    .and_then(|state| state.state_ref.clone());
-                VerifyResource {
-                    name: before_state.name.clone(),
-                    exercised: before_state.restore_exercisable,
-                    before_state_ref: before_state.state_ref.clone(),
-                    after_state_ref: after_ref.clone(),
-                    agree: before_state.state_ref == after_ref,
+        let failed_restores = undo.failed_resources();
+        let mut resources = Vec::new();
+        for before_state in &before.record.resource_states {
+            let after_ref = after
+                .record
+                .resource_states
+                .iter()
+                .find(|state| state.name == before_state.name)
+                .and_then(|state| state.state_ref.clone());
+            let agree = before_state.state_ref == after_ref;
+            let mismatch = before_state.restore_exercisable && !agree;
+            let cause = mismatch.then(|| {
+                if failed_restores.contains(&before_state.name.as_str()) {
+                    MismatchCause::RestoreFailed
+                } else {
+                    self.control_checkpoint(&branch, &before_state.name, after_ref.as_deref())
                 }
-            })
-            .collect();
+            });
+            let diff = if mismatch {
+                self.deposit_diff(before_state.state_ref.as_deref(), after_ref.as_deref())
+            } else {
+                None
+            };
+            resources.push(VerifyResource {
+                name: before_state.name.clone(),
+                exercised: before_state.restore_exercisable,
+                before_state_ref: before_state.state_ref.clone(),
+                after_state_ref: after_ref,
+                agree,
+                cause,
+                diff,
+            });
+        }
 
         Ok(VerifyOutcome {
             before: before.record,
@@ -3665,6 +3708,52 @@ impl BranchManager {
             after: after.record,
             resources,
         })
+    }
+
+    /// Checkpoint one resource again, right after verify's `after`, and say
+    /// whether it reproduced `after`. Only this resource, and only on a
+    /// mismatch: a verify that agrees never pays for it, and a mismatch is
+    /// already a failure worth one more `pg_dump` to explain. Not recorded as
+    /// a checkpoint — it is a measurement, and a third record in the log
+    /// would be one nobody asked to return to. A deposit it makes is left
+    /// unreferenced for `cleanup` to reclaim.
+    fn control_checkpoint(
+        &self,
+        branch: &BranchInstance,
+        name: &str,
+        after_ref: Option<&str>,
+    ) -> MismatchCause {
+        let control = self
+            .resource_definition(name)
+            .and_then(|definition| self.checkpoint_resource(branch, definition));
+        match control {
+            Ok(control) if control.state_ref.as_deref() == after_ref => {
+                MismatchCause::RestoreLandedElsewhere
+            }
+            Ok(control) => MismatchCause::CheckpointUnstable {
+                control_state_ref: control.state_ref,
+            },
+            Err(error) => MismatchCause::ControlFailed(error.to_string()),
+        }
+    }
+
+    /// The line-level difference between two `tracker:<name>@<rev>` deposits,
+    /// or `None` when either ref is not a deposit (an opaque command ref or a
+    /// hash is all the content there is).
+    fn deposit_diff(
+        &self,
+        before_ref: Option<&str>,
+        after_ref: Option<&str>,
+    ) -> Option<std::result::Result<DepositDiff, String>> {
+        let (before_lane, before_rev) = parse_tracker_state_ref(before_ref?)?;
+        let (after_lane, after_rev) = parse_tracker_state_ref(after_ref?)?;
+        Some(
+            diff_deposits(
+                &self.lane(before_lane).rev_path(before_rev),
+                &self.lane(after_lane).rev_path(after_rev),
+            )
+            .map_err(|error| error.to_string()),
+        )
     }
 
     fn checkpoint_branch(

@@ -294,6 +294,16 @@ What this resource records when `newgit checkpoint` runs.
 | `command` | the command's stdout, plus optionally a lane deposit | a database dump |
 | `external` | a rendered handle | a cloud preview, a tunnel |
 
+**A `command` checkpoint should produce the same bytes for the same state.**
+The state ref is how `newgit checkpoint --verify` tells whether a restore
+landed where it started, so a command that stamps each run differently makes
+every verify fail. Common dump tools do this by default: `pg_dump` since
+17.6 (and the matching back-branch releases) opens and closes every dump with
+`\restrict <token>` / `\unrestrict <token>`, a fresh random token per run —
+including the bundled Postgres templates' checkpoints. Timestamps and
+`-- Dumped at` headers do the same. `--verify` names this case when it
+happens rather than blaming `[restore]`; it does not paper over it.
+
 ### `[restore]`
 
 What `newgit undo` does with that record.
@@ -371,8 +381,32 @@ clears it, and it stays cleared even if a later restore fails: the claim is
 real rollback: checkpoint, `undo` back to that checkpoint, checkpoint
 again, and diff the two runs' resource state refs. Agreement is a stronger
 claim than "the command exited 0" — a restore can exit clean and still
-land on the wrong state, which `--verify` is what catches. It is
-destructive (a real `undo`, stopping and restarting whatever the instance's
+land on the wrong state, which `--verify` is what catches.
+
+A mismatch has two opposite fixes, and `--verify` says which one it saw.
+It checkpoints the mismatched resource once more, straight after the
+second checkpoint with nothing restored in between: if that reproduces the
+second ref, the checkpoint is stable and `[restore]` landed somewhere else;
+if it does not, `[checkpoint]` is not deterministic and this run could not
+judge the restore at all. A restore that failed outright is named as such
+without the extra run. Either way the verify still fails — this is evidence
+for whoever fixes it, never a reason to call a mismatch verified. The extra
+checkpoint is paid only on a mismatch, and only for that resource.
+
+When both refs are `into_tracker` deposits, it also shows what differs —
+each file, its changed line counts, the first few changed lines — and the
+`git diff --no-index` command over both snapshot directories for the rest:
+
+```
+resource: db MISMATCH  before: tracker:db-snapshots@a71acd9dcafa  after: tracker:db-snapshots@f5b2685a1347
+          cause: [checkpoint] is not deterministic — checkpointed again with nothing restored in between, it gave tracker:db-snapshots@00f1294c80fb, not `after`. ...
+          db.sql: -1 +1 lines (of 3300)
+            -\restrict 2be4c53b4f2cecc23d7a7e7c01272f7e
+            +\restrict 113121fbb8e948b29a0d2b496760c3a2
+          full diff: git diff --no-index .newgit/snapshots/db-snapshots/a71acd9dcafa .newgit/snapshots/db-snapshots/f5b2685a1347
+```
+
+It is destructive (a real `undo`, stopping and restarting whatever the instance's
 resources run) and prints what it is about to do before doing it; run it
 against an instance you can afford to spend, not one you are mid-task on.
 

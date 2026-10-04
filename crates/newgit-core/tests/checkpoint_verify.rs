@@ -212,16 +212,16 @@ fn verify_proves_a_restore_whose_state_ref_reproduces() {
     assert!(checked.record.resource_states[0].restore_proven);
 }
 
-/// A checkpoint whose state ref is never the same twice — standing in for a
-/// restore that runs (and exits 0) but leaves the resource in a different
-/// state than the checkpoint recorded. This is the case `--verify` exists
-/// to catch: `date` moves regardless of what `[restore]` did, the same way
-/// a real resource's state can drift even though its restore "succeeded".
+/// A checkpoint whose state ref is never the same twice: `$$`, the shell's
+/// pid, is new on every run regardless of what `[restore]` did. (Not `date
+/// +%s%N` — BSD `date` has no `%N`, so on macOS it moves once a second.)
+/// Which half of the round trip that blames is `verify_mismatch_cause.rs`;
+/// this only pins that a mismatch fails the verify.
 const DRIFTING_COMMAND_RESOURCE: &str = r#"ownership = "branch"
 
 [checkpoint]
 mode = "command"
-command = "date +%s%N"
+command = "echo state-$$"
 
 [restore]
 mode = "command"
@@ -244,7 +244,7 @@ fn verify_reports_a_mismatch_when_state_refs_disagree() {
     assert!(resource.exercised);
     assert!(
         !resource.agree,
-        "the clock moves between the two checkpoints, so before != after"
+        "the pid differs between the two checkpoints, so before != after"
     );
     assert!(
         !outcome.is_proven(),

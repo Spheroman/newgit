@@ -4,12 +4,14 @@ use clap::{Args, Parser, Subcommand};
 use newgit_core::branch::branch_slug;
 use newgit_core::checkpoint::CheckpointReason;
 use newgit_core::cleanup::{ArchivedCheckpoints, HookDetail, HookOutcome};
+use newgit_core::deposit_diff::{DepositDiff, FileChange};
 use newgit_core::export::{ExportFilter, Reason};
 use newgit_core::exports::unresolved_placeholder;
 use newgit_core::installs::InstallReport;
 use newgit_core::manager::{
     ActionOutcome, ActionPlan, BaseReport, BindOrigin, BranchManager, InstanceReport, KeptBranch,
-    RemoveOutcome, SourceBranchOutcome, SourceBranchPolicy, TrackerBindOutcome, UndoOptions,
+    MismatchCause, RemoveOutcome, SourceBranchOutcome, SourceBranchPolicy, TrackerBindOutcome,
+    UndoOptions, VerifyResource,
 };
 use newgit_core::resource::{CheckpointMode, ResourceDefinition};
 use newgit_core::source::{RefUpdate, find_repo_root};
@@ -1596,17 +1598,77 @@ fn checkpoint_verify(instance: Option<String>, message: Option<&str>) -> Result<
             resource.before_state_ref.as_deref().unwrap_or("—"),
             resource.after_state_ref.as_deref().unwrap_or("—"),
         );
+        print_mismatch_evidence(resource);
     }
     if outcome.is_proven() {
         println!("Verified: `{instance}`'s restore ran cleanly and every state ref agreed.");
     } else {
         println!(
-            "NOT verified: `{instance}`'s restore either failed or landed on a different state \
-             ref. See the resource lines above, and the recovery record if one was written."
+            "NOT verified: `{instance}`'s restore was not shown to land on the state it started \
+             from. Each MISMATCH above says whether to fix `[restore]` or `[checkpoint]`; see \
+             also the recovery record if one was written."
         );
         std::process::exit(1);
     }
     Ok(())
+}
+
+/// Under a MISMATCH line: which half of the round trip to fix, and — for
+/// deposited content — what actually differs and where both copies are.
+fn print_mismatch_evidence(resource: &VerifyResource) {
+    let indent = "            ";
+    match &resource.cause {
+        None => {}
+        Some(MismatchCause::RestoreFailed) => {
+            println!("{indent}cause: its [restore] command failed; fix [restore]");
+        }
+        Some(MismatchCause::RestoreLandedElsewhere) => println!(
+            "{indent}cause: [restore] — checkpointed again with nothing restored in between, \
+             it reproduced `after`: the checkpoint is stable, so the restore landed on a \
+             different state"
+        ),
+        Some(MismatchCause::CheckpointUnstable { control_state_ref }) => println!(
+            "{indent}cause: [checkpoint] is not deterministic — checkpointed again with nothing \
+             restored in between, it gave {}, not `after`. This run could not judge [restore]; \
+             make [checkpoint] produce the same bytes for the same state, then verify again",
+            control_state_ref.as_deref().unwrap_or("no ref")
+        ),
+        Some(MismatchCause::ControlFailed(error)) => println!(
+            "{indent}cause: unknown — the control checkpoint that would tell [restore] from \
+             [checkpoint] failed: {error}"
+        ),
+    }
+    match &resource.diff {
+        None => {}
+        Some(Err(error)) => println!("{indent}could not diff the two deposits: {error}"),
+        Some(Ok(diff)) => print_deposit_diff(diff, indent),
+    }
+}
+
+fn print_deposit_diff(diff: &DepositDiff, indent: &str) {
+    for file in &diff.files {
+        let change = match file.change {
+            FileChange::OnlyBefore => "only in before".to_owned(),
+            FileChange::OnlyAfter => "only in after".to_owned(),
+            FileChange::Binary => "binary, differs".to_owned(),
+            FileChange::Text {
+                removed,
+                added,
+                lines_before,
+            } => format!("-{removed} +{added} lines (of {lines_before})"),
+        };
+        println!("{indent}{}: {change}", file.path);
+    }
+    if diff.more_files > 0 {
+        println!("{indent}… and {} more files", diff.more_files);
+    }
+    for line in &diff.excerpt {
+        println!("{indent}  {line}");
+    }
+    if diff.excerpt_omitted > 0 {
+        println!("{indent}  … {} more changed lines", diff.excerpt_omitted);
+    }
+    println!("{indent}full diff: {}", diff.full_diff_command());
 }
 
 fn undo(instance: Option<String>, options: UndoOptions) -> Result<()> {

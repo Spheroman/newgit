@@ -1348,7 +1348,24 @@ resource state refs. Agreement across every resource whose restore could
 fail is what "verified" means; disagreement is reported even when every
 restore command exited `0`, because exiting `0` and reproducing the
 checkpointed state are different claims — the whole reason a byte-level
-comparison is worth running at all. Destructive and expensive on purpose:
+comparison is worth running at all.
+
+A mismatch is never called verified, but it is explained. Its two causes
+need opposite fixes — a `[restore]` that lands on the wrong state, or a
+`[checkpoint]` that never produces the same ref twice (`pg_dump`'s
+per-run `\restrict` token) — and two refs alone cannot tell them apart. So
+for each exercised resource that disagrees, verify runs that resource's
+checkpoint once more with nothing restored in between (a *control*, not
+recorded as a checkpoint; any deposit it makes is left for `cleanup`): a
+control that reproduces the second ref blames `[restore]`, one that does
+not blames `[checkpoint]`. A restore that failed outright skips the control.
+The cost — one more checkpoint command, possibly a slow dump — is paid only
+on a mismatch, which is already a failure. Where both refs are deposits, it
+also diffs the two snapshot directories (`git diff --no-index`, bounded to
+the changed files, line counts, and a few changed lines) and prints the
+command for the full diff.
+
+Destructive and expensive on purpose:
 it is a real `undo`, stopping and restarting whatever the instance's
 resources run, so it is a separate, explicitly named command rather than
 something `checkpoint` runs on its own, and it prints what it is about to
