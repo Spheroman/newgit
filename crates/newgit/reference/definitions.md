@@ -252,7 +252,8 @@ clean pass.
 
 **Actions are not lifecycle hooks.** Only `prepare` runs on its own — at
 `spawn`, and again for a `recompute` restore. Every other action is something
-you invoke: `newgit action <resource>.<action> [instance]`.
+you invoke: `newgit action <resource>.<action> [instance]`. Add `--dry-run`
+to print the rendered command and its directory without running it.
 
 **`stop` is the one name newgit reads.** Names are otherwise inert —
 `start` is pure convention, made real by `long_running` and not by the name —
@@ -888,6 +889,26 @@ it did not receive that variable it would fall back to whatever its committed
 default names — usually the developer's shared local database — and destroy
 the wrong state, quietly and plausibly. Every variable a `[restore]` needs is
 there.
+
+`newgit env [instance]` prints it, one `NAME=value` line per variable with
+the declaration it came from, so a destructive hook's inputs can be read
+instead of discovered by running it:
+
+```
+DB_PORT=5434                            # db [ports.pg]
+DB_TOKEN=tok_123                        # db [actions.mint] captures
+DATABASE_URL=postgres://...:5434/feat-x # db [exports]
+NEWGIT_BRANCH=feature/x                 # newgit
+NEWGIT_WORKSPACE=/Users/.../feature-x   # newgit
+```
+
+It is the same assembly the hooks use, not a reconstruction of it, and it is
+valid shell (`eval "$(newgit env)"`). Values are printed verbatim: a
+credential a resource exports appears in plain text, exactly as a hook
+receives it. What it leaves out is the environment of whoever runs newgit,
+which every command inherits underneath these variables. The command itself
+— the other half of "what is this about to do" — is `newgit action
+<resource>.<action> --dry-run`.
 
 Note that this is the opposite shape to `{{...}}` substitution, where scope
 genuinely differs per site (see *Template variables*). The environment does

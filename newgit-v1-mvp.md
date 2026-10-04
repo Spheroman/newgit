@@ -1178,6 +1178,38 @@ the terminal.
 newgit run feature-a -- pnpm test
 ```
 
+### `newgit env [instance]`
+
+Prints the environment `newgit run` and every hook — actions,
+`key_command`, `[checkpoint]`, `[restore]`, `[cleanup]` — get, one
+`NAME=value  # <declaration>` line per variable:
+
+```
+DB_PORT=5434                            # db [ports.pg]
+DATABASE_URL=postgres://...:5434/feat-x # db [exports]
+NEWGIT_BRANCH=feature/x                 # newgit
+```
+
+The question it answers — "which database does this hook talk to?" — used
+to be answerable only by firing the hook. It prints the output of the one
+assembly every command uses, with each variable's origin carried through,
+rather than a second computation that could drift from it. The single-owner
+rule is what makes the label honest: each name has exactly one declaration
+to name.
+
+It is one command and not a filter on `run` or `action` because the
+environment does not vary by resource: there is no `--resource` flag,
+since narrowing the listing to one resource's declarations would hide
+variables that resource's hooks receive. The output is valid shell, so `eval
+"$(newgit env)"` reproduces it.
+
+Values are printed verbatim, credentials included — the same values `newgit
+run -- env` would show. Redacting here would be simulated security: anything
+that can run `newgit env` can run a hook that echoes the value. The help text
+says so, rather than letting someone learn it from a pasted log. The
+inherited environment of the caller, which every command gets underneath, is
+not printed.
+
 Template variables available in exports and action commands are kept
 minimal: `{{ports.<name>}}`, `{{branch.name}}`, `{{branch.slug}}`,
 `{{workspace}}`, `{{scripts}}`. Checkpoint and restore commands additionally
@@ -1240,6 +1272,27 @@ the process starts detached in its own process group with output to a log
 file under `.newgit/logs/`, the PID is recorded in `.newgit/state/`, `stop`
 sends the action's configured signal (default TERM) to the group, and
 `status` checks liveness. No daemon, no restart policy — boring.
+
+`--dry-run` prints what would happen and runs nothing: the rendered
+command, the directory it runs in, any `captures`, whether it would start
+supervised, or which signal a command-less action sends. It refuses for
+exactly the reasons a real run refuses (unknown action, missing workspace or
+`workdir`, a failed dependency), because it shares that resolution with the
+real run rather than repeating it. A `{{...}}` left in the rendered command
+is called out: rendering leaves unknown variables verbatim, which is right
+for `{{.Field}}` meant for another tool and wrong for a typo, and only the
+person reading it can tell which. The environment is `newgit env`'s, and is
+pointed to rather than repeated.
+
+`--dry-run` covers actions only, which is a known gap rather than a
+decision. The hooks are not actions — `newgit action db.cleanup` is not a
+thing a run can do, so a dry run must not pretend it is — and each one
+renders against state only its own command has: `[restore]` against the
+checkpoint being restored, `[cleanup]` against the latest checkpoint's
+`{{state_ref}}`. Their dry runs belong to `undo` and `remove`. Today only
+`newgit cleanup --dry-run` shows a rendered `[cleanup]`, and only for an
+instance whose workspace is already gone. Their *environment*, the half
+most likely to aim a hook at the wrong database, is `newgit env`'s already.
 
 Convenience shorthands can come later, but the primitive should be resource actions.
 
