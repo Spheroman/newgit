@@ -311,24 +311,41 @@ only by `newgit tracker merge <tracker>`.
 
 ## On the remote
 
-| Repo | Holds | Read | Write |
+**A branch is a list (decided).** A newgit branch names one commit per code
+tracker; `main` is the default branch, as on GitHub. A checkpoint is a frozen
+list and an instance is a list being worked on, so spawning starts an
+instance from a branch's list. Lists live in the project's Durable Object,
+and moving a branch is one write: every tracker moves together or none does.
+`newgit remote add` creates `main` from the project root's current list, its
+first publication; after that `main` moves only by `newgit merge` (step 5).
+`newgit branch create <name> [--from <instance>]` and `newgit branch default
+<name>` manage the rest. (A newgit branch is not the Git branches an agent
+makes inside one workspace.)
+
+| Repo (Artifacts) | Holds | Read | Write |
 |---|---|---|---|
-| `<p>.t.<tracker>` | a shared tracker's `main` | its audience | the merge executor |
-| `<p>.t.<tracker>.<login>` | a per-user tracker, all branches | that user | that user |
-| `<p>.i.<instance>.<tracker>` | an instance's branch of one shared tracker | members | the instance |
-| `<p>.composed` | the composed projection of every shared tracker's `main` | members | the merge executor |
+| `<owner>.<project>.t.<tracker>` | a code tracker's history | its audience | seeding, then merges |
+| `<owner>.<project>.i.<instance>.<tracker>` | an instance's branch of one code tracker, forked the first time the instance changes it | the tracker's audience | the instance |
+| `<owner>.<project>.t.<tracker>[.<login>]` | a secret tracker, as before | its audience | its audience |
 
-**Instance writes (decided).** Artifacts has no branch permissions, so an
-instance never writes a shared tracker's repo: it writes a fork of it, made
-**lazily** — only for trackers the instance actually changes, at first push.
-Most instances change one or two trackers, so most cost one or two forks.
-Per-user trackers are written directly; their repo is the user's own.
+No trunk repo, no composed repo, no whole-source fork per instance: spawning
+forks nothing.
 
-**`origin` (decided).** A workspace's `origin` fetches `<p>.composed`, so `git
-pull` shows trunk as one repository. Per-user content is never in it; the
-workspace composes the user's own on top.
+**The Git endpoint (decided).** `https://newgit.dev/<owner>/<project>.git` is
+an ordinary Git remote: `git clone` and `git pull` work with plain Git, no
+newgit installed. It advertises each newgit branch as `refs/heads/<branch>`.
+The Worker authenticates the caller and hands the request to the project's
+sandbox, which runs real `git` and the `newgit` binary: it fetches the
+tracker repos, composes the branch's list from the trackers *this caller*
+may read, and answers with `git upload-pack`. A workspace's `origin` fetches
+from it, so `git pull` shows `main`. Each person's view holds only what they
+may read, enforced by the server; nothing is pre-built, so nothing is
+rebuilt on merge. The sandbox snapshots its tracker repos and composed views
+after each fetch, so a cold start restores rather than re-clones. Read-only
+in step 3d: pushes go through a newgit workspace, which splits locally.
 
----
+Why a sandbox and not the Worker: a Worker cannot run Git, and composing in
+JavaScript would mean writing Git's object model ourselves.
 
 ## Git and GitHub
 
@@ -375,12 +392,16 @@ Each step lands alone and keeps the suite green.
      composing path arrives with `use`/`drop` in step 4); and split
      follows the first parent, so a merge *inside* the work being split is
      flattened (step 5, with merges).
-   - *3d — remote.* One Artifacts repo per code tracker (`<p>.t.root`
-     replaces `<p>.src`), forked lazily.
+   - *3d — remote. (Next.)* Branches as lists, one Artifacts repo per code
+     tracker, lazy per-tracker forks, the Git endpoint at
+     `newgit.dev/<owner>/<project>.git`, `newgit clone`. Starts with a spike:
+     a sandbox behind the Worker serving a composed clone, cold and warm.
 4. **Roles, priority, resources, use/drop.** Binding per slot; resources
    brought by trackers; role dependencies.
-5. **Coherent merges** locally and on the remote (lazy per-tracker forks,
-   ProjectDO-serialized all-or-nothing `main` moves, `<p>.composed`).
+5. **Coherent merges** locally and on the remote: `newgit merge` writes a
+   branch's new list in one step — per tracker, the instance's commit when
+   `main` has not moved, a real Git merge when both sides changed it —
+   with `--only` stacking checked against `requires`.
 6. **GitHub export.**
 
 Then the preview work in `newgit-cloudflare.md` continues on top: a preview's

@@ -313,9 +313,11 @@ code cannot read another's cookies or storage).
 > and a tracker is the unit audience is declared on.
 
 - `<p>.src` — trunk. Readable by every member. Source only — forks copy every
-  ref, so nothing goes here that a fork's owner may not read. *(Becomes
-  `<p>.t.root`, one repo per code tracker, in newgit-trackers.md step 3d;
-  this section describes what is deployed today.)*
+  ref, so nothing goes here that a fork's owner may not read. *(Replaced in
+  newgit-trackers.md step 3d: branches as lists, one repo per code tracker,
+  lazy per-tracker forks, and a Git endpoint at
+  `newgit.dev/<owner>/<project>.git`. This section describes what is
+  deployed today.)*
 - `<p>.i.<instance>` — forked from `<p>.src`, asynchronously, at spawn.
   Write tokens go **only** to the instance's owner. Deleted by `newgit remove`.
 - `<p>.t.<tracker>` / `<p>.t.<tracker>.<login>` — a tracker's lane and rev
