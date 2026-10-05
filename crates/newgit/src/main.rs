@@ -102,6 +102,17 @@ enum Command {
         #[arg(long)]
         force_recompute: bool,
     },
+    /// Show one tracker's history: an instance's branch (as of its last
+    /// checkpoint), or with no instance, the project root's. Arguments after
+    /// `--` go to `git log`
+    Log {
+        tracker: String,
+        /// Instance (inferred when run inside a workspace)
+        instance: Option<String>,
+        /// Extra `git log` arguments
+        #[arg(last = true)]
+        git_args: Vec<String>,
+    },
     /// List an instance's checkpoints
     Checkpoints {
         /// Instance (inferred when run inside a workspace)
@@ -241,12 +252,13 @@ enum TrackerCommand {
         tracker: String,
         /// Instance (inferred when run inside a workspace)
         instance: Option<String>,
-        /// Seed the lane from the store repo's working tree instead, and make
-        /// it the lane head — how you carry existing files into a new lane
+        /// Seed the tracker from the store repo's working tree instead, and
+        /// make that its `main` — how you carry existing files into a new
+        /// tracker
         #[arg(long, conflicts_with = "instance")]
         from_store: bool,
     },
-    /// Promote this instance's tracker revision to the lane head/default
+    /// Promote this instance's tracker revision to the tracker's `main`
     Merge {
         tracker: String,
         /// Instance (inferred when run inside a workspace)
@@ -261,7 +273,7 @@ enum TrackerCommand {
         #[arg(long)]
         rev: Option<String>,
     },
-    /// Pull the latest lane head into an existing tracker binding
+    /// Pull the tracker's `main` into an existing tracker binding
     Pull {
         tracker: String,
         /// Instance (inferred when run inside a workspace)
@@ -377,6 +389,11 @@ fn main() -> Result<()> {
                 force_recompute,
             },
         ),
+        Command::Log {
+            tracker,
+            instance,
+            git_args,
+        } => tracker_log(&tracker, instance, &git_args),
         Command::Checkpoints { instance } => checkpoints(instance),
         Command::Export(args) => export(args),
         Command::Cleanup {
@@ -709,6 +726,7 @@ fn spawn(args: SpawnArgs) -> Result<()> {
                 "source_rev": outcome.branch.source_rev,
                 "remote": outcome.branch.remote.as_ref().map(|remote| &remote.repo),
                 "remote_warning": outcome.remote_warning,
+                "projection_warning": outcome.projection_warning,
             })
         );
         return Ok(());
@@ -732,6 +750,9 @@ fn spawn(args: SpawnArgs) -> Result<()> {
     );
     println!("  workspace: {}", branch.workspace_path);
     println!("  record:    {}", outcome.record_path);
+    if let Some(warning) = &outcome.projection_warning {
+        println!("  trackers:  the project root's commits were not split ({warning})");
+    }
     // The workspace's `origin` is the store, a local path. An agent reaching
     // for `git push` should know before it does where that push will go.
     match (&branch.remote, &outcome.remote_warning) {
@@ -1209,7 +1230,7 @@ fn tracker(command: TrackerCommand) -> Result<()> {
             }
             if outcome.seedable {
                 println!(
-                    "  seed the lane from what is already here: \
+                    "  seed it from what is already here: \
                      newgit tracker capture {tracker} --from-store"
                 );
             } else {
@@ -1314,7 +1335,7 @@ fn tracker(command: TrackerCommand) -> Result<()> {
             let note = if report.changed {
                 ""
             } else {
-                " (lane head unchanged)"
+                " (its `main` unchanged)"
             };
             println!(
                 "Seeded `{tracker}` @ {} ({}) from the store repo{note}",
@@ -1345,7 +1366,7 @@ fn tracker(command: TrackerCommand) -> Result<()> {
             let (manager, instance) = manager_and_instance(instance)?;
             let outcome = manager.merge_tracker(&instance, &tracker)?;
             println!(
-                "Merged `{}` @ {} from `{instance}` into the lane head",
+                "Merged `{}` @ {} from `{instance}` into its `main`",
                 outcome.tracker, outcome.rev
             );
             Ok(())
@@ -1438,12 +1459,12 @@ fn status(name: Option<&str>, path_only: bool) -> Result<()> {
     }
     if any_never_pulled {
         println!(
-            "\n^ = lane has content this instance never pulled; catch up with `newgit tracker pull <tracker> [instance]`"
+            "\n^ = its `main` has content this instance never pulled; catch up with `newgit tracker pull <tracker> [instance]`"
         );
     }
     if any_diverged {
         println!(
-            "\n~ = differs from lane head; `newgit tracker pull` takes the head (auto-saves current), `newgit tracker merge` makes this instance the head"
+            "\n~ = differs from its `main`; `newgit tracker pull` takes `main` (auto-saves current), `newgit tracker merge` makes this instance's content `main`"
         );
     }
     if any_base_drift {
@@ -2242,7 +2263,7 @@ fn bind_line(outcome: &TrackerBindOutcome, deposit_only: bool) -> String {
                 files_label(outcome.files)
             };
             format!(
-                "`{}` @ {} ({count}, from lane head)",
+                "`{}` @ {} ({count}, from its `main`)",
                 outcome.name,
                 outcome.content_rev.as_deref().unwrap_or("-"),
             )
@@ -2360,6 +2381,23 @@ fn context_here() -> Result<Context> {
 
 fn manager_here() -> Result<BranchManager> {
     Ok(BranchManager::open(context_here()?.store)?)
+}
+
+fn tracker_log(tracker: &str, instance: Option<String>, git_args: &[String]) -> Result<()> {
+    let context = context_here()?;
+    let instance = instance.or_else(|| context.current_branch.clone());
+    let manager = BranchManager::open(context.store)?;
+    let (store, reference) = manager.tracker_log_target(tracker, instance.as_deref())?;
+    let status = std::process::Command::new("git")
+        .arg(format!("--git-dir={store}"))
+        .args(["log", &reference])
+        .args(git_args)
+        .status()
+        .context("could not run git log")?;
+    if !status.success() {
+        bail!("`{tracker}` has no history here yet");
+    }
+    Ok(())
 }
 
 fn manager_and_instance(instance: Option<String>) -> Result<(BranchManager, String)> {

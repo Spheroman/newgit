@@ -176,6 +176,19 @@ so a recomposed commit cannot carry the original's. Three rules:
 **Splitting happens when work leaves the machine (decided):** sync, push,
 merge. Local history is left alone, and local undo works on the view.
 
+**The project root is the instance `main` (decided).** Before a spawn, the
+project root's commits not yet split reach each tracker's `instances/main`.
+Its Git is the truth for that instance: a `git reset` there moves those
+branches back. A refusal there is a warning, not an error — nothing has
+left the machine — and the split runs again before anything does.
+
+**Composing decides ownership among code trackers (decided).** A secret
+tracker is never in a view, so a path it owns now that history once
+committed (a `.env`, later gitignored) stays in the history of the code
+tracker that held it then. Dropping it would rewrite every commit after
+it; removing it is a history rewrite (`git filter-repo`), which is not
+newgit's to do silently.
+
 **Carving out a tracker** (`newgit tracker create electron --code
 --path apps/electron`) splits its paths' history out of root the same way,
 each commit marked with its source, so the view reproduces the original
@@ -194,9 +207,15 @@ are projected into workspaces as today.
 bind is simply not in its view (Git's sparse checkout underneath): `tracker
 use` widens it, `tracker drop` narrows it.
 
-**Secrets never enter Git (decided).** A commit containing a secret
-tracker's file (`git add -f .env.local`) is refused at split, naming the
-file: secrets never enter Git, even by force.
+**Secrets never leave through Git (decided).** A commit containing a
+secret tracker's file (`git add -f .env.local`) is refused when it would
+leave the machine, naming the commit and the file, even by force. A push
+checks every ref it sends — any branch, any tag — not only the instance's
+own, for every commit the remote does not have yet; a checkpoint sync
+checks the uncommitted-work commit it carries as well. **New work only:**
+root's `main` (the history from before newgit, and what has been merged
+since) is exempt, so an old committed `.env` never blocks a first push to a
+fresh remote.
 
 **Writes outside the binding (decided).** A change to a path whose owner is
 not bound (an agent creates `apps/electron/x` in an instance without
@@ -333,10 +352,17 @@ Each step lands alone and keeps the suite green.
      owner, history included; `project` owns `.newgit`. A code tracker's
      paths are set at creation — adding one later would splice a second
      history into it.
-   - *3c — wiring. (Next.)* Spawn composes the instance's view; push and
-     checkpoint sync split the instance's work back into tracker instance
-     branches; split commits are signed as their author when
-     `commit.gpgSign` is set. `newgit log <tracker>`.
+   - *3c — wiring. (Landed.)* The project root's commits split into
+     `instances/main` at spawn; push and checkpoint sync split an
+     instance's work into `instances/<instance>` and refuse secrets on
+     every ref sent; code trackers without history are carved the first
+     time they are needed; split commits are signed as their author when
+     `commit.gpgSign` is set; `newgit log <tracker> [instance]`. Two
+     things wait for later steps: spawn composes nothing yet, because with
+     every code tracker bound the view of `HEAD`'s state *is* `HEAD` (the
+     composing path arrives with `use`/`drop` in step 4); and split
+     follows the first parent, so a merge *inside* the work being split is
+     flattened (step 5, with merges).
    - *3d — remote.* One Artifacts repo per code tracker (`<p>.t.root`
      replaces `<p>.src`), forked lazily.
 4. **Roles, priority, resources, use/drop.** Binding per slot; resources

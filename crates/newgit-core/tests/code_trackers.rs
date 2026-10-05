@@ -173,6 +173,7 @@ fn a_carved_code_tracker_composes_back_into_the_project_history() {
                 commit: electron_tip,
             },
         ],
+        &[],
     )
     .expect("compose");
     assert_eq!(view.tip.as_deref(), Some(head.as_str()));

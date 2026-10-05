@@ -47,7 +47,25 @@ pub struct View {
 pub type State = BTreeMap<String, String>;
 
 /// Replay every tracker's history into one view history at `view_ref`.
-pub fn compose(repo: &Utf8Path, view_ref: &str, tips: &[TrackerTip<'_>]) -> Result<View> {
+///
+/// `all` is every tracker definition. Which tracker a change belongs to is
+/// decided among the *code* trackers only: a secret tracker is never in a
+/// view, so a path it owns now that history once committed (a `.env` later
+/// gitignored) stays in the history of the code tracker that held it then.
+/// Rewriting that away would change every commit after it.
+pub fn compose(
+    repo: &Utf8Path,
+    view_ref: &str,
+    tips: &[TrackerTip<'_>],
+    all: &[TrackerDefinition],
+) -> Result<View> {
+    let mut code: Vec<&TrackerDefinition> = tips.iter().map(|tip| tip.definition).collect();
+    for definition in all {
+        if !definition.secret && !code.iter().any(|known| known.name == definition.name) {
+            code.push(definition);
+        }
+    }
+    let owner_of = |path: &Utf8Path| code_owner(&code, path).map(|owner| owner.name.as_str());
     // Each tracker's whole history: its first-parent spine, interleaved with
     // the other trackers' spines into the view's main line, and its side
     // branches (what its merges brought in), replayed as real commits so a
@@ -72,7 +90,9 @@ pub fn compose(repo: &Utf8Path, view_ref: &str, tips: &[TrackerTip<'_>]) -> Resu
             let all_changes = changes.get(&id).cloned().unwrap_or_default();
             let owned: Vec<Change> = all_changes
                 .iter()
-                .filter(|change| tip.definition.owns(Utf8Path::new(&change.path)))
+                .filter(|change| {
+                    owner_of(Utf8Path::new(&change.path)) == Some(tip.definition.name.as_str())
+                })
                 .cloned()
                 .collect();
             if spine.contains(&id) {
@@ -95,8 +115,9 @@ pub fn compose(repo: &Utf8Path, view_ref: &str, tips: &[TrackerTip<'_>]) -> Resu
                 let applied: Vec<Change> = all_changes
                     .iter()
                     .filter(|change| {
-                        let path = Utf8Path::new(&change.path);
-                        tips.iter().any(|bound| bound.definition.owns(path))
+                        let owner = owner_of(Utf8Path::new(&change.path));
+                        tips.iter()
+                            .any(|bound| Some(bound.definition.name.as_str()) == owner)
                     })
                     .cloned()
                     .collect();
@@ -533,10 +554,7 @@ type Described = (Option<String>, Vec<Change>);
 /// For split sources that are not themselves tracker commits (view commits
 /// an agent made): whether each exists here, its first parent, and its full
 /// changes — what reusing it as-is requires. Absent sources are left out.
-fn describe_sources(
-    repo: &Utf8Path,
-    sources: &[String],
-) -> Result<BTreeMap<String, Described>> {
+fn describe_sources(repo: &Utf8Path, sources: &[String]) -> Result<BTreeMap<String, Described>> {
     let mut described = BTreeMap::new();
     if sources.is_empty() {
         return Ok(described);
@@ -644,10 +662,15 @@ pub fn carve(
             continue;
         }
         let commit = raw.get(id).ok_or_else(|| missing(id))?;
-        let message = format!(
-            "{}\n\n{SPLIT_TRAILER}{id}\n",
-            commit.message.trim_end_matches('\n')
-        );
+        // A commit that was itself split keeps the view commit it came from,
+        // so all of that view commit's pieces still fold back together.
+        let message = match &commit.split_source {
+            Some(_) => commit.message.clone(),
+            None => format!(
+                "{}\n\n{SPLIT_TRAILER}{id}\n",
+                commit.message.trim_end_matches('\n')
+            ),
+        };
         mark += 1;
         writeln!(stream, "commit {target_ref}").ok();
         writeln!(stream, "mark :{mark}").ok();
@@ -744,6 +767,7 @@ pub fn split(
             commit.message.trim_end_matches('\n')
         );
         let identity = commit.identity_env();
+        let sign = signs_for(repo, &commit.author);
         for (tracker, tracker_changes) in by_tracker {
             let parent = state.get(&tracker).cloned();
             let definition = bound
@@ -753,10 +777,11 @@ pub fn split(
             let made_commit = commit_changes(
                 repo,
                 parent.as_deref(),
-                &definition.excluded,
+                &carved_out(definition, all),
                 &tracker_changes,
                 &message,
                 &identity,
+                sign,
             )?;
             state.insert(tracker.clone(), made_commit.clone());
             made.push((tracker, made_commit));
@@ -795,6 +820,124 @@ pub fn read_state(repo: &Utf8Path, view_commit: &str) -> Result<State> {
         .filter_map(|line| line.split_once(' '))
         .map(|(tracker, commit)| (tracker.to_owned(), commit.to_owned()))
         .collect())
+}
+
+/// The most specific of `code` claiming `path` (root claims everything).
+fn code_owner<'a>(
+    code: &[&'a TrackerDefinition],
+    path: &Utf8Path,
+) -> Option<&'a TrackerDefinition> {
+    code.iter()
+        .copied()
+        .filter(|definition| definition.owns_everything() || claims(definition, path))
+        .max_by_key(|definition| specificity(definition, path))
+}
+
+/// The paths more specific code trackers carved out of `definition`: what
+/// its new commits must not carry forward from history before the carve.
+fn carved_out(definition: &TrackerDefinition, all: &[TrackerDefinition]) -> Vec<Utf8PathBuf> {
+    all.iter()
+        .filter(|other| !other.secret && other.name != definition.name)
+        .flat_map(|other| other.paths.iter())
+        .filter(|path| {
+            path.as_str() != "."
+                && (definition.owns_everything() || claims(definition, path))
+                && specificity(definition, path) < path.as_str().len()
+        })
+        .cloned()
+        .collect()
+}
+
+/// The first commit among `rev_list` (arguments to `git rev-list`, so a
+/// caller says what is new: `<tip> --not --all`) that changes a path a
+/// secret tracker owns, with that path and tracker. Every parent of a merge
+/// is diffed, so a secret cannot ride in on one. `env` lets the caller see
+/// objects Git is still holding in quarantine.
+pub fn find_secret(
+    repo: &Utf8Path,
+    rev_list: &[&str],
+    env: &[(String, String)],
+    all: &[TrackerDefinition],
+) -> Result<Option<(String, String, String)>> {
+    let mut args = vec!["rev-list"];
+    args.extend_from_slice(rev_list);
+    let commits = git_env(repo, &args, env)?;
+    if commits.trim().is_empty() {
+        return Ok(None);
+    }
+    let output = run(
+        command(
+            repo,
+            &[
+                "diff-tree",
+                "--stdin",
+                "-r",
+                "-m",
+                "--root",
+                "--name-only",
+                "-z",
+            ],
+        )
+        .envs(env.iter().map(|(key, value)| (key, value))),
+        "git diff-tree",
+        Some(format!("{}\n", commits.trim()).as_bytes()),
+    )?;
+    let output = String::from_utf8_lossy(&output);
+    let mut commit = String::new();
+    for field in output.split('\0').filter(|field| !field.is_empty()) {
+        let field = field.trim_start_matches('\n');
+        if field.len() == 40 && field.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            commit = field.to_owned();
+            continue;
+        }
+        let path = Utf8Path::new(field);
+        let owner = all
+            .iter()
+            .filter(|definition| definition.owns_everything() || claims(definition, path))
+            .max_by_key(|definition| specificity(definition, path));
+        if let Some(owner) = owner.filter(|owner| owner.secret) {
+            return Ok(Some((commit, field.to_owned(), owner.name.clone())));
+        }
+    }
+    Ok(None)
+}
+
+/// The nearest commit on `rev`'s first-parent line (itself included) that
+/// carries a note — the last point whose tracker state is known.
+pub fn find_base(repo: &Utf8Path, rev: &str) -> Result<Option<String>> {
+    let noted: std::collections::BTreeSet<String> =
+        git_lines(repo, &["notes", "--ref", NOTES_REF, "list"])
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|line| line.split_once(' ').map(|(_, commit)| commit.to_owned()))
+            .collect();
+    if noted.is_empty() {
+        return Ok(None);
+    }
+    Ok(git_lines(repo, &["rev-list", "--first-parent", rev])?
+        .into_iter()
+        .find(|commit| noted.contains(commit)))
+}
+
+/// Whether a commit by `author` (`Name <email> …`) is signed when newgit
+/// makes it here: only when this machine signs its commits
+/// (`commit.gpgSign`) and the author is this machine's user — newgit signs
+/// with your key, never on someone else's behalf.
+fn signs_for(repo: &Utf8Path, author: &str) -> bool {
+    let config = |key: &str| {
+        git_lines(repo, &["config", "--get", key])
+            .ok()
+            .and_then(|lines| lines.into_iter().next())
+    };
+    let signing = git_lines(repo, &["config", "--bool", "--get", "commit.gpgSign"])
+        .ok()
+        .and_then(|lines| lines.into_iter().next())
+        .is_some_and(|value| value == "true");
+    let email = author
+        .split_once(" <")
+        .and_then(|(_, rest)| rest.split_once('>'))
+        .map(|(email, _)| email);
+    signing && email.is_some() && config("user.email").as_deref() == email
 }
 
 fn claims(definition: &TrackerDefinition, path: &Utf8Path) -> bool {
@@ -856,6 +999,7 @@ fn commit_changes(
     changes: &[Change],
     message: &str,
     identity: &[(String, String)],
+    sign: bool,
 ) -> Result<String> {
     let index = repo_tmp_file(repo, "split-index");
     let env = vec![("GIT_INDEX_FILE".to_owned(), index.to_string())];
@@ -901,6 +1045,9 @@ fn commit_changes(
             "-F",
             "-",
         ];
+        if sign {
+            args.push("-S");
+        }
         if let Some(parent) = parent {
             args.extend(["-p", parent]);
         }

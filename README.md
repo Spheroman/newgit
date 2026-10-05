@@ -192,6 +192,9 @@ Definition management (noun subcommands):
 - `newgit tracker capture <tracker> --from-store` — seed a lane from the store
   repo's working tree, so the first `spawn` comes up with the content
 - `newgit tracker list`
+- `newgit log <tracker> [instance] [-- <git log args>]` — one tracker's
+  history: an instance's branch as of its last checkpoint, or the project
+  root's
 - `newgit resource add <name> --template <template>` / `list` / `templates`
 
 Remote:

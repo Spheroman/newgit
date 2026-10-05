@@ -78,7 +78,9 @@ pub enum NewgitError {
         reason: String,
     },
 
-    #[error("trackers `{left}` and `{right}` both own `{path}`; content lanes must be disjoint")]
+    #[error(
+        "trackers `{left}` and `{right}` both own `{path}`; give one of them a more specific path"
+    )]
     TrackerPathConflict {
         left: String,
         right: String,
@@ -246,6 +248,11 @@ pub enum NewgitError {
 
     #[error("{0}")]
     Unsupported(String),
+
+    /// Work that may not leave this machine as it is: a secret tracker's
+    /// file committed, or a path whose tracker the instance has not bound.
+    #[error("refusing to send this work anywhere: {0}")]
+    SplitRefused(String),
 
     #[error("path is not valid UTF-8: {0}")]
     NonUtf8Path(String),

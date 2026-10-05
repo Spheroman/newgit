@@ -193,6 +193,7 @@ fn composing_root_alone_is_the_project_history_itself() {
             definition: &root,
             commit: commits[3].clone(),
         }],
+        &[],
     )
     .expect("compose");
     assert_eq!(view.commits, 4);
@@ -224,6 +225,7 @@ fn a_carved_tracker_composes_back_into_the_original_history() {
                 commit: electron_tip.clone(),
             },
         ],
+        &[],
     )
     .expect("compose");
     assert_eq!(
@@ -242,6 +244,7 @@ fn a_carved_tracker_composes_back_into_the_original_history() {
             definition: &root,
             commit: commits[3].clone(),
         }],
+        std::slice::from_ref(&electron),
     )
     .expect("compose");
     let files = git(
@@ -283,7 +286,7 @@ fn splitting_an_agents_work_and_recomposing_gives_back_the_same_commits() {
             },
         ]
     };
-    let base = compose::compose(&repo, VIEW, &tips(&commits[3], &electron_tip))
+    let base = compose::compose(&repo, VIEW, &tips(&commits[3], &electron_tip), &[])
         .expect("compose")
         .tip
         .expect("tip");
@@ -327,8 +330,8 @@ fn splitting_an_agents_work_and_recomposing_gives_back_the_same_commits() {
         "root holds only root's files"
     );
 
-    let recomposed =
-        compose::compose(&repo, VIEW, &tips(&root_tip, &electron_split_tip)).expect("recompose");
+    let recomposed = compose::compose(&repo, VIEW, &tips(&root_tip, &electron_split_tip), &[])
+        .expect("recompose");
     assert_eq!(
         recomposed.tip.as_deref(),
         Some(second.as_str()),
@@ -350,6 +353,7 @@ fn a_secret_file_in_a_commit_is_refused() {
             definition: &root,
             commit: commits[3].clone(),
         }],
+        &[],
     )
     .expect("compose")
     .tip
@@ -389,6 +393,7 @@ fn a_path_owned_by_an_unbound_tracker_is_refused_with_the_fix() {
             definition: &root,
             commit: commits[3].clone(),
         }],
+        &[],
     )
     .expect("compose")
     .tip
@@ -479,6 +484,7 @@ fn merge_commits_survive_composition_whole() {
                 commit: electron_tip,
             },
         ],
+        &[],
     )
     .expect("compose");
     assert_eq!(
@@ -507,6 +513,7 @@ fn a_merge_after_trackers_diverge_keeps_every_parent() {
             definition: &root,
             commit: commits[3].clone(),
         }],
+        &[],
     )
     .expect("compose");
     assert!(carved.tip.is_some());
@@ -575,6 +582,7 @@ fn a_merge_after_trackers_diverge_keeps_every_parent() {
                 commit: electron_only,
             },
         ],
+        &[],
     )
     .expect("compose");
     let tip = view.tip.expect("tip");

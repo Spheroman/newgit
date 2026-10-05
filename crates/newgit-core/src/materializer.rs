@@ -70,7 +70,7 @@ pub fn workspace_marker_path(workspace: &Utf8Path) -> Utf8PathBuf {
 pub fn exclude_tracker_paths(workspace: &Utf8Path, paths: &[Utf8PathBuf]) -> Result<()> {
     exclude_paths(
         workspace,
-        "tracker-owned paths — these lanes own this content",
+        "tracker-owned paths — secret trackers own this content",
         paths,
     )
 }
