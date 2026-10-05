@@ -3,7 +3,8 @@ import type { MintedToken, Repos } from "../src/artifacts";
 /** Artifacts in memory: repos are file maps; tokens are recognisable strings. */
 export class FakeRepos implements Repos {
 	readonly repos = new Map<string, Map<string, string>>();
-	readonly minted: { name: string; scope: string }[] = [];
+	readonly minted: { name: string; scope: string; id: string }[] = [];
+	readonly revokedTokens = new Set<string>();
 
 	async create(name: string) {
 		if (this.repos.has(name)) throw Object.assign(new Error("exists"), { code: "ALREADY_EXISTS" });
@@ -23,8 +24,13 @@ export class FakeRepos implements Repos {
 		return this.repos.delete(name);
 	}
 	async mint(name: string, scope: "read" | "write"): Promise<MintedToken> {
-		this.minted.push({ name, scope });
-		return { password: `pw-${name}-${scope}`, expiresAt: "2099-01-01T00:00:00Z" };
+		const id = `art-${this.minted.length + 1}`;
+		this.minted.push({ name, scope, id });
+		return { id, password: `pw-${name}-${scope}`, expiresAt: "2099-01-01T00:00:00Z" };
+	}
+	async revokeToken(_name: string, tokenId: string) {
+		this.revokedTokens.add(tokenId);
+		return true;
 	}
 	async readFile(name: string, _ref: string, path: string) {
 		return this.repos.get(name)?.get(path) ?? null;

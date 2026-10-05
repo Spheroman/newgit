@@ -137,7 +137,7 @@ async function route(request: Request, env: Env, deps: Deps): Promise<Response> 
 			instance: caller.instance,
 			ttlSeconds: AGENT_TTL_SECONDS,
 		});
-		await userStub(env, login).revoke(caller.tokenId);
+		await userStub(env, login).revoke(caller.tokenId, true);
 		return json({ token: issued.token, ...issued.record }, 201);
 	}
 	const tokenMatch = path.match(/^\/v1\/tokens\/([^/]+)$/);
@@ -145,9 +145,10 @@ async function route(request: Request, env: Env, deps: Deps): Promise<Response> 
 		const id = decodeURIComponent(tokenMatch[1]);
 		// A human revokes any of their tokens; an agent may revoke only itself.
 		if (caller.kind === "agent" && id !== caller.tokenId) requireHuman(caller, "revoke other tokens");
-		const revoked = await userStub(env, login).revoke(id);
+		const { revoked, repoTokens } = await userStub(env, login).revoke(id);
 		if (!revoked) throw new HttpError(404, `no token \`${id}\``);
-		return json({ id, revoked: true });
+		await revokeRepoTokens(deps, repoTokens);
+		return json({ id, revoked: true, repo_tokens_revoked: repoTokens.length });
 	}
 
 	// ── Projects ───────────────────────────────────────────────────────────
@@ -196,7 +197,7 @@ async function route(request: Request, env: Env, deps: Deps): Promise<Response> 
 			throw new HttpError(400, `\`${repo}\` is not one of ${projectName}'s repos`);
 		if (caller.instance !== undefined && scope === "write" && ref.kind === "instance")
 			requireThisInstance(caller, ref.instance);
-		return json(await credential(env, deps, project, ref, scope, { login, member }));
+		return json(await credential(env, deps, project, ref, scope, caller, member));
 	}
 
 	if (!member) throw new HttpError(403, `${login} is not a member of ${projectName}`);
@@ -280,7 +281,7 @@ async function route(request: Request, env: Env, deps: Deps): Promise<Response> 
 			requireNotInstance(caller, "remove instances");
 			await deps.repos.delete(repo).catch(() => false);
 			await project.deleteInstance(name);
-			await userStub(env, instance.owner).revokeInstance(projectName, name);
+			await revokeRepoTokens(deps, await userStub(env, instance.owner).revokeInstance(projectName, name));
 			return json({ name, removed: true });
 		}
 	}
@@ -320,8 +321,10 @@ async function credential(
 	project: DurableObjectStub<ProjectDO>,
 	ref: RepoRef,
 	scope: "read" | "write",
-	who: { login: string; member: boolean },
+	caller: Caller,
+	member: boolean,
 ) {
+	const who = { login: caller.login, member };
 	const facts: { instanceOwner?: string; audience?: Audience } = {};
 	if (ref.kind === "instance") facts.instanceOwner = (await project.instance(ref.instance))?.owner;
 	if (ref.kind === "tracker") facts.audience = await trunkAudience(deps.repos, ref.project, ref.tracker);
@@ -337,6 +340,7 @@ async function credential(
 		remote = (await deps.repos.create(name)).remote;
 	}
 	const minted = await deps.repos.mint(name, scope, CREDENTIAL_TTL_SECONDS);
+	await userStub(env, caller.login).recordRepoToken(caller.tokenId, name, minted.id, minted.expiresAt);
 	return { repo: name, remote, scope, username: "x", password: minted.password, expires_at: minted.expiresAt };
 }
 
@@ -394,6 +398,14 @@ export async function issue(env: Env, spec: NewToken) {
 
 function userStub(env: Env, login: string): DurableObjectStub<UserDO> {
 	return env.USERS.getByName(login.toLowerCase());
+}
+
+/**
+ * Revoke repo passwords at Artifacts. Best effort per password: one already
+ * gone (expired, or its repo deleted) must not stop the rest.
+ */
+async function revokeRepoTokens(deps: Deps, tokens: { repo: string; artifactsId: string }[]) {
+	await Promise.allSettled(tokens.map((token) => deps.repos.revokeToken(token.repo, token.artifactsId)));
 }
 
 /** Instance tokens write only their own instance. */

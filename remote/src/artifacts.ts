@@ -2,6 +2,8 @@
 // under Miniflare, which has no Artifacts binding, and inject a fake.
 
 export interface MintedToken {
+	/** Artifacts' id for the token: what revoking it early names. */
+	id: string;
 	/** The Git password: the token without its `?expires=` suffix. */
 	password: string;
 	expiresAt: string;
@@ -15,6 +17,8 @@ export interface Repos {
 	remote(name: string): Promise<string | null>;
 	delete(name: string): Promise<boolean>;
 	mint(name: string, scope: "read" | "write", ttlSeconds: number): Promise<MintedToken>;
+	/** Revoke a minted token before it expires. False when it no longer exists. */
+	revokeToken(name: string, tokenId: string): Promise<boolean>;
 	/** A file's text at `ref`, or null when the repo, ref, or path is missing. */
 	readFile(name: string, ref: string, path: string): Promise<string | null>;
 }
@@ -65,7 +69,17 @@ export class ArtifactsRepos implements Repos {
 	async mint(name: string, scope: "read" | "write", ttlSeconds: number) {
 		using repo = await this.artifacts.get(name);
 		const token = await repo.createToken(scope, ttlSeconds);
-		return { password: tokenPassword(token.plaintext), expiresAt: token.expiresAt };
+		return { id: token.id, password: tokenPassword(token.plaintext), expiresAt: token.expiresAt };
+	}
+
+	async revokeToken(name: string, tokenId: string) {
+		try {
+			using repo = await this.artifacts.get(name);
+			return await repo.revokeToken(tokenId);
+		} catch (error) {
+			if (isNotFound(error)) return false;
+			throw error;
+		}
 	}
 
 	async readFile(name: string, ref: string, path: string) {

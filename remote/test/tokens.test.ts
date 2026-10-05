@@ -98,7 +98,7 @@ describe("tokens", () => {
 		const other = await agentToken("agent-4");
 		expect((await call(leaked.token, "GET", "/v1/me")).status).toBe(200);
 
-		expect((await call(jack, "DELETE", `/v1/tokens/${leaked.id}`)).body).toEqual({ id: leaked.id, revoked: true });
+		expect((await call(jack, "DELETE", `/v1/tokens/${leaked.id}`)).body).toMatchObject({ id: leaked.id, revoked: true });
 		expect((await call(leaked.token, "GET", "/v1/me")).status).toBe(401);
 		expect((await call(other.token, "GET", "/v1/me")).status).toBe(200);
 		expect((await call(jack, "GET", "/v1/me")).status).toBe(200);

@@ -19,6 +19,11 @@ export interface TokenRecord {
 	lastUsedAt: string | null;
 }
 
+export interface RepoToken {
+	repo: string;
+	artifactsId: string;
+}
+
 /** last_used_at is written at most this often per token, so reads stay cheap. */
 const LAST_USED_GRANULARITY_MS = 60_000;
 
@@ -33,6 +38,13 @@ export class UserDO extends DurableObject<Env> {
 				id TEXT PRIMARY KEY, kind TEXT NOT NULL, agent TEXT, project TEXT,
 				created_at TEXT NOT NULL, expires_at TEXT NOT NULL,
 				revoked_at TEXT, last_used_at TEXT);
+		`);
+		// Repo passwords minted on a token's behalf, so revoking the token can
+		// revoke them at Artifacts too instead of leaving them live until expiry.
+		this.sql.exec(`
+			CREATE TABLE IF NOT EXISTS repo_tokens (
+				token_id TEXT NOT NULL, repo TEXT NOT NULL, artifacts_id TEXT NOT NULL, expires_at TEXT NOT NULL,
+				PRIMARY KEY (token_id, artifacts_id));
 		`);
 		const columns = this.sql.exec<{ name: string }>("PRAGMA table_info(tokens)").toArray();
 		if (!columns.some((column) => column.name === "instance")) this.sql.exec("ALTER TABLE tokens ADD COLUMN instance TEXT");
@@ -81,25 +93,53 @@ export class UserDO extends DurableObject<Env> {
 			.map(toRecord);
 	}
 
-	/** Revoke every token pinned to one instance — what removing the instance does. */
-	revokeInstance(project: string, instance: string): number {
-		return this.sql.exec(
-			"UPDATE tokens SET revoked_at = ? WHERE project = ? AND instance = ? AND revoked_at IS NULL",
-			new Date().toISOString(),
-			project,
-			instance,
-		).rowsWritten;
+	/** Remember a repo password minted for `tokenId`. Forgets expired ones while at it. */
+	recordRepoToken(tokenId: string, repo: string, artifactsId: string, expiresAt: string): void {
+		this.sql.exec("DELETE FROM repo_tokens WHERE expires_at <= ?", new Date().toISOString());
+		this.sql.exec("INSERT OR REPLACE INTO repo_tokens VALUES (?, ?, ?, ?)", tokenId, repo, artifactsId, expiresAt);
 	}
 
-	/** Revoke one token. False when there is no such token. */
-	revoke(id: string): boolean {
-		return (
+	/**
+	 * Revoke every token pinned to one instance — what removing the instance
+	 * does. Returns their live repo passwords, for the caller to revoke at
+	 * Artifacts.
+	 */
+	revokeInstance(project: string, instance: string): RepoToken[] {
+		const ids = this.sql
+			.exec<{ id: string }>(
+				"SELECT id FROM tokens WHERE project = ? AND instance = ? AND revoked_at IS NULL",
+				project,
+				instance,
+			)
+			.toArray()
+			.map((row) => row.id);
+		return ids.flatMap((id) => this.revoke(id).repoTokens);
+	}
+
+	/**
+	 * Revoke one token. Returns whether it existed and the repo passwords it
+	 * minted that have not expired, which the caller revokes at Artifacts.
+	 * `keepRepoTokens` is for renewal: the token is replaced, not compromised,
+	 * and cancelling its repo passwords could break a push in flight.
+	 */
+	revoke(id: string, keepRepoTokens = false): { revoked: boolean; repoTokens: RepoToken[] } {
+		const revoked =
 			this.sql.exec(
 				"UPDATE tokens SET revoked_at = COALESCE(revoked_at, ?) WHERE id = ?",
 				new Date().toISOString(),
 				id,
-			).rowsWritten > 0
-		);
+			).rowsWritten > 0;
+		if (keepRepoTokens) return { revoked, repoTokens: [] };
+		const repoTokens = this.sql
+			.exec<{ repo: string; artifacts_id: string }>(
+				"SELECT repo, artifacts_id FROM repo_tokens WHERE token_id = ? AND expires_at > ?",
+				id,
+				new Date().toISOString(),
+			)
+			.toArray()
+			.map((row) => ({ repo: row.repo, artifactsId: row.artifacts_id }));
+		this.sql.exec("DELETE FROM repo_tokens WHERE token_id = ?", id);
+		return { revoked, repoTokens };
 	}
 }
 

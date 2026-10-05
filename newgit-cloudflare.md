@@ -382,8 +382,15 @@ instance token matters wherever a workspace leaves the machine.
 
 A by-hand agent token is the escape hatch for an agent not tied to one
 instance (an orchestrator in CI). Records name the agent either way
-(`agent` on instances and checkpoints). A revoked token is refused on its
-next request.
+(`agent` on instances and checkpoints).
+
+**Revocation is immediate, Git included.** A revoked newgit token is refused
+on its next request, and every repo password it was handed is revoked at
+Artifacts in the same step (each minted password is recorded against the
+token that asked for it). Artifacts refuses a revoked password on the very
+next Git request (verified live). The one exception is renewal: the replaced
+token's repo passwords are left to expire (≤ 15 min), because renewal is
+routine and cancelling them could break a push in flight.
 
 ### The credential helper
 
