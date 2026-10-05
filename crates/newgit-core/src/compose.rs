@@ -26,6 +26,12 @@ use crate::tracker::TrackerDefinition;
 /// Where the per-view-commit tracker state lives.
 pub const NOTES_REF: &str = "refs/notes/newgit-composed";
 
+/// Where a rebuilt view commit names the commit it stands for — its
+/// canonical id, the commit as its author made it — when the two differ (a
+/// view without every tracker cannot reuse the original). Reused commits
+/// need no note: they are the original.
+pub const CANONICAL_NOTES_REF: &str = "refs/notes/newgit-canonical";
+
 const SPLIT_TRAILER: &str = "Newgit-Split: ";
 
 /// One tracker to compose, at the commit it is bound to.
@@ -293,6 +299,7 @@ pub fn compose(
         view_of: BTreeMap::new(),
         state_of: BTreeMap::new(),
         notes: Vec::new(),
+        canonical: Vec::new(),
         commits: 0,
     };
     let mut tip = Target::None;
@@ -371,7 +378,7 @@ pub fn compose(
             // Recreated: the source's metadata (the member that is an original
             // commit, or any member with its trailer stripped).
             let lead = original.unwrap_or(&events[members[0]]);
-            out.write(&lead.commit, &tip, &merges, &combined, &state)
+            out.write(&lead.commit, &tip, &merges, &combined, &state, &source)
         };
         for &index in members {
             out.view_of.insert(events[index].id.clone(), tip.clone());
@@ -423,6 +430,8 @@ struct Emitter {
     /// Tracker commit → the tracker state of the view commit holding it.
     state_of: BTreeMap<String, State>,
     notes: Vec<(String, String)>,
+    /// Rebuilt view commit (as a mark) → the original it stands for.
+    canonical: Vec<(String, String)>,
     commits: usize,
 }
 
@@ -440,6 +449,7 @@ impl Emitter {
         merges: &[Target],
         changes: &[&Change],
         state: &State,
+        canonical: &str,
     ) -> Target {
         let message = commit.message_without_trailer();
         self.mark += 1;
@@ -470,6 +480,8 @@ impl Emitter {
         stream.push(b'\n');
         self.notes
             .push((format!(":{}", self.mark), render_state(state)));
+        self.canonical
+            .push((format!(":{}", self.mark), canonical.to_owned()));
         self.commits += 1;
         Target::Mark(self.mark)
     }
@@ -536,6 +548,7 @@ impl Emitter {
                     &parents[1.min(parents.len())..],
                     &changes,
                     &state,
+                    &current,
                 )
             };
             self.view_of.insert(current.clone(), target);
@@ -573,6 +586,29 @@ impl Emitter {
             stream.push(b'\n');
         }
         stream.push(b'\n');
+        if !self.canonical.is_empty() {
+            let parent = git_lines(repo, &["rev-parse", "-q", "--verify", CANONICAL_NOTES_REF])
+                .ok()
+                .and_then(|lines| lines.into_iter().next());
+            writeln!(stream, "commit {CANONICAL_NOTES_REF}").ok();
+            writeln!(
+                stream,
+                "committer newgit <newgit@localhost> 946684800 +0000"
+            )
+            .ok();
+            writeln!(stream, "data 10\ncanonical\n").ok();
+            if let Some(parent) = parent {
+                writeln!(stream, "from {parent}").ok();
+            }
+            for (target, original) in &self.canonical {
+                let note = format!("canonical {original}\n");
+                writeln!(stream, "N inline {target}").ok();
+                writeln!(stream, "data {}", note.len()).ok();
+                stream.extend_from_slice(note.as_bytes());
+                stream.push(b'\n');
+            }
+            stream.push(b'\n');
+        }
 
         let marks = repo_tmp_file(repo, "compose-marks");
         run(

@@ -115,6 +115,9 @@ pub fn compose_view(plan: &Plan) -> Result<Utf8PathBuf> {
         )?;
     }
 
+    let notes_ref = format!("refs/views/{key}/notes");
+    let has_notes = view_notes(&store, &key, &notes_ref)?;
+
     // A repository of its own, so it holds only what these views reach: a
     // fetch copies nothing else, and upload-pack serves nothing else.
     let staging = views.join(format!("{key}.tmp-{}", std::process::id()));
@@ -130,6 +133,20 @@ pub fn compose_view(plan: &Plan) -> Result<Utf8PathBuf> {
         ],
         &[],
     )?;
+    if has_notes {
+        // Git's default notes ref: `git log` shows a rebuilt commit's
+        // canonical id once a clone fetches `refs/notes/*`.
+        run_git_env(
+            &[
+                &format!("--git-dir={staging}"),
+                "fetch",
+                "-q",
+                store.as_str(),
+                &format!("+{notes_ref}:refs/notes/commits"),
+            ],
+            &[],
+        )?;
+    }
     run_git_env(
         &[
             &format!("--git-dir={staging}"),
@@ -148,6 +165,87 @@ pub fn compose_view(plan: &Plan) -> Result<Utf8PathBuf> {
         }
         Err(source) => Err(NewgitError::io(&view, source)),
     }
+}
+
+/// The canonical-id notes for just the commits these views hold, as one
+/// notes commit at `notes_ref`: a reader learns nothing about commits outside
+/// their view. False when no commit of theirs was rebuilt.
+fn view_notes(store: &Utf8Path, key: &str, notes_ref: &str) -> Result<bool> {
+    let git_dir = format!("--git-dir={store}");
+    let reachable: std::collections::BTreeSet<String> = run_git_env(
+        &[
+            &git_dir,
+            "rev-list",
+            &format!("--glob=refs/views/{key}/heads/*"),
+        ],
+        &[],
+    )?
+    .lines()
+    .map(ToOwned::to_owned)
+    .collect();
+    let listing = run_git_env(
+        &[
+            &git_dir,
+            "notes",
+            "--ref",
+            compose::CANONICAL_NOTES_REF,
+            "list",
+        ],
+        &[],
+    )
+    .unwrap_or_default();
+    let mut stream = Vec::new();
+    let mut any = false;
+    for line in listing.lines() {
+        let Some((blob, commit)) = line.split_once(' ') else {
+            continue;
+        };
+        if !reachable.contains(commit) {
+            continue;
+        }
+        if !any {
+            stream.extend_from_slice(
+                format!(
+                    "commit {notes_ref}\ncommitter newgit <newgit@localhost> 946684800 +0000\ndata 9\ncanonical\n"
+                )
+                .as_bytes(),
+            );
+            any = true;
+        }
+        let note = run_git_env(&[&git_dir, "cat-file", "-p", blob], &[])?;
+        let note = format!("{}\n", note.trim_end());
+        stream.extend_from_slice(
+            format!("N inline {commit}\ndata {}\n{note}\n", note.len()).as_bytes(),
+        );
+    }
+    if !any {
+        return Ok(false);
+    }
+    stream.push(b'\n');
+    let mut child = std::process::Command::new("git")
+        .args([git_dir.as_str(), "fast-import", "--quiet", "--force"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|source| NewgitError::io(store.to_path_buf(), source))?;
+    {
+        use std::io::Write as _;
+        let mut stdin = child.stdin.take().expect("piped stdin");
+        stdin
+            .write_all(&stream)
+            .map_err(|source| NewgitError::io(store.to_path_buf(), source))?;
+    }
+    let output = child
+        .wait_with_output()
+        .map_err(|source| NewgitError::io(store.to_path_buf(), source))?;
+    if !output.status.success() {
+        return Err(NewgitError::SourceCommand {
+            command: "git fast-import (view notes)".to_owned(),
+            stderr: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+        });
+    }
+    Ok(true)
 }
 
 fn has_commit(store: &Utf8Path, commit: &str) -> bool {

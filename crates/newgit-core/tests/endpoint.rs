@@ -166,6 +166,16 @@ fn a_tracker_left_out_of_the_plan_leaves_not_one_object_behind() {
 
     let files = git(&view, &["ls-tree", "-r", "--name-only", "main"]);
     assert!(!files.contains("apps/payments"), "{files}");
+
+    // Every rebuilt commit names the commit it stands for, and only commits
+    // this view holds have a note.
+    let notes = git(&view, &["notes", "list"]);
+    assert!(!notes.is_empty(), "the restricted view rebuilt commits");
+    for line in notes.lines() {
+        let (_, commit) = line.split_once(' ').expect("note line");
+        let note = git(&view, &["notes", "show", commit]);
+        assert!(note.starts_with("canonical "), "{note}");
+    }
     let objects = git(
         &view,
         &[
