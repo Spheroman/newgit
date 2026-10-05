@@ -67,6 +67,7 @@ priority = 10
 | `resources` | Resources this tracker brings. A resource is bound iff a bound tracker brings it. |
 | `requires` | Trackers or roles this one needs: bound with it, and merged before (or with) it. |
 | `merge` | `with-change` (default: merged together with whatever else a change touched) or `explicit` (only by `newgit tracker merge`; env files). Replaces `merge_with_source`. |
+| `secret` | Never in the workspace's Git: excluded, never committed, captured by newgit from the files at checkpoint. Env trackers set it. |
 | `production` | Production content: agent and instance tokens may not bind it, and its resources' destructive hooks are refused. |
 
 **Ownership (decided).** Every path in a workspace has exactly one owner:
@@ -245,11 +246,16 @@ environment identity is simply the set of tracker commits it composes.
 
 1. **The project root is a workspace:** the instance `main`, bound to every
    tracker's `main`. You work there as today; merges land there.
-2. **Tracker content is tracked by the workspace's Git.** `.env.local` shows
-   in `git status`, can be committed, and is split into its own
-   audience-restricted repo on capture. Every push goes through newgit, and
-   GitHub export includes only chosen trackers, so "just commit the .env"
-   is safe. (Rendered instance values are still reversed before capture.)
+2. **Secret trackers stay out of the workspace's Git; code trackers are
+   tracked.** *(Revised the same day.)* The first answer was to track
+   everything, on the grounds that every push goes through newgit — but only
+   pushes to `origin` do, so an agent pushing anywhere else would carry a
+   committed `.env` with it. A tracker marked `secret = true` (env trackers
+   by default) is excluded from the workspace's Git as in v1: never in a
+   commit, captured by newgit from the files at checkpoint, so no push can
+   carry it. Code trackers are tracked and split into their repos on
+   capture. Limit, stated plainly: an agent can read anything in its
+   workspace, so this prevents accidental leaks, not a malicious agent.
 3. **Merges stack by tracker**: choose which trackers' changes to merge;
    a tracker's changes merge only with the changes of the trackers it
    `requires` (see *Checkpoints, merges, and coherence*).
