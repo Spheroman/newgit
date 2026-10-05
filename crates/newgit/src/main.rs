@@ -775,7 +775,20 @@ fn spawn(args: SpawnArgs) -> Result<()> {
         "(existing branch)".to_owned()
     };
 
-    println!("Spawned branch instance `{}`", branch.name);
+    let failed = outcome.failed_resources();
+    if failed.is_empty() {
+        println!("Spawned branch instance `{}`", branch.name);
+    } else {
+        println!(
+            "Spawned branch instance `{}` — but {} did not come up (see below)",
+            branch.name,
+            failed
+                .iter()
+                .map(|name| format!("`{name}`"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
     println!(
         "  source:    {} @ {} {branch_note}",
         branch.source_ref,
@@ -1312,8 +1325,10 @@ fn tracker(command: TrackerCommand) -> Result<()> {
             warn_gitignore(&manager);
             warn_graph(&manager);
             // Root first: it owns everything the others do not, so the list
-            // reads as "the rest of the project, then the parts carved out".
+            // reads as "the rest of the project, then the parts carved out" —
+            // code trackers, then secret ones.
             let definitions: Vec<_> = std::iter::once(manager.root_tracker())
+                .chain(manager.code_trackers())
                 .chain(manager.tracker_definitions())
                 .collect();
             // Same reasoning as `resource list`: compute widths from every
@@ -1589,6 +1604,12 @@ fn checkpoint(instance: Option<String>, message: Option<&str>) -> Result<()> {
             "  resource: {} [{}] {state}{running}{unproven}",
             resource.name, resource.mode
         );
+    }
+    if let Some(link) = manager.remote_link() {
+        match &outcome.sync_error {
+            None => println!("  remote:   synced to {}", link.project),
+            Some(_) => println!("  remote:   not synced (the warning above says why)"),
+        }
     }
     println!("  undo with: newgit undo {instance}");
     Ok(())

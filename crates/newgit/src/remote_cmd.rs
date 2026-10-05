@@ -239,14 +239,40 @@ pub fn clone(project: &str, dir: Option<camino::Utf8PathBuf>, url: Option<String
         .default_list()
         .cloned()
         .with_context(|| format!("`{project}` has no `{}` branch yet", view.default_branch))?;
+    // Absolute, so every step names the same place whatever it runs from.
     let dir = match dir {
-        Some(dir) => dir,
+        Some(dir) if dir.is_absolute() => dir,
+        Some(dir) => crate::current_dir()?.join(dir),
         None => crate::current_dir()?.join(&view.name),
     };
     if dir.exists() && std::fs::read_dir(&dir)?.next().is_some() {
         bail!("{dir} exists and is not empty");
     }
+    let existed = dir.exists();
     std::fs::create_dir_all(&dir)?;
+    // A clone that fails partway leaves nothing behind.
+    let result = clone_into(&client, project, &url, &view, &list, &dir);
+    if result.is_err() {
+        if existed {
+            for entry in std::fs::read_dir(&dir)?.flatten() {
+                let _ = std::fs::remove_dir_all(entry.path())
+                    .or_else(|_| std::fs::remove_file(entry.path()));
+            }
+        } else {
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+    result
+}
+
+fn clone_into(
+    client: &HttpRemote,
+    project: &str,
+    url: &str,
+    view: &remote::ProjectView,
+    list: &std::collections::BTreeMap<String, String>,
+    dir: &camino::Utf8Path,
+) -> Result<()> {
     let git = |args: &[&str]| -> Result<String> {
         let output = std::process::Command::new("git")
             .arg("-C")
@@ -266,12 +292,12 @@ pub fn clone(project: &str, dir: Option<camino::Utf8PathBuf>, url: Option<String
     git(&["init", "-q", "-b", &view.default_branch])?;
 
     // Every code tracker you may read, into the tracker store.
-    let paths = MetadataStore::at(dir.clone()).paths().clone();
+    let paths = MetadataStore::at(dir).paths().clone();
     newgit_core::tracker_repo::ensure_store(&paths.tracker_store)?;
     let prefix = project.replace('/', ".");
     let mut warnings = Vec::new();
     let mut fetched = Vec::new();
-    for (tracker, commit) in &list {
+    for (tracker, commit) in list {
         let repo = format!("{prefix}.t.{tracker}");
         let credential = match client.credential(project, &repo, Scope::Read) {
             Ok(credential) => credential,
@@ -331,13 +357,13 @@ pub fn clone(project: &str, dir: Option<camino::Utf8PathBuf>, url: Option<String
             "refs/newgit/trackers/project/main",
         ])?;
     }
-    let store = MetadataStore::adopt(dir.clone())?;
+    let store = MetadataStore::adopt(dir)?;
     let manager = BranchManager::open(store.clone())?;
     let head = manager.check_out_composed(&view.default_branch)?;
 
     let mut config = store.load_config()?;
     config.remote = Some(RemoteSection {
-        url: url.clone(),
+        url: url.to_owned(),
         project: Some(view.key.clone()),
     });
     store.write_config(&config)?;

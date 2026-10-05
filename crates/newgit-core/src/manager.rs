@@ -4787,8 +4787,10 @@ impl BranchManager {
         }
         if !self.source.is_ancestor(&tip, &view)? {
             return Ok(Some(format!(
-                "the project root's `{branch}` has commits of its own, so it was left as it is \
-                 (`newgit merge main` publishes them)"
+                "the project root's own branch, `{branch}` (checked out at `newgit init`), has \
+                 commits `main` does not, so it was left as it is: `git merge {}` there brings \
+                 the merge in, and `newgit merge main` publishes those commits",
+                &view[..view.len().min(12)]
             )));
         }
         let checked_out =
