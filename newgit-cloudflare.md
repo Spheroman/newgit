@@ -271,6 +271,23 @@ snapshots.
 
 ### Auth
 
+**Hostnames (decided).** Everything lives on `newgit.dev`, a domain used for
+nothing else — no real app's cookies can reach agent-written preview code.
+
+- `app.newgit.dev` — the web UI and the API.
+- `<id>.newgit.dev` — one preview each. One level deep, because the free
+  certificate covers `*.newgit.dev` only. Ids are random (`pv-…`) and can
+  never equal a reserved name (`app`, `www`, `api`).
+
+Previews and the UI are the *same site* to a browser, so preview code could
+send requests to the UI with the user's cookies or plant a domain-wide
+cookie. Two rules close that: **every newgit cookie is `__Host-` prefixed**
+(host-only; no subdomain can set or overwrite it), and **every
+state-changing request to the UI or API must carry a matching `Origin`**.
+A preview gets its viewer through a redirect to `app.newgit.dev`, which
+returns a short-lived signed ticket; the preview host then sets its own
+`__Host-` session cookie.
+
 **URLs the app hands to the browser** (`SUPABASE_URL`, a site URL, a base
 path) must point at the preview, not `127.0.0.1`. That is a render, like
 ports: a preview exports `{{preview.url}}` and per-port public URLs, and the
@@ -609,13 +626,9 @@ Resolved loudly; each is reversible after the competition.
 
 ## Open Questions
 
-- **Preview domain.** `faretable.app` is on the account but serves the live
-  FareTable app. A preview on its subdomain receives any cookie FareTable
-  sets with `Domain=faretable.app`, and preview code is agent-written. The
-  free certificate also covers one subdomain level only. Recommended: a
-  dedicated newgit preview domain (as `vercel.app` is for Vercel). Fallback
-  for the demo: `<name>.faretable.app`, if FareTable sets only host-only
-  cookies.
+- **Wildcard DNS for `newgit.dev`** has to be added (a proxied `*` record);
+  the Wrangler OAuth token cannot read or write DNS. Jack adds it, or a token
+  scoped to DNS edit on that zone.
 - **Cold restores.** The first restore of a multi-GB snapshot on a host is
   slow (70–100 s seen); repeats are fast (5 s). Running CI and actions from
   the snapshot right after it is built warms it as a side effect, but
