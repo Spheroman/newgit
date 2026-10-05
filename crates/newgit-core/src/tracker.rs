@@ -14,11 +14,24 @@ pub struct TrackerDefinition {
     /// Whether a source merge should carry this tracker binding with it.
     pub merge_with_source: bool,
     /// Workspace-relative paths this tracker owns. May be empty for lanes
-    /// that only receive deposits (e.g. `db-snapshots`).
+    /// that only receive deposits (e.g. `db-snapshots`). `.` means everything
+    /// no more specific tracker owns — the `root` tracker.
     pub paths: Vec<Utf8PathBuf>,
+    /// Kept out of Git entirely: excluded in every workspace, never committed,
+    /// captured by newgit from the files. True unless a definition says
+    /// otherwise — fails closed, like export's audience filter.
+    pub secret: bool,
+    /// Paths inside this tracker's own that a more specific tracker owns, so
+    /// they are not this tracker's to capture, restore, or clear. Computed
+    /// from the full set of definitions ([`resolve_ownership`]); not part of
+    /// the definition file.
+    pub excluded: Vec<Utf8PathBuf>,
     /// `sha256:<hex12>` of the definition file contents.
     pub definition_rev: String,
 }
+
+/// The tracker owning everything no other tracker claims.
+pub const ROOT_TRACKER: &str = "root";
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
@@ -37,6 +50,16 @@ pub struct TrackerDefinitionFile {
     merge_with_source: bool,
     #[serde(default)]
     paths: Vec<Utf8PathBuf>,
+    #[serde(default = "secret_by_default", skip_serializing_if = "is_true")]
+    secret: bool,
+}
+
+fn secret_by_default() -> bool {
+    true
+}
+
+fn is_true(value: &bool) -> bool {
+    *value
 }
 
 impl TrackerDefinition {
@@ -53,6 +76,8 @@ impl TrackerDefinition {
             storage,
             merge_with_source,
             paths,
+            secret: true,
+            excluded: Vec::new(),
             definition_rev: String::new(),
         };
         definition.validate()?;
@@ -81,6 +106,8 @@ impl TrackerDefinition {
             storage: file.storage,
             merge_with_source: file.merge_with_source,
             paths: file.paths,
+            secret: file.secret,
+            excluded: Vec::new(),
             definition_rev: format!("sha256:{hex}"),
         };
         definition.validate()?;
@@ -97,7 +124,27 @@ impl TrackerDefinition {
             )));
         }
 
+        if self.owns_everything() && self.paths.len() > 1 {
+            return Err(self.invalid(
+                "`.` owns everything not claimed elsewhere, so it must be the only path".to_owned(),
+            ));
+        }
+        // A tracker whose content is committed (not secret) is a code tracker:
+        // its history comes from splitting workspace commits, which arrives
+        // with the composed workspace (newgit-trackers.md, step 3). Until then
+        // only `root` — whose history is the project's own — can be one.
+        if !self.secret && !self.owns_everything() {
+            return Err(self.invalid(
+                "`secret = false` (a tracker whose content is committed) is supported only for \
+                 the root tracker until workspaces are composed from trackers"
+                    .to_owned(),
+            ));
+        }
+
         for path in &self.paths {
+            if path.as_str() == "." {
+                continue;
+            }
             if path.is_absolute()
                 || path.as_str().is_empty()
                 || path.components().any(|c| c.as_str() == "..")
@@ -134,7 +181,43 @@ impl TrackerDefinition {
             storage: self.storage,
             merge_with_source: self.merge_with_source,
             paths: self.paths.clone(),
+            secret: self.secret,
         }
+    }
+
+    /// The root tracker as `newgit init` writes it: owns `.`, committed, read
+    /// by the project's developers. Its history is the project's own Git
+    /// history.
+    pub fn root() -> Self {
+        let mut definition = Self {
+            name: ROOT_TRACKER.to_owned(),
+            audience: "project-devs".to_owned(),
+            storage: Storage::Local,
+            merge_with_source: true,
+            paths: vec![Utf8PathBuf::from(".")],
+            secret: false,
+            excluded: Vec::new(),
+            definition_rev: String::new(),
+        };
+        definition.definition_rev = definition
+            .compute_definition_rev()
+            .expect("the root definition serializes");
+        definition
+    }
+
+    /// Owns `.`: everything no more specific tracker claims.
+    pub fn owns_everything(&self) -> bool {
+        self.paths.iter().any(|path| path.as_str() == ".")
+    }
+
+    /// Whether `relative` is this tracker's: under one of its paths and not
+    /// under a more specific tracker's.
+    pub fn owns(&self, relative: &Utf8Path) -> bool {
+        let claimed = self
+            .paths
+            .iter()
+            .any(|path| path.as_str() == "." || relative.starts_with(path));
+        claimed && !self.excluded.iter().any(|path| relative.starts_with(path))
     }
 
     fn compute_definition_rev(&self) -> Result<String> {
@@ -160,23 +243,60 @@ impl TrackerDefinition {
     }
 }
 
-/// Content lanes must be disjoint: no two trackers may own the same path or
-/// nest inside each other, or projection/restore order would matter.
-pub fn validate_disjoint(definitions: &[TrackerDefinition]) -> Result<()> {
+/// Settle who owns what across every tracker. A path's owner is its most
+/// specific claimant, so trackers may nest — `apps` can hold `apps/electron`
+/// for another tracker — but no two may claim the identical path, and only
+/// one may own `.`. Fills in each definition's `excluded` (paths inside its
+/// own that a more specific tracker owns).
+pub fn resolve_ownership(definitions: &mut [TrackerDefinition]) -> Result<()> {
+    let roots: Vec<&str> = definitions
+        .iter()
+        .filter(|definition| definition.owns_everything())
+        .map(|definition| definition.name.as_str())
+        .collect();
+    if roots.len() > 1 {
+        return Err(NewgitError::TrackerPathConflict {
+            left: roots[0].to_owned(),
+            right: roots[1].to_owned(),
+            path: Utf8PathBuf::from("."),
+        });
+    }
     for (index, left) in definitions.iter().enumerate() {
         for right in &definitions[index + 1..] {
-            for left_path in &left.paths {
-                for right_path in &right.paths {
-                    if left_path.starts_with(right_path) || right_path.starts_with(left_path) {
-                        return Err(NewgitError::TrackerPathConflict {
-                            left: left.name.clone(),
-                            right: right.name.clone(),
-                            path: left_path.clone(),
-                        });
-                    }
+            for path in &left.paths {
+                if right.paths.contains(path) {
+                    return Err(NewgitError::TrackerPathConflict {
+                        left: left.name.clone(),
+                        right: right.name.clone(),
+                        path: path.clone(),
+                    });
                 }
             }
         }
+    }
+    let claims: Vec<(String, Utf8PathBuf)> = definitions
+        .iter()
+        .flat_map(|definition| {
+            definition
+                .paths
+                .iter()
+                .map(|path| (definition.name.clone(), path.clone()))
+        })
+        .collect();
+    for definition in definitions.iter_mut() {
+        definition.excluded = claims
+            .iter()
+            .filter(|(name, inner)| {
+                name != &definition.name
+                    && inner.as_str() != "."
+                    && definition.paths.iter().any(|outer| {
+                        outer.as_str() == "." || (inner != outer && inner.starts_with(outer))
+                    })
+            })
+            .map(|(_, inner)| inner.clone())
+            .collect();
+        definition.excluded.sort();
+        definition.excluded.dedup();
     }
     Ok(())
 }
@@ -187,7 +307,14 @@ pub fn collect_owned_files(
     workspace: &Utf8Path,
     definition: &TrackerDefinition,
 ) -> Result<Vec<(Utf8PathBuf, Utf8PathBuf)>> {
-    collect_files(workspace, &definition.paths)
+    let mut files = collect_files(workspace, &definition.paths)?;
+    files.retain(|(relative, _)| {
+        !definition
+            .excluded
+            .iter()
+            .any(|inner| relative.starts_with(inner))
+    });
+    Ok(files)
 }
 
 /// Files under the given root-relative paths, as (relative, absolute) pairs,
@@ -276,25 +403,64 @@ mod tests {
             storage: Storage::Local,
             merge_with_source: false,
             paths: paths.iter().map(Utf8PathBuf::from).collect(),
+            secret: true,
+            excluded: Vec::new(),
             definition_rev: "sha256:000000000000".to_owned(),
         }
     }
 
     #[test]
-    fn nested_paths_conflict() {
-        let defs = [
+    fn the_most_specific_owner_wins_and_identical_claims_conflict() {
+        let mut defs = [
             definition("a", &["src/generated"]),
             definition("b", &["src/generated/sdk"]),
+            TrackerDefinition::root(),
         ];
-        assert!(matches!(
-            validate_disjoint(&defs),
-            Err(NewgitError::TrackerPathConflict { .. })
-        ));
-        let ok = [
-            definition("a", &["src/generated"]),
+        resolve_ownership(&mut defs).expect("nesting is allowed");
+        assert_eq!(
+            defs[0].excluded,
+            vec![Utf8PathBuf::from("src/generated/sdk")]
+        );
+        assert!(defs[1].excluded.is_empty());
+        assert_eq!(
+            defs[2].excluded,
+            vec![
+                Utf8PathBuf::from("src/generated"),
+                Utf8PathBuf::from("src/generated/sdk")
+            ]
+        );
+        assert!(defs[0].owns(Utf8Path::new("src/generated/types.ts")));
+        assert!(!defs[0].owns(Utf8Path::new("src/generated/sdk/client.ts")));
+        assert!(defs[2].owns(Utf8Path::new("README.md")));
+        assert!(!defs[2].owns(Utf8Path::new("src/generated/types.ts")));
+
+        let mut clash = [
+            definition("a", &[".env.local"]),
             definition("b", &[".env.local"]),
         ];
-        assert!(validate_disjoint(&ok).is_ok());
+        assert!(matches!(
+            resolve_ownership(&mut clash),
+            Err(NewgitError::TrackerPathConflict { .. })
+        ));
+    }
+
+    #[test]
+    fn only_root_may_be_committed_for_now() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path =
+            Utf8PathBuf::from_path_buf(temp.path().join("electron.toml")).expect("utf8 path");
+        std::fs::write(
+            &path,
+            "audience = \"project-devs\"\nstorage = \"local\"\npaths = [\"apps/electron\"]\nsecret = false\n",
+        )
+        .expect("write");
+        let error = TrackerDefinition::from_file("electron", &path)
+            .expect_err("a committed non-root tracker waits for step 3");
+        assert!(
+            error.to_string().contains("only for the root tracker"),
+            "{error}"
+        );
+        assert!(!TrackerDefinition::root().secret);
     }
 
     #[test]

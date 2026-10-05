@@ -267,8 +267,10 @@ impl TrackerRepo {
         clear_owned_paths(workspace, definition)?;
 
         // Only what the definition owns *now*: a rev captured before a path
-        // was untracked must not write that path back.
-        let files = self.tree_files(&commit, &definition.paths)?;
+        // was untracked — or before a more specific tracker took part of it —
+        // must not write that path back.
+        let mut files = self.tree_files(&commit, &definition.paths)?;
+        files.retain(|file| definition.owns(Utf8Path::new(file)));
         self.check_out(&commit, workspace, &files)?;
         Ok(files.len())
     }
@@ -434,6 +436,35 @@ fn tracker_refs(git_dir: &Utf8Path) -> Result<Vec<(String, String)>> {
     Ok(refs)
 }
 
+/// Give a tracker the project's existing Git history: borrow the project
+/// repository's objects (Git alternates — nothing is copied, and the project
+/// repository never sees the store's objects in return) and point the
+/// tracker's `main` at `commit`. How `newgit init` hands root its history.
+pub fn import_history(
+    git_dir: &Utf8Path,
+    objects: &Utf8Path,
+    tracker: &str,
+    commit: &str,
+) -> Result<()> {
+    ensure_repo(git_dir)?;
+    let alternates = git_dir.join("objects/info/alternates");
+    let existing = std::fs::read_to_string(&alternates).unwrap_or_default();
+    if !existing.lines().any(|line| line == objects.as_str()) {
+        create_dir_all(&git_dir.join("objects/info"))?;
+        std::fs::write(&alternates, format!("{existing}{objects}\n"))
+            .map_err(|source| NewgitError::io(&alternates, source))?;
+    }
+    git(
+        git_dir,
+        &[
+            "update-ref",
+            &format!("refs/trackers/{tracker}/main"),
+            commit,
+        ],
+    )
+    .map(drop)
+}
+
 /// Create the store if this machine has none yet.
 pub fn ensure_store(git_dir: &Utf8Path) -> Result<()> {
     ensure_repo(git_dir)
@@ -593,6 +624,19 @@ fn run(command: &mut Command, description: &str, stdin: Option<&[u8]>) -> Result
 /// content" means file absence, not leftovers.
 pub fn clear_owned_paths(workspace: &Utf8Path, definition: &TrackerDefinition) -> Result<()> {
     for owned in &definition.paths {
+        // A more specific tracker owns something inside: remove this
+        // tracker's files one by one and leave that tracker's alone.
+        if definition
+            .excluded
+            .iter()
+            .any(|inner| inner.starts_with(owned))
+        {
+            for (_, absolute) in collect_owned_files(workspace, definition)? {
+                std::fs::remove_file(&absolute)
+                    .map_err(|source| NewgitError::io(&absolute, source))?;
+            }
+            continue;
+        }
         let target = workspace.join(owned);
         if target.is_dir() {
             std::fs::remove_dir_all(&target).map_err(|source| NewgitError::io(&target, source))?;

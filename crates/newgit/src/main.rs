@@ -1222,23 +1222,27 @@ fn tracker(command: TrackerCommand) -> Result<()> {
             let manager = manager_here()?;
             warn_gitignore(&manager);
             warn_graph(&manager);
-            let definitions = manager.tracker_definitions();
-            if definitions.is_empty() {
-                println!("No trackers defined. Create one with `newgit tracker create <name>`.");
-                return Ok(());
-            }
+            // Root first: it owns everything the others do not, so the list
+            // reads as "the rest of the project, then the parts carved out".
+            let definitions: Vec<_> = std::iter::once(manager.root_tracker())
+                .chain(manager.tracker_definitions())
+                .collect();
             // Same reasoning as `resource list`: compute widths from every
             // row plus the header, so a long AUDIENCE value can't push PATHS
             // out of alignment.
             let rows: Vec<_> = definitions
                 .iter()
                 .map(|definition| {
-                    let paths = definition
-                        .paths
-                        .iter()
-                        .map(|path| path.as_str())
-                        .collect::<Vec<_>>()
-                        .join(", ");
+                    let paths = if definition.owns_everything() {
+                        "(everything no other tracker claims)".to_owned()
+                    } else {
+                        definition
+                            .paths
+                            .iter()
+                            .map(|path| path.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    };
                     (
                         definition.name.clone(),
                         definition.merge_with_source.to_string(),

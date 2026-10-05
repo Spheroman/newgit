@@ -227,9 +227,15 @@ Each step lands alone and keeps the suite green.
 1. **Tracker repos with history.** Lanes become real branches (`main`,
    `instances/<instance>`) with parents, messages, authors. Capture commits;
    merge merges. The env-file case keeps working unchanged in behavior.
-2. **`project` and `root` trackers; ownership by specificity.** `newgit init`
-   imports history into `root`. Source stops being special in the code.
-3. **The projection.** Composed workspace commits, splitting at capture, the
+2. **`root` tracker; ownership by specificity; `secret`.** *(Landed.)*
+   `newgit init` writes `trackers/root.toml` (owns `.`, committed) and
+   imports the project's history as root's `main`, borrowing its objects.
+   Trackers nest; the most specific owner wins. `secret` defaults to true,
+   and until step 3 only root may be committed (`secret = false`). The
+   `project` tracker moved to step 3: until workspaces are composed,
+   `.newgit/` lives in the project's own history, and a second copy would
+   have nothing reading it.
+3. **The projection, and the `project` tracker.** Composed workspace commits, splitting at capture, the
    unbound-owner refusal, `newgit log <tracker>`.
 4. **Roles, priority, resources, use/drop.** Binding per slot; resources
    brought by trackers; role dependencies.

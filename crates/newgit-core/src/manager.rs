@@ -62,6 +62,10 @@ pub struct BranchManager {
     graph: ResourceGraph,
     /// The project's remote, when `[remote]` is configured.
     remote: Option<RemoteLink>,
+    /// The tracker owning everything no other tracker claims. Held apart
+    /// from `trackers`, the ones newgit captures from files: root's history
+    /// is the project's own Git history, committed with Git.
+    root: TrackerDefinition,
 }
 
 /// What `spawn --from-checkpoint` did.
@@ -559,7 +563,13 @@ impl BranchManager {
         store.ensure_initialized()?;
         let config = store.load_config()?;
         let source = GitSource::open(&store.paths().project_root, config.project.source)?;
-        let trackers = store.load_tracker_definitions()?;
+        let mut trackers = store.load_tracker_definitions()?;
+        // A project initialized before `root` existed has no root.toml; it
+        // still has a root — everything its other trackers do not claim.
+        let root = match trackers.iter().position(TrackerDefinition::owns_everything) {
+            Some(index) => trackers.remove(index),
+            None => TrackerDefinition::root(),
+        };
         let resources = store.load_resource_definitions()?;
         let tracker_names: BTreeSet<String> = trackers.iter().map(|t| t.name.clone()).collect();
         let graph = resolve_graph(&resources, &tracker_names);
@@ -588,6 +598,7 @@ impl BranchManager {
             resources,
             graph,
             remote,
+            root,
         })
     }
 
@@ -647,6 +658,22 @@ impl BranchManager {
 
     pub fn tracker_definitions(&self) -> &[TrackerDefinition] {
         &self.trackers
+    }
+
+    /// The root tracker: owns everything no other tracker claims.
+    pub fn root_tracker(&self) -> &TrackerDefinition {
+        &self.root
+    }
+
+    /// Refuse a tracker command aimed at root, saying what to do instead.
+    fn refuse_root(&self, tracker: &str, action: &str) -> Result<()> {
+        if tracker == self.root.name {
+            return Err(NewgitError::Unsupported(format!(
+                "`{tracker}` owns everything no other tracker claims, and its history is this \
+                 project's own Git history: {action}"
+            )));
+        }
+        Ok(())
     }
 
     /// The tracker-path invariant, checked loudly: non-source tracker paths
@@ -2611,6 +2638,7 @@ impl BranchManager {
         merge_with_source: bool,
     ) -> Result<AddTrackerOutcome> {
         validate_name(name)?;
+        self.refuse_root(name, "it always exists")?;
         // A remote tracker with nowhere to sync would behave exactly like a
         // local one while claiming otherwise. Refuse it here, where the claim
         // is made; definitions written by hand are not bricked on load.
@@ -2638,7 +2666,9 @@ impl BranchManager {
     pub fn track_paths(&self, tracker: &str, paths: &[Utf8PathBuf]) -> Result<TrackPathsOutcome> {
         let definition = self.definition_or_load(tracker)?;
         let updated = definition.with_added_paths(paths)?;
-        validate_disjoint_with_replacement(&self.trackers, &updated)?;
+        let mut all = self.trackers.clone();
+        all.push(self.root.clone());
+        validate_ownership_with_replacement(&all, &updated)?;
         let path = self.store.save_tracker_definition(&updated)?;
 
         let mut patterns = Vec::new();
@@ -2669,13 +2699,7 @@ impl BranchManager {
     /// left in place; see the caller for why that is safe to leave to
     /// `newgit cleanup`.
     pub fn remove_tracker(&self, name: &str) -> Result<RemoveTrackerOutcome> {
-        if name == "source" {
-            return Err(NewgitError::Unsupported(
-                "`source` is the default tracker: Git/jj owns its history, and there is no \
-                 `.newgit/trackers/source.toml` to remove"
-                    .to_owned(),
-            ));
-        }
+        self.refuse_root(name, "it cannot be removed")?;
 
         let definition = self
             .trackers
@@ -4527,6 +4551,7 @@ impl BranchManager {
     }
 
     fn definition(&self, tracker: &str) -> Result<&TrackerDefinition> {
+        self.refuse_root(tracker, "commit to it with Git instead")?;
         self.trackers
             .iter()
             .find(|definition| definition.name == tracker)
@@ -4534,6 +4559,7 @@ impl BranchManager {
     }
 
     fn definition_or_load(&self, tracker: &str) -> Result<TrackerDefinition> {
+        self.refuse_root(tracker, "commit to it with Git instead")?;
         if let Some(definition) = self
             .trackers
             .iter()
@@ -4709,7 +4735,7 @@ fn differing_lines(expected: &str, actual: &str) -> usize {
     common + expected.len().abs_diff(actual.len())
 }
 
-fn validate_disjoint_with_replacement(
+fn validate_ownership_with_replacement(
     definitions: &[TrackerDefinition],
     replacement: &TrackerDefinition,
 ) -> Result<()> {
@@ -4726,7 +4752,7 @@ fn validate_disjoint_with_replacement(
     if !replaced {
         updated.push(replacement.clone());
     }
-    crate::tracker::validate_disjoint(&updated)
+    crate::tracker::resolve_ownership(&mut updated)
 }
 
 /// Why a per-user tracker came up empty for whoever is spawning: nothing of

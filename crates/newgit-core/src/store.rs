@@ -9,7 +9,7 @@ use crate::error::{NewgitError, Result};
 use crate::installs::InstallStore;
 use crate::materializer::{WorkspaceMarker, create_dir_all};
 use crate::resource::ResourceDefinition;
-use crate::tracker::{TrackerDefinition, validate_disjoint};
+use crate::tracker::{TrackerDefinition, resolve_ownership};
 
 const LOCAL_GITIGNORE: &str = "\
 # newgit local state — never committed
@@ -110,7 +110,44 @@ impl MetadataStore {
         store.create_layout()?;
         let config = ProjectConfig::new(project_name, source);
         store.write_toml(&store.paths.config, "project config", &config)?;
+        store.init_root()?;
         Ok(store)
+    }
+
+    /// Write the root tracker's definition and give it the project's history
+    /// as its `main`: the repository's current commit, objects borrowed rather
+    /// than copied. A repository with no commits yet gives root no history.
+    fn init_root(&self) -> Result<()> {
+        let root = TrackerDefinition::root();
+        self.create_tracker_definition(&root)?;
+        let project = self.paths.project_root.as_str();
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(project)
+                .args(args)
+                .output()
+                .ok()
+                .filter(|output| output.status.success())
+                .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+        };
+        let (Some(commit), Some(objects)) = (
+            git(&["rev-parse", "--verify", "--quiet", "HEAD^{commit}"]),
+            git(&[
+                "rev-parse",
+                "--path-format=absolute",
+                "--git-path",
+                "objects",
+            ]),
+        ) else {
+            return Ok(());
+        };
+        crate::tracker_repo::import_history(
+            &self.paths.tracker_store,
+            Utf8Path::new(&objects),
+            &root.name,
+            &commit,
+        )
     }
 
     /// Walk upward from `cwd` to find the governing metadata. A workspace is
@@ -205,7 +242,8 @@ impl MetadataStore {
     }
 
     /// Tracker definitions, one per file in `.newgit/trackers/`; the name
-    /// comes from the filename. Lanes are validated as disjoint.
+    /// comes from the filename. Ownership is resolved across all of them: a
+    /// path belongs to its most specific claimant.
     pub fn load_tracker_definitions(&self) -> Result<Vec<TrackerDefinition>> {
         self.ensure_initialized()?;
         let mut definitions = Vec::new();
@@ -218,7 +256,7 @@ impl MetadataStore {
             };
             definitions.push(TrackerDefinition::from_file(name, &entry)?);
         }
-        validate_disjoint(&definitions)?;
+        resolve_ownership(&mut definitions)?;
         Ok(definitions)
     }
 

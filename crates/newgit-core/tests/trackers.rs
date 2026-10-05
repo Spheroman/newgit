@@ -315,12 +315,14 @@ fn dual_tracked_paths_warn_loudly() {
 }
 
 #[test]
-fn disjoint_lanes_and_empty_pull_are_enforced() {
+fn identical_claims_and_empty_pull_are_enforced() {
     let (_guard, temp) = tempdir();
     let store = setup(&temp);
     let repo = store.paths().project_root.clone();
 
-    for (name, path) in [("a", "src/generated"), ("b", "src/generated/sdk")] {
+    // Nesting is fine (the most specific owner wins); claiming the very same
+    // path twice is not.
+    for (name, path) in [("a", "src/generated"), ("b", "src/generated")] {
         std::fs::write(
             store.paths().trackers.join(format!("{name}.toml")),
             format!(
