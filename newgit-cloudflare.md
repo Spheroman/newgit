@@ -427,18 +427,20 @@ The workspace's `origin` fetch URL is `<p>.src`, so `git pull` shows trunk.
 
 ---
 
-## Tracker Lanes Are Git (landed)
+## Tracker Repos (landed)
 
-Lanes are commits in a bare repo at `.newgit/local/lanes.git`, separate from
-the store repo (secrets must never reach a `git push --mirror` or the object
-store a local clone hardlinks into each workspace). A rev is a parentless
-commit with a fixed identity and date, so identical content is the identical
-rev on any machine. `refs/lanes/<tracker>/revs/<rev>` keeps a rev alive;
-`refs/lanes/<tracker>/head` is the lane head. Cleanup deletes unrooted rev
-refs and runs `gc --prune=now`.
+Each tracker's history lives in a bare repo at `.newgit/local/trackers.git`,
+separate from the project repo (secrets must never reach a `git push
+--mirror` or the object store a local clone hardlinks into each workspace),
+under `refs/trackers/<tracker>/`: `main`, `instances/<instance>`, and
+`pins/<rev>` keeping what bindings and checkpoints name. Captures are real
+commits with parents, authors, and messages; equal content is an equal
+tree on any machine. Cleanup drops unrooted pins and runs
+`gc --prune=now`. The full model is in `newgit-trackers.md`.
 
-Pushing a tracker is one refspec, `refs/lanes/<tracker>/*`, to its repo. A
-push sends only objects reachable from the refs pushed, so no other tracker's
+A checkpoint syncs a tracker by pushing its pin and the instance's branch
+(and, for a per-user tracker, its `main`) to that tracker's repo. A push
+sends only objects reachable from the refs pushed, so no other tracker's
 content can ride along.
 
 ---
@@ -589,7 +591,7 @@ CLI).
 
 | Question | Answer | Consequence |
 |---|---|---|
-| newgit in a sandbox | **Works.** A full session — init, seed a tracker, spawn with a Postgres `command-snapshot` resource, checkpoint, wreck the database and `.env.local`, undo — in **4.4 s**. Lane revs land in `lanes.git` as designed. First boot of a custom image 5–9 s. | The base image is real; newgit needs no changes to run in a sandbox. |
+| newgit in a sandbox | **Works.** A full session — init, seed a tracker, spawn with a Postgres `command-snapshot` resource, checkpoint, wreck the database and `.env.local`, undo — in **4.4 s**. Tracker revs land in the tracker store as designed. First boot of a custom image 5–9 s. | The base image is real; newgit needs no changes to run in a sandbox. |
 | Docker in a sandbox | Docker runs. `--network=host` containers work; the default bridge network **fails** (`failed to disable IPv6 on container's interface`). | Docker-based resources work only if they run on the host network. |
 | Supabase in a sandbox | Fails as configured: its database container dies on that bridge-network error. **Fixed in round 3** (below). | — |
 | Snapshot of a restored sandbox | **Incremental:** 9 s and 35 MB, against 41 s and 995 MB for the first. | A checkpoint snapshot taken on top of an environment snapshot costs only its delta. Layer snapshots: environment → checkpoint. |
@@ -663,7 +665,7 @@ Resolved loudly; each is reversible after the competition.
 10. **Artifacts is the project remote** in remote mode; GitHub is a mirror.
 11. **Identity is GitHub login**, via device flow. **Agents act as their
     owner.**
-12. **Tracker lanes are Git** (`refs/lanes/<tracker>/*`), in a lanes repo
+12. **Tracker history is Git** (`refs/trackers/<tracker>/*`), in a tracker repo
     separate from the store.
 
 ## Open Questions

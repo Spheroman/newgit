@@ -6,7 +6,6 @@ pub mod error;
 pub mod export;
 pub mod exports;
 pub mod installs;
-pub mod lane;
 pub mod manager;
 pub mod materializer;
 pub mod ports;
@@ -18,6 +17,7 @@ pub mod store;
 pub mod supervisor;
 pub mod templates;
 pub mod tracker;
+pub mod tracker_repo;
 
 pub use branch::{BranchInstance, InstanceStatus, ResourceBinding, TrackerBinding};
 pub use config::{ProjectConfig, SourceSubstrate};

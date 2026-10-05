@@ -844,7 +844,11 @@ fn remove_reports_the_history_it_keeps() {
 
 /// A tracker's lane in the store's lanes repo — what "this rev still exists"
 /// is asked of.
-fn lane(store: &MetadataStore, tracker: &str) -> newgit_core::lane::TrackerLane {
+fn lane(store: &MetadataStore, tracker: &str) -> newgit_core::tracker_repo::TrackerRepo {
     let paths = store.paths();
-    newgit_core::lane::TrackerLane::new(&paths.lanes, &paths.lane_checkouts, tracker)
+    newgit_core::tracker_repo::TrackerRepo::new(
+        &paths.tracker_store,
+        &paths.tracker_checkouts,
+        tracker,
+    )
 }

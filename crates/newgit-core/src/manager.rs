@@ -20,10 +20,6 @@ use crate::error::{NewgitError, Result};
 use crate::export::{self, ExportFilter, ExportPlan, prepare_destination};
 use crate::exports::{RenderContext, render, unresolved_placeholder};
 use crate::installs::{Admission, InstallReport, InstallStore};
-use crate::lane::{
-    TrackerLane, clear_owned_paths, copy_file, lane_revs, parse_tracker_state_ref,
-    prune_unreferenced,
-};
 use crate::materializer::{
     Materializer, RealDirMaterializer, exclude_produced_paths, exclude_tracker_paths,
     unexclude_tracker_paths,
@@ -40,6 +36,10 @@ use crate::store::MetadataStore;
 use crate::supervisor::{StopOutcome, Supervisor, run_captured, run_foreground};
 use crate::templates::{instantiate, resource_template};
 use crate::tracker::{Storage, TrackerDefinition, collect_files, collect_owned_files, content_rev};
+use crate::tracker_repo::{
+    Branch, CaptureAt, TrackerRepo, clear_owned_paths, copy_file, parse_tracker_state_ref,
+    pinned_revs, prune_unreferenced,
+};
 
 /// The store remote a workspace's `git push` is forwarded to.
 const PUBLISH_REMOTE: &str = "origin";
@@ -920,7 +920,7 @@ impl BranchManager {
                     .split_once(&marker)
                     .map(|(_, rest)| rest.trim_start_matches('/').to_owned())
                     .unwrap_or_default();
-                let local = self.store.paths().lane_checkouts.join(tracker).join(rev);
+                let local = self.store.paths().tracker_checkouts.join(tracker).join(rev);
                 state.state_path = Some(if relative.is_empty() {
                     local
                 } else {
@@ -971,8 +971,8 @@ impl BranchManager {
                 None => Ok(None),
             };
         }
-        let lanes = format!("--git-dir={}", self.store.paths().lanes);
-        crate::lane::ensure_lanes_repo(&self.store.paths().lanes)
+        let lanes = format!("--git-dir={}", self.store.paths().tracker_store);
+        crate::tracker_repo::ensure_store(&self.store.paths().tracker_store)
             .map_err(|error| error.to_string())?;
         if definition.audience == "user" {
             // Your own content, never the author's.
@@ -980,14 +980,14 @@ impl BranchManager {
             let credential = match remote.credential(project, &repo, Scope::Read) {
                 Ok(credential) => credential,
                 Err(NewgitError::Remote { status: 404, .. }) => {
-                    return match lane.latest() {
+                    return match lane.main() {
                         Some(rev) => Ok(Some(rev)),
                         None => Err("you have no content for it yet; it starts empty".to_owned()),
                     };
                 }
                 Err(error) => return Err(error.to_string()),
             };
-            let pattern = format!("refs/lanes/{}/*", definition.name);
+            let pattern = format!("refs/trackers/{}/*", definition.name);
             GitSource::fetch_refs(
                 &[&lanes],
                 credential.remote.as_deref().unwrap_or_default(),
@@ -995,7 +995,7 @@ impl BranchManager {
                 &basic_auth_header(&credential),
             )
             .map_err(|error| error.to_string())?;
-            return match lane.latest() {
+            return match lane.main() {
                 Some(rev) => Ok(Some(rev)),
                 None => Err("you have no content for it yet; it starts empty".to_owned()),
             };
@@ -1014,7 +1014,7 @@ impl BranchManager {
                     NewgitError::Remote { message, .. } => format!("refused: {message}"),
                     other => other.to_string(),
                 })?;
-        let rev_ref = format!("refs/lanes/{}/revs/{rev}", definition.name);
+        let rev_ref = format!("refs/trackers/{}/pins/{rev}", definition.name);
         GitSource::fetch_refs(
             &[&lanes],
             credential.remote.as_deref().unwrap_or_default(),
@@ -2331,11 +2331,26 @@ impl BranchManager {
         if refresh && !definition.paths.is_empty() {
             let existing = collect_owned_files(&workspace, definition)?;
             if !existing.is_empty() {
-                lane.capture(&workspace, definition)?;
+                let bound = branch
+                    .trackers
+                    .get(&definition.name)
+                    .and_then(|binding| binding.content_rev.clone());
+                lane.capture(
+                    &workspace,
+                    definition,
+                    CaptureAt {
+                        parent: bound.as_deref(),
+                        branch: Branch::Instance(&branch.slug),
+                        message: &format!(
+                            "{} in `{}`, before re-binding",
+                            definition.name, branch.name
+                        ),
+                    },
+                )?;
             }
         }
 
-        let (origin, content_rev, files) = match lane.latest() {
+        let (origin, content_rev, files) = match lane.main() {
             Some(rev) => {
                 let files = lane.restore(&workspace, definition, &rev)?;
                 (BindOrigin::LaneHead, Some(rev), files)
@@ -2372,15 +2387,23 @@ impl BranchManager {
         // Reversing the substitution keeps the edits and drops the values.
         let reversed = self.unrender_for_capture(&branch, definition)?;
 
-        let lane = self.lane(&definition.name);
-        let capture = lane.capture(&branch.workspace_path, definition);
-        reversed.restore()?;
-        let capture = capture?;
-
         let previous = branch
             .trackers
             .get(&definition.name)
             .and_then(|binding| binding.content_rev.clone());
+        let lane = self.lane(&definition.name);
+        let capture = lane.capture(
+            &branch.workspace_path,
+            definition,
+            CaptureAt {
+                parent: previous.as_deref(),
+                branch: Branch::Instance(&branch.slug),
+                message: &format!("{} in `{}`", definition.name, branch.name),
+            },
+        );
+        reversed.restore()?;
+        let capture = capture?;
+
         let changed = previous.as_deref() != Some(capture.rev.as_str());
         branch.trackers.insert(
             definition.name.clone(),
@@ -2435,9 +2458,17 @@ impl BranchManager {
         }
 
         let lane = self.lane(&definition.name);
-        let capture = lane.capture(&root, definition)?;
-        let changed = lane.latest().as_deref() != Some(capture.rev.as_str());
-        lane.set_latest(&capture.rev)?;
+        let main = lane.main();
+        let capture = lane.capture(
+            &root,
+            definition,
+            CaptureAt {
+                parent: main.as_deref(),
+                branch: Branch::Main,
+                message: &format!("{} seeded from the project", definition.name),
+            },
+        )?;
+        let changed = capture.committed;
 
         Ok(SeedReport {
             rev: capture.rev,
@@ -2482,7 +2513,22 @@ impl BranchManager {
         // with renders reversed, so the safety rev is a lane rev like any
         // other rather than one instance's ports.
         let reversed = self.unrender_for_capture(&branch, definition)?;
-        let safety = lane.capture(&branch.workspace_path, definition);
+        let bound = branch
+            .trackers
+            .get(&definition.name)
+            .and_then(|binding| binding.content_rev.clone());
+        let safety = lane.capture(
+            &branch.workspace_path,
+            definition,
+            CaptureAt {
+                parent: bound.as_deref(),
+                branch: Branch::Instance(&branch.slug),
+                message: &format!(
+                    "{} in `{}`, before checking out {target_rev}",
+                    definition.name, branch.name
+                ),
+            },
+        );
         reversed.restore()?;
         let safety = safety?;
         let safety_rev = (safety.rev != target_rev).then_some(safety.rev);
@@ -2516,7 +2562,7 @@ impl BranchManager {
         let definition = self.definition(tracker)?;
         self.require_workspace(&branch)?;
 
-        if self.lane(&definition.name).latest().is_none() {
+        if self.lane(&definition.name).main().is_none() {
             return Err(NewgitError::Unsupported(format!(
                 "tracker `{}` has no merged content to pull",
                 definition.name
@@ -2550,7 +2596,7 @@ impl BranchManager {
                 rev,
             });
         }
-        lane.set_latest(&rev)?;
+        lane.set_main(&rev)?;
         Ok(MergeTrackerOutcome {
             tracker: definition.name.clone(),
             rev,
@@ -2713,12 +2759,7 @@ impl BranchManager {
         let lane_heads: Vec<(String, Option<String>)> = self
             .trackers
             .iter()
-            .map(|definition| {
-                (
-                    definition.name.clone(),
-                    self.lane(&definition.name).latest(),
-                )
-            })
+            .map(|definition| (definition.name.clone(), self.lane(&definition.name).main()))
             .collect();
 
         self.store
@@ -2866,6 +2907,11 @@ impl BranchManager {
         };
 
         RealDirMaterializer.remove(&branch)?;
+        // Its branches go with it; pins keep whatever its archived
+        // checkpoints still name.
+        for definition in &self.trackers {
+            self.lane(&definition.name).drop_instance(&branch.slug)?;
+        }
         let archived_record = self.store.archive_branch_record(&branch)?;
         // Either way, count what the instance leaves behind: checkpoints kept
         // for an unreachable instance are disk nobody will reclaim by accident.
@@ -3161,8 +3207,8 @@ impl BranchManager {
         // Lane pruning. Roots come from the records that survive this pass,
         // so a dry run reports exactly what a real run would remove.
         let roots = SnapshotRoots::collect(&self.store, &surviving, archived)?;
-        let lanes = self.store.paths().lanes.clone();
-        for lane_rev in lane_revs(&lanes)? {
+        let lanes = self.store.paths().tracker_store.clone();
+        for lane_rev in pinned_revs(&lanes)? {
             if roots.contains(&lane_rev.tracker, &lane_rev.rev) {
                 continue;
             }
@@ -3658,9 +3704,24 @@ impl BranchManager {
                     .get(&definition.name)
                     .and_then(|binding| binding.content_rev.clone())
             } else {
+                let bound = branch
+                    .trackers
+                    .get(&definition.name)
+                    .and_then(|binding| binding.content_rev.clone());
                 Some(
                     self.lane(&definition.name)
-                        .capture(&workspace, definition)?
+                        .capture(
+                            &workspace,
+                            definition,
+                            CaptureAt {
+                                parent: bound.as_deref(),
+                                branch: Branch::Instance(&branch.slug),
+                                message: &format!(
+                                    "{} in `{}` at {id}",
+                                    definition.name, branch.name
+                                ),
+                            },
+                        )?
                         .rev,
                 )
             };
@@ -3766,17 +3827,21 @@ impl BranchManager {
             );
             let credential = remote.credential(&binding.project, &repo, Scope::Write)?;
             let url = credential.remote.clone().unwrap_or_default();
-            let lane_ref = format!("refs/lanes/{}/revs/{rev}", state.name);
-            let mut refspecs = vec![format!("{lane_ref}:{lane_ref}")];
-            // The lane head is what "your own content" means on another
-            // machine. Lane commits are parentless, so it is always a forced
-            // update: the last machine to sync names it.
-            if self.lane(&state.name).latest().is_some() {
-                let head = format!("refs/lanes/{}/head", state.name);
-                refspecs.push(format!("+{head}:{head}"));
+            let prefix = format!("refs/trackers/{}", state.name);
+            let pin = format!("{prefix}/pins/{rev}");
+            let instance = format!("{prefix}/instances/{}", branch.slug);
+            // The pin keeps the checkpoint's commit; the instance's branch is
+            // its history (forced: a checkout can move it back).
+            let mut refspecs = vec![format!("{pin}:{pin}"), format!("+{instance}:{instance}")];
+            // A per-user tracker's repo is the user's own, and its `main` is
+            // what "your own content" means on another machine. A shared
+            // tracker's `main` moves only by merge, never by a sync.
+            if definition.audience == "user" && self.lane(&state.name).main().is_some() {
+                let main = format!("{prefix}/main");
+                refspecs.push(format!("+{main}:{main}"));
             }
             GitSource::push_refs(
-                &[&format!("--git-dir={}", self.store.paths().lanes)],
+                &[&format!("--git-dir={}", self.store.paths().tracker_store)],
                 &url,
                 &refspecs,
                 &basic_auth_header(&credential),
@@ -3879,7 +3944,21 @@ impl BranchManager {
                 match (&spec.into_tracker, &staging_path) {
                     (Some(tracker), Some(staging_path)) => {
                         let lane = self.lane(tracker);
-                        let deposit = lane.deposit(staging_path)?;
+                        let bound = branch
+                            .trackers
+                            .get(tracker)
+                            .and_then(|binding| binding.content_rev.clone());
+                        let deposit = lane.deposit(
+                            staging_path,
+                            CaptureAt {
+                                parent: bound.as_deref(),
+                                branch: Branch::Instance(&branch.slug),
+                                message: &format!(
+                                    "{} checkpoint of `{}`",
+                                    definition.name, branch.name
+                                ),
+                            },
+                        )?;
                         // A path the command echoed under {{snapshot.path}}
                         // maps to the same relative location inside the lane.
                         let checkout = lane.checkout_dir(&deposit.rev)?;
@@ -4482,9 +4561,9 @@ impl BranchManager {
         Ok(state.consumable_state_ref())
     }
 
-    fn lane(&self, tracker: &str) -> TrackerLane {
+    fn lane(&self, tracker: &str) -> TrackerRepo {
         let paths = self.store.paths();
-        TrackerLane::new(&paths.lanes, &paths.lane_checkouts, tracker)
+        TrackerRepo::new(&paths.tracker_store, &paths.tracker_checkouts, tracker)
     }
 
     fn require_workspace(&self, branch: &BranchInstance) -> Result<()> {

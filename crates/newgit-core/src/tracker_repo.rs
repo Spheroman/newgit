@@ -8,42 +8,39 @@ use crate::materializer::create_dir_all;
 use crate::tracker::{TrackerDefinition, collect_all_files, collect_owned_files};
 
 /// Length of the rev string newgit shows and records: a prefix of the
-/// lane commit's id, the way Git abbreviates.
+/// commit id, the way Git abbreviates.
 const REV_LEN: usize = 12;
 
-/// Fixed identity and date for lane commits. A lane commit is a name for a
-/// tree, not an event, so nothing about who or when may enter its id —
-/// identical content has to yield the identical rev, on any machine.
-const LANE_IDENT: [(&str, &str); 6] = [
+/// Who a commit says made it, when Git has no identity configured. With one
+/// configured, captures carry the developer's own name, like any commit.
+const FALLBACK_IDENT: [(&str, &str); 4] = [
     ("GIT_AUTHOR_NAME", "newgit"),
     ("GIT_AUTHOR_EMAIL", "newgit@localhost"),
-    ("GIT_AUTHOR_DATE", "@946684800 +0000"),
     ("GIT_COMMITTER_NAME", "newgit"),
     ("GIT_COMMITTER_EMAIL", "newgit@localhost"),
-    ("GIT_COMMITTER_DATE", "@946684800 +0000"),
 ];
 
-/// A tracker's content lane: Git commits in the store's lanes repo
-/// (`.newgit/local/lanes.git`), one per distinct captured content.
+/// A tracker's repository: its history, kept in the store's tracker repo
+/// (`.newgit/local/trackers.git`) under `refs/trackers/<tracker>/`.
 ///
-/// - `refs/lanes/<tracker>/revs/<rev>` keeps each captured rev alive.
-/// - `refs/lanes/<tracker>/head` marks the lane head — what new instances
-///   project and `pull` brings in.
+/// - `main` — what new instances get, and where merges land.
+/// - `instances/<instance>` — one branch per instance that changed it.
+/// - `pins/<rev>` — keeps a commit alive while a binding or checkpoint names
+///   it, even after a branch has moved past it.
 ///
-/// A rev is a parentless commit of the captured files with a fixed identity
-/// and date, so it is content-addressed: capturing identical content again
-/// yields the same rev. Lane history is not a parent chain; checkpoint
-/// records already say which rev was bound when.
+/// A rev is a commit (shown as its 12-hex prefix) with a parent, a message,
+/// and an author, like any commit. Capturing content identical to the
+/// parent's makes no commit: the parent is the answer.
 ///
-/// The lanes repo is separate from the store repo on purpose. Lane content
-/// includes secrets, and the store repo is the one a `git push --mirror`
-/// publishes and a local `git clone` hardlinks wholesale into every
-/// workspace.
+/// The store is separate from the project's own repository on purpose:
+/// tracker content includes secrets, and a project repository is what a
+/// `git push --mirror` publishes and a local `git clone` hardlinks wholesale
+/// into every workspace.
 ///
-/// Checkpoints reference lane revs by name, so cleanup must never delete a
-/// rev ref any checkpoint record still points at.
+/// Checkpoints reference revs by name, so cleanup never removes the pin of a
+/// rev any checkpoint record still points at.
 #[derive(Debug, Clone)]
-pub struct TrackerLane {
+pub struct TrackerRepo {
     git_dir: Utf8PathBuf,
     checkouts: Utf8PathBuf,
     tracker: String,
@@ -53,18 +50,37 @@ pub struct TrackerLane {
 pub struct CaptureOutcome {
     pub rev: String,
     pub files: usize,
+    /// False when the content equalled the parent's, so no commit was made.
+    pub committed: bool,
 }
 
-/// A lane rev present in the lanes repo.
+/// Where a capture lands: on top of `parent` (none for a first capture), on
+/// `branch`, with `message`.
+#[derive(Debug, Clone, Copy)]
+pub struct CaptureAt<'a> {
+    pub parent: Option<&'a str>,
+    pub branch: Branch<'a>,
+    pub message: &'a str,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Branch<'a> {
+    /// The tracker's `main`: what seeding from the store writes.
+    Main,
+    /// One instance's branch, by slug.
+    Instance(&'a str),
+}
+
+/// A pinned rev present in the store.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LaneRev {
+pub struct PinnedRev {
     pub tracker: String,
     pub rev: String,
 }
 
-impl TrackerLane {
-    /// `git_dir` is the lanes repo; `checkouts` is the cache directory revs
-    /// are materialized into when a command needs a path.
+impl TrackerRepo {
+    /// `git_dir` is the store; `checkouts` is the cache directory revs are
+    /// materialized into when a command needs a path.
     pub fn new(git_dir: &Utf8Path, checkouts: &Utf8Path, tracker: &str) -> Self {
         Self {
             git_dir: git_dir.to_path_buf(),
@@ -73,44 +89,54 @@ impl TrackerLane {
         }
     }
 
-    pub fn latest(&self) -> Option<String> {
-        self.resolve(&self.head_ref()).map(|commit| short(&commit))
+    /// The tip of `main`, or `None` before anything was merged or seeded.
+    pub fn main(&self) -> Option<String> {
+        self.resolve(&self.main_ref()).map(|commit| short(&commit))
     }
 
-    pub fn set_latest(&self, rev: &str) -> Result<()> {
+    /// Move `main` to `rev` — what merging a tracker does for now.
+    pub fn set_main(&self, rev: &str) -> Result<()> {
         let commit = self.commit_for(rev)?;
-        git(&self.git_dir, &["update-ref", &self.head_ref(), &commit]).map(drop)
+        git(&self.git_dir, &["update-ref", &self.main_ref(), &commit]).map(drop)
     }
 
     pub fn has_rev(&self, rev: &str) -> bool {
-        self.resolve(&self.rev_ref(rev)).is_some()
+        self.resolve(&self.pin_ref(rev)).is_some()
     }
 
-    /// Snapshot the tracker's owned paths from `workspace`. Identical
-    /// content dedupes to an existing rev.
+    /// The tree a rev holds: what "same content" compares, now that equal
+    /// content on two branches is two commits.
+    pub fn tree_of(&self, rev: &str) -> Result<String> {
+        let commit = self.commit_for(rev)?;
+        git(&self.git_dir, &["rev-parse", &format!("{commit}^{{tree}}")])
+    }
+
+    /// Commit the tracker's owned paths from `workspace`.
     pub fn capture(
         &self,
         workspace: &Utf8Path,
         definition: &TrackerDefinition,
+        at: CaptureAt<'_>,
     ) -> Result<CaptureOutcome> {
         if definition.paths.is_empty() {
             return Err(NewgitError::TrackerHasNoPaths(self.tracker.clone()));
         }
         let files = collect_owned_files(workspace, definition)?;
-        self.store_snapshot(&files)
+        self.commit_files(&files, at)
     }
 
-    /// Snapshot an arbitrary directory's contents into the lane — how a
-    /// resource checkpoint deposits into a deposit-only tracker (one with no
-    /// owned workspace paths).
-    pub fn deposit(&self, dir: &Utf8Path) -> Result<CaptureOutcome> {
+    /// Commit an arbitrary directory's contents — how a resource checkpoint
+    /// deposits into a deposit-only tracker (one with no owned paths).
+    pub fn deposit(&self, dir: &Utf8Path, at: CaptureAt<'_>) -> Result<CaptureOutcome> {
         let files = collect_all_files(dir)?;
-        self.store_snapshot(&files)
+        self.commit_files(&files, at)
     }
 
-    /// Write files as a content-addressed rev. Identical content dedupes to
-    /// an existing rev.
-    fn store_snapshot(&self, files: &[(Utf8PathBuf, Utf8PathBuf)]) -> Result<CaptureOutcome> {
+    fn commit_files(
+        &self,
+        files: &[(Utf8PathBuf, Utf8PathBuf)],
+        at: CaptureAt<'_>,
+    ) -> Result<CaptureOutcome> {
         ensure_repo(&self.git_dir)?;
 
         // Blobs: hashed straight from the files, bytes exactly as they are
@@ -148,27 +174,56 @@ impl TrackerLane {
         )?;
         let tree = git_env(&self.git_dir, &["write-tree"], &index.env())?;
 
-        let commit = git_env(
-            &self.git_dir,
-            &[
-                "-c",
-                "commit.gpgSign=false",
-                "-c",
-                "i18n.commitEncoding=UTF-8",
-                "commit-tree",
-                &tree,
-                "-m",
-                &self.tracker,
-            ],
-            &LANE_IDENT.map(|(key, value)| (key.to_owned(), value.to_owned())),
-        )?;
+        let parent = at.parent.map(|rev| self.commit_for(rev)).transpose()?;
+        let unchanged = match &parent {
+            Some(parent) => {
+                git(&self.git_dir, &["rev-parse", &format!("{parent}^{{tree}}")])? == tree
+            }
+            None => false,
+        };
+        let commit = match (unchanged, parent) {
+            (true, Some(parent)) => parent,
+            (_, parent) => {
+                let mut args = vec![
+                    "-c",
+                    "commit.gpgSign=false",
+                    "commit-tree",
+                    tree.as_str(),
+                    "-m",
+                    at.message,
+                ];
+                if let Some(parent) = &parent {
+                    args.extend(["-p", parent.as_str()]);
+                }
+                git_env(&self.git_dir, &args, &identity(&self.git_dir))?
+            }
+        };
         let rev = short(&commit);
-        git(&self.git_dir, &["update-ref", &self.rev_ref(&rev), &commit])?;
+        git(&self.git_dir, &["update-ref", &self.pin_ref(&rev), &commit])?;
+        let branch = match at.branch {
+            Branch::Main => self.main_ref(),
+            Branch::Instance(slug) => self.instance_ref(slug),
+        };
+        git(&self.git_dir, &["update-ref", &branch, &commit])?;
 
         Ok(CaptureOutcome {
             rev,
             files: files.len(),
+            committed: !unchanged,
         })
+    }
+
+    /// Drop an instance's branch — when the instance is removed. Pins keep
+    /// whatever its checkpoints still name.
+    pub fn drop_instance(&self, slug: &str) -> Result<()> {
+        if self.resolve(&self.instance_ref(slug)).is_none() {
+            return Ok(());
+        }
+        git(
+            &self.git_dir,
+            &["update-ref", "-d", &self.instance_ref(slug)],
+        )
+        .map(drop)
     }
 
     /// A directory holding a captured rev's files, for commands that take a
@@ -246,7 +301,7 @@ impl TrackerLane {
     }
 
     fn commit_for(&self, rev: &str) -> Result<String> {
-        self.resolve(&self.rev_ref(rev))
+        self.resolve(&self.pin_ref(rev))
             .ok_or_else(|| NewgitError::NoSnapshot {
                 tracker: self.tracker.clone(),
                 rev: rev.to_owned(),
@@ -264,12 +319,16 @@ impl TrackerLane {
         .ok()
     }
 
-    fn head_ref(&self) -> String {
-        format!("refs/lanes/{}/head", self.tracker)
+    fn main_ref(&self) -> String {
+        format!("refs/trackers/{}/main", self.tracker)
     }
 
-    fn rev_ref(&self, rev: &str) -> String {
-        format!("refs/lanes/{}/revs/{rev}", self.tracker)
+    fn instance_ref(&self, slug: &str) -> String {
+        format!("refs/trackers/{}/instances/{slug}", self.tracker)
+    }
+
+    fn pin_ref(&self, rev: &str) -> String {
+        format!("refs/trackers/{}/pins/{rev}", self.tracker)
     }
 
     /// One file's content at a captured rev, or `None` when the rev does not
@@ -298,10 +357,10 @@ impl TrackerLane {
         git(&self.git_dir, &["rev-parse", "-q", "--verify", spec]).ok()
     }
 
-    /// Forget a rev: drop the ref keeping it alive and its materialized
-    /// copy. The objects go at the next [`prune_unreferenced`].
+    /// Forget a rev: drop its pin and its materialized copy. Its objects go
+    /// at the next [`prune_unreferenced`] unless a branch still reaches them.
     pub fn forget(&self, rev: &str) -> Result<()> {
-        git(&self.git_dir, &["update-ref", "-d", &self.rev_ref(rev)])?;
+        git(&self.git_dir, &["update-ref", "-d", &self.pin_ref(rev)])?;
         let dir = self.checkouts.join(rev);
         if dir.exists() {
             std::fs::remove_dir_all(&dir).map_err(|source| NewgitError::io(&dir, source))?;
@@ -310,9 +369,9 @@ impl TrackerLane {
     }
 }
 
-/// Every tracker with anything in the lanes repo, sorted.
-pub fn lane_names(git_dir: &Utf8Path) -> Result<Vec<String>> {
-    let mut names: Vec<String> = lane_refs(git_dir)?
+/// Every tracker with anything in the store, sorted.
+pub fn tracker_names(git_dir: &Utf8Path) -> Result<Vec<String>> {
+    let mut names: Vec<String> = tracker_refs(git_dir)?
         .into_iter()
         .map(|(tracker, _)| tracker)
         .collect();
@@ -320,12 +379,12 @@ pub fn lane_names(git_dir: &Utf8Path) -> Result<Vec<String>> {
     Ok(names)
 }
 
-/// Every captured rev in every lane, sorted by tracker then rev.
-pub fn lane_revs(git_dir: &Utf8Path) -> Result<Vec<LaneRev>> {
-    Ok(lane_refs(git_dir)?
+/// Every pinned rev of every tracker, sorted by tracker then rev.
+pub fn pinned_revs(git_dir: &Utf8Path) -> Result<Vec<PinnedRev>> {
+    Ok(tracker_refs(git_dir)?
         .into_iter()
         .filter_map(|(tracker, rest)| {
-            rest.strip_prefix("revs/").map(|rev| LaneRev {
+            rest.strip_prefix("pins/").map(|rev| PinnedRev {
                 tracker,
                 rev: rev.to_owned(),
             })
@@ -333,7 +392,7 @@ pub fn lane_revs(git_dir: &Utf8Path) -> Result<Vec<LaneRev>> {
         .collect())
 }
 
-/// Delete objects no ref reaches any more. Lane content can be secrets, so
+/// Delete objects no ref reaches any more. Tracker content can be secrets, so
 /// a forgotten rev is removed now rather than whenever Git's own gc would
 /// have got to it.
 pub fn prune_unreferenced(git_dir: &Utf8Path) -> Result<()> {
@@ -349,19 +408,19 @@ pub fn parse_tracker_state_ref(state_ref: &str) -> Option<(&str, &str)> {
     state_ref.strip_prefix("tracker:")?.split_once('@')
 }
 
-/// `(tracker, rest)` for every ref under `refs/lanes/`, sorted.
-fn lane_refs(git_dir: &Utf8Path) -> Result<Vec<(String, String)>> {
+/// `(tracker, rest)` for every ref under `refs/trackers/`, sorted.
+fn tracker_refs(git_dir: &Utf8Path) -> Result<Vec<(String, String)>> {
     if !git_dir.join("HEAD").is_file() {
         return Ok(Vec::new());
     }
     let listing = git(
         git_dir,
-        &["for-each-ref", "--format=%(refname)", "refs/lanes/"],
+        &["for-each-ref", "--format=%(refname)", "refs/trackers/"],
     )?;
     let mut refs: Vec<(String, String)> = listing
         .lines()
         .filter_map(|name| {
-            let (tracker, rest) = name.strip_prefix("refs/lanes/")?.split_once('/')?;
+            let (tracker, rest) = name.strip_prefix("refs/trackers/")?.split_once('/')?;
             Some((tracker.to_owned(), rest.to_owned()))
         })
         .collect();
@@ -369,8 +428,8 @@ fn lane_refs(git_dir: &Utf8Path) -> Result<Vec<(String, String)>> {
     Ok(refs)
 }
 
-/// Create the lanes repo if this machine has none yet.
-pub fn ensure_lanes_repo(git_dir: &Utf8Path) -> Result<()> {
+/// Create the store if this machine has none yet.
+pub fn ensure_store(git_dir: &Utf8Path) -> Result<()> {
     ensure_repo(git_dir)
 }
 
@@ -385,6 +444,18 @@ fn ensure_repo(git_dir: &Utf8Path) -> Result<()> {
         None,
     )
     .map(drop)
+}
+
+/// The developer's own Git identity when they have one; newgit's otherwise,
+/// where Git would refuse to commit at all.
+fn identity(git_dir: &Utf8Path) -> Vec<(String, String)> {
+    if git(git_dir, &["var", "GIT_COMMITTER_IDENT"]).is_ok() {
+        return Vec::new();
+    }
+    FALLBACK_IDENT
+        .iter()
+        .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
+        .collect()
 }
 
 fn short(commit: &str) -> String {

@@ -1,8 +1,9 @@
-//! Tracker lanes are Git commits in the store's lanes repo
-//! (`.newgit/local/lanes.git`), not snapshot directories. These tests pin the
-//! properties that change is for: revs are content-addressed across
-//! machines, lane content never enters the store repo or a workspace's Git,
-//! and a pruned rev's content is actually gone.
+//! Each tracker's history is a set of branches in the store's tracker repo
+//! (`.newgit/local/trackers.git`): `main`, one per instance, and pins for
+//! what bindings and checkpoints name. These tests pin what that is for:
+//! captures are real commits with history; equal content is an equal tree
+//! on any machine; tracker content never enters the project repo or a
+//! workspace's Git; and a pruned rev's content is actually gone.
 
 use std::process::Command;
 
@@ -10,10 +11,10 @@ use camino::{Utf8Path, Utf8PathBuf};
 use newgit_core::SourceSubstrate;
 use newgit_core::cleanup::ArchivedCheckpoints;
 use newgit_core::config::WorkspaceSection;
-use newgit_core::lane::TrackerLane;
 use newgit_core::manager::{BranchManager, UndoOptions};
 use newgit_core::store::MetadataStore;
 use newgit_core::tracker::Storage;
+use newgit_core::tracker_repo::TrackerRepo;
 
 const SECRET: &str = "STRIPE_KEY=sk_live_do_not_leak_4f1c\n";
 
@@ -74,9 +75,9 @@ fn with_env_tracker(store: MetadataStore) -> BranchManager {
     BranchManager::open(manager.store().clone()).expect("reopen")
 }
 
-fn lane(store: &MetadataStore, tracker: &str) -> TrackerLane {
+fn lane(store: &MetadataStore, tracker: &str) -> TrackerRepo {
     let paths = store.paths();
-    TrackerLane::new(&paths.lanes, &paths.lane_checkouts, tracker)
+    TrackerRepo::new(&paths.tracker_store, &paths.tracker_checkouts, tracker)
 }
 
 /// Whether any object in a Git repository (reachable or not, loose or
@@ -96,33 +97,104 @@ fn repo_contains(git_dir: &Utf8Path, needle: &str) -> bool {
 }
 
 #[test]
-fn identical_content_is_the_same_rev_in_two_unrelated_stores() {
+fn identical_content_is_the_same_tree_in_two_unrelated_stores() {
     let (_guard, temp) = tempdir();
     let laptop = with_env_tracker(setup(&temp, "laptop"));
     let desktop = with_env_tracker(setup(&temp, "desktop"));
 
-    let mut revs = Vec::new();
+    let mut trees = Vec::new();
     for manager in [&laptop, &desktop] {
         let spawned = manager.spawn("feature-a", None).expect("spawn");
         std::fs::write(spawned.branch.workspace_path.join(".env.local"), "A=1\n").expect("write");
-        revs.push(
-            manager
-                .capture_tracker("feature-a", "env")
-                .expect("capture")
-                .rev,
-        );
+        let rev = manager
+            .capture_tracker("feature-a", "env")
+            .expect("capture")
+            .rev;
+        trees.push(lane(manager.store(), "env").tree_of(&rev).expect("tree"));
     }
     assert_eq!(
-        revs[0], revs[1],
-        "a rev names content, not who captured it or when — the remote relies on that"
+        trees[0], trees[1],
+        "same content is the same tree anywhere — what previews compare"
     );
 
-    // And within one lane, capturing the same content again is no change.
-    let again = laptop
+    // Capturing unchanged content again makes no commit.
+    let first = laptop.capture_tracker("feature-a", "env").expect("again");
+    assert!(!first.changed);
+}
+
+#[test]
+fn captures_are_a_history_on_the_instance_branch() {
+    let (_guard, temp) = tempdir();
+    let manager = with_env_tracker(setup(&temp, "store"));
+    let workspace = manager
+        .spawn("feature-a", None)
+        .expect("spawn")
+        .branch
+        .workspace_path;
+    let store = manager.store().paths().tracker_store.clone();
+
+    std::fs::write(workspace.join(".env.local"), "A=1\n").expect("write");
+    let first = manager
         .capture_tracker("feature-a", "env")
-        .expect("capture again");
-    assert_eq!(again.rev, revs[0]);
-    assert!(!again.changed);
+        .expect("first")
+        .rev;
+    std::fs::write(workspace.join(".env.local"), "A=2\n").expect("write");
+    let second = manager
+        .capture_tracker("feature-a", "env")
+        .expect("second")
+        .rev;
+
+    let branch = "refs/trackers/env/instances/feature-a";
+    assert!(
+        git(&store, &["rev-parse", branch]).starts_with(&second),
+        "the branch is at the latest capture"
+    );
+    assert!(
+        git(&store, &["rev-parse", &format!("{branch}~1")]).starts_with(&first),
+        "each capture's parent is the one before it"
+    );
+    // Ordinary commits: an author (whoever Git says you are) and a message
+    // saying what made them.
+    let log = git(&store, &["log", "--format=%an|%s", branch]);
+    assert_eq!(log.lines().count(), 2, "{log}");
+    assert!(
+        log.lines().all(|line| {
+            let (author, subject) = line.split_once('|').unwrap_or_default();
+            !author.is_empty() && subject == "env in `feature-a`"
+        }),
+        "{log}"
+    );
+}
+
+#[test]
+fn removing_an_instance_drops_its_branch_but_not_what_its_checkpoints_name() {
+    let (_guard, temp) = tempdir();
+    let manager = with_env_tracker(setup(&temp, "store"));
+    let workspace = manager
+        .spawn("feature-a", None)
+        .expect("spawn")
+        .branch
+        .workspace_path;
+    std::fs::write(workspace.join(".env.local"), "KEEP=1\n").expect("write");
+    let checkpoint = manager.checkpoint("feature-a", None).expect("checkpoint");
+    let rev = checkpoint.record.tracker_states[0]
+        .content_rev
+        .clone()
+        .expect("rev");
+
+    let root = manager.store().paths().project_root.clone();
+    manager
+        .remove("feature-a", &root, ArchivedCheckpoints::Keep)
+        .expect("remove");
+    let store = manager.store().paths().tracker_store.clone();
+    assert!(git(&store, &["for-each-ref", "refs/trackers/env/instances/"]).is_empty());
+    manager
+        .cleanup(false, ArchivedCheckpoints::Keep)
+        .expect("cleanup");
+    assert!(
+        lane(manager.store(), "env").has_rev(&rev),
+        "kept for the archived checkpoint"
+    );
 }
 
 #[test]
@@ -159,7 +231,7 @@ fn lane_content_never_enters_the_store_repo_or_a_workspace() {
         );
     }
     assert!(repo_contains(
-        &manager.store().paths().lanes,
+        &manager.store().paths().tracker_store,
         "sk_live_do_not_leak"
     ));
 }
@@ -281,7 +353,7 @@ command = "cp {{state_ref}} restored.sql"
     manager.checkpoint("feature-d", None).expect("checkpoint");
 
     // The checkout cache is disposable; undo must not depend on it.
-    std::fs::remove_dir_all(&manager.store().paths().lane_checkouts).expect("clear cache");
+    std::fs::remove_dir_all(&manager.store().paths().tracker_checkouts).expect("clear cache");
 
     let undo = manager
         .undo("feature-d", &UndoOptions::default())
@@ -322,7 +394,7 @@ fn a_pruned_rev_is_gone_from_the_lanes_repo_not_just_unreferenced() {
             .collect::<Vec<_>>(),
         [rev.as_str()]
     );
-    let lanes = manager.store().paths().lanes.clone();
+    let lanes = manager.store().paths().tracker_store.clone();
     assert!(!lane(manager.store(), "env").has_rev(&rev));
     assert!(
         !repo_contains(&lanes, "sk_live_do_not_leak"),

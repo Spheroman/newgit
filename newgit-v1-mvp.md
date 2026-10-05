@@ -286,7 +286,7 @@ understand or change which paths a tracker owns.
 
 ### Capture, Merge, Pull, And Checkout
 
-Tracker capture is always the same operation: snapshot the tracker's content into the store and bind the current branch instance to that rev. In v1 the "store" is a content lane per tracker in a bare Git repo at `.newgit/local/lanes.git`. A rev is a parentless commit of the captured files with a fixed identity and date, so `<rev>` (a 12-hex prefix of the commit id) is content-addressed: identical captures dedupe, on any machine, and M5's checkpoints simply reference these revs. `refs/lanes/<tracker>/revs/<rev>` keeps each rev alive, and `refs/lanes/<tracker>/head` marks the lane head/default for future instances and explicit pulls.
+Tracker capture is always the same operation: snapshot the tracker's content into the store and bind the current branch instance to that rev. The "store" is each tracker's history in a bare Git repo at `.newgit/local/trackers.git`, under `refs/trackers/<tracker>/`: `main` is the lane head/default for future instances and explicit pulls, `instances/<instance>` holds each instance's captures as ordinary commits (parent, author, message), and `pins/<rev>` keeps every rev a binding or checkpoint names alive. `<rev>` is a 12-hex prefix of the commit id; capturing content identical to the parent's makes no commit. (*Lane* is the v1 word for a tracker's history; `newgit-trackers.md` retires it in favor of "the tracker's repo".)
 
 The lanes repo is deliberately *not* the store repo. Lane content includes secrets, and the store repo is the one a `git push --mirror` publishes and a local `git clone` hardlinks wholesale into every workspace's object store. It lives under `local/`, which every project's `.newgit/.gitignore` already ignores. Lanes being Git is also what lets a tracker sync to a remote (see `newgit-cloudflare.md`).
 
@@ -873,8 +873,8 @@ v1 can use a simple `.newgit/` directory in the project root:
   scripts/                 # committed scripts resource commands call
     db-up.sh               #   as {{scripts}}/db-up.sh
   local/                   # gitignored local state
-    lanes.git/             #   captured tracker content (bare Git repo)
-    lane-checkouts/        #   lane revs materialized for commands; a cache
+    trackers.git/          #   every tracker's history (bare Git repo)
+    tracker-checkouts/     #   tracker revs materialized for commands; a cache
   branches/                # gitignored branch bindings
     feature-a.toml
     feature-b.toml
@@ -2040,7 +2040,7 @@ store_ref = "refs/newgit/checkpoints/feature-a/ckpt_017"
 [[tracker_states]]
 name = "runtime-env"
 definition_rev = "sha256:..."
-content_rev = "3bd17e8ba807"         # lane rev: refs/lanes/runtime-env/revs/3bd17e8ba807
+content_rev = "3bd17e8ba807"         # rev: refs/trackers/runtime-env/pins/3bd17e8ba807
 
 [[resource_states]]
 name = "deps"
@@ -2054,7 +2054,7 @@ name = "postgres-db"
 definition_rev = "sha256:..."
 mode = "command"
 state_ref = "tracker:db-snapshots@77e10b2c4451"
-state_path = ".../.newgit/local/lane-checkouts/db-snapshots/77e10b2c4451/db.sql"
+state_path = ".../.newgit/local/tracker-checkouts/db-snapshots/77e10b2c4451/db.sql"
 was_running = false
 ```
 

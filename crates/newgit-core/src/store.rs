@@ -69,12 +69,12 @@ pub struct NewgitPaths {
     /// rather than a workspace. Part of the committed control plane.
     pub scripts: Utf8PathBuf,
     pub local: Utf8PathBuf,
-    /// Tracker lanes: a bare Git repo of captured content. Under `local/`,
+    /// Every tracker's history: a bare Git repo of tracker branches. Under `local/`,
     /// which every project's `.newgit/.gitignore` already ignores — lane
     /// content can be secrets and must never be committable.
-    pub lanes: Utf8PathBuf,
-    /// Lane revs materialized for commands that take a path. A cache.
-    pub lane_checkouts: Utf8PathBuf,
+    pub tracker_store: Utf8PathBuf,
+    /// Tracker revs materialized for commands that take a path. A cache.
+    pub tracker_checkouts: Utf8PathBuf,
     pub logs: Utf8PathBuf,
     pub state: Utf8PathBuf,
     pub checkpoints: Utf8PathBuf,
@@ -537,8 +537,8 @@ impl NewgitPaths {
             resources: metadata_root.join("resources"),
             scripts: metadata_root.join("scripts"),
             local: metadata_root.join("local"),
-            lanes: metadata_root.join("local/lanes.git"),
-            lane_checkouts: metadata_root.join("local/lane-checkouts"),
+            tracker_store: metadata_root.join("local/trackers.git"),
+            tracker_checkouts: metadata_root.join("local/tracker-checkouts"),
             logs: metadata_root.join("logs"),
             state: metadata_root.join("state"),
             checkpoints: metadata_root.join("checkpoints"),

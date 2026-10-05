@@ -5,10 +5,10 @@ use camino::{Utf8Path, Utf8PathBuf};
 use crate::branch::BranchInstance;
 use crate::checkpoint::CheckpointLog;
 use crate::error::{NewgitError, Result};
-use crate::lane::{lane_names, parse_tracker_state_ref};
 use crate::materializer::workspace_marker_path;
 use crate::resource::Ownership;
 use crate::store::{MetadataStore, read_subdirs_sorted};
+use crate::tracker_repo::{parse_tracker_state_ref, tracker_names};
 
 /// What one cleanup pass did, or would do under `--dry-run`. Garbage
 /// collection has to be reportable to be trustworthy: every list here is
@@ -229,12 +229,16 @@ impl SnapshotRoots {
             .map(|tracker| tracker.name)
             .collect();
         let paths = store.paths();
-        for lane in lane_names(&paths.lanes)? {
+        for lane in tracker_names(&paths.tracker_store)? {
             if !defined.contains(&lane) {
                 continue;
             }
-            if let Some(head) =
-                crate::lane::TrackerLane::new(&paths.lanes, &paths.lane_checkouts, &lane).latest()
+            if let Some(head) = crate::tracker_repo::TrackerRepo::new(
+                &paths.tracker_store,
+                &paths.tracker_checkouts,
+                &lane,
+            )
+            .main()
             {
                 roots.lane_heads.insert((lane, head));
             }

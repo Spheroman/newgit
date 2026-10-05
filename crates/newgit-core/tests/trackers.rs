@@ -622,8 +622,11 @@ fn remove_tracker_reverses_the_definition_and_gitignore_and_leaves_snapshots_for
         .expect("capture");
     m.merge_tracker("feature-a", "runtime-env").expect("merge");
     let paths = m.store().paths().clone();
-    let lane =
-        newgit_core::lane::TrackerLane::new(&paths.lanes, &paths.lane_checkouts, "runtime-env");
+    let lane = newgit_core::tracker_repo::TrackerRepo::new(
+        &paths.tracker_store,
+        &paths.tracker_checkouts,
+        "runtime-env",
+    );
     assert!(
         lane.has_rev(&captured.rev),
         "captured content exists in the lanes repo"

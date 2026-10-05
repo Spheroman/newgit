@@ -140,7 +140,7 @@ tests by nature.
 - `.newgit/` is created by `newgit init`. Committed: `config.toml`,
   `trackers/`, `resources/`, `scripts/`. Gitignored local state: `branches/`,
   `checkpoints/`, `logs/`, `state/`, `installs/`, and `local/` — which holds
-  `lanes.git`, the bare repo of captured tracker content.
+  `trackers.git`, every tracker's history (bare repo).
 
 ## Commands
 

@@ -638,10 +638,11 @@ fn a_checkpoint_syncs_source_remote_trackers_and_then_the_record() {
     let lane = fixture.remote.repo("store.t.runtime-env.jack");
     let lane_refs = git(
         &lane,
-        &["for-each-ref", "--format=%(refname)", "refs/lanes/"],
+        &["for-each-ref", "--format=%(refname)", "refs/trackers/"],
     );
     assert!(
-        lane_refs.starts_with("refs/lanes/runtime-env/revs/"),
+        lane_refs.contains("refs/trackers/runtime-env/pins/")
+            && lane_refs.contains("refs/trackers/runtime-env/instances/feature-a"),
         "{lane_refs}"
     );
     assert!(
@@ -848,7 +849,7 @@ fn a_teammate_spawns_a_checkpoint_running_with_their_own_keys() {
     );
 
     // And Jack's key is nowhere on Ana's machine.
-    let ana_lanes = ana.join(".newgit/local/lanes.git");
+    let ana_lanes = ana.join(".newgit/local/trackers.git");
     let objects = git(
         &ana_lanes,
         &[
