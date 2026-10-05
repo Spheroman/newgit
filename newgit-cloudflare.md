@@ -188,7 +188,11 @@ paired with:
 
 ```
 credential.https://<account>.artifacts.cloudflare.net.helper = !newgit credential
+credential.https://<account>.artifacts.cloudflare.net.useHttpPath = true
 ```
+
+(`useHttpPath` is required: without it Git does not pass the repo path, and
+the helper cannot tell which repo to mint for.)
 
 Git calls `newgit credential get`; newgit asks the Worker for a token for
 *that* repo (from the URL path), the Worker checks membership and scope, mints
@@ -215,8 +219,18 @@ Remote mode changes only **where it forwards**:
 1. Agent runs `git push` in its workspace.
 2. The outbox's `pre-receive` checkpoints the instance (reason `push`).
 3. It forwards to `<p>.i.<inst>` instead of the store's `origin`.
-4. The `pushed` event reaches the Worker: it records the new head in the
-   binding record and runs the overlap check (below).
+4. The checkpoint write-through tells ProjectDO the new head synchronously;
+   ProjectDO updates the binding record and runs the overlap check (below)
+   before the push returns.
+
+The outbox, not an Artifacts event, is the primary signal: it is already on
+the path, it is synchronous, and it needs no per-repo subscription. A
+per-fork `pushed` subscription (created by the Worker at spawn, through the
+REST API) is the **backstop**: it catches a push that bypassed the outbox —
+the credential helper answers any Git on the machine — and ProjectDO
+reconciles the binding record when it sees a head it was not told about.
+Measured lag is ~5.5 s, which is fine for a backstop and too slow for
+the primary.
 
 The workspace's `origin` fetch URL points at `<p>.src`, so `git pull` shows
 trunk — what an agent expects `origin` to mean. When the project also has a
@@ -299,9 +313,10 @@ entry at a time:
    each `merge_with_source = true` tracker's bound lane rev to its lane head.
    Trackers with `merge_with_source = false` stay where they are.
 
-**Where it runs** is spike-dependent (Day 0): isomorphic-git in the Worker if
-the merge fits CPU limits, otherwise a Sandbox container running real Git.
-Real Git is preferred if both work — boring beats clever.
+**Where it runs:** isomorphic-git in the Worker, fetching shallow to the
+merge base (Day 0: ~4 s on a 41 MB repo; full history exceeds Worker
+memory). A Sandbox container running real Git is the fallback for a base too
+deep or a tree too large; it is not built until something needs it.
 
 ### Overlap detection
 
@@ -371,7 +386,22 @@ Throwaway, in `scratch/` or a separate repo. Each answers one question:
    a realistic repo?* If not: the same merge in a Sandbox container.
 5. A queue consumer receiving `pushed`. *Latency from push to event?*
 
-Write the answers into this document before Day 1 work starts.
+#### Day 0 results (2026-10-04)
+
+Run against namespace `newgit-spike` with a tiny repo and an import of
+`honojs/hono` (2,866 commits, 41 MB packed) as the realistic case.
+
+| Question | Answer | Consequence |
+|---|---|---|
+| Basic loop | Works. Create via Wrangler, push ~1 s. Tokens are `art_v2_…?expires=` (docs say `v1`); a create-time token lasts ~24 h. | Parse the token by the `?expires=` split, never by prefix. |
+| Custom refs | `refs/newgit/lanes/*`, `refs/newgit/checkpoints/*`, `refs/notes/*` all push and list. | Lanes-as-Git works on the remote as designed. |
+| Fork copies refs? | **All refs, even with `default_branch_only: true`.** | Never put anything in `<p>.src` that a fork's owner may not read. It holds trunk only, so this holds today; keep it that way. |
+| Fork speed | Tiny repo ~2.4 s. Hono **5–22 s**, high variance. | Fork **asynchronously** at spawn (or lazily on first push). Never block spawn on it. |
+| Clone speed | Hono full clone **9–38 s** vs GitHub 1.8 s. `--depth 1` 1.1 s. Incremental fetch 0.7 s, push 1 s. | Spawn keeps cloning **from the local store**. Artifacts is a push target and a fetch source for deltas, never a full-clone source. A machine with no store does `--depth 1` then deepens in the background. |
+| Token isolation | Fork token on `<p>.src` → 403 "Invalid or expired token". Read token push → 403 "Insufficient permissions". Force-push with write token is allowed. | Enforcement claims in *Repo Topology* hold. Write tokens permit history rewrites on that repo; acceptable, since a fork is its owner's. |
+| Credential helper | Works for fetch and push. Artifacts answers with a Basic challenge. **Requires `credential.useHttpPath=true`**, otherwise Git omits the repo path. | `spawn` sets both `credential.<host>.helper` and `credential.<host>.useHttpPath`. |
+| Merge in a Worker | isomorphic-git + memfs. Tiny repo: clean merge + push 1.7 s; conflict reported with per-file detail in 0.7 s. Hono full history: **fails, error 1102** (resource limits; the 128 MB memory cap). Hono at `depth: 10`: merge + push 3.9 s, conflict 1.2 s. | The executor fetches **shallow**, deep enough to reach the merge base — known exactly, because the binding record stores the instance's base rev. If the base is deeper than the budget allows, fall back to a Sandbox container running real Git (not spiked). |
+| Push events | Per-repo `pushed` subscriptions work, but **only through the REST API** (`/event_subscriptions/subscriptions`, `source.type = "artifacts.repo"` + `namespace` + `repo_name`); Wrangler's CLI has no flag for the repo. Push-to-consumer latency **~5.5 s**. The account-level `repo.forked` event did **not** arrive within minutes. | Events cannot be the primary signal: one subscription per fork, a Cloudflare API token held by the Worker, and seconds of lag. See *The Push Path*. |
 
 ### Days 1–2 — Barrier (alone)
 
@@ -449,9 +479,14 @@ reversible after the competition.
 
 ## Open Questions
 
-- How fast is a fork of a realistic repo? If spawn feels slow, fork lazily
-  (create the instance repo on first push) and clone from `<p>.src` at spawn.
-- Does a merge fit in a Worker? Decides isomorphic-git vs sandbox executor.
+- Fork latency varies 5–22 s on a medium repo. Async fork at spawn hides it
+  for the first push only if the fork finishes first; the outbox must wait on
+  (or trigger) a fork that is still in flight.
+- The account-level `repo.forked` event never arrived in the spike. Not
+  needed by the design, but worth one more try before relying on any
+  account-level event.
+- The Worker needs a Cloudflare API token secret (Queues event-subscription
+  permission) to create per-fork push subscriptions. Scope it to that alone.
 - The 1 GB repo cap: large `db-snapshots` lanes may need per-tracker repos or
   rotation. Fine for the demo; note it.
 - Rate limits are per namespace. One namespace per project is fine for the
