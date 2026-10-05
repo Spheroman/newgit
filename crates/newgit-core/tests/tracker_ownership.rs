@@ -61,7 +61,7 @@ fn define(store: &MetadataStore, name: &str, path: &str) {
 }
 
 #[test]
-fn init_gives_root_the_project_history_without_copying_it() {
+fn init_gives_root_its_own_copy_of_the_project_history() {
     let (_guard, temp) = tempdir();
     let store = setup(&temp);
     let repo = store.paths().project_root.clone();
@@ -93,13 +93,18 @@ fn init_gives_root_the_project_history_without_copying_it() {
         ),
         "initial"
     );
-    // Borrowed, not copied: the store holds no objects of its own for it.
+    // A real copy, not borrowed objects: Git's cleanup in the project repo
+    // must not be able to take root's history with it.
+    assert!(!trackers.join("objects/info/alternates").exists());
+    std::fs::rename(repo.join(".git"), repo.join(".git-away")).expect("hide the project repo");
     assert_eq!(
-        git(&trackers, &["count-objects", "-v"])
-            .lines()
-            .find(|l| l.starts_with("count:")),
-        Some("count: 0")
+        git(
+            &trackers,
+            &["log", "--format=%s", "refs/trackers/root/main"]
+        ),
+        "initial"
     );
+    std::fs::rename(repo.join(".git-away"), repo.join(".git")).expect("restore");
 }
 
 #[test]

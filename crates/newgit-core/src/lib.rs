@@ -1,6 +1,7 @@
 pub mod branch;
 pub mod checkpoint;
 pub mod cleanup;
+pub mod compose;
 pub mod config;
 pub mod error;
 pub mod export;

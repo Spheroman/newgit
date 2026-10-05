@@ -151,8 +151,13 @@ apps/electron`, code) splits its paths' history out of root the same way,
 each commit marked with its source, so the view reproduces the original
 history exactly — mixed commits included.
 
-**Objects.** Only code trackers' objects are copied into the project repo
-for the view to reference. Secret trackers never enter the view: their files
+**Objects: every repository references what it needs (decided).** No
+borrowing between repositories (Git alternates): Git's own cleanup in a
+repository deletes whatever *that* repository does not reference, so
+borrowed history can vanish weeks later. Root's history is copied into the
+tracker store at `newgit init`; split commits are fetched into the store's
+refs once made; composing fetches code trackers' commits into the project
+repo under its own refs. Secret trackers never enter the view: their files
 are projected into workspaces as today.
 
 **Unbound trackers are absent (decided).** A tracker the instance does not

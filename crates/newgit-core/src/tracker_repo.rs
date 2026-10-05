@@ -436,30 +436,26 @@ fn tracker_refs(git_dir: &Utf8Path) -> Result<Vec<(String, String)>> {
     Ok(refs)
 }
 
-/// Give a tracker the project's existing Git history: borrow the project
-/// repository's objects (Git alternates — nothing is copied, and the project
-/// repository never sees the store's objects in return) and point the
-/// tracker's `main` at `commit`. How `newgit init` hands root its history.
+/// Give a tracker a history from another repository: fetch `source_ref`
+/// from `source` into the tracker's `main`. A real copy, never borrowed
+/// objects: Git's own cleanup in either repository deletes what *that*
+/// repository does not reference, so each must hold what it needs. How
+/// `newgit init` hands root the project's history.
 pub fn import_history(
     git_dir: &Utf8Path,
-    objects: &Utf8Path,
+    source: &Utf8Path,
+    source_ref: &str,
     tracker: &str,
-    commit: &str,
 ) -> Result<()> {
     ensure_repo(git_dir)?;
-    let alternates = git_dir.join("objects/info/alternates");
-    let existing = std::fs::read_to_string(&alternates).unwrap_or_default();
-    if !existing.lines().any(|line| line == objects.as_str()) {
-        create_dir_all(&git_dir.join("objects/info"))?;
-        std::fs::write(&alternates, format!("{existing}{objects}\n"))
-            .map_err(|source| NewgitError::io(&alternates, source))?;
-    }
     git(
         git_dir,
         &[
-            "update-ref",
-            &format!("refs/trackers/{tracker}/main"),
-            commit,
+            "fetch",
+            "--quiet",
+            "--no-tags",
+            source.as_str(),
+            &format!("+{source_ref}:refs/trackers/{tracker}/main"),
         ],
     )
     .map(drop)

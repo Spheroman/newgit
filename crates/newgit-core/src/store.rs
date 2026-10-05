@@ -115,8 +115,8 @@ impl MetadataStore {
     }
 
     /// Write the root tracker's definition and give it the project's history
-    /// as its `main`: the repository's current commit, objects borrowed rather
-    /// than copied. A repository with no commits yet gives root no history.
+    /// as its `main`: a copy of the repository's current branch. A repository
+    /// with no commits yet gives root no history.
     fn init_root(&self) -> Result<()> {
         let root = TrackerDefinition::root();
         self.create_tracker_definition(&root)?;
@@ -131,22 +131,14 @@ impl MetadataStore {
                 .filter(|output| output.status.success())
                 .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned())
         };
-        let (Some(commit), Some(objects)) = (
-            git(&["rev-parse", "--verify", "--quiet", "HEAD^{commit}"]),
-            git(&[
-                "rev-parse",
-                "--path-format=absolute",
-                "--git-path",
-                "objects",
-            ]),
-        ) else {
+        if git(&["rev-parse", "--verify", "--quiet", "HEAD^{commit}"]).is_none() {
             return Ok(());
-        };
+        }
         crate::tracker_repo::import_history(
             &self.paths.tracker_store,
-            Utf8Path::new(&objects),
+            &self.paths.project_root,
+            "HEAD",
             &root.name,
-            &commit,
         )
     }
 
