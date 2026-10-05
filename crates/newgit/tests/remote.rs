@@ -859,6 +859,138 @@ fn merge_moves_the_remote_branch_and_brings_new_trackers_with_it() {
     assert_eq!(list["docs"], git(&docs, &["rev-parse", "main"]));
 }
 
+/// A secret tracker owning `.env.local`, its definition committed.
+fn with_env_tracker(fixture: &Fixture) {
+    fixture.ok(
+        &fixture.store,
+        &["tracker", "create", "env", "--audience", "user"],
+    );
+    fixture.ok(&fixture.store, &["tracker", "track", "env", ".env.local"]);
+    git(&fixture.store, &["add", "-A"]);
+    git(&fixture.store, &["commit", "-q", "-m", "env tracker"]);
+}
+
+fn force_commit_secret(dir: &Utf8Path) {
+    std::fs::write(dir.join(".env.local"), "SECRET=leak\n").expect("write");
+    git(dir, &["add", "-f", ".env.local"]);
+    git(dir, &["commit", "-q", "-m", "oops"]);
+}
+
+fn remote_root_files(fixture: &Fixture) -> String {
+    files_at(&fixture.remote.repo("jack.store.t.root"), "main")
+}
+
+#[test]
+fn a_merge_never_carries_what_the_push_refused() {
+    let (_guard, temp) = tempdir();
+    let fixture = setup(&temp);
+    with_env_tracker(&fixture);
+    fixture.ok(&fixture.store, &["spawn", "feature-a"]);
+    let workspace = workspace_of(&fixture, "feature-a");
+    force_commit_secret(&workspace);
+    let push = git_output(&workspace, &["push", "-q", "origin", "feature-a"]);
+    assert!(!push.status.success(), "the push is refused");
+
+    let merge = fixture.newgit(&fixture.store, &["merge", "feature-a"]);
+    assert!(!merge.status.success(), "and so is the merge");
+    assert!(!remote_root_files(&fixture).contains(".env.local"));
+}
+
+#[test]
+fn merging_the_project_root_never_carries_a_secret_it_committed() {
+    let (_guard, temp) = tempdir();
+    let fixture = setup(&temp);
+    with_env_tracker(&fixture);
+    force_commit_secret(&fixture.store);
+    let merge = fixture.newgit(&fixture.store, &["merge", "main"]);
+    assert!(!merge.status.success());
+    assert!(
+        String::from_utf8_lossy(&merge.stderr).contains(".env.local"),
+        "{}",
+        String::from_utf8_lossy(&merge.stderr)
+    );
+    assert!(!remote_root_files(&fixture).contains(".env.local"));
+}
+
+#[test]
+fn a_checkpoint_after_a_merge_spawns_elsewhere() {
+    let (_guard, temp) = tempdir();
+    let fixture = setup(&temp);
+    fixture.ok(&fixture.store, &["spawn", "feature-a"]);
+    let workspace = workspace_of(&fixture, "feature-a");
+    std::fs::write(workspace.join("feature.txt"), "work\n").expect("write");
+    git(&workspace, &["add", "feature.txt"]);
+    git(&workspace, &["commit", "-q", "-m", "feature"]);
+    fixture.ok(&fixture.store, &["merge", "feature-a"]);
+    // Nothing changed since the merge: the fork has no commit for this one.
+    fixture.ok(&workspace, &["checkpoint"]);
+    let spawned = fixture.ok(
+        &fixture.store,
+        &["spawn", "review", "--from-checkpoint", "feature-a/ckpt_002"],
+    );
+    let review = workspace_of(&fixture, "review");
+    assert!(review.join("feature.txt").exists(), "{spawned}");
+}
+
+#[test]
+fn a_merge_brings_the_project_root_along_so_the_next_spawn_has_it() {
+    let (_guard, temp) = tempdir();
+    let fixture = setup(&temp);
+    fixture.ok(&fixture.store, &["spawn", "feature-a"]);
+    let workspace = workspace_of(&fixture, "feature-a");
+    std::fs::write(workspace.join("feature.txt"), "work\n").expect("write");
+    git(&workspace, &["add", "feature.txt"]);
+    git(&workspace, &["commit", "-q", "-m", "feature"]);
+    let merged = fixture.ok(&fixture.store, &["merge", "feature-a"]);
+    assert!(merged.contains("fast-forwarded"), "{merged}");
+    assert!(fixture.store.join("feature.txt").exists());
+    fixture.ok(&fixture.store, &["spawn", "feature-b"]);
+    assert!(
+        workspace_of(&fixture, "feature-b")
+            .join("feature.txt")
+            .exists()
+    );
+}
+
+#[test]
+fn remote_add_never_publishes_a_secret_committed_after_init() {
+    let (_guard, temp) = tempdir();
+    let repos = temp.join("artifacts");
+    std::fs::create_dir_all(&repos).expect("mkdir");
+    let remote = FakeRemote::start(repos);
+    let store = temp.join("store");
+    std::fs::create_dir_all(&store).expect("mkdir");
+    git(&store, &["init", "-q", "-b", "main"]);
+    std::fs::write(store.join("README.md"), "hello\n").expect("write");
+    git(&store, &["add", "."]);
+    git(&store, &["commit", "-q", "-m", "initial"]);
+    let home = temp.join("home");
+    save_login(&home, &remote.url, "jack", LOGIN_TOKEN_ID);
+    newgit_as(&home, &store, &["init"]);
+    newgit_as(
+        &home,
+        &store,
+        &["tracker", "create", "env", "--audience", "user"],
+    );
+    newgit_as(&home, &store, &["tracker", "track", "env", ".env.local"]);
+    git(&store, &["add", "-A"]);
+    git(&store, &["commit", "-q", "-m", "newgit"]);
+    force_commit_secret(&store);
+    let output = Command::new(env!("CARGO_BIN_EXE_newgit"))
+        .current_dir(store.as_str())
+        .args(["remote", "add", "--url", &remote.url])
+        .env("HOME", home.as_str())
+        .output()
+        .expect("newgit runs");
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains(".env.local"));
+    assert!(
+        !temp.join("artifacts/jack.store.t.root.git").exists()
+            || !files_at(&temp.join("artifacts/jack.store.t.root.git"), "main")
+                .contains(".env.local")
+    );
+}
+
 /// Run newgit as a given user: their own HOME, so their own saved login.
 fn newgit_as(home: &Utf8Path, dir: &Utf8Path, args: &[&str]) -> String {
     let output = Command::new(env!("CARGO_BIN_EXE_newgit"))

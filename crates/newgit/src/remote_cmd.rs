@@ -322,6 +322,15 @@ pub fn clone(project: &str, dir: Option<camino::Utf8PathBuf>, url: Option<String
         "--",
         ".newgit",
     ])?;
+    // A tracker left out stays absent: never carved out of root's older
+    // history here, which would invent content for it.
+    for tracker in list.keys().filter(|tracker| !fetched.contains(tracker)) {
+        git(&[
+            "update-ref",
+            &format!("refs/newgit/carve-checked/{tracker}"),
+            "refs/newgit/trackers/project/main",
+        ])?;
+    }
     let store = MetadataStore::adopt(dir.clone())?;
     let manager = BranchManager::open(store.clone())?;
     let head = manager.check_out_composed(&view.default_branch)?;

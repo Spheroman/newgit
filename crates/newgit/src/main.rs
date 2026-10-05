@@ -2466,6 +2466,9 @@ fn merge(instance: Option<String>, into: &str) -> Result<()> {
             &merge.commit[..merge.commit.len().min(12)]
         );
     }
+    if let Some(note) = &outcome.project_root {
+        println!("  {note}");
+    }
     Ok(())
 }
 

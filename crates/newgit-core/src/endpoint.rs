@@ -50,7 +50,11 @@ pub fn compose_view(plan: &Plan) -> Result<Utf8PathBuf> {
         run_git_env(&["init", "-q", "--bare", store.as_str()], &[])?;
     }
 
-    // Fetch each tracker whose commits are not here yet.
+    // Fetch each tracker whose commits are not in its own history here yet.
+    // A commit counts for a tracker only if that tracker's repo has it: the
+    // store is shared by every reader of this project, so a commit being
+    // *somewhere* in it proves nothing — a branch could name another
+    // tracker's commit under this tracker's name.
     let mut wanted: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
     for list in plan.branches.values() {
         for (tracker, commit) in list {
@@ -62,7 +66,10 @@ pub fn compose_view(plan: &Plan) -> Result<Utf8PathBuf> {
         .or_default()
         .push(&plan.definitions);
     for (tracker, commits) in &wanted {
-        if commits.iter().all(|commit| has_commit(&store, commit)) {
+        if commits
+            .iter()
+            .all(|commit| in_tracker(&store, tracker, commit))
+        {
             continue;
         }
         let source = plan.repos.get(*tracker).ok_or_else(|| {
@@ -71,17 +78,37 @@ pub fn compose_view(plan: &Plan) -> Result<Utf8PathBuf> {
         GitSource::fetch_refs(
             &[&format!("--git-dir={store}")],
             &source.url,
-            &[format!("+refs/heads/*:refs/trackers/{tracker}/*")],
+            &[format!("+refs/heads/*:refs/trackers/{tracker}/heads/*")],
             Some(&source.auth),
         )?;
-        for commit in commits {
-            if !has_commit(&store, commit) {
-                return Err(NewgitError::Unsupported(format!(
-                    "`{tracker}`'s repo does not have {commit}"
-                )));
-            }
-        }
     }
+    if !in_tracker(&store, PROJECT_TRACKER, &plan.definitions) {
+        return Err(NewgitError::Unsupported(format!(
+            "the definitions commit {} is not in the project tracker's history",
+            plan.definitions
+        )));
+    }
+    // A branch naming a commit its tracker does not have is left out —
+    // logged, not served, and not allowed to take the others down with it.
+    let mut plan = plan.clone();
+    plan.branches.retain(|branch, list| {
+        let bad: Vec<&String> = list
+            .iter()
+            .filter(|(tracker, commit)| !in_tracker(&store, tracker, commit))
+            .map(|(tracker, _)| tracker)
+            .collect();
+        if !bad.is_empty() {
+            eprintln!("newgit: branch `{branch}` names commits its trackers do not have: {bad:?}");
+        }
+        bad.is_empty()
+    });
+    if !plan.branches.contains_key(&plan.default_branch) {
+        return Err(NewgitError::Unsupported(format!(
+            "branch `{}` names commits its trackers do not have",
+            plan.default_branch
+        )));
+    }
+    let plan = &plan;
 
     let key = plan_key(plan);
     let view = views.join(format!("{key}.git"));
@@ -248,17 +275,21 @@ fn view_notes(store: &Utf8Path, key: &str, notes_ref: &str) -> Result<bool> {
     Ok(true)
 }
 
-fn has_commit(store: &Utf8Path, commit: &str) -> bool {
+/// Whether `commit` is in `tracker`'s own history here: reachable from what
+/// was fetched from that tracker's repo.
+fn in_tracker(store: &Utf8Path, tracker: &str, commit: &str) -> bool {
     run_git_env(
         &[
             &format!("--git-dir={store}"),
-            "cat-file",
-            "-e",
-            &format!("{commit}^{{commit}}"),
+            "for-each-ref",
+            "--count=1",
+            "--format=%(refname)",
+            &format!("--contains={commit}"),
+            &format!("refs/trackers/{tracker}/"),
         ],
         &[],
     )
-    .is_ok()
+    .is_ok_and(|found| !found.trim().is_empty())
 }
 
 /// The same lists compose to the same view.

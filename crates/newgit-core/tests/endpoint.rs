@@ -191,3 +191,43 @@ fn a_tracker_left_out_of_the_plan_leaves_not_one_object_behind() {
         );
     }
 }
+
+#[test]
+fn a_branch_naming_another_trackers_commit_is_not_served() {
+    let (_guard, temp) = tempdir();
+    let (head, trackers) = published(&temp);
+    let container = temp.join("container");
+    // Someone who may read payments fetched first: its commit is in the
+    // container's store.
+    compose_view(&plan(
+        &container,
+        &trackers,
+        &["root", "project", "payments"],
+    ))
+    .expect("full view");
+
+    // A branch that names payments' commit as `root`'s.
+    let mut forged = plan(&container, &trackers, &["root", "project"]);
+    let mut leak = forged.branches["main"].clone();
+    leak.insert("root".to_owned(), trackers["payments"].1.clone());
+    forged.branches.insert("leak".to_owned(), leak);
+    let view = compose_view(&forged).expect("main is still served");
+
+    let branches = git(
+        &view,
+        &["for-each-ref", "--format=%(refname)", "refs/heads"],
+    );
+    assert_eq!(branches, "refs/heads/main", "the forged branch is left out");
+    let objects = git(
+        &view,
+        &[
+            "cat-file",
+            "--batch-all-objects",
+            "--batch-check=%(objectname)",
+        ],
+    );
+    for object in objects.lines() {
+        assert!(!git(&view, &["cat-file", "-p", object]).contains("PAYMENTS-ONLY"));
+    }
+    let _ = head;
+}

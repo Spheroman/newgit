@@ -55,9 +55,16 @@ export class GitEndpoint extends DurableObject<Env> {
 				const probe = await container.exec(["true"]);
 				if ((await probe.exitCode) === 0) return container;
 			} catch {
-				if (Date.now() > deadline) throw new Error("the Git endpoint's container did not start");
-				await new Promise((resolve) => setTimeout(resolve, 100));
+				// not up yet
 			}
+			if (Date.now() > deadline) {
+				// A snapshot that cannot come up is dropped, so the next
+				// request starts from the image instead of failing forever.
+				await this.ctx.storage.delete("snapshot");
+				await container.destroy().catch(() => {});
+				throw new Error("the Git endpoint's container did not start");
+			}
+			await new Promise((resolve) => setTimeout(resolve, 100));
 		}
 	}
 
@@ -89,7 +96,7 @@ export class GitEndpoint extends DurableObject<Env> {
 		if (composed.exitCode !== 0) {
 			const why = new TextDecoder().decode(composed.stderr).trim();
 			console.error("endpoint-compose failed", why);
-			return new Response(`newgit could not compose this view: ${why}\n`, { status: 502 });
+			return new Response("newgit could not compose this view; the remote logged why\n", { status: 502 });
 		}
 		const view = new TextDecoder().decode(composed.stdout).trim();
 		await this.snapshotSoon();

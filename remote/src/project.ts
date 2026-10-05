@@ -179,8 +179,20 @@ export class ProjectDO extends DurableObject<Env> {
 			new Date().toISOString(),
 			name,
 		);
-		this.sql.exec("DELETE FROM meta WHERE key = ?", `merge:${name}`);
+		this.sql.exec("DELETE FROM meta WHERE key IN (?, ?)", `merge:${name}`, `merge-trackers:${name}`);
 		return { ok: true, branch: this.branch(name)! };
+	}
+
+	/** Record which trackers the merge in flight into `name` will move. */
+	declareMerge(name: string, trackers: string[]): void {
+		this.sql.exec("INSERT OR REPLACE INTO meta VALUES (?, ?)", `merge-trackers:${name}`, JSON.stringify(trackers));
+	}
+
+	mergeDeclares(name: string, tracker: string): boolean {
+		const row = this.sql
+			.exec<{ value: string }>("SELECT value FROM meta WHERE key = ?", `merge-trackers:${name}`)
+			.toArray()[0];
+		return row ? (JSON.parse(row.value) as string[]).includes(tracker) : false;
 	}
 
 	private mergeLock(name: string): { by: string; until: string } | null {

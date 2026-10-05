@@ -97,7 +97,7 @@ describe("branches", () => {
 		const spawned = (await call(jack, "POST", `/v1/projects/${project}/instances`, { name: "attempt-1", base_rev: "abc" })).body;
 		const refused = await put(spawned.token, "sneaky", { root: commit("c") });
 		expect(refused.status).toBe(403);
-		expect(refused.body.error).toContain("workspace's token");
+		expect(refused.body.error).toContain("agent tokens cannot");
 		expect((await call(spawned.token, "PUT", `/v1/projects/${project}/branches/default`, { name: "main" })).status).toBe(403);
 		expect((await call(spawned.token, "GET", `/v1/projects/${project}/branches/sneaky`)).status).toBe(404);
 		// Reading is fine.

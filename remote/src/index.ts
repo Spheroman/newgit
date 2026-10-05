@@ -276,13 +276,25 @@ async function route(request: Request, env: Env, deps: Deps): Promise<Response> 
 	// A code tracker carved after the project was created gets its repo here,
 	// seeded once by whoever carved it. It joins a branch only by a merge.
 	if (method === "POST" && rest === "/trackers") {
+		// Definitions are the owner's: a new code tracker comes with a change
+		// to them, which only the owner merges.
 		requireHuman(caller, "create code tracker repos");
+		requireOwner(info.owner, login, "add code trackers");
 		const { name: tracker } = await body<{ name?: string }>(request);
 		if (!tracker) throw new HttpError(400, "name is required");
 		requirePart("tracker name", tracker);
+		const defined = await definitionFacts(deps.repos, id, info.defaultBranch, tracker);
+		if (defined !== undefined && !defined.code)
+			throw new HttpError(400, `\`${tracker}\` is a secret tracker; its repo is made by its first sync`);
 		const ref: RepoRef = { kind: "tracker", project: id, tracker };
-		if ((await deps.repos.remote(repoName(ref))) !== null)
-			throw new HttpError(409, `${repoName(ref)} exists already; its history moves only through \`newgit merge\``);
+		if ((await deps.repos.remote(repoName(ref))) !== null) {
+			// Made before by a merge or a first publication that did not
+			// finish: until it is on a branch, its owner may seed it again.
+			const listed = (await project.branches()).some((branch) => tracker in branch.list);
+			if (listed)
+				throw new HttpError(409, `${repoName(ref)} exists already; its history moves only through \`newgit merge\``);
+			return json(await seed(env, deps, caller, ref, false), 200);
+		}
 		return json(await seed(env, deps, caller, ref), 201);
 	}
 
@@ -303,8 +315,25 @@ async function route(request: Request, env: Env, deps: Deps): Promise<Response> 
 		requireHuman(caller, "merge");
 		const branch = decodeURIComponent(mergeMatch[1]);
 		const { base, trackers } = await body<{ base?: Record<string, string>; trackers?: string[] }>(request);
-		if (!base || !Array.isArray(trackers) || trackers.length === 0)
+		if (!base || !Array.isArray(trackers))
 			throw new HttpError(400, "base (the list you merged onto) and trackers (the ones that move) are required");
+		// Everything is checked before the lock is taken: a refused merge
+		// holds nothing.
+		const who = { login, member };
+		for (const tracker of trackers) {
+			requirePart("tracker name", tracker);
+			const facts = await definitionFacts(deps.repos, id, info.defaultBranch, tracker);
+			if (facts === undefined)
+				throw new HttpError(
+					400,
+					`\`${tracker}\` is not defined on \`${info.defaultBranch}\`: a new code tracker joins by its own seeded repo`,
+				);
+			if (!facts.code) throw new HttpError(400, `\`${tracker}\` is a secret tracker; \`newgit merge\` never carries it`);
+			const read = decide({ kind: "tracker", project: id, tracker }, "read", who, { tracker: facts });
+			if (!read.ok) throw new HttpError(403, read.reason);
+			// The definitions decide every audience: changing them is the owner's.
+			if (tracker === "project") requireOwner(info.owner, login, "merge changes to the project's definitions");
+		}
 		const started = await project.beginMerge(branch, base, login, MERGE_LOCK_SECONDS);
 		if (!started.ok) {
 			if (started.reason === "missing") throw new HttpError(404, `no branch \`${branch}\` in ${key}`);
@@ -314,13 +343,7 @@ async function route(request: Request, env: Env, deps: Deps): Promise<Response> 
 		}
 		const credentials = [];
 		for (const tracker of trackers) {
-			requirePart("tracker name", tracker);
 			const ref: RepoRef = { kind: "tracker", project: id, tracker };
-			const facts = await definitionFacts(deps.repos, id, info.defaultBranch, tracker);
-			// A tracker the merge introduces is not defined on the branch yet;
-			// its repo was just made through the trackers route. Never a secret one.
-			if (facts !== undefined && !facts.code)
-				throw new HttpError(400, `\`${tracker}\` is a secret tracker; \`newgit merge\` never carries it`);
 			const name = repoName(ref);
 			if ((await deps.repos.remote(name)) === null) throw new HttpError(404, `${name} does not exist`);
 			const minted = await deps.repos.mint(name, "write", CREDENTIAL_TTL_SECONDS);
@@ -334,6 +357,7 @@ async function route(request: Request, env: Env, deps: Deps): Promise<Response> 
 				expires_at: minted.expiresAt,
 			});
 		}
+		await project.declareMerge(branch, trackers);
 		return json({ branch, until: started.until, credentials });
 	}
 
@@ -346,7 +370,7 @@ async function route(request: Request, env: Env, deps: Deps): Promise<Response> 
 			return json(found);
 		}
 		if (method === "PUT") {
-			requireNotInstance(caller, "create branches");
+			requireHuman(caller, "create or move branches");
 			requirePart("branch name", branch);
 			const { list, base } = await body<{ list?: Record<string, string>; base?: Record<string, string> }>(
 				request,
@@ -361,6 +385,20 @@ async function route(request: Request, env: Env, deps: Deps): Promise<Response> 
 			if (base !== undefined) {
 				// The end of a merge: the list moves from `base`, all at once.
 				requireHuman(caller, "merge");
+				// Only what the merge declared may move: every other tracker
+				// keeps its commit, and a new one joins only from the repo the
+				// owner seeded for it.
+				for (const [tracker, commit] of Object.entries(list)) {
+					if (base[tracker] === commit) continue;
+					if (await project.mergeDeclares(branch, tracker)) continue;
+					if (!(tracker in base) && info.owner === login) {
+						const defined = await definitionFacts(deps.repos, id, info.defaultBranch, tracker);
+						if (defined === undefined || defined.code) continue;
+					}
+					throw new HttpError(400, `this merge did not declare \`${tracker}\`, so it cannot move it`);
+				}
+				for (const tracker of Object.keys(base))
+					if (!(tracker in list)) throw new HttpError(400, `a merge cannot drop \`${tracker}\` from a branch`);
 				const finished = await project.finishMerge(branch, base, list, login);
 				if (!finished.ok) {
 					if (finished.reason === "missing") throw new HttpError(404, `no branch \`${branch}\` in ${key}`);
@@ -506,7 +544,12 @@ async function gitEndpoint(request: Request, env: Env, deps: Deps, match: RegExp
 	const header = request.headers.get("authorization") ?? "";
 	let token = "";
 	if (header.startsWith("Basic ")) {
-		const decoded = atob(header.slice("Basic ".length));
+		let decoded = "";
+		try {
+			decoded = atob(header.slice("Basic ".length));
+		} catch {
+			throw new HttpError(401, "that Authorization header is not Basic auth");
+		}
 		token = decoded.slice(decoded.indexOf(":") + 1);
 	} else if (header.startsWith("Bearer ")) {
 		token = header.slice("Bearer ".length);
@@ -514,7 +557,12 @@ async function gitEndpoint(request: Request, env: Env, deps: Deps, match: RegExp
 	if (!token) throw new HttpError(401, "log in with `newgit login`; the credential helper answers for this URL");
 	const caller = await callerFor(token, env);
 
-	const id = parseProjectKey(`${decodeURIComponent(match[1])}/${decodeURIComponent(match[2])}`);
+	let id: ProjectId | null = null;
+	try {
+		id = parseProjectKey(`${decodeURIComponent(match[1])}/${decodeURIComponent(match[2])}`);
+	} catch {
+		id = null;
+	}
 	if (id === null) throw new HttpError(404, "a project is <owner>/<name>.git");
 	const key = projectKey(id);
 	if (caller.project !== undefined && caller.project !== key)
@@ -568,9 +616,9 @@ function endpointUrl(url: URL, id: ProjectId): string {
 }
 
 /** Create a code tracker's repo and mint the one short write that seeds it. */
-async function seed(env: Env, deps: Deps, caller: Caller, ref: RepoRef) {
+async function seed(env: Env, deps: Deps, caller: Caller, ref: RepoRef, create = true) {
 	const name = repoName(ref);
-	const { remote } = await deps.repos.create(name);
+	const remote = create ? (await deps.repos.create(name)).remote : deps.repos.url(name);
 	const minted = await deps.repos.mint(name, "write", CREDENTIAL_TTL_SECONDS);
 	await userStub(env, caller.login).recordRepoToken(caller.tokenId, name, minted.id, minted.expiresAt);
 	return {
@@ -633,7 +681,10 @@ async function definitionFacts(
 		branch,
 		`.newgit/trackers/${tracker}.toml`,
 	);
-	if (text === null) return undefined;
+	if (text === null) {
+		// `root` and `project` always exist, file or not.
+		return tracker === "root" || tracker === "project" ? { audience: { kind: "project-devs" }, code: true } : undefined;
+	}
 	let definition: { audience?: unknown; secret?: unknown };
 	try {
 		definition = parseToml(text) as { audience?: unknown; secret?: unknown };

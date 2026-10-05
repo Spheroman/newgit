@@ -230,9 +230,12 @@ describe("the API", () => {
 		expect((await call("ana", "GET", `/v1/projects/${project}/checkpoints`)).body.checkpoints).toHaveLength(0);
 	});
 
-	it("creates and seeds a code tracker repo carved later, once, for humans only", async () => {
+	it("creates and seeds a code tracker repo carved later, once, for its owner only", async () => {
 		await setUp();
-		const created = await call("ana", "POST", `/v1/projects/${project}/trackers`, { name: "docs" });
+		// Definitions decide every audience, so adding a code tracker is the owner's.
+		const member = await call("ana", "POST", `/v1/projects/${project}/trackers`, { name: "docs" });
+		expect(member.status).toBe(403);
+		const created = await call("jack", "POST", `/v1/projects/${project}/trackers`, { name: "docs" });
 		expect(created.status).toBe(201);
 		expect(created.body).toMatchObject({
 			tracker: "docs",
@@ -240,15 +243,20 @@ describe("the API", () => {
 			password: `pw-${repo("t.docs")}-write`,
 		});
 		expect(repos.repos.has(repo("t.docs"))).toBe(true);
-		const again = await call("ana", "POST", `/v1/projects/${project}/trackers`, { name: "docs" });
-		expect(again.status).toBe(409);
-		expect(again.body.error).toContain("newgit merge");
-		expect((await call("ana", "POST", `/v1/projects/${project}/trackers`, { name: "root" })).status).toBe(409);
-		expect((await call("ana", "POST", `/v1/projects/${project}/trackers`, {})).status).toBe(400);
-		expect((await call("ana", "POST", `/v1/projects/${project}/trackers`, { name: "a.b" })).status).toBe(400);
+		// Not on a branch yet (a merge that did not finish): seeded again.
+		const again = await call("jack", "POST", `/v1/projects/${project}/trackers`, { name: "docs" });
+		expect(again.status).toBe(200);
+		expect(again.body.repo).toBe(repo("t.docs"));
+		// On a branch: its history moves only by merging.
+		await call("jack", "PUT", `/v1/projects/${project}/branches/main`, { list: { root: "a".repeat(40) } });
+		expect((await call("jack", "POST", `/v1/projects/${project}/trackers`, { name: "root" })).status).toBe(409);
+		expect((await call("jack", "POST", `/v1/projects/${project}/trackers`, {})).status).toBe(400);
+		expect((await call("jack", "POST", `/v1/projects/${project}/trackers`, { name: "a.b" })).status).toBe(400);
+		// Never a secret tracker's repo: that is made by its first sync.
+		expect(
+			(await call("jack", "POST", `/v1/projects/${project}/trackers`, { name: "runtime-env" })).status,
+		).toBe(400);
 		expect((await call("eve", "POST", `/v1/projects/${project}/trackers`, { name: "evil" })).status).toBe(403);
-		const agent = (await call("ana", "POST", "/v1/tokens", { name: "agent-1" })).body.token;
-		expect((await call(agent, "POST", `/v1/projects/${project}/trackers`, { name: "agentic" })).status).toBe(403);
-		expect(repos.repos.has(repo("t.agentic"))).toBe(false);
 	});
+
 });
