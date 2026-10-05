@@ -681,6 +681,37 @@ impl GitSource {
         run_git_env(&args, &auth_env(auth)).map(|_| ())
     }
 
+    /// Push `commit` to `branch` at `url`, moving it only if it is still
+    /// `expected` (or creating it, with `None`) — or if it is `commit`
+    /// already, which a retry finds.
+    pub fn push_leased(
+        location: &[&str],
+        url: &str,
+        commit: &str,
+        branch: &str,
+        expected: Option<&str>,
+        auth: Option<&str>,
+    ) -> Result<()> {
+        let refspec = format!("{commit}:{branch}");
+        let attempt = |lease: &str| {
+            let lease = format!("--force-with-lease={branch}:{lease}");
+            let mut args: Vec<&str> = location.to_vec();
+            args.extend([
+                "push",
+                "--quiet",
+                lease.as_str(),
+                "--",
+                url,
+                refspec.as_str(),
+            ]);
+            run_git_env(&args, &auth_env(auth)).map(|_| ())
+        };
+        match attempt(expected.unwrap_or("")) {
+            Ok(()) => Ok(()),
+            Err(error) => attempt(commit).map_err(|_| error),
+        }
+    }
+
     /// `git <location> fetch <url> <refspecs>`, authenticated like [`Self::push_refs`].
     pub fn fetch_refs(
         location: &[&str],

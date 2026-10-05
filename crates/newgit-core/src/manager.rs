@@ -1101,6 +1101,7 @@ impl BranchManager {
         git(&["update-ref", &format!("refs/heads/{branch}"), &view])?;
         git(&["symbolic-ref", "HEAD", &format!("refs/heads/{branch}")])?;
         git(&["reset", "-q", "--hard", &view])?;
+        git(&["update-ref", ADOPTED_REF, &view])?;
         let file = self.store.paths().project_branch_file();
         std::fs::write(&file, format!("{branch}\n"))
             .map_err(|source| NewgitError::io(&file, source))?;
@@ -1109,13 +1110,20 @@ impl BranchManager {
 
     /// Refuse when anything about to be published from `rev` — every commit
     /// behind it, every parent of every merge, back to the history newgit
-    /// adopted (root's `main`) — adds or changes a secret tracker's file. The
+    /// adopted (as `newgit init` found it, or a clone received it) — adds or
+    /// changes a secret tracker's file. Every commit pushed is checked, view
+    /// commits and tracker commits alike: a tracker's `main` can hold work
+    /// merged here that no branch of the project root has. The
     /// one gate every path that sends work to the remote passes: sync, push,
     /// merge, and a project's first publication.
-    fn refuse_unpublished(&self, rev: &str) -> Result<()> {
+    fn refuse_unpublished(&self, revs: &[&str]) -> Result<()> {
+        if revs.is_empty() {
+            return Ok(());
+        }
         let root = self.store.paths().project_root.clone();
-        let adopted = self.fetch_code_ref(&self.root.name, "main")?;
-        let mut args = vec![rev, "--not"];
+        let adopted = self.source.rev_parse(ADOPTED_REF).ok();
+        let mut args = revs.to_vec();
+        args.push("--not");
         args.extend(adopted.as_deref());
         self.refuse_secrets(&root, &args, &[])
     }
@@ -4094,7 +4102,7 @@ impl BranchManager {
             .iter()
             .filter_map(|update| update.new.as_deref())
             .collect();
-        let history = self.fetch_code_ref(&self.root.name, "main")?;
+        let history = self.source.rev_parse(ADOPTED_REF).ok();
         if !rev_list.is_empty() {
             rev_list.extend(["--not", "--all"]);
             rev_list.extend(history.as_deref());
@@ -4430,11 +4438,12 @@ impl BranchManager {
     pub fn create_on_remote(&self, client: &dyn Remote, name: &str) -> Result<PublishedProject> {
         // Here first: the project root merged into `main` — work already
         // merged locally stays, and the project root's commits join it.
+        if self.source.rev_parse("HEAD").is_err() {
+            return Err(NewgitError::Unsupported(
+                "commit something first: a project reaches the remote as its history".to_owned(),
+            ));
+        }
         self.merge(PROJECT_ROOT_INSTANCE, "main")?;
-        let branch = std::fs::read_to_string(self.store.paths().project_branch_file())
-            .map(|branch| branch.trim().to_owned())
-            .unwrap_or_else(|_| PROJECT_ROOT_INSTANCE.to_owned());
-        self.refuse_unpublished(&format!("refs/heads/{branch}"))?;
         let root = self.store.paths().project_root.clone();
         let mut list = BTreeMap::new();
         for definition in self.code_definitions() {
@@ -4452,6 +4461,10 @@ impl BranchManager {
                     .to_owned(),
             ));
         }
+        // Exactly what will be pushed: each tracker's `main`, which may hold
+        // work merged here that the project root's branch never had.
+        let commits: Vec<&str> = list.values().map(String::as_str).collect();
+        self.refuse_unpublished(&commits)?;
         let trackers: Vec<String> = list.keys().cloned().collect();
         let (key, endpoint, seeds) = match client.create_project(name, &trackers) {
             Ok(created) => (created.key, created.endpoint, created.seeds),
@@ -4537,7 +4550,7 @@ impl BranchManager {
             (branch.name, checkpoint.record.id, head)
         };
         if self.remote.is_some() {
-            self.refuse_unpublished(&head)?;
+            self.refuse_unpublished(&[&head])?;
         }
         let root = self.store.paths().project_root.clone();
         let code = self.code_definitions();
@@ -4648,14 +4661,22 @@ impl BranchManager {
         if !moved.is_empty()
             && let Some((client, project)) = &client
         {
-            let push = |remote: &str, auth: &crate::remote::RepoCredential, commit: &str| {
-                // Forced: a tracker repo's branch mirrors the list, which is
-                // the truth; only the merge holding the lock pushes, and a
-                // retry after a failed finish replaces its own earlier push.
-                GitSource::push_refs(
+            let pushed: Vec<&str> = moved.iter().map(|merge| merge.commit.as_str()).collect();
+            self.refuse_unpublished(&pushed)?;
+            // Each tracker's branch moves only from the commit this merge
+            // started from (or is it already, on a retry): never over
+            // another merge that landed meanwhile.
+            let branch_ref = format!("refs/heads/{into}");
+            let push = |remote: &str,
+                        auth: &crate::remote::RepoCredential,
+                        tracker: &str,
+                        commit: &str| {
+                GitSource::push_leased(
                     &["-C", root.as_str()],
                     remote,
-                    &[format!("+{commit}:refs/heads/{into}")],
+                    commit,
+                    &branch_ref,
+                    base.get(tracker).map(String::as_str),
                     Some(&basic_auth_header(auth)),
                 )
             };
@@ -4667,6 +4688,7 @@ impl BranchManager {
                 push(
                     seed.credential.remote.as_deref().unwrap_or_default(),
                     &seed.credential,
+                    &merge.tracker,
                     &merge.commit,
                 )?;
             }
@@ -4677,6 +4699,12 @@ impl BranchManager {
                 .filter(|merge| merge.action != TrackerMergeAction::New)
                 .map(|merge| merge.tracker.clone())
                 .collect();
+            if names.is_empty() {
+                return Err(NewgitError::Unsupported(format!(
+                    "a new code tracker joins `{into}` with the change to the definitions that \
+                     made it: merge that too (`newgit merge main` from the project root)"
+                )));
+            }
             let credentials = client.begin_merge(project, into, &base, &names)?;
             for credential in &credentials {
                 let Some(merge) = moved
@@ -4688,6 +4716,7 @@ impl BranchManager {
                 push(
                     credential.credential.remote.as_deref().unwrap_or_default(),
                     &credential.credential,
+                    &merge.tracker,
                     &merge.commit,
                 )?;
             }
@@ -4698,8 +4727,15 @@ impl BranchManager {
                 .update_ref(&local_tracker_ref(tracker, into), commit)?;
             self.publish_code_refs(tracker, &[into])?;
         }
+        // The merge is done; bringing the project root along is a courtesy,
+        // and its failing is said, not mistaken for the merge failing.
         let project_root = if name != PROJECT_ROOT_INSTANCE && into == PROJECT_ROOT_INSTANCE {
-            self.catch_up_project_root(&list)?
+            match self.catch_up_project_root(&list) {
+                Ok(note) => note,
+                Err(error) => Some(format!(
+                    "the project root was not brought along to the merge: {error}"
+                )),
+            }
         } else {
             None
         };
@@ -5075,7 +5111,7 @@ impl BranchManager {
         // history newgit adopted (root's `main`). A secret committed after
         // that never reaches newgit's remote, even one already pushed
         // somewhere else by plain Git: it has to come out of the history.
-        self.refuse_unpublished(&record.source.store_ref)?;
+        self.refuse_unpublished(&[&record.source.store_ref])?;
         self.split_instance(&branch.slug, &record.source.head_rev)?;
 
         let remote = link.connect(Acting::Workspace(&branch.workspace_path))?;
@@ -6017,6 +6053,10 @@ fn no_own_content(tracker: &str) -> String {
 }
 
 /// Where a checkpoint's source lives in its instance's fork.
+/// The history newgit adopted — as `newgit init` found it, or as a clone
+/// received it: published already, so never held against a push.
+pub const ADOPTED_REF: &str = "refs/newgit/adopted";
+
 /// The project root's name as an instance: its tracker branches are
 /// `instances/main`, so no spawned instance may take the name.
 const PROJECT_ROOT_INSTANCE: &str = "main";

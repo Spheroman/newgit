@@ -315,7 +315,7 @@ async function route(request: Request, env: Env, deps: Deps): Promise<Response> 
 		requireHuman(caller, "merge");
 		const branch = decodeURIComponent(mergeMatch[1]);
 		const { base, trackers } = await body<{ base?: Record<string, string>; trackers?: string[] }>(request);
-		if (!base || !Array.isArray(trackers))
+		if (!base || !Array.isArray(trackers) || trackers.length === 0)
 			throw new HttpError(400, "base (the list you merged onto) and trackers (the ones that move) are required");
 		// Everything is checked before the lock is taken: a refused merge
 		// holds nothing.
@@ -334,19 +334,23 @@ async function route(request: Request, env: Env, deps: Deps): Promise<Response> 
 			// The definitions decide every audience: changing them is the owner's.
 			if (tracker === "project") requireOwner(info.owner, login, "merge changes to the project's definitions");
 		}
-		const started = await project.beginMerge(branch, base, login, MERGE_LOCK_SECONDS);
+		const started = await project.beginMerge(branch, base, login, MERGE_LOCK_SECONDS, trackers);
 		if (!started.ok) {
 			if (started.reason === "missing") throw new HttpError(404, `no branch \`${branch}\` in ${key}`);
 			if (started.reason === "moved")
 				throw new HttpError(409, `\`${branch}\` moved since you looked: merge again onto what it is now`);
 			throw new HttpError(409, `${started.by} is merging into \`${branch}\` until ${started.until}`);
 		}
+		await revokeRepoTokens(deps, started.stale);
 		const credentials = [];
+		const handed = [];
 		for (const tracker of trackers) {
 			const ref: RepoRef = { kind: "tracker", project: id, tracker };
 			const name = repoName(ref);
 			if ((await deps.repos.remote(name)) === null) throw new HttpError(404, `${name} does not exist`);
-			const minted = await deps.repos.mint(name, "write", CREDENTIAL_TTL_SECONDS);
+			// No longer-lived than the lock, and cancelled when the merge ends.
+			const minted = await deps.repos.mint(name, "write", MERGE_LOCK_SECONDS);
+			handed.push({ repo: name, artifactsId: minted.id });
 			await userStub(env, login).recordRepoToken(caller.tokenId, name, minted.id, minted.expiresAt);
 			credentials.push({
 				tracker,
@@ -357,7 +361,7 @@ async function route(request: Request, env: Env, deps: Deps): Promise<Response> 
 				expires_at: minted.expiresAt,
 			});
 		}
-		await project.declareMerge(branch, trackers);
+		await project.recordMergeTokens(branch, handed);
 		return json({ branch, until: started.until, credentials });
 	}
 
@@ -406,6 +410,7 @@ async function route(request: Request, env: Env, deps: Deps): Promise<Response> 
 						throw new HttpError(409, `you hold no merge into \`${branch}\`: start one with \`newgit merge\``);
 					throw new HttpError(409, `\`${branch}\` moved since you looked: merge again onto what it is now`);
 				}
+				await revokeRepoTokens(deps, finished.tokens);
 				return json(finished.branch);
 			}
 			const created = await project.createBranch(branch, list, login);

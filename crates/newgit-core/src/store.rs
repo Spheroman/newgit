@@ -162,7 +162,11 @@ impl MetadataStore {
             &self.paths.project_root,
             "HEAD",
             &root.name,
-        )
+        )?;
+        // The history newgit adopted: published already, wherever it went,
+        // so the secret gate never holds it against a push.
+        git(&["update-ref", crate::manager::ADOPTED_REF, "HEAD"]);
+        Ok(())
     }
 
     /// Walk upward from `cwd` to find the governing metadata. A workspace is

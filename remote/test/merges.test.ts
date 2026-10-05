@@ -55,6 +55,26 @@ describe("merging into a branch", () => {
 		expect((await call(jack, "GET", path("/branches/main"))).body.list).toEqual(moved);
 	});
 
+	it("cancels its write passwords when it finishes, and moves nothing it did not declare", async () => {
+		const started = await call(jack, "POST", path("/branches/main/merge"), { base: main, trackers: ["root"] });
+		const minted = repos.minted.at(-1)!.id;
+		const sneaky = await call(jack, "PUT", path("/branches/main"), {
+			base: main,
+			list: { root: sha("c"), project: sha("e") },
+		});
+		expect(sneaky.status).toBe(400);
+		expect(sneaky.body.error).toContain("did not declare `project`");
+		expect(started.status).toBe(200);
+		expect((await call(jack, "PUT", path("/branches/main"), { base: main, list: { ...main, root: sha("c") } })).status).toBe(
+			200,
+		);
+		expect(repos.revokedTokens.has(minted)).toBe(true);
+	});
+
+	it("is refused with nothing to move", async () => {
+		expect((await call(jack, "POST", path("/branches/main/merge"), { base: main, trackers: [] })).status).toBe(400);
+	});
+
 	it("refuses a merge onto a list that has moved since", async () => {
 		const stale = { ...main, root: sha("f") };
 		const refused = await call(jack, "POST", path("/branches/main/merge"), { base: stale, trackers: ["root"] });

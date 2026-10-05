@@ -18,14 +18,23 @@ export interface ProjectInfo {
 /** A branch: one commit per code tracker, by tracker name. */
 export type TrackerList = Record<string, string>;
 
+interface MergeLock {
+	by: string;
+	until: string;
+	/** The trackers the merge declared when it began: all it may move. */
+	trackers?: string[];
+	/** Write passwords handed out for it. */
+	tokens?: { repo: string; artifactsId: string }[];
+}
+
 export type MergeStart =
-	| { ok: true; until: string }
+	| { ok: true; until: string; stale: { repo: string; artifactsId: string }[] }
 	| { ok: false; reason: "missing" }
 	| { ok: false; reason: "moved"; list: TrackerList }
 	| { ok: false; reason: "locked"; by: string; until: string };
 
 export type MergeFinish =
-	| { ok: true; branch: Branch }
+	| { ok: true; branch: Branch; tokens: { repo: string; artifactsId: string }[] }
 	| { ok: false; reason: "missing" | "unlocked" }
 	| { ok: false; reason: "moved"; list: TrackerList };
 
@@ -149,16 +158,31 @@ export class ProjectDO extends DurableObject<Env> {
 	 * (someone else merged first: merge again) and no other merge into it is
 	 * in flight. Takes the branch's merge lock for `seconds`.
 	 */
-	beginMerge(name: string, base: TrackerList, by: string, seconds: number): MergeStart {
+	beginMerge(name: string, base: TrackerList, by: string, seconds: number, trackers: string[]): MergeStart {
 		const branch = this.branch(name);
 		if (branch === null) return { ok: false, reason: "missing" };
 		if (!sameList(branch.list, base)) return { ok: false, reason: "moved", list: branch.list };
 		const lock = this.mergeLock(name);
 		if (lock !== null && lock.by !== by && Date.parse(lock.until) > Date.now())
 			return { ok: false, reason: "locked", by: lock.by, until: lock.until };
+		// Whatever the lock it replaces handed out is cancelled: a merge that
+		// stalled past its lock cannot push over this one.
+		const stale = lock?.tokens ?? [];
 		const until = new Date(Date.now() + seconds * 1000).toISOString();
-		this.sql.exec("INSERT OR REPLACE INTO meta VALUES (?, ?)", `merge:${name}`, JSON.stringify({ by, until }));
-		return { ok: true, until };
+		this.sql.exec(
+			"INSERT OR REPLACE INTO meta VALUES (?, ?)",
+			`merge:${name}`,
+			JSON.stringify({ by, until, trackers, tokens: [] }),
+		);
+		return { ok: true, until, stale };
+	}
+
+	/** The write passwords handed out for the merge in flight, to cancel when it ends. */
+	recordMergeTokens(name: string, tokens: { repo: string; artifactsId: string }[]): void {
+		const lock = this.mergeLock(name);
+		if (lock === null) return;
+		lock.tokens = [...(lock.tokens ?? []), ...tokens];
+		this.sql.exec("INSERT OR REPLACE INTO meta VALUES (?, ?)", `merge:${name}`, JSON.stringify(lock));
 	}
 
 	/**
@@ -179,27 +203,20 @@ export class ProjectDO extends DurableObject<Env> {
 			new Date().toISOString(),
 			name,
 		);
-		this.sql.exec("DELETE FROM meta WHERE key IN (?, ?)", `merge:${name}`, `merge-trackers:${name}`);
-		return { ok: true, branch: this.branch(name)! };
+		this.sql.exec("DELETE FROM meta WHERE key = ?", `merge:${name}`);
+		return { ok: true, branch: this.branch(name)!, tokens: lock.tokens ?? [] };
 	}
 
-	/** Record which trackers the merge in flight into `name` will move. */
-	declareMerge(name: string, trackers: string[]): void {
-		this.sql.exec("INSERT OR REPLACE INTO meta VALUES (?, ?)", `merge-trackers:${name}`, JSON.stringify(trackers));
-	}
-
+	/** Whether the merge in flight into `name` declared `tracker` when it began. */
 	mergeDeclares(name: string, tracker: string): boolean {
-		const row = this.sql
-			.exec<{ value: string }>("SELECT value FROM meta WHERE key = ?", `merge-trackers:${name}`)
-			.toArray()[0];
-		return row ? (JSON.parse(row.value) as string[]).includes(tracker) : false;
+		return this.mergeLock(name)?.trackers?.includes(tracker) ?? false;
 	}
 
-	private mergeLock(name: string): { by: string; until: string } | null {
+	private mergeLock(name: string): MergeLock | null {
 		const row = this.sql
 			.exec<{ value: string }>("SELECT value FROM meta WHERE key = ?", `merge:${name}`)
 			.toArray()[0];
-		return row ? (JSON.parse(row.value) as { by: string; until: string }) : null;
+		return row ? (JSON.parse(row.value) as MergeLock) : null;
 	}
 
 	isMember(login: string): boolean {
