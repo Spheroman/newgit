@@ -78,9 +78,9 @@ Facts from the docs (2026-10), because the design leans on each one:
    git push ─► outbox ─► checkpoint ─┐           │     checkpoints, merge queue, path leases
                                      │           │
    git credential helper ── mints ───┼──────────►├─► Artifacts namespace <project>
-     short-lived repo tokens         │           │     <p>.src          trunk (public tier)
+     short-lived repo tokens         │           │     <p>.src          trunk
                                      └─ push ───►│     <p>.i.<inst>     fork per instance
-                                                 │     <p>.t.<tier>     tracker lanes per audience
+                                                 │     <p>.t.<tracker>  one repo per tracker
                                                  │
                          pushed event ─► Queue ─►└─► Worker consumer: update binding record,
                                                        overlap check, notify, start CI/review
@@ -109,11 +109,11 @@ when more than one machine is involved.
 | Source trunk | the store repo's branches | repo `<p>.src` |
 | Branch instance | binding record + workspace clone | ProjectDO row + **fork** `<p>.i.<instance>` |
 | Workspace `origin` push | outbox → real remote | outbox → the instance's fork |
-| Tracker lane | `.newgit/snapshots/<tracker>/<rev>/` | `refs/newgit/lanes/<tracker>` in `<p>.t.<tier>` |
+| Tracker lane | `.newgit/snapshots/<tracker>/<rev>/` | `refs/newgit/lanes/<tracker>` in `<p>.t.<tracker>` |
 | Checkpoint | `.newgit/checkpoints/<inst>/*.json` + store refs | ProjectDO row + `refs/newgit/checkpoints/<id>` in each repo it names |
 | `merge` (source) | — (v1 leaves source merges to Git) | merge queue in ProjectDO, executed server-side into `<p>.src` |
-| `merge` (tracker) | moves the lane's LATEST | moves `refs/newgit/lanes/<tracker>` in the tier repo |
-| Audience | declared intent | **enforced**: tokens for `<p>.t.<tier>` are minted only for members of `<tier>` |
+| `merge` (tracker) | moves the lane's LATEST | moves `refs/newgit/lanes/<tracker>` in the tracker's repo |
+| Audience | declared intent | **enforced**: tokens for `<p>.t.<tracker>` are minted only for the tracker's audience |
 | Resources | local lifecycle | still local. Stretch: run in a Sandbox container |
 
 Resources do not move. They exist precisely because their state cannot make
@@ -124,32 +124,51 @@ the trip; a remote does not change that. What crosses is their *deposits*
 
 ## Repo Topology
 
-> **Decision (loud): one repo per audience tier, plus one fork per
-> instance.** The architecture doc's rule is "one store, not
-> repo-per-tracker," for atomicity, hunk privacy, and cheap reclassification.
-> That rule still holds **locally**. The remote is different by construction:
-> Artifacts tokens are repo-scoped, so a permission boundary *must* be a repo
-> boundary. And the architecture doc already says the native remote stores
-> "client-precomputed projection bundles," one per audience tier. A repo per
-> tier is that design, with Artifacts as the dumb auth-gated server.
+> **Decision (loud): one repo per tracker, plus one fork per instance.** The
+> architecture doc's rule is "one store, not repo-per-tracker," for
+> atomicity, hunk privacy, and cheap reclassification. That rule still holds
+> **locally**. The remote is different by construction: Artifacts tokens are
+> repo-scoped, so a permission boundary *must* be a repo boundary. A tracker
+> is the unit audience is declared on, so a tracker is a repo.
 
 Concretely, for project `acme`:
 
-- `acme.src` — trunk. Audience `everyone` (in the project). Source only.
+- `acme.src` — trunk. Readable by every project member. Source only.
 - `acme.i.<instance>` — forked from `acme.src` at spawn. The instance's
   source history and checkpoint refs. Write tokens for it go **only** to that
   instance's owner. Deleted by `newgit remove`.
-- `acme.t.<tier>` — one per distinct tracker audience: `acme.t.project-devs`,
-  `acme.t.user-jack`. Holds lanes and lane checkpoint refs for every tracker
-  with that audience. Created lazily on first push.
+- `acme.t.<tracker>` — one per non-source tracker: `acme.t.runtime-env`,
+  `acme.t.jack-env`, `acme.t.db-snapshots`. Holds that tracker's lane and its
+  checkpoint refs. Created lazily on first push.
+
+Why per tracker rather than grouping trackers that share an audience into one
+repo (an earlier draft did that):
+
+- **It is the obvious model.** "A tracker is a repo" needs no explanation.
+- **Audience is a rule, not a location.** Changing a tracker's audience
+  changes who the Worker mints tokens for; no content moves between repos.
+- **Lifecycle and limits are per tracker.** Retiring a tracker deletes its
+  repo. A large `db-snapshots` lane spends its own 1 GB cap and rate limit,
+  not the `.env` lanes'.
+- **The cost is small.** More repos (Artifacts treats them as unlimited),
+  and a checkpoint pushes to one repo per changed tracker — about 1 s each,
+  run in parallel.
+
+The workspace is still assembled **on the client, into files**: spawn clones
+source from the local store, then fetches each tracker the user may read and
+writes its files into the workspace, excluded from Git as in v1. Nothing
+assembles a combined repo per workspace — that would put tracker content into
+a commit an agent can push (see *Tracker Paths and Git* in the v1 spec), and
+a Worker cannot build a repo of real size in memory (Day 0).
 
 What this buys, stated plainly because these are real properties and not
 simulations:
 
 - **An agent cannot push to trunk.** Its credential only opens its fork.
   Trunk moves only through the merge queue.
-- **An agent cannot read a tier it is not in.** The Worker will not mint the
-  token. `jack-env` is unreadable to a teammate's machine — not hidden, absent.
+- **An agent cannot read a tracker outside its audience.** The Worker will not
+  mint the token. `jack-env` is unreadable to a teammate's machine — not
+  hidden, absent.
 - **An agent cannot damage another instance.** Different repos, different
   tokens.
 
@@ -158,7 +177,11 @@ What it does **not** buy (say so in the docs and the video):
 - Isolation *within* a machine. Two agents under one OS user share the
   credential helper and can read each other's workspaces. Per-agent identity
   on one machine is future work (sandboxes give it for free; see Stretch).
-- Hunk-level privacy. Tiers are path-granular, same as v1.
+- Hunk-level privacy. Trackers are path-granular, same as v1.
+- Cross-repo atomicity. A checkpoint spans several repos, so no single push
+  commits it. ProjectDO's checkpoint row is the commit point: every ref is
+  pushed first, the row is written last, and a failure partway leaves only
+  unreferenced refs, never a half-checkpoint.
 
 ---
 
@@ -207,7 +230,7 @@ Scope rules the Worker applies:
 |---|---|---|
 | `<p>.src` | members | **nobody** (the merge executor only) |
 | `<p>.i.<inst>` | members | the instance owner |
-| `<p>.t.<tier>` | members of the tier | members of the tier |
+| `<p>.t.<tracker>` | the tracker's audience | the tracker's audience |
 
 ---
 
@@ -260,9 +283,9 @@ local design regardless:
   `refs/newgit/checkpoints/<id>/<tracker>` so `git gc` cannot drop them.
 
 Lane commits live in the **store** repo locally, on refs Git never checks
-out, so they never appear in source history or `git log`. Pushing a tier
-means pushing just that tier's `refs/newgit/lanes/*` and checkpoint refs to
-`<p>.t.<tier>` — Git's own refspecs do the projection.
+out, so they never appear in source history or `git log`. Pushing a tracker
+means pushing just its `refs/newgit/lanes/<tracker>` and checkpoint refs to
+`<p>.t.<tracker>` — Git's own refspecs do the projection.
 
 This change renames and deletes shared code (`lane.rs`, `TrackerLane`,
 snapshot layout, checkpoint resolution). Per the repo convention it **lands
@@ -279,7 +302,7 @@ resources. In remote mode:
   machine can list and restore it, and the web UI can show it.
 - **Source:** the checkpoint's head and dirty commits are pushed to the
   instance fork under `refs/newgit/checkpoints/<id>/source`.
-- **Trackers:** each lane commit is pushed to its tier repo under
+- **Trackers:** each lane commit is pushed to its tracker's repo under
   `refs/newgit/checkpoints/<id>/<tracker>`.
 - **Resources:** unchanged. `hash` and `command` states stay local; deposits
   are tracker content and travel as above. A checkpoint restored on a
@@ -347,7 +370,7 @@ Served by the same Worker. User-facing, so it is built by a taste ≥ 7 model
 - **Instance view:** checkpoint timeline (source + every tracker per
   checkpoint), per-tracker diffs read with `readTree`/`readBlob`, undo-to and
   merge buttons.
-- **Tier view:** which tiers exist and who is in each — what the server
+- **Audience view:** every tracker and who may read it — what the server
   enforces, shown plainly.
 
 No code editor and no PR conversation threads. Review is diffs plus the
@@ -419,7 +442,7 @@ Run against namespace `newgit-spike` with a tiny repo and an import of
 9. **CLI remote client** (new `crates/newgit-core/src/remote.rs`, CLI
    commands): `login`, `remote add`, `credential`, `members`; spawn forks,
    checkpoint writes through, undo/spawn-from-checkpoint fetch.
-10. **Push path:** outbox forwards to the instance fork; tier pushes for lanes.
+10. **Push path:** outbox forwards to the instance fork; lane pushes to tracker repos.
 11. **Events:** queue consumer, binding-record updates, overlap detection.
 12. **Merge queue + executor.**
 
@@ -445,7 +468,8 @@ Run against namespace `newgit-spike` with a tiny repo and an import of
 ## Demo Script (the video)
 
 1. `newgit init` a real app, `newgit remote add`, `newgit login`. Show the
-   tiers: `project-devs`, `user-jack`.
+   trackers and their audiences: `runtime-env` (project-devs), `jack-env`
+   (user:jack).
 2. Spawn three agents' instances. Each is a fork; show it in the web UI
    appearing live. Each gets its own ports, DB, and `.env.local`.
 3. Two agents edit overlapping files. Both are warned on push, before either
@@ -466,7 +490,7 @@ Run against namespace `newgit-spike` with a tiny repo and an import of
 Resolved here, loudly, so branches can build against them. Each is
 reversible after the competition.
 
-1. **Repo per audience tier + fork per instance** on the remote; one store
+1. **Repo per tracker + fork per instance** on the remote; one store
    locally. (See *Repo Topology*.)
 2. **Worker in TypeScript; CLI stays Rust.** The Artifacts binding's types are
    TypeScript-first, and workers-rs would fight them.
