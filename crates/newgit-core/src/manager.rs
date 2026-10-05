@@ -64,6 +64,20 @@ pub struct BranchManager {
     remote: Option<RemoteLink>,
 }
 
+/// What `spawn --from-checkpoint` did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpawnFromCheckpointOutcome {
+    /// The instance as it stands after the restore.
+    pub branch: BranchInstance,
+    pub spawned: SpawnOutcome,
+    pub undo: UndoOutcome,
+    /// Who took the checkpoint, and the agent that did, if one did.
+    pub author: String,
+    pub agent: Option<String>,
+    /// Trackers that did not come across, and why; plus the restore's own.
+    pub warnings: Vec<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SpawnOutcome {
     pub branch: BranchInstance,
@@ -800,6 +814,215 @@ impl BranchManager {
             ],
             &format!("!{} credential", sh_quote(&newgit_program())),
         )
+    }
+
+    /// Spawn someone's checkpoint here: a new instance named `name` that comes
+    /// up as the checkpoint was — source (uncommitted work included), tracker
+    /// content, and resource state such as a database restored from its dump.
+    ///
+    /// Trackers resolve for the person spawning, not the author: a per-user
+    /// tracker gets *their own* content, a shared one the checkpoint's exact
+    /// rev, and one they may not read nothing — each said in `warnings`.
+    ///
+    /// Built from parts that already exist: fetch, `spawn` at the checkpoint's
+    /// head, import the record into the new instance's own history, `undo`
+    /// to it.
+    pub fn spawn_from_checkpoint(
+        &self,
+        name: &str,
+        from_instance: &str,
+        checkpoint_id: &str,
+    ) -> Result<SpawnFromCheckpointOutcome> {
+        let link = self.remote.as_ref().ok_or(NewgitError::NoRemote)?;
+        let remote = link.connect(Acting::Login)?;
+        let project = link.project.clone();
+        let from_slug = branch_slug(from_instance);
+        let found = remote.checkpoint(&project, &from_slug, checkpoint_id)?;
+        let mut record: CheckpointRecord =
+            serde_json::from_value(found.record.clone()).map_err(|error| NewgitError::Remote {
+                status: 0,
+                message: format!("checkpoint {from_slug}/{checkpoint_id} is not one this newgit can read: {error}"),
+            })?;
+        let mut warnings = Vec::new();
+
+        // Source: the checkpoint's tip (its uncommitted state, when it had
+        // any) from the author's fork, into this store.
+        let fork = remote.credential(&project, &format!("{project}.i.{from_slug}"), Scope::Read)?;
+        let imported_ref = format!("refs/newgit/imported/{from_slug}/{checkpoint_id}");
+        GitSource::fetch_refs(
+            &["-C", self.store.paths().project_root.as_str()],
+            fork.remote.as_deref().unwrap_or_default(),
+            &[format!(
+                "+{}:{imported_ref}",
+                remote_checkpoint_ref(checkpoint_id)
+            )],
+            &basic_auth_header(&fork),
+        )?;
+
+        // Trackers, resolved for whoever is spawning.
+        let me = remote.me()?.login;
+        for state in &mut record.tracker_states {
+            let Some(definition) = self
+                .trackers
+                .iter()
+                .find(|definition| definition.name == state.name)
+            else {
+                continue;
+            };
+            let resolved = self.resolve_imported_tracker(
+                remote.as_ref(),
+                &project,
+                definition,
+                &me,
+                state.content_rev.as_deref(),
+            );
+            match resolved {
+                Ok(rev) => state.content_rev = rev,
+                Err(reason) => {
+                    warnings.push(format!("tracker `{}`: {reason}", state.name));
+                    state.content_rev = None;
+                }
+            }
+        }
+
+        let spawned = self.spawn(name, Some(&record.source.head_rev))?;
+        let mut branch = spawned.branch.clone();
+
+        // The record joins the new instance's own history, rewritten to
+        // point at what is on this machine.
+        let log = self.checkpoint_log(&branch);
+        record.id = log.next_id()?;
+        record.branch = branch.name.clone();
+        record.message = Some(format!(
+            "spawned from {from_slug}/{checkpoint_id} (by {}{})",
+            found.created_by,
+            found
+                .agent
+                .as_deref()
+                .map(|agent| format!(", agent {agent}"))
+                .unwrap_or_default()
+        ));
+        let store_ref = format!("refs/newgit/checkpoints/{}/{}", branch.slug, record.id);
+        self.source
+            .update_ref(&store_ref, &self.source.rev_parse(&imported_ref)?)?;
+        self.source.delete_ref(&imported_ref)?;
+        record.source.store_ref = store_ref;
+        for state in &mut record.resource_states {
+            // A deposit's recorded path was on the author's machine; it is the
+            // same rev's file here, in this machine's lane checkout cache.
+            if let (Some(state_ref), Some(path)) =
+                (state.state_ref.as_deref(), state.state_path.as_ref())
+                && let Some((tracker, rev)) = parse_tracker_state_ref(state_ref)
+            {
+                let marker = format!("/{tracker}/{rev}");
+                let relative = path
+                    .as_str()
+                    .split_once(&marker)
+                    .map(|(_, rest)| rest.trim_start_matches('/').to_owned())
+                    .unwrap_or_default();
+                let local = self.store.paths().lane_checkouts.join(tracker).join(rev);
+                state.state_path = Some(if relative.is_empty() {
+                    local
+                } else {
+                    local.join(relative)
+                });
+            }
+        }
+        log.save(&record)?;
+
+        let undo = self.undo(
+            &branch.name,
+            &UndoOptions {
+                to: Some(record.id.clone()),
+                ..UndoOptions::default()
+            },
+        )?;
+        warnings.extend(undo.warnings.iter().cloned());
+        branch = self.store.find_branch(&branch.name)?;
+
+        Ok(SpawnFromCheckpointOutcome {
+            branch,
+            spawned,
+            undo,
+            author: found.created_by,
+            agent: found.agent,
+            warnings,
+        })
+    }
+
+    /// Which rev of `definition` someone importing a checkpoint gets, after
+    /// fetching it into the local lane; `Err` says why they get none.
+    fn resolve_imported_tracker(
+        &self,
+        remote: &dyn Remote,
+        project: &str,
+        definition: &TrackerDefinition,
+        me: &str,
+        checkpoint_rev: Option<&str>,
+    ) -> std::result::Result<Option<String>, String> {
+        let lane = self.lane(&definition.name);
+        if definition.storage != Storage::Remote {
+            // Never synced: usable only if this machine already has it.
+            return match checkpoint_rev {
+                Some(rev) if lane.has_rev(rev) => Ok(Some(rev.to_owned())),
+                Some(_) => Err(
+                    "kept on the author's machine (`storage = \"local\"`), so not here".to_owned(),
+                ),
+                None => Ok(None),
+            };
+        }
+        let lanes = format!("--git-dir={}", self.store.paths().lanes);
+        crate::lane::ensure_lanes_repo(&self.store.paths().lanes)
+            .map_err(|error| error.to_string())?;
+        if definition.audience == "user" {
+            // Your own content, never the author's.
+            let repo = tracker_repo(project, definition, me);
+            let credential = match remote.credential(project, &repo, Scope::Read) {
+                Ok(credential) => credential,
+                Err(NewgitError::Remote { status: 404, .. }) => {
+                    return match lane.latest() {
+                        Some(rev) => Ok(Some(rev)),
+                        None => Err("you have no content for it yet; it starts empty".to_owned()),
+                    };
+                }
+                Err(error) => return Err(error.to_string()),
+            };
+            let pattern = format!("refs/lanes/{}/*", definition.name);
+            GitSource::fetch_refs(
+                &[&lanes],
+                credential.remote.as_deref().unwrap_or_default(),
+                &[format!("+{pattern}:{pattern}")],
+                &basic_auth_header(&credential),
+            )
+            .map_err(|error| error.to_string())?;
+            return match lane.latest() {
+                Some(rev) => Ok(Some(rev)),
+                None => Err("you have no content for it yet; it starts empty".to_owned()),
+            };
+        }
+        let Some(rev) = checkpoint_rev else {
+            return Ok(None);
+        };
+        if lane.has_rev(rev) {
+            return Ok(Some(rev.to_owned()));
+        }
+        let repo = tracker_repo(project, definition, me);
+        let credential =
+            remote
+                .credential(project, &repo, Scope::Read)
+                .map_err(|error| match error {
+                    NewgitError::Remote { message, .. } => format!("refused: {message}"),
+                    other => other.to_string(),
+                })?;
+        let rev_ref = format!("refs/lanes/{}/revs/{rev}", definition.name);
+        GitSource::fetch_refs(
+            &[&lanes],
+            credential.remote.as_deref().unwrap_or_default(),
+            &[format!("+{rev_ref}:{rev_ref}")],
+            &basic_auth_header(&credential),
+        )
+        .map_err(|error| error.to_string())?;
+        Ok(Some(rev.to_owned()))
     }
 
     /// Allocate ports, render exports, and run `prepare` hooks in dependency
@@ -3474,11 +3697,98 @@ impl BranchManager {
         branch.updated_at = Utc::now();
         self.store.save_branch_record(branch)?;
 
+        // The checkpoint exists locally now, whatever happens next; syncing
+        // it is what lets another machine spawn it.
+        if let Err(error) = self.sync_checkpoint(branch, &record) {
+            warnings.push(format!(
+                "checkpoint {} is saved here but not on the remote: {error}",
+                record.id
+            ));
+        }
+
         Ok(CheckpointOutcome {
             record,
             record_path,
             warnings,
         })
+    }
+
+    /// Put a checkpoint on the remote so any member can spawn it: its source
+    /// commits to the instance's fork, each remote-stored tracker's rev to
+    /// that tracker's repo, and then — last, so it never names a ref that
+    /// is not there — the record itself.
+    ///
+    /// Registers the instance first if an earlier attempt failed. Runs on
+    /// the workspace's own token, so it works where only that token exists.
+    fn sync_checkpoint(
+        &self,
+        branch: &mut BranchInstance,
+        record: &CheckpointRecord,
+    ) -> Result<()> {
+        let Some(link) = &self.remote else {
+            return Ok(());
+        };
+        self.register_remote(branch)?;
+        let Some(binding) = branch.remote.clone() else {
+            return Ok(());
+        };
+        let remote = link.connect(Acting::Workspace(&branch.workspace_path))?;
+        wait_for_fork(remote.as_ref(), &binding.project, &branch.slug)?;
+
+        let fork = remote.credential(&binding.project, &binding.repo, Scope::Write)?;
+        GitSource::push_refs(
+            &["-C", self.store.paths().project_root.as_str()],
+            &binding.fork_url,
+            &[format!(
+                "{}:{}",
+                record.source.store_ref,
+                remote_checkpoint_ref(&record.id)
+            )],
+            &basic_auth_header(&fork),
+        )?;
+
+        let mut login = None;
+        for state in &record.tracker_states {
+            let Some(rev) = &state.content_rev else {
+                continue;
+            };
+            let definition = self.definition(&state.name)?;
+            if definition.storage != Storage::Remote {
+                continue;
+            }
+            if login.is_none() {
+                login = Some(remote.me()?.login);
+            }
+            let repo = tracker_repo(
+                &binding.project,
+                definition,
+                login.as_deref().unwrap_or_default(),
+            );
+            let credential = remote.credential(&binding.project, &repo, Scope::Write)?;
+            let url = credential.remote.clone().unwrap_or_default();
+            let lane_ref = format!("refs/lanes/{}/revs/{rev}", state.name);
+            let mut refspecs = vec![format!("{lane_ref}:{lane_ref}")];
+            // The lane head is what "your own content" means on another
+            // machine. Lane commits are parentless, so it is always a forced
+            // update: the last machine to sync names it.
+            if self.lane(&state.name).latest().is_some() {
+                let head = format!("refs/lanes/{}/head", state.name);
+                refspecs.push(format!("+{head}:{head}"));
+            }
+            GitSource::push_refs(
+                &[&format!("--git-dir={}", self.store.paths().lanes)],
+                &url,
+                &refspecs,
+                &basic_auth_header(&credential),
+            )?;
+        }
+
+        let value = serde_json::to_value(record).map_err(|error| NewgitError::Remote {
+            status: 0,
+            message: format!("could not encode checkpoint {}: {error}", record.id),
+        })?;
+        remote.put_checkpoint(&binding.project, &branch.slug, &record.id, &value)?;
+        remote.set_head(&binding.project, &branch.slug, &record.source.head_rev)
     }
 
     fn checkpoint_resource(
@@ -4338,6 +4648,21 @@ fn validate_disjoint_with_replacement(
         updated.push(replacement.clone());
     }
     crate::tracker::validate_disjoint(&updated)
+}
+
+/// Where a checkpoint's source lives in its instance's fork.
+pub fn remote_checkpoint_ref(id: &str) -> String {
+    format!("refs/newgit/checkpoints/{id}/source")
+}
+
+/// The repo a tracker's content lives in on the remote: one per user for a
+/// per-user (`audience = "user"`) tracker, one shared otherwise.
+pub fn tracker_repo(project: &str, definition: &TrackerDefinition, login: &str) -> String {
+    if definition.audience == "user" {
+        format!("{project}.t.{}.{login}", definition.name)
+    } else {
+        format!("{project}.t.{}", definition.name)
+    }
 }
 
 /// A fork takes seconds to make (5–22 s measured on a medium repo), and an

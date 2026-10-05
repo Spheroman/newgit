@@ -273,8 +273,16 @@ struct InitArgs {
 struct SpawnArgs {
     name: String,
     /// Base revision when creating a new source branch (defaults to HEAD)
-    #[arg(long)]
+    #[arg(long, conflicts_with = "from_checkpoint")]
     from: Option<String>,
+    /// Spawn a checkpoint from the project's remote, `<instance>/<checkpoint>`
+    /// (as `newgit checkpoints --remote` lists them): source, trackers you
+    /// may read, and resource state, with your own per-user tracker content
+    #[arg(long, value_name = "INSTANCE/CHECKPOINT")]
+    from_checkpoint: Option<String>,
+    /// Print what happened as JSON
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -622,10 +630,82 @@ fn init(args: InitArgs) -> Result<()> {
     Ok(())
 }
 
+fn spawn_from_checkpoint(
+    manager: &BranchManager,
+    name: &str,
+    spec: &str,
+    json: bool,
+) -> Result<()> {
+    let (instance, checkpoint) = spec.split_once('/').with_context(|| {
+        format!("`{spec}` is not `<instance>/<checkpoint>`, e.g. `fix-login/ckpt_003`")
+    })?;
+    let outcome = manager.spawn_from_checkpoint(name, instance, checkpoint)?;
+    let by = match &outcome.agent {
+        Some(agent) => format!("{} (agent {agent})", outcome.author),
+        None => outcome.author.clone(),
+    };
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "name": outcome.branch.name,
+                "workspace": outcome.branch.workspace_path,
+                "from": spec,
+                "author": outcome.author,
+                "agent": outcome.agent,
+                "trackers": outcome.undo.trackers.iter().map(|tracker| serde_json::json!({
+                    "name": tracker.name, "rev": tracker.rev, "files": tracker.files,
+                })).collect::<Vec<_>>(),
+                "resources": outcome.undo.resources.iter().map(|resource| serde_json::json!({
+                    "name": resource.name, "ok": resource.ok, "action": resource.action,
+                })).collect::<Vec<_>>(),
+                "warnings": outcome.warnings,
+            })
+        );
+        return Ok(());
+    }
+    println!(
+        "Spawned `{}` from {spec}, taken by {by}",
+        outcome.branch.name
+    );
+    println!("  workspace: {}", outcome.branch.workspace_path);
+    for tracker in &outcome.undo.trackers {
+        match &tracker.rev {
+            Some(rev) => println!(
+                "  tracker:   {} @ {rev} ({})",
+                tracker.name,
+                files_label(tracker.files)
+            ),
+            None => println!("  tracker:   {} (empty)", tracker.name),
+        }
+    }
+    for resource in &outcome.undo.resources {
+        println!("  resource:  {} {}", resource.name, resource.action);
+    }
+    print_warnings(&outcome.warnings);
+    Ok(())
+}
+
 fn spawn(args: SpawnArgs) -> Result<()> {
     let manager = manager_here()?;
     warn_gitignore(&manager);
+    if let Some(spec) = &args.from_checkpoint {
+        return spawn_from_checkpoint(&manager, &args.name, spec, args.json);
+    }
     let outcome = manager.spawn(&args.name, args.from.as_deref())?;
+    if args.json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "name": outcome.branch.name,
+                "workspace": outcome.branch.workspace_path,
+                "source_rev": outcome.branch.source_rev,
+                "remote": outcome.branch.remote.as_ref().map(|remote| &remote.repo),
+                "remote_warning": outcome.remote_warning,
+            })
+        );
+        return Ok(());
+    }
     let branch = &outcome.branch;
 
     let branch_note = if outcome.created_source_branch {

@@ -45,6 +45,24 @@ struct State {
     /// Instance name → how many more times to answer "pending" before "ready".
     pending_polls: BTreeMap<String, u32>,
     checkpoints: BTreeMap<(String, String), Value>,
+    /// Who checkpointed what, for `createdBy`.
+    checkpoint_authors: BTreeMap<(String, String), String>,
+    /// Instance token → the login it acts as.
+    instance_tokens: BTreeMap<String, String>,
+}
+
+/// Ana's login token; every other login token is jack's.
+const ANA_TOKEN_ID: &str = "tok_ana";
+
+fn login_of(state: &State, token: &str) -> String {
+    if token == fake_token(ANA_TOKEN_ID) {
+        return "ana".to_owned();
+    }
+    state
+        .instance_tokens
+        .get(token)
+        .cloned()
+        .unwrap_or_else(|| "jack".to_owned())
 }
 
 struct FakeRemote {
@@ -54,7 +72,6 @@ struct FakeRemote {
 }
 
 const LOGIN_TOKEN_ID: &str = "tok_login";
-const INSTANCE_TOKEN_ID: &str = "tok_instance";
 
 impl FakeRemote {
     fn start(repos: Utf8PathBuf) -> Self {
@@ -133,26 +150,44 @@ fn route(
     state
         .requests
         .push((method.to_owned(), path.to_owned(), token.to_owned()));
+    let caller = login_of(&state, token);
     let repo_url = |name: &str| repos.join(format!("{name}.git")).to_string();
+    let exists = |name: &str| repos.join(format!("{name}.git")).exists();
     let segments: Vec<&str> = path.trim_start_matches('/').split(['/', '?']).collect();
     let credential = |repo: &str| json!({ "repo": repo, "remote": repo_url(repo), "username": "x", "password": "pw", "expires_at": "2099-01-01T00:00:00Z" });
     match (method, segments.as_slice()) {
         ("GET", ["v1", "me"]) => (
             200,
-            json!({ "login": "jack", "kind": "login", "token_id": LOGIN_TOKEN_ID }),
+            json!({ "login": caller, "kind": "login", "token_id": "tok" }),
         ),
         ("POST", ["v1", "projects"]) => {
             let name = body["name"].as_str().unwrap_or_default();
             let src = format!("{name}.src");
+            if exists(&src) {
+                return (
+                    409,
+                    json!({ "error": format!("project `{name}` already exists") }),
+                );
+            }
             git(
                 repos,
                 &["init", "-q", "--bare", "-b", "main", &repo_url(&src)],
             );
             (
                 201,
-                json!({ "name": name, "owner": "jack", "src": { "repo": src, "remote": repo_url(&src) }, "seed_credential": credential(&src) }),
+                json!({
+                    "name": name, "owner": caller, "src": { "repo": src, "remote": repo_url(&src) },
+                    "seed_credential": credential(&src),
+                }),
             )
         }
+        ("GET", ["v1", "projects", project]) => (
+            200,
+            json!({
+                "name": project, "owner": "jack", "members": [{ "login": "ana" }, { "login": "jack" }],
+                "src": { "repo": format!("{project}.src"), "remote": repo_url(&format!("{project}.src")) },
+            }),
+        ),
         ("POST", ["v1", "projects", project, "instances"]) => {
             let name = body["name"].as_str().unwrap_or_default();
             let fork = format!("{project}.i.{name}");
@@ -168,13 +203,17 @@ fn route(
             );
             // The first push polls once while the "fork" is still being made.
             state.pending_polls.insert(name.to_owned(), 1);
+            let instance_token = fake_token(&format!("tok_instance_{name}"));
+            state
+                .instance_tokens
+                .insert(instance_token.clone(), caller.clone());
             (
                 201,
                 json!({
-                    "name": name, "owner": "jack", "agent": null, "baseRev": body["base_rev"], "headRev": null,
+                    "name": name, "owner": caller, "agent": null, "baseRev": body["base_rev"], "headRev": null,
                     "forkState": "pending", "repo": fork, "remote": repo_url(&fork),
                     "trunk": { "repo": format!("{project}.src"), "remote": repo_url(&format!("{project}.src")) },
-                    "token": fake_token(INSTANCE_TOKEN_ID), "token_id": INSTANCE_TOKEN_ID,
+                    "token": instance_token, "token_id": format!("tok_instance_{name}"),
                 }),
             )
         }
@@ -189,7 +228,10 @@ fn route(
             let fork_state = if remaining > 0 { "pending" } else { "ready" };
             (
                 200,
-                json!({ "name": name, "owner": "jack", "baseRev": "x", "forkState": fork_state, "repo": fork, "remote": repo_url(&fork) }),
+                json!({
+                    "name": name, "owner": caller, "baseRev": "x", "forkState": fork_state,
+                    "repo": fork, "remote": repo_url(&fork),
+                }),
             )
         }
         ("DELETE", ["v1", "projects", project, "instances", name]) => {
@@ -198,17 +240,54 @@ fn route(
         }
         ("POST", ["v1", "projects", _, "credentials"]) => {
             let repo = body["repo"].as_str().unwrap_or_default();
+            // Like the real remote: a per-user lane is its owner's alone.
+            if let Some(owner) = repo.split('.').nth(3)
+                && owner != caller
+            {
+                return (
+                    403,
+                    json!({ "error": format!("{repo} is {owner}'s own; each user reads only their own") }),
+                );
+            }
+            if !exists(repo) {
+                // A tracker repo is created on first write; nothing else is.
+                if repo.contains(".t.") && body["scope"] == "write" {
+                    git(repos, &["init", "-q", "--bare", &repo_url(repo)]);
+                } else {
+                    return (
+                        404,
+                        json!({ "error": format!("{repo} does not exist yet") }),
+                    );
+                }
+            }
             (200, credential(repo))
         }
+        ("PUT", ["v1", "projects", _, "instances", name, "head"]) => {
+            (200, json!({ "name": name, "headRev": body["head_rev"] }))
+        }
         ("PUT", ["v1", "projects", _, "checkpoints", instance, id]) => {
-            state.checkpoints.insert(
-                ((*instance).to_owned(), (*id).to_owned()),
-                body["record"].clone(),
-            );
+            let key = ((*instance).to_owned(), (*id).to_owned());
+            state
+                .checkpoints
+                .insert(key.clone(), body["record"].clone());
+            state.checkpoint_authors.insert(key, caller.clone());
             (
                 201,
-                json!({ "instance": instance, "id": id, "createdBy": "jack", "createdAt": "now", "record": body["record"] }),
+                json!({ "instance": instance, "id": id, "createdBy": caller, "createdAt": "now", "record": body["record"] }),
             )
+        }
+        ("GET", ["v1", "projects", _, "checkpoints", instance, id]) => {
+            let key = ((*instance).to_owned(), (*id).to_owned());
+            match state.checkpoints.get(&key) {
+                Some(record) => (
+                    200,
+                    json!({
+                        "instance": instance, "id": id, "createdBy": state.checkpoint_authors[&key],
+                        "agent": null, "createdAt": "now", "record": record,
+                    }),
+                ),
+                None => (404, json!({ "error": "no such checkpoint" })),
+            }
         }
         _ => (
             404,
@@ -375,7 +454,7 @@ fn spawn_registers_the_instance_and_gives_the_workspace_its_own_token() {
     let token_path = workspace.join(".git/newgit/token");
     assert_eq!(
         std::fs::read_to_string(&token_path).expect("token"),
-        fake_token(INSTANCE_TOKEN_ID)
+        fake_token("tok_instance_feature-a")
     );
     #[cfg(unix)]
     {
@@ -436,7 +515,7 @@ fn a_push_lands_in_the_instance_fork_authenticated_as_the_instance() {
         "not trunk"
     );
 
-    let instance_token = fake_token(INSTANCE_TOKEN_ID);
+    let instance_token = fake_token("tok_instance_feature-a");
     let requests = fixture.remote.requests();
     // It waited for the fork, then minted the fork's password on the
     // workspace's own token — not the owner's login.
@@ -496,4 +575,289 @@ fn spawn_still_works_when_the_remote_is_unreachable() {
         all.contains("not on the remote"),
         "the spawn says so:\n{all}"
     );
+}
+
+#[test]
+fn a_checkpoint_syncs_source_remote_trackers_and_then_the_record() {
+    let (_guard, temp) = tempdir();
+    let fixture = setup(&temp);
+    // One tracker synced to the remote, one kept on this machine.
+    fixture.ok(
+        &fixture.store,
+        &[
+            "tracker",
+            "create",
+            "runtime-env",
+            "--audience",
+            "user",
+            "--storage",
+            "remote",
+        ],
+    );
+    fixture.ok(
+        &fixture.store,
+        &["tracker", "track", "runtime-env", ".env.local"],
+    );
+    fixture.ok(
+        &fixture.store,
+        &[
+            "tracker",
+            "create",
+            "scratch",
+            "--audience",
+            "user",
+            "--storage",
+            "local",
+        ],
+    );
+    fixture.ok(
+        &fixture.store,
+        &["tracker", "track", "scratch", "notes.txt"],
+    );
+    fixture.ok(&fixture.store, &["spawn", "feature-a"]);
+    let workspace = workspace_of(&fixture, "feature-a");
+    std::fs::write(workspace.join(".env.local"), "KEY=jack\n").expect("write");
+    std::fs::write(workspace.join("notes.txt"), "private\n").expect("write");
+    std::fs::write(workspace.join("wip.txt"), "uncommitted\n").expect("write");
+
+    let output = fixture.ok(&workspace, &["checkpoint"]);
+    assert!(!output.contains("not on the remote"), "{output}");
+
+    // Source, uncommitted work included, is in the fork.
+    let fork = fixture.remote.repo("store.i.feature-a");
+    let tip = git(
+        &fork,
+        &["rev-parse", "refs/newgit/checkpoints/ckpt_001/source"],
+    );
+    assert_eq!(
+        git(&fork, &["show", &format!("{tip}:wip.txt")]),
+        "uncommitted"
+    );
+
+    // The remote tracker's rev is in jack's own repo for it; the local one is nowhere.
+    let lane = fixture.remote.repo("store.t.runtime-env.jack");
+    let lane_refs = git(
+        &lane,
+        &["for-each-ref", "--format=%(refname)", "refs/lanes/"],
+    );
+    assert!(
+        lane_refs.starts_with("refs/lanes/runtime-env/revs/"),
+        "{lane_refs}"
+    );
+    assert!(
+        !temp.join("artifacts/store.t.scratch.jack.git").exists(),
+        "local trackers stay local"
+    );
+
+    // The record was written last, naming those refs.
+    let requests = fixture.remote.requests();
+    let put = requests
+        .iter()
+        .position(|(m, p, _)| m == "PUT" && p.ends_with("/checkpoints/feature-a/ckpt_001"));
+    let last_credential = requests
+        .iter()
+        .rposition(|(_, p, _)| p.ends_with("/credentials"));
+    assert!(
+        put.is_some() && put > last_credential,
+        "record after the refs it names"
+    );
+}
+
+/// Run newgit as a given user: their own HOME, so their own saved login.
+fn newgit_as(home: &Utf8Path, dir: &Utf8Path, args: &[&str]) -> String {
+    let output = Command::new(env!("CARGO_BIN_EXE_newgit"))
+        .current_dir(dir.as_str())
+        .args(args)
+        .env("HOME", home.as_str())
+        .env("GIT_AUTHOR_NAME", "test")
+        .env("GIT_AUTHOR_EMAIL", "test@example.com")
+        .env("GIT_COMMITTER_NAME", "test")
+        .env("GIT_COMMITTER_EMAIL", "test@example.com")
+        .output()
+        .expect("newgit runs");
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    assert!(
+        output.status.success(),
+        "newgit {args:?} failed:\n{stdout}\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    stdout
+}
+
+fn save_login(home: &Utf8Path, url: &str, login: &str, token_id: &str) {
+    std::fs::create_dir_all(home.join(".newgit")).expect("mkdir");
+    std::fs::write(
+        home.join(".newgit/auth.toml"),
+        format!(
+            "[remotes.\"{url}\"]\nlogin = \"{login}\"\ntoken = \"{}\"\ntoken_id = \"{token_id}\"\n",
+            fake_token(token_id)
+        ),
+    )
+    .expect("write auth");
+}
+
+const DB_RESOURCE: &str = r#"ownership = "branch"
+
+[checkpoint]
+mode = "command"
+command = "echo jacks-rows > {{snapshot.path}}/db.sql && echo {{snapshot.path}}/db.sql"
+into_tracker = "db-snapshots"
+
+[restore]
+mode = "command"
+command = "cp {{state_ref}} restored.sql"
+"#;
+
+#[test]
+fn a_teammate_spawns_a_checkpoint_running_with_their_own_keys() {
+    let (_guard, temp) = tempdir();
+    let remote = FakeRemote::start(temp.join("artifacts"));
+    std::fs::create_dir_all(temp.join("artifacts")).expect("mkdir");
+    let (jack_home, ana_home) = (temp.join("home-jack"), temp.join("home-ana"));
+    save_login(&jack_home, &remote.url, "jack", LOGIN_TOKEN_ID);
+    save_login(&ana_home, &remote.url, "ana", ANA_TOKEN_ID);
+
+    // Jack's machine: the project, its trackers and a database resource,
+    // committed so a teammate's clone has the same definitions.
+    let jack = temp.join("store");
+    std::fs::create_dir_all(&jack).expect("mkdir");
+    git(&jack, &["init", "-q", "-b", "main"]);
+    std::fs::write(jack.join("README.md"), "hello\n").expect("write");
+    git(&jack, &["add", "."]);
+    git(&jack, &["commit", "-q", "-m", "initial"]);
+    newgit_as(&jack_home, &jack, &["init"]);
+    let config = jack.join(".newgit/config.toml");
+    let mut text = std::fs::read_to_string(&config).expect("config");
+    text.push_str(&format!(
+        "\n[workspace]\nroot = \"{}\"\n",
+        temp.join("workspaces")
+    ));
+    // Name the remote first, so trackers may be remote-stored; `remote add`
+    // below creates the project and seeds trunk with all of this.
+    text.push_str(&format!("\n[remote]\nurl = \"{}\"\n", remote.url));
+    std::fs::write(&config, text).expect("write config");
+    newgit_as(
+        &jack_home,
+        &jack,
+        &[
+            "tracker",
+            "create",
+            "runtime-env",
+            "--audience",
+            "user",
+            "--storage",
+            "remote",
+        ],
+    );
+    newgit_as(
+        &jack_home,
+        &jack,
+        &["tracker", "track", "runtime-env", ".env.local"],
+    );
+    newgit_as(
+        &jack_home,
+        &jack,
+        &[
+            "tracker",
+            "create",
+            "db-snapshots",
+            "--audience",
+            "project-devs",
+            "--storage",
+            "remote",
+        ],
+    );
+    std::fs::write(jack.join(".newgit/resources/db.toml"), DB_RESOURCE).expect("resource");
+    git(&jack, &["add", "-A"]);
+    git(&jack, &["commit", "-q", "-m", "newgit definitions"]);
+    newgit_as(&jack_home, &jack, &["remote", "add"]);
+
+    // Jack's agent works: a commit, uncommitted work, Jack's key, a database.
+    newgit_as(&jack_home, &jack, &["spawn", "feature-a"]);
+    let jack_ws =
+        Utf8PathBuf::from(newgit_as(&jack_home, &jack, &["status", "feature-a", "--path"]).trim());
+    std::fs::write(jack_ws.join("feature.txt"), "committed work\n").expect("write");
+    git(&jack_ws, &["add", "feature.txt"]);
+    git(&jack_ws, &["commit", "-q", "-m", "feature"]);
+    std::fs::write(jack_ws.join("wip.txt"), "uncommitted work\n").expect("write");
+    std::fs::write(jack_ws.join(".env.local"), "STRIPE_KEY=jacks-key\n").expect("write");
+    let checkpointed = newgit_as(&jack_home, &jack_ws, &["checkpoint"]);
+    assert!(
+        !checkpointed.contains("not on the remote"),
+        "{checkpointed}"
+    );
+
+    // Ana's machine: a clone of trunk, her own key, never Jack's.
+    let ana = temp.join("ana-store");
+    git(
+        &temp,
+        &[
+            "clone",
+            "-q",
+            remote.repo("store.src").as_str(),
+            ana.as_str(),
+        ],
+    );
+    // The clone already names the remote; joining checks Ana is a member.
+    newgit_as(&ana_home, &ana, &["remote", "add"]);
+    std::fs::write(ana.join(".env.local"), "STRIPE_KEY=anas-key\n").expect("write");
+    newgit_as(
+        &ana_home,
+        &ana,
+        &["tracker", "capture", "runtime-env", "--from-store"],
+    );
+
+    let spawned = newgit_as(
+        &ana_home,
+        &ana,
+        &[
+            "spawn",
+            "review",
+            "--from-checkpoint",
+            "feature-a/ckpt_001",
+            "--json",
+        ],
+    );
+    let outcome: Value = serde_json::from_str(spawned.trim()).expect("json");
+    assert_eq!(outcome["author"], "jack");
+    let ana_ws = Utf8PathBuf::from(outcome["workspace"].as_str().expect("workspace"));
+
+    let read = |file: &str| {
+        std::fs::read_to_string(ana_ws.join(file)).unwrap_or_else(|_| panic!("{file} missing"))
+    };
+    assert_eq!(
+        read("feature.txt"),
+        "committed work\n",
+        "source came across"
+    );
+    assert_eq!(
+        read("wip.txt"),
+        "uncommitted work\n",
+        "uncommitted work came across, still uncommitted"
+    );
+    assert!(git(&ana_ws, &["status", "--porcelain"]).contains("wip.txt"));
+    assert_eq!(
+        read(".env.local"),
+        "STRIPE_KEY=anas-key\n",
+        "Ana runs it with her own key"
+    );
+    assert_eq!(
+        read("restored.sql"),
+        "jacks-rows\n",
+        "the database came across from its dump"
+    );
+
+    // And Jack's key is nowhere on Ana's machine.
+    let ana_lanes = ana.join(".newgit/local/lanes.git");
+    let objects = git(
+        &ana_lanes,
+        &[
+            "cat-file",
+            "--batch-all-objects",
+            "--batch-check=%(objectname)",
+        ],
+    );
+    for object in objects.lines() {
+        assert!(!git(&ana_lanes, &["cat-file", "-p", object]).contains("jacks-key"));
+    }
 }

@@ -475,7 +475,9 @@ action is also a CLI command.
 
 ## Build Order (2026-10-05 → 2026-10-14)
 
-Done: Day 0 spikes (Artifacts), lanes as Git, `[remote]` config.
+Done: Day 0 spikes (Artifacts), lanes as Git, `[remote]` config, Day 1
+sandbox spikes, the Worker (items 4), and the CLI remote client with
+`spawn --from-checkpoint` and the push path (items 5–6).
 
 ### Day 1 — Spikes, round 2 (sandboxes)
 
@@ -684,3 +686,7 @@ Resolved loudly; each is reversible after the competition.
 - **Fork latency** (5–22 s): the outbox must wait on, or trigger, a fork
   still in flight at first push.
 - **The 1 GB repo cap** for large `db-snapshots` lanes.
+- **Definitions reach trunk only through a merge.** `remote add` seeds trunk
+  once; after that, a new or changed tracker or resource definition gets to
+  teammates only when an instance carrying it is merged. Until the merge
+  executor exists, link a project after its definitions are committed.

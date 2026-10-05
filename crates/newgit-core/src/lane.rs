@@ -369,6 +369,11 @@ fn lane_refs(git_dir: &Utf8Path) -> Result<Vec<(String, String)>> {
     Ok(refs)
 }
 
+/// Create the lanes repo if this machine has none yet.
+pub fn ensure_lanes_repo(git_dir: &Utf8Path) -> Result<()> {
+    ensure_repo(git_dir)
+}
+
 fn ensure_repo(git_dir: &Utf8Path) -> Result<()> {
     if git_dir.join("HEAD").is_file() {
         return Ok(());

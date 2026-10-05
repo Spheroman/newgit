@@ -666,6 +666,25 @@ impl RefUpdate {
     }
 }
 
+impl GitSource {
+    /// `git <location> push <url> <refspecs>`, authenticated with `auth` (an
+    /// `Authorization` header). `location` is `-C <repo>` or `--git-dir=…`.
+    pub fn push_refs(location: &[&str], url: &str, refspecs: &[String], auth: &str) -> Result<()> {
+        let mut args: Vec<&str> = location.to_vec();
+        args.extend(["push", "--quiet", "--", url]);
+        args.extend(refspecs.iter().map(String::as_str));
+        run_git_env(&args, &auth_env(Some(auth))).map(|_| ())
+    }
+
+    /// `git <location> fetch <url> <refspecs>`, authenticated like [`Self::push_refs`].
+    pub fn fetch_refs(location: &[&str], url: &str, refspecs: &[String], auth: &str) -> Result<()> {
+        let mut args: Vec<&str> = location.to_vec();
+        args.extend(["fetch", "--quiet", "--no-write-fetch-head", "--", url]);
+        args.extend(refspecs.iter().map(String::as_str));
+        run_git_env(&args, &auth_env(Some(auth))).map(|_| ())
+    }
+}
+
 /// Git config for one command, carrying an `Authorization` header. Passed in
 /// the environment rather than as `-c` so the password never appears in the
 /// process list; the credential helper is cleared so nothing caches it.
