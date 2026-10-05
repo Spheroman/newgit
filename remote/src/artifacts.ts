@@ -71,7 +71,10 @@ export class ArtifactsRepos implements Repos {
 	async readFile(name: string, ref: string, path: string) {
 		try {
 			using repo = await this.artifacts.get(name);
-			const blob = await repo.readFile({ ref, path });
+			// readFile does not resolve HEAD (seen against the live service);
+			// the default branch is what HEAD means for a bare remote.
+			const resolved = ref === "HEAD" ? (await repo.info()).defaultBranch : ref;
+			const blob = await repo.readFile({ ref: resolved, path });
 			return blob === null ? null : await blob.text();
 		} catch (error) {
 			if (isNotFound(error)) return null;

@@ -53,6 +53,8 @@ describe("the API", () => {
 	it("creates a project with trunk, and refuses a second with the same name", async () => {
 		const created = await call("jack", "POST", "/v1/projects", { name: project });
 		expect(created.body.src.repo).toBe(`${project}.src`);
+		// The creator's one-time write to trunk, for the initial push.
+		expect(created.body.seed_credential.password).toBe(`pw-${project}.src-write`);
 		expect(repos.repos.has(`${project}.src`)).toBe(true);
 		expect((await call("ana", "POST", "/v1/projects", { name: project })).status).toBe(409);
 	});

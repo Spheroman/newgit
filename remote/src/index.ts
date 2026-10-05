@@ -84,7 +84,18 @@ async function route(request: Request, env: Env, deps: Deps): Promise<Response> 
 		if (!(await project.init(name, login))) throw new HttpError(409, `project \`${name}\` already exists`);
 		const src = repoName({ kind: "src", project: name });
 		const { remote } = await deps.repos.create(src);
-		return json({ name, owner: login, src: { repo: src, remote } }, 201);
+		// The one write to trunk outside a merge: the creator's initial push of
+		// the project's existing history. Only here, only once, only briefly.
+		const seed = await deps.repos.mint(src, "write", CREDENTIAL_TTL_SECONDS);
+		return json(
+			{
+				name,
+				owner: login,
+				src: { repo: src, remote },
+				seed_credential: { username: "x", password: seed.password, expires_at: seed.expiresAt },
+			},
+			201,
+		);
 	}
 
 	const projectMatch = path.match(/^\/v1\/projects\/([^/]+)(\/.*)?$/);
