@@ -65,6 +65,7 @@ priority = 10
 | `role` | Trackers with the same role are mutually exclusive alternatives: an instance binds exactly one per role. A tracker without a role is its own slot. |
 | `priority` | Which alternative is picked by default: highest readable wins. **Negative: never picked automatically** — only by `--use` or a personal setting. |
 | `resources` | Resources this tracker brings. A resource is bound iff a bound tracker brings it. |
+| `requires` | Trackers or roles this one needs: bound with it, and merged before (or with) it. |
 | `merge` | `with-change` (default: merged together with whatever else a change touched) or `explicit` (only by `newgit tracker merge`; env files). Replaces `merge_with_source`. |
 | `production` | Production content: agent and instance tokens may not bind it, and its resources' destructive hooks are refused. |
 
@@ -144,22 +145,39 @@ records one instance's ports.
 is the atomic unit across trackers: spawning or undoing a checkpoint restores
 every tracker to the commit it names.
 
-**Merges are all or nothing, or as a stack (decided).** The unit of merging
-is a workspace commit, not a tracker: the tracker commits split from one
-workspace commit are atomic, and they merge together or not at all.
+**Merges stack by tracker (decided).** Trackers declare what they require:
 
-- **An instance's commits are a stack.** `newgit merge <instance>` merges the
-  whole stack; `newgit merge <instance> --through <commit>` merges a prefix
-  of it. So an agent that committed the backend change before the frontend
-  one can land the backend alone — backend changes without frontend changes
-  — while a commit that touched both never lands half. Separating one
-  anyway takes `--split`, which names the commits it would cut.
-- **Instances stack too.** An instance spawned from another (`spawn
-  frontend --from backend`) is stacked on it: merging `frontend` merges
-  `backend` first (or together), never `frontend` alone.
-- Every merge moves each affected tracker's `main` only after every one of
-  them succeeded: the remote's ProjectDO serializes merges and flips the
-  `main`s together.
+```toml
+# .newgit/trackers/electron.toml
+paths = ["apps/electron"]
+requires = ["supabase"]      # trackers or roles; a client assumes its backend
+```
+
+From an instance's changes, you choose which trackers' changes to merge
+(`newgit merge <instance> --only supabase`); the rest are left on the
+instance's branches, not lost. A choice is valid when, for every tracker it
+merges, every tracker it requires *that also changed in this instance* is
+merged too:
+
+- `supabase` alone — fine; the electron changes stay unmerged.
+- `supabase` and `electron` — fine; `main`s move in requirement order, all or
+  nothing.
+- `electron` alone while `supabase` also changed — refused, naming the
+  requirement. If `supabase` did not change here, `electron` merges alone:
+  its requirement is already met by `main`.
+
+Commits are split per tracker, so a commit that touched both does not pin
+them together: the requirement graph, not commit boundaries, decides what may
+be separated. An instance spawned from another (`spawn frontend --from
+backend`) stacks the same way — its changes merge after, or with, the ones it
+was built on. Every merge moves the affected `main`s only after all of them
+succeeded: the remote's ProjectDO serializes merges and flips them together.
+
+**`requires` governs binding too.** An instance cannot bind `electron`
+without `supabase` (or, for a role, some tracker filling it): `newgit tracker
+use electron` brings in what it requires, and dropping a tracker others
+require is refused, naming them. Trackers have `requires` (trackers or
+roles); resources have `depends_on` (resources or roles) — one model.
 
 `explicit` trackers (env files) are never carried by `newgit merge`; they move
 only by `newgit tracker merge <tracker>`.
@@ -232,8 +250,9 @@ environment identity is simply the set of tracker commits it composes.
    audience-restricted repo on capture. Every push goes through newgit, and
    GitHub export includes only chosen trackers, so "just commit the .env"
    is safe. (Rendered instance values are still reversed before capture.)
-3. **Merges are all or nothing per commit, or as a stack** (see *Checkpoints,
-   merges, and coherence*).
+3. **Merges stack by tracker**: choose which trackers' changes to merge;
+   a tracker's changes merge only with the changes of the trackers it
+   `requires` (see *Checkpoints, merges, and coherence*).
 4. **The video leads with spawning anything, anywhere** — an agent's attempt
    on your machine or as a preview, with its whole environment and your
    keys — with trackers shown as how it works.
