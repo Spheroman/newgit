@@ -9,7 +9,7 @@ use std::process::Command;
 use camino::{Utf8Path, Utf8PathBuf};
 use newgit_core::SourceSubstrate;
 use newgit_core::cleanup::ArchivedCheckpoints;
-use newgit_core::manager::BranchManager;
+use newgit_core::manager::{BranchManager, SourceBranchPolicy};
 use newgit_core::store::MetadataStore;
 
 fn git(dir: &Utf8Path, args: &[&str]) {
@@ -80,7 +80,12 @@ fn respawning_a_removed_name_reports_the_numbering_it_continues() {
     manager.checkpoint("feature-a", Some("v2")).expect("ckpt 2");
     manager.checkpoint("feature-a", Some("v3")).expect("ckpt 3");
     manager
-        .remove("feature-a", &temp, ArchivedCheckpoints::Keep)
+        .remove(
+            "feature-a",
+            &temp,
+            ArchivedCheckpoints::Keep,
+            SourceBranchPolicy::Auto,
+        )
         .expect("remove");
 
     // A brand-new instance: new workspace, new record, nothing carried over
@@ -109,7 +114,12 @@ fn a_different_name_starts_clean_even_after_another_name_was_removed() {
     manager.spawn("feature-a", None).expect("spawn");
     manager.checkpoint("feature-a", Some("v1")).expect("ckpt");
     manager
-        .remove("feature-a", &temp, ArchivedCheckpoints::Keep)
+        .remove(
+            "feature-a",
+            &temp,
+            ArchivedCheckpoints::Keep,
+            SourceBranchPolicy::Auto,
+        )
         .expect("remove");
 
     let other = manager.spawn("feature-b", None).expect("spawn b");

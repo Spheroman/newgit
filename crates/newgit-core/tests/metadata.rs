@@ -4,7 +4,7 @@ use camino::{Utf8Path, Utf8PathBuf};
 use newgit_core::branch::InstanceStatus;
 use newgit_core::cleanup::ArchivedCheckpoints;
 use newgit_core::config::WorkspaceSection;
-use newgit_core::manager::BranchManager;
+use newgit_core::manager::{BranchManager, SourceBranchPolicy};
 use newgit_core::store::MetadataStore;
 use newgit_core::{NewgitError, SourceSubstrate};
 
@@ -124,7 +124,12 @@ fn two_instances_then_remove_one() {
     assert_eq!(manager.statuses().expect("statuses").len(), 2);
 
     let removed = manager
-        .remove("feature-a", &temp, ArchivedCheckpoints::Keep)
+        .remove(
+            "feature-a",
+            &temp,
+            ArchivedCheckpoints::Keep,
+            SourceBranchPolicy::Auto,
+        )
         .expect("remove");
     assert!(!a.branch.workspace_path.exists());
     assert!(removed.archived_record.is_file());
@@ -144,7 +149,12 @@ fn remove_refuses_from_inside_the_workspace() {
     let outcome = manager.spawn("feature-a", None).expect("spawn");
     let inside = outcome.branch.workspace_path.clone();
     assert!(matches!(
-        manager.remove("feature-a", &inside, ArchivedCheckpoints::Keep),
+        manager.remove(
+            "feature-a",
+            &inside,
+            ArchivedCheckpoints::Keep,
+            SourceBranchPolicy::Auto
+        ),
         Err(NewgitError::Unsupported(_))
     ));
     assert!(inside.exists());
