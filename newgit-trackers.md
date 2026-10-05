@@ -114,20 +114,54 @@ Agents expect one Git repository, and newgit lies to them about it, on
 purpose, without emulating Git: the workspace's `.git` is a real repository
 whose commits newgit composes.
 
-**Composing (decided).** A composed commit's tree is the bound trackers'
-trees, each grafted at its paths. Its message lists the tracker commits it
-was composed from (`Newgit-Tracker: web 3f2a…` trailers); identity and date
-are fixed, so composing the same tracker commits gives the same composed
-commit on any machine. The workspace's history is one composed commit per
-state the instance has been in: spawn, each merge brought in, each capture.
-`git log`, `git diff`, `git blame` (within a state) all work; per-tracker
-history is `newgit log <tracker>`.
+**Tracker repos are the truth; a workspace's Git is a view (decided).** The
+remote holds one repo per tracker, with its own permissions. A machine
+composes the code trackers its instance binds (and its user may read) into
+one ordinary Git history — the view — in the project repo, and workspaces
+clone that as they always have. Work leaving the machine is split back into
+per-tracker commits. Two people's views can differ: each composes only what
+its user may read. Tracker repos store files at their workspace paths
+(`apps/electron/…`), so composing is overlaying trees; ownership guarantees
+they never collide.
 
-**Splitting (decided).** At capture (checkpoint, push), every workspace
-commit since the last capture is split by ownership into one commit per
-tracker it touched, on that tracker's instance branch — same message,
-author, and date, plus a `Newgit-Split: <workspace commit>` trailer. The
-workspace commit is recorded as split (a note), so it is never split twice.
+**Composing is full replay (decided).** Every bound code tracker's history
+is read in one `git log --raw` pass (first parent, diff against it), all
+trackers' commits are interleaved by committer date (ties: tracker name,
+then commit id), and the whole view is written in one `git fast-import`
+stream, applying each commit's changes to the running tree. View commits
+carry the original author, date, and message — nothing added — so `git log`
+and `git blame` are real everywhere. Which tracker commits a view commit
+came from is kept in a note (`refs/notes/newgit-composed`). Composing again
+after trackers move appends to the view; it rewrites the view only past
+the earliest commit whose position changed.
+
+**Splitting (decided).** A view commit is split by ownership into one commit
+per code tracker it touched, on that tracker's instance branch: same author,
+date, and message, plus a `Newgit-Split: <view commit>` trailer. On replay,
+tracker commits sharing a split source fold back into one view commit with
+the trailer stripped — so a commit split and recomposed is *the same commit*:
+same tree, parent, author, date, and message, same id. Commit ids never
+change under an agent, on any machine.
+
+**Splitting happens when work leaves the machine (decided):** sync, push,
+merge. Local history is left alone, and local undo works on the view.
+
+**Carving out a tracker** (`newgit tracker create electron --paths
+apps/electron`, code) splits its paths' history out of root the same way,
+each commit marked with its source, so the view reproduces the original
+history exactly — mixed commits included.
+
+**Objects.** Only code trackers' objects are copied into the project repo
+for the view to reference. Secret trackers never enter the view: their files
+are projected into workspaces as today.
+
+**Unbound trackers are absent (decided).** A tracker the instance does not
+bind is simply not in its view (Git's sparse checkout underneath): `tracker
+use` widens it, `tracker drop` narrows it.
+
+**Secrets never enter Git (decided).** A commit containing a secret
+tracker's file (`git add -f .env.local`) is refused at split, naming the
+file: secrets never enter Git, even by force.
 
 **Writes outside the binding (decided).** A change to a path whose owner is
 not bound (an agent creates `apps/electron/x` in an instance without
@@ -268,3 +302,10 @@ environment identity is simply the set of tracker commits it composes.
 4. **The video leads with spawning anything, anywhere** — an agent's attempt
    on your machine or as a preview, with its whole environment and your
    keys — with trackers shown as how it works.
+5. **Full replay** for composing the view, rather than root-as-spine: real
+   `git log` and `git blame` everywhere, and stable commit ids across a
+   split.
+6. **Splitting happens when work leaves the machine** (sync, push, merge),
+   never at a local checkpoint.
+7. **The project root is an instance like any other:** its commits reach a
+   shared tracker's `main` only through `newgit merge main`.
