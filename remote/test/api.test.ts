@@ -21,7 +21,7 @@ async function call(login: string | null, method: string, path: string, body?: u
 	const headers: Record<string, string> = { "content-type": "application/json" };
 	if (login) headers.authorization = `Bearer ${await issueToken(env.TOKEN_KEY, login)}`;
 	const response = await handle(
-		new Request(`https://app.newgit.dev${path}`, {
+		new Request(`https://newgit.dev${path}`, {
 			method,
 			headers,
 			body: body === undefined ? undefined : JSON.stringify(body),
