@@ -2097,7 +2097,7 @@ command = "pnpm db:migrate"
 
 [checkpoint]
 mode = "command"
-command = "pg_dump {{branch.slug}} > {{snapshot.path}}/db.sql && echo {{snapshot.path}}/db.sql"
+command = "pg_dump --restrict-key=newgit {{branch.slug}} > {{snapshot.path}}/db.sql && echo {{snapshot.path}}/db.sql"
 into_tracker = "db-snapshots"
 
 [restore]

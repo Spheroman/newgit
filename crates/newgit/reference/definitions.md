@@ -299,8 +299,9 @@ The state ref is how `newgit checkpoint --verify` tells whether a restore
 landed where it started, so a command that stamps each run differently makes
 every verify fail. Common dump tools do this by default: `pg_dump` since
 17.6 (and the matching back-branch releases) opens and closes every dump with
-`\restrict <token>` / `\unrestrict <token>`, a fresh random token per run —
-including the bundled Postgres templates' checkpoints. Timestamps and
+`\restrict <token>` / `\unrestrict <token>`, a fresh random token per run.
+Pass `--restrict-key=<fixed>` to make it stable, as the bundled Postgres
+templates do (their comments say what a fixed key gives up). Timestamps and
 `-- Dumped at` headers do the same. `--verify` names this case when it
 happens rather than blaming `[restore]`; it does not paper over it.
 
