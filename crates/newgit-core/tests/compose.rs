@@ -5,7 +5,7 @@
 use std::process::Command;
 
 use camino::{Utf8Path, Utf8PathBuf};
-use newgit_core::compose::{self, Refusal, SplitError, TrackerTip};
+use newgit_core::compose::{self, TrackerTip};
 use newgit_core::tracker::{Storage, TrackerDefinition};
 
 const VIEW: &str = "refs/newgit/views/test";
@@ -341,7 +341,7 @@ fn splitting_an_agents_work_and_recomposing_gives_back_the_same_commits() {
 }
 
 #[test]
-fn a_secret_file_in_a_commit_is_refused() {
+fn a_secret_file_in_a_commit_is_found_where_it_would_leave() {
     let (_guard, temp) = tempdir();
     let (repo, commits) = project(&temp);
     let root = tracker("root", &["."], &[".env.local"], false);
@@ -367,17 +367,18 @@ fn a_secret_file_in_a_commit_is_refused() {
         &who("agent", 5_000),
     );
     let tip = git(&repo, &["rev-parse", "HEAD"]);
-    let error = compose::split(&repo, &base, &tip, &[&root], &[root.clone(), env.clone()])
-        .expect_err("refused");
-    match error {
-        SplitError::Refused(Refusal::Secret { path, tracker }) => {
-            assert_eq!(
-                (path.as_str(), tracker.as_str()),
-                (".env.local", "runtime-env")
-            );
-        }
-        other => panic!("expected a secret refusal, got {other}"),
-    }
+    // Splitting is ownership only; the secret check runs over what leaves.
+    let found = compose::find_secret(
+        &repo,
+        &[&tip, "--not", &base],
+        &[],
+        &[root.clone(), env.clone()],
+    )
+    .expect("scan");
+    assert_eq!(
+        found,
+        Some((tip, ".env.local".to_owned(), "runtime-env".to_owned()))
+    );
 }
 
 #[test]

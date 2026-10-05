@@ -135,6 +135,18 @@ impl MetadataStore {
         if git(&["rev-parse", "--verify", "--quiet", "HEAD^{commit}"]).is_none() {
             return Ok(());
         }
+        // The project root is the instance `main`, and this is its branch:
+        // what it has checked out later (a feature branch, an old tag) is
+        // not its history.
+        if let Some(branch) = git(&["symbolic-ref", "--short", "-q", "HEAD"]) {
+            let file = self.paths.project_branch_file();
+            if let Some(parent) = file.parent() {
+                std::fs::create_dir_all(parent)
+                    .map_err(|source| NewgitError::io(parent, source))?;
+            }
+            std::fs::write(&file, format!("{branch}\n"))
+                .map_err(|source| NewgitError::io(&file, source))?;
+        }
         crate::tracker_repo::import_history(
             &self.paths.tracker_store,
             &self.paths.project_root,
@@ -557,6 +569,12 @@ impl MetadataStore {
 }
 
 impl NewgitPaths {
+    /// Names the project root's own branch (the instance `main`), written at
+    /// `newgit init`.
+    pub fn project_branch_file(&self) -> Utf8PathBuf {
+        self.local.join("project-branch")
+    }
+
     pub fn new(project_root: Utf8PathBuf) -> Self {
         let metadata_root = project_root.join(".newgit");
         Self {

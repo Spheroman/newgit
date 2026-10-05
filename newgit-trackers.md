@@ -178,8 +178,10 @@ merge. Local history is left alone, and local undo works on the view.
 
 **The project root is the instance `main` (decided).** Before a spawn, the
 project root's commits not yet split reach each tracker's `instances/main`.
-Its Git is the truth for that instance: a `git reset` there moves those
-branches back. A refusal there is a warning, not an error — nothing has
+Its own branch — the one checked out at `newgit init` — is the truth for
+that instance: a `git reset` of it moves those branches back, while a
+feature branch or tag checked out in the project root is not its history.
+No spawned instance may be named `main`. A refusal there is a warning, not an error — nothing has
 left the machine — and the split runs again before anything does.
 
 **Composing decides ownership among code trackers (decided).** A secret
@@ -192,7 +194,10 @@ newgit's to do silently.
 **Carving out a tracker** (`newgit tracker create electron --code
 --path apps/electron`) splits its paths' history out of root the same way,
 each commit marked with its source, so the view reproduces the original
-history exactly — mixed commits included.
+history exactly — mixed commits included. Every branch of the source is
+carved — `main` and every instance's — and every view is recomposed, so
+no instance is left with notes that predate the new tracker. Split refuses
+rather than guess if one ever is.
 
 **Objects: every repository references what it needs (decided).** No
 borrowing between repositories (Git alternates): Git's own cleanup in a
@@ -207,15 +212,22 @@ are projected into workspaces as today.
 bind is simply not in its view (Git's sparse checkout underneath): `tracker
 use` widens it, `tracker drop` narrows it.
 
-**Secrets never leave through Git (decided).** A commit containing a
-secret tracker's file (`git add -f .env.local`) is refused when it would
-leave the machine, naming the commit and the file, even by force. A push
-checks every ref it sends — any branch, any tag — not only the instance's
-own, for every commit the remote does not have yet; a checkpoint sync
-checks the uncommitted-work commit it carries as well. **New work only:**
-root's `main` (the history from before newgit, and what has been merged
-since) is exempt, so an old committed `.env` never blocks a first push to a
-fresh remote.
+**Secrets never leave through Git (decided).** A commit adding or changing
+a secret tracker's file (`git add -f .env.local`) is refused when it would
+leave the machine, naming the commit and the file, even by force. There is
+one gate, run over exactly what is sent — every commit, every parent of a
+merge, so a secret added and deleted on a merged side branch is still
+caught: a push checks every ref it sends (any branch, any tag) against
+what the remote already has; a checkpoint sync checks everything it
+uploads, its uncommitted-work commit included. Deleting a secret file is
+how it comes out, so it is never refused. Splitting itself only assigns
+paths to trackers.
+
+**New work only (decided):** root's `main` — the history newgit adopted —
+is exempt, so an old committed `.env` never blocks a first push to a fresh
+remote. A secret committed *after* `newgit init` is refused by newgit's
+remote even when plain Git already pushed it elsewhere: it has to come out
+of the history (`git filter-repo`).
 
 **Writes outside the binding (decided).** A change to a path whose owner is
 not bound (an agent creates `apps/electron/x` in an instance without

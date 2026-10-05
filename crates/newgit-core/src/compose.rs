@@ -594,11 +594,11 @@ fn describe_sources(repo: &Utf8Path, sources: &[String]) -> Result<BTreeMap<Stri
     Ok(described)
 }
 
-/// Why a change cannot be split into a tracker.
+/// Why a change cannot be split into a tracker. (Secrets are not split's
+/// concern: [`find_secret`] checks exactly what leaves the machine, with
+/// the exemptions that belong to where it is going.)
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Refusal {
-    /// A secret tracker's file was committed — secrets never enter Git.
-    Secret { path: String, tracker: String },
     /// The path's owner is not bound in this view.
     Unbound { path: String, tracker: String },
 }
@@ -606,11 +606,6 @@ pub enum Refusal {
 impl std::fmt::Display for Refusal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Refusal::Secret { path, tracker } => write!(
-                f,
-                "`{path}` belongs to the secret tracker `{tracker}`, and secrets never enter Git: \
-                 `git rm --cached {path}` and commit again"
-            ),
             Refusal::Unbound { path, tracker } => write!(
                 f,
                 "`{path}` belongs to `{tracker}`, which this instance has not bound: \
@@ -713,9 +708,14 @@ pub fn carve(
 /// Split the view commits after `base` up to `tip` (first parent) into
 /// tracker commits. `bound` are the code trackers this view composes; `all`
 /// is every definition, to name the owner of a path nothing bound owns.
+/// Ownership is decided among code trackers, as composing decides it.
 ///
 /// Each view commit is noted with the state it leaves, so a later split, or
 /// a recompose, picks up where this one stopped.
+///
+/// Refuses, rather than guess, when `base`'s state names no commit for a
+/// bound tracker whose paths have files at `base`: starting that tracker
+/// from nothing would record every file it did not touch as deleted.
 pub fn split(
     repo: &Utf8Path,
     base: &str,
@@ -724,6 +724,27 @@ pub fn split(
     all: &[TrackerDefinition],
 ) -> std::result::Result<SplitOutcome, SplitError> {
     let mut state = read_state(repo, base)?;
+    for definition in bound {
+        if definition.owns_everything() || state.contains_key(&definition.name) {
+            continue;
+        }
+        let mut args = vec!["ls-tree", "-r", "--name-only", base, "--"];
+        args.extend(definition.paths.iter().map(|path| path.as_str()));
+        if !git(repo, &args)?.is_empty() {
+            return Err(SplitError::Git(NewgitError::Unsupported(format!(
+                "the tracker state noted on {} predates `{}`, which has files there; \
+                 recompose before splitting",
+                &base[..base.len().min(12)],
+                definition.name
+            ))));
+        }
+    }
+    let mut code: Vec<&TrackerDefinition> = bound.to_vec();
+    for definition in all {
+        if !definition.secret && !code.iter().any(|known| known.name == definition.name) {
+            code.push(definition);
+        }
+    }
     let ids = first_parent_history(repo, &format!("{base}..{tip}"))?;
     let changes = diff_tree(repo, &ids)?;
     let ids: Vec<String> = ids.into_iter().map(|(id, _)| id).collect();
@@ -734,33 +755,18 @@ pub fn split(
         let mut by_tracker: BTreeMap<String, Vec<Change>> = BTreeMap::new();
         for change in changes.get(id).cloned().unwrap_or_default() {
             let path = Utf8Path::new(&change.path);
-            if let Some(owner) = bound.iter().find(|definition| definition.owns(path)) {
-                by_tracker
-                    .entry(owner.name.clone())
-                    .or_default()
-                    .push(change);
-                continue;
+            let owner = code_owner(&code, path).map(|owner| owner.name.clone());
+            match owner {
+                Some(owner) if bound.iter().any(|definition| definition.name == owner) => {
+                    by_tracker.entry(owner).or_default().push(change);
+                }
+                owner => {
+                    return Err(SplitError::Refused(Refusal::Unbound {
+                        path: change.path,
+                        tracker: owner.unwrap_or_default(),
+                    }));
+                }
             }
-            let owner = all
-                .iter()
-                .filter(|definition| definition.owns(path) || claims(definition, path))
-                .max_by_key(|definition| specificity(definition, path))
-                .map(|definition| definition.name.clone())
-                .unwrap_or_default();
-            let secret = all
-                .iter()
-                .any(|definition| definition.name == owner && definition.secret);
-            return Err(SplitError::Refused(if secret {
-                Refusal::Secret {
-                    path: change.path,
-                    tracker: owner,
-                }
-            } else {
-                Refusal::Unbound {
-                    path: change.path,
-                    tracker: owner,
-                }
-            }));
         }
         let message = format!(
             "{}\n\n{SPLIT_TRAILER}{id}\n",
@@ -848,46 +854,44 @@ fn carved_out(definition: &TrackerDefinition, all: &[TrackerDefinition]) -> Vec<
         .collect()
 }
 
-/// The first commit among `rev_list` (arguments to `git rev-list`, so a
-/// caller says what is new: `<tip> --not --all`) that changes a path a
+/// The first commit among `rev_list` (arguments to `git log`, so a caller
+/// says what is new: `<tip> --not --all`) that adds or changes a path a
 /// secret tracker owns, with that path and tracker. Every parent of a merge
-/// is diffed, so a secret cannot ride in on one. `env` lets the caller see
-/// objects Git is still holding in quarantine.
+/// is diffed, so a secret cannot ride in on one; deleting a secret file is
+/// what removing it looks like, so it is never refused. `env` lets the
+/// caller see objects Git is still holding in quarantine.
 pub fn find_secret(
     repo: &Utf8Path,
     rev_list: &[&str],
     env: &[(String, String)],
     all: &[TrackerDefinition],
 ) -> Result<Option<(String, String, String)>> {
-    let mut args = vec!["rev-list"];
+    // Each commit starts with \x01 — no path holds that byte, so a file
+    // named like a commit id cannot be mistaken for one.
+    let mut args = vec![
+        "log",
+        "-m",
+        "--no-renames",
+        "--name-only",
+        "--diff-filter=d",
+        "-z",
+        "--format=%x01%H",
+    ];
     args.extend_from_slice(rev_list);
-    let commits = git_env(repo, &args, env)?;
-    if commits.trim().is_empty() {
-        return Ok(None);
-    }
     let output = run(
-        command(
-            repo,
-            &[
-                "diff-tree",
-                "--stdin",
-                "-r",
-                "-m",
-                "--root",
-                "--name-only",
-                "-z",
-            ],
-        )
-        .envs(env.iter().map(|(key, value)| (key, value))),
-        "git diff-tree",
-        Some(format!("{}\n", commits.trim()).as_bytes()),
+        command(repo, &args).envs(env.iter().map(|(key, value)| (key, value))),
+        "git log",
+        None,
     )?;
     let output = String::from_utf8_lossy(&output);
     let mut commit = String::new();
-    for field in output.split('\0').filter(|field| !field.is_empty()) {
+    for field in output.split('\0') {
         let field = field.trim_start_matches('\n');
-        if field.len() == 40 && field.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-            commit = field.to_owned();
+        if let Some(id) = field.strip_prefix('\x01') {
+            commit = id.to_owned();
+            continue;
+        }
+        if field.is_empty() {
             continue;
         }
         let path = Utf8Path::new(field);
@@ -903,8 +907,29 @@ pub fn find_secret(
 }
 
 /// The nearest commit on `rev`'s first-parent line (itself included) that
-/// carries a note — the last point whose tracker state is known.
+/// carries a note — the last point whose tracker state is known. A note
+/// naming a commit this repository no longer has (an instance removed, its
+/// commits collected) is passed over: splitting from further back makes
+/// the same commits again, since a split commit is fully determined by its
+/// parent, tree, identity, and message.
 pub fn find_base(repo: &Utf8Path, rev: &str) -> Result<Option<String>> {
+    let usable = |commit: &str| -> Result<bool> {
+        let state = read_state(repo, commit)?;
+        Ok(!state.is_empty()
+            && state.values().all(|tracker_commit| {
+                command(
+                    repo,
+                    &["cat-file", "-e", &format!("{tracker_commit}^{{commit}}")],
+                )
+                .output()
+                .is_ok_and(|output| output.status.success())
+            }))
+    };
+    // Usually the tip itself, or close to it: try it before listing every
+    // note and the whole history.
+    if usable(rev)? {
+        return Ok(Some(git(repo, &["rev-parse", rev])?));
+    }
     let noted: std::collections::BTreeSet<String> =
         git_lines(repo, &["notes", "--ref", NOTES_REF, "list"])
             .unwrap_or_default()
@@ -914,9 +939,12 @@ pub fn find_base(repo: &Utf8Path, rev: &str) -> Result<Option<String>> {
     if noted.is_empty() {
         return Ok(None);
     }
-    Ok(git_lines(repo, &["rev-list", "--first-parent", rev])?
-        .into_iter()
-        .find(|commit| noted.contains(commit)))
+    for commit in git_lines(repo, &["rev-list", "--first-parent", rev])? {
+        if noted.contains(&commit) && usable(&commit)? {
+            return Ok(Some(commit));
+        }
+    }
+    Ok(None)
 }
 
 /// Whether a commit by `author` (`Name <email> …`) is signed when newgit

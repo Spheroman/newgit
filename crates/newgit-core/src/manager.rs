@@ -779,67 +779,97 @@ impl BranchManager {
     }
 
     /// Carve `definition`'s history out of `source`'s into the tracker
-    /// store: its `main`, and the project root's own unmerged work
-    /// (`instances/main`) when there is any. Carving is deterministic, so the
-    /// two share every commit up to where they part. Both repositories end
-    /// up referencing what they hold: the carved commits are made in the
-    /// project repo under its own refs, then fetched into the store.
+    /// store: every branch of it — `main`, the project root's
+    /// `instances/main`, and every instance's — so no instance is left with
+    /// work that still files those paths under `source`. Carving is
+    /// deterministic, so the branches share every commit up to where they
+    /// part. Both repositories end up referencing what they hold: the carved
+    /// commits are made in the project repo under its own refs, then fetched
+    /// into the store. The next projection recomposes every view, so their
+    /// notes name the new tracker.
     ///
     /// Returns the carved `main`'s tip.
     fn carve_from(&self, source: &str, definition: &TrackerDefinition) -> Result<Option<String>> {
+        self.fetch_code_trackers()?;
         let mut carved_main = None;
-        for branch in ["main", "instances/main"] {
-            let Some(source_tip) = self.fetch_code_ref(source, branch)? else {
-                continue;
-            };
-            let target = local_tracker_ref(&definition.name, branch);
+        let mut carved = Vec::new();
+        for branch in self.code_branches(source)? {
+            let source_tip = self.source.rev_parse(&local_tracker_ref(source, &branch))?;
+            let target = local_tracker_ref(&definition.name, &branch);
             let tip = crate::compose::carve(
                 &self.store.paths().project_root,
                 &source_tip,
                 definition,
                 &target,
             )?;
-            if tip.is_some() {
-                self.publish_code_refs(&definition.name, &[branch])?;
-            }
             if branch == "main" {
-                carved_main = tip;
+                carved_main = tip.clone();
             }
+            if tip.is_some() {
+                carved.push(branch);
+            }
+        }
+        if !carved.is_empty() {
+            let branches: Vec<&str> = carved.iter().map(String::as_str).collect();
+            self.publish_code_refs(&definition.name, &branches)?;
         }
         Ok(carved_main)
     }
 
-    /// Bring a code tracker's `branch` from the store into the project repo
-    /// (`refs/newgit/trackers/<tracker>/<branch>`), where composing and
-    /// splitting run. Code trackers only: a secret tracker's content never
-    /// enters the project repo, which is the one `git push --mirror`
-    /// publishes and every workspace clone hardlinks.
-    fn fetch_code_ref(&self, tracker: &str, branch: &str) -> Result<Option<String>> {
+    /// Bring every code tracker's branches from the store into the project
+    /// repo (`refs/newgit/trackers/<tracker>/…`), where composing and
+    /// splitting run — one fetch. Code trackers only: a secret tracker's
+    /// content never enters the project repo, which is the one `git push
+    /// --mirror` publishes and every workspace clone hardlinks.
+    fn fetch_code_trackers(&self) -> Result<()> {
         let store = self.store.paths().tracker_store.clone();
-        let remote_ref = format!("refs/trackers/{tracker}/{branch}");
-        if crate::tracker_repo::ensure_store(&store).is_err()
-            || crate::source::run_git_env(
-                &[
-                    &format!("--git-dir={store}"),
-                    "rev-parse",
-                    "-q",
-                    "--verify",
-                    &remote_ref,
-                ],
-                &[],
-            )
-            .is_err()
-        {
-            return Ok(None);
-        }
-        let local = local_tracker_ref(tracker, branch);
+        crate::tracker_repo::ensure_store(&store)?;
+        let refspecs: Vec<String> = self
+            .code_definitions()
+            .iter()
+            .map(|definition| {
+                format!(
+                    "+refs/trackers/{0}/*:refs/newgit/trackers/{0}/*",
+                    definition.name
+                )
+            })
+            .collect();
         GitSource::fetch_refs(
             &["-C", self.store.paths().project_root.as_str()],
             store.as_str(),
-            &[format!("+{remote_ref}:{local}")],
+            &refspecs,
             None,
-        )?;
-        self.source.rev_parse(&local).map(Some)
+        )
+    }
+
+    /// A code tracker's branches in the project repo: `main`,
+    /// `instances/<slug>`.
+    fn code_branches(&self, tracker: &str) -> Result<Vec<String>> {
+        let prefix = format!("refs/newgit/trackers/{tracker}/");
+        Ok(crate::source::run_git_env(
+            &[
+                "-C",
+                self.store.paths().project_root.as_str(),
+                "for-each-ref",
+                "--format=%(refname)",
+                &prefix,
+            ],
+            &[],
+        )?
+        .lines()
+        .filter_map(|line| line.strip_prefix(&prefix))
+        .map(ToOwned::to_owned)
+        .collect())
+    }
+
+    /// One code tracker branch, brought from the store into the project
+    /// repo: its commit there, or `None` when the store has no such branch.
+    fn fetch_code_ref(&self, tracker: &str, branch: &str) -> Result<Option<String>> {
+        self.fetch_code_trackers()?;
+        Ok(self
+            .source
+            .rev_parse(&local_tracker_ref(tracker, branch))
+            .ok())
     }
 
     /// The reverse: a code tracker's branches, made in the project repo,
@@ -902,68 +932,85 @@ impl BranchManager {
             .map_or_else(|| self.root.name.clone(), |(_, other)| other.name.clone())
     }
 
-    /// Get the project repo ready to compose or split: every code tracker
-    /// has its history (carved out of its owner the first time it is
-    /// needed — a tracker defined by hand, or `project`), the trackers'
-    /// branches are in the project repo, and `rev`'s history carries the
-    /// notes saying which tracker commits it stands for — recomposed when
-    /// they are missing or the set of code trackers changed since.
-    fn prepare_projection(&self, rev: &str) -> Result<()> {
-        let project = self.store.paths().project_root.clone();
-        let root_main = self.fetch_code_ref(&self.root.name, "main")?;
+    /// Get the project repo ready to compose or split: the code trackers'
+    /// branches are in the project repo, every code tracker has its history
+    /// (carved out of its owner the first time it is needed — a tracker
+    /// defined by hand, or `project`), and every view's commits carry notes
+    /// saying which tracker commits they stand for — recomposed when there
+    /// are none yet, or when the set of code trackers with history changed.
+    fn prepare_projection(&self) -> Result<()> {
+        self.fetch_code_trackers()?;
         for definition in &self.code {
-            let has_history = self.fetch_code_ref(&definition.name, "main")?.is_some()
-                | self
-                    .fetch_code_ref(&definition.name, "instances/main")?
-                    .is_some();
-            if has_history {
+            if !self.code_branches(&definition.name)?.is_empty() {
                 continue;
             }
-            // Carving reads the whole history, so remember the root tip it
-            // last found nothing in.
+            // Carving reads the whole history: once is enough. A tracker it
+            // found nothing for gets its first commit from a split.
             let marker = format!("refs/newgit/carve-checked/{}", definition.name);
-            let checked = self.source.rev_parse(&marker).ok();
-            if root_main.is_some() && checked != root_main {
-                self.carve_from(&self.carve_source(definition), definition)?;
-                if let Some(tip) = &root_main {
-                    self.source.update_ref(&marker, tip)?;
+            if self.source.rev_parse(&marker).is_ok() {
+                continue;
+            }
+            let source = self.carve_source(definition);
+            let Some(source_main) = self.fetch_code_ref(&source, "main")? else {
+                continue;
+            };
+            self.carve_from(&source, definition)?;
+            self.source.update_ref(&marker, &source_main)?;
+        }
+
+        let mut names = String::new();
+        for definition in self.code_definitions() {
+            if !self.code_branches(&definition.name)?.is_empty() {
+                names.push_str(&format!("{}\n", definition.name));
+            }
+        }
+        let composed_file = self.store.paths().local.join("composed");
+        let composed = std::fs::read_to_string(&composed_file).unwrap_or_default();
+        let noted = self.source.rev_parse(crate::compose::NOTES_REF).is_ok();
+        if composed == names && noted {
+            return Ok(());
+        }
+        self.recompose_views()?;
+        std::fs::write(&composed_file, names)
+            .map_err(|source| NewgitError::io(&composed_file, source))
+    }
+
+    /// Compose every view again — the project root's and each instance's —
+    /// from its tracker branches (each tracker's `instances/<slug>`, else
+    /// its `main`). Where the result is the commits that are already there,
+    /// nothing is written but their notes, which now name every tracker.
+    fn recompose_views(&self) -> Result<()> {
+        let project = self.store.paths().project_root.clone();
+        let code = self.code_definitions();
+        let mut slugs = BTreeSet::from(["main".to_owned()]);
+        for definition in &code {
+            for branch in self.code_branches(&definition.name)? {
+                if let Some(slug) = branch.strip_prefix("instances/") {
+                    slugs.insert(slug.to_owned());
                 }
             }
         }
-        let _ = self.fetch_code_ref(&self.root.name, "instances/main")?;
-
-        let composed_file = self.store.paths().local.join("composed");
-        let code = self.code_definitions();
-        let mut tips = Vec::new();
-        for definition in &code {
-            let tip = ["instances/main", "main"].iter().find_map(|branch| {
-                self.source
-                    .rev_parse(&local_tracker_ref(&definition.name, branch))
-                    .ok()
-            });
-            if let Some(commit) = tip {
-                tips.push(crate::compose::TrackerTip { definition, commit });
+        let all = self.all_definitions();
+        for slug in slugs {
+            let mut tips = Vec::new();
+            for definition in &code {
+                let tip = [format!("instances/{slug}"), "main".to_owned()]
+                    .iter()
+                    .find_map(|branch| {
+                        self.source
+                            .rev_parse(&local_tracker_ref(&definition.name, branch))
+                            .ok()
+                    });
+                if let Some(commit) = tip {
+                    tips.push(crate::compose::TrackerTip { definition, commit });
+                }
             }
+            if tips.is_empty() {
+                continue;
+            }
+            crate::compose::compose(&project, &format!("refs/newgit/views/{slug}"), &tips, &all)?;
         }
-        let names: String = tips
-            .iter()
-            .map(|tip| format!("{}\n", tip.definition.name))
-            .collect();
-        let composed = std::fs::read_to_string(&composed_file).unwrap_or_default();
-        if composed == names && crate::compose::find_base(&project, rev)?.is_some() {
-            return Ok(());
-        }
-        if tips.is_empty() {
-            return Ok(());
-        }
-        crate::compose::compose(
-            &project,
-            "refs/newgit/views/main",
-            &tips,
-            &self.all_definitions(),
-        )?;
-        std::fs::write(&composed_file, names)
-            .map_err(|source| NewgitError::io(&composed_file, source))
+        Ok(())
     }
 
     /// Split instance `slug`'s commits up to `tip` into its tracker
@@ -971,11 +1018,12 @@ impl BranchManager {
     /// Every bound tracker's branch is set, moved or not: the branch is the
     /// instance's state, so a reset moves it back.
     ///
-    /// A commit holding a secret tracker's file, or a path whose tracker
-    /// this instance has not bound, refuses the whole split, naming it.
+    /// A path whose tracker this instance has not bound refuses the whole
+    /// split, naming it. Secrets are checked where work leaves, by
+    /// [`Self::refuse_secrets`], against exactly what is sent.
     fn split_instance(&self, slug: &str, tip: &str) -> Result<usize> {
         let project = self.store.paths().project_root.clone();
-        self.prepare_projection(tip)?;
+        self.prepare_projection()?;
         let base = crate::compose::find_base(&project, tip)?.ok_or_else(|| {
             NewgitError::Unsupported(format!(
                 "newgit cannot tell which tracker commits {} stands for: its history shares no \
@@ -1004,10 +1052,10 @@ impl BranchManager {
         Ok(outcome.made.len())
     }
 
-    /// Refuse when any commit `rev_list` selects (in `repo`) carries a file a
-    /// secret tracker owns. Splitting checks the instance's own branch; this
-    /// covers everything else a push or sync sends — other branches, tags,
-    /// the uncommitted-work commit a checkpoint syncs.
+    /// Refuse when any commit `rev_list` selects (in `repo`) adds or changes
+    /// a file a secret tracker owns — every commit, every parent of a merge.
+    /// The one gate for secrets: a push runs it over everything it sends,
+    /// a sync over everything it uploads.
     fn refuse_secrets(
         &self,
         repo: &Utf8Path,
@@ -1028,12 +1076,36 @@ impl BranchManager {
     }
 
     /// The project root is the instance `main` (newgit-trackers.md): bring
-    /// its tracker branches up to the commit it has checked out.
+    /// its tracker branches up to its own branch — the one `newgit init`
+    /// found checked out — not whatever it has checked out now.
     pub fn sync_project_root(&self) -> Result<usize> {
-        let Ok(head) = self.source.rev_parse("HEAD") else {
+        let file = self.store.paths().project_branch_file();
+        let branch = match std::fs::read_to_string(&file) {
+            Ok(branch) => branch.trim().to_owned(),
+            Err(_) => {
+                let Ok(branch) = crate::source::run_git_env(
+                    &[
+                        "-C",
+                        self.store.paths().project_root.as_str(),
+                        "symbolic-ref",
+                        "--short",
+                        "-q",
+                        "HEAD",
+                    ],
+                    &[],
+                ) else {
+                    return Ok(0);
+                };
+                let branch = branch.trim().to_owned();
+                std::fs::write(&file, format!("{branch}\n"))
+                    .map_err(|source| NewgitError::io(&file, source))?;
+                branch
+            }
+        };
+        let Ok(tip) = self.source.rev_parse(&format!("refs/heads/{branch}")) else {
             return Ok(0);
         };
-        self.split_instance("main", &head)
+        self.split_instance(PROJECT_ROOT_INSTANCE, &tip)
     }
 
     /// Where `tracker`'s history is for `instance` (its branch, once its
@@ -1138,6 +1210,12 @@ impl BranchManager {
     pub fn spawn(&self, name: &str, from: Option<&str>) -> Result<SpawnOutcome> {
         self.require_resolvable_graph()?;
         validate_name(name)?;
+        if branch_slug(name) == PROJECT_ROOT_INSTANCE {
+            return Err(NewgitError::Unsupported(format!(
+                "`{name}` is the project root's own instance — its tracker branches are \
+                 `instances/{PROJECT_ROOT_INSTANCE}`; pick another name"
+            )));
+        }
 
         let slug = branch_slug(name);
         let record_path = self.store.branch_record_path(&slug);
@@ -3957,7 +4035,7 @@ impl BranchManager {
         // before the checkpoint, so a refused push leaves nothing behind.
         //
         // New work only: root's `main` — the project's history from before
-        // newgit, and whatever has been merged since — is exempt. A `.env`
+        // newgit (merges will move it, in step 5) — is exempt. A `.env`
         // committed years ago is already in that history, and removing it
         // is a history rewrite (`git filter-repo`), not something to block
         // every first push to a fresh remote over.
@@ -3987,7 +4065,8 @@ impl BranchManager {
             CheckpointReason::Push,
         )?;
         // The work leaves the machine here, so it is split into its trackers
-        // here. A refusal (a secret file committed) stops the push; any other
+        // here (a no-op when the checkpoint's sync already did it). A refusal
+        // (a path whose tracker is not bound) stops the push; any other
         // failure to split is reported and retried at the next push.
         match self.split_instance(&branch.slug, &checkpoint.record.source.head_rev) {
             Ok(_) => {}
@@ -4302,16 +4381,18 @@ impl BranchManager {
         let Some(binding) = branch.remote.clone() else {
             return Ok(());
         };
-        // Split before anything is uploaded: a commit holding a secret
-        // tracker's file stops the sync here, with nothing sent. The split
-        // covers committed work; the checkpoint ref also carries the
-        // uncommitted-work commit, so that is checked too.
-        self.split_instance(&branch.slug, &record.source.head_rev)?;
+        // Nothing is uploaded until everything it would carry is checked:
+        // the checkpoint ref — the uncommitted-work commit included — and
+        // every commit behind it, every parent of every merge, back to the
+        // history newgit adopted (root's `main`). A secret committed after
+        // that never reaches newgit's remote, even one already pushed
+        // somewhere else by plain Git: it has to come out of the history.
         let project = self.store.paths().project_root.clone();
-        let synced = format!("{}^!", record.source.store_ref);
-        if record.source.dirty_rev.is_some() {
-            self.refuse_secrets(&project, &[&synced], &[])?;
-        }
+        let history = self.fetch_code_ref(&self.root.name, "main")?;
+        let mut uploaded = vec![record.source.store_ref.as_str(), "--not"];
+        uploaded.extend(history.as_deref());
+        self.refuse_secrets(&project, &uploaded, &[])?;
+        self.split_instance(&branch.slug, &record.source.head_rev)?;
 
         let remote = link.connect(Acting::Workspace(&branch.workspace_path))?;
         wait_for_fork(remote.as_ref(), &binding.project, &branch.slug)?;
@@ -5262,6 +5343,10 @@ fn no_own_content(tracker: &str) -> String {
 }
 
 /// Where a checkpoint's source lives in its instance's fork.
+/// The project root's name as an instance: its tracker branches are
+/// `instances/main`, so no spawned instance may take the name.
+const PROJECT_ROOT_INSTANCE: &str = "main";
+
 /// Where the project repo keeps a code tracker's `branch` (`main`,
 /// `instances/<slug>`): its own refs, so what it composes from is never
 /// borrowed.
