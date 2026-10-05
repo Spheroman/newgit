@@ -1356,14 +1356,20 @@ need opposite fixes — a `[restore]` that lands on the wrong state, or a
 per-run `\restrict` token) — and two refs alone cannot tell them apart. So
 for each exercised resource that disagrees, verify runs that resource's
 checkpoint once more with nothing restored in between (a *control*, not
-recorded as a checkpoint; any deposit it makes is left for `cleanup`): a
-control that reproduces the second ref blames `[restore]`, one that does
-not blames `[checkpoint]`. A restore that failed outright skips the control.
-The cost — one more checkpoint command, possibly a slow dump — is paid only
-on a mismatch, which is already a failure. Where both refs are deposits, it
-also diffs the two snapshot directories (`git diff --no-index`, bounded to
-the changed files, line counts, and a few changed lines) and prints the
-command for the full diff.
+recorded as a checkpoint, logged as `<resource>.checkpoint-control`; any
+deposit it makes is left for `cleanup`). A control that does not reproduce
+the second ref blames `[checkpoint]`. One that does only proves the
+checkpoint reproduces itself back to back, so it says `[restore]` most
+likely landed on a different state. A restore that failed outright skips
+the control. The cost — one more checkpoint command, possibly a slow dump —
+is paid only on a mismatch, which is already a failure. Where the refs are
+deposits, it also diffs two snapshot directories and prints the command for
+the full diff: `before` → `after` normally, `after` → control for an
+unstable checkpoint, whose every differing line is then pure noise. The
+diff is bounded however large the dump — one `git diff --numstat` for the
+counts, one patch streamed only until a few changed lines are in hand — and
+control characters in those lines are escaped before they reach the
+terminal.
 
 Destructive and expensive on purpose:
 it is a real `undo`, stopping and restarting whatever the instance's

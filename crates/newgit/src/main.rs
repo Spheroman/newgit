@@ -4,14 +4,14 @@ use clap::{Args, Parser, Subcommand};
 use newgit_core::branch::branch_slug;
 use newgit_core::checkpoint::CheckpointReason;
 use newgit_core::cleanup::{ArchivedCheckpoints, HookDetail, HookOutcome};
-use newgit_core::deposit_diff::{DepositDiff, FileChange};
+use newgit_core::deposit_diff::{DepositDiff, FileChange, escape_control};
 use newgit_core::export::{ExportFilter, Reason};
 use newgit_core::exports::unresolved_placeholder;
 use newgit_core::installs::InstallReport;
 use newgit_core::manager::{
-    ActionOutcome, ActionPlan, BaseReport, BindOrigin, BranchManager, InstanceReport, KeptBranch,
-    MismatchCause, RemoveOutcome, SourceBranchOutcome, SourceBranchPolicy, TrackerBindOutcome,
-    UndoOptions, VerifyResource,
+    ActionOutcome, ActionPlan, BaseReport, BindOrigin, BranchManager, DiffPair, InstanceReport,
+    KeptBranch, MismatchCause, RemoveOutcome, SourceBranchOutcome, SourceBranchPolicy,
+    TrackerBindOutcome, UndoOptions, VerifyResource,
 };
 use newgit_core::resource::{CheckpointMode, ResourceDefinition};
 use newgit_core::source::{RefUpdate, find_repo_root};
@@ -1624,8 +1624,8 @@ fn print_mismatch_evidence(resource: &VerifyResource) {
         }
         Some(MismatchCause::RestoreLandedElsewhere) => println!(
             "{indent}cause: [restore] — checkpointed again with nothing restored in between, \
-             it reproduced `after`: the checkpoint is stable, so the restore landed on a \
-             different state"
+             it reproduced `after`: the checkpoint reproduces itself back to back, so the \
+             restore most likely landed on a different state"
         ),
         Some(MismatchCause::CheckpointUnstable { control_state_ref }) => println!(
             "{indent}cause: [checkpoint] is not deterministic — checkpointed again with nothing \
@@ -1638,18 +1638,34 @@ fn print_mismatch_evidence(resource: &VerifyResource) {
              [checkpoint] failed: {error}"
         ),
     }
-    match &resource.diff {
-        None => {}
-        Some(Err(error)) => println!("{indent}could not diff the two deposits: {error}"),
-        Some(Ok(diff)) => print_deposit_diff(diff, indent),
+    let Some(diff) = &resource.diff else {
+        return;
+    };
+    // An unstable checkpoint is shown as after → control: nothing was
+    // restored between those two, so every line is the checkpoint's own
+    // noise, with none of the restore's changes mixed in.
+    let (old, new, note) = match diff.pair {
+        DiffPair::BeforeAfter => ("before", "after", ""),
+        DiffPair::AfterControl => (
+            "after",
+            "control",
+            " (nothing was restored between these two)",
+        ),
+    };
+    match &diff.result {
+        Err(error) => println!("{indent}could not diff {old} against {new}: {error}"),
+        Ok(diff) => {
+            println!("{indent}{old} → {new}{note}:");
+            print_deposit_diff(diff, indent, old, new);
+        }
     }
 }
 
-fn print_deposit_diff(diff: &DepositDiff, indent: &str) {
+fn print_deposit_diff(diff: &DepositDiff, indent: &str, old: &str, new: &str) {
     for file in &diff.files {
         let change = match file.change {
-            FileChange::OnlyBefore => "only in before".to_owned(),
-            FileChange::OnlyAfter => "only in after".to_owned(),
+            FileChange::OnlyBefore => format!("only in {old}"),
+            FileChange::OnlyAfter => format!("only in {new}"),
             FileChange::Binary => "binary, differs".to_owned(),
             FileChange::Text {
                 removed,
@@ -1657,7 +1673,7 @@ fn print_deposit_diff(diff: &DepositDiff, indent: &str) {
                 lines_before,
             } => format!("-{removed} +{added} lines (of {lines_before})"),
         };
-        println!("{indent}{}: {change}", file.path);
+        println!("{indent}{}: {change}", escape_control(file.path.as_str()));
     }
     if diff.more_files > 0 {
         println!("{indent}… and {} more files", diff.more_files);

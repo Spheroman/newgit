@@ -544,9 +544,28 @@ pub struct VerifyResource {
     pub agree: bool,
     /// On an exercised mismatch only: which half of the round trip broke.
     pub cause: Option<MismatchCause>,
-    /// On a mismatch between two `into_tracker` deposits only: what differs
-    /// between them, and where both live.
-    pub diff: Option<std::result::Result<DepositDiff, String>>,
+    /// On a mismatch between `into_tracker` deposits only: what differs
+    /// between two of them, and where both live.
+    pub diff: Option<VerifyDiff>,
+}
+
+/// The deposit diff shown under a MISMATCH, and which pair it compares.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifyDiff {
+    pub pair: DiffPair,
+    pub result: std::result::Result<DepositDiff, String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiffPair {
+    /// The checkpoint before the restore against the one after it — what
+    /// the restore changed, for every cause but an unstable checkpoint.
+    BeforeAfter,
+    /// `after` against the control taken straight after it. Nothing was
+    /// restored between those two, so every line that differs is the
+    /// checkpoint's own noise — exactly what an unstable checkpoint needs
+    /// to show, without the restore's changes mixed in.
+    AfterControl,
 }
 
 /// Why `before` and `after` disagree. A mismatch has two opposite fixes —
@@ -3686,10 +3705,18 @@ impl BranchManager {
                     self.control_checkpoint(&branch, &before_state.name, after_ref.as_deref())
                 }
             });
-            let diff = if mismatch {
-                self.deposit_diff(before_state.state_ref.as_deref(), after_ref.as_deref())
-            } else {
-                None
+            let diff = match &cause {
+                None => None,
+                Some(MismatchCause::CheckpointUnstable { control_state_ref }) => self.deposit_diff(
+                    DiffPair::AfterControl,
+                    after_ref.as_deref(),
+                    control_state_ref.as_deref(),
+                ),
+                Some(_) => self.deposit_diff(
+                    DiffPair::BeforeAfter,
+                    before_state.state_ref.as_deref(),
+                    after_ref.as_deref(),
+                ),
             };
             resources.push(VerifyResource {
                 name: before_state.name.clone(),
@@ -3723,9 +3750,9 @@ impl BranchManager {
         name: &str,
         after_ref: Option<&str>,
     ) -> MismatchCause {
-        let control = self
-            .resource_definition(name)
-            .and_then(|definition| self.checkpoint_resource(branch, definition));
+        let control = self.resource_definition(name).and_then(|definition| {
+            self.checkpoint_resource(branch, definition, "checkpoint-control")
+        });
         match control {
             Ok(control) if control.state_ref.as_deref() == after_ref => {
                 MismatchCause::RestoreLandedElsewhere
@@ -3742,18 +3769,20 @@ impl BranchManager {
     /// hash is all the content there is).
     fn deposit_diff(
         &self,
-        before_ref: Option<&str>,
-        after_ref: Option<&str>,
-    ) -> Option<std::result::Result<DepositDiff, String>> {
-        let (before_lane, before_rev) = parse_tracker_state_ref(before_ref?)?;
-        let (after_lane, after_rev) = parse_tracker_state_ref(after_ref?)?;
-        Some(
-            diff_deposits(
-                &self.lane(before_lane).rev_path(before_rev),
-                &self.lane(after_lane).rev_path(after_rev),
+        pair: DiffPair,
+        old_ref: Option<&str>,
+        new_ref: Option<&str>,
+    ) -> Option<VerifyDiff> {
+        let (old_lane, old_rev) = parse_tracker_state_ref(old_ref?)?;
+        let (new_lane, new_rev) = parse_tracker_state_ref(new_ref?)?;
+        Some(VerifyDiff {
+            pair,
+            result: diff_deposits(
+                &self.lane(old_lane).rev_path(old_rev),
+                &self.lane(new_lane).rev_path(new_rev),
             )
             .map_err(|error| error.to_string()),
-        )
+        })
     }
 
     fn checkpoint_branch(
@@ -3835,7 +3864,7 @@ impl BranchManager {
                 ));
                 CapturedResource::none()
             } else {
-                self.checkpoint_resource(branch, definition)?
+                self.checkpoint_resource(branch, definition, "checkpoint")?
             };
             if let Some(deposit) = captured.deposit {
                 deposits.push(deposit);
@@ -3927,10 +3956,15 @@ impl BranchManager {
         })
     }
 
+    /// `log_name` labels the action log: `checkpoint` for a real checkpoint,
+    /// `checkpoint-control` for verify's control run, so the log of the run
+    /// that settled a MISMATCH can be told apart from the checkpoints it was
+    /// compared against.
     fn checkpoint_resource(
         &self,
         branch: &BranchInstance,
         definition: &ResourceDefinition,
+        log_name: &str,
     ) -> Result<CapturedResource> {
         let Some(spec) = &definition.checkpoint else {
             return Ok(CapturedResource::none());
@@ -3995,7 +4029,7 @@ impl BranchManager {
                 let command = render(template, &context);
                 let log = self
                     .store
-                    .action_log_path(&branch.slug, &format!("{}.checkpoint", definition.name));
+                    .action_log_path(&branch.slug, &format!("{}.{log_name}", definition.name));
                 let env = self.assemble_env(branch)?;
                 let cwd = resource_cwd(
                     &branch.workspace_path,

@@ -8,7 +8,7 @@ use camino::{Utf8Path, Utf8PathBuf};
 use newgit_core::SourceSubstrate;
 use newgit_core::config::WorkspaceSection;
 use newgit_core::deposit_diff::FileChange;
-use newgit_core::manager::{BranchManager, MismatchCause, VerifyResource};
+use newgit_core::manager::{BranchManager, DiffPair, MismatchCause, VerifyResource};
 use newgit_core::store::MetadataStore;
 use newgit_core::tracker::Storage;
 
@@ -89,7 +89,8 @@ const NONCE_DUMP: &str = r#"ownership = "branch"
 
 [checkpoint]
 mode = "command"
-command = "echo \"\\restrict $$\" > {{snapshot.path}}/db.sql && cat STATE >> {{snapshot.path}}/db.sql"
+# `printf`, not `echo`: some `sh` echoes turn `\r` into a carriage return.
+command = '''printf '\\restrict %s\n' $$ > {{snapshot.path}}/db.sql && cat STATE >> {{snapshot.path}}/db.sql'''
 into_tracker = "db-snapshots"
 
 [restore]
@@ -114,10 +115,19 @@ fn a_nondeterministic_checkpoint_is_blamed_and_its_one_changed_line_shown() {
         resource.cause
     );
 
-    let diff = resource
-        .diff
-        .expect("both refs are deposits")
-        .expect("diffable");
+    // Shown as after → control, not before → after: nothing was restored
+    // between those two, so every line in it is the checkpoint's own noise.
+    let shown = resource.diff.expect("both refs are deposits");
+    assert_eq!(shown.pair, DiffPair::AfterControl);
+    let diff = shown.result.expect("diffable");
+    let (lane, after_rev) = resource
+        .after_state_ref
+        .as_deref()
+        .and_then(|r| r.strip_prefix("tracker:"))
+        .and_then(|r| r.split_once('@'))
+        .expect("after is a deposit");
+    assert_eq!(lane, "db-snapshots");
+    assert!(diff.before.ends_with(after_rev), "{}", diff.before);
     assert_eq!(diff.files.len(), 1);
     assert_eq!(diff.files[0].path, "db.sql");
     assert_eq!(
@@ -143,6 +153,34 @@ fn a_nondeterministic_checkpoint_is_blamed_and_its_one_changed_line_shown() {
     assert!(diff.before.join("db.sql").is_file());
     assert!(diff.after.join("db.sql").is_file());
     assert!(diff.full_diff_command().contains(diff.before.as_str()));
+
+    // The control run gets its own log, named as the control, beside the
+    // logs of the checkpoints it is compared against.
+    let store = m.store();
+    let slug = store.find_branch("feature").expect("branch").slug;
+    let logs: Vec<String> = std::fs::read_dir(store.paths().logs.join(&slug))
+        .expect("logs dir")
+        .map(|entry| {
+            entry
+                .expect("entry")
+                .file_name()
+                .into_string()
+                .expect("utf8")
+        })
+        .collect();
+    let control = logs
+        .iter()
+        .filter(|name| name.starts_with("db.checkpoint-control-"))
+        .count();
+    let checkpoints = logs
+        .iter()
+        .filter(|name| name.starts_with("db.checkpoint-") && !name.contains("control"))
+        .count();
+    assert_eq!(control, 1, "{logs:?}");
+    assert!(
+        checkpoints >= 2,
+        "before and after both keep a log: {logs:?}"
+    );
 }
 
 /// A stable dump, and a restore that exits 0 having written the wrong
@@ -166,10 +204,9 @@ fn a_restore_that_lands_elsewhere_is_blamed_when_the_checkpoint_reproduces_itsel
 
     let resource = verify_db(&m);
     assert_eq!(resource.cause, Some(MismatchCause::RestoreLandedElsewhere));
-    let diff = resource
-        .diff
-        .expect("both refs are deposits")
-        .expect("diffable");
+    let shown = resource.diff.expect("both refs are deposits");
+    assert_eq!(shown.pair, DiffPair::BeforeAfter);
+    let diff = shown.result.expect("diffable");
     assert_eq!(
         diff.files[0].change,
         FileChange::Text {

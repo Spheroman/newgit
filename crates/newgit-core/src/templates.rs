@@ -434,7 +434,7 @@ supabase db dump --local --data-only -f {{snapshot.path}}/db.sql || exit 1
 key=$(sed -n 's/^\\restrict //p' {{snapshot.path}}/db.sql | head -n 1)
 if [ -n "$key" ]; then
   sed "s/$key/newgit/" {{snapshot.path}}/db.sql > {{snapshot.path}}/db.sql.tmp || exit 1
-  mv {{snapshot.path}}/db.sql.tmp {{snapshot.path}}/db.sql
+  mv {{snapshot.path}}/db.sql.tmp {{snapshot.path}}/db.sql || exit 1
 fi
 echo {{snapshot.path}}/db.sql
 '''

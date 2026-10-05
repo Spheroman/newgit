@@ -301,9 +301,11 @@ every verify fail. Common dump tools do this by default: `pg_dump` since
 17.6 (and the matching back-branch releases) opens and closes every dump with
 `\restrict <token>` / `\unrestrict <token>`, a fresh random token per run.
 Pass `--restrict-key=<fixed>` to make it stable, as the bundled Postgres
-templates do (their comments say what a fixed key gives up). Timestamps and
-`-- Dumped at` headers do the same. `--verify` names this case when it
-happens rather than blaming `[restore]`; it does not paper over it.
+templates do (their comments say what a fixed key gives up). Anything else
+that stamps a run does the same: a timestamp in the output, or `pg_dump
+--verbose`'s `-- Started on` / `-- Completed on` comments. `--verify` names
+this case when it happens rather than blaming `[restore]`; it does not paper
+over it.
 
 ### `[restore]`
 
@@ -387,25 +389,34 @@ land on the wrong state, which `--verify` is what catches.
 A mismatch has two opposite fixes, and `--verify` says which one it saw.
 It checkpoints the mismatched resource once more, straight after the
 second checkpoint with nothing restored in between: if that reproduces the
-second ref, the checkpoint is stable and `[restore]` landed somewhere else;
-if it does not, `[checkpoint]` is not deterministic and this run could not
-judge the restore at all. A restore that failed outright is named as such
+second ref, the checkpoint reproduces itself back to back, so `[restore]`
+most likely landed on a different state; if it does not, `[checkpoint]` is
+not deterministic and this run could not judge the restore at all. A restore that failed outright is named as such
 without the extra run. Either way the verify still fails — this is evidence
 for whoever fixes it, never a reason to call a mismatch verified. The extra
 checkpoint is paid only on a mismatch, and only for that resource.
 
-When both refs are `into_tracker` deposits, it also shows what differs —
-each file, its changed line counts, the first few changed lines — and the
-`git diff --no-index` command over both snapshot directories for the rest:
+When the refs are `into_tracker` deposits, it also shows what differs —
+each file, its changed line counts, the first few changed lines (control
+characters escaped) — and the `git diff --no-index` command over both
+snapshot directories for the rest. Which two it compares depends on the
+cause: `before` → `after` (what the restore changed) normally, but `after` →
+`control` for an unstable checkpoint, since nothing was restored between
+those two and every line that differs is the checkpoint's own noise:
 
 ```
 resource: db MISMATCH  before: tracker:db-snapshots@a71acd9dcafa  after: tracker:db-snapshots@f5b2685a1347
           cause: [checkpoint] is not deterministic — checkpointed again with nothing restored in between, it gave tracker:db-snapshots@00f1294c80fb, not `after`. ...
+          after → control (nothing was restored between these two):
           db.sql: -1 +1 lines (of 3300)
-            -\restrict 2be4c53b4f2cecc23d7a7e7c01272f7e
-            +\restrict 113121fbb8e948b29a0d2b496760c3a2
-          full diff: git diff --no-index .newgit/snapshots/db-snapshots/a71acd9dcafa .newgit/snapshots/db-snapshots/f5b2685a1347
+            -\restrict 4fQx9ZkTmB2vLr7HcWn0aYdE8sJpU3gNi6KoVbXt1RzA5yCeqM
+            +\restrict Ty7Nw2cLpQ8vZk0RbJmX4hSaFe6UdG1oYi9KtrWnE3sDx5HjBu
+          full diff: git diff --no-index .newgit/snapshots/db-snapshots/f5b2685a1347 .newgit/snapshots/db-snapshots/00f1294c80fb
 ```
+
+The comparison stays bounded however large the dump: one `git diff
+--numstat` for the counts, and one patch streamed only until the excerpt is
+full. The control's own log is `<resource>.checkpoint-control-*.log`.
 
 It is destructive (a real `undo`, stopping and restarting whatever the instance's
 resources run) and prints what it is about to do before doing it; run it
