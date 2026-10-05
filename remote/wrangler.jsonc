@@ -1,0 +1,20 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "newgit",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-10-05",
+  "compatibility_flags": ["nodejs_compat"],
+  "observability": { "enabled": true },
+  // One namespace for every project; repo names carry the project as a
+  // prefix. A binding names exactly one namespace (newgit-cloudflare.md).
+  "artifacts": [{ "binding": "ARTIFACTS", "namespace": "newgit" }],
+  "durable_objects": { "bindings": [{ "class_name": "ProjectDO", "name": "PROJECTS" }] },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["ProjectDO"] }],
+  "vars": {
+    // A public value: GitHub's device flow identifies the app by it.
+    "GITHUB_CLIENT_ID": "",
+    // Where the namespace's repos are served; not a secret.
+    "ARTIFACTS_GIT_BASE": "https://bce0b38de721f350c8d8a51d0520337d.artifacts.cloudflare.net/git/newgit"
+  }
+  // Secrets: TOKEN_KEY (signs newgit tokens).
+}

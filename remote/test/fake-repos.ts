@@ -1,0 +1,41 @@
+import type { MintedToken, Repos } from "../src/artifacts";
+
+/** Artifacts in memory: repos are file maps; tokens are recognisable strings. */
+export class FakeRepos implements Repos {
+	readonly repos = new Map<string, Map<string, string>>();
+	readonly minted: { name: string; scope: string }[] = [];
+
+	async create(name: string) {
+		if (this.repos.has(name)) throw Object.assign(new Error("exists"), { code: "ALREADY_EXISTS" });
+		this.repos.set(name, new Map());
+		return { remote: this.url(name) };
+	}
+	async fork(from: string, to: string) {
+		const source = this.repos.get(from);
+		if (!source) throw Object.assign(new Error("missing"), { code: "NOT_FOUND" });
+		this.repos.set(to, new Map(source));
+		return { remote: this.url(to) };
+	}
+	async remote(name: string) {
+		return this.repos.has(name) ? this.url(name) : null;
+	}
+	async delete(name: string) {
+		return this.repos.delete(name);
+	}
+	async mint(name: string, scope: "read" | "write"): Promise<MintedToken> {
+		this.minted.push({ name, scope });
+		return { password: `pw-${name}-${scope}`, expiresAt: "2099-01-01T00:00:00Z" };
+	}
+	async readFile(name: string, _ref: string, path: string) {
+		return this.repos.get(name)?.get(path) ?? null;
+	}
+
+	/** Commit a file to a repo's trunk, as a merge would. */
+	write(name: string, path: string, text: string) {
+		this.repos.get(name)!.set(path, text);
+	}
+
+	private url(name: string) {
+		return `https://acct.artifacts.example/git/newgit/${name}.git`;
+	}
+}

@@ -1,0 +1,11 @@
+{
+  // Tests run under Miniflare, which has no Artifacts binding; they inject
+  // an in-memory Repos instead (test/fake-repos.ts).
+  "name": "newgit-test",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-10-05",
+  "compatibility_flags": ["nodejs_compat"],
+  "durable_objects": { "bindings": [{ "class_name": "ProjectDO", "name": "PROJECTS" }] },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["ProjectDO"] }],
+  "vars": { "GITHUB_CLIENT_ID": "test-client", "ARTIFACTS_GIT_BASE": "https://acct.artifacts.example/git/newgit", "TOKEN_KEY": "test-signing-key-not-secret" }
+}
