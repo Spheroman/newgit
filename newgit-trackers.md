@@ -347,6 +347,23 @@ in step 3d: pushes go through a newgit workspace, which splits locally.
 Why a sandbox and not the Worker: a Worker cannot run Git, and composing in
 JavaScript would mean writing Git's object model ourselves.
 
+**One name for a commit, whoever reads it (decided).** A Git commit id is the
+hash of the commit's contents and its parent's id, so someone whose view
+leaves out a tracker sees different ids from the first commit that touched
+it onward. Two layers keep that from mattering:
+
+- **Usually it never happens.** Code trackers are readable by every member
+  by default, and everyone who reads the same code gets the same commits.
+  A code tracker with a narrower audience needs an explicit flag, whose
+  warning names both costs: its past stays readable in root's history, and
+  people who cannot read it see different commit ids.
+- **When it does, every commit has a canonical id:** the commit as its author
+  made it, which every tracker commit split from it already carries as
+  `Newgit-Split: <id>`. The endpoint notes it on each rebuilt commit (`git
+  log --notes` shows it), newgit commands accept either id, and newgit's own
+  surfaces — checkpoints, branch lists, the web UI — always show canonical
+  ids. A branch's state as a whole is named by its list.
+
 ## Git and GitHub
 
 **GitHub is an export (decided).** `newgit export --github <repo>` pushes a

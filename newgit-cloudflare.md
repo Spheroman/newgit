@@ -646,6 +646,35 @@ a viewer whose own public values differ sees the build's values until it
 rebuilds with theirs. Server-side secrets are read at runtime and are
 unaffected.
 
+### Round 4: a Git endpoint in a container (2026-10-05)
+
+A spike Worker in front of a Durable Object-managed container (Debian, real
+`git`, `newgit` cross-compiled for x86_64), `standard-1`. The Worker pipes
+Git's smart-HTTP requests into `git upload-pack --stateless-rpc` through the
+Containers `exec` API, stdin and stdout streamed; the container runs no
+server. Stand-in for "fetch the tracker repos from Artifacts": a clone of
+Express from GitHub (6,173 commits), adopted by newgit, `lib` carved out as
+a code tracker, the view composed and served.
+
+| Question | Answer |
+|---|---|
+| Cold start from the image | Boot 6.0 s; clone 2.6 s, adopt and carve 3.2 s, compose 3.1 s, publish 3.1 s — 18.7 s, 41 MB |
+| The composed view | **Identical to Express's own `HEAD`** (`7ef9844`), carved tracker included |
+| Plain `git clone` through the Worker, warm | **1.3–1.8 s** for all 6,173 commits; same ids; `git fsck` clean |
+| Snapshot | 7.5 s, 38 MB |
+| Cold clone: container stopped, restored from the snapshot | **1.75–2.3 s**, restore included (three rounds) |
+
+Consequences:
+
+- **The endpoint is viable as designed.** A stopped endpoint costs about
+  half a second over a warm one, so per-project containers can sleep when
+  idle and snapshot after each change.
+- **Composing per request is cheap** — the whole 6k-commit history in about
+  3 s, once, when the set of trackers changes; after that a fetch touches
+  only new commits.
+- No HTTP server in the container: `exec` with streamed stdin and stdout
+  is the whole transport.
+
 ---
 
 ## Decisions
