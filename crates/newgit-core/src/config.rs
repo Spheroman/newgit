@@ -138,6 +138,39 @@ pub fn default_workspace_root(project_name: &str, project_root: &Utf8Path) -> Ut
     expand_home(Utf8Path::new("~/.newgit/workspaces")).join(format!("{project_name}-{hash}"))
 }
 
+/// This person's own choice of tracker per role for `project`, from
+/// `~/.newgit/config.toml`:
+///
+/// ```toml
+/// [projects.faretable.roles]
+/// db = "staging-db"
+/// ```
+///
+/// It overrides a role's `priority`; newgit never writes it — it exists only
+/// if you do. Unreadable or absent means none.
+pub fn personal_role_defaults(project: &str) -> std::collections::BTreeMap<String, String> {
+    #[derive(serde::Deserialize, Default)]
+    struct Personal {
+        #[serde(default)]
+        projects: std::collections::BTreeMap<String, PersonalProject>,
+    }
+    #[derive(serde::Deserialize, Default)]
+    struct PersonalProject {
+        #[serde(default)]
+        roles: std::collections::BTreeMap<String, String>,
+    }
+    let Ok(home) = std::env::var("HOME") else {
+        return Default::default();
+    };
+    let path = std::path::Path::new(&home).join(".newgit/config.toml");
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|text| toml::from_str::<Personal>(&text).ok())
+        .and_then(|mut personal| personal.projects.remove(project))
+        .map(|project| project.roles)
+        .unwrap_or_default()
+}
+
 #[cfg(test)]
 mod tests {
     use camino::Utf8Path;

@@ -430,8 +430,16 @@ Each step lands alone and keeps the suite green.
      endpoint at `newgit.dev/<owner>/<name>.git` (a per-project container
      composing each reader's view). Canonical-id notes on rebuilt commits
      are not written yet.
-4. **Roles, priority, resources, use/drop.** Binding per slot; resources
-   brought by trackers; role dependencies.
+4. **Roles, priority, resources, use/drop.** *(Landed.)* An instance's
+   history holds every code tracker its user may read; binding is a sparse
+   checkout plus scope: `newgit tracker drop` hides a tracker's files and
+   takes its work out of the instance (refused with uncommitted work unless
+   `--stash` or `--discard`), `use` brings them back. `role`, `priority`
+   (negative: only when asked), `requires`, and `resources` decide what a
+   spawn binds (`--use`, `--drop`; personal defaults in
+   `~/.newgit/config.toml` override priority). `{{bound.trackers}}` and
+   `{{bound.paths}}`; `tracker list` as a tree. Resource `depends_on` naming a
+   role is not wired yet.
 5. **Coherent merges** locally and on the remote: `newgit merge` writes a
    branch's new list in one step — per tracker, the instance's commit when
    `main` has not moved, a real Git merge when both sides changed it —

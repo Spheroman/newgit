@@ -15,7 +15,7 @@ use newgit_core::source::{RefUpdate, find_repo_root};
 use newgit_core::store::Context;
 use newgit_core::supervisor::StopOutcome;
 use newgit_core::templates::{RESOURCE_TEMPLATES, resource_template, resource_template_names};
-use newgit_core::tracker::Storage;
+use newgit_core::tracker::{Storage, TrackerDefinition};
 use newgit_core::{MetadataStore, ProjectConfig};
 
 mod remote_cmd;
@@ -345,6 +345,13 @@ struct SpawnArgs {
     /// you may read, and resource state, with your own per-user tracker content
     #[arg(long, value_name = "INSTANCE/CHECKPOINT")]
     from_checkpoint: Option<String>,
+    /// Bind this tracker (repeatable): over its role's default, or one that
+    /// is only bound when asked for
+    #[arg(long = "use", value_name = "TRACKER")]
+    uses: Vec<String>,
+    /// Do not bind this tracker (repeatable)
+    #[arg(long = "drop", value_name = "TRACKER")]
+    drops: Vec<String>,
     /// Print what happened as JSON
     #[arg(long)]
     json: bool,
@@ -770,7 +777,14 @@ fn spawn(args: SpawnArgs) -> Result<()> {
     if let Some(spec) = &args.from_checkpoint {
         return spawn_from_checkpoint(&manager, &args.name, spec, args.json);
     }
-    let outcome = manager.spawn(&args.name, args.from.as_deref())?;
+    let outcome = manager.spawn_binding(
+        &args.name,
+        args.from.as_deref(),
+        &newgit_core::manager::BindingChoice {
+            uses: args.uses.clone(),
+            drops: args.drops.clone(),
+        },
+    )?;
     if args.json {
         println!(
             "{}",
@@ -1360,24 +1374,104 @@ fn tracker(command: TrackerCommand) -> Result<()> {
             Ok(())
         }
         TrackerCommand::List => {
-            let manager = manager_here()?;
+            let context = context_here()?;
+            let current = context.current_branch.clone();
+            let manager = BranchManager::open(context.store)?;
             warn_gitignore(&manager);
             warn_graph(&manager);
-            // Root first: it owns everything the others do not, so the list
-            // reads as "the rest of the project, then the parts carved out" —
-            // code trackers, then secret ones.
-            let definitions: Vec<_> = std::iter::once(manager.root_tracker())
+            let dropped = current
+                .as_deref()
+                .and_then(|name| manager.store().find_branch(name).ok())
+                .map(|branch| branch.dropped);
+            let definitions: Vec<&TrackerDefinition> = std::iter::once(manager.root_tracker())
                 .chain(manager.code_trackers())
                 .chain(manager.tracker_definitions())
                 .collect();
-            // Same reasoning as `resource list`: compute widths from every
-            // row plus the header, so a long AUDIENCE value can't push PATHS
-            // out of alignment.
-            let rows: Vec<_> = definitions
+            // A tree by ownership: each tracker under the tracker whose paths
+            // hold its own — root at the top, carved trackers and secret ones
+            // beneath whatever they were carved from.
+            let parent_of = |child: &TrackerDefinition| -> Option<String> {
+                if child.owns_everything() {
+                    return None;
+                }
+                let path = child.paths.first()?;
+                definitions
+                    .iter()
+                    .filter(|other| other.name != child.name)
+                    .filter_map(|other| {
+                        other
+                            .paths
+                            .iter()
+                            .filter(|owned| {
+                                owned.as_str() == "."
+                                    || (*owned != path && path.starts_with(owned.as_str()))
+                            })
+                            .map(|owned| {
+                                if owned.as_str() == "." {
+                                    0
+                                } else {
+                                    owned.as_str().len()
+                                }
+                            })
+                            .max()
+                            .map(|depth| (depth, other.name.clone()))
+                    })
+                    .max()
+                    .map(|(_, name)| name)
+                    .or_else(|| Some(manager.root_tracker().name.clone()))
+            };
+            let mut ordered: Vec<(usize, &TrackerDefinition)> = Vec::new();
+            fn walk<'a>(
+                name: &str,
+                depth: usize,
+                definitions: &[&'a TrackerDefinition],
+                parent_of: &dyn Fn(&TrackerDefinition) -> Option<String>,
+                out: &mut Vec<(usize, &'a TrackerDefinition)>,
+            ) {
+                let Some(definition) = definitions.iter().find(|d| d.name == name) else {
+                    return;
+                };
+                out.push((depth, definition));
+                let mut children: Vec<&&TrackerDefinition> = definitions
+                    .iter()
+                    .filter(|child| parent_of(child).as_deref() == Some(name))
+                    .collect();
+                children.sort_by_key(|child| (child.secret, child.name.clone()));
+                for child in children {
+                    walk(&child.name, depth + 1, definitions, parent_of, out);
+                }
+            }
+            walk(
+                &manager.root_tracker().name,
+                0,
+                &definitions,
+                &parent_of,
+                &mut ordered,
+            );
+            let rows: Vec<_> = ordered
                 .iter()
-                .map(|definition| {
+                .map(|(depth, definition)| {
+                    let mark = match &dropped {
+                        Some(dropped) if dropped.contains(&definition.name) => "- ",
+                        Some(_) => "* ",
+                        None => "",
+                    };
+                    let name = format!("{mark}{}{}", "  ".repeat(*depth), definition.name);
+                    let kind = if definition.secret { "secret" } else { "code" };
+                    let mut role = definition.role.clone().unwrap_or_else(|| "-".to_owned());
+                    if definition.priority != 0 {
+                        role.push_str(&format!(" ({})", definition.priority));
+                    }
+                    let audience = match &definition.maintainers {
+                        Some(maintainers) if maintainers != &definition.audience => {
+                            format!("{} (maintained by {maintainers})", definition.audience)
+                        }
+                        _ => definition.audience.clone(),
+                    };
                     let paths = if definition.owns_everything() {
                         "(everything no other tracker claims)".to_owned()
+                    } else if definition.paths.is_empty() {
+                        "-".to_owned()
                     } else {
                         definition
                             .paths
@@ -1387,29 +1481,32 @@ fn tracker(command: TrackerCommand) -> Result<()> {
                             .join(", ")
                     };
                     (
-                        definition.name.clone(),
-                        definition.merge_with_source.to_string(),
+                        name,
+                        kind.to_owned(),
+                        role,
                         format!("{:?}", definition.storage).to_lowercase(),
-                        definition.audience.clone(),
-                        if paths.is_empty() {
-                            "-".to_owned()
-                        } else {
-                            paths
-                        },
+                        audience,
+                        paths,
                     )
                 })
                 .collect();
             let name_width = column_width(rows.iter().map(|r| r.0.len()), "NAME");
-            let merge_width = column_width(rows.iter().map(|r| r.1.len()), "MERGE_WITH_SOURCE");
-            let storage_width = column_width(rows.iter().map(|r| r.2.len()), "STORAGE");
-            let audience_width = column_width(rows.iter().map(|r| r.3.len()), "AUDIENCE");
+            let kind_width = column_width(rows.iter().map(|r| r.1.len()), "KIND");
+            let role_width = column_width(rows.iter().map(|r| r.2.len()), "ROLE");
+            let storage_width = column_width(rows.iter().map(|r| r.3.len()), "STORAGE");
+            let audience_width = column_width(rows.iter().map(|r| r.4.len()), "AUDIENCE");
             println!(
-                "{:<name_width$} {:<merge_width$} {:<storage_width$} {:<audience_width$} PATHS",
-                "NAME", "MERGE_WITH_SOURCE", "STORAGE", "AUDIENCE"
+                "{:<name_width$} {:<kind_width$} {:<role_width$} {:<storage_width$} {:<audience_width$} PATHS",
+                "NAME", "KIND", "ROLE", "STORAGE", "AUDIENCE"
             );
-            for (name, merge_with_source, storage, audience, paths) in &rows {
+            for (name, kind, role, storage, audience, paths) in &rows {
                 println!(
-                    "{name:<name_width$} {merge_with_source:<merge_width$} {storage:<storage_width$} {audience:<audience_width$} {paths}"
+                    "{name:<name_width$} {kind:<kind_width$} {role:<role_width$} {storage:<storage_width$} {audience:<audience_width$} {paths}"
+                );
+            }
+            if let Some(current) = &current {
+                println!(
+                    "\n* = bound in `{current}`, - = dropped (`newgit tracker use|drop <tracker>`)"
                 );
             }
             Ok(())
@@ -1486,6 +1583,15 @@ fn tracker(command: TrackerCommand) -> Result<()> {
                 return Ok(());
             }
             println!("Bound `{tracker}` in `{instance}`");
+            for other in &change.replaced {
+                println!("  dropped `{other}`, which filled the same role");
+            }
+            for other in &change.brought {
+                println!("  bound `{other}` too: `{tracker}` requires it");
+            }
+            if !change.started.is_empty() {
+                println!("  started what it brings: {}", change.started.join(", "));
+            }
             if change.restored_stash {
                 println!("  its uncommitted work, stashed when it was dropped, is back");
             }
@@ -1513,6 +1619,9 @@ fn tracker(command: TrackerCommand) -> Result<()> {
                 return Ok(());
             }
             println!("Dropped `{tracker}` from `{instance}`");
+            if !change.stopped.is_empty() {
+                println!("  stopped what it brought: {}", change.stopped.join(", "));
+            }
             if change.stashed {
                 println!(
                     "  its uncommitted work is stashed; `newgit tracker use {tracker}` brings it back"

@@ -79,6 +79,10 @@ fn tracker(name: &str, paths: &[&str], excluded: &[&str], secret: bool) -> Track
         paths: paths.iter().map(Utf8PathBuf::from).collect(),
         secret,
         maintainers: None,
+        role: None,
+        priority: 0,
+        requires: Vec::new(),
+        resources: Vec::new(),
         excluded: excluded.iter().map(Utf8PathBuf::from).collect(),
         definition_rev: "sha256:000000000000".to_owned(),
     }
@@ -151,4 +155,71 @@ fn a_history_whose_dates_go_backwards_composes_into_itself() {
     )
     .expect("compose");
     assert_eq!(view.tip.as_deref(), Some(head.as_str()));
+}
+
+#[test]
+fn split_work_whose_dates_go_backwards_across_trackers_recomposes_into_itself() {
+    let (_guard, temp) = tempdir();
+    let repo = temp.join("repo");
+    std::fs::create_dir_all(&repo).expect("mkdir");
+    git(&repo, &["init", "-q", "-b", "main"]);
+    let base = commit(
+        &repo,
+        &[("README.md", "1\n"), ("apps/x/y", "1\n")],
+        "base",
+        "ana",
+        1_000,
+    );
+    // The work: first a change to apps/x, then a README change dated
+    // *earlier* — the second is in another tracker, so nothing but the
+    // recorded order keeps them straight.
+    commit(&repo, &[("apps/x/y", "2\n")], "x work", "ana", 3_000);
+    let tip = commit(&repo, &[("README.md", "2\n")], "readme work", "ana", 2_000);
+
+    let root = tracker("root", &["."], &["apps/x"], false);
+    let apps = tracker("apps", &["apps/x"], &[], false);
+    // Both trackers start from the base view commit.
+    let carved = compose::carve(&repo, &base, &apps, "refs/newgit/trackers/apps/main")
+        .expect("carve")
+        .expect("apps has history");
+    compose::compose(
+        &repo,
+        VIEW,
+        &[
+            TrackerTip {
+                definition: &root,
+                commit: base.clone(),
+            },
+            TrackerTip {
+                definition: &apps,
+                commit: carved,
+            },
+        ],
+        &[],
+    )
+    .expect("note the base");
+    let all = [root.clone(), apps.clone()];
+    let split = compose::split(&repo, &base, &tip, &[&root, &apps], &all).expect("split");
+
+    let view = compose::compose(
+        &repo,
+        VIEW,
+        &[
+            TrackerTip {
+                definition: &root,
+                commit: split.state["root"].clone(),
+            },
+            TrackerTip {
+                definition: &apps,
+                commit: split.state["apps"].clone(),
+            },
+        ],
+        &[],
+    )
+    .expect("recompose");
+    assert_eq!(
+        view.tip.as_deref(),
+        Some(tip.as_str()),
+        "the same commits, in their order"
+    );
 }

@@ -34,6 +34,20 @@ pub const CANONICAL_NOTES_REF: &str = "refs/notes/newgit-canonical";
 
 const SPLIT_TRAILER: &str = "Newgit-Split: ";
 
+/// The commit the split one followed in the view — so trackers' commits
+/// interleave back in the order they were made, not merely by date (dates
+/// tie, and rebased dates run backwards). It travels with the tracker
+/// commits, so a composer that has only them (the remote) orders them too.
+const PARENT_TRAILER: &str = "Newgit-Split-Parent: ";
+
+/// The trailers a split or carved commit carries.
+fn split_trailers(source: &str, parent: Option<&str>) -> String {
+    match parent {
+        Some(parent) => format!("\n\n{PARENT_TRAILER}{parent}\n{SPLIT_TRAILER}{source}\n"),
+        None => format!("\n\n{SPLIT_TRAILER}{source}\n"),
+    }
+}
+
 /// One tracker to compose, at the commit it is bound to.
 #[derive(Debug, Clone)]
 pub struct TrackerTip<'a> {
@@ -184,6 +198,19 @@ pub fn compose(
             event.id.clone(),
         )
     };
+    // Where a commit's place in the view is known — the commit it followed —
+    // that order holds over dates: a group waits while the group it followed
+    // still has pieces to come.
+    let source_parent = |event: &Event| -> Option<String> {
+        match &event.commit.split_source {
+            Some(_) => event.commit.split_parent.clone(),
+            None => event.first_parent.clone(),
+        }
+    };
+    let mut remaining: BTreeMap<String, usize> = BTreeMap::new();
+    for event in &events {
+        *remaining.entry(group_key(event)).or_default() += 1;
+    }
     let mut heads = vec![0usize; sequences.len()];
     let mut emitted = vec![false; events.len()];
     let mut ordered_groups: Vec<Vec<usize>> = Vec::new();
@@ -201,11 +228,24 @@ pub fn compose(
                 .iter()
                 .all(|&piece| emitted[piece] || fronts.contains(&piece))
         };
+        let waits = |front: usize| {
+            let source = group_key(&events[front]);
+            source_parent(&events[front]).is_some_and(|parent| {
+                parent != source && remaining.get(&parent).is_some_and(|left| *left > 0)
+            })
+        };
         let pick = fronts
             .iter()
             .copied()
-            .filter(|&front| ready(front))
-            .min_by_key(|&front| order_key(front));
+            .filter(|&front| ready(front) && !waits(front))
+            .min_by_key(|&front| order_key(front))
+            .or_else(|| {
+                fronts
+                    .iter()
+                    .copied()
+                    .filter(|&front| ready(front))
+                    .min_by_key(|&front| order_key(front))
+            });
         let members: Vec<usize> = match pick {
             Some(front) => pieces[&group_key(&events[front])]
                 .iter()
@@ -222,6 +262,9 @@ pub fn compose(
         };
         for &member in &members {
             emitted[member] = true;
+            if let Some(left) = remaining.get_mut(&group_key(&events[member])) {
+                *left -= 1;
+            }
             let sequence = sequences
                 .iter()
                 .zip(&heads)
@@ -747,9 +790,10 @@ pub fn carve(
     definition: &TrackerDefinition,
     target_ref: &str,
 ) -> Result<Option<String>> {
-    let ids = first_parent_history(repo, source)?;
-    let changes = diff_tree(repo, &ids)?;
-    let ids: Vec<String> = ids.into_iter().map(|(id, _)| id).collect();
+    let history = first_parent_history(repo, source)?;
+    let changes = diff_tree(repo, &history)?;
+    let parents: BTreeMap<String, Option<String>> = history.iter().cloned().collect();
+    let ids: Vec<String> = history.into_iter().map(|(id, _)| id).collect();
     let raw = read_commits(repo, &ids)?;
     let mut stream = Vec::new();
     let mut mark = 0usize;
@@ -771,8 +815,9 @@ pub fn carve(
         let message = match &commit.split_source {
             Some(_) => commit.message.clone(),
             None => format!(
-                "{}\n\n{SPLIT_TRAILER}{id}\n",
-                commit.message.trim_end_matches('\n')
+                "{}{}",
+                commit.message.trim_end_matches('\n'),
+                split_trailers(id, parents.get(id).cloned().flatten().as_deref())
             ),
         };
         mark += 1;
@@ -854,9 +899,10 @@ pub fn split(
             code.push(definition);
         }
     }
-    let ids = first_parent_history(repo, &format!("{base}..{tip}"))?;
-    let changes = diff_tree(repo, &ids)?;
-    let ids: Vec<String> = ids.into_iter().map(|(id, _)| id).collect();
+    let history = first_parent_history(repo, &format!("{base}..{tip}"))?;
+    let changes = diff_tree(repo, &history)?;
+    let parents: BTreeMap<String, Option<String>> = history.iter().cloned().collect();
+    let ids: Vec<String> = history.into_iter().map(|(id, _)| id).collect();
     let raw = read_commits(repo, &ids)?;
     let mut made = Vec::new();
     let mut notes = Vec::new();
@@ -879,8 +925,9 @@ pub fn split(
             }
         }
         let message = format!(
-            "{}\n\n{SPLIT_TRAILER}{id}\n",
-            commit.message.trim_end_matches('\n')
+            "{}{}",
+            commit.message.trim_end_matches('\n'),
+            split_trailers(id, parents.get(id).cloned().flatten().as_deref())
         );
         let identity = commit.identity_env();
         let sign = signs_for(repo, &commit.author);
@@ -1259,6 +1306,8 @@ struct RawCommit {
     message: String,
     /// The view commit this was split from, when it was.
     split_source: Option<String>,
+    /// The view commit that one followed, when the trailer says.
+    split_parent: Option<String>,
 }
 
 impl RawCommit {
@@ -1266,9 +1315,16 @@ impl RawCommit {
         match &self.split_source {
             None => self.message.clone(),
             Some(source) => {
-                let trailer = format!("\n\n{SPLIT_TRAILER}{source}");
                 let trimmed = self.message.trim_end_matches('\n');
-                let base = trimmed.strip_suffix(&trailer).unwrap_or(trimmed);
+                let mut base = trimmed
+                    .strip_suffix(&format!("{SPLIT_TRAILER}{source}"))
+                    .unwrap_or(trimmed);
+                if let Some(parent) = &self.split_parent {
+                    base = base
+                        .strip_suffix(&format!("{PARENT_TRAILER}{parent}\n"))
+                        .unwrap_or(base);
+                }
+                let base = base.strip_suffix("\n\n").unwrap_or(base);
                 format!("{base}\n")
             }
         }
@@ -1307,11 +1363,15 @@ fn parse_commit(raw: &str) -> RawCommit {
         .nth(1)
         .and_then(|seconds| seconds.parse().ok())
         .unwrap_or_default();
-    let split_source = message
-        .trim_end_matches('\n')
-        .rsplit('\n')
+    let mut lines = message.trim_end_matches('\n').rsplit('\n');
+    let split_source = lines
         .next()
         .and_then(|last| last.strip_prefix(SPLIT_TRAILER))
+        .map(ToOwned::to_owned);
+    let split_parent = split_source
+        .as_ref()
+        .and_then(|_| lines.next())
+        .and_then(|line| line.strip_prefix(PARENT_TRAILER))
         .map(ToOwned::to_owned);
     RawCommit {
         author,
@@ -1319,6 +1379,7 @@ fn parse_commit(raw: &str) -> RawCommit {
         committer_time,
         message: message.to_owned(),
         split_source,
+        split_parent,
     }
 }
 

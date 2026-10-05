@@ -79,7 +79,7 @@ pub enum NewgitError {
     },
 
     #[error(
-        "trackers `{left}` and `{right}` both own `{path}`; give one of them a more specific path"
+        "trackers `{left}` and `{right}` both own `{path}`; give one of them a more specific path, or give both the same `role` if they are alternatives"
     )]
     TrackerPathConflict {
         left: String,

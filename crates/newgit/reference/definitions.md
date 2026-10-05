@@ -61,6 +61,10 @@ and `track` refuse it.
 | `merge_with_source` | bool | no | `false` | whether a real source merge carries this tracker's bound state with it. |
 | `paths` | array of strings | no | `[]` | workspace-relative paths the lane owns. Must not be absolute, contain `..`, or start with `.git`; only `project` may own `.newgit`, and `.` must be a tracker's only path. May be empty for a tracker that only receives resource deposits (`into_tracker`). |
 | `secret` | bool | no | `true` | `false` makes a code tracker: committed with Git rather than captured. Written only when `false`. |
+| `role` | string | no | — | the slot it fills: trackers sharing a role are alternatives (`dev-db`, `staging-db`) and may claim the same paths; an instance binds one of them. |
+| `priority` | integer | no | `0` | which tracker of a role an instance binds by default (the highest), unless your own default says otherwise (`[projects.<project>.roles]` in `~/.newgit/config.toml`). Negative means only when asked for (`--use`), for a role-less tracker too. |
+| `requires` | array of strings | no | `[]` | trackers or roles it cannot do without: binding it binds them, and they cannot be dropped while it is bound. |
+| `resources` | array of strings | no | `[]` | resources it brings: they bind only while it is bound, start on `newgit tracker use`, and stop on `drop`. |
 | `maintainers` | string | no | its `audience` | who may merge changes to it on a remote: `owner` (the project's owner), `project-devs`, or `user:<login>`. Changing a tracker's definition is changing the tracker that owns its file in `.newgit/trackers/` — `access` unless a more specific code tracker claims it — so governance layers: an `admin` tracker claiming `.newgit/trackers/web.toml` decides who changes `web`'s paths, audience, and maintainers. |
 
 A secret tracker's paths stay out of Git: `newgit tracker track` adds them to

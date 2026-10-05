@@ -1365,7 +1365,19 @@ impl BranchManager {
     }
 
     pub fn spawn(&self, name: &str, from: Option<&str>) -> Result<SpawnOutcome> {
+        self.spawn_binding(name, from, &BindingChoice::default())
+    }
+
+    /// Spawn, binding what `choice` asks on top of the defaults (see
+    /// [`Self::choose_binding`]).
+    pub fn spawn_binding(
+        &self,
+        name: &str,
+        from: Option<&str>,
+        choice: &BindingChoice,
+    ) -> Result<SpawnOutcome> {
         self.require_resolvable_graph()?;
+        let dropped = self.choose_binding(choice)?;
         validate_name(name)?;
         if branch_slug(name) == PROJECT_ROOT_INSTANCE {
             return Err(NewgitError::Unsupported(format!(
@@ -1422,7 +1434,11 @@ impl BranchManager {
             branch = branch.with_base(base_ref, base_rev);
         }
 
+        branch.dropped = dropped;
         RealDirMaterializer.materialize(&self.source, &branch)?;
+        if !branch.dropped.is_empty() {
+            self.apply_sparse(&branch)?;
+        }
 
         // Before any lane content lands, make the clone's Git ignore the
         // paths trackers own and the trees resources build — otherwise both
@@ -1433,6 +1449,9 @@ impl BranchManager {
 
         let mut tracker_outcomes = Vec::new();
         for definition in &self.trackers {
+            if branch.dropped.contains(&definition.name) {
+                continue;
+            }
             let outcome = self.bind_tracker(&mut branch, definition, false)?;
             tracker_outcomes.push(outcome);
         }
@@ -1740,6 +1759,12 @@ impl BranchManager {
         let mut outcomes = Vec::new();
 
         for name in &self.graph.bind_order {
+            // A resource a tracker brings binds only while that tracker does;
+            // one bound already (a `tracker use` adding to a live instance)
+            // is left as it is.
+            if !self.resource_active(branch, name) || branch.resources.contains_key(name) {
+                continue;
+            }
             let definition = self.resource_definition(name)?;
 
             let mut resolved_ports = BTreeMap::new();
@@ -2243,6 +2268,7 @@ impl BranchManager {
                 });
             };
 
+            let bound = self.bound_vars(branch);
             let context = RenderContext {
                 branch_name: &branch.name,
                 branch_slug: &branch.slug,
@@ -2250,6 +2276,7 @@ impl BranchManager {
                 scripts: self.scripts_dir(),
                 ports: Some(&context_ports),
                 exports: Some(&context_exports),
+                bound: Some(&bound),
                 ..RenderContext::default()
             };
             let (contents, applied) = render::apply(&definition.name, spec, &committed, &context)?;
@@ -2358,6 +2385,7 @@ impl BranchManager {
                     .iter()
                     .map(|(key, value)| (key.clone(), value.clone())),
             );
+            let bound = self.bound_vars(branch);
             let context = RenderContext {
                 branch_name: &branch.name,
                 branch_slug: &branch.slug,
@@ -2365,6 +2393,7 @@ impl BranchManager {
                 scripts: self.scripts_dir(),
                 ports: Some(resolved_ports),
                 exports: Some(&visible),
+                bound: Some(&bound),
                 ..RenderContext::default()
             };
 
@@ -2395,6 +2424,7 @@ impl BranchManager {
                 .iter()
                 .map(|(key, value)| (key.clone(), value.clone())),
         );
+        let bound = self.bound_vars(branch);
         let context = RenderContext {
             branch_name: &branch.name,
             branch_slug: &branch.slug,
@@ -2402,6 +2432,7 @@ impl BranchManager {
             scripts: self.scripts_dir(),
             ports: Some(resolved_ports),
             exports: Some(&visible),
+            bound: Some(&bound),
             ..RenderContext::default()
         };
         let unresolved = pending
@@ -2754,6 +2785,7 @@ impl BranchManager {
                 definition.name
             ))
         })?;
+        let bound = self.bound_vars(branch);
         let context = RenderContext {
             branch_name: &branch.name,
             branch_slug: &branch.slug,
@@ -2763,6 +2795,7 @@ impl BranchManager {
                 .resources
                 .get(&definition.name)
                 .map(|binding| &binding.resolved_ports),
+            bound: Some(&bound),
             ..RenderContext::default()
         };
         Ok(render(&command, &context))
@@ -3086,6 +3119,189 @@ impl BranchManager {
         })
     }
 
+    /// `{{bound.trackers}}` and `{{bound.paths}}` for `branch`.
+    fn bound_vars(&self, branch: &BranchInstance) -> crate::exports::Bound {
+        let bound: Vec<&TrackerDefinition> = self
+            .selectable()
+            .into_iter()
+            .filter(|definition| !branch.dropped.contains(&definition.name))
+            .collect();
+        crate::exports::Bound {
+            trackers: bound
+                .iter()
+                .map(|definition| definition.name.as_str())
+                .collect::<Vec<_>>()
+                .join(" "),
+            paths: bound
+                .iter()
+                .filter(|definition| !definition.secret)
+                .flat_map(|definition| definition.paths.iter().map(|path| path.as_str()))
+                .collect::<Vec<_>>()
+                .join(" "),
+        }
+    }
+
+    /// Trackers an instance may bind or drop: every code and secret tracker
+    /// but `root`, `project`, and `access`, which are always bound.
+    fn selectable(&self) -> Vec<&TrackerDefinition> {
+        self.code
+            .iter()
+            .filter(|definition| {
+                definition.name != crate::tracker::PROJECT_TRACKER
+                    && definition.name != crate::tracker::ACCESS_TRACKER
+            })
+            .chain(self.trackers.iter())
+            .collect()
+    }
+
+    /// What a new instance binds — returned as what it drops. One tracker per
+    /// role: the one `choice` names, else this person's own default for the
+    /// role (`~/.newgit/config.toml`), else the highest `priority` (negative
+    /// means only when asked). A role-less tracker is bound unless its
+    /// priority is negative or `choice` drops it. Then everything a bound
+    /// tracker `requires` is bound too.
+    pub fn choose_binding(&self, choice: &BindingChoice) -> Result<BTreeSet<String>> {
+        let selectable = self.selectable();
+        let known = |name: &String| selectable.iter().any(|definition| &definition.name == name);
+        for name in choice.uses.iter().chain(&choice.drops) {
+            if !known(name) {
+                return Err(NewgitError::UnknownTracker(name.clone()));
+            }
+        }
+        if let Some(both) = choice.uses.iter().find(|name| choice.drops.contains(name)) {
+            return Err(NewgitError::Unsupported(format!(
+                "`{both}` is both used and dropped"
+            )));
+        }
+        let defaults = crate::config::personal_role_defaults(&self.config.project.name);
+        let mut bound: BTreeSet<String> = BTreeSet::new();
+        let mut roles: BTreeMap<&str, Vec<&TrackerDefinition>> = BTreeMap::new();
+        for definition in &selectable {
+            match &definition.role {
+                Some(role) => roles.entry(role.as_str()).or_default().push(definition),
+                None => {
+                    let wanted = choice.uses.contains(&definition.name)
+                        || (definition.priority >= 0 && !choice.drops.contains(&definition.name));
+                    if wanted {
+                        bound.insert(definition.name.clone());
+                    }
+                }
+            }
+        }
+        for (role, members) in &roles {
+            if let Some(chosen) = self.fill_role(role, members, choice, &defaults)? {
+                bound.insert(chosen);
+            }
+        }
+        // What they require, transitively.
+        let mut queue: Vec<String> = bound.iter().cloned().collect();
+        while let Some(name) = queue.pop() {
+            let Some(definition) = selectable.iter().find(|definition| definition.name == name)
+            else {
+                continue;
+            };
+            for needed in &definition.requires {
+                let target = if known(needed) {
+                    if choice.drops.contains(needed) {
+                        return Err(NewgitError::Unsupported(format!(
+                            "`{name}` requires `{needed}`, so it cannot be dropped"
+                        )));
+                    }
+                    Some(needed.clone())
+                } else if let Some(members) = roles.get(needed.as_str()) {
+                    if members.iter().any(|member| bound.contains(&member.name)) {
+                        None
+                    } else {
+                        Some(self.fill_role(needed, members, choice, &defaults)?.ok_or_else(|| {
+                            NewgitError::Unsupported(format!(
+                                "`{name}` requires a `{needed}`, and none is chosen by default: \
+                                 `--use` one of {}",
+                                members
+                                    .iter()
+                                    .map(|member| format!("`{}`", member.name))
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
+                            ))
+                        })?)
+                    }
+                } else {
+                    return Err(NewgitError::Unsupported(format!(
+                        "`{name}` requires `{needed}`, which is neither a tracker nor a role"
+                    )));
+                };
+                if let Some(target) = target
+                    && bound.insert(target.clone())
+                {
+                    queue.push(target);
+                }
+            }
+        }
+        Ok(selectable
+            .iter()
+            .filter(|definition| !bound.contains(&definition.name))
+            .map(|definition| definition.name.clone())
+            .collect())
+    }
+
+    /// The tracker a role gets: the one asked for, else this person's
+    /// default, else the highest priority that is not negative.
+    fn fill_role(
+        &self,
+        role: &str,
+        members: &[&TrackerDefinition],
+        choice: &BindingChoice,
+        defaults: &BTreeMap<String, String>,
+    ) -> Result<Option<String>> {
+        let asked: Vec<&&TrackerDefinition> = members
+            .iter()
+            .filter(|member| choice.uses.contains(&member.name))
+            .collect();
+        if asked.len() > 1 {
+            return Err(NewgitError::Unsupported(format!(
+                "{} all fill the role `{role}`; use one",
+                asked
+                    .iter()
+                    .map(|member| format!("`{}`", member.name))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )));
+        }
+        if let Some(asked) = asked.first() {
+            return Ok(Some(asked.name.clone()));
+        }
+        if let Some(default) = defaults.get(role)
+            && members.iter().any(|member| &member.name == default)
+            && !choice.drops.contains(default)
+        {
+            return Ok(Some(default.clone()));
+        }
+        let mut candidates: Vec<&&TrackerDefinition> = members
+            .iter()
+            .filter(|member| member.priority >= 0 && !choice.drops.contains(&member.name))
+            .collect();
+        candidates.sort_by(|left, right| {
+            right
+                .priority
+                .cmp(&left.priority)
+                .then_with(|| left.name.cmp(&right.name))
+        });
+        Ok(candidates.first().map(|member| member.name.clone()))
+    }
+
+    /// Whether `resource` binds in `branch`: not brought by any tracker, or
+    /// brought by one the instance binds.
+    fn resource_active(&self, branch: &BranchInstance, resource: &str) -> bool {
+        let bringers: Vec<&TrackerDefinition> = self
+            .selectable()
+            .into_iter()
+            .filter(|definition| definition.resources.iter().any(|name| name == resource))
+            .collect();
+        bringers.is_empty()
+            || bringers
+                .iter()
+                .any(|definition| !branch.dropped.contains(&definition.name))
+    }
+
     /// Stop binding `tracker` in `instance` (`newgit tracker drop`). A code
     /// tracker leaves the working tree (sparse checkout) but not the history;
     /// uncommitted work in it refuses the drop unless `uncommitted` says to
@@ -3123,6 +3339,34 @@ impl BranchManager {
         if branch.dropped.contains(tracker) {
             change.already = true;
             return Ok(change);
+        }
+        // Nothing bound may be left without what it requires.
+        let role = self
+            .selectable()
+            .into_iter()
+            .find(|definition| definition.name == tracker)
+            .and_then(|definition| definition.role.clone());
+        let others_in_role = |role: &str| {
+            self.selectable().into_iter().any(|definition| {
+                definition.name != tracker
+                    && definition.role.as_deref() == Some(role)
+                    && !branch.dropped.contains(&definition.name)
+            })
+        };
+        for definition in self.selectable() {
+            if branch.dropped.contains(&definition.name) || definition.name == tracker {
+                continue;
+            }
+            let needs = definition.requires.iter().any(|needed| {
+                needed == tracker
+                    || (role.as_deref() == Some(needed.as_str()) && !others_in_role(needed))
+            });
+            if needs {
+                return Err(NewgitError::Unsupported(format!(
+                    "`{}` requires `{tracker}`, so it cannot be dropped while `{}` is bound",
+                    definition.name, definition.name
+                )));
+            }
         }
         let workspace = branch.workspace_path.clone();
         if let Some(definition) = self
@@ -3194,6 +3438,22 @@ impl BranchManager {
             crate::tracker_repo::clear_owned_paths(&workspace, &definition)?;
             branch.dropped.insert(tracker.to_owned());
         }
+        // The resources it brought stop with it (stopped, not cleaned up:
+        // using it again starts them on what they left).
+        let supervisor = self.supervisor(&branch);
+        let gone: Vec<String> = branch
+            .resources
+            .keys()
+            .filter(|name| !self.resource_active(&branch, name))
+            .cloned()
+            .collect();
+        for name in gone {
+            if supervisor.running_pid(&name).is_some() {
+                let _ = supervisor.stop(&name, "term");
+            }
+            branch.resources.remove(&name);
+            change.stopped.push(name);
+        }
         branch.updated_at = Utc::now();
         self.store.save_branch_record(&branch)?;
         Ok(change)
@@ -3215,10 +3475,38 @@ impl BranchManager {
         } else {
             self.definition(tracker)?.clone()
         };
-        if !branch.dropped.remove(tracker) {
+        if !branch.dropped.contains(tracker) {
             change.already = true;
             return Ok(change);
         }
+        // One tracker per role: another bound in it makes way.
+        if let Some(role) = definition.role.clone() {
+            let swapped: Vec<String> = self
+                .selectable()
+                .into_iter()
+                .filter(|other| {
+                    other.name != tracker
+                        && other.role.as_deref() == Some(role.as_str())
+                        && !branch.dropped.contains(&other.name)
+                })
+                .map(|other| other.name.clone())
+                .collect();
+            // The incoming tracker counts as bound while the others go, so a
+            // tracker that requires this role is not left without it.
+            branch.dropped.remove(tracker);
+            self.store.save_branch_record(&branch)?;
+            for other in swapped {
+                if let Err(error) = self.drop_tracker(instance, &other, Uncommitted::Refuse) {
+                    let mut branch = self.store.find_branch(instance)?;
+                    branch.dropped.insert(tracker.to_owned());
+                    self.store.save_branch_record(&branch)?;
+                    return Err(error);
+                }
+                change.replaced.push(other);
+            }
+            branch = self.store.find_branch(instance)?;
+        }
+        branch.dropped.remove(tracker);
         let workspace = branch.workspace_path.clone();
         if !definition.secret {
             self.apply_sparse(&branch)?;
@@ -3253,6 +3541,37 @@ impl BranchManager {
         }
         branch.updated_at = Utc::now();
         self.store.save_branch_record(&branch)?;
+
+        // What it requires comes with it.
+        for needed in &definition.requires {
+            let branch = self.store.find_branch(instance)?;
+            let selectable = self.selectable();
+            let target = if selectable.iter().any(|d| &d.name == needed) {
+                Some(needed.clone())
+            } else {
+                let members: Vec<&TrackerDefinition> = selectable
+                    .into_iter()
+                    .filter(|d| d.role.as_deref() == Some(needed.as_str()))
+                    .collect();
+                if members.iter().any(|m| !branch.dropped.contains(&m.name)) {
+                    None
+                } else {
+                    let defaults = crate::config::personal_role_defaults(&self.config.project.name);
+                    self.fill_role(needed, &members, &BindingChoice::default(), &defaults)?
+                }
+            };
+            if let Some(target) = target
+                && branch.dropped.contains(&target)
+            {
+                self.use_tracker(instance, &target)?;
+                change.brought.push(target);
+            }
+        }
+        // And the resources it brings start.
+        let mut branch = self.store.find_branch(instance)?;
+        let outcomes = self.bind_resources(&mut branch)?;
+        self.store.save_branch_record(&branch)?;
+        change.started = outcomes.into_iter().map(|outcome| outcome.name).collect();
         Ok(change)
     }
 
@@ -3941,6 +4260,7 @@ impl BranchManager {
 
             let binding = branch.resources.get(name);
             let state_ref = self.checkpointed_state_ref(branch, name)?;
+            let bound = self.bound_vars(branch);
             let context = RenderContext {
                 branch_name: &branch.name,
                 branch_slug: &branch.slug,
@@ -3950,6 +4270,7 @@ impl BranchManager {
                 exports: binding.map(|binding| &binding.resolved_exports),
                 snapshot_path: None,
                 state_ref: state_ref.as_deref(),
+                bound: Some(&bound),
             };
             let command = render(template, &context);
 
@@ -5587,6 +5908,7 @@ impl BranchManager {
                     })
                     .transpose()?;
 
+                let bound = self.bound_vars(branch);
                 let context = RenderContext {
                     branch_name: &branch.name,
                     branch_slug: &branch.slug,
@@ -5596,6 +5918,7 @@ impl BranchManager {
                     exports: binding.map(|binding| &binding.resolved_exports),
                     snapshot_path: staging_path.as_deref().map(Utf8Path::as_str),
                     state_ref: None,
+                    bound: Some(&bound),
                 };
                 let command = render(template, &context);
                 let log = self
@@ -5659,6 +5982,7 @@ impl BranchManager {
             }
             CheckpointMode::External => {
                 let template = spec.state_ref.as_deref().expect("validated at parse time");
+                let bound = self.bound_vars(branch);
                 let context = RenderContext {
                     branch_name: &branch.name,
                     branch_slug: &branch.slug,
@@ -5666,6 +5990,7 @@ impl BranchManager {
                     scripts: self.scripts_dir(),
                     ports: binding.map(|binding| &binding.resolved_ports),
                     exports: binding.map(|binding| &binding.resolved_exports),
+                    bound: Some(&bound),
                     ..RenderContext::default()
                 };
                 Ok(CapturedResource {
@@ -6109,6 +6434,7 @@ impl BranchManager {
                 let template = spec.command.as_deref().expect("validated at parse time");
                 let binding = branch.resources.get(&definition.name);
                 let state_ref = self.consumable_state_ref(state)?;
+                let bound = self.bound_vars(branch);
                 let context = RenderContext {
                     branch_name: &branch.name,
                     branch_slug: &branch.slug,
@@ -6118,6 +6444,7 @@ impl BranchManager {
                     exports: binding.map(|binding| &binding.resolved_exports),
                     snapshot_path: None,
                     state_ref: state_ref.as_deref(),
+                    bound: Some(&bound),
                 };
                 let command = render(template, &context);
                 let log = self
@@ -6467,6 +6794,14 @@ pub struct MergeOutcome {
     pub project_root: Option<String>,
 }
 
+/// What a person asks a spawn to bind beyond the defaults: `--use` and
+/// `--drop`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BindingChoice {
+    pub uses: Vec<String>,
+    pub drops: Vec<String>,
+}
+
 /// What to do with uncommitted work in a code tracker being dropped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Uncommitted {
@@ -6494,6 +6829,14 @@ pub struct BindingChange {
     pub captured: Option<String>,
     /// Files a secret tracker's use projected back.
     pub files: usize,
+    /// Trackers in the same role a use dropped to make way.
+    pub replaced: Vec<String>,
+    /// Trackers a use bound because it requires them.
+    pub brought: Vec<String>,
+    /// Resources a use started.
+    pub started: Vec<String>,
+    /// Resources a drop stopped.
+    pub stopped: Vec<String>,
 }
 
 fn stash_message(tracker: &str) -> String {

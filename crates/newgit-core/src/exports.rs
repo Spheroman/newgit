@@ -21,6 +21,19 @@ pub struct RenderContext<'a> {
     pub exports: Option<&'a BTreeMap<String, String>>,
     pub snapshot_path: Option<&'a str>,
     pub state_ref: Option<&'a str>,
+    /// What the instance binds, for `{{bound.trackers}}` and
+    /// `{{bound.paths}}`: an install that builds only the bound members of a
+    /// workspace.
+    pub bound: Option<&'a Bound>,
+}
+
+/// The trackers an instance binds, and the paths of the code trackers among
+/// them (`root`, `project`, and `access` aside, since they are always there),
+/// each space-separated.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Bound {
+    pub trackers: String,
+    pub paths: String,
 }
 
 /// The placeholder a checkpointed state reference renders into. Named because
@@ -33,6 +46,11 @@ pub fn render(template: &str, context: &RenderContext) -> String {
         .replace("{{branch.slug}}", context.branch_slug)
         .replace("{{workspace}}", context.workspace)
         .replace("{{scripts}}", context.scripts);
+    if let Some(bound) = context.bound {
+        rendered = rendered
+            .replace("{{bound.trackers}}", &bound.trackers)
+            .replace("{{bound.paths}}", &bound.paths);
+    }
     for (name, port) in context.ports.into_iter().flatten() {
         rendered = rendered.replace(&format!("{{{{ports.{name}}}}}"), &port.to_string());
     }

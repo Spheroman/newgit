@@ -27,6 +27,18 @@ pub struct TrackerDefinition {
     /// *definition* is changing whichever tracker owns its file, so layers of
     /// governance are trackers owning other trackers' definitions.
     pub maintainers: Option<String>,
+    /// The slot it fills: trackers sharing a role are alternatives (`dev-db`,
+    /// `staging-db`), and an instance binds one of them.
+    pub role: Option<String>,
+    /// Which tracker an instance binds by default: the highest in its role,
+    /// unless a person's own default says otherwise. Negative means only when
+    /// asked for (`--use`), for a role-less tracker too.
+    pub priority: i32,
+    /// Trackers or roles it cannot do without: binding it binds them, and
+    /// they cannot be dropped while it is bound.
+    pub requires: Vec<String>,
+    /// Resources it brings: they bind only while it is bound.
+    pub resources: Vec<String>,
     /// Paths inside this tracker's own that a more specific tracker owns, so
     /// they are not this tracker's to capture, restore, or clear. Computed
     /// from the full set of definitions ([`resolve_ownership`]); not part of
@@ -68,6 +80,18 @@ pub struct TrackerDefinitionFile {
     secret: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     maintainers: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    role: Option<String>,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    priority: i32,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    requires: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    resources: Vec<String>,
+}
+
+fn is_zero(value: &i32) -> bool {
+    *value == 0
 }
 
 fn secret_by_default() -> bool {
@@ -94,6 +118,10 @@ impl TrackerDefinition {
             paths,
             secret: true,
             maintainers: None,
+            role: None,
+            priority: 0,
+            requires: Vec::new(),
+            resources: Vec::new(),
             excluded: Vec::new(),
             definition_rev: String::new(),
         };
@@ -125,6 +153,10 @@ impl TrackerDefinition {
             paths: file.paths,
             secret: file.secret,
             maintainers: file.maintainers,
+            role: file.role,
+            priority: file.priority,
+            requires: file.requires,
+            resources: file.resources,
             excluded: Vec::new(),
             definition_rev: format!("sha256:{hex}"),
         };
@@ -206,6 +238,10 @@ impl TrackerDefinition {
             paths: self.paths.clone(),
             secret: self.secret,
             maintainers: self.maintainers.clone(),
+            role: self.role.clone(),
+            priority: self.priority,
+            requires: self.requires.clone(),
+            resources: self.resources.clone(),
         }
     }
 
@@ -221,6 +257,10 @@ impl TrackerDefinition {
             paths: vec![Utf8PathBuf::from(".")],
             secret: false,
             maintainers: None,
+            role: None,
+            priority: 0,
+            requires: Vec::new(),
+            resources: Vec::new(),
             excluded: Vec::new(),
             definition_rev: String::new(),
         };
@@ -242,6 +282,10 @@ impl TrackerDefinition {
             paths: vec![Utf8PathBuf::from(".newgit/trackers")],
             secret: false,
             maintainers: Some("owner".to_owned()),
+            role: None,
+            priority: 0,
+            requires: Vec::new(),
+            resources: Vec::new(),
             excluded: Vec::new(),
             definition_rev: String::new(),
         };
@@ -263,6 +307,10 @@ impl TrackerDefinition {
             paths: vec![Utf8PathBuf::from(".newgit")],
             secret: false,
             maintainers: None,
+            role: None,
+            priority: 0,
+            requires: Vec::new(),
+            resources: Vec::new(),
             excluded: Vec::new(),
             definition_rev: String::new(),
         };
@@ -336,6 +384,11 @@ pub fn resolve_ownership(definitions: &mut [TrackerDefinition]) -> Result<()> {
     }
     for (index, left) in definitions.iter().enumerate() {
         for right in &definitions[index + 1..] {
+            // Trackers sharing a role are alternatives — an instance binds
+            // one of them — so they may claim the very same paths.
+            if left.role.is_some() && left.role == right.role {
+                continue;
+            }
             for path in &left.paths {
                 if right.paths.contains(path) {
                     return Err(NewgitError::TrackerPathConflict {
@@ -478,6 +531,10 @@ mod tests {
             paths: paths.iter().map(Utf8PathBuf::from).collect(),
             secret: true,
             maintainers: None,
+            role: None,
+            priority: 0,
+            requires: Vec::new(),
+            resources: Vec::new(),
             excluded: Vec::new(),
             definition_rev: "sha256:000000000000".to_owned(),
         }

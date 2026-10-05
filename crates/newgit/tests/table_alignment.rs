@@ -155,7 +155,7 @@ fn resource_list_columns_stay_aligned_when_a_profile_is_long() {
 
     let short_row = lines
         .iter()
-        .find(|line| line.starts_with("a-short"))
+        .find(|line| line.trim_start().starts_with("a-short"))
         .expect("a-short row present");
     let long_row = lines
         .iter()
@@ -215,11 +215,11 @@ fn tracker_list_columns_stay_aligned_when_an_audience_is_long() {
 
     let short_row = lines
         .iter()
-        .find(|line| line.starts_with("a-short"))
+        .find(|line| line.trim_start().starts_with("a-short"))
         .expect("a-short row present");
     let long_row = lines
         .iter()
-        .find(|line| line.starts_with("z-long"))
+        .find(|line| line.trim_start().starts_with("z-long"))
         .expect("z-long row present");
 
     assert_eq!(
