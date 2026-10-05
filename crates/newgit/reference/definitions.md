@@ -26,7 +26,8 @@ whether a lane travels with a merge — both by defaulting, silently.
   trackers/<name>.toml   tracker definitions       committed
   resources/<name>.toml  resource definitions      committed
   scripts/<name>         scripts hooks call        committed
-  branches/ snapshots/ checkpoints/ logs/ state/ local/   local, gitignored
+  branches/ checkpoints/ logs/ state/ local/   local, gitignored
+  local/trackers.git     every tracker's history   local, gitignored
   installs/              built trees, shared       local, gitignored
 ```
 
@@ -34,28 +35,42 @@ whether a lane travels with a merge — both by defaulting, silently.
 
 ## Tracker — `.newgit/trackers/<name>.toml`
 
-A named, versioned lane of file content. Create with `newgit tracker create`;
-hand-edit afterwards.
+A named, versioned history of file content. Create with `newgit tracker
+create`; hand-edit afterwards.
+
+Two trackers always exist: `root` owns `.` — every path no more specific
+tracker claims — and its history starts as the project's Git history;
+`project` owns `.newgit`. Ownership nests: the most specific claim wins, so
+`root` owning `.` and `runtime-env` owning `.env.local` do not conflict. Two
+trackers claiming the identical path is an error.
+
+A tracker is *secret* (the default) or *code*. Secret content is captured
+into the tracker's history and never committed to Git. Code content
+(`secret = false`) is ordinary committed source with its own history — `root`,
+`project`, and anything made with `newgit tracker create <name> --code --path
+<path>`, which carves those paths, history included, out of whichever tracker
+owned them. You commit to a code tracker with Git; `newgit tracker capture`
+and `track` refuse it.
 
 | key | type | required | default | meaning |
 | --- | --- | --- | --- | --- |
 | `audience` | string | yes | — | who may read the lane. `public`, `project-devs`, `user`, or `user:<name>`. Only `public` ships in an `export` without an explicit `--include`. |
-| `storage` | string | yes | — | `local` or `remote` — where synced state lives. v1 implements `local`. |
+| `storage` | string | yes | — | `local` or `remote` — where synced state lives. `remote` needs a `[remote]` in `config.toml`; checkpoint sync then pushes the tracker there. |
 | `merge_with_source` | bool | no | `false` | whether a real source merge carries this tracker's bound state with it. |
-| `paths` | array of strings | no | `[]` | workspace-relative paths the lane owns. Must not be absolute, contain `..`, or start with `.git`/`.newgit`. May be empty for a lane that only receives resource deposits (`into_tracker`). |
+| `paths` | array of strings | no | `[]` | workspace-relative paths the lane owns. Must not be absolute, contain `..`, or start with `.git`; only `project` may own `.newgit`, and `.` must be a tracker's only path. May be empty for a tracker that only receives resource deposits (`into_tracker`). |
+| `secret` | bool | no | `true` | `false` makes a code tracker: committed with Git rather than captured. Written only when `false`. |
 
-A tracker owns its paths outright: `newgit tracker track` adds them to the
-store's `.gitignore`, and each workspace's Git is told to ignore them too, so
-lane content never lands in source history.
+A secret tracker's paths stay out of Git: `newgit tracker track` adds them to
+the store's `.gitignore`, and each workspace's Git is told to ignore them too,
+so their content never lands in source history.
 
 `newgit tracker remove <name>` deletes the definition and reverses both of
 those: the `.gitignore` block and each live workspace's ignore entries. It
 refuses while any live instance still has the tracker bound (`newgit remove
-<instance>` first) and refuses outright for `source`, the default tracker,
-which Git/jj owns and has no definition file. Captured content under
-`.newgit/snapshots/<name>/` is left in place — it becomes unreferenced, and
-`newgit cleanup` reclaims it once nothing else (a checkpoint that captured
-it) still pins a rev.
+<instance>` first) and refuses outright for `root` and the code trackers, whose
+histories are Git's. Captured history in `.newgit/local/trackers.git` is left
+in place — it becomes unreferenced, and `newgit cleanup` reclaims it once
+nothing else (a checkpoint that captured it) still pins a rev.
 
 ---
 

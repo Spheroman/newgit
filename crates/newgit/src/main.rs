@@ -207,10 +207,10 @@ enum Command {
 
 #[derive(Debug, Subcommand)]
 enum TrackerCommand {
-    /// Create an empty Git-like content lane
+    /// Create a tracker: secret (captured, never committed) unless --code
     Create {
         name: String,
-        /// Who may read this lane's content
+        /// Who may read this tracker's content
         #[arg(long, default_value = "project-devs")]
         audience: String,
         /// Carry this tracker when source changes are merged
@@ -227,7 +227,7 @@ enum TrackerCommand {
         #[arg(long = "path", value_name = "PATH")]
         path: Vec<Utf8PathBuf>,
     },
-    /// Add workspace paths to a tracker lane
+    /// Add workspace paths to a secret tracker
     Track {
         tracker: String,
         paths: Vec<Utf8PathBuf>,
@@ -283,8 +283,8 @@ struct SpawnArgs {
     #[arg(long, conflicts_with = "from_checkpoint")]
     from: Option<String>,
     /// Spawn a checkpoint from the project's remote, `<instance>/<checkpoint>`
-    /// (as `newgit checkpoints --remote` lists them): source, trackers you
-    /// may read, and resource state, with your own per-user tracker content
+    /// (the id `newgit checkpoints` shows where it was made): source, trackers
+    /// you may read, and resource state, with your own per-user tracker content
     #[arg(long, value_name = "INSTANCE/CHECKPOINT")]
     from_checkpoint: Option<String>,
     /// Print what happened as JSON

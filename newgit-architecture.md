@@ -73,6 +73,8 @@ A tracker is a named, versioned lane of file content — a partition over the si
 
 `source` is simply the default tracker: audience = everyone, mechanism = the vendored `jj` engine. The `jj` engine covers exactly **one** tracker (source); every other tracker's source-merge behavior is policy you define in the binding layer.
 
+> **Superseded (2026-10):** `newgit-trackers.md` replaces the single `source` tracker. Every tracker is its own Git history; `root` owns whatever no other tracker claims, code trackers are committed, and a workspace's Git history is composed from the bound code trackers.
+
 ### Resources
 
 A resource is a lifecycle unit bound to a branch instance. It has no history and never syncs; it consumes tracker content and exports runtime values (ports, URLs, env vars). Resources exist for exactly three irreducible reasons:

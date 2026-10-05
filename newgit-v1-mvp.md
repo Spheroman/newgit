@@ -34,7 +34,7 @@ The dividing line:
 
 ### Trackers
 
-There is no fixed set of trackers and no limit on how many a project defines. `source` is just the default tracker. A user should be able to create a tracker called `jack-env`, set its audience to a single user, and (in a later version) push it to a remote and pull it from another authenticated machine.
+There is no fixed set of trackers and no limit on how many a project defines. `root` holds whatever no other tracker claims, and its history is the project's Git history (see *Root, Project, and Code Trackers* below). A user should be able to create a tracker called `jack-env`, set its audience to a single user, and (in a later version) push it to a remote and pull it from another authenticated machine.
 
 Every tracker carries three settings:
 
@@ -278,6 +278,7 @@ TrackerDefinition {
   storage       # local | remote (v1: local only)
   merge_with_source # true | false
   paths         # workspace paths this tracker owns
+  secret        # true (default): content stays out of Git | false: a code tracker
 }
 ```
 
@@ -316,12 +317,12 @@ a path does not invent content for it.
 Non-source tracker paths live inside a Git clone, so an agent could `git add`
 them into source history. The rule:
 
-> **A path owned by a non-source tracker must be ignored by Git**, unless the
-> path is deliberately followed by two trackers.
+> **A path owned by a secret tracker must be ignored by Git.**
 
-`newgit tracker track` checks this and appends to `.gitignore`, loudly. The
-config loader validates the invariant — content lanes must be disjoint, so no
-two trackers fight over the same path at projection/restore time.
+`newgit tracker track` checks this and appends to `.gitignore`, loudly.
+Ownership nests: the most specific claim wins, so `root` owns `.` while
+`runtime-env` owns `.env.local`. Two trackers claiming the identical path is a
+config error, refused at load.
 
 The `.gitignore` append is not sufficient on its own: it is an *uncommitted*
 edit in the store worktree, so a workspace clone does not inherit the rule
@@ -343,13 +344,22 @@ concrete. It is not enforcement against a hostile agent force-adding a file;
 v1 does not claim that, and a v2 `git commit` shim is the natural place to
 catch it.
 
-**Open decision (M2):** dual-tracked paths need a defined precedence — whose
-content wins at materialize time, and which capture is authoritative at
-checkpoint.
+### Root, Project, and Code Trackers
 
-### Source Is the Default Tracker
+v1 shipped with `source` as an implicit default tracker. `newgit-trackers.md`
+replaces it, and the code now follows that design:
 
-`source` is a tracker with audience = everyone, storage = Git/`jj`, mechanism = Git/`jj`. It is the one tracker whose history engine is external and non-negotiable (see *Source Tracker* below). Every other tracker uses newgit's capture/merge/pull/checkout policy.
+- **`root`** owns `.` — everything no more specific tracker claims. `newgit
+  init` writes `trackers/root.toml` and copies the project's Git history into
+  root's `main`. Its history engine is Git (see *Source Tracker* below).
+- **`project`** owns `.newgit`, so the definitions travel as their own
+  tracker.
+- **Code trackers** (`secret = false`) are committed content with their own
+  history: `newgit tracker create electron --code --path apps/electron`
+  carves those paths, history included, out of whichever tracker owned them.
+  You commit to them with Git; `capture` refuses them.
+- **Secret trackers** (the default, `secret = true`) are the lanes this
+  section describes: captured, never committed.
 
 ---
 
@@ -772,8 +782,7 @@ Git, capture reverses the substitution, and hand edits round-trip.
 - A render path that no tracker owns must be tracked by Git. A path that is
   neither tracked nor tracker-owned has no committed content to render *from*,
   which the purity rule above makes a contradiction, not an edge case.
-- Two resources rendering the same path is a config error, refused at load —
-  the same disjointness check tracker paths get.
+- Two resources rendering the same path is a config error, refused at load.
 - A `find` that matches zero times, or more times than `count` declares, fails
   the bind rather than rendering partially. The resource is marked `failed`
   and its dependents `blocked`, exactly as a failed `prepare` would.
@@ -1072,6 +1081,14 @@ newgit tracker create dev-db --audience project-devs
 newgit tracker create generated-sdk --merge-with-source
 ```
 
+`--code --path <path>` (repeatable) creates a code tracker instead: committed
+content carved, history included, out of whichever tracker owns those paths
+now. Its paths are fixed at creation.
+
+```sh
+newgit tracker create electron --code --path apps/electron
+```
+
 ### `newgit tracker track <tracker> <path>...`
 
 Adds workspace paths to a tracker lane and appends those paths to `.gitignore`
@@ -1082,6 +1099,16 @@ newgit tracker track runtime-env .env.local
 newgit tracker track dev-db data/dev.sqlite
 newgit tracker track generated-sdk src/generated
 ```
+
+### Remote commands
+
+Beyond v1, newgit talks to the hosted remote described in
+`newgit-cloudflare.md`: `newgit login` / `logout` / `whoami` (GitHub device
+flow), `newgit remote add [--url <url>] [--project <p>]` / `remote show`,
+`newgit members add|remove <github-login>` / `members list`, and `newgit spawn --from-checkpoint
+<instance>/<checkpoint>`, which brings up someone else's checkpoint locally —
+source, uncommitted work, your own copy of their trackers, and resources
+restored.
 
 ### `newgit resource add <name> --template <template>`
 
@@ -1521,7 +1548,7 @@ Shims are a post-MVP milestone (see *What To Defer Until v2*), but `newgit run` 
 
 ## Source Tracker
 
-Source is the one special tracker in v1 because Git compatibility is non-negotiable.
+Source is the one special tracker in v1 because Git compatibility is non-negotiable. (`root` and the code trackers are what it became; their histories are Git's.)
 
 v1 should prefer `jj` if available, because its working-copy model and operation log match the project.
 

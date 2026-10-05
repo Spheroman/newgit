@@ -60,7 +60,7 @@ priority = 10
 
 | Field | Meaning |
 |---|---|
-| `paths` | What it owns. The most specific owner of a path wins, so `root` can own `/` while `electron` owns `apps/electron`. |
+| `paths` | What it owns. The most specific owner of a path wins, so `root` can own `.` while `electron` owns `apps/electron`. |
 | `audience` | Who may read its repo. Enforced by the remote (token minting). |
 | `role` | Trackers with the same role are mutually exclusive alternatives: an instance binds exactly one per role. A tracker without a role is its own slot. |
 | `priority` | Which alternative is picked by default: highest readable wins. **Negative: never picked automatically** — only by `--use` or a personal setting. |
@@ -75,10 +75,10 @@ the most specific path among the *bound* trackers. Two bound trackers may not
 claim the same path unless one's claim is strictly more specific. Trackers in
 the same role may claim identical paths — they are never bound together.
 
-**The root tracker (decided).** `newgit init` creates `root`, owning `/`. It
+**The root tracker (decided).** `newgit init` creates `root`, owning `.`. It
 holds whatever no other tracker claims — in a fresh project, everything — so
 a project never has unowned files. Carving out a tracker (`newgit tracker
-create electron --paths apps/electron`) moves those paths' history out of
+create electron --code --path apps/electron`) moves those paths' history out of
 `root` into the new repo (a path-filtered split, done once).
 
 ---
@@ -176,8 +176,8 @@ so a recomposed commit cannot carry the original's. Three rules:
 **Splitting happens when work leaves the machine (decided):** sync, push,
 merge. Local history is left alone, and local undo works on the view.
 
-**Carving out a tracker** (`newgit tracker create electron --paths
-apps/electron`, code) splits its paths' history out of root the same way,
+**Carving out a tracker** (`newgit tracker create electron --code
+--path apps/electron`) splits its paths' history out of root the same way,
 each commit marked with its source, so the view reproduces the original
 history exactly — mixed commits included.
 
@@ -321,19 +321,24 @@ Each step lands alone and keeps the suite green.
    `instances/<instance>`) with parents, messages, authors. Capture commits;
    merge merges. The env-file case keeps working unchanged in behavior.
 2. **`root` tracker; ownership by specificity; `secret`.** *(Landed.)*
-   *Step 3a (compose/split engine) and 3b (code trackers carved out of
-   their owner, the `project` tracker) landed too; a code tracker's paths
-   are set at creation — adding one later would splice a second history
-   into it.*
    `newgit init` writes `trackers/root.toml` (owns `.`, committed) and
-   imports the project's history as root's `main`, borrowing its objects.
-   Trackers nest; the most specific owner wins. `secret` defaults to true,
-   and until step 3 only root may be committed (`secret = false`). The
-   `project` tracker moved to step 3: until workspaces are composed,
-   `.newgit/` lives in the project's own history, and a second copy would
-   have nothing reading it.
-3. **The projection, and the `project` tracker.** Composed workspace commits, splitting at capture, the
-   unbound-owner refusal, `newgit log <tracker>`.
+   copies the project's history into root's `main` with a real fetch (no
+   alternates; see *Objects*). Trackers nest; the most specific owner wins.
+   `secret` defaults to true.
+3. **The projection, and the `project` tracker.**
+   - *3a — compose/split engine. (Landed.)* Full replay, merges keep every
+     parent, originals reused, split refusals for secret and unbound paths.
+   - *3b — code trackers and the `project` tracker. (Landed.)* `newgit
+     tracker create <name> --code --path <p>` carves paths out of their
+     owner, history included; `project` owns `.newgit`. A code tracker's
+     paths are set at creation — adding one later would splice a second
+     history into it.
+   - *3c — wiring. (Next.)* Spawn composes the instance's view; push and
+     checkpoint sync split the instance's work back into tracker instance
+     branches; split commits are signed as their author when
+     `commit.gpgSign` is set. `newgit log <tracker>`.
+   - *3d — remote.* One Artifacts repo per code tracker (`<p>.t.root`
+     replaces `<p>.src`), forked lazily.
 4. **Roles, priority, resources, use/drop.** Binding per slot; resources
    brought by trackers; role dependencies.
 5. **Coherent merges** locally and on the remote (lazy per-tracker forks,

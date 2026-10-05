@@ -313,7 +313,9 @@ code cannot read another's cookies or storage).
 > and a tracker is the unit audience is declared on.
 
 - `<p>.src` — trunk. Readable by every member. Source only — forks copy every
-  ref, so nothing goes here that a fork's owner may not read.
+  ref, so nothing goes here that a fork's owner may not read. *(Becomes
+  `<p>.t.root`, one repo per code tracker, in newgit-trackers.md step 3d;
+  this section describes what is deployed today.)*
 - `<p>.i.<instance>` — forked from `<p>.src`, asynchronously, at spawn.
   Write tokens go **only** to the instance's owner. Deleted by `newgit remove`.
 - `<p>.t.<tracker>` / `<p>.t.<tracker>.<login>` — a tracker's lane and rev
@@ -478,8 +480,10 @@ action is also a CLI command.
 ## Build Order (2026-10-05 → 2026-10-14)
 
 Done: Day 0 spikes (Artifacts), lanes as Git, `[remote]` config, Day 1
-sandbox spikes, the Worker (items 4), and the CLI remote client with
-`spawn --from-checkpoint` and the push path (items 5–6).
+sandbox spikes, the Worker (item 4), and the CLI remote client with
+`spawn --from-checkpoint` and the push path (items 5–6). Since then, the
+tracker redesign in newgit-trackers.md took priority over previews: steps 1,
+2, 3a, and 3b have landed, and its build order tracks the rest.
 
 ### Day 1 — Spikes, round 2 (sandboxes)
 
