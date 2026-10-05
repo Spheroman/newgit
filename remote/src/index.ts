@@ -253,7 +253,9 @@ async function route(request: Request, env: Env, deps: Deps): Promise<Response> 
 		const instanceToken = await issue(env, {
 			kind: "agent",
 			login,
-			agent: caller.agent ?? name,
+			// Names an agent only when one spawned it: a person running
+			// `newgit checkpoint` in the workspace is not an agent.
+			agent: caller.agent,
 			project: projectName,
 			instance: name,
 			ttlSeconds: AGENT_TTL_SECONDS,

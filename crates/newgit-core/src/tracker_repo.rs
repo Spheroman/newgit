@@ -257,6 +257,12 @@ impl TrackerRepo {
         rev: &str,
     ) -> Result<usize> {
         let commit = self.commit_for(rev)?;
+        // A deposit-only tracker owns no paths: its content reaches resources
+        // through `{{state_ref}}`, never the workspace. (An empty path list
+        // means "the whole tree" to Git, so this has to be said explicitly.)
+        if definition.paths.is_empty() {
+            return Ok(0);
+        }
 
         clear_owned_paths(workspace, definition)?;
 

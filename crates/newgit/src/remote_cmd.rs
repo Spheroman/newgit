@@ -149,6 +149,13 @@ fn add(url: Option<String>, project: Option<String>, json: bool) -> Result<()> {
     let url = url
         .or_else(|| config.remote.as_ref().map(|section| section.url.clone()))
         .unwrap_or_else(|| DEFAULT_REMOTE_URL.to_owned());
+    // An explicit --project wins; otherwise keep the one config.toml names.
+    let project = project.or_else(|| {
+        config
+            .remote
+            .as_ref()
+            .and_then(|section| section.project.clone())
+    });
     let section = RemoteSection {
         url: url.trim_end_matches('/').to_owned(),
         project: project.filter(|name| name != &config.project.name),

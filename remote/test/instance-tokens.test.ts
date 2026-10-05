@@ -51,8 +51,8 @@ describe("instance tokens", () => {
 			login: "jack",
 			kind: "agent",
 			project,
-			agent: "attempt-1",
 		});
+		expect((await call(attempt.token, "GET", "/v1/me")).body.agent).toBeUndefined();
 	});
 
 	it("write their own instance and nothing else", async () => {

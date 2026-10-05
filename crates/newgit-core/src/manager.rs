@@ -982,7 +982,7 @@ impl BranchManager {
                 Err(NewgitError::Remote { status: 404, .. }) => {
                     return match lane.main() {
                         Some(rev) => Ok(Some(rev)),
-                        None => Err("you have no content for it yet; it starts empty".to_owned()),
+                        None => Err(no_own_content(&definition.name)),
                     };
                 }
                 Err(error) => return Err(error.to_string()),
@@ -997,7 +997,7 @@ impl BranchManager {
             .map_err(|error| error.to_string())?;
             return match lane.main() {
                 Some(rev) => Ok(Some(rev)),
-                None => Err("you have no content for it yet; it starts empty".to_owned()),
+                None => Err(no_own_content(&definition.name)),
             };
         }
         let Some(rev) = checkpoint_rev else {
@@ -4727,6 +4727,16 @@ fn validate_disjoint_with_replacement(
         updated.push(replacement.clone());
     }
     crate::tracker::validate_disjoint(&updated)
+}
+
+/// Why a per-user tracker came up empty for whoever is spawning: nothing of
+/// theirs has reached its `main`, which is what "your own" means.
+fn no_own_content(tracker: &str) -> String {
+    format!(
+        "it starts empty: your own `{tracker}` has nothing on its main yet — capture it in an \
+         instance and `newgit tracker merge {tracker}`, or `newgit tracker capture {tracker} \
+         --from-store` in the project"
+    )
 }
 
 /// Where a checkpoint's source lives in its instance's fork.

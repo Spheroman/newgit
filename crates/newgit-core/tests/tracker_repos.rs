@@ -445,3 +445,48 @@ fn capturing_thousands_of_files_does_not_stall() {
         "2999\n"
     );
 }
+
+#[test]
+fn undoing_a_deposit_writes_nothing_into_the_workspace() {
+    let (_guard, temp) = tempdir();
+    let store = setup(&temp, "store");
+    std::fs::write(
+        store.paths().resources.join("db.toml"),
+        r#"ownership = "branch"
+
+[checkpoint]
+mode = "command"
+command = "echo rows > {{snapshot.path}}/db.sql && echo {{snapshot.path}}/db.sql"
+into_tracker = "db-snapshots"
+
+[restore]
+mode = "command"
+command = "cp {{state_ref}} restored.sql"
+"#,
+    )
+    .expect("resource");
+    let manager = BranchManager::open(store).expect("manager");
+    manager
+        .create_tracker("db-snapshots", "project-devs", Storage::Local, false)
+        .expect("tracker");
+    let manager = BranchManager::open(manager.store().clone()).expect("reopen");
+    let workspace = manager
+        .spawn("feature-d", None)
+        .expect("spawn")
+        .branch
+        .workspace_path;
+    manager.checkpoint("feature-d", None).expect("checkpoint");
+    manager
+        .undo("feature-d", &UndoOptions::default())
+        .expect("undo");
+
+    // The dump reached the restore command, not the workspace root.
+    assert_eq!(
+        std::fs::read_to_string(workspace.join("restored.sql")).expect("restored"),
+        "rows\n"
+    );
+    assert!(
+        !workspace.join("db.sql").exists(),
+        "a deposit-only tracker owns no paths"
+    );
+}
