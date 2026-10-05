@@ -693,6 +693,29 @@ Consequences:
 - No HTTP server in the container: `exec` with streamed stdin and stdout
   is the whole transport.
 
+### Live: the whole flow on newgit.dev (2026-10-05)
+
+A three-tracker project (root, `web` carved out of `apps/web`, project) plus
+a per-user secret `.env.local` tracker, against the deployed Worker, its
+endpoint container, and Artifacts.
+
+| Step | Time | Result |
+|---|---|---|
+| `newgit remote add` | 9.4 s | a repo per code tracker, seeded; `main` created |
+| `git clone https://newgit.dev/<owner>/<name>.git` (plain Git), cold container | 10.8 s | `HEAD` identical to the project's |
+| The same, warm (view cached) | 2.6 s | |
+| `spawn` | 0.8 s | nothing forked |
+| Checkpoint: split, fork `root` and `web`, push | 10.4 s | |
+| `git push` | 5.0 s | |
+| `newgit merge` | 6.4 s | `root` and `web` fast-forward; the project root follows |
+| Plain `git clone` after the merge | 7.1 s | `HEAD` is the agent's own commit id; no `.env.local` |
+| `newgit clone` | 4.9 s | |
+| `spawn --from-checkpoint` | 8.4 s | the same commit id, and the uncommitted work |
+
+The commit an agent made in its workspace is the commit a plain `git clone`
+gets after the merge, on another machine: split into trackers, forked,
+merged per tracker, and composed back — with the same id.
+
 ---
 
 ## Decisions
