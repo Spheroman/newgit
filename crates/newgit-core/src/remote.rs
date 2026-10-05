@@ -195,6 +195,26 @@ pub trait Remote {
     ) -> Result<()>;
     /// An instance's fork of one code tracker, made the first time it is asked for.
     fn fork(&self, project: &str, instance: &str, tracker: &str) -> Result<RepoLocation>;
+    /// Create the repo of a code tracker carved after the project was, and
+    /// the one write that seeds it.
+    fn create_tracker_repo(&self, project: &str, tracker: &str) -> Result<SeedCredential>;
+    /// Start merging into `branch`, whose list must still be `base`: write
+    /// passwords for the trackers that move.
+    fn begin_merge(
+        &self,
+        project: &str,
+        branch: &str,
+        base: &std::collections::BTreeMap<String, String>,
+        trackers: &[String],
+    ) -> Result<Vec<SeedCredential>>;
+    /// Finish it: `branch`'s list moves from `base` to `list` in one write.
+    fn finish_merge(
+        &self,
+        project: &str,
+        branch: &str,
+        base: &std::collections::BTreeMap<String, String>,
+        list: &std::collections::BTreeMap<String, String>,
+    ) -> Result<()>;
     fn add_member(&self, project: &str, login: &str) -> Result<bool>;
     fn remove_member(&self, project: &str, login: &str) -> Result<bool>;
     fn register_instance(
@@ -424,6 +444,56 @@ impl Remote for HttpRemote {
                 segment(branch)
             ),
             Some(serde_json::json!({ "list": list })),
+        )?;
+        Ok(())
+    }
+
+    fn create_tracker_repo(&self, project: &str, tracker: &str) -> Result<SeedCredential> {
+        self.send(
+            "POST",
+            &format!("/v1/projects/{}/trackers", project_path(project)),
+            Some(serde_json::json!({ "name": tracker })),
+        )
+    }
+
+    fn begin_merge(
+        &self,
+        project: &str,
+        branch: &str,
+        base: &std::collections::BTreeMap<String, String>,
+        trackers: &[String],
+    ) -> Result<Vec<SeedCredential>> {
+        #[derive(Deserialize)]
+        struct Started {
+            credentials: Vec<SeedCredential>,
+        }
+        let started: Started = self.send(
+            "POST",
+            &format!(
+                "/v1/projects/{}/branches/{}/merge",
+                project_path(project),
+                segment(branch)
+            ),
+            Some(serde_json::json!({ "base": base, "trackers": trackers })),
+        )?;
+        Ok(started.credentials)
+    }
+
+    fn finish_merge(
+        &self,
+        project: &str,
+        branch: &str,
+        base: &std::collections::BTreeMap<String, String>,
+        list: &std::collections::BTreeMap<String, String>,
+    ) -> Result<()> {
+        let _: serde_json::Value = self.send(
+            "PUT",
+            &format!(
+                "/v1/projects/{}/branches/{}",
+                project_path(project),
+                segment(branch)
+            ),
+            Some(serde_json::json!({ "base": base, "list": list })),
         )?;
         Ok(())
     }

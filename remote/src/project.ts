@@ -18,6 +18,23 @@ export interface ProjectInfo {
 /** A branch: one commit per code tracker, by tracker name. */
 export type TrackerList = Record<string, string>;
 
+export type MergeStart =
+	| { ok: true; until: string }
+	| { ok: false; reason: "missing" }
+	| { ok: false; reason: "moved"; list: TrackerList }
+	| { ok: false; reason: "locked"; by: string; until: string };
+
+export type MergeFinish =
+	| { ok: true; branch: Branch }
+	| { ok: false; reason: "missing" | "unlocked" }
+	| { ok: false; reason: "moved"; list: TrackerList };
+
+function sameList(left: TrackerList, right: TrackerList): boolean {
+	const keys = Object.keys(left).sort();
+	const other = Object.keys(right).sort();
+	return keys.length === other.length && keys.every((key, index) => key === other[index] && left[key] === right[key]);
+}
+
 export interface Branch {
 	name: string;
 	list: TrackerList;
@@ -125,6 +142,52 @@ export class ProjectDO extends DurableObject<Env> {
 		const now = new Date().toISOString();
 		this.sql.exec("INSERT INTO branches VALUES (?, ?, ?, ?, ?)", name, JSON.stringify(list), by, now, now);
 		return this.branch(name);
+	}
+
+	/**
+	 * Start merging into `name`: refused unless its list is still `base`
+	 * (someone else merged first: merge again) and no other merge into it is
+	 * in flight. Takes the branch's merge lock for `seconds`.
+	 */
+	beginMerge(name: string, base: TrackerList, by: string, seconds: number): MergeStart {
+		const branch = this.branch(name);
+		if (branch === null) return { ok: false, reason: "missing" };
+		if (!sameList(branch.list, base)) return { ok: false, reason: "moved", list: branch.list };
+		const lock = this.mergeLock(name);
+		if (lock !== null && lock.by !== by && Date.parse(lock.until) > Date.now())
+			return { ok: false, reason: "locked", by: lock.by, until: lock.until };
+		const until = new Date(Date.now() + seconds * 1000).toISOString();
+		this.sql.exec("INSERT OR REPLACE INTO meta VALUES (?, ?)", `merge:${name}`, JSON.stringify({ by, until }));
+		return { ok: true, until };
+	}
+
+	/**
+	 * Finish a merge: move `name`'s list from `base` to `list` in one write,
+	 * and release the lock. Refused unless `by` holds the lock and the list is
+	 * still `base` — every tracker moves together, or none does.
+	 */
+	finishMerge(name: string, base: TrackerList, list: TrackerList, by: string): MergeFinish {
+		const branch = this.branch(name);
+		if (branch === null) return { ok: false, reason: "missing" };
+		const lock = this.mergeLock(name);
+		if (lock === null || lock.by !== by || Date.parse(lock.until) <= Date.now())
+			return { ok: false, reason: "unlocked" };
+		if (!sameList(branch.list, base)) return { ok: false, reason: "moved", list: branch.list };
+		this.sql.exec(
+			"UPDATE branches SET list = ?, updated_at = ? WHERE name = ?",
+			JSON.stringify(list),
+			new Date().toISOString(),
+			name,
+		);
+		this.sql.exec("DELETE FROM meta WHERE key = ?", `merge:${name}`);
+		return { ok: true, branch: this.branch(name)! };
+	}
+
+	private mergeLock(name: string): { by: string; until: string } | null {
+		const row = this.sql
+			.exec<{ value: string }>("SELECT value FROM meta WHERE key = ?", `merge:${name}`)
+			.toArray()[0];
+		return row ? (JSON.parse(row.value) as { by: string; until: string }) : null;
 	}
 
 	isMember(login: string): boolean {

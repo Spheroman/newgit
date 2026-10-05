@@ -189,6 +189,15 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Merge an instance's committed work into a branch, tracker by tracker:
+    /// every tracker moves together, or none does
+    Merge {
+        /// Instance (inferred when run inside a workspace)
+        instance: Option<String>,
+        /// The branch to merge into
+        #[arg(long, default_value = "main")]
+        into: String,
+    },
     /// Clone a project from a newgit remote: its default branch composed from
     /// the code trackers you may read, set up for newgit
     Clone {
@@ -429,6 +438,7 @@ fn main() -> Result<()> {
         Command::Whoami { url, json } => remote_cmd::whoami(url, json),
         Command::Remote { command } => remote_cmd::remote_command(command),
         Command::Clone { project, dir, url } => remote_cmd::clone(&project, dir, url),
+        Command::Merge { instance, into } => merge(instance, &into),
         Command::EndpointCompose => {
             let plan: newgit_core::endpoint::Plan = serde_json::from_reader(std::io::stdin())
                 .context("the plan on stdin is not JSON newgit can read")?;
@@ -2411,6 +2421,52 @@ fn context_here() -> Result<Context> {
 
 fn manager_here() -> Result<BranchManager> {
     Ok(BranchManager::open(context_here()?.store)?)
+}
+
+fn merge(instance: Option<String>, into: &str) -> Result<()> {
+    use newgit_core::manager::TrackerMergeAction;
+    let (manager, instance) = manager_and_instance(instance)?;
+    let outcome = manager.merge(&instance, into)?;
+    let moved = outcome
+        .trackers
+        .iter()
+        .filter(|merge| merge.action != TrackerMergeAction::Unchanged)
+        .count();
+    if moved == 0 {
+        println!(
+            "Nothing to merge: `{}` has nothing `{into}` does not (checkpoint {})",
+            outcome.instance, outcome.checkpoint
+        );
+        return Ok(());
+    }
+    let place = outcome
+        .remote
+        .as_deref()
+        .map(|project| format!(" on {project}"))
+        .unwrap_or_default();
+    let checkpoint = if outcome.checkpoint.is_empty() {
+        String::new()
+    } else {
+        format!(" (checkpoint {})", outcome.checkpoint)
+    };
+    println!(
+        "Merged `{}` into `{into}`{place}{checkpoint}",
+        outcome.instance
+    );
+    for merge in &outcome.trackers {
+        let what = match merge.action {
+            TrackerMergeAction::Unchanged => "unchanged",
+            TrackerMergeAction::FastForward => "fast-forward",
+            TrackerMergeAction::Merged => "merged",
+            TrackerMergeAction::New => "new",
+        };
+        println!(
+            "  {:<12} {what:<12} {}",
+            merge.tracker,
+            &merge.commit[..merge.commit.len().min(12)]
+        );
+    }
+    Ok(())
 }
 
 fn tracker_log(tracker: &str, instance: Option<String>, git_args: &[String]) -> Result<()> {

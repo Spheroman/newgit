@@ -221,9 +221,63 @@ fn route(
                 }),
             )
         }
+        ("POST", ["v1", "projects", owner, name, "trackers"]) => {
+            let tracker = body["name"].as_str().unwrap_or_default();
+            let repo = format!("{owner}.{name}.t.{tracker}");
+            if exists(&repo) {
+                return (409, json!({ "error": format!("{repo} exists already") }));
+            }
+            git(
+                repos,
+                &["init", "-q", "--bare", "-b", "main", &repo_url(&repo)],
+            );
+            let mut seed = credential(&repo);
+            seed["tracker"] = json!(tracker);
+            (201, seed)
+        }
+        ("POST", ["v1", "projects", owner, name, "branches", branch, "merge"]) => {
+            let key = format!("{owner}/{name}");
+            if state
+                .branches
+                .get(&key)
+                .and_then(|branches| branches.get(*branch))
+                != Some(&body["base"])
+            {
+                return (
+                    409,
+                    json!({ "error": "the branch moved since you looked: merge again" }),
+                );
+            }
+            let credentials: Vec<Value> = body["trackers"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+                .iter()
+                .map(|tracker| {
+                    let tracker = tracker.as_str().unwrap_or_default();
+                    let mut seed = credential(&format!("{owner}.{name}.t.{tracker}"));
+                    seed["tracker"] = json!(tracker);
+                    seed
+                })
+                .collect();
+            (
+                200,
+                json!({ "branch": branch, "until": "later", "credentials": credentials }),
+            )
+        }
         ("PUT", ["v1", "projects", owner, name, "branches", branch]) => {
             let key = format!("{owner}/{name}");
             let branches = state.branches.entry(key).or_default();
+            if !body["base"].is_null() {
+                if branches.get(*branch) != Some(&body["base"]) {
+                    return (
+                        409,
+                        json!({ "error": "the branch moved since you looked: merge again" }),
+                    );
+                }
+                branches.insert((*branch).to_owned(), body["list"].clone());
+                return (200, json!({ "name": branch, "list": body["list"] }));
+            }
             if branches.contains_key(*branch) {
                 return (
                     409,
@@ -757,6 +811,52 @@ fn a_checkpoint_syncs_changed_trackers_remote_trackers_and_then_the_record() {
         put.is_some() && put > last_credential,
         "record after the refs it names"
     );
+}
+
+#[test]
+fn merge_moves_the_remote_branch_and_brings_new_trackers_with_it() {
+    let (_guard, temp) = tempdir();
+    let fixture = setup(&temp);
+    fixture.ok(&fixture.store, &["spawn", "feature-a"]);
+    let workspace = workspace_of(&fixture, "feature-a");
+    std::fs::write(workspace.join("feature.txt"), "work\n").expect("write");
+    git(&workspace, &["add", "feature.txt"]);
+    git(&workspace, &["commit", "-q", "-m", "feature"]);
+    let head = git(&workspace, &["rev-parse", "HEAD"]);
+
+    let merged = fixture.ok(&fixture.store, &["merge", "feature-a"]);
+    assert!(merged.contains("fast-forward"), "{merged}");
+    let root = fixture.remote.repo("jack.store.t.root");
+    assert_eq!(
+        split_source(&root, "main"),
+        head,
+        "root's repo took the work"
+    );
+    let list = fixture.remote.state.lock().expect("state").branches["jack/store"]["main"].clone();
+    assert_eq!(
+        list["root"],
+        git(&root, &["rev-parse", "main"]),
+        "and main's list says so"
+    );
+
+    // A code tracker carved after `remote add` reaches the remote by merging
+    // the project root, which made it.
+    std::fs::create_dir_all(fixture.store.join("docs")).expect("mkdir");
+    std::fs::write(fixture.store.join("docs/guide.md"), "guide\n").expect("write");
+    git(&fixture.store, &["add", "docs"]);
+    git(&fixture.store, &["commit", "-q", "-m", "docs"]);
+    fixture.ok(
+        &fixture.store,
+        &["tracker", "create", "docs", "--code", "--path", "docs"],
+    );
+    git(&fixture.store, &["add", "-A"]);
+    git(&fixture.store, &["commit", "-q", "-m", "docs is a tracker"]);
+    let published = fixture.ok(&fixture.store, &["merge", "main"]);
+    assert!(published.contains("new"), "{published}");
+    let docs = fixture.remote.repo("jack.store.t.docs");
+    assert!(files_at(&docs, "main").contains("docs/guide.md"));
+    let list = fixture.remote.state.lock().expect("state").branches["jack/store"]["main"].clone();
+    assert_eq!(list["docs"], git(&docs, &["rev-parse", "main"]));
 }
 
 /// Run newgit as a given user: their own HOME, so their own saved login.

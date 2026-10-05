@@ -4455,6 +4455,256 @@ impl BranchManager {
         })
     }
 
+    /// Merge an instance's committed work into branch `into` (newgit-trackers.md,
+    /// *Checkpoints, merges, and coherence*), tracker by tracker: a tracker the
+    /// instance did not change stays; one `into` has not moved on since takes
+    /// the instance's commit; one both changed gets a real Git merge in that
+    /// tracker's own history. A conflict anywhere moves nothing. Then the
+    /// branch's list moves in one step — on the remote by compare-and-swap, so
+    /// a merge onto a list that moved meanwhile is refused, not mixed.
+    ///
+    /// What is committed in the workspace now is what merges: a checkpoint is
+    /// taken first.
+    ///
+    /// `newgit merge main` merges the project root — the instance `main` — so
+    /// its own commits reach the shared branch the same way.
+    pub fn merge(&self, instance: &str, into: &str) -> Result<MergeOutcome> {
+        self.require_resolvable_graph()?;
+        let (name, checkpoint, head) = if instance == PROJECT_ROOT_INSTANCE {
+            self.sync_project_root()?;
+            let branch = std::fs::read_to_string(self.store.paths().project_branch_file())
+                .map(|branch| branch.trim().to_owned())
+                .unwrap_or_else(|_| PROJECT_ROOT_INSTANCE.to_owned());
+            let head = self.source.rev_parse(&format!("refs/heads/{branch}"))?;
+            (PROJECT_ROOT_INSTANCE.to_owned(), String::new(), head)
+        } else {
+            let mut branch = self.store.find_branch(instance)?;
+            let checkpoint = self.checkpoint_branch(
+                &mut branch,
+                Some(&format!("before `newgit merge` into {into}")),
+                CheckpointReason::Explicit,
+            )?;
+            let head = checkpoint.record.source.head_rev.clone();
+            self.split_instance(&branch.slug, &head)?;
+            (branch.name, checkpoint.record.id, head)
+        };
+        let root = self.store.paths().project_root.clone();
+        let code = self.code_definitions();
+        let theirs: BTreeMap<String, String> = crate::compose::read_state(&root, &head)?
+            .into_iter()
+            .filter(|(tracker, _)| code.iter().any(|definition| &definition.name == tracker))
+            .collect();
+
+        // What `into` is now: on the remote, its list (its commits brought
+        // here); otherwise each tracker's branch here.
+        let client = match &self.remote {
+            Some(link) => Some((link.connect(Acting::Login)?, link.project.clone())),
+            None => None,
+        };
+        let base: BTreeMap<String, String> = match &client {
+            Some((client, project)) => {
+                let view = client.project(project)?;
+                let list = view
+                    .branches
+                    .iter()
+                    .find(|candidate| candidate.name == into)
+                    .map(|candidate| candidate.list.clone())
+                    .ok_or_else(|| {
+                        NewgitError::Unsupported(format!("{project} has no branch `{into}`"))
+                    })?;
+                for (tracker, commit) in &list {
+                    if self
+                        .source
+                        .rev_parse(&format!("{commit}^{{commit}}"))
+                        .is_ok()
+                    {
+                        continue;
+                    }
+                    let repo = format!("{}.t.{tracker}", project.replace('/', "."));
+                    let credential = client.credential(project, &repo, Scope::Read)?;
+                    GitSource::fetch_refs(
+                        &["-C", root.as_str()],
+                        credential.remote.as_deref().unwrap_or_default(),
+                        &[format!("+refs/heads/*:refs/newgit/remote/{tracker}/*")],
+                        Some(&basic_auth_header(&credential)),
+                    )?;
+                }
+                list
+            }
+            None => {
+                self.fetch_code_trackers()?;
+                code.iter()
+                    .filter_map(|definition| {
+                        self.source
+                            .rev_parse(&local_tracker_ref(&definition.name, into))
+                            .ok()
+                            .map(|commit| (definition.name.clone(), commit))
+                    })
+                    .collect()
+            }
+        };
+
+        let mut list = base.clone();
+        let mut trackers = Vec::new();
+        let mut conflicts = Vec::new();
+        let names: BTreeSet<&String> = base.keys().chain(theirs.keys()).collect();
+        for tracker in names {
+            let (action, commit) = match (base.get(tracker), theirs.get(tracker)) {
+                (Some(ours), Some(incoming))
+                    if ours == incoming || self.source.is_ancestor(incoming, ours)? =>
+                {
+                    (TrackerMergeAction::Unchanged, ours.clone())
+                }
+                (Some(ours), Some(incoming)) if self.source.is_ancestor(ours, incoming)? => {
+                    (TrackerMergeAction::FastForward, incoming.clone())
+                }
+                (Some(ours), Some(incoming)) => {
+                    match self.merge_commits(
+                        ours,
+                        incoming,
+                        &format!("Merge `{instance}` into {into}"),
+                    )? {
+                        Ok(merged) => (TrackerMergeAction::Merged, merged),
+                        Err(files) => {
+                            conflicts.push(format!("`{tracker}`: {}", files.join(", ")));
+                            continue;
+                        }
+                    }
+                }
+                (None, Some(incoming)) => (TrackerMergeAction::New, incoming.clone()),
+                (Some(ours), None) => (TrackerMergeAction::Unchanged, ours.clone()),
+                (None, None) => continue,
+            };
+            list.insert(tracker.clone(), commit.clone());
+            trackers.push(TrackerMerge {
+                tracker: tracker.clone(),
+                action,
+                commit,
+            });
+        }
+        if !conflicts.is_empty() {
+            return Err(NewgitError::Unsupported(format!(
+                "`{instance}` conflicts with `{into}`, so nothing moved — {}. Bring `{into}` into \
+                 the instance's workspace, resolve there, and merge again",
+                conflicts.join("; ")
+            )));
+        }
+
+        let moved: Vec<&TrackerMerge> = trackers
+            .iter()
+            .filter(|merge| merge.action != TrackerMergeAction::Unchanged)
+            .collect();
+        if !moved.is_empty()
+            && let Some((client, project)) = &client
+        {
+            let push = |remote: &str, auth: &crate::remote::RepoCredential, commit: &str| {
+                GitSource::push_refs(
+                    &["-C", root.as_str()],
+                    remote,
+                    &[format!("{commit}:refs/heads/{into}")],
+                    Some(&basic_auth_header(auth)),
+                )
+            };
+            for merge in moved
+                .iter()
+                .filter(|merge| merge.action == TrackerMergeAction::New)
+            {
+                let seed = client.create_tracker_repo(project, &merge.tracker)?;
+                push(
+                    seed.credential.remote.as_deref().unwrap_or_default(),
+                    &seed.credential,
+                    &merge.commit,
+                )?;
+            }
+            let names: Vec<String> = moved.iter().map(|merge| merge.tracker.clone()).collect();
+            let credentials = client.begin_merge(project, into, &base, &names)?;
+            for credential in &credentials {
+                let Some(merge) = moved
+                    .iter()
+                    .find(|merge| merge.tracker == credential.tracker)
+                else {
+                    continue;
+                };
+                push(
+                    credential.credential.remote.as_deref().unwrap_or_default(),
+                    &credential.credential,
+                    &merge.commit,
+                )?;
+            }
+            client.finish_merge(project, into, &base, &list)?;
+        }
+        for (tracker, commit) in &list {
+            self.source
+                .update_ref(&local_tracker_ref(tracker, into), commit)?;
+            self.publish_code_refs(tracker, &[into])?;
+        }
+        Ok(MergeOutcome {
+            instance: name,
+            into: into.to_owned(),
+            checkpoint,
+            trackers,
+            remote: client.map(|(_, project)| project),
+        })
+    }
+
+    /// A real merge of two commits of one tracker: the merge commit, or the
+    /// files that conflict.
+    fn merge_commits(
+        &self,
+        ours: &str,
+        theirs: &str,
+        message: &str,
+    ) -> Result<std::result::Result<String, Vec<String>>> {
+        let root = self.store.paths().project_root.clone();
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(root.as_str())
+            .args([
+                "merge-tree",
+                "--write-tree",
+                "--name-only",
+                "--no-messages",
+                ours,
+                theirs,
+            ])
+            .output()
+            .map_err(|source| NewgitError::io(root.clone(), source))?;
+        let text = String::from_utf8_lossy(&output.stdout).into_owned();
+        let mut lines = text.lines();
+        let tree = lines.next().unwrap_or_default().to_owned();
+        match output.status.code() {
+            Some(0) => {}
+            Some(1) => {
+                return Ok(Err(lines
+                    .take_while(|line| !line.is_empty())
+                    .map(ToOwned::to_owned)
+                    .collect()));
+            }
+            _ => {
+                return Err(NewgitError::SourceCommand {
+                    command: format!("git merge-tree --write-tree {ours} {theirs}"),
+                    stderr: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+                });
+            }
+        }
+        let commit = crate::source::run_git_env(
+            &[
+                "-C",
+                root.as_str(),
+                "commit-tree",
+                &tree,
+                "-p",
+                ours,
+                "-p",
+                theirs,
+                "-m",
+                message,
+            ],
+            &[],
+        )?;
+        Ok(Ok(commit.trim().to_owned()))
+    }
+
     /// Publish an instance's work for checkpoint `record`, tracker by tracker:
     /// its committed work (split already) and its uncommitted work (split
     /// here, off the branch) as one commit per code tracker. A tracker the
@@ -5606,6 +5856,37 @@ fn no_own_content(tracker: &str) -> String {
 /// The project root's name as an instance: its tracker branches are
 /// `instances/main`, so no spawned instance may take the name.
 const PROJECT_ROOT_INSTANCE: &str = "main";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrackerMergeAction {
+    /// The instance did not change it, or the branch has its commit already.
+    Unchanged,
+    /// The branch had not moved on: it takes the instance's commit.
+    FastForward,
+    /// Both changed it: a merge commit in its own history.
+    Merged,
+    /// New to the branch with this merge (a tracker carved since).
+    New,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrackerMerge {
+    pub tracker: String,
+    pub action: TrackerMergeAction,
+    pub commit: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MergeOutcome {
+    pub instance: String,
+    pub into: String,
+    /// The checkpoint taken first: what merged. Empty for the project root,
+    /// whose commits are what merged.
+    pub checkpoint: String,
+    pub trackers: Vec<TrackerMerge>,
+    /// The project on the remote whose branch moved, when there is one.
+    pub remote: Option<String>,
+}
 
 /// What `newgit remote add` published when it created the project.
 #[derive(Debug, Clone, PartialEq, Eq)]

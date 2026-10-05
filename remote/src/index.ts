@@ -53,6 +53,9 @@ export interface Caller {
 /** Git credentials last this long: long enough for a big push, short enough that losing membership bites fast. */
 export const CREDENTIAL_TTL_SECONDS = 15 * 60;
 
+/** A merge holds its branch this long at most: pushing the trackers' commits. */
+const MERGE_LOCK_SECONDS = 10 * 60;
+
 export interface Deps {
 	repos: Repos;
 	fetcher: typeof fetch;
@@ -294,6 +297,46 @@ async function route(request: Request, env: Env, deps: Deps): Promise<Response> 
 		if (!(await project.setDefaultBranch(branch))) throw new HttpError(404, `no branch \`${branch}\` in ${key}`);
 		return json({ default: branch });
 	}
+	const mergeMatch = rest.match(/^\/branches\/([^/]+)\/merge$/);
+	if (method === "POST" && mergeMatch) {
+		// Merging is a person's decision: an agent proposes, a member merges.
+		requireHuman(caller, "merge");
+		const branch = decodeURIComponent(mergeMatch[1]);
+		const { base, trackers } = await body<{ base?: Record<string, string>; trackers?: string[] }>(request);
+		if (!base || !Array.isArray(trackers) || trackers.length === 0)
+			throw new HttpError(400, "base (the list you merged onto) and trackers (the ones that move) are required");
+		const started = await project.beginMerge(branch, base, login, MERGE_LOCK_SECONDS);
+		if (!started.ok) {
+			if (started.reason === "missing") throw new HttpError(404, `no branch \`${branch}\` in ${key}`);
+			if (started.reason === "moved")
+				throw new HttpError(409, `\`${branch}\` moved since you looked: merge again onto what it is now`);
+			throw new HttpError(409, `${started.by} is merging into \`${branch}\` until ${started.until}`);
+		}
+		const credentials = [];
+		for (const tracker of trackers) {
+			requirePart("tracker name", tracker);
+			const ref: RepoRef = { kind: "tracker", project: id, tracker };
+			const facts = await definitionFacts(deps.repos, id, info.defaultBranch, tracker);
+			// A tracker the merge introduces is not defined on the branch yet;
+			// its repo was just made through the trackers route. Never a secret one.
+			if (facts !== undefined && !facts.code)
+				throw new HttpError(400, `\`${tracker}\` is a secret tracker; \`newgit merge\` never carries it`);
+			const name = repoName(ref);
+			if ((await deps.repos.remote(name)) === null) throw new HttpError(404, `${name} does not exist`);
+			const minted = await deps.repos.mint(name, "write", CREDENTIAL_TTL_SECONDS);
+			await userStub(env, login).recordRepoToken(caller.tokenId, name, minted.id, minted.expiresAt);
+			credentials.push({
+				tracker,
+				repo: name,
+				remote: deps.repos.url(name),
+				username: "x",
+				password: minted.password,
+				expires_at: minted.expiresAt,
+			});
+		}
+		return json({ branch, until: started.until, credentials });
+	}
+
 	const branchMatch = rest.match(/^\/branches\/([^/]+)$/);
 	if (branchMatch) {
 		const branch = decodeURIComponent(branchMatch[1]);
@@ -305,13 +348,27 @@ async function route(request: Request, env: Env, deps: Deps): Promise<Response> 
 		if (method === "PUT") {
 			requireNotInstance(caller, "create branches");
 			requirePart("branch name", branch);
-			const { list } = await body<{ list?: Record<string, string> }>(request);
+			const { list, base } = await body<{ list?: Record<string, string>; base?: Record<string, string> }>(
+				request,
+			);
 			if (!list || typeof list !== "object" || Object.keys(list).length === 0)
 				throw new HttpError(400, "list is required: one commit per code tracker, by tracker name");
 			for (const [tracker, commit] of Object.entries(list)) {
 				requirePart("tracker name", tracker);
 				if (typeof commit !== "string" || !/^[0-9a-f]{40}$/.test(commit))
 					throw new HttpError(400, `\`${tracker}\` must name a full commit id`);
+			}
+			if (base !== undefined) {
+				// The end of a merge: the list moves from `base`, all at once.
+				requireHuman(caller, "merge");
+				const finished = await project.finishMerge(branch, base, list, login);
+				if (!finished.ok) {
+					if (finished.reason === "missing") throw new HttpError(404, `no branch \`${branch}\` in ${key}`);
+					if (finished.reason === "unlocked")
+						throw new HttpError(409, `you hold no merge into \`${branch}\`: start one with \`newgit merge\``);
+					throw new HttpError(409, `\`${branch}\` moved since you looked: merge again onto what it is now`);
+				}
+				return json(finished.branch);
 			}
 			const created = await project.createBranch(branch, list, login);
 			if (created === null)
