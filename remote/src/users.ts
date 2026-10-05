@@ -12,6 +12,7 @@ export interface TokenRecord {
 	kind: TokenKind;
 	agent: string | null;
 	project: string | null;
+	instance: string | null;
 	createdAt: string;
 	expiresAt: string;
 	revokedAt: string | null;
@@ -33,15 +34,19 @@ export class UserDO extends DurableObject<Env> {
 				created_at TEXT NOT NULL, expires_at TEXT NOT NULL,
 				revoked_at TEXT, last_used_at TEXT);
 		`);
+		const columns = this.sql.exec<{ name: string }>("PRAGMA table_info(tokens)").toArray();
+		if (!columns.some((column) => column.name === "instance")) this.sql.exec("ALTER TABLE tokens ADD COLUMN instance TEXT");
 	}
 
 	register(claims: TokenClaims): TokenRecord {
 		this.sql.exec(
-			"INSERT INTO tokens VALUES (?, ?, ?, ?, ?, ?, NULL, NULL)",
+			`INSERT INTO tokens (id, kind, agent, project, instance, created_at, expires_at, revoked_at, last_used_at)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL)`,
 			claims.jti,
 			claims.kind,
 			claims.agent ?? null,
 			claims.project ?? null,
+			claims.instance ?? null,
 			new Date(claims.iat * 1000).toISOString(),
 			new Date(claims.exp * 1000).toISOString(),
 		);
@@ -76,6 +81,16 @@ export class UserDO extends DurableObject<Env> {
 			.map(toRecord);
 	}
 
+	/** Revoke every token pinned to one instance — what removing the instance does. */
+	revokeInstance(project: string, instance: string): number {
+		return this.sql.exec(
+			"UPDATE tokens SET revoked_at = ? WHERE project = ? AND instance = ? AND revoked_at IS NULL",
+			new Date().toISOString(),
+			project,
+			instance,
+		).rowsWritten;
+	}
+
 	/** Revoke one token. False when there is no such token. */
 	revoke(id: string): boolean {
 		return (
@@ -93,6 +108,7 @@ interface TokenRow extends Record<string, SqlStorageValue> {
 	kind: string;
 	agent: string | null;
 	project: string | null;
+	instance: string | null;
 	created_at: string;
 	expires_at: string;
 	revoked_at: string | null;
@@ -105,6 +121,7 @@ function toRecord(row: TokenRow): TokenRecord {
 		kind: row.kind as TokenKind,
 		agent: row.agent,
 		project: row.project,
+		instance: row.instance,
 		createdAt: row.created_at,
 		expiresAt: row.expires_at,
 		revokedAt: row.revoked_at,

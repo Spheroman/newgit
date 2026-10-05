@@ -29,6 +29,11 @@ export interface TokenClaims {
 	agent?: string;
 	/** Agent tokens: the one project it may touch, when pinned. */
 	project?: string;
+	/**
+	 * Instance tokens: the one instance it may write. Minted by spawn, used by
+	 * the workspace, renewed by itself, revoked with the instance.
+	 */
+	instance?: string;
 	iat: number;
 	exp: number;
 }
@@ -58,6 +63,7 @@ export interface NewToken {
 	login: string;
 	agent?: string;
 	project?: string;
+	instance?: string;
 	ttlSeconds: number;
 }
 
@@ -74,6 +80,7 @@ export async function signToken(
 		kind: spec.kind,
 		...(spec.agent === undefined ? {} : { agent: spec.agent }),
 		...(spec.project === undefined ? {} : { project: spec.project }),
+		...(spec.instance === undefined ? {} : { instance: spec.instance }),
 		iat,
 		exp: iat + spec.ttlSeconds,
 	};

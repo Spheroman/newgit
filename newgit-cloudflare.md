@@ -351,20 +351,39 @@ Identity is the GitHub login (`newgit login`, GitHub's device flow, like
 (`project-devs`) is a list in ProjectDO: `newgit members add <login>`. The
 creator is the first member.
 
-**Agents get their own tokens** (decided). An agent acts as its owner — it
-reads nothing its owner cannot and uses its owner's per-user lanes — but
-holds a separate, narrower token its owner creates:
+**Every workspace gets its own token, automatically** (decided). Nobody
+creates tokens by hand in the normal flow:
 
-| | Login token | Agent token |
-|---|---|---|
-| Created by | `newgit login` | its owner: `newgit token create <agent> [--project p]` |
-| Lifetime | 30 days | 7 days by default, at most 30 |
-| Acts as | the user | the owner, named in records (`agent` on instances and checkpoints) |
-| Can create tokens, create projects, manage members | yes | **no** — a leaked agent token cannot mint itself a successor |
-| Project | any the user is in | optionally pinned to one |
-| Revoked by | the user (any of their tokens) | its owner, or itself |
+- **`spawn` mints it.** Registering an instance with the remote returns a
+  token pinned to that project and instance; the CLI keeps it inside the
+  workspace's `.git/` (never committed, never pushed) and the credential
+  helper uses it for anything run in that workspace.
+- **It writes its own instance and nothing else:** its fork, its
+  checkpoints, its head. Acting as its owner, it reads trunk and uses the
+  owner's per-user lanes. It cannot touch another instance (even the same
+  owner's), create or remove instances, mint tokens, or manage members.
+- **It renews itself** while the instance exists: renewal returns a fresh
+  token and revokes the old one, so a long-running agent never hits expiry
+  and a copy stolen earlier dies at the next renewal.
+- **`newgit remove` revokes it** with the fork.
 
-A revoked token is refused on its next request.
+This is what a sandbox, a cloud agent, or a handed-off workspace carries
+*instead of* its owner's login. On the owner's own laptop, agents under the
+same OS user can still read the login file (see *Repo Topology*); the
+instance token matters wherever a workspace leaves the machine.
+
+| | Login | Instance (automatic) | Agent (by hand) |
+|---|---|---|---|
+| Created by | `newgit login` | `spawn` | `newgit token create <agent> [--project p]` |
+| Lifetime | 30 days | 7 days, renewed while the instance lives | 7 days by default, at most 30 |
+| Writes | everything the user may | its own instance | everything its owner may, in its project |
+| Creates tokens, projects, members, instances | yes | **no** | tokens/projects/members **no**; instances yes |
+| Revoked by | the user | `newgit remove`, the owner, itself | the owner, itself |
+
+A by-hand agent token is the escape hatch for an agent not tied to one
+instance (an orchestrator in CI). Records name the agent either way
+(`agent` on instances and checkpoints). A revoked token is refused on its
+next request.
 
 ### The credential helper
 

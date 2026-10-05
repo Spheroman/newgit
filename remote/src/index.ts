@@ -32,6 +32,8 @@ export interface Caller {
 	agent?: string;
 	/** Set for agent tokens pinned to one project. */
 	project?: string;
+	/** Set for instance tokens: the one instance this caller may write. */
+	instance?: string;
 }
 
 /** Git credentials last this long: long enough for a big push, short enough that losing membership bites fast. */
@@ -118,6 +120,26 @@ async function route(request: Request, env: Env, deps: Deps): Promise<Response> 
 		const issued = await issue(env, { kind: "agent", login, agent: name, project, ttlSeconds });
 		return json({ token: issued.token, ...issued.record }, 201);
 	}
+	if (method === "POST" && path === "/v1/tokens/renew") {
+		// An agent or instance token replaces itself before it expires: a fresh
+		// token with the same reach, and the old one revoked — so a copy stolen
+		// earlier stops working at the next renewal.
+		if (caller.kind !== "agent") throw new HttpError(400, "a login renews by running `newgit login`");
+		if (caller.instance !== undefined && caller.project !== undefined) {
+			const alive = await projectStub(env, caller.project).instance(caller.instance);
+			if (alive === null) throw new HttpError(410, `instance \`${caller.instance}\` was removed`);
+		}
+		const issued = await issue(env, {
+			kind: "agent",
+			login,
+			agent: caller.agent,
+			project: caller.project,
+			instance: caller.instance,
+			ttlSeconds: AGENT_TTL_SECONDS,
+		});
+		await userStub(env, login).revoke(caller.tokenId);
+		return json({ token: issued.token, ...issued.record }, 201);
+	}
 	const tokenMatch = path.match(/^\/v1\/tokens\/([^/]+)$/);
 	if (method === "DELETE" && tokenMatch) {
 		const id = decodeURIComponent(tokenMatch[1]);
@@ -172,6 +194,8 @@ async function route(request: Request, env: Env, deps: Deps): Promise<Response> 
 		const ref = parseRepoName(repoFromUrlOrName(repo));
 		if (ref === null || ref.project !== projectName)
 			throw new HttpError(400, `\`${repo}\` is not one of ${projectName}'s repos`);
+		if (caller.instance !== undefined && scope === "write" && ref.kind === "instance")
+			requireThisInstance(caller, ref.instance);
 		return json(await credential(env, deps, project, ref, scope, { login, member }));
 	}
 
@@ -207,6 +231,7 @@ async function route(request: Request, env: Env, deps: Deps): Promise<Response> 
 
 	// ── Instances ──────────────────────────────────────────────────────────
 	if (method === "POST" && rest === "/instances") {
+		requireNotInstance(caller, "create instances");
 		const { name, base_rev } = await body<{ name?: string; base_rev?: string }>(request);
 		if (!name || !base_rev) throw new HttpError(400, "name and base_rev are required");
 		requirePart("instance name", name);
@@ -221,7 +246,18 @@ async function route(request: Request, env: Env, deps: Deps): Promise<Response> 
 				(error: unknown) => project.setForkState(name, "failed", String(error)),
 			),
 		);
-		return json({ ...created, repo: fork }, 201);
+		// The workspace's own credential, minted here so nobody has to: it can
+		// write this instance and nothing else, renews itself, and is revoked
+		// when the instance is removed.
+		const instanceToken = await issue(env, {
+			kind: "agent",
+			login,
+			agent: caller.agent ?? name,
+			project: projectName,
+			instance: name,
+			ttlSeconds: AGENT_TTL_SECONDS,
+		});
+		return json({ ...created, repo: fork, token: instanceToken.token, token_id: instanceToken.id }, 201);
 	}
 	if (method === "GET" && rest === "/instances") return json({ instances: await project.instances() });
 
@@ -234,14 +270,17 @@ async function route(request: Request, env: Env, deps: Deps): Promise<Response> 
 		if (method === "GET" && !instanceMatch[2]) return json({ ...instance, repo });
 		if (method === "PUT" && instanceMatch[2]) {
 			requireOwner(instance.owner, login, `move \`${name}\`'s head`);
+			requireThisInstance(caller, name);
 			const { head_rev } = await body<{ head_rev?: string }>(request);
 			if (!head_rev) throw new HttpError(400, "head_rev is required");
 			return json({ ...(await project.setHead(name, head_rev)), repo });
 		}
 		if (method === "DELETE" && !instanceMatch[2]) {
 			requireOwner(instance.owner, login, `remove \`${name}\``);
+			requireNotInstance(caller, "remove instances");
 			await deps.repos.delete(repo).catch(() => false);
 			await project.deleteInstance(name);
+			await userStub(env, instance.owner).revokeInstance(projectName, name);
 			return json({ name, removed: true });
 		}
 	}
@@ -264,6 +303,7 @@ async function route(request: Request, env: Env, deps: Deps): Promise<Response> 
 			const owner = (await project.instance(instance))?.owner;
 			if (owner === undefined) throw new HttpError(404, `no instance \`${instance}\` in ${projectName}`);
 			requireOwner(owner, login, `checkpoint \`${instance}\``);
+			requireThisInstance(caller, instance);
 			const { record } = await body<{ record?: unknown }>(request);
 			if (record === undefined) throw new HttpError(400, "record is required");
 			return json(await project.putCheckpoint(instance, id, login, caller.agent ?? null, record), 201);
@@ -341,6 +381,7 @@ async function authenticate(request: Request, env: Env): Promise<Caller> {
 		kind: claims.kind,
 		...(claims.agent === undefined ? {} : { agent: claims.agent }),
 		...(claims.project === undefined ? {} : { project: claims.project }),
+		...(claims.instance === undefined ? {} : { instance: claims.instance }),
 	};
 }
 
@@ -353,6 +394,17 @@ export async function issue(env: Env, spec: NewToken) {
 
 function userStub(env: Env, login: string): DurableObjectStub<UserDO> {
 	return env.USERS.getByName(login.toLowerCase());
+}
+
+/** Instance tokens write only their own instance. */
+function requireThisInstance(caller: Caller, instance: string) {
+	if (caller.instance !== undefined && caller.instance !== instance)
+		throw new HttpError(403, `this workspace's token is for instance \`${caller.instance}\` only`);
+}
+
+function requireNotInstance(caller: Caller, action: string) {
+	if (caller.instance !== undefined)
+		throw new HttpError(403, `a workspace's token cannot ${action}; run it from ${caller.login}'s own login`);
 }
 
 function requireHuman(caller: Caller, action: string) {
