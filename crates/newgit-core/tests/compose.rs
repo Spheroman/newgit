@@ -414,3 +414,192 @@ fn a_path_owned_by_an_unbound_tracker_is_refused_with_the_fix() {
         "{error}"
     );
 }
+
+#[test]
+fn merge_commits_survive_composition_whole() {
+    let (_guard, temp) = tempdir();
+    let (repo, _) = project(&temp);
+    // A merged pull request: a side branch touching both root and electron,
+    // merged with a real merge commit.
+    git(&repo, &["checkout", "-q", "-b", "feature"]);
+    commit(
+        &repo,
+        &[
+            ("README.md", "feature docs\n"),
+            ("apps/electron/main.js", "v-feature\n"),
+        ],
+        "feature work",
+        "ana",
+        5_000,
+    );
+    git(&repo, &["checkout", "-q", "main"]);
+    commit(
+        &repo,
+        &[("NOTES.md", "main moved\n")],
+        "main moves",
+        "jack",
+        6_000,
+    );
+    git_env(
+        &repo,
+        &[
+            "merge",
+            "-q",
+            "--no-ff",
+            "--no-gpg-sign",
+            "-m",
+            "Merge feature",
+            "feature",
+        ],
+        &who("jack", 7_000),
+    );
+    let head = git(&repo, &["rev-parse", "HEAD"]);
+    // The real carve: it diffs every commit, merges included, against its
+    // first parent.
+    let root = tracker("root", &["."], &["apps/electron"], false);
+    let electron = tracker("electron", &["apps/electron"], &[], false);
+    let electron_tip = compose::carve(
+        &repo,
+        &head,
+        &electron,
+        "refs/newgit/trackers/electron/main",
+    )
+    .expect("carve")
+    .expect("electron has history");
+    let view = compose::compose(
+        &repo,
+        VIEW,
+        &[
+            TrackerTip {
+                definition: &root,
+                commit: head.clone(),
+            },
+            TrackerTip {
+                definition: &electron,
+                commit: electron_tip,
+            },
+        ],
+    )
+    .expect("compose");
+    assert_eq!(
+        view.tip.as_deref(),
+        Some(head.as_str()),
+        "the original merge commit itself, both parents intact"
+    );
+    assert_eq!(
+        git(&repo, &["rev-list", "--parents", "-n1", VIEW])
+            .split(' ')
+            .count(),
+        3
+    );
+}
+
+#[test]
+fn a_merge_after_trackers_diverge_keeps_every_parent() {
+    let (_guard, temp) = tempdir();
+    let (repo, commits) = project(&temp);
+    let root = tracker("root", &["."], &["apps/electron"], false);
+    let electron = tracker("electron", &["apps/electron"], &[], false);
+    let carved = compose::compose(
+        &repo,
+        VIEW,
+        &[TrackerTip {
+            definition: &root,
+            commit: commits[3].clone(),
+        }],
+    )
+    .expect("compose");
+    assert!(carved.tip.is_some());
+    let electron_tip = compose::carve(
+        &repo,
+        &commits[3],
+        &electron,
+        "refs/newgit/trackers/electron/main",
+    )
+    .expect("carve")
+    .expect("history");
+
+    // Divergence: electron gains a commit root never had.
+    git(&repo, &["checkout", "-q", &electron_tip]);
+    let electron_only = commit(
+        &repo,
+        &[("apps/electron/main.js", "electron's own\n")],
+        "electron: own work",
+        "ana",
+        4_500,
+    );
+
+    // Then root merges a feature branch.
+    git(&repo, &["checkout", "-q", "-B", "main", &commits[3]]);
+    git(&repo, &["checkout", "-q", "-b", "feature"]);
+    commit(
+        &repo,
+        &[("FEATURE.md", "feature\n")],
+        "feature work",
+        "ana",
+        5_000,
+    );
+    git(&repo, &["checkout", "-q", "main"]);
+    commit(
+        &repo,
+        &[("NOTES.md", "main moved\n")],
+        "main moves",
+        "jack",
+        6_000,
+    );
+    git_env(
+        &repo,
+        &[
+            "merge",
+            "-q",
+            "--no-ff",
+            "--no-gpg-sign",
+            "-m",
+            "Merge feature",
+            "feature",
+        ],
+        &who("jack", 7_000),
+    );
+    let root_tip = git(&repo, &["rev-parse", "HEAD"]);
+
+    let view = compose::compose(
+        &repo,
+        VIEW,
+        &[
+            TrackerTip {
+                definition: &root,
+                commit: root_tip.clone(),
+            },
+            TrackerTip {
+                definition: &electron,
+                commit: electron_only,
+            },
+        ],
+    )
+    .expect("compose");
+    let tip = view.tip.expect("tip");
+    assert_ne!(
+        tip, root_tip,
+        "diverged histories cannot reuse the original merge"
+    );
+    let parents = git(&repo, &["rev-list", "--parents", "-n1", &tip]);
+    assert_eq!(
+        parents.split(' ').count(),
+        3,
+        "the rebuilt merge keeps both parents: {parents}"
+    );
+    let log = git(&repo, &["log", "--format=%s", &tip]);
+    assert!(
+        log.contains("feature work"),
+        "the merged branch is in history:\n{log}"
+    );
+    assert!(log.contains("electron: own work"), "{log}");
+    assert_eq!(
+        git(&repo, &["show", &format!("{tip}:apps/electron/main.js")]),
+        "electron's own"
+    );
+    assert_eq!(
+        git(&repo, &["show", &format!("{tip}:FEATURE.md")]),
+        "feature"
+    );
+}

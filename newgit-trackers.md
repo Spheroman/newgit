@@ -135,6 +135,21 @@ came from is kept in a note (`refs/notes/newgit-composed`). Composing again
 after trackers move appends to the view; it rewrites the view only past
 the earliest commit whose position changed.
 
+**Merges keep every parent (decided).** Replay covers each tracker's whole
+history, not just its first-parent line: the commits a merge brings in are
+replayed as real view commits, and a rebuilt merge points at them, so `git
+log` shows merged branches and `git blame` reaches into them. On a side
+branch, a tracker's commit carries the other trackers' content as it stood
+where the branch forked, plus any of its own changes to paths another bound
+tracker owns (pre-carve history, the true state on that branch).
+
+**Originals are reused (decided).** A view commit is emitted as the existing
+original — same object, id, merge parents, signature — whenever it lands
+exactly where the original sits (same parents, each reused itself) with
+exactly its changes. A history that never diverged across trackers is reused
+whole, and nothing is written; recreating starts only where tracker
+histories really differ.
+
 **Splitting (decided).** A view commit is split by ownership into one commit
 per code tracker it touched, on that tracker's instance branch: same author,
 date, and message, plus a `Newgit-Split: <view commit>` trailer. On replay,
