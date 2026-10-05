@@ -57,9 +57,25 @@ project.
 
 Every tracker is its own history. `root` owns `.` — whatever no more specific
 tracker claims — and starts as your project's Git history; `project` owns
-`.newgit`. Carve out a code tracker, history included, with `newgit tracker
-create electron --code --path apps/electron`. Trackers are secret by default:
-captured, never committed.
+`.newgit` (resources, scripts, config), and `access` owns `.newgit/trackers/`,
+who may read what, which only the project's owner changes by default
+(`maintainers = "owner"`). Carve out a code tracker, history included, with
+`newgit tracker create electron --code --path apps/electron`. Trackers are
+secret by default: captured, never committed.
+
+An instance works on what it binds:
+
+```sh
+newgit spawn fix-db --use staging-db --drop electron   # one per role; the rest as you say
+newgit tracker drop electron --stash   # out of the working tree, history untouched
+newgit tracker use electron            # back, with the stashed work
+newgit status                          # ready / not ready, and why
+```
+
+Trackers sharing a `role` are alternatives (`dev-db`, `staging-db`); a spawn
+picks one by `--use`, then your own default in `~/.newgit/config.toml`, then
+`priority`. A tracker can bring resources (they run only while it is bound) and
+`require` others.
 
 ## Install
 
@@ -177,7 +193,9 @@ tests by nature.
 Branch-instance lifecycle (top-level verbs; `[instance]` is inferred when run
 inside a workspace):
 
-- `newgit init` / `spawn <name>` / `status [name]` / `remove <name> [--purge]`
+- `newgit init` / `spawn <name> [--use <tracker>] [--drop <tracker>]` /
+  `status [name]` / `remove <name> [--purge]` — `status` says whether each
+  instance is ready, and why not
 - `newgit status <instance> --path` — just the workspace path, for scripts
 - `newgit reference` — the definition format, every key and default
 - `newgit run [instance] -- <command>` — run with exports and ports loaded
@@ -199,7 +217,10 @@ Definition management (noun subcommands):
 - `newgit tracker capture|merge|pull|checkout <tracker> [instance]`
 - `newgit tracker capture <tracker> --from-store` — seed a lane from the store
   repo's working tree, so the first `spawn` comes up with the content
-- `newgit tracker list`
+- `newgit tracker list` — a tree by ownership: kind, role, priority,
+  maintainers, and (inside a workspace) what is bound
+- `newgit tracker use <tracker> [instance]` / `newgit tracker drop <tracker>
+  [instance] [--stash | --discard]`
 - `newgit log <tracker> [instance] [-- <git log args>]` — one tracker's
   history: an instance's branch as of its last checkpoint, or the project
   root's

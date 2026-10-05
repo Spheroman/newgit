@@ -473,6 +473,16 @@ branch's list in the project's Durable Object — every tracker moves
 together, or none does. (The Worker's Artifacts binding cannot write refs,
 so the merge's Git work is the merger's; the list is the truth.)
 
+Who may move a tracker is its definition's `maintainers` (`owner`,
+`project-devs`, or `user:<login>`; it defaults to the audience). A
+definition is itself a file, `.newgit/trackers/<name>.toml`, owned by
+`access`, which only the project's owner maintains, so changing who may read
+or merge anything is an owner's merge. Governance layers the same way: a
+tracker that claims some definitions governs them, resolved on the Worker
+from the branch's own `access` before any credential is minted. A merge
+moves only the trackers the merger's instance binds; a dropped tracker stays
+where the branch had it.
+
 On each push, ProjectDO compares the paths the instance touched with every
 other live instance's and reports overlaps in `newgit status --json` and the
 web UI. No queue UI, no review threads. *(Not built yet.)*

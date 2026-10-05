@@ -1107,6 +1107,7 @@ Beyond v1, newgit talks to the hosted remote described in
 flow), `newgit remote add [--url <url>] [--project <owner>/<name>]` /
 `remote show`, `newgit members add|remove <github-login>` / `members list`,
 `newgit clone <owner>/<name>`, `newgit merge [instance] [--into <branch>]`,
+`newgit tracker use|drop <tracker>` (binding, newgit-trackers.md),
 and `newgit spawn --from-checkpoint <instance>/<checkpoint>`, which brings
 up someone else's checkpoint locally — source, uncommitted work, your own
 copy of their trackers, and resources restored.

@@ -66,14 +66,15 @@ priority = 10
 | `priority` | Which alternative is picked by default: highest readable wins. **Negative: never picked automatically** — only by `--use` or a personal setting. |
 | `resources` | Resources this tracker brings. A resource is bound iff a bound tracker brings it. |
 | `requires` | Trackers or roles this one needs: bound with it, and merged before (or with) it. |
-| `merge` | `with-change` (default: merged together with whatever else a change touched) or `explicit` (only by `newgit tracker merge`; env files). Replaces `merge_with_source`. |
-| `secret` | Never in the workspace's Git: excluded, never committed, captured by newgit from the files at checkpoint. Env trackers set it. |
-| `production` | Production content: agent and instance tokens may not bind it, and its resources' destructive hooks are refused. |
+| `secret` | Never in the workspace's Git: excluded, never committed, captured by newgit from the files at checkpoint. The default; `secret = false` makes a code tracker. |
+| `maintainers` | Who may merge changes to it: `owner`, `project-devs`, or `user:<login>`; by default its audience. See *Who may change what*. |
+| `merge` *(planned)* | `with-change` (merged together with whatever else a change touched) or `explicit` (only by `newgit tracker merge`; env files). Would replace `merge_with_source`. |
+| `production` *(planned)* | Production content: agent and instance tokens may not bind it, and its resources' destructive hooks are refused. |
 
-**Ownership (decided).** Every path in a workspace has exactly one owner:
-the most specific path among the *bound* trackers. Two bound trackers may not
-claim the same path unless one's claim is strictly more specific. Trackers in
-the same role may claim identical paths — they are never bound together.
+**Ownership (decided).** Every path has exactly one owner: the most specific
+claim among the project's trackers. Two trackers may not claim the same path
+unless one's claim is strictly more specific — except trackers in the same
+role, which may claim identical paths, since they are never bound together.
 
 **The root tracker (decided).** `newgit init` creates `root`, owning `.`. It
 holds whatever no other tracker claims — in a fresh project, everything — so
@@ -85,26 +86,43 @@ create electron --code --path apps/electron`) moves those paths' history out of
 
 ## Binding
 
+**What a binding is (decided).** An instance's history holds every code
+tracker its user may read, whatever it binds — so every instance of a project
+has the same commit ids. Binding is what the instance *works on*: a dropped
+code tracker's files are left out of its working tree (Git's sparse checkout)
+and its work is out of scope — nothing splits into it, and a merge leaves it at
+the branch's commit. A dropped secret tracker's files are removed after its
+content is captured. Neither ever makes a commit.
+
 At spawn, for each slot (each role, and each role-less tracker):
 
-1. Your explicit choices first: `--use <tracker>` and
-   `.newgit/local/settings.toml` (`use = [...]`, machine-local, uncommitted).
-2. Otherwise the highest-priority tracker in the slot you may read, if its
-   priority is ≥ 0. Two readable alternatives at equal priority is a
-   definition error naming both.
-3. Then the resources the bound trackers bring.
+1. `--use <tracker>` or `--drop <tracker>` first.
+2. Otherwise, for a role, your own default: `[projects.<project>.roles]` in
+   `~/.newgit/config.toml` — yours, never written by newgit, and it overrides
+   priority.
+3. Otherwise the highest-priority tracker in the slot (ties broken by name),
+   if its priority is ≥ 0. A role-less tracker is bound unless its priority is
+   negative.
+4. Then whatever the bound trackers `require`, transitively — an unfilled
+   required role is a spawn error naming the trackers that could fill it — and
+   the resources the bound trackers bring.
 
-`newgit tracker use <tracker>` binds a tracker into an existing instance (swapping
-out whatever filled its slot); `newgit tracker drop <tracker>` unbinds a
-role-less one. Swapping out captures the outgoing tracker's changes to its own
-branch first, stops (never cleans up) resources no longer brought, and starts
-the ones newly brought.
+`newgit tracker use <tracker>` binds a tracker into an existing instance:
+swapping out whatever filled its role, binding what it requires, and starting
+the resources it brings. `newgit tracker drop <tracker>` unbinds one, stopping
+(never cleaning up) the resources no longer brought; it is refused while
+another bound tracker requires it, and while the tracker has uncommitted work
+unless `--stash` (brought back by the next `use`) or `--discard` (after a
+checkpoint, so `newgit undo` gets it back). `root`, `project`, and `access`
+cannot be dropped. A checkpoint records the binding, and undo restores it.
 
-**Dependencies (decided).** `depends_on` names a resource or a role. A role
-dependency is satisfied when the role is filled: if the bound tracker brought
-resources, the dependent waits for them; if it brought none (`staging-db`),
-its content alone satisfies it. An unfilled role is a spawn error naming the
-role and the trackers that could fill it.
+`{{bound.trackers}}` and `{{bound.paths}}` give a resource's commands what the
+instance binds, so a shared install builds only the bound members.
+
+**Dependencies (decided, not wired yet).** `depends_on` names a resource or a
+role. A role dependency is satisfied when the role is filled: if the bound
+tracker brought resources, the dependent waits for them; if it brought none
+(`staging-db`), its content alone satisfies it.
 
 ---
 
@@ -208,9 +226,11 @@ refs once made; composing fetches code trackers' commits into the project
 repo under its own refs. Secret trackers never enter the view: their files
 are projected into workspaces as today.
 
-**Unbound trackers are absent (decided).** A tracker the instance does not
-bind is simply not in its view (Git's sparse checkout underneath): `tracker
-use` widens it, `tracker drop` narrows it.
+**Unbound trackers are out of the working tree, not the history (decided).**
+A tracker the instance does not bind is hidden by Git's sparse checkout:
+`tracker use` widens it, `tracker drop` narrows it, and history never changes
+(see *Binding*). A tracker its *user* may not read is absent from the history
+altogether.
 
 **Secrets never leave through Git (decided).** A commit adding or changing
 a secret tracker's file (`git add -f .env.local`) is refused when it would
