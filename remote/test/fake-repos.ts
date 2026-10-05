@@ -45,3 +45,6 @@ export class FakeRepos implements Repos {
 		return `https://acct.artifacts.example/git/newgit/${name}.git`;
 	}
 }
+
+/** For tests that never reach the Git endpoint. */
+export const noEndpoint = async () => new Response("no endpoint in this test", { status: 501 });

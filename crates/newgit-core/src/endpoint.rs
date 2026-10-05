@@ -1,0 +1,231 @@
+//! The Git endpoint's work inside its container (newgit-trackers.md, *The Git
+//! endpoint*). The Worker decides who may read what and hands the container a
+//! plan: each branch's list, cut down to the trackers this reader may read,
+//! and where to fetch every tracker. This composes those lists into a bare
+//! repository holding exactly that — nothing a tracker the reader may not read
+//! put there — for `git upload-pack` to serve.
+//!
+//! Views are cached by plan: the same lists compose to the same repository,
+//! so a second fetch of an unchanged branch serves at once.
+
+use std::collections::BTreeMap;
+
+use camino::{Utf8Path, Utf8PathBuf};
+use serde::Deserialize;
+use sha2::{Digest as _, Sha256};
+
+use crate::compose::{self, TrackerTip};
+use crate::error::{NewgitError, Result};
+use crate::source::{GitSource, run_git_env};
+use crate::tracker::{PROJECT_TRACKER, TrackerDefinition, resolve_ownership};
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct Plan {
+    /// Where the container keeps its repositories.
+    pub dir: Utf8PathBuf,
+    /// Branch → tracker → commit: only the trackers this reader may read.
+    pub branches: BTreeMap<String, BTreeMap<String, String>>,
+    pub default_branch: String,
+    /// The `project` tracker's commit on the default branch: where the
+    /// definitions come from. Always fetched — the server reads them even
+    /// when the reader may not — and never served unless listed above.
+    pub definitions: String,
+    /// Tracker → where to fetch it.
+    pub repos: BTreeMap<String, Source>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct Source {
+    pub url: String,
+    /// The `Authorization` header Git sends.
+    pub auth: String,
+}
+
+/// Compose `plan` into a bare repository and return its path.
+pub fn compose_view(plan: &Plan) -> Result<Utf8PathBuf> {
+    let store = plan.dir.join("trackers.git");
+    let views = plan.dir.join("views");
+    std::fs::create_dir_all(&views).map_err(|source| NewgitError::io(&views, source))?;
+    if !store.join("HEAD").exists() {
+        run_git_env(&["init", "-q", "--bare", store.as_str()], &[])?;
+    }
+
+    // Fetch each tracker whose commits are not here yet.
+    let mut wanted: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    for list in plan.branches.values() {
+        for (tracker, commit) in list {
+            wanted.entry(tracker).or_default().push(commit);
+        }
+    }
+    wanted
+        .entry(PROJECT_TRACKER)
+        .or_default()
+        .push(&plan.definitions);
+    for (tracker, commits) in &wanted {
+        if commits.iter().all(|commit| has_commit(&store, commit)) {
+            continue;
+        }
+        let source = plan.repos.get(*tracker).ok_or_else(|| {
+            NewgitError::Unsupported(format!("the plan names `{tracker}` but not where it is"))
+        })?;
+        GitSource::fetch_refs(
+            &[&format!("--git-dir={store}")],
+            &source.url,
+            &[format!("+refs/heads/*:refs/trackers/{tracker}/*")],
+            Some(&source.auth),
+        )?;
+        for commit in commits {
+            if !has_commit(&store, commit) {
+                return Err(NewgitError::Unsupported(format!(
+                    "`{tracker}`'s repo does not have {commit}"
+                )));
+            }
+        }
+    }
+
+    let key = plan_key(plan);
+    let view = views.join(format!("{key}.git"));
+    if view.join("HEAD").exists() {
+        return Ok(view);
+    }
+
+    let definitions = definitions_at(&store, &plan.definitions, &plan.dir)?;
+    let code: Vec<&TrackerDefinition> = definitions
+        .iter()
+        .filter(|definition| !definition.secret)
+        .collect();
+    for (branch, list) in &plan.branches {
+        let tips: Vec<TrackerTip<'_>> = code
+            .iter()
+            .filter_map(|definition| {
+                list.get(&definition.name).map(|commit| TrackerTip {
+                    definition,
+                    commit: commit.clone(),
+                })
+            })
+            .collect();
+        if tips.is_empty() {
+            continue;
+        }
+        compose::compose(
+            &store,
+            &format!("refs/views/{key}/heads/{branch}"),
+            &tips,
+            &definitions,
+        )?;
+    }
+
+    // A repository of its own, so it holds only what these views reach: a
+    // fetch copies nothing else, and upload-pack serves nothing else.
+    let staging = views.join(format!("{key}.tmp-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&staging);
+    run_git_env(&["init", "-q", "--bare", staging.as_str()], &[])?;
+    run_git_env(
+        &[
+            &format!("--git-dir={staging}"),
+            "fetch",
+            "-q",
+            store.as_str(),
+            &format!("+refs/views/{key}/heads/*:refs/heads/*"),
+        ],
+        &[],
+    )?;
+    run_git_env(
+        &[
+            &format!("--git-dir={staging}"),
+            "symbolic-ref",
+            "HEAD",
+            &format!("refs/heads/{}", plan.default_branch),
+        ],
+        &[],
+    )?;
+    match std::fs::rename(&staging, &view) {
+        Ok(()) => Ok(view),
+        // Another request composed the same view first: it is the same.
+        Err(_) if view.join("HEAD").exists() => {
+            let _ = std::fs::remove_dir_all(&staging);
+            Ok(view)
+        }
+        Err(source) => Err(NewgitError::io(&view, source)),
+    }
+}
+
+fn has_commit(store: &Utf8Path, commit: &str) -> bool {
+    run_git_env(
+        &[
+            &format!("--git-dir={store}"),
+            "cat-file",
+            "-e",
+            &format!("{commit}^{{commit}}"),
+        ],
+        &[],
+    )
+    .is_ok()
+}
+
+/// The same lists compose to the same view.
+fn plan_key(plan: &Plan) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(plan.default_branch.as_bytes());
+    hasher.update(plan.definitions.as_bytes());
+    for (branch, list) in &plan.branches {
+        hasher.update(format!("\n{branch}").as_bytes());
+        for (tracker, commit) in list {
+            hasher.update(format!(" {tracker}={commit}").as_bytes());
+        }
+    }
+    hasher
+        .finalize()
+        .iter()
+        .take(16)
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+/// The tracker definitions committed at `commit` of the `project` tracker,
+/// with `root` and `project` themselves whether or not they have files.
+fn definitions_at(
+    store: &Utf8Path,
+    commit: &str,
+    scratch: &Utf8Path,
+) -> Result<Vec<TrackerDefinition>> {
+    let dir = scratch.join(format!("definitions-{commit}"));
+    std::fs::create_dir_all(&dir).map_err(|source| NewgitError::io(&dir, source))?;
+    let listing = run_git_env(
+        &[
+            &format!("--git-dir={store}"),
+            "ls-tree",
+            "--name-only",
+            &format!("{commit}:.newgit/trackers"),
+        ],
+        &[],
+    )
+    .unwrap_or_default();
+    let mut definitions = Vec::new();
+    for file in listing.lines().filter(|file| file.ends_with(".toml")) {
+        let text = run_git_env(
+            &[
+                &format!("--git-dir={store}"),
+                "show",
+                &format!("{commit}:.newgit/trackers/{file}"),
+            ],
+            &[],
+        )?;
+        let path = dir.join(file);
+        std::fs::write(&path, format!("{text}\n"))
+            .map_err(|source| NewgitError::io(&path, source))?;
+        let name = file.trim_end_matches(".toml");
+        definitions.push(TrackerDefinition::from_file(name, &path)?);
+    }
+    if !definitions.iter().any(TrackerDefinition::owns_everything) {
+        definitions.push(TrackerDefinition::root());
+    }
+    if !definitions
+        .iter()
+        .any(|definition| definition.name == PROJECT_TRACKER)
+    {
+        definitions.push(TrackerDefinition::project());
+    }
+    resolve_ownership(&mut definitions)?;
+    Ok(definitions)
+}

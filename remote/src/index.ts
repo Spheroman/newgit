@@ -29,9 +29,11 @@ import {
 	projectKey,
 	repoName,
 } from "./names";
+import { type EndpointKind, type EndpointPlan, PLAN_HEADER } from "./endpoint";
 import type { ProjectDO } from "./project";
 import type { UserDO } from "./users";
 
+export { GitEndpoint } from "./endpoint";
 export { ProjectDO } from "./project";
 export { UserDO } from "./users";
 
@@ -56,6 +58,8 @@ export interface Deps {
 	fetcher: typeof fetch;
 	/** Work that may outlive the response (a fork takes seconds). */
 	waitUntil(promise: Promise<unknown>): void;
+	/** Serve one Git request from a project's endpoint container. */
+	endpoint(project: string, kind: EndpointKind, plan: EndpointPlan, request: Request): Promise<Response>;
 }
 
 class HttpError extends Error {
@@ -75,14 +79,33 @@ export default {
 			repos: new ArtifactsRepos(env.ARTIFACTS, env.ARTIFACTS_GIT_BASE),
 			fetcher: fetch,
 			waitUntil: (promise) => ctx.waitUntil(promise),
+			endpoint: (project, kind, plan, original) => {
+				const headers = new Headers({ [PLAN_HEADER]: btoa(JSON.stringify(plan)) });
+				for (const name of ["git-protocol", "content-encoding", "content-type"]) {
+					const value = original.headers.get(name);
+					if (value) headers.set(name, value);
+				}
+				return env.ENDPOINTS.getByName(project).fetch(
+					new Request(`https://endpoint/${kind}`, { method: "POST", headers, body: original.body }),
+				);
+			},
 		});
 	},
 } satisfies ExportedHandler<Env>;
 
 export async function handle(request: Request, env: Env, deps: Deps): Promise<Response> {
+	const git = new URL(request.url).pathname.match(GIT_ROUTE);
 	try {
+		if (git) return await gitEndpoint(request, env, deps, git);
 		return await route(request, env, deps);
 	} catch (error) {
+		// Git shows a plain-text body to whoever ran it; JSON is for the API.
+		if (error instanceof HttpError && git)
+			return new Response(`newgit: ${error.message}\n`, {
+				status: error.status,
+				headers:
+					error.status === 401 ? { "www-authenticate": 'Basic realm="newgit"' } : { "content-type": "text/plain" },
+			});
 		if (error instanceof HttpError) return json({ error: error.message }, error.status);
 		console.error(error);
 		return json({ error: "internal error" }, 500);
@@ -400,6 +423,88 @@ async function route(request: Request, env: Env, deps: Deps): Promise<Response> 
 	throw new HttpError(404, `no route for ${method} ${path}`);
 }
 
+// ── The Git endpoint ──────────────────────────────────────────────────────
+
+/** `/<owner>/<name>.git/info/refs` and `/<owner>/<name>.git/git-upload-pack`. */
+const GIT_ROUTE = /^\/([^/]+)\/([^/]+?)\.git\/(info\/refs|git-upload-pack|git-receive-pack)$/;
+
+/**
+ * Answer a Git client: `git clone https://newgit.dev/<owner>/<name>.git`
+ * with plain Git. The password is a newgit token (the credential helper gives
+ * a workspace's own); each branch is composed from the trackers this caller
+ * may read, each fetched with a short read password minted for them and
+ * recorded against their token, so revoking the token revokes those too.
+ * Read-only: pushes go through a newgit workspace, which splits them.
+ */
+async function gitEndpoint(request: Request, env: Env, deps: Deps, match: RegExpMatchArray): Promise<Response> {
+	const url = new URL(request.url);
+	const service = match[3] === "info/refs" ? url.searchParams.get("service") : match[3];
+	if (service === "git-receive-pack")
+		throw new HttpError(
+			403,
+			"this endpoint is read-only: push from a newgit workspace, which splits your work into its trackers",
+		);
+	if (service !== "git-upload-pack") throw new HttpError(400, "only Git's smart HTTP protocol is served here");
+
+	const header = request.headers.get("authorization") ?? "";
+	let token = "";
+	if (header.startsWith("Basic ")) {
+		const decoded = atob(header.slice("Basic ".length));
+		token = decoded.slice(decoded.indexOf(":") + 1);
+	} else if (header.startsWith("Bearer ")) {
+		token = header.slice("Bearer ".length);
+	}
+	if (!token) throw new HttpError(401, "log in with `newgit login`; the credential helper answers for this URL");
+	const caller = await callerFor(token, env);
+
+	const id = parseProjectKey(`${decodeURIComponent(match[1])}/${decodeURIComponent(match[2])}`);
+	if (id === null) throw new HttpError(404, "a project is <owner>/<name>.git");
+	const key = projectKey(id);
+	if (caller.project !== undefined && caller.project !== key)
+		throw new HttpError(403, `this token is for ${caller.project} only`);
+	const project = projectStub(env, id);
+	const info = await project.info();
+	if (info === null) throw new HttpError(404, `no project \`${key}\``);
+	const who = { login: caller.login, member: await project.isMember(caller.login) };
+
+	const branches = await project.branches();
+	const definitions = branches.find((branch) => branch.name === info.defaultBranch)?.list.project;
+	if (!definitions) throw new HttpError(404, `${key} has no \`${info.defaultBranch}\` branch yet`);
+
+	// Each branch, cut down to the code trackers this caller may read.
+	const facts = new Map<string, Awaited<ReturnType<typeof definitionFacts>>>();
+	const plan: EndpointPlan = {
+		dir: "/work",
+		branches: {},
+		default_branch: info.defaultBranch,
+		definitions,
+		repos: {},
+	};
+	const needed = new Set<string>(["project"]);
+	for (const branch of branches) {
+		const list: Record<string, string> = {};
+		for (const [tracker, commit] of Object.entries(branch.list)) {
+			if (!facts.has(tracker)) facts.set(tracker, await definitionFacts(deps.repos, id, info.defaultBranch, tracker));
+			const tracker_facts = facts.get(tracker);
+			if (!tracker_facts?.code) continue;
+			if (!decide({ kind: "tracker", project: id, tracker }, "read", who, { tracker: tracker_facts }).ok) continue;
+			list[tracker] = commit;
+			needed.add(tracker);
+		}
+		if (Object.keys(list).length > 0) plan.branches[branch.name] = list;
+	}
+	if (Object.keys(plan.branches).length === 0)
+		throw new HttpError(who.member ? 403 : 404, who.member ? `nothing in ${key} is yours to read` : `no project \`${key}\``);
+
+	for (const tracker of needed) {
+		const name = repoName({ kind: "tracker", project: id, tracker });
+		const minted = await deps.repos.mint(name, "read", CREDENTIAL_TTL_SECONDS);
+		await userStub(env, caller.login).recordRepoToken(caller.tokenId, name, minted.id, minted.expiresAt);
+		plan.repos[tracker] = { url: deps.repos.url(name), auth: `Basic ${btoa(`x:${minted.password}`)}` };
+	}
+	return deps.endpoint(key, service === match[3] ? "upload-pack" : "advertise", plan, request);
+}
+
 /** Where a project's Git endpoint is: `https://<host>/<owner>/<name>.git`. */
 function endpointUrl(url: URL, id: ProjectId): string {
 	return `${url.origin}/${id.owner}/${id.name}.git`;
@@ -494,6 +599,10 @@ function repoFromUrlOrName(value: string): string {
 async function authenticate(request: Request, env: Env): Promise<Caller> {
 	const header = request.headers.get("authorization") ?? "";
 	const token = header.startsWith("Bearer ") ? header.slice("Bearer ".length) : "";
+	return callerFor(token, env);
+}
+
+async function callerFor(token: string, env: Env): Promise<Caller> {
 	const claims = token ? await verifyToken(env.TOKEN_KEY, token) : null;
 	if (claims === null) throw new HttpError(401, "not logged in: run `newgit login`");
 	if (!(await userStub(env, claims.sub).check(claims.jti)))

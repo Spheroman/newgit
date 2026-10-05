@@ -1,0 +1,6 @@
+# The Git endpoint's image is built with the repository as its context
+# (remote/endpoint.Dockerfile); it needs only the Rust sources.
+*
+!Cargo.toml
+!Cargo.lock
+!crates/

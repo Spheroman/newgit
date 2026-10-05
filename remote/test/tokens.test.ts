@@ -3,7 +3,7 @@ import { beforeEach, describe, expect, it } from "vitest";
 
 import { LOGIN_TTL_SECONDS, signToken } from "../src/auth";
 import { handle, issue } from "../src/index";
-import { FakeRepos } from "./fake-repos";
+import { FakeRepos, noEndpoint } from "./fake-repos";
 
 let repos: FakeRepos;
 let project: string;
@@ -26,7 +26,7 @@ async function call(token: string, method: string, path: string, body?: unknown)
 			body: body === undefined ? undefined : JSON.stringify(body),
 		}),
 		env,
-		{ repos, fetcher: fetch, waitUntil: () => {} },
+		{ repos, fetcher: fetch, waitUntil: () => {}, endpoint: noEndpoint },
 	);
 	return { status: response.status, body: (await response.json()) as any };
 }

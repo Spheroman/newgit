@@ -3,7 +3,7 @@ import { beforeEach, describe, expect, it } from "vitest";
 
 import { LOGIN_TTL_SECONDS } from "../src/auth";
 import { handle, issue } from "../src/index";
-import { FakeRepos } from "./fake-repos";
+import { FakeRepos, noEndpoint } from "./fake-repos";
 
 let repos: FakeRepos;
 let pending: Promise<unknown>[];
@@ -31,7 +31,7 @@ async function call(token: string, method: string, path: string, body?: unknown)
 			body: body === undefined ? undefined : JSON.stringify(body),
 		}),
 		env,
-		{ repos, fetcher: fetch, waitUntil: (promise) => pending.push(promise) },
+		{ repos, fetcher: fetch, waitUntil: (promise) => pending.push(promise), endpoint: noEndpoint },
 	);
 	return { status: response.status, body: (await response.json()) as any };
 }

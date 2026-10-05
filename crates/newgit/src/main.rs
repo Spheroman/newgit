@@ -200,6 +200,10 @@ enum Command {
         #[arg(long)]
         url: Option<String>,
     },
+    /// The Git endpoint's composer, run inside its container: reads a plan
+    /// (JSON) on stdin, prints the bare repository it composed
+    #[command(hide = true)]
+    EndpointCompose,
     /// Link this project to a newgit remote
     Remote {
         #[command(subcommand)]
@@ -425,6 +429,12 @@ fn main() -> Result<()> {
         Command::Whoami { url, json } => remote_cmd::whoami(url, json),
         Command::Remote { command } => remote_cmd::remote_command(command),
         Command::Clone { project, dir, url } => remote_cmd::clone(&project, dir, url),
+        Command::EndpointCompose => {
+            let plan: newgit_core::endpoint::Plan = serde_json::from_reader(std::io::stdin())
+                .context("the plan on stdin is not JSON newgit can read")?;
+            println!("{}", newgit_core::endpoint::compose_view(&plan)?);
+            Ok(())
+        }
         Command::Members { command } => remote_cmd::members(command),
         Command::Credential { operation } => remote_cmd::credential(&operation),
     }

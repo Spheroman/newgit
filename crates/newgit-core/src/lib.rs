@@ -3,6 +3,7 @@ pub mod checkpoint;
 pub mod cleanup;
 pub mod compose;
 pub mod config;
+pub mod endpoint;
 pub mod error;
 pub mod export;
 pub mod exports;
