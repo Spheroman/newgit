@@ -1416,33 +1416,54 @@ all of these hold:
   branch.
 - **Its tip is on some other ref**: another local branch (merged, or the
   instance never committed), a remote-tracking ref, a tag, or a branch the
-  real remote had as of the last workspace `git push`. That last one is read
-  from the outbox, because a push from a workspace never updates the store's
-  own `refs/remotes`. newgit's checkpoint refs do not count: they are undo
-  history, not a place anyone looks for their work.
+  real remote has *right now*. newgit's checkpoint refs do not count: they
+  are undo history, not a place anyone looks for their work.
+
+The remote is asked only when no local ref holds the tip, and asked live:
+`remove` refreshes the outbox from `origin` first, because a push from a
+workspace never updates the store's own `refs/remotes`, and the outbox
+otherwise mirrors the remote only as of the last push — after which a PR
+can be closed and its branch deleted. If the refresh fails (offline, auth),
+the remote is not counted, and the branch is kept with the reason
+("couldn't reach origin to confirm it has this commit"). Keeping is always
+the safe direction.
+
+Teardown runs between the decision and the deletion, and cleanup hooks can
+be slow, so `remove` asks again immediately before deleting and keeps the
+branch if the other ref has moved or gone — two parallel removals of
+branches sharing a tip would otherwise each count the other. The deletion
+itself is guarded on the tip it decided about; a branch that moved anyway is
+kept and reported, never an error, since by then the removal has happened.
 
 `--keep-branch` keeps it regardless; `--delete-branch` deletes it
 regardless, and then prints the tip and the `git branch <name> <tip>` that
-brings it back. A `--delete-branch` that cannot be honoured (the branch is
-checked out) refuses before anything is torn down, not after.
+brings it back — saying whether a checkpoint ref still pins it, or only the
+next `git gc` stands between it and deletion. A `--delete-branch` that
+cannot be honoured (the branch is checked out) refuses before anything is
+torn down, not after.
 
 The default deletes because the alternative inverted the asymmetry: removal
 already destroys the workspace and every resource it can tear down, and the
 branch is the one artifact that is both cheap to keep and certain to change
 the next `spawn` of the same name — which silently adopts a leftover branch
-instead of starting from `HEAD`. Deleting nothing unique cannot lose work,
-and the checks run against what Git can prove, not a guess at intent. A
-squash-merged branch whose remote branch was then deleted looks unique and
-is kept — the safe miss, named in the output with the command to finish
-the job.
+instead of starting from `HEAD`. Every check runs against what Git can show
+at the moment of deletion, not a guess at intent. What it can show is still
+only what refs say: a remote-tracking ref is as current as the store's last
+`git fetch`, the same trust `git branch -d` places in it. A squash-merged
+branch whose remote branch was then deleted looks unique and is kept — the
+safe miss, named in the output with the command to finish the job.
 
 Deleting the branch breaks no undo and no archived record. A checkpoint
 pins its source commits through `refs/newgit/checkpoints/<slug>/*`, not the
 branch, and `undo` re-points the branch from the checkpoint; a re-spawned
 instance of the same name recreates it. The archived record only names the
-branch. What `remove` does not protect is work in the workspace since its
-last checkpoint, branch or no branch — that is the workspace being
-disposable, and is unchanged.
+branch.
+
+What `remove` does not protect is work in the workspace since its last
+checkpoint — the workspace is disposable, and `remove` does not checkpoint
+first. It does say so: when no ref in the store contains the workspace's
+`HEAD`, the output names it as lost, so "nothing unique" about the store's
+branch never reads as "nothing lost".
 
 `newgit cleanup`, when it finalizes an instance whose workspace is gone,
 leaves the source branch alone: a garbage collector deleting branches is a

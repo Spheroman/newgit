@@ -303,6 +303,12 @@ pub struct RemoveOutcome {
     pub kept_checkpoints: usize,
     /// What happened to the instance's source branch in the store, and why.
     pub source_branch: SourceBranchOutcome,
+    /// The workspace's HEAD when no ref in the store contained it: commits
+    /// made after the last checkpoint, deleted with the workspace. `remove`
+    /// does not checkpoint first (the workspace is disposable), but it does
+    /// say so, rather than let "nothing unique" on the branch read as
+    /// "nothing lost".
+    pub unsaved_workspace_head: Option<String>,
 }
 
 /// What `remove` should do with the instance's source branch.
@@ -328,6 +334,10 @@ pub enum SourceBranchOutcome {
     Deleted {
         tip: String,
         found_on: Option<String>,
+        /// Whether a checkpoint ref in the store still reaches `tip` after
+        /// removal — i.e. whether `git branch <name> <tip>` keeps working
+        /// past the next `git gc`.
+        pinned_by_checkpoint: bool,
     },
     Kept(KeptBranch),
     /// The branch was already gone from the store.
@@ -346,6 +356,37 @@ pub enum KeptBranch {
     /// Its tip is on no other branch, tag, or remote ref — deleting it is
     /// the only way these commits stop being a branch.
     Unique { tip: String },
+    /// Its tip is on no local ref, and the publish remote could not be
+    /// reached to confirm it has the tip. Keeping is the safe direction.
+    RemoteUnconfirmed { tip: String, error: String },
+    /// The branch moved while removal ran, so the deletion — guarded on the
+    /// tip it decided about — did not happen. `now` is where it points.
+    Moved {
+        expected: String,
+        now: Option<String>,
+    },
+}
+
+/// Whether, and how, [`BranchManager::ref_holding`] may read the outbox.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OutboxRead {
+    /// Bring it up to date with the publish remote first (a network fetch),
+    /// and count it only if that succeeded.
+    Refresh,
+    /// Read it as it stands — only right after a `Refresh`.
+    AsIs,
+    /// Do not count it.
+    Skip,
+}
+
+/// What [`BranchManager::ref_holding`] found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Holding {
+    found_on: Option<String>,
+    /// `found_on` came from the outbox.
+    via_outbox: bool,
+    /// The outbox refresh failed, so the remote went uncounted.
+    remote_error: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2570,7 +2611,9 @@ impl BranchManager {
             )));
         }
 
-        let source_branch = self.decide_source_branch(&branch, source_branch)?;
+        let policy = source_branch;
+        let (mut source_branch, via_outbox) = self.decide_source_branch(&branch, policy)?;
+        let unsaved_workspace_head = self.unsaved_workspace_head(&branch);
 
         // Stop anything still running before the workspace disappears.
         let supervisor = self.supervisor(&branch);
@@ -2599,10 +2642,13 @@ impl BranchManager {
             (false, purged) => (purged, 0),
         };
 
-        // Last, after everything that could fail: a removal that errors
-        // halfway should leave the branch for the retry to decide about.
+        // Last, so an error anywhere above leaves the branch untouched. By
+        // now the record is archived and the removal has happened, so
+        // nothing below may fail it: every way the deletion can go wrong
+        // becomes a kept branch with the reason, never an error.
         if let SourceBranchOutcome::Deleted { tip, .. } = &source_branch {
-            self.source.delete_branch(&branch.source_ref, tip)?;
+            let tip = tip.clone();
+            source_branch = self.delete_source_branch(&branch, policy, tip, via_outbox);
         }
 
         Ok(RemoveOutcome {
@@ -2612,29 +2658,99 @@ impl BranchManager {
             purged_checkpoints,
             kept_checkpoints,
             source_branch,
+            unsaved_workspace_head,
         })
+    }
+
+    /// Carry out a decided deletion. Cleanup hooks ran between the decision
+    /// and here, and may have taken long enough for the ref that held the
+    /// tip to move or go — two parallel removals of branches sharing a tip
+    /// would otherwise each count the other and both delete. So `Auto`
+    /// asks again, and keeps the branch if the answer changed.
+    fn delete_source_branch(
+        &self,
+        branch: &BranchInstance,
+        policy: SourceBranchPolicy,
+        tip: String,
+        via_outbox: bool,
+    ) -> SourceBranchOutcome {
+        let own = format!("refs/heads/{}", branch.source_ref);
+        let mut found_on = None;
+        if policy == SourceBranchPolicy::Auto {
+            // Re-read the outbox only if the decision came from a fresh
+            // read of it; otherwise it may be as old as the last push.
+            let outbox = if via_outbox {
+                OutboxRead::AsIs
+            } else {
+                OutboxRead::Skip
+            };
+            match self.ref_holding(&tip, &own, outbox) {
+                Ok(Holding {
+                    found_on: Some(name),
+                    ..
+                }) => found_on = Some(name),
+                _ => return SourceBranchOutcome::Kept(KeptBranch::Unique { tip }),
+            }
+        } else if let Ok(holding) = self.ref_holding(&tip, &own, OutboxRead::Skip) {
+            found_on = holding.found_on;
+        }
+
+        if self.source.delete_branch(&branch.source_ref, &tip).is_err() {
+            return SourceBranchOutcome::Kept(KeptBranch::Moved {
+                expected: tip,
+                now: self.source.ref_rev(&own),
+            });
+        }
+        let pinned_by_checkpoint = crate::source::refs_containing_in(
+            self.source.root(),
+            &tip,
+            &["refs/newgit/checkpoints"],
+        )
+        .is_ok_and(|refs| !refs.is_empty());
+        SourceBranchOutcome::Deleted {
+            tip,
+            found_on,
+            pinned_by_checkpoint,
+        }
+    }
+
+    /// The workspace's HEAD, when no ref in the store contains it — work
+    /// since the last checkpoint that removing the workspace destroys.
+    fn unsaved_workspace_head(&self, branch: &BranchInstance) -> Option<String> {
+        if !branch.workspace_path.is_dir() {
+            return None;
+        }
+        let head = GitSource::workspace_head(&branch.workspace_path).ok()?;
+        // An object the store never received is an error here, which is
+        // the same answer as "no ref contains it".
+        let saved = crate::source::refs_containing_in(self.source.root(), &head, &["refs"])
+            .is_ok_and(|refs| !refs.is_empty());
+        (!saved).then_some(head)
     }
 
     /// Decide what `remove` does with the source branch, without doing it.
     ///
     /// "Nothing unique" means the tip is in the history of some other
     /// branch, tag, or remote-tracking ref in the store, or of a branch the
-    /// publish remote had as of the last `git push` through the outbox —
-    /// which is where a workspace's pushes land, and which the store's own
-    /// `refs/remotes` never hears about. newgit's checkpoint refs do not
-    /// count: they are undo history, not a place a person would look for
-    /// their work.
+    /// publish remote has right now — read by refreshing the outbox, since
+    /// that is where a workspace's pushes land and the store's own
+    /// `refs/remotes` never hears about them. newgit's checkpoint refs do
+    /// not count: they are undo history, not a place a person would look
+    /// for their work.
+    ///
+    /// Also returns whether the answer came from the outbox, so the
+    /// re-check before deleting knows whether it may read it again.
     fn decide_source_branch(
         &self,
         branch: &BranchInstance,
         policy: SourceBranchPolicy,
-    ) -> Result<SourceBranchOutcome> {
+    ) -> Result<(SourceBranchOutcome, bool)> {
         let own = format!("refs/heads/{}", branch.source_ref);
         let Some(tip) = self.source.ref_rev(&own) else {
-            return Ok(SourceBranchOutcome::Missing);
+            return Ok((SourceBranchOutcome::Missing, false));
         };
         if policy == SourceBranchPolicy::Keep {
-            return Ok(SourceBranchOutcome::Kept(KeptBranch::Asked));
+            return Ok((SourceBranchOutcome::Kept(KeptBranch::Asked), false));
         }
         if let Some(path) = self.source.checked_out_at(&branch.source_ref)? {
             if policy == SourceBranchPolicy::Delete {
@@ -2645,54 +2761,113 @@ impl BranchManager {
                     branch.source_ref
                 )));
             }
-            return Ok(SourceBranchOutcome::Kept(KeptBranch::CheckedOut(path)));
+            return Ok((
+                SourceBranchOutcome::Kept(KeptBranch::CheckedOut(path)),
+                false,
+            ));
         }
         if policy == SourceBranchPolicy::Auto && !branch.created_source_branch {
-            return Ok(SourceBranchOutcome::Kept(KeptBranch::Adopted));
+            return Ok((SourceBranchOutcome::Kept(KeptBranch::Adopted), false));
+        }
+        if policy == SourceBranchPolicy::Delete {
+            // Deleting regardless: where else the tip lives is reported
+            // after the fact, from local refs, with no network.
+            return Ok((
+                SourceBranchOutcome::Deleted {
+                    tip,
+                    found_on: None,
+                    pinned_by_checkpoint: false,
+                },
+                false,
+            ));
         }
 
-        let found_on = self.ref_holding(&tip, &own)?;
-        match (policy, found_on) {
-            (SourceBranchPolicy::Auto, None) => {
-                Ok(SourceBranchOutcome::Kept(KeptBranch::Unique { tip }))
+        let holding = self.ref_holding(&tip, &own, OutboxRead::Refresh)?;
+        let outcome = match (holding.found_on, holding.remote_error) {
+            (Some(found_on), _) => SourceBranchOutcome::Deleted {
+                tip,
+                found_on: Some(found_on),
+                pinned_by_checkpoint: false,
+            },
+            (None, Some(error)) => {
+                SourceBranchOutcome::Kept(KeptBranch::RemoteUnconfirmed { tip, error })
             }
-            (_, found_on) => Ok(SourceBranchOutcome::Deleted { tip, found_on }),
-        }
+            (None, None) => SourceBranchOutcome::Kept(KeptBranch::Unique { tip }),
+        };
+        Ok((outcome, holding.via_outbox))
     }
 
     /// One ref other than `own` whose history contains `tip`, named for a
-    /// reader: local branches first, then remotes, then tags.
-    fn ref_holding(&self, tip: &str, own: &str) -> Result<Option<String>> {
+    /// reader: local branches first, then remote-tracking refs, then tags,
+    /// then the publish remote itself. The remote is asked only when no
+    /// local ref answers, since asking costs a fetch.
+    fn ref_holding(&self, tip: &str, own: &str, outbox: OutboxRead) -> Result<Holding> {
         let mut store = self.source.refs_containing(tip)?;
         store.retain(|name| name != own);
-        // The outbox mirrors the publish remote as of the last push. It
-        // borrows the store's objects, so `tip` resolves there; if it cannot
-        // be read for any reason, that only means one fewer place to find
-        // the tip, which errs toward keeping the branch.
-        let outbox = self.outbox();
-        let pushed = if outbox.join("HEAD").is_file() {
-            crate::source::refs_containing_in(&outbox, tip, &["refs/heads"]).unwrap_or_default()
-        } else {
-            Vec::new()
+        let named = |prefix: &str| {
+            store
+                .iter()
+                .find_map(|name| name.strip_prefix(prefix))
+                .map(ToOwned::to_owned)
         };
+        let local = named("refs/heads/")
+            .map(|name| format!("`{name}`"))
+            .or_else(|| named("refs/remotes/").map(|name| format!("`{name}`")))
+            .or_else(|| named("refs/tags/").map(|name| format!("tag `{name}`")));
+        if local.is_some() {
+            return Ok(Holding {
+                found_on: local,
+                via_outbox: false,
+                remote_error: None,
+            });
+        }
 
-        let local = store
-            .iter()
-            .find_map(|name| name.strip_prefix("refs/heads/"))
-            .map(|name| format!("`{name}`"));
-        let remote = store
-            .iter()
-            .find_map(|name| name.strip_prefix("refs/remotes/"))
-            .map(|name| format!("`{name}`"));
-        let pushed = pushed
-            .iter()
-            .find_map(|name| name.strip_prefix("refs/heads/"))
-            .map(|name| format!("`{PUBLISH_REMOTE}/{name}` (as of the last push)"));
-        let tag = store
-            .iter()
-            .find_map(|name| name.strip_prefix("refs/tags/"))
-            .map(|name| format!("tag `{name}`"));
-        Ok(local.or(remote).or(pushed).or(tag))
+        // The outbox mirrors the publish remote only as of its last sync,
+        // and a branch can vanish from the remote after it — a PR closed
+        // unmerged, a force-push. Counting a stale mirror would delete the
+        // only copy, so it is refreshed first, and a refresh that fails
+        // means the remote is not counted at all.
+        let outbox_dir = self.outbox();
+        let mut remote_error = None;
+        let readable = match outbox {
+            OutboxRead::Skip => false,
+            OutboxRead::AsIs => outbox_dir.join("HEAD").is_file(),
+            OutboxRead::Refresh => match self.publish_url()? {
+                None => false,
+                Some(url) => match self
+                    .source
+                    .ensure_outbox(&outbox_dir)
+                    .and_then(|()| GitSource::sync_outbox(&outbox_dir, &url))
+                {
+                    Ok(()) => true,
+                    Err(error) => {
+                        // Git's own reason, not the whole fetch command line.
+                        let text = error.to_string();
+                        let reason = text
+                            .split_once("fatal: ")
+                            .map_or(text.as_str(), |(_, reason)| reason);
+                        remote_error = Some(reason.lines().next().unwrap_or("").trim().to_owned());
+                        false
+                    }
+                },
+            },
+        };
+        // The outbox borrows the store's objects, so `tip` resolves there;
+        // a read that fails anyway only means one fewer place to find it.
+        let pushed = if readable {
+            crate::source::refs_containing_in(&outbox_dir, tip, &["refs/heads"])
+                .unwrap_or_default()
+                .iter()
+                .find_map(|name| name.strip_prefix("refs/heads/"))
+                .map(|name| format!("`{PUBLISH_REMOTE}/{name}`"))
+        } else {
+            None
+        };
+        Ok(Holding {
+            via_outbox: pushed.is_some(),
+            found_on: pushed,
+            remote_error,
+        })
     }
 
     /// Drop one instance's checkpoint log and the store refs it held.

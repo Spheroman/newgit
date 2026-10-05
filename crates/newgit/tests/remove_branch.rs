@@ -165,7 +165,7 @@ fn a_branch_published_by_a_workspace_push_is_deleted() {
     let stdout = remove(&fixture, "feature/pushed", &[]);
     assert!(
         stdout.contains("`feature/pushed` deleted")
-            && stdout.contains("`origin/feature/pushed` (as of the last push)"),
+            && stdout.contains("its tip is on `origin/feature/pushed`"),
         "{stdout}"
     );
     assert_eq!(rev(&fixture.store, "refs/heads/feature/pushed"), None);
@@ -216,4 +216,60 @@ fn keep_branch_and_delete_branch_conflict() {
         &["remove", "feature/both", "--keep-branch", "--delete-branch"],
     );
     assert!(!output.status.success());
+}
+
+/// Spawn `name`, commit, and publish it with a workspace `git push`.
+fn spawn_and_push(fixture: &Fixture, name: &str) -> String {
+    let (workspace, _) = spawn(fixture, name);
+    let tip = commit(&workspace, "a.txt", "a\n");
+    let push = git_output(&workspace, &["push", "origin", name]);
+    assert!(
+        push.status.success(),
+        "{}",
+        String::from_utf8_lossy(&push.stderr)
+    );
+    tip
+}
+
+#[test]
+fn a_branch_deleted_from_the_remote_since_the_push_is_kept() {
+    let (_guard, temp) = tempdir();
+    let fixture = setup(&temp);
+    let tip = spawn_and_push(&fixture, "feature/closed");
+    // The PR was closed unmerged and its branch deleted. The outbox still
+    // says `feature/closed` is on the remote until something refreshes it.
+    git(&fixture.remote, &["branch", "-D", "feature/closed"]);
+
+    let stdout = remove(&fixture, "feature/closed", &["--purge"]);
+    assert!(
+        stdout.contains("is on no other branch, tag, or remote"),
+        "{stdout}"
+    );
+    assert_eq!(rev(&fixture.store, "refs/heads/feature/closed"), Some(tip));
+}
+
+#[test]
+fn an_unreachable_remote_keeps_the_branch() {
+    let (_guard, temp) = tempdir();
+    let fixture = setup(&temp);
+    let tip = spawn_and_push(&fixture, "feature/offline");
+    std::fs::rename(&fixture.remote, temp.join("moved.git")).expect("take the remote away");
+
+    let stdout = remove(&fixture, "feature/offline", &[]);
+    assert!(
+        stdout.contains("couldn't reach origin to confirm it has this commit"),
+        "{stdout}"
+    );
+    assert_eq!(rev(&fixture.store, "refs/heads/feature/offline"), Some(tip));
+}
+
+#[test]
+fn uncheckpointed_commits_are_named_as_lost() {
+    let (_guard, temp) = tempdir();
+    let fixture = setup(&temp);
+    let (workspace, _) = spawn(&fixture, "feature/late");
+    commit(&workspace, "late.txt", "late\n");
+
+    let stdout = remove(&fixture, "feature/late", &[]);
+    assert!(stdout.contains("was never checkpointed"), "{stdout}");
 }

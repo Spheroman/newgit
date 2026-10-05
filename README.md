@@ -92,7 +92,8 @@ Nothing about your repository changes until you ask for it. `init` writes
 `.newgit/`, and `tracker track` appends to `.gitignore`; no command rewrites
 source history, and the one branch newgit ever deletes is an instance's own:
 `remove` deletes the source branch `spawn` created for it, and only when its
-commits are already on another branch, a tag, or the remote. Otherwise it is
+tip is already on another branch, a tag, or the remote (asked live; an
+unreachable remote keeps the branch). Otherwise it is
 kept, and `remove` says why (`--keep-branch` / `--delete-branch` override).
 
 ### What your package manager will cost you

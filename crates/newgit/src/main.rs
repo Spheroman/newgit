@@ -2047,6 +2047,15 @@ fn remove(name: &str, purge: bool, source_branch: SourceBranchPolicy) -> Result<
         print_hook(hook);
     }
     println!("  workspace: {} (deleted)", outcome.branch.workspace_path);
+    if let Some(head) = &outcome.unsaved_workspace_head {
+        // Whatever the branch line says next is about the store's branch;
+        // this is the work that never reached it.
+        println!(
+            "  lost:      the workspace's HEAD {} was never checkpointed; commits made since \
+             the last checkpoint were deleted with it",
+            short_rev(head)
+        );
+    }
     println!("  record:    archived at {}", outcome.archived_record);
     match &outcome.purged_checkpoints {
         Some(purged) => {
@@ -2081,6 +2090,7 @@ fn source_branch_line(outcome: &RemoveOutcome) -> String {
         SourceBranchOutcome::Deleted {
             tip,
             found_on: Some(found_on),
+            ..
         } => format!(
             "`{name}` deleted (was {}; nothing unique — its tip is on {found_on})",
             short_rev(tip)
@@ -2088,17 +2098,18 @@ fn source_branch_line(outcome: &RemoveOutcome) -> String {
         SourceBranchOutcome::Deleted {
             tip,
             found_on: None,
+            pinned_by_checkpoint,
         } => {
-            // Forced past commits that are on no other branch. Say exactly
-            // how to get them back, and for how long that works.
-            let pinned = if outcome.kept_checkpoints > 0 {
-                "this instance's checkpoints still pin them"
+            // Forced past commits on no other local ref. Say exactly how to
+            // get them back, and for how long that works.
+            let pinned = if *pinned_by_checkpoint {
+                "a newgit checkpoint ref still pins them"
             } else {
                 "only until the store's next `git gc` prunes them"
             };
             format!(
-                "`{name}` deleted at {} (--delete-branch); its commits were on no other branch. \
-                 Recover with `git branch {name} {tip}` — {pinned}",
+                "`{name}` deleted at {} (--delete-branch); its tip was on no other local branch, \
+                 tag, or remote-tracking ref. Recover with `git branch {name} {tip}` — {pinned}",
                 short_rev(tip)
             )
         }
@@ -2114,6 +2125,17 @@ fn source_branch_line(outcome: &RemoveOutcome) -> String {
             "`{name}` kept: its tip {} is on no other branch, tag, or remote, so deleting it \
              could lose work; {delete_hint}",
             short_rev(tip)
+        ),
+        SourceBranchOutcome::Kept(KeptBranch::RemoteUnconfirmed { tip, error }) => format!(
+            "`{name}` kept: its tip {} is on no local ref, and newgit couldn't reach origin to \
+             confirm it has this commit ({error}); {delete_hint}",
+            short_rev(tip)
+        ),
+        SourceBranchOutcome::Kept(KeptBranch::Moved { expected, now }) => format!(
+            "`{name}` kept: it moved while removal ran (was {}, now {}), so the deletion \
+             decided against the old tip did not happen; {delete_hint}",
+            short_rev(expected),
+            now.as_deref().map_or("gone", short_rev)
         ),
     }
 }

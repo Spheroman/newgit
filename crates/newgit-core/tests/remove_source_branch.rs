@@ -91,6 +91,15 @@ fn spawn_with_commit(repo: &Utf8Path, name: &str) -> String {
     git(&workspace, &["rev-parse", "HEAD"])
 }
 
+fn write_cleanup_hook(repo: &Utf8Path, command: &str) {
+    let store = MetadataStore::at(repo.to_path_buf());
+    std::fs::write(
+        store.paths().resources.join("hook.toml"),
+        format!("ownership = \"branch\"\n\n[cleanup]\ncommand = \"{command}\"\n"),
+    )
+    .expect("write resource");
+}
+
 fn remove(
     repo: &Utf8Path,
     name: &str,
@@ -149,6 +158,7 @@ fn a_merged_branch_is_deleted() {
         SourceBranchOutcome::Deleted {
             tip: head,
             found_on: Some("`main`".to_owned()),
+            pinned_by_checkpoint: true,
         }
     );
     assert_eq!(branch_rev(&repo, "feature-a"), None);
@@ -170,6 +180,7 @@ fn a_branch_on_a_remote_tracking_ref_is_deleted() {
         SourceBranchOutcome::Deleted {
             tip: head,
             found_on: Some("`origin/feature-a`".to_owned()),
+            pinned_by_checkpoint: true,
         }
     );
 }
@@ -186,6 +197,7 @@ fn a_forced_delete_leaves_the_commits_pinned_by_checkpoints() {
         SourceBranchOutcome::Deleted {
             tip: head.clone(),
             found_on: None,
+            pinned_by_checkpoint: true,
         }
     );
     assert_eq!(branch_rev(&repo, "feature-a"), None);
@@ -280,4 +292,100 @@ fn a_branch_already_gone_is_reported_not_an_error() {
 
     let outcome = remove(&repo, "smoke", SourceBranchPolicy::Delete).expect("remove");
     assert_eq!(outcome.source_branch, SourceBranchOutcome::Missing);
+}
+
+#[test]
+fn a_purged_forced_delete_says_nothing_pins_the_commits() {
+    let (_guard, temp) = tempdir();
+    let repo = setup(&temp);
+    spawn_with_commit(&repo, "feature-a");
+
+    let outcome = manager(&repo)
+        .remove(
+            "feature-a",
+            &repo,
+            ArchivedCheckpoints::Purge,
+            SourceBranchPolicy::Delete,
+        )
+        .expect("remove");
+    assert!(matches!(
+        outcome.source_branch,
+        SourceBranchOutcome::Deleted {
+            pinned_by_checkpoint: false,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn a_holder_that_vanishes_during_teardown_keeps_the_branch() {
+    let (_guard, temp) = tempdir();
+    let repo = setup(&temp);
+    // The resource exists before spawn so the instance binds it.
+    write_cleanup_hook(&repo, &format!("git -C {repo} branch -D holder"));
+    let head = spawn_with_commit(&repo, "feature-a");
+    git(&repo, &["branch", "holder", &head]);
+
+    // Decided "on `holder`" before teardown; the cleanup hook then deletes
+    // `holder` — standing in for a parallel `remove` — so the re-check just
+    // before deleting must find nothing and keep the branch.
+    let outcome = remove(&repo, "feature-a", SourceBranchPolicy::Auto).expect("remove");
+    assert_eq!(
+        outcome.source_branch,
+        SourceBranchOutcome::Kept(KeptBranch::Unique { tip: head.clone() })
+    );
+    assert_eq!(branch_rev(&repo, "feature-a"), Some(head));
+}
+
+#[test]
+fn a_branch_that_moves_during_teardown_is_kept_not_an_error() {
+    let (_guard, temp) = tempdir();
+    let repo = setup(&temp);
+    let main = git(&repo, &["rev-parse", "main"]);
+    write_cleanup_hook(
+        &repo,
+        &format!("git -C {repo} update-ref refs/heads/feature-a {main}"),
+    );
+    let head = spawn_with_commit(&repo, "feature-a");
+
+    let outcome = remove(&repo, "feature-a", SourceBranchPolicy::Delete)
+        .expect("the removal itself succeeded and is reported");
+    assert_eq!(
+        outcome.source_branch,
+        SourceBranchOutcome::Kept(KeptBranch::Moved {
+            expected: head,
+            now: Some(main.clone()),
+        })
+    );
+    assert_eq!(branch_rev(&repo, "feature-a"), Some(main));
+}
+
+#[test]
+fn commits_never_checkpointed_are_reported_lost() {
+    let (_guard, temp) = tempdir();
+    let repo = setup(&temp);
+    let spawned = manager(&repo).spawn("smoke", None).expect("spawn");
+    let workspace = spawned.branch.workspace_path;
+    std::fs::write(workspace.join("late.txt"), "late\n").expect("write");
+    git(&workspace, &["add", "late.txt"]);
+    git(&workspace, &["commit", "-q", "-m", "late"]);
+    let head = git(&workspace, &["rev-parse", "HEAD"]);
+
+    let outcome = remove(&repo, "smoke", SourceBranchPolicy::Auto).expect("remove");
+    assert_eq!(outcome.unsaved_workspace_head, Some(head));
+    // The store's branch never had that commit, so it still looks deletable
+    // — the lost line is what keeps the report honest.
+    assert!(matches!(
+        outcome.source_branch,
+        SourceBranchOutcome::Deleted { .. }
+    ));
+}
+
+#[test]
+fn a_checkpointed_workspace_reports_nothing_lost() {
+    let (_guard, temp) = tempdir();
+    let repo = setup(&temp);
+    spawn_with_commit(&repo, "feature-a");
+    let outcome = remove(&repo, "feature-a", SourceBranchPolicy::Auto).expect("remove");
+    assert_eq!(outcome.unsaved_workspace_head, None);
 }
