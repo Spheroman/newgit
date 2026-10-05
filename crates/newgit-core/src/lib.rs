@@ -10,6 +10,7 @@ pub mod lane;
 pub mod manager;
 pub mod materializer;
 pub mod ports;
+pub mod remote;
 pub mod render;
 pub mod resource;
 pub mod source;

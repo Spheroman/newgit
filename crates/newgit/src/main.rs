@@ -18,6 +18,8 @@ use newgit_core::templates::{RESOURCE_TEMPLATES, resource_template, resource_tem
 use newgit_core::tracker::Storage;
 use newgit_core::{MetadataStore, ProjectConfig};
 
+mod remote_cmd;
+
 /// `0.1.0 (a1b2c3d4e5f6)` — the release plus the commit it was built from.
 const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), " (", env!("NEWGIT_BUILD"), ")");
 
@@ -157,6 +159,41 @@ enum Command {
         instance: String,
         /// The repository Git asked to receive into (the outbox)
         repository: Utf8PathBuf,
+    },
+    /// Log in to a newgit remote with your GitHub account
+    Login {
+        /// The remote (default: this project's, else https://newgit.dev)
+        #[arg(long)]
+        url: Option<String>,
+    },
+    /// Log out of a newgit remote and revoke the saved token
+    Logout {
+        #[arg(long)]
+        url: Option<String>,
+    },
+    /// Show who you are logged in as
+    Whoami {
+        #[arg(long)]
+        url: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Link this project to a newgit remote
+    Remote {
+        #[command(subcommand)]
+        command: remote_cmd::RemoteCommand,
+    },
+    /// Manage who can use this project on its remote
+    Members {
+        #[command(subcommand)]
+        command: remote_cmd::MembersCommand,
+    },
+    /// Git credential helper for the newgit remote, never run by hand: Git
+    /// calls `newgit credential get` and reads a short-lived repo password
+    #[command(hide = true)]
+    Credential {
+        /// get, store, or erase (only get does anything)
+        operation: String,
     },
     /// The outbox's `pre-receive` hook, never run by hand: reads the ref
     /// updates on stdin, checkpoints the instance, and forwards the push to
@@ -340,6 +377,12 @@ fn main() -> Result<()> {
             repository,
         } => push_receive_pack(&store, &instance, &repository),
         Command::PushPreReceive { instance } => push_pre_receive(&instance),
+        Command::Login { url } => remote_cmd::login(url),
+        Command::Logout { url } => remote_cmd::logout(url),
+        Command::Whoami { url, json } => remote_cmd::whoami(url, json),
+        Command::Remote { command } => remote_cmd::remote_command(command),
+        Command::Members { command } => remote_cmd::members(command),
+        Command::Credential { operation } => remote_cmd::credential(&operation),
     }
 }
 
@@ -604,12 +647,26 @@ fn spawn(args: SpawnArgs) -> Result<()> {
     println!("  record:    {}", outcome.record_path);
     // The workspace's `origin` is the store, a local path. An agent reaching
     // for `git push` should know before it does where that push will go.
-    match manager.publish_url()? {
-        Some(url) => println!("  push:      `git push` checkpoints, then publishes to {url}"),
-        None => println!(
-            "  push:      the store has no `origin` remote, so `git push` from this workspace \
-             will be refused"
-        ),
+    match (&branch.remote, &outcome.remote_warning) {
+        (Some(remote), _) => {
+            println!(
+                "  remote:    {} (its own fork, token in the workspace's .git/)",
+                remote.repo
+            );
+            println!("  push:      `git push` checkpoints, then publishes to the fork");
+        }
+        (None, Some(warning)) => {
+            println!(
+                "  remote:    not on the remote yet ({warning}); retried at the next checkpoint"
+            );
+        }
+        (None, None) => match manager.publish_url()? {
+            Some(url) => println!("  push:      `git push` checkpoints, then publishes to {url}"),
+            None => println!(
+                "  push:      the store has no `origin` remote, so `git push` from this workspace \
+                 will be refused"
+            ),
+        },
     }
     // Everything else `remove` touched — workspace, containers, volumes — was
     // destroyed and rebuilt, so checkpoint numbering carrying over is the one
@@ -1370,7 +1427,7 @@ fn push_receive_pack(store: &Utf8Path, instance: &str, repository: &Utf8Path) ->
     use std::os::unix::process::CommandExt as _;
 
     let manager = BranchManager::open(MetadataStore::at(store))?;
-    let outbox = manager.serve_push()?;
+    let outbox = manager.serve_push(instance)?;
     if outbox != repository {
         bail!("asked to receive into {repository}, but this workspace's outbox is {outbox}");
     }
@@ -2022,6 +2079,14 @@ fn remove(name: &str, purge: bool) -> Result<()> {
     }
     println!("  workspace: {} (deleted)", outcome.branch.workspace_path);
     println!("  record:    archived at {}", outcome.archived_record);
+    match (&outcome.branch.remote, &outcome.remote_warning) {
+        (Some(remote), None) => println!("  remote:    {} deleted; its token revoked", remote.repo),
+        (Some(remote), Some(warning)) => println!(
+            "  remote:    could not remove {} ({warning}); its fork and token remain until removed there",
+            remote.repo
+        ),
+        (None, _) => {}
+    }
     match &outcome.purged_checkpoints {
         Some(purged) => {
             println!(

@@ -4,7 +4,8 @@ use camino::{Utf8Path, Utf8PathBuf};
 use chrono::Utc;
 
 use crate::branch::{
-    BranchInstance, ResourceBinding, ResourceStatus, TrackerBinding, branch_slug, validate_name,
+    BranchInstance, RemoteBinding, ResourceBinding, ResourceStatus, TrackerBinding, branch_slug,
+    validate_name,
 };
 use crate::checkpoint::{
     CheckpointLog, CheckpointReason, CheckpointRecord, HASH_STATE_REF_PREFIX, RecoveryRecord,
@@ -28,6 +29,7 @@ use crate::materializer::{
     unexclude_tracker_paths,
 };
 use crate::ports;
+use crate::remote::{Acting, Remote, RemoteLink, Scope, basic_auth_header};
 use crate::render::{self, RenderRecord};
 use crate::resource::{
     Captures, CheckpointMode, DataEdges, GraphProblem, ResourceDefinition, ResourceGraph,
@@ -58,6 +60,8 @@ pub struct BranchManager {
     /// and why it does not hold together if it doesn't. Resources whose
     /// dependencies are unresolved are still ordered; see `graph_problems`.
     graph: ResourceGraph,
+    /// The project's remote, when `[remote]` is configured.
+    remote: Option<RemoteLink>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -72,6 +76,10 @@ pub struct SpawnOutcome {
     /// previous, archived instance, so numbering continues rather than
     /// restarting. See [`InheritedCheckpoints`].
     pub inherited_checkpoints: Option<InheritedCheckpoints>,
+    /// Why the instance is not on the project's remote yet, when it has one
+    /// and registering failed. The instance works locally regardless, and
+    /// registration is retried at its next checkpoint.
+    pub remote_warning: Option<String>,
 }
 
 /// Checkpoint numbering is per name, and `remove` archives the binding record
@@ -304,6 +312,9 @@ pub struct RemoveOutcome {
     /// How many checkpoints removal left behind instead — retained disk the
     /// caller should be told about, since nothing reaches them any more.
     pub kept_checkpoints: usize,
+    /// Why the instance could not be removed from the remote, when it was on
+    /// one: its fork and token outlive it until removed there.
+    pub remote_warning: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -549,6 +560,11 @@ impl BranchManager {
         } else {
             InstallStore::at(store.paths().installs.clone())
         };
+        let remote = config
+            .remote
+            .as_ref()
+            .zip(config.remote_project())
+            .map(|(section, project)| RemoteLink::http(project, &section.url));
         Ok(Self {
             store,
             installs,
@@ -557,6 +573,7 @@ impl BranchManager {
             trackers,
             resources,
             graph,
+            remote,
         })
     }
 
@@ -580,6 +597,17 @@ impl BranchManager {
     /// `checkpoint`, `undo`, `remove`. Commands that *build* the graph
     /// (`tracker create`, `tracker track`, `resource add`) must not call this:
     /// they are how an incomplete graph gets completed.
+    /// Use `link` as the project's remote instead of the one `[remote]`
+    /// names — how tests stand in a fake.
+    pub fn with_remote(mut self, link: RemoteLink) -> Self {
+        self.remote = Some(link);
+        self
+    }
+
+    pub fn remote_link(&self) -> Option<&RemoteLink> {
+        self.remote.as_ref()
+    }
+
     pub fn require_resolvable_graph(&self) -> Result<()> {
         match self.graph.problems.first() {
             Some(problem) => Err(problem.clone().into_error()),
@@ -713,6 +741,13 @@ impl BranchManager {
 
         let record_path = self.store.create_branch_record(&branch)?;
 
+        // The instance exists locally whatever the remote says: a failure to
+        // register is reported, not fatal, and retried at the next checkpoint.
+        let remote_warning = self
+            .register_remote(&mut branch)
+            .err()
+            .map(|error| error.to_string());
+
         Ok(SpawnOutcome {
             branch,
             record_path,
@@ -720,7 +755,51 @@ impl BranchManager {
             trackers: tracker_outcomes,
             resources: resource_outcomes,
             inherited_checkpoints,
+            remote_warning,
         })
+    }
+
+    /// Put an instance on the project's remote, if it has one and the instance
+    /// is not there yet: register it (which forks trunk in the background and
+    /// mints the workspace's own token), keep the token in the workspace's
+    /// `.git/`, and point the workspace's Git at the remote.
+    ///
+    /// Idempotent: a registered instance is left alone, so callers retry it
+    /// freely.
+    fn register_remote(&self, branch: &mut BranchInstance) -> Result<()> {
+        let Some(link) = &self.remote else {
+            return Ok(());
+        };
+        if branch.remote.is_some() {
+            return Ok(());
+        }
+        let registered = link.connect(Acting::Login)?.register_instance(
+            &link.project,
+            &branch.slug,
+            &branch.source_rev,
+        )?;
+        crate::remote::write_private(
+            &crate::remote::workspace_token_path(&branch.workspace_path),
+            &registered.token,
+        )?;
+        branch.remote = Some(RemoteBinding {
+            project: link.project.clone(),
+            repo: registered.instance.repo.clone(),
+            fork_url: registered.instance.remote.clone().unwrap_or_default(),
+            trunk_url: registered.trunk_remote.clone(),
+        });
+        branch.updated_at = Utc::now();
+        self.store.save_branch_record(branch)?;
+        // `origin` now fetches trunk, and Git asks newgit for passwords.
+        self.ensure_workspace_push(branch)?;
+        GitSource::workspace_use_credential_helper(
+            &branch.workspace_path,
+            &[
+                &registered.trunk_remote,
+                registered.instance.remote.as_deref().unwrap_or_default(),
+            ],
+            &format!("!{} credential", sh_quote(&newgit_program())),
+        )
     }
 
     /// Allocate ports, render exports, and run `prepare` hooks in dependency
@@ -999,9 +1078,14 @@ impl BranchManager {
             sh_quote(self.store.paths().project_root.as_str()),
             sh_quote(&branch.name),
         );
+        // On a remote, `origin` is trunk; otherwise the store's own origin.
+        let fetch_url = match &branch.remote {
+            Some(remote) => Some(remote.trunk_url.clone()),
+            None => self.source.remote_url(PUBLISH_REMOTE, false)?,
+        };
         GitSource::workspace_route_origin(
             &branch.workspace_path,
-            self.source.remote_url(PUBLISH_REMOTE, false)?.as_deref(),
+            fetch_url.as_deref(),
             &outbox,
             &receive_pack,
         )
@@ -2546,6 +2630,18 @@ impl BranchManager {
                 .map_err(|source| NewgitError::io(state_dir, source))?;
         }
 
+        // Off the remote first, while the record still says where it is: this
+        // deletes the fork and revokes the workspace's token and the Git
+        // passwords it holds.
+        let remote_warning = match (&self.remote, &branch.remote) {
+            (Some(link), Some(binding)) => link
+                .connect(Acting::Login)
+                .and_then(|remote| remote.remove_instance(&binding.project, &branch.slug))
+                .err()
+                .map(|error| error.to_string()),
+            _ => None,
+        };
+
         RealDirMaterializer.remove(&branch)?;
         let archived_record = self.store.archive_branch_record(&branch)?;
         // Either way, count what the instance leaves behind: checkpoints kept
@@ -2563,6 +2659,7 @@ impl BranchManager {
             hooks,
             purged_checkpoints,
             kept_checkpoints,
+            remote_warning,
         })
     }
 
@@ -3056,12 +3153,31 @@ impl BranchManager {
     /// the real remote, so the pushing Git decides fast-forward, and checks
     /// `--force-with-lease`, against what that remote has right now.
     /// Returns the outbox, for `git receive-pack` to serve.
-    pub fn serve_push(&self) -> Result<Utf8PathBuf> {
-        let url = self.require_publish_url()?;
+    pub fn serve_push(&self, instance: &str) -> Result<Utf8PathBuf> {
+        let branch = self.store.find_branch(instance)?;
+        let (url, auth) = self.publish_target(&branch)?;
         let outbox = self.outbox();
         self.source.ensure_outbox(&outbox)?;
-        GitSource::sync_outbox(&outbox, &url)?;
+        GitSource::sync_outbox(&outbox, &url, auth.as_deref())?;
         Ok(outbox)
+    }
+
+    /// Where a push from `branch` publishes, and the `Authorization` header
+    /// it needs. On a remote: the instance's own fork, with a password minted
+    /// on the workspace's own token — waiting for the fork if it is still
+    /// being made. Otherwise the store's `origin`, authenticated however the
+    /// developer's Git already is.
+    fn publish_target(&self, branch: &BranchInstance) -> Result<(String, Option<String>)> {
+        let (Some(link), Some(binding)) = (&self.remote, &branch.remote) else {
+            return Ok((self.require_publish_url()?, None));
+        };
+        let remote = link.connect(Acting::Workspace(&branch.workspace_path))?;
+        wait_for_fork(remote.as_ref(), &binding.project, &branch.slug)?;
+        let credential = remote.credential(&binding.project, &binding.repo, Scope::Write)?;
+        Ok((
+            binding.fork_url.clone(),
+            Some(basic_auth_header(&credential)),
+        ))
     }
 
     /// The second half, run from the outbox's `pre-receive` hook while the
@@ -3083,7 +3199,7 @@ impl BranchManager {
     ) -> Result<PushOutcome> {
         self.require_resolvable_graph()?;
         let mut branch = self.store.find_branch(instance)?;
-        let url = self.require_publish_url()?;
+        let (url, auth) = self.publish_target(&branch)?;
 
         let own_ref = format!("refs/heads/{}", branch.source_ref);
         if updates
@@ -3102,7 +3218,7 @@ impl BranchManager {
             Some(&format!("before `git push` to {PUBLISH_REMOTE}")),
             CheckpointReason::Push,
         )?;
-        GitSource::forward_push(&self.outbox(), &url, updates, admitting)?;
+        GitSource::forward_push(&self.outbox(), &url, auth.as_deref(), updates, admitting)?;
 
         Ok(PushOutcome {
             checkpoint,
@@ -4222,6 +4338,29 @@ fn validate_disjoint_with_replacement(
         updated.push(replacement.clone());
     }
     crate::tracker::validate_disjoint(&updated)
+}
+
+/// A fork takes seconds to make (5–22 s measured on a medium repo), and an
+/// instance's first push can arrive before it is done. Wait for it.
+fn wait_for_fork(remote: &dyn Remote, project: &str, instance: &str) -> Result<()> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(90);
+    loop {
+        let found = remote.instance(project, instance)?;
+        match found.fork_state.as_str() {
+            "ready" => return Ok(()),
+            "failed" => {
+                return Err(NewgitError::Unsupported(format!(
+                    "the remote could not fork trunk for `{instance}`; remove and spawn it again"
+                )));
+            }
+            _ if std::time::Instant::now() > deadline => {
+                return Err(NewgitError::Unsupported(format!(
+                    "`{instance}`'s fork on the remote is still not ready after 90 s; try the push again"
+                )));
+            }
+            _ => std::thread::sleep(std::time::Duration::from_millis(500)),
+        }
+    }
 }
 
 #[cfg(test)]

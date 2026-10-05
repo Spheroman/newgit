@@ -35,8 +35,25 @@ pub struct BranchInstance {
     pub trackers: BTreeMap<String, TrackerBinding>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub resources: BTreeMap<String, ResourceBinding>,
+    /// Where this instance lives on the project's remote, once registered.
+    /// `None` for a project without a remote, or when registration has not
+    /// succeeded yet (it is retried at the next checkpoint).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote: Option<RemoteBinding>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+}
+
+/// An instance's place on the remote.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RemoteBinding {
+    pub project: String,
+    /// The instance's fork: `<project>.i.<instance>`.
+    pub repo: String,
+    /// The fork's Git URL — where this workspace's pushes go.
+    pub fork_url: String,
+    /// Trunk's Git URL — what this workspace's `origin` fetches.
+    pub trunk_url: String,
 }
 
 /// Which concrete instance of a resource this branch instance is bound to:
@@ -120,6 +137,7 @@ impl BranchInstance {
             trackers: BTreeMap::new(),
             resources: BTreeMap::new(),
             created_at: now,
+            remote: None,
             updated_at: now,
         })
     }

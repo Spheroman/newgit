@@ -57,6 +57,20 @@ pub enum NewgitError {
     #[error("`{command}` failed: {stderr}")]
     SourceCommand { command: String, stderr: String },
 
+    /// The newgit remote answered with an error. `message` is the remote's
+    /// own explanation, which says why (a refused credential names the rule).
+    #[error("the newgit remote refused ({status}): {message}")]
+    Remote { status: u16, message: String },
+
+    #[error("could not reach the newgit remote at {url}: {detail}")]
+    RemoteUnreachable { url: String, detail: String },
+
+    #[error("not logged in to {0}; run `newgit login`")]
+    NotLoggedIn(String),
+
+    #[error("this project has no [remote] in .newgit/config.toml; run `newgit remote add`")]
+    NoRemote,
+
     #[error("{kind} `{name}` is invalid: {reason}")]
     InvalidDefinition {
         kind: &'static str,
