@@ -481,6 +481,32 @@ Run against namespace `newgit-spike` with a tiny repo and an import of
 | Merge in a Worker | Tiny repo 1.7 s; hono full history **fails (1102, memory)**; hono at `depth: 10` 3.9 s; conflicts reported per file. | Fetch shallow to the merge base; sandbox with real Git as fallback. |
 | Push events | Per-repo `pushed` subscriptions work **only via REST**; ~5.5 s lag. Account-level `repo.forked` never arrived. | Outbox is the primary signal; events are the backstop and the CI trigger. |
 
+## Day 1 Results (Sandboxes, 2026-10-05)
+
+A spike Worker (key-gated) with one Durable Object class on the
+`durable_object` scheduling policy, the managed `cloudflare/debian-trixie`
+image (Node 24, x86_64, root, no `curl`/`wget`), instance `standard-2`. The
+"realistic app": Postgres with `pgbench -s 20` (2 M rows, 580 MB on disk) and
+a fresh `create-next-app` (457 MB of `node_modules`).
+
+| Question | Answer | Consequence |
+|---|---|---|
+| Fresh sandbox boot | 0.2–0.3 s to accept a command. | Starting a sandbox is not the cost; building the environment is. |
+| Building the environment from nothing | **215 s**: apt 86 s, Postgres init + data 16 s, `npm` 112 s. | This is what every snapshot saves. |
+| Snapshot | **41 s for 995 MB** (Postgres stopped cleanly first). Returns `{id, size}`. | Taking one is too slow to sit inside an agent's checkpoint synchronously; do it in the background or at CI's step. |
+| Restore boot | **0.56–0.6 s** in 4 of 5 runs; one outlier at **13.6 s**. | Plan for ~1 s, tolerate ~15 s, and show progress. |
+| Restored state | Files intact: 2 M rows queryable 0.75 s after boot; Postgres up in 0.3 s. | Restoring a database from a snapshot is near-instant, unlike replaying a dump. |
+| `/run` after restore | **Empty — it is a tmpfs, not in the snapshot.** Postgres failed until `/run/postgresql` was recreated. | Resources' `start` hooks must recreate runtime directories; templates should do it. |
+| App ready | Next.js **dev** server: first page **10–20 s** (compile on 1 vCPU). | Previews should serve a production build, or use a bigger instance; the dev compile dominates. |
+| Through the Worker | First request 0.69 s, warm 0.31 s, from outside via `getTcpPort().fetch`. | The Worker-as-front-door preview path works without a domain (path-based). |
+
+End to end, a preview from a snapshot is **~1 s boot + ~0.3 s database +
+the app's own start time**, against **215 s+** to build the same environment
+from nothing.
+
+Not yet run: Docker in a sandbox and newgit in a custom base image. Both need
+a custom image, which Wrangler builds with a local Docker daemon.
+
 ---
 
 ## Decisions
@@ -517,6 +543,9 @@ Resolved loudly; each is reversible after the competition.
 - **Preview domain.** Own-hostname previews need a domain on the account.
   Path-based previews work without one but break apps with absolute URLs.
 - **Snapshot pricing** is unlisted while snapshots are in beta.
+- **Snapshot time** (41 s for ~1 GB) is too slow to block a checkpoint on.
+  Snapshot in the background after the checkpoint record is written, and
+  attach the id when it lands.
 - **Fork latency** (5–22 s): the outbox must wait on, or trigger, a fork
   still in flight at first push.
 - **The 1 GB repo cap** for large `db-snapshots` lanes.
