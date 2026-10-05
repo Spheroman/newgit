@@ -276,7 +276,7 @@ impl SnapshotRoots {
 }
 
 /// `tracker:<name>@<rev>` — the state ref an `into_tracker` deposit records.
-fn parse_tracker_state_ref(state_ref: &str) -> Option<(&str, &str)> {
+pub(crate) fn parse_tracker_state_ref(state_ref: &str) -> Option<(&str, &str)> {
     state_ref.strip_prefix("tracker:")?.split_once('@')
 }
 

@@ -2,6 +2,7 @@ pub mod branch;
 pub mod checkpoint;
 pub mod cleanup;
 pub mod config;
+pub mod deposit_diff;
 pub mod error;
 pub mod export;
 pub mod exports;
