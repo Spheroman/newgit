@@ -2171,6 +2171,19 @@ As implemented:
   also name something no tracker owns and Git does not track — a build
   output). **`--exclude <path>`** is applied last and beats everything,
   including `--include`.
+- **What ships is what is committed.** The export's commit holds exactly
+  the plan, added with `git add --force`: every tracker path is gitignored
+  (`tracker track` put it there) and that `.gitignore` ships with the
+  source tree, so a plain `git add -A` dropped every public or `--include`d
+  lane file onto disk and out of the repository — invisible to `git status`
+  and to a clone. Lane content entering an export is not lane content
+  entering source history: the export is a new repository, and its content
+  was chosen by audience or by an explicit flag. The shipped `.gitignore` is
+  left as it is — it is a source file, its patterns do no harm to a file Git
+  already tracks, and it is what keeps a recipient's own `.env.local` out of
+  their commits. The CLI names each committed file it still matches
+  (`gitignored but committed:`), since a *new* file beside one would be
+  ignored.
 - **One commit, never history.** Exporting the branch's commits would carry
   any file those commits contain, including the content the audience filter
   just withheld. The export is a single commit on a branch named after the

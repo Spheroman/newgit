@@ -400,6 +400,8 @@ pub struct ExportOutcome {
     /// The single commit the export produced.
     pub commit: String,
     pub plan: ExportPlan,
+    /// Committed files the export's own `.gitignore` still matches.
+    pub still_gitignored: Vec<Utf8PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3329,6 +3331,7 @@ impl BranchManager {
                 &head_rev[..8.min(head_rev.len())]
             ),
         )?;
+        let still_gitignored = GitSource::export_ignored_but_committed(destination)?;
 
         Ok(ExportOutcome {
             destination: destination.to_path_buf(),
@@ -3337,6 +3340,7 @@ impl BranchManager {
             source_head: head_rev,
             commit,
             plan,
+            still_gitignored,
         })
     }
 

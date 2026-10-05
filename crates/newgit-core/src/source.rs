@@ -550,10 +550,18 @@ impl GitSource {
     /// One commit, never a history rewrite: exporting the workspace's Git
     /// history would carry every file any past commit contained, which is
     /// exactly the content the audience filter just excluded.
+    ///
+    /// `--force`, because the directory holds exactly the export plan and
+    /// nothing else — the plan *is* the filter, and `.gitignore` must not
+    /// apply a second one. Without it, every tracker path is dropped by
+    /// construction: `tracker track` is what gitignored it, and that
+    /// `.gitignore` ships with the source tree. A path the plan said ships
+    /// would land on disk and not in the repository, and `git status` would
+    /// hide that it had.
     pub fn init_export_repo(destination: &Utf8Path, branch: &str, message: &str) -> Result<String> {
         let dest = destination.as_str();
         run_git(&["init", "--quiet", "-b", branch, "--", dest])?;
-        run_git(&["-C", dest, "add", "-A"])?;
+        run_git(&["-C", dest, "add", "--all", "--force"])?;
         run_git_env(
             &["-C", dest, "commit", "--quiet", "-m", message],
             &export_identity(destination),
@@ -595,6 +603,27 @@ impl GitSource {
     pub fn delete_branch(&self, name: &str, expected: &str) -> Result<()> {
         self.git(&["update-ref", "-d", &format!("refs/heads/{name}"), expected])
             .map(|_| ())
+    }
+
+    /// Files committed in an export that its own `.gitignore` still
+    /// matches. Git tracks them regardless, but a new file beside one — in a
+    /// shipped tracker directory, say — would be ignored by the next
+    /// `git add`, so the CLI names them rather than leave that to be found.
+    pub fn export_ignored_but_committed(destination: &Utf8Path) -> Result<Vec<Utf8PathBuf>> {
+        let listing = run_git(&[
+            "-C",
+            destination.as_str(),
+            "ls-files",
+            "-z",
+            "--cached",
+            "--ignored",
+            "--exclude-standard",
+        ])?;
+        Ok(listing
+            .split('\0')
+            .filter(|entry| !entry.is_empty())
+            .map(Utf8PathBuf::from)
+            .collect())
     }
 
     fn git(&self, args: &[&str]) -> Result<String> {
