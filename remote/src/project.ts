@@ -16,6 +16,8 @@ export type ForkState = "pending" | "ready" | "failed";
 export interface Instance {
 	name: string;
 	owner: string;
+	/** The agent that created it, acting as `owner`; null when the owner did. */
+	agent: string | null;
 	baseRev: string;
 	headRev: string | null;
 	forkState: ForkState;
@@ -28,6 +30,8 @@ export interface Checkpoint {
 	instance: string;
 	id: string;
 	createdBy: string;
+	/** The agent that took it, acting as `createdBy`; null when a human did. */
+	agent: string | null;
 	createdAt: string;
 	/** The CLI's `CheckpointRecord`, as it wrote it. The remote stores it, never interprets it. */
 	record: unknown;
@@ -50,6 +54,12 @@ export class ProjectDO extends DurableObject<Env> {
 				instance TEXT NOT NULL, id TEXT NOT NULL, created_by TEXT NOT NULL, created_at TEXT NOT NULL,
 				record TEXT NOT NULL, PRIMARY KEY (instance, id));
 		`);
+		// Which agent (acting as its owner) made a record, when one did.
+		for (const table of ["instances", "checkpoints"]) {
+			const columns = this.sql.exec<{ name: string }>(`PRAGMA table_info(${table})`).toArray();
+			if (!columns.some((column) => column.name === "agent"))
+				this.sql.exec(`ALTER TABLE ${table} ADD COLUMN agent TEXT`);
+		}
 	}
 
 	/** Create the project. Returns false when it already exists. */
@@ -91,16 +101,18 @@ export class ProjectDO extends DurableObject<Env> {
 		return this.sql.exec("DELETE FROM members WHERE login = ?", login).rowsWritten > 0;
 	}
 
-	createInstance(name: string, owner: string, baseRev: string): Instance | null {
+	createInstance(name: string, owner: string, baseRev: string, agent: string | null = null): Instance | null {
 		if (this.instance(name) !== null) return null;
 		const now = new Date().toISOString();
 		this.sql.exec(
-			"INSERT INTO instances VALUES (?, ?, ?, NULL, 'pending', NULL, ?, ?)",
+			`INSERT INTO instances (name, owner, base_rev, head_rev, fork_state, fork_error, created_at, updated_at, agent)
+			 VALUES (?, ?, ?, NULL, 'pending', NULL, ?, ?, ?)`,
 			name,
 			owner,
 			baseRev,
 			now,
 			now,
+			agent,
 		);
 		return this.instance(name);
 	}
@@ -145,17 +157,19 @@ export class ProjectDO extends DurableObject<Env> {
 	 * this row is what makes a checkpoint exist across machines. Rewriting
 	 * the same id replaces it (a retried write-through is not a conflict).
 	 */
-	putCheckpoint(instance: string, id: string, by: string, record: unknown): Checkpoint {
+	putCheckpoint(instance: string, id: string, by: string, agent: string | null, record: unknown): Checkpoint {
 		const now = new Date().toISOString();
 		this.sql.exec(
-			"INSERT OR REPLACE INTO checkpoints VALUES (?, ?, ?, ?, ?)",
+			`INSERT OR REPLACE INTO checkpoints (instance, id, created_by, created_at, record, agent)
+			 VALUES (?, ?, ?, ?, ?, ?)`,
 			instance,
 			id,
 			by,
 			now,
 			JSON.stringify(record),
+			agent,
 		);
-		return { instance, id, createdBy: by, createdAt: now, record };
+		return { instance, id, createdBy: by, agent, createdAt: now, record };
 	}
 
 	checkpoint(instance: string, id: string): Checkpoint | null {
@@ -180,6 +194,7 @@ export class ProjectDO extends DurableObject<Env> {
 interface InstanceRow extends Record<string, SqlStorageValue> {
 	name: string;
 	owner: string;
+	agent: string | null;
 	base_rev: string;
 	head_rev: string | null;
 	fork_state: string;
@@ -192,6 +207,7 @@ interface CheckpointRow extends Record<string, SqlStorageValue> {
 	instance: string;
 	id: string;
 	created_by: string;
+	agent: string | null;
 	created_at: string;
 	record: string;
 }
@@ -200,6 +216,7 @@ function toInstance(row: InstanceRow): Instance {
 	return {
 		name: row.name,
 		owner: row.owner,
+		agent: row.agent,
 		baseRev: row.base_rev,
 		headRev: row.head_rev,
 		forkState: row.fork_state as ForkState,
@@ -214,6 +231,7 @@ function toCheckpoint(row: CheckpointRow): Checkpoint {
 		instance: row.instance,
 		id: row.id,
 		createdBy: row.created_by,
+		agent: row.agent,
 		createdAt: row.created_at,
 		record: JSON.parse(row.record),
 	};

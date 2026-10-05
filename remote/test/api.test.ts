@@ -1,13 +1,20 @@
 import { env } from "cloudflare:workers";
 import { beforeEach, describe, expect, it } from "vitest";
 
-import { issueToken } from "../src/auth";
-import { handle } from "../src/index";
+import { LOGIN_TTL_SECONDS } from "../src/auth";
+import { handle, issue } from "../src/index";
 import { FakeRepos } from "./fake-repos";
 
 let repos: FakeRepos;
 let pending: Promise<unknown>[];
 let project: string;
+const logins = new Map<string, string>();
+
+/** A recorded login token for `who`, one per test run. */
+async function tokenFor(who: string) {
+	if (!logins.has(who)) logins.set(who, (await issue(env, { kind: "login", login: who, ttlSeconds: LOGIN_TTL_SECONDS })).token);
+	return logins.get(who)!;
+}
 
 beforeEach(() => {
 	repos = new FakeRepos();
@@ -19,7 +26,7 @@ beforeEach(() => {
 
 async function call(login: string | null, method: string, path: string, body?: unknown) {
 	const headers: Record<string, string> = { "content-type": "application/json" };
-	if (login) headers.authorization = `Bearer ${await issueToken(env.TOKEN_KEY, login)}`;
+	if (login) headers.authorization = `Bearer ${login.startsWith("ngt_") ? login : await tokenFor(login)}`;
 	const response = await handle(
 		new Request(`https://newgit.dev${path}`, {
 			method,
@@ -47,7 +54,7 @@ const credential = (login: string, repo: string, scope = "read") =>
 describe("the API", () => {
 	it("needs a token everywhere but login", async () => {
 		expect((await call(null, "GET", "/v1/me")).status).toBe(401);
-		expect((await call("jack", "GET", "/v1/me")).body).toEqual({ login: "jack" });
+		expect((await call("jack", "GET", "/v1/me")).body).toMatchObject({ login: "jack", kind: "login" });
 	});
 
 	it("creates a project with trunk, and refuses a second with the same name", async () => {

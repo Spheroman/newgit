@@ -339,18 +339,32 @@ Not provided (say so in the docs and the video):
 
 ## Identity And Tokens
 
-1. **newgit token** — who you are, to the Worker. Issued by `newgit login`
-   (GitHub OAuth device flow, like `gh`). Identity is the GitHub login, so
-   `audience = "user:jack"` means GitHub user `jack`.
+1. **newgit token** — who you are, to the Worker. Signed by the Worker and
+   **recorded** in a Durable Object per user (`UserDO`); a token is good only
+   while its record says so, so any one token can be revoked without logging
+   anyone else out.
 2. **Artifacts repo token** — what one repo lets you do, for minutes. Minted
-   by the Worker on demand.
+   by the Worker on demand, never stored.
 
-Membership (`project-devs`) is a list in ProjectDO: `newgit members add
-<login>`. The creator is the first member.
+Identity is the GitHub login (`newgit login`, GitHub's device flow, like
+`gh`), so `audience = "user:jack"` means GitHub user `jack`. Membership
+(`project-devs`) is a list in ProjectDO: `newgit members add <login>`. The
+creator is the first member.
 
-**Agents act as their owner** (decided): an agent holds a scoped token issued
-to its owner, reads nothing its owner cannot, and uses its owner's per-user
-lanes (`<p>.t.<tracker>.<owner>`).
+**Agents get their own tokens** (decided). An agent acts as its owner — it
+reads nothing its owner cannot and uses its owner's per-user lanes — but
+holds a separate, narrower token its owner creates:
+
+| | Login token | Agent token |
+|---|---|---|
+| Created by | `newgit login` | its owner: `newgit token create <agent> [--project p]` |
+| Lifetime | 30 days | 7 days by default, at most 30 |
+| Acts as | the user | the owner, named in records (`agent` on instances and checkpoints) |
+| Can create tokens, create projects, manage members | yes | **no** — a leaked agent token cannot mint itself a successor |
+| Project | any the user is in | optionally pinned to one |
+| Revoked by | the user (any of their tokens) | its owner, or itself |
+
+A revoked token is refused on its next request.
 
 ### The credential helper
 

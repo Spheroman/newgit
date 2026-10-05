@@ -1,17 +1,34 @@
 // Who is calling. Two credentials, never confused:
 //
-// - A newgit token says who you are, to this Worker. It is signed, not
-//   stored: `ngt_<payload>.<signature>`, HMAC-SHA256 over the payload with
-//   TOKEN_KEY. Rotating TOKEN_KEY revokes every token at once.
+// - A newgit token says who you are, to this Worker:
+//   `ngt_<payload>.<signature>`, HMAC-SHA256 over the payload with TOKEN_KEY.
+//   The signature proves the Worker issued it; the issuer's UserDO (users.ts)
+//   proves it has not been revoked. Each token has an id, so one can be
+//   revoked without logging anyone else out.
 // - An Artifacts repo token says what one repo lets you do, for minutes. The
 //   Worker mints those per request (see index.ts) and never stores them.
 
 const PREFIX = "ngt_";
-const TOKEN_TTL_SECONDS = 60 * 60 * 24 * 30;
+const DAY = 60 * 60 * 24;
 
-interface Payload {
-	/** GitHub login, lowercased. */
+/** A human's login lasts this long. */
+export const LOGIN_TTL_SECONDS = 30 * DAY;
+/** An agent's token defaults to this, and may not exceed the cap. */
+export const AGENT_TTL_SECONDS = 7 * DAY;
+export const AGENT_TTL_MAX_SECONDS = 30 * DAY;
+
+export type TokenKind = "login" | "agent";
+
+export interface TokenClaims {
+	/** Token id: what revocation names. */
+	jti: string;
+	/** The GitHub login it acts as, lowercased. Agents act as their owner. */
 	sub: string;
+	kind: TokenKind;
+	/** Agent tokens: the agent's name, as its owner gave it. */
+	agent?: string;
+	/** Agent tokens: the one project it may touch, when pinned. */
+	project?: string;
 	iat: number;
 	exp: number;
 }
@@ -36,16 +53,40 @@ async function hmacKey(secret: string): Promise<CryptoKey> {
 	]);
 }
 
-export async function issueToken(secret: string, login: string, now = Date.now()): Promise<string> {
-	const iat = Math.floor(now / 1000);
-	const payload: Payload = { sub: login.toLowerCase(), iat, exp: iat + TOKEN_TTL_SECONDS };
-	const body = base64url(encoder.encode(JSON.stringify(payload)));
-	const signature = await crypto.subtle.sign("HMAC", await hmacKey(secret), encoder.encode(body));
-	return `${PREFIX}${body}.${base64url(new Uint8Array(signature))}`;
+export interface NewToken {
+	kind: TokenKind;
+	login: string;
+	agent?: string;
+	project?: string;
+	ttlSeconds: number;
 }
 
-/** The login a valid, unexpired token was issued to; null for anything else. */
-export async function verifyToken(secret: string, token: string, now = Date.now()): Promise<string | null> {
+/** Sign a token. The caller records it (UserDO.register) before handing it out. */
+export async function signToken(
+	secret: string,
+	spec: NewToken,
+	now = Date.now(),
+): Promise<{ token: string; claims: TokenClaims }> {
+	const iat = Math.floor(now / 1000);
+	const claims: TokenClaims = {
+		jti: `tok_${crypto.randomUUID().replaceAll("-", "").slice(0, 20)}`,
+		sub: spec.login.toLowerCase(),
+		kind: spec.kind,
+		...(spec.agent === undefined ? {} : { agent: spec.agent }),
+		...(spec.project === undefined ? {} : { project: spec.project }),
+		iat,
+		exp: iat + spec.ttlSeconds,
+	};
+	const body = base64url(encoder.encode(JSON.stringify(claims)));
+	const signature = await crypto.subtle.sign("HMAC", await hmacKey(secret), encoder.encode(body));
+	return { token: `${PREFIX}${body}.${base64url(new Uint8Array(signature))}`, claims };
+}
+
+/**
+ * The claims of a correctly signed, unexpired token; null for anything else.
+ * Says nothing about revocation — that is the issuer's UserDO.
+ */
+export async function verifyToken(secret: string, token: string, now = Date.now()): Promise<TokenClaims | null> {
 	if (!token.startsWith(PREFIX)) return null;
 	const [body, signature, extra] = token.slice(PREFIX.length).split(".");
 	if (!body || !signature || extra !== undefined) return null;
@@ -56,15 +97,21 @@ export async function verifyToken(secret: string, token: string, now = Date.now(
 		return null;
 	}
 	if (!valid) return null;
-	let payload: Payload;
+	let claims: TokenClaims;
 	try {
-		payload = JSON.parse(new TextDecoder().decode(unbase64url(body)));
+		claims = JSON.parse(new TextDecoder().decode(unbase64url(body)));
 	} catch {
 		return null;
 	}
-	if (typeof payload.sub !== "string" || typeof payload.exp !== "number") return null;
-	if (payload.exp * 1000 <= now) return null;
-	return payload.sub;
+	if (
+		typeof claims.sub !== "string" ||
+		typeof claims.jti !== "string" ||
+		typeof claims.exp !== "number" ||
+		(claims.kind !== "login" && claims.kind !== "agent")
+	)
+		return null;
+	if (claims.exp * 1000 <= now) return null;
+	return claims;
 }
 
 // GitHub OAuth device flow — what `gh auth login` does. The CLI shows a code,

@@ -6,11 +6,33 @@
 import { parse as parseToml } from "smol-toml";
 
 import { type Repos, ArtifactsRepos } from "./artifacts";
-import { issueToken, pollDeviceFlow, startDeviceFlow, verifyToken } from "./auth";
+import {
+	AGENT_TTL_MAX_SECONDS,
+	AGENT_TTL_SECONDS,
+	LOGIN_TTL_SECONDS,
+	type NewToken,
+	pollDeviceFlow,
+	signToken,
+	startDeviceFlow,
+	verifyToken,
+} from "./auth";
 import { type Audience, type RepoRef, decide, parseAudience, parseRepoName, partProblem, repoName } from "./names";
 import type { ProjectDO } from "./project";
+import type { UserDO } from "./users";
 
 export { ProjectDO } from "./project";
+export { UserDO } from "./users";
+
+/** Who a request acts as, after the token was verified and found unrevoked. */
+export interface Caller {
+	login: string;
+	tokenId: string;
+	kind: "login" | "agent";
+	/** Set for agent tokens. */
+	agent?: string;
+	/** Set for agent tokens pinned to one project. */
+	project?: string;
+}
 
 /** Git credentials last this long: long enough for a big push, short enough that losing membership bites fast. */
 export const CREDENTIAL_TTL_SECONDS = 15 * 60;
@@ -68,15 +90,47 @@ async function route(request: Request, env: Env, deps: Deps): Promise<Response> 
 		if (!device_code) throw new HttpError(400, "device_code is required");
 		const result = await pollDeviceFlow(env.GITHUB_CLIENT_ID, device_code, deps.fetcher);
 		if (result.status !== "done") return json(result, result.status === "pending" ? 202 : 401);
-		return json({ status: "done", login: result.login, token: await issueToken(env.TOKEN_KEY, result.login) });
+		const issued = await issue(env, { kind: "login", login: result.login, ttlSeconds: LOGIN_TTL_SECONDS });
+		return json({ status: "done", login: result.login, token: issued.token, token_id: issued.id });
 	}
 
-	const login = await authenticate(request, env);
+	const caller = await authenticate(request, env);
+	const login = caller.login;
 
-	if (method === "GET" && path === "/v1/me") return json({ login });
+	if (method === "GET" && path === "/v1/me")
+		return json({ login, kind: caller.kind, token_id: caller.tokenId, agent: caller.agent, project: caller.project });
+
+	// ── Tokens ─────────────────────────────────────────────────────────────
+	if (method === "GET" && path === "/v1/tokens") {
+		requireHuman(caller, "list tokens");
+		return json({ tokens: await userStub(env, login).tokens() });
+	}
+	if (method === "POST" && path === "/v1/tokens") {
+		// An agent cannot mint tokens, so a leaked one cannot outlive its revocation.
+		requireHuman(caller, "create tokens");
+		const { name, project, ttl_days } = await body<{ name?: string; project?: string; ttl_days?: number }>(request);
+		if (!name) throw new HttpError(400, "name is required: what the agent is called in records and the UI");
+		requirePart("agent name", name);
+		if (project !== undefined) requirePart("project name", project);
+		const ttlSeconds = ttl_days === undefined ? AGENT_TTL_SECONDS : Math.round(ttl_days * 86_400);
+		if (!(ttlSeconds > 0 && ttlSeconds <= AGENT_TTL_MAX_SECONDS))
+			throw new HttpError(400, `ttl_days must be more than 0 and at most ${AGENT_TTL_MAX_SECONDS / 86_400}`);
+		const issued = await issue(env, { kind: "agent", login, agent: name, project, ttlSeconds });
+		return json({ token: issued.token, ...issued.record }, 201);
+	}
+	const tokenMatch = path.match(/^\/v1\/tokens\/([^/]+)$/);
+	if (method === "DELETE" && tokenMatch) {
+		const id = decodeURIComponent(tokenMatch[1]);
+		// A human revokes any of their tokens; an agent may revoke only itself.
+		if (caller.kind === "agent" && id !== caller.tokenId) requireHuman(caller, "revoke other tokens");
+		const revoked = await userStub(env, login).revoke(id);
+		if (!revoked) throw new HttpError(404, `no token \`${id}\``);
+		return json({ id, revoked: true });
+	}
 
 	// ── Projects ───────────────────────────────────────────────────────────
 	if (method === "POST" && path === "/v1/projects") {
+		requireHuman(caller, "create projects");
 		const { name } = await body<{ name?: string }>(request);
 		if (!name) throw new HttpError(400, "name is required");
 		requirePart("project name", name);
@@ -102,6 +156,8 @@ async function route(request: Request, env: Env, deps: Deps): Promise<Response> 
 	if (!projectMatch) throw new HttpError(404, `no route for ${method} ${path}`);
 	const projectName = decodeURIComponent(projectMatch[1]);
 	const rest = projectMatch[2] ?? "";
+	if (caller.project !== undefined && caller.project !== projectName)
+		throw new HttpError(403, `this agent token (\`${caller.agent}\`) is for ${caller.project} only`);
 	const project = projectStub(env, projectName);
 	const info = await project.info();
 	if (info === null) throw new HttpError(404, `no project \`${projectName}\``);
@@ -132,6 +188,7 @@ async function route(request: Request, env: Env, deps: Deps): Promise<Response> 
 
 	// ── Members ────────────────────────────────────────────────────────────
 	if (method === "POST" && rest === "/members") {
+		requireHuman(caller, "add members");
 		requireOwner(info.owner, login, "add members");
 		const { login: added } = await body<{ login?: string }>(request);
 		if (!added) throw new HttpError(400, "login is required");
@@ -141,6 +198,7 @@ async function route(request: Request, env: Env, deps: Deps): Promise<Response> 
 	}
 	const memberMatch = rest.match(/^\/members\/([^/]+)$/);
 	if (method === "DELETE" && memberMatch) {
+		requireHuman(caller, "remove members");
 		requireOwner(info.owner, login, "remove members");
 		const removed = decodeURIComponent(memberMatch[1]).toLowerCase();
 		if (removed === info.owner) throw new HttpError(409, "the project owner cannot be removed");
@@ -152,7 +210,7 @@ async function route(request: Request, env: Env, deps: Deps): Promise<Response> 
 		const { name, base_rev } = await body<{ name?: string; base_rev?: string }>(request);
 		if (!name || !base_rev) throw new HttpError(400, "name and base_rev are required");
 		requirePart("instance name", name);
-		const created = await project.createInstance(name, login, base_rev);
+		const created = await project.createInstance(name, login, base_rev, caller.agent ?? null);
 		if (created === null) throw new HttpError(409, `instance \`${name}\` already exists in ${projectName}`);
 		// A fork takes seconds; the record exists now and says the fork is pending.
 		const src = repoName({ kind: "src", project: projectName });
@@ -208,7 +266,7 @@ async function route(request: Request, env: Env, deps: Deps): Promise<Response> 
 			requireOwner(owner, login, `checkpoint \`${instance}\``);
 			const { record } = await body<{ record?: unknown }>(request);
 			if (record === undefined) throw new HttpError(400, "record is required");
-			return json(await project.putCheckpoint(instance, id, login, record), 201);
+			return json(await project.putCheckpoint(instance, id, login, caller.agent ?? null, record), 201);
 		}
 	}
 
@@ -270,12 +328,36 @@ function repoFromUrlOrName(value: string): string {
 	return last.endsWith(".git") ? last.slice(0, -".git".length) : last;
 }
 
-async function authenticate(request: Request, env: Env): Promise<string> {
+async function authenticate(request: Request, env: Env): Promise<Caller> {
 	const header = request.headers.get("authorization") ?? "";
 	const token = header.startsWith("Bearer ") ? header.slice("Bearer ".length) : "";
-	const login = token ? await verifyToken(env.TOKEN_KEY, token) : null;
-	if (login === null) throw new HttpError(401, "not logged in: run `newgit login`");
-	return login;
+	const claims = token ? await verifyToken(env.TOKEN_KEY, token) : null;
+	if (claims === null) throw new HttpError(401, "not logged in: run `newgit login`");
+	if (!(await userStub(env, claims.sub).check(claims.jti)))
+		throw new HttpError(401, "this token was revoked: run `newgit login`, or ask its owner for a new agent token");
+	return {
+		login: claims.sub,
+		tokenId: claims.jti,
+		kind: claims.kind,
+		...(claims.agent === undefined ? {} : { agent: claims.agent }),
+		...(claims.project === undefined ? {} : { project: claims.project }),
+	};
+}
+
+/** Sign a token and record it with its user, so it can later be revoked. */
+export async function issue(env: Env, spec: NewToken) {
+	const { token, claims } = await signToken(env.TOKEN_KEY, spec);
+	const record = await userStub(env, claims.sub).register(claims);
+	return { token, id: claims.jti, record };
+}
+
+function userStub(env: Env, login: string): DurableObjectStub<UserDO> {
+	return env.USERS.getByName(login.toLowerCase());
+}
+
+function requireHuman(caller: Caller, action: string) {
+	if (caller.kind === "agent")
+		throw new HttpError(403, `agent tokens cannot ${action}; ${caller.login} can, from their own login`);
 }
 
 function projectStub(env: Env, name: string): DurableObjectStub<ProjectDO> {
