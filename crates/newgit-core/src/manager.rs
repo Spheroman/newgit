@@ -5077,6 +5077,7 @@ impl BranchManager {
             tracker_states,
             resource_states,
             code: Default::default(),
+            dropped: branch.dropped.clone(),
         };
         let record_path = checkpoint_log.save(&record)?;
         branch.updated_at = Utc::now();
@@ -6088,6 +6089,34 @@ impl BranchManager {
                 Some(&safety.record.source.head_rev),
                 &mut warnings,
             )?;
+
+            // The binding, as it was: what the checkpoint did not bind is
+            // dropped again, and what it bound comes back — its content with
+            // the trackers below, its resources with the resources. Nothing is
+            // lost: the safety checkpoint above holds what was here.
+            if restored.dropped != branch.dropped {
+                for tracker in restored.dropped.difference(&branch.dropped) {
+                    if let Some(definition) = self.trackers.iter().find(|d| &d.name == tracker) {
+                        crate::tracker_repo::clear_owned_paths(&workspace, definition)?;
+                    }
+                }
+                branch.dropped = restored.dropped.clone();
+                self.apply_sparse(&branch)?;
+                let supervisor = self.supervisor(&branch);
+                let gone: Vec<String> = branch
+                    .resources
+                    .keys()
+                    .filter(|name| !self.resource_active(&branch, name))
+                    .cloned()
+                    .collect();
+                for name in gone {
+                    if supervisor.running_pid(&name).is_some() {
+                        let _ = supervisor.stop(&name, "term");
+                    }
+                    branch.resources.remove(&name);
+                }
+                self.bind_resources(&mut branch)?;
+            }
         }
 
         // Trackers: plain content, restored exactly; should not partially

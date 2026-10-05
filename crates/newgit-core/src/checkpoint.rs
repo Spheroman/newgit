@@ -41,6 +41,10 @@ pub struct CheckpointRecord {
     /// composes its source from these.
     #[serde(default, skip_serializing_if = "CodeState::is_empty")]
     pub code: CodeState,
+    /// The trackers the instance did not bind at the checkpoint: undo puts
+    /// the binding back along with everything else.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeSet::is_empty")]
+    pub dropped: std::collections::BTreeSet<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -294,6 +298,7 @@ mod tests {
             tracker_states: vec![],
             resource_states: vec![],
             code: CodeState::default(),
+            dropped: Default::default(),
         };
         log.save(&record).expect("save");
 
