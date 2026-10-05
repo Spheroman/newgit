@@ -266,11 +266,18 @@ snapshots.
   so in the docs; most frameworks inline only explicitly-public variables.
 - **A running app has one environment.** "Preview as me" means a sandbox
   started for me. The UI labels a preview with whose environment it runs.
-- **Docker-based resources** run in a preview only on Docker's host network.
-  The Supabase template's stack does not run in a sandbox at all (Day 1
-  results); Supabase projects get local spawns, not previews.
+- **Docker-based resources** need `/proc/sys` remounted read-write before
+  `dockerd` starts (Day 1, round 3). With that, Supabase runs in a preview.
 
 ### Auth
+
+**URLs the app hands to the browser** (`SUPABASE_URL`, a site URL, a base
+path) must point at the preview, not `127.0.0.1`. That is a render, like
+ports: a preview exports `{{preview.url}}` and per-port public URLs, and the
+same `[[render]]` find/replace that writes ports writes those. Render fixes
+configured URLs; it cannot fix absolute paths hard-coded in app code (`fetch
+("/api")`, `<a href="/">`), which is why own-hostname previews (with a
+domain) remain the robust answer and path-based previews the fallback.
 
 Every preview request passes through the Worker before it reaches the
 container, so the Worker checks the viewer's newgit session and project
@@ -525,9 +532,46 @@ CLI).
 |---|---|---|
 | newgit in a sandbox | **Works.** A full session — init, seed a tracker, spawn with a Postgres `command-snapshot` resource, checkpoint, wreck the database and `.env.local`, undo — in **4.4 s**. Lane revs land in `lanes.git` as designed. First boot of a custom image 5–9 s. | The base image is real; newgit needs no changes to run in a sandbox. |
 | Docker in a sandbox | Docker runs. `--network=host` containers work; the default bridge network **fails** (`failed to disable IPv6 on container's interface`). | Docker-based resources work only if they run on the host network. |
-| Supabase in a sandbox | **Fails.** All 12 images pulled (162 s, with registry rate-limit retries), then its database container fails on that bridge-network error. Host networking is not an option: its services collide on ports. The CLI also needs glibc (the `docker:dind` image is Alpine). | **Supabase projects cannot be previewed in sandboxes today.** Say so; native Postgres works. |
+| Supabase in a sandbox | Fails as configured: its database container dies on that bridge-network error. **Fixed in round 3** (below). | — |
 | Snapshot of a restored sandbox | **Incremental:** 9 s and 35 MB, against 41 s and 995 MB for the first. | A checkpoint snapshot taken on top of an environment snapshot costs only its delta. Layer snapshots: environment → checkpoint. |
 | Capturing the production build | `next build` 61 s once, captured in the snapshot. A preview restored from it serves its first page **5.7 s** after boot (including Postgres), against 10–20 s for a dev compile. | Capture builds in the snapshot. A build is a *path-dependent resource*: its identity is the source rev, lockfile, and build-time env; it is recomputed when those change and restored from the snapshot when they do not. |
+
+### Round 3: making Docker (and Supabase) work
+
+Root cause of the bridge failure: **`/proc/sys` is a separate read-only mount**
+over a read-writable `/proc`, so every sysctl write fails — including the
+per-interface IPv6 write Docker 26+ makes for each container. Bridges and
+veth pairs can be created; only the sysctl writes were blocked. The sandbox's
+root holds `CAP_SYS_ADMIN` and `CAP_NET_ADMIN`, and **`mount -o remount,rw
+/proc/sys` succeeds**; after it, sysctl writes work, inside new network
+namespaces too.
+
+A Debian image with Docker's static binaries installed at runtime
+(`docker-at <version>`), the Supabase CLI native (glibc):
+
+| Step | Result |
+|---|---|
+| Remount `/proc/sys`, start Docker 29.8.2 (`--iptables=false`) | Docker up in 5 s; **bridge networking works** |
+| `supabase start` from nothing | **All 12 services healthy in 122 s**, image pulls included |
+| Snapshot (stopped, images + volumes, 50 k rows added) | 5.1 GB in 54 s |
+| Restore, `supabase start` | 47 s (37 s with unused services excluded); data intact; REST API answers **through the Worker in 0.3–0.4 s** |
+| Snapshot with containers **stopped, not removed**; restore, `docker start` | **+3 MB** delta. Database ready **4.9 s**, API healthy **13.3 s** after boot |
+| Cold vs warm restore of a large snapshot | First restore of the ~5 GB chain on a host: **70–100 s**. A repeat: **5 s**. |
+
+Consequences:
+
+- **Docker resources work in sandboxes**, Supabase included. The base image
+  remounts `/proc/sys` before starting `dockerd`. This depends on the
+  sandbox's current capabilities; if Cloudflare tightens them, it breaks, so
+  CI should exercise it.
+- **Snapshot Docker resources stopped, not removed.** `docker start` on
+  restore is ~10× faster than recreating containers.
+- **Big snapshots need warming.** The first restore of a multi-GB snapshot on
+  a host is slow; warm the environment snapshot right after it is built
+  (restore it once in the background) so the first human preview does not pay.
+- **Bake images into the environment snapshot.** Registries rate-limit
+  anonymous pulls (seen in round 2); a snapshot that already holds the images
+  pulls nothing.
 
 **Caveat on captured builds:** a build inlines build-time public env vars
 (`NEXT_PUBLIC_*`). Built with project-audience trackers (CI is not a person),
