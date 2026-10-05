@@ -186,7 +186,7 @@ The test for the design is simple:
 
 ### No Native Remote
 
-v1 should not implement a new remote protocol. It can push and pull through the project's existing Git remote — and does push through it: a `git push` from a workspace publishes to the store's `origin` (see *`git push` Publishes*). Tracker `storage = "remote"` is declared in the model but not implemented.
+v1 should not implement a new remote protocol. It can push and pull through the project's existing Git remote — and does push through it: a `git push` from a workspace publishes to the store's `origin` (see *`git push` Publishes*). Tracker `storage = "remote"` is declared in the model but not implemented. The native remote is being built on Cloudflare (see `newgit-cloudflare.md`); so far a project can name it in `config.toml` (`[remote] url = "https://..."`, optional `project`), and `tracker create --storage remote` is refused until one is configured, rather than quietly behaving as local.
 
 ### No Hunk-Level Privacy
 
@@ -2127,7 +2127,8 @@ This keeps the "repositories are outputs" idea alive without making it the first
 
 Definitions live one per file, not inlined in `config.toml`:
 
-- `config.toml` holds only `[project]` and (optionally) `[workspace]`.
+- `config.toml` holds only `[project]` and (optionally) `[workspace]` and
+  `[remote]`.
 - Each tracker is a file in `.newgit/trackers/`; each resource is a file in
   `.newgit/resources/`. The definition's name comes from the filename.
 

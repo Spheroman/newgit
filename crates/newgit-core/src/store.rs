@@ -159,7 +159,19 @@ impl MetadataStore {
     }
 
     pub fn load_config(&self) -> Result<ProjectConfig> {
-        read_toml_at(&self.paths.config)
+        let config: ProjectConfig = read_toml_at(&self.paths.config)?;
+        if let Some(problem) = config
+            .remote
+            .as_ref()
+            .and_then(|remote| remote.problem(&config.project.name))
+        {
+            return Err(NewgitError::InvalidDefinition {
+                kind: "config section",
+                name: "[remote]".to_owned(),
+                reason: problem,
+            });
+        }
+        Ok(config)
     }
 
     pub fn write_config(&self, config: &ProjectConfig) -> Result<()> {

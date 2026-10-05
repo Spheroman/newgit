@@ -2258,6 +2258,16 @@ impl BranchManager {
         merge_with_source: bool,
     ) -> Result<AddTrackerOutcome> {
         validate_name(name)?;
+        // A remote tracker with nowhere to sync would behave exactly like a
+        // local one while claiming otherwise. Refuse it here, where the claim
+        // is made; definitions written by hand are not bricked on load.
+        if storage == Storage::Remote && self.config.remote.is_none() {
+            return Err(NewgitError::Unsupported(format!(
+                "tracker `{name}` would use `storage = \"remote\"`, but .newgit/config.toml has no \
+                 [remote] to sync it to; add one (`[remote] url = \"https://...\"`), or create \
+                 the tracker with `--storage local`"
+            )));
+        }
         let definition = TrackerDefinition::new(
             name,
             audience.to_owned(),

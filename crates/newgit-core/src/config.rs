@@ -10,6 +10,8 @@ pub struct ProjectConfig {
     pub project: ProjectSection,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace: Option<WorkspaceSection>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote: Option<RemoteSection>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -37,6 +39,65 @@ pub struct WorkspaceSection {
     pub materializer: Option<String>,
 }
 
+/// The newgit remote this project syncs to: a newgit Worker, which keeps
+/// binding records and checkpoints and mints the Git credentials for the
+/// project's repos. Committed — every member of the project uses the same one.
+///
+/// ```toml
+/// [remote]
+/// url = "https://newgit.example.workers.dev"
+/// project = "acme"   # optional; defaults to [project] name
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RemoteSection {
+    pub url: String,
+    /// The project's name on the remote, which also names its repos. Only
+    /// needed when it differs from `[project] name`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project: Option<String>,
+}
+
+impl RemoteSection {
+    /// Why this section cannot be used, if it cannot.
+    pub fn problem(&self, project_name: &str) -> Option<String> {
+        let url = self.url.trim_end_matches('/');
+        let local = ["http://localhost", "http://127.0.0.1"]
+            .iter()
+            .any(|prefix| url == *prefix || url.starts_with(&format!("{prefix}:")));
+        if !url.starts_with("https://") && !local {
+            return Some(format!(
+                "`url = \"{}\"` must be https:// — newgit tokens travel over it (plain http \
+                 is accepted only for localhost, for a local `wrangler dev`)",
+                self.url
+            ));
+        }
+        let name = self.project.as_deref().unwrap_or(project_name);
+        if !is_remote_name(name) {
+            return Some(format!(
+                "project name `{name}` cannot name repos on the remote: use 2-63 letters, digits, \
+                 `.`, `_`, or `-`, starting with a letter or digit{}",
+                if self.project.is_none() {
+                    " (set `project` under [remote] to use a different name there)"
+                } else {
+                    ""
+                }
+            ));
+        }
+        None
+    }
+}
+
+/// Artifacts' naming rule for namespaces and repos.
+fn is_remote_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    (2..=63).contains(&name.len())
+        && chars
+            .next()
+            .is_some_and(|first| first.is_ascii_alphanumeric())
+        && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+}
+
 impl ProjectConfig {
     pub fn new(project_name: impl Into<String>, source: SourceSubstrate) -> Self {
         Self {
@@ -45,7 +106,14 @@ impl ProjectConfig {
                 source,
             },
             workspace: None,
+            remote: None,
         }
+    }
+
+    /// The project's name on the remote, when one is configured.
+    pub fn remote_project(&self) -> Option<&str> {
+        let remote = self.remote.as_ref()?;
+        Some(remote.project.as_deref().unwrap_or(&self.project.name))
     }
 
     /// Where this project's workspaces live. Defaults to
