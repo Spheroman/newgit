@@ -154,7 +154,10 @@ inside a workspace):
 - `newgit status <instance> --path` — just the workspace path, for scripts
 - `newgit reference` — the definition format, every key and default
 - `newgit run [instance] -- <command>` — run with exports and ports loaded
-- `newgit action <resource>.<action> [instance]`
+- `newgit env [instance]` — the environment `run` and every hook get, each
+  variable labeled with the declaration it came from
+- `newgit action <resource>.<action> [instance] [--dry-run]` — `--dry-run`
+  prints the rendered command and its directory, and runs nothing
 - `newgit checkpoint [instance] [-m <msg>]` / `undo [instance] [--to <id>]` /
   `checkpoints [instance]`
 - `newgit export [instance] --to <dir> [--include <path>] [--exclude <path>]`

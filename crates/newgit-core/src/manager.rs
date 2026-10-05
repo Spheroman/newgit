@@ -196,6 +196,92 @@ impl RenderCheckTarget {
     }
 }
 
+/// One variable of the command environment, and the declaration it came
+/// from. `check_env_names` guarantees every name has exactly one declaring
+/// resource, so the origin is never a guess.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EnvVar {
+    pub name: String,
+    pub value: String,
+    pub source: EnvSource,
+}
+
+/// Where a command-environment variable is declared.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EnvSource {
+    /// A key in the resource's `[exports]`.
+    Export { resource: String },
+    /// Captured from an action's stdout, with no `[exports]` key of its own.
+    Capture { resource: String, action: String },
+    /// A port's `env` name.
+    Port { resource: String, port: String },
+    /// `NEWGIT_BRANCH` and `NEWGIT_WORKSPACE`, set by newgit itself.
+    Newgit,
+}
+
+impl std::fmt::Display for EnvSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Export { resource } => write!(f, "{resource} [exports]"),
+            Self::Capture { resource, action } => {
+                write!(f, "{resource} [actions.{action}] captures")
+            }
+            Self::Port { resource, port } => write!(f, "{resource} [ports.{port}]"),
+            Self::Newgit => f.write_str("newgit"),
+        }
+    }
+}
+
+/// The declaration a bound export value came from: an `[exports]` key when
+/// there is one (a capture of the same name only refines it), otherwise the
+/// action that captures it. A binding whose definition has since vanished
+/// is still an export of that resource.
+fn export_source(resource: &str, definition: Option<&ResourceDefinition>, key: &str) -> EnvSource {
+    let capturing_action = definition
+        .filter(|definition| !definition.exports.contains_key(key))
+        .and_then(|definition| {
+            definition
+                .actions
+                .iter()
+                .find(|(_, action)| action.captures.iter().any(|name| name == key))
+        });
+    match capturing_action {
+        Some((action, _)) => EnvSource::Capture {
+            resource: resource.to_owned(),
+            action: action.clone(),
+        },
+        None => EnvSource::Export {
+            resource: resource.to_owned(),
+        },
+    }
+}
+
+/// The signal a command-less action sends: its own, else the resource's
+/// stop signal.
+fn action_signal(definition: &ResourceDefinition, action: &crate::resource::ActionSpec) -> String {
+    action
+        .signal
+        .clone()
+        .unwrap_or_else(|| definition.stop_signal())
+}
+
+/// What `newgit action <resource>.<action>` would do, without doing it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ActionPlan {
+    /// A command-less action (e.g. `stop`): signal the supervised process.
+    Signal { signal: String },
+    /// Run this exact command — rendered, in this directory, with
+    /// [`BranchManager::assemble_env`] layered over the caller's environment.
+    Command {
+        command: String,
+        cwd: Utf8PathBuf,
+        /// Started under supervision rather than run to completion.
+        long_running: bool,
+        /// Names read out of stdout into the binding's exports.
+        captures: Vec<String>,
+    },
+}
+
 /// What running an action did.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ActionOutcome {
@@ -1628,58 +1714,26 @@ impl BranchManager {
 
     /// Run `<resource>.<action>` for an instance.
     pub fn run_action(&self, instance: &str, spec: &str) -> Result<ActionOutcome> {
-        self.require_resolvable_graph()?;
-        let (resource_name, action_name) = spec.split_once('.').ok_or_else(|| {
-            NewgitError::Unsupported(format!("`{spec}` is not of the form <resource>.<action>"))
-        })?;
-        let mut branch = self.store.find_branch(instance)?;
-        self.require_workspace(&branch)?;
-        let definition = self.resource_definition(resource_name)?;
-        let action =
-            definition
-                .actions
-                .get(action_name)
-                .ok_or_else(|| NewgitError::UnknownAction {
-                    resource: resource_name.to_owned(),
-                    action: action_name.to_owned(),
-                })?;
+        let (mut branch, definition, action, action_name) = self.resolve_action(instance, spec)?;
         let supervisor = self.supervisor(&branch);
 
         // Signal-only action (e.g. stop): signal the supervised process.
         if action.command.is_none() {
-            let signal = action
-                .signal
-                .clone()
-                .unwrap_or_else(|| definition.stop_signal());
+            let signal = action_signal(definition, action);
             return Ok(ActionOutcome::Stopped(
                 supervisor.stop(&definition.name, &signal)?,
             ));
         }
-
-        // Refusing to run is the right call, but it is not this resource's own
-        // outcome — it is derived from a dependency, and re-derivable the
-        // moment that dependency changes. Nothing is written to the record.
-        let blocked_by = self.blocked_dependencies(&branch, definition);
-        if !blocked_by.is_empty() {
-            return Err(NewgitError::Unsupported(format!(
-                "resource `{resource_name}` is blocked by failed dependency/dependencies: {}",
-                blocked_by.join(", ")
-            )));
-        }
+        self.refuse_if_blocked(&branch, definition)?;
 
         let log = self
             .store
             .action_log_path(&branch.slug, &format!("{}.{action_name}", definition.name));
 
         if action.long_running {
-            let command = self.rendered_command(&branch, definition, action)?;
+            let (command, cwd) =
+                self.action_invocation(&branch, definition, action, action_name)?;
             let env = self.assemble_env(&branch)?;
-            let cwd = resource_cwd(
-                &branch.workspace_path,
-                &definition.name,
-                action_name,
-                definition.workdir_for(Some(action)),
-            )?;
             let pid = supervisor.start(&definition.name, &command, &cwd, &env, &log)?;
             return Ok(ActionOutcome::Started { pid, log });
         }
@@ -1720,6 +1774,96 @@ impl BranchManager {
         })
     }
 
+    /// What [`Self::run_action`] would do, refusing for exactly the reasons
+    /// it would refuse, and running nothing. The command is rendered by the
+    /// same code that renders it for a real run; the environment it gets is
+    /// [`Self::command_env`].
+    pub fn plan_action(&self, instance: &str, spec: &str) -> Result<ActionPlan> {
+        let (branch, definition, action, action_name) = self.resolve_action(instance, spec)?;
+        if action.command.is_none() {
+            return Ok(ActionPlan::Signal {
+                signal: action_signal(definition, action),
+            });
+        }
+        self.refuse_if_blocked(&branch, definition)?;
+        let (command, cwd) = self.action_invocation(&branch, definition, action, action_name)?;
+        Ok(ActionPlan::Command {
+            command,
+            cwd,
+            long_running: action.long_running,
+            captures: action.captures.clone(),
+        })
+    }
+
+    /// Look up `<resource>.<action>` for an instance, with every refusal a
+    /// run makes before it reaches the command.
+    fn resolve_action<'s>(
+        &self,
+        instance: &str,
+        spec: &'s str,
+    ) -> Result<(
+        BranchInstance,
+        &ResourceDefinition,
+        &crate::resource::ActionSpec,
+        &'s str,
+    )> {
+        self.require_resolvable_graph()?;
+        let (resource_name, action_name) = spec.split_once('.').ok_or_else(|| {
+            NewgitError::Unsupported(format!("`{spec}` is not of the form <resource>.<action>"))
+        })?;
+        let branch = self.store.find_branch(instance)?;
+        self.require_workspace(&branch)?;
+        let definition = self.resource_definition(resource_name)?;
+        let action =
+            definition
+                .actions
+                .get(action_name)
+                .ok_or_else(|| NewgitError::UnknownAction {
+                    resource: resource_name.to_owned(),
+                    action: action_name.to_owned(),
+                })?;
+        Ok((branch, definition, action, action_name))
+    }
+
+    /// Refusing to run is the right call, but it is not this resource's own
+    /// outcome — it is derived from a dependency, and re-derivable the
+    /// moment that dependency changes. Nothing is written to the record.
+    fn refuse_if_blocked(
+        &self,
+        branch: &BranchInstance,
+        definition: &ResourceDefinition,
+    ) -> Result<()> {
+        let blocked_by = self.blocked_dependencies(branch, definition);
+        if blocked_by.is_empty() {
+            return Ok(());
+        }
+        Err(NewgitError::Unsupported(format!(
+            "resource `{}` is blocked by failed dependency/dependencies: {}",
+            definition.name,
+            blocked_by.join(", ")
+        )))
+    }
+
+    /// The rendered command an action runs and the directory it runs in —
+    /// shared by real runs and [`Self::plan_action`], so a dry run cannot
+    /// describe a different command than the one that would run.
+    fn action_invocation(
+        &self,
+        branch: &BranchInstance,
+        definition: &ResourceDefinition,
+        action: &crate::resource::ActionSpec,
+        action_name: &str,
+    ) -> Result<(String, Utf8PathBuf)> {
+        let command = self.rendered_command(branch, definition, action)?;
+        let cwd = resource_cwd(
+            &branch.workspace_path,
+            &definition.name,
+            action_name,
+            definition.workdir_for(Some(action)),
+        )?;
+        Ok((command, cwd))
+    }
+
     /// Run an arbitrary command inside the instance with the full export
     /// environment loaded. Returns the exit code.
     pub fn run_command(
@@ -1747,14 +1891,8 @@ impl BranchManager {
         action_name: &str,
         log: &Utf8Path,
     ) -> Result<(i32, Captures)> {
-        let command = self.rendered_command(branch, definition, action)?;
+        let (command, cwd) = self.action_invocation(branch, definition, action, action_name)?;
         let env = self.assemble_env(branch)?;
-        let cwd = resource_cwd(
-            &branch.workspace_path,
-            &definition.name,
-            action_name,
-            definition.workdir_for(Some(action)),
-        )?;
 
         if action.captures.is_empty() {
             let code = run_foreground(
@@ -1838,20 +1976,35 @@ impl BranchManager {
         Ok(render(&command, &context))
     }
 
-    /// The layered environment `newgit run` and actions see. Later layers
+    /// The layered environment `newgit run` and every hook see: actions,
+    /// `key_command`, checkpoint, restore, and cleanup alike. Later layers
     /// win: resource exports in dependency order → port env vars → newgit
     /// context vars. Trackers own content; command environment wiring lives
-    /// outside the tracker primitive.
+    /// outside the tracker primitive. The variables are added on top of the
+    /// environment of whoever ran newgit; nothing inherited is removed.
     pub fn assemble_env(&self, branch: &BranchInstance) -> Result<Vec<(String, String)>> {
+        Ok(self
+            .command_env(branch)?
+            .into_iter()
+            .map(|var| (var.name, var.value))
+            .collect())
+    }
+
+    /// [`Self::assemble_env`] with each variable's origin attached — what
+    /// `newgit env` prints. This *is* the assembly; `assemble_env` only drops
+    /// the origins, so what is printed cannot drift from what a hook gets.
+    pub fn command_env(&self, branch: &BranchInstance) -> Result<Vec<EnvVar>> {
         // Layering depends on dependency order, so the order has to be real.
         self.require_resolvable_graph()?;
-        let mut env: BTreeMap<String, String> = BTreeMap::new();
+        let mut env: BTreeMap<String, (String, EnvSource)> = BTreeMap::new();
 
         // Layer 1: resource exports, dependency order (dependents win).
         for name in &self.graph.bind_order {
             if let Some(binding) = branch.resources.get(name) {
+                let definition = self.resource_definition(name).ok();
                 for (key, value) in &binding.resolved_exports {
-                    env.insert(key.clone(), value.clone());
+                    let source = export_source(name, definition, key);
+                    env.insert(key.clone(), (value.clone(), source));
                 }
             }
         }
@@ -1868,19 +2021,33 @@ impl BranchManager {
                 if let (Some(env_name), Some(port)) =
                     (&request.env, binding.resolved_ports.get(port_name))
                 {
-                    env.insert(env_name.clone(), port.to_string());
+                    let source = EnvSource::Port {
+                        resource: name.clone(),
+                        port: port_name.clone(),
+                    };
+                    env.insert(env_name.clone(), (port.to_string(), source));
                 }
             }
         }
 
         // Layer 3: context vars.
-        env.insert("NEWGIT_BRANCH".to_owned(), branch.name.clone());
+        env.insert(
+            "NEWGIT_BRANCH".to_owned(),
+            (branch.name.clone(), EnvSource::Newgit),
+        );
         env.insert(
             "NEWGIT_WORKSPACE".to_owned(),
-            branch.workspace_path.to_string(),
+            (branch.workspace_path.to_string(), EnvSource::Newgit),
         );
 
-        Ok(env.into_iter().collect())
+        Ok(env
+            .into_iter()
+            .map(|(name, (value, source))| EnvVar {
+                name,
+                value,
+                source,
+            })
+            .collect())
     }
 
     pub fn add_resource(&self, name: &str, template_name: &str) -> Result<AddResourceOutcome> {

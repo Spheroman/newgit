@@ -252,7 +252,8 @@ clean pass.
 
 **Actions are not lifecycle hooks.** Only `prepare` runs on its own — at
 `spawn`, and again for a `recompute` restore. Every other action is something
-you invoke: `newgit action <resource>.<action> [instance]`.
+you invoke: `newgit action <resource>.<action> [instance]`. Add `--dry-run`
+to print the rendered command and its directory without running it.
 
 **`stop` is the one name newgit reads.** Names are otherwise inert —
 `start` is pure convention, made real by `long_running` and not by the name —
@@ -888,6 +889,33 @@ it did not receive that variable it would fall back to whatever its committed
 default names — usually the developer's shared local database — and destroy
 the wrong state, quietly and plausibly. Every variable a `[restore]` needs is
 there.
+
+`newgit env [instance]` prints it, one `export NAME=value` line per variable
+with the declaration it came from, so a destructive hook's inputs can be read
+instead of discovered by running it:
+
+```
+export DB_PORT=5434                            # db [ports.pg]
+export DB_TOKEN=tok_123                        # db [actions.mint] captures
+export DATABASE_URL=postgres://...:5434/feat-x # db [exports]
+export NEWGIT_BRANCH=feature/x                 # newgit
+export NEWGIT_WORKSPACE=/Users/.../feature-x   # newgit
+```
+
+It is the same assembly the hooks use, not a reconstruction of it, and it is
+valid shell: `eval "$(newgit env)"` sets and exports every variable, so the
+programs that shell starts see them as a hook would. A name a shell cannot
+assign (`NEXT-PUBLIC-URL`) is listed commented out rather than dropped:
+newgit sets it for the hook's `sh`, but whether the programs that `sh`
+starts see it depends on the shell (bash passes it on, dash drops it), so
+use names a shell can assign. One case it cannot show in advance: during an
+`undo`, a `recompute` restore that captures a new value hands it to the
+`[restore]` hooks after it in the same undo. Values are printed verbatim: a
+credential a resource exports appears in plain text, exactly as a hook
+receives it. What it leaves out is the environment of whoever runs newgit,
+which every command inherits underneath these variables. The command itself
+— the other half of "what is this about to do" — is `newgit action
+<resource>.<action> --dry-run`.
 
 Note that this is the opposite shape to `{{...}}` substitution, where scope
 genuinely differs per site (see *Template variables*). The environment does

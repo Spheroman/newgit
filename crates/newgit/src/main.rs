@@ -5,9 +5,10 @@ use newgit_core::branch::branch_slug;
 use newgit_core::checkpoint::CheckpointReason;
 use newgit_core::cleanup::{ArchivedCheckpoints, HookDetail, HookOutcome};
 use newgit_core::export::{ExportFilter, Reason};
+use newgit_core::exports::unresolved_placeholder;
 use newgit_core::installs::InstallReport;
 use newgit_core::manager::{
-    ActionOutcome, BaseReport, BindOrigin, BranchManager, InstanceReport, KeptBranch,
+    ActionOutcome, ActionPlan, BaseReport, BindOrigin, BranchManager, InstanceReport, KeptBranch,
     RemoveOutcome, SourceBranchOutcome, SourceBranchPolicy, TrackerBindOutcome, UndoOptions,
 };
 use newgit_core::resource::{CheckpointMode, ResourceDefinition};
@@ -77,12 +78,30 @@ enum Command {
     },
     /// Run a command inside an instance with exports and ports loaded
     Run(RunArgs),
+    /// Print the environment `newgit run` and every resource hook get, and
+    /// which declaration each variable comes from
+    ///
+    /// One environment, the same for every action, checkpoint, restore, and
+    /// cleanup command of the instance, layered over the environment of
+    /// whoever runs newgit (which is not shown). The output is valid shell.
+    ///
+    /// Values are printed verbatim. A credential a resource exports — a
+    /// password inside a `DATABASE_URL`, a token an action captured — is
+    /// printed in plain text, exactly as the hook receives it.
+    Env {
+        /// Instance (inferred when run inside a workspace)
+        instance: Option<String>,
+    },
     /// Run a resource action: newgit action <resource>.<action> [instance]
     Action {
         /// <resource>.<action>, e.g. app.start
         spec: String,
         /// Instance (inferred when run inside a workspace)
         instance: Option<String>,
+        /// Print the rendered command and the directory it would run in,
+        /// and run nothing. Refuses for the same reasons a real run would.
+        #[arg(long)]
+        dry_run: bool,
     },
     /// Record one coherent snapshot across source, trackers, and resources
     Checkpoint {
@@ -326,7 +345,17 @@ fn main() -> Result<()> {
         Command::Tracker { command } => tracker(command),
         Command::Resource { command } => resource(command),
         Command::Run(args) => run(args),
-        Command::Action { spec, instance } => action(&spec, instance),
+        Command::Env { instance } => env_command(instance),
+        Command::Action {
+            spec,
+            instance,
+            dry_run: false,
+        } => action(&spec, instance),
+        Command::Action {
+            spec,
+            instance,
+            dry_run: true,
+        } => action_dry_run(&spec, instance),
         Command::Checkpoint {
             instance,
             message,
@@ -1006,6 +1035,110 @@ fn action(spec: &str, instance: Option<String>) -> Result<()> {
             }
             Ok(())
         }
+    }
+}
+
+fn action_dry_run(spec: &str, instance: Option<String>) -> Result<()> {
+    let (manager, instance) = manager_and_instance(instance)?;
+    match manager.plan_action(&instance, spec)? {
+        ActionPlan::Signal { signal } => {
+            let resource = spec.split('.').next().unwrap_or(spec);
+            println!(
+                "`{spec}` for `{instance}` would send `{signal}` to `{resource}`'s supervised \
+                 process, if one is running"
+            );
+        }
+        ActionPlan::Command {
+            command,
+            cwd,
+            long_running,
+            captures,
+        } => {
+            let verb = if long_running {
+                "would start, supervised"
+            } else {
+                "would run"
+            };
+            println!("`{spec}` for `{instance}` {verb}:");
+            println!("  in:       {cwd}");
+            println!("  command:  {command}");
+            if !captures.is_empty() {
+                println!(
+                    "  captures: {} (read from stdout into this resource's exports)",
+                    captures.join(", ")
+                );
+            }
+            println!("  env:      `newgit env {instance}`, over the caller's environment");
+            // Rendering leaves unknown variables verbatim, which is right
+            // for `{{.Field}}` meant for another tool and wrong for a typo.
+            // Only a person reading the command can tell which.
+            if let Some(placeholder) = unresolved_placeholder(&command) {
+                println!(
+                    "  note:     {placeholder} is not a variable an action can use, so it \
+                     reaches the shell verbatim"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn env_command(instance: Option<String>) -> Result<()> {
+    let (manager, instance) = manager_and_instance(instance)?;
+    let branch = manager.store().find_branch(&instance)?;
+    let vars = manager.command_env(&branch)?;
+    // `export`, so `eval "$(newgit env)"` reaches the programs the shell
+    // starts — which is what a hook's environment is — not just the shell.
+    // A name the shell cannot assign (`NEXT-PUBLIC-URL`) is still set for
+    // the hook's `sh`, but whether it reaches the programs that `sh` starts
+    // depends on the shell — bash passes it on, dash drops it. So it is
+    // shown, commented out, rather than dropped or printed as a line that
+    // `eval` would run as a command.
+    let assignments: Vec<String> = vars
+        .iter()
+        .map(|var| {
+            let assignment = format!("{}={}", var.name, shell_quote(&var.value));
+            if is_shell_name(&var.name) {
+                format!("export {assignment}")
+            } else {
+                format!("# {assignment}")
+            }
+        })
+        .collect();
+    let width = column_width(assignments.iter().map(String::len), "");
+    for (assignment, var) in assignments.iter().zip(&vars) {
+        if is_shell_name(&var.name) {
+            println!("{assignment:<width$}  # {}", var.source);
+        } else {
+            println!(
+                "{assignment:<width$}  # {} (not a shell name: set for hooks, but some shells drop it)",
+                var.source
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Whether a POSIX shell can assign `name`: `[A-Za-z_][A-Za-z0-9_]*`.
+fn is_shell_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    chars
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// A value as a POSIX shell word: bare when it is plainly safe, otherwise
+/// single-quoted, so `newgit env` output can be sourced as printed.
+fn shell_quote(value: &str) -> String {
+    let safe = !value.is_empty()
+        && value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "_@%+=:,./-".contains(c));
+    if safe {
+        value.to_owned()
+    } else {
+        format!("'{}'", value.replace('\'', r"'\''"))
     }
 }
 
