@@ -1064,7 +1064,20 @@ impl BranchManager {
             ))
         })?;
         let code = self.code_definitions();
-        let bound: Vec<&TrackerDefinition> = code.iter().collect();
+        let dropped = if slug == PROJECT_ROOT_INSTANCE {
+            BTreeSet::new()
+        } else {
+            self.store
+                .find_branch(slug)
+                .map(|branch| branch.dropped)
+                .unwrap_or_default()
+        };
+        // Only what the instance binds: a dropped tracker is out of its
+        // scope, so work in it refuses, naming `newgit tracker use`.
+        let bound: Vec<&TrackerDefinition> = code
+            .iter()
+            .filter(|definition| !dropped.contains(&definition.name))
+            .collect();
         let outcome = crate::compose::split(&project, &base, tip, &bound, &self.all_definitions())
             .map_err(|error| match error {
                 crate::compose::SplitError::Refused(refusal) => {
@@ -3073,6 +3086,220 @@ impl BranchManager {
         })
     }
 
+    /// Stop binding `tracker` in `instance` (`newgit tracker drop`). A code
+    /// tracker leaves the working tree (sparse checkout) but not the history;
+    /// uncommitted work in it refuses the drop unless `uncommitted` says to
+    /// stash it (`use` brings it back) or discard it (after a checkpoint, so
+    /// it can be undone). A secret tracker's content is captured first, then
+    /// its files removed; `use` projects that content back.
+    pub fn drop_tracker(
+        &self,
+        instance: &str,
+        tracker: &str,
+        uncommitted: Uncommitted,
+    ) -> Result<BindingChange> {
+        let mut branch = self.store.find_branch(instance)?;
+        self.require_workspace(&branch)?;
+        let mut change = BindingChange {
+            tracker: tracker.to_owned(),
+            ..BindingChange::default()
+        };
+        if [
+            self.root.name.as_str(),
+            crate::tracker::PROJECT_TRACKER,
+            crate::tracker::ACCESS_TRACKER,
+        ]
+        .contains(&tracker)
+        {
+            return Err(NewgitError::Unsupported(format!(
+                "`{tracker}` cannot be dropped: it holds {}",
+                if tracker == self.root.name {
+                    "everything no other tracker claims"
+                } else {
+                    "the project's definitions"
+                }
+            )));
+        }
+        if branch.dropped.contains(tracker) {
+            change.already = true;
+            return Ok(change);
+        }
+        let workspace = branch.workspace_path.clone();
+        if let Some(definition) = self
+            .code
+            .iter()
+            .find(|definition| definition.name == tracker)
+        {
+            let paths: Vec<&str> = definition.paths.iter().map(|path| path.as_str()).collect();
+            let mut status_args = vec![
+                "-C",
+                workspace.as_str(),
+                "status",
+                "--porcelain",
+                "--untracked-files=all",
+                "--",
+            ];
+            status_args.extend(&paths);
+            let dirty = !crate::source::run_git_env(&status_args, &[])?
+                .trim()
+                .is_empty();
+            if dirty {
+                match uncommitted {
+                    Uncommitted::Refuse => {
+                        return Err(NewgitError::Unsupported(format!(
+                            "`{tracker}` has uncommitted changes in this workspace: commit them, \
+                             or drop it with `--stash` (kept for when you use it again) or \
+                             `--discard` (after a checkpoint, so `newgit undo` gets them back)"
+                        )));
+                    }
+                    Uncommitted::Stash => {
+                        let message = stash_message(tracker);
+                        let mut args = vec![
+                            "-C",
+                            workspace.as_str(),
+                            "stash",
+                            "push",
+                            "--include-untracked",
+                            "-m",
+                            message.as_str(),
+                            "--",
+                        ];
+                        args.extend(&paths);
+                        crate::source::run_git_env(&args, &[])?;
+                        change.stashed = true;
+                    }
+                    Uncommitted::Discard => {
+                        let checkpoint = self.checkpoint_branch(
+                            &mut branch,
+                            Some(&format!("before dropping `{tracker}`")),
+                            CheckpointReason::Explicit,
+                        )?;
+                        change.checkpoint = Some(checkpoint.record.id);
+                        let mut restore = vec!["-C", workspace.as_str(), "checkout", "HEAD", "--"];
+                        restore.extend(&paths);
+                        let _ = crate::source::run_git_env(&restore, &[]);
+                        let mut clean = vec!["-C", workspace.as_str(), "clean", "-fdq", "--"];
+                        clean.extend(&paths);
+                        crate::source::run_git_env(&clean, &[])?;
+                    }
+                }
+            }
+            branch.dropped.insert(tracker.to_owned());
+            self.apply_sparse(&branch)?;
+        } else {
+            let definition = self.definition(tracker)?.clone();
+            let report = self.capture_tracker(instance, tracker)?;
+            branch = self.store.find_branch(instance)?;
+            change.captured = Some(report.rev);
+            crate::tracker_repo::clear_owned_paths(&workspace, &definition)?;
+            branch.dropped.insert(tracker.to_owned());
+        }
+        branch.updated_at = Utc::now();
+        self.store.save_branch_record(&branch)?;
+        Ok(change)
+    }
+
+    /// Bind `tracker` in `instance` again (`newgit tracker use`): a code
+    /// tracker's files come back into the working tree, with whatever a drop
+    /// stashed; a secret tracker's last content in this instance is projected
+    /// back.
+    pub fn use_tracker(&self, instance: &str, tracker: &str) -> Result<BindingChange> {
+        let mut branch = self.store.find_branch(instance)?;
+        self.require_workspace(&branch)?;
+        let mut change = BindingChange {
+            tracker: tracker.to_owned(),
+            ..BindingChange::default()
+        };
+        let definition = if let Some(code) = self.code.iter().find(|d| d.name == tracker) {
+            code.clone()
+        } else {
+            self.definition(tracker)?.clone()
+        };
+        if !branch.dropped.remove(tracker) {
+            change.already = true;
+            return Ok(change);
+        }
+        let workspace = branch.workspace_path.clone();
+        if !definition.secret {
+            self.apply_sparse(&branch)?;
+            let listing = crate::source::run_git_env(
+                &[
+                    "-C",
+                    workspace.as_str(),
+                    "stash",
+                    "list",
+                    "--format=%gd%x09%s",
+                ],
+                &[],
+            )
+            .unwrap_or_default();
+            let wanted = stash_message(tracker);
+            if let Some(stash) = listing.lines().find_map(|line| {
+                let (reference, subject) = line.split_once('\t')?;
+                subject.ends_with(&wanted).then(|| reference.to_owned())
+            }) {
+                crate::source::run_git_env(
+                    &["-C", workspace.as_str(), "stash", "pop", "-q", &stash],
+                    &[],
+                )?;
+                change.restored_stash = true;
+            }
+        } else if let Some(rev) = branch
+            .trackers
+            .get(tracker)
+            .and_then(|binding| binding.content_rev.clone())
+        {
+            change.files = self.lane(tracker).restore(&workspace, &definition, &rev)?;
+        }
+        branch.updated_at = Utc::now();
+        self.store.save_branch_record(&branch)?;
+        Ok(change)
+    }
+
+    /// The working tree follows the binding: every dropped code tracker's
+    /// paths left out (Git's sparse checkout), with any bound tracker nested
+    /// inside one put back.
+    fn apply_sparse(&self, branch: &BranchInstance) -> Result<()> {
+        let workspace = branch.workspace_path.as_str();
+        let dropped: Vec<&TrackerDefinition> = self
+            .code
+            .iter()
+            .filter(|definition| branch.dropped.contains(&definition.name))
+            .collect();
+        if dropped.is_empty() {
+            crate::source::run_git_env(&["-C", workspace, "sparse-checkout", "disable"], &[])?;
+            return Ok(());
+        }
+        let mut patterns = vec!["/*".to_owned()];
+        for definition in &dropped {
+            for path in &definition.paths {
+                patterns.push(format!("!/{path}/"));
+                patterns.push(format!("!/{path}"));
+            }
+        }
+        for definition in &self.code {
+            if branch.dropped.contains(&definition.name) {
+                continue;
+            }
+            for path in &definition.paths {
+                let inside = dropped.iter().any(|outer| {
+                    outer
+                        .paths
+                        .iter()
+                        .any(|outer| path != outer && path.starts_with(outer))
+                });
+                if inside {
+                    patterns.push(format!("/{path}/"));
+                    patterns.push(format!("/{path}"));
+                }
+            }
+        }
+        let mut args = vec!["-C", workspace, "sparse-checkout", "set", "--no-cone"];
+        args.extend(patterns.iter().map(String::as_str));
+        crate::source::run_git_env(&args, &[])?;
+        Ok(())
+    }
+
     pub fn capture_tracker(&self, instance: &str, tracker: &str) -> Result<CaptureReport> {
         let mut branch = self.store.find_branch(instance)?;
         let definition = self.definition(tracker)?;
@@ -4470,33 +4697,36 @@ impl BranchManager {
         // capture bound.
         let mut tracker_states = Vec::new();
         for definition in &self.trackers {
-            let content_rev = if definition.paths.is_empty() {
-                branch
-                    .trackers
-                    .get(&definition.name)
-                    .and_then(|binding| binding.content_rev.clone())
-            } else {
-                let bound = branch
-                    .trackers
-                    .get(&definition.name)
-                    .and_then(|binding| binding.content_rev.clone());
-                Some(
-                    self.lane(&definition.name)
-                        .capture(
-                            &workspace,
-                            definition,
-                            CaptureAt {
-                                parent: bound.as_deref(),
-                                branch: Branch::Instance(&branch.slug),
-                                message: &format!(
-                                    "{} in `{}` at {id}",
-                                    definition.name, branch.name
-                                ),
-                            },
-                        )?
-                        .rev,
-                )
-            };
+            // A dropped tracker's files are gone from the workspace on
+            // purpose: its binding's content stands, uncaptured.
+            let content_rev =
+                if definition.paths.is_empty() || branch.dropped.contains(&definition.name) {
+                    branch
+                        .trackers
+                        .get(&definition.name)
+                        .and_then(|binding| binding.content_rev.clone())
+                } else {
+                    let bound = branch
+                        .trackers
+                        .get(&definition.name)
+                        .and_then(|binding| binding.content_rev.clone());
+                    Some(
+                        self.lane(&definition.name)
+                            .capture(
+                                &workspace,
+                                definition,
+                                CaptureAt {
+                                    parent: bound.as_deref(),
+                                    branch: Branch::Instance(&branch.slug),
+                                    message: &format!(
+                                        "{} in `{}` at {id}",
+                                        definition.name, branch.name
+                                    ),
+                                },
+                            )?
+                            .rev,
+                    )
+                };
             branch.trackers.insert(
                 definition.name.clone(),
                 TrackerBinding {
@@ -4679,9 +4909,17 @@ impl BranchManager {
         }
         let root = self.store.paths().project_root.clone();
         let code = self.code_definitions();
+        // Only what the instance binds: a dropped tracker keeps the branch's
+        // commit, whatever the instance's history says about it.
+        let dropped = if instance == PROJECT_ROOT_INSTANCE {
+            BTreeSet::new()
+        } else {
+            self.store.find_branch(instance)?.dropped
+        };
         let theirs: BTreeMap<String, String> = crate::compose::read_state(&root, &head)?
             .into_iter()
             .filter(|(tracker, _)| code.iter().any(|definition| &definition.name == tracker))
+            .filter(|(tracker, _)| !dropped.contains(tracker))
             .collect();
 
         // What `into` is now: on the remote, its list (its commits brought
@@ -5530,7 +5768,12 @@ impl BranchManager {
         // Trackers: plain content, restored exactly; should not partially
         // fail in interesting ways, so failures here are hard errors.
         let mut trackers = Vec::new();
-        for state in restored.tracker_states.iter().filter(|_| !partial) {
+        for state in restored
+            .tracker_states
+            .iter()
+            .filter(|_| !partial)
+            .filter(|state| !branch.dropped.contains(&state.name))
+        {
             let Some(definition) = self
                 .trackers
                 .iter()
@@ -6222,6 +6465,39 @@ pub struct MergeOutcome {
     pub remote: Option<String>,
     /// What happened to the project root after a merge into `main`.
     pub project_root: Option<String>,
+}
+
+/// What to do with uncommitted work in a code tracker being dropped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Uncommitted {
+    /// Refuse the drop, saying what to do.
+    Refuse,
+    /// Stash it; `newgit tracker use` brings it back.
+    Stash,
+    /// Throw it away, after a checkpoint so `newgit undo` gets it back.
+    Discard,
+}
+
+/// What `newgit tracker use` or `drop` did.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BindingChange {
+    pub tracker: String,
+    /// It was already bound (use) or already dropped (drop): nothing done.
+    pub already: bool,
+    /// Uncommitted work stashed by the drop.
+    pub stashed: bool,
+    /// A stash from an earlier drop, brought back by the use.
+    pub restored_stash: bool,
+    /// The checkpoint a discarding drop took first.
+    pub checkpoint: Option<String>,
+    /// A secret tracker's content, captured before its files were removed.
+    pub captured: Option<String>,
+    /// Files a secret tracker's use projected back.
+    pub files: usize,
+}
+
+fn stash_message(tracker: &str) -> String {
+    format!("newgit: uncommitted work in `{tracker}`")
 }
 
 /// What `newgit remote add` published when it created the project.

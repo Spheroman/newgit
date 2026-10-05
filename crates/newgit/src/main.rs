@@ -303,6 +303,28 @@ enum TrackerCommand {
         /// Instance (inferred when run inside a workspace)
         instance: Option<String>,
     },
+    /// Bind a tracker in an instance again: its files come back (a code
+    /// tracker's history never left), with any work a drop stashed
+    Use {
+        tracker: String,
+        /// Instance (inferred when run inside a workspace)
+        instance: Option<String>,
+    },
+    /// Stop binding a tracker in an instance: its files leave the working
+    /// tree and its work leaves the instance's scope. Refused while it has
+    /// uncommitted changes, unless told what to do with them
+    Drop {
+        tracker: String,
+        /// Instance (inferred when run inside a workspace)
+        instance: Option<String>,
+        /// Stash its uncommitted work; `newgit tracker use` brings it back
+        #[arg(long, conflicts_with = "discard")]
+        stash: bool,
+        /// Throw its uncommitted work away, after a checkpoint (`newgit undo`
+        /// gets it back)
+        #[arg(long)]
+        discard: bool,
+    },
 }
 
 #[derive(Debug, Args)]
@@ -1453,6 +1475,58 @@ fn tracker(command: TrackerCommand) -> Result<()> {
             );
             if let Some(safety) = report.safety_rev {
                 println!("  previous content saved @ {safety}; check it out with --rev");
+            }
+            Ok(())
+        }
+        TrackerCommand::Use { tracker, instance } => {
+            let (manager, instance) = manager_and_instance(instance)?;
+            let change = manager.use_tracker(&instance, &tracker)?;
+            if change.already {
+                println!("`{tracker}` is already bound in `{instance}`");
+                return Ok(());
+            }
+            println!("Bound `{tracker}` in `{instance}`");
+            if change.restored_stash {
+                println!("  its uncommitted work, stashed when it was dropped, is back");
+            }
+            if change.files > 0 {
+                println!("  {} restored", plural(change.files, "file"));
+            }
+            Ok(())
+        }
+        TrackerCommand::Drop {
+            tracker,
+            instance,
+            stash,
+            discard,
+        } => {
+            use newgit_core::manager::Uncommitted;
+            let (manager, instance) = manager_and_instance(instance)?;
+            let how = match (stash, discard) {
+                (true, _) => Uncommitted::Stash,
+                (_, true) => Uncommitted::Discard,
+                _ => Uncommitted::Refuse,
+            };
+            let change = manager.drop_tracker(&instance, &tracker, how)?;
+            if change.already {
+                println!("`{tracker}` is already dropped from `{instance}`");
+                return Ok(());
+            }
+            println!("Dropped `{tracker}` from `{instance}`");
+            if change.stashed {
+                println!(
+                    "  its uncommitted work is stashed; `newgit tracker use {tracker}` brings it back"
+                );
+            }
+            if let Some(checkpoint) = &change.checkpoint {
+                println!(
+                    "  its uncommitted work was discarded after checkpoint {checkpoint} (`newgit undo` gets it back)"
+                );
+            }
+            if let Some(rev) = &change.captured {
+                println!(
+                    "  its content was captured first ({rev}); `newgit tracker use {tracker}` brings it back"
+                );
             }
             Ok(())
         }
