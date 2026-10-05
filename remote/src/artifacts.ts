@@ -15,6 +15,8 @@ export interface Repos {
 	fork(from: string, to: string): Promise<{ remote: string }>;
 	/** The repo's Git remote, or null when it does not exist. */
 	remote(name: string): Promise<string | null>;
+	/** Where the repo is (or will be) served, without checking it exists. */
+	url(name: string): string;
 	delete(name: string): Promise<boolean>;
 	mint(name: string, scope: "read" | "write", ttlSeconds: number): Promise<MintedToken>;
 	/** Revoke a minted token before it expires. False when it no longer exists. */
@@ -58,6 +60,10 @@ export class ArtifactsRepos implements Repos {
 			if (isNotFound(error)) return null;
 			throw error;
 		}
+		return this.url(name);
+	}
+
+	url(name: string) {
 		// info() carries no remote; the URL is fixed by account, namespace, and name.
 		return `${this.gitBase}/${name}.git`;
 	}

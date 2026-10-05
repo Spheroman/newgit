@@ -41,7 +41,7 @@ export class FakeRepos implements Repos {
 		this.repos.get(name)!.set(path, text);
 	}
 
-	private url(name: string) {
+	url(name: string) {
 		return `https://acct.artifacts.example/git/newgit/${name}.git`;
 	}
 }

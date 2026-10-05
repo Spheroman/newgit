@@ -258,7 +258,17 @@ async function route(request: Request, env: Env, deps: Deps): Promise<Response> 
 			instance: name,
 			ttlSeconds: AGENT_TTL_SECONDS,
 		});
-		return json({ ...created, repo: fork, token: instanceToken.token, token_id: instanceToken.id }, 201);
+		return json(
+			{
+				...created,
+				repo: fork,
+				remote: deps.repos.url(fork),
+				trunk: { repo: src, remote: deps.repos.url(src) },
+				token: instanceToken.token,
+				token_id: instanceToken.id,
+			},
+			201,
+		);
 	}
 	if (method === "GET" && rest === "/instances") return json({ instances: await project.instances() });
 
@@ -268,7 +278,7 @@ async function route(request: Request, env: Env, deps: Deps): Promise<Response> 
 		const instance = await project.instance(name);
 		if (instance === null) throw new HttpError(404, `no instance \`${name}\` in ${projectName}`);
 		const repo = repoName({ kind: "instance", project: projectName, instance: name });
-		if (method === "GET" && !instanceMatch[2]) return json({ ...instance, repo });
+		if (method === "GET" && !instanceMatch[2]) return json({ ...instance, repo, remote: deps.repos.url(repo) });
 		if (method === "PUT" && instanceMatch[2]) {
 			requireOwner(instance.owner, login, `move \`${name}\`'s head`);
 			requireThisInstance(caller, name);
