@@ -1087,15 +1087,43 @@ fn env_command(instance: Option<String>) -> Result<()> {
     let (manager, instance) = manager_and_instance(instance)?;
     let branch = manager.store().find_branch(&instance)?;
     let vars = manager.command_env(&branch)?;
+    // `export`, so `eval "$(newgit env)"` reaches the programs the shell
+    // starts — which is what a hook's environment is — not just the shell.
+    // A name the shell cannot assign (`NEXT-PUBLIC-URL`) still reaches hooks
+    // through execve, so it is shown, commented out, rather than dropped or
+    // printed as a line that `eval` would run as a command.
     let assignments: Vec<String> = vars
         .iter()
-        .map(|var| format!("{}={}", var.name, shell_quote(&var.value)))
+        .map(|var| {
+            let assignment = format!("{}={}", var.name, shell_quote(&var.value));
+            if is_shell_name(&var.name) {
+                format!("export {assignment}")
+            } else {
+                format!("# {assignment}")
+            }
+        })
         .collect();
     let width = column_width(assignments.iter().map(String::len), "");
     for (assignment, var) in assignments.iter().zip(&vars) {
-        println!("{assignment:<width$}  # {}", var.source);
+        if is_shell_name(&var.name) {
+            println!("{assignment:<width$}  # {}", var.source);
+        } else {
+            println!(
+                "{assignment:<width$}  # {} (hooks receive it; a shell cannot assign this name)",
+                var.source
+            );
+        }
     }
     Ok(())
+}
+
+/// Whether a POSIX shell can assign `name`: `[A-Za-z_][A-Za-z0-9_]*`.
+fn is_shell_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    chars
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
 /// A value as a POSIX shell word: bare when it is plainly safe, otherwise

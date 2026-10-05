@@ -1182,12 +1182,12 @@ newgit run feature-a -- pnpm test
 
 Prints the environment `newgit run` and every hook — actions,
 `key_command`, `[checkpoint]`, `[restore]`, `[cleanup]` — get, one
-`NAME=value  # <declaration>` line per variable:
+`export NAME=value  # <declaration>` line per variable:
 
 ```
-DB_PORT=5434                            # db [ports.pg]
-DATABASE_URL=postgres://...:5434/feat-x # db [exports]
-NEWGIT_BRANCH=feature/x                 # newgit
+export DB_PORT=5434                            # db [ports.pg]
+export DATABASE_URL=postgres://...:5434/feat-x # db [exports]
+export NEWGIT_BRANCH=feature/x                 # newgit
 ```
 
 The question it answers — "which database does this hook talk to?" — used
@@ -1201,7 +1201,11 @@ It is one command and not a filter on `run` or `action` because the
 environment does not vary by resource: there is no `--resource` flag,
 since narrowing the listing to one resource's declarations would hide
 variables that resource's hooks receive. The output is valid shell, so `eval
-"$(newgit env)"` reproduces it.
+"$(newgit env)"` reproduces it — `export`ed, because a hook's environment is
+what the programs it starts inherit, not shell-local variables. A name no
+shell can assign (`NEXT-PUBLIC-URL`) still reaches hooks through `execve`, so
+it is listed commented out, with its origin, instead of being dropped or
+printed as a line `eval` would run as a command.
 
 Values are printed verbatim, credentials included — the same values `newgit
 run -- env` would show. Redacting here would be simulated security: anything

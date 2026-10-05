@@ -89,6 +89,7 @@ depends_on = ["db"]
 
 [exports]
 APP_NAME = "app-{{branch.slug}}"
+"APP-LABEL" = "label"
 "#;
 
 /// A store with both resources and one spawned instance, `feature-a`.
@@ -158,7 +159,9 @@ fn parse_env(text: &str) -> BTreeMap<String, String> {
 fn source_of<'a>(printed: &'a str, name: &str) -> &'a str {
     printed
         .lines()
-        .find(|line| line.starts_with(&format!("{name}=")))
+        .find(|line| {
+            line.starts_with(&format!("export {name}=")) || line.starts_with(&format!("# {name}="))
+        })
         .unwrap_or_else(|| panic!("`{name}` not printed:\n{printed}"))
         .rsplit_once("  # ")
         .expect("every line names its source")
@@ -179,16 +182,25 @@ fn env_prints_exactly_what_a_hook_receives() {
     // Sourcing the output as printed must reproduce every value — which
     // proves the quoting and the values in one comparison.
     let sourced = Command::new("sh")
-        .args(["-c", "set -a; eval \"$1\"; env", "sh", &printed])
+        .args(["-c", "eval \"$1\"; env", "sh", &printed])
         .env_clear()
         .output()
         .expect("sh runs");
     assert!(sourced.status.success(), "output is not valid shell");
     let sourced = parse_env(&String::from_utf8(sourced.stdout).expect("utf8"));
 
+    // Every assignable name is `export`ed, so a plain `eval` reaches the
+    // programs the shell starts, not just the shell itself.
     let names: Vec<&str> = printed
         .lines()
-        .map(|line| line.split_once('=').expect("NAME=value").0)
+        .filter(|line| !line.starts_with("# "))
+        .map(|line| {
+            line.strip_prefix("export ")
+                .expect("every assignable variable is exported")
+                .split_once('=')
+                .expect("NAME=value")
+                .0
+        })
         .collect();
     for name in [
         "DB_PORT",
@@ -209,6 +221,19 @@ fn env_prints_exactly_what_a_hook_receives() {
         );
     }
     assert_eq!(hook["DB_NOTE"], "it's got $pace & quotes");
+
+    // A name no shell can assign still reaches the hook; `env` shows it
+    // commented out, so the output stays valid shell instead of `eval`
+    // running `APP-LABEL=label` as a command.
+    assert_eq!(hook["APP-LABEL"], "label");
+    assert!(
+        printed
+            .lines()
+            .any(|line| line.starts_with("# APP-LABEL=label")),
+        "unassignable name not shown commented out:\n{printed}"
+    );
+    assert!(source_of(&printed, "APP-LABEL").contains("a shell cannot assign this name"));
+    assert!(!sourced.contains_key("APP-LABEL"));
 }
 
 #[test]
@@ -244,7 +269,7 @@ fn dry_run_prints_the_rendered_command_and_runs_nothing() {
     let (_guard, temp) = tempdir();
     let repo = setup(&temp);
     let workspace = workspace(&repo);
-    let port = parse_env(&newgit_ok(&repo, &["env", "feature-a"]))["DB_PORT"]
+    let port = parse_env(&newgit_ok(&repo, &["env", "feature-a"]))["export DB_PORT"]
         .split_whitespace()
         .next()
         .expect("port")

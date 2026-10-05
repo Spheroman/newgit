@@ -890,20 +890,25 @@ default names — usually the developer's shared local database — and destroy
 the wrong state, quietly and plausibly. Every variable a `[restore]` needs is
 there.
 
-`newgit env [instance]` prints it, one `NAME=value` line per variable with
-the declaration it came from, so a destructive hook's inputs can be read
+`newgit env [instance]` prints it, one `export NAME=value` line per variable
+with the declaration it came from, so a destructive hook's inputs can be read
 instead of discovered by running it:
 
 ```
-DB_PORT=5434                            # db [ports.pg]
-DB_TOKEN=tok_123                        # db [actions.mint] captures
-DATABASE_URL=postgres://...:5434/feat-x # db [exports]
-NEWGIT_BRANCH=feature/x                 # newgit
-NEWGIT_WORKSPACE=/Users/.../feature-x   # newgit
+export DB_PORT=5434                            # db [ports.pg]
+export DB_TOKEN=tok_123                        # db [actions.mint] captures
+export DATABASE_URL=postgres://...:5434/feat-x # db [exports]
+export NEWGIT_BRANCH=feature/x                 # newgit
+export NEWGIT_WORKSPACE=/Users/.../feature-x   # newgit
 ```
 
 It is the same assembly the hooks use, not a reconstruction of it, and it is
-valid shell (`eval "$(newgit env)"`). Values are printed verbatim: a
+valid shell: `eval "$(newgit env)"` sets and exports every variable, so the
+programs that shell starts see them as a hook would. A name a shell cannot
+assign (`NEXT-PUBLIC-URL`) still reaches hooks, so it is listed commented
+out rather than dropped. One case it cannot show in advance: during an
+`undo`, a `recompute` restore that captures a new value hands it to the
+`[restore]` hooks after it in the same undo. Values are printed verbatim: a
 credential a resource exports appears in plain text, exactly as a hook
 receives it. What it leaves out is the environment of whoever runs newgit,
 which every command inherits underneath these variables. The command itself
