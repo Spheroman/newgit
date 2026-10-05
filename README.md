@@ -139,7 +139,8 @@ tests by nature.
 - `crates/newgit` is the CLI, published as the `newgit` crate.
 - `.newgit/` is created by `newgit init`. Committed: `config.toml`,
   `trackers/`, `resources/`, `scripts/`. Gitignored local state: `branches/`,
-  `snapshots/`, `checkpoints/`, `logs/`, `state/`, `local/`.
+  `checkpoints/`, `logs/`, `state/`, `installs/`, and `local/` — which holds
+  `lanes.git`, the bare repo of captured tracker content.
 
 ## Commands
 

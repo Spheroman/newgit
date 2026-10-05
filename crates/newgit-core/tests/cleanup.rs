@@ -604,27 +604,27 @@ fn pruning_never_drops_a_rev_a_checkpoint_still_points_at() {
         4,
         "the four captures must be distinct revs for this test to mean anything"
     );
-    let lane = store.paths().snapshots.join("runtime-env");
+    let lane = lane(&store, "runtime-env");
 
     let dry = manager
         .cleanup(true, ArchivedCheckpoints::Keep)
         .expect("dry run");
     let would_prune: Vec<&str> = dry.pruned.iter().map(|rev| rev.rev.as_str()).collect();
     assert_eq!(would_prune, [orphaned.as_str()]);
-    assert!(lane.join(&orphaned).is_dir(), "a dry run removes nothing");
+    assert!(lane.has_rev(&orphaned), "a dry run removes nothing");
 
     let outcome = manager
         .cleanup(false, ArchivedCheckpoints::Keep)
         .expect("cleanup");
     let pruned: Vec<&str> = outcome.pruned.iter().map(|rev| rev.rev.as_str()).collect();
     assert_eq!(pruned, [orphaned.as_str()]);
-    assert!(!lane.join(&orphaned).exists(), "unreferenced rev pruned");
+    assert!(!lane.has_rev(&orphaned), "unreferenced rev pruned");
     assert!(
-        lane.join(&checkpointed).is_dir(),
+        lane.has_rev(&checkpointed),
         "a rev only a checkpoint references must survive — pruning it breaks undo"
     );
-    assert!(lane.join(&head_rev).is_dir(), "the lane head must survive");
-    assert!(lane.join(&bound).is_dir(), "a bound rev must survive");
+    assert!(lane.has_rev(&head_rev), "the lane head must survive");
+    assert!(lane.has_rev(&bound), "a bound rev must survive");
     assert!(outcome.pinned_by_checkpoints > 0);
 
     // Undo still works against the checkpoint whose content survived.
@@ -726,14 +726,14 @@ fn purging_an_archived_instance_releases_what_its_checkpoints_pinned() {
         .remove("throwaway", &temp, ArchivedCheckpoints::Keep)
         .expect("remove");
 
-    let lane = store.paths().snapshots.join("env");
+    let lane = lane(&store, "env");
     let checkpoints = store.checkpoint_dir(&doomed.branch.slug);
 
     // Removal alone keeps the history, and says how much is pinned by it.
     let kept = manager
         .cleanup(false, ArchivedCheckpoints::Keep)
         .expect("cleanup");
-    assert!(lane.join(&doomed_rev).is_dir(), "kept for a possible undo");
+    assert!(lane.has_rev(&doomed_rev), "kept for a possible undo");
     assert!(checkpoints.is_dir());
     assert_eq!(kept.pinned_by_checkpoints, 2, "one per instance");
     assert_eq!(
@@ -756,16 +756,16 @@ fn purging_an_archived_instance_releases_what_its_checkpoints_pinned() {
         [doomed_rev.as_str()]
     );
     assert!(checkpoints.is_dir(), "a dry run touches nothing");
-    assert!(lane.join(&doomed_rev).is_dir());
+    assert!(lane.has_rev(&doomed_rev));
 
     let purged = manager
         .cleanup(false, ArchivedCheckpoints::Purge)
         .expect("purge");
     assert_eq!(purged.purged_checkpoints.len(), 1);
     assert!(!checkpoints.exists(), "the archived instance's log is gone");
-    assert!(!lane.join(&doomed_rev).exists(), "and so is what it pinned");
+    assert!(!lane.has_rev(&doomed_rev), "and so is what it pinned");
     assert!(
-        lane.join(&live_rev).is_dir(),
+        lane.has_rev(&live_rev),
         "a live instance's checkpoint is never purged, whatever the flag says"
     );
     assert!(
@@ -818,7 +818,7 @@ fn remove_purge_drops_the_instance_history_in_one_step() {
         .expect("cleanup");
     assert_eq!(cleaned.pinned_by_checkpoints, 0);
     assert!(
-        !store.paths().snapshots.join("env").join(&rev).exists(),
+        !lane(&store, "env").has_rev(&rev),
         "the rev its checkpoint pinned is reclaimed"
     );
 }
@@ -840,4 +840,11 @@ fn remove_reports_the_history_it_keeps() {
         store.checkpoint_dir(&spawned.branch.slug).is_dir(),
         "keeping is the default: nothing breaks an undo unasked"
     );
+}
+
+/// A tracker's lane in the store's lanes repo — what "this rev still exists"
+/// is asked of.
+fn lane(store: &MetadataStore, tracker: &str) -> newgit_core::lane::TrackerLane {
+    let paths = store.paths();
+    newgit_core::lane::TrackerLane::new(&paths.lanes, &paths.lane_checkouts, tracker)
 }

@@ -5,6 +5,7 @@ use camino::{Utf8Path, Utf8PathBuf};
 use crate::branch::BranchInstance;
 use crate::checkpoint::CheckpointLog;
 use crate::error::{NewgitError, Result};
+use crate::lane::{lane_names, parse_tracker_state_ref};
 use crate::materializer::workspace_marker_path;
 use crate::resource::Ownership;
 use crate::store::{MetadataStore, read_subdirs_sorted};
@@ -130,17 +131,6 @@ pub enum HookDetail {
 pub struct PrunedRev {
     pub tracker: String,
     pub rev: String,
-    pub path: Utf8PathBuf,
-}
-
-/// A tracker lane rev on disk.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LaneRev {
-    pub tracker: String,
-    pub rev: String,
-    pub path: Utf8PathBuf,
-    /// Staging directory a crashed capture left behind (`<rev>.tmp`).
-    pub is_staging: bool,
 }
 
 /// Whether per-branch teardown may run this resource's cleanup hook at all.
@@ -167,7 +157,7 @@ pub struct SnapshotRoots {
     /// record is gone. These are the claims a purge can release, so cleanup
     /// can say so instead of reporting retained disk with no way out.
     pub archived_checkpoints: BTreeSet<(String, String)>,
-    /// Claimed by a lane's own head (`LATEST`), which new instances project.
+    /// Claimed by a lane's own head, which new instances project.
     pub lane_heads: BTreeSet<(String, String)>,
 }
 
@@ -232,18 +222,19 @@ impl SnapshotRoots {
         // Only a tracker that still has a definition gets to call its head "the
         // thing new instances project" — otherwise `tracker remove` could
         // delete a definition and its lane's head would stay pinned forever,
-        // since a directory under `snapshots/` outlives the file that named it.
+        // since a lane's refs outlive the file that named it.
         let defined: BTreeSet<String> = store
             .load_tracker_definitions()?
             .into_iter()
             .map(|tracker| tracker.name)
             .collect();
-        for lane in lane_names(&store.paths().snapshots)? {
+        let paths = store.paths();
+        for lane in lane_names(&paths.lanes)? {
             if !defined.contains(&lane) {
                 continue;
             }
             if let Some(head) =
-                crate::lane::TrackerLane::new(&store.paths().snapshots, &lane).latest()
+                crate::lane::TrackerLane::new(&paths.lanes, &paths.lane_checkouts, &lane).latest()
             {
                 roots.lane_heads.insert((lane, head));
             }
@@ -273,42 +264,6 @@ impl SnapshotRoots {
         self.pinned_only_by_checkpoints()
             .filter(|key| self.archived_checkpoints.contains(*key))
     }
-}
-
-/// `tracker:<name>@<rev>` — the state ref an `into_tracker` deposit records.
-fn parse_tracker_state_ref(state_ref: &str) -> Option<(&str, &str)> {
-    state_ref.strip_prefix("tracker:")?.split_once('@')
-}
-
-pub fn lane_names(snapshots_root: &Utf8Path) -> Result<Vec<String>> {
-    Ok(read_subdirs_sorted(snapshots_root)?
-        .iter()
-        .filter_map(|dir| dir.file_name().map(ToOwned::to_owned))
-        .collect())
-}
-
-/// Every rev directory present in every lane, including leftover staging
-/// directories.
-pub fn lane_revs(snapshots_root: &Utf8Path) -> Result<Vec<LaneRev>> {
-    let mut revs = Vec::new();
-    for tracker in lane_names(snapshots_root)? {
-        for dir in read_subdirs_sorted(&snapshots_root.join(&tracker))? {
-            let Some(name) = dir.file_name() else {
-                continue;
-            };
-            let (rev, is_staging) = match name.strip_suffix(".tmp") {
-                Some(rev) => (rev.to_owned(), true),
-                None => (name.to_owned(), false),
-            };
-            revs.push(LaneRev {
-                tracker: tracker.clone(),
-                rev,
-                path: dir,
-                is_staging,
-            });
-        }
-    }
-    Ok(revs)
 }
 
 /// Workspace directories under `workspace_root` that no binding record
@@ -374,21 +329,5 @@ mod tests {
         assert!(may_tear_down(Ownership::External));
         assert!(!may_tear_down(Ownership::Project));
         assert!(!may_tear_down(Ownership::User));
-    }
-
-    #[test]
-    fn lane_revs_flag_staging_directories() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let root = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).expect("utf8");
-        std::fs::create_dir_all(root.join("runtime-env/abc123")).expect("mkdir");
-        std::fs::create_dir_all(root.join("runtime-env/def456.tmp")).expect("mkdir");
-        std::fs::write(root.join("runtime-env/LATEST"), "abc123\n").expect("write");
-
-        let revs = lane_revs(&root).expect("lane revs");
-        assert_eq!(revs.len(), 2, "LATEST is a file, not a rev");
-        assert_eq!(revs[0].rev, "abc123");
-        assert!(!revs[0].is_staging);
-        assert_eq!(revs[1].rev, "def456");
-        assert!(revs[1].is_staging);
     }
 }

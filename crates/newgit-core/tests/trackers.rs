@@ -621,13 +621,13 @@ fn remove_tracker_reverses_the_definition_and_gitignore_and_leaves_snapshots_for
         .capture_tracker("feature-a", "runtime-env")
         .expect("capture");
     m.merge_tracker("feature-a", "runtime-env").expect("merge");
-    let snapshot_dir = m
-        .store()
-        .paths()
-        .snapshots
-        .join("runtime-env")
-        .join(&captured.rev);
-    assert!(snapshot_dir.is_dir(), "captured content exists on disk");
+    let paths = m.store().paths().clone();
+    let lane =
+        newgit_core::lane::TrackerLane::new(&paths.lanes, &paths.lane_checkouts, "runtime-env");
+    assert!(
+        lane.has_rev(&captured.rev),
+        "captured content exists in the lanes repo"
+    );
 
     // Not removable while the instance is still bound to it.
     assert!(m.remove_tracker("runtime-env").is_err());
@@ -651,14 +651,14 @@ fn remove_tracker_reverses_the_definition_and_gitignore_and_leaves_snapshots_for
 
     // The captured content is untouched — it is `newgit cleanup`'s job, not
     // `tracker remove`'s, to reclaim it once nothing pins it.
-    assert!(snapshot_dir.is_dir());
+    assert!(lane.has_rev(&captured.rev));
     let cleaned = m
         .cleanup(false, ArchivedCheckpoints::Keep)
         .expect("cleanup");
     assert_eq!(cleaned.pruned.len(), 1);
     assert_eq!(cleaned.pruned[0].tracker, "runtime-env");
     assert!(
-        !snapshot_dir.is_dir(),
+        !lane.has_rev(&captured.rev),
         "a removed tracker's head is no longer pinned once nothing else claims it"
     );
 }

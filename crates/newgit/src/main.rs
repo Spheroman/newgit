@@ -568,7 +568,7 @@ fn init(args: InitArgs) -> Result<()> {
     println!("  .newgit/scripts/      scripts your resources call, as {{{{scripts}}}}/<name>");
     println!(
         "Everything else under .newgit/ is local state and is already ignored: branches/, \
-         snapshots/, checkpoints/, logs/, state/, local/."
+         checkpoints/, logs/, state/, installs/, local/ (tracker content lives in local/lanes.git)."
     );
     println!("\nNext: newgit tracker create <name> [--audience user]");
     println!(
@@ -1075,7 +1075,7 @@ fn tracker(command: TrackerCommand) -> Result<()> {
                 );
             }
             println!(
-                "  snapshots: content under .newgit/snapshots/{name}/ is left in place and is \
+                "  content: the lane's revs in .newgit/local/lanes.git are left in place and are \
                  now unreferenced; `newgit cleanup` reclaims it once nothing else (a checkpoint \
                  that captured it) still pins a rev"
             );

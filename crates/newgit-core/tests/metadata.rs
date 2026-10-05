@@ -60,9 +60,17 @@ fn init_is_not_repeatable_and_writes_gitignore() {
 
     let gitignore = store.paths().metadata_root.join(".gitignore");
     let contents = std::fs::read_to_string(gitignore).expect("gitignore written");
-    for line in ["/local/", "/branches/", "/snapshots/", "/logs/", "/state/"] {
+    for line in ["/local/", "/branches/", "/logs/", "/state/"] {
         assert!(contents.contains(line), "missing {line}");
     }
+    // Lane content can be secrets: the lanes repo must sit under a directory
+    // every project's .gitignore already ignores, old ones included.
+    assert!(
+        store
+            .paths()
+            .lanes
+            .starts_with(store.paths().metadata_root.join("local"))
+    );
 
     let again = MetadataStore::init(&store.paths().project_root, "proj", SourceSubstrate::Git);
     assert!(matches!(again, Err(NewgitError::AlreadyExists(_))));

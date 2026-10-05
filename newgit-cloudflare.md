@@ -109,10 +109,10 @@ when more than one machine is involved.
 | Source trunk | the store repo's branches | repo `<p>.src` |
 | Branch instance | binding record + workspace clone | ProjectDO row + **fork** `<p>.i.<instance>` |
 | Workspace `origin` push | outbox → real remote | outbox → the instance's fork |
-| Tracker lane | `.newgit/snapshots/<tracker>/<rev>/` | `refs/newgit/lanes/<tracker>` in `<p>.t.<tracker>` |
+| Tracker lane | `refs/lanes/<tracker>/*` in `.newgit/local/lanes.git` | the same refs in `<p>.t.<tracker>` |
 | Checkpoint | `.newgit/checkpoints/<inst>/*.json` + store refs | ProjectDO row + `refs/newgit/checkpoints/<id>` in each repo it names |
 | `merge` (source) | — (v1 leaves source merges to Git) | merge queue in ProjectDO, executed server-side into `<p>.src` |
-| `merge` (tracker) | moves the lane's LATEST | moves `refs/newgit/lanes/<tracker>` in the tracker's repo |
+| `merge` (tracker) | moves `refs/lanes/<tracker>/head` | the same, pushed to the tracker's repo |
 | Audience | declared intent | **enforced**: tokens for `<p>.t.<tracker>` are minted only for the tracker's audience |
 | Resources | local lifecycle | still local. Stretch: run in a Sandbox container |
 
@@ -266,30 +266,36 @@ GitHub remote, publishing there is the export/mirror step, not the daily push.
 
 ---
 
-## Tracker Lanes Become Git (the barrier change)
+## Tracker Lanes Are Git (the barrier change — landed)
 
-Today a lane is a directory of snapshot files plus a `LATEST` pointer. That
-cannot be pushed to Artifacts, and it is a small reimplementation of what Git
-objects already are. Remote mode needs lanes to be Git, and it is the better
-local design regardless:
+A lane used to be a directory of snapshot files plus a `LATEST` pointer.
+That could not be pushed to Artifacts, and it was a small reimplementation of
+what Git objects already are. Lanes are now Git, locally:
 
-- A lane rev is a **commit** whose tree is the tracker's owned files.
-  Parent: the previous lane rev. Message: what captured it.
-- The lane head is `refs/newgit/lanes/<tracker>` in the store.
-- Content-addressed dedupe comes free (identical tree → same tree hash; we
-  still skip creating a commit when the tree is unchanged).
-- A resource deposit is a capture from a directory instead of the workspace.
-- Checkpoints reference lane commits by hash, and pin them with
-  `refs/newgit/checkpoints/<id>/<tracker>` so `git gc` cannot drop them.
+- **Where:** a bare repo at `.newgit/local/lanes.git`, separate from the
+  store repo. Lane content includes secrets, and the store repo is the one a
+  `git push --mirror` publishes and a local `git clone` hardlinks wholesale
+  into every workspace's object store. `local/` is already ignored by every
+  project's `.newgit/.gitignore`, old ones included.
+- **A rev is a parentless commit** of the captured files with a fixed
+  identity and date. So a rev is content-addressed: identical content is the
+  identical rev, on any machine — which is what lets two machines agree on a
+  rev without coordinating. The rev string is a 12-hex prefix of the commit
+  id.
+- **Refs:** `refs/lanes/<tracker>/revs/<rev>` keeps each rev alive;
+  `refs/lanes/<tracker>/head` is the lane head. Lane history is not a parent
+  chain — checkpoint records already say which rev was bound when.
+- **Cleanup** deletes the rev refs nothing roots, then runs
+  `git gc --prune=now`: a pruned secret is gone, not merely unreachable.
+- **Commands that need a path** (a restore handed `{{state_ref}}`) get the
+  rev materialized into `.newgit/local/lane-checkouts/`, a cache restore
+  re-fills on demand.
 
-Lane commits live in the **store** repo locally, on refs Git never checks
-out, so they never appear in source history or `git log`. Pushing a tracker
-means pushing just its `refs/newgit/lanes/<tracker>` and checkpoint refs to
-`<p>.t.<tracker>` — Git's own refspecs do the projection.
-
-This change renames and deletes shared code (`lane.rs`, `TrackerLane`,
-snapshot layout, checkpoint resolution). Per the repo convention it **lands
-first, alone**, before any parallel branch starts.
+Pushing a tracker to the remote is one refspec,
+`refs/lanes/<tracker>/*:refs/lanes/<tracker>/*`, to `<p>.t.<tracker>`. A
+push only sends objects reachable from the refs pushed, and a tracker's revs
+contain only that tracker's files, so no other tracker's content can ride
+along.
 
 ---
 
@@ -302,8 +308,9 @@ resources. In remote mode:
   machine can list and restore it, and the web UI can show it.
 - **Source:** the checkpoint's head and dirty commits are pushed to the
   instance fork under `refs/newgit/checkpoints/<id>/source`.
-- **Trackers:** each lane commit is pushed to its tracker's repo under
-  `refs/newgit/checkpoints/<id>/<tracker>`.
+- **Trackers:** each bound rev's ref, `refs/lanes/<tracker>/revs/<rev>`, is
+  pushed to its tracker's repo. Rev refs are already what keeps a rev alive,
+  so a checkpoint needs no extra tracker refs.
 - **Resources:** unchanged. `hash` and `command` states stay local; deposits
   are tracker content and travel as above. A checkpoint restored on a
   different machine re-runs `prepare` for resources whose state is local-only,
@@ -498,7 +505,8 @@ reversible after the competition.
    when a remote is configured. Local is a cache.
 4. **Artifacts is the project remote** in remote mode; GitHub is a mirror.
 5. **Identity is GitHub login**, via device flow.
-6. **Tracker lanes are Git commits on `refs/newgit/lanes/*`**, locally and
+6. **Tracker lanes are Git commits on `refs/lanes/<tracker>/*`**, in a lanes
+   repo separate from the store, locally and
    remotely.
 
 ## Open Questions

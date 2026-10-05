@@ -475,15 +475,12 @@ fn capture_reverses_the_render_and_keeps_edits_made_beside_it() {
         .capture_tracker("feature-a", "runtime-env")
         .expect("capture");
 
-    let lane_content = std::fs::read_to_string(
-        m.store()
-            .paths()
-            .snapshots
-            .join("runtime-env")
-            .join(&report.rev)
-            .join(".env.local"),
-    )
-    .expect("lane content");
+    let paths = m.store().paths();
+    let lane_content =
+        newgit_core::lane::TrackerLane::new(&paths.lanes, &paths.lane_checkouts, "runtime-env")
+            .read_file(&report.rev, camino::Utf8Path::new(".env.local"))
+            .expect("read lane")
+            .expect("lane content");
     assert_eq!(
         lane_content,
         "SUPABASE_URL=http://127.0.0.1:54321\nSTRIPE_KEY=sk_test_123\n"

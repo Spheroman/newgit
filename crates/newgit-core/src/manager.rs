@@ -12,14 +12,17 @@ use crate::checkpoint::{
 };
 use crate::cleanup::{
     ArchivedCheckpoints, CleanupOutcome, FinalizedInstance, HookDetail, HookOutcome, PrunedInstall,
-    PrunedRev, PurgedCheckpoints, SnapshotRoots, lane_revs, may_tear_down, orphan_workspaces,
+    PrunedRev, PurgedCheckpoints, SnapshotRoots, may_tear_down, orphan_workspaces,
 };
 use crate::config::ProjectConfig;
 use crate::error::{NewgitError, Result};
 use crate::export::{self, ExportFilter, ExportPlan, prepare_destination};
 use crate::exports::{RenderContext, render, unresolved_placeholder};
 use crate::installs::{Admission, InstallReport, InstallStore};
-use crate::lane::{TrackerLane, clear_owned_paths, copy_file};
+use crate::lane::{
+    TrackerLane, clear_owned_paths, copy_file, lane_revs, parse_tracker_state_ref,
+    prune_unreferenced,
+};
 use crate::materializer::{
     Materializer, RealDirMaterializer, exclude_produced_paths, exclude_tracker_paths,
     unexclude_tracker_paths,
@@ -1445,12 +1448,11 @@ impl BranchManager {
         else {
             return Ok(None);
         };
-        let source = self.lane(tracker).rev_path(&rev).join(path);
-        match std::fs::read_to_string(&source) {
-            Ok(contents) => Ok(Some(contents)),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(error) => Err(NewgitError::io(source, error)),
+        let lane = self.lane(tracker);
+        if !lane.has_rev(&rev) {
+            return Ok(None);
         }
+        lane.read_file(&rev, path)
     }
 
     /// Rendered paths across every resource — what export must take from HEAD
@@ -2300,7 +2302,7 @@ impl BranchManager {
     /// The inverse of `tracker create` — undoes exactly what `tracker
     /// create`/`tracker track` did: the definition file, the store
     /// `.gitignore` block, and each live workspace's `.git/info/exclude`
-    /// entries. Captured lane content under `.newgit/snapshots/<name>/` is
+    /// entries. The lane's captured revs in the lanes repo are
     /// left in place; see the caller for why that is safe to leave to
     /// `newgit cleanup`.
     pub fn remove_tracker(&self, name: &str) -> Result<RemoveTrackerOutcome> {
@@ -2716,7 +2718,7 @@ impl BranchManager {
                 .resource_states
                 .iter()
                 .find(|state| state.name == resource)
-                && let Some(resolved) = state.consumable_state_ref()
+                && let Some(resolved) = self.consumable_state_ref(state)?
             {
                 return Ok(Some(resolved));
             }
@@ -2829,19 +2831,21 @@ impl BranchManager {
         // Lane pruning. Roots come from the records that survive this pass,
         // so a dry run reports exactly what a real run would remove.
         let roots = SnapshotRoots::collect(&self.store, &surviving, archived)?;
-        for lane_rev in lane_revs(&self.store.paths().snapshots)? {
-            if !lane_rev.is_staging && roots.contains(&lane_rev.tracker, &lane_rev.rev) {
+        let lanes = self.store.paths().lanes.clone();
+        for lane_rev in lane_revs(&lanes)? {
+            if roots.contains(&lane_rev.tracker, &lane_rev.rev) {
                 continue;
             }
             if !dry_run {
-                std::fs::remove_dir_all(&lane_rev.path)
-                    .map_err(|source| NewgitError::io(&lane_rev.path, source))?;
+                self.lane(&lane_rev.tracker).forget(&lane_rev.rev)?;
             }
             outcome.pruned.push(PrunedRev {
                 tracker: lane_rev.tracker,
                 rev: lane_rev.rev,
-                path: lane_rev.path,
             });
+        }
+        if !dry_run && !outcome.pruned.is_empty() {
+            prune_unreferenced(&lanes)?;
         }
         outcome.pinned_by_checkpoints = roots.pinned_only_by_checkpoints().count();
         outcome.pinned_by_archived = roots.pinned_only_by_archived_checkpoints().count();
@@ -3442,10 +3446,11 @@ impl BranchManager {
                         let deposit = lane.deposit(staging_path)?;
                         // A path the command echoed under {{snapshot.path}}
                         // maps to the same relative location inside the lane.
+                        let checkout = lane.checkout_dir(&deposit.rev)?;
                         let state_path = Utf8Path::new(&stdout)
                             .strip_prefix(staging_path)
-                            .map(|relative| lane.rev_path(&deposit.rev).join(relative))
-                            .unwrap_or_else(|_| lane.rev_path(&deposit.rev));
+                            .map(|relative| checkout.join(relative))
+                            .unwrap_or(checkout);
                         Ok(CapturedResource {
                             mode: "command".to_owned(),
                             state_ref: Some(format!("tracker:{tracker}@{}", deposit.rev)),
@@ -3904,7 +3909,7 @@ impl BranchManager {
             RestoreMode::Command => {
                 let template = spec.command.as_deref().expect("validated at parse time");
                 let binding = branch.resources.get(&definition.name);
-                let state_ref = state.consumable_state_ref();
+                let state_ref = self.consumable_state_ref(state)?;
                 let context = RenderContext {
                     branch_name: &branch.name,
                     branch_slug: &branch.slug,
@@ -4028,8 +4033,22 @@ impl BranchManager {
         Err(NewgitError::UnknownTracker(tracker.to_owned()))
     }
 
+    /// [`ResourceState::consumable_state_ref`], with deposited content
+    /// materialized first: the recorded path points into the lane checkout
+    /// cache, which may have been cleared since the checkpoint wrote it.
+    fn consumable_state_ref(&self, state: &ResourceState) -> Result<Option<String>> {
+        if state.state_path.is_some()
+            && let Some((tracker, rev)) =
+                state.state_ref.as_deref().and_then(parse_tracker_state_ref)
+        {
+            self.lane(tracker).checkout_dir(rev)?;
+        }
+        Ok(state.consumable_state_ref())
+    }
+
     fn lane(&self, tracker: &str) -> TrackerLane {
-        TrackerLane::new(&self.store.paths().snapshots, tracker)
+        let paths = self.store.paths();
+        TrackerLane::new(&paths.lanes, &paths.lane_checkouts, tracker)
     }
 
     fn require_workspace(&self, branch: &BranchInstance) -> Result<()> {

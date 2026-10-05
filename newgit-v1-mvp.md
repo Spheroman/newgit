@@ -286,7 +286,9 @@ understand or change which paths a tracker owns.
 
 ### Capture, Merge, Pull, And Checkout
 
-Tracker capture is always the same operation: snapshot the tracker's content into the store and bind the current branch instance to that rev. In v1 the "store" is a content lane per tracker at `.newgit/snapshots/<tracker>/<rev>/`, where `<rev>` is a content hash — identical captures dedupe, and M5's checkpoints simply reference these revs. Each lane keeps a `LATEST` pointer marking the lane head/default for future instances and explicit pulls.
+Tracker capture is always the same operation: snapshot the tracker's content into the store and bind the current branch instance to that rev. In v1 the "store" is a content lane per tracker in a bare Git repo at `.newgit/local/lanes.git`. A rev is a parentless commit of the captured files with a fixed identity and date, so `<rev>` (a 12-hex prefix of the commit id) is content-addressed: identical captures dedupe, on any machine, and M5's checkpoints simply reference these revs. `refs/lanes/<tracker>/revs/<rev>` keeps each rev alive, and `refs/lanes/<tracker>/head` marks the lane head/default for future instances and explicit pulls.
+
+The lanes repo is deliberately *not* the store repo. Lane content includes secrets, and the store repo is the one a `git push --mirror` publishes and a local `git clone` hardlinks wholesale into every workspace's object store. It lives under `local/`, which every project's `.newgit/.gitignore` already ignores. Lanes being Git is also what lets a tracker sync to a remote (see `newgit-cloudflare.md`).
 
 Capture alone is branch-local. `newgit tracker merge` promotes the current instance's bound tracker rev to the lane head. `newgit tracker pull` checks the lane head into the current instance. `newgit tracker checkout --rev <rev>` checks out a specific captured rev. Checkout clears owned paths first so it reproduces the captured state exactly; before overwriting, the current content is auto-captured, so checkout is always undoable.
 
@@ -870,11 +872,12 @@ v1 can use a simple `.newgit/` directory in the project root:
     postgres-db.toml
   scripts/                 # committed scripts resource commands call
     db-up.sh               #   as {{scripts}}/db-up.sh
-  local/                   # gitignored local overrides
+  local/                   # gitignored local state
+    lanes.git/             #   captured tracker content (bare Git repo)
+    lane-checkouts/        #   lane revs materialized for commands; a cache
   branches/                # gitignored branch bindings
     feature-a.toml
     feature-b.toml
-  snapshots/               # gitignored captured tracker content
   installs/                # gitignored built trees, keyed by identity
   logs/                    # gitignored action logs
   state/                   # gitignored runtime state
@@ -1001,7 +1004,7 @@ This keeps the upgrade path clean:
 Resource state references should likewise avoid assuming a local file path:
 
 ```text
-local:snapshots/ckpt_017/runtime-env
+local:lanes/runtime-env@3bd17e8ba807
 external:op://Team/myapp-dev-env
 remote:newgit://project/runtime-env/ckpt_017
 ```
@@ -1426,8 +1429,10 @@ Garbage collection across everything; `remove` targets one instance. Takes
   is reported and left alone.
 - **Clears dead process state**: PID files whose process group has exited,
   and state directories belonging to no live instance.
-- **Prunes tracker lane revs nothing references**, plus staging directories a
-  crashed capture left behind. Roots are the surviving instances' bindings,
+- **Prunes tracker lane revs nothing references**: their refs in the lanes
+  repo are deleted and the repo is garbage-collected at once, so pruned
+  content (which may be a secret) is gone rather than merely unreachable.
+  Roots are the surviving instances' bindings,
   every checkpoint record (including archived instances'), and each lane's
   head. It never deletes a checkpoint record, and never a rev a checkpoint
   still points at — the count of revs retained for that reason is reported,
@@ -2035,7 +2040,7 @@ store_ref = "refs/newgit/checkpoints/feature-a/ckpt_017"
 [[tracker_states]]
 name = "runtime-env"
 definition_rev = "sha256:..."
-content_rev = "3bd17e8ba807"         # lane rev under .newgit/snapshots/runtime-env/
+content_rev = "3bd17e8ba807"         # lane rev: refs/lanes/runtime-env/revs/3bd17e8ba807
 
 [[resource_states]]
 name = "deps"
@@ -2049,14 +2054,15 @@ name = "postgres-db"
 definition_rev = "sha256:..."
 mode = "command"
 state_ref = "tracker:db-snapshots@77e10b2c4451"
-state_path = ".../.newgit/snapshots/db-snapshots/77e10b2c4451/db.sql"
+state_path = ".../.newgit/local/lane-checkouts/db-snapshots/77e10b2c4451/db.sql"
 was_running = false
 ```
 
 `state_path` is how the seam closes at restore time: when a checkpoint
 command deposited into a tracker and echoed a path under `{{snapshot.path}}`,
-that path is rebased onto the lane rev directory, and the restore command's
-`{{state_ref}}` renders to it.
+that path is rebased onto the rev's directory in the lane checkout cache, and
+the restore command's `{{state_ref}}` renders to it. The cache is disposable:
+restore re-materializes the rev from the lanes repo before rendering.
 
 Checkpoint refs keep the commits alive and checkpoints reference lane revs,
 so lane pruning (a `cleanup`/M6 concern) must never delete a rev a

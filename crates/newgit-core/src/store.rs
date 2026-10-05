@@ -15,7 +15,6 @@ const LOCAL_GITIGNORE: &str = "\
 # newgit local state — never committed
 /local/
 /branches/
-/snapshots/
 /logs/
 /state/
 /checkpoints/
@@ -70,7 +69,12 @@ pub struct NewgitPaths {
     /// rather than a workspace. Part of the committed control plane.
     pub scripts: Utf8PathBuf,
     pub local: Utf8PathBuf,
-    pub snapshots: Utf8PathBuf,
+    /// Tracker lanes: a bare Git repo of captured content. Under `local/`,
+    /// which every project's `.newgit/.gitignore` already ignores — lane
+    /// content can be secrets and must never be committable.
+    pub lanes: Utf8PathBuf,
+    /// Lane revs materialized for commands that take a path. A cache.
+    pub lane_checkouts: Utf8PathBuf,
     pub logs: Utf8PathBuf,
     pub state: Utf8PathBuf,
     pub checkpoints: Utf8PathBuf,
@@ -477,7 +481,6 @@ impl MetadataStore {
             &self.paths.resources,
             &self.paths.scripts,
             &self.paths.local,
-            &self.paths.snapshots,
             &self.paths.logs,
             &self.paths.state,
             &self.paths.checkpoints,
@@ -522,7 +525,8 @@ impl NewgitPaths {
             resources: metadata_root.join("resources"),
             scripts: metadata_root.join("scripts"),
             local: metadata_root.join("local"),
-            snapshots: metadata_root.join("snapshots"),
+            lanes: metadata_root.join("local/lanes.git"),
+            lane_checkouts: metadata_root.join("local/lane-checkouts"),
             logs: metadata_root.join("logs"),
             state: metadata_root.join("state"),
             checkpoints: metadata_root.join("checkpoints"),
@@ -565,8 +569,7 @@ where
 }
 
 /// Immediate subdirectories, sorted. The dir-shaped counterpart to
-/// [`read_dir_sorted`], for walking per-instance checkpoint dirs and lane
-/// rev dirs.
+/// [`read_dir_sorted`], for walking per-instance checkpoint dirs.
 pub(crate) fn read_subdirs_sorted(path: &Utf8Path) -> Result<Vec<Utf8PathBuf>> {
     if !path.exists() {
         return Ok(Vec::new());
