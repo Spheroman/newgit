@@ -1089,9 +1089,11 @@ fn env_command(instance: Option<String>) -> Result<()> {
     let vars = manager.command_env(&branch)?;
     // `export`, so `eval "$(newgit env)"` reaches the programs the shell
     // starts — which is what a hook's environment is — not just the shell.
-    // A name the shell cannot assign (`NEXT-PUBLIC-URL`) still reaches hooks
-    // through execve, so it is shown, commented out, rather than dropped or
-    // printed as a line that `eval` would run as a command.
+    // A name the shell cannot assign (`NEXT-PUBLIC-URL`) is still set for
+    // the hook's `sh`, but whether it reaches the programs that `sh` starts
+    // depends on the shell — bash passes it on, dash drops it. So it is
+    // shown, commented out, rather than dropped or printed as a line that
+    // `eval` would run as a command.
     let assignments: Vec<String> = vars
         .iter()
         .map(|var| {
@@ -1109,7 +1111,7 @@ fn env_command(instance: Option<String>) -> Result<()> {
             println!("{assignment:<width$}  # {}", var.source);
         } else {
             println!(
-                "{assignment:<width$}  # {} (hooks receive it; a shell cannot assign this name)",
+                "{assignment:<width$}  # {} (not a shell name: set for hooks, but some shells drop it)",
                 var.source
             );
         }

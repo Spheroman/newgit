@@ -1203,9 +1203,11 @@ since narrowing the listing to one resource's declarations would hide
 variables that resource's hooks receive. The output is valid shell, so `eval
 "$(newgit env)"` reproduces it — `export`ed, because a hook's environment is
 what the programs it starts inherit, not shell-local variables. A name no
-shell can assign (`NEXT-PUBLIC-URL`) still reaches hooks through `execve`, so
-it is listed commented out, with its origin, instead of being dropped or
-printed as a line `eval` would run as a command.
+shell can assign (`NEXT-PUBLIC-URL`) is listed commented out, with its
+origin, instead of being dropped or printed as a line `eval` would run as a
+command. newgit does set it for the hook's `sh`, but whether it reaches the
+programs that `sh` starts depends on the shell: bash passes it on, dash (the
+`/bin/sh` on Debian and Ubuntu) drops it.
 
 Values are printed verbatim, credentials included — the same values `newgit
 run -- env` would show. Redacting here would be simulated security: anything

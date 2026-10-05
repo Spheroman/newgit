@@ -905,8 +905,10 @@ export NEWGIT_WORKSPACE=/Users/.../feature-x   # newgit
 It is the same assembly the hooks use, not a reconstruction of it, and it is
 valid shell: `eval "$(newgit env)"` sets and exports every variable, so the
 programs that shell starts see them as a hook would. A name a shell cannot
-assign (`NEXT-PUBLIC-URL`) still reaches hooks, so it is listed commented
-out rather than dropped. One case it cannot show in advance: during an
+assign (`NEXT-PUBLIC-URL`) is listed commented out rather than dropped:
+newgit sets it for the hook's `sh`, but whether the programs that `sh`
+starts see it depends on the shell (bash passes it on, dash drops it), so
+use names a shell can assign. One case it cannot show in advance: during an
 `undo`, a `recompute` restore that captures a new value hands it to the
 `[restore]` hooks after it in the same undo. Values are printed verbatim: a
 credential a resource exports appears in plain text, exactly as a hook

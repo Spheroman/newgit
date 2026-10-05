@@ -222,17 +222,17 @@ fn env_prints_exactly_what_a_hook_receives() {
     }
     assert_eq!(hook["DB_NOTE"], "it's got $pace & quotes");
 
-    // A name no shell can assign still reaches the hook; `env` shows it
-    // commented out, so the output stays valid shell instead of `eval`
-    // running `APP-LABEL=label` as a command.
-    assert_eq!(hook["APP-LABEL"], "label");
+    // A name no shell can assign is shown commented out, so the output
+    // stays valid shell instead of `eval` running `APP-LABEL=label` as a
+    // command. Whether the hook saw it depends on the shell (dash drops it),
+    // so that is not asserted.
     assert!(
         printed
             .lines()
             .any(|line| line.starts_with("# APP-LABEL=label")),
         "unassignable name not shown commented out:\n{printed}"
     );
-    assert!(source_of(&printed, "APP-LABEL").contains("a shell cannot assign this name"));
+    assert!(source_of(&printed, "APP-LABEL").contains("not a shell name"));
     assert!(!sourced.contains_key("APP-LABEL"));
 }
 
