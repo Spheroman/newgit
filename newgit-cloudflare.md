@@ -242,6 +242,15 @@ present only after it. CI on GitHub Actions cannot produce these (a snapshot
 restores only onto its own image); those projects fall back to the
 environment snapshot.
 
+**Snapshots are incremental** (Day 1): one taken from a restored sandbox stores
+only its delta. So layer them — environment snapshot, then CI's or the
+checkpoint's on top — and each layer costs only what changed.
+
+**Builds are captured, not rebuilt on preview.** A production build is a
+path-dependent resource keyed on source rev, lockfile, and build-time env; CI
+builds it before its snapshot step, and a preview serves it directly (5.7 s to
+first page in the spike, against 10–20 s for a dev compile).
+
 **Environment snapshots.** Keyed on `hash(every resource's definition_rev +
 every identity hash)`. Built in a sandbox: install the host tools the
 templates declare, run `prepare` for path-dependent resources, snapshot. A
@@ -257,8 +266,9 @@ snapshots.
   so in the docs; most frameworks inline only explicitly-public variables.
 - **A running app has one environment.** "Preview as me" means a sandbox
   started for me. The UI labels a preview with whose environment it runs.
-- **Docker-based resources** (the Supabase template) run in a preview only if
-  Docker runs in a sandbox. Spike below.
+- **Docker-based resources** run in a preview only on Docker's host network.
+  The Supabase template's stack does not run in a sandbox at all (Day 1
+  results); Supabase projects get local spawns, not previews.
 
 ### Auth
 
@@ -504,8 +514,26 @@ End to end, a preview from a snapshot is **~1 s boot + ~0.3 s database +
 the app's own start time**, against **215 s+** to build the same environment
 from nothing.
 
-Not yet run: Docker in a sandbox and newgit in a custom base image. Both need
-a custom image, which Wrangler builds with a local Docker daemon.
+### Round 2: custom images, Docker, and captured builds
+
+Two named images built by Wrangler from local Dockerfiles: `base` (Node 24 on
+Debian, git, Postgres, and newgit cross-compiled for x86_64 in a build stage)
+and `dind` (Cloudflare's documented `docker:dind` setup plus the Supabase
+CLI).
+
+| Question | Answer | Consequence |
+|---|---|---|
+| newgit in a sandbox | **Works.** A full session — init, seed a tracker, spawn with a Postgres `command-snapshot` resource, checkpoint, wreck the database and `.env.local`, undo — in **4.4 s**. Lane revs land in `lanes.git` as designed. First boot of a custom image 5–9 s. | The base image is real; newgit needs no changes to run in a sandbox. |
+| Docker in a sandbox | Docker runs. `--network=host` containers work; the default bridge network **fails** (`failed to disable IPv6 on container's interface`). | Docker-based resources work only if they run on the host network. |
+| Supabase in a sandbox | **Fails.** All 12 images pulled (162 s, with registry rate-limit retries), then its database container fails on that bridge-network error. Host networking is not an option: its services collide on ports. The CLI also needs glibc (the `docker:dind` image is Alpine). | **Supabase projects cannot be previewed in sandboxes today.** Say so; native Postgres works. |
+| Snapshot of a restored sandbox | **Incremental:** 9 s and 35 MB, against 41 s and 995 MB for the first. | A checkpoint snapshot taken on top of an environment snapshot costs only its delta. Layer snapshots: environment → checkpoint. |
+| Capturing the production build | `next build` 61 s once, captured in the snapshot. A preview restored from it serves its first page **5.7 s** after boot (including Postgres), against 10–20 s for a dev compile. | Capture builds in the snapshot. A build is a *path-dependent resource*: its identity is the source rev, lockfile, and build-time env; it is recomputed when those change and restored from the snapshot when they do not. |
+
+**Caveat on captured builds:** a build inlines build-time public env vars
+(`NEXT_PUBLIC_*`). Built with project-audience trackers (CI is not a person),
+a viewer whose own public values differ sees the build's values until it
+rebuilds with theirs. Server-side secrets are read at runtime and are
+unaffected.
 
 ---
 
