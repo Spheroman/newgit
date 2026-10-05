@@ -143,6 +143,21 @@ the trailer stripped — so a commit split and recomposed is *the same commit*:
 same tree, parent, author, date, and message, same id. Commit ids never
 change under an agent, on any machine.
 
+**Signed commits (decided).** A signature covers a commit's exact content,
+so a recomposed commit cannot carry the original's. Three rules:
+
+1. **Locally, the original is reused.** When a group would recompose into
+   content identical to the view commit it was split from (same parent,
+   same changes), compose emits that original object — signature and id
+   intact. An agent's own workspace never sees its commits change.
+2. **Split commits are signed as their author** when the author configured
+   signing (`commit.gpgSign`): newgit signs the per-tracker commits on that
+   person's machine, with their key.
+3. **The limit, stated plainly:** a teammate composing your trackers, or a
+   GitHub export, receives tracker commits, not your combined commit. Their
+   composed commit is newly made and unsigned; your tracker commits stay
+   signed by you.
+
 **Splitting happens when work leaves the machine (decided):** sync, push,
 merge. Local history is left alone, and local undo works on the view.
 
