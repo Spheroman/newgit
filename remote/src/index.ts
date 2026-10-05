@@ -605,7 +605,7 @@ async function gitEndpoint(request: Request, env: Env, deps: Deps, match: RegExp
 		const name = repoName({ kind: "tracker", project: id, tracker });
 		const minted = await deps.repos.mint(name, "read", CREDENTIAL_TTL_SECONDS);
 		await userStub(env, caller.login).recordRepoToken(caller.tokenId, name, minted.id, minted.expiresAt);
-		plan.repos[tracker] = { url: deps.repos.url(name), auth: `Basic ${btoa(`x:${minted.password}`)}` };
+		plan.repos[tracker] = { url: deps.repos.url(name), auth: `Authorization: Basic ${btoa(`x:${minted.password}`)}` };
 	}
 	return deps.endpoint(key, service === match[3] ? "upload-pack" : "advertise", plan, request);
 }

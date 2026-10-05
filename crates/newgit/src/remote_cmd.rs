@@ -162,14 +162,14 @@ fn add(url: Option<String>, project: Option<String>, json: bool) -> Result<()> {
     }
     let client = remote::login_remote(&url)?;
 
-    let (key, endpoint, created) = match wanted.filter(|project| project.contains('/')) {
+    let (key, endpoint, created) = match wanted.clone().filter(|project| project.contains('/')) {
         Some(key) => {
             // Joining: a member sees it; anyone else is refused, with why.
             let view = client.project(&key)?;
             (view.key, view.endpoint, None)
         }
         None => {
-            let name = config.project.name.clone();
+            let name = wanted.unwrap_or_else(|| config.project.name.clone());
             if !newgit_core::config::is_remote_part(&name) {
                 bail!(
                     "this project's name `{name}` cannot name repos on the remote: use \
@@ -475,11 +475,7 @@ pub fn credential(operation: &str) -> Result<()> {
             fields.insert(key.to_owned(), value.to_owned());
         }
     }
-    // Without a path Git did not say which repo it wants, and a password is
-    // per repo. Not answering lets Git fall through to other helpers.
-    let Some(path) = fields.get("path") else {
-        return Ok(());
-    };
+    let path = fields.get("path").cloned().unwrap_or_default();
     let cwd = crate::current_dir()?;
     let url = url_here(None);
     let workspace = remote::enclosing_workspace_token(&cwd)?;
@@ -487,11 +483,22 @@ pub fn credential(operation: &str) -> Result<()> {
     // The project's Git endpoint, `<owner>/<project>.git`: the password is
     // your newgit token itself — the workspace's own inside a workspace — and
     // the endpoint composes what that token may read.
+    // Without a path (Git leaves it out over HTTPS unless `useHttpPath` is
+    // set) only the endpoint can be answered: its password is the same for
+    // every project. An Artifacts password is per repo, so there, not
+    // answering lets Git fall through to other helpers.
+    let remote_host = url
+        .split("://")
+        .nth(1)
+        .unwrap_or_default()
+        .split('/')
+        .next()
+        .unwrap_or_default()
+        .to_owned();
+    let on_remote_host = fields.get("host").is_some_and(|host| *host == remote_host);
     let parts: Vec<&str> = path.trim_matches('/').split('/').collect();
-    if let [owner, project] = parts.as_slice()
-        && project.ends_with(".git")
-        && !owner.contains('.')
-    {
+    let endpoint_path = matches!(parts.as_slice(), [owner, project] if project.ends_with(".git") && !owner.contains('.'));
+    if endpoint_path || (path.is_empty() && on_remote_host) {
         let token = match workspace {
             Some((_, token)) => token,
             None => {
@@ -508,6 +515,9 @@ pub fn credential(operation: &str) -> Result<()> {
 
     // An Artifacts repo, `<owner>.<project>.<role>…`: a short-lived password
     // for that one repo, minted by the remote if the rules allow it.
+    if path.is_empty() {
+        return Ok(());
+    }
     let repo = path
         .trim_end_matches('/')
         .rsplit('/')

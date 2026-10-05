@@ -93,7 +93,7 @@ describe("the Git endpoint", () => {
 		expect(plan.definitions).toBe(sha("b"));
 		expect(Object.keys(plan.repos).sort()).toEqual(["payments", "project", "root"]);
 		expect(plan.repos.root.url).toBe(repos.url(`jack.${name}.t.root`));
-		expect(plan.repos.root.auth.startsWith("Basic ")).toBe(true);
+		expect(plan.repos.root.auth.startsWith("Authorization: Basic ")).toBe(true);
 	});
 
 	it("leaves out a tracker its reader may not read — the secret one never enters", async () => {
