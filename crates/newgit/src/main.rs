@@ -219,6 +219,13 @@ enum TrackerCommand {
         /// Where synced state lives: local or remote
         #[arg(long, default_value = "local")]
         storage: String,
+        /// A code tracker: committed content with its own history, carved out
+        /// of whichever tracker owns its paths now (usually root)
+        #[arg(long, requires = "path")]
+        code: bool,
+        /// A path a code tracker owns (repeatable; set at creation)
+        #[arg(long = "path", value_name = "PATH")]
+        path: Vec<Utf8PathBuf>,
     },
     /// Add workspace paths to a tracker lane
     Track {
@@ -1125,8 +1132,33 @@ fn tracker(command: TrackerCommand) -> Result<()> {
         TrackerCommand::Create {
             name,
             audience,
+            code: true,
+            path,
+            ..
+        } => {
+            let manager = manager_here()?;
+            let outcome = manager.create_code_tracker(&name, &audience, &path)?;
+            let root = manager.store().paths().project_root.clone();
+            println!(
+                "Created code tracker `{name}` at {}",
+                display_path(&root, &outcome.path)
+            );
+            println!(
+                "  history:   {} carved out of `{}` (each marked with its source, so nothing is rewritten)",
+                plural(outcome.commits as usize, "commit"),
+                outcome.source
+            );
+            println!(
+                "  commit to it with Git; newgit splits your commits into it when work leaves the machine"
+            );
+            Ok(())
+        }
+        TrackerCommand::Create {
+            name,
+            audience,
             merge_with_source,
             storage,
+            ..
         } => {
             let manager = manager_here()?;
             let root = manager.store().paths().project_root.clone();

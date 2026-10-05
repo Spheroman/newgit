@@ -66,6 +66,19 @@ pub struct BranchManager {
     /// from `trackers`, the ones newgit captures from files: root's history
     /// is the project's own Git history, committed with Git.
     root: TrackerDefinition,
+    /// Committed trackers with their own histories, composed into workspaces
+    /// (newgit-trackers.md, step 3): `project` and any carved-out code.
+    code: Vec<TrackerDefinition>,
+}
+
+/// What creating a code tracker did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateCodeTrackerOutcome {
+    pub path: Utf8PathBuf,
+    /// The tracker its history was carved out of.
+    pub source: String,
+    /// How many commits it starts with.
+    pub commits: u32,
 }
 
 /// What `spawn --from-checkpoint` did.
@@ -564,12 +577,29 @@ impl BranchManager {
         let config = store.load_config()?;
         let source = GitSource::open(&store.paths().project_root, config.project.source)?;
         let mut trackers = store.load_tracker_definitions()?;
-        // A project initialized before `root` existed has no root.toml; it
-        // still has a root — everything its other trackers do not claim.
-        let root = match trackers.iter().position(TrackerDefinition::owns_everything) {
-            Some(index) => trackers.remove(index),
-            None => TrackerDefinition::root(),
-        };
+        // A project initialized before `root` or `project` existed has no
+        // file for them; it still has both — everything its other trackers
+        // do not claim, and its own definitions.
+        if !trackers.iter().any(TrackerDefinition::owns_everything) {
+            trackers.push(TrackerDefinition::root());
+        }
+        if !trackers
+            .iter()
+            .any(|definition| definition.name == crate::tracker::PROJECT_TRACKER)
+        {
+            trackers.push(TrackerDefinition::project());
+        }
+        crate::tracker::resolve_ownership(&mut trackers)?;
+        let root = trackers.remove(
+            trackers
+                .iter()
+                .position(TrackerDefinition::owns_everything)
+                .expect("root was just ensured"),
+        );
+        // Code trackers are composed into workspaces; the rest are captured
+        // from files.
+        let (code, trackers): (Vec<_>, Vec<_>) =
+            trackers.into_iter().partition(TrackerDefinition::is_code);
         let resources = store.load_resource_definitions()?;
         let tracker_names: BTreeSet<String> = trackers.iter().map(|t| t.name.clone()).collect();
         let graph = resolve_graph(&resources, &tracker_names);
@@ -599,6 +629,7 @@ impl BranchManager {
             graph,
             remote,
             root,
+            code,
         })
     }
 
@@ -665,8 +696,135 @@ impl BranchManager {
         &self.root
     }
 
-    /// Refuse a tracker command aimed at root, saying what to do instead.
+    /// Code trackers: committed, with their own histories, composed into
+    /// workspaces. `project` is always one.
+    pub fn code_trackers(&self) -> &[TrackerDefinition] {
+        &self.code
+    }
+
+    /// Create a code tracker owning `paths`, its history carved out of
+    /// whichever tracker owns them now (usually root): every commit that
+    /// touched them, marked with its source, so composing the two still
+    /// reproduces the original history.
+    pub fn create_code_tracker(
+        &self,
+        name: &str,
+        audience: &str,
+        paths: &[Utf8PathBuf],
+    ) -> Result<CreateCodeTrackerOutcome> {
+        validate_name(name)?;
+        self.refuse_root(name, "it always exists")?;
+        if paths.is_empty() {
+            return Err(NewgitError::Unsupported(format!(
+                "a code tracker's paths are set when it is created: `newgit tracker create {name} \
+                 --code --path <path>`"
+            )));
+        }
+        let mut definition = TrackerDefinition::new(
+            name,
+            audience.to_owned(),
+            Storage::Local,
+            true,
+            paths.to_vec(),
+        )?;
+        definition.secret = false;
+
+        // Who owns these paths now: one tracker, so there is one history to
+        // carve from.
+        let mut owners = BTreeSet::new();
+        for path in paths {
+            let owner = self
+                .code
+                .iter()
+                .chain(std::iter::once(&self.root))
+                .filter(|candidate| candidate.owns(path))
+                .map(|candidate| candidate.name.clone())
+                .next()
+                .unwrap_or_else(|| self.root.name.clone());
+            owners.insert(owner);
+        }
+        if owners.len() > 1 {
+            return Err(NewgitError::Unsupported(format!(
+                "`{name}`'s paths belong to {} now; carve one tracker's paths at a time",
+                owners
+                    .iter()
+                    .map(|owner| format!("`{owner}`"))
+                    .collect::<Vec<_>>()
+                    .join(" and ")
+            )));
+        }
+        let source = owners.into_iter().next().expect("one owner");
+
+        let mut all: Vec<TrackerDefinition> =
+            self.trackers.iter().chain(&self.code).cloned().collect();
+        all.push(self.root.clone());
+        all.push(definition.clone());
+        crate::tracker::resolve_ownership(&mut all)?;
+
+        let tip = self.carve_from(&source, &definition)?;
+        let path = self.store.create_tracker_definition(&definition)?;
+        let commits = match &tip {
+            Some(tip) => self.source.commit_count(tip)?,
+            None => 0,
+        };
+        Ok(CreateCodeTrackerOutcome {
+            path,
+            source,
+            commits,
+        })
+    }
+
+    /// Carve `definition`'s history out of `source`'s `main` into the
+    /// tracker store. Both repositories end up referencing what they hold:
+    /// the carved commits are made in the project repo under its own ref,
+    /// then fetched into the store.
+    fn carve_from(&self, source: &str, definition: &TrackerDefinition) -> Result<Option<String>> {
+        let store = self.store.paths().tracker_store.clone();
+        let project = self.store.paths().project_root.clone();
+        let source_main = format!("refs/trackers/{source}/main");
+        let local_source = format!("refs/newgit/trackers/{source}/main");
+        // Root's history is the project's own; another source's comes from
+        // the store.
+        let source_tip = if source == self.root.name {
+            let head = self.source.rev_parse("HEAD")?;
+            self.source.update_ref(&local_source, &head)?;
+            head
+        } else {
+            GitSource::fetch_refs(
+                &["-C", project.as_str()],
+                store.as_str(),
+                &[format!("+{source_main}:{local_source}")],
+                None,
+            )?;
+            self.source.rev_parse(&local_source)?
+        };
+        let target = format!("refs/newgit/trackers/{}/main", definition.name);
+        let tip = crate::compose::carve(&project, &source_tip, definition, &target)?;
+        if tip.is_some() {
+            crate::tracker_repo::ensure_store(&store)?;
+            GitSource::fetch_refs(
+                &[&format!("--git-dir={store}")],
+                project.as_str(),
+                &[format!("+{target}:refs/trackers/{}/main", definition.name)],
+                None,
+            )?;
+        }
+        Ok(tip)
+    }
+
+    /// Refuse a tracker command aimed at root or a code tracker, saying what
+    /// to do instead: both are committed with Git.
     fn refuse_root(&self, tracker: &str, action: &str) -> Result<()> {
+        if self
+            .code
+            .iter()
+            .any(|definition| definition.name == tracker)
+        {
+            return Err(NewgitError::Unsupported(format!(
+                "`{tracker}` is a code tracker: its content is committed, and newgit splits your \
+                 commits into it — {action}"
+            )));
+        }
         if tracker == self.root.name {
             return Err(NewgitError::Unsupported(format!(
                 "`{tracker}` owns everything no other tracker claims, and its history is this \
@@ -883,7 +1041,7 @@ impl BranchManager {
                 "+{}:{imported_ref}",
                 remote_checkpoint_ref(checkpoint_id)
             )],
-            &basic_auth_header(&fork),
+            Some(&basic_auth_header(&fork)),
         )?;
 
         // Trackers, resolved for whoever is spawning.
@@ -1019,7 +1177,7 @@ impl BranchManager {
                 &[&lanes],
                 credential.remote.as_deref().unwrap_or_default(),
                 &[format!("+{pattern}:{pattern}")],
-                &basic_auth_header(&credential),
+                Some(&basic_auth_header(&credential)),
             )
             .map_err(|error| error.to_string())?;
             return match lane.main() {
@@ -1046,7 +1204,7 @@ impl BranchManager {
             &[&lanes],
             credential.remote.as_deref().unwrap_or_default(),
             &[format!("+{rev_ref}:{rev_ref}")],
-            &basic_auth_header(&credential),
+            Some(&basic_auth_header(&credential)),
         )
         .map_err(|error| error.to_string())?;
         Ok(Some(rev.to_owned()))
@@ -3829,7 +3987,7 @@ impl BranchManager {
                 record.source.store_ref,
                 remote_checkpoint_ref(&record.id)
             )],
-            &basic_auth_header(&fork),
+            Some(&basic_auth_header(&fork)),
         )?;
 
         let mut login = None;
@@ -3868,7 +4026,7 @@ impl BranchManager {
                 &[&format!("--git-dir={}", self.store.paths().tracker_store)],
                 &url,
                 &refspecs,
-                &basic_auth_header(&credential),
+                Some(&basic_auth_header(&credential)),
             )?;
         }
 

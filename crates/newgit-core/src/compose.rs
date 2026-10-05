@@ -256,6 +256,83 @@ pub struct SplitOutcome {
     pub made: Vec<(String, String)>,
 }
 
+/// Carve a new code tracker's history out of `source` (the history of
+/// whatever owned its paths until now, usually root): every commit that
+/// touched `definition`'s paths becomes a commit of the new tracker — only
+/// those paths, the original author, date, and message, marked
+/// `Newgit-Split: <original>` — written to `target_ref` in one fast-import
+/// pass. Because each is marked with its source, composing the source and
+/// the new tracker folds them back into the original commits.
+///
+/// Returns the new tracker's tip, or `None` when its paths have no history.
+pub fn carve(
+    repo: &Utf8Path,
+    source: &str,
+    definition: &TrackerDefinition,
+    target_ref: &str,
+) -> Result<Option<String>> {
+    let ids = first_parent_history(repo, source)?;
+    let changes = diff_tree(repo, &ids)?;
+    let ids: Vec<String> = ids.into_iter().map(|(id, _)| id).collect();
+    let raw = read_commits(repo, &ids)?;
+    let mut stream = Vec::new();
+    let mut mark = 0usize;
+    for id in &ids {
+        let owned: Vec<&Change> = changes
+            .get(id)
+            .map(|all| {
+                all.iter()
+                    .filter(|change| claims(definition, Utf8Path::new(&change.path)))
+                    .collect()
+            })
+            .unwrap_or_default();
+        if owned.is_empty() {
+            continue;
+        }
+        let commit = raw.get(id).ok_or_else(|| missing(id))?;
+        let message = format!(
+            "{}\n\n{SPLIT_TRAILER}{id}\n",
+            commit.message.trim_end_matches('\n')
+        );
+        mark += 1;
+        writeln!(stream, "commit {target_ref}").ok();
+        writeln!(stream, "mark :{mark}").ok();
+        writeln!(stream, "author {}", commit.author).ok();
+        writeln!(stream, "committer {}", commit.committer).ok();
+        writeln!(stream, "data {}", message.len()).ok();
+        stream.extend_from_slice(message.as_bytes());
+        stream.push(b'\n');
+        if mark > 1 {
+            writeln!(stream, "from :{}", mark - 1).ok();
+        }
+        for change in owned {
+            match &change.new {
+                Some((mode, sha)) => {
+                    writeln!(stream, "M {mode} {sha} {}", quote(&change.path)).ok()
+                }
+                None => writeln!(stream, "D {}", quote(&change.path)).ok(),
+            };
+        }
+        stream.push(b'\n');
+    }
+    if mark == 0 {
+        return Ok(None);
+    }
+    run(
+        Command::new("git").arg("-C").arg(repo.as_str()).args([
+            "fast-import",
+            "--quiet",
+            "--force",
+            "--date-format=raw",
+        ]),
+        "git fast-import",
+        Some(&stream),
+    )?;
+    Ok(git_lines(repo, &["rev-parse", target_ref])?
+        .into_iter()
+        .next())
+}
+
 /// Split the view commits after `base` up to `tip` (first parent) into
 /// tracker commits. `bound` are the code trackers this view composes; `all`
 /// is every definition, to name the owner of a path nothing bound owns.

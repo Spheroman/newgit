@@ -33,6 +33,9 @@ pub struct TrackerDefinition {
 /// The tracker owning everything no other tracker claims.
 pub const ROOT_TRACKER: &str = "root";
 
+/// The tracker carrying the project's committed definitions, `.newgit/`.
+pub const PROJECT_TRACKER: &str = "project";
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum Storage {
@@ -129,20 +132,14 @@ impl TrackerDefinition {
                 "`.` owns everything not claimed elsewhere, so it must be the only path".to_owned(),
             ));
         }
-        // A tracker whose content is committed (not secret) is a code tracker:
-        // its history comes from splitting workspace commits, which arrives
-        // with the composed workspace (newgit-trackers.md, step 3). Until then
-        // only `root` — whose history is the project's own — can be one.
-        if !self.secret && !self.owns_everything() {
-            return Err(self.invalid(
-                "`secret = false` (a tracker whose content is committed) is supported only for \
-                 the root tracker until workspaces are composed from trackers"
-                    .to_owned(),
-            ));
-        }
+        // `.newgit` holds the project's own definitions, which only the
+        // project tracker carries; anyone else claiming it would split the
+        // definitions across trackers.
+        let is_project =
+            self.name == PROJECT_TRACKER && self.paths == [Utf8PathBuf::from(".newgit")];
 
         for path in &self.paths {
-            if path.as_str() == "." {
+            if path.as_str() == "." || is_project {
                 continue;
             }
             if path.is_absolute()
@@ -203,6 +200,32 @@ impl TrackerDefinition {
             .compute_definition_rev()
             .expect("the root definition serializes");
         definition
+    }
+
+    /// The project tracker as `newgit init` writes it: the committed parts of
+    /// `.newgit/` (its local state is gitignored, so never committed), read
+    /// by the project's developers, merged with the work that changes it.
+    pub fn project() -> Self {
+        let mut definition = Self {
+            name: PROJECT_TRACKER.to_owned(),
+            audience: "project-devs".to_owned(),
+            storage: Storage::Local,
+            merge_with_source: true,
+            paths: vec![Utf8PathBuf::from(".newgit")],
+            secret: false,
+            excluded: Vec::new(),
+            definition_rev: String::new(),
+        };
+        definition.definition_rev = definition
+            .compute_definition_rev()
+            .expect("the project definition serializes");
+        definition
+    }
+
+    /// Committed content with its own history, composed into workspaces
+    /// rather than captured from files — every non-secret tracker but root.
+    pub fn is_code(&self) -> bool {
+        !self.secret && !self.owns_everything()
     }
 
     /// Owns `.`: everything no more specific tracker claims.
@@ -445,22 +468,19 @@ mod tests {
     }
 
     #[test]
-    fn only_root_may_be_committed_for_now() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let path =
-            Utf8PathBuf::from_path_buf(temp.path().join("electron.toml")).expect("utf8 path");
-        std::fs::write(
-            &path,
-            "audience = \"project-devs\"\nstorage = \"local\"\npaths = [\"apps/electron\"]\nsecret = false\n",
+    fn code_trackers_and_the_project_tracker_are_committed() {
+        assert!(TrackerDefinition::project().is_code());
+        assert!(!TrackerDefinition::root().is_code() && !TrackerDefinition::root().secret);
+        // Only the project tracker may own `.newgit`.
+        let error = TrackerDefinition::new(
+            "sneaky",
+            "project-devs".to_owned(),
+            Storage::Local,
+            false,
+            vec![Utf8PathBuf::from(".newgit")],
         )
-        .expect("write");
-        let error = TrackerDefinition::from_file("electron", &path)
-            .expect_err("a committed non-root tracker waits for step 3");
-        assert!(
-            error.to_string().contains("only for the root tracker"),
-            "{error}"
-        );
-        assert!(!TrackerDefinition::root().secret);
+        .expect_err("`.newgit` is the project tracker's");
+        assert!(error.to_string().contains("may not reach into"), "{error}");
     }
 
     #[test]

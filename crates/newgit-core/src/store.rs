@@ -120,6 +120,7 @@ impl MetadataStore {
     fn init_root(&self) -> Result<()> {
         let root = TrackerDefinition::root();
         self.create_tracker_definition(&root)?;
+        self.create_tracker_definition(&TrackerDefinition::project())?;
         let project = self.paths.project_root.as_str();
         let git = |args: &[&str]| {
             std::process::Command::new("git")

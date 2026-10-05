@@ -179,6 +179,30 @@ records one instance's ports.
 
 ---
 
+## Installs across trackers
+
+Trackers decide which manifests exist; resources build environments from
+them; the package manager resolves. newgit never merges package lists or
+resolves versions — that would be emulating npm or pip.
+
+- **A package's own manifest** (`apps/electron/package.json`,
+  `apps/ml/requirements.txt`) lives in its tracker, which brings the install
+  resource for it. Separate environments cannot conflict.
+- **One shared lockfile** (a pnpm/npm workspace, a uv workspace's `uv.lock`)
+  is owned by whoever owns it — usually root — and lists every member, bound
+  or not. Its install resource installs only the bound members (`pnpm install
+  --filter …`, `uv sync --frozen --package …`) through a `{{bound…}}`
+  template variable naming the bound trackers' paths, and the bound set is
+  part of the install's identity, so copy-on-write installs are keyed
+  correctly. (Step 4.)
+- **Python environments are flat**, so code sharing one venv needs one
+  resolution — the shared lockfile, where conflicts surface when locking,
+  not at spawn.
+- **A conflict** fails the install's `prepare` with the package manager's own
+  message, blocks dependents (as v1 does), and breaks only the combination of
+  bound trackers that conflicts: swapping one out returns to an environment
+  already built.
+
 ## Checkpoints, merges, and coherence
 
 **A checkpoint** names one commit per bound tracker (plus resource state). It
@@ -267,6 +291,10 @@ Each step lands alone and keeps the suite green.
    `instances/<instance>`) with parents, messages, authors. Capture commits;
    merge merges. The env-file case keeps working unchanged in behavior.
 2. **`root` tracker; ownership by specificity; `secret`.** *(Landed.)*
+   *Step 3a (compose/split engine) and 3b (code trackers carved out of
+   their owner, the `project` tracker) landed too; a code tracker's paths
+   are set at creation — adding one later would splice a second history
+   into it.*
    `newgit init` writes `trackers/root.toml` (owns `.`, committed) and
    imports the project's history as root's `main`, borrowing its objects.
    Trackers nest; the most specific owner wins. `secret` defaults to true,
