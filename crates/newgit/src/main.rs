@@ -189,6 +189,17 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Clone a project from a newgit remote: its default branch composed from
+    /// the code trackers you may read, set up for newgit
+    Clone {
+        /// The project, `<owner>/<name>`
+        project: String,
+        /// Where to put it (default: the project's name)
+        dir: Option<Utf8PathBuf>,
+        /// The remote (default: https://newgit.dev)
+        #[arg(long)]
+        url: Option<String>,
+    },
     /// Link this project to a newgit remote
     Remote {
         #[command(subcommand)]
@@ -413,6 +424,7 @@ fn main() -> Result<()> {
         Command::Logout { url } => remote_cmd::logout(url),
         Command::Whoami { url, json } => remote_cmd::whoami(url, json),
         Command::Remote { command } => remote_cmd::remote_command(command),
+        Command::Clone { project, dir, url } => remote_cmd::clone(&project, dir, url),
         Command::Members { command } => remote_cmd::members(command),
         Command::Credential { operation } => remote_cmd::credential(&operation),
     }
@@ -724,7 +736,8 @@ fn spawn(args: SpawnArgs) -> Result<()> {
                 "name": outcome.branch.name,
                 "workspace": outcome.branch.workspace_path,
                 "source_rev": outcome.branch.source_rev,
-                "remote": outcome.branch.remote.as_ref().map(|remote| &remote.repo),
+                "remote": outcome.branch.remote.as_ref().map(|remote| &remote.project),
+                "endpoint": outcome.branch.remote.as_ref().map(|remote| &remote.endpoint),
                 "remote_warning": outcome.remote_warning,
                 "projection_warning": outcome.projection_warning,
             })
@@ -758,10 +771,13 @@ fn spawn(args: SpawnArgs) -> Result<()> {
     match (&branch.remote, &outcome.remote_warning) {
         (Some(remote), _) => {
             println!(
-                "  remote:    {} (its own fork, token in the workspace's .git/)",
-                remote.repo
+                "  remote:    {} (token in the workspace's .git/; `origin` fetches {})",
+                remote.project, remote.endpoint
             );
-            println!("  push:      `git push` checkpoints, then publishes to the fork");
+            println!(
+                "  push:      `git push` checkpoints, then publishes each changed tracker to \
+                 this instance's fork of it"
+            );
         }
         (None, Some(warning)) => {
             println!(
@@ -2217,10 +2233,14 @@ fn remove(name: &str, purge: bool) -> Result<()> {
     println!("  workspace: {} (deleted)", outcome.branch.workspace_path);
     println!("  record:    archived at {}", outcome.archived_record);
     match (&outcome.branch.remote, &outcome.remote_warning) {
-        (Some(remote), None) => println!("  remote:    {} deleted; its token revoked", remote.repo),
+        (Some(remote), None) => println!(
+            "  remote:    removed from {}; its forks deleted and its token revoked",
+            remote.project
+        ),
         (Some(remote), Some(warning)) => println!(
-            "  remote:    could not remove {} ({warning}); its fork and token remain until removed there",
-            remote.repo
+            "  remote:    could not remove it from {} ({warning}); its forks and token remain \
+             until removed there",
+            remote.project
         ),
         (None, _) => {}
     }

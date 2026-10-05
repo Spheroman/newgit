@@ -60,7 +60,7 @@ pub struct RemoteSection {
 
 impl RemoteSection {
     /// Why this section cannot be used, if it cannot.
-    pub fn problem(&self, project_name: &str) -> Option<String> {
+    pub fn problem(&self) -> Option<String> {
         let url = self.url.trim_end_matches('/');
         let local = ["http://localhost", "http://127.0.0.1"]
             .iter()
@@ -72,30 +72,31 @@ impl RemoteSection {
                 self.url
             ));
         }
-        let name = self.project.as_deref().unwrap_or(project_name);
-        if !is_remote_name(name) {
+        if let Some(project) = &self.project
+            && !is_project_key(project)
+        {
             return Some(format!(
-                "project name `{name}` cannot name repos on the remote: use 2-63 letters, digits, \
-                 `.`, `_`, or `-`, starting with a letter or digit{}",
-                if self.project.is_none() {
-                    " (set `project` under [remote] to use a different name there)"
-                } else {
-                    ""
-                }
+                "`project = \"{project}\"` must be `<owner>/<name>` — like a GitHub repository — \
+                 each part 1-63 letters, digits, `_`, or `-`, starting with a letter or digit"
             ));
         }
         None
     }
 }
 
-/// Artifacts' naming rule for namespaces and repos.
-fn is_remote_name(name: &str) -> bool {
+/// One part of a repo name on the remote: `.` separates the parts there.
+pub fn is_remote_part(name: &str) -> bool {
     let mut chars = name.chars();
-    (2..=63).contains(&name.len())
+    (1..=63).contains(&name.len())
         && chars
             .next()
             .is_some_and(|first| first.is_ascii_alphanumeric())
-        && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+        && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-'))
+}
+
+/// `<owner>/<name>`.
+pub fn is_project_key(key: &str) -> bool {
+    matches!(key.split_once('/'), Some((owner, name)) if is_remote_part(owner) && is_remote_part(name))
 }
 
 impl ProjectConfig {
@@ -111,9 +112,10 @@ impl ProjectConfig {
     }
 
     /// The project's name on the remote, when one is configured.
+    /// The project on the remote, `<owner>/<name>` — set once `newgit remote
+    /// add` has created or joined it.
     pub fn remote_project(&self) -> Option<&str> {
-        let remote = self.remote.as_ref()?;
-        Some(remote.project.as_deref().unwrap_or(&self.project.name))
+        self.remote.as_ref()?.project.as_deref()
     }
 
     /// Where this project's workspaces live. Defaults to

@@ -38,13 +38,25 @@ pub struct RepoLocation {
     pub remote: Option<String>,
 }
 
+/// A project just created: `<owner>/<name>`, and one repo per code tracker.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct CreatedProject {
     pub name: String,
     pub owner: String,
-    pub src: RepoLocation,
-    /// The one write to trunk outside a merge: for pushing existing history.
-    pub seed_credential: RepoCredential,
+    /// `<owner>/<name>`: how every other call names it.
+    pub key: String,
+    /// Its Git endpoint, `https://<remote>/<owner>/<name>.git`.
+    pub endpoint: String,
+    /// The one write to each code tracker's repo outside a merge: for pushing
+    /// its existing history.
+    pub seeds: Vec<SeedCredential>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct SeedCredential {
+    pub tracker: String,
+    #[serde(flatten)]
+    pub credential: RepoCredential,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -52,12 +64,32 @@ pub struct Member {
     pub login: String,
 }
 
+/// A branch: one commit per code tracker.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct RemoteBranch {
+    pub name: String,
+    pub list: std::collections::BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ProjectView {
     pub name: String,
     pub owner: String,
+    pub key: String,
+    pub endpoint: String,
+    pub default_branch: String,
     pub members: Vec<Member>,
-    pub src: RepoLocation,
+    pub branches: Vec<RemoteBranch>,
+}
+
+impl ProjectView {
+    pub fn default_list(&self) -> Option<&std::collections::BTreeMap<String, String>> {
+        self.branches
+            .iter()
+            .find(|branch| branch.name == self.default_branch)
+            .map(|branch| &branch.list)
+    }
 }
 
 /// A Git password for one repo, good for minutes.
@@ -82,11 +114,9 @@ pub struct RemoteInstance {
     pub base_rev: String,
     #[serde(default)]
     pub head_rev: Option<String>,
-    pub fork_state: String,
-    pub repo: String,
-    /// The fork's Git URL.
+    /// The code trackers it has forked: the ones it changed.
     #[serde(default)]
-    pub remote: Option<String>,
+    pub forks: Vec<String>,
 }
 
 /// What registering an instance returns: its record, and the workspace's own
@@ -94,8 +124,8 @@ pub struct RemoteInstance {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RegisteredInstance {
     pub instance: RemoteInstance,
-    /// Trunk's Git URL: what the workspace's `origin` fetches.
-    pub trunk_remote: String,
+    /// The project's Git endpoint: what the workspace's `origin` fetches.
+    pub endpoint: String,
     pub token: String,
     pub token_id: String,
 }
@@ -153,8 +183,18 @@ impl Scope {
 pub trait Remote {
     fn url(&self) -> &str;
     fn me(&self) -> Result<Me>;
-    fn create_project(&self, name: &str) -> Result<CreatedProject>;
-    fn project(&self, name: &str) -> Result<ProjectView>;
+    /// Create `<you>/<name>` with one repo per code tracker in `trackers`.
+    fn create_project(&self, name: &str, trackers: &[String]) -> Result<CreatedProject>;
+    fn project(&self, project: &str) -> Result<ProjectView>;
+    /// Create a branch from a list; refused if it exists (branches move by merge).
+    fn create_branch(
+        &self,
+        project: &str,
+        branch: &str,
+        list: &std::collections::BTreeMap<String, String>,
+    ) -> Result<()>;
+    /// An instance's fork of one code tracker, made the first time it is asked for.
+    fn fork(&self, project: &str, instance: &str, tracker: &str) -> Result<RepoLocation>;
     fn add_member(&self, project: &str, login: &str) -> Result<bool>;
     fn remove_member(&self, project: &str, login: &str) -> Result<bool>;
     fn register_instance(
@@ -322,6 +362,15 @@ fn remote_error(status: u16, text: &str) -> NewgitError {
     NewgitError::Remote { status, message }
 }
 
+/// A project's path: `<owner>/<name>`, each part encoded.
+fn project_path(project: &str) -> String {
+    project
+        .split('/')
+        .map(segment)
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
 fn segment(value: &str) -> String {
     // Names are already restricted to URL-safe characters; encode the rest
     // anyway so a stray one cannot change the route.
@@ -345,16 +394,51 @@ impl Remote for HttpRemote {
         self.send("GET", "/v1/me", None)
     }
 
-    fn create_project(&self, name: &str) -> Result<CreatedProject> {
+    fn create_project(&self, name: &str, trackers: &[String]) -> Result<CreatedProject> {
         self.send(
             "POST",
             "/v1/projects",
-            Some(serde_json::json!({ "name": name })),
+            Some(serde_json::json!({ "name": name, "trackers": trackers })),
         )
     }
 
-    fn project(&self, name: &str) -> Result<ProjectView> {
-        self.send("GET", &format!("/v1/projects/{}", segment(name)), None)
+    fn project(&self, project: &str) -> Result<ProjectView> {
+        self.send(
+            "GET",
+            &format!("/v1/projects/{}", project_path(project)),
+            None,
+        )
+    }
+
+    fn create_branch(
+        &self,
+        project: &str,
+        branch: &str,
+        list: &std::collections::BTreeMap<String, String>,
+    ) -> Result<()> {
+        let _: serde_json::Value = self.send(
+            "PUT",
+            &format!(
+                "/v1/projects/{}/branches/{}",
+                project_path(project),
+                segment(branch)
+            ),
+            Some(serde_json::json!({ "list": list })),
+        )?;
+        Ok(())
+    }
+
+    fn fork(&self, project: &str, instance: &str, tracker: &str) -> Result<RepoLocation> {
+        self.send(
+            "POST",
+            &format!(
+                "/v1/projects/{}/instances/{}/trackers/{}/fork",
+                project_path(project),
+                segment(instance),
+                segment(tracker)
+            ),
+            None,
+        )
     }
 
     fn add_member(&self, project: &str, login: &str) -> Result<bool> {
@@ -364,7 +448,7 @@ impl Remote for HttpRemote {
         }
         let added: Added = self.send(
             "POST",
-            &format!("/v1/projects/{}/members", segment(project)),
+            &format!("/v1/projects/{}/members", project_path(project)),
             Some(serde_json::json!({ "login": login })),
         )?;
         Ok(added.added)
@@ -379,7 +463,7 @@ impl Remote for HttpRemote {
             "DELETE",
             &format!(
                 "/v1/projects/{}/members/{}",
-                segment(project),
+                project_path(project),
                 segment(login)
             ),
             None,
@@ -397,18 +481,18 @@ impl Remote for HttpRemote {
         struct Registered {
             #[serde(flatten)]
             instance: RemoteInstance,
-            trunk: RepoLocation,
+            endpoint: String,
             token: String,
             token_id: String,
         }
         let registered: Registered = self.send(
             "POST",
-            &format!("/v1/projects/{}/instances", segment(project)),
+            &format!("/v1/projects/{}/instances", project_path(project)),
             Some(serde_json::json!({ "name": name, "base_rev": base_rev })),
         )?;
         Ok(RegisteredInstance {
             instance: registered.instance,
-            trunk_remote: registered.trunk.remote.unwrap_or_default(),
+            endpoint: registered.endpoint,
             token: registered.token,
             token_id: registered.token_id,
         })
@@ -419,7 +503,7 @@ impl Remote for HttpRemote {
             "GET",
             &format!(
                 "/v1/projects/{}/instances/{}",
-                segment(project),
+                project_path(project),
                 segment(name)
             ),
             None,
@@ -431,7 +515,7 @@ impl Remote for HttpRemote {
             "DELETE",
             &format!(
                 "/v1/projects/{}/instances/{}",
-                segment(project),
+                project_path(project),
                 segment(name)
             ),
             None,
@@ -444,7 +528,7 @@ impl Remote for HttpRemote {
             "PUT",
             &format!(
                 "/v1/projects/{}/instances/{}/head",
-                segment(project),
+                project_path(project),
                 segment(instance)
             ),
             Some(serde_json::json!({ "head_rev": head_rev })),
@@ -455,7 +539,7 @@ impl Remote for HttpRemote {
     fn credential(&self, project: &str, repo: &str, scope: Scope) -> Result<RepoCredential> {
         self.send(
             "POST",
-            &format!("/v1/projects/{}/credentials", segment(project)),
+            &format!("/v1/projects/{}/credentials", project_path(project)),
             Some(serde_json::json!({ "repo": repo, "scope": scope.as_str() })),
         )
     }
@@ -471,7 +555,7 @@ impl Remote for HttpRemote {
             "PUT",
             &format!(
                 "/v1/projects/{}/checkpoints/{}/{}",
-                segment(project),
+                project_path(project),
                 segment(instance),
                 segment(id)
             ),
@@ -485,7 +569,7 @@ impl Remote for HttpRemote {
             "GET",
             &format!(
                 "/v1/projects/{}/checkpoints/{}/{}",
-                segment(project),
+                project_path(project),
                 segment(instance),
                 segment(id)
             ),
@@ -503,7 +587,7 @@ impl Remote for HttpRemote {
             .unwrap_or_default();
         let list: List = self.send(
             "GET",
-            &format!("/v1/projects/{}/checkpoints{query}", segment(project)),
+            &format!("/v1/projects/{}/checkpoints{query}", project_path(project)),
             None,
         )?;
         Ok(list.checkpoints)

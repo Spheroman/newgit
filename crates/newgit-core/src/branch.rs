@@ -44,16 +44,14 @@ pub struct BranchInstance {
     pub updated_at: DateTime<Utc>,
 }
 
-/// An instance's place on the remote.
+/// An instance's place on the remote. Nothing is forked when it is
+/// registered: it forks a code tracker the first time it changes it.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RemoteBinding {
+    /// `<owner>/<name>`.
     pub project: String,
-    /// The instance's fork: `<project>.i.<instance>`.
-    pub repo: String,
-    /// The fork's Git URL — where this workspace's pushes go.
-    pub fork_url: String,
-    /// Trunk's Git URL — what this workspace's `origin` fetches.
-    pub trunk_url: String,
+    /// The project's Git endpoint — what this workspace's `origin` fetches.
+    pub endpoint: String,
 }
 
 /// Which concrete instance of a resource this branch instance is bound to:

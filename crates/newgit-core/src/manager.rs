@@ -370,6 +370,9 @@ pub struct CheckpointOutcome {
     pub record: CheckpointRecord,
     pub record_path: Utf8PathBuf,
     pub warnings: Vec<String>,
+    /// Why the checkpoint is not on the remote, when there is one and syncing
+    /// failed. (Also among `warnings`.)
+    pub sync_error: Option<String>,
 }
 
 /// A `git push` from a workspace, published: the checkpoint taken first, and
@@ -1075,6 +1078,28 @@ impl BranchManager {
         }
     }
 
+    /// Put branch `branch` here, composed from the code trackers' `main`s in
+    /// the tracker store: the project repo's `refs/heads/<branch>` and its
+    /// working tree become the composed view, and that branch is the project
+    /// root's own. What `newgit clone` ends with. Returns the view's commit.
+    pub fn check_out_composed(&self, branch: &str) -> Result<String> {
+        self.prepare_projection()?;
+        let view = self.source.rev_parse("refs/newgit/views/main")?;
+        let root = self.store.paths().project_root.clone();
+        let git = |args: &[&str]| {
+            let mut full = vec!["-C", root.as_str()];
+            full.extend_from_slice(args);
+            crate::source::run_git_env(&full, &[])
+        };
+        git(&["update-ref", &format!("refs/heads/{branch}"), &view])?;
+        git(&["symbolic-ref", "HEAD", &format!("refs/heads/{branch}")])?;
+        git(&["reset", "-q", "--hard", &view])?;
+        let file = self.store.paths().project_branch_file();
+        std::fs::write(&file, format!("{branch}\n"))
+            .map_err(|source| NewgitError::io(&file, source))?;
+        Ok(view)
+    }
+
     /// The project root is the instance `main` (newgit-trackers.md): bring
     /// its tracker branches up to its own branch — the one `newgit init`
     /// found checked out — not whatever it has checked out now.
@@ -1318,9 +1343,10 @@ impl BranchManager {
     }
 
     /// Put an instance on the project's remote, if it has one and the instance
-    /// is not there yet: register it (which forks trunk in the background and
-    /// mints the workspace's own token), keep the token in the workspace's
-    /// `.git/`, and point the workspace's Git at the remote.
+    /// is not there yet: register it (which forks nothing — an instance forks
+    /// a code tracker the first time it changes it — and mints the
+    /// workspace's own token), keep the token in the workspace's `.git/`, and
+    /// point the workspace's `origin` at the project's Git endpoint.
     ///
     /// Idempotent: a registered instance is left alone, so callers retry it
     /// freely.
@@ -1342,20 +1368,16 @@ impl BranchManager {
         )?;
         branch.remote = Some(RemoteBinding {
             project: link.project.clone(),
-            repo: registered.instance.repo.clone(),
-            fork_url: registered.instance.remote.clone().unwrap_or_default(),
-            trunk_url: registered.trunk_remote.clone(),
+            endpoint: registered.endpoint.clone(),
         });
         branch.updated_at = Utc::now();
         self.store.save_branch_record(branch)?;
-        // `origin` now fetches trunk, and Git asks newgit for passwords.
+        // `origin` now fetches the endpoint, and Git asks newgit for the
+        // password — the workspace's own token.
         self.ensure_workspace_push(branch)?;
         GitSource::workspace_use_credential_helper(
             &branch.workspace_path,
-            &[
-                &registered.trunk_remote,
-                registered.instance.remote.as_deref().unwrap_or_default(),
-            ],
+            &[&registered.endpoint],
             &format!("!{} credential", sh_quote(&newgit_program())),
         )
     }
@@ -1389,19 +1411,21 @@ impl BranchManager {
             })?;
         let mut warnings = Vec::new();
 
-        // Source: the checkpoint's tip (its uncommitted state, when it had
-        // any) from the author's fork, into this store.
-        let fork = remote.credential(&project, &format!("{project}.i.{from_slug}"), Scope::Read)?;
-        let imported_ref = format!("refs/newgit/imported/{from_slug}/{checkpoint_id}");
-        GitSource::fetch_refs(
-            &["-C", self.store.paths().project_root.as_str()],
-            fork.remote.as_deref().unwrap_or_default(),
-            &[format!(
-                "+{}:{imported_ref}",
-                remote_checkpoint_ref(checkpoint_id)
-            )],
-            Some(&basic_auth_header(&fork)),
+        // Source: the checkpoint's list, composed here from the code trackers
+        // this person may read — the author's exact commits when they read
+        // everything the author did.
+        let imported = self.import_code(
+            remote.as_ref(),
+            &project,
+            &from_slug,
+            checkpoint_id,
+            &record.code,
+            &mut warnings,
         )?;
+        record.source.head_rev = imported.head.clone();
+        record.source.dirty_rev = (imported.tip != imported.head).then(|| imported.tip.clone());
+        let imported_ref = format!("refs/newgit/imported/{from_slug}/{checkpoint_id}");
+        self.source.update_ref(&imported_ref, &imported.tip)?;
 
         // Trackers, resolved for whoever is spawning.
         let me = remote.me()?.login;
@@ -1431,6 +1455,13 @@ impl BranchManager {
 
         let spawned = self.spawn(name, Some(&record.source.head_rev))?;
         let mut branch = spawned.branch.clone();
+        // Its tracker branches start where the checkpoint's committed work is.
+        for (tracker, commit) in &imported.trackers {
+            let instance_branch = format!("instances/{}", branch.slug);
+            self.source
+                .update_ref(&local_tracker_ref(tracker, &instance_branch), commit)?;
+            self.publish_code_refs(tracker, &[&instance_branch])?;
+        }
 
         // The record joins the new instance's own history, rewritten to
         // point at what is on this machine.
@@ -1845,9 +1876,10 @@ impl BranchManager {
             sh_quote(self.store.paths().project_root.as_str()),
             sh_quote(&branch.name),
         );
-        // On a remote, `origin` is trunk; otherwise the store's own origin.
+        // On a remote, `origin` is the project's Git endpoint; otherwise the
+        // store's own origin.
         let fetch_url = match &branch.remote {
-            Some(remote) => Some(remote.trunk_url.clone()),
+            Some(remote) => Some(remote.endpoint.clone()),
             None => self.source.remote_url(PUBLISH_REMOTE, false)?,
         };
         GitSource::workspace_route_origin(
@@ -3970,31 +4002,17 @@ impl BranchManager {
     /// the real remote, so the pushing Git decides fast-forward, and checks
     /// `--force-with-lease`, against what that remote has right now.
     /// Returns the outbox, for `git receive-pack` to serve.
+    ///
+    /// On a newgit remote there is nothing to mirror: a push publishes the
+    /// instance's work into its trackers' forks, not one history somewhere.
     pub fn serve_push(&self, instance: &str) -> Result<Utf8PathBuf> {
         let branch = self.store.find_branch(instance)?;
-        let (url, auth) = self.publish_target(&branch)?;
         let outbox = self.outbox();
         self.source.ensure_outbox(&outbox)?;
-        GitSource::sync_outbox(&outbox, &url, auth.as_deref())?;
+        if branch.remote.is_none() || self.remote.is_none() {
+            GitSource::sync_outbox(&outbox, &self.require_publish_url()?, None)?;
+        }
         Ok(outbox)
-    }
-
-    /// Where a push from `branch` publishes, and the `Authorization` header
-    /// it needs. On a remote: the instance's own fork, with a password minted
-    /// on the workspace's own token — waiting for the fork if it is still
-    /// being made. Otherwise the store's `origin`, authenticated however the
-    /// developer's Git already is.
-    fn publish_target(&self, branch: &BranchInstance) -> Result<(String, Option<String>)> {
-        let (Some(link), Some(binding)) = (&self.remote, &branch.remote) else {
-            return Ok((self.require_publish_url()?, None));
-        };
-        let remote = link.connect(Acting::Workspace(&branch.workspace_path))?;
-        wait_for_fork(remote.as_ref(), &binding.project, &branch.slug)?;
-        let credential = remote.credential(&binding.project, &binding.repo, Scope::Write)?;
-        Ok((
-            binding.fork_url.clone(),
-            Some(basic_auth_header(&credential)),
-        ))
     }
 
     /// The second half, run from the outbox's `pre-receive` hook while the
@@ -4016,7 +4034,11 @@ impl BranchManager {
     ) -> Result<PushOutcome> {
         self.require_resolvable_graph()?;
         let mut branch = self.store.find_branch(instance)?;
-        let (url, auth) = self.publish_target(&branch)?;
+        let on_remote = self.remote.is_some() && branch.remote.is_some();
+        let url = match &branch.remote {
+            Some(binding) if on_remote => binding.endpoint.clone(),
+            _ => self.require_publish_url()?,
+        };
 
         let own_ref = format!("refs/heads/{}", branch.source_ref);
         if updates
@@ -4075,7 +4097,18 @@ impl BranchManager {
                 "this push's commits were not split into their trackers: {error}"
             )),
         }
-        GitSource::forward_push(&self.outbox(), &url, auth.as_deref(), updates, admitting)?;
+        if on_remote {
+            // On a newgit remote, the checkpoint's sync *is* the push: the
+            // instance's work went to its trackers' forks. It succeeds only
+            // if that reached the remote.
+            if let Some(error) = &checkpoint.sync_error {
+                return Err(NewgitError::Unsupported(format!(
+                    "the push did not reach {url}: {error}"
+                )));
+            }
+        } else {
+            GitSource::forward_push(&self.outbox(), &url, None, updates, admitting)?;
+        }
 
         Ok(PushOutcome {
             checkpoint,
@@ -4341,6 +4374,7 @@ impl BranchManager {
             },
             tracker_states,
             resource_states,
+            code: Default::default(),
         };
         let record_path = checkpoint_log.save(&record)?;
         branch.updated_at = Utc::now();
@@ -4348,17 +4382,253 @@ impl BranchManager {
 
         // The checkpoint exists locally now, whatever happens next; syncing
         // it is what lets another machine spawn it.
-        if let Err(error) = self.sync_checkpoint(branch, &record) {
-            warnings.push(format!(
-                "checkpoint {} is saved here but not on the remote: {error}",
-                record.id
-            ));
-        }
+        let sync_error = match self.sync_checkpoint(branch, &record) {
+            Ok(()) => None,
+            Err(error) => {
+                warnings.push(format!(
+                    "checkpoint {} is saved here but not on the remote: {error}",
+                    record.id
+                ));
+                Some(error.to_string())
+            }
+        };
 
         Ok(CheckpointOutcome {
             record,
             record_path,
             warnings,
+            sync_error,
+        })
+    }
+
+    /// Create this project on a remote as `<you>/<name>`: one repo per code
+    /// tracker, each seeded with its history, and branch `main` naming each
+    /// tracker's commit. Its first publication, so it publishes the project
+    /// root's work as it stands — split into its trackers first — and each
+    /// tracker's `main` here becomes what was pushed. After this, `main`
+    /// moves only through `newgit merge`.
+    pub fn create_on_remote(&self, client: &dyn Remote, name: &str) -> Result<PublishedProject> {
+        self.sync_project_root()?;
+        self.fetch_code_trackers()?;
+        let root = self.store.paths().project_root.clone();
+        let mut list = BTreeMap::new();
+        for definition in self.code_definitions() {
+            let tip = ["instances/main", "main"].iter().find_map(|branch| {
+                self.source
+                    .rev_parse(&local_tracker_ref(&definition.name, branch))
+                    .ok()
+            });
+            if let Some(tip) = tip {
+                list.insert(definition.name.clone(), tip);
+            }
+        }
+        if !list.contains_key(crate::tracker::PROJECT_TRACKER) {
+            return Err(NewgitError::Unsupported(
+                "commit `.newgit/` first: the remote reads every tracker's audience from the \
+                 `project` tracker's definitions, so they have to be in the history it publishes"
+                    .to_owned(),
+            ));
+        }
+        let trackers: Vec<String> = list.keys().cloned().collect();
+        let created = client.create_project(name, &trackers)?;
+        for seed in &created.seeds {
+            let Some(commit) = list.get(&seed.tracker) else {
+                continue;
+            };
+            GitSource::push_refs(
+                &["-C", root.as_str()],
+                seed.credential.remote.as_deref().unwrap_or_default(),
+                &[format!("+{commit}:refs/heads/main")],
+                Some(&basic_auth_header(&seed.credential)),
+            )?;
+        }
+        for (tracker, commit) in &list {
+            self.source
+                .update_ref(&local_tracker_ref(tracker, "main"), commit)?;
+            self.publish_code_refs(tracker, &["main"])?;
+        }
+        client.create_branch(&created.key, "main", &list)?;
+        Ok(PublishedProject {
+            key: created.key,
+            endpoint: created.endpoint,
+            list,
+        })
+    }
+
+    /// Publish an instance's work for checkpoint `record`, tracker by tracker:
+    /// its committed work (split already) and its uncommitted work (split
+    /// here, off the branch) as one commit per code tracker. A tracker the
+    /// instance changed — its commit is not the default branch's — is forked
+    /// the first time and gets its branch (`refs/heads/<instance>`) and the
+    /// checkpoint's commit pushed there. Returns the checkpoint as lists.
+    fn publish_code(
+        &self,
+        remote: &dyn Remote,
+        project: &str,
+        branch: &BranchInstance,
+        record: &CheckpointRecord,
+    ) -> Result<crate::checkpoint::CodeState> {
+        let root = self.store.paths().project_root.clone();
+        let code = self.code_definitions();
+        let code_only = |state: crate::compose::State| -> BTreeMap<String, String> {
+            state
+                .into_iter()
+                .filter(|(tracker, _)| code.iter().any(|definition| &definition.name == tracker))
+                .collect()
+        };
+        let head = code_only(crate::compose::read_state(&root, &record.source.head_rev)?);
+        let tip = match &record.source.dirty_rev {
+            None => head.clone(),
+            Some(dirty) => {
+                let bound: Vec<&TrackerDefinition> = code.iter().collect();
+                let outcome = crate::compose::split(
+                    &root,
+                    &record.source.head_rev,
+                    dirty,
+                    &bound,
+                    &self.all_definitions(),
+                )
+                .map_err(|error| match error {
+                    crate::compose::SplitError::Refused(refusal) => {
+                        NewgitError::SplitRefused(refusal.to_string())
+                    }
+                    crate::compose::SplitError::Git(error) => error,
+                })?;
+                code_only(outcome.state)
+            }
+        };
+
+        let view = remote.project(project)?;
+        let main = view.default_list().cloned().unwrap_or_default();
+        for (tracker, tip_commit) in &tip {
+            let Some(head_commit) = head.get(tracker) else {
+                continue;
+            };
+            if main.get(tracker) == Some(head_commit) && head_commit == tip_commit {
+                continue;
+            }
+            if !main.contains_key(tracker) {
+                return Err(NewgitError::Unsupported(format!(
+                    "`{tracker}` is not on {project}'s `{}` yet, so this instance has no fork of \
+                     it to push to: a code tracker made after the project reached the remote \
+                     joins it through `newgit merge`",
+                    view.default_branch
+                )));
+            }
+            let fork = remote.fork(project, &branch.slug, tracker)?;
+            let credential = remote.credential(project, &fork.repo, Scope::Write)?;
+            GitSource::push_refs(
+                &["-C", root.as_str()],
+                fork.remote.as_deref().unwrap_or_default(),
+                &[
+                    format!("+{head_commit}:refs/heads/{}", branch.slug),
+                    format!("+{tip_commit}:{}", fork_checkpoint_ref(&record.id)),
+                ],
+                Some(&basic_auth_header(&credential)),
+            )?;
+        }
+        Ok(crate::checkpoint::CodeState { head, tip })
+    }
+
+    /// Bring a checkpoint's code here and compose it: each code tracker this
+    /// person may read is fetched — from the author's fork when the author
+    /// changed it, from the tracker's own repo otherwise — and the lists
+    /// composed into two views, the committed work and the checkpoint's tip.
+    /// A tracker this person may not read is left out, and said so.
+    fn import_code(
+        &self,
+        remote: &dyn Remote,
+        project: &str,
+        from_slug: &str,
+        checkpoint_id: &str,
+        code: &crate::checkpoint::CodeState,
+        warnings: &mut Vec<String>,
+    ) -> Result<ImportedCode> {
+        if code.is_empty() {
+            return Err(NewgitError::Unsupported(format!(
+                "checkpoint {from_slug}/{checkpoint_id} carries no code trackers' commits, so it \
+                 cannot be composed here; checkpoint it again with this newgit"
+            )));
+        }
+        let root = self.store.paths().project_root.clone();
+        let forks = remote.instance(project, from_slug)?.forks;
+        let code_definitions = self.code_definitions();
+        let mut readable = Vec::new();
+        for definition in &code_definitions {
+            let tracker = &definition.name;
+            if !code.tip.contains_key(tracker) {
+                continue;
+            }
+            let forked = forks.contains(tracker);
+            let repo = if forked {
+                fork_repo(project, from_slug, tracker)
+            } else {
+                format!("{}.t.{tracker}", project.replace('/', "."))
+            };
+            let credential = match remote.credential(project, &repo, Scope::Read) {
+                Ok(credential) => credential,
+                Err(error) => {
+                    warnings.push(format!("code tracker `{tracker}` is left out: {error}"));
+                    continue;
+                }
+            };
+            let mut refspecs = vec![format!(
+                "+refs/heads/*:refs/newgit/imported/trackers/{tracker}/heads/*"
+            )];
+            if forked {
+                refspecs.push(format!(
+                    "+{}:refs/newgit/imported/trackers/{tracker}/checkpoint",
+                    fork_checkpoint_ref(checkpoint_id)
+                ));
+            }
+            GitSource::fetch_refs(
+                &["-C", root.as_str()],
+                credential.remote.as_deref().unwrap_or_default(),
+                &refspecs,
+                Some(&basic_auth_header(&credential)),
+            )?;
+            readable.push(definition);
+        }
+
+        let all = self.all_definitions();
+        let compose = |list: &BTreeMap<String, String>, view: &str| -> Result<String> {
+            let tips: Vec<crate::compose::TrackerTip<'_>> = readable
+                .iter()
+                .filter_map(|definition| {
+                    list.get(&definition.name)
+                        .map(|commit| crate::compose::TrackerTip {
+                            definition,
+                            commit: commit.clone(),
+                        })
+                })
+                .collect();
+            crate::compose::compose(&root, view, &tips, &all)?
+                .tip
+                .ok_or_else(|| {
+                    NewgitError::Unsupported(format!(
+                        "checkpoint {from_slug}/{checkpoint_id} composes to nothing you may read"
+                    ))
+                })
+        };
+        let base = format!("refs/newgit/views/imported/{from_slug}/{checkpoint_id}");
+        let head = compose(&code.head, &format!("{base}/head"))?;
+        let tip = if code.tip == code.head {
+            head.clone()
+        } else {
+            compose(&code.tip, &format!("{base}/tip"))?
+        };
+        let trackers = readable
+            .iter()
+            .filter_map(|definition| {
+                code.head
+                    .get(&definition.name)
+                    .map(|commit| (definition.name.clone(), commit.clone()))
+            })
+            .collect();
+        Ok(ImportedCode {
+            head,
+            tip,
+            trackers,
         })
     }
 
@@ -4395,19 +4665,9 @@ impl BranchManager {
         self.split_instance(&branch.slug, &record.source.head_rev)?;
 
         let remote = link.connect(Acting::Workspace(&branch.workspace_path))?;
-        wait_for_fork(remote.as_ref(), &binding.project, &branch.slug)?;
-
-        let fork = remote.credential(&binding.project, &binding.repo, Scope::Write)?;
-        GitSource::push_refs(
-            &["-C", self.store.paths().project_root.as_str()],
-            &binding.fork_url,
-            &[format!(
-                "{}:{}",
-                record.source.store_ref,
-                remote_checkpoint_ref(&record.id)
-            )],
-            Some(&basic_auth_header(&fork)),
-        )?;
+        let code = self.publish_code(remote.as_ref(), &binding.project, branch, record)?;
+        let mut record = record.clone();
+        record.code = code;
 
         let mut login = None;
         for state in &record.tracker_states {
@@ -4449,7 +4709,7 @@ impl BranchManager {
             )?;
         }
 
-        let value = serde_json::to_value(record).map_err(|error| NewgitError::Remote {
+        let value = serde_json::to_value(&record).map_err(|error| NewgitError::Remote {
             status: 0,
             message: format!("could not encode checkpoint {}: {error}", record.id),
         })?;
@@ -5347,6 +5607,24 @@ fn no_own_content(tracker: &str) -> String {
 /// `instances/main`, so no spawned instance may take the name.
 const PROJECT_ROOT_INSTANCE: &str = "main";
 
+/// What `newgit remote add` published when it created the project.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublishedProject {
+    /// `<owner>/<name>`.
+    pub key: String,
+    pub endpoint: String,
+    /// Branch `main`: one commit per code tracker.
+    pub list: BTreeMap<String, String>,
+}
+
+/// A checkpoint's code, composed here: its committed work, its tip, and the
+/// committed commit of each code tracker that was readable.
+struct ImportedCode {
+    head: String,
+    tip: String,
+    trackers: Vec<(String, String)>,
+}
+
 /// Where the project repo keeps a code tracker's `branch` (`main`,
 /// `instances/<slug>`): its own refs, so what it composes from is never
 /// borrowed.
@@ -5354,41 +5632,25 @@ fn local_tracker_ref(tracker: &str, branch: &str) -> String {
     format!("refs/newgit/trackers/{tracker}/{branch}")
 }
 
-pub fn remote_checkpoint_ref(id: &str) -> String {
-    format!("refs/newgit/checkpoints/{id}/source")
-}
-
 /// The repo a tracker's content lives in on the remote: one per user for a
 /// per-user (`audience = "user"`) tracker, one shared otherwise.
 pub fn tracker_repo(project: &str, definition: &TrackerDefinition, login: &str) -> String {
+    let prefix = project.replace('/', ".");
     if definition.audience == "user" {
-        format!("{project}.t.{}.{login}", definition.name)
+        format!("{prefix}.t.{}.{login}", definition.name)
     } else {
-        format!("{project}.t.{}", definition.name)
+        format!("{prefix}.t.{}", definition.name)
     }
 }
 
-/// A fork takes seconds to make (5–22 s measured on a medium repo), and an
-/// instance's first push can arrive before it is done. Wait for it.
-fn wait_for_fork(remote: &dyn Remote, project: &str, instance: &str) -> Result<()> {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(90);
-    loop {
-        let found = remote.instance(project, instance)?;
-        match found.fork_state.as_str() {
-            "ready" => return Ok(()),
-            "failed" => {
-                return Err(NewgitError::Unsupported(format!(
-                    "the remote could not fork trunk for `{instance}`; remove and spawn it again"
-                )));
-            }
-            _ if std::time::Instant::now() > deadline => {
-                return Err(NewgitError::Unsupported(format!(
-                    "`{instance}`'s fork on the remote is still not ready after 90 s; try the push again"
-                )));
-            }
-            _ => std::thread::sleep(std::time::Duration::from_millis(500)),
-        }
-    }
+/// An instance's fork of one code tracker on the remote.
+pub fn fork_repo(project: &str, instance: &str, tracker: &str) -> String {
+    format!("{}.i.{instance}.{tracker}", project.replace('/', "."))
+}
+
+/// Where a fork keeps a checkpoint's commit for its tracker.
+pub fn fork_checkpoint_ref(id: &str) -> String {
+    format!("refs/newgit/checkpoints/{id}")
 }
 
 #[cfg(test)]

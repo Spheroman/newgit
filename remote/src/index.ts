@@ -16,7 +16,19 @@ import {
 	startDeviceFlow,
 	verifyToken,
 } from "./auth";
-import { type Audience, type RepoRef, decide, parseAudience, parseRepoName, partProblem, repoName } from "./names";
+import {
+	type Audience,
+	type Facts,
+	type ProjectId,
+	type RepoRef,
+	decide,
+	parseAudience,
+	parseProjectKey,
+	parseRepoName,
+	partProblem,
+	projectKey,
+	repoName,
+} from "./names";
 import type { ProjectDO } from "./project";
 import type { UserDO } from "./users";
 
@@ -113,7 +125,8 @@ async function route(request: Request, env: Env, deps: Deps): Promise<Response> 
 		const { name, project, ttl_days } = await body<{ name?: string; project?: string; ttl_days?: number }>(request);
 		if (!name) throw new HttpError(400, "name is required: what the agent is called in records and the UI");
 		requirePart("agent name", name);
-		if (project !== undefined) requirePart("project name", project);
+		if (project !== undefined && parseProjectKey(project) === null)
+			throw new HttpError(400, "project is <owner>/<name>");
 		const ttlSeconds = ttl_days === undefined ? AGENT_TTL_SECONDS : Math.round(ttl_days * 86_400);
 		if (!(ttlSeconds > 0 && ttlSeconds <= AGENT_TTL_MAX_SECONDS))
 			throw new HttpError(400, `ttl_days must be more than 0 and at most ${AGENT_TTL_MAX_SECONDS / 86_400}`);
@@ -126,7 +139,8 @@ async function route(request: Request, env: Env, deps: Deps): Promise<Response> 
 		// earlier stops working at the next renewal.
 		if (caller.kind !== "agent") throw new HttpError(400, "a login renews by running `newgit login`");
 		if (caller.instance !== undefined && caller.project !== undefined) {
-			const alive = await projectStub(env, caller.project).instance(caller.instance);
+			const pinned = parseProjectKey(caller.project);
+			const alive = pinned === null ? null : await projectStub(env, pinned).instance(caller.instance);
 			if (alive === null) throw new HttpError(410, `instance \`${caller.instance}\` was removed`);
 		}
 		const issued = await issue(env, {
@@ -154,36 +168,37 @@ async function route(request: Request, env: Env, deps: Deps): Promise<Response> 
 	// ── Projects ───────────────────────────────────────────────────────────
 	if (method === "POST" && path === "/v1/projects") {
 		requireHuman(caller, "create projects");
-		const { name } = await body<{ name?: string }>(request);
+		const { name, trackers = [] } = await body<{ name?: string; trackers?: string[] }>(request);
 		if (!name) throw new HttpError(400, "name is required");
 		requirePart("project name", name);
-		const project = projectStub(env, name);
-		if (!(await project.init(name, login))) throw new HttpError(409, `project \`${name}\` already exists`);
-		const src = repoName({ kind: "src", project: name });
-		const { remote } = await deps.repos.create(src);
-		// The one write to trunk outside a merge: the creator's initial push of
-		// the project's existing history. Only here, only once, only briefly.
-		const seed = await deps.repos.mint(src, "write", CREDENTIAL_TTL_SECONDS);
+		if (!Array.isArray(trackers) || trackers.length === 0)
+			throw new HttpError(400, "trackers is required: the code trackers whose repos to create (root, project, …)");
+		for (const tracker of trackers) requirePart("tracker name", tracker);
+		const id: ProjectId = { owner: login, name };
+		const project = projectStub(env, id);
+		if (!(await project.init(name, login)))
+			throw new HttpError(409, `project \`${projectKey(id)}\` already exists`);
+		// The one write to a code tracker's repo outside a merge: the creator's
+		// initial push of its history. Only here, only once, only briefly.
+		const seeds = [];
+		for (const tracker of trackers) seeds.push(await seed(env, deps, caller, { kind: "tracker", project: id, tracker }));
 		return json(
-			{
-				name,
-				owner: login,
-				src: { repo: src, remote },
-				seed_credential: { username: "x", password: seed.password, expires_at: seed.expiresAt },
-			},
+			{ owner: login, name, key: projectKey(id), endpoint: endpointUrl(url, id), seeds },
 			201,
 		);
 	}
 
-	const projectMatch = path.match(/^\/v1\/projects\/([^/]+)(\/.*)?$/);
+	const projectMatch = path.match(/^\/v1\/projects\/([^/]+)\/([^/]+)(\/.*)?$/);
 	if (!projectMatch) throw new HttpError(404, `no route for ${method} ${path}`);
-	const projectName = decodeURIComponent(projectMatch[1]);
-	const rest = projectMatch[2] ?? "";
-	if (caller.project !== undefined && caller.project !== projectName)
+	const id = parseProjectKey(`${decodeURIComponent(projectMatch[1])}/${decodeURIComponent(projectMatch[2])}`);
+	if (id === null) throw new HttpError(400, "a project is <owner>/<name>");
+	const key = projectKey(id);
+	const rest = projectMatch[3] ?? "";
+	if (caller.project !== undefined && caller.project !== key)
 		throw new HttpError(403, `this agent token (\`${caller.agent}\`) is for ${caller.project} only`);
-	const project = projectStub(env, projectName);
+	const project = projectStub(env, id);
 	const info = await project.info();
-	if (info === null) throw new HttpError(404, `no project \`${projectName}\``);
+	if (info === null) throw new HttpError(404, `no project \`${key}\``);
 	const member = await project.isMember(login);
 
 	// Credentials are answered for non-members too: a public tracker is
@@ -193,21 +208,22 @@ async function route(request: Request, env: Env, deps: Deps): Promise<Response> 
 		if (!repo) throw new HttpError(400, "repo is required (a repo name, or a remote URL)");
 		if (scope !== "read" && scope !== "write") throw new HttpError(400, "scope is read or write");
 		const ref = parseRepoName(repoFromUrlOrName(repo));
-		if (ref === null || ref.project !== projectName)
-			throw new HttpError(400, `\`${repo}\` is not one of ${projectName}'s repos`);
-		if (caller.instance !== undefined && scope === "write" && ref.kind === "instance")
+		if (ref === null || projectKey(ref.project) !== key)
+			throw new HttpError(400, `\`${repo}\` is not one of ${key}'s repos`);
+		if (caller.instance !== undefined && scope === "write" && ref.kind === "fork")
 			requireThisInstance(caller, ref.instance);
-		return json(await credential(env, deps, project, ref, scope, caller, member));
+		return json(await credential(env, deps, project, info.defaultBranch, ref, scope, caller, member));
 	}
 
-	if (!member) throw new HttpError(403, `${login} is not a member of ${projectName}`);
+	if (!member) throw new HttpError(403, `${login} is not a member of ${key}`);
 
 	if (method === "GET" && rest === "") {
-		const src = repoName({ kind: "src", project: projectName });
 		return json({
 			...info,
+			key,
+			endpoint: endpointUrl(url, id),
 			members: await project.members(),
-			src: { repo: src, remote: await deps.repos.remote(src) },
+			branches: await project.branches(),
 		});
 	}
 
@@ -230,6 +246,57 @@ async function route(request: Request, env: Env, deps: Deps): Promise<Response> 
 		return json({ login: removed, removed: await project.removeMember(removed) });
 	}
 
+	// ── Code trackers ──────────────────────────────────────────────────────
+	// A code tracker carved after the project was created gets its repo here,
+	// seeded once by whoever carved it. It joins a branch only by a merge.
+	if (method === "POST" && rest === "/trackers") {
+		requireHuman(caller, "create code tracker repos");
+		const { name: tracker } = await body<{ name?: string }>(request);
+		if (!tracker) throw new HttpError(400, "name is required");
+		requirePart("tracker name", tracker);
+		const ref: RepoRef = { kind: "tracker", project: id, tracker };
+		if ((await deps.repos.remote(repoName(ref))) !== null)
+			throw new HttpError(409, `${repoName(ref)} exists already; its history moves only through \`newgit merge\``);
+		return json(await seed(env, deps, caller, ref), 201);
+	}
+
+	// ── Branches ───────────────────────────────────────────────────────────
+	if (method === "GET" && rest === "/branches")
+		return json({ default: info.defaultBranch, branches: await project.branches() });
+	if (method === "PUT" && rest === "/branches/default") {
+		requireOwner(info.owner, login, "change the default branch");
+		requireNotInstance(caller, "change the default branch");
+		const { name: branch } = await body<{ name?: string }>(request);
+		if (!branch) throw new HttpError(400, "name is required");
+		if (!(await project.setDefaultBranch(branch))) throw new HttpError(404, `no branch \`${branch}\` in ${key}`);
+		return json({ default: branch });
+	}
+	const branchMatch = rest.match(/^\/branches\/([^/]+)$/);
+	if (branchMatch) {
+		const branch = decodeURIComponent(branchMatch[1]);
+		if (method === "GET") {
+			const found = await project.branch(branch);
+			if (found === null) throw new HttpError(404, `no branch \`${branch}\` in ${key}`);
+			return json(found);
+		}
+		if (method === "PUT") {
+			requireNotInstance(caller, "create branches");
+			requirePart("branch name", branch);
+			const { list } = await body<{ list?: Record<string, string> }>(request);
+			if (!list || typeof list !== "object" || Object.keys(list).length === 0)
+				throw new HttpError(400, "list is required: one commit per code tracker, by tracker name");
+			for (const [tracker, commit] of Object.entries(list)) {
+				requirePart("tracker name", tracker);
+				if (typeof commit !== "string" || !/^[0-9a-f]{40}$/.test(commit))
+					throw new HttpError(400, `\`${tracker}\` must name a full commit id`);
+			}
+			const created = await project.createBranch(branch, list, login);
+			if (created === null)
+				throw new HttpError(409, `branch \`${branch}\` exists; a branch moves only through \`newgit merge\``);
+			return json(created, 201);
+		}
+	}
+
 	// ── Instances ──────────────────────────────────────────────────────────
 	if (method === "POST" && rest === "/instances") {
 		requireNotInstance(caller, "create instances");
@@ -237,63 +304,70 @@ async function route(request: Request, env: Env, deps: Deps): Promise<Response> 
 		if (!name || !base_rev) throw new HttpError(400, "name and base_rev are required");
 		requirePart("instance name", name);
 		const created = await project.createInstance(name, login, base_rev, caller.agent ?? null);
-		if (created === null) throw new HttpError(409, `instance \`${name}\` already exists in ${projectName}`);
-		// A fork takes seconds; the record exists now and says the fork is pending.
-		const src = repoName({ kind: "src", project: projectName });
-		const fork = repoName({ kind: "instance", project: projectName, instance: name });
-		deps.waitUntil(
-			deps.repos.fork(src, fork).then(
-				() => project.setForkState(name, "ready"),
-				(error: unknown) => project.setForkState(name, "failed", String(error)),
-			),
-		);
-		// The workspace's own credential, minted here so nobody has to: it can
-		// write this instance and nothing else, renews itself, and is revoked
-		// when the instance is removed.
+		if (created === null) throw new HttpError(409, `instance \`${name}\` already exists in ${key}`);
+		// Nothing is forked here: an instance forks a tracker the first time
+		// it changes it. The workspace's own credential is minted here so
+		// nobody has to: it writes this instance and nothing else, renews
+		// itself, and is revoked when the instance is removed.
 		const instanceToken = await issue(env, {
 			kind: "agent",
 			login,
 			// Names an agent only when one spawned it: a person running
 			// `newgit checkpoint` in the workspace is not an agent.
 			agent: caller.agent,
-			project: projectName,
+			project: key,
 			instance: name,
 			ttlSeconds: AGENT_TTL_SECONDS,
 		});
 		return json(
-			{
-				...created,
-				repo: fork,
-				remote: deps.repos.url(fork),
-				trunk: { repo: src, remote: deps.repos.url(src) },
-				token: instanceToken.token,
-				token_id: instanceToken.id,
-			},
+			{ ...created, endpoint: endpointUrl(url, id), token: instanceToken.token, token_id: instanceToken.id },
 			201,
 		);
 	}
 	if (method === "GET" && rest === "/instances") return json({ instances: await project.instances() });
 
+	const forkMatch = rest.match(/^\/instances\/([^/]+)\/trackers\/([^/]+)\/fork$/);
+	if (method === "POST" && forkMatch) {
+		const name = decodeURIComponent(forkMatch[1]);
+		const tracker = decodeURIComponent(forkMatch[2]);
+		const instance = await project.instance(name);
+		if (instance === null) throw new HttpError(404, `no instance \`${name}\` in ${key}`);
+		requireOwner(instance.owner, login, `fork for \`${name}\``);
+		requireThisInstance(caller, name);
+		const facts = await definitionFacts(deps.repos, id, info.defaultBranch, tracker);
+		if (facts === undefined) throw new HttpError(404, `tracker \`${tracker}\` is not defined on ${key}'s default branch`);
+		if (!facts.code) throw new HttpError(400, `\`${tracker}\` is a secret tracker; instances do not fork it`);
+		const fork = repoName({ kind: "fork", project: id, instance: name, tracker });
+		let remote = await deps.repos.remote(fork);
+		if (remote === null) {
+			// Seconds on a real repo; the request waits, since the push that
+			// asked for it cannot go anywhere until it exists.
+			remote = (await deps.repos.fork(repoName({ kind: "tracker", project: id, tracker }), fork)).remote;
+		}
+		await project.addFork(name, tracker);
+		return json({ instance: name, tracker, repo: fork, remote });
+	}
+
 	const instanceMatch = rest.match(/^\/instances\/([^/]+)(\/head)?$/);
 	if (instanceMatch) {
 		const name = decodeURIComponent(instanceMatch[1]);
 		const instance = await project.instance(name);
-		if (instance === null) throw new HttpError(404, `no instance \`${name}\` in ${projectName}`);
-		const repo = repoName({ kind: "instance", project: projectName, instance: name });
-		if (method === "GET" && !instanceMatch[2]) return json({ ...instance, repo, remote: deps.repos.url(repo) });
+		if (instance === null) throw new HttpError(404, `no instance \`${name}\` in ${key}`);
+		if (method === "GET" && !instanceMatch[2]) return json(instance);
 		if (method === "PUT" && instanceMatch[2]) {
 			requireOwner(instance.owner, login, `move \`${name}\`'s head`);
 			requireThisInstance(caller, name);
 			const { head_rev } = await body<{ head_rev?: string }>(request);
 			if (!head_rev) throw new HttpError(400, "head_rev is required");
-			return json({ ...(await project.setHead(name, head_rev)), repo });
+			return json(await project.setHead(name, head_rev));
 		}
 		if (method === "DELETE" && !instanceMatch[2]) {
 			requireOwner(instance.owner, login, `remove \`${name}\``);
 			requireNotInstance(caller, "remove instances");
-			await deps.repos.delete(repo).catch(() => false);
+			for (const tracker of instance.forks)
+				await deps.repos.delete(repoName({ kind: "fork", project: id, instance: name, tracker })).catch(() => false);
 			await project.deleteInstance(name);
-			await revokeRepoTokens(deps, await userStub(env, instance.owner).revokeInstance(projectName, name));
+			await revokeRepoTokens(deps, await userStub(env, instance.owner).revokeInstance(key, name));
 			return json({ name, removed: true });
 		}
 	}
@@ -306,24 +380,45 @@ async function route(request: Request, env: Env, deps: Deps): Promise<Response> 
 	const checkpointMatch = rest.match(/^\/checkpoints\/([^/]+)\/([^/]+)$/);
 	if (checkpointMatch) {
 		const instance = decodeURIComponent(checkpointMatch[1]);
-		const id = decodeURIComponent(checkpointMatch[2]);
+		const checkpoint = decodeURIComponent(checkpointMatch[2]);
 		if (method === "GET") {
-			const found = await project.checkpoint(instance, id);
-			if (found === null) throw new HttpError(404, `no checkpoint ${instance}/${id} in ${projectName}`);
+			const found = await project.checkpoint(instance, checkpoint);
+			if (found === null) throw new HttpError(404, `no checkpoint ${instance}/${checkpoint} in ${key}`);
 			return json(found);
 		}
 		if (method === "PUT") {
 			const owner = (await project.instance(instance))?.owner;
-			if (owner === undefined) throw new HttpError(404, `no instance \`${instance}\` in ${projectName}`);
+			if (owner === undefined) throw new HttpError(404, `no instance \`${instance}\` in ${key}`);
 			requireOwner(owner, login, `checkpoint \`${instance}\``);
 			requireThisInstance(caller, instance);
 			const { record } = await body<{ record?: unknown }>(request);
 			if (record === undefined) throw new HttpError(400, "record is required");
-			return json(await project.putCheckpoint(instance, id, login, caller.agent ?? null, record), 201);
+			return json(await project.putCheckpoint(instance, checkpoint, login, caller.agent ?? null, record), 201);
 		}
 	}
 
 	throw new HttpError(404, `no route for ${method} ${path}`);
+}
+
+/** Where a project's Git endpoint is: `https://<host>/<owner>/<name>.git`. */
+function endpointUrl(url: URL, id: ProjectId): string {
+	return `${url.origin}/${id.owner}/${id.name}.git`;
+}
+
+/** Create a code tracker's repo and mint the one short write that seeds it. */
+async function seed(env: Env, deps: Deps, caller: Caller, ref: RepoRef) {
+	const name = repoName(ref);
+	const { remote } = await deps.repos.create(name);
+	const minted = await deps.repos.mint(name, "write", CREDENTIAL_TTL_SECONDS);
+	await userStub(env, caller.login).recordRepoToken(caller.tokenId, name, minted.id, minted.expiresAt);
+	return {
+		tracker: ref.kind === "tracker" ? ref.tracker : "",
+		repo: name,
+		remote,
+		username: "x",
+		password: minted.password,
+		expires_at: minted.expiresAt,
+	};
 }
 
 /** Mint a Git credential for one repo, if the rules allow it. */
@@ -331,15 +426,16 @@ async function credential(
 	env: Env,
 	deps: Deps,
 	project: DurableObjectStub<ProjectDO>,
+	defaultBranch: string,
 	ref: RepoRef,
 	scope: "read" | "write",
 	caller: Caller,
 	member: boolean,
 ) {
 	const who = { login: caller.login, member };
-	const facts: { instanceOwner?: string; audience?: Audience } = {};
-	if (ref.kind === "instance") facts.instanceOwner = (await project.instance(ref.instance))?.owner;
-	if (ref.kind === "tracker") facts.audience = await trunkAudience(deps.repos, ref.project, ref.tracker);
+	const facts: Facts = {};
+	if (ref.kind === "fork") facts.instanceOwner = (await project.instance(ref.instance))?.owner;
+	facts.tracker = await definitionFacts(deps.repos, ref.project, defaultBranch, ref.tracker);
 
 	const decision = decide(ref, scope, who, facts);
 	if (!decision.ok) throw new HttpError(403, decision.reason);
@@ -347,8 +443,10 @@ async function credential(
 	const name = repoName(ref);
 	let remote = await deps.repos.remote(name);
 	if (remote === null) {
-		// Tracker repos are created on first write; nothing else is created here.
-		if (ref.kind !== "tracker" || scope !== "write") throw new HttpError(404, `${name} does not exist yet`);
+		// A secret tracker's repo is created on its first write. Code tracker
+		// repos are seeded with the project, and forks made by the fork route.
+		if (ref.kind !== "tracker" || scope !== "write" || facts.tracker?.code)
+			throw new HttpError(404, `${name} does not exist yet`);
 		remote = (await deps.repos.create(name)).remote;
 	}
 	const minted = await deps.repos.mint(name, scope, CREDENTIAL_TTL_SECONDS);
@@ -357,24 +455,33 @@ async function credential(
 }
 
 /**
- * A tracker's audience as committed on trunk. Read from trunk, not taken from
- * the caller: an audience changes only by merging a change to its definition,
- * and only the merge executor writes trunk.
+ * A tracker's definition — audience, and whether it is a code tracker — as
+ * committed on the project's default branch: the `project` tracker's
+ * `.newgit/trackers/<name>.toml` there. Read from the branch, not taken from
+ * the caller: a definition changes only by merging a change to it.
  */
-async function trunkAudience(repos: Repos, project: string, tracker: string): Promise<Audience | undefined> {
+async function definitionFacts(
+	repos: Repos,
+	project: ProjectId,
+	branch: string,
+	tracker: string,
+): Promise<{ audience: Audience; code: boolean } | undefined> {
 	const text = await repos.readFile(
-		repoName({ kind: "src", project }),
-		"HEAD",
+		repoName({ kind: "tracker", project, tracker: "project" }),
+		branch,
 		`.newgit/trackers/${tracker}.toml`,
 	);
 	if (text === null) return undefined;
-	let definition: { audience?: unknown };
+	let definition: { audience?: unknown; secret?: unknown };
 	try {
-		definition = parseToml(text) as { audience?: unknown };
+		definition = parseToml(text) as { audience?: unknown; secret?: unknown };
 	} catch {
 		return undefined;
 	}
-	return typeof definition.audience === "string" ? (parseAudience(definition.audience) ?? undefined) : undefined;
+	const audience = typeof definition.audience === "string" ? parseAudience(definition.audience) : null;
+	if (audience === null) return undefined;
+	// `secret` defaults to true, and is written only when false.
+	return { audience, code: definition.secret === false };
 }
 
 /** Accept a bare repo name or anything ending in `/<repo>.git` (what a credential helper sees). */
@@ -436,8 +543,8 @@ function requireHuman(caller: Caller, action: string) {
 		throw new HttpError(403, `agent tokens cannot ${action}; ${caller.login} can, from their own login`);
 }
 
-function projectStub(env: Env, name: string): DurableObjectStub<ProjectDO> {
-	return env.PROJECTS.getByName(name);
+function projectStub(env: Env, id: ProjectId): DurableObjectStub<ProjectDO> {
+	return env.PROJECTS.getByName(projectKey(id));
 }
 
 function requirePart(what: string, value: string) {

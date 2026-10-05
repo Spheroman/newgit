@@ -40,10 +40,14 @@ fn base64_url(bytes: &[u8]) -> String {
 
 #[derive(Default)]
 struct State {
+    /// The fake's own URL, for the endpoint it names.
+    base: String,
     /// `(method, path, bearer token)` for every request, in order.
     requests: Vec<(String, String, String)>,
-    /// Instance name → how many more times to answer "pending" before "ready".
-    pending_polls: BTreeMap<String, u32>,
+    /// Project key → branch name → list.
+    branches: BTreeMap<String, BTreeMap<String, Value>>,
+    /// Instance name → the code trackers it forked.
+    forks: BTreeMap<String, Vec<String>>,
     checkpoints: BTreeMap<(String, String), Value>,
     /// Who checkpointed what, for `createdBy`.
     checkpoint_authors: BTreeMap<(String, String), String>,
@@ -80,7 +84,10 @@ impl FakeRemote {
             "http://127.0.0.1:{}",
             listener.local_addr().expect("addr").port()
         );
-        let state = Arc::new(Mutex::new(State::default()));
+        let state = Arc::new(Mutex::new(State {
+            base: url.clone(),
+            ..State::default()
+        }));
         let (thread_state, thread_repos) = (state.clone(), repos.clone());
         std::thread::spawn(move || {
             for stream in listener.incoming() {
@@ -155,6 +162,12 @@ fn route(
     let exists = |name: &str| repos.join(format!("{name}.git")).exists();
     let segments: Vec<&str> = path.trim_start_matches('/').split(['/', '?']).collect();
     let credential = |repo: &str| json!({ "repo": repo, "remote": repo_url(repo), "username": "x", "password": "pw", "expires_at": "2099-01-01T00:00:00Z" });
+    let instance_json = |state: &State, owner: &str, name: &str| {
+        json!({
+            "name": name, "owner": owner, "agent": null, "baseRev": "x", "headRev": null,
+            "forks": state.forks.get(name).cloned().unwrap_or_default(),
+        })
+    };
     match (method, segments.as_slice()) {
         ("GET", ["v1", "me"]) => (
             200,
@@ -162,96 +175,134 @@ fn route(
         ),
         ("POST", ["v1", "projects"]) => {
             let name = body["name"].as_str().unwrap_or_default();
-            let src = format!("{name}.src");
-            if exists(&src) {
+            let key = format!("{caller}/{name}");
+            if state.branches.contains_key(&key) {
                 return (
                     409,
-                    json!({ "error": format!("project `{name}` already exists") }),
+                    json!({ "error": format!("project `{key}` already exists") }),
                 );
             }
-            git(
-                repos,
-                &["init", "-q", "--bare", "-b", "main", &repo_url(&src)],
-            );
+            state.branches.insert(key.clone(), BTreeMap::new());
+            let mut seeds = Vec::new();
+            for tracker in body["trackers"].as_array().cloned().unwrap_or_default() {
+                let tracker = tracker.as_str().unwrap_or_default();
+                let repo = format!("{caller}.{name}.t.{tracker}");
+                git(
+                    repos,
+                    &["init", "-q", "--bare", "-b", "main", &repo_url(&repo)],
+                );
+                let mut seed = credential(&repo);
+                seed["tracker"] = json!(tracker);
+                seeds.push(seed);
+            }
             (
                 201,
                 json!({
-                    "name": name, "owner": caller, "src": { "repo": src, "remote": repo_url(&src) },
-                    "seed_credential": credential(&src),
+                    "name": name, "owner": caller, "key": key,
+                    "endpoint": format!("{}/{key}.git", state.base), "seeds": seeds,
                 }),
             )
         }
-        ("GET", ["v1", "projects", project]) => (
-            200,
-            json!({
-                "name": project, "owner": "jack", "members": [{ "login": "ana" }, { "login": "jack" }],
-                "src": { "repo": format!("{project}.src"), "remote": repo_url(&format!("{project}.src")) },
-            }),
-        ),
-        ("POST", ["v1", "projects", project, "instances"]) => {
+        ("GET", ["v1", "projects", owner, name]) => {
+            let key = format!("{owner}/{name}");
+            let Some(branches) = state.branches.get(&key) else {
+                return (404, json!({ "error": format!("no project `{key}`") }));
+            };
+            let branches: Vec<Value> = branches
+                .iter()
+                .map(|(branch, list)| json!({ "name": branch, "list": list }))
+                .collect();
+            (
+                200,
+                json!({
+                    "name": name, "owner": owner, "key": key, "defaultBranch": "main",
+                    "endpoint": format!("{}/{key}.git", state.base),
+                    "members": [{ "login": "ana" }, { "login": "jack" }], "branches": branches,
+                }),
+            )
+        }
+        ("PUT", ["v1", "projects", owner, name, "branches", branch]) => {
+            let key = format!("{owner}/{name}");
+            let branches = state.branches.entry(key).or_default();
+            if branches.contains_key(*branch) {
+                return (
+                    409,
+                    json!({ "error": "branches move only through `newgit merge`" }),
+                );
+            }
+            branches.insert((*branch).to_owned(), body["list"].clone());
+            (201, json!({ "name": branch, "list": body["list"] }))
+        }
+        ("POST", ["v1", "projects", owner, project, "instances"]) => {
             let name = body["name"].as_str().unwrap_or_default();
-            let fork = format!("{project}.i.{name}");
-            git(
-                repos,
-                &[
-                    "clone",
-                    "-q",
-                    "--bare",
-                    &repo_url(&format!("{project}.src")),
-                    &repo_url(&fork),
-                ],
-            );
-            // The first push polls once while the "fork" is still being made.
-            state.pending_polls.insert(name.to_owned(), 1);
             let instance_token = fake_token(&format!("tok_instance_{name}"));
             state
                 .instance_tokens
                 .insert(instance_token.clone(), caller.clone());
-            (
-                201,
-                json!({
-                    "name": name, "owner": caller, "agent": null, "baseRev": body["base_rev"], "headRev": null,
-                    "forkState": "pending", "repo": fork, "remote": repo_url(&fork),
-                    "trunk": { "repo": format!("{project}.src"), "remote": repo_url(&format!("{project}.src")) },
-                    "token": instance_token, "token_id": format!("tok_instance_{name}"),
-                }),
-            )
+            let mut created = instance_json(&state, &caller, name);
+            created["endpoint"] = json!(format!("{}/{owner}/{project}.git", state.base));
+            created["token"] = json!(instance_token);
+            created["token_id"] = json!(format!("tok_instance_{name}"));
+            (201, created)
         }
-        ("GET", ["v1", "projects", project, "instances", name]) => {
-            let remaining = state.pending_polls.get(*name).copied().unwrap_or(0);
-            if remaining > 0 {
-                state
-                    .pending_polls
-                    .insert((*name).to_owned(), remaining - 1);
+        (
+            "POST",
+            [
+                "v1",
+                "projects",
+                owner,
+                project,
+                "instances",
+                name,
+                "trackers",
+                tracker,
+                "fork",
+            ],
+        ) => {
+            let fork = format!("{owner}.{project}.i.{name}.{tracker}");
+            if !exists(&fork) {
+                git(
+                    repos,
+                    &[
+                        "clone",
+                        "-q",
+                        "--bare",
+                        &repo_url(&format!("{owner}.{project}.t.{tracker}")),
+                        &repo_url(&fork),
+                    ],
+                );
             }
-            let fork = format!("{project}.i.{name}");
-            let fork_state = if remaining > 0 { "pending" } else { "ready" };
-            (
-                200,
-                json!({
-                    "name": name, "owner": caller, "baseRev": "x", "forkState": fork_state,
-                    "repo": fork, "remote": repo_url(&fork),
-                }),
-            )
+            let forks = state.forks.entry((*name).to_owned()).or_default();
+            if !forks.iter().any(|known| known == tracker) {
+                forks.push((*tracker).to_owned());
+            }
+            (200, json!({ "repo": fork, "remote": repo_url(&fork) }))
         }
-        ("DELETE", ["v1", "projects", project, "instances", name]) => {
-            let _ = std::fs::remove_dir_all(repo_url(&format!("{project}.i.{name}")));
+        ("GET", ["v1", "projects", _, _, "instances", name]) => {
+            (200, instance_json(&state, &caller, name))
+        }
+        ("DELETE", ["v1", "projects", owner, project, "instances", name]) => {
+            for tracker in state.forks.remove(*name).unwrap_or_default() {
+                let _ = std::fs::remove_dir_all(repo_url(&format!(
+                    "{owner}.{project}.i.{name}.{tracker}"
+                )));
+            }
             (200, json!({ "name": name, "removed": true }))
         }
-        ("POST", ["v1", "projects", _, "credentials"]) => {
+        ("POST", ["v1", "projects", _, _, "credentials"]) => {
             let repo = body["repo"].as_str().unwrap_or_default();
-            // Like the real remote: a per-user lane is its owner's alone.
-            if let Some(owner) = repo.split('.').nth(3)
-                && owner != caller
-            {
+            // Like the real remote: a per-user tracker's repo is its owner's alone.
+            let parts: Vec<&str> = repo.split('.').collect();
+            if parts.len() == 5 && parts[2] == "t" && parts[4] != caller {
                 return (
                     403,
-                    json!({ "error": format!("{repo} is {owner}'s own; each user reads only their own") }),
+                    json!({ "error": format!("{repo} is {}'s own; each user reads only their own", parts[4]) }),
                 );
             }
             if !exists(repo) {
-                // A tracker repo is created on first write; nothing else is.
-                if repo.contains(".t.") && body["scope"] == "write" {
+                // A secret tracker's repo is created on first write; code
+                // tracker repos are seeded and forks made by the fork route.
+                if parts.get(2) == Some(&"t") && body["scope"] == "write" {
                     git(repos, &["init", "-q", "--bare", &repo_url(repo)]);
                 } else {
                     return (
@@ -262,10 +313,10 @@ fn route(
             }
             (200, credential(repo))
         }
-        ("PUT", ["v1", "projects", _, "instances", name, "head"]) => {
+        ("PUT", ["v1", "projects", _, _, "instances", name, "head"]) => {
             (200, json!({ "name": name, "headRev": body["head_rev"] }))
         }
-        ("PUT", ["v1", "projects", _, "checkpoints", instance, id]) => {
+        ("PUT", ["v1", "projects", _, _, "checkpoints", instance, id]) => {
             let key = ((*instance).to_owned(), (*id).to_owned());
             state
                 .checkpoints
@@ -276,7 +327,7 @@ fn route(
                 json!({ "instance": instance, "id": id, "createdBy": caller, "createdAt": "now", "record": body["record"] }),
             )
         }
-        ("GET", ["v1", "projects", _, "checkpoints", instance, id]) => {
+        ("GET", ["v1", "projects", _, _, "checkpoints", instance, id]) => {
             let key = ((*instance).to_owned(), (*id).to_owned());
             match state.checkpoints.get(&key) {
                 Some(record) => (
@@ -410,11 +461,31 @@ fn setup(temp: &Utf8Path) -> Fixture {
         temp.join("workspaces")
     ));
     std::fs::write(&config, text).expect("write config");
+    // The definitions are committed: the remote reads audiences from them.
+    git(&fixture.store, &["add", "-A"]);
+    git(&fixture.store, &["commit", "-q", "-m", "newgit"]);
     fixture.ok(
         &fixture.store,
         &["remote", "add", "--url", &fixture.remote.url],
     );
     fixture
+}
+
+/// A tracker repo's (or fork's) commit, and the files in its tree.
+fn files_at(repo: &Utf8Path, reference: &str) -> String {
+    git(repo, &["ls-tree", "-r", "--name-only", reference])
+}
+
+fn split_source(repo: &Utf8Path, reference: &str) -> String {
+    git(
+        repo,
+        &[
+            "log",
+            "-1",
+            "--format=%(trailers:key=Newgit-Split,valueonly)",
+            reference,
+        ],
+    )
 }
 
 fn workspace_of(fixture: &Fixture, name: &str) -> Utf8PathBuf {
@@ -428,24 +499,32 @@ fn workspace_of(fixture: &Fixture, name: &str) -> Utf8PathBuf {
 // ── Tests ──────────────────────────────────────────────────────────────────
 
 #[test]
-fn remote_add_creates_the_project_and_seeds_trunk_with_this_history() {
+fn remote_add_creates_the_project_with_a_repo_per_code_tracker_and_main() {
     let (_guard, temp) = tempdir();
     let fixture = setup(&temp);
-    let trunk = fixture.remote.repo("store.src");
-    assert_eq!(
-        git(&trunk, &["rev-parse", "main"]),
-        git(&fixture.store, &["rev-parse", "main"])
+    let root = fixture.remote.repo("jack.store.t.root");
+    let project = fixture.remote.repo("jack.store.t.project");
+    assert!(files_at(&root, "main").contains("README.md"));
+    assert!(
+        !files_at(&root, "main").contains(".newgit"),
+        "root holds what no other tracker claims"
     );
+    assert!(files_at(&project, "main").contains(".newgit/config.toml"));
+
+    // `main` names each tracker's commit, and they are what was pushed.
+    let state = fixture.remote.state.lock().expect("state");
+    let list = &state.branches["jack/store"]["main"];
+    assert_eq!(list["root"], git(&root, &["rev-parse", "main"]));
+    assert_eq!(list["project"], git(&project, &["rev-parse", "main"]));
+    drop(state);
+
     let config =
         std::fs::read_to_string(fixture.store.join(".newgit/config.toml")).expect("config");
-    assert!(
-        config.contains(&format!("url = \"{}\"", fixture.remote.url)),
-        "{config}"
-    );
+    assert!(config.contains("project = \"jack/store\""), "{config}");
 }
 
 #[test]
-fn spawn_registers_the_instance_and_gives_the_workspace_its_own_token() {
+fn spawn_registers_the_instance_forks_nothing_and_gives_the_workspace_its_own_token() {
     let (_guard, temp) = tempdir();
     let fixture = setup(&temp);
     fixture.ok(&fixture.store, &["spawn", "feature-a"]);
@@ -472,19 +551,23 @@ fn spawn_registers_the_instance_and_gives_the_workspace_its_own_token() {
     // Never committed: it lives inside .git/.
     assert!(git(&workspace, &["status", "--porcelain"]).is_empty());
 
-    // `origin` fetches trunk.
+    // `origin` fetches the project's Git endpoint.
     assert_eq!(
         git(&workspace, &["config", "remote.origin.url"]),
-        fixture.remote.repo("store.src").as_str()
+        format!("{}/jack/store.git", fixture.remote.url)
     );
-
+    // Nothing forked yet: an instance forks a tracker when it changes it.
+    assert!(
+        !fixture.remote.repo("jack.store.i.feature-a.root").exists(),
+        "spawning forks nothing"
+    );
     let record = std::fs::read_to_string(fixture.store.join(".newgit/branches/feature-a.toml"))
         .expect("record");
-    assert!(record.contains("repo = \"store.i.feature-a\""), "{record}");
+    assert!(record.contains("project = \"jack/store\""), "{record}");
 }
 
 #[test]
-fn a_push_lands_in_the_instance_fork_authenticated_as_the_instance() {
+fn a_push_forks_the_tracker_it_changed_and_lands_there_as_the_instance() {
     let (_guard, temp) = tempdir();
     let fixture = setup(&temp);
     fixture.ok(&fixture.store, &["spawn", "feature-a"]);
@@ -501,26 +584,29 @@ fn a_push_lands_in_the_instance_fork_authenticated_as_the_instance() {
         String::from_utf8_lossy(&push.stderr)
     );
 
-    let fork = fixture.remote.repo("store.i.feature-a");
-    assert_eq!(
-        git(&fork, &["rev-parse", "feature-a"]),
-        head,
-        "the push reached the fork"
-    );
-    let trunk = fixture.remote.repo("store.src");
+    // Root changed, so root was forked; the work is there, split from the
+    // commit the agent made.
+    let fork = fixture.remote.repo("jack.store.i.feature-a.root");
+    assert_eq!(split_source(&fork, "refs/heads/feature-a"), head);
+    assert!(files_at(&fork, "refs/heads/feature-a").contains("change.txt"));
     assert!(
-        git_output(&trunk, &["rev-parse", "--verify", "--quiet", "feature-a"])
-            .stdout
-            .is_empty(),
-        "not trunk"
+        !fixture
+            .remote
+            .repo("jack.store.i.feature-a.project")
+            .exists(),
+        "the tracker it did not change was not forked"
+    );
+    let root = fixture.remote.repo("jack.store.t.root");
+    assert!(
+        !files_at(&root, "main").contains("change.txt"),
+        "root's own history moves only by merge"
     );
 
+    // The fork and its password were asked for on the workspace's own token.
     let instance_token = fake_token("tok_instance_feature-a");
     let requests = fixture.remote.requests();
-    // It waited for the fork, then minted the fork's password on the
-    // workspace's own token — not the owner's login.
-    assert!(requests.iter().any(|(m, p, t)| m == "GET"
-        && p.ends_with("/instances/feature-a")
+    assert!(requests.iter().any(|(m, p, t)| m == "POST"
+        && p.ends_with("/instances/feature-a/trackers/root/fork")
         && *t == instance_token));
     assert!(
         requests
@@ -530,15 +616,18 @@ fn a_push_lands_in_the_instance_fork_authenticated_as_the_instance() {
 }
 
 #[test]
-fn remove_takes_the_instance_off_the_remote() {
+fn remove_takes_the_instance_and_its_forks_off_the_remote() {
     let (_guard, temp) = tempdir();
     let fixture = setup(&temp);
     fixture.ok(&fixture.store, &["spawn", "feature-a"]);
-    assert!(fixture.remote.repo("store.i.feature-a").exists());
+    let workspace = workspace_of(&fixture, "feature-a");
+    std::fs::write(workspace.join("change.txt"), "agent work\n").expect("write");
+    fixture.ok(&workspace, &["checkpoint"]);
+    assert!(fixture.remote.repo("jack.store.i.feature-a.root").exists());
     fixture.ok(&fixture.store, &["remove", "feature-a"]);
     assert!(
-        !fixture.remote.repo("store.i.feature-a").exists(),
-        "the fork is gone"
+        !fixture.remote.repo("jack.store.i.feature-a.root").exists(),
+        "its fork is gone"
     );
     let login = fake_token(LOGIN_TOKEN_ID);
     assert!(
@@ -578,7 +667,7 @@ fn spawn_still_works_when_the_remote_is_unreachable() {
 }
 
 #[test]
-fn a_checkpoint_syncs_source_remote_trackers_and_then_the_record() {
+fn a_checkpoint_syncs_changed_trackers_remote_trackers_and_then_the_record() {
     let (_guard, temp) = tempdir();
     let fixture = setup(&temp);
     // One tracker synced to the remote, one kept on this machine.
@@ -623,19 +712,15 @@ fn a_checkpoint_syncs_source_remote_trackers_and_then_the_record() {
     let output = fixture.ok(&workspace, &["checkpoint"]);
     assert!(!output.contains("not on the remote"), "{output}");
 
-    // Source, uncommitted work included, is in the fork.
-    let fork = fixture.remote.repo("store.i.feature-a");
-    let tip = git(
-        &fork,
-        &["rev-parse", "refs/newgit/checkpoints/ckpt_001/source"],
-    );
-    assert_eq!(
-        git(&fork, &["show", &format!("{tip}:wip.txt")]),
-        "uncommitted"
-    );
+    // The uncommitted work is in root's fork, at the checkpoint's ref — and
+    // no secret tracker's file is.
+    let fork = fixture.remote.repo("jack.store.i.feature-a.root");
+    let files = files_at(&fork, "refs/newgit/checkpoints/ckpt_001");
+    assert!(files.contains("wip.txt"), "{files}");
+    assert!(!files.contains(".env.local") && !files.contains("notes.txt"));
 
     // The remote tracker's rev is in jack's own repo for it; the local one is nowhere.
-    let lane = fixture.remote.repo("store.t.runtime-env.jack");
+    let lane = fixture.remote.repo("jack.store.t.runtime-env.jack");
     let lane_refs = git(
         &lane,
         &["for-each-ref", "--format=%(refname)", "refs/trackers/"],
@@ -646,11 +731,21 @@ fn a_checkpoint_syncs_source_remote_trackers_and_then_the_record() {
         "{lane_refs}"
     );
     assert!(
-        !temp.join("artifacts/store.t.scratch.jack.git").exists(),
+        !temp
+            .join("artifacts/jack.store.t.scratch.jack.git")
+            .exists(),
         "local trackers stay local"
     );
 
-    // The record was written last, naming those refs.
+    // The record names each code tracker's commits, and was written last.
+    let state = fixture.remote.state.lock().expect("state");
+    let record = &state.checkpoints[&("feature-a".to_owned(), "ckpt_001".to_owned())];
+    assert!(record["code"]["tip"]["root"].is_string(), "{record}");
+    assert_ne!(
+        record["code"]["tip"]["root"],
+        record["code"]["head"]["root"]
+    );
+    drop(state);
     let requests = fixture.remote.requests();
     let put = requests
         .iter()
@@ -780,6 +875,7 @@ fn a_teammate_spawns_a_checkpoint_running_with_their_own_keys() {
     std::fs::write(jack_ws.join("feature.txt"), "committed work\n").expect("write");
     git(&jack_ws, &["add", "feature.txt"]);
     git(&jack_ws, &["commit", "-q", "-m", "feature"]);
+    let jack_head = git(&jack_ws, &["rev-parse", "HEAD"]);
     std::fs::write(jack_ws.join("wip.txt"), "uncommitted work\n").expect("write");
     std::fs::write(jack_ws.join(".env.local"), "STRIPE_KEY=jacks-key\n").expect("write");
     let checkpointed = newgit_as(&jack_home, &jack_ws, &["checkpoint"]);
@@ -788,19 +884,19 @@ fn a_teammate_spawns_a_checkpoint_running_with_their_own_keys() {
         "{checkpointed}"
     );
 
-    // Ana's machine: a clone of trunk, her own key, never Jack's.
+    // Ana's machine: a clone composed from the trackers she may read, her
+    // own key, never Jack's.
     let ana = temp.join("ana-store");
-    git(
+    newgit_as(
+        &ana_home,
         &temp,
-        &[
-            "clone",
-            "-q",
-            remote.repo("store.src").as_str(),
-            ana.as_str(),
-        ],
+        &["clone", "jack/store", ana.as_str(), "--url", &remote.url],
     );
-    // The clone already names the remote; joining checks Ana is a member.
-    newgit_as(&ana_home, &ana, &["remote", "add"]);
+    assert_eq!(
+        git(&ana, &["rev-parse", "HEAD"]),
+        git(&jack, &["rev-parse", "HEAD"]),
+        "the clone is Jack's history, commit for commit"
+    );
     std::fs::write(ana.join(".env.local"), "STRIPE_KEY=anas-key\n").expect("write");
     newgit_as(
         &ana_home,
@@ -822,6 +918,11 @@ fn a_teammate_spawns_a_checkpoint_running_with_their_own_keys() {
     let outcome: Value = serde_json::from_str(spawned.trim()).expect("json");
     assert_eq!(outcome["author"], "jack");
     let ana_ws = Utf8PathBuf::from(outcome["workspace"].as_str().expect("workspace"));
+    assert_eq!(
+        git(&ana_ws, &["rev-parse", "HEAD"]),
+        jack_head,
+        "the same commit ids on both machines"
+    );
 
     let read = |file: &str| {
         std::fs::read_to_string(ana_ws.join(file)).unwrap_or_else(|_| panic!("{file} missing"))

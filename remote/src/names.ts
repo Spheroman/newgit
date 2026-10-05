@@ -1,21 +1,38 @@
 // Repo naming and the rules for who may hold a token for which repo.
 //
 // Every project shares one Artifacts namespace (a binding names exactly one),
-// so a repo's name carries its project and role:
+// so a repo's name carries its owner, project, and role:
 //
-//   <project>.src                  trunk
-//   <project>.i.<instance>         one fork per branch instance
-//   <project>.t.<tracker>          a shared tracker's lane
-//   <project>.t.<tracker>.<login>  one user's lane of a per-user tracker
+//   <owner>.<project>.t.<tracker>             a tracker's history: a code
+//                                             tracker's, or a shared secret one
+//   <owner>.<project>.t.<tracker>.<login>     one user's per-user secret tracker
+//   <owner>.<project>.i.<instance>.<tracker>  an instance's fork of one code
+//                                             tracker, made the first time the
+//                                             instance changes it
 //
-// `.` separates the parts, so no part may contain one. Pure functions only:
-// everything here is decided from its arguments, so it can be tested
-// exhaustively without a runtime.
+// A project is `<owner>/<project>`, like a GitHub repository: the owner is
+// the GitHub login that created it. `.` separates the parts, so no part may
+// contain one. Pure functions only: everything here is decided from its
+// arguments, so it can be tested exhaustively without a runtime.
+
+/** A project, as `<owner>/<name>`. */
+export interface ProjectId {
+	owner: string;
+	name: string;
+}
+
+export const projectKey = (project: ProjectId) => `${project.owner}/${project.name}`;
+
+export function parseProjectKey(key: string): ProjectId | null {
+	const [owner, name, ...rest] = key.split("/");
+	if (rest.length > 0 || owner === undefined || name === undefined) return null;
+	if (!PART.test(owner) || !PART.test(name)) return null;
+	return { owner: owner.toLowerCase(), name };
+}
 
 export type RepoRef =
-	| { kind: "src"; project: string }
-	| { kind: "instance"; project: string; instance: string }
-	| { kind: "tracker"; project: string; tracker: string; login?: string };
+	| { kind: "tracker"; project: ProjectId; tracker: string; login?: string }
+	| { kind: "fork"; project: ProjectId; instance: string; tracker: string };
 
 const PART = /^[A-Za-z0-9][A-Za-z0-9_-]{0,62}$/;
 
@@ -26,27 +43,25 @@ export function partProblem(what: string, value: string): string | null {
 }
 
 export function repoName(ref: RepoRef): string {
+	const prefix = `${ref.project.owner}.${ref.project.name}`;
 	switch (ref.kind) {
-		case "src":
-			return `${ref.project}.src`;
-		case "instance":
-			return `${ref.project}.i.${ref.instance}`;
 		case "tracker":
-			return ref.login === undefined
-				? `${ref.project}.t.${ref.tracker}`
-				: `${ref.project}.t.${ref.tracker}.${ref.login}`;
+			return ref.login === undefined ? `${prefix}.t.${ref.tracker}` : `${prefix}.t.${ref.tracker}.${ref.login}`;
+		case "fork":
+			return `${prefix}.i.${ref.instance}.${ref.tracker}`;
 	}
 }
 
 export function parseRepoName(name: string): RepoRef | null {
 	const parts = name.split(".");
 	if (parts.some((part) => !PART.test(part))) return null;
-	const [project, role, ...rest] = parts;
-	if (role === "src" && rest.length === 0) return { kind: "src", project };
-	if (role === "i" && rest.length === 1) return { kind: "instance", project, instance: rest[0] };
+	const [owner, projectName, role, ...rest] = parts;
+	if (owner === undefined || projectName === undefined) return null;
+	const project = { owner: owner.toLowerCase(), name: projectName };
 	if (role === "t" && rest.length === 1) return { kind: "tracker", project, tracker: rest[0] };
 	if (role === "t" && rest.length === 2)
 		return { kind: "tracker", project, tracker: rest[0], login: rest[1].toLowerCase() };
+	if (role === "i" && rest.length === 2) return { kind: "fork", project, instance: rest[0], tracker: rest[1] };
 	return null;
 }
 
@@ -75,10 +90,14 @@ export interface Requester {
 }
 
 export interface Facts {
-	/** Owner of the instance, for instance repos; undefined when there is no such instance. */
+	/** Owner of the instance, for forks; undefined when there is no such instance. */
 	instanceOwner?: string;
-	/** The tracker's audience on trunk, for tracker repos; undefined when trunk does not define it. */
-	audience?: Audience;
+	/**
+	 * The tracker's definition on the project's default branch — its
+	 * audience, and whether it is a code tracker (committed) or a secret one.
+	 * Undefined when that branch does not define it.
+	 */
+	tracker?: { audience: Audience; code: boolean };
 }
 
 export type Decision = { ok: true } | { ok: false; reason: string };
@@ -86,52 +105,68 @@ export type Decision = { ok: true } | { ok: false; reason: string };
 const allow: Decision = { ok: true };
 const deny = (reason: string): Decision => ({ ok: false, reason });
 
+/** May `who` read content whose audience is `audience`? */
+function mayRead(audience: Audience, who: Requester, project: string): Decision {
+	switch (audience.kind) {
+		case "public":
+			return allow;
+		case "project-devs":
+		case "user":
+			return who.member ? allow : deny(`${who.login} is not a member of ${project}`);
+		case "named":
+			if (!who.member) return deny(`${who.login} is not a member of ${project}`);
+			return audience.login === who.login ? allow : deny(`this is for user:${audience.login} only`);
+	}
+}
+
 /**
- * May `who` hold a `scope` token for `ref`? The table in newgit-cloudflare.md
- * (*Identity And Tokens*), as code.
+ * May `who` hold a `scope` token for `ref`? The table in newgit-trackers.md
+ * (*On the remote*), as code.
  */
 export function decide(ref: RepoRef, scope: Scope, who: Requester, facts: Facts): Decision {
 	const name = repoName(ref);
-	switch (ref.kind) {
-		case "src":
-			if (!who.member) return deny(`${who.login} is not a member of ${ref.project}`);
-			if (scope === "write")
-				return deny(`nobody pushes to trunk (${name}); trunk moves only through \`newgit merge\``);
-			return allow;
+	const project = projectKey(ref.project);
+	const tracker = facts.tracker;
+	if (tracker === undefined)
+		return deny(`tracker \`${ref.tracker}\` is not defined on ${project}'s default branch`);
 
-		case "instance":
-			if (!who.member) return deny(`${who.login} is not a member of ${ref.project}`);
-			if (facts.instanceOwner === undefined) return deny(`no instance \`${ref.instance}\` in ${ref.project}`);
+	switch (ref.kind) {
+		case "fork": {
+			if (!tracker.code) return deny(`\`${ref.tracker}\` is a secret tracker; instances do not fork it`);
+			if (facts.instanceOwner === undefined) return deny(`no instance \`${ref.instance}\` in ${project}`);
+			const read = mayRead(tracker.audience, who, project);
+			if (!read.ok) return read;
 			if (scope === "write" && facts.instanceOwner !== who.login)
-				return deny(`instance \`${ref.instance}\` belongs to ${facts.instanceOwner}; only its owner pushes to ${name}`);
+				return deny(
+					`instance \`${ref.instance}\` belongs to ${facts.instanceOwner}; only its owner pushes to ${name}`,
+				);
 			return allow;
+		}
 
 		case "tracker": {
-			const audience = facts.audience;
-			if (audience === undefined)
-				return deny(`tracker \`${ref.tracker}\` is not defined on ${ref.project}'s trunk`);
+			const audience = tracker.audience;
 			if (audience.kind === "user") {
 				if (ref.login === undefined)
 					return deny(`tracker \`${ref.tracker}\` is per-user; its content lives in ${name}.<login>`);
-				if (!who.member) return deny(`${who.login} is not a member of ${ref.project}`);
+				if (!who.member) return deny(`${who.login} is not a member of ${project}`);
 				if (ref.login !== who.login)
 					return deny(`${name} is ${ref.login}'s own \`${ref.tracker}\`; each user reads only their own`);
 				return allow;
 			}
 			if (ref.login !== undefined)
 				return deny(`tracker \`${ref.tracker}\` is not per-user, so it has no per-user repos`);
-			switch (audience.kind) {
-				case "public":
-					if (scope === "read") return allow;
-					return who.member ? allow : deny(`${who.login} is not a member of ${ref.project}`);
-				case "project-devs":
-					return who.member ? allow : deny(`${who.login} is not a member of ${ref.project}`);
-				case "named":
-					if (!who.member) return deny(`${who.login} is not a member of ${ref.project}`);
-					return audience.login === who.login
-						? allow
-						: deny(`tracker \`${ref.tracker}\` is for user:${audience.login} only`);
-			}
+			const read = mayRead(audience, who, project);
+			if (!read.ok) return read;
+			if (scope === "read") return allow;
+			// A code tracker's history moves only through `newgit merge`; an
+			// instance's work goes to its fork. A shared secret tracker is
+			// written by its audience, as its content is captured.
+			if (tracker.code)
+				return deny(
+					`nobody pushes to ${name}: a code tracker's history moves only through \`newgit merge\`; an instance pushes to its fork`,
+				);
+			if (audience.kind === "public" && !who.member) return deny(`${who.login} is not a member of ${project}`);
+			return allow;
 		}
 	}
 }

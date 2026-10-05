@@ -114,6 +114,16 @@ impl MetadataStore {
         Ok(store)
     }
 
+    /// Take up a `.newgit/` that arrived with the project's history (a clone):
+    /// its committed definitions are kept, and only the local state around
+    /// them is made.
+    pub fn adopt(project_root: impl Into<Utf8PathBuf>) -> Result<Self> {
+        let store = Self::at(project_root);
+        store.ensure_initialized()?;
+        store.create_layout()?;
+        Ok(store)
+    }
+
     /// Write the root tracker's definition and give it the project's history
     /// as its `main`: a copy of the repository's current branch. A repository
     /// with no commits yet gives root no history.
@@ -202,11 +212,7 @@ impl MetadataStore {
 
     pub fn load_config(&self) -> Result<ProjectConfig> {
         let config: ProjectConfig = read_toml_at(&self.paths.config)?;
-        if let Some(problem) = config
-            .remote
-            .as_ref()
-            .and_then(|remote| remote.problem(&config.project.name))
-        {
+        if let Some(problem) = config.remote.as_ref().and_then(|remote| remote.problem()) {
             return Err(NewgitError::InvalidDefinition {
                 kind: "config section",
                 name: "[remote]".to_owned(),

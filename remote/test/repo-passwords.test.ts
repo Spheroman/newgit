@@ -12,14 +12,19 @@ import { FakeRepos } from "./fake-repos";
 let repos: FakeRepos;
 let pending: Promise<unknown>[];
 let project: string;
+let slug: string;
+let root: string;
 let jack: string;
 
 beforeEach(async () => {
 	repos = new FakeRepos();
 	pending = [];
-	project = `acme-${crypto.randomUUID().slice(0, 8)}`;
+	slug = `acme-${crypto.randomUUID().slice(0, 8)}`;
+	project = `jack/${slug}`;
 	jack = (await issue(env, { kind: "login", login: "jack", ttlSeconds: LOGIN_TTL_SECONDS })).token;
-	expect((await call(jack, "POST", "/v1/projects", { name: project })).status).toBe(201);
+	expect((await call(jack, "POST", "/v1/projects", { name: slug, trackers: ["root", "project"] })).status).toBe(201);
+	root = `jack.${slug}.t.root`;
+	repos.write(`jack.${slug}.t.project`, ".newgit/trackers/root.toml", 'audience = "project-devs"\nsecret = false\n');
 });
 
 async function call(token: string, method: string, path: string, body?: unknown) {
@@ -49,8 +54,8 @@ describe("revoking a newgit token", () => {
 	it("revokes the repo passwords it minted, and only those", async () => {
 		const agent = (await call(jack, "POST", "/v1/tokens", { name: "agent-3" })).body;
 		const other = (await call(jack, "POST", "/v1/tokens", { name: "agent-4" })).body;
-		const leaked = await passwordsFor(agent.token, `${project}.src`, `${project}.src`);
-		const kept = await passwordsFor(other.token, `${project}.src`);
+		const leaked = await passwordsFor(agent.token, root, root);
+		const kept = await passwordsFor(other.token, root);
 
 		const revoked = await call(jack, "DELETE", `/v1/tokens/${agent.id}`);
 		expect(revoked.body.repo_tokens_revoked).toBe(2);
@@ -61,7 +66,8 @@ describe("revoking a newgit token", () => {
 	it("removing an instance revokes its workspace's repo passwords", async () => {
 		const spawned = (await call(jack, "POST", `/v1/projects/${project}/instances`, { name: "attempt-1", base_rev: "a" })).body;
 		await Promise.all(pending);
-		const ids = await passwordsFor(spawned.token, `${project}.i.attempt-1`);
+		expect((await call(spawned.token, "POST", `/v1/projects/${project}/instances/attempt-1/trackers/root/fork`)).status).toBe(200);
+		const ids = await passwordsFor(spawned.token, `jack.${slug}.i.attempt-1.root`);
 		expect((await call(jack, "DELETE", `/v1/projects/${project}/instances/attempt-1`)).status).toBe(200);
 		for (const id of ids) expect(repos.revokedTokens.has(id)).toBe(true);
 	});
@@ -69,7 +75,7 @@ describe("revoking a newgit token", () => {
 	it("renewal does not cut off a push in flight", async () => {
 		const spawned = (await call(jack, "POST", `/v1/projects/${project}/instances`, { name: "attempt-1", base_rev: "a" })).body;
 		await Promise.all(pending);
-		const ids = await passwordsFor(spawned.token, `${project}.src`);
+		const ids = await passwordsFor(spawned.token, root);
 		expect((await call(spawned.token, "POST", "/v1/tokens/renew")).status).toBe(201);
 		for (const id of ids) expect(repos.revokedTokens.has(id)).toBe(false);
 	});

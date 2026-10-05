@@ -8,15 +8,19 @@ import { FakeRepos } from "./fake-repos";
 let repos: FakeRepos;
 let pending: Promise<unknown>[];
 let project: string;
+let slug: string;
 let jack: string;
 
 beforeEach(async () => {
 	repos = new FakeRepos();
 	pending = [];
-	project = `acme-${crypto.randomUUID().slice(0, 8)}`;
+	slug = `acme-${crypto.randomUUID().slice(0, 8)}`;
+	project = `jack/${slug}`;
 	jack = (await issue(env, { kind: "login", login: "jack", ttlSeconds: LOGIN_TTL_SECONDS })).token;
-	expect((await call(jack, "POST", "/v1/projects", { name: project })).status).toBe(201);
-	repos.write(`${project}.src`, ".newgit/trackers/runtime-env.toml", 'audience = "user"\n');
+	expect((await call(jack, "POST", "/v1/projects", { name: slug, trackers: ["root", "project"] })).status).toBe(201);
+	const define = (name: string, text: string) => repos.write(`jack.${slug}.t.project`, `.newgit/trackers/${name}.toml`, text);
+	define("root", 'audience = "project-devs"\nsecret = false\n');
+	define("runtime-env", 'audience = "user"\n');
 });
 
 async function call(token: string, method: string, path: string, body?: unknown) {
@@ -37,7 +41,7 @@ async function spawn(name: string, as = jack) {
 	const created = await call(as, "POST", `/v1/projects/${project}/instances`, { name, base_rev: "abc" });
 	expect(created.status).toBe(201);
 	await Promise.all(pending);
-	return created.body as { token: string; token_id: string; repo: string };
+	return created.body as { token: string; token_id: string };
 }
 
 const credential = (token: string, repo: string, scope = "read") =>
@@ -59,17 +63,19 @@ describe("instance tokens", () => {
 		const one = await spawn("attempt-1");
 		await spawn("attempt-2");
 
-		expect((await credential(one.token, `${project}.i.attempt-1`, "write")).status).toBe(200);
+		for (const name of ["attempt-1", "attempt-2"])
+			expect((await call(jack, "POST", `/v1/projects/${project}/instances/${name}/trackers/root/fork`)).status).toBe(200);
+		expect((await credential(one.token, `jack.${slug}.i.attempt-1.root`, "write")).status).toBe(200);
 		expect((await call(one.token, "PUT", `/v1/projects/${project}/checkpoints/attempt-1/ckpt_001`, { record: {} })).status).toBe(201);
 		expect((await call(one.token, "PUT", `/v1/projects/${project}/instances/attempt-1/head`, { head_rev: "def" })).status).toBe(200);
 
-		// Acting as jack, it may still read trunk and use jack's own lanes.
-		expect((await credential(one.token, `${project}.src`)).status).toBe(200);
-		expect((await credential(one.token, `${project}.t.runtime-env.jack`, "write")).status).toBe(200);
+		// Acting as jack, it may still read the code tracker and use jack's own lanes.
+		expect((await credential(one.token, `jack.${slug}.t.root`)).status).toBe(200);
+		expect((await credential(one.token, `jack.${slug}.t.runtime-env.jack`, "write")).status).toBe(200);
 
 		// But not another attempt, even one jack owns.
 		for (const refused of [
-			await credential(one.token, `${project}.i.attempt-2`, "write"),
+			await credential(one.token, `jack.${slug}.i.attempt-2.root`, "write"),
 			await call(one.token, "PUT", `/v1/projects/${project}/checkpoints/attempt-2/ckpt_001`, { record: {} }),
 			await call(one.token, "PUT", `/v1/projects/${project}/instances/attempt-2/head`, { head_rev: "def" }),
 		]) {

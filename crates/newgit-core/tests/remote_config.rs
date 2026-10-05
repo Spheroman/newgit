@@ -51,23 +51,23 @@ fn store_with(temp: &Utf8Path, remote: &str) -> MetadataStore {
 }
 
 #[test]
-fn a_remote_names_its_project_after_the_local_one_unless_told_otherwise() {
+fn a_remote_project_is_owner_slash_name_once_remote_add_set_it() {
+    // A url alone: the project is not on the remote yet.
     let (_guard, temp) = tempdir();
     let store = store_with(
         &temp,
         "\n[remote]\nurl = \"https://newgit.example.workers.dev\"\n",
     );
-    let config = store.load_config().expect("load");
-    assert_eq!(config.remote_project(), Some("acme"));
+    assert_eq!(store.load_config().expect("load").remote_project(), None);
 
     let (_guard, temp) = tempdir();
     let store = store_with(
         &temp,
-        "\n[remote]\nurl = \"https://newgit.example.workers.dev\"\nproject = \"acme-web\"\n",
+        "\n[remote]\nurl = \"https://newgit.example.workers.dev\"\nproject = \"jack/acme-web\"\n",
     );
     assert_eq!(
         store.load_config().expect("load").remote_project(),
-        Some("acme-web")
+        Some("jack/acme-web")
     );
 
     let (_guard, temp) = tempdir();
@@ -103,14 +103,18 @@ fn plain_http_is_refused_except_for_a_local_worker() {
 }
 
 #[test]
-fn a_project_name_the_remote_cannot_use_is_refused_with_the_fix() {
-    let (_guard, temp) = tempdir();
-    let store = store_with(
-        &temp,
-        "\n[remote]\nurl = \"https://newgit.example.workers.dev\"\nproject = \"-acme\"\n",
-    );
-    let error = store.load_config().expect_err("leading dash");
-    assert!(error.to_string().contains("cannot name repos"), "{error}");
+fn a_project_the_remote_cannot_name_is_refused_with_the_fix() {
+    for project in ["-acme", "acme", "jack/ac.me", "jack/acme/extra"] {
+        let (_guard, temp) = tempdir();
+        let store = store_with(
+            &temp,
+            &format!(
+                "\n[remote]\nurl = \"https://newgit.example.workers.dev\"\nproject = \"{project}\"\n"
+            ),
+        );
+        let error = store.load_config().expect_err(project);
+        assert!(error.to_string().contains("<owner>/<name>"), "{error}");
+    }
 }
 
 #[test]

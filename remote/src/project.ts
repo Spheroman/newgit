@@ -1,7 +1,10 @@
-// One Durable Object per project: the records *about* history. Artifacts holds
-// the history itself; this holds who is in the project, which instances exist
-// and what they are bound to, and every checkpoint. A Durable Object handles
-// one request at a time, so two agents writing at once queue rather than race.
+// One Durable Object per project (`<owner>/<name>`): the records *about*
+// history. Artifacts holds the history itself, one repo per tracker; this
+// holds who is in the project, its branches — each a list of one commit per
+// code tracker — which instances exist and which trackers they forked, and
+// every checkpoint. A Durable Object handles one request at a time, so two
+// agents writing at once queue rather than race, and a branch's list moves in
+// one write: every tracker together, or none.
 
 import { DurableObject } from "cloudflare:workers";
 
@@ -9,9 +12,19 @@ export interface ProjectInfo {
 	name: string;
 	owner: string;
 	createdAt: string;
+	defaultBranch: string;
 }
 
-export type ForkState = "pending" | "ready" | "failed";
+/** A branch: one commit per code tracker, by tracker name. */
+export type TrackerList = Record<string, string>;
+
+export interface Branch {
+	name: string;
+	list: TrackerList;
+	createdBy: string;
+	createdAt: string;
+	updatedAt: string;
+}
 
 export interface Instance {
 	name: string;
@@ -20,8 +33,8 @@ export interface Instance {
 	agent: string | null;
 	baseRev: string;
 	headRev: string | null;
-	forkState: ForkState;
-	forkError: string | null;
+	/** The code trackers this instance has forked: the ones it changed. */
+	forks: string[];
 	createdAt: string;
 	updatedAt: string;
 }
@@ -47,26 +60,30 @@ export class ProjectDO extends DurableObject<Env> {
 			CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 			CREATE TABLE IF NOT EXISTS members (
 				login TEXT PRIMARY KEY, added_by TEXT NOT NULL, added_at TEXT NOT NULL);
+			CREATE TABLE IF NOT EXISTS branches (
+				name TEXT PRIMARY KEY, list TEXT NOT NULL, created_by TEXT NOT NULL,
+				created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
 			CREATE TABLE IF NOT EXISTS instances (
-				name TEXT PRIMARY KEY, owner TEXT NOT NULL, base_rev TEXT NOT NULL, head_rev TEXT,
-				fork_state TEXT NOT NULL, fork_error TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+				name TEXT PRIMARY KEY, owner TEXT NOT NULL, agent TEXT, base_rev TEXT NOT NULL, head_rev TEXT,
+				created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+			CREATE TABLE IF NOT EXISTS forks (
+				instance TEXT NOT NULL, tracker TEXT NOT NULL, PRIMARY KEY (instance, tracker));
 			CREATE TABLE IF NOT EXISTS checkpoints (
-				instance TEXT NOT NULL, id TEXT NOT NULL, created_by TEXT NOT NULL, created_at TEXT NOT NULL,
-				record TEXT NOT NULL, PRIMARY KEY (instance, id));
+				instance TEXT NOT NULL, id TEXT NOT NULL, created_by TEXT NOT NULL, agent TEXT,
+				created_at TEXT NOT NULL, record TEXT NOT NULL, PRIMARY KEY (instance, id));
 		`);
-		// Which agent (acting as its owner) made a record, when one did.
-		for (const table of ["instances", "checkpoints"]) {
-			const columns = this.sql.exec<{ name: string }>(`PRAGMA table_info(${table})`).toArray();
-			if (!columns.some((column) => column.name === "agent"))
-				this.sql.exec(`ALTER TABLE ${table} ADD COLUMN agent TEXT`);
-		}
 	}
 
 	/** Create the project. Returns false when it already exists. */
 	init(name: string, owner: string): boolean {
 		if (this.info() !== null) return false;
 		const now = new Date().toISOString();
-		this.sql.exec("INSERT INTO meta VALUES ('name', ?), ('owner', ?), ('created_at', ?)", name, owner, now);
+		this.sql.exec(
+			"INSERT INTO meta VALUES ('name', ?), ('owner', ?), ('created_at', ?), ('default_branch', 'main')",
+			name,
+			owner,
+			now,
+		);
 		this.sql.exec("INSERT INTO members VALUES (?, ?, ?)", owner, owner, now);
 		return true;
 	}
@@ -75,7 +92,39 @@ export class ProjectDO extends DurableObject<Env> {
 		const rows = this.sql.exec<{ key: string; value: string }>("SELECT key, value FROM meta").toArray();
 		const meta = Object.fromEntries(rows.map((row) => [row.key, row.value]));
 		if (!meta.name) return null;
-		return { name: meta.name, owner: meta.owner, createdAt: meta.created_at };
+		return {
+			name: meta.name,
+			owner: meta.owner,
+			createdAt: meta.created_at,
+			defaultBranch: meta.default_branch ?? "main",
+		};
+	}
+
+	setDefaultBranch(name: string): boolean {
+		if (this.branch(name) === null) return false;
+		this.sql.exec("INSERT OR REPLACE INTO meta VALUES ('default_branch', ?)", name);
+		return true;
+	}
+
+	branch(name: string): Branch | null {
+		const row = this.sql.exec<BranchRow>("SELECT * FROM branches WHERE name = ?", name).toArray()[0];
+		return row ? toBranch(row) : null;
+	}
+
+	branches(): Branch[] {
+		return this.sql.exec<BranchRow>("SELECT * FROM branches ORDER BY name").toArray().map(toBranch);
+	}
+
+	/**
+	 * Create a branch from a list. Returns null when it exists already: a
+	 * branch's list moves only by merging (`newgit merge`), never by being
+	 * written over.
+	 */
+	createBranch(name: string, list: TrackerList, by: string): Branch | null {
+		if (this.branch(name) !== null) return null;
+		const now = new Date().toISOString();
+		this.sql.exec("INSERT INTO branches VALUES (?, ?, ?, ?, ?)", name, JSON.stringify(list), by, now, now);
+		return this.branch(name);
 	}
 
 	isMember(login: string): boolean {
@@ -105,35 +154,50 @@ export class ProjectDO extends DurableObject<Env> {
 		if (this.instance(name) !== null) return null;
 		const now = new Date().toISOString();
 		this.sql.exec(
-			`INSERT INTO instances (name, owner, base_rev, head_rev, fork_state, fork_error, created_at, updated_at, agent)
-			 VALUES (?, ?, ?, NULL, 'pending', NULL, ?, ?, ?)`,
+			`INSERT INTO instances (name, owner, agent, base_rev, head_rev, created_at, updated_at)
+			 VALUES (?, ?, ?, ?, NULL, ?, ?)`,
 			name,
 			owner,
+			agent,
 			baseRev,
 			now,
 			now,
-			agent,
 		);
 		return this.instance(name);
 	}
 
 	instance(name: string): Instance | null {
 		const row = this.sql.exec<InstanceRow>("SELECT * FROM instances WHERE name = ?", name).toArray()[0];
-		return row ? toInstance(row) : null;
+		return row ? this.toInstance(row) : null;
 	}
 
 	instances(): Instance[] {
-		return this.sql.exec<InstanceRow>("SELECT * FROM instances ORDER BY created_at, name").toArray().map(toInstance);
+		return this.sql
+			.exec<InstanceRow>("SELECT * FROM instances ORDER BY created_at, name")
+			.toArray()
+			.map((row) => this.toInstance(row));
 	}
 
-	setForkState(name: string, state: ForkState, error: string | null = null): void {
-		this.sql.exec(
-			"UPDATE instances SET fork_state = ?, fork_error = ?, updated_at = ? WHERE name = ?",
-			state,
-			error,
-			new Date().toISOString(),
-			name,
-		);
+	/** Record that `instance` forked `tracker`. */
+	addFork(instance: string, tracker: string): void {
+		this.sql.exec("INSERT OR IGNORE INTO forks VALUES (?, ?)", instance, tracker);
+	}
+
+	private toInstance(row: InstanceRow): Instance {
+		const forks = this.sql
+			.exec<{ tracker: string }>("SELECT tracker FROM forks WHERE instance = ? ORDER BY tracker", row.name)
+			.toArray()
+			.map((fork) => fork.tracker);
+		return {
+			name: row.name,
+			owner: row.owner,
+			agent: row.agent,
+			baseRev: row.base_rev,
+			headRev: row.head_rev,
+			forks,
+			createdAt: row.created_at,
+			updatedAt: row.updated_at,
+		};
 	}
 
 	setHead(name: string, headRev: string): Instance | null {
@@ -146,9 +210,10 @@ export class ProjectDO extends DurableObject<Env> {
 		return this.instance(name);
 	}
 
-	/** Remove the instance and its checkpoints. Its repo is the caller's to delete. */
+	/** Remove the instance, its forks' records, and its checkpoints. Its fork repos are the caller's to delete. */
 	deleteInstance(name: string): boolean {
 		this.sql.exec("DELETE FROM checkpoints WHERE instance = ?", name);
+		this.sql.exec("DELETE FROM forks WHERE instance = ?", name);
 		return this.sql.exec("DELETE FROM instances WHERE name = ?", name).rowsWritten > 0;
 	}
 
@@ -197,10 +262,26 @@ interface InstanceRow extends Record<string, SqlStorageValue> {
 	agent: string | null;
 	base_rev: string;
 	head_rev: string | null;
-	fork_state: string;
-	fork_error: string | null;
 	created_at: string;
 	updated_at: string;
+}
+
+interface BranchRow extends Record<string, SqlStorageValue> {
+	name: string;
+	list: string;
+	created_by: string;
+	created_at: string;
+	updated_at: string;
+}
+
+function toBranch(row: BranchRow): Branch {
+	return {
+		name: row.name,
+		list: JSON.parse(row.list) as TrackerList,
+		createdBy: row.created_by,
+		createdAt: row.created_at,
+		updatedAt: row.updated_at,
+	};
 }
 
 interface CheckpointRow extends Record<string, SqlStorageValue> {
@@ -210,20 +291,6 @@ interface CheckpointRow extends Record<string, SqlStorageValue> {
 	agent: string | null;
 	created_at: string;
 	record: string;
-}
-
-function toInstance(row: InstanceRow): Instance {
-	return {
-		name: row.name,
-		owner: row.owner,
-		agent: row.agent,
-		baseRev: row.base_rev,
-		headRev: row.head_rev,
-		forkState: row.fork_state as ForkState,
-		forkError: row.fork_error,
-		createdAt: row.created_at,
-		updatedAt: row.updated_at,
-	};
 }
 
 function toCheckpoint(row: CheckpointRow): Checkpoint {

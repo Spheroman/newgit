@@ -7,13 +7,15 @@ import { FakeRepos } from "./fake-repos";
 
 let repos: FakeRepos;
 let project: string;
+let slug: string;
 let jack: string;
 
 beforeEach(async () => {
 	repos = new FakeRepos();
-	project = `acme-${crypto.randomUUID().slice(0, 8)}`;
+	slug = `acme-${crypto.randomUUID().slice(0, 8)}`;
+	project = `jack/${slug}`;
 	jack = (await issue(env, { kind: "login", login: "jack", ttlSeconds: LOGIN_TTL_SECONDS })).token;
-	expect((await call(jack, "POST", "/v1/projects", { name: project })).status).toBe(201);
+	expect((await call(jack, "POST", "/v1/projects", { name: slug, trackers: ["root", "project"] })).status).toBe(201);
 });
 
 async function call(token: string, method: string, path: string, body?: unknown) {
@@ -74,7 +76,7 @@ describe("tokens", () => {
 		for (const [method, path, body] of [
 			["POST", "/v1/tokens", { name: "child" }],
 			["GET", "/v1/tokens", undefined],
-			["POST", "/v1/projects", { name: `${project}-2` }],
+			["POST", "/v1/projects", { name: `${slug}-2`, trackers: ["root"] }],
 			["POST", `/v1/projects/${project}/members`, { login: "eve" }],
 		] as const) {
 			const refused = await call(agent.token, method, path, body);
@@ -84,8 +86,8 @@ describe("tokens", () => {
 	});
 
 	it("an agent pinned to a project cannot touch another", async () => {
-		const other = `${project}-other`;
-		expect((await call(jack, "POST", "/v1/projects", { name: other })).status).toBe(201);
+		const other = `jack/${slug}-other`;
+		expect((await call(jack, "POST", "/v1/projects", { name: `${slug}-other`, trackers: ["root"] })).status).toBe(201);
 		const pinned = await agentToken("agent-3", { project });
 		expect((await call(pinned.token, "GET", `/v1/projects/${project}`)).status).toBe(200);
 		const refused = await call(pinned.token, "GET", `/v1/projects/${other}`);
