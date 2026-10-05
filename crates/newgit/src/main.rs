@@ -808,8 +808,8 @@ fn spawn(args: SpawnArgs) -> Result<()> {
                 remote.project, remote.endpoint
             );
             println!(
-                "  push:      `git push` checkpoints, then publishes each changed tracker to \
-                 this instance's fork of it"
+                "  push:      nothing leaves this machine until you `git push` or checkpoint; \
+                 then each changed tracker goes to this instance's fork of it"
             );
         }
         (None, Some(warning)) => {
@@ -818,7 +818,10 @@ fn spawn(args: SpawnArgs) -> Result<()> {
             );
         }
         (None, None) => match manager.publish_url()? {
-            Some(url) => println!("  push:      `git push` checkpoints, then publishes to {url}"),
+            Some(url) => println!(
+                "  push:      nothing leaves this machine until you `git push`; that checkpoints, \
+                 then publishes to {url}"
+            ),
             None => println!(
                 "  push:      the store has no `origin` remote, so `git push` from this workspace \
                  will be refused"
@@ -867,8 +870,13 @@ fn spawn(args: SpawnArgs) -> Result<()> {
             (None, None) => match &resource.prepare {
                 Some((true, _)) => " prepare: ok".to_owned(),
                 Some((false, log)) => {
+                    // The hook ran quietly; its last lines are usually the why.
+                    let tail = newgit_core::supervisor::log_tail(log, 8)
+                        .into_iter()
+                        .map(|line| format!("\n               | {line}"))
+                        .collect::<String>();
                     format!(
-                        " prepare: FAILED (log: {log}; re-run with `newgit action {}.prepare`)",
+                        " prepare: FAILED (log: {log}; re-run with `newgit action {}.prepare`){tail}",
                         resource.name
                     )
                 }
@@ -929,6 +937,15 @@ fn spawn(args: SpawnArgs) -> Result<()> {
             branch.name
         );
         std::process::exit(1);
+    }
+    let readiness = manager.readiness(branch);
+    if readiness.is_ready() {
+        println!("ready: `{}`", branch.name);
+    } else {
+        println!("not ready: `{}`", branch.name);
+        for problem in &readiness.problems {
+            println!("  - {problem}");
+        }
     }
     Ok(())
 }
@@ -1508,6 +1525,15 @@ fn status(name: Option<&str>, path_only: bool) -> Result<()> {
             width = name_width - 2,
         );
     }
+    for report in reports
+        .iter()
+        .filter(|report| report.workspace_exists && !report.readiness.is_ready())
+    {
+        println!("\n`{}` is not ready:", report.branch.name);
+        for problem in &report.readiness.problems {
+            println!("  - {problem}");
+        }
+    }
     if any_never_pulled {
         println!(
             "\n^ = its `main` has content this instance never pulled; catch up with `newgit tracker pull <tracker> [instance]`"
@@ -1533,9 +1559,16 @@ fn status_column(report: &InstanceReport) -> String {
     if !report.workspace_exists {
         return "ws-missing".to_owned();
     }
+    let health = if report.readiness.is_ready() {
+        "ready"
+    } else {
+        "not ready"
+    };
     match &report.base {
-        Some(BaseReport { base_ref, ahead }) if *ahead > 0 => format!("ok, {base_ref} +{ahead}"),
-        _ => "ok".to_owned(),
+        Some(BaseReport { base_ref, ahead }) if *ahead > 0 => {
+            format!("{health}, {base_ref} +{ahead}")
+        }
+        _ => health.to_owned(),
     }
 }
 
@@ -1603,6 +1636,17 @@ fn checkpoint(instance: Option<String>, message: Option<&str>) -> Result<()> {
         println!(
             "  resource: {} [{}] {state}{running}{unproven}",
             resource.name, resource.mode
+        );
+    }
+    if !outcome.degraded.is_empty() {
+        println!(
+            "  degraded: {} not captured (not up); an undo to this checkpoint leaves them as they are",
+            outcome
+                .degraded
+                .iter()
+                .map(|name| format!("`{name}`"))
+                .collect::<Vec<_>>()
+                .join(", ")
         );
     }
     if let Some(link) = manager.remote_link() {

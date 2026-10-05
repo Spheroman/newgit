@@ -19,7 +19,7 @@ beforeEach(async () => {
 	slug = `acme-${crypto.randomUUID().slice(0, 8)}`;
 	project = `jack/${slug}`;
 	[jack, ana, eve] = await Promise.all([login("jack"), login("ana"), login("eve")]);
-	expect((await call(jack, "POST", "/v1/projects", { name: slug, trackers: ["root", "project"] })).status).toBe(201);
+	expect((await call(jack, "POST", "/v1/projects", { name: slug, trackers: ["root", "access", "project"] })).status).toBe(201);
 	expect((await call(jack, "POST", `/v1/projects/${project}/members`, { login: "ana" })).status).toBe(200);
 });
 

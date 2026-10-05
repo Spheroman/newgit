@@ -44,11 +44,11 @@ async function call(login: string | null, method: string, path: string, body?: u
 const repo = (suffix: string) => `jack.${slug}.${suffix}`;
 
 async function setUp() {
-	const created = await call("jack", "POST", "/v1/projects", { name: slug, trackers: ["root", "project", "web"] });
+	const created = await call("jack", "POST", "/v1/projects", { name: slug, trackers: ["root", "access", "project", "web"] });
 	expect(created.status).toBe(201);
 	expect((await call("jack", "POST", `/v1/projects/${project}/members`, { login: "Ana" })).status).toBe(200);
 	// The project tracker's committed definitions are what audiences and kinds are read from.
-	const define = (name: string, text: string) => repos.write(repo("t.project"), `.newgit/trackers/${name}.toml`, text);
+	const define = (name: string, text: string) => repos.write(repo("t.access"), `.newgit/trackers/${name}.toml`, text);
 	define("root", 'audience = "project-devs"\nsecret = false\n');
 	define("project", 'audience = "project-devs"\nsecret = false\n');
 	define("web", 'audience = "public"\nsecret = false\n');
@@ -68,7 +68,7 @@ describe("the API", () => {
 	});
 
 	it("creates a project owned by its creator, with one repo and one seed per tracker", async () => {
-		const created = await call("Jack", "POST", "/v1/projects", { name: slug, trackers: ["root", "project"] });
+		const created = await call("Jack", "POST", "/v1/projects", { name: slug, trackers: ["root", "access", "project"] });
 		expect(created.status).toBe(201);
 		expect(created.body).toMatchObject({
 			owner: "jack",
@@ -76,7 +76,7 @@ describe("the API", () => {
 			key: project,
 			endpoint: `https://newgit.dev/jack/${slug}.git`,
 		});
-		expect(created.body.seeds.map((seed: { tracker: string }) => seed.tracker)).toEqual(["root", "project"]);
+		expect(created.body.seeds.map((seed: { tracker: string }) => seed.tracker)).toEqual(["root", "access", "project"]);
 		const [root] = created.body.seeds;
 		// The creator's one write to each code tracker's repo, for the initial push.
 		expect(root).toMatchObject({
@@ -86,7 +86,7 @@ describe("the API", () => {
 			password: `pw-${repo("t.root")}-write`,
 		});
 		expect(root.expires_at).toBeTruthy();
-		expect([...repos.repos.keys()].sort()).toEqual([repo("t.project"), repo("t.root")]);
+		expect([...repos.repos.keys()].sort()).toEqual([repo("t.access"), repo("t.project"), repo("t.root")]);
 		expect((await call("jack", "GET", `/v1/projects/${project}`)).body).toMatchObject({ owner: "jack", name: slug });
 	});
 
@@ -201,10 +201,10 @@ describe("the API", () => {
 		await credential("jack", repo("t.jack-env"), "write");
 		expect((await credential("ana", repo("t.jack-env"))).status).toBe(403);
 		// A merged definition change is what opens it up.
-		repos.write(repo("t.project"), ".newgit/trackers/jack-env.toml", 'audience = "project-devs"\n');
+		repos.write(repo("t.access"), ".newgit/trackers/jack-env.toml", 'audience = "project-devs"\n');
 		expect((await credential("ana", repo("t.jack-env"))).status).toBe(200);
 		// Turning a tracker into a code tracker takes its write away.
-		repos.write(repo("t.project"), ".newgit/trackers/jack-env.toml", 'audience = "project-devs"\nsecret = false\n');
+		repos.write(repo("t.access"), ".newgit/trackers/jack-env.toml", 'audience = "project-devs"\nsecret = false\n');
 		expect((await credential("jack", repo("t.jack-env"), "write")).status).toBe(403);
 	});
 

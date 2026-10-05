@@ -15,7 +15,8 @@ export interface EndpointPlan {
 	dir: string;
 	branches: Record<string, Record<string, string>>;
 	default_branch: string;
-	definitions: string;
+	/** The trackers holding definitions, at the default branch's commits. */
+	definitions: Record<string, string>;
 	repos: Record<string, { url: string; auth: string }>;
 }
 

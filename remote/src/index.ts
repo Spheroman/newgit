@@ -23,6 +23,9 @@ import {
 	type RepoRef,
 	decide,
 	parseAudience,
+	parseMaintainers,
+	mayMaintain,
+	type Maintainers,
 	parseProjectKey,
 	parseRepoName,
 	partProblem,
@@ -276,14 +279,14 @@ async function route(request: Request, env: Env, deps: Deps): Promise<Response> 
 	// A code tracker carved after the project was created gets its repo here,
 	// seeded once by whoever carved it. It joins a branch only by a merge.
 	if (method === "POST" && rest === "/trackers") {
-		// Definitions are the owner's: a new code tracker comes with a change
-		// to them, which only the owner merges.
+		// A new code tracker comes with its definition, which is a change to
+		// the tracker that owns its file: only that tracker's maintainers add it.
 		requireHuman(caller, "create code tracker repos");
-		requireOwner(info.owner, login, "add code trackers");
 		const { name: tracker } = await body<{ name?: string }>(request);
 		if (!tracker) throw new HttpError(400, "name is required");
 		requirePart("tracker name", tracker);
-		const defined = await definitionFacts(deps.repos, id, info.defaultBranch, tracker);
+		await requireGovernor(deps, id, info, { login, member }, tracker, await listedTrackers(project));
+		const defined = await definitionFacts(deps.repos, id, info.defaultBranch, tracker, await listedTrackers(project));
 		if (defined !== undefined && !defined.code)
 			throw new HttpError(400, `\`${tracker}\` is a secret tracker; its repo is made by its first sync`);
 		const ref: RepoRef = { kind: "tracker", project: id, tracker };
@@ -322,7 +325,7 @@ async function route(request: Request, env: Env, deps: Deps): Promise<Response> 
 		const who = { login, member };
 		for (const tracker of trackers) {
 			requirePart("tracker name", tracker);
-			const facts = await definitionFacts(deps.repos, id, info.defaultBranch, tracker);
+			const facts = await definitionFacts(deps.repos, id, info.defaultBranch, tracker, await listedTrackers(project));
 			if (facts === undefined)
 				throw new HttpError(
 					400,
@@ -331,8 +334,15 @@ async function route(request: Request, env: Env, deps: Deps): Promise<Response> 
 			if (!facts.code) throw new HttpError(400, `\`${tracker}\` is a secret tracker; \`newgit merge\` never carries it`);
 			const read = decide({ kind: "tracker", project: id, tracker }, "read", who, { tracker: facts });
 			if (!read.ok) throw new HttpError(403, read.reason);
-			// The definitions decide every audience: changing them is the owner's.
-			if (tracker === "project") requireOwner(info.owner, login, "merge changes to the project's definitions");
+			// `access` (`.newgit/trackers/`) decides every tracker's paths and
+			// audience: changing it is the owner's. Everything else in
+			// `.newgit/` — resources, scripts, config — is the `project`
+			// tracker, which anyone who merges may change.
+			// Merging a tracker is its maintainers' (by default, its readers'):
+			// `access`, which holds every definition, is the owner's unless the
+			// definitions say otherwise.
+			const may = mayMaintain(facts.maintainers, who, info.owner, tracker);
+			if (!may.ok) throw new HttpError(403, may.reason);
 		}
 		const started = await project.beginMerge(branch, base, login, MERGE_LOCK_SECONDS, trackers);
 		if (!started.ok) {
@@ -395,9 +405,10 @@ async function route(request: Request, env: Env, deps: Deps): Promise<Response> 
 				for (const [tracker, commit] of Object.entries(list)) {
 					if (base[tracker] === commit) continue;
 					if (await project.mergeDeclares(branch, tracker)) continue;
-					if (!(tracker in base) && info.owner === login) {
-						const defined = await definitionFacts(deps.repos, id, info.defaultBranch, tracker);
-						if (defined === undefined || defined.code) continue;
+					if (!(tracker in base)) {
+						const defined = await definitionFacts(deps.repos, id, info.defaultBranch, tracker, await listedTrackers(project));
+						const governs = await governs_(deps, id, info, { login, member }, tracker, await listedTrackers(project));
+						if (governs && (defined === undefined || defined.code)) continue;
 					}
 					throw new HttpError(400, `this merge did not declare \`${tracker}\`, so it cannot move it`);
 				}
@@ -457,7 +468,7 @@ async function route(request: Request, env: Env, deps: Deps): Promise<Response> 
 		if (instance === null) throw new HttpError(404, `no instance \`${name}\` in ${key}`);
 		requireOwner(instance.owner, login, `fork for \`${name}\``);
 		requireThisInstance(caller, name);
-		const facts = await definitionFacts(deps.repos, id, info.defaultBranch, tracker);
+		const facts = await definitionFacts(deps.repos, id, info.defaultBranch, tracker, await listedTrackers(project));
 		if (facts === undefined) throw new HttpError(404, `tracker \`${tracker}\` is not defined on ${key}'s default branch`);
 		if (!facts.code) throw new HttpError(400, `\`${tracker}\` is a secret tracker; instances do not fork it`);
 		const fork = repoName({ kind: "fork", project: id, instance: name, tracker });
@@ -578,11 +589,22 @@ async function gitEndpoint(request: Request, env: Env, deps: Deps, match: RegExp
 	const who = { login: caller.login, member: await project.isMember(caller.login) };
 
 	const branches = await project.branches();
-	const definitions = branches.find((branch) => branch.name === info.defaultBranch)?.list.project;
-	if (!definitions) throw new HttpError(404, `${key} has no \`${info.defaultBranch}\` branch yet`);
+	const main = branches.find((branch) => branch.name === info.defaultBranch)?.list;
+	if (!main?.access) throw new HttpError(404, `${key} has no \`${info.defaultBranch}\` branch yet`);
+
+	// The definitions, layered as the remote reads them: each held by the
+	// tracker that owns its file. The container reads them from the same
+	// trackers, at the default branch's commits, whoever is reading.
+	const facts = await loadDefinitions(
+		deps.repos,
+		id,
+		info.defaultBranch,
+		branches.flatMap((branch) => Object.keys(branch.list)),
+	);
+	const definitions: Record<string, string> = { access: main.access };
+	for (const { source } of facts.values()) if (main[source]) definitions[source] = main[source];
 
 	// Each branch, cut down to the code trackers this caller may read.
-	const facts = new Map<string, Awaited<ReturnType<typeof definitionFacts>>>();
 	const plan: EndpointPlan = {
 		dir: "/work",
 		branches: {},
@@ -590,11 +612,10 @@ async function gitEndpoint(request: Request, env: Env, deps: Deps, match: RegExp
 		definitions,
 		repos: {},
 	};
-	const needed = new Set<string>(["project"]);
+	const needed = new Set<string>(Object.keys(definitions));
 	for (const branch of branches) {
 		const list: Record<string, string> = {};
 		for (const [tracker, commit] of Object.entries(branch.list)) {
-			if (!facts.has(tracker)) facts.set(tracker, await definitionFacts(deps.repos, id, info.defaultBranch, tracker));
 			const tracker_facts = facts.get(tracker);
 			if (!tracker_facts?.code) continue;
 			if (!decide({ kind: "tracker", project: id, tracker }, "read", who, { tracker: tracker_facts }).ok) continue;
@@ -650,7 +671,7 @@ async function credential(
 	const who = { login: caller.login, member };
 	const facts: Facts = {};
 	if (ref.kind === "fork") facts.instanceOwner = (await project.instance(ref.instance))?.owner;
-	facts.tracker = await definitionFacts(deps.repos, ref.project, defaultBranch, ref.tracker);
+	facts.tracker = await definitionFacts(deps.repos, ref.project, defaultBranch, ref.tracker, await listedTrackers(project));
 
 	const decision = decide(ref, scope, who, facts);
 	if (!decision.ok) throw new HttpError(403, decision.reason);
@@ -669,37 +690,154 @@ async function credential(
 	return { repo: name, remote, scope, username: "x", password: minted.password, expires_at: minted.expiresAt };
 }
 
-/**
- * A tracker's definition — audience, and whether it is a code tracker — as
- * committed on the project's default branch: the `project` tracker's
- * `.newgit/trackers/<name>.toml` there. Read from the branch, not taken from
- * the caller: a definition changes only by merging a change to it.
- */
-async function definitionFacts(
-	repos: Repos,
-	project: ProjectId,
-	branch: string,
-	tracker: string,
-): Promise<{ audience: Audience; code: boolean } | undefined> {
-	const text = await repos.readFile(
-		repoName({ kind: "tracker", project, tracker: "project" }),
-		branch,
-		`.newgit/trackers/${tracker}.toml`,
-	);
-	if (text === null) {
-		// `root` and `project` always exist, file or not.
-		return tracker === "root" || tracker === "project" ? { audience: { kind: "project-devs" }, code: true } : undefined;
+/** A tracker's committed definition, as the remote reads it. */
+export interface TrackerFacts {
+	audience: Audience;
+	code: boolean;
+	maintainers: Maintainers;
+	/** The paths it owns, for working out which tracker owns which definition. */
+	paths: string[];
+	/** The tracker whose history holds this definition's file. */
+	source: string;
+}
+
+const DEFINITIONS = ".newgit/trackers";
+
+/** Trackers that always exist, file or not. */
+function implicitFacts(tracker: string): TrackerFacts | undefined {
+	switch (tracker) {
+		case "root":
+			return { audience: { kind: "project-devs" }, code: true, maintainers: { kind: "project-devs" }, paths: ["."], source: "access" };
+		case "project":
+			return { audience: { kind: "project-devs" }, code: true, maintainers: { kind: "project-devs" }, paths: [".newgit"], source: "access" };
+		case "access":
+			return { audience: { kind: "project-devs" }, code: true, maintainers: { kind: "owner" }, paths: [DEFINITIONS], source: "access" };
+		default:
+			return undefined;
 	}
-	let definition: { audience?: unknown; secret?: unknown };
+}
+
+function parseFacts(text: string, source: string): TrackerFacts | undefined {
+	let definition: { audience?: unknown; secret?: unknown; maintainers?: unknown; paths?: unknown };
 	try {
-		definition = parseToml(text) as { audience?: unknown; secret?: unknown };
+		definition = parseToml(text) as typeof definition;
 	} catch {
 		return undefined;
 	}
 	const audience = typeof definition.audience === "string" ? parseAudience(definition.audience) : null;
 	if (audience === null) return undefined;
+	// `maintainers` defaults to the audience: anyone who may read it may change it.
+	const maintainers =
+		typeof definition.maintainers === "string"
+			? parseMaintainers(definition.maintainers)
+			: parseMaintainers(typeof definition.audience === "string" ? definition.audience : "");
+	if (maintainers === null) return undefined;
+	const paths = Array.isArray(definition.paths) ? definition.paths.filter((path) => typeof path === "string") : [];
 	// `secret` defaults to true, and is written only when false.
-	return { audience, code: definition.secret === false };
+	return { audience, code: definition.secret === false, maintainers, paths, source };
+}
+
+/**
+ * Every named tracker's committed definition on the project's default
+ * branch, each read from the tracker that owns its file: `access` owns
+ * `.newgit/trackers/` unless a more specific code tracker claims a file in it
+ * — which is how governance layers: changing a tracker's definition is
+ * changing the tracker that owns its file, and only that tracker's
+ * maintainers merge it. Resolved to a fixed point, a few reads per round.
+ */
+async function loadDefinitions(
+	repos: Repos,
+	project: ProjectId,
+	branch: string,
+	names: Iterable<string>,
+): Promise<Map<string, TrackerFacts>> {
+	const all = new Set<string>(["root", "project", "access", ...names]);
+	const source = new Map<string, string>([...all].map((name) => [name, "access"]));
+	let facts = new Map<string, TrackerFacts>();
+	for (let round = 0; round < 4; round++) {
+		facts = new Map();
+		for (const name of all) {
+			const from = source.get(name)!;
+			const text = await repos.readFile(
+				repoName({ kind: "tracker", project, tracker: from }),
+				branch,
+				`${DEFINITIONS}/${name}.toml`,
+			);
+			const read = text === null ? implicitFacts(name) : parseFacts(text, from);
+			if (read !== undefined) facts.set(name, { ...read, source: from });
+		}
+		let moved = false;
+		for (const name of all) {
+			const file = `${DEFINITIONS}/${name}.toml`;
+			let owner = "access";
+			let claim = DEFINITIONS.length;
+			for (const [candidate, candidateFacts] of facts) {
+				if (!candidateFacts.code) continue;
+				for (const path of candidateFacts.paths) {
+					const covers = file === path || file.startsWith(`${path}/`);
+					if (covers && path.startsWith(DEFINITIONS) && path.length > claim) {
+						owner = candidate;
+						claim = path.length;
+					}
+				}
+			}
+			if (source.get(name) !== owner) {
+				source.set(name, owner);
+				moved = true;
+			}
+		}
+		if (!moved) return facts;
+	}
+	return facts;
+}
+
+/**
+ * Whether `who` maintains the tracker that owns `tracker`'s definition file —
+ * the one whose change adds or redefines `tracker`.
+ */
+async function governs_(
+	deps: Deps,
+	id: ProjectId,
+	info: { owner: string; defaultBranch: string },
+	who: { login: string; member: boolean },
+	tracker: string,
+	listed: Iterable<string>,
+): Promise<boolean> {
+	const definitions = await loadDefinitions(deps.repos, id, info.defaultBranch, [tracker, ...listed]);
+	const governor = definitions.get(tracker)?.source ?? "access";
+	const facts = definitions.get(governor) ?? implicitFacts("access")!;
+	return mayMaintain(facts.maintainers, who, info.owner, governor).ok;
+}
+
+async function requireGovernor(
+	deps: Deps,
+	id: ProjectId,
+	info: { owner: string; defaultBranch: string },
+	who: { login: string; member: boolean },
+	tracker: string,
+	listed: Iterable<string>,
+) {
+	if (!(await governs_(deps, id, info, who, tracker, listed)))
+		throw new HttpError(
+			403,
+			`only the maintainers of the tracker holding \`${tracker}\`'s definition may add or redefine it`,
+		);
+}
+
+/** Every tracker any branch of the project lists: whose definitions may layer. */
+async function listedTrackers(project: DurableObjectStub<ProjectDO>): Promise<string[]> {
+	return [...new Set((await project.branches()).flatMap((branch) => Object.keys(branch.list)))];
+}
+
+/** One tracker's definition (see [`loadDefinitions`]). */
+async function definitionFacts(
+	repos: Repos,
+	project: ProjectId,
+	branch: string,
+	tracker: string,
+	listed: Iterable<string> = [],
+): Promise<TrackerFacts | undefined> {
+	return (await loadDefinitions(repos, project, branch, [tracker, ...listed])).get(tracker);
 }
 
 /** Accept a bare repo name or anything ending in `/<repo>.git` (what a credential helper sees). */

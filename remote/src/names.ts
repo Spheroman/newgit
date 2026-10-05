@@ -81,6 +81,41 @@ export function parseAudience(value: string): Audience | null {
 	return null;
 }
 
+/**
+ * A tracker's `maintainers`: who may merge changes to it. Defaults to its
+ * audience; `owner` is the project's owner. Changing a tracker's *definition*
+ * is changing the tracker that owns its `.newgit/trackers/<name>.toml`, so
+ * layers of governance are just trackers owning other trackers' definitions.
+ */
+export type Maintainers =
+	| { kind: "owner" }
+	| { kind: "project-devs" }
+	| { kind: "named"; login: string };
+
+export function parseMaintainers(value: string): Maintainers | null {
+	if (value === "owner") return { kind: "owner" };
+	// Anyone who may read it, for the audiences where reading means a member.
+	if (value === "project-devs" || value === "public" || value === "user") return { kind: "project-devs" };
+	if (value.startsWith("user:") && value.length > "user:".length)
+		return { kind: "named", login: value.slice("user:".length).toLowerCase() };
+	return null;
+}
+
+/** May `who` merge changes to a tracker its definition says `maintainers` maintain? */
+export function mayMaintain(maintainers: Maintainers, who: Requester, owner: string, tracker: string): Decision {
+	if (!who.member) return deny(`${who.login} is not a member`);
+	switch (maintainers.kind) {
+		case "project-devs":
+			return allow;
+		case "owner":
+			return who.login === owner ? allow : deny(`only ${owner}, the project's owner, merges \`${tracker}\``);
+		case "named":
+			return who.login === maintainers.login
+				? allow
+				: deny(`only ${maintainers.login} maintains \`${tracker}\``);
+	}
+}
+
 export type Scope = "read" | "write";
 
 export interface Requester {

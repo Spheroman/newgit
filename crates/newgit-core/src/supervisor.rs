@@ -314,6 +314,57 @@ pub fn run_foreground(
     Ok(status.code().unwrap_or(-1))
 }
 
+/// Run a one-shot command in the workspace with its output going to the log
+/// only — for hooks newgit runs on someone's behalf (a spawn's `prepare`, an
+/// undo's restore), whose output is noise unless they fail; the caller shows
+/// the log's tail then. Returns the exit code.
+pub fn run_quiet(
+    command_line: &[String],
+    cwd: &Utf8Path,
+    env: &[(String, String)],
+    log_path: &Utf8Path,
+) -> Result<i32> {
+    if let Some(parent) = log_path.parent() {
+        create_dir_all(parent)?;
+    }
+    let mut log =
+        std::fs::File::create(log_path).map_err(|source| NewgitError::io(log_path, source))?;
+    writeln!(log, "[newgit] $ {}", command_line.join(" "))
+        .map_err(|source| NewgitError::io(log_path, source))?;
+    let (program, args) = command_line
+        .split_first()
+        .ok_or_else(|| NewgitError::Unsupported("empty command".to_owned()))?;
+    let err = log
+        .try_clone()
+        .map_err(|source| NewgitError::io(log_path, source))?;
+    let status = Command::new(program)
+        .args(args)
+        .current_dir(cwd)
+        .envs(env.iter().map(|(key, value)| (key, value)))
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(log))
+        .stderr(Stdio::from(err))
+        .status()
+        .map_err(|source| NewgitError::SourceCommand {
+            command: command_line.join(" "),
+            stderr: source.to_string(),
+        })?;
+    Ok(status.code().unwrap_or(-1))
+}
+
+/// The last `lines` lines of a log, for saying why a quiet hook failed.
+pub fn log_tail(log_path: &Utf8Path, lines: usize) -> Vec<String> {
+    let text = std::fs::read_to_string(log_path).unwrap_or_default();
+    let all: Vec<&str> = text
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .collect();
+    all[all.len().saturating_sub(lines)..]
+        .iter()
+        .map(|line| (*line).to_owned())
+        .collect()
+}
+
 /// Run a one-shot shell command, capturing stdout (for state refs) while
 /// still logging both streams. Unlike `run_foreground`, output does not go
 /// to the terminal — checkpoint machinery consumes it instead.

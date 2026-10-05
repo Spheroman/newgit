@@ -146,7 +146,7 @@ fn git_push_checkpoints_then_publishes_to_the_real_remote() {
     let (workspace, spawn_output) = spawn(&fixture, "feature/push");
     assert!(
         spawn_output.contains(&format!(
-            "`git push` checkpoints, then publishes to {}",
+            "until you `git push`; that checkpoints, then publishes to {}",
             fixture.remote
         )),
         "{spawn_output}"

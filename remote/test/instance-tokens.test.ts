@@ -17,8 +17,8 @@ beforeEach(async () => {
 	slug = `acme-${crypto.randomUUID().slice(0, 8)}`;
 	project = `jack/${slug}`;
 	jack = (await issue(env, { kind: "login", login: "jack", ttlSeconds: LOGIN_TTL_SECONDS })).token;
-	expect((await call(jack, "POST", "/v1/projects", { name: slug, trackers: ["root", "project"] })).status).toBe(201);
-	const define = (name: string, text: string) => repos.write(`jack.${slug}.t.project`, `.newgit/trackers/${name}.toml`, text);
+	expect((await call(jack, "POST", "/v1/projects", { name: slug, trackers: ["root", "access", "project"] })).status).toBe(201);
+	const define = (name: string, text: string) => repos.write(`jack.${slug}.t.access`, `.newgit/trackers/${name}.toml`, text);
 	define("root", 'audience = "project-devs"\nsecret = false\n');
 	define("runtime-env", 'audience = "user"\n');
 });

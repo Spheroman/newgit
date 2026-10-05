@@ -78,6 +78,7 @@ fn tracker(name: &str, paths: &[&str], excluded: &[&str], secret: bool) -> Track
         merge_with_source: true,
         paths: paths.iter().map(Utf8PathBuf::from).collect(),
         secret,
+        maintainers: None,
         excluded: excluded.iter().map(Utf8PathBuf::from).collect(),
         definition_rev: "sha256:000000000000".to_owned(),
     }

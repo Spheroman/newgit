@@ -21,6 +21,12 @@ pub struct TrackerDefinition {
     /// captured by newgit from the files. True unless a definition says
     /// otherwise — fails closed, like export's audience filter.
     pub secret: bool,
+    /// Who may merge changes to it: an audience (`project-devs`,
+    /// `user:<login>`) or `owner`, the project's owner. `None` means its
+    /// audience — anyone who may read it may change it. Changing a tracker's
+    /// *definition* is changing whichever tracker owns its file, so layers of
+    /// governance are trackers owning other trackers' definitions.
+    pub maintainers: Option<String>,
     /// Paths inside this tracker's own that a more specific tracker owns, so
     /// they are not this tracker's to capture, restore, or clear. Computed
     /// from the full set of definitions ([`resolve_ownership`]); not part of
@@ -35,6 +41,11 @@ pub const ROOT_TRACKER: &str = "root";
 
 /// The tracker carrying the project's committed definitions, `.newgit/`.
 pub const PROJECT_TRACKER: &str = "project";
+
+/// The tracker carrying `.newgit/trackers/`: which tracker owns which paths
+/// and who may read each. Its own tracker so that only the project's owner
+/// changes it, while anyone who merges may change resources and scripts.
+pub const ACCESS_TRACKER: &str = "access";
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
@@ -55,6 +66,8 @@ pub struct TrackerDefinitionFile {
     paths: Vec<Utf8PathBuf>,
     #[serde(default = "secret_by_default", skip_serializing_if = "is_true")]
     secret: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    maintainers: Option<String>,
 }
 
 fn secret_by_default() -> bool {
@@ -80,6 +93,7 @@ impl TrackerDefinition {
             merge_with_source,
             paths,
             secret: true,
+            maintainers: None,
             excluded: Vec::new(),
             definition_rev: String::new(),
         };
@@ -110,6 +124,7 @@ impl TrackerDefinition {
             merge_with_source: file.merge_with_source,
             paths: file.paths,
             secret: file.secret,
+            maintainers: file.maintainers,
             excluded: Vec::new(),
             definition_rev: format!("sha256:{hex}"),
         };
@@ -118,6 +133,15 @@ impl TrackerDefinition {
     }
 
     fn validate(&self) -> Result<()> {
+        if let Some(maintainers) = &self.maintainers {
+            let ok = matches!(maintainers.as_str(), "owner" | "project-devs")
+                || (maintainers.starts_with("user:") && maintainers.len() > "user:".len());
+            if !ok {
+                return Err(self.invalid(format!(
+                    "maintainers `{maintainers}` must be `owner`, `project-devs`, or `user:<login>`"
+                )));
+            }
+        }
         let audience_ok = matches!(self.audience.as_str(), "public" | "project-devs" | "user")
             || self.audience.starts_with("user:");
         if !audience_ok {
@@ -135,8 +159,10 @@ impl TrackerDefinition {
         // `.newgit` holds the project's own definitions, which only the
         // project tracker carries; anyone else claiming it would split the
         // definitions across trackers.
-        let is_project =
-            self.name == PROJECT_TRACKER && self.paths == [Utf8PathBuf::from(".newgit")];
+        let is_project = (self.name == PROJECT_TRACKER
+            && self.paths == [Utf8PathBuf::from(".newgit")])
+            || (self.name == ACCESS_TRACKER
+                && self.paths == [Utf8PathBuf::from(".newgit/trackers")]);
 
         for path in &self.paths {
             if path.as_str() == "." || is_project {
@@ -179,6 +205,7 @@ impl TrackerDefinition {
             merge_with_source: self.merge_with_source,
             paths: self.paths.clone(),
             secret: self.secret,
+            maintainers: self.maintainers.clone(),
         }
     }
 
@@ -193,12 +220,34 @@ impl TrackerDefinition {
             merge_with_source: true,
             paths: vec![Utf8PathBuf::from(".")],
             secret: false,
+            maintainers: None,
             excluded: Vec::new(),
             definition_rev: String::new(),
         };
         definition.definition_rev = definition
             .compute_definition_rev()
             .expect("the root definition serializes");
+        definition
+    }
+
+    /// The access tracker as `newgit init` writes it: `.newgit/trackers/`,
+    /// every tracker's paths and audience. Carved out of `project` so the
+    /// remote can make changing it the owner's alone.
+    pub fn access() -> Self {
+        let mut definition = Self {
+            name: ACCESS_TRACKER.to_owned(),
+            audience: "project-devs".to_owned(),
+            storage: Storage::Local,
+            merge_with_source: true,
+            paths: vec![Utf8PathBuf::from(".newgit/trackers")],
+            secret: false,
+            maintainers: Some("owner".to_owned()),
+            excluded: Vec::new(),
+            definition_rev: String::new(),
+        };
+        definition.definition_rev = definition
+            .compute_definition_rev()
+            .expect("the access definition serializes");
         definition
     }
 
@@ -213,6 +262,7 @@ impl TrackerDefinition {
             merge_with_source: true,
             paths: vec![Utf8PathBuf::from(".newgit")],
             secret: false,
+            maintainers: None,
             excluded: Vec::new(),
             definition_rev: String::new(),
         };
@@ -427,6 +477,7 @@ mod tests {
             merge_with_source: false,
             paths: paths.iter().map(Utf8PathBuf::from).collect(),
             secret: true,
+            maintainers: None,
             excluded: Vec::new(),
             definition_rev: "sha256:000000000000".to_owned(),
         }

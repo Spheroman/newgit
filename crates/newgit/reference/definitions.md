@@ -38,9 +38,11 @@ whether a lane travels with a merge — both by defaulting, silently.
 A named, versioned history of file content. Create with `newgit tracker
 create`; hand-edit afterwards.
 
-Two trackers always exist: `root` owns `.` — every path no more specific
+Three trackers always exist: `root` owns `.` — every path no more specific
 tracker claims — and its history starts as the project's Git history;
-`project` owns `.newgit`. Ownership nests: the most specific claim wins, so
+`project` owns `.newgit` (resources, scripts, config); and `access` owns
+`.newgit/trackers/`, every tracker's definition, with `maintainers =
+"owner"`. Ownership nests: the most specific claim wins, so
 `root` owning `.` and `runtime-env` owning `.env.local` do not conflict. Two
 trackers claiming the identical path is an error.
 
@@ -59,6 +61,7 @@ and `track` refuse it.
 | `merge_with_source` | bool | no | `false` | whether a real source merge carries this tracker's bound state with it. |
 | `paths` | array of strings | no | `[]` | workspace-relative paths the lane owns. Must not be absolute, contain `..`, or start with `.git`; only `project` may own `.newgit`, and `.` must be a tracker's only path. May be empty for a tracker that only receives resource deposits (`into_tracker`). |
 | `secret` | bool | no | `true` | `false` makes a code tracker: committed with Git rather than captured. Written only when `false`. |
+| `maintainers` | string | no | its `audience` | who may merge changes to it on a remote: `owner` (the project's owner), `project-devs`, or `user:<login>`. Changing a tracker's definition is changing the tracker that owns its file in `.newgit/trackers/` — `access` unless a more specific code tracker claims it — so governance layers: an `admin` tracker claiming `.newgit/trackers/web.toml` decides who changes `web`'s paths, audience, and maintainers. |
 
 A secret tracker's paths stay out of Git: `newgit tracker track` adds them to
 the store's `.gitignore`, and each workspace's Git is told to ignore them too,

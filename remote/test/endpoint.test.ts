@@ -21,9 +21,9 @@ beforeEach(async () => {
 	jack = await issue(env, { kind: "login", login: "jack", ttlSeconds: LOGIN_TTL_SECONDS });
 	ana = (await issue(env, { kind: "login", login: "ana", ttlSeconds: LOGIN_TTL_SECONDS })).token;
 	expect(
-		(await api(jack.token, "POST", "/v1/projects", { name, trackers: ["root", "project", "payments"] })).status,
+		(await api(jack.token, "POST", "/v1/projects", { name, trackers: ["root", "access", "project", "payments"] })).status,
 	).toBe(201);
-	const defs = `jack.${name}.t.project`;
+	const defs = `jack.${name}.t.access`;
 	repos.write(defs, ".newgit/trackers/root.toml", 'audience = "project-devs"\nsecret = false\n');
 	repos.write(defs, ".newgit/trackers/project.toml", 'audience = "project-devs"\nsecret = false\n');
 	// A code tracker only Jack may read, and a secret tracker: neither is Ana's.
@@ -32,7 +32,7 @@ beforeEach(async () => {
 	expect(
 		(
 			await api(jack.token, "PUT", `/v1/projects/jack/${name}/branches/main`, {
-				list: { root: sha("a"), project: sha("b"), payments: sha("c"), env: sha("d") },
+				list: { root: sha("a"), project: sha("b"), payments: sha("c"), env: sha("d"), access: sha("e") },
 			})
 		).status,
 	).toBe(201);
@@ -89,9 +89,9 @@ describe("the Git endpoint", () => {
 		expect(served.map((call) => call.kind)).toEqual(["advertise", "upload-pack"]);
 		const plan = served[0].plan;
 		expect(served[0].project).toBe(`jack/${name}`);
-		expect(plan.branches.main).toEqual({ root: sha("a"), project: sha("b"), payments: sha("c") });
-		expect(plan.definitions).toBe(sha("b"));
-		expect(Object.keys(plan.repos).sort()).toEqual(["payments", "project", "root"]);
+		expect(plan.branches.main).toEqual({ root: sha("a"), project: sha("b"), payments: sha("c"), access: sha("e") });
+		expect(plan.definitions).toEqual({ access: sha("e") });
+		expect(Object.keys(plan.repos).sort()).toEqual(["access", "payments", "project", "root"]);
 		expect(plan.repos.root.url).toBe(repos.url(`jack.${name}.t.root`));
 		expect(plan.repos.root.auth.startsWith("Authorization: Basic ")).toBe(true);
 	});
@@ -99,7 +99,7 @@ describe("the Git endpoint", () => {
 	it("leaves out a tracker its reader may not read — the secret one never enters", async () => {
 		expect((await git(ana, "/info/refs?service=git-upload-pack")).status).toBe(200);
 		const plan = served[0].plan;
-		expect(plan.branches.main).toEqual({ root: sha("a"), project: sha("b") });
+		expect(plan.branches.main).toEqual({ root: sha("a"), project: sha("b"), access: sha("e") });
 		expect(plan.repos.payments).toBeUndefined();
 		expect(plan.repos.env).toBeUndefined();
 	});
@@ -113,7 +113,7 @@ describe("the Git endpoint", () => {
 	it("mints its read passwords against the reader's token, so revoking it revokes them", async () => {
 		await git(jack.token, "/info/refs?service=git-upload-pack");
 		const minted = repos.minted.filter((token) => token.scope === "read").map((token) => token.id);
-		expect(minted.length).toBe(3);
+		expect(minted.length).toBe(4);
 		expect((await api(jack.token, "DELETE", `/v1/tokens/${jack.id}`)).status).toBe(200);
 		for (const id of minted) expect(repos.revokedTokens.has(id)).toBe(true);
 		expect((await git(jack.token, "/info/refs?service=git-upload-pack")).status).toBe(401);

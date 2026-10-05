@@ -329,24 +329,36 @@ fn clone_into(
         }
         fetched.push(tracker.clone());
     }
-    if !fetched.iter().any(|tracker| tracker == "project") {
-        bail!(
-            "cannot clone `{project}` without its `project` tracker, which holds its definitions"
-        );
+    for needed in ["project", "access"] {
+        if !fetched.iter().any(|tracker| tracker == needed) {
+            bail!(
+                "cannot clone `{project}` without its `{needed}` tracker, which holds its \
+                 definitions"
+            );
+        }
     }
 
-    // Its definitions first, so newgit knows what composes the rest.
-    git(&[
-        "fetch",
-        "-q",
-        paths.tracker_store.as_str(),
-        "+refs/trackers/project/main:refs/newgit/trackers/project/main",
-    ])?;
+    // Its definitions first, so newgit knows what composes the rest: `.newgit/`
+    // from `project`, and `.newgit/trackers/` from `access`, which owns it.
+    for tracker in ["project", "access"] {
+        git(&[
+            "fetch",
+            "-q",
+            paths.tracker_store.as_str(),
+            &format!("+refs/trackers/{tracker}/main:refs/newgit/trackers/{tracker}/main"),
+        ])?;
+    }
     git(&[
         "checkout",
         "refs/newgit/trackers/project/main",
         "--",
         ".newgit",
+    ])?;
+    git(&[
+        "checkout",
+        "refs/newgit/trackers/access/main",
+        "--",
+        ".newgit/trackers",
     ])?;
     // A tracker left out stays absent: never carved out of root's older
     // history here, which would invent content for it.

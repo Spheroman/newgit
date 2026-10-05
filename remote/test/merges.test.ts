@@ -18,8 +18,8 @@ beforeEach(async () => {
 	name = `web-${crypto.randomUUID().slice(0, 8)}`;
 	jack = (await issue(env, { kind: "login", login: "jack", ttlSeconds: LOGIN_TTL_SECONDS })).token;
 	ana = (await issue(env, { kind: "login", login: "ana", ttlSeconds: LOGIN_TTL_SECONDS })).token;
-	await call(jack, "POST", "/v1/projects", { name, trackers: ["root", "project"] });
-	const defs = `jack.${name}.t.project`;
+	await call(jack, "POST", "/v1/projects", { name, trackers: ["root", "access", "project"] });
+	const defs = `jack.${name}.t.access`;
 	repos.write(defs, ".newgit/trackers/root.toml", 'audience = "project-devs"\nsecret = false\n');
 	repos.write(defs, ".newgit/trackers/project.toml", 'audience = "project-devs"\nsecret = false\n');
 	repos.write(defs, ".newgit/trackers/env.toml", 'audience = "project-devs"\n');
@@ -100,6 +100,19 @@ describe("merging into a branch", () => {
 		expect((await call(agent, "POST", path("/branches/main/merge"), { base: main, trackers: ["root"] })).status).toBe(
 			403,
 		);
+	});
+
+	it("lets members change resources and scripts, but only the owner who may read what", async () => {
+		const withDefinitions = { ...main, access: sha("f") };
+		await call(jack, "PUT", path("/branches/next"), { list: withDefinitions });
+		expect(
+			(await call(ana, "POST", path("/branches/next/merge"), { base: withDefinitions, trackers: ["project"] })).status,
+		).toBe(200);
+		await call(ana, "PUT", path("/branches/next"), { base: withDefinitions, list: { ...withDefinitions, project: sha("1") } });
+		const moved = (await call(ana, "GET", path("/branches/next"))).body.list;
+		const refused = await call(ana, "POST", path("/branches/next/merge"), { base: moved, trackers: ["access"] });
+		expect(refused.status).toBe(403);
+		expect(refused.body.error).toContain("project's owner");
 	});
 
 	it("never carries a secret tracker", async () => {

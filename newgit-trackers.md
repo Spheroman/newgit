@@ -347,6 +347,20 @@ in step 3d: pushes go through a newgit workspace, which splits locally.
 Why a sandbox and not the Worker: a Worker cannot run Git, and composing in
 JavaScript would mean writing Git's object model ourselves.
 
+**Who may change what (decided).** A tracker's `maintainers` may merge
+changes to it; by default they are its audience — anyone who may read a
+tracker may change it. Who may change a tracker's *security* (its paths,
+audience, maintainers) is then just who may change the tracker that owns its
+definition file, `.newgit/trackers/<name>.toml`. That is `access` — which
+`newgit init` creates with `maintainers = "owner"` — unless a more specific
+code tracker claims the file. So governance layers with no special case:
+project trackers; an admin tracker owning their definitions (readable by
+everyone who uses them, since newgit needs their paths, but maintained by
+admins); and a tracker of yours owning the admin tracker's. Everything else
+in `.newgit/` — resources, scripts, config — is the `project` tracker, which
+anyone who merges may change. The remote reads each definition from the
+tracker that owns its file, at the default branch, to a fixed point.
+
 **One name for a commit, whoever reads it (decided).** A Git commit id is the
 hash of the commit's contents and its parent's id, so someone whose view
 leaves out a tracker sees different ids from the first commit that touched

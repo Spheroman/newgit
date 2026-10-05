@@ -22,9 +22,9 @@ beforeEach(async () => {
 	slug = `acme-${crypto.randomUUID().slice(0, 8)}`;
 	project = `jack/${slug}`;
 	jack = (await issue(env, { kind: "login", login: "jack", ttlSeconds: LOGIN_TTL_SECONDS })).token;
-	expect((await call(jack, "POST", "/v1/projects", { name: slug, trackers: ["root", "project"] })).status).toBe(201);
+	expect((await call(jack, "POST", "/v1/projects", { name: slug, trackers: ["root", "access", "project"] })).status).toBe(201);
 	root = `jack.${slug}.t.root`;
-	repos.write(`jack.${slug}.t.project`, ".newgit/trackers/root.toml", 'audience = "project-devs"\nsecret = false\n');
+	repos.write(`jack.${slug}.t.access`, ".newgit/trackers/root.toml", 'audience = "project-devs"\nsecret = false\n');
 });
 
 async function call(token: string, method: string, path: string, body?: unknown) {

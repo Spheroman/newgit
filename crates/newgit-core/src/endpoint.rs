@@ -17,7 +17,7 @@ use sha2::{Digest as _, Sha256};
 use crate::compose::{self, TrackerTip};
 use crate::error::{NewgitError, Result};
 use crate::source::{GitSource, run_git_env};
-use crate::tracker::{PROJECT_TRACKER, TrackerDefinition, resolve_ownership};
+use crate::tracker::{ACCESS_TRACKER, PROJECT_TRACKER, TrackerDefinition, resolve_ownership};
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Plan {
@@ -26,10 +26,11 @@ pub struct Plan {
     /// Branch → tracker → commit: only the trackers this reader may read.
     pub branches: BTreeMap<String, BTreeMap<String, String>>,
     pub default_branch: String,
-    /// The `project` tracker's commit on the default branch: where the
-    /// definitions come from. Always fetched — the server reads them even
-    /// when the reader may not — and never served unless listed above.
-    pub definitions: String,
+    /// The trackers holding definitions — `access`, and any tracker owning a
+    /// file in `.newgit/trackers/` — at the default branch's commits. Always
+    /// fetched — the server reads them even when the reader may not — and
+    /// never served unless listed above.
+    pub definitions: BTreeMap<String, String>,
     /// Tracker → where to fetch it.
     pub repos: BTreeMap<String, Source>,
 }
@@ -61,10 +62,9 @@ pub fn compose_view(plan: &Plan) -> Result<Utf8PathBuf> {
             wanted.entry(tracker).or_default().push(commit);
         }
     }
-    wanted
-        .entry(PROJECT_TRACKER)
-        .or_default()
-        .push(&plan.definitions);
+    for (tracker, commit) in &plan.definitions {
+        wanted.entry(tracker).or_default().push(commit);
+    }
     for (tracker, commits) in &wanted {
         if commits
             .iter()
@@ -82,11 +82,17 @@ pub fn compose_view(plan: &Plan) -> Result<Utf8PathBuf> {
             Some(&source.auth),
         )?;
     }
-    if !in_tracker(&store, PROJECT_TRACKER, &plan.definitions) {
-        return Err(NewgitError::Unsupported(format!(
-            "the definitions commit {} is not in the project tracker's history",
-            plan.definitions
-        )));
+    if !plan.definitions.contains_key(ACCESS_TRACKER) {
+        return Err(NewgitError::Unsupported(
+            "the plan names no `access` commit to read definitions from".to_owned(),
+        ));
+    }
+    for (tracker, commit) in &plan.definitions {
+        if !in_tracker(&store, tracker, commit) {
+            return Err(NewgitError::Unsupported(format!(
+                "the definitions commit {commit} is not in `{tracker}`'s history"
+            )));
+        }
     }
     // A branch naming a commit its tracker does not have is left out —
     // logged, not served, and not allowed to take the others down with it.
@@ -296,7 +302,9 @@ fn in_tracker(store: &Utf8Path, tracker: &str, commit: &str) -> bool {
 fn plan_key(plan: &Plan) -> String {
     let mut hasher = Sha256::new();
     hasher.update(plan.default_branch.as_bytes());
-    hasher.update(plan.definitions.as_bytes());
+    for (tracker, commit) in &plan.definitions {
+        hasher.update(format!("{tracker}={commit};").as_bytes());
+    }
     for (branch, list) in &plan.branches {
         hasher.update(format!("\n{branch}").as_bytes());
         for (tracker, commit) in list {
@@ -311,35 +319,56 @@ fn plan_key(plan: &Plan) -> String {
         .collect()
 }
 
-/// The tracker definitions committed at `commit` of the `project` tracker,
-/// with `root` and `project` themselves whether or not they have files.
+/// The tracker definitions, read from the trackers that hold them: `access`'s
+/// `.newgit/trackers/` first, then each tracker owning files in it on top —
+/// the layering the remote enforces. `root`, `project`, and `access` are
+/// there whether or not they have files.
 fn definitions_at(
     store: &Utf8Path,
-    commit: &str,
+    holders: &BTreeMap<String, String>,
     scratch: &Utf8Path,
 ) -> Result<Vec<TrackerDefinition>> {
-    let dir = scratch.join(format!("definitions-{commit}"));
+    let key: String = holders
+        .values()
+        .map(|commit| &commit[..commit.len().min(12)])
+        .collect::<Vec<_>>()
+        .join("-");
+    let dir = scratch.join(format!("definitions-{key}"));
     std::fs::create_dir_all(&dir).map_err(|source| NewgitError::io(&dir, source))?;
-    let listing = run_git_env(
-        &[
-            &format!("--git-dir={store}"),
-            "ls-tree",
-            "--name-only",
-            &format!("{commit}:.newgit/trackers"),
-        ],
-        &[],
-    )
-    .unwrap_or_default();
-    let mut definitions = Vec::new();
-    for file in listing.lines().filter(|file| file.ends_with(".toml")) {
-        let text = run_git_env(
+    let order = holders
+        .iter()
+        .filter(|(tracker, _)| tracker.as_str() == ACCESS_TRACKER)
+        .chain(
+            holders
+                .iter()
+                .filter(|(tracker, _)| tracker.as_str() != ACCESS_TRACKER),
+        );
+    let mut files: BTreeMap<String, String> = BTreeMap::new();
+    for (_, commit) in order {
+        let listing = run_git_env(
             &[
                 &format!("--git-dir={store}"),
-                "show",
-                &format!("{commit}:.newgit/trackers/{file}"),
+                "ls-tree",
+                "--name-only",
+                &format!("{commit}:.newgit/trackers"),
             ],
             &[],
-        )?;
+        )
+        .unwrap_or_default();
+        for file in listing.lines().filter(|file| file.ends_with(".toml")) {
+            let text = run_git_env(
+                &[
+                    &format!("--git-dir={store}"),
+                    "show",
+                    &format!("{commit}:.newgit/trackers/{file}"),
+                ],
+                &[],
+            )?;
+            files.insert(file.to_owned(), text);
+        }
+    }
+    let mut definitions = Vec::new();
+    for (file, text) in &files {
         let path = dir.join(file);
         std::fs::write(&path, format!("{text}\n"))
             .map_err(|source| NewgitError::io(&path, source))?;
@@ -354,6 +383,12 @@ fn definitions_at(
         .any(|definition| definition.name == PROJECT_TRACKER)
     {
         definitions.push(TrackerDefinition::project());
+    }
+    if !definitions
+        .iter()
+        .any(|definition| definition.name == ACCESS_TRACKER)
+    {
+        definitions.push(TrackerDefinition::access());
     }
     resolve_ownership(&mut definitions)?;
     Ok(definitions)

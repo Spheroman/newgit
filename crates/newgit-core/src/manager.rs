@@ -296,6 +296,22 @@ pub struct InstanceReport {
     /// the instance has no recorded base, or its base branch no longer
     /// exists in the store to compare against.
     pub base: Option<BaseReport>,
+    pub readiness: Readiness,
+}
+
+/// Whether an instance works right now — checked, not remembered: each
+/// resource bound, each tree it builds present, each port of a running one
+/// answering. What `status` and the end of `spawn` say.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Readiness {
+    /// What is wrong, one line each; empty when ready.
+    pub problems: Vec<String>,
+}
+
+impl Readiness {
+    pub fn is_ready(&self) -> bool {
+        self.problems.is_empty()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -373,6 +389,8 @@ pub struct CheckpointOutcome {
     /// Why the checkpoint is not on the remote, when there is one and syncing
     /// failed. (Also among `warnings`.)
     pub sync_error: Option<String>,
+    /// Resources that were not up, so not captured.
+    pub degraded: Vec<String>,
 }
 
 /// A `git push` from a workspace, published: the checkpoint taken first, and
@@ -595,6 +613,12 @@ impl BranchManager {
             .any(|definition| definition.name == crate::tracker::PROJECT_TRACKER)
         {
             trackers.push(TrackerDefinition::project());
+        }
+        if !trackers
+            .iter()
+            .any(|definition| definition.name == crate::tracker::ACCESS_TRACKER)
+        {
+            trackers.push(TrackerDefinition::access());
         }
         crate::tracker::resolve_ownership(&mut trackers)?;
         let root = trackers.remove(
@@ -1233,6 +1257,73 @@ impl BranchManager {
         Ok(())
     }
 
+    /// Check that `branch` works right now (see [`Readiness`]).
+    pub fn readiness(&self, branch: &BranchInstance) -> Readiness {
+        let mut problems = Vec::new();
+        if !branch.workspace_path.is_dir() {
+            problems.push(format!(
+                "its workspace is missing ({})",
+                branch.workspace_path
+            ));
+            return Readiness { problems };
+        }
+        let supervisor = self.supervisor(branch);
+        for (name, binding) in &branch.resources {
+            let Ok(definition) = self.resource_definition(name) else {
+                continue;
+            };
+            match binding.status {
+                ResourceStatus::Ready => {}
+                ResourceStatus::Failed => {
+                    problems.push(format!(
+                        "`{name}` failed — retry with `newgit action {name}.prepare`; its logs are \
+                         under {}",
+                        self.store.paths().logs.join(&branch.slug)
+                    ));
+                    continue;
+                }
+                ResourceStatus::Pending => {
+                    problems.push(format!(
+                        "`{name}` never came up (a dependency of it did not)"
+                    ));
+                    continue;
+                }
+            }
+            for path in definition.identity_produces() {
+                if !branch.workspace_path.join(path).exists() {
+                    problems.push(format!(
+                        "`{name}`'s {path} is missing — rebuild with `newgit action {name}.prepare`"
+                    ));
+                }
+            }
+            if supervisor.running_pid(name).is_some() {
+                for (port_name, port) in &binding.resolved_ports {
+                    let address = std::net::SocketAddr::from(([127, 0, 0, 1], *port));
+                    let answering = std::net::TcpStream::connect_timeout(
+                        &address,
+                        std::time::Duration::from_millis(300),
+                    )
+                    .is_ok();
+                    if !answering {
+                        problems.push(format!(
+                            "`{name}` is running but its port {port_name} ({port}) is not \
+                             answering yet"
+                        ));
+                    }
+                }
+            }
+        }
+        Readiness { problems }
+    }
+
+    /// Whether every tree `definition` builds is in the workspace.
+    fn produced_present(&self, branch: &BranchInstance, definition: &ResourceDefinition) -> bool {
+        definition
+            .identity_produces()
+            .iter()
+            .all(|path| branch.workspace_path.join(path).exists())
+    }
+
     /// The tracker-path invariant, checked loudly: non-source tracker paths
     /// must be gitignored unless deliberately dual-tracked with source.
     pub fn gitignore_warnings(&self) -> Vec<String> {
@@ -1808,7 +1899,7 @@ impl BranchManager {
                         .store
                         .action_log_path(&branch.slug, &format!("{}.prepare", definition.name));
                     let (code, captured) =
-                        self.run_one_shot(branch, definition, action, "prepare", &log)?;
+                        self.run_one_shot(branch, definition, action, "prepare", &log, true)?;
                     captured_names = captured.found.keys().cloned().collect();
                     missing_captures = Self::missing_capture_warnings(
                         &definition.name,
@@ -2508,7 +2599,8 @@ impl BranchManager {
             return Ok(ActionOutcome::Started { pid, log });
         }
 
-        let (code, captured) = self.run_one_shot(&branch, definition, action, action_name, &log)?;
+        let (code, captured) =
+            self.run_one_shot(&branch, definition, action, action_name, &log, false)?;
         let missing_captures =
             Self::missing_capture_warnings(&definition.name, action_name, &captured, &log);
         let mut dirty = Self::apply_captures(&mut branch, &definition.name, captured.found);
@@ -2570,6 +2662,7 @@ impl BranchManager {
         action: &crate::resource::ActionSpec,
         action_name: &str,
         log: &Utf8Path,
+        quiet: bool,
     ) -> Result<(i32, Captures)> {
         let command = self.rendered_command(branch, definition, action)?;
         let env = self.assemble_env(branch)?;
@@ -2581,12 +2674,12 @@ impl BranchManager {
         )?;
 
         if action.captures.is_empty() {
-            let code = run_foreground(
-                &["sh".to_owned(), "-c".to_owned(), command],
-                &cwd,
-                &env,
-                log,
-            )?;
+            let command_line = ["sh".to_owned(), "-c".to_owned(), command];
+            let code = if quiet {
+                crate::supervisor::run_quiet(&command_line, &cwd, &env, log)?
+            } else {
+                run_foreground(&command_line, &cwd, &env, log)?
+            };
             return Ok((code, Captures::default()));
         }
 
@@ -3435,6 +3528,7 @@ impl BranchManager {
                     })
                     .collect();
                 let base = self.base_report(&branch);
+                let readiness = self.readiness(&branch);
                 Ok(InstanceReport {
                     branch,
                     workspace_exists,
@@ -3442,6 +3536,7 @@ impl BranchManager {
                     trackers,
                     resources,
                     base,
+                    readiness,
                 })
             })
             .collect()
@@ -4283,6 +4378,7 @@ impl BranchManager {
         // Lifecycle order, for the same reason cleanup uses it — a template
         // that reads an export is not a claim about capture order (#43).
         let mut resource_states = Vec::new();
+        let mut degraded = Vec::new();
         let mut deposits: Vec<(String, String)> = Vec::new();
         for name in self.graph.lifecycle_order.iter().rev() {
             let Some(binding) = branch.resources.get(name) else {
@@ -4297,6 +4393,20 @@ impl BranchManager {
             // against it spends real time and I/O dumping rubble nobody is
             // likely to ask to go back to. Explicit checkpoints still run
             // it: a person asked for that one on purpose (#58).
+            // A safety checkpoint minted ahead of an undo captures whatever
+            // is there so redo has something to restore to. But a resource
+            // whose last restore already failed is known-broken, not merely
+            // unobserved — running its checkpoint command (a `pg_dump`, say)
+            // against it spends real time and I/O dumping rubble nobody is
+            // likely to ask to go back to. Explicit checkpoints still run
+            // it: a person asked for that one on purpose (#58).
+            //
+            // But a resource that is not up — its prepare or last restore
+            // failed, or a dependency of it did — must not take the whole
+            // checkpoint down with it when its capture fails: the checkpoint
+            // goes ahead without it, degraded, and says so. An undo to it
+            // leaves that resource as it finds it. A resource that *was* up
+            // and fails to capture still aborts: that is unexpected.
             let captured = if reason == CheckpointReason::BeforeUndo
                 && binding.status == ResourceStatus::Failed
             {
@@ -4305,7 +4415,20 @@ impl BranchManager {
                      checkpoint capture rather than run an expensive command against \
                      known-broken state"
                 ));
+                degraded.push(name.clone());
                 CapturedResource::none()
+            } else if binding.status != ResourceStatus::Ready {
+                match self.checkpoint_resource(branch, definition) {
+                    Ok(captured) => captured,
+                    Err(error) => {
+                        warnings.push(format!(
+                            "resource `{name}` is not up and its capture failed ({error}), so \
+                             this checkpoint is degraded — undoing to it leaves `{name}` as it is"
+                        ));
+                        degraded.push(name.clone());
+                        CapturedResource::none()
+                    }
+                }
             } else {
                 self.checkpoint_resource(branch, definition)?
             };
@@ -4426,6 +4549,7 @@ impl BranchManager {
             record_path,
             warnings,
             sync_error,
+            degraded,
         })
     }
 
@@ -4454,10 +4578,11 @@ impl BranchManager {
                 list.insert(definition.name.clone(), tip);
             }
         }
-        if !list.contains_key(crate::tracker::PROJECT_TRACKER) {
+        if !list.contains_key(crate::tracker::ACCESS_TRACKER) {
             return Err(NewgitError::Unsupported(
                 "commit `.newgit/` first: the remote reads every tracker's audience from the \
-                 `project` tracker's definitions, so they have to be in the history it publishes"
+                 `access` tracker (`.newgit/trackers/`), so it has to be in the history it \
+                 publishes"
                     .to_owned(),
             ));
         }
@@ -5627,7 +5752,10 @@ impl BranchManager {
                 // and then the skip is wrong. That is what `--force-recompute`
                 // is for, and why the skip says so on the line rather than
                 // passing silently.
+                // And only while the tree is there at all: a lockfile that did
+                // not move says nothing about a `node_modules` someone deleted.
                 if !undo.force_recompute
+                    && self.produced_present(branch, definition)
                     && let Some(recorded) = state.state_ref.as_deref()
                     && recorded.starts_with(HASH_STATE_REF_PREFIX)
                     && undo
@@ -5693,7 +5821,7 @@ impl BranchManager {
                     .store
                     .action_log_path(&branch.slug, &format!("{}.restore", definition.name));
                 let (code, captured) =
-                    self.run_one_shot(branch, definition, action, action_name, &log)?;
+                    self.run_one_shot(branch, definition, action, action_name, &log, true)?;
                 warnings.extend(Self::missing_capture_warnings(
                     &definition.name,
                     action_name,

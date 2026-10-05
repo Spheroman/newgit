@@ -215,6 +215,7 @@ mod tests {
             paths: paths.iter().map(Utf8PathBuf::from).collect(),
             definition_rev: "sha256:000000000000".to_owned(),
             secret: true,
+            maintainers: None,
             excluded: Vec::new(),
         }
     }
