@@ -331,9 +331,9 @@ Not provided (say so in the docs and the video):
 Membership (`project-devs`) is a list in ProjectDO: `newgit members add
 <login>`. The creator is the first member.
 
-**Agents** act as their owner with a scoped token: they can read nothing their
-owner cannot, and they have their own per-user lanes (`<p>.t.<tracker>.<owner>`
-by default). *Open decision — see the end.*
+**Agents act as their owner** (decided): an agent holds a scoped token issued
+to its owner, reads nothing its owner cannot, and uses its owner's per-user
+lanes (`<p>.t.<tracker>.<owner>`).
 
 ### The credential helper
 
@@ -602,18 +602,28 @@ Resolved loudly; each is reversible after the competition.
 9. **ProjectDO is the source of truth** for binding records and checkpoints
    when a remote is configured.
 10. **Artifacts is the project remote** in remote mode; GitHub is a mirror.
-11. **Identity is GitHub login**, via device flow.
+11. **Identity is GitHub login**, via device flow. **Agents act as their
+    owner.**
 12. **Tracker lanes are Git** (`refs/lanes/<tracker>/*`), in a lanes repo
     separate from the store.
 
 ## Open Questions
 
-- **Agent identity.** Proposed: an agent acts as its owner with a scoped
-  token and uses its owner's per-user lanes. Alternative: agents as their own
-  principals with their own lanes and memberships. Decide before building
-  auth.
-- **Preview domain.** Own-hostname previews need a domain on the account.
-  Path-based previews work without one but break apps with absolute URLs.
+- **Preview domain.** `faretable.app` is on the account but serves the live
+  FareTable app. A preview on its subdomain receives any cookie FareTable
+  sets with `Domain=faretable.app`, and preview code is agent-written. The
+  free certificate also covers one subdomain level only. Recommended: a
+  dedicated newgit preview domain (as `vercel.app` is for Vercel). Fallback
+  for the demo: `<name>.faretable.app`, if FareTable sets only host-only
+  cookies.
+- **Cold restores.** The first restore of a multi-GB snapshot on a host is
+  slow (70–100 s seen); repeats are fast (5 s). Running CI and actions from
+  the snapshot right after it is built warms it as a side effect, but
+  placement is not ours, so a later preview can still land cold. Show
+  progress; do not promise a warm start.
+- **If `/proc/sys` stops being remountable,** fall back to userspace
+  networking (rootless Docker or Podman with `slirp4netns`/`pasta`), which
+  never writes kernel sysctls.
 - **Snapshot pricing** is unlisted while snapshots are in beta.
 - **Snapshot time** (41 s for ~1 GB) is too slow to block a checkpoint on.
   Snapshot in the background after the checkpoint record is written, and
