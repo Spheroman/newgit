@@ -141,33 +141,106 @@ pub fn compose(
         });
     }
 
-    // Interleave by committer date, then tracker name, then commit id — a
-    // total order, so the same tracker histories always give the same view.
-    events.sort_by(|left, right| {
-        (left.commit.committer_time, &left.tracker, &left.id).cmp(&(
-            right.commit.committer_time,
-            &right.tracker,
-            &right.id,
-        ))
-    });
-
-    // Commits split from one source fold back into one view commit.
-    let mut groups: Vec<Vec<usize>> = Vec::new();
-    let mut group_of: BTreeMap<String, usize> = BTreeMap::new();
-    for (index, event) in events.iter().enumerate() {
-        let key = event
+    // Interleave the trackers' spines into one line. Each tracker's own
+    // commits keep their order — parents before children — whatever their
+    // dates say: real histories are not in date order (rebases, cherry-picks,
+    // skewed clocks), and reordering a tracker's own commits would give them
+    // new parents, so nothing could be reused. Between trackers, the next
+    // view commit is the earliest by committer date (then tracker name, then
+    // commit id — a total order, so the same histories always give the same
+    // view). The pieces split from one view commit fold back into one, so a
+    // group is taken only once every piece is at the front of its tracker;
+    // if none is ready (histories that disagree on order), the earliest
+    // piece goes alone rather than out of its tracker's order.
+    let group_key = |event: &Event| {
+        event
             .commit
             .split_source
             .clone()
-            .unwrap_or_else(|| event.id.clone());
-        match group_of.get(&key) {
-            Some(&group) => groups[group].push(index),
-            None => {
-                group_of.insert(key, groups.len());
-                groups.push(vec![index]);
-            }
+            .unwrap_or_else(|| event.id.clone())
+    };
+    let mut sequences: Vec<Vec<usize>> = Vec::new();
+    for (index, event) in events.iter().enumerate() {
+        match sequences.last_mut() {
+            Some(sequence) if events[sequence[0]].tracker == event.tracker => sequence.push(index),
+            _ => sequences.push(vec![index]),
         }
     }
+    let mut pieces: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+    for (index, event) in events.iter().enumerate() {
+        pieces.entry(group_key(event)).or_default().push(index);
+    }
+    let order_key = |index: usize| {
+        let event = &events[index];
+        (
+            event.commit.committer_time,
+            event.tracker.clone(),
+            event.id.clone(),
+        )
+    };
+    let mut heads = vec![0usize; sequences.len()];
+    let mut emitted = vec![false; events.len()];
+    let mut ordered_groups: Vec<Vec<usize>> = Vec::new();
+    loop {
+        let fronts: Vec<usize> = sequences
+            .iter()
+            .zip(&heads)
+            .filter_map(|(sequence, &head)| sequence.get(head).copied())
+            .collect();
+        if fronts.is_empty() {
+            break;
+        }
+        let ready = |front: usize| {
+            pieces[&group_key(&events[front])]
+                .iter()
+                .all(|&piece| emitted[piece] || fronts.contains(&piece))
+        };
+        let pick = fronts
+            .iter()
+            .copied()
+            .filter(|&front| ready(front))
+            .min_by_key(|&front| order_key(front));
+        let members: Vec<usize> = match pick {
+            Some(front) => pieces[&group_key(&events[front])]
+                .iter()
+                .copied()
+                .filter(|&piece| !emitted[piece])
+                .collect(),
+            None => vec![
+                fronts
+                    .iter()
+                    .copied()
+                    .min_by_key(|&front| order_key(front))
+                    .expect("a front"),
+            ],
+        };
+        for &member in &members {
+            emitted[member] = true;
+            let sequence = sequences
+                .iter()
+                .zip(&heads)
+                .position(|(sequence, &head)| sequence.get(head) == Some(&member))
+                .expect("a member is at its tracker's front");
+            heads[sequence] += 1;
+        }
+        ordered_groups.push(members);
+    }
+    // Lay the events out in view order, and the groups over the new indices.
+    let order: Vec<usize> = ordered_groups.iter().flatten().copied().collect();
+    let mut position = vec![0usize; events.len()];
+    for (new, &old) in order.iter().enumerate() {
+        position[old] = new;
+    }
+    let mut slots: Vec<Option<Event>> = events.into_iter().map(Some).collect();
+    let events: Vec<Event> = order
+        .iter()
+        .map(|&old| slots[old].take().expect("each event once"))
+        .collect();
+    let groups: Vec<Vec<usize>> = ordered_groups
+        .into_iter()
+        .map(|members| members.into_iter().map(|old| position[old]).collect())
+        .collect();
+
     // A group whose every member changed only paths it no longer owns is
     // another tracker's commit seen from here: drop it, or a view without
     // that tracker shows it as an empty commit. (A genuinely empty commit is
@@ -750,6 +823,7 @@ pub fn split(
     let ids: Vec<String> = ids.into_iter().map(|(id, _)| id).collect();
     let raw = read_commits(repo, &ids)?;
     let mut made = Vec::new();
+    let mut notes = Vec::new();
     for id in &ids {
         let commit = raw.get(id).cloned().ok_or_else(|| missing(id))?;
         let mut by_tracker: BTreeMap<String, Vec<Change>> = BTreeMap::new();
@@ -792,8 +866,9 @@ pub fn split(
             state.insert(tracker.clone(), made_commit.clone());
             made.push((tracker, made_commit));
         }
-        write_note(repo, id, &render_state(&state))?;
+        notes.push((id.clone(), render_state(&state)));
     }
+    write_notes(repo, &notes)?;
     Ok(SplitOutcome { state, made })
 }
 
@@ -1000,19 +1075,42 @@ fn render_state(state: &State) -> String {
         .collect()
 }
 
-fn write_note(repo: &Utf8Path, commit: &str, note: &str) -> Result<()> {
-    git(
-        repo,
-        &[
-            "notes",
-            "--ref",
-            NOTES_REF,
-            "add",
-            "-f",
-            "-m",
-            note.trim_end(),
-            commit,
-        ],
+/// Note every `(commit, state)` in one notes commit — one `git
+/// fast-import`, however many commits a split made. (`git notes add` once
+/// per commit rewrites the whole notes tree each time.)
+fn write_notes(repo: &Utf8Path, notes: &[(String, String)]) -> Result<()> {
+    if notes.is_empty() {
+        return Ok(());
+    }
+    let parent = git_lines(repo, &["rev-parse", "-q", "--verify", NOTES_REF])
+        .ok()
+        .and_then(|lines| lines.into_iter().next());
+    let mut stream = Vec::new();
+    writeln!(stream, "commit {NOTES_REF}").ok();
+    writeln!(
+        stream,
+        "committer newgit <newgit@localhost> 946684800 +0000"
+    )
+    .ok();
+    writeln!(stream, "data 6\nsplit\n").ok();
+    if let Some(parent) = parent {
+        writeln!(stream, "from {parent}").ok();
+    }
+    for (commit, note) in notes {
+        writeln!(stream, "N inline {commit}").ok();
+        writeln!(stream, "data {}", note.len()).ok();
+        stream.extend_from_slice(note.as_bytes());
+        stream.push(b'\n');
+    }
+    stream.push(b'\n');
+    run(
+        Command::new("git").arg("-C").arg(repo.as_str()).args([
+            "fast-import",
+            "--quiet",
+            "--date-format=raw",
+        ]),
+        "git fast-import",
+        Some(&stream),
     )
     .map(drop)
 }

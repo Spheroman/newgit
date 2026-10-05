@@ -190,7 +190,10 @@ fn work_split_before_a_carve_keeps_every_file_after_it() {
     workspace_commit(
         &manager,
         "feature-a",
-        &[("README.md", "more\n"), ("apps/electron/other.js", "other\n")],
+        &[
+            ("README.md", "more\n"),
+            ("apps/electron/other.js", "other\n"),
+        ],
         "more electron work, after the carve",
     );
     manager
