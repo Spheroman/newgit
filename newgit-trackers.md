@@ -409,16 +409,23 @@ Each step lands alone and keeps the suite green.
      composing path arrives with `use`/`drop` in step 4); and split
      follows the first parent, so a merge *inside* the work being split is
      flattened (step 5, with merges).
-   - *3d — remote. (Next.)* Branches as lists, one Artifacts repo per code
-     tracker, lazy per-tracker forks, the Git endpoint at
-     `newgit.dev/<owner>/<project>.git`, `newgit clone`. Starts with a spike:
-     a sandbox behind the Worker serving a composed clone, cold and warm.
+   - *3d — remote. (Landed.)* Projects as `<owner>/<name>`, branches as
+     lists, one Artifacts repo per code tracker, per-tracker forks made
+     when an instance changes a tracker, checkpoints synced as lists and
+     composed by `spawn --from-checkpoint`, `newgit clone`, and the Git
+     endpoint at `newgit.dev/<owner>/<name>.git` (a per-project container
+     composing each reader's view). Canonical-id notes on rebuilt commits
+     are not written yet.
 4. **Roles, priority, resources, use/drop.** Binding per slot; resources
    brought by trackers; role dependencies.
 5. **Coherent merges** locally and on the remote: `newgit merge` writes a
    branch's new list in one step — per tracker, the instance's commit when
    `main` has not moved, a real Git merge when both sides changed it —
-   with `--only` stacking checked against `requires`.
+   with `--only` stacking checked against `requires`. *(Landed, without
+   `--only`, which waits for `requires` in step 4. `newgit merge main`
+   merges the project root, which is how trackers made after `remote add`
+   reach the remote. Merges inside the work being split are still
+   flattened.)*
 6. **GitHub export.**
 
 Then the preview work in `newgit-cloudflare.md` continues on top: a preview's

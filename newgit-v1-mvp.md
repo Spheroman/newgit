@@ -1104,11 +1104,12 @@ newgit tracker track generated-sdk src/generated
 
 Beyond v1, newgit talks to the hosted remote described in
 `newgit-cloudflare.md`: `newgit login` / `logout` / `whoami` (GitHub device
-flow), `newgit remote add [--url <url>] [--project <p>]` / `remote show`,
-`newgit members add|remove <github-login>` / `members list`, and `newgit spawn --from-checkpoint
-<instance>/<checkpoint>`, which brings up someone else's checkpoint locally —
-source, uncommitted work, your own copy of their trackers, and resources
-restored.
+flow), `newgit remote add [--url <url>] [--project <owner>/<name>]` /
+`remote show`, `newgit members add|remove <github-login>` / `members list`,
+`newgit clone <owner>/<name>`, `newgit merge [instance] [--into <branch>]`,
+and `newgit spawn --from-checkpoint <instance>/<checkpoint>`, which brings
+up someone else's checkpoint locally — source, uncommitted work, your own
+copy of their trackers, and resources restored.
 
 ### `newgit resource add <name> --template <template>`
 

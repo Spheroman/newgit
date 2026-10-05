@@ -306,28 +306,35 @@ code cannot read another's cookies or storage).
 
 ## Repo Topology
 
-> **Decision (loud): one repo per tracker (per user for `user` trackers),
-> plus one fork per instance.** The architecture doc's "one store, not
-> repo-per-tracker" rule still holds **locally**. On the remote, Artifacts
-> tokens are repo-scoped, so a permission boundary *must* be a repo boundary,
-> and a tracker is the unit audience is declared on.
+> **Decision (loud): one repo per tracker, and an instance forks only the
+> trackers it changes.** A project is `<owner>/<name>`, like GitHub. On the
+> remote, Artifacts tokens are repo-scoped, so a permission boundary *must*
+> be a repo boundary, and a tracker is the unit audience is declared on
+> (newgit-trackers.md, *On the remote*).
 
-- `<p>.src` — trunk. Readable by every member. Source only — forks copy every
-  ref, so nothing goes here that a fork's owner may not read. *(Replaced in
-  newgit-trackers.md step 3d: branches as lists, one repo per code tracker,
-  lazy per-tracker forks, and a Git endpoint at
-  `newgit.dev/<owner>/<project>.git`. This section describes what is
-  deployed today.)*
-- `<p>.i.<instance>` — forked from `<p>.src`, asynchronously, at spawn.
-  Write tokens go **only** to the instance's owner. Deleted by `newgit remove`.
-- `<p>.t.<tracker>` / `<p>.t.<tracker>.<login>` — a tracker's lane and rev
-  refs. Created lazily on first push.
+- `<owner>.<name>.t.<tracker>` — a code tracker's history: one Git branch per
+  newgit branch (`main`), the entry in that branch's list. Readable by the
+  tracker's audience; written only when it is seeded and by `newgit merge`.
+  Also a shared secret tracker's content.
+- `<owner>.<name>.t.<tracker>.<login>` — one user's per-user secret tracker.
+- `<owner>.<name>.i.<instance>.<tracker>` — an instance's fork of one code
+  tracker, made the first time the instance changes it; its branch is
+  `refs/heads/<instance>` and each checkpoint's commit
+  `refs/newgit/checkpoints/<id>`. Written only by that instance. Deleted by
+  `newgit remove`.
+- **Branches** are lists — one commit per code tracker — in the project's
+  Durable Object, where a merge moves one by compare-and-swap.
+- **The Git endpoint**, `https://newgit.dev/<owner>/<name>.git`, is what
+  `git clone`, `git pull`, and a workspace's `origin` fetch: each branch
+  composed, in the project's container, from the trackers the caller may
+  read (*The Git endpoint* in newgit-trackers.md; round 4 below).
 
 Real properties, not simulations:
 
-- **An agent cannot push to trunk.** Its credential only opens its fork.
+- **An agent cannot move a branch.** Merging is a person's decision; agent
+  and instance tokens are refused.
 - **An agent cannot read a tracker outside its audience.** The Worker will not
-  mint the token.
+  mint the token, and the endpoint composes nothing it may not read.
 - **An agent cannot damage another instance.** Different repos, different
   tokens.
 
@@ -336,8 +343,8 @@ Not provided (say so in the docs and the video):
 - Isolation *within* a machine: agents under one OS user share the credential
   helper. Sandboxes give per-agent identity.
 - Hunk-level privacy. Trackers are path-granular.
-- Cross-repo atomicity. ProjectDO's checkpoint row is the commit point: refs
-  are pushed first, the row is written last.
+- Carving does not hide the past: a narrower code tracker's earlier versions
+  stay readable in root's history (newgit-trackers.md, *On the remote*).
 
 ---
 
@@ -399,35 +406,40 @@ routine and cancelling them could break a push in flight.
 ### The credential helper
 
 ```
+credential.https://newgit.dev.helper = !newgit credential
 credential.https://<account>.artifacts.cloudflare.net.helper = !newgit credential
 credential.https://<account>.artifacts.cloudflare.net.useHttpPath = true
 ```
 
-Git calls `newgit credential get`; newgit asks the Worker for a token for the
-repo in the URL path; the Worker checks the rules and mints a 15-minute token.
-`useHttpPath` is required — without it Git omits the repo path.
+Git calls `newgit credential get`. For the endpoint (`<owner>/<name>.git`)
+the password is the newgit token itself — a workspace's own inside a
+workspace. For an Artifacts repo, newgit asks the Worker for a password for
+the repo in the URL path; the Worker checks the rules and mints a 15-minute
+one. `useHttpPath` is required — without it Git omits the repo path.
 
 | Repo | read | write |
 |---|---|---|
-| `<p>.src` | members | **nobody** (the merge executor only) |
-| `<p>.i.<inst>` | members | the instance owner |
-| `<p>.t.<tracker>` | the tracker's audience | the tracker's audience |
-| `<p>.t.<tracker>.<login>` | `<login>` | `<login>` |
+| `<o>.<p>.t.<code tracker>` | its audience | nobody (seeding; `newgit merge`) |
+| `<o>.<p>.t.<secret tracker>` | its audience | its audience |
+| `<o>.<p>.t.<tracker>.<login>` | `<login>` | `<login>` |
+| `<o>.<p>.i.<inst>.<tracker>` | the tracker's audience | the instance owner |
 
 ---
 
 ## The Push Path
 
-v1's outbox already checkpoints before forwarding a push. Remote mode changes
-where it forwards: to `<p>.i.<inst>`, then the checkpoint write-through tells
-ProjectDO the new head synchronously. A per-fork `pushed` event subscription
-is the backstop for pushes that bypass the outbox (~5.5 s lag) and the
-trigger for CI.
+A push from a workspace goes to newgit's outbox, which checkpoints the
+instance. On a newgit remote the checkpoint's sync *is* the push: the
+instance's work is split into its trackers, every commit it sends checked
+for secret files, and each changed tracker's branch and the checkpoint's
+commit pushed to the instance's fork of it — forked then, the first time.
+The push succeeds exactly when that reached the remote. Nothing is forwarded
+as one history; the endpoint composes views, and `newgit merge` moves
+branches.
 
-The workspace's `origin` fetch URL is `<p>.src`, so `git pull` shows trunk.
-
-> **Decision:** in remote mode, Artifacts is the project's remote; GitHub is a
-> mirror. Keeping GitHub primary puts trunk outside enforced audience.
+> **Decision:** in remote mode, newgit's remote is the project's remote;
+> GitHub is an export (newgit-trackers.md, step 6). Keeping GitHub primary
+> puts trunk outside enforced audience.
 
 ---
 
@@ -451,15 +463,19 @@ content can ride along.
 
 ## Merge And Overlap (table stakes, kept small)
 
-`newgit merge <instance>` merges the instance into trunk server-side:
-isomorphic-git in the Worker, fetching shallow to the merge base (~4 s on a
-41 MB repo in the Day 0 spike; full history exceeds Worker memory). On
-conflict nothing moves and the conflicting paths are reported. On success,
-`merge_with_source` trackers' bound revs become their lane heads.
+`newgit merge <instance>` runs on the merger's machine, tracker by tracker:
+fast-forward where the branch has not moved, `git merge-tree` where both
+sides changed a tracker, nothing at all on a conflict (newgit-trackers.md,
+*Checkpoints, merges, and coherence*). On the remote it begins under a short
+lock with the list it was based on, pushes each moved tracker's commit with
+passwords minted for that merge, and finishes with a compare-and-swap of the
+branch's list in the project's Durable Object — every tracker moves
+together, or none does. (The Worker's Artifacts binding cannot write refs,
+so the merge's Git work is the merger's; the list is the truth.)
 
 On each push, ProjectDO compares the paths the instance touched with every
 other live instance's and reports overlaps in `newgit status --json` and the
-web UI. No queue UI, no review threads.
+web UI. No queue UI, no review threads. *(Not built yet.)*
 
 Undo stays as it is in v1, local only. It is not part of the pitch.
 
@@ -484,8 +500,10 @@ action is also a CLI command.
 Done: Day 0 spikes (Artifacts), lanes as Git, `[remote]` config, Day 1
 sandbox spikes, the Worker (item 4), and the CLI remote client with
 `spawn --from-checkpoint` and the push path (items 5–6). Since then, the
-tracker redesign in newgit-trackers.md took priority over previews: steps 1,
-2, 3a, and 3b have landed, and its build order tracks the rest.
+tracker redesign in newgit-trackers.md took priority over previews: steps 1
+through 3d and the core of step 5 (`newgit merge`) have landed — branches as
+lists, a repo per code tracker, lazy forks, the Git endpoint, `newgit
+clone` — and its build order tracks the rest.
 
 ### Day 1 — Spikes, round 2 (sandboxes)
 

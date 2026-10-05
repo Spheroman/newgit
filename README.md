@@ -42,10 +42,18 @@ resources restored.
 
 ```sh
 newgit login                      # GitHub device flow
-newgit remote add                 # create or join this project on the remote
+newgit remote add                 # create <you>/<project>: a repo per code tracker
 newgit members add octocat
 newgit spawn --from-checkpoint auth-refactor/ckpt_003
+newgit merge auth-refactor        # into main, tracker by tracker, all at once
+
+# a teammate
+newgit clone jack/widget          # or plain: git clone https://newgit.dev/jack/widget.git
 ```
+
+Plain `git clone` works too: the remote composes each branch from the code
+trackers you may read, so two people can read different parts of one
+project.
 
 Every tracker is its own history. `root` owns `.` — whatever no more specific
 tracker claims — and starts as your project's Git history; `project` owns
@@ -200,7 +208,10 @@ Definition management (noun subcommands):
 Remote:
 
 - `newgit login` / `logout` / `whoami`
-- `newgit remote add [--url <url>] [--project <name>]` / `remote show`
+- `newgit remote add [--url <url>] [--project <owner>/<name>]` / `remote show`
+- `newgit clone <owner>/<name> [dir]`
+- `newgit merge [instance] [--into <branch>]` — `newgit merge main` merges
+  the project root
 - `newgit members add|remove <github-login>` / `members list`
 - `newgit spawn <name> --from-checkpoint <instance>/<checkpoint>`
 
