@@ -321,7 +321,9 @@ code cannot read another's cookies or storage).
   tracker, made the first time the instance changes it; its branch is
   `refs/heads/<instance>` and each checkpoint's commit
   `refs/newgit/checkpoints/<id>`. Written only by that instance. Deleted by
-  `newgit remove`.
+  `newgit remove`. A private instance's forks (`newgit spawn --private`) are
+  readable only by its owner, and its record and checkpoints are hidden
+  from everyone else until its work is merged.
 - **Branches** are lists — one commit per code tracker — in the project's
   Durable Object, where a merge moves one by compare-and-swap.
 - **The Git endpoint**, `https://newgit.dev/<owner>/<name>.git`, is what

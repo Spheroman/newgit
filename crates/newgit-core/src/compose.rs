@@ -14,7 +14,7 @@
 //! commit stands for is kept in a note on it (`refs/notes/newgit-composed`):
 //! one `<tracker> <commit>` line per tracker, as of that view commit.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write as _;
 use std::process::{Command, Stdio};
 
@@ -753,6 +753,15 @@ fn describe_sources(repo: &Utf8Path, sources: &[String]) -> Result<BTreeMap<Stri
 pub enum Refusal {
     /// The path's owner is not bound in this view.
     Unbound { path: String, tracker: String },
+    /// One commit changes code trackers with different audiences. Its message
+    /// would be copied into each, so everyone who may read any of them would
+    /// read a message about work some of them may not see.
+    MixedAudience {
+        commit: String,
+        subject: String,
+        /// Each tracker the commit changes, with its audience.
+        trackers: Vec<(String, String)>,
+    },
 }
 
 impl std::fmt::Display for Refusal {
@@ -763,6 +772,26 @@ impl std::fmt::Display for Refusal {
                 "`{path}` belongs to `{tracker}`, which this instance has not bound: \
                  `newgit tracker use {tracker}`"
             ),
+            Refusal::MixedAudience {
+                commit,
+                subject,
+                trackers,
+            } => {
+                let listed = trackers
+                    .iter()
+                    .map(|(tracker, audience)| format!("`{tracker}` ({audience})"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                write!(
+                    f,
+                    "commit {} (\"{subject}\") changes trackers with different audiences: \
+                     {listed}. A commit has one message, and every tracker it changes keeps a \
+                     copy, so each audience would read a message about work it may not see. \
+                     Make one commit per audience (for the last commit, `git reset HEAD~` and \
+                     commit each tracker's files on their own), then try again",
+                    &commit[..commit.len().min(12)]
+                )
+            }
         }
     }
 }
@@ -922,6 +951,29 @@ pub fn split(
                         tracker: owner.unwrap_or_default(),
                     }));
                 }
+            }
+        }
+        // A merge is exempt: its message is almost always Git's own ("Merge
+        // branch 'main'"), and its first-parent diff spans whatever the
+        // merged branch changed.
+        if !commit.merge {
+            let audiences: BTreeSet<&str> = by_tracker
+                .keys()
+                .filter_map(|tracker| bound.iter().find(|definition| &definition.name == tracker))
+                .map(|definition| definition.audience.as_str())
+                .collect();
+            if audiences.len() > 1 {
+                return Err(SplitError::Refused(Refusal::MixedAudience {
+                    commit: id.clone(),
+                    subject: commit.message.lines().next().unwrap_or_default().to_owned(),
+                    trackers: by_tracker
+                        .keys()
+                        .filter_map(|tracker| {
+                            bound.iter().find(|definition| &definition.name == tracker)
+                        })
+                        .map(|definition| (definition.name.clone(), definition.audience.clone()))
+                        .collect(),
+                }));
             }
         }
         let message = format!(
@@ -1304,6 +1356,8 @@ struct RawCommit {
     committer: String,
     committer_time: i64,
     message: String,
+    /// Whether it has more than one parent.
+    merge: bool,
     /// The view commit this was split from, when it was.
     split_source: Option<String>,
     /// The view commit that one followed, when the trailer says.
@@ -1351,8 +1405,11 @@ fn parse_commit(raw: &str) -> RawCommit {
     let (headers, message) = raw.split_once("\n\n").unwrap_or((raw, ""));
     let mut author = String::new();
     let mut committer = String::new();
+    let mut parents = 0;
     for line in headers.lines() {
-        if let Some(value) = line.strip_prefix("author ") {
+        if line.starts_with("parent ") {
+            parents += 1;
+        } else if let Some(value) = line.strip_prefix("author ") {
             author = value.to_owned();
         } else if let Some(value) = line.strip_prefix("committer ") {
             committer = value.to_owned();
@@ -1378,6 +1435,7 @@ fn parse_commit(raw: &str) -> RawCommit {
         committer,
         committer_time,
         message: message.to_owned(),
+        merge: parents > 1,
         split_source,
         split_parent,
     }

@@ -193,7 +193,7 @@ tests by nature.
 Branch-instance lifecycle (top-level verbs; `[instance]` is inferred when run
 inside a workspace):
 
-- `newgit init` / `spawn <name> [--use <tracker>] [--drop <tracker>]` /
+- `newgit init` / `spawn <name> [--use <tracker>] [--drop <tracker>] [--private]` /
   `status [name]` / `remove <name> [--purge]` — `status` says whether each
   instance is ready, and why not
 - `newgit status <instance> --path` — just the workspace path, for scripts

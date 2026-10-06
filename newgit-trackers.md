@@ -176,6 +176,17 @@ the trailer stripped — so a commit split and recomposed is *the same commit*:
 same tree, parent, author, date, and message, same id. Commit ids never
 change under an agent, on any machine.
 
+**One commit, one audience (decided).** Because every part of a split keeps
+the commit's message, a commit that changes code trackers with different
+audiences would put a message about work only some may read into a tracker
+everyone else reads ("Fix the refund bypass" landing in `root`). The split
+refuses it, naming the commit and each tracker's audience: make one commit
+per audience. A refusal, not a warning, because the split is where work
+leaves the machine, so a warning would arrive after the message had gone.
+Merge commits are exempt (their message is Git's own, and their first-parent
+diff spans whatever the merged branch changed); history already split is not
+checked again, so a teammate's published work never blocks your sync.
+
 **Signed commits (decided).** A signature covers a commit's exact content,
 so a recomposed commit cannot carry the original's. Three rules:
 
@@ -345,11 +356,21 @@ makes inside one workspace.)
 | Repo (Artifacts) | Holds | Read | Write |
 |---|---|---|---|
 | `<owner>.<project>.t.<tracker>` | a code tracker's history | its audience | seeding, then merges |
-| `<owner>.<project>.i.<instance>.<tracker>` | an instance's branch of one code tracker, forked the first time the instance changes it | the tracker's audience | the instance |
+| `<owner>.<project>.i.<instance>.<tracker>` | an instance's branch of one code tracker, forked the first time the instance changes it | the tracker's audience; only the instance's owner when it is private | the instance |
 | `<owner>.<project>.t.<tracker>[.<login>]` | a secret tracker, as before | its audience | its audience |
 
 No trunk repo, no composed repo, no whole-source fork per instance: spawning
 forks nothing.
+
+**Private instances (decided).** `newgit spawn <name> --private` makes an
+instance that only its owner sees on the remote: its record, its
+checkpoints, and its forks answer everyone else as though it did not exist,
+the project's owner included. That is an embargo: a security fix is built,
+checkpointed, and spawned elsewhere by its author without the rest of the
+project seeing it, and `newgit merge` is the moment it is disclosed. It needs
+a newgit remote; without one, `--private` is refused, since a `git push`
+to a plain Git remote would publish it. Its name is not hidden: creating
+another instance with the same name says it exists.
 
 **The Git endpoint (decided).** `https://newgit.dev/<owner>/<project>.git` is
 an ordinary Git remote: `git clone` and `git pull` work with plain Git, no

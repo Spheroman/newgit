@@ -118,6 +118,7 @@ fn a_prepare_sees_only_the_bound_trackers() {
             &BindingChoice {
                 uses: Vec::new(),
                 drops: vec!["electron".to_owned()],
+                ..Default::default()
             },
         )
         .expect("spawn");

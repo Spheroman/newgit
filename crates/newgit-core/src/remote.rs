@@ -117,6 +117,9 @@ pub struct RemoteInstance {
     /// The code trackers it has forked: the ones it changed.
     #[serde(default)]
     pub forks: Vec<String>,
+    /// Only its owner sees it until its work is merged.
+    #[serde(default)]
+    pub private: bool,
 }
 
 /// What registering an instance returns: its record, and the workspace's own
@@ -217,11 +220,13 @@ pub trait Remote {
     ) -> Result<()>;
     fn add_member(&self, project: &str, login: &str) -> Result<bool>;
     fn remove_member(&self, project: &str, login: &str) -> Result<bool>;
+    /// `private`: only its owner sees it until its work is merged.
     fn register_instance(
         &self,
         project: &str,
         name: &str,
         base_rev: &str,
+        private: bool,
     ) -> Result<RegisteredInstance>;
     fn instance(&self, project: &str, name: &str) -> Result<RemoteInstance>;
     fn remove_instance(&self, project: &str, name: &str) -> Result<()>;
@@ -546,6 +551,7 @@ impl Remote for HttpRemote {
         project: &str,
         name: &str,
         base_rev: &str,
+        private: bool,
     ) -> Result<RegisteredInstance> {
         #[derive(Deserialize)]
         struct Registered {
@@ -558,7 +564,7 @@ impl Remote for HttpRemote {
         let registered: Registered = self.send(
             "POST",
             &format!("/v1/projects/{}/instances", project_path(project)),
-            Some(serde_json::json!({ "name": name, "base_rev": base_rev })),
+            Some(serde_json::json!({ "name": name, "base_rev": base_rev, "private": private })),
         )?;
         Ok(RegisteredInstance {
             instance: registered.instance,

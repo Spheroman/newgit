@@ -1377,6 +1377,14 @@ impl BranchManager {
         choice: &BindingChoice,
     ) -> Result<SpawnOutcome> {
         self.require_resolvable_graph()?;
+        if choice.private && self.remote.is_none() {
+            return Err(NewgitError::Unsupported(
+                "a private instance is private on the project's newgit remote, and this project \
+                 has none: nothing here could keep it private, and a `git push` would publish \
+                 it. `newgit remote add` first"
+                    .to_owned(),
+            ));
+        }
         let dropped = self.choose_binding(choice)?;
         validate_name(name)?;
         if branch_slug(name) == PROJECT_ROOT_INSTANCE {
@@ -1430,6 +1438,7 @@ impl BranchManager {
             .workspace_root(&self.store.paths().project_root)
             .join(&slug);
         let mut branch = BranchInstance::new(name, name, source_rev, workspace_path)?;
+        branch.private = choice.private;
         if let Some((base_ref, base_rev)) = base {
             branch = branch.with_base(base_ref, base_rev);
         }
@@ -1512,7 +1521,18 @@ impl BranchManager {
             &link.project,
             &branch.slug,
             &branch.source_rev,
+            branch.private,
         )?;
+        // Never assume it: a remote that does not know private instances
+        // registers a public one. Stopping here keeps every sync of this
+        // instance from running, so nothing of it leaves.
+        if branch.private && !registered.instance.private {
+            return Err(NewgitError::Unsupported(format!(
+                "{} registered `{}` as an ordinary instance, not a private one (it predates \
+                 private instances), so nothing of it will be synced there",
+                link.project, branch.name
+            )));
+        }
         crate::remote::write_private(
             &crate::remote::workspace_token_path(&branch.workspace_path),
             &registered.token,
@@ -6823,12 +6843,14 @@ pub struct MergeOutcome {
     pub project_root: Option<String>,
 }
 
-/// What a person asks a spawn to bind beyond the defaults: `--use` and
-/// `--drop`.
+/// What a person asks of a spawn beyond the defaults: `--use`, `--drop`,
+/// and `--private`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct BindingChoice {
     pub uses: Vec<String>,
     pub drops: Vec<String>,
+    /// Spawn it private: on the remote, only its owner sees it until merged.
+    pub private: bool,
 }
 
 /// What to do with uncommitted work in a code tracker being dropped.

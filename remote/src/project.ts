@@ -61,6 +61,12 @@ export interface Instance {
 	headRev: string | null;
 	/** The code trackers this instance has forked: the ones it changed. */
 	forks: string[];
+	/**
+	 * Only its owner sees it — its record, its checkpoints, its forks —
+	 * until its work is merged: an embargo, for work (a security fix) the
+	 * rest of the project must not see yet.
+	 */
+	private: boolean;
 	createdAt: string;
 	updatedAt: string;
 }
@@ -91,13 +97,17 @@ export class ProjectDO extends DurableObject<Env> {
 				created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
 			CREATE TABLE IF NOT EXISTS instances (
 				name TEXT PRIMARY KEY, owner TEXT NOT NULL, agent TEXT, base_rev TEXT NOT NULL, head_rev TEXT,
-				created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+				created_at TEXT NOT NULL, updated_at TEXT NOT NULL, private INTEGER NOT NULL DEFAULT 0);
 			CREATE TABLE IF NOT EXISTS forks (
 				instance TEXT NOT NULL, tracker TEXT NOT NULL, PRIMARY KEY (instance, tracker));
 			CREATE TABLE IF NOT EXISTS checkpoints (
 				instance TEXT NOT NULL, id TEXT NOT NULL, created_by TEXT NOT NULL, agent TEXT,
 				created_at TEXT NOT NULL, record TEXT NOT NULL, PRIMARY KEY (instance, id));
 		`);
+		// Projects made before private instances: add the column (a no-op error otherwise).
+		try {
+			this.sql.exec("ALTER TABLE instances ADD COLUMN private INTEGER NOT NULL DEFAULT 0");
+		} catch {}
 	}
 
 	/** Create the project. Returns false when it already exists. */
@@ -242,18 +252,25 @@ export class ProjectDO extends DurableObject<Env> {
 		return this.sql.exec("DELETE FROM members WHERE login = ?", login).rowsWritten > 0;
 	}
 
-	createInstance(name: string, owner: string, baseRev: string, agent: string | null = null): Instance | null {
+	createInstance(
+		name: string,
+		owner: string,
+		baseRev: string,
+		agent: string | null = null,
+		isPrivate = false,
+	): Instance | null {
 		if (this.instance(name) !== null) return null;
 		const now = new Date().toISOString();
 		this.sql.exec(
-			`INSERT INTO instances (name, owner, agent, base_rev, head_rev, created_at, updated_at)
-			 VALUES (?, ?, ?, ?, NULL, ?, ?)`,
+			`INSERT INTO instances (name, owner, agent, base_rev, head_rev, created_at, updated_at, private)
+			 VALUES (?, ?, ?, ?, NULL, ?, ?, ?)`,
 			name,
 			owner,
 			agent,
 			baseRev,
 			now,
 			now,
+			isPrivate ? 1 : 0,
 		);
 		return this.instance(name);
 	}
@@ -287,6 +304,7 @@ export class ProjectDO extends DurableObject<Env> {
 			baseRev: row.base_rev,
 			headRev: row.head_rev,
 			forks,
+			private: row.private === 1,
 			createdAt: row.created_at,
 			updatedAt: row.updated_at,
 		};
@@ -336,7 +354,8 @@ export class ProjectDO extends DurableObject<Env> {
 		return row ? toCheckpoint(row) : null;
 	}
 
-	checkpoints(instance?: string): Checkpoint[] {
+	/** Checkpoints `viewer` may see: none of another user's private instance. */
+	checkpoints(instance: string | undefined, viewer: string): Checkpoint[] {
 		const rows =
 			instance === undefined
 				? this.sql.exec<CheckpointRow>("SELECT * FROM checkpoints ORDER BY created_at, instance, id")
@@ -344,7 +363,16 @@ export class ProjectDO extends DurableObject<Env> {
 						"SELECT * FROM checkpoints WHERE instance = ? ORDER BY created_at, id",
 						instance,
 					);
-		return rows.toArray().map(toCheckpoint);
+		const hidden = new Set(
+			this.sql
+				.exec<{ name: string }>("SELECT name FROM instances WHERE private = 1 AND owner != ?", viewer)
+				.toArray()
+				.map((row) => row.name),
+		);
+		return rows
+			.toArray()
+			.map(toCheckpoint)
+			.filter((checkpoint) => !hidden.has(checkpoint.instance));
 	}
 }
 
@@ -356,6 +384,7 @@ interface InstanceRow extends Record<string, SqlStorageValue> {
 	head_rev: string | null;
 	created_at: string;
 	updated_at: string;
+	private: number;
 }
 
 interface BranchRow extends Record<string, SqlStorageValue> {

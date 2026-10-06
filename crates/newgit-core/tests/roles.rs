@@ -138,6 +138,7 @@ fn asking_for_a_tracker_fills_its_role_instead() {
             &BindingChoice {
                 uses: vec!["staging-db".to_owned(), "extras".to_owned()],
                 drops: Vec::new(),
+                ..Default::default()
             },
         )
         .expect("spawn");
@@ -159,6 +160,7 @@ fn a_required_role_cannot_be_left_empty() {
             &BindingChoice {
                 uses: Vec::new(),
                 drops: vec!["dev-db".to_owned(), "staging-db".to_owned()],
+                ..Default::default()
             },
         )
         .expect_err("api requires a db");

@@ -127,6 +127,8 @@ export interface Requester {
 export interface Facts {
 	/** Owner of the instance, for forks; undefined when there is no such instance. */
 	instanceOwner?: string;
+	/** Whether that instance is private: only its owner reads its forks. */
+	instancePrivate?: boolean;
 	/**
 	 * The tracker's definition on the project's default branch — its
 	 * audience, and whether it is a code tracker (committed) or a secret one.
@@ -168,7 +170,10 @@ export function decide(ref: RepoRef, scope: Scope, who: Requester, facts: Facts)
 	switch (ref.kind) {
 		case "fork": {
 			if (!tracker.code) return deny(`\`${ref.tracker}\` is a secret tracker; instances do not fork it`);
-			if (facts.instanceOwner === undefined) return deny(`no instance \`${ref.instance}\` in ${project}`);
+			// A private instance is not there for anyone but its owner: the
+			// same answer as no instance at all.
+			if (facts.instanceOwner === undefined || (facts.instancePrivate && facts.instanceOwner !== who.login))
+				return deny(`no instance \`${ref.instance}\` in ${project}`);
 			const read = mayRead(tracker.audience, who, project);
 			if (!read.ok) return read;
 			if (scope === "write" && facts.instanceOwner !== who.login)

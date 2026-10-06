@@ -48,6 +48,11 @@ pub struct BranchInstance {
     /// succeeded yet (it is retried at the next checkpoint).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remote: Option<RemoteBinding>,
+    /// On the remote, only its owner sees it — its record, checkpoints, and
+    /// forks — until its work is merged (`newgit spawn --private`): an
+    /// embargo, for work the rest of the project must not see yet.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub private: bool,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -143,6 +148,7 @@ impl BranchInstance {
             trackers: BTreeMap::new(),
             resources: BTreeMap::new(),
             dropped: Default::default(),
+            private: false,
             created_at: now,
             remote: None,
             updated_at: now,

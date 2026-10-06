@@ -33,7 +33,7 @@ import {
 	repoName,
 } from "./names";
 import { type EndpointKind, type EndpointPlan, PLAN_HEADER } from "./endpoint";
-import type { ProjectDO } from "./project";
+import type { Instance, ProjectDO } from "./project";
 import type { UserDO } from "./users";
 
 export { GitEndpoint } from "./endpoint";
@@ -434,10 +434,14 @@ async function route(request: Request, env: Env, deps: Deps): Promise<Response> 
 	// ── Instances ──────────────────────────────────────────────────────────
 	if (method === "POST" && rest === "/instances") {
 		requireNotInstance(caller, "create instances");
-		const { name, base_rev } = await body<{ name?: string; base_rev?: string }>(request);
+		const { name, base_rev, private: isPrivate } = await body<{
+			name?: string;
+			base_rev?: string;
+			private?: boolean;
+		}>(request);
 		if (!name || !base_rev) throw new HttpError(400, "name and base_rev are required");
 		requirePart("instance name", name);
-		const created = await project.createInstance(name, login, base_rev, caller.agent ?? null);
+		const created = await project.createInstance(name, login, base_rev, caller.agent ?? null, isPrivate === true);
 		if (created === null) throw new HttpError(409, `instance \`${name}\` already exists in ${key}`);
 		// Nothing is forked here: an instance forks a tracker the first time
 		// it changes it. The workspace's own credential is minted here so
@@ -458,14 +462,15 @@ async function route(request: Request, env: Env, deps: Deps): Promise<Response> 
 			201,
 		);
 	}
-	if (method === "GET" && rest === "/instances") return json({ instances: await project.instances() });
+	if (method === "GET" && rest === "/instances")
+		return json({ instances: (await project.instances()).filter((instance) => visibleTo(instance, login)) });
 
 	const forkMatch = rest.match(/^\/instances\/([^/]+)\/trackers\/([^/]+)\/fork$/);
 	if (method === "POST" && forkMatch) {
 		const name = decodeURIComponent(forkMatch[1]);
 		const tracker = decodeURIComponent(forkMatch[2]);
 		const instance = await project.instance(name);
-		if (instance === null) throw new HttpError(404, `no instance \`${name}\` in ${key}`);
+		if (instance === null || !visibleTo(instance, login)) throw new HttpError(404, `no instance \`${name}\` in ${key}`);
 		requireOwner(instance.owner, login, `fork for \`${name}\``);
 		requireThisInstance(caller, name);
 		const facts = await definitionFacts(deps.repos, id, info.defaultBranch, tracker, await listedTrackers(project));
@@ -486,7 +491,7 @@ async function route(request: Request, env: Env, deps: Deps): Promise<Response> 
 	if (instanceMatch) {
 		const name = decodeURIComponent(instanceMatch[1]);
 		const instance = await project.instance(name);
-		if (instance === null) throw new HttpError(404, `no instance \`${name}\` in ${key}`);
+		if (instance === null || !visibleTo(instance, login)) throw new HttpError(404, `no instance \`${name}\` in ${key}`);
 		if (method === "GET" && !instanceMatch[2]) return json(instance);
 		if (method === "PUT" && instanceMatch[2]) {
 			requireOwner(instance.owner, login, `move \`${name}\`'s head`);
@@ -509,19 +514,21 @@ async function route(request: Request, env: Env, deps: Deps): Promise<Response> 
 	// ── Checkpoints ────────────────────────────────────────────────────────
 	if (method === "GET" && rest === "/checkpoints") {
 		const instance = url.searchParams.get("instance") ?? undefined;
-		return json({ checkpoints: await project.checkpoints(instance) });
+		return json({ checkpoints: await project.checkpoints(instance, login) });
 	}
 	const checkpointMatch = rest.match(/^\/checkpoints\/([^/]+)\/([^/]+)$/);
 	if (checkpointMatch) {
 		const instance = decodeURIComponent(checkpointMatch[1]);
 		const checkpoint = decodeURIComponent(checkpointMatch[2]);
 		if (method === "GET") {
-			const found = await project.checkpoint(instance, checkpoint);
+			const owner = await project.instance(instance);
+			const found = owner === null || visibleTo(owner, login) ? await project.checkpoint(instance, checkpoint) : null;
 			if (found === null) throw new HttpError(404, `no checkpoint ${instance}/${checkpoint} in ${key}`);
 			return json(found);
 		}
 		if (method === "PUT") {
-			const owner = (await project.instance(instance))?.owner;
+			const found = await project.instance(instance);
+			const owner = found !== null && visibleTo(found, login) ? found.owner : undefined;
 			if (owner === undefined) throw new HttpError(404, `no instance \`${instance}\` in ${key}`);
 			requireOwner(owner, login, `checkpoint \`${instance}\``);
 			requireThisInstance(caller, instance);
@@ -670,7 +677,11 @@ async function credential(
 ) {
 	const who = { login: caller.login, member };
 	const facts: Facts = {};
-	if (ref.kind === "fork") facts.instanceOwner = (await project.instance(ref.instance))?.owner;
+	if (ref.kind === "fork") {
+		const instance = await project.instance(ref.instance);
+		facts.instanceOwner = instance?.owner;
+		facts.instancePrivate = instance?.private;
+	}
 	facts.tracker = await definitionFacts(deps.repos, ref.project, defaultBranch, ref.tracker, await listedTrackers(project));
 
 	const decision = decide(ref, scope, who, facts);
@@ -885,6 +896,11 @@ function userStub(env: Env, login: string): DurableObjectStub<UserDO> {
  */
 async function revokeRepoTokens(deps: Deps, tokens: { repo: string; artifactsId: string }[]) {
 	await Promise.allSettled(tokens.map((token) => deps.repos.revokeToken(token.repo, token.artifactsId)));
+}
+
+/** A private instance is there only for its owner (and agents acting as them). */
+function visibleTo(instance: Instance, login: string): boolean {
+	return !instance.private || instance.owner === login;
 }
 
 /** Instance tokens write only their own instance. */

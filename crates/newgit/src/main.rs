@@ -352,6 +352,11 @@ struct SpawnArgs {
     /// Do not bind this tracker (repeatable)
     #[arg(long = "drop", value_name = "TRACKER")]
     drops: Vec<String>,
+    /// On the remote, only you see this instance — its checkpoints and its
+    /// forks of the code trackers — until `newgit merge` publishes its work:
+    /// an embargo, for a fix the rest of the project must not see yet
+    #[arg(long, conflicts_with = "from_checkpoint")]
+    private: bool,
     /// Print what happened as JSON
     #[arg(long)]
     json: bool,
@@ -783,6 +788,7 @@ fn spawn(args: SpawnArgs) -> Result<()> {
         &newgit_core::manager::BindingChoice {
             uses: args.uses.clone(),
             drops: args.drops.clone(),
+            private: args.private,
         },
     )?;
     if args.json {
@@ -793,6 +799,7 @@ fn spawn(args: SpawnArgs) -> Result<()> {
                 "workspace": outcome.branch.workspace_path,
                 "source_rev": outcome.branch.source_rev,
                 "remote": outcome.branch.remote.as_ref().map(|remote| &remote.project),
+                "private": outcome.branch.private,
                 "endpoint": outcome.branch.remote.as_ref().map(|remote| &remote.endpoint),
                 "remote_warning": outcome.remote_warning,
                 "projection_warning": outcome.projection_warning,
@@ -847,6 +854,13 @@ fn spawn(args: SpawnArgs) -> Result<()> {
                 "  push:      nothing leaves this machine until you `git push` or checkpoint; \
                  then each changed tracker goes to this instance's fork of it"
             );
+            if branch.private {
+                println!(
+                    "  private:   only you see this instance on {} until `newgit merge` \
+                     publishes its work",
+                    remote.project
+                );
+            }
         }
         (None, Some(warning)) => {
             println!(
@@ -1747,11 +1761,16 @@ fn status_column(report: &InstanceReport) -> String {
     } else {
         "not ready"
     };
+    let health = if report.branch.private {
+        format!("{health}, private")
+    } else {
+        health.to_owned()
+    };
     match &report.base {
         Some(BaseReport { base_ref, ahead }) if *ahead > 0 => {
             format!("{health}, {base_ref} +{ahead}")
         }
-        _ => health.to_owned(),
+        _ => health,
     }
 }
 
