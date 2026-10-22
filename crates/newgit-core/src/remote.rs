@@ -868,7 +868,8 @@ mod base64_lite {
                 ("fo", "Zm8="),
                 ("foo", "Zm9v"),
                 ("foob", "Zm9vYg=="),
-                ("x:art_secret", "eDphcnRfc2VjcmV0"),
+                ("fooba", "Zm9vYmE="),
+                ("foobar", "Zm9vYmFy"),
             ] {
                 assert_eq!(super::encode(input.as_bytes()), expected);
             }

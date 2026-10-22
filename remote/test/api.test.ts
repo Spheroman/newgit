@@ -3,7 +3,7 @@ import { beforeEach, describe, expect, it } from "vitest";
 
 import { LOGIN_TTL_SECONDS } from "../src/auth";
 import { handle, issue } from "../src/index";
-import { FakeRepos, noEndpoint } from "./fake-repos";
+import { FakeRepos, fakePassword, noEndpoint } from "./fake-repos";
 
 let repos: FakeRepos;
 let pending: Promise<unknown>[];
@@ -83,7 +83,7 @@ describe("the API", () => {
 			repo: repo("t.root"),
 			remote: repos.url(repo("t.root")),
 			username: "x",
-			password: `pw-${repo("t.root")}-write`,
+			password: fakePassword(repo("t.root"), "write"),
 		});
 		expect(root.expires_at).toBeTruthy();
 		expect([...repos.repos.keys()].sort()).toEqual([repo("t.access"), repo("t.project"), repo("t.root")]);
@@ -145,7 +145,7 @@ describe("the API", () => {
 		await call("ana", "POST", `/v1/projects/${project}/instances/fix-login/trackers/root/fork`);
 
 		// A code tracker: its audience reads, nobody writes.
-		expect((await credential("jack", repo("t.root"))).body.password).toBe(`pw-${repo("t.root")}-read`);
+		expect((await credential("jack", repo("t.root"))).body.password).toBe(fakePassword(repo("t.root"), "read"));
 		const noWrite = await credential("jack", repo("t.root"), "write");
 		expect(noWrite.status).toBe(403);
 		expect(noWrite.body.error).toContain("newgit merge");
@@ -240,7 +240,7 @@ describe("the API", () => {
 		expect(created.body).toMatchObject({
 			tracker: "docs",
 			repo: repo("t.docs"),
-			password: `pw-${repo("t.docs")}-write`,
+			password: fakePassword(repo("t.docs"), "write"),
 		});
 		expect(repos.repos.has(repo("t.docs"))).toBe(true);
 		// Not on a branch yet (a merge that did not finish): seeded again.
