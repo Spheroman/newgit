@@ -176,3 +176,17 @@ export async function pollDeviceFlow(
 	const { login } = (await user.json()) as { login: string };
 	return { status: "done", login: login.toLowerCase() };
 }
+
+/**
+ * Whether `login` may use this remote at all. `allowed` is the
+ * `ALLOWED_LOGINS` secret: GitHub logins separated by commas or whitespace,
+ * or `*` for anyone. Unset admits no one, so a deployment that forgot it is
+ * closed rather than open to every GitHub account.
+ */
+export function invited(allowed: string | undefined, login: string): boolean {
+	const entries = (allowed ?? "")
+		.split(/[\s,]+/)
+		.map((entry) => entry.trim().toLowerCase())
+		.filter(Boolean);
+	return entries.includes("*") || entries.includes(login.toLowerCase());
+}

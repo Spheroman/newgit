@@ -38,5 +38,6 @@
     // Where the namespace's repos are served; not a secret.
     "ARTIFACTS_GIT_BASE": "https://bce0b38de721f350c8d8a51d0520337d.artifacts.cloudflare.net/git/newgit"
   }
-  // Secrets: TOKEN_KEY (signs newgit tokens).
+  // Secrets: TOKEN_KEY (signs newgit tokens), ALLOWED_LOGINS (who may use
+  // this remote; unset admits no one).
 }

@@ -7,5 +7,5 @@
   "compatibility_flags": ["nodejs_compat"],
   "durable_objects": { "bindings": [{ "class_name": "ProjectDO", "name": "PROJECTS" }, { "class_name": "UserDO", "name": "USERS" }] },
   "migrations": [{ "tag": "v1", "new_sqlite_classes": ["ProjectDO"] }, { "tag": "v2", "new_sqlite_classes": ["UserDO"] }],
-  "vars": { "GITHUB_CLIENT_ID": "test-client", "ARTIFACTS_GIT_BASE": "https://acct.artifacts.example/git/newgit", "TOKEN_KEY": "test-signing-key-not-secret" }
+  "vars": { "GITHUB_CLIENT_ID": "test-client", "ARTIFACTS_GIT_BASE": "https://acct.artifacts.example/git/newgit", "TOKEN_KEY": "test-signing-key-not-secret", "ALLOWED_LOGINS": "*" }
 }

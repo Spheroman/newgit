@@ -10,6 +10,7 @@ import {
 	AGENT_TTL_MAX_SECONDS,
 	AGENT_TTL_SECONDS,
 	LOGIN_TTL_SECONDS,
+	invited,
 	type NewToken,
 	pollDeviceFlow,
 	signToken,
@@ -133,6 +134,7 @@ async function route(request: Request, env: Env, deps: Deps): Promise<Response> 
 		if (!device_code) throw new HttpError(400, "device_code is required");
 		const result = await pollDeviceFlow(env.GITHUB_CLIENT_ID, device_code, deps.fetcher);
 		if (result.status !== "done") return json(result, result.status === "pending" ? 202 : 401);
+		requireInvited(env, result.login);
 		const issued = await issue(env, { kind: "login", login: result.login, ttlSeconds: LOGIN_TTL_SECONDS });
 		return json({ status: "done", login: result.login, token: issued.token, token_id: issued.id });
 	}
@@ -867,6 +869,9 @@ async function authenticate(request: Request, env: Env): Promise<Caller> {
 async function callerFor(token: string, env: Env): Promise<Caller> {
 	const claims = token ? await verifyToken(env.TOKEN_KEY, token) : null;
 	if (claims === null) throw new HttpError(401, "not logged in: run `newgit login`");
+	// On every request, not only at login: taking someone off the list shuts
+	// out the tokens they already hold, agents' included.
+	requireInvited(env, claims.sub);
 	if (!(await userStub(env, claims.sub).check(claims.jti)))
 		throw new HttpError(401, "this token was revoked: run `newgit login`, or ask its owner for a new agent token");
 	return {
@@ -877,6 +882,13 @@ async function callerFor(token: string, env: Env): Promise<Caller> {
 		...(claims.project === undefined ? {} : { project: claims.project }),
 		...(claims.instance === undefined ? {} : { instance: claims.instance }),
 	};
+}
+
+function requireInvited(env: Env, login: string) {
+	if (!env.ALLOWED_LOGINS)
+		throw new HttpError(503, "this remote admits no one yet: its operator has not set ALLOWED_LOGINS (`*` for anyone)");
+	if (!invited(env.ALLOWED_LOGINS, login))
+		throw new HttpError(403, `this remote is invite-only, and GitHub user \`${login}\` is not invited`);
 }
 
 /** Sign a token and record it with its user, so it can later be revoked. */

@@ -35,7 +35,8 @@ newgit export auth-refactor --to ../public-export
 newgit cleanup
 ```
 
-With a remote (the hosted one is `https://newgit.dev`), the same checkpoint
+With a remote (the hosted one, `https://newgit.dev`, is invite-only for
+now; the Worker in `remote/` deploys your own), the same checkpoint
 travels: a teammate, or a cloud agent's checkpoint, comes up on your machine
 with its source, uncommitted work, your own copy of its trackers, and its
 resources restored.

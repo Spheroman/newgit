@@ -42,6 +42,7 @@ Objects, the Git endpoint's container, and Artifacts.
 
 - GitHub login (device flow), project members, and a recorded,
   individually revocable token for every login, agent, and instance.
+- Invite-only: only the GitHub logins in `ALLOWED_LOGINS` may use it.
 - `newgit remote add`: a project as `<owner>/<name>`, one Artifacts repo per
   code tracker, seeded with its history; branch `main`.
 - `spawn` (forks nothing), checkpoint and `git push` (split into trackers;
@@ -206,6 +207,18 @@ Identity is the GitHub login (`newgit login`, GitHub's device flow, like
 `gh`), so `audience = "user:jack"` means GitHub user `jack`. Membership
 (`project-devs`) is a list in ProjectDO: `newgit members add <login>`. The
 creator is the first member.
+
+**Invite-only (decided).** Who may use a remote at all is the Worker's
+`ALLOWED_LOGINS` secret: GitHub logins separated by commas or whitespace, or
+`*` for anyone. Unset admits no one, so a deployment that forgot it is
+closed, not open to every GitHub account. It is checked at login and on
+every request after, so taking a login off the list shuts out the tokens it
+already holds, its agents' and instances' included, and the Git endpoint
+with them. Repo passwords already minted for it still work at Artifacts
+until they expire (≤ 15 min). Changing it is `wrangler secret put
+ALLOWED_LOGINS`; no deploy is needed. Being on the list grants nothing in
+any project: membership still decides that, and adding a member who is not
+on the list gives them nothing until they are.
 
 **Every workspace gets its own token, automatically** (decided). Nobody
 creates tokens by hand in the normal flow:
