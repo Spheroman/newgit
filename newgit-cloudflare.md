@@ -37,6 +37,8 @@ and never the only way to do anything.
 
 Deployed at `newgit.dev`: the Worker (`remote/`, TypeScript), its Durable
 Objects, the Git endpoint's container, and Artifacts.
+`.github/workflows/deploy-remote.yml` deploys it after CI passes on
+`main`, or by hand from the Actions tab.
 
 **Built, and run live:**
 
