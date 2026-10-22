@@ -5,8 +5,11 @@
 // piping it through `git upload-pack --stateless-rpc`. The container runs no
 // server: `exec` with streamed stdin and stdout is the whole transport.
 //
-// It sleeps when idle and comes back from a snapshot of its repositories, so
-// a cold fetch costs a restore, not a re-clone (newgit-cloudflare.md, round 4).
+// It sleeps after `IDLE_MS` without a request: an alarm snapshots anything
+// composed since the last snapshot, then stops it. It comes back from that
+// snapshot, so a cold fetch costs a restore, not a re-clone
+// (newgit-cloudflare.md, *Measurements*). The runtime's inactivity timeout
+// is the backstop, in case the alarm never runs.
 
 import { DurableObject } from "cloudflare:workers";
 
@@ -25,9 +28,87 @@ export type EndpointKind = "advertise" | "upload-pack";
 /** Snapshot at most this often, after a compose changed what is on disk. */
 const SNAPSHOT_EVERY_MS = 10 * 60_000;
 
+/** How long the container runs after its last request. */
+export const IDLE_MS = 10 * 60_000;
+
+/**
+ * How long the runtime keeps it running once nothing calls the Durable
+ * Object. Longer than `IDLE_MS`, so the alarm normally stops it first,
+ * after its snapshot; this only stops a container the alarm missed.
+ */
+const BACKSTOP_MS = IDLE_MS + 5 * 60_000;
+
+/** When an idle alarm finds a fetch still streaming, it looks again this much later. */
+const BUSY_RETRY_MS = 60_000;
+
 export const PLAN_HEADER = "x-newgit-plan";
 
+export type SleepDecision = "not-running" | "busy" | "too-soon" | "snapshot-then-stop" | "stop";
+
+/** What the idle alarm should do. Pure, so the tests can check it without a container. */
+export function decideSleep(state: {
+	now: number;
+	running: boolean;
+	inFlight: number;
+	lastRequestAt: number;
+	composedAt: number;
+	snapshotAt: number;
+}): SleepDecision {
+	if (!state.running) return "not-running";
+	if (state.inFlight > 0) return "busy";
+	if (state.now - state.lastRequestAt < IDLE_MS) return "too-soon";
+	return state.composedAt > state.snapshotAt ? "snapshot-then-stop" : "stop";
+}
+
 export class GitEndpoint extends DurableObject<Env> {
+	/** Fetches whose response is still streaming. Lost on eviction, which only happens when it is 0. */
+	private inFlight = 0;
+
+	constructor(ctx: DurableObjectState, env: Env) {
+		super(ctx, env);
+		// Not persisted: a restarted object (a deploy) has to set it again.
+		const container = ctx.container;
+		if (container) ctx.blockConcurrencyWhile(() => container.setInactivityTimeout(BACKSTOP_MS));
+	}
+
+	private async sleepDecision(): Promise<SleepDecision> {
+		const storage = this.ctx.storage;
+		return decideSleep({
+			now: Date.now(),
+			running: this.container().running,
+			inFlight: this.inFlight,
+			lastRequestAt: (await storage.get<number>("request_at")) ?? 0,
+			composedAt: (await storage.get<number>("composed_at")) ?? 0,
+			snapshotAt: (await storage.get<number>("snapshot_at")) ?? 0,
+		});
+	}
+
+	async alarm(): Promise<void> {
+		let decision = await this.sleepDecision();
+		if (decision === "snapshot-then-stop") {
+			try {
+				await this.takeSnapshot();
+			} catch (error) {
+				// Stop anyway: the older snapshot only costs the next cold
+				// start a fetch of what changed since.
+				console.error("endpoint snapshot before sleep failed", error);
+			}
+			// A request may have arrived while the snapshot ran.
+			decision = await this.sleepDecision();
+			if (decision === "snapshot-then-stop") decision = "stop";
+		}
+		if (decision === "busy") await this.ctx.storage.setAlarm(Date.now() + BUSY_RETRY_MS);
+		// `not-running`, or `too-soon`: a request since this alarm was set moved it.
+		if (decision !== "stop") return;
+		// Checked again with nothing awaited before the stop, so a fetch that
+		// started during the decision is never cut off.
+		if (this.inFlight > 0) {
+			await this.ctx.storage.setAlarm(Date.now() + BUSY_RETRY_MS);
+			return;
+		}
+		await this.container().destroy("idle");
+	}
+
 	private container(): Container {
 		const container = this.ctx.container;
 		if (!container) throw new Error("the Git endpoint has no container binding");
@@ -69,19 +150,57 @@ export class GitEndpoint extends DurableObject<Env> {
 		}
 	}
 
+	/** Snapshot the container now; `snapshot_at` is when it began, so a compose during it is not missed. */
+	private async takeSnapshot(): Promise<void> {
+		const startedAt = Date.now();
+		const snapshot = await this.container().snapshotContainer({ name: "endpoint" });
+		await this.ctx.storage.put({ snapshot: snapshot.id, snapshot_at: startedAt });
+	}
+
 	private async snapshotSoon(): Promise<void> {
 		const last = (await this.ctx.storage.get<number>("snapshot_at")) ?? 0;
 		if (Date.now() - last < SNAPSHOT_EVERY_MS) return;
+		// Claimed up front, so concurrent fetches do not each start one.
 		await this.ctx.storage.put("snapshot_at", Date.now());
 		this.ctx.waitUntil(
-			this.container()
-				.snapshotContainer({ name: "endpoint" })
-				.then((snapshot) => this.ctx.storage.put("snapshot", snapshot.id))
-				.catch((error: unknown) => console.error("endpoint snapshot failed", error)),
+			this.takeSnapshot().catch(async (error: unknown) => {
+				console.error("endpoint snapshot failed", error);
+				// Give the claim back, so the idle alarm knows there is still
+				// something to snapshot.
+				await this.ctx.storage.put("snapshot_at", last);
+			}),
 		);
 	}
 
 	async fetch(request: Request): Promise<Response> {
+		this.inFlight++;
+		let response: Response;
+		try {
+			// Before serving, so a request that fails still schedules the sleep.
+			await this.ctx.storage.put("request_at", Date.now());
+			await this.ctx.storage.setAlarm(Date.now() + IDLE_MS);
+			response = await this.serve(request);
+		} catch (error) {
+			this.inFlight--;
+			throw error;
+		}
+		if (!response.body) {
+			this.inFlight--;
+			return response;
+		}
+		// Done when the body has been read to the end or abandoned.
+		let done = false;
+		const finish = () => {
+			if (!done) {
+				done = true;
+				this.inFlight--;
+			}
+		};
+		const body = response.body.pipeThrough(new TransformStream({ flush: finish, cancel: finish }));
+		return new Response(body, response);
+	}
+
+	private async serve(request: Request): Promise<Response> {
 		const kind = new URL(request.url).pathname.slice(1) as EndpointKind;
 		const encoded = request.headers.get(PLAN_HEADER);
 		if (!encoded) return new Response("no plan\n", { status: 400 });
@@ -100,6 +219,7 @@ export class GitEndpoint extends DurableObject<Env> {
 			return new Response("newgit could not compose this view; the remote logged why\n", { status: 502 });
 		}
 		const view = new TextDecoder().decode(composed.stdout).trim();
+		await this.ctx.storage.put("composed_at", Date.now());
 		await this.snapshotSoon();
 
 		const protocol = request.headers.get("git-protocol");
