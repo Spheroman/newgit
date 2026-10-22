@@ -469,8 +469,8 @@ Each step lands alone and keeps the suite green.
      when an instance changes a tracker, checkpoints synced as lists and
      composed by `spawn --from-checkpoint`, `newgit clone`, and the Git
      endpoint at `newgit.dev/<owner>/<name>.git` (a per-project container
-     composing each reader's view). Canonical-id notes on rebuilt commits
-     are not written yet.
+     composing each reader's view). Rebuilt commits carry a note naming
+     their canonical id.
 4. **Roles, priority, resources, use/drop.** *(Landed.)* An instance's
    history holds every code tracker its user may read; binding is a sparse
    checkout plus scope: `newgit tracker drop` hides a tracker's files and
