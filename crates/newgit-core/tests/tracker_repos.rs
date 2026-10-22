@@ -11,7 +11,7 @@ use camino::{Utf8Path, Utf8PathBuf};
 use newgit_core::SourceSubstrate;
 use newgit_core::cleanup::ArchivedCheckpoints;
 use newgit_core::config::WorkspaceSection;
-use newgit_core::manager::{BranchManager, UndoOptions};
+use newgit_core::manager::{BranchManager, SourceBranchPolicy, UndoOptions};
 use newgit_core::store::MetadataStore;
 use newgit_core::tracker::Storage;
 use newgit_core::tracker_repo::TrackerRepo;
@@ -184,7 +184,12 @@ fn removing_an_instance_drops_its_branch_but_not_what_its_checkpoints_name() {
 
     let root = manager.store().paths().project_root.clone();
     manager
-        .remove("feature-a", &root, ArchivedCheckpoints::Keep)
+        .remove(
+            "feature-a",
+            &root,
+            ArchivedCheckpoints::Keep,
+            SourceBranchPolicy::Auto,
+        )
         .expect("remove");
     let store = manager.store().paths().tracker_store.clone();
     assert!(git(&store, &["for-each-ref", "refs/trackers/env/instances/"]).is_empty());
@@ -380,6 +385,7 @@ fn a_pruned_rev_is_gone_from_the_lanes_repo_not_just_unreferenced() {
             "throwaway",
             &manager.store().paths().project_root.clone(),
             ArchivedCheckpoints::Purge,
+            SourceBranchPolicy::Auto,
         )
         .expect("remove");
 

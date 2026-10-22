@@ -4,11 +4,14 @@ use clap::{Args, Parser, Subcommand};
 use newgit_core::branch::branch_slug;
 use newgit_core::checkpoint::CheckpointReason;
 use newgit_core::cleanup::{ArchivedCheckpoints, HookDetail, HookOutcome};
+use newgit_core::deposit_diff::{DepositDiff, FileChange, escape_control};
 use newgit_core::export::{ExportFilter, Reason};
+use newgit_core::exports::unresolved_placeholder;
 use newgit_core::installs::InstallReport;
 use newgit_core::manager::{
-    ActionOutcome, BaseReport, BindOrigin, BranchManager, InstanceReport, TrackerBindOutcome,
-    UndoOptions,
+    ActionOutcome, ActionPlan, BaseReport, BindOrigin, BranchManager, DiffPair, InstanceReport,
+    KeptBranch, MismatchCause, RemoveOutcome, SourceBranchOutcome, SourceBranchPolicy,
+    TrackerBindOutcome, UndoOptions, VerifyResource,
 };
 use newgit_core::resource::{CheckpointMode, ResourceDefinition};
 use newgit_core::source::{RefUpdate, find_repo_root};
@@ -47,13 +50,25 @@ enum Command {
         path: bool,
     },
     /// Delete an instance's workspace and archive its binding record
+    ///
+    /// The source branch goes too when it holds nothing unique: spawn
+    /// created it, nothing has it checked out, and its tip is already on
+    /// another branch, a tag, or the remote. Otherwise it is kept, and
+    /// removal says why.
     Remove {
-        /// Instance to remove; its source branch is kept
+        /// Instance to remove
         name: String,
         /// Also discard its checkpoints, giving up undo to reclaim what they
         /// pin; the revs come back on the next `newgit cleanup`
         #[arg(long)]
         purge: bool,
+        /// Keep the source branch even when it holds nothing unique
+        #[arg(long, conflicts_with = "delete_branch")]
+        keep_branch: bool,
+        /// Delete the source branch even when its commits are on no other
+        /// branch; removal prints the tip to recover it from
+        #[arg(long)]
+        delete_branch: bool,
     },
     /// Manage tracker definitions and content
     Tracker {
@@ -67,12 +82,30 @@ enum Command {
     },
     /// Run a command inside an instance with exports and ports loaded
     Run(RunArgs),
+    /// Print the environment `newgit run` and every resource hook get, and
+    /// which declaration each variable comes from
+    ///
+    /// One environment, the same for every action, checkpoint, restore, and
+    /// cleanup command of the instance, layered over the environment of
+    /// whoever runs newgit (which is not shown). The output is valid shell.
+    ///
+    /// Values are printed verbatim. A credential a resource exports — a
+    /// password inside a `DATABASE_URL`, a token an action captured — is
+    /// printed in plain text, exactly as the hook receives it.
+    Env {
+        /// Instance (inferred when run inside a workspace)
+        instance: Option<String>,
+    },
     /// Run a resource action: newgit action <resource>.<action> [instance]
     Action {
         /// <resource>.<action>, e.g. app.start
         spec: String,
         /// Instance (inferred when run inside a workspace)
         instance: Option<String>,
+        /// Print the rendered command and the directory it would run in,
+        /// and run nothing. Refuses for the same reasons a real run would.
+        #[arg(long)]
+        dry_run: bool,
     },
     /// Record one coherent snapshot across source, trackers, and resources
     Checkpoint {
@@ -418,11 +451,35 @@ fn main() -> Result<()> {
         Command::Init(args) => init(args),
         Command::Spawn(args) => spawn(args),
         Command::Status { name, path } => status(name.as_deref(), path),
-        Command::Remove { name, purge } => remove(&name, purge),
+        Command::Remove {
+            name,
+            purge,
+            keep_branch,
+            delete_branch,
+        } => {
+            let source_branch = if keep_branch {
+                SourceBranchPolicy::Keep
+            } else if delete_branch {
+                SourceBranchPolicy::Delete
+            } else {
+                SourceBranchPolicy::Auto
+            };
+            remove(&name, purge, source_branch)
+        }
         Command::Tracker { command } => tracker(command),
         Command::Resource { command } => resource(command),
         Command::Run(args) => run(args),
-        Command::Action { spec, instance } => action(&spec, instance),
+        Command::Env { instance } => env_command(instance),
+        Command::Action {
+            spec,
+            instance,
+            dry_run: false,
+        } => action(&spec, instance),
+        Command::Action {
+            spec,
+            instance,
+            dry_run: true,
+        } => action_dry_run(&spec, instance),
         Command::Checkpoint {
             instance,
             message,
@@ -1264,6 +1321,110 @@ fn action(spec: &str, instance: Option<String>) -> Result<()> {
     }
 }
 
+fn action_dry_run(spec: &str, instance: Option<String>) -> Result<()> {
+    let (manager, instance) = manager_and_instance(instance)?;
+    match manager.plan_action(&instance, spec)? {
+        ActionPlan::Signal { signal } => {
+            let resource = spec.split('.').next().unwrap_or(spec);
+            println!(
+                "`{spec}` for `{instance}` would send `{signal}` to `{resource}`'s supervised \
+                 process, if one is running"
+            );
+        }
+        ActionPlan::Command {
+            command,
+            cwd,
+            long_running,
+            captures,
+        } => {
+            let verb = if long_running {
+                "would start, supervised"
+            } else {
+                "would run"
+            };
+            println!("`{spec}` for `{instance}` {verb}:");
+            println!("  in:       {cwd}");
+            println!("  command:  {command}");
+            if !captures.is_empty() {
+                println!(
+                    "  captures: {} (read from stdout into this resource's exports)",
+                    captures.join(", ")
+                );
+            }
+            println!("  env:      `newgit env {instance}`, over the caller's environment");
+            // Rendering leaves unknown variables verbatim, which is right
+            // for `{{.Field}}` meant for another tool and wrong for a typo.
+            // Only a person reading the command can tell which.
+            if let Some(placeholder) = unresolved_placeholder(&command) {
+                println!(
+                    "  note:     {placeholder} is not a variable an action can use, so it \
+                     reaches the shell verbatim"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn env_command(instance: Option<String>) -> Result<()> {
+    let (manager, instance) = manager_and_instance(instance)?;
+    let branch = manager.store().find_branch(&instance)?;
+    let vars = manager.command_env(&branch)?;
+    // `export`, so `eval "$(newgit env)"` reaches the programs the shell
+    // starts — which is what a hook's environment is — not just the shell.
+    // A name the shell cannot assign (`NEXT-PUBLIC-URL`) is still set for
+    // the hook's `sh`, but whether it reaches the programs that `sh` starts
+    // depends on the shell — bash passes it on, dash drops it. So it is
+    // shown, commented out, rather than dropped or printed as a line that
+    // `eval` would run as a command.
+    let assignments: Vec<String> = vars
+        .iter()
+        .map(|var| {
+            let assignment = format!("{}={}", var.name, shell_quote(&var.value));
+            if is_shell_name(&var.name) {
+                format!("export {assignment}")
+            } else {
+                format!("# {assignment}")
+            }
+        })
+        .collect();
+    let width = column_width(assignments.iter().map(String::len), "");
+    for (assignment, var) in assignments.iter().zip(&vars) {
+        if is_shell_name(&var.name) {
+            println!("{assignment:<width$}  # {}", var.source);
+        } else {
+            println!(
+                "{assignment:<width$}  # {} (not a shell name: set for hooks, but some shells drop it)",
+                var.source
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Whether a POSIX shell can assign `name`: `[A-Za-z_][A-Za-z0-9_]*`.
+fn is_shell_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    chars
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// A value as a POSIX shell word: bare when it is plainly safe, otherwise
+/// single-quoted, so `newgit env` output can be sourced as printed.
+fn shell_quote(value: &str) -> String {
+    let safe = !value.is_empty()
+        && value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "_@%+=:,./-".contains(c));
+    if safe {
+        value.to_owned()
+    } else {
+        format!("'{}'", value.replace('\'', r"'\''"))
+    }
+}
+
 fn tracker(command: TrackerCommand) -> Result<()> {
     match command {
         TrackerCommand::Create {
@@ -1934,17 +2095,93 @@ fn checkpoint_verify(instance: Option<String>, message: Option<&str>) -> Result<
             resource.before_state_ref.as_deref().unwrap_or("—"),
             resource.after_state_ref.as_deref().unwrap_or("—"),
         );
+        print_mismatch_evidence(resource);
     }
     if outcome.is_proven() {
         println!("Verified: `{instance}`'s restore ran cleanly and every state ref agreed.");
     } else {
         println!(
-            "NOT verified: `{instance}`'s restore either failed or landed on a different state \
-             ref. See the resource lines above, and the recovery record if one was written."
+            "NOT verified: `{instance}`'s restore was not shown to land on the state it started \
+             from. Each MISMATCH above says whether to fix `[restore]` or `[checkpoint]`; see \
+             also the recovery record if one was written."
         );
         std::process::exit(1);
     }
     Ok(())
+}
+
+/// Under a MISMATCH line: which half of the round trip to fix, and — for
+/// deposited content — what actually differs and where both copies are.
+fn print_mismatch_evidence(resource: &VerifyResource) {
+    let indent = "            ";
+    match &resource.cause {
+        None => {}
+        Some(MismatchCause::RestoreFailed) => {
+            println!("{indent}cause: its [restore] command failed; fix [restore]");
+        }
+        Some(MismatchCause::RestoreLandedElsewhere) => println!(
+            "{indent}cause: [restore] — checkpointed again with nothing restored in between, \
+             it reproduced `after`: the checkpoint reproduces itself back to back, so the \
+             restore most likely landed on a different state"
+        ),
+        Some(MismatchCause::CheckpointUnstable { control_state_ref }) => println!(
+            "{indent}cause: [checkpoint] is not deterministic — checkpointed again with nothing \
+             restored in between, it gave {}, not `after`. This run could not judge [restore]; \
+             make [checkpoint] produce the same bytes for the same state, then verify again",
+            control_state_ref.as_deref().unwrap_or("no ref")
+        ),
+        Some(MismatchCause::ControlFailed(error)) => println!(
+            "{indent}cause: unknown — the control checkpoint that would tell [restore] from \
+             [checkpoint] failed: {error}"
+        ),
+    }
+    let Some(diff) = &resource.diff else {
+        return;
+    };
+    // An unstable checkpoint is shown as after → control: nothing was
+    // restored between those two, so every line is the checkpoint's own
+    // noise, with none of the restore's changes mixed in.
+    let (old, new, note) = match diff.pair {
+        DiffPair::BeforeAfter => ("before", "after", ""),
+        DiffPair::AfterControl => (
+            "after",
+            "control",
+            " (nothing was restored between these two)",
+        ),
+    };
+    match &diff.result {
+        Err(error) => println!("{indent}could not diff {old} against {new}: {error}"),
+        Ok(diff) => {
+            println!("{indent}{old} → {new}{note}:");
+            print_deposit_diff(diff, indent, old, new);
+        }
+    }
+}
+
+fn print_deposit_diff(diff: &DepositDiff, indent: &str, old: &str, new: &str) {
+    for file in &diff.files {
+        let change = match file.change {
+            FileChange::OnlyBefore => format!("only in {old}"),
+            FileChange::OnlyAfter => format!("only in {new}"),
+            FileChange::Binary => "binary, differs".to_owned(),
+            FileChange::Text {
+                removed,
+                added,
+                lines_before,
+            } => format!("-{removed} +{added} lines (of {lines_before})"),
+        };
+        println!("{indent}{}: {change}", escape_control(file.path.as_str()));
+    }
+    if diff.more_files > 0 {
+        println!("{indent}… and {} more files", diff.more_files);
+    }
+    for line in &diff.excerpt {
+        println!("{indent}  {line}");
+    }
+    if diff.excerpt_omitted > 0 {
+        println!("{indent}  … {} more changed lines", diff.excerpt_omitted);
+    }
+    println!("{indent}full diff: {}", diff.full_diff_command());
 }
 
 fn undo(instance: Option<String>, options: UndoOptions) -> Result<()> {
@@ -2158,6 +2395,20 @@ fn export(args: ExportArgs) -> Result<()> {
         );
     }
     println!("  commit:   {}", short_rev(&outcome.commit));
+    if !outcome.still_gitignored.is_empty() {
+        // Committed and tracked, so nothing is hidden — but the export's
+        // `.gitignore` (a source file, shipped as it is) still names these,
+        // and a new file next to one would not be picked up by `git add`.
+        println!(
+            "  gitignored but committed: {}",
+            outcome
+                .still_gitignored
+                .iter()
+                .map(|path| path.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
 
     // Both of these are load-bearing, not boilerplate: the export is one
     // commit precisely so excluded content cannot ride along in history, and
@@ -2504,20 +2755,29 @@ fn print_warnings(warnings: &[String]) {
     }
 }
 
-fn remove(name: &str, purge: bool) -> Result<()> {
+fn remove(name: &str, purge: bool, source_branch: SourceBranchPolicy) -> Result<()> {
     let manager = manager_here()?;
     let checkpoints = if purge {
         ArchivedCheckpoints::Purge
     } else {
         ArchivedCheckpoints::Keep
     };
-    let outcome = manager.remove(name, &current_dir()?, checkpoints)?;
+    let outcome = manager.remove(name, &current_dir()?, checkpoints, source_branch)?;
 
     println!("Removed branch instance `{}`", outcome.branch.name);
     for hook in &outcome.hooks {
         print_hook(hook);
     }
     println!("  workspace: {} (deleted)", outcome.branch.workspace_path);
+    if let Some(head) = &outcome.unsaved_workspace_head {
+        // Whatever the branch line says next is about the store's branch;
+        // this is the work that never reached it.
+        println!(
+            "  lost:      the workspace's HEAD {} was never checkpointed; commits made since \
+             the last checkpoint were deleted with it",
+            short_rev(head)
+        );
+    }
     println!("  record:    archived at {}", outcome.archived_record);
     match (&outcome.branch.remote, &outcome.remote_warning) {
         (Some(remote), None) => println!(
@@ -2550,11 +2810,68 @@ fn remove(name: &str, purge: bool) -> Result<()> {
         ),
         None => {}
     }
-    println!(
-        "  source branch `{}` kept in the store; delete with `git branch -D {}` if unwanted",
-        outcome.branch.source_ref, outcome.branch.source_ref
-    );
+    println!("  branch:    {}", source_branch_line(&outcome));
     Ok(())
+}
+
+/// One line on what happened to the source branch, and always the reason —
+/// the reader should never have to go and look to learn which case applied.
+fn source_branch_line(outcome: &RemoveOutcome) -> String {
+    let name = &outcome.branch.source_ref;
+    let delete_hint = format!("delete with `git branch -D {name}` if unwanted");
+    match &outcome.source_branch {
+        SourceBranchOutcome::Missing => format!("`{name}` was already gone from the store"),
+        SourceBranchOutcome::Deleted {
+            tip,
+            found_on: Some(found_on),
+            ..
+        } => format!(
+            "`{name}` deleted (was {}; nothing unique — its tip is on {found_on})",
+            short_rev(tip)
+        ),
+        SourceBranchOutcome::Deleted {
+            tip,
+            found_on: None,
+            pinned_by_checkpoint,
+        } => {
+            // Forced past commits on no other local ref. Say exactly how to
+            // get them back, and for how long that works.
+            let pinned = if *pinned_by_checkpoint {
+                "a newgit checkpoint ref still pins them"
+            } else {
+                "only until the store's next `git gc` prunes them"
+            };
+            format!(
+                "`{name}` deleted at {} (--delete-branch); its tip was on no other local branch, \
+                 tag, or remote-tracking ref. Recover with `git branch {name} {tip}` — {pinned}",
+                short_rev(tip)
+            )
+        }
+        SourceBranchOutcome::Kept(KeptBranch::Asked) => format!("`{name}` kept (--keep-branch)"),
+        SourceBranchOutcome::Kept(KeptBranch::Adopted) => format!(
+            "`{name}` kept: it existed before `newgit spawn`, so it is not newgit's to delete; \
+             {delete_hint}"
+        ),
+        SourceBranchOutcome::Kept(KeptBranch::CheckedOut(path)) => {
+            format!("`{name}` kept: it is checked out at {path}")
+        }
+        SourceBranchOutcome::Kept(KeptBranch::Unique { tip }) => format!(
+            "`{name}` kept: its tip {} is on no other branch, tag, or remote, so deleting it \
+             could lose work; {delete_hint}",
+            short_rev(tip)
+        ),
+        SourceBranchOutcome::Kept(KeptBranch::RemoteUnconfirmed { tip, error }) => format!(
+            "`{name}` kept: its tip {} is on no local ref, and newgit couldn't reach origin to \
+             confirm it has this commit ({error}); {delete_hint}",
+            short_rev(tip)
+        ),
+        SourceBranchOutcome::Kept(KeptBranch::Moved { expected, now }) => format!(
+            "`{name}` kept: it moved while removal ran (was {}, now {}), so the deletion \
+             decided against the old tip did not happen; {delete_hint}",
+            short_rev(expected),
+            now.as_deref().map_or("gone", short_rev)
+        ),
+    }
 }
 
 fn bind_line(outcome: &TrackerBindOutcome, deposit_only: bool) -> String {

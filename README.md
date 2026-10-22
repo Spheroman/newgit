@@ -132,8 +132,11 @@ and must be committed before a spawn that calls it.
 
 Nothing about your repository changes until you ask for it. `init` writes
 `.newgit/`, and `tracker track` appends to `.gitignore`; no command rewrites
-source history, and `remove`/`cleanup` never touch the store repository's
-branches.
+source history, and the one branch newgit ever deletes is an instance's own:
+`remove` deletes the source branch `spawn` created for it, and only when its
+tip is already on another branch, a tag, or the remote (asked live; an
+unreachable remote keeps the branch). Otherwise it is
+kept, and `remove` says why (`--keep-branch` / `--delete-branch` override).
 
 ### What your package manager will cost you
 
@@ -194,12 +197,15 @@ Branch-instance lifecycle (top-level verbs; `[instance]` is inferred when run
 inside a workspace):
 
 - `newgit init` / `spawn <name> [--use <tracker>] [--drop <tracker>] [--private]` /
-  `status [name]` / `remove <name> [--purge]` — `status` says whether each
-  instance is ready, and why not
+  `status [name]` / `remove <name> [--purge] [--keep-branch | --delete-branch]` —
+  `status` says whether each instance is ready, and why not
 - `newgit status <instance> --path` — just the workspace path, for scripts
 - `newgit reference` — the definition format, every key and default
 - `newgit run [instance] -- <command>` — run with exports and ports loaded
-- `newgit action <resource>.<action> [instance]`
+- `newgit env [instance]` — the environment `run` and every hook get, each
+  variable labeled with the declaration it came from
+- `newgit action <resource>.<action> [instance] [--dry-run]` — `--dry-run`
+  prints the rendered command and its directory, and runs nothing
 - `newgit checkpoint [instance] [-m <msg>]` / `undo [instance] [--to <id>]` /
   `checkpoints [instance]`
 - `newgit export [instance] --to <dir> [--include <path>] [--exclude <path>]`

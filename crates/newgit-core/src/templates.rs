@@ -220,7 +220,18 @@ command = "npm run db:migrate"
 
 [checkpoint]
 mode = "command"
-command = "pg_dump {{branch.slug}} > {{snapshot.path}}/db.sql && echo {{snapshot.path}}/db.sql"
+# `--restrict-key=newgit` keeps the dump byte-identical for the same state.
+# pg_dump (since 17.6, 16.10, 15.14, 14.19, 13.22) otherwise wraps every
+# dump in `\restrict <key>` / `\unrestrict <key>` with a fresh random key,
+# so no two checkpoints of one database ever match and `checkpoint --verify`
+# always fails. The cost, stated plainly: the key exists so a hostile
+# *server* cannot smuggle psql meta-commands into a dump and have them run
+# on the machine that restores it, and a fixed key is a known key. The
+# server here is this instance's own local database, and anything that can
+# make it hostile — an agent working in the instance — can already run
+# commands on this machine. Drop the flag on an older pg_dump that rejects
+# it; those never emit the wrapper, so their dumps are stable anyway.
+command = "pg_dump --restrict-key=newgit {{branch.slug}} > {{snapshot.path}}/db.sql && echo {{snapshot.path}}/db.sql"
 into_tracker = "db-snapshots"
 
 [restore]
@@ -284,7 +295,10 @@ command = "npm run db:migrate:reset"
 
 [checkpoint]
 mode = "command"
-command = "pg_dump --data-only {{branch.slug}} > {{snapshot.path}}/db.sql && echo {{snapshot.path}}/db.sql"
+# `--restrict-key=newgit` keeps the dump byte-identical for the same state;
+# without it `checkpoint --verify` always fails. `command-snapshot`'s
+# checkpoint explains why, and what a fixed key gives up.
+command = "pg_dump --data-only --restrict-key=newgit {{branch.slug}} > {{snapshot.path}}/db.sql && echo {{snapshot.path}}/db.sql"
 into_tracker = "db-snapshots"
 
 [restore]
@@ -408,7 +422,22 @@ command = "supabase db reset"
 mode = "command"
 # `--data-only`, because the schema comes from migrations rather than from
 # the dump — the same reasoning as `command-snapshot-migrations`.
-command = "supabase db dump --local --data-only -f {{snapshot.path}}/db.sql && echo {{snapshot.path}}/db.sql"
+#
+# The `sed` after the dump swaps pg_dump's per-run random `\restrict` key
+# for a fixed one, so the same database always dumps to the same bytes —
+# without it `checkpoint --verify` always fails. `supabase db dump` has no
+# way to pass pg_dump `--restrict-key`, which is what `command-snapshot`
+# uses for this; that template's checkpoint explains what a fixed key gives
+# up. A dump with no `\restrict` line is left alone.
+command = '''
+supabase db dump --local --data-only -f {{snapshot.path}}/db.sql || exit 1
+key=$(sed -n 's/^\\restrict //p' {{snapshot.path}}/db.sql | head -n 1)
+if [ -n "$key" ]; then
+  sed "s/$key/newgit/" {{snapshot.path}}/db.sql > {{snapshot.path}}/db.sql.tmp || exit 1
+  mv {{snapshot.path}}/db.sql.tmp {{snapshot.path}}/db.sql || exit 1
+fi
+echo {{snapshot.path}}/db.sql
+'''
 into_tracker = "db-snapshots"
 
 [restore]

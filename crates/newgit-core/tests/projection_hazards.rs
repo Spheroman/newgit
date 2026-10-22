@@ -326,6 +326,7 @@ fn a_removed_instances_commits_collected_away_do_not_break_a_split() {
             "feature-a",
             &repo,
             newgit_core::cleanup::ArchivedCheckpoints::Keep,
+            newgit_core::manager::SourceBranchPolicy::Auto,
         )
         .expect("remove");
     for dir in [repo.clone(), store.paths().tracker_store.clone()] {

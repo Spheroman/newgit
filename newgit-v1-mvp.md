@@ -1210,6 +1210,44 @@ the terminal.
 newgit run feature-a -- pnpm test
 ```
 
+### `newgit env [instance]`
+
+Prints the environment `newgit run` and every hook — actions,
+`key_command`, `[checkpoint]`, `[restore]`, `[cleanup]` — get, one
+`export NAME=value  # <declaration>` line per variable:
+
+```
+export DB_PORT=5434                            # db [ports.pg]
+export DATABASE_URL=postgres://...:5434/feat-x # db [exports]
+export NEWGIT_BRANCH=feature/x                 # newgit
+```
+
+The question it answers — "which database does this hook talk to?" — used
+to be answerable only by firing the hook. It prints the output of the one
+assembly every command uses, with each variable's origin carried through,
+rather than a second computation that could drift from it. The single-owner
+rule is what makes the label honest: each name has exactly one declaration
+to name.
+
+It is one command and not a filter on `run` or `action` because the
+environment does not vary by resource: there is no `--resource` flag,
+since narrowing the listing to one resource's declarations would hide
+variables that resource's hooks receive. The output is valid shell, so `eval
+"$(newgit env)"` reproduces it — `export`ed, because a hook's environment is
+what the programs it starts inherit, not shell-local variables. A name no
+shell can assign (`NEXT-PUBLIC-URL`) is listed commented out, with its
+origin, instead of being dropped or printed as a line `eval` would run as a
+command. newgit does set it for the hook's `sh`, but whether it reaches the
+programs that `sh` starts depends on the shell: bash passes it on, dash (the
+`/bin/sh` on Debian and Ubuntu) drops it.
+
+Values are printed verbatim, credentials included — the same values `newgit
+run -- env` would show. Redacting here would be simulated security: anything
+that can run `newgit env` can run a hook that echoes the value. The help text
+says so, rather than letting someone learn it from a pasted log. The
+inherited environment of the caller, which every command gets underneath, is
+not printed.
+
 Template variables available in exports and action commands are kept
 minimal: `{{ports.<name>}}`, `{{branch.name}}`, `{{branch.slug}}`,
 `{{workspace}}`, `{{scripts}}`. Checkpoint and restore commands additionally
@@ -1273,6 +1311,27 @@ file under `.newgit/logs/`, the PID is recorded in `.newgit/state/`, `stop`
 sends the action's configured signal (default TERM) to the group, and
 `status` checks liveness. No daemon, no restart policy — boring.
 
+`--dry-run` prints what would happen and runs nothing: the rendered
+command, the directory it runs in, any `captures`, whether it would start
+supervised, or which signal a command-less action sends. It refuses for
+exactly the reasons a real run refuses (unknown action, missing workspace or
+`workdir`, a failed dependency), because it shares that resolution with the
+real run rather than repeating it. A `{{...}}` left in the rendered command
+is called out: rendering leaves unknown variables verbatim, which is right
+for `{{.Field}}` meant for another tool and wrong for a typo, and only the
+person reading it can tell which. The environment is `newgit env`'s, and is
+pointed to rather than repeated.
+
+`--dry-run` covers actions only, which is a known gap rather than a
+decision. The hooks are not actions — `newgit action db.cleanup` is not a
+thing a run can do, so a dry run must not pretend it is — and each one
+renders against state only its own command has: `[restore]` against the
+checkpoint being restored, `[cleanup]` against the latest checkpoint's
+`{{state_ref}}`. Their dry runs belong to `undo` and `remove`. Today only
+`newgit cleanup --dry-run` shows a rendered `[cleanup]`, and only for an
+instance whose workspace is already gone. Their *environment*, the half
+most likely to aim a hook at the wrong database, is `newgit env`'s already.
+
 Convenience shorthands can come later, but the primitive should be resource actions.
 
 ### `newgit checkpoint [instance] [-m <message>]`
@@ -1321,7 +1380,30 @@ resource state refs. Agreement across every resource whose restore could
 fail is what "verified" means; disagreement is reported even when every
 restore command exited `0`, because exiting `0` and reproducing the
 checkpointed state are different claims — the whole reason a byte-level
-comparison is worth running at all. Destructive and expensive on purpose:
+comparison is worth running at all.
+
+A mismatch is never called verified, but it is explained. Its two causes
+need opposite fixes — a `[restore]` that lands on the wrong state, or a
+`[checkpoint]` that never produces the same ref twice (`pg_dump`'s
+per-run `\restrict` token) — and two refs alone cannot tell them apart. So
+for each exercised resource that disagrees, verify runs that resource's
+checkpoint once more with nothing restored in between (a *control*, not
+recorded as a checkpoint, logged as `<resource>.checkpoint-control`; any
+deposit it makes is left for `cleanup`). A control that does not reproduce
+the second ref blames `[checkpoint]`. One that does only proves the
+checkpoint reproduces itself back to back, so it says `[restore]` most
+likely landed on a different state. A restore that failed outright skips
+the control. The cost — one more checkpoint command, possibly a slow dump —
+is paid only on a mismatch, which is already a failure. Where the refs are
+deposits, it also diffs two snapshot directories and prints the command for
+the full diff: `before` → `after` normally, `after` → control for an
+unstable checkpoint, whose every differing line is then pure noise. The
+diff is bounded however large the dump — one `git diff --numstat` for the
+counts, one patch streamed only until a few changed lines are in hand — and
+control characters in those lines are escaped before they reach the
+terminal.
+
+Destructive and expensive on purpose:
 it is a real `undo`, stopping and restarting whatever the instance's
 resources run, so it is a separate, explicitly named command rather than
 something `checkpoint` runs on its own, and it prints what it is about to
@@ -1433,6 +1515,75 @@ Deletes a single branch instance: stops its resources, deletes the workspace
 record. Workspaces are disposable; this is the command that proves it, and it
 belongs in Milestone 1 — the two-branch success criterion is not really
 testable without teardown.
+
+#### The Source Branch
+
+`remove` deletes the source branch too when it holds nothing unique, and
+otherwise keeps it and says which reason applied. The branch goes only when
+all of these hold:
+
+- **`spawn` created it.** A branch that already existed (`newgit spawn
+  develop`) was adopted, and stays the user's. The binding record carries
+  `created_source_branch` for exactly this.
+- **Nothing has it checked out** in the store, in its main checkout or any
+  `git worktree` — deleting it would leave that checkout on an unborn
+  branch.
+- **Its tip is on some other ref**: another local branch (merged, or the
+  instance never committed), a remote-tracking ref, a tag, or a branch the
+  real remote has *right now*. newgit's checkpoint refs do not count: they
+  are undo history, not a place anyone looks for their work.
+
+The remote is asked only when no local ref holds the tip, and asked live:
+`remove` refreshes the outbox from `origin` first, because a push from a
+workspace never updates the store's own `refs/remotes`, and the outbox
+otherwise mirrors the remote only as of the last push — after which a PR
+can be closed and its branch deleted. If the refresh fails (offline, auth),
+the remote is not counted, and the branch is kept with the reason
+("couldn't reach origin to confirm it has this commit"). Keeping is always
+the safe direction.
+
+Teardown runs between the decision and the deletion, and cleanup hooks can
+be slow, so `remove` asks again immediately before deleting and keeps the
+branch if the other ref has moved or gone — two parallel removals of
+branches sharing a tip would otherwise each count the other. The deletion
+itself is guarded on the tip it decided about; a branch that moved anyway is
+kept and reported, never an error, since by then the removal has happened.
+
+`--keep-branch` keeps it regardless; `--delete-branch` deletes it
+regardless, and then prints the tip and the `git branch <name> <tip>` that
+brings it back — saying whether a checkpoint ref still pins it, or only the
+next `git gc` stands between it and deletion. A `--delete-branch` that
+cannot be honoured (the branch is checked out) refuses before anything is
+torn down, not after.
+
+The default deletes because the alternative inverted the asymmetry: removal
+already destroys the workspace and every resource it can tear down, and the
+branch is the one artifact that is both cheap to keep and certain to change
+the next `spawn` of the same name — which silently adopts a leftover branch
+instead of starting from `HEAD`. Every check runs against what Git can show
+at the moment of deletion, not a guess at intent. What it can show is still
+only what refs say: a remote-tracking ref is as current as the store's last
+`git fetch`, the same trust `git branch -d` places in it. A squash-merged
+branch whose remote branch was then deleted looks unique and is kept — the
+safe miss, named in the output with the command to finish the job.
+
+Deleting the branch breaks no undo and no archived record. A checkpoint
+pins its source commits through `refs/newgit/checkpoints/<slug>/*`, not the
+branch, and `undo` re-points the branch from the checkpoint; a re-spawned
+instance of the same name recreates it. The archived record only names the
+branch.
+
+What `remove` does not protect is work in the workspace since its last
+checkpoint — the workspace is disposable, and `remove` does not checkpoint
+first. It does say so: when no ref in the store contains the workspace's
+`HEAD`, the output names it as lost, so "nothing unique" about the store's
+branch never reads as "nothing lost".
+
+`newgit cleanup`, when it finalizes an instance whose workspace is gone,
+leaves the source branch alone: a garbage collector deleting branches is a
+surprise in a way that an explicit `remove` is not.
+
+#### Checkpoints
 
 Checkpoints outlive removal: they pin the tracker revs their undo would need,
 and newgit never breaks an undo on its own initiative. That leaves retained
@@ -1986,7 +2137,7 @@ command = "pnpm db:migrate"
 
 [checkpoint]
 mode = "command"
-command = "pg_dump {{branch.slug}} > {{snapshot.path}}/db.sql && echo {{snapshot.path}}/db.sql"
+command = "pg_dump --restrict-key=newgit {{branch.slug}} > {{snapshot.path}}/db.sql && echo {{snapshot.path}}/db.sql"
 into_tracker = "db-snapshots"
 
 [restore]
@@ -2137,6 +2288,19 @@ As implemented:
   also name something no tracker owns and Git does not track — a build
   output). **`--exclude <path>`** is applied last and beats everything,
   including `--include`.
+- **What ships is what is committed.** The export's commit holds exactly
+  the plan, added with `git add --force`: every tracker path is gitignored
+  (`tracker track` put it there) and that `.gitignore` ships with the
+  source tree, so a plain `git add -A` dropped every public or `--include`d
+  lane file onto disk and out of the repository — invisible to `git status`
+  and to a clone. Lane content entering an export is not lane content
+  entering source history: the export is a new repository, and its content
+  was chosen by audience or by an explicit flag. The shipped `.gitignore` is
+  left as it is — it is a source file, its patterns do no harm to a file Git
+  already tracks, and it is what keeps a recipient's own `.env.local` out of
+  their commits. The CLI names each committed file it still matches
+  (`gitignored but committed:`), since a *new* file beside one would be
+  ignored.
 - **One commit, never history.** Exporting the branch's commits would carry
   any file those commits contain, including the content the audience filter
   just withheld. The export is a single commit on a branch named after the

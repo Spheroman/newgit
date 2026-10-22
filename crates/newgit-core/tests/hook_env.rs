@@ -10,7 +10,7 @@ use std::process::Command;
 use camino::{Utf8Path, Utf8PathBuf};
 use newgit_core::SourceSubstrate;
 use newgit_core::cleanup::ArchivedCheckpoints;
-use newgit_core::manager::{BranchManager, UndoOptions};
+use newgit_core::manager::{BranchManager, SourceBranchPolicy, UndoOptions};
 use newgit_core::store::MetadataStore;
 
 fn git(dir: &Utf8Path, args: &[&str]) {
@@ -130,7 +130,12 @@ command = "echo cleanup $COMPOSE_PROJECT $PG_PORT $NEWGIT_BRANCH $NEWGIT_WORKSPA
         .undo("feature-a", &UndoOptions::default())
         .expect("undo");
     manager
-        .remove("feature-a", &temp, ArchivedCheckpoints::Keep)
+        .remove(
+            "feature-a",
+            &temp,
+            ArchivedCheckpoints::Keep,
+            SourceBranchPolicy::Auto,
+        )
         .expect("remove");
 
     let expected_tail = format!("csr-feature-a {port} feature-a {workspace}");

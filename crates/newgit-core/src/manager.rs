@@ -16,6 +16,7 @@ use crate::cleanup::{
     PrunedRev, PurgedCheckpoints, SnapshotRoots, may_tear_down, orphan_workspaces,
 };
 use crate::config::ProjectConfig;
+use crate::deposit_diff::{DepositDiff, diff_deposits};
 use crate::error::{NewgitError, Result};
 use crate::export::{self, ExportFilter, ExportPlan, prepare_destination};
 use crate::exports::{RenderContext, render, unresolved_placeholder};
@@ -242,6 +243,92 @@ impl RenderCheckTarget {
     }
 }
 
+/// One variable of the command environment, and the declaration it came
+/// from. `check_env_names` guarantees every name has exactly one declaring
+/// resource, so the origin is never a guess.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EnvVar {
+    pub name: String,
+    pub value: String,
+    pub source: EnvSource,
+}
+
+/// Where a command-environment variable is declared.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EnvSource {
+    /// A key in the resource's `[exports]`.
+    Export { resource: String },
+    /// Captured from an action's stdout, with no `[exports]` key of its own.
+    Capture { resource: String, action: String },
+    /// A port's `env` name.
+    Port { resource: String, port: String },
+    /// `NEWGIT_BRANCH` and `NEWGIT_WORKSPACE`, set by newgit itself.
+    Newgit,
+}
+
+impl std::fmt::Display for EnvSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Export { resource } => write!(f, "{resource} [exports]"),
+            Self::Capture { resource, action } => {
+                write!(f, "{resource} [actions.{action}] captures")
+            }
+            Self::Port { resource, port } => write!(f, "{resource} [ports.{port}]"),
+            Self::Newgit => f.write_str("newgit"),
+        }
+    }
+}
+
+/// The declaration a bound export value came from: an `[exports]` key when
+/// there is one (a capture of the same name only refines it), otherwise the
+/// action that captures it. A binding whose definition has since vanished
+/// is still an export of that resource.
+fn export_source(resource: &str, definition: Option<&ResourceDefinition>, key: &str) -> EnvSource {
+    let capturing_action = definition
+        .filter(|definition| !definition.exports.contains_key(key))
+        .and_then(|definition| {
+            definition
+                .actions
+                .iter()
+                .find(|(_, action)| action.captures.iter().any(|name| name == key))
+        });
+    match capturing_action {
+        Some((action, _)) => EnvSource::Capture {
+            resource: resource.to_owned(),
+            action: action.clone(),
+        },
+        None => EnvSource::Export {
+            resource: resource.to_owned(),
+        },
+    }
+}
+
+/// The signal a command-less action sends: its own, else the resource's
+/// stop signal.
+fn action_signal(definition: &ResourceDefinition, action: &crate::resource::ActionSpec) -> String {
+    action
+        .signal
+        .clone()
+        .unwrap_or_else(|| definition.stop_signal())
+}
+
+/// What `newgit action <resource>.<action>` would do, without doing it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ActionPlan {
+    /// A command-less action (e.g. `stop`): signal the supervised process.
+    Signal { signal: String },
+    /// Run this exact command — rendered, in this directory, with
+    /// [`BranchManager::assemble_env`] layered over the caller's environment.
+    Command {
+        command: String,
+        cwd: Utf8PathBuf,
+        /// Started under supervision rather than run to completion.
+        long_running: bool,
+        /// Names read out of stdout into the binding's exports.
+        captures: Vec<String>,
+    },
+}
+
 /// What running an action did.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ActionOutcome {
@@ -366,6 +453,92 @@ pub struct RemoveOutcome {
     /// Why the instance could not be removed from the remote, when it was on
     /// one: its fork and token outlive it until removed there.
     pub remote_warning: Option<String>,
+    /// What happened to the instance's source branch in the store, and why.
+    pub source_branch: SourceBranchOutcome,
+    /// The workspace's HEAD when no ref in the store contained it: commits
+    /// made after the last checkpoint, deleted with the workspace. `remove`
+    /// does not checkpoint first (the workspace is disposable), but it does
+    /// say so, rather than let "nothing unique" on the branch read as
+    /// "nothing lost".
+    pub unsaved_workspace_head: Option<String>,
+}
+
+/// What `remove` should do with the instance's source branch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SourceBranchPolicy {
+    /// Delete it when it holds nothing unique — newgit created it, nothing
+    /// has it checked out, and its tip is already on another branch, a tag,
+    /// or the remote. Otherwise keep it and say which of those failed.
+    #[default]
+    Auto,
+    /// Keep it whatever it holds.
+    Keep,
+    /// Delete it whatever it holds. Still refuses a branch checked out in
+    /// the store, before anything is torn down.
+    Delete,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SourceBranchOutcome {
+    /// Deleted at `tip`. `found_on` names one other ref whose history holds
+    /// the tip (`main`, `origin/feature-a`, `tag v1.2`) — `None` only when
+    /// the deletion was forced past commits that existed nowhere else.
+    Deleted {
+        tip: String,
+        found_on: Option<String>,
+        /// Whether a checkpoint ref in the store still reaches `tip` after
+        /// removal — i.e. whether `git branch <name> <tip>` keeps working
+        /// past the next `git gc`.
+        pinned_by_checkpoint: bool,
+    },
+    Kept(KeptBranch),
+    /// The branch was already gone from the store.
+    Missing,
+}
+
+/// Why `remove` left the source branch in place.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum KeptBranch {
+    /// `--keep-branch`.
+    Asked,
+    /// It existed before `spawn`; newgit adopted it and does not own it.
+    Adopted,
+    /// Checked out in the store at this path.
+    CheckedOut(Utf8PathBuf),
+    /// Its tip is on no other branch, tag, or remote ref — deleting it is
+    /// the only way these commits stop being a branch.
+    Unique { tip: String },
+    /// Its tip is on no local ref, and the publish remote could not be
+    /// reached to confirm it has the tip. Keeping is the safe direction.
+    RemoteUnconfirmed { tip: String, error: String },
+    /// The branch moved while removal ran, so the deletion — guarded on the
+    /// tip it decided about — did not happen. `now` is where it points.
+    Moved {
+        expected: String,
+        now: Option<String>,
+    },
+}
+
+/// Whether, and how, [`BranchManager::ref_holding`] may read the outbox.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OutboxRead {
+    /// Bring it up to date with the publish remote first (a network fetch),
+    /// and count it only if that succeeded.
+    Refresh,
+    /// Read it as it stands — only right after a `Refresh`.
+    AsIs,
+    /// Do not count it.
+    Skip,
+}
+
+/// What [`BranchManager::ref_holding`] found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Holding {
+    found_on: Option<String>,
+    /// `found_on` came from the outbox.
+    via_outbox: bool,
+    /// The outbox refresh failed, so the remote went uncounted.
+    remote_error: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -379,6 +552,8 @@ pub struct ExportOutcome {
     /// The single commit the export produced.
     pub commit: String,
     pub plan: ExportPlan,
+    /// Committed files the export's own `.gitignore` still matches.
+    pub still_gitignored: Vec<Utf8PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -436,6 +611,53 @@ pub struct VerifyResource {
     pub before_state_ref: Option<String>,
     pub after_state_ref: Option<String>,
     pub agree: bool,
+    /// On an exercised mismatch only: which half of the round trip broke.
+    pub cause: Option<MismatchCause>,
+    /// On a mismatch between `into_tracker` deposits only: what differs
+    /// between two of them, and where both live.
+    pub diff: Option<VerifyDiff>,
+}
+
+/// The deposit diff shown under a MISMATCH, and which pair it compares.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifyDiff {
+    pub pair: DiffPair,
+    pub result: std::result::Result<DepositDiff, String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiffPair {
+    /// The checkpoint before the restore against the one after it — what
+    /// the restore changed, for every cause but an unstable checkpoint.
+    BeforeAfter,
+    /// `after` against the control taken straight after it. Nothing was
+    /// restored between those two, so every line that differs is the
+    /// checkpoint's own noise — exactly what an unstable checkpoint needs
+    /// to show, without the restore's changes mixed in.
+    AfterControl,
+}
+
+/// Why `before` and `after` disagree. A mismatch has two opposite fixes —
+/// a `[restore]` that lands on the wrong state, or a `[checkpoint]` that
+/// never produces the same ref twice — and the two refs alone cannot say
+/// which. A control checkpoint can: the resource checkpointed once more
+/// straight after `after`, with nothing restored in between. Either way the
+/// verify still fails; this is evidence for the person fixing it, never a
+/// reason to call a mismatch verified.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MismatchCause {
+    /// The restore command itself failed during the undo, so of course the
+    /// state moved. No control was taken.
+    RestoreFailed,
+    /// The control reproduced `after`: the checkpoint is stable, so the
+    /// restore landed on a different state than the one checkpointed.
+    RestoreLandedElsewhere,
+    /// The control differed from `after` with nothing restored between
+    /// them: the checkpoint command does not produce the same ref for the
+    /// same state, so this run could not judge the restore at all.
+    CheckpointUnstable { control_state_ref: Option<String> },
+    /// The control checkpoint could not be taken.
+    ControlFailed(String),
 }
 
 /// What this undo knows about a resource beyond the checkpoint being
@@ -1439,6 +1661,7 @@ impl BranchManager {
             .join(&slug);
         let mut branch = BranchInstance::new(name, name, source_rev, workspace_path)?;
         branch.private = choice.private;
+        branch.created_source_branch = created_source_branch;
         if let Some((base_ref, base_rev)) = base {
             branch = branch.with_base(base_ref, base_rev);
         }
@@ -2607,58 +2830,26 @@ impl BranchManager {
 
     /// Run `<resource>.<action>` for an instance.
     pub fn run_action(&self, instance: &str, spec: &str) -> Result<ActionOutcome> {
-        self.require_resolvable_graph()?;
-        let (resource_name, action_name) = spec.split_once('.').ok_or_else(|| {
-            NewgitError::Unsupported(format!("`{spec}` is not of the form <resource>.<action>"))
-        })?;
-        let mut branch = self.store.find_branch(instance)?;
-        self.require_workspace(&branch)?;
-        let definition = self.resource_definition(resource_name)?;
-        let action =
-            definition
-                .actions
-                .get(action_name)
-                .ok_or_else(|| NewgitError::UnknownAction {
-                    resource: resource_name.to_owned(),
-                    action: action_name.to_owned(),
-                })?;
+        let (mut branch, definition, action, action_name) = self.resolve_action(instance, spec)?;
         let supervisor = self.supervisor(&branch);
 
         // Signal-only action (e.g. stop): signal the supervised process.
         if action.command.is_none() {
-            let signal = action
-                .signal
-                .clone()
-                .unwrap_or_else(|| definition.stop_signal());
+            let signal = action_signal(definition, action);
             return Ok(ActionOutcome::Stopped(
                 supervisor.stop(&definition.name, &signal)?,
             ));
         }
-
-        // Refusing to run is the right call, but it is not this resource's own
-        // outcome — it is derived from a dependency, and re-derivable the
-        // moment that dependency changes. Nothing is written to the record.
-        let blocked_by = self.blocked_dependencies(&branch, definition);
-        if !blocked_by.is_empty() {
-            return Err(NewgitError::Unsupported(format!(
-                "resource `{resource_name}` is blocked by failed dependency/dependencies: {}",
-                blocked_by.join(", ")
-            )));
-        }
+        self.refuse_if_blocked(&branch, definition)?;
 
         let log = self
             .store
             .action_log_path(&branch.slug, &format!("{}.{action_name}", definition.name));
 
         if action.long_running {
-            let command = self.rendered_command(&branch, definition, action)?;
+            let (command, cwd) =
+                self.action_invocation(&branch, definition, action, action_name)?;
             let env = self.assemble_env(&branch)?;
-            let cwd = resource_cwd(
-                &branch.workspace_path,
-                &definition.name,
-                action_name,
-                definition.workdir_for(Some(action)),
-            )?;
             let pid = supervisor.start(&definition.name, &command, &cwd, &env, &log)?;
             return Ok(ActionOutcome::Started { pid, log });
         }
@@ -2700,6 +2891,96 @@ impl BranchManager {
         })
     }
 
+    /// What [`Self::run_action`] would do, refusing for exactly the reasons
+    /// it would refuse, and running nothing. The command is rendered by the
+    /// same code that renders it for a real run; the environment it gets is
+    /// [`Self::command_env`].
+    pub fn plan_action(&self, instance: &str, spec: &str) -> Result<ActionPlan> {
+        let (branch, definition, action, action_name) = self.resolve_action(instance, spec)?;
+        if action.command.is_none() {
+            return Ok(ActionPlan::Signal {
+                signal: action_signal(definition, action),
+            });
+        }
+        self.refuse_if_blocked(&branch, definition)?;
+        let (command, cwd) = self.action_invocation(&branch, definition, action, action_name)?;
+        Ok(ActionPlan::Command {
+            command,
+            cwd,
+            long_running: action.long_running,
+            captures: action.captures.clone(),
+        })
+    }
+
+    /// Look up `<resource>.<action>` for an instance, with every refusal a
+    /// run makes before it reaches the command.
+    fn resolve_action<'s>(
+        &self,
+        instance: &str,
+        spec: &'s str,
+    ) -> Result<(
+        BranchInstance,
+        &ResourceDefinition,
+        &crate::resource::ActionSpec,
+        &'s str,
+    )> {
+        self.require_resolvable_graph()?;
+        let (resource_name, action_name) = spec.split_once('.').ok_or_else(|| {
+            NewgitError::Unsupported(format!("`{spec}` is not of the form <resource>.<action>"))
+        })?;
+        let branch = self.store.find_branch(instance)?;
+        self.require_workspace(&branch)?;
+        let definition = self.resource_definition(resource_name)?;
+        let action =
+            definition
+                .actions
+                .get(action_name)
+                .ok_or_else(|| NewgitError::UnknownAction {
+                    resource: resource_name.to_owned(),
+                    action: action_name.to_owned(),
+                })?;
+        Ok((branch, definition, action, action_name))
+    }
+
+    /// Refusing to run is the right call, but it is not this resource's own
+    /// outcome — it is derived from a dependency, and re-derivable the
+    /// moment that dependency changes. Nothing is written to the record.
+    fn refuse_if_blocked(
+        &self,
+        branch: &BranchInstance,
+        definition: &ResourceDefinition,
+    ) -> Result<()> {
+        let blocked_by = self.blocked_dependencies(branch, definition);
+        if blocked_by.is_empty() {
+            return Ok(());
+        }
+        Err(NewgitError::Unsupported(format!(
+            "resource `{}` is blocked by failed dependency/dependencies: {}",
+            definition.name,
+            blocked_by.join(", ")
+        )))
+    }
+
+    /// The rendered command an action runs and the directory it runs in —
+    /// shared by real runs and [`Self::plan_action`], so a dry run cannot
+    /// describe a different command than the one that would run.
+    fn action_invocation(
+        &self,
+        branch: &BranchInstance,
+        definition: &ResourceDefinition,
+        action: &crate::resource::ActionSpec,
+        action_name: &str,
+    ) -> Result<(String, Utf8PathBuf)> {
+        let command = self.rendered_command(branch, definition, action)?;
+        let cwd = resource_cwd(
+            &branch.workspace_path,
+            &definition.name,
+            action_name,
+            definition.workdir_for(Some(action)),
+        )?;
+        Ok((command, cwd))
+    }
+
     /// Run an arbitrary command inside the instance with the full export
     /// environment loaded. Returns the exit code.
     pub fn run_command(
@@ -2728,14 +3009,8 @@ impl BranchManager {
         log: &Utf8Path,
         quiet: bool,
     ) -> Result<(i32, Captures)> {
-        let command = self.rendered_command(branch, definition, action)?;
+        let (command, cwd) = self.action_invocation(branch, definition, action, action_name)?;
         let env = self.assemble_env(branch)?;
-        let cwd = resource_cwd(
-            &branch.workspace_path,
-            &definition.name,
-            action_name,
-            definition.workdir_for(Some(action)),
-        )?;
 
         if action.captures.is_empty() {
             let command_line = ["sh".to_owned(), "-c".to_owned(), command];
@@ -2821,20 +3096,35 @@ impl BranchManager {
         Ok(render(&command, &context))
     }
 
-    /// The layered environment `newgit run` and actions see. Later layers
+    /// The layered environment `newgit run` and every hook see: actions,
+    /// `key_command`, checkpoint, restore, and cleanup alike. Later layers
     /// win: resource exports in dependency order → port env vars → newgit
     /// context vars. Trackers own content; command environment wiring lives
-    /// outside the tracker primitive.
+    /// outside the tracker primitive. The variables are added on top of the
+    /// environment of whoever ran newgit; nothing inherited is removed.
     pub fn assemble_env(&self, branch: &BranchInstance) -> Result<Vec<(String, String)>> {
+        Ok(self
+            .command_env(branch)?
+            .into_iter()
+            .map(|var| (var.name, var.value))
+            .collect())
+    }
+
+    /// [`Self::assemble_env`] with each variable's origin attached — what
+    /// `newgit env` prints. This *is* the assembly; `assemble_env` only drops
+    /// the origins, so what is printed cannot drift from what a hook gets.
+    pub fn command_env(&self, branch: &BranchInstance) -> Result<Vec<EnvVar>> {
         // Layering depends on dependency order, so the order has to be real.
         self.require_resolvable_graph()?;
-        let mut env: BTreeMap<String, String> = BTreeMap::new();
+        let mut env: BTreeMap<String, (String, EnvSource)> = BTreeMap::new();
 
         // Layer 1: resource exports, dependency order (dependents win).
         for name in &self.graph.bind_order {
             if let Some(binding) = branch.resources.get(name) {
+                let definition = self.resource_definition(name).ok();
                 for (key, value) in &binding.resolved_exports {
-                    env.insert(key.clone(), value.clone());
+                    let source = export_source(name, definition, key);
+                    env.insert(key.clone(), (value.clone(), source));
                 }
             }
         }
@@ -2851,19 +3141,33 @@ impl BranchManager {
                 if let (Some(env_name), Some(port)) =
                     (&request.env, binding.resolved_ports.get(port_name))
                 {
-                    env.insert(env_name.clone(), port.to_string());
+                    let source = EnvSource::Port {
+                        resource: name.clone(),
+                        port: port_name.clone(),
+                    };
+                    env.insert(env_name.clone(), (port.to_string(), source));
                 }
             }
         }
 
         // Layer 3: context vars.
-        env.insert("NEWGIT_BRANCH".to_owned(), branch.name.clone());
+        env.insert(
+            "NEWGIT_BRANCH".to_owned(),
+            (branch.name.clone(), EnvSource::Newgit),
+        );
         env.insert(
             "NEWGIT_WORKSPACE".to_owned(),
-            branch.workspace_path.to_string(),
+            (branch.workspace_path.to_string(), EnvSource::Newgit),
         );
 
-        Ok(env.into_iter().collect())
+        Ok(env
+            .into_iter()
+            .map(|(name, (value, source))| EnvVar {
+                name,
+                value,
+                source,
+            })
+            .collect())
     }
 
     pub fn add_resource(&self, name: &str, template_name: &str) -> Result<AddResourceOutcome> {
@@ -4124,11 +4428,17 @@ impl BranchManager {
     /// undo would need, and the instance may be re-created. `checkpoints =
     /// Purge` says that undo will never be wanted, and drops them so the next
     /// `cleanup` can reclaim what they held.
+    ///
+    /// The source branch goes too when it holds nothing unique (see
+    /// [`SourceBranchPolicy::Auto`]); the decision is made before anything
+    /// is torn down, so a `Delete` that cannot be honoured refuses the whole
+    /// removal rather than half of it.
     pub fn remove(
         &self,
         name: &str,
         cwd: &Utf8Path,
         checkpoints: ArchivedCheckpoints,
+        source_branch: SourceBranchPolicy,
     ) -> Result<RemoveOutcome> {
         let branch = self.store.find_branch(name)?;
 
@@ -4139,6 +4449,10 @@ impl BranchManager {
                 branch.name
             )));
         }
+
+        let policy = source_branch;
+        let (mut source_branch, via_outbox) = self.decide_source_branch(&branch, policy)?;
+        let unsaved_workspace_head = self.unsaved_workspace_head(&branch);
 
         // Stop anything still running before the workspace disappears.
         let supervisor = self.supervisor(&branch);
@@ -4191,6 +4505,15 @@ impl BranchManager {
             (false, purged) => (purged, 0),
         };
 
+        // Last, so an error anywhere above leaves the branch untouched. By
+        // now the record is archived and the removal has happened, so
+        // nothing below may fail it: every way the deletion can go wrong
+        // becomes a kept branch with the reason, never an error.
+        if let SourceBranchOutcome::Deleted { tip, .. } = &source_branch {
+            let tip = tip.clone();
+            source_branch = self.delete_source_branch(&branch, policy, tip, via_outbox);
+        }
+
         Ok(RemoveOutcome {
             branch,
             archived_record,
@@ -4198,6 +4521,216 @@ impl BranchManager {
             purged_checkpoints,
             kept_checkpoints,
             remote_warning,
+            source_branch,
+            unsaved_workspace_head,
+        })
+    }
+
+    /// Carry out a decided deletion. Cleanup hooks ran between the decision
+    /// and here, and may have taken long enough for the ref that held the
+    /// tip to move or go — two parallel removals of branches sharing a tip
+    /// would otherwise each count the other and both delete. So `Auto`
+    /// asks again, and keeps the branch if the answer changed.
+    fn delete_source_branch(
+        &self,
+        branch: &BranchInstance,
+        policy: SourceBranchPolicy,
+        tip: String,
+        via_outbox: bool,
+    ) -> SourceBranchOutcome {
+        let own = format!("refs/heads/{}", branch.source_ref);
+        let mut found_on = None;
+        if policy == SourceBranchPolicy::Auto {
+            // Re-read the outbox only if the decision came from a fresh
+            // read of it; otherwise it may be as old as the last push.
+            let outbox = if via_outbox {
+                OutboxRead::AsIs
+            } else {
+                OutboxRead::Skip
+            };
+            match self.ref_holding(&tip, &own, outbox) {
+                Ok(Holding {
+                    found_on: Some(name),
+                    ..
+                }) => found_on = Some(name),
+                _ => return SourceBranchOutcome::Kept(KeptBranch::Unique { tip }),
+            }
+        } else if let Ok(holding) = self.ref_holding(&tip, &own, OutboxRead::Skip) {
+            found_on = holding.found_on;
+        }
+
+        if self.source.delete_branch(&branch.source_ref, &tip).is_err() {
+            return SourceBranchOutcome::Kept(KeptBranch::Moved {
+                expected: tip,
+                now: self.source.ref_rev(&own),
+            });
+        }
+        let pinned_by_checkpoint = crate::source::refs_containing_in(
+            self.source.root(),
+            &tip,
+            &["refs/newgit/checkpoints"],
+        )
+        .is_ok_and(|refs| !refs.is_empty());
+        SourceBranchOutcome::Deleted {
+            tip,
+            found_on,
+            pinned_by_checkpoint,
+        }
+    }
+
+    /// The workspace's HEAD, when no ref in the store contains it — work
+    /// since the last checkpoint that removing the workspace destroys.
+    fn unsaved_workspace_head(&self, branch: &BranchInstance) -> Option<String> {
+        if !branch.workspace_path.is_dir() {
+            return None;
+        }
+        let head = GitSource::workspace_head(&branch.workspace_path).ok()?;
+        // An object the store never received is an error here, which is
+        // the same answer as "no ref contains it".
+        let saved = crate::source::refs_containing_in(self.source.root(), &head, &["refs"])
+            .is_ok_and(|refs| !refs.is_empty());
+        (!saved).then_some(head)
+    }
+
+    /// Decide what `remove` does with the source branch, without doing it.
+    ///
+    /// "Nothing unique" means the tip is in the history of some other
+    /// branch, tag, or remote-tracking ref in the store, or of a branch the
+    /// publish remote has right now — read by refreshing the outbox, since
+    /// that is where a workspace's pushes land and the store's own
+    /// `refs/remotes` never hears about them. newgit's checkpoint refs do
+    /// not count: they are undo history, not a place a person would look
+    /// for their work.
+    ///
+    /// Also returns whether the answer came from the outbox, so the
+    /// re-check before deleting knows whether it may read it again.
+    fn decide_source_branch(
+        &self,
+        branch: &BranchInstance,
+        policy: SourceBranchPolicy,
+    ) -> Result<(SourceBranchOutcome, bool)> {
+        let own = format!("refs/heads/{}", branch.source_ref);
+        let Some(tip) = self.source.ref_rev(&own) else {
+            return Ok((SourceBranchOutcome::Missing, false));
+        };
+        if policy == SourceBranchPolicy::Keep {
+            return Ok((SourceBranchOutcome::Kept(KeptBranch::Asked), false));
+        }
+        if let Some(path) = self.source.checked_out_at(&branch.source_ref)? {
+            if policy == SourceBranchPolicy::Delete {
+                return Err(NewgitError::Unsupported(format!(
+                    "cannot delete source branch `{}`: it is checked out in the store at {path}. \
+                     Switch that checkout to another branch first, or remove with \
+                     `--keep-branch`",
+                    branch.source_ref
+                )));
+            }
+            return Ok((
+                SourceBranchOutcome::Kept(KeptBranch::CheckedOut(path)),
+                false,
+            ));
+        }
+        if policy == SourceBranchPolicy::Auto && !branch.created_source_branch {
+            return Ok((SourceBranchOutcome::Kept(KeptBranch::Adopted), false));
+        }
+        if policy == SourceBranchPolicy::Delete {
+            // Deleting regardless: where else the tip lives is reported
+            // after the fact, from local refs, with no network.
+            return Ok((
+                SourceBranchOutcome::Deleted {
+                    tip,
+                    found_on: None,
+                    pinned_by_checkpoint: false,
+                },
+                false,
+            ));
+        }
+
+        let holding = self.ref_holding(&tip, &own, OutboxRead::Refresh)?;
+        let outcome = match (holding.found_on, holding.remote_error) {
+            (Some(found_on), _) => SourceBranchOutcome::Deleted {
+                tip,
+                found_on: Some(found_on),
+                pinned_by_checkpoint: false,
+            },
+            (None, Some(error)) => {
+                SourceBranchOutcome::Kept(KeptBranch::RemoteUnconfirmed { tip, error })
+            }
+            (None, None) => SourceBranchOutcome::Kept(KeptBranch::Unique { tip }),
+        };
+        Ok((outcome, holding.via_outbox))
+    }
+
+    /// One ref other than `own` whose history contains `tip`, named for a
+    /// reader: local branches first, then remote-tracking refs, then tags,
+    /// then the publish remote itself. The remote is asked only when no
+    /// local ref answers, since asking costs a fetch.
+    fn ref_holding(&self, tip: &str, own: &str, outbox: OutboxRead) -> Result<Holding> {
+        let mut store = self.source.refs_containing(tip)?;
+        store.retain(|name| name != own);
+        let named = |prefix: &str| {
+            store
+                .iter()
+                .find_map(|name| name.strip_prefix(prefix))
+                .map(ToOwned::to_owned)
+        };
+        let local = named("refs/heads/")
+            .map(|name| format!("`{name}`"))
+            .or_else(|| named("refs/remotes/").map(|name| format!("`{name}`")))
+            .or_else(|| named("refs/tags/").map(|name| format!("tag `{name}`")));
+        if local.is_some() {
+            return Ok(Holding {
+                found_on: local,
+                via_outbox: false,
+                remote_error: None,
+            });
+        }
+
+        // The outbox mirrors the publish remote only as of its last sync,
+        // and a branch can vanish from the remote after it — a PR closed
+        // unmerged, a force-push. Counting a stale mirror would delete the
+        // only copy, so it is refreshed first, and a refresh that fails
+        // means the remote is not counted at all.
+        let outbox_dir = self.outbox();
+        let mut remote_error = None;
+        let readable = match outbox {
+            OutboxRead::Skip => false,
+            OutboxRead::AsIs => outbox_dir.join("HEAD").is_file(),
+            OutboxRead::Refresh => match self.publish_url()? {
+                None => false,
+                Some(url) => match self
+                    .source
+                    .ensure_outbox(&outbox_dir)
+                    .and_then(|()| GitSource::sync_outbox(&outbox_dir, &url, None))
+                {
+                    Ok(()) => true,
+                    Err(error) => {
+                        // Git's own reason, not the whole fetch command line.
+                        let text = error.to_string();
+                        let reason = text
+                            .split_once("fatal: ")
+                            .map_or(text.as_str(), |(_, reason)| reason);
+                        remote_error = Some(reason.lines().next().unwrap_or("").trim().to_owned());
+                        false
+                    }
+                },
+            },
+        };
+        // The outbox borrows the store's objects, so `tip` resolves there;
+        // a read that fails anyway only means one fewer place to find it.
+        let pushed = if readable {
+            crate::source::refs_containing_in(&outbox_dir, tip, &["refs/heads"])
+                .unwrap_or_default()
+                .iter()
+                .find_map(|name| name.strip_prefix("refs/heads/"))
+                .map(|name| format!("`{PUBLISH_REMOTE}/{name}`"))
+        } else {
+            None
+        };
+        Ok(Holding {
+            via_outbox: pushed.is_some(),
+            found_on: pushed,
+            remote_error,
         })
     }
 
@@ -4664,6 +5197,7 @@ impl BranchManager {
                 &head_rev[..8.min(head_rev.len())]
             ),
         )?;
+        let still_gitignored = GitSource::export_ignored_but_committed(destination)?;
 
         Ok(ExportOutcome {
             destination: destination.to_path_buf(),
@@ -4672,6 +5206,7 @@ impl BranchManager {
             source_head: head_rev,
             commit,
             plan,
+            still_gitignored,
         })
     }
 
@@ -4862,32 +5397,104 @@ impl BranchManager {
             CheckpointReason::Explicit,
         )?;
 
-        let resources = before
-            .record
-            .resource_states
-            .iter()
-            .map(|before_state| {
-                let after_ref = after
-                    .record
-                    .resource_states
-                    .iter()
-                    .find(|state| state.name == before_state.name)
-                    .and_then(|state| state.state_ref.clone());
-                VerifyResource {
-                    name: before_state.name.clone(),
-                    exercised: before_state.restore_exercisable,
-                    before_state_ref: before_state.state_ref.clone(),
-                    after_state_ref: after_ref.clone(),
-                    agree: before_state.state_ref == after_ref,
+        let failed_restores = undo.failed_resources();
+        let mut resources = Vec::new();
+        for before_state in &before.record.resource_states {
+            let after_ref = after
+                .record
+                .resource_states
+                .iter()
+                .find(|state| state.name == before_state.name)
+                .and_then(|state| state.state_ref.clone());
+            let agree = before_state.state_ref == after_ref;
+            let mismatch = before_state.restore_exercisable && !agree;
+            let cause = mismatch.then(|| {
+                if failed_restores.contains(&before_state.name.as_str()) {
+                    MismatchCause::RestoreFailed
+                } else {
+                    self.control_checkpoint(&branch, &before_state.name, after_ref.as_deref())
                 }
-            })
-            .collect();
+            });
+            let diff = match &cause {
+                None => None,
+                Some(MismatchCause::CheckpointUnstable { control_state_ref }) => self.deposit_diff(
+                    DiffPair::AfterControl,
+                    after_ref.as_deref(),
+                    control_state_ref.as_deref(),
+                ),
+                Some(_) => self.deposit_diff(
+                    DiffPair::BeforeAfter,
+                    before_state.state_ref.as_deref(),
+                    after_ref.as_deref(),
+                ),
+            };
+            resources.push(VerifyResource {
+                name: before_state.name.clone(),
+                exercised: before_state.restore_exercisable,
+                before_state_ref: before_state.state_ref.clone(),
+                after_state_ref: after_ref,
+                agree,
+                cause,
+                diff,
+            });
+        }
 
         Ok(VerifyOutcome {
             before: before.record,
             undo,
             after: after.record,
             resources,
+        })
+    }
+
+    /// Checkpoint one resource again, right after verify's `after`, and say
+    /// whether it reproduced `after`. Only this resource, and only on a
+    /// mismatch: a verify that agrees never pays for it, and a mismatch is
+    /// already a failure worth one more `pg_dump` to explain. Not recorded as
+    /// a checkpoint — it is a measurement, and a third record in the log
+    /// would be one nobody asked to return to. A deposit it makes is left
+    /// unreferenced for `cleanup` to reclaim.
+    fn control_checkpoint(
+        &self,
+        branch: &BranchInstance,
+        name: &str,
+        after_ref: Option<&str>,
+    ) -> MismatchCause {
+        let control = self.resource_definition(name).and_then(|definition| {
+            self.checkpoint_resource(branch, definition, "checkpoint-control")
+        });
+        match control {
+            Ok(control) if control.state_ref.as_deref() == after_ref => {
+                MismatchCause::RestoreLandedElsewhere
+            }
+            Ok(control) => MismatchCause::CheckpointUnstable {
+                control_state_ref: control.state_ref,
+            },
+            Err(error) => MismatchCause::ControlFailed(error.to_string()),
+        }
+    }
+
+    /// The line-level difference between two `tracker:<name>@<rev>` deposits,
+    /// or `None` when either ref is not a deposit (an opaque command ref or a
+    /// hash is all the content there is).
+    fn deposit_diff(
+        &self,
+        pair: DiffPair,
+        old_ref: Option<&str>,
+        new_ref: Option<&str>,
+    ) -> Option<VerifyDiff> {
+        let (old_lane, old_rev) = parse_tracker_state_ref(old_ref?)?;
+        let (new_lane, new_rev) = parse_tracker_state_ref(new_ref?)?;
+        Some(VerifyDiff {
+            pair,
+            result: self
+                .lane(old_lane)
+                .checkout_dir(old_rev)
+                .and_then(|before| {
+                    let after = self.lane(new_lane).checkout_dir(new_rev)?;
+                    diff_deposits(&before, &after)
+                })
+                .map_err(|error| error.to_string()),
         })
     }
 
@@ -4986,7 +5593,7 @@ impl BranchManager {
                 degraded.push(name.clone());
                 CapturedResource::none()
             } else if binding.status != ResourceStatus::Ready {
-                match self.checkpoint_resource(branch, definition) {
+                match self.checkpoint_resource(branch, definition, "checkpoint") {
                     Ok(captured) => captured,
                     Err(error) => {
                         warnings.push(format!(
@@ -4998,7 +5605,7 @@ impl BranchManager {
                     }
                 }
             } else {
-                self.checkpoint_resource(branch, definition)?
+                self.checkpoint_resource(branch, definition, "checkpoint")?
             };
             if let Some(deposit) = captured.deposit {
                 deposits.push(deposit);
@@ -5874,10 +6481,15 @@ impl BranchManager {
         remote.set_head(&binding.project, &branch.slug, &record.source.head_rev)
     }
 
+    /// `log_name` labels the action log: `checkpoint` for a real checkpoint,
+    /// `checkpoint-control` for verify's control run, so the log of the run
+    /// that settled a MISMATCH can be told apart from the checkpoints it was
+    /// compared against.
     fn checkpoint_resource(
         &self,
         branch: &BranchInstance,
         definition: &ResourceDefinition,
+        log_name: &str,
     ) -> Result<CapturedResource> {
         let Some(spec) = &definition.checkpoint else {
             return Ok(CapturedResource::none());
@@ -5944,7 +6556,7 @@ impl BranchManager {
                 let command = render(template, &context);
                 let log = self
                     .store
-                    .action_log_path(&branch.slug, &format!("{}.checkpoint", definition.name));
+                    .action_log_path(&branch.slug, &format!("{}.{log_name}", definition.name));
                 let env = self.assemble_env(branch)?;
                 let cwd = resource_cwd(
                     &branch.workspace_path,

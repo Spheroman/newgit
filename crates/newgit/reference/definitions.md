@@ -274,7 +274,8 @@ clean pass.
 
 **Actions are not lifecycle hooks.** Only `prepare` runs on its own — at
 `spawn`, and again for a `recompute` restore. Every other action is something
-you invoke: `newgit action <resource>.<action> [instance]`.
+you invoke: `newgit action <resource>.<action> [instance]`. Add `--dry-run`
+to print the rendered command and its directory without running it.
 
 **`stop` is the one name newgit reads.** Names are otherwise inert —
 `start` is pure convention, made real by `long_running` and not by the name —
@@ -314,6 +315,19 @@ What this resource records when `newgit checkpoint` runs.
 | `hash` | content hash of `[identity] paths` | installs — the lockfile is the truth |
 | `command` | the command's stdout, plus optionally a lane deposit | a database dump |
 | `external` | a rendered handle | a cloud preview, a tunnel |
+
+**A `command` checkpoint should produce the same bytes for the same state.**
+The state ref is how `newgit checkpoint --verify` tells whether a restore
+landed where it started, so a command that stamps each run differently makes
+every verify fail. Common dump tools do this by default: `pg_dump` since
+17.6 (and the matching back-branch releases) opens and closes every dump with
+`\restrict <token>` / `\unrestrict <token>`, a fresh random token per run.
+Pass `--restrict-key=<fixed>` to make it stable, as the bundled Postgres
+templates do (their comments say what a fixed key gives up). Anything else
+that stamps a run does the same: a timestamp in the output, or `pg_dump
+--verbose`'s `-- Started on` / `-- Completed on` comments. `--verify` names
+this case when it happens rather than blaming `[restore]`; it does not paper
+over it.
 
 ### `[restore]`
 
@@ -392,8 +406,41 @@ clears it, and it stays cleared even if a later restore fails: the claim is
 real rollback: checkpoint, `undo` back to that checkpoint, checkpoint
 again, and diff the two runs' resource state refs. Agreement is a stronger
 claim than "the command exited 0" — a restore can exit clean and still
-land on the wrong state, which `--verify` is what catches. It is
-destructive (a real `undo`, stopping and restarting whatever the instance's
+land on the wrong state, which `--verify` is what catches.
+
+A mismatch has two opposite fixes, and `--verify` says which one it saw.
+It checkpoints the mismatched resource once more, straight after the
+second checkpoint with nothing restored in between: if that reproduces the
+second ref, the checkpoint reproduces itself back to back, so `[restore]`
+most likely landed on a different state; if it does not, `[checkpoint]` is
+not deterministic and this run could not judge the restore at all. A restore that failed outright is named as such
+without the extra run. Either way the verify still fails — this is evidence
+for whoever fixes it, never a reason to call a mismatch verified. The extra
+checkpoint is paid only on a mismatch, and only for that resource.
+
+When the refs are `into_tracker` deposits, it also shows what differs —
+each file, its changed line counts, the first few changed lines (control
+characters escaped) — and the `git diff --no-index` command over both
+snapshot directories for the rest. Which two it compares depends on the
+cause: `before` → `after` (what the restore changed) normally, but `after` →
+`control` for an unstable checkpoint, since nothing was restored between
+those two and every line that differs is the checkpoint's own noise:
+
+```
+resource: db MISMATCH  before: tracker:db-snapshots@a71acd9dcafa  after: tracker:db-snapshots@f5b2685a1347
+          cause: [checkpoint] is not deterministic — checkpointed again with nothing restored in between, it gave tracker:db-snapshots@00f1294c80fb, not `after`. ...
+          after → control (nothing was restored between these two):
+          db.sql: -1 +1 lines (of 3300)
+            -\restrict 4fQx9ZkTmB2vLr7HcWn0aYdE8sJpU3gNi6KoVbXt1RzA5yCeqM
+            +\restrict Ty7Nw2cLpQ8vZk0RbJmX4hSaFe6UdG1oYi9KtrWnE3sDx5HjBu
+          full diff: git diff --no-index .newgit/snapshots/db-snapshots/f5b2685a1347 .newgit/snapshots/db-snapshots/00f1294c80fb
+```
+
+The comparison stays bounded however large the dump: one `git diff
+--numstat` for the counts, and one patch streamed only until the excerpt is
+full. The control's own log is `<resource>.checkpoint-control-*.log`.
+
+It is destructive (a real `undo`, stopping and restarting whatever the instance's
 resources run) and prints what it is about to do before doing it; run it
 against an instance you can afford to spend, not one you are mid-task on.
 
@@ -910,6 +957,33 @@ it did not receive that variable it would fall back to whatever its committed
 default names — usually the developer's shared local database — and destroy
 the wrong state, quietly and plausibly. Every variable a `[restore]` needs is
 there.
+
+`newgit env [instance]` prints it, one `export NAME=value` line per variable
+with the declaration it came from, so a destructive hook's inputs can be read
+instead of discovered by running it:
+
+```
+export DB_PORT=5434                            # db [ports.pg]
+export DB_TOKEN=tok_123                        # db [actions.mint] captures
+export DATABASE_URL=postgres://...:5434/feat-x # db [exports]
+export NEWGIT_BRANCH=feature/x                 # newgit
+export NEWGIT_WORKSPACE=/Users/.../feature-x   # newgit
+```
+
+It is the same assembly the hooks use, not a reconstruction of it, and it is
+valid shell: `eval "$(newgit env)"` sets and exports every variable, so the
+programs that shell starts see them as a hook would. A name a shell cannot
+assign (`NEXT-PUBLIC-URL`) is listed commented out rather than dropped:
+newgit sets it for the hook's `sh`, but whether the programs that `sh`
+starts see it depends on the shell (bash passes it on, dash drops it), so
+use names a shell can assign. One case it cannot show in advance: during an
+`undo`, a `recompute` restore that captures a new value hands it to the
+`[restore]` hooks after it in the same undo. Values are printed verbatim: a
+credential a resource exports appears in plain text, exactly as a hook
+receives it. What it leaves out is the environment of whoever runs newgit,
+which every command inherits underneath these variables. The command itself
+— the other half of "what is this about to do" — is `newgit action
+<resource>.<action> --dry-run`.
 
 Note that this is the opposite shape to `{{...}}` substitution, where scope
 genuinely differs per site (see *Template variables*). The environment does

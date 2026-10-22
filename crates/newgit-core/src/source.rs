@@ -609,15 +609,80 @@ impl GitSource {
     /// One commit, never a history rewrite: exporting the workspace's Git
     /// history would carry every file any past commit contained, which is
     /// exactly the content the audience filter just excluded.
+    ///
+    /// `--force`, because the directory holds exactly the export plan and
+    /// nothing else — the plan *is* the filter, and `.gitignore` must not
+    /// apply a second one. Without it, every tracker path is dropped by
+    /// construction: `tracker track` is what gitignored it, and that
+    /// `.gitignore` ships with the source tree. A path the plan said ships
+    /// would land on disk and not in the repository, and `git status` would
+    /// hide that it had.
     pub fn init_export_repo(destination: &Utf8Path, branch: &str, message: &str) -> Result<String> {
         let dest = destination.as_str();
         run_git(&["init", "--quiet", "-b", branch, "--", dest])?;
-        run_git(&["-C", dest, "add", "-A"])?;
+        run_git(&["-C", dest, "add", "--all", "--force"])?;
         run_git_env(
             &["-C", dest, "commit", "--quiet", "-m", message],
             &export_identity(destination),
         )?;
         run_git(&["-C", dest, "rev-parse", "HEAD"])
+    }
+
+    /// Every branch, tag, and remote-tracking ref in the store whose history
+    /// contains `rev` — "does this commit exist anywhere but here". Symbolic
+    /// `refs/remotes/<remote>/HEAD` aliases are left out; they only repeat
+    /// the branch they point at.
+    pub fn refs_containing(&self, rev: &str) -> Result<Vec<String>> {
+        refs_containing_in(
+            &self.root,
+            rev,
+            &["refs/heads", "refs/remotes", "refs/tags"],
+        )
+    }
+
+    /// Where `branch` is checked out in the store — its main worktree or any
+    /// linked one — if anywhere. Deleting a branch out from under a worktree
+    /// leaves that worktree on an unborn branch, which is why `git branch -D`
+    /// refuses it too.
+    pub fn checked_out_at(&self, branch: &str) -> Result<Option<Utf8PathBuf>> {
+        let listing = self.git(&["worktree", "list", "--porcelain"])?;
+        let wanted = format!("branch refs/heads/{branch}");
+        let mut current: Option<&str> = None;
+        for line in listing.lines() {
+            if let Some(path) = line.strip_prefix("worktree ") {
+                current = Some(path);
+            } else if line == wanted {
+                return Ok(current.map(Utf8PathBuf::from));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Delete `refs/heads/<name>`, only if it still points at `expected`.
+    pub fn delete_branch(&self, name: &str, expected: &str) -> Result<()> {
+        self.git(&["update-ref", "-d", &format!("refs/heads/{name}"), expected])
+            .map(|_| ())
+    }
+
+    /// Files committed in an export that its own `.gitignore` still
+    /// matches. Git tracks them regardless, but a new file beside one — in a
+    /// shipped tracker directory, say — would be ignored by the next
+    /// `git add`, so the CLI names them rather than leave that to be found.
+    pub fn export_ignored_but_committed(destination: &Utf8Path) -> Result<Vec<Utf8PathBuf>> {
+        let listing = run_git(&[
+            "-C",
+            destination.as_str(),
+            "ls-files",
+            "-z",
+            "--cached",
+            "--ignored",
+            "--exclude-standard",
+        ])?;
+        Ok(listing
+            .split('\0')
+            .filter(|entry| !entry.is_empty())
+            .map(Utf8PathBuf::from)
+            .collect())
     }
 
     fn git(&self, args: &[&str]) -> Result<String> {
@@ -747,6 +812,26 @@ pub fn auth_env(auth: Option<&str>) -> Vec<(String, String)> {
 
 fn run_git(args: &[&str]) -> Result<String> {
     run_git_env(args, &[])
+}
+
+/// The refs under `namespaces` in `repo` whose history contains `rev`.
+pub fn refs_containing_in(repo: &Utf8Path, rev: &str, namespaces: &[&str]) -> Result<Vec<String>> {
+    let mut args = vec![
+        "-C",
+        repo.as_str(),
+        "for-each-ref",
+        "--format=%(refname)",
+        "--contains",
+        rev,
+    ];
+    args.extend_from_slice(namespaces);
+    Ok(run_git(&args)?
+        .lines()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .filter(|name| !(name.starts_with("refs/remotes/") && name.ends_with("/HEAD")))
+        .map(ToOwned::to_owned)
+        .collect())
 }
 
 /// The user's own Git identity when they have one, so an exported repo looks
