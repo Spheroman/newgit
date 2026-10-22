@@ -12,6 +12,483 @@ time by `scripts/release-changelog.sh`, which then deletes the fragments.
 Two changes never touch the same lines, so nothing queues behind whichever
 branch landed first.
 
+## [0.5.0] — 2026-10-22
+
+The newgit remote (invite-only for now, at `newgit.dev`) and trackers all
+the way down: every tracker is its own Git history, and a workspace's Git
+is composed from the ones it binds. **Upgrading from 0.4.0 means
+re-initializing the project**: see *Upgrading* in `CHANGELOG.md`.
+
+### Added
+
+- `newgit env [instance]` prints the environment `newgit run` and every
+  hook get, each variable labeled with the declaration it came from, and
+  `newgit action <resource>.<action> --dry-run` prints the rendered command
+  and the directory it would run in, running nothing
+  ([#80](https://github.com/Spheroman/newgit/issues/80)).
+
+  Before this, the only way to learn which database a `[restore]` would
+  drop was to run it. Both read the same code a real run uses — `env` is
+  the one assembly every hook gets, `--dry-run` shares the run's
+  resolution and refusals — so neither can describe something other than
+  what would happen. Values are printed verbatim, credentials included,
+  as `newgit run -- env` would; the help text says so.
+
+- A workspace's `origin` now behaves like the project's real remote, and a
+  plain `git push` from it publishes
+  ([#96](https://github.com/Spheroman/newgit/issues/96)).
+
+  A workspace is cloned from the store, so its `origin` was a local path: a
+  push landed silently in the store (moving the branch ref behind
+  checkpoint's back, reaching nothing anyone could see, and reporting
+  success), `git pull` read the store, and `gh` could not find the
+  repository. Agents kept rediscovering this and hand-rolling the two hops.
+
+  Now `origin` fetches from the store's own `origin`, so `git pull` and
+  `gh pr create` (no flags) work as in any clone. Pushes go to an outbox in
+  `.newgit/local/publish/`, kept identical to the real remote, whose hook
+  checkpoints the instance (reason `push` — `undo` cannot take a push back)
+  and forwards the push. It succeeds exactly when the real remote accepted
+  it; a store with no `origin` refuses it. Fast-forward and
+  `--force-with-lease` are judged against the real remote, not the store.
+  Existing workspaces pick up the route at their next `newgit checkpoint`.
+
+- A view commit rebuilt because its reader cannot see every tracker carries
+  a note naming the commit it stands for (`canonical <id>`). The Git endpoint
+  serves each view's notes as `refs/notes/commits` — only for commits in that
+  view — so `git log` shows them once a clone fetches `refs/notes/*`.
+
+- `newgit login`, `logout`, and `whoami` sign in to a newgit remote with a
+  GitHub account; `newgit remote add` creates the project there (pushing
+  the store's history to its trunk) or joins it; `newgit members` manages
+  access. In a linked project, `spawn` registers the instance — its own
+  fork, and a token of its own kept in the workspace's `.git/` — and points
+  the workspace's `origin` at trunk with newgit as Git's credential helper;
+  `git push` publishes to the instance's fork on that token; `remove` takes
+  the instance off the remote. A spawn whose registration fails still
+  works locally and says so.
+
+- `newgit tracker create <name> --code --path <path>` creates a code
+  tracker: committed content with its own history, carved out of whichever
+  tracker owned its paths (usually root) — every commit that touched them,
+  marked with its source, so nothing is rewritten and composing still
+  reproduces the project's history exactly. `newgit init` also writes the
+  `project` tracker, which carries the committed parts of `.newgit/`.
+  Capturing or tracking paths on a code tracker is refused: you commit to it
+  with Git.
+
+- The remote serves every project as an ordinary Git remote,
+  `https://newgit.dev/<owner>/<name>.git`: `git clone` and `git pull` work
+  with plain Git. Each branch is composed, in a per-project container running
+  real `git` and `newgit`, from only the code trackers the caller may read,
+  into a repository holding nothing else. Read-only; pushes go through a
+  newgit workspace. The container sleeps when idle and restores from a
+  snapshot.
+
+- `.newgit/trackers/` is its own code tracker, `access`, created by `newgit
+  init` with `maintainers = "owner"`: only the project's owner changes who may
+  read what, while anyone who merges may change resources, scripts, and
+  config (the `project` tracker).
+- Trackers take an optional `maintainers` key — who may merge changes to them
+  on a remote (`owner`, `project-devs`, `user:<login>`); by default, anyone
+  who may read a tracker may change it. Changing a tracker's definition is
+  changing the tracker that owns its file in `.newgit/trackers/`, so
+  governance layers: a tracker can own other trackers' definitions, and only
+  its maintainers redefine them. The remote and the Git endpoint read each
+  definition from the tracker that owns its file.
+- An instance reports whether it works, checked rather than remembered:
+  `status` says `ready` or `not ready` with the reasons (a resource that did
+  not come up, a tree it builds that is missing, a running resource's port
+  not answering), and `spawn` ends with the same verdict. A resource's
+  `prepare` runs quietly during `spawn`; a failure shows its last lines and
+  its log.
+- A checkpoint no longer aborts on a resource that is not up and whose
+  capture fails: it goes ahead without it, marked degraded. `undo` rebuilds
+  a resource's tree when it is missing, even if its inputs did not change.
+- `spawn` says plainly that nothing leaves the machine until `git push`.
+
+- `newgit merge [instance] [--into main]` merges an instance's committed work
+  into a branch, tracker by tracker: unchanged trackers stay, one the branch
+  has not moved on takes the instance's commit, one both sides changed gets a
+  real Git merge in its own history, and any conflict moves nothing, naming
+  the tracker and files. The branch's list then moves in one step — on the
+  remote by compare-and-swap under a short merge lock, so a merge onto a list
+  that moved meanwhile is refused. `newgit merge main` merges the project
+  root. Merging is a person's decision: agent tokens cannot.
+- Trackers carved, created, or redefined after `newgit remote add` reach the
+  remote with the merge of the project root that made them: a new code
+  tracker gets its repo then.
+
+- A commit that changes code trackers with different audiences is refused
+  where it would leave the machine (push, sync, merge): every tracker it
+  changes keeps a copy of its message, so a message about work only some
+  may read would land where everyone else reads it. Make one commit per
+  audience. Merge commits are exempt.
+
+- `newgit spawn <name> --private`: on the remote, only the instance's owner
+  sees it — its record, checkpoints, and forks of the code trackers — until
+  `newgit merge` publishes its work. Everyone else, the project's owner
+  included, gets the same answer as for an instance that does not exist.
+  Refused without a newgit remote, where a `git push` would publish it.
+  `newgit status` shows `private`.
+
+- Work is split into its trackers when it leaves the machine. Before a
+  spawn, the project root's new commits reach each code tracker's
+  `instances/main`; a `git push` or remote checkpoint sync splits the
+  instance's commits into `instances/<instance>`. Split commits are signed
+  as their author when `commit.gpgSign` is set and the author is you.
+  Code trackers without history (one defined by hand, or `project`) are
+  carved the first time they are needed.
+- `newgit log <tracker> [instance]` shows one tracker's history.
+
+- Every newgit token is recorded and can be revoked on its own, without
+  logging anyone else out. Agents get their own tokens: they act as their
+  owner and are named in the records they create, but cannot mint tokens,
+  create projects, or manage members, default to 7 days, and can be pinned
+  to one project.
+
+- `.newgit/config.toml` accepts a `[remote]` section (`url`, optional
+  `project`) naming the newgit remote a project syncs to. Nothing syncs yet.
+  `url` must be https (plain http only for localhost), and
+  `tracker create --storage remote` is refused when no `[remote]` is
+  configured instead of quietly behaving as local.
+
+- Registering an instance with the remote returns that workspace's own
+  token, so nobody creates tokens by hand: it writes only its own instance
+  (fork, checkpoints, head), renews itself while the instance exists, and
+  is revoked when the instance is removed.
+
+- The remote is invite-only. Only the GitHub logins in the Worker's
+  `ALLOWED_LOGINS` secret (or anyone, with `*`) may log in or use a token,
+  and the check runs on every request, so taking someone off the list shuts
+  out the tokens they already hold. Unset admits no one: a deployment that
+  forgot it is closed rather than open to every GitHub account.
+
+- `remote/` is the newgit remote: a Cloudflare Worker with one Durable
+  Object per project. It logs users in with GitHub's device flow, keeps
+  members, instances, and checkpoints, forks an Artifacts repo per instance,
+  and mints short-lived Git credentials by rule — trunk is never writable,
+  a fork only by its owner, a tracker only by its audience as committed on
+  trunk, and a per-user tracker only by that user.
+
+- Tracker definitions take `role`, `priority`, `requires`, and `resources`.
+  Trackers in a role are alternatives and may claim the same paths; a spawn
+  binds one per role — the one `--use` names, else your own default
+  (`[projects.<project>.roles]` in `~/.newgit/config.toml`), else the highest
+  priority; a negative priority means only when asked. Binding a tracker
+  binds what it `requires`, and a required tracker cannot be dropped.
+  Resources a tracker brings bind only while it is bound, and start and stop
+  with `newgit tracker use` and `drop`; `use` swaps a role's tracker.
+  `spawn --use` / `--drop`.
+- `{{bound.trackers}}` and `{{bound.paths}}` give a resource's commands what
+  the instance binds, so an install can build only the bound members.
+- `tracker list` is a tree by ownership, with each tracker's kind, role,
+  priority, and maintainers; inside a workspace it marks what is bound.
+
+- `newgit init` creates the `root` tracker, which owns everything no other
+  tracker claims and starts with the project's own Git history (borrowed,
+  not copied). Trackers may now nest — `apps` can hold `apps/electron` for
+  another tracker — and a path belongs to its most specific owner, so
+  capturing or restoring the outer tracker leaves the inner one's files
+  alone. Two trackers claiming the identical path is still an error.
+  Tracker definitions gain `secret` (default `true`: kept out of Git and
+  captured from files, as every tracker has been); `newgit tracker list`
+  shows root first.
+
+- `newgit spawn <name> --from-checkpoint <instance>/<checkpoint>` spawns a
+  checkpoint from the project's remote — anyone's, an agent's included — and
+  it comes up as it was: source with its uncommitted work, shared tracker
+  content, and resource state such as a database restored from its dump.
+  Per-user trackers resolve to *your* content, never the author's, and a
+  tracker you may not read is left out and named. In a linked project,
+  every checkpoint syncs its source, its remote-stored tracker revs, and
+  then its record to the remote; a failed sync is a warning, not a failed
+  checkpoint. `spawn --json` prints what happened for agents.
+
+- `newgit tracker use <tracker>` and `newgit tracker drop <tracker>` change
+  what an instance binds. An instance's history holds every code tracker its
+  user may read; dropping one takes its files out of the working tree (Git's
+  sparse checkout) and its work out of the instance's scope — nothing splits
+  into it, and a merge leaves it at the branch's commit — without a commit
+  or any change to history. A drop is refused while the tracker has
+  uncommitted work, unless `--stash` (brought back by `use`) or `--discard`
+  (after a checkpoint, so `newgit undo` gets it back). Dropping a secret
+  tracker captures its content first; `use` projects it back. `root`,
+  `project`, and `access` cannot be dropped.
+
+
+### Changed
+
+- `newgit remove` deletes the instance's source branch when it holds
+  nothing unique, and says why when it keeps it
+  ([#82](https://github.com/Spheroman/newgit/issues/82)).
+
+  It used to destroy the workspace and every resource it could tear down,
+  then keep the one artifact that is cheap to keep and certain to bite: a
+  leftover branch makes the next `spawn` of the same name adopt it instead
+  of starting from `HEAD`, so every spawn/remove cycle needed a manual
+  `git branch -D`. Now the branch goes when `spawn` created it, nothing has
+  it checked out, and its tip is already on another branch, a tag, a
+  remote-tracking ref, or the remote — asked live at removal, so a branch
+  deleted from the remote since the last push counts as unique, and an
+  unreachable remote keeps the branch. The check is repeated just before
+  deleting. Otherwise it is kept and the output names the reason.
+  `--keep-branch` and `--delete-branch` override; a forced delete prints the
+  tip to recover from. `remove` also now says when the workspace held
+  commits no checkpoint captured, since those go with the workspace. Instances spawned before this change
+  never recorded whether `spawn` created their branch, so `remove` treats
+  their branch as adopted and keeps it.
+
+- The Git endpoint's container now stops after 10 minutes without a request,
+  taking a snapshot first when anything was composed since the last one, so
+  the next fetch restores everything it had. A fetch still streaming keeps
+  it awake. Before, nothing stopped it explicitly, and a sleep could leave
+  up to 10 minutes of composed views out of the snapshot.
+
+- A `git push` from a workspace is refused when any commit it sends — on any
+  branch or tag — adds or changes a file a secret tracker owns, naming the
+  commit and file. A remote checkpoint sync checks the same, including its
+  uncommitted-work commit. History from before newgit (root's `main`) is
+  exempt, so an old committed `.env` never blocks a first push.
+- Composing decides ownership among code trackers only, so history that once
+  committed a now-secret file composes with its commit ids unchanged.
+- CLI output says a tracker's `main` where it said "lane head".
+
+- The remote stores code the way the machine does: one Artifacts repo per
+  code tracker (`<owner>.<project>.t.<tracker>`), and an instance forks a
+  tracker only the first time it changes it (`<owner>.<project>.i.<instance>.<tracker>`).
+  The trunk repo and the whole-source fork per instance are gone; spawning
+  forks nothing.
+- Projects are `<owner>/<name>`, like GitHub. `newgit remote add` creates
+  one, seeds each code tracker's repo, and creates branch `main`: a list of
+  one commit per code tracker, which moves only through `newgit merge`.
+  `--project <owner>/<name>` joins an existing one.
+- A checkpoint sync pushes each changed tracker's branch and the
+  checkpoint's commit to the instance's fork of it, and the record carries
+  the checkpoint as lists. `spawn --from-checkpoint` composes those lists
+  from the trackers you may read — the author's exact commits when you can
+  read what they could. A `git push` on a remote succeeds only when that
+  sync reached it.
+- `newgit clone <owner>/<name>` composes a project's default branch from
+  the code trackers you may read and sets newgit up around it.
+- A workspace's `origin` is the project's Git endpoint,
+  `https://newgit.dev/<owner>/<name>.git`; the credential helper answers it
+  with the workspace's own token.
+
+- The root tracker's history is copied into the tracker store at
+  `newgit init` instead of borrowing the project repository's objects, so
+  routine `git gc` in the project repository can never delete it.
+
+- Each tracker's history is real Git history in a bare repo at
+  `.newgit/local/trackers.git`, separate from the project repository:
+  `main` (what new instances get), one branch per instance holding its
+  captures as ordinary commits with a parent, author, and message, and pins
+  keeping whatever bindings and checkpoints name. Capturing unchanged content
+  makes no commit. Tracker content never reaches the project repository, a
+  `git push --mirror`, or a workspace clone's object store, and
+  `newgit cleanup` garbage-collects pruned revs at once.
+
+  Upgrading: content under `.newgit/snapshots/` (and an interim
+  `.newgit/local/lanes.git`) is not migrated. Re-seed each tracker
+  (`newgit tracker capture <name> --from-store`) or re-capture it from an
+  instance. Checkpoints recorded before the upgrade cannot restore tracker
+  content.
+
+
+### Fixed
+
+- `checkpoint --verify` now says why a resource MISMATCHed — a `[restore]`
+  that most likely landed elsewhere, or a `[checkpoint]` that is not
+  deterministic — and shows what differs between the deposits
+  ([#79](https://github.com/Spheroman/newgit/issues/79)).
+
+  The two causes need opposite fixes, and two opaque revs could not tell
+  them apart: a `pg_dump` checkpoint stamps every dump with a fresh random
+  `\restrict` token, so a correct restore was reported as a failed one. On
+  a mismatch, verify now checkpoints that resource once more with nothing
+  restored in between: if that differs from the second ref, `[checkpoint]`
+  is at fault; if it matches, `[restore]` most likely is. For
+  `into_tracker` deposits it lists the changed files and line counts, shows
+  the first changed lines with control characters escaped, and prints the
+  `git diff --no-index` command for the rest — comparing `after` against
+  the control when the checkpoint is the problem, since every line there is
+  noise. The diff stays bounded for a dump of any size. A mismatch still
+  fails the verify — this is evidence, not a looser check.
+
+- `newgit export` now commits every path it ships, including `--include`d
+  and public tracker paths
+  ([#94](https://github.com/Spheroman/newgit/issues/94)).
+
+  `tracker track` gitignores a lane's paths, and that `.gitignore` ships
+  with the source tree, so the export's `git add -A` silently left every
+  tracker file on disk and out of the repository. `git status` showed a
+  clean tree and a clone of the export did not have the file, so the check
+  the command recommends could not see what it had done. The export's
+  commit is now exactly the plan, and the output lists any committed file
+  the shipped `.gitignore` still matches — Git tracks it regardless, but a
+  new file beside it would be ignored. The `.gitignore` itself is not
+  rewritten: it is source, and it is what keeps a recipient's own copy of a
+  withheld path out of their commits.
+
+- A checkpoint no longer copies the workspace's tags into the store.
+
+  Checkpoint fetches the workspace's state into the store, and a fetch
+  follows tags by default, so every tag an agent created in a workspace
+  appeared in the store as a side effect. Found because a `git push` of
+  that tag was then refused: the store already had it.
+
+- Composing keeps each tracker's own commit order whatever its dates say. It
+  sorted every commit by committer date, so a real history with a rebased or
+  cherry-picked commit (Express, 6,173 commits) recomposed into new commit
+  ids, and the project root's first split then re-split almost all of it.
+  Express now composes into itself, carved trackers included, in seconds.
+- A split writes its notes in one batch instead of once per commit.
+
+- Split commits record the commit they followed (`Newgit-Split-Parent`), and
+  composing keeps that order over dates: work in two trackers made in the
+  same second, or with dates running backwards, recomposes into the same
+  commits — on the remote too, which has only the tracker commits.
+
+- Restoring a deposit-only tracker (one that owns no paths, like
+  `db-snapshots`) no longer writes its files into the workspace root; its
+  content reaches resources through `{{state_ref}}` only. `newgit remote add`
+  keeps a `[remote] project` already in `config.toml` instead of falling back
+  to the local project name. Both found by running the flow against the live
+  remote.
+
+- From setting up a real monorepo (FareTable) with only the help text:
+  - `newgit clone <project> <relative-dir>` works, and a clone that fails
+    partway leaves nothing behind.
+  - `tracker list` shows code trackers (`project`, and any carved ones).
+  - A checkpoint says whether it reached the remote.
+  - A spawn whose resources did not come up says so in its first line.
+  - After a merge, the note about a project root with commits of its own
+    names the branch and both ways forward.
+
+- Fixes from the first live run against newgit.dev: `newgit remote add
+  --project <name>` creates the project under that name; the credential
+  helper answers for the Git endpoint when Git sends no path (as it does over
+  HTTPS by default); and the endpoint's container authenticates its fetches
+  from Artifacts.
+
+- The bundled Postgres templates (`command-snapshot`,
+  `command-snapshot-migrations`, `supabase`) now checkpoint to the same
+  bytes for the same database, so `checkpoint --verify` can pass on them.
+
+  Since 17.6 (and 16.10, 15.14, 14.19, 13.22), `pg_dump` wraps every plain
+  dump in `\restrict` / `\unrestrict` with a fresh random key, so two dumps
+  of an unchanged database never matched and every verify failed. The two
+  host-`pg_dump` templates pass `--restrict-key=newgit`; `supabase`, whose
+  CLI cannot forward that flag, swaps the random key for the same fixed one
+  after dumping. A fixed key is a known key: it gives up pg_dump's defence
+  against a hostile *server* injecting psql meta-commands into the dump.
+  The server here is the instance's own local database, and the template
+  comments say so. Existing resource files copied from these templates are
+  not changed — add the flag by hand.
+
+- Fixed data loss when a code tracker was carved after an instance's work
+  had been split: carving now covers every branch and refreshes every view,
+  and split refuses rather than start a tracker from an empty tree.
+- Remote checkpoint sync checks every commit it uploads for secret files,
+  merges included, like a push does; deleting a secret file is never
+  refused; split no longer refuses secrets on its own, so one gate decides.
+- The project root's tracker branches follow its own branch (the one
+  checked out at `newgit init`), not a feature branch checked out there; an
+  instance may not be named `main`.
+- A split survives Git collecting a removed instance's commits, and does
+  less repeated work (one fetch, the tip checked first, recomposing only
+  when the set of code trackers changes).
+
+- Revoking a newgit token, or removing an instance, also revokes the repo
+  passwords it was handed, so Git access ends at once instead of lasting up
+  to 15 minutes. Renewal is the exception: it leaves them to expire, so a
+  push in flight is not cut off.
+
+- Security fixes from review of the remote:
+  - Tracker definitions decide every audience, so they are the project
+    owner's: only the owner merges changes to the `project` tracker, adds
+    code tracker repos, or writes the `project` tracker's repo. A member can
+    no longer widen a secret tracker's audience by any route.
+  - The Git endpoint composes a commit for a tracker only if that tracker's
+    own repo has it; a branch naming another tracker's commit is left out,
+    and cannot take the endpoint down with it.
+  - Merge passwords require read access to a code tracker; a merge may move
+    only the trackers it declared; branches are created by people only.
+  - One secret gate before everything sent to the remote: sync, push,
+    `newgit merge`, `newgit merge main`, and `remote add`'s first
+    publication. A merge refuses when the instance's work did not sync.
+- `spawn --from-checkpoint` works for a checkpoint taken after a merge.
+- Merges and `remote add` can be retried after failing partway; `remote add`
+  publishes `main` after merging the project root into it, so local merges
+  are kept.
+- A merge into `main` fast-forwards the project root when it can, so the next
+  spawn starts from the merged work.
+- `newgit clone` leaves trackers you cannot read absent rather than inventing
+  their history; importing a checkpoint warns about trackers not defined
+  here.
+
+- Second-round review fixes:
+  - The secret gate checks every commit actually pushed — each tracker's
+    `main` too, which can hold work merged here that the project root's
+    branch never had — against the history `newgit init` adopted (or a clone
+    received), recorded once as `refs/newgit/adopted`.
+  - A merge moves each tracker's branch on the remote only from the commit it
+    started from (`--force-with-lease`), so a merge that stalled past its
+    lock cannot rewind one that landed meanwhile. Merge write passwords last
+    no longer than the lock and are cancelled when the merge finishes or a
+    later merge takes an expired lock; the trackers a merge may move are
+    recorded with its lock. A merge with nothing to move is refused.
+  - A merge that succeeded is reported as succeeded even when bringing the
+    project root along fails; `remote add` on an empty repository says to
+    commit something first.
+
+- A checkpoint records which trackers the instance did not bind, and `newgit
+  undo` restores that too: trackers dropped since come back with their
+  content, trackers used since are dropped again, and the resources they
+  bring start or stop to match. `spawn --from-checkpoint` binds what the
+  author's checkpoint bound.
+
+
+### Documentation
+
+- The README, AGENTS.md, the v1 spec, newgit-trackers.md, and
+  newgit-cloudflare.md now describe binding as built: the `access` tracker
+  and `maintainers`, roles and `priority` with personal defaults in
+  `~/.newgit/config.toml`, `spawn --use/--drop`, `tracker use|drop
+  [--stash|--discard]` by sparse checkout, readiness in `status`, the
+  `tracker list` tree, and undo restoring the binding. Planned keys (`merge`,
+  `production`) and role `depends_on` are marked as not wired yet.
+
+- `newgit-cloudflare.md` now centers on `spawn --from-checkpoint` and
+  trackers: spawning someone else's checkpoint resolves per-user trackers to
+  your own content, and previews run in one sandbox per distinct
+  environment, started from the checkpoint's container snapshot, a CI
+  snapshot, or an environment snapshot keyed on resource versions.
+
+- `newgit-cloudflare.md` plans the newgit remote on Cloudflare Workers and
+  Artifacts: a fork per branch instance, a repo per tracker audience with
+  server-enforced tokens, a Durable Object for binding records and
+  checkpoints, and a server-side merge queue with overlap detection.
+
+- `newgit-cloudflare.md`, `newgit-trackers.md`, the README, and the spec
+  describe the remote as built: repos per tracker, branches as lists, the Git
+  endpoint, `newgit clone`, and `newgit merge`.
+
+- newgit-cloudflare.md is now the remote's design document rather than a
+  competition plan: a status section of what is built and run live, an
+  ordered *What's next* (GitHub export first, then previews and the web UI),
+  and the spike results kept as *Measurements*. The repo topology and
+  `spawn --from-checkpoint` sections describe per-tracker repos as built.
+
+- The README, the v1 spec, `newgit reference`, and the architecture and
+  Cloudflare docs now describe the tracker model the code implements: `root`
+  owns `.` and `project` owns `.newgit`; ownership nests, with the most
+  specific claim winning; `secret` and code trackers (`tracker create --code
+  --path`) replace the implicit `source` tracker; and the remote commands
+  (`login`, `remote add`, `members`, `spawn --from-checkpoint`) are listed.
+  The `--from-checkpoint` help no longer points at a `checkpoints --remote`
+  flag that does not exist.
+
 ## [0.4.0] — 2026-09-16
 
 ### Added
@@ -1323,14 +1800,37 @@ instance under `0.2.0` restores it.
 
 - **Committed definitions** (`config.toml`, `trackers/`, `resources/`) are
   the control plane. Changes here will be called out in this file.
-- **Local state** (`branches/`, `snapshots/`, `checkpoints/`, `logs/`,
-  `state/`) is derived or disposable. If a `0.x` release changes its format,
-  the upgrade path is `newgit cleanup`, then re-spawn — workspaces are
-  disposable by design.
+- **Local state** (`branches/`, `checkpoints/`, `logs/`, `state/`, and
+  tracker history in `local/trackers.git`) is derived or disposable. If a
+  `0.x` release changes its format, the upgrade path is `newgit cleanup`,
+  then re-spawn — workspaces are disposable by design.
 
 Binding records and checkpoints are the exception worth caring about: they
 are the only local state that is not reconstructible. A release that changes
 their format will say so here explicitly.
+
+**0.5.0 does not read 0.4.0's local state; re-initialize.** Tracker content
+moved from `.newgit/snapshots/` directories into a Git repository at
+`.newgit/local/trackers.git`, and `newgit init` now copies the project's
+history into the `root` tracker. A 0.4.0 project still loads under 0.5.0,
+but its existing instances cannot checkpoint or undo (`tracker ... has no
+captured content at rev ...`), and new ones cannot split commits into code
+trackers, so `git push` and the remote do not work for it. `newgit init`
+refuses to run again on a project that has `.newgit/`, so start it fresh:
+
+1. Copy out any secret tracker files you want to keep (`.env.local` and
+   the like) from each workspace. 0.4.0's captured content is not carried
+   over.
+2. Remove every instance, and drop their checkpoints:
+   `newgit remove <name>` for each, then `newgit cleanup --purge-archived`.
+3. Keep your definitions: copy `.newgit/trackers/` and `.newgit/resources/`
+   somewhere, then `rm -rf .newgit`.
+4. Run `newgit init`, then copy your tracker and resource definitions back
+   into `.newgit/trackers/` and `.newgit/resources/`. `init` writes
+   `root.toml`, `project.toml`, and `access.toml` itself, so leave those.
+   Keep the new `config.toml`, and carry over any settings you had changed.
+5. Re-spawn, put the secret files back, and `newgit tracker capture
+   <tracker> <instance>`.
 
 **0.4.0 changes no formats.** Nothing was added to the binding record or to
 a checkpoint, so there is no migration and no reason to re-spawn. Two things
@@ -1365,7 +1865,8 @@ themselves and neither of which is a reason to re-spawn:
   fresh field it has not. One successful `undo`, or one `newgit checkpoint
   --verify`, clears it for good.
 
-[Unreleased]: https://github.com/Spheroman/newgit/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/Spheroman/newgit/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/Spheroman/newgit/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/Spheroman/newgit/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/Spheroman/newgit/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/Spheroman/newgit/compare/v0.1.1...v0.2.0

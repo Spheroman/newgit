@@ -655,7 +655,7 @@ dependencies = [
 
 [[package]]
 name = "newgit"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "camino",
@@ -666,7 +666,7 @@ dependencies = [
 
 [[package]]
 name = "newgit-core"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "camino",
  "chrono",
