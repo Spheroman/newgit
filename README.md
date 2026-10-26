@@ -164,12 +164,20 @@ here than it is on plain Git.
 
 [T3 Code](https://github.com/pingdotgg/t3code) gives each agent thread its
 own Git worktree. A fork,
-[`Spheroman/t3code`](https://github.com/Spheroman/t3code) (branch
-`newgit-workspaces`), gives it a newgit instance instead. In a project with
-`.newgit/config.toml` at its root, "New worktree" runs `newgit spawn
-<branch> --from <base> --json` and opens the thread in that workspace, with
-its trackers bound and its resources prepared. Deleting the thread runs
-`newgit remove`. Every other project gets plain worktrees, as before.
+[`Spheroman/t3code`](https://github.com/Spheroman/t3code), gives it a
+newgit instance instead. In a project with `.newgit/config.toml` at its
+root, "New worktree" runs `newgit spawn <branch> --from <base> --json` and
+opens the thread in that workspace, with its trackers bound and its
+resources prepared. Deleting the thread runs `newgit remove`. Every other
+project gets plain worktrees, as before.
+
+On macOS it installs as "T3 Code (newgit)", beside upstream T3 Code: its
+own app ID, state in `~/.t3-newgit`, and no auto-update.
+
+```sh
+git clone https://github.com/Spheroman/t3code && cd t3code
+scripts/fork/install-mac.sh
+```
 
 - `T3CODE_NEWGIT=0` turns it off; `T3CODE_NEWGIT_BIN` names a `newgit`
   that is not on the T3 Code server's `PATH`. If `newgit` cannot run, the
@@ -186,23 +194,9 @@ its trackers bound and its resources prepared. Deleting the thread runs
   the branch there too, and the workspace's remote for it is the one `gh`
   uses.
 
-The fork is a patch, not a rewrite, so it rebases onto a fast-moving
-upstream: the newgit logic lives in `apps/server/src/vcs/newgitWorkspaces.ts`,
-and each hook in an upstream file is marked `newgit fork patch`. Branch
-`newgit-desktop-identity` stacks on it and builds a desktop app, "T3 Code
-(newgit)", that installs beside upstream T3 Code: its own app ID, state in
-`~/.t3-newgit`, a `t3code-newgit` command, no `t3code://` handler, and no
-auto-update. On macOS (arm64):
-
-```sh
-git clone -b newgit-desktop-identity https://github.com/Spheroman/t3code
-cd t3code && pnpm install
-node scripts/build-desktop-artifact.ts --platform mac --target zip --arch arm64 --output-dir release-newgit
-ditto -x -k release-newgit/T3-Code-*-arm64.zip /Applications
-```
-
-The build is unsigned. Run it from a plain terminal: inside T3 Code,
-`ELECTRON_RUN_AS_NODE` is set, and it makes the app start as Node.
+The fork is a small patch stack rebased onto a fast-moving upstream; its
+[`FORK.md`](https://github.com/Spheroman/t3code/blob/newgit/FORK.md) lists
+every change, its limits, and how to rebase.
 
 ## Development
 
