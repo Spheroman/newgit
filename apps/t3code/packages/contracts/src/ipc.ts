@@ -78,7 +78,8 @@ export type DesktopUpdateStatus =
 export type DesktopRuntimeArch = "arm64" | "x64" | "other";
 export type DesktopTheme = "light" | "dark" | "system";
 export type DesktopUpdateChannel = "latest" | "nightly";
-export type DesktopAppStageLabel = "Alpha" | "Beta" | "Dev" | "Nightly";
+// newgit fork patch: "newgit" labels the fork so its app name and keychain entries stay its own.
+export type DesktopAppStageLabel = "Alpha" | "Beta" | "Dev" | "Nightly" | "newgit";
 
 export const DesktopUpdateStatusSchema = Schema.Literals([
   "disabled",

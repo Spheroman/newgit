@@ -62,7 +62,9 @@ import { Command, Flag } from "effect/cli";
 import { ChildProcess, ChildProcessSpawner } from "effect/process";
 
 const LINUX_ICON_SIZES = [16, 22, 24, 32, 48, 64, 128, 256, 512] as const;
-const DESKTOP_APP_ID = "com.t3tools.t3code";
+// newgit fork patch: own identity, so it installs beside upstream T3 Code.
+const DESKTOP_APP_ID = "com.spheroman.t3code-newgit";
+const FORK_PRODUCT_NAME = "T3 Code (newgit)";
 const APPLE_TEAM_ID_PATTERN = /^[A-Z0-9]{10}$/u;
 
 const BuildPlatform = Schema.Literals(["mac", "linux", "win"]);
@@ -2748,10 +2750,9 @@ export function resolvePackageManagerUserAgent(packageManager: string): string {
   return `${trimmed.slice(0, versionSeparator)}/${trimmed.slice(versionSeparator + 1)}`;
 }
 
-export function resolveDesktopProductName(version: string): string {
-  return resolveDesktopUpdateChannel(version) === "nightly"
-    ? "T3 Code (Nightly)"
-    : (desktopPackageJson.productName ?? "T3 Code");
+// newgit fork patch: one product name for every channel.
+export function resolveDesktopProductName(_version: string): string {
+  return FORK_PRODUCT_NAME;
 }
 
 export const createBuildConfig = Effect.fn("createBuildConfig")(function* (
@@ -2814,6 +2815,8 @@ export const createBuildConfig = Effect.fn("createBuildConfig")(function* (
       ];
     }
   }
+  // newgit fork patch: upstream's update feed would replace this build with upstream T3 Code.
+  if (!mockUpdates) buildConfig.publish = null;
 
   if (platform === "mac") {
     const path = yield* Path.Path;
@@ -2844,17 +2847,8 @@ export const createBuildConfig = Effect.fn("createBuildConfig")(function* (
           },
         ],
       },
-      protocols: [
-        {
-          name: "T3 Code",
-          schemes: ["t3code", "t3code-dev"],
-        },
-        {
-          name: "Web site URL",
-          schemes: ["http", "https"],
-          role: "Viewer",
-        },
-      ],
+      // newgit fork patch: no URL schemes, so t3code:// and web links keep opening upstream T3 Code.
+      protocols: [],
       ...(signed ? { sign: path.join(repoRoot, "scripts/sign-macos.ts") } : {}),
       ...(macPasskeySigning
         ? {
@@ -2896,12 +2890,8 @@ export const createBuildConfig = Effect.fn("createBuildConfig")(function* (
       category: "Development",
       synopsis: "Desktop GUI for coding agents",
       maintainer: "T3 Tools <hello@t3.codes>",
-      protocols: [
-        {
-          name: "T3 Code",
-          schemes: ["t3code", "t3code-dev"],
-        },
-      ],
+      // newgit fork patch: no URL schemes, so t3code:// links keep opening upstream T3 Code.
+      protocols: [],
       desktop: {
         entry: {
           StartupWMClass: "t3code",
