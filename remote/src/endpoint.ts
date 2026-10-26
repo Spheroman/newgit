@@ -63,13 +63,13 @@ export function decideSleep(state: {
 export class GitEndpoint extends DurableObject<Env> {
 	/** Fetches whose response is still streaming. Lost on eviction, which only happens when it is 0. */
 	private inFlight = 0;
-
-	constructor(ctx: DurableObjectState, env: Env) {
-		super(ctx, env);
-		// Not persisted: a restarted object (a deploy) has to set it again.
-		const container = ctx.container;
-		if (container) ctx.blockConcurrencyWhile(() => container.setInactivityTimeout(BACKSTOP_MS));
-	}
+	/**
+	 * Whether this object has set the container's backstop. Not persisted: a
+	 * restarted object (a deploy) sets it again. Only a running container
+	 * takes one — setting it before the start throws, and thrown from the
+	 * constructor that failed every request the object ever got.
+	 */
+	private backstopSet = false;
 
 	private async sleepDecision(): Promise<SleepDecision> {
 		const storage = this.ctx.storage;
@@ -115,10 +115,21 @@ export class GitEndpoint extends DurableObject<Env> {
 		return container;
 	}
 
-	/** Start the container — from its last snapshot when there is one. */
+	/** The container, running, with its backstop set. */
 	private async ensureRunning(): Promise<Container> {
+		const container = await this.startContainer();
+		if (!this.backstopSet) {
+			await container.setInactivityTimeout(BACKSTOP_MS);
+			this.backstopSet = true;
+		}
+		return container;
+	}
+
+	/** Start the container — from its last snapshot when there is one. */
+	private async startContainer(): Promise<Container> {
 		const container = this.container();
 		if (container.running) return container;
+		this.backstopSet = false;
 		const snapshot = await this.ctx.storage.get<string>("snapshot");
 		const image = { image: container.images.endpoint, enableInternet: true } as const;
 		if (snapshot) {

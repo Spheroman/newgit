@@ -1263,7 +1263,17 @@ impl BranchManager {
     /// are none yet, or when the set of code trackers with history changed.
     fn prepare_projection(&self) -> Result<()> {
         self.fetch_code_trackers()?;
-        for definition in &self.code {
+        // A tracker carves out of the one claiming a strict prefix of its
+        // path, so shorter claims go first: `project` (`.newgit`) has its
+        // history before `access` (`.newgit/trackers`) carves out of it.
+        let mut by_claim: Vec<&TrackerDefinition> = self.code.iter().collect();
+        by_claim.sort_by_key(|definition| {
+            definition
+                .paths
+                .first()
+                .map_or(0, |path| path.as_str().len())
+        });
+        for definition in by_claim {
             if !self.code_branches(&definition.name)?.is_empty() {
                 continue;
             }
