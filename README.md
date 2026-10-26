@@ -265,7 +265,10 @@ composed history to an ordinary repository defined in
 public mirror and a private one can show different views, and a history that
 ever committed a secret tracker's file is refused. Exporting again
 fast-forwards, and the push uses your own Git credentials, so `gh`, GitHub
-Actions, and anyone cloning from GitHub keep working.
+Actions, and anyone cloning from GitHub keep working. With `branches =
+true`, every push from a workspace exports its branch there too, and on a
+newgit remote the workspace gets the target as the remote `gh` resolves, so
+an agent's `git push` then `gh pr create` opens a real pull request.
 
 **`[[render]]` puts this instance's ports in the config file your tool
 actually reads.** Most tools take a port from a committed config file rather

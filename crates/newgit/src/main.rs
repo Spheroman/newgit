@@ -204,6 +204,9 @@ enum Command {
         instance: String,
         /// The repository Git asked to receive into (the outbox)
         repository: Utf8PathBuf,
+        /// The push went to this export target's remote, not `origin`
+        #[arg(long)]
+        export_target: Option<String>,
     },
     /// Log in to a newgit remote with your GitHub account
     Login {
@@ -534,7 +537,14 @@ fn main() -> Result<()> {
         Command::PushReceivePack {
             store,
             instance,
+            repository: _,
+            export_target: Some(target),
+        } => refuse_export_push(&store, &instance, &target),
+        Command::PushReceivePack {
+            store,
+            instance,
             repository,
+            export_target: None,
         } => push_receive_pack(&store, &instance, &repository),
         Command::PushPreReceive { instance } => push_pre_receive(&instance),
         Command::Login { url } => remote_cmd::login(url),
@@ -2054,6 +2064,21 @@ fn push_receive_pack(store: &Utf8Path, instance: &str, repository: &Utf8Path) ->
     Err(error).context("could not run `git receive-pack`")
 }
 
+/// A push to an export target's remote in a workspace. Advise, don't
+/// redirect: say where the push goes instead, since newgit exports the
+/// branch there itself.
+fn refuse_export_push(store: &Utf8Path, instance: &str, target: &str) -> Result<()> {
+    let manager = BranchManager::open(MetadataStore::at(store))?;
+    let branch = manager.store().find_branch(instance)?.source_ref;
+    bail!(
+        "newgit: `{target}` is an export target: newgit pushes this branch there itself, \
+         composed from the trackers `{target}` ships. A push straight to it would skip the \
+         checkpoint and could carry trackers it withholds.\n\
+         newgit: push with `git push origin {branch}`, then open a pull request with `gh pr \
+         create`."
+    )
+}
+
 fn push_pre_receive(instance: &str) -> Result<()> {
     let mut updates = Vec::new();
     for line in std::io::stdin().lines() {
@@ -2076,6 +2101,30 @@ fn push_pre_receive(instance: &str) -> Result<()> {
         outcome.checkpoint.record.id, outcome.remote, outcome.url
     );
     println!("newgit: undo the workspace with `newgit undo {instance}` (a push cannot be undone)");
+    for export in &outcome.exports {
+        match &export.result {
+            Ok(exported) if exported.same_commits => println!(
+                "newgit: exported `{}` to `{}` ({}); `gh pr create` opens a pull request there",
+                export.branch, export.target, export.url
+            ),
+            Ok(exported) => println!(
+                "newgit: exported `{}` to `{}` ({}) without {}, so its commits there are not \
+                 these ones; open a pull request with `gh pr create --head {}`",
+                export.branch,
+                export.target,
+                export.url,
+                exported.withheld.join(", "),
+                export.branch
+            ),
+            Err(error) if export.target.is_empty() => {
+                println!("newgit: warning: this branch was not exported: {error}");
+            }
+            Err(error) => println!(
+                "newgit: warning: `{}` was not exported to `{}`: {error}",
+                export.branch, export.target
+            ),
+        }
+    }
     Ok(())
 }
 

@@ -22,6 +22,9 @@ pub struct ExportTarget {
     pub branch: String,
     /// Code trackers shipped besides the `public` ones.
     pub trackers: Vec<String>,
+    /// Instances' branches go here too, each time a workspace pushes one —
+    /// so a pull request can be opened against the target.
+    pub branches: bool,
 }
 
 /// On-disk shape (everything but the filename-derived name).
@@ -33,6 +36,8 @@ struct ExportTargetFile {
     branch: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     trackers: Vec<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    branches: bool,
 }
 
 impl ExportTarget {
@@ -49,6 +54,7 @@ impl ExportTarget {
             url: file.url,
             branch: file.branch.unwrap_or_else(|| "main".to_owned()),
             trackers: file.trackers,
+            branches: file.branches,
         };
         target.validate()?;
         Ok(target)
@@ -65,6 +71,12 @@ impl ExportTarget {
     }
 
     fn validate(&self) -> Result<()> {
+        // The name is also the remote's name in a workspace, beside `origin`.
+        if self.name == "origin" {
+            return Err(self.invalid(
+                "`origin` is a workspace's own remote; name the target anything else".to_owned(),
+            ));
+        }
         if self.url.trim().is_empty() {
             return Err(self.invalid("`url` is empty".to_owned()));
         }
@@ -127,6 +139,7 @@ mod tests {
             url: url.to_owned(),
             branch: branch.to_owned(),
             trackers: Vec::new(),
+            branches: false,
         }
     }
 
