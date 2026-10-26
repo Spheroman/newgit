@@ -124,6 +124,15 @@ export class ProjectDO extends DurableObject<Env> {
 		return true;
 	}
 
+	/**
+	 * Forget the project: every row, so `info()` is null and the name can be
+	 * created again. The tables stay; this object keeps running on them.
+	 */
+	destroy(): void {
+		for (const table of ["meta", "members", "branches", "instances", "forks", "checkpoints"])
+			this.sql.exec(`DELETE FROM ${table}`);
+	}
+
 	info(): ProjectInfo | null {
 		const rows = this.sql.exec<{ key: string; value: string }>("SELECT key, value FROM meta").toArray();
 		const meta = Object.fromEntries(rows.map((row) => [row.key, row.value]));

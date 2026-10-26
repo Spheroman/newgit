@@ -117,6 +117,19 @@ export class UserDO extends DurableObject<Env> {
 	}
 
 	/**
+	 * Revoke every token pinned to one project, agents' and instances' alike —
+	 * what deleting the project does, so a project made later under the same
+	 * name does not inherit them. Returns their live repo passwords.
+	 */
+	revokeProject(project: string): RepoToken[] {
+		const ids = this.sql
+			.exec<{ id: string }>("SELECT id FROM tokens WHERE project = ? AND revoked_at IS NULL", project)
+			.toArray()
+			.map((row) => row.id);
+		return ids.flatMap((id) => this.revoke(id).repoTokens);
+	}
+
+	/**
 	 * Revoke one token. Returns whether it existed and the repo passwords it
 	 * minted that have not expired, which the caller revokes at Artifacts.
 	 * `keepRepoTokens` is for renewal: the token is replaced, not compromised,

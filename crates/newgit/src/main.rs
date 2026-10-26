@@ -37,7 +37,7 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Initialize .newgit/ in the current repository
+    /// Initialize .newgit/ in the current repository, or adopt one already there (giving `root` its history)
     Init(InitArgs),
     /// Create a branch instance: source branch + workspace + binding record
     Spawn(SpawnArgs),
@@ -766,6 +766,21 @@ fn init(args: InitArgs) -> Result<()> {
         .name
         .or_else(|| repo_root.file_name().map(ToOwned::to_owned))
         .unwrap_or_else(|| "newgit-project".to_owned());
+    if repo_root.join(".newgit/config.toml").is_file() {
+        let (_, done) = MetadataStore::adopt_in_place(&repo_root)?;
+        if done.is_empty() {
+            println!("newgit is already set up here: nothing to do");
+        } else {
+            println!("Adopted the existing .newgit/ at {repo_root}");
+            for line in &done {
+                println!("  {line}");
+            }
+            println!(
+                "  commit .newgit/trackers/ if it changed: the remote reads audiences from it"
+            );
+        }
+        return Ok(());
+    }
     let store = MetadataStore::init(&repo_root, &project_name, source)?;
     let config = store.load_config()?;
 

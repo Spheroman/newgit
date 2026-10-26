@@ -127,6 +127,44 @@ impl MetadataStore {
         Ok(store)
     }
 
+    /// `newgit init` where `.newgit/` already is: one made before trackers
+    /// had histories, or one that arrived with a plain `git clone`. Writes
+    /// whichever built-in definitions are missing and gives root the
+    /// project's history if it has none — what `init` would have done.
+    /// Returns what it did; nothing, run again.
+    pub fn adopt_in_place(project_root: impl Into<Utf8PathBuf>) -> Result<(Self, Vec<String>)> {
+        let store = Self::adopt(project_root)?;
+        let mut done = Vec::new();
+        for definition in [
+            TrackerDefinition::root(),
+            TrackerDefinition::project(),
+            TrackerDefinition::access(),
+        ] {
+            let path = store
+                .paths
+                .trackers
+                .join(format!("{}.toml", definition.name));
+            if !path.exists() {
+                store.create_tracker_definition(&definition)?;
+                done.push(format!("wrote .newgit/trackers/{}.toml", definition.name));
+            }
+        }
+        let seeded = std::process::Command::new("git")
+            .arg(format!("--git-dir={}", store.paths.tracker_store))
+            .args([
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                "refs/trackers/root/main",
+            ])
+            .output()
+            .is_ok_and(|output| output.status.success());
+        if !seeded && store.adopt_root_history()? {
+            done.push("gave `root` this project's history as its `main`".to_owned());
+        }
+        Ok((store, done))
+    }
+
     /// Write the root tracker's definition and give it the project's history
     /// as its `main`: a copy of the repository's current branch. A repository
     /// with no commits yet gives root no history.
@@ -135,6 +173,13 @@ impl MetadataStore {
         self.create_tracker_definition(&root)?;
         self.create_tracker_definition(&TrackerDefinition::project())?;
         self.create_tracker_definition(&TrackerDefinition::access())?;
+        self.adopt_root_history().map(drop)
+    }
+
+    /// Root's `main` becomes the repository's current branch, history and
+    /// all. False when there are no commits to give it.
+    fn adopt_root_history(&self) -> Result<bool> {
+        let root = TrackerDefinition::root();
         let project = self.paths.project_root.as_str();
         let git = |args: &[&str]| {
             std::process::Command::new("git")
@@ -147,7 +192,7 @@ impl MetadataStore {
                 .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned())
         };
         if git(&["rev-parse", "--verify", "--quiet", "HEAD^{commit}"]).is_none() {
-            return Ok(());
+            return Ok(false);
         }
         // The project root is the instance `main`, and this is its branch:
         // what it has checked out later (a feature branch, an old tag) is
@@ -170,7 +215,7 @@ impl MetadataStore {
         // The history newgit adopted: published already, wherever it went,
         // so the secret gate never holds it against a push.
         git(&["update-ref", crate::manager::ADOPTED_REF, "HEAD"]);
-        Ok(())
+        Ok(true)
     }
 
     /// Walk upward from `cwd` to find the governing metadata. A workspace is

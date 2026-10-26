@@ -220,6 +220,9 @@ pub trait Remote {
     ) -> Result<()>;
     fn add_member(&self, project: &str, login: &str) -> Result<bool>;
     fn remove_member(&self, project: &str, login: &str) -> Result<bool>;
+    /// Delete the project: its repos, its record, and every token pinned to
+    /// it. Owner only. Returns how many repos went with it.
+    fn delete_project(&self, project: &str) -> Result<usize>;
     /// `private`: only its owner sees it until its work is merged.
     fn register_instance(
         &self,
@@ -544,6 +547,19 @@ impl Remote for HttpRemote {
             None,
         )?;
         Ok(removed.removed)
+    }
+
+    fn delete_project(&self, project: &str) -> Result<usize> {
+        #[derive(Deserialize)]
+        struct Deleted {
+            repos_deleted: usize,
+        }
+        let deleted: Deleted = self.send(
+            "DELETE",
+            &format!("/v1/projects/{}", project_path(project)),
+            None,
+        )?;
+        Ok(deleted.repos_deleted)
     }
 
     fn register_instance(

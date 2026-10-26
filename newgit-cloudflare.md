@@ -56,6 +56,9 @@ Objects, the Git endpoint's container, and Artifacts.
 - `newgit clone`, and `spawn --from-checkpoint` with the spawner's own
   per-user trackers.
 - Private instances (`spawn --private`), hidden from everyone until merged.
+- `newgit remote delete <owner>/<name>`: the owner deletes the project —
+  every token pinned to it revoked first, then every repo under its prefix,
+  then its record — so the name can be linked again from scratch.
 
 **Not built yet** (order in *What's next*):
 

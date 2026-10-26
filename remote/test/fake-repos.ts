@@ -26,6 +26,9 @@ export class FakeRepos implements Repos {
 	async delete(name: string) {
 		return this.repos.delete(name);
 	}
+	async names(prefix: string) {
+		return [...this.repos.keys()].filter((name) => name.startsWith(prefix));
+	}
 	async mint(name: string, scope: "read" | "write"): Promise<MintedToken> {
 		const id = `art-${this.minted.length + 1}`;
 		this.minted.push({ name, scope, id });

@@ -1355,7 +1355,8 @@ impl BranchManager {
         let base = crate::compose::find_base(&project, tip)?.ok_or_else(|| {
             NewgitError::Unsupported(format!(
                 "newgit cannot tell which tracker commits {} stands for: its history shares no \
-                 commit with the trackers' histories",
+                 commit with the trackers' histories (a `.newgit/` from before trackers had \
+                 histories, or from a plain `git clone`, gets them from `newgit init`)",
                 &tip[..tip.len().min(12)]
             ))
         })?;

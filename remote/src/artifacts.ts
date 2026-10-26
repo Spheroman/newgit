@@ -18,6 +18,8 @@ export interface Repos {
 	/** Where the repo is (or will be) served, without checking it exists. */
 	url(name: string): string;
 	delete(name: string): Promise<boolean>;
+	/** Every repo whose name starts with `prefix`. */
+	names(prefix: string): Promise<string[]>;
 	mint(name: string, scope: "read" | "write", ttlSeconds: number): Promise<MintedToken>;
 	/** Revoke a minted token before it expires. False when it no longer exists. */
 	revokeToken(name: string, tokenId: string): Promise<boolean>;
@@ -70,6 +72,17 @@ export class ArtifactsRepos implements Repos {
 
 	async delete(name: string) {
 		return this.artifacts.delete(name);
+	}
+
+	async names(prefix: string) {
+		const names: string[] = [];
+		let cursor: string | undefined;
+		do {
+			const page = await this.artifacts.list({ limit: 200, cursor });
+			names.push(...page.repos.map((repo) => repo.name).filter((name) => name.startsWith(prefix)));
+			cursor = page.cursor;
+		} while (cursor);
+		return names;
 	}
 
 	async mint(name: string, scope: "read" | "write", ttlSeconds: number) {

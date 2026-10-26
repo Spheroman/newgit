@@ -223,6 +223,21 @@ fn route(
                 }),
             )
         }
+        ("DELETE", ["v1", "projects", owner, name]) => {
+            let key = format!("{owner}/{name}");
+            if state.branches.remove(&key).is_none() {
+                return (404, json!({ "error": format!("no project `{key}`") }));
+            }
+            let prefix = format!("{owner}.{name}.");
+            let mut deleted = 0;
+            for entry in std::fs::read_dir(repos).expect("repos").flatten() {
+                if entry.file_name().to_string_lossy().starts_with(&prefix) {
+                    std::fs::remove_dir_all(entry.path()).expect("delete repo");
+                    deleted += 1;
+                }
+            }
+            (200, json!({ "key": key, "deleted": true, "repos_deleted": deleted }))
+        }
         ("POST", ["v1", "projects", owner, name, "trackers"]) => {
             let tracker = body["name"].as_str().unwrap_or_default();
             let repo = format!("{owner}.{name}.t.{tracker}");

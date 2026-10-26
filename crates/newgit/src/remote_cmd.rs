@@ -32,6 +32,15 @@ pub enum RemoteCommand {
         #[arg(long)]
         json: bool,
     },
+    /// Delete this project from the remote: every tracker's repo, every
+    /// instance's fork and checkpoint, and every token pinned to it. Owner
+    /// only, and not undoable. Removes [remote] from config.toml
+    Delete {
+        /// The project's `<owner>/<name>`, typed out to confirm
+        project: String,
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -135,6 +144,7 @@ pub fn remote_command(command: RemoteCommand) -> Result<()> {
     match command {
         RemoteCommand::Add { url, project, json } => add(url, project, json),
         RemoteCommand::Show { json } => show(json),
+        RemoteCommand::Delete { project, json } => delete(&project, json),
     }
 }
 
@@ -440,6 +450,43 @@ fn show(json: bool) -> Result<()> {
                 println!("    {tracker:<12} {}", &commit[..commit.len().min(12)]);
             }
         }
+    }
+    Ok(())
+}
+
+fn delete(confirm: &str, json: bool) -> Result<()> {
+    let context = MetadataStore::discover(&crate::current_dir()?)?;
+    if context.current_branch.is_some() {
+        bail!("run `newgit remote delete` in the project's store, not inside a workspace");
+    }
+    let (section, name, client) = linked()?;
+    if confirm != name {
+        bail!(
+            "this project is `{name}` on {}; to delete it, run `newgit remote delete {name}`",
+            section.url
+        );
+    }
+    let repos = client.delete_project(&name)?;
+    let store = context.store;
+    let mut config = store.load_config()?;
+    config.remote = None;
+    store.write_config(&config)?;
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({ "project": name, "url": section.url, "repos_deleted": repos })
+        );
+    } else {
+        println!(
+            "Deleted `{name}` from {}, with its {repos} repos",
+            section.url
+        );
+        println!(
+            "  every token pinned to it is revoked, so this machine's instances of it no longer sync"
+        );
+        println!(
+            "  removed [remote] from .newgit/config.toml — commit it, or link again with `newgit remote add`"
+        );
     }
     Ok(())
 }

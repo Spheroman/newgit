@@ -118,7 +118,10 @@ cd your-project        # any Git repository with at least one commit
 newgit init
 ```
 
-`init` prints what to commit. The split matters: `.newgit/config.toml`,
+`init` prints what to commit. Run it again where `.newgit/` already exists
+(a plain `git clone` of a newgit project, or one set up by an older newgit)
+and it adopts what is there: it writes any missing built-in tracker
+definitions and gives `root` the project's history. The split matters: `.newgit/config.toml`,
 `trackers/`, `resources/`, and `scripts/` are the control plane and belong in
 Git, so teammates and CI see the same orchestration. Everything else under
 `.newgit/` — branch bindings, captured content, checkpoints, logs, runtime
@@ -278,6 +281,8 @@ Remote:
 
 - `newgit login` / `logout` / `whoami`
 - `newgit remote add [--url <url>] [--project <owner>/<name>]` / `remote show`
+- `newgit remote delete <owner>/<name>` — the owner deletes the project
+  from the remote: every repo, record, and token pinned to it. Not undoable
 - `newgit clone <owner>/<name> [dir]`
 - `newgit merge [instance] [--into <branch>]` — `newgit merge main` merges
   the project root
