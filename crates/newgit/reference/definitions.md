@@ -11,8 +11,8 @@ The design narrative — why trackers and resources are the only two
 primitives, what each one is for — lives in `newgit-v1-mvp.md` at
 <https://github.com/Spheroman/newgit>. This page is the lookup table.
 
-Definitions are TOML. The name of a tracker or resource comes from its
-filename, never from a key inside the file.
+Definitions are TOML. The name of a tracker, resource, or export target
+comes from its filename, never from a key inside the file.
 
 Every key below is the complete list for its table: a key newgit does not
 recognize is an error naming the file, the key, and what was expected, never
@@ -25,6 +25,7 @@ whether a lane travels with a merge — both by defaulting, silently.
   config.toml            project settings          committed
   trackers/<name>.toml   tracker definitions       committed
   resources/<name>.toml  resource definitions      committed
+  exports/<name>.toml    export targets            committed
   scripts/<name>         scripts hooks call        committed
   branches/ checkpoints/ logs/ state/ local/   local, gitignored
   local/trackers.git     every tracker's history   local, gitignored
@@ -1022,6 +1023,48 @@ or `DATABASE_URL`. Two services in one project cannot both publish `PORT`,
 so `newgit resource add web --template process` writes `WEB_PORT` and
 `WEB_URL`, naming them after the resource. Rename them if you have one
 service and your tool insists on `PORT` — the generated file says so.
+
+---
+
+## Export — `.newgit/exports/<name>.toml`
+
+Somewhere `newgit export --remote <name>` pushes: an ordinary Git
+repository, usually a GitHub mirror, that receives the trackers' `main`s
+composed into one history. Real authors, dates, and messages, so the result
+is an ordinary repository that `git clone`, `gh`, and GitHub's UI read like
+any other. Write one by hand; one file per target, so a public mirror and a
+private one can each show a different view of the same project.
+
+```toml
+# .newgit/exports/github.toml
+url = "acme/widget"
+trackers = ["root"]
+```
+
+| key | type | required | default | meaning |
+| --- | --- | --- | --- | --- |
+| `url` | string | yes | — | where to push. `owner/repo` means `https://github.com/owner/repo.git`; anything else (an `https://` or `git@` URL, a path) is used as written. Pushed with plain `git push`, so your own Git credentials apply (`gh auth setup-git` sets them up for GitHub). |
+| `branch` | string | no | `main` | the branch the export is pushed to. |
+| `trackers` | array of strings | no | `[]` | code trackers to ship besides the `public` ones. A secret tracker here is an error: secrets never leave through Git. |
+
+What ships fails closed. Only code trackers whose audience is `public` ship
+unless `trackers` names them, and `root`, `project`, and `access` are
+`project-devs`. So `trackers = ["root"]` mirrors the project's code without
+`.newgit/`, and adding `"project", "access"` mirrors that too. A path owned
+by a tracker that does not ship stays out of every exported commit. A
+history that ever adds a path a secret tracker owns, such as a `.env`
+committed before it was tracked, refuses the whole export before anything
+is pushed.
+
+The export is composed from each tracker's `main`: on a newgit remote, the
+remote's; otherwise this project's. Work committed in the project root
+reaches `main` with `newgit merge main`, and the export says when it is
+leaving such work behind. Composing is deterministic. Exporting again
+fast-forwards the target, and while every tracker that ever touched a commit
+ships, its id is the original's. Dropping a tracker from the set (or a
+target that already has history of its own) rebuilds commits under new ids,
+and the push is refused until `--force` replaces the branch. `--dry-run`
+composes and checks but pushes nothing.
 
 ---
 

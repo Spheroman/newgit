@@ -210,6 +210,9 @@ inside a workspace):
 - `newgit checkpoint [instance] [-m <msg>]` / `undo [instance] [--to <id>]` /
   `checkpoints [instance]`
 - `newgit export [instance] --to <dir> [--include <path>] [--exclude <path>]`
+- `newgit export --remote <name> [--dry-run] [--force]` — push the trackers'
+  `main`s, history and all, to the target in `.newgit/exports/<name>.toml`
+  (a GitHub mirror, say); `public` trackers plus the ones it names
 - `newgit cleanup [--dry-run] [--purge-archived]`
 - `newgit ports [--check]` — claimed ports, or detect a listening one nothing
   claims
@@ -254,6 +257,15 @@ trackers whose audience is `public`. Anything narrower is withheld and
 reported; `--include <path>` overrides. It writes one commit, not history,
 because exporting the branch's commits would carry any file they contain —
 including withheld ones. This is a path-level filter, not concealment.
+
+**GitHub stays where it is.** `newgit export --remote github` pushes a
+composed history to an ordinary repository defined in
+`.newgit/exports/github.toml` (`url = "acme/widget"`, `trackers =
+["root"]`). Only `public` trackers and the ones a target names ship, so a
+public mirror and a private one can show different views, and a history that
+ever committed a secret tracker's file is refused. Exporting again
+fast-forwards, and the push uses your own Git credentials, so `gh`, GitHub
+Actions, and anyone cloning from GitHub keep working.
 
 **`[[render]]` puts this instance's ports in the config file your tool
 actually reads.** Most tools take a port from a committed config file rather

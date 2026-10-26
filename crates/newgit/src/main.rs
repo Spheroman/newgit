@@ -9,9 +9,9 @@ use newgit_core::export::{ExportFilter, Reason};
 use newgit_core::exports::unresolved_placeholder;
 use newgit_core::installs::InstallReport;
 use newgit_core::manager::{
-    ActionOutcome, ActionPlan, BaseReport, BindOrigin, BranchManager, DiffPair, InstanceReport,
-    KeptBranch, MismatchCause, RemoveOutcome, SourceBranchOutcome, SourceBranchPolicy,
-    TrackerBindOutcome, UndoOptions, VerifyResource,
+    ActionOutcome, ActionPlan, BaseReport, BindOrigin, BranchManager, DiffPair, ExportReason,
+    InstanceReport, KeptBranch, MismatchCause, RemoteExportOptions, RemoveOutcome,
+    SourceBranchOutcome, SourceBranchPolicy, TrackerBindOutcome, UndoOptions, VerifyResource,
 };
 use newgit_core::resource::{CheckpointMode, ResourceDefinition};
 use newgit_core::source::{RefUpdate, find_repo_root};
@@ -151,7 +151,8 @@ enum Command {
         /// Instance (inferred when run inside a workspace)
         instance: Option<String>,
     },
-    /// Write an instance out as an ordinary Git repository
+    /// Write an instance out as an ordinary Git repository, or push the
+    /// project to an export target (`--remote`)
     Export(ExportArgs),
     /// Garbage-collect across everything: stale workspaces, dead process
     /// state, and unreferenced tracker snapshots
@@ -422,18 +423,30 @@ enum ResourceCommand {
 }
 
 #[derive(Debug, Args)]
+#[command(group(clap::ArgGroup::new("destination").required(true).args(["to", "remote"])))]
 struct ExportArgs {
     /// Instance (inferred when run inside a workspace)
     instance: Option<String>,
     /// Destination directory; must be empty or nonexistent
     #[arg(long, value_name = "DIR")]
-    to: Utf8PathBuf,
+    to: Option<Utf8PathBuf>,
+    /// Push the trackers' `main`s, history and all, to the target defined in
+    /// .newgit/exports/<NAME>.toml (a GitHub mirror, say)
+    #[arg(long, value_name = "NAME", conflicts_with_all = ["instance", "includes", "excludes"])]
+    remote: Option<String>,
     /// Include this path regardless of tracker audience; repeatable
     #[arg(long = "include", value_name = "PATH")]
     includes: Vec<Utf8PathBuf>,
     /// Leave this path out whatever its origin; repeatable, and wins over --include
     #[arg(long = "exclude", value_name = "PATH")]
     excludes: Vec<Utf8PathBuf>,
+    /// With --remote: replace the target branch even when the export does not
+    /// descend from it
+    #[arg(long, requires = "remote")]
+    force: bool,
+    /// With --remote: compose and check, but push nothing
+    #[arg(long, requires = "remote")]
+    dry_run: bool,
 }
 
 #[derive(Debug, Args)]
@@ -2334,12 +2347,22 @@ fn checkpoints(instance: Option<String>) -> Result<()> {
 }
 
 fn export(args: ExportArgs) -> Result<()> {
+    if let Some(name) = &args.remote {
+        return export_to_remote(
+            name,
+            RemoteExportOptions {
+                force: args.force,
+                dry_run: args.dry_run,
+            },
+        );
+    }
+    let to = args.to.expect("clap requires --to or --remote");
     let (manager, instance) = manager_and_instance(args.instance)?;
     let filter = ExportFilter {
         includes: args.includes,
         excludes: args.excludes,
     };
-    let outcome = manager.export(&instance, &args.to, &filter)?;
+    let outcome = manager.export(&instance, &to, &filter)?;
     let plan = &outcome.plan;
 
     println!(
@@ -2423,6 +2446,80 @@ fn export(args: ExportArgs) -> Result<()> {
     if plan.trackers.iter().any(|t| !t.withheld.is_empty()) {
         println!(
             "  Ship a withheld path with: newgit export {instance} --to <dir> --include <path>"
+        );
+    }
+    Ok(())
+}
+
+/// `newgit export --remote <name>`: the trackers' `main`s, composed and
+/// pushed to an ordinary Git repository.
+fn export_to_remote(name: &str, options: RemoteExportOptions) -> Result<()> {
+    let manager = BranchManager::open(context_here()?.store)?;
+    warn_gitignore(&manager);
+    let outcome = manager.export_to_remote(name, options)?;
+    let target = &outcome.target;
+
+    let verb = if outcome.pushed {
+        "Exported"
+    } else {
+        "Would export (dry run)"
+    };
+    println!("{verb} `main` → {} (branch {})", outcome.url, target.branch);
+    let width = column_width(outcome.trackers.iter().map(|t| t.name.len()), "");
+    for tracker in &outcome.trackers {
+        let at = tracker
+            .commit
+            .as_deref()
+            .map_or("no history yet", short_rev);
+        match tracker.reason {
+            ExportReason::Public => println!(
+                "  tracker:  {:<width$}  included (audience public) @ {at}",
+                tracker.name
+            ),
+            ExportReason::Listed => println!(
+                "  tracker:  {:<width$}  included (named by .newgit/exports/{}.toml, audience {}) @ {at}",
+                tracker.name, target.name, tracker.audience
+            ),
+            ExportReason::Withheld => println!(
+                "  withheld: {:<width$}  (audience {})",
+                tracker.name, tracker.audience
+            ),
+        }
+    }
+    println!(
+        "  history:  {} @ {}",
+        if outcome.commits == 1 {
+            "1 commit".to_owned()
+        } else {
+            format!("{} commits", outcome.commits)
+        },
+        short_rev(&outcome.tip)
+    );
+
+    let unmerged: Vec<&str> = outcome
+        .trackers
+        .iter()
+        .filter(|t| t.unmerged && t.reason != ExportReason::Withheld)
+        .map(|t| t.name.as_str())
+        .collect();
+    if !unmerged.is_empty() {
+        println!(
+            "\n  The project root has work in {} that `main` does not, so it was not exported: \
+             `newgit merge main` brings it in.",
+            unmerged.join(", ")
+        );
+    }
+    if let Some(error) = &outcome.project_root_error {
+        println!("\n  Could not compare the project root's own work with `main`: {error}");
+    }
+    if outcome
+        .trackers
+        .iter()
+        .any(|t| t.reason == ExportReason::Withheld)
+    {
+        println!(
+            "  Ship a withheld tracker by naming it in .newgit/exports/{}.toml: trackers = [\"<name>\"]",
+            target.name
         );
     }
     Ok(())

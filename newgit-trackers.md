@@ -489,7 +489,13 @@ Each step lands alone and keeps the suite green.
    merges the project root, which is how trackers made after `remote add`
    reach the remote. Merges inside the work being split are still
    flattened.)*
-6. **GitHub export.**
+6. **GitHub export.** *(Landed.)* `newgit export --remote <name>` pushes
+   the composed `main`s to the target in `.newgit/exports/<name>.toml`:
+   `public` code trackers plus the ones it names, so each target has its
+   own view. A history adding a secret tracker's path is refused; a push
+   that is not a fast-forward needs `--force`. Targets live under
+   `project`, so whoever may change resources may change what a mirror
+   shows; moving them under `access` waits until that matters.
 
 Then the preview work in `newgit-cloudflare.md` continues on top: a preview's
 environment identity is simply the set of tracker commits it composes.

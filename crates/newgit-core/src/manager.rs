@@ -19,6 +19,7 @@ use crate::config::ProjectConfig;
 use crate::deposit_diff::{DepositDiff, diff_deposits};
 use crate::error::{NewgitError, Result};
 use crate::export::{self, ExportFilter, ExportPlan, prepare_destination};
+use crate::export_target::ExportTarget;
 use crate::exports::{RenderContext, render, unresolved_placeholder};
 use crate::installs::{Admission, InstallReport, InstallStore};
 use crate::materializer::{
@@ -554,6 +555,53 @@ pub struct ExportOutcome {
     pub plan: ExportPlan,
     /// Committed files the export's own `.gitignore` still matches.
     pub still_gitignored: Vec<Utf8PathBuf>,
+}
+
+/// Why a code tracker is in a remote export, or that it is not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExportReason {
+    /// Its audience is `public`.
+    Public,
+    /// The target's `trackers` names it.
+    Listed,
+    /// Neither: its history stays out.
+    Withheld,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExportedTracker {
+    pub name: String,
+    pub audience: String,
+    pub reason: ExportReason,
+    /// Its `main`, or `None` when it has no history yet.
+    pub commit: Option<String>,
+    /// The project root has commits in it that `main` does not: work this
+    /// export leaves behind until `newgit merge main`.
+    pub unmerged: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RemoteExportOptions {
+    /// Replace the target branch even when the export does not descend from it.
+    pub force: bool,
+    /// Compose and check, but push nothing.
+    pub dry_run: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteExportOutcome {
+    pub target: ExportTarget,
+    /// Where Git pushed (or would have).
+    pub url: String,
+    /// Every code tracker, shipped or withheld.
+    pub trackers: Vec<ExportedTracker>,
+    /// The composed history's tip.
+    pub tip: String,
+    pub commits: usize,
+    /// False on a dry run.
+    pub pushed: bool,
+    /// Why the project root's own work could not be compared with `main`.
+    pub project_root_error: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -5210,6 +5258,207 @@ impl BranchManager {
         })
     }
 
+    /// Push a composed projection of the trackers' `main`s to export target
+    /// `name` (`.newgit/exports/<name>.toml`), history and all.
+    ///
+    /// Fails closed: only `public` code trackers and the ones the target
+    /// names ship, a secret tracker cannot be named, and a composed history
+    /// that ever adds a path a secret tracker owns is refused before anything
+    /// is pushed. Composing is deterministic, so exporting again
+    /// fast-forwards the target; a different tracker set is a different
+    /// history, which needs `force`.
+    pub fn export_to_remote(
+        &self,
+        name: &str,
+        options: RemoteExportOptions,
+    ) -> Result<RemoteExportOutcome> {
+        let targets = self.store.load_export_targets()?;
+        let target = targets
+            .iter()
+            .find(|target| target.name == name)
+            .cloned()
+            .ok_or_else(|| {
+                let known: Vec<&str> = targets.iter().map(|target| target.name.as_str()).collect();
+                NewgitError::Unsupported(if known.is_empty() {
+                    format!(
+                        "no export target `{name}`: define one in .newgit/exports/{name}.toml \
+                         (`newgit reference export`)"
+                    )
+                } else {
+                    format!(
+                        "no export target `{name}` (defined: {}); targets live in \
+                         .newgit/exports/<name>.toml",
+                        known.join(", ")
+                    )
+                })
+            })?;
+
+        let code = self.code_definitions();
+        for listed in &target.trackers {
+            if code.iter().any(|definition| &definition.name == listed) {
+                continue;
+            }
+            let reason = if self
+                .trackers
+                .iter()
+                .any(|definition| &definition.name == listed)
+            {
+                "is secret, and a secret tracker never leaves this machine through Git"
+            } else {
+                "is not a tracker in this project"
+            };
+            return Err(NewgitError::InvalidDefinition {
+                kind: "export",
+                name: target.name.clone(),
+                reason: format!("`trackers` names `{listed}`, which {reason}"),
+            });
+        }
+
+        self.prepare_projection()?;
+        // Only to say what the export leaves behind, so its failing is said,
+        // not mistaken for the export failing.
+        let project_root_error = self
+            .sync_project_root()
+            .err()
+            .map(|error| error.to_string());
+        let client = match &self.remote {
+            Some(link) => Some((link.connect(Acting::Login)?, link.project.clone())),
+            None => None,
+        };
+        let list = self.branch_list(
+            client
+                .as_ref()
+                .map(|(client, project)| (client.as_ref(), project.as_str())),
+            PROJECT_ROOT_INSTANCE,
+        )?;
+
+        let trackers: Vec<ExportedTracker> = code
+            .iter()
+            .map(|definition| {
+                let reason = if definition.audience == "public" {
+                    ExportReason::Public
+                } else if target.trackers.contains(&definition.name) {
+                    ExportReason::Listed
+                } else {
+                    ExportReason::Withheld
+                };
+                let commit = list.get(&definition.name).cloned();
+                let unmerged = self
+                    .source
+                    .rev_parse(&local_tracker_ref(
+                        &definition.name,
+                        &format!("instances/{PROJECT_ROOT_INSTANCE}"),
+                    ))
+                    .ok()
+                    .is_some_and(|ours| match &commit {
+                        Some(main) => !self.source.is_ancestor(&ours, main).unwrap_or(true),
+                        None => true,
+                    });
+                ExportedTracker {
+                    name: definition.name.clone(),
+                    audience: definition.audience.clone(),
+                    reason,
+                    commit,
+                    unmerged,
+                }
+            })
+            .collect();
+        let tips: Vec<crate::compose::TrackerTip<'_>> = code
+            .iter()
+            .zip(&trackers)
+            .filter(|(_, tracker)| tracker.reason != ExportReason::Withheld)
+            .filter_map(|(definition, tracker)| {
+                tracker
+                    .commit
+                    .clone()
+                    .map(|commit| crate::compose::TrackerTip { definition, commit })
+            })
+            .collect();
+        if tips.is_empty() {
+            return Err(NewgitError::Unsupported(format!(
+                "nothing to export to `{}`: no public code tracker has history on `main`, and \
+                 the target names none. Name the trackers to ship in \
+                 .newgit/exports/{}.toml — `trackers = [\"root\"]` mirrors the project's own \
+                 code",
+                target.name, target.name
+            )));
+        }
+
+        let root = self.store.paths().project_root.clone();
+        let view = crate::compose::compose(
+            &root,
+            &format!("refs/newgit/exports/{}", target.name),
+            &tips,
+            &self.all_definitions(),
+        )?;
+        let tip = view.tip.ok_or_else(|| {
+            NewgitError::Unsupported(format!(
+                "nothing to export to `{}`: its trackers' histories are empty",
+                target.name
+            ))
+        })?;
+        // A history composed only of code trackers can still carry a secret:
+        // a path made secret later stays in the commits that once held it.
+        if let Some((commit, path, tracker)) =
+            crate::compose::find_secret(&root, &[&tip], &[], &self.all_definitions())?
+        {
+            return Err(NewgitError::SplitRefused(format!(
+                "the export to `{}` would carry commit {}, which adds `{path}`, and `{path}` \
+                 belongs to the secret tracker `{tracker}`. Secrets never leave this machine \
+                 through Git, so this history cannot be exported as it is",
+                target.name,
+                &commit[..commit.len().min(12)]
+            )));
+        }
+
+        let url = target.push_url();
+        if !options.dry_run {
+            let refspec = format!(
+                "{}{tip}:refs/heads/{}",
+                if options.force { "+" } else { "" },
+                target.branch
+            );
+            // `--no-verify`: the project's own pre-push hooks are for its
+            // work, not for a mirror of it.
+            crate::source::run_git_env(
+                &[
+                    "-C",
+                    root.as_str(),
+                    "push",
+                    "--quiet",
+                    "--no-verify",
+                    &url,
+                    &refspec,
+                ],
+                &[],
+            )
+            .map_err(|error| match error {
+                NewgitError::SourceCommand { stderr, .. }
+                    if stderr.contains("non-fast-forward") || stderr.contains("[rejected]") =>
+                {
+                    NewgitError::Unsupported(format!(
+                        "`{}` holds commits the export does not descend from, so the push was \
+                         refused. That is expected the first time, when the target has history \
+                         of its own, or after the target's tracker set changed (a different \
+                         set composes a different history). `--force` replaces the branch:\n{stderr}",
+                        target.branch
+                    ))
+                }
+                other => other,
+            })?;
+        }
+
+        Ok(RemoteExportOutcome {
+            target,
+            url,
+            trackers,
+            tip,
+            commits: view.commits,
+            pushed: !options.dry_run,
+            project_root_error,
+        })
+    }
+
     /// Record one coherent snapshot across source, trackers, and resources.
     pub fn checkpoint(&self, instance: &str, message: Option<&str>) -> Result<CheckpointOutcome> {
         self.require_resolvable_graph()?;
@@ -5813,6 +6062,57 @@ impl BranchManager {
         })
     }
 
+    /// Branch `branch`'s list — tracker → commit — with every commit in the
+    /// project repo: on the remote, its list there (commits fetched from each
+    /// tracker's repo); otherwise each code tracker's branch here.
+    fn branch_list(
+        &self,
+        client: Option<(&dyn Remote, &str)>,
+        branch: &str,
+    ) -> Result<BTreeMap<String, String>> {
+        let root = self.store.paths().project_root.clone();
+        let Some((client, project)) = client else {
+            self.fetch_code_trackers()?;
+            return Ok(self
+                .code_definitions()
+                .iter()
+                .filter_map(|definition| {
+                    self.source
+                        .rev_parse(&local_tracker_ref(&definition.name, branch))
+                        .ok()
+                        .map(|commit| (definition.name.clone(), commit))
+                })
+                .collect());
+        };
+        let view = client.project(project)?;
+        let list = view
+            .branches
+            .iter()
+            .find(|candidate| candidate.name == branch)
+            .map(|candidate| candidate.list.clone())
+            .ok_or_else(|| {
+                NewgitError::Unsupported(format!("{project} has no branch `{branch}`"))
+            })?;
+        for (tracker, commit) in &list {
+            if self
+                .source
+                .rev_parse(&format!("{commit}^{{commit}}"))
+                .is_ok()
+            {
+                continue;
+            }
+            let repo = format!("{}.t.{tracker}", project.replace('/', "."));
+            let credential = client.credential(project, &repo, Scope::Read)?;
+            GitSource::fetch_refs(
+                &["-C", root.as_str()],
+                credential.remote.as_deref().unwrap_or_default(),
+                &[format!("+refs/heads/*:refs/newgit/remote/{tracker}/*")],
+                Some(&basic_auth_header(&credential)),
+            )?;
+        }
+        Ok(list)
+    }
+
     /// Merge an instance's committed work into branch `into` (newgit-trackers.md,
     /// *Checkpoints, merges, and coherence*), tracker by tracker: a tracker the
     /// instance did not change stays; one `into` has not moved on since takes
@@ -5877,48 +6177,12 @@ impl BranchManager {
             Some(link) => Some((link.connect(Acting::Login)?, link.project.clone())),
             None => None,
         };
-        let base: BTreeMap<String, String> = match &client {
-            Some((client, project)) => {
-                let view = client.project(project)?;
-                let list = view
-                    .branches
-                    .iter()
-                    .find(|candidate| candidate.name == into)
-                    .map(|candidate| candidate.list.clone())
-                    .ok_or_else(|| {
-                        NewgitError::Unsupported(format!("{project} has no branch `{into}`"))
-                    })?;
-                for (tracker, commit) in &list {
-                    if self
-                        .source
-                        .rev_parse(&format!("{commit}^{{commit}}"))
-                        .is_ok()
-                    {
-                        continue;
-                    }
-                    let repo = format!("{}.t.{tracker}", project.replace('/', "."));
-                    let credential = client.credential(project, &repo, Scope::Read)?;
-                    GitSource::fetch_refs(
-                        &["-C", root.as_str()],
-                        credential.remote.as_deref().unwrap_or_default(),
-                        &[format!("+refs/heads/*:refs/newgit/remote/{tracker}/*")],
-                        Some(&basic_auth_header(&credential)),
-                    )?;
-                }
-                list
-            }
-            None => {
-                self.fetch_code_trackers()?;
-                code.iter()
-                    .filter_map(|definition| {
-                        self.source
-                            .rev_parse(&local_tracker_ref(&definition.name, into))
-                            .ok()
-                            .map(|commit| (definition.name.clone(), commit))
-                    })
-                    .collect()
-            }
-        };
+        let base = self.branch_list(
+            client
+                .as_ref()
+                .map(|(client, project)| (client.as_ref(), project.as_str())),
+            into,
+        )?;
 
         let mut list = base.clone();
         let mut trackers = Vec::new();

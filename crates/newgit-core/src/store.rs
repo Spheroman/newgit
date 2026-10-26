@@ -6,6 +6,7 @@ use serde::de::DeserializeOwned;
 use crate::branch::BranchInstance;
 use crate::config::{ProjectConfig, SourceSubstrate};
 use crate::error::{NewgitError, Result};
+use crate::export_target::ExportTarget;
 use crate::installs::InstallStore;
 use crate::materializer::{WorkspaceMarker, create_dir_all};
 use crate::resource::ResourceDefinition;
@@ -65,6 +66,8 @@ pub struct NewgitPaths {
     pub archived_branches: Utf8PathBuf,
     pub trackers: Utf8PathBuf,
     pub resources: Utf8PathBuf,
+    /// Where `newgit export --remote` pushes, one target per file.
+    pub exports: Utf8PathBuf,
     /// Scripts a resource's commands shell out to, resolved from the store
     /// rather than a workspace. Part of the committed control plane.
     pub scripts: Utf8PathBuf,
@@ -333,6 +336,22 @@ impl MetadataStore {
         Ok(definitions)
     }
 
+    /// Export targets, one per file in `.newgit/exports/`.
+    pub fn load_export_targets(&self) -> Result<Vec<ExportTarget>> {
+        self.ensure_initialized()?;
+        let mut targets = Vec::new();
+        for entry in read_dir_sorted(&self.paths.exports)? {
+            if entry.extension() != Some("toml") {
+                continue;
+            }
+            let Some(name) = entry.file_stem() else {
+                continue;
+            };
+            targets.push(ExportTarget::from_file(name, &entry)?);
+        }
+        Ok(targets)
+    }
+
     pub fn write_resource_file(&self, name: &str, contents: &str) -> Result<Utf8PathBuf> {
         create_dir_all(&self.paths.resources)?;
         let path = self.paths.resources.join(format!("{name}.toml"));
@@ -595,6 +614,7 @@ impl NewgitPaths {
             archived_branches: metadata_root.join("branches/archived"),
             trackers: metadata_root.join("trackers"),
             resources: metadata_root.join("resources"),
+            exports: metadata_root.join("exports"),
             scripts: metadata_root.join("scripts"),
             local: metadata_root.join("local"),
             tracker_store: metadata_root.join("local/trackers.git"),
