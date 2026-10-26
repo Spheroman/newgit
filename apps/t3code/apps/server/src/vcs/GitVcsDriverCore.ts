@@ -43,6 +43,7 @@ import * as GitVcsDriver from "./GitVcsDriver.ts";
 import { removeEmptyDirectory } from "./removeEmptyDirectory.ts";
 import { explicitBareRepositoryEnv, gitConfigEnv } from "./VcsProcess.ts";
 import { removeLinkedWorktree } from "./worktreeRemoval.ts";
+import * as NewgitWorkspaces from "./newgitWorkspaces.ts";
 import { resolveWorktreesDirectory } from "../worktreesDirectory.ts";
 import {
   parseRemoteNames,
@@ -925,6 +926,11 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
   const path = yield* Path.Path;
   const commandSpawner = yield* ChildProcessSpawner.ChildProcessSpawner;
   const { worktreesDir } = yield* ServerConfig.ServerConfig;
+  const withNewgit = NewgitWorkspaces.provideNewgitServices({
+    fileSystem,
+    path,
+    spawner: commandSpawner,
+  });
   const crypto = yield* Crypto.Crypto;
   const hostPlatform = yield* HostProcess.Platform;
   const serviceScope = yield* Effect.scope;
@@ -3679,6 +3685,25 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
     yield* refuseOptionLikeRefName("GitVcsDriver.createWorktree", input.cwd, input.refName);
     yield* refuseOptionLikeRefName("GitVcsDriver.createWorktree", input.cwd, input.newRefName);
     const targetBranch = input.newRefName ?? input.refName;
+    // newgit fork patch: a newgit project gets a newgit workspace instead.
+    if (input.path == null && input.newRefName) {
+      const newgitPath = yield* withNewgit(
+        Effect.gen(function* () {
+          if (!(yield* NewgitWorkspaces.projectUsesNewgit(input.cwd))) return Option.none<string>();
+          return yield* NewgitWorkspaces.spawnNewgitWorkspace({
+            cwd: input.cwd,
+            name: targetBranch,
+            from: input.refName,
+          });
+        }),
+      );
+      if (Option.isSome(newgitPath)) {
+        if (options?.progress?.onWorktreeClaimed) {
+          yield* options.progress.onWorktreeClaimed(newgitPath.value);
+        }
+        return { worktree: { path: newgitPath.value, refName: targetBranch } };
+      }
+    }
     const sanitizedBranch = targetBranch.replace(/\//g, "-");
     // Resolve sub/.. before taking the basename.
     const repoName = path.basename(path.resolve(input.cwd));
@@ -4161,6 +4186,11 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
     // folder than this path. Resolving it once keeps Git, the Windows deletion
     // in removeLinkedWorktree, and the leftover cleanup below on one directory.
     const target = path.resolve(input.cwd, input.path);
+    // newgit fork patch: newgit owns its workspaces' removal.
+    const newgitWorkspace = yield* withNewgit(NewgitWorkspaces.readNewgitWorkspace(target));
+    if (newgitWorkspace !== null) {
+      return yield* withNewgit(NewgitWorkspaces.removeNewgitWorkspace(newgitWorkspace));
+    }
     const result = yield* removeLinkedWorktree({
       operation: "GitVcsDriver.removeWorktree",
       cwd: input.cwd,
@@ -4249,6 +4279,10 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
   )(function* (input) {
     if (input.oldBranch === input.newBranch) {
       return { branch: input.newBranch };
+    }
+    // newgit fork patch: the branch names a newgit instance, which cannot be renamed.
+    if ((yield* withNewgit(NewgitWorkspaces.readNewgitWorkspace(input.cwd))) !== null) {
+      return { branch: input.oldBranch };
     }
     const targetBranch = input.exactName
       ? input.newBranch
