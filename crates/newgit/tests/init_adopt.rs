@@ -79,3 +79,47 @@ fn init_in_a_plain_clone_gives_root_the_project_history_once() {
     let out = ok(NEWGIT, &clone, &["init"]);
     assert!(out.contains("nothing to do"), "{out}");
 }
+
+#[test]
+fn init_in_a_workspace_is_refused() {
+    let (_guard, temp) = tempdir();
+    let store = temp.join("store");
+    std::fs::create_dir_all(&store).expect("mkdir");
+    ok("git", &store, &["init", "-q", "-b", "main"]);
+    std::fs::write(store.join("README.md"), "hello\n").expect("write");
+    ok("git", &store, &["add", "."]);
+    ok("git", &store, &["commit", "-q", "-m", "initial"]);
+    ok(NEWGIT, &store, &["init"]);
+    let config = store.join(".newgit/config.toml");
+    let text = std::fs::read_to_string(&config).expect("config");
+    std::fs::write(
+        &config,
+        format!(
+            "{text}\n[workspace]\nroot = \"{}\"\n",
+            temp.join("workspaces")
+        ),
+    )
+    .expect("write");
+    ok("git", &store, &["add", "-A"]);
+    ok("git", &store, &["commit", "-q", "-m", "newgit"]);
+    ok(NEWGIT, &store, &["spawn", "feature"]);
+
+    let workspace = std::fs::read_dir(temp.join("workspaces"))
+        .expect("workspaces")
+        .flatten()
+        .flat_map(|project| {
+            std::fs::read_dir(project.path())
+                .expect("project")
+                .flatten()
+        })
+        .map(|entry| Utf8PathBuf::from_path_buf(entry.path()).expect("utf8"))
+        .next()
+        .expect("a workspace");
+    let output = run(NEWGIT, &workspace, &["init"]);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("run `newgit init` in the project's store"),
+        "{stderr}"
+    );
+}

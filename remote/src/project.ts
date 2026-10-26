@@ -113,6 +113,9 @@ export class ProjectDO extends DurableObject<Env> {
 	/** Create the project. Returns false when it already exists. */
 	init(name: string, owner: string): boolean {
 		if (this.info() !== null) return false;
+		// A deleted project's name is free again: start from nothing, even if
+		// a request in flight during the delete wrote a row after it.
+		this.destroy();
 		const now = new Date().toISOString();
 		this.sql.exec(
 			"INSERT INTO meta VALUES ('name', ?), ('owner', ?), ('created_at', ?), ('default_branch', 'main')",
@@ -126,7 +129,8 @@ export class ProjectDO extends DurableObject<Env> {
 
 	/**
 	 * Forget the project: every row, so `info()` is null and the name can be
-	 * created again. The tables stay; this object keeps running on them.
+	 * created again. `meta` goes first, so the project is gone to every
+	 * request from then on. The tables stay; this object keeps running on them.
 	 */
 	destroy(): void {
 		for (const table of ["meta", "members", "branches", "instances", "forks", "checkpoints"])

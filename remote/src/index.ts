@@ -258,21 +258,21 @@ async function route(request: Request, env: Env, deps: Deps): Promise<Response> 
 		});
 	}
 
-	// Deleting a project takes everything with it: tokens pinned to it first,
-	// so nothing writes while it goes, then every repo, then its record.
+	// Deleting a project takes everything with it. Its record goes first, so
+	// every request after this one finds no project; then the tokens pinned
+	// to it; then its repos, and with each repo every password minted for it.
 	if (method === "DELETE" && rest === "") {
 		requireHuman(caller, "delete projects");
-		requireNotInstance(caller, "delete projects");
 		requireOwner(info.owner, login, `delete ${key}`);
 		const holders = new Set([
 			...(await project.members()).map((m) => m.login),
 			...(await project.instances()).map((i) => i.owner),
 		]);
+		await project.destroy();
 		for (const holder of holders) await revokeRepoTokens(deps, await userStub(env, holder).revokeProject(key));
 		// Parts never contain dots, so this prefix is this project's and no other's.
 		const names = await deps.repos.names(`${id.owner}.${id.name}.`);
 		for (const name of names) await deps.repos.delete(name);
-		await project.destroy();
 		return json({ key, deleted: true, repos_deleted: names.length });
 	}
 

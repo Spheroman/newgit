@@ -159,7 +159,15 @@ impl MetadataStore {
             ])
             .output()
             .is_ok_and(|output| output.status.success());
-        if !seeded && store.adopt_root_history()? {
+        // A fresh `init` vouches for the history it finds: nothing could have
+        // been secret yet. Here secret trackers may already be defined, and
+        // unpublished commits may touch their paths, so the secret gate keeps
+        // checking every commit unless none are.
+        let vouch = !store
+            .load_tracker_definitions()?
+            .iter()
+            .any(|definition| definition.secret);
+        if !seeded && store.adopt_root_history(vouch)? {
             done.push("gave `root` this project's history as its `main`".to_owned());
         }
         Ok((store, done))
@@ -173,12 +181,13 @@ impl MetadataStore {
         self.create_tracker_definition(&root)?;
         self.create_tracker_definition(&TrackerDefinition::project())?;
         self.create_tracker_definition(&TrackerDefinition::access())?;
-        self.adopt_root_history().map(drop)
+        self.adopt_root_history(true).map(drop)
     }
 
     /// Root's `main` becomes the repository's current branch, history and
-    /// all. False when there are no commits to give it.
-    fn adopt_root_history(&self) -> Result<bool> {
+    /// all. False when there are no commits to give it. `vouch` marks that
+    /// history published, so the secret gate does not check it again.
+    fn adopt_root_history(&self, vouch: bool) -> Result<bool> {
         let root = TrackerDefinition::root();
         let project = self.paths.project_root.as_str();
         let git = |args: &[&str]| {
@@ -214,7 +223,9 @@ impl MetadataStore {
         )?;
         // The history newgit adopted: published already, wherever it went,
         // so the secret gate never holds it against a push.
-        git(&["update-ref", crate::manager::ADOPTED_REF, "HEAD"]);
+        if vouch {
+            git(&["update-ref", crate::manager::ADOPTED_REF, "HEAD"]);
+        }
         Ok(true)
     }
 

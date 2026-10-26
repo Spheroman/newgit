@@ -766,6 +766,9 @@ fn init(args: InitArgs) -> Result<()> {
         .name
         .or_else(|| repo_root.file_name().map(ToOwned::to_owned))
         .unwrap_or_else(|| "newgit-project".to_owned());
+    if repo_root.join(".newgit/local/instance.toml").is_file() {
+        bail!("this is a newgit workspace; run `newgit init` in the project's store");
+    }
     if repo_root.join(".newgit/config.toml").is_file() {
         let (_, done) = MetadataStore::adopt_in_place(&repo_root)?;
         if done.is_empty() {
