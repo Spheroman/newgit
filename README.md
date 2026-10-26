@@ -179,6 +179,12 @@ its trackers bound and its resources prepared. Deleting the thread runs
   renamed.
 - T3 Code's storage cleanup leaves newgit workspaces alone; `newgit cleanup`
   owns them.
+- An agent in a thread pushes and opens pull requests the usual way, `git
+  push` then `gh pr create`. On a newgit remote, `origin` is the newgit
+  endpoint, which `gh` cannot read, so give the project an export target
+  with `branches = true` (`newgit reference export`): each push then lands
+  the branch there too, and the workspace's remote for it is the one `gh`
+  uses.
 
 The fork is a patch, not a rewrite, so it rebases onto a fast-moving
 upstream: the newgit logic lives in `apps/server/src/vcs/newgitWorkspaces.ts`,
