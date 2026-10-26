@@ -12,6 +12,78 @@ time by `scripts/release-changelog.sh`, which then deletes the fragments.
 Two changes never touch the same lines, so nothing queues behind whichever
 branch landed first.
 
+## [0.6.0] — 2026-10-26
+
+GitHub stays where it is. `newgit export --remote` pushes the trackers you
+choose to an ordinary repository such as a GitHub mirror, history and all,
+and with `branches = true` every push from a workspace lands its branch
+there too, so an agent's `git push` then `gh pr create` opens a real pull
+request even on a newgit remote. No formats change; see *Upgrading*.
+
+### Added
+
+- `newgit export --remote <name>` pushes the trackers' `main`s, composed
+  with their history, to an ordinary Git repository such as a GitHub mirror,
+  defined in `.newgit/exports/<name>.toml`.
+
+  Nobody moves their code off GitHub to try a tool, so newgit has to sit
+  beside it: a project can live in newgit while its GitHub repository, and
+  everything that reads it (`gh`, Actions, clones), keeps working. What
+  ships fails closed: `public` code trackers, plus the ones a target names
+  in `trackers`, so a public mirror and a private one can show different
+  views. A secret tracker cannot be named, and a history that ever added a
+  secret tracker's path is refused before anything is pushed. Pushing uses
+  plain `git push` with your own credentials; exporting again
+  fast-forwards, and a rewritten history (a narrower tracker set) needs
+  `--force`.
+
+- Export targets with `branches = true` receive each instance's branch
+  every time its workspace pushes, and on a newgit remote the target
+  becomes the workspace remote `gh` resolves.
+
+  On a newgit remote, a workspace's `origin` is the newgit endpoint, so an
+  agent's reflexive `git push` then `gh pr create` failed: `gh` cannot map
+  that URL to a GitHub repository, and the branch never reached GitHub. Now
+  the push exports the branch, the workspace's `refs/remotes/<target>/`
+  holds the commit the target really has, and `gh pr create` works as is
+  when the target ships every tracker the branch touches. When it does
+  not, the commits there differ, and the push says `gh pr create --head
+  <branch>` instead of pretending otherwise. A push straight to the
+  target's remote is refused, since it would carry trackers the target
+  withholds.
+
+### Fixed
+
+- `undo` restarts a long-running action in its `workdir`, as `newgit
+  action` does, rather than in the workspace root
+  ([#109](https://github.com/Spheroman/newgit/issues/109)).
+
+  The restart built its own invocation and handed the supervisor the
+  workspace root, so a dev server with `workdir = "apps/web"` came back in
+  the wrong directory after an undo, where `npm run dev` fails or runs the
+  wrong package. newgit reported it restarted, because the supervisor only
+  tracks liveness. Both paths now resolve the directory the same way, and
+  a `workdir` the undo removed is reported as a failed restart.
+
+- `newgit undo` now brings back an uncommitted deletion of a tracked file.
+
+  A checkpoint promises the worktree as it stood, uncommitted changes
+  included, and its snapshot did record the deletion. But undo first reset
+  hard to the checkpoint's commit, which put the file back, and then laid
+  the snapshot over it, writing every path the snapshot had and removing
+  none it lacked. The file came back with its committed content and a
+  clean `git status`: work resumed from a state the instance was never in,
+  and nothing showed it. With every tracked file deleted, undo failed
+  instead, after the reset had already run. Checkpoints taken before this
+  fix recorded their deletions too; undoing to one now restores them.
+
+
+### Documentation
+
+- The README covers using newgit from T3 Code: a fork gives each agent
+  thread a newgit instance where T3 Code would add a Git worktree, and
+  builds a desktop app that installs beside upstream T3 Code.
+
 ## [0.5.0] — 2026-10-22
 
 The newgit remote (invite-only for now, at `newgit.dev`) and trackers all
@@ -1798,7 +1870,8 @@ instance under `0.2.0` restores it.
 
 `.newgit/` holds two kinds of thing, and they upgrade differently:
 
-- **Committed definitions** (`config.toml`, `trackers/`, `resources/`) are
+- **Committed definitions** (`config.toml`, `trackers/`, `resources/`,
+  `exports/`) are
   the control plane. Changes here will be called out in this file.
 - **Local state** (`branches/`, `checkpoints/`, `logs/`, `state/`, and
   tracker history in `local/trackers.git`) is derived or disposable. If a
@@ -1808,6 +1881,12 @@ instance under `0.2.0` restores it.
 Binding records and checkpoints are the exception worth caring about: they
 are the only local state that is not reconstructible. A release that changes
 their format will say so here explicitly.
+
+**0.6.0 changes no formats.** Nothing new is required: export targets
+live in a new, optional `.newgit/exports/` (committed, like `trackers/`
+and `resources/`), and a project without one behaves as on 0.5.0.
+Workspaces pick up a `branches = true` target's remote at their next
+checkpoint or push, so there is no need to re-spawn.
 
 **0.5.0 does not read 0.4.0's local state; re-initialize.** Tracker content
 moved from `.newgit/snapshots/` directories into a Git repository at
@@ -1865,7 +1944,8 @@ themselves and neither of which is a reason to re-spawn:
   fresh field it has not. One successful `undo`, or one `newgit checkpoint
   --verify`, clears it for good.
 
-[Unreleased]: https://github.com/Spheroman/newgit/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/Spheroman/newgit/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/Spheroman/newgit/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/Spheroman/newgit/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/Spheroman/newgit/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/Spheroman/newgit/compare/v0.2.0...v0.3.0

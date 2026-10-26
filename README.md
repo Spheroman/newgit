@@ -86,7 +86,7 @@ put `newgit` on your `PATH`:
 
 ```sh
 TARGET=aarch64-apple-darwin   # or x86_64-apple-darwin, {x86_64,aarch64}-unknown-linux-gnu
-VERSION=v0.5.0
+VERSION=v0.6.0
 BASE=https://github.com/Spheroman/newgit/releases/download/$VERSION
 curl -fsSLO $BASE/newgit-$TARGET.tar.gz -O $BASE/newgit-$TARGET.tar.gz.sha256
 shasum -a 256 -c newgit-$TARGET.tar.gz.sha256
@@ -108,7 +108,7 @@ Check what you installed. The commit is part of the version because `0.x`
 moves fast, and `-dirty` means the binary does not match any commit:
 
 ```sh
-newgit --version   # newgit 0.5.0 (ba40d59d8f4f)
+newgit --version   # newgit 0.6.0 (ba40d59d8f4f)
 ```
 
 ## Adopting it in a project
