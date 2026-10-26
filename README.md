@@ -160,6 +160,44 @@ tree is the thing that would be wrong. If you run many instances of a large
 repository, a package manager with a content-addressed store is worth more
 here than it is on plain Git.
 
+## Using it with T3 Code
+
+[T3 Code](https://github.com/pingdotgg/t3code) gives each agent thread its
+own Git worktree. A fork,
+[`Spheroman/t3code`](https://github.com/Spheroman/t3code) (branch
+`newgit-workspaces`), gives it a newgit instance instead. In a project with
+`.newgit/config.toml` at its root, "New worktree" runs `newgit spawn
+<branch> --from <base> --json` and opens the thread in that workspace, with
+its trackers bound and its resources prepared. Deleting the thread runs
+`newgit remove`. Every other project gets plain worktrees, as before.
+
+- `T3CODE_NEWGIT=0` turns it off; `T3CODE_NEWGIT_BIN` names a `newgit`
+  that is not on the T3 Code server's `PATH`. If `newgit` cannot run, the
+  thread falls back to a Git worktree and the server logs why.
+- Threads keep their temporary `t3code/<hex>` branch name. T3 Code renames
+  a worktree's branch after the first message, and an instance cannot be
+  renamed.
+- T3 Code's storage cleanup leaves newgit workspaces alone; `newgit cleanup`
+  owns them.
+
+The fork is a patch, not a rewrite, so it rebases onto a fast-moving
+upstream: the newgit logic lives in `apps/server/src/vcs/newgitWorkspaces.ts`,
+and each hook in an upstream file is marked `newgit fork patch`. Branch
+`newgit-desktop-identity` stacks on it and builds a desktop app, "T3 Code
+(newgit)", that installs beside upstream T3 Code: its own app ID, state in
+`~/.t3-newgit`, a `t3code-newgit` command, no `t3code://` handler, and no
+auto-update. On macOS (arm64):
+
+```sh
+git clone -b newgit-desktop-identity https://github.com/Spheroman/t3code
+cd t3code && pnpm install
+node scripts/build-desktop-artifact.ts --platform mac --target zip --arch arm64 --output-dir release-newgit
+ditto -x -k release-newgit/T3-Code-*-arm64.zip /Applications
+```
+
+The build is unsigned. Run it from a plain terminal: inside T3 Code,
+`ELECTRON_RUN_AS_NODE` is set, and it makes the app start as Node.
+
 ## Development
 
 This repository uses [`mise`](https://mise.jdx.dev/) to pin Rust.
