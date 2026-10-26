@@ -1,0 +1,6 @@
+[project]
+name = "newgit"
+source = "git"
+
+[remote]
+url = "https://newgit.dev"

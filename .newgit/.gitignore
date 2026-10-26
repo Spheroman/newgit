@@ -1,0 +1,7 @@
+# newgit local state — never committed
+/local/
+/branches/
+/logs/
+/state/
+/checkpoints/
+/installs/

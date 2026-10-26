@@ -1,0 +1,7 @@
+audience = "user"
+storage = "remote"
+merge_with_source = false
+paths = [
+    "AGENTS.md",
+    "CLAUDE.md",
+]

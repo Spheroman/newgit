@@ -1,0 +1,5 @@
+audience = "project-devs"
+storage = "local"
+merge_with_source = true
+paths = [".newgit"]
+secret = false
