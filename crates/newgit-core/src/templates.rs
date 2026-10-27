@@ -328,7 +328,7 @@ RESOURCE_URL = "postgres://localhost/{{branch.slug}}"
     },
     ResourceTemplate {
         name: "supabase",
-        description: "a per-instance Supabase stack: own project_id, own six ports, dump/reset/load",
+        description: "a per-instance Supabase stack: own project_id, own seven ports, dump/reset/load",
         companions: &[],
         // Same lane as the other two database templates: a lane is per
         // database, not per template.
@@ -358,12 +358,19 @@ RESOURCE_URL = "postgres://localhost/{{branch.slug}}"
 [ports]
 # Supabase's committed defaults, one lane each. `start` is where scanning
 # begins, so instance two lands just above instance one.
+#
+# Every port the committed config.toml names is allocated here, including
+# the pooler's even though `supabase init` leaves it disabled. A port the
+# file names but this table does not is a port some instance's scan will
+# eventually land on, and that render would then write a number the file
+# already has, which `newgit capture` could not reverse (#205).
 api       = { start = 54321, env = "RESOURCE_API_PORT" }
 db        = { start = 54322, env = "RESOURCE_DB_PORT" }
 shadow    = { start = 54320 }
 studio    = { start = 54323 }
 inbucket  = { start = 54324 }
 analytics = { start = 54327 }
+pooler    = { start = 54329 }
 
 [exports]
 # EDIT ME: the left half must match your committed `project_id`.
@@ -393,6 +400,7 @@ replace = [
   { find = "port = 54323",        with = "port = {{ports.studio}}" },
   { find = "port = 54324",        with = "port = {{ports.inbucket}}" },
   { find = "port = 54327",        with = "port = {{ports.analytics}}" },
+  { find = "port = 54329",        with = "port = {{ports.pooler}}" },
 ]
 
 # If a dev server in this project publishes a URL the auth config has to

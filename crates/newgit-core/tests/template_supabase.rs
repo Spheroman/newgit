@@ -156,7 +156,7 @@ fn the_supabase_template_renders_against_the_clis_committed_defaults() {
         "project_id must carry the instance slug, got:\n{rendered}"
     );
 
-    // All six ports moved to their allocated values. The allocated numbers
+    // All seven ports moved to their allocated values. The allocated numbers
     // depend on what is listening on the machine, so assert against the
     // binding record rather than against literals — a suite running in
     // parallel legitimately pushes these around.
@@ -168,6 +168,7 @@ fn the_supabase_template_renders_against_the_clis_committed_defaults() {
         ("studio", "port", "studio"),
         ("inbucket", "port", "inbucket"),
         ("analytics", "port", "analytics"),
+        ("db.pooler", "port", "pooler"),
     ] {
         assert_eq!(
             rendered_ports
@@ -179,16 +180,11 @@ fn the_supabase_template_renders_against_the_clis_committed_defaults() {
     }
 
     // `shadow_port = 54320` must not have been eaten by the `port = 54320`
-    // that is its own substring, and the pooler is not one of the six.
+    // that is its own substring.
     assert_ne!(
         rendered_ports[&("db".to_owned(), "shadow_port".to_owned())],
         rendered_ports[&("db".to_owned(), "port".to_owned())],
         "shadow_port and port collided"
-    );
-    assert_eq!(
-        rendered_ports[&("db.pooler".to_owned(), "port".to_owned())],
-        54329,
-        "the pooler port is not newgit's to rewrite"
     );
 
     // The exports the restore hook depends on resolved to real values.
@@ -245,7 +241,15 @@ fn two_instances_get_different_ports_and_different_project_ids() {
         a.resolved_exports["SUPABASE_PROJECT"],
         b.resolved_exports["SUPABASE_PROJECT"]
     );
-    for port_name in ["api", "db", "shadow", "studio", "inbucket", "analytics"] {
+    for port_name in [
+        "api",
+        "db",
+        "shadow",
+        "studio",
+        "inbucket",
+        "analytics",
+        "pooler",
+    ] {
         assert_ne!(
             a.resolved_ports[port_name], b.resolved_ports[port_name],
             "`{port_name}` was handed to both instances"
