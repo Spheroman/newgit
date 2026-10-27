@@ -328,7 +328,7 @@ RESOURCE_URL = "postgres://localhost/{{branch.slug}}"
     },
     ResourceTemplate {
         name: "supabase",
-        description: "a per-instance Supabase stack: own project_id, own seven ports, dump/reset/load",
+        description: "a per-instance Supabase stack: own project_id, own nine ports, dump/reset/load",
         companions: &[],
         // Same lane as the other two database templates: a lane is per
         // database, not per template.
@@ -359,17 +359,22 @@ RESOURCE_URL = "postgres://localhost/{{branch.slug}}"
 # Supabase's committed defaults, one lane each. `start` is where scanning
 # begins, so instance two lands just above instance one.
 #
-# Every port the committed config.toml names is allocated here, including
-# the pooler's even though `supabase init` leaves it disabled. A port the
-# file names but this table does not is a port some instance's scan will
-# eventually land on, and that render would then write a number the file
-# already has, which `newgit capture` could not reverse (#205).
+# Every 543xx port `supabase init` writes has a lane here, including the
+# disabled pooler's and the commented-out `smtp_port` and `pop3_port`. The
+# lanes scan up through that block, so a number the file names but no lane
+# owns is one some instance will land on, and its render would then write a
+# value the file already has, which `newgit capture` could not reverse
+# (#205). If your config.toml names another port in that range, give it a
+# lane and a `[[render]]` line the same way. `inspector_port = 8083` is
+# outside it and stays shared.
 api       = { start = 54321, env = "RESOURCE_API_PORT" }
 db        = { start = 54322, env = "RESOURCE_DB_PORT" }
 shadow    = { start = 54320 }
 studio    = { start = 54323 }
 inbucket  = { start = 54324 }
 analytics = { start = 54327 }
+smtp      = { start = 54325 }
+pop3      = { start = 54326 }
 pooler    = { start = 54329 }
 
 [exports]
@@ -389,7 +394,9 @@ RESOURCE_DB_URL = "postgresql://postgres:postgres@127.0.0.1:{{ports.db}}/postgre
 #
 # Careful with `shadow_port`: the literal `port = 54320` is a substring of
 # `shadow_port = 54320`, so it is spelled out in full here rather than left
-# to match the wrong line.
+# to match the wrong line. `smtp_port` and `pop3_port` are spelled out for
+# the same reason, and without their `# ` so the rule still matches once you
+# uncomment them.
 [[render]]
 path = "supabase/config.toml"
 replace = [
@@ -399,6 +406,8 @@ replace = [
   { find = "shadow_port = 54320", with = "shadow_port = {{ports.shadow}}" },
   { find = "port = 54323",        with = "port = {{ports.studio}}" },
   { find = "port = 54324",        with = "port = {{ports.inbucket}}" },
+  { find = "smtp_port = 54325",   with = "smtp_port = {{ports.smtp}}" },
+  { find = "pop3_port = 54326",   with = "pop3_port = {{ports.pop3}}" },
   { find = "port = 54327",        with = "port = {{ports.analytics}}" },
   { find = "port = 54329",        with = "port = {{ports.pooler}}" },
 ]

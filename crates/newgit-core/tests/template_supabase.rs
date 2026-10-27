@@ -12,41 +12,10 @@ use newgit_core::SourceSubstrate;
 use newgit_core::manager::BranchManager;
 use newgit_core::store::MetadataStore;
 
-/// The port lines `supabase init` writes, in the shape it writes them.
-const CONFIG_TOML: &str = r#"project_id = "EDIT_ME_PROJECT"
-
-[api]
-enabled = true
-port = 54321
-schemas = ["public", "graphql_public"]
-
-[db]
-port = 54322
-shadow_port = 54320
-major_version = 15
-
-[db.pooler]
-enabled = false
-port = 54329
-
-[studio]
-enabled = true
-port = 54323
-api_url = "http://127.0.0.1"
-
-[inbucket]
-enabled = true
-port = 54324
-
-[analytics]
-enabled = true
-port = 54327
-backend = "postgres"
-
-[auth]
-site_url = "http://127.0.0.1:3000"
-additional_redirect_urls = ["exp://127.0.0.1:8081"]
-"#;
+/// `supabase init` output from CLI 2.111.0, verbatim apart from `project_id`,
+/// which the CLI sets to the directory name and the template's `find` expects
+/// as `EDIT_ME_PROJECT`.
+const CONFIG_TOML: &str = include_str!("fixtures/supabase-init-config.toml");
 
 fn git(dir: &Utf8Path, args: &[&str]) {
     let output = Command::new("git")
@@ -156,7 +125,7 @@ fn the_supabase_template_renders_against_the_clis_committed_defaults() {
         "project_id must carry the instance slug, got:\n{rendered}"
     );
 
-    // All seven ports moved to their allocated values. The allocated numbers
+    // Every port moved to its allocated value. The allocated numbers
     // depend on what is listening on the machine, so assert against the
     // binding record rather than against literals — a suite running in
     // parallel legitimately pushes these around.
@@ -166,7 +135,7 @@ fn the_supabase_template_renders_against_the_clis_committed_defaults() {
         ("db", "port", "db"),
         ("db", "shadow_port", "shadow"),
         ("studio", "port", "studio"),
-        ("inbucket", "port", "inbucket"),
+        ("local_smtp", "port", "inbucket"),
         ("analytics", "port", "analytics"),
         ("db.pooler", "port", "pooler"),
     ] {
@@ -176,6 +145,16 @@ fn the_supabase_template_renders_against_the_clis_committed_defaults() {
                 .copied(),
             Some(binding.resolved_ports[port_name]),
             "[{section}] {key} did not render to the allocated `{port_name}`:\n{rendered}"
+        );
+    }
+
+    // `supabase init` leaves these two commented out; they move anyway, so
+    // uncommenting one does not reintroduce the default.
+    for (key, port_name) in [("smtp_port", "smtp"), ("pop3_port", "pop3")] {
+        let line = format!("# {key} = {}", binding.resolved_ports[port_name]);
+        assert!(
+            rendered.contains(&line),
+            "`{line}` missing from the render:\n{rendered}"
         );
     }
 
@@ -247,6 +226,8 @@ fn two_instances_get_different_ports_and_different_project_ids() {
         "shadow",
         "studio",
         "inbucket",
+        "smtp",
+        "pop3",
         "analytics",
         "pooler",
     ] {
