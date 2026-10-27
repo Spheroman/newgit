@@ -264,6 +264,10 @@ Definition management (noun subcommands):
   [--merge-with-source]`
 - `newgit tracker create <name> --code --path <path>...` — a committed code
   tracker, carved with its history out of whichever tracker owns the paths
+- `newgit tracker create <name> --code --path <path> --from <repository>
+  [--from-branch <branch>]` — a code tracker brought in from another
+  repository with its history, rewritten under the path, joining the project
+  root's branch through one merge
 - `newgit tracker track <tracker> <path>...`
 - `newgit tracker capture|merge|pull|checkout <tracker> [instance]`
 - `newgit tracker capture <tracker> --from-store` — seed a lane from the store

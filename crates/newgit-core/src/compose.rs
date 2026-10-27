@@ -1507,6 +1507,159 @@ pub fn carve(
         .next())
 }
 
+/// Where an imported commit's original is mapped to its rewrite: a note on
+/// each original commit (as fetched from outside) naming the commit it
+/// became, so export can hand back the originals (#141) and pulling can
+/// tell which outside commits are new (#142).
+pub const IMPORTED_NOTES_REF: &str = "refs/notes/newgit-imported";
+
+/// A history brought in from outside the project ([`import`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Imported {
+    /// The rewritten tip.
+    pub tip: String,
+    /// How many commits were rewritten.
+    pub commits: usize,
+}
+
+/// Rewrite the history at `source` (fetched from another repository) so
+/// every tree sits under `prefix`, written to `target_ref` in one
+/// fast-import pass: every commit, every parent kept (a fork has merges),
+/// author, committer, dates, encoding, and message as they were, and no
+/// trailers, so each rewritten id is a pure function of its original.
+/// Signatures do not survive: they signed the original trees. Each original
+/// is noted on [`IMPORTED_NOTES_REF`] with the commit it became.
+pub fn import(
+    repo: &Utf8Path,
+    source: &str,
+    prefix: &Utf8Path,
+    target_ref: &str,
+) -> Result<Imported> {
+    // Oldest first, so every parent is written before its children.
+    let history: Vec<(String, Vec<String>)> = git_lines(
+        repo,
+        &["rev-list", "--topo-order", "--reverse", "--parents", source],
+    )?
+    .into_iter()
+    .map(|line| {
+        let mut ids = line.split(' ').map(ToOwned::to_owned);
+        let id = ids.next().unwrap_or_default();
+        (id, ids.collect())
+    })
+    .collect();
+    let tip = git(repo, &["rev-parse", &format!("{source}^{{commit}}")])?;
+    let input: String = history.iter().map(|(id, _)| format!("{id}\n")).collect();
+    let objects = run(
+        &mut command(repo, &["cat-file", "--batch"]),
+        "git cat-file --batch",
+        Some(input.as_bytes()),
+    )?;
+    let mut bodies: BTreeMap<String, &[u8]> = BTreeMap::new();
+    let mut rest: &[u8] = &objects;
+    while let Some(newline) = rest.iter().position(|&byte| byte == b'\n') {
+        let header = String::from_utf8_lossy(&rest[..newline]).to_string();
+        let mut parts = header.split(' ');
+        let (Some(id), Some(_kind), Some(size)) = (parts.next(), parts.next(), parts.next()) else {
+            break;
+        };
+        let size: usize = size.parse().unwrap_or(0);
+        let start = newline + 1;
+        bodies.insert(id.to_owned(), &rest[start..start + size]);
+        rest = &rest[(start + size + 1).min(rest.len())..];
+    }
+
+    const EMPTY_TREE: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
+    let mut marks: BTreeMap<&str, usize> = BTreeMap::new();
+    let mut stream = Vec::new();
+    for (index, (id, parents)) in history.iter().enumerate() {
+        let body = bodies.get(id).ok_or_else(|| missing(id))?;
+        let split = body
+            .windows(2)
+            .position(|pair| pair == b"\n\n")
+            .unwrap_or(body.len());
+        let headers = String::from_utf8_lossy(&body[..split]);
+        let message = body.get(split + 2..).unwrap_or_default();
+        let header = |key: &str| {
+            headers
+                .lines()
+                .find_map(|line| line.strip_prefix(key).map(ToOwned::to_owned))
+        };
+        let tree = header("tree ").ok_or_else(|| missing(id))?;
+        let mark = index + 1;
+        marks.insert(id, mark);
+        if parents.is_empty() {
+            writeln!(stream, "reset {target_ref}").ok();
+        }
+        writeln!(stream, "commit {target_ref}").ok();
+        writeln!(stream, "mark :{mark}").ok();
+        if let Some(author) = header("author ") {
+            writeln!(stream, "author {author}").ok();
+        }
+        writeln!(
+            stream,
+            "committer {}",
+            header("committer ").unwrap_or_default()
+        )
+        .ok();
+        if let Some(encoding) = header("encoding ") {
+            writeln!(stream, "encoding {encoding}").ok();
+        }
+        writeln!(stream, "data {}", message.len()).ok();
+        stream.extend_from_slice(message);
+        stream.push(b'\n');
+        for (position, parent) in parents.iter().enumerate() {
+            let parent = marks.get(parent.as_str()).ok_or_else(|| missing(parent))?;
+            let verb = if position == 0 { "from" } else { "merge" };
+            writeln!(stream, "{verb} :{parent}").ok();
+        }
+        writeln!(stream, "deleteall").ok();
+        if tree != EMPTY_TREE {
+            writeln!(stream, "M 040000 {tree} {}", quote(prefix.as_str())).ok();
+        }
+        stream.push(b'\n');
+    }
+    let Some(&tip_mark) = marks.get(tip.as_str()) else {
+        return Err(missing(&tip));
+    };
+    writeln!(stream, "reset {target_ref}\nfrom :{tip_mark}\n").ok();
+    let marks_file = repo_tmp_file(repo, "import-marks");
+    let imported = run(
+        Command::new("git").arg("-C").arg(repo.as_str()).args([
+            "fast-import",
+            "--quiet",
+            "--force",
+            "--date-format=raw",
+            &format!("--export-marks={marks_file}"),
+        ]),
+        "git fast-import",
+        Some(&stream),
+    );
+    let exported = std::fs::read_to_string(&marks_file);
+    let _ = std::fs::remove_file(&marks_file);
+    imported?;
+    let exported = exported.map_err(|source| NewgitError::io(&marks_file, source))?;
+    let by_mark: BTreeMap<usize, &str> = exported
+        .lines()
+        .filter_map(|line| {
+            let (mark, id) = line.split_once(' ')?;
+            Some((mark.strip_prefix(':')?.parse().ok()?, id))
+        })
+        .collect();
+    let notes: Vec<(String, String)> = marks
+        .iter()
+        .filter_map(|(original, mark)| {
+            by_mark
+                .get(mark)
+                .map(|rewritten| ((*original).to_owned(), format!("{rewritten}\n")))
+        })
+        .collect();
+    write_notes_to(repo, IMPORTED_NOTES_REF, "import", &notes)?;
+    Ok(Imported {
+        tip: git(repo, &["rev-parse", target_ref])?,
+        commits: history.len(),
+    })
+}
+
 /// Split the view commits after `base` up to `tip` (first parent) into
 /// tracker commits. `bound` are the code trackers this view composes; `all`
 /// is every definition, to name the owner of a path nothing bound owns.
@@ -1667,6 +1820,17 @@ impl std::fmt::Display for SplitError {
             SplitError::Git(error) => error.fmt(f),
         }
     }
+}
+
+/// The commit view commit `commit` stands for: what a canonical note names
+/// for a rebuilt one, else itself — the id trackers' trailers use.
+pub fn canonical(repo: &Utf8Path, commit: &str) -> Result<String> {
+    let id = git(repo, &["rev-parse", &format!("{commit}^{{commit}}")])?;
+    let note = git(repo, &["notes", "--ref", CANONICAL_NOTES_REF, "show", &id]).unwrap_or_default();
+    Ok(note
+        .lines()
+        .find_map(|line| line.strip_prefix("canonical "))
+        .map_or(id, |original| original.trim().to_owned()))
 }
 
 /// The tracker state noted on a view commit.

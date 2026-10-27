@@ -299,6 +299,14 @@ enum TrackerCommand {
         /// A path a code tracker owns (repeatable; set at creation)
         #[arg(long = "path", value_name = "PATH")]
         path: Vec<Utf8PathBuf>,
+        /// Bring in another repository's history instead of carving: its
+        /// commits, rewritten under --path, join the project root's branch
+        /// through one merge
+        #[arg(long, value_name = "REPOSITORY", requires = "code")]
+        from: Option<String>,
+        /// The branch of --from to bring in (default: its HEAD)
+        #[arg(long, value_name = "BRANCH", requires = "from")]
+        from_branch: Option<String>,
     },
     /// Add workspace paths to a secret tracker
     Track {
@@ -1568,6 +1576,52 @@ fn shell_quote(value: &str) -> String {
 
 fn tracker(command: TrackerCommand) -> Result<()> {
     match command {
+        TrackerCommand::Create {
+            name,
+            audience,
+            code: true,
+            path,
+            from: Some(from),
+            from_branch,
+            ..
+        } => {
+            // A local repository named relative to here, not the project root
+            // the fetch runs in.
+            let from = match std::fs::canonicalize(&from) {
+                Ok(local) => local.to_string_lossy().into_owned(),
+                Err(_) => from,
+            };
+            let manager = manager_here()?;
+            let outcome = manager.import_code_tracker(
+                &name,
+                &audience,
+                &path,
+                &from,
+                from_branch.as_deref(),
+            )?;
+            let root = manager.store().paths().project_root.clone();
+            println!(
+                "Created code tracker `{name}` at {}",
+                display_path(&root, &outcome.path)
+            );
+            println!(
+                "  history:   {} imported from {from}, each under {}",
+                plural(outcome.commits, "commit"),
+                path.iter()
+                    .map(|path| path.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+            println!(
+                "  joined:    `{}` through one merge, {}",
+                outcome.branch,
+                &outcome.join[..outcome.join.len().min(12)]
+            );
+            println!(
+                "  commit to it with Git; newgit splits your commits into it when work leaves the machine"
+            );
+            Ok(())
+        }
         TrackerCommand::Create {
             name,
             audience,
