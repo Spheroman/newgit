@@ -353,3 +353,169 @@ fn an_unknown_target_names_the_defined_ones() {
     let stderr = fails(&fixture.store, &["export", "--remote", "gitlab"]);
     assert!(stderr.contains("defined: github"), "{stderr}");
 }
+
+/// A pull request merged on the target: a branch, merged with a merge
+/// commit, then one more commit straight onto `main` — in a clone of the
+/// mirror, as GitHub's merge button would leave it. Returns the new tip.
+fn merge_on_target(temp: &Utf8Path, fixture: &Fixture) -> String {
+    let clone = temp.join("elsewhere");
+    git(
+        temp,
+        &["clone", "-q", fixture.mirror.as_str(), clone.as_str()],
+    );
+    git(&clone, &["checkout", "-q", "-b", "feature"]);
+    std::fs::write(clone.join("src/feature.rs"), "pub fn f() {}\n").expect("write");
+    git(&clone, &["add", "."]);
+    git(&clone, &["commit", "-q", "-m", "add feature"]);
+    git(&clone, &["checkout", "-q", "main"]);
+    git(
+        &clone,
+        &[
+            "merge",
+            "-q",
+            "--no-ff",
+            "-m",
+            "Merge pull request #1",
+            "feature",
+        ],
+    );
+    std::fs::write(clone.join("README.md"), "hello from the target\n").expect("write");
+    git(&clone, &["commit", "-q", "-am", "edit on the target"]);
+    git(&clone, &["push", "-q", "origin", "main"]);
+    git(&clone, &["rev-parse", "main"])
+}
+
+#[test]
+fn commits_merged_on_the_target_come_into_main_before_the_push() {
+    let (_guard, temp) = tempdir();
+    let fixture = setup(&temp, &[]);
+    define(
+        &fixture,
+        "github",
+        &format!("url = \"{}\"\ntrackers = [\"root\"]\n", fixture.mirror),
+    );
+    succeeds(&fixture.store, &["export", "--remote", "github"]);
+    let theirs = merge_on_target(&temp, &fixture);
+
+    let dry = succeeds(
+        &fixture.store,
+        &["export", "--remote", "github", "--dry-run"],
+    );
+    assert!(dry.contains("Would bring in 3 commits"), "{dry}");
+    assert_ne!(
+        git(&fixture.store, &["rev-parse", "HEAD"]),
+        theirs,
+        "a dry run moves nothing"
+    );
+
+    let stdout = succeeds(&fixture.store, &["export", "--remote", "github"]);
+    assert!(stdout.contains("Brought in 3 commits"), "{stdout}");
+    assert_eq!(git(&fixture.mirror, &["rev-parse", "main"]), theirs);
+    assert_eq!(
+        git(&fixture.store, &["rev-parse", "HEAD"]),
+        theirs,
+        "the project root fast-forwarded to the target's commits"
+    );
+    assert_eq!(
+        std::fs::read_to_string(fixture.store.join("README.md")).expect("read"),
+        "hello from the target\n"
+    );
+
+    // `main` holds them now: work after them exports as a fast-forward.
+    std::fs::write(fixture.store.join("src/lib.rs"), "fn main() { }\n").expect("write");
+    git(&fixture.store, &["commit", "-q", "-am", "after the pull"]);
+    succeeds(&fixture.store, &["merge", "main"]);
+    let stdout = succeeds(&fixture.store, &["export", "--remote", "github"]);
+    assert!(!stdout.contains("Brought in"), "{stdout}");
+    assert_eq!(git(&fixture.mirror, &["rev-parse", "main~1"]), theirs);
+}
+
+#[test]
+fn project_root_work_of_its_own_leaves_the_target_commits_to_bring_in_by_hand() {
+    let (_guard, temp) = tempdir();
+    let fixture = setup(&temp, &[]);
+    define(
+        &fixture,
+        "github",
+        &format!("url = \"{}\"\ntrackers = [\"root\"]\n", fixture.mirror),
+    );
+    succeeds(&fixture.store, &["export", "--remote", "github"]);
+    let theirs = merge_on_target(&temp, &fixture);
+    std::fs::write(fixture.store.join("src/lib.rs"), "fn main() { }\n").expect("write");
+    git(&fixture.store, &["commit", "-q", "-am", "ours"]);
+    let ours = git(&fixture.store, &["rev-parse", "HEAD"]);
+
+    let stderr = fails(&fixture.store, &["export", "--remote", "github"]);
+    assert!(stderr.contains("git pull"), "{stderr}");
+    assert!(stderr.contains("newgit merge main"), "{stderr}");
+    assert_eq!(git(&fixture.mirror, &["rev-parse", "main"]), theirs);
+    assert_eq!(git(&fixture.store, &["rev-parse", "HEAD"]), ours);
+}
+
+#[test]
+fn force_replaces_the_target_instead_of_pulling() {
+    let (_guard, temp) = tempdir();
+    let fixture = setup(&temp, &[]);
+    define(
+        &fixture,
+        "github",
+        &format!("url = \"{}\"\ntrackers = [\"root\"]\n", fixture.mirror),
+    );
+    succeeds(&fixture.store, &["export", "--remote", "github"]);
+    let ours = git(&fixture.mirror, &["rev-parse", "main"]);
+    merge_on_target(&temp, &fixture);
+
+    let stdout = succeeds(&fixture.store, &["export", "--remote", "github", "--force"]);
+    assert!(!stdout.contains("Brought in"), "{stdout}");
+    assert_eq!(git(&fixture.mirror, &["rev-parse", "main"]), ours);
+    assert_eq!(git(&fixture.store, &["rev-parse", "HEAD"]), ours);
+}
+
+#[test]
+fn a_target_shipping_every_tracker_pulls_with_newgit_committed() {
+    let (_guard, temp) = tempdir();
+    let fixture = setup(&temp, &[]);
+    git(&fixture.store, &["add", ".newgit"]);
+    git(&fixture.store, &["commit", "-q", "-m", "add newgit"]);
+    succeeds(&fixture.store, &["merge", "main"]);
+    define(
+        &fixture,
+        "github",
+        &format!(
+            "url = \"{}\"\ntrackers = [\"root\", \"project\", \"access\"]\n",
+            fixture.mirror
+        ),
+    );
+    git(&fixture.store, &["add", ".newgit/exports"]);
+    git(&fixture.store, &["commit", "-q", "-m", "add export target"]);
+    succeeds(&fixture.store, &["merge", "main"]);
+    succeeds(&fixture.store, &["export", "--remote", "github"]);
+    let theirs = merge_on_target(&temp, &fixture);
+
+    let stdout = succeeds(&fixture.store, &["export", "--remote", "github"]);
+    assert!(stdout.contains("Brought in 3 commits"), "{stdout}");
+    assert_eq!(git(&fixture.mirror, &["rev-parse", "main"]), theirs);
+    assert_eq!(git(&fixture.store, &["rev-parse", "HEAD"]), theirs);
+}
+
+#[test]
+fn a_target_withholding_a_tracker_cannot_be_pulled_from() {
+    let (_guard, temp) = tempdir();
+    let fixture = setup(&temp, &[]);
+    git(&fixture.store, &["add", ".newgit"]);
+    git(&fixture.store, &["commit", "-q", "-m", "add newgit"]);
+    succeeds(&fixture.store, &["merge", "main"]);
+    define(
+        &fixture,
+        "github",
+        &format!("url = \"{}\"\ntrackers = [\"root\"]\n", fixture.mirror),
+    );
+    succeeds(&fixture.store, &["export", "--remote", "github"]);
+    let theirs = merge_on_target(&temp, &fixture);
+    let ours = git(&fixture.store, &["rev-parse", "HEAD"]);
+
+    let stderr = fails(&fixture.store, &["export", "--remote", "github"]);
+    assert!(stderr.contains("withholds a tracker"), "{stderr}");
+    assert_eq!(git(&fixture.mirror, &["rev-parse", "main"]), theirs);
+    assert_eq!(git(&fixture.store, &["rev-parse", "HEAD"]), ours);
+}

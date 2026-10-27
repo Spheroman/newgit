@@ -645,6 +645,10 @@ pub struct RemoteExportOutcome {
     pub pushed: bool,
     /// Why the project root's own work could not be compared with `main`.
     pub project_root_error: Option<String>,
+    /// Commits the target's branch had that `main` did not — merged there,
+    /// say, as a pull request — brought into `main` before pushing (or, on a
+    /// dry run, that would be). Zero when the target was not ahead.
+    pub pulled: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2943,6 +2947,11 @@ impl BranchManager {
     /// A recompute that fails (the committed content moved under the
     /// definition) is not drift and is not reported here; the re-render that
     /// follows reports it.
+    ///
+    /// Nor is a file holding exactly its committed content: a re-render
+    /// loses none of it. That is what a tracker restore leaves — undo,
+    /// `tracker checkout` and `tracker pull` write lane content, then
+    /// re-render — so counting it would name an edit nobody made.
     fn render_drift(&self, branch: &BranchInstance) -> Vec<String> {
         let mut drifted = Vec::new();
         for (resource, binding) in &branch.resources {
@@ -2961,7 +2970,7 @@ impl BranchManager {
                 else {
                     continue;
                 };
-                if actual != expected {
+                if actual != expected && actual != committed {
                     drifted.push(format!(
                         "`{}` has changes that render will discard: it is rendered by resource \
                          `{resource}`, so newgit rewrites it from committed content and this \
@@ -3564,7 +3573,9 @@ impl BranchManager {
         let lane = self.lane(&definition.name);
         let workspace = branch.workspace_path.clone();
 
-        // Safety net when re-materializing over existing content.
+        // Safety net when re-materializing over existing content — with
+        // renders reversed, as in `checkout_tracker`, so the safety rev is a
+        // lane rev like any other rather than one instance's ports.
         if refresh && !definition.paths.is_empty() {
             let existing = collect_owned_files(&workspace, definition)?;
             if !existing.is_empty() {
@@ -3572,7 +3583,8 @@ impl BranchManager {
                     .trackers
                     .get(&definition.name)
                     .and_then(|binding| binding.content_rev.clone());
-                lane.capture(
+                let reversed = self.unrender_for_capture(branch, definition)?;
+                let safety = lane.capture(
                     &workspace,
                     definition,
                     CaptureAt {
@@ -3583,7 +3595,9 @@ impl BranchManager {
                             definition.name, branch.name
                         ),
                     },
-                )?;
+                );
+                reversed.restore()?;
+                safety?;
             }
         }
 
@@ -5433,7 +5447,39 @@ impl BranchManager {
             PROJECT_ROOT_INSTANCE,
         )?;
 
-        let (mut trackers, view) = self.compose_export(&target, &list, PROJECT_ROOT_INSTANCE)?;
+        let (mut trackers, mut view) =
+            self.compose_export(&target, &list, PROJECT_ROOT_INSTANCE)?;
+        let pulled = if options.force {
+            0
+        } else {
+            self.pull_export_target(&target, &view.tip, options.dry_run)?
+        };
+        if pulled > 0 && !options.dry_run {
+            let list = self.branch_list(
+                client
+                    .as_ref()
+                    .map(|(client, project)| (client.as_ref(), project.as_str())),
+                PROJECT_ROOT_INSTANCE,
+            )?;
+            (trackers, view) = self.compose_export(&target, &list, PROJECT_ROOT_INSTANCE)?;
+            // Composing is deterministic, so `main` recomposed is the target's
+            // commits, plus whatever `main` had besides; anything else would
+            // be refused by the push for a reason it could not name.
+            let theirs = self
+                .source
+                .rev_parse(&export_ref(&target.name, "upstream"))?;
+            if !self.source.is_ancestor(&theirs, &view.tip)? {
+                return Err(NewgitError::Unsupported(format!(
+                    "brought `{}` on `{}` into `main`, but `main` composed for it does not \
+                     descend from {}, so it was not pushed. `newgit export --remote {} --dry-run` \
+                     shows what would be",
+                    target.branch,
+                    target.name,
+                    &theirs[..theirs.len().min(12)],
+                    target.name
+                )));
+            }
+        }
         for tracker in &mut trackers {
             tracker.unmerged = self
                 .source
@@ -5474,7 +5520,99 @@ impl BranchManager {
             commits: view.commits,
             pushed: !options.dry_run,
             project_root_error,
+            pulled,
         })
+    }
+
+    /// When `target`'s branch is ahead of `tip`, the export about to be
+    /// pushed — a pull request merged there — bring its commits into `main`
+    /// first, as `git pull` then `newgit merge main` in the project root
+    /// would: the project root's branch fast-forwards to them, and they
+    /// merge. Returns how many commits that is (counted, not merged, on a
+    /// dry run); zero when the target is not ahead.
+    ///
+    /// Only a fast-forward of the project root's own branch: when the
+    /// target's commits are not ones it can move to — it has work of its
+    /// own, or the target withholds a tracker, so its commits are not the
+    /// project's — this refuses, saying how to bring them in by hand. A
+    /// target that diverged from the export is left to the push to refuse.
+    fn pull_export_target(&self, target: &ExportTarget, tip: &str, dry_run: bool) -> Result<u32> {
+        let root = self.store.paths().project_root.clone();
+        let upstream = export_ref(&target.name, "upstream");
+        let fetched = crate::source::run_git_env(
+            &[
+                "-C",
+                root.as_str(),
+                "fetch",
+                "--quiet",
+                "--no-tags",
+                &target.push_url(),
+                &format!("+refs/heads/{}:{upstream}", target.branch),
+            ],
+            &[],
+        );
+        match fetched {
+            Ok(_) => {}
+            // Not exported yet: nothing there to bring in.
+            Err(NewgitError::SourceCommand { stderr, .. })
+                if stderr.contains("couldn't find remote ref") =>
+            {
+                return Ok(0);
+            }
+            Err(error) => return Err(error),
+        }
+        let theirs = self.source.rev_parse(&upstream)?;
+        if theirs == tip
+            || self.source.is_ancestor(&theirs, tip)?
+            || !self.source.is_ancestor(tip, &theirs)?
+        {
+            return Ok(0);
+        }
+        let commits = self.source.commit_count(&format!("{tip}..{theirs}"))?;
+
+        let branch = std::fs::read_to_string(self.store.paths().project_branch_file())
+            .map(|branch| branch.trim().to_owned())
+            .unwrap_or_else(|_| PROJECT_ROOT_INSTANCE.to_owned());
+        let ours = self.source.rev_parse(&format!("refs/heads/{branch}"))?;
+        if !self.source.is_ancestor(&ours, &theirs)? {
+            return Err(NewgitError::Unsupported(format!(
+                "`{}` on `{}` has {commits} commit(s) `main` does not (merged there?), and the \
+                 project root's `{branch}` cannot fast-forward to them: it has commits of its \
+                 own, or the target withholds a tracker, so its commits are not the project's. \
+                 Bring them in by hand — `git pull {} {}` in the project root, then `newgit merge \
+                 main` — or replace the branch with `--force`",
+                target.branch,
+                target.name,
+                target.push_url(),
+                target.branch
+            )));
+        }
+        if dry_run {
+            return Ok(commits);
+        }
+
+        let checked_out =
+            crate::source::run_git_env(&["-C", root.as_str(), "symbolic-ref", "-q", "HEAD"], &[])
+                .is_ok_and(|head| head.trim() == format!("refs/heads/{branch}"));
+        if checked_out {
+            crate::source::run_git_env(
+                &["-C", root.as_str(), "merge", "--ff-only", "-q", &theirs],
+                &[],
+            )
+            .map_err(|error| {
+                NewgitError::Unsupported(format!(
+                    "`{}` on `{}` has {commits} commit(s) `main` does not, but the project \
+                     root's `{branch}` could not fast-forward to them (uncommitted changes in \
+                     the way?): {error}",
+                    target.branch, target.name
+                ))
+            })?;
+        } else {
+            self.source
+                .update_ref(&format!("refs/heads/{branch}"), &theirs)?;
+        }
+        self.merge(PROJECT_ROOT_INSTANCE, "main")?;
+        Ok(commits)
     }
 
     /// Every export target, each checked against this project's trackers:
@@ -6158,22 +6296,22 @@ impl BranchManager {
                         .trackers
                         .get(&definition.name)
                         .and_then(|binding| binding.content_rev.clone());
-                    Some(
-                        self.lane(&definition.name)
-                            .capture(
-                                &workspace,
-                                definition,
-                                CaptureAt {
-                                    parent: bound.as_deref(),
-                                    branch: Branch::Instance(&branch.slug),
-                                    message: &format!(
-                                        "{} in `{}` at {id}",
-                                        definition.name, branch.name
-                                    ),
-                                },
-                            )?
-                            .rev,
-                    )
+                    // Renders reversed, as in `capture_tracker`: the lane is
+                    // shared, and the rev recorded here is what an undo
+                    // re-renders on top of, so it has to hold the committed
+                    // values a render's `find` matches.
+                    let reversed = self.unrender_for_capture(branch, definition)?;
+                    let capture = self.lane(&definition.name).capture(
+                        &workspace,
+                        definition,
+                        CaptureAt {
+                            parent: bound.as_deref(),
+                            branch: Branch::Instance(&branch.slug),
+                            message: &format!("{} in `{}` at {id}", definition.name, branch.name),
+                        },
+                    );
+                    reversed.restore()?;
+                    Some(capture?.rev)
                 };
             branch.trackers.insert(
                 definition.name.clone(),

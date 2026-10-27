@@ -445,7 +445,7 @@ struct ExportArgs {
     #[arg(long = "exclude", value_name = "PATH")]
     excludes: Vec<Utf8PathBuf>,
     /// With --remote: replace the target branch even when the export does not
-    /// descend from it
+    /// descend from it, rather than bringing in what the target has first
     #[arg(long, requires = "remote")]
     force: bool,
     /// With --remote: compose and check, but push nothing
@@ -2626,6 +2626,24 @@ fn export_to_remote(name: &str, options: RemoteExportOptions) -> Result<()> {
     let outcome = manager.export_to_remote(name, options)?;
     let target = &outcome.target;
 
+    if outcome.pulled > 0 {
+        let commits = if outcome.pulled == 1 {
+            "1 commit".to_owned()
+        } else {
+            format!("{} commits", outcome.pulled)
+        };
+        if outcome.pushed {
+            println!(
+                "Brought in {commits} from {} (branch {}) first: merged into `main`",
+                outcome.url, target.branch
+            );
+        } else {
+            println!(
+                "Would bring in {commits} from {} (branch {}) first, merging them into `main` (dry run)",
+                outcome.url, target.branch
+            );
+        }
+    }
     let verb = if outcome.pushed {
         "Exported"
     } else {

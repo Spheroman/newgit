@@ -1080,6 +1080,16 @@ target that already has history of its own) rebuilds commits under new ids,
 and the push is refused until `--force` replaces the branch. `--dry-run`
 composes and checks but pushes nothing.
 
+A pull request merged on the target, or anything else pushed straight to
+its branch, comes back before the push. When the target's branch is ahead
+of the export, the project root's branch fast-forwards to it and merges into
+`main`, as `git pull` then `newgit merge main` there would, and the export
+pushes what results. That works while the target's commits are the
+project's: the project root has no commits of its own, and the target ships
+every tracker those commits touch. Otherwise the export refuses and says how
+to bring them in by hand. `--dry-run` says how many commits would come in;
+`--force` replaces the branch instead.
+
 ### Pull requests from a workspace: `branches = true`
 
 On a newgit remote a workspace's `origin` is the newgit endpoint, which `gh`
