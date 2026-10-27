@@ -835,27 +835,28 @@ fn resource_json(
     binding: &ResourceBinding,
     bound: Option<&ResourceBindOutcome>,
 ) -> serde_json::Value {
-    // Read from the record, like the status, and not from the bind: the
-    // restore after a bind can bring a failed dependency back. A `ready`
-    // resource is blocked by nothing, however its dependencies fared — one
-    // with no runnable `prepare` had nothing to withhold — and a failed
-    // dependency is reported on its own entry.
-    let blocked_by = match binding.status {
-        ResourceStatus::Ready => Vec::new(),
-        ResourceStatus::Failed | ResourceStatus::Pending => manager
-            .resource_definitions()
-            .iter()
-            .find(|definition| definition.name == name)
-            .map(|definition| manager.blocked_dependencies(branch, definition))
-            .unwrap_or_default(),
-    };
+    // Derived from the record, like the status, and not from the bind: the
+    // restore after a bind can bring a failed dependency back. Derived for
+    // every stored status, `ready` included: a resource with no runnable
+    // `prepare` is recorded `ready` because nothing was withheld from it,
+    // but `status` and `action` still treat it as blocked while a
+    // dependency is down, and a script reading this must see the same
+    // instance they do (#209).
+    let blocked_by = manager
+        .resource_definitions()
+        .iter()
+        .find(|definition| definition.name == name)
+        .map(|definition| manager.blocked_dependencies(branch, definition))
+        .unwrap_or_default();
     // `blocked` is not a stored status — it is derived from the dependencies
     // so that it cannot go stale (see `ResourceStatus::Pending`) — but a
-    // script should not have to derive it.
+    // script should not have to derive it. A resource whose own `prepare`
+    // failed stays `failed`: that is its own outcome, and the blocker is
+    // still named in `blocked_by`.
     let status = match binding.status {
-        ResourceStatus::Ready => "ready",
         ResourceStatus::Failed => "failed",
-        ResourceStatus::Pending if !blocked_by.is_empty() => "blocked",
+        ResourceStatus::Ready | ResourceStatus::Pending if !blocked_by.is_empty() => "blocked",
+        ResourceStatus::Ready => "ready",
         ResourceStatus::Pending => "pending",
     };
     serde_json::json!({
@@ -896,8 +897,20 @@ fn prepare_label(resource: &ResourceBindOutcome) -> String {
                     resource.name
                 )
             }
-            None if !resource.blocked_by.is_empty() => {
-                format!(" prepare: BLOCKED by {}", resource.blocked_by.join(", "))
+            // Named as what was withheld. A resource with no `prepare`
+            // had none withheld, but its command actions are refused
+            // until the dependency is repaired, so it is no less blocked
+            // — just not at `prepare` (#209).
+            None if resource.is_blocked() => {
+                let blocked_by = resource.blocked_by.join(", ");
+                if resource.prepare_withheld {
+                    format!(" prepare: BLOCKED by {blocked_by}")
+                } else {
+                    format!(
+                        " BLOCKED by {blocked_by} (no prepare to run; its actions are \
+                         refused until that is repaired)"
+                    )
+                }
             }
             // Said where prepare's result would be, because it is the
             // answer to the same question — the tree is there. What put
@@ -3297,6 +3310,13 @@ fn bind_line(outcome: &TrackerBindOutcome, deposit_only: bool) -> String {
         }
         BindOrigin::Nothing => format!("`{}` bound (no captured content)", outcome.name),
     }
+}
+
+fn resource_has_runnable_prepare(manager: &BranchManager, name: &str) -> bool {
+    manager
+        .resource_definitions()
+        .iter()
+        .any(|definition| definition.name == name && definition.runnable_prepare().is_some())
 }
 
 fn tracker_is_deposit_only(manager: &BranchManager, name: &str) -> bool {

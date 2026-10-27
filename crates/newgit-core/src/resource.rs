@@ -264,6 +264,16 @@ impl ResourceDefinition {
         self.actions.values().any(|action| action.long_running)
     }
 
+    /// The `prepare` spawn would run for this resource, if there is one: a
+    /// `prepare` with a command that finishes. A `prepare` with no command
+    /// or one marked `long_running` is not something spawn runs, so a
+    /// failed dependency has nothing to withhold from it.
+    pub fn runnable_prepare(&self) -> Option<&ActionSpec> {
+        self.actions
+            .get("prepare")
+            .filter(|action| action.command.is_some() && !action.long_running)
+    }
+
     /// The `workdir` in effect for one command: an action's own `workdir`
     /// replaces the resource-level one entirely rather than nesting under
     /// it. `action` is `None` for hooks that are not actions (`checkpoint`,

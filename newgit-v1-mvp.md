@@ -1180,10 +1180,14 @@ spawned with failures: 1 of 4 resources did not bind.
 ```
 
 A resource counts as not bound whenever its line would read `export:
-FAILED`, `render: FAILED`, `prepare: FAILED`, or `prepare: BLOCKED by ...`.
-The blocked case is included on purpose: a blocked `prepare` never ran, so
-the resource is no more usable than one whose `prepare` ran and failed —
-only *where* the failure originated differs. The instance is not rolled
+FAILED`, `render: FAILED`, `prepare: FAILED`, `prepare: BLOCKED by ...`, or
+`BLOCKED by ...` (a dependent with no `prepare` to withhold, whose command
+actions are refused all the same). The blocked case is included on purpose:
+a blocked `prepare` never ran, so the resource is no more usable than one
+whose `prepare` ran and failed — only *where* the failure originated
+differs. `spawn --json` reports the same resource as `blocked` with its
+`blocked_by`, whatever the record stores for it, so a script and `status`
+describe one instance. The instance is not rolled
 back on exit 1; the record and workspace from the successful part of the
 spawn are exactly as printed, matching the plain `exit 1` `undo` and
 `checkpoint --verify` already use for the same "spawned/restored with

@@ -256,43 +256,6 @@ replace = [
     );
 }
 
-/// A dependent with no runnable `prepare` has nothing a failed dependency
-/// could withhold, so it is `ready` however its dependency fared — and a
-/// `ready` resource names nothing as blocking it. The dependency's own entry
-/// is where its failure is reported.
-#[test]
-fn spawn_json_names_no_blocker_for_a_ready_resource() {
-    let (_guard, temp) = tempdir();
-    let store = setup(&temp);
-    write_resource(&store, "base", FAILING_RESOURCE);
-    write_resource(
-        &store,
-        "dep",
-        r#"ownership = "branch"
-depends_on = ["base"]
-"#,
-    );
-    let repo = store.paths().project_root.clone();
-
-    let result = run_spawn_json(&repo, "x");
-    assert_eq!(
-        result.status.code(),
-        Some(1),
-        "`base` failed:\nstdout:\n{}\nstderr:\n{}",
-        result.stdout,
-        result.stderr
-    );
-    let dep = result.resource("dep");
-    assert_eq!(dep["status"], "ready", "{}", result.stdout);
-    assert_eq!(dep["blocked_by"], json!([]), "{}", result.stdout);
-    assert_eq!(
-        result.resource("base")["status"],
-        "failed",
-        "{}",
-        result.stdout
-    );
-}
-
 #[test]
 fn spawn_json_exits_zero_and_reports_ready_when_every_resource_binds() {
     let (_guard, temp) = tempdir();
