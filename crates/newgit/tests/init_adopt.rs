@@ -104,17 +104,12 @@ fn init_in_a_workspace_is_refused() {
     ok("git", &store, &["commit", "-q", "-m", "newgit"]);
     ok(NEWGIT, &store, &["spawn", "feature"]);
 
-    let workspace = std::fs::read_dir(temp.join("workspaces"))
-        .expect("workspaces")
-        .flatten()
-        .flat_map(|project| {
-            std::fs::read_dir(project.path())
-                .expect("project")
-                .flatten()
-        })
-        .map(|entry| Utf8PathBuf::from_path_buf(entry.path()).expect("utf8"))
-        .next()
-        .expect("a workspace");
+    // A configured `[workspace] root` holds the workspaces directly, with no
+    // per-project directory in between, so the path is known. Walking the
+    // directory instead found the workspace's own contents, in whatever order
+    // `read_dir` returned them, and picked a file as the cwd on Linux (#204).
+    let workspace = temp.join("workspaces").join("feature");
+    assert!(workspace.is_dir(), "{workspace} is not a workspace");
     let output = run(NEWGIT, &workspace, &["init"]);
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
