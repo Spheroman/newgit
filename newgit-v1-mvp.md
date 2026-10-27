@@ -1258,10 +1258,10 @@ not printed.
 Template variables available in exports, action commands, and `key_command`
 are kept minimal: `{{ports.<name>}}`, `{{branch.name}}`, `{{branch.slug}}`,
 `{{workspace}}`, `{{scripts}}`, `{{bound.trackers}}`, `{{bound.paths}}`.
-Checkpoint and restore commands additionally
-see `{{exports.<name>}}`, `{{snapshot.path}}` (the staging dir for
-`into_tracker` deposits), and `{{state_ref}}` (the checkpointed state
-reference) — nowhere else. `newgit reference` prints the full scope table.
+Checkpoint and restore commands additionally see `{{exports.<name>}}`,
+`{{snapshot.path}}` (the staging dir for `into_tracker` deposits), and
+`{{state_ref}}` (the checkpointed state reference) — nowhere else. `newgit
+reference` prints the full scope table.
 
 ### Where A Resource's Script Lives
 

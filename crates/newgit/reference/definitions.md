@@ -950,9 +950,13 @@ Scope — which of them have a value where:
 | `[restore] command` | yes | yes | yes | yes | — | yes |
 | `[cleanup] command` | yes | yes | yes | yes | — | yes |
 
-A `key_command` is rendered exactly like an action `command`, so a key over a
-shared lockfile can take `{{bound.paths}}` into account the same way the
-install it keys does.
+A `key_command` is rendered exactly like an action `command`. The binding is
+already part of every key (see *Installs: use a content-addressed store*), so
+`{{bound.*}}` is not there to make the key depend on it: it lets the command
+pass the binding to whatever it inspects, as in `git hash-object
+{{bound.paths}}`. Keep per-instance values —
+`{{workspace}}`, `{{branch.*}}`, `{{ports.*}}` — out of what it prints. Every
+instance would key differently, and the shared store would never hit.
 
 Action commands do not get `{{exports.*}}`: exports reach them as environment
 variables, which is what a command already knows how to read. A `[[render]]`

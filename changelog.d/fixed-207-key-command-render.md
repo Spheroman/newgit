@@ -5,14 +5,12 @@
 
   The reference said every command is rendered, but `key_command` was
   handed to the shell verbatim, so `{{bound.paths}}` in one printed as
-  `{{bound.paths}}`. A key over a shared lockfile has the same reason to
-  see the binding as the install it keys, so it now gets the scope an
-  action command gets: branch, workspace, scripts, this resource's ports
-  and `{{bound.*}}`. The two `bound` variables were described everywhere
-  but the tables that are supposed to list every variable and where it
-  has a value; they now have rows and a scope column, and the scope table
-  has a `key_command` row.
-
-  A `key_command` that happened to contain `{{…}}` keyed on the literal
-  text before and keys on the rendered value now, so its entries re-key
-  once; `newgit cleanup` reclaims the old ones.
+  `{{bound.paths}}`. It now gets the scope an action command gets: branch,
+  workspace, scripts, this resource's ports and `{{bound.*}}`. The binding
+  is already part of every key; `{{bound.paths}}` lets the command pass it
+  to what it inspects. The reference now warns against printing
+  per-instance values like `{{workspace}}`, which would key every instance
+  apart. The two `bound` variables were described everywhere but the
+  tables that are supposed to list every variable and where it has a
+  value; they now have rows and a scope column, and the scope table has a
+  `key_command` row.

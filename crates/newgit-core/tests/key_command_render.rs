@@ -1,9 +1,8 @@
 //! `[identity] key_command` is rendered like an action `command` before it
 //! runs. The reference says every command is rendered, and a `key_command`
-//! has the same reason to see `{{bound.paths}}` as the install it keys: a
-//! shared lockfile's key may depend on which members are bound. It used to
-//! be handed to the shell verbatim, so `{{branch.name}}` printed as
-//! `{{branch.name}}`.
+//! has the same use for `{{bound.paths}}` as the install it keys: an
+//! argument naming what to inspect. It used to be handed to the shell
+//! verbatim, so `{{branch.name}}` printed as `{{branch.name}}`.
 
 use std::process::Command;
 
@@ -38,13 +37,16 @@ fn tempdir() -> (tempfile::TempDir, Utf8PathBuf) {
     (temp, path)
 }
 
+/// A project with one code tracker, `app`, owning `apps/a`, so the
+/// instance's `{{bound.*}}` has something to render.
 fn setup(temp: &Utf8Path) -> MetadataStore {
     let repo = temp.join("store");
-    std::fs::create_dir_all(&repo).expect("mkdir");
+    std::fs::create_dir_all(repo.join("apps/a")).expect("mkdir");
     git(&repo, &["init", "-q", "-b", "main"]);
     std::fs::write(repo.join("README.md"), "hello\n").expect("write");
     std::fs::write(repo.join("lock.txt"), "v1\n").expect("write lock");
-    git(&repo, &["add", "."]);
+    std::fs::write(repo.join("apps/a/index.js"), "a\n").expect("write");
+    git(&repo, &["add", "-A"]);
     git(&repo, &["commit", "-q", "-m", "initial"]);
 
     let store = MetadataStore::init(&repo, "proj", SourceSubstrate::Git).expect("init");
@@ -54,6 +56,20 @@ fn setup(temp: &Utf8Path) -> MetadataStore {
         materializer: None,
     });
     store.write_config(&config).expect("write config");
+    git(&repo, &["add", "-A"]);
+    git(&repo, &["commit", "-q", "-m", "newgit"]);
+
+    BranchManager::open(store.clone())
+        .expect("manager")
+        .create_code_tracker("app", "project-devs", &[Utf8PathBuf::from("apps/a")])
+        .expect("carve");
+    git(&repo, &["add", "-A"]);
+    git(&repo, &["commit", "-q", "-m", "trackers"]);
+    // The project root's own commits reach `main` like anyone's.
+    BranchManager::open(store.clone())
+        .expect("manager")
+        .merge("main", "main")
+        .expect("merge the project root");
     store
 }
 
@@ -75,7 +91,7 @@ app = {{ start = 4300 }}
 [identity]
 paths = ["lock.txt"]
 produces = ["node_modules"]
-key_command = "printf '%s|%s|%s|%s|%s' '{{{{branch.name}}}}' '{{{{workspace}}}}' '{{{{ports.app}}}}' '{{{{bound.trackers}}}}' '{{{{bound.paths}}}}' > {seen}; echo v24"
+key_command = "printf '%s|%s|%s|%s|%s|%s' '{{{{branch.name}}}}' '{{{{workspace}}}}' '{{{{scripts}}}}' '{{{{ports.app}}}}' '{{{{bound.trackers}}}}' '{{{{bound.paths}}}}' > {seen}; echo v24"
 
 [actions.prepare]
 command = "mkdir -p node_modules && echo built > node_modules/marker"
@@ -97,7 +113,11 @@ command = "mkdir -p node_modules && echo built > node_modules/marker"
     let saw = std::fs::read_to_string(&seen).expect("the key_command ran");
     assert_eq!(
         saw,
-        format!("one|{}|{port}||", branch.workspace_path),
+        format!(
+            "one|{}|{}|{port}|app|apps/a",
+            branch.workspace_path,
+            store.paths().scripts
+        ),
         "key_command sees what an action command sees"
     );
 }

@@ -3385,9 +3385,10 @@ impl BranchManager {
     /// `{{exports.*}}` — a command reads those from its environment.
     ///
     /// Shared with `[identity] key_command`, which is a command like any
-    /// other and has the same reason to see `{{bound.paths}}` as the install
-    /// it keys: a shared lockfile's key may depend on which members are
-    /// bound.
+    /// other. The binding is already mixed into every key
+    /// (`installs::identity_key`); `{{bound.paths}}` lets the command pass it
+    /// to what it inspects. Its output should not carry per-instance values
+    /// such as `{{workspace}}`, or no two instances share an entry.
     fn render_as_action_command(
         &self,
         branch: &BranchInstance,
