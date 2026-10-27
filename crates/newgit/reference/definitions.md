@@ -134,7 +134,7 @@ require it to exist up front.
 | --- | --- | --- | --- | --- |
 | `paths` | array of strings | yes if the section is present | — | the files whose content *is* this resource's identity (a lockfile, a manifest). Path-dependent state is recomputed from its identity, not copied. Workspace-relative, no `..`, and may not reach into `.git` or `.newgit`. |
 | `produces` | array of strings | no | `[]` | the tree those inputs build — `node_modules` for an install. Same path rules as `paths`. |
-| `key_command` | string | no | — | a command whose stdout is mixed into the identity key, for what `paths` cannot see. |
+| `key_command` | string | no | — | a command whose stdout is mixed into the identity key, for what `paths` cannot see. Rendered like an action `command` (see *Template variables*). |
 
 Paths in both lists are workspace-relative with **no `.` or `..` components**
 — one spelling per path, because every check here reads the first one.
@@ -934,18 +934,25 @@ environment variable handed to every later process.
 | `{{exports.<name>}}` | a rendered export from this resource's binding |
 | `{{snapshot.path}}` | directory to write checkpoint output into |
 | `{{state_ref}}` | the handle the last checkpoint recorded, or the path of the snapshot it deposited. A `hash` checkpoint records neither, so it has no value |
+| `{{bound.trackers}}` | the trackers the instance binds, space-separated — every selectable tracker it has not dropped (`root`, `project`, and `access` are always bound and not listed) |
+| `{{bound.paths}}` | the paths those trackers own, code trackers only, space-separated — what a shared install should build |
 
 Scope — which of them have a value where:
 
-| rendered in | branch/workspace/scripts | `ports.*` | `exports.*` | `snapshot.path` | `state_ref` |
-| --- | --- | --- | --- | --- | --- |
-| `[exports]` values | yes | yes | yes | — | — |
-| `[[render]]` `with` | yes | yes | yes | — | — |
-| action `command` | yes | yes | — | — | — |
-| `[checkpoint] command` | yes | yes | yes | yes | — |
-| `[checkpoint] state_ref` | yes | yes | yes | — | — |
-| `[restore] command` | yes | yes | yes | — | yes |
-| `[cleanup] command` | yes | yes | yes | — | yes |
+| rendered in | branch/workspace/scripts | `bound.*` | `ports.*` | `exports.*` | `snapshot.path` | `state_ref` |
+| --- | --- | --- | --- | --- | --- | --- |
+| `[exports]` values | yes | yes | yes | yes | — | — |
+| `[[render]]` `with` | yes | yes | yes | yes | — | — |
+| action `command` | yes | yes | yes | — | — | — |
+| `[identity] key_command` | yes | yes | yes | — | — | — |
+| `[checkpoint] command` | yes | yes | yes | yes | yes | — |
+| `[checkpoint] state_ref` | yes | yes | yes | yes | — | — |
+| `[restore] command` | yes | yes | yes | yes | — | yes |
+| `[cleanup] command` | yes | yes | yes | yes | — | yes |
+
+A `key_command` is rendered exactly like an action `command`, so a key over a
+shared lockfile can take `{{bound.paths}}` into account the same way the
+install it keys does.
 
 Action commands do not get `{{exports.*}}`: exports reach them as environment
 variables, which is what a command already knows how to read. A `[[render]]`

@@ -2641,7 +2641,8 @@ impl BranchManager {
                         }));
                     }
                 };
-                match run_captured(command, &branch.workspace_path, &env, &log) {
+                let command = self.render_as_action_command(branch, definition, command);
+                match run_captured(&command, &branch.workspace_path, &env, &log) {
                     Ok((0, stdout)) => Some(stdout),
                     Ok((code, _)) => {
                         return Some(Err(InstallReport::Unavailable {
@@ -3376,6 +3377,23 @@ impl BranchManager {
                 definition.name
             ))
         })?;
+        Ok(self.render_as_action_command(branch, definition, &command))
+    }
+
+    /// Render `template` in an action command's scope: branch, workspace,
+    /// scripts, this resource's ports, and what the instance binds. No
+    /// `{{exports.*}}` — a command reads those from its environment.
+    ///
+    /// Shared with `[identity] key_command`, which is a command like any
+    /// other and has the same reason to see `{{bound.paths}}` as the install
+    /// it keys: a shared lockfile's key may depend on which members are
+    /// bound.
+    fn render_as_action_command(
+        &self,
+        branch: &BranchInstance,
+        definition: &ResourceDefinition,
+        template: &str,
+    ) -> String {
         let bound = self.bound_vars(branch);
         let context = RenderContext {
             branch_name: &branch.name,
@@ -3389,7 +3407,7 @@ impl BranchManager {
             bound: Some(&bound),
             ..RenderContext::default()
         };
-        Ok(render(&command, &context))
+        render(template, &context)
     }
 
     /// The layered environment `newgit run` and every hook see: actions,
