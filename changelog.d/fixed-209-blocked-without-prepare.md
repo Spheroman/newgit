@@ -17,3 +17,8 @@
   "1 of 2 resources did not bind". It now says `BLOCKED by base (no prepare
   to run; its actions are refused until that is repaired)`, and the count
   includes every blocked resource, as the spec already said it should.
+
+  A resource that failed itself (its export, render or `prepare`) with a
+  dependency down too is now `failed` in `status`, as it already was in
+  `spawn` and `spawn --json`, rather than `blocked(...)`: repairing the
+  dependency would not fix it.

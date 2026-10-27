@@ -179,9 +179,11 @@ pub struct InheritedCheckpoints {
 impl SpawnOutcome {
     /// Resources that did not come up ready: `Failed` (export, render, or
     /// prepare itself failed) and `Pending` (prepare never ran because a
-    /// dependency blocked it) both count. A blocked prepare is not a milder
-    /// case than a failed one — the resource is equally unusable either way,
-    /// it just failed for a reason one step upstream.
+    /// dependency blocked it) both count, and so does a `Ready` resource with
+    /// a non-empty `blocked_by` — one with no `prepare` to withhold, whose
+    /// command actions are refused all the same (#209). A blocked resource
+    /// is not a milder case than a failed one — it is equally unusable either
+    /// way, it just failed for a reason one step upstream.
     pub fn failed_resources(&self) -> Vec<&str> {
         self.resources
             .iter()
@@ -212,6 +214,10 @@ pub struct ResourceBindOutcome {
     /// are repaired — so a resource with any is blocked whatever its own
     /// `status` says, and counts as not bound (#209).
     pub blocked_by: Vec<String>,
+    /// Whether `blocked_by` withheld a runnable `prepare`. False for a
+    /// blocked resource with no `prepare` to run, which is blocked all the
+    /// same but not *at* `prepare`.
+    pub prepare_withheld: bool,
     /// Export names `prepare` published through `captures`.
     pub captured: Vec<String>,
     /// One warning per declared capture `prepare` never emitted.
@@ -2312,6 +2318,7 @@ impl BranchManager {
                     status: ResourceStatus::Failed,
                     prepare: None,
                     blocked_by: std::mem::take(&mut blocked_by),
+                    prepare_withheld: false,
                     captured: Vec::new(),
                     missing_captures: Vec::new(),
                     rendered: Vec::new(),
@@ -2430,6 +2437,7 @@ impl BranchManager {
                 ports: resolved_ports,
                 status,
                 prepare,
+                prepare_withheld: runnable_prepare.is_some() && !blocked_by.is_empty(),
                 blocked_by,
                 captured: captured_names,
                 missing_captures,
@@ -4905,16 +4913,20 @@ impl BranchManager {
                                     // action), so this can't and doesn't claim
                                     // more than "it ran, and isn't running now."
                                     "stopped".to_owned()
+                                } else if binding.status == ResourceStatus::Failed {
+                                    // Its own failure (export, render or
+                                    // prepare) comes first, as it does in
+                                    // `spawn` and `spawn --json`: repairing a
+                                    // dependency would not fix it.
+                                    "failed".to_owned()
                                 } else {
                                     let blocked_by = self.blocked_dependencies(&branch, definition);
                                     if !blocked_by.is_empty() {
                                         format!("blocked({})", blocked_by.join(","))
+                                    } else if binding.status == ResourceStatus::Pending {
+                                        "pending".to_owned()
                                     } else {
-                                        match binding.status {
-                                            ResourceStatus::Pending => "pending".to_owned(),
-                                            ResourceStatus::Ready => "ready".to_owned(),
-                                            ResourceStatus::Failed => "failed".to_owned(),
-                                        }
+                                        "ready".to_owned()
                                     }
                                 }
                             }

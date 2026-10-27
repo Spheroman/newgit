@@ -235,3 +235,124 @@ command = "true"
         result.stdout
     );
 }
+
+/// The issue's third surface: `action` refuses a command action on the
+/// dependent, whatever the record stores for it.
+#[test]
+fn action_refuses_a_blocked_dependent_without_prepare() {
+    let (_guard, temp) = tempdir();
+    let store = setup(&temp);
+    write_resource(&store, "base", BASE);
+    write_resource(&store, "dep", DEP);
+    let repo = store.paths().project_root.clone();
+
+    let spawned = run_newgit(&repo, &["spawn", "x"]);
+    assert_eq!(spawned.status.code(), Some(1), "{}", spawned.stdout);
+
+    let result = run_newgit(&repo, &["action", "dep.start", "x"]);
+    assert!(
+        !result.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        result.stdout,
+        result.stderr
+    );
+    assert!(
+        result
+            .stderr
+            .contains("blocked by failed dependency/dependencies: base"),
+        "{}",
+        result.stderr
+    );
+}
+
+/// The #124 shape: a dependent with no actions at all, only `depends_on`.
+/// It has nothing to run, and is still blocked on every surface.
+#[test]
+fn a_bare_dependent_with_no_actions_is_blocked_too() {
+    let (_guard, temp) = tempdir();
+    let store = setup(&temp);
+    write_resource(&store, "base", BASE);
+    write_resource(
+        &store,
+        "dep",
+        r#"ownership = "branch"
+depends_on = ["base"]
+"#,
+    );
+    let repo = store.paths().project_root.clone();
+
+    let result = run_newgit(&repo, &["spawn", "y", "--json"]);
+    assert_eq!(result.status.code(), Some(1), "{}", result.stdout);
+    let json: Value = serde_json::from_str(&result.stdout).expect("one JSON document");
+    let dep = resource(&json, "dep", &result.stdout);
+    assert_eq!(dep["status"], "blocked", "{}", result.stdout);
+    assert_eq!(dep["blocked_by"], json!(["base"]), "{}", result.stdout);
+
+    let result = run_newgit(&repo, &["spawn", "x"]);
+    assert_eq!(result.status.code(), Some(1), "{}", result.stdout);
+    assert!(
+        result.stdout.contains("`dep` BLOCKED by base"),
+        "{}",
+        result.stdout
+    );
+    assert!(
+        result.stdout.contains("2 of 2 resources did not bind"),
+        "{}",
+        result.stdout
+    );
+
+    let status = run_newgit(&repo, &["status"]);
+    assert!(
+        status.stdout.contains("dep:blocked(base)"),
+        "{}",
+        status.stdout
+    );
+}
+
+/// A resource whose own render failed, behind a failed dependency, is
+/// `failed` on every surface — its own failure comes first, because
+/// repairing the dependency would not fix it — with the dependency still
+/// named in `--json`'s `blocked_by`.
+#[test]
+fn a_resource_failed_itself_is_failed_everywhere_even_behind_a_failed_dependency() {
+    let (_guard, temp) = tempdir();
+    let store = setup(&temp);
+    write_resource(&store, "base", BASE);
+    write_resource(
+        &store,
+        "dep",
+        r#"ownership = "branch"
+depends_on = ["base"]
+
+[[render]]
+path = "not/committed.toml"
+replace = [
+  { find = "port = 1", with = "port = 2" },
+]
+"#,
+    );
+    let repo = store.paths().project_root.clone();
+
+    let result = run_newgit(&repo, &["spawn", "y", "--json"]);
+    assert_eq!(result.status.code(), Some(1), "{}", result.stdout);
+    let json: Value = serde_json::from_str(&result.stdout).expect("one JSON document");
+    let dep = resource(&json, "dep", &result.stdout);
+    assert_eq!(dep["status"], "failed", "{}", result.stdout);
+    assert_eq!(dep["blocked_by"], json!(["base"]), "{}", result.stdout);
+
+    let result = run_newgit(&repo, &["spawn", "x"]);
+    assert_eq!(result.status.code(), Some(1), "{}", result.stdout);
+    assert!(
+        result.stdout.contains("`dep` render: FAILED"),
+        "{}",
+        result.stdout
+    );
+
+    let status = run_newgit(&repo, &["status"]);
+    assert!(
+        status.stdout.contains("dep:failed"),
+        "stdout:\n{}\nstderr:\n{}",
+        status.stdout,
+        status.stderr
+    );
+}

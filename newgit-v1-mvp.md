@@ -1187,7 +1187,10 @@ a blocked `prepare` never ran, so the resource is no more usable than one
 whose `prepare` ran and failed — only *where* the failure originated
 differs. `spawn --json` reports the same resource as `blocked` with its
 `blocked_by`, whatever the record stores for it, so a script and `status`
-describe one instance. The instance is not rolled
+describe one instance. A resource that failed itself (its export, render or
+`prepare`) is `failed` on every surface even with a dependency down too —
+repairing the dependency would not fix it — and `spawn --json` still names
+the dependency in its `blocked_by`. The instance is not rolled
 back on exit 1; the record and workspace from the successful part of the
 spawn are exactly as printed, matching the plain `exit 1` `undo` and
 `checkpoint --verify` already use for the same "spawned/restored with

@@ -3312,13 +3312,6 @@ fn bind_line(outcome: &TrackerBindOutcome, deposit_only: bool) -> String {
     }
 }
 
-fn resource_has_runnable_prepare(manager: &BranchManager, name: &str) -> bool {
-    manager
-        .resource_definitions()
-        .iter()
-        .any(|definition| definition.name == name && definition.runnable_prepare().is_some())
-}
-
 fn tracker_is_deposit_only(manager: &BranchManager, name: &str) -> bool {
     manager
         .tracker_definitions()
