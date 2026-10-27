@@ -2442,8 +2442,18 @@ fn undo(instance: Option<String>, options: UndoOptions) -> Result<()> {
     }
     for resource in &outcome.resources {
         let verdict = if resource.ok { "ok" } else { "FAILED" };
+        // The verdict is on the restore action, and a restore that runs
+        // nothing (`none`, `external`, no `[restore]`) is always ok — it
+        // does not bring a resource up. Under "Restored" a bare `ok` reads
+        // as the resource being fine, so when it is not, say the status it
+        // is left in, the one `newgit status` will show.
+        let left = match resource.status {
+            ResourceStatus::Ready => "",
+            ResourceStatus::Failed => ", left failed",
+            ResourceStatus::Pending => ", left pending (its prepare has never run)",
+        };
         println!(
-            "  resource: {} {} {verdict}",
+            "  resource: {} {} {verdict}{left}",
             resource.name, resource.action
         );
     }

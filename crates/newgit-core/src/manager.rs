@@ -832,7 +832,16 @@ pub struct UndoResourceOutcome {
     /// `command`, `external (no-op)`; `+ restarted` when a process came back.
     pub action: String,
     pub name: String,
+    /// Whether the restore action itself succeeded. A restore that runs
+    /// nothing always does, so this says nothing about whether the resource
+    /// is up — that is `status`.
     pub ok: bool,
+    /// The status the resource is left in, as `newgit status` will report
+    /// it. A restore that ran nothing leaves the status it found, so a
+    /// `prepare` that failed before the undo is still `Failed` after it,
+    /// with `ok` true; a restart that failed after an ok restore is
+    /// `Failed` too.
+    pub status: ResourceStatus,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -7604,11 +7613,7 @@ impl BranchManager {
                     }),
                 }
             }
-            resources.push(UndoResourceOutcome {
-                name: name.clone(),
-                action: action_label,
-                ok,
-            });
+            resources.push((name.clone(), action_label, ok));
         }
 
         let recovery_record = if failures.is_empty() {
@@ -7626,6 +7631,17 @@ impl BranchManager {
                 failures,
             })?)
         };
+        // Read back only now, after a failed restart has marked its resource
+        // failed: the outcome reports the status the record is saved with.
+        let resources = resources
+            .into_iter()
+            .map(|(name, action, ok)| UndoResourceOutcome {
+                status: branch.resources[&name].status,
+                name,
+                action,
+                ok,
+            })
+            .collect();
 
         branch.updated_at = Utc::now();
         self.store.save_branch_record(&branch)?;
