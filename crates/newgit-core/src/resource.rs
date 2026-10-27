@@ -1089,7 +1089,7 @@ fn resolve_order(
 
 /// Names newgit sets on every command it runs, after every resource's. A
 /// declaration claiming one of these is dead on arrival.
-const RESERVED_ENV_NAMES: [&str; 2] = ["NEWGIT_BRANCH", "NEWGIT_WORKSPACE"];
+const RESERVED_ENV_NAMES: [&str; 3] = ["NEWGIT_BRANCH", "NEWGIT_WORKSPACE", "NEWGIT_LOCKED"];
 
 /// Check that no environment variable name is claimed by two declarations.
 ///

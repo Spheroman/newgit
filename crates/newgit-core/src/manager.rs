@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::{Arc, Mutex, PoisonError, Weak};
 
 use camino::{Utf8Path, Utf8PathBuf};
 use chrono::Utc;
@@ -22,6 +23,7 @@ use crate::export::{self, ExportFilter, ExportPlan, prepare_destination};
 use crate::export_target::ExportTarget;
 use crate::exports::{RenderContext, render, unresolved_placeholder};
 use crate::installs::{Admission, InstallReport, InstallStore};
+use crate::lock::{InstanceLock, LOCKED_ENV};
 use crate::materializer::{
     Materializer, RealDirMaterializer, exclude_produced_paths, exclude_tracker_paths,
     unexclude_tracker_paths,
@@ -71,6 +73,22 @@ pub struct BranchManager {
     /// Committed trackers with their own histories, composed into workspaces
     /// (newgit-trackers.md, step 3): `project` and any carved-out code.
     code: Vec<TrackerDefinition>,
+    /// The instance locks this manager holds right now, by slug (see
+    /// [`crate::lock`]). A nested call for an instance already locked gets
+    /// the held lock back instead of waiting on its own process; the entry
+    /// dies with the last guard.
+    locks: Mutex<BTreeMap<String, Weak<InstanceLock>>>,
+}
+
+/// An instance's lock as a command holds it; dropping the last guard for an
+/// instance releases it. See [`BranchManager::lock_instance`].
+#[derive(Debug)]
+pub struct HeldLock(Arc<InstanceLock>);
+
+impl HeldLock {
+    pub fn slug(&self) -> &str {
+        self.0.slug()
+    }
 }
 
 /// What creating a code tracker did.
@@ -1001,7 +1019,45 @@ impl BranchManager {
             remote,
             root,
             code,
+            locks: Mutex::new(BTreeMap::new()),
         })
+    }
+
+    /// Hold `slug`'s lock for the rest of the command: every command that
+    /// changes an instance takes it first, so two of them cannot interleave
+    /// their load-change-save (#212). Waits for another process holding it.
+    /// Within this manager it is reentrant — `checkpoint_verify` calling
+    /// `undo` gets the lock it already holds — so a nested call never waits
+    /// for its own caller.
+    pub fn lock_instance(&self, slug: &str, name: &str) -> Result<HeldLock> {
+        if let Some(held) = self.held_lock(slug) {
+            return Ok(HeldLock(held));
+        }
+        let lock = Arc::new(self.store.lock_instance(slug, name)?);
+        self.locks
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(slug.to_owned(), Arc::downgrade(&lock));
+        Ok(HeldLock(lock))
+    }
+
+    /// Lock the instance `instance` names and load its record under the
+    /// lock: the shape of every command that will save that record back.
+    fn locked_branch(&self, instance: &str) -> Result<(HeldLock, BranchInstance)> {
+        // A name resolves to its slug without the lock; the slug is what the
+        // lock is keyed on, and only the record's contents can change.
+        let found = self.store.find_branch(instance)?;
+        let lock = self.lock_instance(&found.slug, &found.name)?;
+        let branch = self.store.find_branch(&found.slug)?;
+        Ok((lock, branch))
+    }
+
+    fn held_lock(&self, slug: &str) -> Option<Arc<InstanceLock>> {
+        self.locks
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(slug)
+            .and_then(Weak::upgrade)
     }
 
     /// The shared store of built trees. One per manager — see the field.
@@ -1747,6 +1803,7 @@ impl BranchManager {
         }
 
         let slug = branch_slug(name);
+        let _lock = self.lock_instance(&slug, name)?;
         let record_path = self.store.branch_record_path(&slug);
         if record_path.exists() {
             return Err(NewgitError::BranchInstanceExists {
@@ -1924,6 +1981,10 @@ impl BranchManager {
         checkpoint_id: &str,
     ) -> Result<SpawnFromCheckpointOutcome> {
         let link = self.remote.as_ref().ok_or(NewgitError::NoRemote)?;
+        validate_name(name)?;
+        // Held across the spawn and the undo that finishes it: nothing else
+        // gets to see the instance half-built.
+        let _lock = self.lock_instance(&branch_slug(name), name)?;
         let remote = link.connect(Acting::Login)?;
         let project = link.project.clone();
         let from_slug = branch_slug(from_instance);
@@ -3028,6 +3089,7 @@ impl BranchManager {
 
     /// Run `<resource>.<action>` for an instance.
     pub fn run_action(&self, instance: &str, spec: &str) -> Result<ActionOutcome> {
+        let (_lock, _) = self.locked_branch(instance)?;
         let (mut branch, definition, action, action_name) = self.resolve_action(instance, spec)?;
         let supervisor = self.supervisor(&branch);
 
@@ -3379,6 +3441,18 @@ impl BranchManager {
             "NEWGIT_WORKSPACE".to_owned(),
             (branch.workspace_path.to_string(), EnvSource::Newgit),
         );
+        // A hook run under the instance's lock is told so, with the pid
+        // holding it, so a `newgit` it starts on this instance can refuse
+        // instead of waiting for its own ancestor (see `crate::lock`).
+        if self.held_lock(&branch.slug).is_some() {
+            env.insert(
+                LOCKED_ENV.to_owned(),
+                (
+                    format!("{}:{}", branch.slug, std::process::id()),
+                    EnvSource::Newgit,
+                ),
+            );
+        }
 
         let vars = env
             .into_iter()
@@ -3541,7 +3615,11 @@ impl BranchManager {
         }
 
         let mut unbound_instances = Vec::new();
-        for mut branch in bound {
+        for branch in bound {
+            let (_lock, mut branch) = self.locked_branch(&branch.slug)?;
+            if !branch.resources.contains_key(name) {
+                continue;
+            }
             let supervisor = self.supervisor(&branch);
             if supervisor.running_pid(name).is_some() {
                 // Best-effort: a `--force` remove should not leave a process
@@ -3867,6 +3945,9 @@ impl BranchManager {
         tracker: &str,
         uncommitted: Uncommitted,
     ) -> Result<BindingChange> {
+        // Held through the rebuild too, which saves the record it loads;
+        // the inner change takes the same lock again.
+        let (_lock, _) = self.locked_branch(instance)?;
         let before = self.binding_before(instance)?;
         let mut change = self.drop_tracker_inner(instance, tracker, uncommitted)?;
         change.rebuilt = self.rebuild_for_binding(instance, &before)?;
@@ -3881,7 +3962,7 @@ impl BranchManager {
         tracker: &str,
         uncommitted: Uncommitted,
     ) -> Result<BindingChange> {
-        let mut branch = self.store.find_branch(instance)?;
+        let (_lock, mut branch) = self.locked_branch(instance)?;
         self.require_workspace(&branch)?;
         let mut change = BindingChange {
             tracker: tracker.to_owned(),
@@ -4031,6 +4112,9 @@ impl BranchManager {
     /// stashed; a secret tracker's last content in this instance is projected
     /// back.
     pub fn use_tracker(&self, instance: &str, tracker: &str) -> Result<BindingChange> {
+        // Held through the rebuild too, which saves the record it loads;
+        // the inner change takes the same lock again.
+        let (_lock, _) = self.locked_branch(instance)?;
         let before = self.binding_before(instance)?;
         let mut change = self.use_tracker_inner(instance, tracker, true)?;
         change.rebuilt = self.rebuild_for_binding(instance, &before)?;
@@ -4053,7 +4137,7 @@ impl BranchManager {
         tracker: &str,
         outermost: bool,
     ) -> Result<BindingChange> {
-        let mut branch = self.store.find_branch(instance)?;
+        let (_lock, mut branch) = self.locked_branch(instance)?;
         self.require_workspace(&branch)?;
         let mut change = BindingChange {
             tracker: tracker.to_owned(),
@@ -4359,7 +4443,7 @@ impl BranchManager {
     }
 
     pub fn capture_tracker(&self, instance: &str, tracker: &str) -> Result<CaptureReport> {
-        let mut branch = self.store.find_branch(instance)?;
+        let (_lock, mut branch) = self.locked_branch(instance)?;
         let definition = self.definition(tracker)?;
         self.require_workspace(&branch)?;
 
@@ -4466,7 +4550,7 @@ impl BranchManager {
         tracker: &str,
         rev: Option<&str>,
     ) -> Result<RestoreReport> {
-        let mut branch = self.store.find_branch(instance)?;
+        let (_lock, mut branch) = self.locked_branch(instance)?;
         let definition = self.definition(tracker)?;
         self.require_workspace(&branch)?;
         let lane = self.lane(&definition.name);
@@ -4540,7 +4624,7 @@ impl BranchManager {
 
     /// Pull a tracker's lane head into an existing instance.
     pub fn pull_tracker(&self, instance: &str, tracker: &str) -> Result<TrackerBindOutcome> {
-        let mut branch = self.store.find_branch(instance)?;
+        let (_lock, mut branch) = self.locked_branch(instance)?;
         let definition = self.definition(tracker)?;
         self.require_workspace(&branch)?;
 
@@ -4858,7 +4942,7 @@ impl BranchManager {
         checkpoints: ArchivedCheckpoints,
         source_branch: SourceBranchPolicy,
     ) -> Result<RemoveOutcome> {
-        let branch = self.store.find_branch(name)?;
+        let (_lock, branch) = self.locked_branch(name)?;
 
         if cwd.starts_with(&branch.workspace_path) {
             return Err(NewgitError::Unsupported(format!(
@@ -5384,6 +5468,7 @@ impl BranchManager {
             .partition(|branch| branch.workspace_path.is_dir());
 
         for branch in &stale {
+            let _lock = self.lock_instance(&branch.slug, &branch.name)?;
             let hooks = self.run_cleanup_hooks(branch, dry_run)?;
             let archived_record = if dry_run {
                 None
@@ -6107,7 +6192,7 @@ impl BranchManager {
     /// Record one coherent snapshot across source, trackers, and resources.
     pub fn checkpoint(&self, instance: &str, message: Option<&str>) -> Result<CheckpointOutcome> {
         self.require_resolvable_graph()?;
-        let mut branch = self.store.find_branch(instance)?;
+        let (_lock, mut branch) = self.locked_branch(instance)?;
         self.checkpoint_branch(&mut branch, message, CheckpointReason::Explicit)
     }
 
@@ -6153,7 +6238,7 @@ impl BranchManager {
         admitting: Option<&Utf8Path>,
     ) -> Result<PushOutcome> {
         self.require_resolvable_graph()?;
-        let mut branch = self.store.find_branch(instance)?;
+        let (_lock, mut branch) = self.locked_branch(instance)?;
         let on_remote = self.remote.is_some() && branch.remote.is_some();
         let url = match &branch.remote {
             Some(binding) if on_remote => binding.endpoint.clone(),
@@ -6291,7 +6376,7 @@ impl BranchManager {
         message: Option<&str>,
     ) -> Result<VerifyOutcome> {
         self.require_resolvable_graph()?;
-        let mut branch = self.store.find_branch(instance)?;
+        let (_lock, mut branch) = self.locked_branch(instance)?;
         let before = self.checkpoint_branch(&mut branch, message, CheckpointReason::Explicit)?;
 
         let undo = self.undo(
@@ -6418,6 +6503,10 @@ impl BranchManager {
         message: Option<&str>,
         reason: CheckpointReason,
     ) -> Result<CheckpointOutcome> {
+        debug_assert!(
+            self.held_lock(&branch.slug).is_some(),
+            "a checkpoint is taken under the instance's lock"
+        );
         self.require_workspace(branch)?;
         // A checkpoint is the promise that this state can be returned to.
         // Hand edits to a rendered file are the one thing it cannot carry —
@@ -6795,7 +6884,7 @@ impl BranchManager {
             let head = self.source.rev_parse(&format!("refs/heads/{branch}"))?;
             (PROJECT_ROOT_INSTANCE.to_owned(), String::new(), head)
         } else {
-            let mut branch = self.store.find_branch(instance)?;
+            let (_lock, mut branch) = self.locked_branch(instance)?;
             let checkpoint = self.checkpoint_branch(
                 &mut branch,
                 Some(&format!("before `newgit merge` into {into}")),
@@ -7564,7 +7653,7 @@ impl BranchManager {
     /// always undoable and running it twice is redo.
     pub fn undo(&self, instance: &str, options: &UndoOptions) -> Result<UndoOutcome> {
         self.require_resolvable_graph()?;
-        let mut branch = self.store.find_branch(instance)?;
+        let (_lock, mut branch) = self.locked_branch(instance)?;
         self.require_workspace(&branch)?;
         let checkpoint_log = self.checkpoint_log(&branch);
         let restored = match options.to.as_deref() {

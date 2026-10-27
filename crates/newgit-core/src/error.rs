@@ -48,6 +48,13 @@ pub enum NewgitError {
     #[error("no branch instance named `{0}`")]
     UnknownBranchInstance(String),
 
+    #[error(
+        "a newgit command (pid {pid}) is already running on `{instance}` and this one was \
+         started from inside it — a hook cannot run a newgit command that changes its own \
+         instance; it would wait for itself forever"
+    )]
+    NestedCommand { instance: String, pid: u32 },
+
     #[error("workspace directory already exists at {0}; remove it or pick another name")]
     WorkspaceExists(Utf8PathBuf),
 

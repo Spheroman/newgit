@@ -10,6 +10,7 @@ pub mod export;
 pub mod export_target;
 pub mod exports;
 pub mod installs;
+pub mod lock;
 pub mod manager;
 pub mod materializer;
 pub mod ports;

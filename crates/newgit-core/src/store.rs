@@ -1,3 +1,5 @@
+use std::io::Write;
+
 use camino::{Utf8Path, Utf8PathBuf};
 use chrono::Utc;
 use serde::Serialize;
@@ -8,6 +10,7 @@ use crate::config::{ProjectConfig, SourceSubstrate};
 use crate::error::{NewgitError, Result};
 use crate::export_target::ExportTarget;
 use crate::installs::InstallStore;
+use crate::lock::InstanceLock;
 use crate::materializer::{WorkspaceMarker, create_dir_all};
 use crate::resource::ResourceDefinition;
 use crate::tracker::{TrackerDefinition, resolve_ownership};
@@ -306,6 +309,14 @@ impl MetadataStore {
         }
         self.write_toml(&path, &format!("branch `{}`", branch.name), branch)?;
         Ok(path)
+    }
+
+    /// Take `slug`'s lock (see [`crate::lock`]), waiting for any other
+    /// process that holds it. Commands go through
+    /// `BranchManager::lock_instance`, which also hands a nested call the
+    /// lock the manager already holds.
+    pub fn lock_instance(&self, slug: &str, name: &str) -> Result<InstanceLock> {
+        InstanceLock::acquire(&self.paths.local.join("locks"), slug, name)
     }
 
     /// Overwrite an existing binding record (e.g. after a tracker capture).
@@ -713,7 +724,23 @@ where
         label: label.to_owned(),
         source,
     })?;
-    std::fs::write(path, contents).map_err(|source| NewgitError::io(path, source))
+    // Written whole to a temporary file beside it, then renamed over it:
+    // a reader sees the old record or the new one, never the truncated
+    // middle `std::fs::write` goes through, and a process that dies
+    // mid-write leaves the record it found (#212). The temporary has no
+    // `.toml` extension, so a directory listing never mistakes a leftover
+    // one for a record.
+    let dir = path.parent().unwrap_or_else(|| Utf8Path::new("."));
+    let mut temp = tempfile::Builder::new()
+        .prefix(".")
+        .suffix(".tmp")
+        .tempfile_in(dir)
+        .map_err(|source| NewgitError::io(dir, source))?;
+    temp.write_all(contents.as_bytes())
+        .map_err(|source| NewgitError::io(path, source))?;
+    temp.persist(path)
+        .map_err(|error| NewgitError::io(path, error.error))?;
+    Ok(())
 }
 
 /// Immediate subdirectories, sorted. The dir-shaped counterpart to

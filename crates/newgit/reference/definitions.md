@@ -1062,10 +1062,21 @@ one deliberate overlap is a `captures` entry naming its *own* resource's
 front, and the action overwrites it with the one that did not exist until it
 ran. The owner is the same resource either way.
 
-`NEWGIT_BRANCH` and `NEWGIT_WORKSPACE` are reserved. newgit sets them for
-every command it runs, so a resource declaring one is reported too — a
-declaration that could never reach the process is a mistake worth naming,
-not a silent no-op.
+`NEWGIT_BRANCH`, `NEWGIT_WORKSPACE`, and `NEWGIT_LOCKED` are reserved.
+newgit sets them for every command it runs, so a resource declaring one is
+reported too — a declaration that could never reach the process is a
+mistake worth naming, not a silent no-op.
+
+`NEWGIT_LOCKED` is set only for a hook run by a command that holds the
+instance's lock — every command that changes an instance (`spawn`,
+`action`, `checkpoint`, `undo`, `tracker` binding changes, `remove`) holds
+it from start to finish, so two of them on one instance run one after the
+other rather than over each other. Its value is `<slug>:<pid>`, the locked
+instance and the process holding it. A `newgit` started from such a hook
+that would need the same lock — a `[checkpoint] command` running `newgit
+checkpoint` on its own instance — refuses at once and says so, instead of
+waiting for its own ancestor forever. `newgit run` holds no lock and does
+not set it.
 
 This is why the starter templates do not ship conventional names like `PORT`
 or `DATABASE_URL`. Two services in one project cannot both publish `PORT`,
