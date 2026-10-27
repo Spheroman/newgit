@@ -307,3 +307,106 @@ fn an_import_refuses_history_that_adds_a_secret() {
         ""
     );
 }
+
+/// An instance spawned before the import, with work of its own on top of
+/// the root's tip, keeps its view: it went on from that tip without
+/// t3code, so the marker on t3code's `main` is not its join.
+#[test]
+fn an_import_leaves_instances_from_before_it_alone() {
+    let (_guard, temp) = tempdir();
+    let (store, outside) = setup(&temp);
+    let repo = store.paths().project_root.clone();
+    let manager = BranchManager::open(store.clone()).expect("manager");
+    let spawned = manager.spawn("feature-a", None).expect("spawn");
+    let workspace = spawned.branch.workspace_path.clone();
+    let work = commit(
+        &workspace,
+        &[("notes.txt", "mine\n")],
+        "my work",
+        "ana",
+        7_000,
+    );
+    manager.checkpoint("feature-a", None).expect("checkpoint");
+    manager
+        .tracker_log_target("root", Some("feature-a"))
+        .expect("split the work");
+    let root_branch = "refs/newgit/trackers/root/instances/feature-a";
+    assert_eq!(
+        git(&repo, &["log", "-1", "--format=%s", root_branch]),
+        "my work"
+    );
+    let view_ref = "refs/newgit/views/instances/feature-a";
+
+    let manager = BranchManager::open(store.clone()).expect("reopen");
+    manager
+        .import_code_tracker(
+            "t3code",
+            "project-devs",
+            Utf8Path::new(MOUNT),
+            outside.as_str(),
+            Some("newgit"),
+        )
+        .expect("import");
+    assert_eq!(
+        git(&repo, &["rev-parse", view_ref]),
+        work,
+        "the instance's work keeps its id, and has no t3code"
+    );
+}
+
+/// Carving a tracker out of a mounted one is refused, and leaves nothing
+/// behind: the mounted tracker's commits hold its files at its own root,
+/// where the carve would find none of them.
+#[test]
+fn carving_inside_a_mount_is_refused() {
+    let (_guard, temp) = tempdir();
+    let (store, outside) = setup(&temp);
+    let manager = BranchManager::open(store.clone()).expect("manager");
+    manager
+        .import_code_tracker(
+            "t3code",
+            "project-devs",
+            Utf8Path::new(MOUNT),
+            outside.as_str(),
+            Some("newgit"),
+        )
+        .expect("import");
+    let manager = BranchManager::open(store.clone()).expect("reopen");
+    let error = manager
+        .create_code_tracker("t3side", "project-devs", &path("apps/t3code/side.js"))
+        .expect_err("refused");
+    assert!(
+        error.to_string().contains("mounted at `apps/t3code`"),
+        "{error}"
+    );
+    assert!(!store.paths().trackers.join("t3side.toml").exists());
+    let manager = BranchManager::open(store).expect("reopen");
+    manager.sync_project_root().expect("sync still works");
+}
+
+#[test]
+fn an_import_says_when_the_history_has_submodules() {
+    let (_guard, temp) = tempdir();
+    let (store, outside) = setup(&temp);
+    commit(
+        &outside,
+        &[(
+            ".gitmodules",
+            "[submodule \"x\"]\n\tpath = x\n\turl = ../x\n",
+        )],
+        "submodules",
+        "bo",
+        3_500,
+    );
+    let manager = BranchManager::open(store).expect("manager");
+    let outcome = manager
+        .import_code_tracker(
+            "t3code",
+            "project-devs",
+            Utf8Path::new(MOUNT),
+            outside.as_str(),
+            Some("newgit"),
+        )
+        .expect("import");
+    assert!(outcome.submodules);
+}

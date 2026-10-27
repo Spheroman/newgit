@@ -1628,6 +1628,12 @@ fn tracker(command: TrackerCommand) -> Result<()> {
             println!(
                 "  commit to it with Git; newgit splits your commits into it when work leaves the machine"
             );
+            if outcome.submodules {
+                println!(
+                    "  note:      its .gitmodules is now {mount}/.gitmodules, which Git does not read, \
+                     so its submodules are not checked out"
+                );
+            }
             Ok(())
         }
         TrackerCommand::Create {

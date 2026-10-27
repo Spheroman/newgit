@@ -96,6 +96,9 @@ pub struct ImportCodeTrackerOutcome {
     pub join: String,
     /// The join marker on the tracker's `main` recording it.
     pub marker: String,
+    /// The history has a `.gitmodules`: under the mount Git does not read
+    /// it, so its submodules are not checked out.
+    pub submodules: bool,
 }
 
 /// What `spawn --from-checkpoint` did.
@@ -1240,6 +1243,9 @@ impl BranchManager {
                 .trim()
                 .parse()
                 .unwrap_or(0);
+            let submodules = !git(&["ls-tree", "--name-only", &imported, "--", ".gitmodules"])?
+                .trim()
+                .is_empty();
             let joined = crate::compose::join(&root, &definition, &after, &imported, &main)?;
 
             // The root's view with the new tracker in it: the join on top of
@@ -1257,31 +1263,44 @@ impl BranchManager {
                     "`{name}` would not join on top of `{project_branch}`; nothing was imported"
                 )));
             }
-            Ok((commits, joined, view))
+            Ok((commits, submodules, joined, view))
         });
         let _ = git(&["update-ref", "-d", &fetched_ref]);
-        let (commits, joined, view) = match result {
-            Ok(done) => done,
-            Err(error) => {
-                let _ = git(&["update-ref", "-d", &main]);
-                return Err(error);
+        let finished = result.and_then(|(commits, submodules, joined, view)| {
+            self.publish_code_refs(name, &["main"])?;
+            let definition_path = self.store.create_tracker_definition(&definition)?;
+            let checked_out = git(&["symbolic-ref", "-q", "HEAD"]).unwrap_or_default();
+            if checked_out.trim() == branch_ref {
+                git(&["merge", "--ff-only", "-q", &view])?;
+            } else {
+                self.source.update_ref(&branch_ref, &view)?;
             }
-        };
-
-        self.publish_code_refs(name, &["main"])?;
-        let definition_path = self.store.create_tracker_definition(&definition)?;
-        let checked_out = git(&["symbolic-ref", "-q", "HEAD"]).unwrap_or_default();
-        if checked_out.trim() == branch_ref {
-            git(&["merge", "--ff-only", "-q", &view])?;
-        } else {
-            self.source.update_ref(&branch_ref, &view)?;
-        }
-        Ok(ImportCodeTrackerOutcome {
-            path: definition_path,
-            branch: project_branch,
-            commits,
-            join: joined.view,
-            marker: joined.marker,
+            Ok(ImportCodeTrackerOutcome {
+                path: definition_path,
+                branch: project_branch.clone(),
+                commits,
+                join: view,
+                marker: joined.marker,
+                submodules,
+            })
+        });
+        // A refused or failed import leaves nothing: no tracker refs here or
+        // in the store, no definition, and every view as it was (composing
+        // is deterministic, so composing without the tracker restores them).
+        finished.inspect_err(|_| {
+            let _ = git(&["update-ref", "-d", &main]);
+            let store = self.store.paths().tracker_store.clone();
+            let _ = crate::source::run_git_env(
+                &[
+                    &format!("--git-dir={store}"),
+                    "update-ref",
+                    "-d",
+                    &format!("refs/trackers/{name}/main"),
+                ],
+                &[],
+            );
+            let _ = std::fs::remove_file(self.store.paths().trackers.join(format!("{name}.toml")));
+            let _ = self.recompose_views();
         })
     }
 
