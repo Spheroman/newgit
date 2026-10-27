@@ -142,6 +142,29 @@ pub fn compose(
             }
         }
     }
+    // The view commits this view's own line went on from: what each commit
+    // made on a spine followed (a split commit says; an original's first
+    // parent is it). A marker joins after its view commit only where
+    // nothing else did — a branch that went on from there without taking
+    // the import (forked at the import's tip, before it) never took it,
+    // even when its trackers' `main` carries the marker. A tracker's own
+    // merge (`newgit merge`) is not work made there: what it brings in
+    // decides for itself.
+    let mut went_on: BTreeSet<String> = BTreeSet::new();
+    for (_, dag, spine, raw, markers) in &histories {
+        for (id, parents) in dag {
+            if !spine.contains(id) || markers.contains(id) {
+                continue;
+            }
+            let Some(commit) = raw.get(id) else { continue };
+            let followed = match &commit.split_source {
+                Some(_) => commit.split_parent.clone(),
+                None if commit.merge => None,
+                None => parents.first().cloned(),
+            };
+            went_on.extend(followed);
+        }
+    }
     // Which marker joins each tracker here — repeated, since a join can
     // follow another tracker's join.
     let mut joining: BTreeMap<String, String> = BTreeMap::new();
@@ -155,7 +178,7 @@ pub fn compose(
                 raw[*marker]
                     .split_parent
                     .as_ref()
-                    .is_some_and(|after| present.contains(after))
+                    .is_some_and(|after| present.contains(after) && !went_on.contains(after))
             });
             if let Some(marker) = found {
                 joining.insert(tip.definition.name.clone(), marker.clone());
@@ -1167,30 +1190,28 @@ fn mounted(repo: &Utf8Path, tip: &str, mount: &Utf8Path) -> Result<BTreeMap<Stri
             .windows(2)
             .position(|pair| pair == b"\n\n")
             .unwrap_or(body.len());
-        let headers = String::from_utf8_lossy(&body[..split]);
-        let message = body.get(split + 2..).unwrap_or_default();
-        let header = |key: &str| {
-            headers
-                .lines()
-                .find_map(|line| line.strip_prefix(key).map(ToOwned::to_owned))
+        // Headers as bytes: a name in another encoding is copied as it is.
+        let header = |key: &[u8]| {
+            body[..split]
+                .split(|&byte| byte == b'\n')
+                .find_map(|line| line.strip_prefix(key))
         };
-        let tree = header("tree ").ok_or_else(|| missing(id))?;
+        let message = body.get(split + 2..).unwrap_or_default();
+        let tree = header(b"tree ")
+            .map(|tree| String::from_utf8_lossy(tree).into_owned())
+            .ok_or_else(|| missing(id))?;
         let mark = index + 1;
         marks.insert(id, mark);
         writeln!(stream, "reset {scratch}").ok();
         writeln!(stream, "commit {scratch}").ok();
         writeln!(stream, "mark :{mark}").ok();
-        if let Some(author) = header("author ") {
-            writeln!(stream, "author {author}").ok();
-        }
-        writeln!(
-            stream,
-            "committer {}",
-            header("committer ").unwrap_or_default()
-        )
-        .ok();
-        if let Some(encoding) = header("encoding ") {
-            writeln!(stream, "encoding {encoding}").ok();
+        for key in ["author", "committer", "encoding"] {
+            let Some(value) = header(format!("{key} ").as_bytes()) else {
+                continue;
+            };
+            stream.extend_from_slice(format!("{key} ").as_bytes());
+            stream.extend_from_slice(value);
+            stream.push(b'\n');
         }
         writeln!(stream, "data {}", message.len()).ok();
         stream.extend_from_slice(message);

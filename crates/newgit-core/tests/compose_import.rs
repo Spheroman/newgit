@@ -363,6 +363,100 @@ fn a_branch_from_before_the_import_has_no_t3code_until_it_takes_it() {
     assert_eq!(git(repo, &["show", &format!("{after}:README.md")]), "hello");
 }
 
+/// Forked at the import's own view commit `b`, with work on top of it made
+/// before the import: the branch went on from `b` without t3code, so the
+/// marker on t3code's `main` (joining after `b`) is not its join.
+#[test]
+fn a_branch_that_went_on_from_the_imports_tip_does_not_take_it() {
+    let (_guard, temp) = tempdir();
+    let project = project(&temp);
+    let repo = &project.repo;
+    let (root, t3code) = definitions();
+    let all = [root.clone(), t3code.clone()];
+
+    // Work made in the view on top of `b` and split into root, as an
+    // instance does, and work committed straight onto root's history.
+    let only_root = [TrackerTip {
+        definition: &root,
+        commit: project.b.clone(),
+    }];
+    assert_eq!(view(repo, "before", &only_root, &all), project.b);
+    git(repo, &["checkout", "-q", "--detach", &project.b]);
+    let split_work = commit(repo, &[("notes.txt", "split\n")], "split work", 7_000);
+    let split = compose::split(repo, &project.b, &split_work, &[&root], &all).expect("split");
+    git(repo, &["checkout", "-q", "--detach", &project.b]);
+    let plain_work = commit(repo, &[("notes.txt", "plain\n")], "plain work", 7_000);
+
+    let joined = import(&project, &t3code);
+    for (name, root_tip, expected) in [
+        ("split", &split.state["root"], &split_work),
+        ("plain", &plain_work, &plain_work),
+    ] {
+        let tip = view(
+            repo,
+            name,
+            &tips(&root, root_tip, &t3code, &joined.marker),
+            &all,
+        );
+        assert_eq!(&tip, expected, "{name}: nothing rewritten, no t3code");
+    }
+
+    // Taking it, the branch gets its own join, after its own work.
+    let taken = compose::join(
+        repo,
+        &t3code,
+        &split_work,
+        &joined.marker,
+        "refs/test/t3code/split",
+    )
+    .expect("take");
+    let tip = view(
+        repo,
+        "split",
+        &tips(&root, &split.state["root"], &t3code, &taken.marker),
+        &all,
+    );
+    assert_eq!(tip, taken.view);
+    assert_eq!(git(repo, &["rev-parse", &format!("{tip}^1")]), split_work);
+}
+
+/// The join is made again from the marker alone: a repository holding only
+/// root's history and t3code's composes the very same join commit.
+#[test]
+fn the_join_is_made_again_without_the_join_commit() {
+    let (_guard, temp) = tempdir();
+    let project = project(&temp);
+    let (root, t3code) = definitions();
+    let all = [root.clone(), t3code.clone()];
+    let joined = import(&project, &t3code);
+
+    let fresh = temp.join("fresh");
+    git(&temp, &["init", "-q", "-b", "main", fresh.as_str()]);
+    git(
+        &fresh,
+        &[
+            "fetch",
+            "-q",
+            project.repo.as_str(),
+            &format!("{}:refs/test/root", project.b),
+            &format!("{T3CODE_MAIN}:refs/test/t3code"),
+        ],
+    );
+    let missing = Command::new("git")
+        .args(["-C", fresh.as_str(), "cat-file", "-e", &joined.view])
+        .output()
+        .expect("git runs");
+    assert!(!missing.status.success(), "the join commit is not there");
+
+    let tip = view(
+        &fresh,
+        "main",
+        &tips(&root, &project.b, &t3code, &joined.marker),
+        &all,
+    );
+    assert_eq!(tip, joined.view);
+}
+
 #[test]
 fn a_second_import_can_join_after_the_first() {
     let (_guard, temp) = tempdir();
@@ -659,4 +753,65 @@ fn outside_commits_on_the_trackers_line_rewrite_the_view() {
         !reachable.contains(&r),
         "`r` was rebuilt under the upstream commits: why a sync is one merge"
     );
+}
+
+/// A commit's raw headers, bytes as they are.
+fn raw_headers(repo: &Utf8Path, commit: &str) -> Vec<Vec<u8>> {
+    let output = Command::new("git")
+        .args(["-C", repo.as_str(), "cat-file", "commit", commit])
+        .output()
+        .expect("git runs");
+    output
+        .stdout
+        .split(|&byte| byte == b'\n')
+        .filter(|line| line.starts_with(b"author ") || line.starts_with(b"committer "))
+        .map(<[u8]>::to_vec)
+        .collect()
+}
+
+/// The copy under the mount keeps the original's bytes: an author name in
+/// Latin-1, as older repositories have them, is not turned into U+FFFD.
+#[test]
+fn the_copy_under_the_mount_keeps_header_bytes() {
+    let (_guard, temp) = tempdir();
+    let project = project(&temp);
+    let repo = &project.repo;
+    let (root, t3code) = definitions();
+    let all = [root.clone(), t3code.clone()];
+    let under = project.imported.last().expect("tip").clone();
+    let tree = git(repo, &["rev-parse", &format!("{under}^{{tree}}")]);
+    let mut raw = format!("tree {tree}\nparent {under}\n").into_bytes();
+    raw.extend_from_slice(b"author J\xf6rg <j@example.com> 3500 +0000\n");
+    raw.extend_from_slice(b"committer J\xf6rg <j@example.com> 3500 +0000\n");
+    raw.extend_from_slice(b"encoding ISO-8859-1\n\nt3code: latin-1\n");
+    let mut child = Command::new("git")
+        .args([
+            "-C",
+            repo.as_str(),
+            "hash-object",
+            "-w",
+            "-t",
+            "commit",
+            "--stdin",
+        ])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .expect("git runs");
+    std::io::Write::write_all(&mut child.stdin.take().expect("stdin"), &raw).expect("write");
+    let latin = String::from_utf8(child.wait_with_output().expect("git runs").stdout)
+        .expect("an id")
+        .trim()
+        .to_owned();
+
+    let joined = compose::join(repo, &t3code, &project.b, &latin, T3CODE_MAIN).expect("join");
+    let tip = view(
+        repo,
+        "main",
+        &tips(&root, &project.b, &t3code, &joined.marker),
+        &all,
+    );
+    let copy = git(repo, &["rev-parse", &format!("{tip}^2")]);
+    assert_ne!(copy, latin);
+    assert_eq!(raw_headers(repo, &copy), raw_headers(repo, &latin));
 }

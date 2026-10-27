@@ -177,7 +177,10 @@ the tracker as `main` has it, joining after that branch's own commit. The two
 are siblings, as in Git: `main` keeps its join, the branch gets its own
 without taking anything else from `main`, and merging the branch back merges
 the tracker as usual. The first marker whose view commit is in a view joins
-it; a later one (merged back from a branch) changes nothing there. A join's
+it, unless that view went on from the same commit without it (work made on
+top of it, by a branch forked there before the import): that branch never
+took the tracker, even though its `main` carries the marker. A later marker
+(merged back from a branch) changes nothing there. A join's
 second parent skips earlier markers: they are bookkeeping, never history
 anyone reads. The join is deterministic: author and committer `newgit
 <newgit@localhost>`, dated the later of its two parents, message `Import
