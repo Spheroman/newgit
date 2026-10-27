@@ -68,7 +68,6 @@ priority = 10
 | `requires` | Trackers or roles this one needs: bound with it, and merged before (or with) it. |
 | `secret` | Never in the workspace's Git: excluded, never committed, captured by newgit from the files at checkpoint. The default; `secret = false` makes a code tracker. |
 | `maintainers` | Who may merge changes to it: `owner`, `project-devs`, or `user:<login>`; by default its audience. See *Who may change what*. |
-| `imported` | Set by an import from outside the project (`imported = { anchor = "<view commit>", tip = "<tracker commit>" }`): the view commit the tracker joined after, and the last imported commit. See *An imported tracker joins through one merge*. |
 | `merge` *(planned)* | `with-change` (merged together with whatever else a change touched) or `explicit` (only by `newgit tracker merge`; env files). Would replace `merge_with_source`. |
 | `production` *(planned)* | Production content: agent and instance tokens may not bind it, and its resources' destructive hooks are refused. |
 
@@ -158,32 +157,35 @@ the earliest commit whose position changed.
 history comes from outside the project (a separate repository brought in
 with its history) is not interleaved by date: its commits predate and
 interleave with the project's, so date order would give every existing view
-commit a new parent and a new id. Instead its definition records an
-`imported` anchor, the view commit it joined after, and the import's tip.
-Composing places one merge commit right after the group whose source is the
-anchor: first parent the anchor, second parent the import tip itself,
-reused as-is, and the anchor's tree with the tracker's paths set to the
-tip's. (A view that drops the anchor, because it lacks the tracker the
-anchor changed, places the merge after the commit before it.) Commits the
-tracker makes after the import interleave as usual and never ahead of that
-merge. Adding the tracker appends exactly one commit to
-every view and rewrites nothing. The merge is deterministic, so every
-machine and the Git endpoint compose the same id: author and committer
-`newgit <newgit@localhost>`, dated the later of the anchor's and the tip's
-committer dates, message `Import <tracker> into <paths>`. It is `git subtree
-add`'s shape, so `git log -- <path>` and `git blame` follow the second
-parent into the real history, and `git log --first-parent` shows the
-import as one commit. The anchor lives in the definition rather than a
-note: compose already has every definition, on every machine, and a note
-that was never fetched would silently compose different ids.
+commit a new parent and a new id. It joins a branch the way `git subtree add`
+would: one merge on top of the branch, first parent the branch's commit,
+second parent the imported history itself, reused as-is, and the branch's
+tree with the tracker's paths set to the imported history's. Adding the
+tracker appends exactly one commit and rewrites nothing, and `git log --
+<path>` and `git blame` follow the second parent into the real history.
 
-**A view without the anchor leaves an imported tracker out (decided).** A
-branch forked before the import does not contain the anchor, so its view
-has no merge to hang the tracker on, and the tracker contributes nothing to
-it until the branch merges `main`. Placing the merge on the branch's first
-commit after the anchor's date would give every later commit on the branch
-a new parent, which is the rewrite this design exists to avoid. `newgit
-tracker use` on such an instance refuses and says to merge `main` first.
+**The join is a commit on the tracker's history (decided).** Where a branch
+took the tracker is recorded as a *join marker*: a commit on top of the
+history it took, changing nothing, marked `Newgit-Import: <that commit>`,
+`Newgit-Split-Parent: <the view commit it joins after>`, and `Newgit-Split:
+<the join>`. It is the tracker's piece of the join, so it travels wherever
+tracker history goes (other machines, the remote, the Git endpoint), and
+composing makes the join again from it. The import writes one on `main`; a
+branch from before the import that takes the tracker gets its own, on top of
+the tracker as `main` has it, joining after that branch's own commit. The two
+are siblings, as in Git: `main` keeps its join, the branch gets its own
+without taking anything else from `main`, and merging the branch back merges
+the tracker as usual. The first marker whose view commit is in a view joins
+it; a later one (merged back from a branch) changes nothing there. A join's
+second parent skips earlier markers: they are bookkeeping, never history
+anyone reads. The join is deterministic: author and committer `newgit
+<newgit@localhost>`, dated the later of its two parents, message `Import
+<tracker> into <paths>`.
+
+**A view the tracker has not joined leaves it out (decided).** A branch
+forked before the import has no join, so its view has no t3code until the
+branch takes it. Placing the merge by date would give every later commit on
+the branch a new parent, which is the rewrite this design exists to avoid.
 
 **Merges keep every parent (decided).** Replay covers each tracker's whole
 history, not just its first-parent line: the commits a merge brings in are
@@ -570,10 +572,18 @@ environment identity is simply the set of tracker commits it composes.
 
 ## Decided with Jack (2026-10-26)
 
-1. **An imported tracker joins through one merge** on top of an `imported`
-   anchor kept in its definition, not a note (see *An imported tracker joins
-   through one merge*). Its post-import commits interleave as usual.
-2. **A view without the anchor leaves an imported tracker out** until the
-   branch merges `main`, rather than placing the merge by date.
-3. **`git log` and `git blame` reach through the merge**: its second parent
-   is the imported history itself, reused as-is.
+1. **An imported tracker joins through one merge**, `git subtree add`'s
+   shape, rather than interleaving by date (see *An imported tracker joins
+   through one merge*).
+2. **The join is a commit on the tracker's history**, a join marker, not a
+   field in its definition or a branch record: it travels with tracker
+   history, and `main` and older branches use the same mechanism.
+   *(Revised the same day.)* The first answer kept one anchor in the
+   definition and left the tracker out of any branch without it; a branch
+   from before the import then had no way in but merging `main`, and
+   splitting that merge loses its second parent.
+3. **A branch from before the import takes the tracker with its own join**,
+   on top of its own commits, like a normal Git merge, without taking the
+   rest of `main`.
+4. **`git log` and `git blame` reach through the join**: its second parent
+   is the imported history itself.

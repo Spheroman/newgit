@@ -1,15 +1,14 @@
 //! An imported tracker (newgit-trackers.md, *An imported tracker joins
-//! through one merge*): a history from outside the project joins the view
-//! through one merge on its anchor, rather than interleaving by date, so
-//! adding it rewrites nothing.
+//! through one merge*): a history from outside the project joins each view
+//! through one merge, marked on its history, rather than interleaving by
+//! date, so taking it rewrites nothing — on `main` at the import, and on a
+//! branch from before the import when that branch takes it.
 
 use std::process::Command;
 
 use camino::{Utf8Path, Utf8PathBuf};
 use newgit_core::compose::{self, TrackerTip};
-use newgit_core::tracker::{Imported, Storage, TrackerDefinition};
-
-const VIEW: &str = "refs/newgit/views/test";
+use newgit_core::tracker::{Storage, TrackerDefinition};
 
 fn git_env(dir: &Utf8Path, args: &[&str], env: &[(&str, String)]) -> String {
     let output = Command::new("git")
@@ -79,7 +78,6 @@ fn tracker(name: &str, paths: &[&str], excluded: &[&str]) -> TrackerDefinition {
         requires: Vec::new(),
         resources: Vec::new(),
         excluded: excluded.iter().map(Utf8PathBuf::from).collect(),
-        imported: None,
         definition_rev: "sha256:000000000000".to_owned(),
     }
 }
@@ -147,14 +145,19 @@ fn project(temp: &Utf8Path) -> Project {
     }
 }
 
-fn definitions(project: &Project) -> (TrackerDefinition, TrackerDefinition) {
-    let root = tracker("root", &["."], &["apps/t3code"]);
-    let mut t3code = tracker("t3code", &["apps/t3code"], &[]);
-    t3code.imported = Some(Imported {
-        anchor: project.b.clone(),
-        tip: project.imported.last().expect("tip").clone(),
-    });
-    (root, t3code)
+const T3CODE_MAIN: &str = "refs/test/t3code/main";
+
+fn definitions() -> (TrackerDefinition, TrackerDefinition) {
+    (
+        tracker("root", &["."], &["apps/t3code"]),
+        tracker("t3code", &["apps/t3code"], &[]),
+    )
+}
+
+/// The import on `main`: t3code joins after `b`.
+fn import(project: &Project, t3code: &TrackerDefinition) -> compose::Joined {
+    let under = project.imported.last().expect("tip");
+    compose::join(&project.repo, t3code, &project.b, under, T3CODE_MAIN).expect("join")
 }
 
 fn tips<'a>(
@@ -175,47 +178,46 @@ fn tips<'a>(
     ]
 }
 
+fn view(repo: &Utf8Path, name: &str, tips: &[TrackerTip<'_>], all: &[TrackerDefinition]) -> String {
+    compose::compose(repo, &format!("refs/newgit/views/{name}"), tips, all)
+        .expect("compose")
+        .tip
+        .expect("a view")
+}
+
 #[test]
-fn an_imported_tracker_joins_through_one_merge_on_its_anchor() {
+fn an_imported_tracker_joins_main_through_one_merge() {
     let (_guard, temp) = tempdir();
     let project = project(&temp);
     let repo = &project.repo;
-    let (root, t3code) = definitions(&project);
-    let import_tip = project.imported.last().expect("tip");
+    let (root, t3code) = definitions();
+    let all = [root.clone(), t3code.clone()];
+    let under = project.imported.last().expect("tip");
+    let joined = import(&project, &t3code);
 
-    let view = compose::compose(
+    let merge = view(
         repo,
-        VIEW,
-        &tips(&root, &project.b, &t3code, import_tip),
-        &[root.clone(), t3code.clone()],
-    )
-    .expect("compose");
-    let merge = view.tip.expect("a view");
+        "main",
+        &tips(&root, &project.b, &t3code, &joined.marker),
+        &all,
+    );
+    assert_eq!(merge, joined.view, "the join is reused as itself");
 
     // One commit appended; everything before it is the original history.
     assert_eq!(git(repo, &["rev-parse", &format!("{merge}^1")]), project.b);
-    assert_eq!(
-        git(repo, &["rev-parse", &format!("{merge}^2")]),
-        *import_tip
-    );
+    assert_eq!(git(repo, &["rev-parse", &format!("{merge}^2")]), *under);
     assert_eq!(
         git(repo, &["rev-list", "--first-parent", &merge]),
         format!("{merge}\n{}\n{}", project.b, project.a),
         "the project's commits keep their ids"
     );
     assert_eq!(
-        git(repo, &["log", "-1", "--format=%an <%ae> %at|%s", &merge]),
+        git(repo, &["log", "-1", "--format=%an <%ae> %at|%B", &merge]),
         "newgit <newgit@localhost> 6000|Import t3code into apps/t3code"
     );
-
-    // The anchor's tree plus the tracker's paths at the tip.
     assert_eq!(
         git(repo, &["ls-tree", "-r", "--name-only", &merge]),
         "README.md\napps/t3code/app.js\napps/t3code/side.js"
-    );
-    assert_eq!(
-        git(repo, &["show", &format!("{merge}:README.md")]),
-        "hello, world"
     );
 
     // `git log` and `git blame` reach through the merge into the real history.
@@ -227,22 +229,12 @@ fn an_imported_tracker_joins_through_one_merge_on_its_anchor() {
         repo,
         &["blame", "--porcelain", &merge, "--", "apps/t3code/app.js"],
     );
-    assert!(
-        blame.starts_with(&project.imported[0]),
-        "the first line is blamed on the imported commit that wrote it"
-    );
+    assert!(blame.starts_with(&project.imported[0]));
 
-    // Deterministic: another composer gets the same commit.
-    let again = compose::compose(
-        repo,
-        "refs/newgit/views/again",
-        &tips(&root, &project.b, &t3code, import_tip),
-        &[root.clone(), t3code.clone()],
-    )
-    .expect("compose");
-    assert_eq!(again.tip.as_deref(), Some(merge.as_str()));
+    // Composed where the join is not already a commit, it comes out the same.
+    git(repo, &["update-ref", "-d", "refs/newgit/views/main"]);
     let state = compose::read_state(repo, &merge).expect("state");
-    assert_eq!(state.get("t3code"), Some(import_tip));
+    assert_eq!(state.get("t3code"), Some(&joined.marker));
     assert_eq!(state.get("root"), Some(&project.b));
 }
 
@@ -251,21 +243,18 @@ fn work_after_the_import_follows_the_merge_and_keeps_its_ids() {
     let (_guard, temp) = tempdir();
     let project = project(&temp);
     let repo = &project.repo;
-    let (root, t3code) = definitions(&project);
+    let (root, t3code) = definitions();
     let all = [root.clone(), t3code.clone()];
-    let import_tip = project.imported.last().expect("tip");
-    let merge = compose::compose(
+    let joined = import(&project, &t3code);
+    let merge = view(
         repo,
-        VIEW,
-        &tips(&root, &project.b, &t3code, import_tip),
+        "main",
+        &tips(&root, &project.b, &t3code, &joined.marker),
         &all,
-    )
-    .expect("compose")
-    .tip
-    .expect("a view");
+    );
 
-    // A commit made in the view on top of the merge, touching both trackers,
-    // dated before everything (a skewed clock): it still goes after the merge.
+    // A commit on top of the merge touching both trackers, dated before
+    // everything (a skewed clock): it still goes after the merge.
     git(repo, &["checkout", "-q", "--detach", &merge]);
     let work = commit(
         repo,
@@ -278,144 +267,210 @@ fn work_after_the_import_follows_the_merge_and_keeps_its_ids() {
     );
     let split = compose::split(repo, &merge, &work, &[&root, &t3code], &all).expect("split");
     assert_eq!(split.made.len(), 2, "one commit per tracker");
-
-    let recomposed = compose::compose(
+    let recomposed = view(
         repo,
-        VIEW,
+        "main",
         &tips(&root, &split.state["root"], &t3code, &split.state["t3code"]),
         &all,
-    )
-    .expect("compose");
-    assert_eq!(
-        recomposed.tip.as_deref(),
-        Some(work.as_str()),
-        "split and recomposed, the commit on top of the merge is the same commit"
     );
+    assert_eq!(recomposed, work, "split and recomposed, the same commit");
 }
 
 #[test]
-fn a_view_without_the_anchor_leaves_the_imported_tracker_out() {
+fn a_branch_from_before_the_import_has_no_t3code_until_it_takes_it() {
     let (_guard, temp) = tempdir();
     let project = project(&temp);
     let repo = &project.repo;
-    let (root, t3code) = definitions(&project);
-    let import_tip = project.imported.last().expect("tip");
+    let (root, t3code) = definitions();
+    let all = [root.clone(), t3code.clone()];
+    let joined = import(&project, &t3code);
 
-    // A branch forked before the import: root is still at `a`.
-    let view = compose::compose(
-        repo,
-        VIEW,
-        &tips(&root, &project.a, &t3code, import_tip),
-        &[root.clone(), t3code.clone()],
-    )
-    .expect("compose");
+    // Forked at `a`, with work of its own; t3code's `main` is all it can see.
+    git(repo, &["checkout", "-q", "--detach", &project.a]);
+    let c = commit(repo, &[("notes.txt", "mine\n")], "my work", 7_000);
+    let before = view(repo, "old", &tips(&root, &c, &t3code, &joined.marker), &all);
     assert_eq!(
-        view.tip.as_deref(),
-        Some(project.a.as_str()),
+        before, c,
         "nothing is rewritten, and nothing of t3code is there"
     );
-    assert_eq!(view.commits, 1);
+
+    // Taking it: one join on top of the branch, on t3code as `main` has it.
+    let taken =
+        compose::join(repo, &t3code, &c, &joined.marker, "refs/test/t3code/old").expect("take");
+    let after = view(repo, "old", &tips(&root, &c, &t3code, &taken.marker), &all);
+    assert_eq!(after, taken.view);
+    assert_eq!(
+        git(repo, &["rev-parse", &format!("{after}^1")]),
+        c,
+        "`c` keeps its id"
+    );
+    assert_eq!(
+        git(repo, &["ls-tree", "-r", "--name-only", &after]),
+        "README.md\napps/t3code/app.js\napps/t3code/side.js\nnotes.txt",
+        "t3code, without root's `b`"
+    );
+    assert_eq!(git(repo, &["show", &format!("{after}:README.md")]), "hello");
 }
 
-/// The project with one more root commit, `b`, that also writes
-/// `apps/other` (plus `README.md` when `readme`), and `t3code` anchored on it.
-fn anchored_on_other(
-    project: &Project,
-    readme: bool,
-) -> (
-    String,
-    TrackerDefinition,
-    TrackerDefinition,
-    TrackerDefinition,
-) {
+#[test]
+fn a_second_import_can_join_after_the_first() {
+    let (_guard, temp) = tempdir();
+    let project = project(&temp);
     let repo = &project.repo;
-    git(repo, &["checkout", "-q", "main"]);
-    let mut files = vec![("apps/other/x", "x\n")];
-    if readme {
-        files.push(("README.md", "hello, other\n"));
-    }
-    let b = commit(repo, &files, "other", 6_500);
-    let (root, mut t3code) = definitions(project);
+    let (root, t3code) = definitions();
+    let other = tracker("other", &["apps/other"], &[]);
     let root = TrackerDefinition {
         excluded: vec!["apps/t3code".into(), "apps/other".into()],
         ..root
     };
-    t3code.imported.as_mut().expect("imported").anchor = b.clone();
-    (b, root, t3code, tracker("other", &["apps/other"], &[]))
+    let all = [root.clone(), t3code.clone(), other.clone()];
+    let joined = import(&project, &t3code);
+
+    git(repo, &["checkout", "-q", "--orphan", "other"]);
+    git(repo, &["rm", "-rfq", "."]);
+    let o = commit(repo, &[("apps/other/x", "x\n")], "other: start", 900);
+    git(repo, &["checkout", "-q", "main"]);
+    let second = compose::join(repo, &other, &joined.view, &o, "refs/test/other/main")
+        .expect("join after the first join");
+
+    let mut both = tips(&root, &project.b, &t3code, &joined.marker);
+    both.push(TrackerTip {
+        definition: &other,
+        commit: second.marker.clone(),
+    });
+    let tip = view(repo, "main", &both, &all);
+    assert_eq!(tip, second.view);
+    assert_eq!(git(repo, &["rev-parse", &format!("{tip}^1")]), joined.view);
 }
 
+/// Not an assertion so much as a look: the whole flow, printing each view.
+/// `cargo test -p newgit-core --test compose_import walkthrough -- --nocapture`
 #[test]
-fn a_rebuilt_anchor_still_gets_the_merge() {
+fn walkthrough_import_take_work_merge_back() {
     let (_guard, temp) = tempdir();
     let project = project(&temp);
     let repo = &project.repo;
-    // `b` also wrote `apps/other`, which this view does not bind, so `b` is
-    // rebuilt without it and the merge is written on the rebuilt commit.
-    let (b, root, t3code, other) = anchored_on_other(&project, true);
-    let import_tip = project.imported.last().expect("tip");
+    let (root, t3code) = definitions();
+    let all = [root.clone(), t3code.clone()];
+    let graph = |title: &str, tip: &str| {
+        println!(
+            "\n== {title}\n{}",
+            git(
+                repo,
+                &[
+                    "log",
+                    "--graph",
+                    "--format=%h %an: %s (%ad)",
+                    "--date=unix",
+                    tip
+                ]
+            )
+        );
+    };
 
-    let view = compose::compose(
+    // 1. The import on `main`.
+    let joined = import(&project, &t3code);
+    let main = view(
         repo,
-        VIEW,
-        &tips(&root, &b, &t3code, import_tip),
-        &[root.clone(), t3code.clone(), other],
-    )
-    .expect("compose");
-    let merge = view.tip.expect("a view");
-    assert_ne!(
-        git(repo, &["rev-parse", &format!("{merge}^1")]),
-        b,
-        "rebuilt"
+        "main",
+        &tips(&root, &project.b, &t3code, &joined.marker),
+        &all,
     );
-    assert_eq!(
-        git(repo, &["log", "-1", "--format=%s", &format!("{merge}^1")]),
-        "other"
-    );
-    assert_eq!(
-        git(repo, &["rev-parse", &format!("{merge}^2")]),
-        *import_tip
-    );
-    assert_eq!(
-        git(repo, &["ls-tree", "-r", "--name-only", &merge]),
-        "README.md\napps/t3code/app.js\napps/t3code/side.js",
-        "the anchor as this view has it, plus t3code"
-    );
-    assert_eq!(
-        git(repo, &["log", "-1", "--format=%an %at|%s", &merge]),
-        "newgit 6500|Import t3code into apps/t3code"
-    );
-}
+    graph("main after the import", &main);
 
-#[test]
-fn a_dropped_anchor_joins_after_the_commit_before_it() {
-    let (_guard, temp) = tempdir();
-    let project = project(&temp);
-    let repo = &project.repo;
-    // `b` wrote only `apps/other`: a view without `other` has no commit for
-    // it, so the merge goes where `b` would have been.
-    let (b, root, t3code, other) = anchored_on_other(&project, false);
-    let import_tip = project.imported.last().expect("tip");
+    // 2. An instance from before the import, with its own work.
+    git(repo, &["checkout", "-q", "--detach", &project.a]);
+    let c = commit(repo, &[("notes.txt", "mine\n")], "instance: my work", 7_000);
+    graph(
+        "the old instance",
+        &view(repo, "old", &tips(&root, &c, &t3code, &joined.marker), &all),
+    );
 
-    let view = compose::compose(
+    // 3. It takes t3code, then works on both.
+    let taken =
+        compose::join(repo, &t3code, &c, &joined.marker, "refs/test/t3code/old").expect("take");
+    let instance = view(repo, "old", &tips(&root, &c, &t3code, &taken.marker), &all);
+    git(repo, &["checkout", "-q", "--detach", &instance]);
+    let d = commit(
         repo,
-        VIEW,
-        &tips(&root, &b, &t3code, import_tip),
-        &[root.clone(), t3code.clone(), other],
-    )
-    .expect("compose");
-    let merge = view.tip.expect("a view");
-    assert_eq!(
-        git(repo, &["rev-parse", &format!("{merge}^1")]),
-        project.b,
-        "the commit before the dropped anchor, as itself"
+        &[
+            ("notes.txt", "mine, with t3code\n"),
+            ("apps/t3code/app.js", "one\ntwo\nmine\n"),
+        ],
+        "instance: use t3code",
+        8_000,
     );
-    assert_eq!(
-        git(repo, &["rev-parse", &format!("{merge}^2")]),
-        *import_tip
+    let split = compose::split(repo, &instance, &d, &[&root, &t3code], &all).expect("split");
+    let instance = view(
+        repo,
+        "old",
+        &tips(&root, &split.state["root"], &t3code, &split.state["t3code"]),
+        &all,
     );
-    assert_eq!(
-        git(repo, &["log", "-1", "--format=%an %at|%s", &merge]),
-        "newgit 6500|Import t3code into apps/t3code",
-        "dated by the anchor, as in every other view"
+    assert_eq!(instance, d, "the instance's own commits keep their ids");
+    graph(
+        "the old instance after taking t3code and working",
+        &instance,
+    );
+
+    // 4. Merging it into `main`, tracker by tracker: root's branches really
+    // merge; t3code's `main` fast-forwards to the instance's.
+    let root_tree = git(
+        repo,
+        &[
+            "merge-tree",
+            "--write-tree",
+            &project.b,
+            &split.state["root"],
+        ],
+    );
+    let root_main = git_env(
+        repo,
+        &[
+            "commit-tree",
+            &root_tree,
+            "-p",
+            &project.b,
+            "-p",
+            &split.state["root"],
+            "-m",
+            "Merge instance old",
+        ],
+        &who("jack", 9_000),
+    );
+    let merged = view(
+        repo,
+        "main",
+        &tips(&root, &root_main, &t3code, &split.state["t3code"]),
+        &all,
+    );
+    graph("main after merging the instance", &merged);
+    let first_parents = git(repo, &["rev-list", "--first-parent", &merged]);
+    assert!(
+        first_parents.contains(&main),
+        "main's history before the merge is untouched"
+    );
+    let reachable = git(repo, &["rev-list", &merged]);
+    println!(
+        "\nthe instance's commits in main's view: c {}, join {}, d {}",
+        if reachable.contains(&c) {
+            "same id"
+        } else {
+            "new id"
+        },
+        if reachable.contains(&taken.view) {
+            "same id"
+        } else {
+            "new id"
+        },
+        if reachable.contains(&d) {
+            "same id"
+        } else {
+            "new id"
+        },
+    );
+    println!(
+        "main's files:\n{}",
+        git(repo, &["ls-tree", "-r", "--name-only", &merged])
     );
 }

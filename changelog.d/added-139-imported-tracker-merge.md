@@ -1,12 +1,12 @@
-- A tracker definition can record where a history from outside the project
-  joined it, `imported = { anchor = "<view commit>", tip = "<commit>" }`,
-  and composing brings that history in through one merge on the anchor
-  instead of interleaving it by date
+- A tracker whose history came from outside the project joins each branch
+  through one merge commit instead of interleaving its history by date
   ([#139](https://github.com/Spheroman/newgit/issues/139)).
 
-  Adding such a tracker appends exactly one commit to every view and
-  rewrites none: the project's commit ids stay the same everywhere, and
-  `git log` and `git blame` under the tracker's paths reach through the
-  merge into the imported history. A branch forked before the import leaves
-  the tracker out until it merges `main`, and `newgit tracker use` there
-  says so. Writing the anchor is the import's job (#140).
+  Where it joined is a commit on the tracker's own history, a join marker
+  (`compose::join` writes one), so it travels wherever tracker history goes.
+  Joining appends exactly one commit and rewrites none: the project's commit
+  ids stay the same everywhere, and `git log` and `git blame` under the
+  tracker's paths reach through the merge into the imported history. A
+  branch from before the import has no t3code until it takes the tracker,
+  which gives it a join of its own on top of its commits. Writing the
+  import's marker is #140; `newgit tracker use` taking a tracker is next.
