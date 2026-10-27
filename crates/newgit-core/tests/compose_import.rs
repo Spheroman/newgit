@@ -1,0 +1,817 @@
+//! An imported tracker (newgit-trackers.md, *An imported tracker joins
+//! through one merge*): a history from outside the project joins each view
+//! through one merge, marked on its history, rather than interleaving by
+//! date, so taking it rewrites nothing — on `main` at the import, and on a
+//! branch from before the import when that branch takes it. The imported
+//! tracker is mounted: its history keeps its files at its own root, as the
+//! outside repository has them, and the view shows it under `apps/t3code`.
+
+use std::process::Command;
+
+use camino::{Utf8Path, Utf8PathBuf};
+use newgit_core::compose::{self, TrackerTip};
+use newgit_core::tracker::{Storage, TrackerDefinition};
+
+fn git_env(dir: &Utf8Path, args: &[&str], env: &[(&str, String)]) -> String {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(dir.as_str())
+        .args(args)
+        .envs(env.iter().map(|(key, value)| (*key, value.as_str())))
+        .output()
+        .expect("git runs");
+    assert!(
+        output.status.success(),
+        "git {args:?} failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout).trim().to_owned()
+}
+
+fn git(dir: &Utf8Path, args: &[&str]) -> String {
+    git_env(dir, args, &[])
+}
+
+/// Author and committer for a commit at `time`, so dates are deterministic.
+fn who(name: &str, time: i64) -> Vec<(&'static str, String)> {
+    vec![
+        ("GIT_AUTHOR_NAME", name.to_owned()),
+        ("GIT_AUTHOR_EMAIL", format!("{name}@example.com")),
+        ("GIT_AUTHOR_DATE", format!("@{time} +0000")),
+        ("GIT_COMMITTER_NAME", name.to_owned()),
+        ("GIT_COMMITTER_EMAIL", format!("{name}@example.com")),
+        ("GIT_COMMITTER_DATE", format!("@{time} +0000")),
+    ]
+}
+
+fn commit(repo: &Utf8Path, files: &[(&str, &str)], message: &str, time: i64) -> String {
+    for (path, contents) in files {
+        let path = repo.join(path);
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+        std::fs::write(&path, contents).expect("write");
+    }
+    git(repo, &["add", "-A"]);
+    git_env(
+        repo,
+        &["commit", "-q", "--no-gpg-sign", "-m", message],
+        &who("ana", time),
+    );
+    git(repo, &["rev-parse", "HEAD"])
+}
+
+fn tempdir() -> (tempfile::TempDir, Utf8PathBuf) {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let path = Utf8PathBuf::from_path_buf(temp.path().canonicalize().expect("canonicalize"))
+        .expect("utf8 tempdir");
+    (temp, path)
+}
+
+fn tracker(name: &str, paths: &[&str], excluded: &[&str]) -> TrackerDefinition {
+    TrackerDefinition {
+        name: name.to_owned(),
+        audience: "project-devs".to_owned(),
+        storage: Storage::Local,
+        merge_with_source: true,
+        paths: paths.iter().map(Utf8PathBuf::from).collect(),
+        mount: None,
+        secret: false,
+        maintainers: None,
+        role: None,
+        priority: 0,
+        requires: Vec::new(),
+        resources: Vec::new(),
+        excluded: excluded.iter().map(Utf8PathBuf::from).collect(),
+        definition_rev: "sha256:000000000000".to_owned(),
+    }
+}
+
+/// A project (root: `a`, then `b`) and, on an unrelated branch, an outside
+/// history at its own root that is older than all of it and has a merge —
+/// what an import fetches, unchanged.
+struct Project {
+    repo: Utf8PathBuf,
+    a: String,
+    b: String,
+    /// Every imported commit, and the import's tip last.
+    imported: Vec<String>,
+}
+
+fn project(temp: &Utf8Path) -> Project {
+    let repo = temp.join("project");
+    std::fs::create_dir_all(&repo).expect("mkdir");
+    git(&repo, &["init", "-q", "-b", "main"]);
+    let a = commit(&repo, &[("README.md", "hello\n")], "start", 5_000);
+    let b = commit(&repo, &[("README.md", "hello, world\n")], "readme", 6_000);
+
+    git(&repo, &["checkout", "-q", "--orphan", "t3code"]);
+    git(&repo, &["rm", "-rfq", "."]);
+    let x1 = commit(&repo, &[("app.js", "one\n")], "t3code: start", 1_000);
+    git(&repo, &["checkout", "-q", "-b", "t3code-side"]);
+    let side = commit(&repo, &[("side.js", "side\n")], "t3code: side", 2_500);
+    git(&repo, &["checkout", "-q", "t3code"]);
+    let x2 = commit(&repo, &[("app.js", "one\ntwo\n")], "t3code: two", 2_000);
+    git_env(
+        &repo,
+        &[
+            "merge",
+            "-q",
+            "--no-ff",
+            "--no-gpg-sign",
+            "-m",
+            "t3code: merge side",
+            "t3code-side",
+        ],
+        &who("ana", 3_000),
+    );
+    let tip = git(&repo, &["rev-parse", "HEAD"]);
+    git(&repo, &["checkout", "-q", "main"]);
+    Project {
+        repo,
+        a,
+        b,
+        imported: vec![x1, side, x2, tip],
+    }
+}
+
+const T3CODE_MAIN: &str = "refs/test/t3code/main";
+
+fn definitions() -> (TrackerDefinition, TrackerDefinition) {
+    (
+        tracker("root", &["."], &["apps/t3code"]),
+        TrackerDefinition {
+            mount: Some("apps/t3code".into()),
+            ..tracker("t3code", &["apps/t3code"], &[])
+        },
+    )
+}
+
+/// The view's copy of imported commit `original`: the same commit with its
+/// files under the mount.
+fn assert_copy(repo: &Utf8Path, copy: &str, original: &str) {
+    let show = |commit: &str| {
+        git(
+            repo,
+            &["log", "-1", "--format=%an %ae %at %cn %ce %ct%n%B", commit],
+        )
+    };
+    assert_eq!(show(copy), show(original), "same author, dates, message");
+    assert_eq!(
+        git(repo, &["rev-parse", &format!("{copy}:apps/t3code")]),
+        git(repo, &["rev-parse", &format!("{original}^{{tree}}")]),
+        "the original tree, under the mount"
+    );
+    assert_eq!(
+        git(repo, &["ls-tree", "--name-only", copy]),
+        "apps",
+        "nothing else"
+    );
+}
+
+/// The import on `main`: t3code joins after `b`.
+fn import(project: &Project, t3code: &TrackerDefinition) -> compose::Joined {
+    let under = project.imported.last().expect("tip");
+    compose::join(&project.repo, t3code, &project.b, under, T3CODE_MAIN).expect("join")
+}
+
+fn tips<'a>(
+    root: &'a TrackerDefinition,
+    root_commit: &str,
+    t3code: &'a TrackerDefinition,
+    t3code_commit: &str,
+) -> Vec<TrackerTip<'a>> {
+    vec![
+        TrackerTip {
+            definition: root,
+            commit: root_commit.to_owned(),
+        },
+        TrackerTip {
+            definition: t3code,
+            commit: t3code_commit.to_owned(),
+        },
+    ]
+}
+
+fn view(repo: &Utf8Path, name: &str, tips: &[TrackerTip<'_>], all: &[TrackerDefinition]) -> String {
+    compose::compose(repo, &format!("refs/newgit/views/{name}"), tips, all)
+        .expect("compose")
+        .tip
+        .expect("a view")
+}
+
+#[test]
+fn an_imported_tracker_joins_main_through_one_merge() {
+    let (_guard, temp) = tempdir();
+    let project = project(&temp);
+    let repo = &project.repo;
+    let (root, t3code) = definitions();
+    let all = [root.clone(), t3code.clone()];
+    let under = project.imported.last().expect("tip");
+    let joined = import(&project, &t3code);
+
+    let merge = view(
+        repo,
+        "main",
+        &tips(&root, &project.b, &t3code, &joined.marker),
+        &all,
+    );
+    assert_eq!(merge, joined.view, "the join is reused as itself");
+
+    // One commit appended; everything before it is the original history.
+    assert_eq!(git(repo, &["rev-parse", &format!("{merge}^1")]), project.b);
+    assert_copy(
+        repo,
+        &git(repo, &["rev-parse", &format!("{merge}^2")]),
+        under,
+    );
+    assert_eq!(
+        git(repo, &["rev-list", "--first-parent", &merge]),
+        format!("{merge}\n{}\n{}", project.b, project.a),
+        "the project's commits keep their ids"
+    );
+    assert_eq!(
+        git(repo, &["log", "-1", "--format=%an <%ae> %at|%B", &merge]),
+        "newgit <newgit@localhost> 6000|Import t3code into apps/t3code"
+    );
+    assert_eq!(
+        git(repo, &["ls-tree", "-r", "--name-only", &merge]),
+        "README.md\napps/t3code/app.js\napps/t3code/side.js"
+    );
+
+    // `git log` and `git blame` reach through the merge into the history,
+    // as the copy under the mount.
+    assert_eq!(
+        git(repo, &["log", "--format=%s", &merge, "--", "apps/t3code"]),
+        "t3code: merge side\nt3code: side\nt3code: two\nt3code: start"
+    );
+    let blame = git(
+        repo,
+        &["blame", "--porcelain", &merge, "--", "apps/t3code/app.js"],
+    );
+    assert!(blame.contains("\nsummary t3code: start\n"), "{blame}");
+    assert!(blame.contains("\nsummary t3code: two\n"), "{blame}");
+
+    // The tracker keeps the history as it came: the marker sits on the
+    // imported tip itself, ids unchanged.
+    assert_eq!(
+        git(repo, &["rev-parse", &format!("{}^", joined.marker)]),
+        *under
+    );
+
+    // The copy under the mount is a pure function of the history: made again
+    // without its cache, the view comes out the same.
+    git(repo, &["update-ref", "-d", compose::MOUNTED_NOTES_REF]);
+    git(repo, &["update-ref", "-d", "refs/newgit/views/main"]);
+    assert_eq!(
+        view(
+            repo,
+            "main",
+            &tips(&root, &project.b, &t3code, &joined.marker),
+            &all,
+        ),
+        merge
+    );
+
+    // Composed where the join is not already a commit, it comes out the same.
+    git(repo, &["update-ref", "-d", "refs/newgit/views/main"]);
+    let state = compose::read_state(repo, &merge).expect("state");
+    assert_eq!(state.get("t3code"), Some(&joined.marker));
+    assert_eq!(state.get("root"), Some(&project.b));
+}
+
+#[test]
+fn work_after_the_import_follows_the_merge_and_keeps_its_ids() {
+    let (_guard, temp) = tempdir();
+    let project = project(&temp);
+    let repo = &project.repo;
+    let (root, t3code) = definitions();
+    let all = [root.clone(), t3code.clone()];
+    let joined = import(&project, &t3code);
+    let merge = view(
+        repo,
+        "main",
+        &tips(&root, &project.b, &t3code, &joined.marker),
+        &all,
+    );
+
+    // A commit on top of the merge touching both trackers, dated before
+    // everything (a skewed clock): it still goes after the merge.
+    git(repo, &["checkout", "-q", "--detach", &merge]);
+    let work = commit(
+        repo,
+        &[
+            ("README.md", "hello, t3code\n"),
+            ("apps/t3code/app.js", "one\ntwo\nthree\n"),
+        ],
+        "use t3code",
+        500,
+    );
+    let split = compose::split(repo, &merge, &work, &[&root, &t3code], &all).expect("split");
+    assert_eq!(split.made.len(), 2, "one commit per tracker");
+    let t3code_commit = &split.state["t3code"];
+    assert_eq!(
+        git(repo, &["ls-tree", "-r", "--name-only", t3code_commit]),
+        "app.js\nside.js",
+        "t3code's commit holds its files at its own root"
+    );
+    assert_eq!(
+        git(repo, &["rev-parse", &format!("{t3code_commit}^")]),
+        joined.marker,
+        "on top of the history as imported"
+    );
+    let recomposed = view(
+        repo,
+        "main",
+        &tips(&root, &split.state["root"], &t3code, &split.state["t3code"]),
+        &all,
+    );
+    assert_eq!(recomposed, work, "split and recomposed, the same commit");
+}
+
+#[test]
+fn a_branch_from_before_the_import_has_no_t3code_until_it_takes_it() {
+    let (_guard, temp) = tempdir();
+    let project = project(&temp);
+    let repo = &project.repo;
+    let (root, t3code) = definitions();
+    let all = [root.clone(), t3code.clone()];
+    let joined = import(&project, &t3code);
+
+    // Forked at `a`, with work of its own; t3code's `main` is all it can see.
+    git(repo, &["checkout", "-q", "--detach", &project.a]);
+    let c = commit(repo, &[("notes.txt", "mine\n")], "my work", 7_000);
+    let before = view(repo, "old", &tips(&root, &c, &t3code, &joined.marker), &all);
+    assert_eq!(
+        before, c,
+        "nothing is rewritten, and nothing of t3code is there"
+    );
+
+    // Taking it: one join on top of the branch, on t3code as `main` has it.
+    let taken =
+        compose::join(repo, &t3code, &c, &joined.marker, "refs/test/t3code/old").expect("take");
+    let after = view(repo, "old", &tips(&root, &c, &t3code, &taken.marker), &all);
+    assert_eq!(after, taken.view);
+    assert_eq!(
+        git(repo, &["rev-parse", &format!("{after}^1")]),
+        c,
+        "`c` keeps its id"
+    );
+    assert_eq!(
+        git(repo, &["ls-tree", "-r", "--name-only", &after]),
+        "README.md\napps/t3code/app.js\napps/t3code/side.js\nnotes.txt",
+        "t3code, without root's `b`"
+    );
+    assert_eq!(git(repo, &["show", &format!("{after}:README.md")]), "hello");
+}
+
+/// Forked at the import's own view commit `b`, with work on top of it made
+/// before the import: the branch went on from `b` without t3code, so the
+/// marker on t3code's `main` (joining after `b`) is not its join.
+#[test]
+fn a_branch_that_went_on_from_the_imports_tip_does_not_take_it() {
+    let (_guard, temp) = tempdir();
+    let project = project(&temp);
+    let repo = &project.repo;
+    let (root, t3code) = definitions();
+    let all = [root.clone(), t3code.clone()];
+
+    // Work made in the view on top of `b` and split into root, as an
+    // instance does, and work committed straight onto root's history.
+    let only_root = [TrackerTip {
+        definition: &root,
+        commit: project.b.clone(),
+    }];
+    assert_eq!(view(repo, "before", &only_root, &all), project.b);
+    git(repo, &["checkout", "-q", "--detach", &project.b]);
+    let split_work = commit(repo, &[("notes.txt", "split\n")], "split work", 7_000);
+    let split = compose::split(repo, &project.b, &split_work, &[&root], &all).expect("split");
+    git(repo, &["checkout", "-q", "--detach", &project.b]);
+    let plain_work = commit(repo, &[("notes.txt", "plain\n")], "plain work", 7_000);
+
+    let joined = import(&project, &t3code);
+    for (name, root_tip, expected) in [
+        ("split", &split.state["root"], &split_work),
+        ("plain", &plain_work, &plain_work),
+    ] {
+        let tip = view(
+            repo,
+            name,
+            &tips(&root, root_tip, &t3code, &joined.marker),
+            &all,
+        );
+        assert_eq!(&tip, expected, "{name}: nothing rewritten, no t3code");
+    }
+
+    // Taking it, the branch gets its own join, after its own work.
+    let taken = compose::join(
+        repo,
+        &t3code,
+        &split_work,
+        &joined.marker,
+        "refs/test/t3code/split",
+    )
+    .expect("take");
+    let tip = view(
+        repo,
+        "split",
+        &tips(&root, &split.state["root"], &t3code, &taken.marker),
+        &all,
+    );
+    assert_eq!(tip, taken.view);
+    assert_eq!(git(repo, &["rev-parse", &format!("{tip}^1")]), split_work);
+}
+
+/// The join is made again from the marker alone: a repository holding only
+/// root's history and t3code's composes the very same join commit.
+#[test]
+fn the_join_is_made_again_without_the_join_commit() {
+    let (_guard, temp) = tempdir();
+    let project = project(&temp);
+    let (root, t3code) = definitions();
+    let all = [root.clone(), t3code.clone()];
+    let joined = import(&project, &t3code);
+
+    let fresh = temp.join("fresh");
+    git(&temp, &["init", "-q", "-b", "main", fresh.as_str()]);
+    git(
+        &fresh,
+        &[
+            "fetch",
+            "-q",
+            project.repo.as_str(),
+            &format!("{}:refs/test/root", project.b),
+            &format!("{T3CODE_MAIN}:refs/test/t3code"),
+        ],
+    );
+    let missing = Command::new("git")
+        .args(["-C", fresh.as_str(), "cat-file", "-e", &joined.view])
+        .output()
+        .expect("git runs");
+    assert!(!missing.status.success(), "the join commit is not there");
+
+    let tip = view(
+        &fresh,
+        "main",
+        &tips(&root, &project.b, &t3code, &joined.marker),
+        &all,
+    );
+    assert_eq!(tip, joined.view);
+}
+
+#[test]
+fn a_second_import_can_join_after_the_first() {
+    let (_guard, temp) = tempdir();
+    let project = project(&temp);
+    let repo = &project.repo;
+    let (root, t3code) = definitions();
+    let other = tracker("other", &["apps/other"], &[]);
+    let root = TrackerDefinition {
+        excluded: vec!["apps/t3code".into(), "apps/other".into()],
+        ..root
+    };
+    let all = [root.clone(), t3code.clone(), other.clone()];
+    let joined = import(&project, &t3code);
+
+    git(repo, &["checkout", "-q", "--orphan", "other"]);
+    git(repo, &["rm", "-rfq", "."]);
+    let o = commit(repo, &[("apps/other/x", "x\n")], "other: start", 900);
+    git(repo, &["checkout", "-q", "main"]);
+    let second = compose::join(repo, &other, &joined.view, &o, "refs/test/other/main")
+        .expect("join after the first join");
+
+    let mut both = tips(&root, &project.b, &t3code, &joined.marker);
+    both.push(TrackerTip {
+        definition: &other,
+        commit: second.marker.clone(),
+    });
+    let tip = view(repo, "main", &both, &all);
+    assert_eq!(tip, second.view);
+    assert_eq!(git(repo, &["rev-parse", &format!("{tip}^1")]), joined.view);
+}
+
+/// Not an assertion so much as a look: the whole flow, printing each view.
+/// `cargo test -p newgit-core --test compose_import walkthrough -- --nocapture`
+#[test]
+fn walkthrough_import_take_work_merge_back() {
+    let (_guard, temp) = tempdir();
+    let project = project(&temp);
+    let repo = &project.repo;
+    let (root, t3code) = definitions();
+    let all = [root.clone(), t3code.clone()];
+    let graph = |title: &str, tip: &str| {
+        println!(
+            "\n== {title}\n{}",
+            git(
+                repo,
+                &[
+                    "log",
+                    "--graph",
+                    "--format=%h %an: %s (%ad)",
+                    "--date=unix",
+                    tip
+                ]
+            )
+        );
+    };
+
+    // 1. The import on `main`.
+    let joined = import(&project, &t3code);
+    let main = view(
+        repo,
+        "main",
+        &tips(&root, &project.b, &t3code, &joined.marker),
+        &all,
+    );
+    graph("main after the import", &main);
+
+    // 2. An instance from before the import, with its own work.
+    git(repo, &["checkout", "-q", "--detach", &project.a]);
+    let c = commit(repo, &[("notes.txt", "mine\n")], "instance: my work", 7_000);
+    graph(
+        "the old instance",
+        &view(repo, "old", &tips(&root, &c, &t3code, &joined.marker), &all),
+    );
+
+    // 3. It takes t3code, then works on both.
+    let taken =
+        compose::join(repo, &t3code, &c, &joined.marker, "refs/test/t3code/old").expect("take");
+    let instance = view(repo, "old", &tips(&root, &c, &t3code, &taken.marker), &all);
+    git(repo, &["checkout", "-q", "--detach", &instance]);
+    let d = commit(
+        repo,
+        &[
+            ("notes.txt", "mine, with t3code\n"),
+            ("apps/t3code/app.js", "one\ntwo\nmine\n"),
+        ],
+        "instance: use t3code",
+        8_000,
+    );
+    let split = compose::split(repo, &instance, &d, &[&root, &t3code], &all).expect("split");
+    let instance = view(
+        repo,
+        "old",
+        &tips(&root, &split.state["root"], &t3code, &split.state["t3code"]),
+        &all,
+    );
+    assert_eq!(instance, d, "the instance's own commits keep their ids");
+    graph(
+        "the old instance after taking t3code and working",
+        &instance,
+    );
+
+    // 4. Merging it into `main`, tracker by tracker: root's branches really
+    // merge; t3code's `main` fast-forwards to the instance's.
+    let root_tree = git(
+        repo,
+        &[
+            "merge-tree",
+            "--write-tree",
+            &project.b,
+            &split.state["root"],
+        ],
+    );
+    let root_main = git_env(
+        repo,
+        &[
+            "commit-tree",
+            &root_tree,
+            "-p",
+            &project.b,
+            "-p",
+            &split.state["root"],
+            "-m",
+            "Merge instance old",
+        ],
+        &who("jack", 9_000),
+    );
+    let merged = view(
+        repo,
+        "main",
+        &tips(&root, &root_main, &t3code, &split.state["t3code"]),
+        &all,
+    );
+    graph("main after merging the instance", &merged);
+    let first_parents = git(repo, &["rev-list", "--first-parent", &merged]);
+    assert!(
+        first_parents.contains(&main),
+        "main's history before the merge is untouched"
+    );
+    let reachable = git(repo, &["rev-list", &merged]);
+    println!(
+        "\nthe instance's commits in main's view: c {}, join {}, d {}",
+        if reachable.contains(&c) {
+            "same id"
+        } else {
+            "new id"
+        },
+        if reachable.contains(&taken.view) {
+            "same id"
+        } else {
+            "new id"
+        },
+        if reachable.contains(&d) {
+            "same id"
+        } else {
+            "new id"
+        },
+    );
+    println!(
+        "main's files:\n{}",
+        git(repo, &["ls-tree", "-r", "--name-only", &merged])
+    );
+}
+
+/// `main` after the import, with root work `r` on top of the join: the
+/// view an upstream sync arrives at. Returns the join and `r`'s root piece.
+fn main_with_work(
+    project: &Project,
+    root: &TrackerDefinition,
+    t3code: &TrackerDefinition,
+    all: &[TrackerDefinition],
+) -> (compose::Joined, String, String) {
+    let repo = &project.repo;
+    let joined = import(project, t3code);
+    let merge = view(
+        repo,
+        "main",
+        &tips(root, &project.b, t3code, &joined.marker),
+        all,
+    );
+    git(repo, &["checkout", "-q", "--detach", &merge]);
+    let r = commit(
+        repo,
+        &[("README.md", "after the import\n")],
+        "root work",
+        8_000,
+    );
+    let split = compose::split(repo, &merge, &r, &[root, t3code], all).expect("split");
+    let root_tip = split.state["root"].clone();
+    assert_eq!(
+        view(
+            repo,
+            "main",
+            &tips(root, &root_tip, t3code, &joined.marker),
+            all
+        ),
+        r
+    );
+    (joined, r, root_tip)
+}
+
+/// Upstream commits on top of `parent`, dated before everything in the
+/// project since the import, as a fork sync brings them.
+fn upstream(repo: &Utf8Path, parent: &str) -> (String, String) {
+    git(repo, &["checkout", "-q", "--detach", parent]);
+    let first = commit(
+        repo,
+        &[("app.js", "one\ntwo\nupstream\n")],
+        "upstream: one",
+        3_500,
+    );
+    let second = commit(repo, &[("up.js", "up\n")], "upstream: two", 3_600);
+    (first, second)
+}
+
+#[test]
+fn an_upstream_sync_merge_goes_on_top_whatever_its_dates() {
+    let (_guard, temp) = tempdir();
+    let project = project(&temp);
+    let repo = &project.repo;
+    let (root, t3code) = definitions();
+    let all = [root.clone(), t3code.clone()];
+    let (joined, r, root_tip) = main_with_work(&project, &root, &t3code, &all);
+
+    // Upstream moved on from what was imported; the sync merges it into
+    // t3code's history, naming the view commit it follows. Its own date is
+    // skewed far into the past.
+    let under = project.imported.last().expect("tip");
+    let (_, second) = upstream(repo, under);
+    let tree = git(repo, &["rev-parse", &format!("{second}^{{tree}}")]);
+    let message = format!(
+        "Sync t3code with upstream\n\n{}{r}\n",
+        compose::FOLLOWS_TRAILER
+    );
+    let sync = git_env(
+        repo,
+        &[
+            "commit-tree",
+            &tree,
+            "-p",
+            &joined.marker,
+            "-p",
+            &second,
+            "-m",
+            &message,
+        ],
+        &who("jack", 100),
+    );
+
+    let tip = view(repo, "main", &tips(&root, &root_tip, &t3code, &sync), &all);
+    assert_eq!(
+        git(repo, &["rev-parse", &format!("{tip}^1")]),
+        r,
+        "one commit on top; `r` keeps its id"
+    );
+    assert_copy(
+        repo,
+        &git(repo, &["rev-parse", &format!("{tip}^2")]),
+        &second,
+    );
+    assert_eq!(
+        git(repo, &["log", "-1", "--format=%B", &tip]),
+        "Sync t3code with upstream"
+    );
+    assert_eq!(
+        git(repo, &["show", &format!("{tip}:apps/t3code/app.js")]),
+        "one\ntwo\nupstream"
+    );
+    assert_eq!(
+        git(repo, &["show", &format!("{tip}:README.md")]),
+        "after the import"
+    );
+}
+
+/// Without the rule: outside commits laid straight onto t3code's line are
+/// interleaved by their (old) dates, under work already in the view.
+#[test]
+fn outside_commits_on_the_trackers_line_rewrite_the_view() {
+    let (_guard, temp) = tempdir();
+    let project = project(&temp);
+    let repo = &project.repo;
+    let (root, t3code) = definitions();
+    let all = [root.clone(), t3code.clone()];
+    let (joined, r, root_tip) = main_with_work(&project, &root, &t3code, &all);
+
+    let (_, second) = upstream(repo, &joined.marker);
+    let tip = view(
+        repo,
+        "main",
+        &tips(&root, &root_tip, &t3code, &second),
+        &all,
+    );
+    let reachable = git(repo, &["rev-list", &tip]);
+    assert!(
+        !reachable.contains(&r),
+        "`r` was rebuilt under the upstream commits: why a sync is one merge"
+    );
+}
+
+/// A commit's raw headers, bytes as they are.
+fn raw_headers(repo: &Utf8Path, commit: &str) -> Vec<Vec<u8>> {
+    let output = Command::new("git")
+        .args(["-C", repo.as_str(), "cat-file", "commit", commit])
+        .output()
+        .expect("git runs");
+    output
+        .stdout
+        .split(|&byte| byte == b'\n')
+        .filter(|line| line.starts_with(b"author ") || line.starts_with(b"committer "))
+        .map(<[u8]>::to_vec)
+        .collect()
+}
+
+/// The copy under the mount keeps the original's bytes: an author name in
+/// Latin-1, as older repositories have them, is not turned into U+FFFD.
+#[test]
+fn the_copy_under_the_mount_keeps_header_bytes() {
+    let (_guard, temp) = tempdir();
+    let project = project(&temp);
+    let repo = &project.repo;
+    let (root, t3code) = definitions();
+    let all = [root.clone(), t3code.clone()];
+    let under = project.imported.last().expect("tip").clone();
+    let tree = git(repo, &["rev-parse", &format!("{under}^{{tree}}")]);
+    let mut raw = format!("tree {tree}\nparent {under}\n").into_bytes();
+    raw.extend_from_slice(b"author J\xf6rg <j@example.com> 3500 +0000\n");
+    raw.extend_from_slice(b"committer J\xf6rg <j@example.com> 3500 +0000\n");
+    raw.extend_from_slice(b"encoding ISO-8859-1\n\nt3code: latin-1\n");
+    let mut child = Command::new("git")
+        .args([
+            "-C",
+            repo.as_str(),
+            "hash-object",
+            "-w",
+            "-t",
+            "commit",
+            "--stdin",
+        ])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .expect("git runs");
+    std::io::Write::write_all(&mut child.stdin.take().expect("stdin"), &raw).expect("write");
+    let latin = String::from_utf8(child.wait_with_output().expect("git runs").stdout)
+        .expect("an id")
+        .trim()
+        .to_owned();
+
+    let joined = compose::join(repo, &t3code, &project.b, &latin, T3CODE_MAIN).expect("join");
+    let tip = view(
+        repo,
+        "main",
+        &tips(&root, &project.b, &t3code, &joined.marker),
+        &all,
+    );
+    let copy = git(repo, &["rev-parse", &format!("{tip}^2")]);
+    assert_ne!(copy, latin);
+    assert_eq!(raw_headers(repo, &copy), raw_headers(repo, &latin));
+}

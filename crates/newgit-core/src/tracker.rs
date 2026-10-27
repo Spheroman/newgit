@@ -15,8 +15,16 @@ pub struct TrackerDefinition {
     pub merge_with_source: bool,
     /// Workspace-relative paths this tracker owns. May be empty for lanes
     /// that only receive deposits (e.g. `db-snapshots`). `.` means everything
-    /// no more specific tracker owns — the `root` tracker.
+    /// no more specific tracker owns — the `root` tracker. A mounted
+    /// tracker's file states them relative to its mount; here they are
+    /// always joined to it.
     pub paths: Vec<Utf8PathBuf>,
+    /// Where the tracker's own root sits in the workspace, for a code tracker
+    /// stored relative to its own root (one imported from outside, which
+    /// keeps its ids): its commits hold `app.js`, the workspace has
+    /// `apps/t3code/app.js`. `None` is the project root, where every other
+    /// tracker sits, so their paths read the same either way.
+    pub mount: Option<Utf8PathBuf>,
     /// Kept out of Git entirely: excluded in every workspace, never committed,
     /// captured by newgit from the files. True unless a definition says
     /// otherwise — fails closed, like export's audience filter.
@@ -74,6 +82,8 @@ pub struct TrackerDefinitionFile {
     storage: Storage,
     #[serde(default)]
     merge_with_source: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    mount: Option<Utf8PathBuf>,
     #[serde(default)]
     paths: Vec<Utf8PathBuf>,
     #[serde(default = "secret_by_default", skip_serializing_if = "is_true")]
@@ -116,6 +126,7 @@ impl TrackerDefinition {
             storage,
             merge_with_source,
             paths,
+            mount: None,
             secret: true,
             maintainers: None,
             role: None,
@@ -150,7 +161,15 @@ impl TrackerDefinition {
             audience: file.audience,
             storage: file.storage,
             merge_with_source: file.merge_with_source,
-            paths: file.paths,
+            paths: match &file.mount {
+                Some(mount) => file
+                    .paths
+                    .iter()
+                    .map(|path| mounted_path(mount, path))
+                    .collect(),
+                None => file.paths,
+            },
+            mount: file.mount,
             secret: file.secret,
             maintainers: file.maintainers,
             role: file.role,
@@ -183,6 +202,26 @@ impl TrackerDefinition {
             )));
         }
 
+        if let Some(mount) = &self.mount {
+            if self.secret {
+                return Err(self.invalid(
+                    "only a code tracker (`secret = false`) may have a `mount`".to_owned(),
+                ));
+            }
+            let first = mount.components().next().map(|c| c.as_str().to_owned());
+            if mount.is_absolute()
+                || matches!(mount.as_str(), "" | ".")
+                || mount.components().any(|c| matches!(c.as_str(), ".." | "."))
+                || matches!(first.as_deref(), Some(".git" | ".newgit"))
+            {
+                return Err(self.invalid(format!(
+                    "mount `{mount}` must be a workspace-relative directory outside `.git` and `.newgit`"
+                )));
+            }
+            if let Some(path) = self.paths.iter().find(|path| !path.starts_with(mount)) {
+                return Err(self.invalid(format!("path `{path}` is outside its mount `{mount}`")));
+            }
+        }
         if self.owns_everything() && self.paths.len() > 1 {
             return Err(self.invalid(
                 "`.` owns everything not claimed elsewhere, so it must be the only path".to_owned(),
@@ -235,7 +274,19 @@ impl TrackerDefinition {
             audience: self.audience.clone(),
             storage: self.storage,
             merge_with_source: self.merge_with_source,
-            paths: self.paths.clone(),
+            mount: self.mount.clone(),
+            paths: match &self.mount {
+                Some(mount) => self
+                    .paths
+                    .iter()
+                    .map(|path| match path.strip_prefix(mount) {
+                        Ok(inner) if inner.as_str().is_empty() => Utf8PathBuf::from("."),
+                        Ok(inner) => inner.to_path_buf(),
+                        Err(_) => path.clone(),
+                    })
+                    .collect(),
+                None => self.paths.clone(),
+            },
             secret: self.secret,
             maintainers: self.maintainers.clone(),
             role: self.role.clone(),
@@ -255,6 +306,7 @@ impl TrackerDefinition {
             storage: Storage::Local,
             merge_with_source: true,
             paths: vec![Utf8PathBuf::from(".")],
+            mount: None,
             secret: false,
             maintainers: None,
             role: None,
@@ -280,6 +332,7 @@ impl TrackerDefinition {
             storage: Storage::Local,
             merge_with_source: true,
             paths: vec![Utf8PathBuf::from(".newgit/trackers")],
+            mount: None,
             secret: false,
             maintainers: Some("owner".to_owned()),
             role: None,
@@ -305,6 +358,7 @@ impl TrackerDefinition {
             storage: Storage::Local,
             merge_with_source: true,
             paths: vec![Utf8PathBuf::from(".newgit")],
+            mount: None,
             secret: false,
             maintainers: None,
             role: None,
@@ -318,6 +372,27 @@ impl TrackerDefinition {
             .compute_definition_rev()
             .expect("the project definition serializes");
         definition
+    }
+
+    /// A workspace path as this tracker's commits hold it: relative to its
+    /// mount, or unchanged when it has none. `None` when the path is outside
+    /// the mount (or is the mount itself, which no change names).
+    pub fn tracker_path<'p>(&self, workspace: &'p str) -> Option<&'p str> {
+        match &self.mount {
+            None => Some(workspace),
+            Some(mount) => workspace
+                .strip_prefix(mount.as_str())
+                .and_then(|rest| rest.strip_prefix('/'))
+                .filter(|rest| !rest.is_empty()),
+        }
+    }
+
+    /// A path in this tracker's commits, as the workspace has it.
+    pub fn workspace_path(&self, tracker: &str) -> String {
+        match &self.mount {
+            None => tracker.to_owned(),
+            Some(mount) => format!("{mount}/{tracker}"),
+        }
     }
 
     /// Committed content with its own history, composed into workspaces
@@ -361,6 +436,16 @@ impl TrackerDefinition {
             name: self.name.clone(),
             reason,
         }
+    }
+}
+
+/// `path` from a mounted definition file, joined to its `mount`: `.` is the
+/// mount itself.
+fn mounted_path(mount: &Utf8Path, path: &Utf8Path) -> Utf8PathBuf {
+    if path.as_str() == "." {
+        mount.to_path_buf()
+    } else {
+        mount.join(path)
     }
 }
 
@@ -529,6 +614,7 @@ mod tests {
             storage: Storage::Local,
             merge_with_source: false,
             paths: paths.iter().map(Utf8PathBuf::from).collect(),
+            mount: None,
             secret: true,
             maintainers: None,
             role: None,
@@ -631,6 +717,90 @@ merge_with_sauce = true
         assert!(
             message.contains("merge_with_source"),
             "names the valid keys"
+        );
+    }
+
+    /// A mounted tracker's file states its paths relative to its mount; the
+    /// definition holds them as the workspace has them, and writes them back
+    /// as they were.
+    #[test]
+    fn a_mounted_trackers_paths_are_relative_to_its_mount() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let write = |name: &str, contents: &str| {
+            let path = Utf8PathBuf::from_path_buf(temp.path().join(format!("{name}.toml")))
+                .expect("utf8 path");
+            std::fs::write(&path, contents).expect("write definition");
+            TrackerDefinition::from_file(name, &path)
+        };
+        let code = "audience = \"project-devs\"\nstorage = \"local\"\nsecret = false\n";
+
+        let t3code = write(
+            "t3code",
+            &format!("{code}mount = \"apps/t3code\"\npaths = [\".\"]\n"),
+        )
+        .expect("a mounted code tracker");
+        assert_eq!(t3code.paths, [Utf8PathBuf::from("apps/t3code")]);
+        assert!(
+            !t3code.owns_everything(),
+            "`.` is its mount, not everything"
+        );
+        assert_eq!(t3code.to_file().paths, [Utf8PathBuf::from(".")]);
+        assert_eq!(
+            t3code.tracker_path("apps/t3code/src/app.js"),
+            Some("src/app.js")
+        );
+        assert_eq!(t3code.tracker_path("apps/t3codex/app.js"), None);
+        assert_eq!(
+            t3code.workspace_path("src/app.js"),
+            "apps/t3code/src/app.js"
+        );
+
+        let nested = write(
+            "docs",
+            &format!("{code}mount = \"vendor/lib\"\npaths = [\"docs\", \"README.md\"]\n"),
+        )
+        .expect("paths inside the mount");
+        assert_eq!(
+            nested.paths,
+            [
+                Utf8PathBuf::from("vendor/lib/docs"),
+                Utf8PathBuf::from("vendor/lib/README.md")
+            ]
+        );
+        assert_eq!(
+            nested.to_file().paths,
+            [Utf8PathBuf::from("docs"), Utf8PathBuf::from("README.md")]
+        );
+
+        let refused = |name: &str, contents: String, says: &str| {
+            let error = write(name, &contents).expect_err(says);
+            assert!(error.to_string().contains(says), "{error}");
+        };
+        refused(
+            "env",
+            "audience = \"project-devs\"\nstorage = \"local\"\nmount = \"apps/env\"\npaths = [\".\"]\n"
+                .to_owned(),
+            "only a code tracker",
+        );
+        refused(
+            "up",
+            format!("{code}mount = \"../elsewhere\"\npaths = [\".\"]\n"),
+            "must be a workspace-relative directory",
+        );
+        refused(
+            "dot",
+            format!("{code}mount = \".\"\npaths = [\".\"]\n"),
+            "must be a workspace-relative directory",
+        );
+        refused(
+            "git",
+            format!("{code}mount = \".newgit/x\"\npaths = [\".\"]\n"),
+            "must be a workspace-relative directory",
+        );
+        refused(
+            "out",
+            format!("{code}mount = \"apps/x\"\npaths = [\"../y\"]\n"),
+            "workspace-relative",
         );
     }
 }

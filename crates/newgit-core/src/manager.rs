@@ -1105,6 +1105,19 @@ impl BranchManager {
             )));
         }
         let source = owners.into_iter().next().expect("one owner");
+        // A mounted tracker's commits hold its files at its own root, so
+        // carving its workspace paths would find none of them.
+        if let Some(mount) = self
+            .code
+            .iter()
+            .find(|candidate| candidate.name == source)
+            .and_then(|candidate| candidate.mount.as_ref())
+        {
+            return Err(NewgitError::Unsupported(format!(
+                "`{name}`'s paths are inside `{source}`, which is mounted at `{mount}`; carving \
+                 a tracker out of a mounted one is not supported yet"
+            )));
+        }
 
         let mut all: Vec<TrackerDefinition> =
             self.trackers.iter().chain(&self.code).cloned().collect();
