@@ -15,6 +15,7 @@ lanes.
 
 ## The workflow
 
+All eight v1 milestones are implemented. The workflow the MVP set out to make
 feel normal now runs end to end:
 
 ```sh
