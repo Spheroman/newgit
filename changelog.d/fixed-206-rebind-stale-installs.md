@@ -17,9 +17,12 @@
   tree once the binding has moved, the same way a spawn builds it: filled
   from the store when another instance built that binding already, else by
   running its `prepare` and publishing the result. The command reports each
-  rebuild; one that fails leaves the resource `failed`, with `newgit action
-  <resource>.prepare` as the retry. A long-running action that was up on
-  the old tree is restarted on the new one. Undo's skip now requires the
-  binding it restored to be the one the instance had, so it compares the
-  inputs the store key does; an undo that drops or brings back a tracker
-  rebuilds, through the store first.
+  rebuild; one that fails leaves the resource `failed` without failing the
+  command, with `newgit action <resource>.prepare` as the retry, and what
+  depends on it is reported as not rebuilt and left `pending`. A `use` that
+  brings what a tracker `requires` binds their resources once all of it is
+  bound, so they are built for the whole binding. Undo's skip now requires
+  the binding it restored to be the one the instance had, for a resource
+  that declares `[identity] produces`, so it compares the inputs the store
+  key does; an undo that drops or brings back a tracker rebuilds such a
+  tree, through the store first.

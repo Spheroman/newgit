@@ -3227,24 +3227,34 @@ fn parse_storage(value: &str) -> Result<Storage> {
 }
 
 /// The installs a `tracker use` or `drop` rebuilt, because the binding is
-/// part of their identity.
+/// part of their identity. The binding has changed either way; a failed or
+/// blocked rebuild says what to run once the cause is fixed.
 fn print_rebuilt(rebuilt: &[newgit_core::manager::RebuiltInstall]) {
     for install in rebuilt {
-        let verdict = if install.ok {
-            "rebuilt"
+        let name = &install.name;
+        let retry = format!("`newgit action {name}.prepare`");
+        let line = if !install.blocked_by.is_empty() {
+            format!(
+                "  {name} for the new binding: not rebuilt, waiting on {}; then {retry}",
+                install.blocked_by.join(", ")
+            )
+        } else if let Some(error) = &install.error {
+            format!("  {name} for the new binding: rebuild failed: {error}; retry with {retry}")
         } else {
-            "rebuild failed"
+            let verdict = if install.ok {
+                "rebuilt"
+            } else {
+                "rebuild failed"
+            };
+            let mut line = format!("  {name} for the new binding: {verdict}");
+            if let Some(report) = &install.install {
+                line.push_str(&format!(", {}", report.summary()));
+            }
+            if let (false, Some(log)) = (install.ok, &install.log) {
+                line.push_str(&format!("; see {log}, then {retry}"));
+            }
+            line
         };
-        let mut line = format!("  {} for the new binding: {verdict}", install.name);
-        if let Some(report) = &install.install {
-            line.push_str(&format!(", {}", report.summary()));
-        }
-        if let (false, Some(log)) = (install.ok, &install.log) {
-            line.push_str(&format!(
-                "; see {log}, then `newgit action {}.prepare`",
-                install.name
-            ));
-        }
         println!("{line}");
     }
 }

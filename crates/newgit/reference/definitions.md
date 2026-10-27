@@ -370,11 +370,13 @@ runtime one does: a checkpoint record written under an older definition is not
 something reading the current file can predict.
 
 A `recompute` restore skips when this resource's `[identity]` hash is the same
-now as at the checkpoint, and the undo restored the binding the instance
-already had: the tree was already built from those inputs, so the rebuild
-would change nothing. The binding counts because the install store keys a tree
-on it (see *Installs: use a content-addressed store*); an undo that drops or brings back a tracker
-rebuilds, lockfile or no lockfile. It says so rather than passing silently:
+now as at the checkpoint and, for a resource that declares `[identity]
+produces`, the undo restored the binding the instance already had: the tree was
+already built from those inputs, so the rebuild would change nothing. The
+binding counts because the install store keys a tree on it (see *Installs: use
+a content-addressed store*); an undo that drops or brings back a tracker
+rebuilds such a tree, lockfile or no lockfile. It says so rather than passing
+silently:
 
 ```
 resource: deps recompute(prepare) skipped: identity unchanged
@@ -811,6 +813,22 @@ filled from the store when that binding was built before, else by running its
 Bound `b` in `x`
   deps for the new binding: rebuilt, install store: filled from 3ec46aa385bb (copy-on-write)
 ```
+
+The binding is the store key's, so binding or dropping a secret tracker
+rebuilds too: `{{bound.trackers}}` names it. Running processes are left as
+they are, as under `newgit action deps.prepare`. The binding has changed by
+the time an install rebuilds, so a rebuild that fails does not fail the
+command. It leaves the resource `failed`, and what depends on it is not
+rebuilt but left `pending` behind it, each with its retry:
+
+```
+Bound `b` in `x`
+  deps for the new binding: rebuild failed; see .newgit/logs/x/deps.prepare-….log, then `newgit action deps.prepare`
+  dev for the new binding: not rebuilt, waiting on deps; then `newgit action dev.prepare`
+```
+
+When newgit cannot run the action at all (its `workdir` left the working tree
+with the tracker, say), the line gives that error in place of the log.
 
 **An undo is filled from it too.** The rebuild a `recompute` restore triggers
 is the expensive one — a full reinstall in the middle of an operation someone

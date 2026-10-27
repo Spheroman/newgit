@@ -4032,7 +4032,7 @@ impl BranchManager {
     /// back.
     pub fn use_tracker(&self, instance: &str, tracker: &str) -> Result<BindingChange> {
         let before = self.binding_before(instance)?;
-        let mut change = self.use_tracker_inner(instance, tracker)?;
+        let mut change = self.use_tracker_inner(instance, tracker, true)?;
         change.rebuilt = self.rebuild_for_binding(instance, &before)?;
         Ok(change)
     }
@@ -4040,7 +4040,19 @@ impl BranchManager {
     /// The use itself, without the rebuild: a tracker's `requires` are
     /// bound through here, so one `use` rebuilds once, for the binding it
     /// ends with, rather than once per tracker it brought.
-    fn use_tracker_inner(&self, instance: &str, tracker: &str) -> Result<BindingChange> {
+    ///
+    /// `outermost` binds the resources the change brings; a nested call for a
+    /// requirement leaves that to the `use` that asked for it. A resource is
+    /// prepared under the binding at the moment it binds, and with
+    /// `requires = ["b", "c"]` the one `b` brings would otherwise be built
+    /// while `c` is still dropped — and, being new to the instance, not
+    /// rebuilt afterwards either.
+    fn use_tracker_inner(
+        &self,
+        instance: &str,
+        tracker: &str,
+        outermost: bool,
+    ) -> Result<BindingChange> {
         let mut branch = self.store.find_branch(instance)?;
         self.require_workspace(&branch)?;
         let mut change = BindingChange {
@@ -4140,11 +4152,15 @@ impl BranchManager {
             if let Some(target) = target
                 && branch.dropped.contains(&target)
             {
-                self.use_tracker_inner(instance, &target)?;
+                self.use_tracker_inner(instance, &target, false)?;
                 change.brought.push(target);
             }
         }
-        // And the resources it brings start.
+        // And the resources it brings start, once everything it brings is
+        // bound.
+        if !outermost {
+            return Ok(change);
+        }
         let mut branch = self.store.find_branch(instance)?;
         let outcomes = self.bind_resources(&mut branch)?;
         self.store.save_branch_record(&branch)?;
@@ -4172,19 +4188,28 @@ impl BranchManager {
     /// once that moves it is the tree of some other binding — whatever the
     /// lockfile says. Starting and stopping what the tracker *brings* does
     /// not reach it, because a shared install is brought by `root`, which is
-    /// always bound.
+    /// always bound. The binding here is the store key's: secret trackers
+    /// count (`{{bound.trackers}}` names them), so binding or dropping one
+    /// rebuilds too, through the store like any other.
     ///
     /// This is the same job a spawn does for the same tree, so it goes the
     /// same way: filled from the store when another instance built this
     /// binding already, else the producing action runs and publishes what it
-    /// built. A rebuild that fails is loud and leaves the resource `failed`,
-    /// as a failed `prepare` at spawn does; `newgit action <resource>.prepare`
-    /// is the retry. Only a tree that is there is rebuilt: a resource whose
-    /// install never ran, or is still blocked behind a dependency, holds
-    /// nothing the binding made stale. A long-running action that was up on
-    /// the old tree is restarted on the new one, as undo restarts what a
-    /// restore replaced beneath. A resource the change itself just bound was
-    /// prepared under the new binding and is left alone.
+    /// built. Only a tree that is there is rebuilt: a resource whose install
+    /// never ran holds nothing the binding made stale, and one the change
+    /// itself just bound was prepared under the new binding.
+    ///
+    /// The binding has moved by the time this runs, so nothing here fails
+    /// the command; each install says how it went. One that fails — its
+    /// action exits non-zero, or newgit cannot run it at all — is left
+    /// `failed`, as a failed `prepare` at spawn is, with
+    /// `newgit action <resource>.prepare` as the retry. One whose dependency
+    /// is not ready is not rebuilt: it is reported as blocked and left
+    /// `pending` behind it, its tree still the old binding's. The record is
+    /// saved after each, so what finished is kept whatever comes next.
+    ///
+    /// Processes are left running: rebuilding beneath a live dev server is
+    /// what `newgit action deps.prepare` does too.
     fn rebuild_for_binding(
         &self,
         instance: &str,
@@ -4199,10 +4224,24 @@ impl BranchManager {
             if !branch.resources.contains_key(name) || !before.resources.contains(name) {
                 continue;
             }
-            let definition = self.resource_definition(name)?;
+            let mut report = RebuiltInstall {
+                name: name.clone(),
+                ok: false,
+                install: None,
+                log: None,
+                error: None,
+                blocked_by: Vec::new(),
+            };
+            let definition = match self.resource_definition(name) {
+                Ok(definition) => definition,
+                Err(error) => {
+                    report.error = Some(error.to_string());
+                    rebuilt.push(report);
+                    continue;
+                }
+            };
             if definition.identity_produces().is_empty()
                 || !self.produced_present(&branch, definition)
-                || !self.blocked_dependencies(&branch, definition).is_empty()
             {
                 continue;
             }
@@ -4210,62 +4249,69 @@ impl BranchManager {
             let Some(action) = definition.actions.get(action_name) else {
                 continue;
             };
-            let was_running = self.supervisor(&branch).running_pid(name).is_some();
-            if was_running {
-                let _ = self.supervisor(&branch).stop(name, "term");
-            }
-
-            let install_key = match self.install_key(&branch, definition) {
-                Some(Ok(key)) => Ok(key),
-                Some(Err(report)) => Err(Some(report)),
-                None => Err(None),
-            };
-            let filled = install_key
-                .as_deref()
-                .ok()
-                .and_then(|key| self.refill_from_install_store(&branch, definition, key));
-            let (ok, install, log) = match filled {
-                Some(InstallReport::Filled { key, method }) => {
-                    (true, Some(InstallReport::Filled { key, method }), None)
+            report.blocked_by = self.blocked_dependencies(&branch, definition);
+            let status = if !report.blocked_by.is_empty() {
+                ResourceStatus::Pending
+            } else {
+                match self.rebuild_install(&mut branch, definition, action, action_name) {
+                    Ok((ok, install, log)) => {
+                        report.ok = ok;
+                        report.install = install;
+                        report.log = log;
+                    }
+                    Err(error) => report.error = Some(error.to_string()),
                 }
-                not_filled => {
-                    let log = self
-                        .store
-                        .action_log_path(&branch.slug, &format!("{name}.{action_name}"));
-                    let (code, captured) =
-                        self.run_one_shot(&branch, definition, action, action_name, &log, true)?;
-                    Self::apply_captures(&mut branch, name, captured.found);
-                    let ok = code == 0;
-                    let install = match (&install_key, not_filled) {
-                        (Ok(key), _) if ok => self.admit_to_install_store(&branch, definition, key),
-                        (Ok(_), unavailable) => unavailable,
-                        (Err(report), _) => report.clone(),
-                    };
-                    (ok, install, Some(log))
-                }
-            };
-            if let Some(binding) = branch.resources.get_mut(name) {
-                binding.status = if ok {
+                if report.ok {
                     ResourceStatus::Ready
                 } else {
                     ResourceStatus::Failed
-                };
+                }
+            };
+            if let Some(binding) = branch.resources.get_mut(name) {
+                binding.status = status;
             }
-            if ok && was_running {
-                self.restart_long_running(&branch, definition)?;
-            }
-            rebuilt.push(RebuiltInstall {
-                name: name.clone(),
-                ok,
-                install,
-                log,
-            });
-        }
-        if !rebuilt.is_empty() {
             branch.updated_at = Utc::now();
             self.store.save_branch_record(&branch)?;
+            rebuilt.push(report);
         }
         Ok(rebuilt)
+    }
+
+    /// One install's rebuild for [`Self::rebuild_for_binding`]: filled from
+    /// the store, else the producing action run and its tree stored. Whether
+    /// it succeeded, what the store did, and the log if the action ran.
+    fn rebuild_install(
+        &self,
+        branch: &mut BranchInstance,
+        definition: &ResourceDefinition,
+        action: &crate::resource::ActionSpec,
+        action_name: &str,
+    ) -> Result<(bool, Option<InstallReport>, Option<Utf8PathBuf>)> {
+        let install_key = match self.install_key(branch, definition) {
+            Some(Ok(key)) => Ok(key),
+            Some(Err(report)) => Err(Some(report)),
+            None => Err(None),
+        };
+        let filled = install_key
+            .as_deref()
+            .ok()
+            .and_then(|key| self.refill_from_install_store(branch, definition, key));
+        if let Some(InstallReport::Filled { key, method }) = filled {
+            return Ok((true, Some(InstallReport::Filled { key, method }), None));
+        }
+        let log = self
+            .store
+            .action_log_path(&branch.slug, &format!("{}.{action_name}", definition.name));
+        let (code, captured) =
+            self.run_one_shot(branch, definition, action, action_name, &log, true)?;
+        Self::apply_captures(branch, &definition.name, captured.found);
+        let ok = code == 0;
+        let install = match (&install_key, filled) {
+            (Ok(key), _) if ok => self.admit_to_install_store(branch, definition, key),
+            (Ok(_), unavailable) => unavailable,
+            (Err(report), _) => report.clone(),
+        };
+        Ok((ok, install, Some(log)))
     }
 
     /// The working tree follows the binding: every dropped code tracker's
@@ -7908,7 +7954,10 @@ impl BranchManager {
                 // member and the install builds the bound ones. An undo that
                 // restored a different binding has changed what the tree is
                 // built from, whether or not the lockfile moved, so the skip
-                // compares the same inputs the store key does.
+                // compares the same inputs the store key does. Only for a
+                // resource the store keys at all, one that declares
+                // `[identity] produces`: a codegen step keyed on its inputs
+                // alone skips on them alone, as it did.
                 //
                 // Identity describes the inputs, not the tree: someone can
                 // delete half of `node_modules` without touching the lockfile,
@@ -7917,8 +7966,9 @@ impl BranchManager {
                 // passing silently.
                 // And only while the tree is there at all: a lockfile that did
                 // not move says nothing about a `node_modules` someone deleted.
+                let key_moved = undo.binding_moved && !definition.identity_produces().is_empty();
                 if !undo.force_recompute
-                    && !undo.binding_moved
+                    && !key_moved
                     && self.produced_present(branch, definition)
                     && let Some(recorded) = state.state_ref.as_deref()
                     && recorded.starts_with(HASH_STATE_REF_PREFIX)
@@ -8458,6 +8508,12 @@ pub struct RebuiltInstall {
     pub install: Option<InstallReport>,
     /// The action log, when the producing action ran.
     pub log: Option<Utf8PathBuf>,
+    /// Why newgit could not run the rebuild at all, as opposed to the
+    /// producing action failing (which `log` holds).
+    pub error: Option<String>,
+    /// Dependencies not ready, so this install was not rebuilt: its tree is
+    /// still the old binding's, and it waits as `pending` behind them.
+    pub blocked_by: Vec<String>,
 }
 
 fn stash_message(tracker: &str) -> String {
