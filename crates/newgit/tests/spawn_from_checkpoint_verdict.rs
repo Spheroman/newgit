@@ -140,3 +140,89 @@ command = "true"
     assert!(!spawned.stdout.contains("did not come up"), "{all}");
     assert!(!spawned.stderr.contains("recovery record"), "{all}");
 }
+
+/// A checkpoint that holds state for a resource whose restore runs nothing
+/// (no `[restore]`) leaves it as the spawn's bind left it. When that bind
+/// failed, the restore's `ok` must not stand alone on the line: the
+/// resource is not up, and the line says why and where the log is.
+#[test]
+fn a_restore_that_runs_nothing_still_reports_a_failed_bind() {
+    let (_guard, temp) = tempdir();
+    let fixture = setup(&temp);
+    let flag = temp.join("break-prepare");
+    std::fs::write(
+        fixture.store.join(".newgit/resources/late.toml"),
+        format!(
+            r#"ownership = "branch"
+
+[actions.prepare]
+command = "test ! -e {flag}"
+"#
+        ),
+    )
+    .expect("resource");
+    checkpointed(&fixture);
+    // The checkpoint holds `late`; from here on its prepare fails.
+    std::fs::write(&flag, "").expect("flag");
+
+    let spawned = spawn_review(&fixture);
+    let all = format!("{}\nstderr:\n{}", spawned.stdout, spawned.stderr);
+    assert_eq!(spawned.status.code(), Some(1), "{all}");
+    assert!(
+        spawned
+            .stdout
+            .contains("resource:  late none ok; prepare: FAILED (log: "),
+        "{all}"
+    );
+    assert!(
+        spawned
+            .stdout
+            .contains("re-run with `newgit action late.prepare`"),
+        "{all}"
+    );
+    assert!(spawned.stdout.contains("`late` did not come up"), "{all}");
+    // The restore itself did not fail, so no recovery record is claimed.
+    assert!(!spawned.stderr.contains("recovery record"), "{all}");
+}
+
+/// The human-readable form judges by the same condition `--json` does, so
+/// the same fixture exits the same way under both.
+#[test]
+fn the_human_and_json_forms_exit_alike() {
+    for (restore, code) in [("exit 1", 1), ("true", 0)] {
+        let (_guard, temp) = tempdir();
+        let fixture = setup(&temp);
+        std::fs::write(
+            fixture.store.join(".newgit/resources/seed.toml"),
+            format!(
+                r#"ownership = "branch"
+
+[restore]
+mode = "command"
+command = "{restore}"
+"#
+            ),
+        )
+        .expect("resource");
+        checkpointed(&fixture);
+
+        let human = spawn_review(&fixture);
+        let json = fixture.newgit(
+            &fixture.store,
+            &[
+                "spawn",
+                "review-json",
+                "--from-checkpoint",
+                "feature-a/ckpt_001",
+                "--json",
+            ],
+        );
+        assert_eq!(human.status.code(), Some(code), "{}", human.stdout);
+        assert_eq!(
+            json.status.code(),
+            Some(code),
+            "{}",
+            String::from_utf8_lossy(&json.stdout)
+        );
+    }
+}

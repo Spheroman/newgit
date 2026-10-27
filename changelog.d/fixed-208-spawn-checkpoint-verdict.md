@@ -13,4 +13,6 @@
   state for that failed to bind, both exit 1. The headline names what did
   not come up, and every resource the instance has gets a line — one the
   restore did not touch shows its bind's `prepare` verdict, as a plain
-  `spawn` prints it. The instance and its record are kept, as before.
+  `spawn` prints it, and so does one whose restore ran nothing (no
+  `[restore]`, `none`, `external`) and left it as a failed bind had it. The
+  instance and its record are kept, as before.

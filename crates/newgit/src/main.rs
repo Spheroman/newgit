@@ -1028,9 +1028,22 @@ fn spawn_from_checkpoint(
             .iter()
             .find(|resource| &resource.name == name);
         match (restored, bound) {
-            (Some(restored), _) => {
+            (Some(restored), bound) => {
                 let verdict = if restored.ok { "ok" } else { "FAILED" };
-                println!("  resource:  {name} {} {verdict}", restored.action);
+                // A restore that ran nothing — `none`, `external`, no
+                // `[restore]` — succeeds without bringing the resource up,
+                // so it is still whatever the bind left it. Say what that
+                // was, or the line reads `ok` for a resource that is not.
+                let ready = outcome.branch.resources[name].status == ResourceStatus::Ready;
+                let left = if restored.ok && !ready {
+                    match bound.map(prepare_label).filter(|label| !label.is_empty()) {
+                        Some(label) => format!(";{label}"),
+                        None => "; not ready".to_owned(),
+                    }
+                } else {
+                    String::new()
+                };
+                println!("  resource:  {name} {} {verdict}{left}", restored.action);
             }
             (None, Some(bound)) => println!("  resource:  {name}{}", prepare_label(bound)),
             (None, None) => println!("  resource:  {name}"),
@@ -1044,18 +1057,25 @@ fn spawn_from_checkpoint(
         // As a plain `spawn` exits: the instance and its record stay, exactly
         // as printed above, and exit 1 reports that state rather than
         // undoing it.
-        println!(
-            "spawned with failures: {} of {} resources did not come up.",
-            not_ready.len(),
-            outcome.branch.resources.len()
+        exit_spawned_with_failures(
+            &outcome.branch.name,
+            &format!(
+                "{} of {} resources did not come up",
+                not_ready.len(),
+                outcome.branch.resources.len()
+            ),
         );
-        println!(
-            "  `{}` exists but is not ready. See the FAILED/BLOCKED lines above.",
-            outcome.branch.name
-        );
-        std::process::exit(1);
     }
     Ok(())
+}
+
+/// The footer both spawns end on when a resource is not up, and their exit.
+/// The instance is not rolled back — it exists, with a record on disk,
+/// exactly as printed above. Exit 1 reports that state; it does not undo it.
+fn exit_spawned_with_failures(name: &str, summary: &str) -> ! {
+    println!("spawned with failures: {summary}.");
+    println!("  `{name}` exists but is not ready. See the FAILED/BLOCKED lines above.");
+    std::process::exit(1);
 }
 
 fn spawn(args: SpawnArgs) -> Result<()> {
@@ -1241,22 +1261,18 @@ fn spawn(args: SpawnArgs) -> Result<()> {
     }
     if !outcome.is_complete() {
         let failed = outcome.failed_resources();
-        // The instance is not rolled back — it exists, with a record on
-        // disk, exactly as printed above. Exit 1 reports that state; it does
-        // not undo it. A blocked prepare is named alongside a failed one:
-        // both mean the resource never came up, and printing only "FAILED"
-        // here would let a blocked resource read as fine when its own line
-        // above said otherwise.
-        println!(
-            "spawned with failures: {} of {} resources did not bind.",
-            failed.len(),
-            outcome.resources.len()
+        // A blocked prepare is named alongside a failed one: both mean the
+        // resource never came up, and printing only "FAILED" here would let
+        // a blocked resource read as fine when its own line above said
+        // otherwise.
+        exit_spawned_with_failures(
+            &branch.name,
+            &format!(
+                "{} of {} resources did not bind",
+                failed.len(),
+                outcome.resources.len()
+            ),
         );
-        println!(
-            "  `{}` exists but is not ready. See the FAILED/BLOCKED lines above.",
-            branch.name
-        );
-        std::process::exit(1);
     }
     let readiness = manager.readiness(branch);
     if readiness.is_ready() {
