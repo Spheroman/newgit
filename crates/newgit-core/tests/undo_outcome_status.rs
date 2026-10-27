@@ -109,16 +109,64 @@ fn an_ok_restore_that_ran_nothing_reports_the_status_it_left() {
             .unwrap_or_else(|| panic!("`{name}` in {:?}", undo.resources))
     };
     let branch = m.store().find_branch("feature-a").expect("instance");
-    for (name, status) in [
-        ("deps", ResourceStatus::Failed),
-        ("fine", ResourceStatus::Ready),
-        ("dependent", ResourceStatus::Pending),
+    for (name, status, blocked_by) in [
+        ("deps", ResourceStatus::Failed, &[][..]),
+        ("fine", ResourceStatus::Ready, &[]),
+        ("dependent", ResourceStatus::Pending, &["deps"]),
     ] {
         let resource = outcome(name);
         assert!(resource.ok, "`{name}`: nothing ran, so nothing failed");
+        assert!(!resource.restart_failed, "`{name}`: nothing was running");
         assert_eq!(resource.action, "none", "`{name}`");
         assert_eq!(resource.status, status, "`{name}`");
+        assert_eq!(resource.blocked_by, blocked_by, "`{name}`");
         // The outcome says what the record says.
         assert_eq!(branch.resources[name].status, status, "`{name}`");
     }
+}
+
+/// A restore that is ok can still leave its resource failed: one running at
+/// checkpoint time whose start then fails. The outcome's status is read
+/// after that failure marks it, so it says `Failed`, not `Ready`.
+#[test]
+fn an_ok_restore_whose_restart_fails_reports_failed() {
+    let (_guard, temp) = tempdir();
+    let store = setup(&temp);
+    let resource = |workdir: &str| {
+        format!(
+            r#"ownership = "workspace"
+
+[actions.start]
+command = "sleep 30"
+long_running = true
+workdir = "{workdir}"
+
+[actions.stop]
+signal = "term"
+"#
+        )
+    };
+    write_resource(&store, "app", &resource("."));
+    let resources = store.paths().resources.clone();
+    let m = BranchManager::open(store).expect("manager");
+    m.spawn("feature-a", None).expect("spawn");
+    m.run_action("feature-a", "app.start").expect("start");
+    let checkpoint = m.checkpoint("feature-a", None).expect("checkpoint");
+    assert!(checkpoint.record.resource_states[0].was_running);
+
+    // Point the start at a workdir that does not exist, so the restart the
+    // undo attempts fails before anything runs.
+    std::fs::write(resources.join("app.toml"), resource("missing")).expect("rewrite");
+    let m = BranchManager::open(m.store().clone()).expect("reopen");
+    let undo = m.undo("feature-a", &UndoOptions::default()).expect("undo");
+
+    let app = &undo.resources[0];
+    assert_eq!(app.name, "app");
+    assert!(app.ok, "the restore itself ran nothing: {app:?}");
+    assert!(app.restart_failed, "{app:?}");
+    assert_eq!(app.status, ResourceStatus::Failed, "{app:?}");
+    assert!(!undo.is_complete());
+    assert!(undo.recovery_record.is_some());
+    let branch = m.store().find_branch("feature-a").expect("instance");
+    assert_eq!(branch.resources["app"].status, ResourceStatus::Failed);
 }

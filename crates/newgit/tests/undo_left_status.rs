@@ -141,7 +141,7 @@ fn undo_says_what_status_a_resource_is_left_in() {
         "{stdout}"
     );
     assert!(
-        stdout.contains("  resource: dependent none ok, left pending"),
+        stdout.contains("  resource: dependent none ok, left blocked by deps\n"),
         "{stdout}"
     );
     // A resource the undo leaves ready says nothing more than it did.

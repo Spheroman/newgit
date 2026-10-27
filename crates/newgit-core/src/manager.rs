@@ -842,6 +842,13 @@ pub struct UndoResourceOutcome {
     /// with `ok` true; a restart that failed after an ok restore is
     /// `Failed` too.
     pub status: ResourceStatus,
+    /// The resource was running at checkpoint time and its restore was ok,
+    /// but starting it again failed. `ok` stays true — the restore did what
+    /// it set out to — and `status` is `Failed`.
+    pub restart_failed: bool,
+    /// Dependencies not `Ready` once the undo is done, as `newgit status`
+    /// derives `blocked(..)` from them.
+    pub blocked_by: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -7598,6 +7605,7 @@ impl BranchManager {
                 }
             }
 
+            let mut restart_failed = false;
             if ok && state.was_running {
                 match self.restart_long_running(&branch, definition) {
                     Ok(true) => action_label.push_str(" + restarted"),
@@ -7605,25 +7613,37 @@ impl BranchManager {
                         "resource `{name}` was running at checkpoint time but has no \
                          long-running action to restart"
                     )),
-                    Err(error) => failures.push(RestoreFailure {
-                        resource: name.clone(),
-                        detail: format!("restart failed: {error}"),
-                        log: None,
-                        retry_with: format!("newgit action {name}.start {}", branch.name),
-                    }),
+                    Err(error) => {
+                        restart_failed = true;
+                        if let Some(binding) = branch.resources.get_mut(name) {
+                            binding.status = ResourceStatus::Failed;
+                        }
+                        failures.push(RestoreFailure {
+                            resource: name.clone(),
+                            detail: format!("restart failed: {error}"),
+                            log: None,
+                            retry_with: format!("newgit action {name}.start {}", branch.name),
+                        });
+                    }
                 }
             }
-            resources.push((name.clone(), action_label, ok));
+            // Read only now, after a failed restore or restart has marked the
+            // resource failed, so the outcome says what the record is saved
+            // with. Dependencies come first in bind order, so theirs are
+            // already final too.
+            resources.push(UndoResourceOutcome {
+                status: branch.resources[name].status,
+                blocked_by: self.blocked_dependencies(&branch, definition),
+                name: name.clone(),
+                action: action_label,
+                ok,
+                restart_failed,
+            });
         }
 
         let recovery_record = if failures.is_empty() {
             None
         } else {
-            for failure in &failures {
-                if let Some(binding) = branch.resources.get_mut(&failure.resource) {
-                    binding.status = ResourceStatus::Failed;
-                }
-            }
             Some(checkpoint_log.save_recovery(&RecoveryRecord {
                 checkpoint: restored.id.clone(),
                 branch: branch.name.clone(),
@@ -7631,17 +7651,6 @@ impl BranchManager {
                 failures,
             })?)
         };
-        // Read back only now, after a failed restart has marked its resource
-        // failed: the outcome reports the status the record is saved with.
-        let resources = resources
-            .into_iter()
-            .map(|(name, action, ok)| UndoResourceOutcome {
-                status: branch.resources[&name].status,
-                name,
-                action,
-                ok,
-            })
-            .collect();
 
         branch.updated_at = Utc::now();
         self.store.save_branch_record(&branch)?;

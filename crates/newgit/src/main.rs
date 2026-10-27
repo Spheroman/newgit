@@ -2379,7 +2379,14 @@ fn undo(instance: Option<String>, options: UndoOptions) -> Result<()> {
     // half-failed undo leaves its resource in neither the pre-undo state nor
     // the checkpoint state — saying "Restored" and "FAILED" about the same
     // operation sends you looking at your script instead of at the resource.
-    let failed = outcome.failed_resources();
+    // Not `failed_resources()`, which is restores only: a resource whose
+    // restore was ok but whose restart failed was not brought back either.
+    let failed: Vec<&str> = outcome
+        .resources
+        .iter()
+        .filter(|resource| !resource.ok || resource.restart_failed)
+        .map(|resource| resource.name.as_str())
+        .collect();
     if outcome.partial && outcome.is_complete() {
         // Never says "Restored `<instance>`": no source and no tracker content
         // moved, so the instance as a whole is not at this checkpoint and
@@ -2447,13 +2454,27 @@ fn undo(instance: Option<String>, options: UndoOptions) -> Result<()> {
         // does not bring a resource up. Under "Restored" a bare `ok` reads
         // as the resource being fine, so when it is not, say the status it
         // is left in, the one `newgit status` will show.
-        let left = match resource.status {
-            ResourceStatus::Ready => "",
-            ResourceStatus::Failed => ", left failed",
-            ResourceStatus::Pending => ", left pending (its prepare has never run)",
+        let restart = if resource.restart_failed {
+            ", restart FAILED"
+        } else {
+            ""
+        };
+        // Derived the way `status` derives it: a resource behind a
+        // dependency that is not ready reads as blocked, whatever its own
+        // status. A failed restore or restart has already said "failed".
+        let left = if !resource.blocked_by.is_empty() {
+            format!(", left blocked by {}", resource.blocked_by.join(", "))
+        } else if !resource.ok || resource.restart_failed {
+            String::new()
+        } else {
+            match resource.status {
+                ResourceStatus::Ready => String::new(),
+                ResourceStatus::Failed => ", left failed".to_owned(),
+                ResourceStatus::Pending => ", left pending".to_owned(),
+            }
         };
         println!(
-            "  resource: {} {} {verdict}{left}",
+            "  resource: {} {} {verdict}{restart}{left}",
             resource.name, resource.action
         );
     }
