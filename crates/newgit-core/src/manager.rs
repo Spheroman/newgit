@@ -7435,20 +7435,42 @@ impl BranchManager {
         // restore of one resource is not a state this instance was ever in.
         let workspace = branch.workspace_path.clone();
         if !partial {
-            // The binding first, as it was: what the checkpoint did not bind
-            // is dropped again, and what it bound comes back — its content
-            // with the source and trackers below, its resources with the
-            // resources. Nothing is lost: the safety checkpoint above holds
-            // what was here.
+            // Fetched first: it only touches the object store, so a
+            // checkpoint whose ref is gone fails here with nothing changed.
+            GitSource::workspace_fetch_ref(
+                &workspace,
+                self.source.root(),
+                &restored.source.store_ref,
+            )?;
+
+            // The binding before the source, as it was: what the checkpoint
+            // did not bind is dropped again, and what it bound comes back —
+            // its content with the source and trackers below, its resources
+            // once the source is back. Nothing is lost: the safety checkpoint
+            // above holds what was here.
             //
             // Before the source restore, not after: a dropped code tracker's
             // paths are skip-worktree entries, which the restore leaves alone
             // — so a file the checkpoint had deleted would stay in the index
             // and come back when the tracker is bound again (#210).
-            if restored.dropped != branch.dropped {
+            let rebound = restored.dropped != branch.dropped;
+            if rebound {
                 for tracker in restored.dropped.difference(&branch.dropped) {
                     if let Some(definition) = self.trackers.iter().find(|d| &d.name == tracker) {
                         crate::tracker_repo::clear_owned_paths(&workspace, definition)?;
+                    }
+                    // A code tracker's paths go back to HEAD, as a discarding
+                    // drop leaves them, so the sparse checkout below takes
+                    // its files and their directories out of the tree.
+                    if let Some(definition) = self.code.iter().find(|d| &d.name == tracker) {
+                        let paths: Vec<&str> =
+                            definition.paths.iter().map(|path| path.as_str()).collect();
+                        let mut restore = vec!["-C", workspace.as_str(), "checkout", "HEAD", "--"];
+                        restore.extend(&paths);
+                        let _ = crate::source::run_git_env(&restore, &[]);
+                        let mut clean = vec!["-C", workspace.as_str(), "clean", "-fdq", "--"];
+                        clean.extend(&paths);
+                        crate::source::run_git_env(&clean, &[])?;
                     }
                 }
                 branch.dropped = restored.dropped.clone();
@@ -7466,14 +7488,11 @@ impl BranchManager {
                     }
                     branch.resources.remove(&name);
                 }
-                self.bind_resources(&mut branch)?;
+                // The workspace now has the checkpoint's binding, so the
+                // record says so too, before anything below can fail.
+                self.store.save_branch_record(&branch)?;
             }
 
-            GitSource::workspace_fetch_ref(
-                &workspace,
-                self.source.root(),
-                &restored.source.store_ref,
-            )?;
             GitSource::workspace_restore_to(
                 &workspace,
                 &restored.source.head_rev,
@@ -7487,6 +7506,12 @@ impl BranchManager {
                 Some(&safety.record.source.head_rev),
                 &mut warnings,
             )?;
+
+            // After the source: `prepare`, install keys and renders read
+            // the restored content, not what was here before the undo.
+            if rebound {
+                self.bind_resources(&mut branch)?;
+            }
         }
 
         // Trackers: plain content, restored exactly; should not partially
