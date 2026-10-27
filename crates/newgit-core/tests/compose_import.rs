@@ -2,7 +2,9 @@
 //! through one merge*): a history from outside the project joins each view
 //! through one merge, marked on its history, rather than interleaving by
 //! date, so taking it rewrites nothing — on `main` at the import, and on a
-//! branch from before the import when that branch takes it.
+//! branch from before the import when that branch takes it. The imported
+//! tracker is mounted: its history keeps its files at its own root, as the
+//! outside repository has them, and the view shows it under `apps/t3code`.
 
 use std::process::Command;
 
@@ -71,6 +73,7 @@ fn tracker(name: &str, paths: &[&str], excluded: &[&str]) -> TrackerDefinition {
         storage: Storage::Local,
         merge_with_source: true,
         paths: paths.iter().map(Utf8PathBuf::from).collect(),
+        mount: None,
         secret: false,
         maintainers: None,
         role: None,
@@ -83,8 +86,8 @@ fn tracker(name: &str, paths: &[&str], excluded: &[&str]) -> TrackerDefinition {
 }
 
 /// A project (root: `a`, then `b`) and, on an unrelated branch, an outside
-/// history under `apps/t3code` that is older than all of it and has a
-/// merge — what an import writes.
+/// history at its own root that is older than all of it and has a merge —
+/// what an import fetches, unchanged.
 struct Project {
     repo: Utf8PathBuf,
     a: String,
@@ -102,26 +105,11 @@ fn project(temp: &Utf8Path) -> Project {
 
     git(&repo, &["checkout", "-q", "--orphan", "t3code"]);
     git(&repo, &["rm", "-rfq", "."]);
-    let x1 = commit(
-        &repo,
-        &[("apps/t3code/app.js", "one\n")],
-        "t3code: start",
-        1_000,
-    );
+    let x1 = commit(&repo, &[("app.js", "one\n")], "t3code: start", 1_000);
     git(&repo, &["checkout", "-q", "-b", "t3code-side"]);
-    let side = commit(
-        &repo,
-        &[("apps/t3code/side.js", "side\n")],
-        "t3code: side",
-        2_500,
-    );
+    let side = commit(&repo, &[("side.js", "side\n")], "t3code: side", 2_500);
     git(&repo, &["checkout", "-q", "t3code"]);
-    let x2 = commit(
-        &repo,
-        &[("apps/t3code/app.js", "one\ntwo\n")],
-        "t3code: two",
-        2_000,
-    );
+    let x2 = commit(&repo, &[("app.js", "one\ntwo\n")], "t3code: two", 2_000);
     git_env(
         &repo,
         &[
@@ -150,8 +138,33 @@ const T3CODE_MAIN: &str = "refs/test/t3code/main";
 fn definitions() -> (TrackerDefinition, TrackerDefinition) {
     (
         tracker("root", &["."], &["apps/t3code"]),
-        tracker("t3code", &["apps/t3code"], &[]),
+        TrackerDefinition {
+            mount: Some("apps/t3code".into()),
+            ..tracker("t3code", &["apps/t3code"], &[])
+        },
     )
+}
+
+/// The view's copy of imported commit `original`: the same commit with its
+/// files under the mount.
+fn assert_copy(repo: &Utf8Path, copy: &str, original: &str) {
+    let show = |commit: &str| {
+        git(
+            repo,
+            &["log", "-1", "--format=%an %ae %at %cn %ce %ct%n%B", commit],
+        )
+    };
+    assert_eq!(show(copy), show(original), "same author, dates, message");
+    assert_eq!(
+        git(repo, &["rev-parse", &format!("{copy}:apps/t3code")]),
+        git(repo, &["rev-parse", &format!("{original}^{{tree}}")]),
+        "the original tree, under the mount"
+    );
+    assert_eq!(
+        git(repo, &["ls-tree", "--name-only", copy]),
+        "apps",
+        "nothing else"
+    );
 }
 
 /// The import on `main`: t3code joins after `b`.
@@ -205,7 +218,11 @@ fn an_imported_tracker_joins_main_through_one_merge() {
 
     // One commit appended; everything before it is the original history.
     assert_eq!(git(repo, &["rev-parse", &format!("{merge}^1")]), project.b);
-    assert_eq!(git(repo, &["rev-parse", &format!("{merge}^2")]), *under);
+    assert_copy(
+        repo,
+        &git(repo, &["rev-parse", &format!("{merge}^2")]),
+        under,
+    );
     assert_eq!(
         git(repo, &["rev-list", "--first-parent", &merge]),
         format!("{merge}\n{}\n{}", project.b, project.a),
@@ -220,16 +237,39 @@ fn an_imported_tracker_joins_main_through_one_merge() {
         "README.md\napps/t3code/app.js\napps/t3code/side.js"
     );
 
-    // `git log` and `git blame` reach through the merge into the real history.
-    let touched = git(repo, &["log", "--format=%H", &merge, "--", "apps/t3code"]);
-    for imported in &project.imported {
-        assert!(touched.contains(imported.as_str()), "{imported} in log");
-    }
+    // `git log` and `git blame` reach through the merge into the history,
+    // as the copy under the mount.
+    assert_eq!(
+        git(repo, &["log", "--format=%s", &merge, "--", "apps/t3code"]),
+        "t3code: merge side\nt3code: side\nt3code: two\nt3code: start"
+    );
     let blame = git(
         repo,
         &["blame", "--porcelain", &merge, "--", "apps/t3code/app.js"],
     );
-    assert!(blame.starts_with(&project.imported[0]));
+    assert!(blame.contains("\nsummary t3code: start\n"), "{blame}");
+    assert!(blame.contains("\nsummary t3code: two\n"), "{blame}");
+
+    // The tracker keeps the history as it came: the marker sits on the
+    // imported tip itself, ids unchanged.
+    assert_eq!(
+        git(repo, &["rev-parse", &format!("{}^", joined.marker)]),
+        *under
+    );
+
+    // The copy under the mount is a pure function of the history: made again
+    // without its cache, the view comes out the same.
+    git(repo, &["update-ref", "-d", compose::MOUNTED_NOTES_REF]);
+    git(repo, &["update-ref", "-d", "refs/newgit/views/main"]);
+    assert_eq!(
+        view(
+            repo,
+            "main",
+            &tips(&root, &project.b, &t3code, &joined.marker),
+            &all,
+        ),
+        merge
+    );
 
     // Composed where the join is not already a commit, it comes out the same.
     git(repo, &["update-ref", "-d", "refs/newgit/views/main"]);
@@ -267,6 +307,17 @@ fn work_after_the_import_follows_the_merge_and_keeps_its_ids() {
     );
     let split = compose::split(repo, &merge, &work, &[&root, &t3code], &all).expect("split");
     assert_eq!(split.made.len(), 2, "one commit per tracker");
+    let t3code_commit = &split.state["t3code"];
+    assert_eq!(
+        git(repo, &["ls-tree", "-r", "--name-only", t3code_commit]),
+        "app.js\nside.js",
+        "t3code's commit holds its files at its own root"
+    );
+    assert_eq!(
+        git(repo, &["rev-parse", &format!("{t3code_commit}^")]),
+        joined.marker,
+        "on top of the history as imported"
+    );
     let recomposed = view(
         repo,
         "main",
@@ -518,16 +569,11 @@ fn upstream(repo: &Utf8Path, parent: &str) -> (String, String) {
     git(repo, &["checkout", "-q", "--detach", parent]);
     let first = commit(
         repo,
-        &[("apps/t3code/app.js", "one\ntwo\nupstream\n")],
+        &[("app.js", "one\ntwo\nupstream\n")],
         "upstream: one",
         3_500,
     );
-    let second = commit(
-        repo,
-        &[("apps/t3code/up.js", "up\n")],
-        "upstream: two",
-        3_600,
-    );
+    let second = commit(repo, &[("up.js", "up\n")], "upstream: two", 3_600);
     (first, second)
 }
 
@@ -571,10 +617,10 @@ fn an_upstream_sync_merge_goes_on_top_whatever_its_dates() {
         r,
         "one commit on top; `r` keeps its id"
     );
-    assert_eq!(
-        git(repo, &["rev-parse", &format!("{tip}^2")]),
-        second,
-        "the upstream commits come in as themselves"
+    assert_copy(
+        repo,
+        &git(repo, &["rev-parse", &format!("{tip}^2")]),
+        &second,
     );
     assert_eq!(
         git(repo, &["log", "-1", "--format=%B", &tip]),

@@ -159,8 +159,9 @@ with its history) is not interleaved by date: its commits predate and
 interleave with the project's, so date order would give every existing view
 commit a new parent and a new id. It joins a branch the way `git subtree add`
 would: one merge on top of the branch, first parent the branch's commit,
-second parent the imported history itself, reused as-is, and the branch's
-tree with the tracker's paths set to the imported history's. Adding the
+second parent the imported history itself, reused as-is (for a tracker
+with a `mount`, its copy under the mount, below), and the branch's tree
+with the tracker's paths set to the imported history's. Adding the
 tracker appends exactly one commit and rewrites nothing, and `git log --
 <path>` and `git blame` follow the second parent into the real history.
 
@@ -181,6 +182,24 @@ second parent skips earlier markers: they are bookkeeping, never history
 anyone reads. The join is deterministic: author and committer `newgit
 <newgit@localhost>`, dated the later of its two parents, message `Import
 <tracker> into <paths>`.
+
+**An imported tracker is stored relative to its own root (decided).** Its
+definition has a `mount`, the workspace directory its root sits at, and its
+`paths` are relative to that (`["."]` is the whole mount). Its commits are
+the outside repository's own, ids and signatures intact, with files at
+their root; split strips the mount from what it commits there, and compose
+adds it to what the tracker's commits change. The history a join brings in
+is a copy under the mount: every commit and parent kept, author, dates, and
+message as they were, so the copy is a pure function of the original and
+every machine makes the same one (cached on `refs/notes/newgit-mounted`).
+That keeps `git log` and `git blame` under the mount working through the
+join. The view's commit ids for that history differ from the outside
+repository's, which is the price of one Git history over everything: ids
+are stable per root, not across roots. Rooted at the tracker itself (an
+export of it alone), its commits are the originals. Every other tracker
+has no mount, which is the project root, so nothing migrates. This is the
+first step of #201 (trackers all the way down), taken for imported trackers
+only.
 
 **Commits from outside come in through one merge (decided).** New commits
 made outside newgit (an upstream sync of a fork, a push straight to the
@@ -597,7 +616,13 @@ environment identity is simply the set of tracker commits it composes.
    on top of its own commits, like a normal Git merge, without taking the
    rest of `main`.
 4. **`git log` and `git blame` reach through the join**: its second parent
-   is the imported history itself.
+   is the imported history itself (for a mounted tracker, its copy under
+   the mount).
 5. **Commits from outside come in through one merge** pinned to the view
    commit it follows (`Newgit-Follows`), `git subtree pull`'s shape, never
    laid onto the tracker's line, where their dates would rewrite the view.
+6. **An imported tracker is stored relative to its own root**, placed by a
+   `mount` in its definition, so its commits are the outside repository's
+   own; views show a copy under the mount (see *An imported tracker is
+   stored relative to its own root*). Decided 2026-10-27, replacing an
+   import that rewrote every commit under its path.

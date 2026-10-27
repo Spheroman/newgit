@@ -176,13 +176,15 @@ pub fn compose(
     // rebuilt merge keeps every parent.
     let mut events = Vec::new();
     let mut side: BTreeMap<String, SideCommit> = BTreeMap::new();
-    let mut imported: BTreeMap<String, String> = BTreeMap::new();
+    // Imported commit → its tracker and the commit the view shows for it.
+    let mut imported: BTreeMap<String, (String, String)> = BTreeMap::new();
     for (tip, mut dag, spine, raw, markers) in histories {
         let name = &tip.definition.name;
         let join = joining.get(name);
         if join.is_none() && !markers.is_empty() {
             continue;
         }
+        let mount = tip.definition.mount.as_ref();
         let mut join_tip = None;
         if let Some(marker) = join {
             let under = beneath_markers(&raw, &dag, marker).ok_or_else(|| missing(marker))?;
@@ -190,16 +192,28 @@ pub fn compose(
                 .into_iter()
                 .collect();
             dag.retain(|(id, _)| !before.contains(id));
+            // A mounted tracker's history is in the view as its copy under
+            // the mount, so `git log` and `git blame` there reach it.
+            let copies = match mount {
+                Some(mount) => mounted(repo, &under, mount)?,
+                None => BTreeMap::new(),
+            };
             for id in before {
-                imported.insert(id, name.clone());
+                let shown = copies.get(&id).cloned().unwrap_or_else(|| id.clone());
+                imported.insert(id, (name.clone(), shown));
             }
-            join_tip = Some(under);
+            join_tip = Some(copies.get(&under).cloned().unwrap_or(under));
         }
         let pairs: Vec<(String, Option<String>)> = dag
             .iter()
             .map(|(id, parents)| (id.clone(), parents.first().cloned()))
             .collect();
-        let changes = diff_tree(repo, &pairs)?;
+        let mut changes = diff_tree(repo, &pairs)?;
+        if let Some(mount) = mount {
+            for change in changes.values_mut().flatten() {
+                change.path = format!("{mount}/{}", change.path);
+            }
+        }
         for (id, parents) in dag {
             let commit = raw.get(&id).cloned().ok_or_else(|| missing(&id))?;
             let all_changes = changes.get(&id).cloned().unwrap_or_default();
@@ -223,6 +237,7 @@ pub fn compose(
                     changes: owned,
                     all_changes,
                     joins,
+                    mounted: mount.is_some(),
                 });
             } else {
                 // On a side branch only this tracker's history exists — the
@@ -247,6 +262,7 @@ pub fn compose(
                         commit,
                         changes: applied,
                         all_changes,
+                        mounted: mount.is_some(),
                     },
                 );
             }
@@ -459,10 +475,12 @@ pub fn compose(
         canonical: Vec::new(),
         commits: 0,
     };
-    // Imported commits are in the view as themselves, reached through the
-    // merge's second parent.
-    for (id, tracker) in &imported {
-        out.view_of.insert(id.clone(), Target::Commit(id.clone()));
+    // Imported commits are in the view as themselves (or, for a mounted
+    // tracker, their copies under the mount), reached through the merge's
+    // second parent.
+    for (id, (tracker, shown)) in &imported {
+        out.view_of
+            .insert(id.clone(), Target::Commit(shown.clone()));
         out.state_of
             .insert(id.clone(), State::from([(tracker.clone(), id.clone())]));
     }
@@ -560,7 +578,14 @@ pub fn compose(
                 join_reusable(repo, &source, from, under, definition)
             }
             (Some(_), _) => false,
-            (None, _) => parent_matches && merges_match && changes_match,
+            // A mounted tracker's commit holds its files at the tracker's
+            // root, never where the view has them: it is always rewritten.
+            (None, _) => {
+                parent_matches
+                    && merges_match
+                    && changes_match
+                    && !original.is_some_and(|event| event.mounted)
+            }
         };
         tip = if reusable {
             out.reuse(&source, &state)
@@ -595,6 +620,8 @@ struct SideCommit {
     commit: RawCommit,
     changes: Vec<Change>,
     all_changes: Vec<Change>,
+    /// Its tracker has a mount, so it is never reused as itself.
+    mounted: bool,
 }
 
 /// Where a tracker commit landed in the view.
@@ -737,19 +764,20 @@ impl Emitter {
             own.sort_by(|left, right| left.path.cmp(&right.path));
             let mut changes: Vec<&Change> = commit.changes.iter().collect();
             changes.sort_by(|left, right| left.path.cmp(&right.path));
-            let target = if all_original && own.iter().collect::<Vec<_>>() == changes {
-                self.reuse(&current, &state)
-            } else {
-                let from = parents.first().cloned().unwrap_or(Target::None);
-                self.write(
-                    &commit.commit,
-                    &from,
-                    &parents[1.min(parents.len())..],
-                    &changes,
-                    &state,
-                    Some(&current),
-                )
-            };
+            let target =
+                if all_original && !commit.mounted && own.iter().collect::<Vec<_>>() == changes {
+                    self.reuse(&current, &state)
+                } else {
+                    let from = parents.first().cloned().unwrap_or(Target::None);
+                    self.write(
+                        &commit.commit,
+                        &from,
+                        &parents[1.min(parents.len())..],
+                        &changes,
+                        &state,
+                        Some(&current),
+                    )
+                };
             self.view_of.insert(current.clone(), target);
             self.state_of.insert(current, state);
         }
@@ -881,6 +909,14 @@ pub fn join(
             None => break,
         }
     }
+    // A mounted tracker's history joins as its copy under the mount; the
+    // marker still goes on the tracker's own history.
+    let under = match &definition.mount {
+        Some(mount) => mounted(repo, &under, mount)?
+            .remove(&under)
+            .ok_or_else(|| missing(&under))?,
+        None => under,
+    };
     let under = under.as_str();
     let ids = [after.to_owned(), under.to_owned()];
     let raw = read_commits(repo, &ids)?;
@@ -1040,6 +1076,210 @@ fn join_reusable(
     command(repo, &args)
         .output()
         .is_ok_and(|output| output.status.success())
+}
+
+/// Where each commit of a mounted tracker is noted with its copy under the
+/// mount ([`mounted`]): `<mount> <copy>` lines. Only a cache — a copy is a
+/// pure function of its original and the mount, so every machine makes the
+/// same one — and a copy Git has since collected is simply made again.
+pub const MOUNTED_NOTES_REF: &str = "refs/notes/newgit-mounted";
+
+/// `tip`'s history with every tree moved under `mount`: how a view shows a
+/// tracker stored relative to its own root. Every commit and parent is kept
+/// (an imported history has merges), with author, committer, dates,
+/// encoding, and message as they were, so each copy is a pure function of
+/// its original. Signatures do not survive: they signed the original trees.
+/// Returns original → copy for every commit reachable from `tip`, making
+/// only the copies not already noted on [`MOUNTED_NOTES_REF`].
+fn mounted(repo: &Utf8Path, tip: &str, mount: &Utf8Path) -> Result<BTreeMap<String, String>> {
+    const EMPTY_TREE: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
+    let history = full_history(repo, tip)?;
+    let wanted: BTreeSet<&str> = history.iter().map(|(id, _)| id.as_str()).collect();
+
+    // What earlier composes made, and Git still has.
+    let listed: Vec<(String, String)> =
+        git_lines(repo, &["notes", "--ref", MOUNTED_NOTES_REF, "list"])
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|line| {
+                let (blob, commit) = line.split_once(' ')?;
+                wanted
+                    .contains(commit)
+                    .then(|| (blob.to_owned(), commit.to_owned()))
+            })
+            .collect();
+    let blobs: Vec<String> = listed.iter().map(|(blob, _)| blob.clone()).collect();
+    let contents = cat_file_batch(repo, &blobs)?;
+    let mut lines_of: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut copies: BTreeMap<String, String> = BTreeMap::new();
+    for (blob, commit) in &listed {
+        let text = contents
+            .get(blob)
+            .map(|body| String::from_utf8_lossy(body).to_string())
+            .unwrap_or_default();
+        for line in text.lines() {
+            match line.rsplit_once(' ') {
+                Some((noted, copy)) if noted == mount.as_str() => {
+                    copies.insert(commit.clone(), copy.to_owned());
+                }
+                _ => lines_of
+                    .entry(commit.clone())
+                    .or_default()
+                    .push(line.to_owned()),
+            }
+        }
+    }
+    if !copies.is_empty() {
+        let input: String = copies.values().map(|copy| format!("{copy}\n")).collect();
+        let present = run(
+            &mut command(
+                repo,
+                &["cat-file", "--batch-check=%(objectname) %(objecttype)"],
+            ),
+            "git cat-file --batch-check",
+            Some(input.as_bytes()),
+        )?;
+        let present: BTreeSet<String> = String::from_utf8_lossy(&present)
+            .lines()
+            .filter(|line| line.ends_with(" commit"))
+            .filter_map(|line| line.split(' ').next().map(ToOwned::to_owned))
+            .collect();
+        copies.retain(|_, copy| present.contains(copy));
+    }
+    let todo: Vec<&(String, Vec<String>)> = history
+        .iter()
+        .filter(|(id, _)| !copies.contains_key(id))
+        .collect();
+    if todo.is_empty() {
+        return Ok(copies);
+    }
+
+    // Oldest first, so every parent is made (or already noted) before its
+    // children.
+    let ids: Vec<String> = todo.iter().map(|(id, _)| id.clone()).collect();
+    let bodies = cat_file_batch(repo, &ids)?;
+    let scratch = "refs/newgit/mounting";
+    let mut marks: BTreeMap<&str, usize> = BTreeMap::new();
+    let mut stream = Vec::new();
+    for (index, (id, parents)) in todo.iter().enumerate() {
+        let body = bodies.get(id).ok_or_else(|| missing(id))?;
+        let split = body
+            .windows(2)
+            .position(|pair| pair == b"\n\n")
+            .unwrap_or(body.len());
+        let headers = String::from_utf8_lossy(&body[..split]);
+        let message = body.get(split + 2..).unwrap_or_default();
+        let header = |key: &str| {
+            headers
+                .lines()
+                .find_map(|line| line.strip_prefix(key).map(ToOwned::to_owned))
+        };
+        let tree = header("tree ").ok_or_else(|| missing(id))?;
+        let mark = index + 1;
+        marks.insert(id, mark);
+        writeln!(stream, "reset {scratch}").ok();
+        writeln!(stream, "commit {scratch}").ok();
+        writeln!(stream, "mark :{mark}").ok();
+        if let Some(author) = header("author ") {
+            writeln!(stream, "author {author}").ok();
+        }
+        writeln!(
+            stream,
+            "committer {}",
+            header("committer ").unwrap_or_default()
+        )
+        .ok();
+        if let Some(encoding) = header("encoding ") {
+            writeln!(stream, "encoding {encoding}").ok();
+        }
+        writeln!(stream, "data {}", message.len()).ok();
+        stream.extend_from_slice(message);
+        stream.push(b'\n');
+        for (position, parent) in parents.iter().enumerate() {
+            let reference = match (marks.get(parent.as_str()), copies.get(parent)) {
+                (Some(mark), _) => format!(":{mark}"),
+                (None, Some(copy)) => copy.clone(),
+                (None, None) => return Err(missing(parent)),
+            };
+            let verb = if position == 0 { "from" } else { "merge" };
+            writeln!(stream, "{verb} {reference}").ok();
+        }
+        writeln!(stream, "deleteall").ok();
+        if tree != EMPTY_TREE {
+            writeln!(stream, "M 040000 {tree} {}", quote(mount.as_str())).ok();
+        }
+        stream.push(b'\n');
+    }
+    let marks_file = repo_tmp_file(repo, "mount-marks");
+    let made = run(
+        Command::new("git").arg("-C").arg(repo.as_str()).args([
+            "fast-import",
+            "--quiet",
+            "--force",
+            "--date-format=raw",
+            &format!("--export-marks={marks_file}"),
+        ]),
+        "git fast-import",
+        Some(&stream),
+    );
+    let exported = std::fs::read_to_string(&marks_file);
+    let _ = std::fs::remove_file(&marks_file);
+    let _ = git(repo, &["update-ref", "-d", scratch]);
+    made?;
+    let exported = exported.map_err(|source| NewgitError::io(&marks_file, source))?;
+    let by_mark: BTreeMap<usize, String> = exported
+        .lines()
+        .filter_map(|line| {
+            let (mark, id) = line.split_once(' ')?;
+            Some((mark.strip_prefix(':')?.parse().ok()?, id.to_owned()))
+        })
+        .collect();
+    let mut notes = Vec::new();
+    for (original, mark) in &marks {
+        let copy = by_mark.get(mark).ok_or_else(|| missing(original))?;
+        copies.insert((*original).to_owned(), copy.clone());
+        let mut note: String = lines_of
+            .get(*original)
+            .map(|lines| lines.iter().map(|line| format!("{line}\n")).collect())
+            .unwrap_or_default();
+        note.push_str(&format!("{mount} {copy}\n"));
+        notes.push(((*original).to_owned(), note));
+    }
+    write_notes_to(repo, MOUNTED_NOTES_REF, "mount", &notes)?;
+    Ok(copies)
+}
+
+/// Each object's body, by id, in one `git cat-file --batch` pass. Missing
+/// objects are left out.
+fn cat_file_batch(repo: &Utf8Path, ids: &[String]) -> Result<BTreeMap<String, Vec<u8>>> {
+    let mut bodies = BTreeMap::new();
+    if ids.is_empty() {
+        return Ok(bodies);
+    }
+    let input: String = ids.iter().map(|id| format!("{id}\n")).collect();
+    let objects = run(
+        &mut command(repo, &["cat-file", "--batch"]),
+        "git cat-file --batch",
+        Some(input.as_bytes()),
+    )?;
+    let mut rest: &[u8] = &objects;
+    while let Some(newline) = rest.iter().position(|&byte| byte == b'\n') {
+        let header = String::from_utf8_lossy(&rest[..newline]).to_string();
+        let mut parts = header.split(' ');
+        let (Some(id), Some(kind)) = (parts.next(), parts.next()) else {
+            break;
+        };
+        if kind == "missing" {
+            rest = &rest[newline + 1..];
+            continue;
+        }
+        let size: usize = parts.next().and_then(|size| size.parse().ok()).unwrap_or(0);
+        let start = newline + 1;
+        let end = (start + size).min(rest.len());
+        bodies.insert(id.to_owned(), rest[start..end].to_vec());
+        rest = &rest[(end + 1).min(rest.len())..];
+    }
+    Ok(bodies)
 }
 
 /// Every commit reachable from `tip`, oldest first in topological order,
@@ -1347,10 +1587,32 @@ pub fn split(
                 .iter()
                 .find(|definition| definition.name == tracker)
                 .expect("bound owner");
+            // A mounted tracker's commits hold its paths relative to its root.
+            let tracker_changes = tracker_changes
+                .into_iter()
+                .map(|change| match definition.tracker_path(&change.path) {
+                    Some(path) => Ok(Change {
+                        path: path.to_owned(),
+                        new: change.new,
+                    }),
+                    None => Err(NewgitError::Unsupported(format!(
+                        "`{}` is `{}`'s mount itself, not a path inside it",
+                        change.path, definition.name
+                    ))),
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let disowned: Vec<Utf8PathBuf> = carved_out(definition, all)
+                .iter()
+                .filter_map(|path| {
+                    definition
+                        .tracker_path(path.as_str())
+                        .map(Utf8PathBuf::from)
+                })
+                .collect();
             let made_commit = commit_changes(
                 repo,
                 parent.as_deref(),
-                &carved_out(definition, all),
+                &disowned,
                 &tracker_changes,
                 &message,
                 &identity,
@@ -1572,20 +1834,30 @@ fn render_state(state: &State) -> String {
 /// fast-import`, however many commits a split made. (`git notes add` once
 /// per commit rewrites the whole notes tree each time.)
 fn write_notes(repo: &Utf8Path, notes: &[(String, String)]) -> Result<()> {
+    write_notes_to(repo, NOTES_REF, "split", notes)
+}
+
+/// [`write_notes`] on `notes_ref`, the notes commit saying `message`.
+fn write_notes_to(
+    repo: &Utf8Path,
+    notes_ref: &str,
+    message: &str,
+    notes: &[(String, String)],
+) -> Result<()> {
     if notes.is_empty() {
         return Ok(());
     }
-    let parent = git_lines(repo, &["rev-parse", "-q", "--verify", NOTES_REF])
+    let parent = git_lines(repo, &["rev-parse", "-q", "--verify", notes_ref])
         .ok()
         .and_then(|lines| lines.into_iter().next());
     let mut stream = Vec::new();
-    writeln!(stream, "commit {NOTES_REF}").ok();
+    writeln!(stream, "commit {notes_ref}").ok();
     writeln!(
         stream,
         "committer newgit <newgit@localhost> 946684800 +0000"
     )
     .ok();
-    writeln!(stream, "data 6\nsplit\n").ok();
+    writeln!(stream, "data {}\n{message}\n", message.len() + 1).ok();
     if let Some(parent) = parent {
         writeln!(stream, "from {parent}").ok();
     }
@@ -1699,8 +1971,11 @@ struct Event {
     /// commit from before a carve-out that touched only the carved paths).
     disowned: bool,
     /// It is the join marker that joins its tracker to this view: the
-    /// imported commit under it, the join's second parent.
+    /// imported commit under it (its copy under the mount, for a mounted
+    /// tracker), the join's second parent.
     joins: Option<String>,
+    /// Its tracker has a mount: its own tree is never the view's.
+    mounted: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -77,6 +77,7 @@ fn tracker(name: &str, paths: &[&str], excluded: &[&str], secret: bool) -> Track
         storage: Storage::Local,
         merge_with_source: true,
         paths: paths.iter().map(Utf8PathBuf::from).collect(),
+        mount: None,
         secret,
         maintainers: None,
         role: None,
