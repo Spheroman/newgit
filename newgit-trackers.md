@@ -295,6 +295,19 @@ carved — `main` and every instance's — and every view is recomposed, so
 no instance is left with notes that predate the new tracker. Split refuses
 rather than guess if one ever is.
 
+**Importing a tracker** (`newgit tracker create t3code --code --mount
+apps/t3code --from <repository> [--from-branch <branch>]`) brings in another
+repository's history instead of carving one. The fetched branch becomes the
+tracker's history unchanged, ids and signatures intact, stored at its own
+root (*An imported tracker is stored relative to its own root*); the
+definition gets `mount = "apps/t3code"` and `paths = ["."]`. Nothing needs
+mapping back: export can push the tracker's own commits (#141), and pulling
+brings the outside repository's new commits straight onto them (#142). The
+history joins the project root's branch after its tip, through one merge
+(*An imported tracker joins through one merge*), and the branch moves to that
+merge. It refuses when the directory already has files (carve those instead)
+and when the history adds a file a secret tracker owns under the mount.
+
 **Objects: every repository references what it needs (decided).** No
 borrowing between repositories (Git alternates): Git's own cleanup in a
 repository deletes whatever *that* repository does not reference, so

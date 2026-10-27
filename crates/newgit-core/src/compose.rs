@@ -1669,6 +1669,17 @@ impl std::fmt::Display for SplitError {
     }
 }
 
+/// The commit view commit `commit` stands for: what a canonical note names
+/// for a rebuilt one, else itself — the id trackers' trailers use.
+pub fn canonical(repo: &Utf8Path, commit: &str) -> Result<String> {
+    let id = git(repo, &["rev-parse", &format!("{commit}^{{commit}}")])?;
+    let note = git(repo, &["notes", "--ref", CANONICAL_NOTES_REF, "show", &id]).unwrap_or_default();
+    Ok(note
+        .lines()
+        .find_map(|line| line.strip_prefix("canonical "))
+        .map_or(id, |original| original.trim().to_owned()))
+}
+
 /// The tracker state noted on a view commit.
 pub fn read_state(repo: &Utf8Path, view_commit: &str) -> Result<State> {
     let note = git(repo, &["notes", "--ref", NOTES_REF, "show", view_commit]).unwrap_or_default();
@@ -1717,6 +1728,19 @@ pub fn find_secret(
     env: &[(String, String)],
     all: &[TrackerDefinition],
 ) -> Result<Option<(String, String, String)>> {
+    find_secret_under(repo, rev_list, env, all, None)
+}
+
+/// [`find_secret`] over a history whose files sit at `mount` in the
+/// workspace (a mounted tracker's, held at its own root): each path is
+/// judged, and reported, where the workspace would have it.
+pub fn find_secret_under(
+    repo: &Utf8Path,
+    rev_list: &[&str],
+    env: &[(String, String)],
+    all: &[TrackerDefinition],
+    mount: Option<&Utf8Path>,
+) -> Result<Option<(String, String, String)>> {
     // Each commit starts with \x01 — no path holds that byte, so a file
     // named like a commit id cannot be mistaken for one.
     let mut args = vec![
@@ -1745,13 +1769,17 @@ pub fn find_secret(
         if field.is_empty() {
             continue;
         }
-        let path = Utf8Path::new(field);
+        let field = match mount {
+            Some(mount) => format!("{mount}/{field}"),
+            None => field.to_owned(),
+        };
+        let path = Utf8Path::new(&field);
         let owner = all
             .iter()
             .filter(|definition| definition.owns_everything() || claims(definition, path))
             .max_by_key(|definition| specificity(definition, path));
         if let Some(owner) = owner.filter(|owner| owner.secret) {
-            return Ok(Some((commit, field.to_owned(), owner.name.clone())));
+            return Ok(Some((commit, field, owner.name.clone())));
         }
     }
     Ok(None)

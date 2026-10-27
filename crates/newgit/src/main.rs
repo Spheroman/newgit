@@ -281,6 +281,7 @@ enum Command {
 #[derive(Debug, Subcommand)]
 enum TrackerCommand {
     /// Create a tracker: secret (captured, never committed) unless --code
+    #[command(group(clap::ArgGroup::new("place").args(["path", "mount"]).multiple(true)))]
     Create {
         name: String,
         /// Who may read this tracker's content
@@ -293,12 +294,25 @@ enum TrackerCommand {
         #[arg(long, default_value = "local")]
         storage: String,
         /// A code tracker: committed content with its own history, carved out
-        /// of whichever tracker owns its paths now (usually root)
-        #[arg(long, requires = "path")]
+        /// of whichever tracker owns its paths now (usually root), or with
+        /// --from, brought in from another repository
+        #[arg(long, requires = "place")]
         code: bool,
         /// A path a code tracker owns (repeatable; set at creation)
         #[arg(long = "path", value_name = "PATH")]
         path: Vec<Utf8PathBuf>,
+        /// Bring in another repository's history instead of carving: its
+        /// commits, unchanged, join the project root's branch through one
+        /// merge, shown under --mount
+        #[arg(long, value_name = "REPOSITORY", requires = "code")]
+        from: Option<String>,
+        /// Where an imported tracker's root sits in the workspace (with
+        /// --from; its commits keep their files at their own root)
+        #[arg(long, value_name = "DIR", requires = "from")]
+        mount: Option<Utf8PathBuf>,
+        /// The branch of --from to bring in (default: its HEAD)
+        #[arg(long, value_name = "BRANCH", requires = "from")]
+        from_branch: Option<String>,
     },
     /// Add workspace paths to a secret tracker
     Track {
@@ -1568,6 +1582,60 @@ fn shell_quote(value: &str) -> String {
 
 fn tracker(command: TrackerCommand) -> Result<()> {
     match command {
+        TrackerCommand::Create {
+            name,
+            audience,
+            from: Some(from),
+            mount,
+            path,
+            from_branch,
+            ..
+        } => {
+            let Some(mount) = mount.filter(|_| path.is_empty()) else {
+                bail!(
+                    "an imported tracker is placed with --mount, not --path: `newgit tracker \
+                     create {name} --code --mount <dir> --from {from}`"
+                );
+            };
+            // A local repository named relative to here, not the project root
+            // the fetch runs in.
+            let from = match std::fs::canonicalize(&from) {
+                Ok(local) => local.to_string_lossy().into_owned(),
+                Err(_) => from,
+            };
+            let manager = manager_here()?;
+            let outcome = manager.import_code_tracker(
+                &name,
+                &audience,
+                &mount,
+                &from,
+                from_branch.as_deref(),
+            )?;
+            let root = manager.store().paths().project_root.clone();
+            println!(
+                "Created code tracker `{name}` at {}",
+                display_path(&root, &outcome.path)
+            );
+            println!(
+                "  history:   {} from {from}, unchanged, mounted at {mount}",
+                plural(outcome.commits, "commit"),
+            );
+            println!(
+                "  joined:    `{}` through one merge, {}",
+                outcome.branch,
+                &outcome.join[..outcome.join.len().min(12)]
+            );
+            println!(
+                "  commit to it with Git; newgit splits your commits into it when work leaves the machine"
+            );
+            if outcome.submodules {
+                println!(
+                    "  note:      its .gitmodules is now {mount}/.gitmodules, which Git does not read, \
+                     so its submodules are not checked out"
+                );
+            }
+            Ok(())
+        }
         TrackerCommand::Create {
             name,
             audience,
