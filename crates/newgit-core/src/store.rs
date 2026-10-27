@@ -1,4 +1,5 @@
 use std::io::Write;
+use std::os::unix::fs::PermissionsExt;
 
 use camino::{Utf8Path, Utf8PathBuf};
 use chrono::Utc;
@@ -316,7 +317,12 @@ impl MetadataStore {
     /// `BranchManager::lock_instance`, which also hands a nested call the
     /// lock the manager already holds.
     pub fn lock_instance(&self, slug: &str, name: &str) -> Result<InstanceLock> {
-        InstanceLock::acquire(&self.paths.local.join("locks"), slug, name)
+        InstanceLock::acquire(&self.locks_dir(), slug, name)
+    }
+
+    /// Where instance lock files live: `.newgit/local/locks/<slug>.lock`.
+    pub fn locks_dir(&self) -> Utf8PathBuf {
+        self.paths.local.join("locks")
     }
 
     /// Overwrite an existing binding record (e.g. after a tracker capture).
@@ -724,22 +730,51 @@ where
         label: label.to_owned(),
         source,
     })?;
-    // Written whole to a temporary file beside it, then renamed over it:
-    // a reader sees the old record or the new one, never the truncated
-    // middle `std::fs::write` goes through, and a process that dies
-    // mid-write leaves the record it found (#212). The temporary has no
-    // `.toml` extension, so a directory listing never mistakes a leftover
-    // one for a record.
+    // Written whole to a temporary file beside it, flushed to disk, then
+    // renamed over it: a reader sees the old record or the new one, never
+    // the truncated middle `std::fs::write` goes through, and a process or
+    // machine that dies mid-write leaves the record it found (#212).
+    //
+    // The temporary has no `.toml` extension, so a directory listing never
+    // mistakes one for a record. One is left behind only if the process is
+    // killed between creating and renaming it; nothing reads it, and it is
+    // safe to delete.
+    //
+    // A new file gets the mode `std::fs::write` would give it (0666 less the
+    // umask) rather than the temporary's 0600, and an existing one keeps its
+    // own.
     let dir = path.parent().unwrap_or_else(|| Utf8Path::new("."));
+    let mode = match std::fs::metadata(path) {
+        Ok(metadata) => Some(metadata.permissions()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(source) => return Err(NewgitError::io(path, source)),
+    };
     let mut temp = tempfile::Builder::new()
         .prefix(".")
         .suffix(".tmp")
+        .permissions(std::fs::Permissions::from_mode(0o666))
         .tempfile_in(dir)
         .map_err(|source| NewgitError::io(dir, source))?;
+    if let Some(mode) = mode {
+        temp.as_file()
+            .set_permissions(mode)
+            .map_err(|source| NewgitError::io(path, source))?;
+    }
     temp.write_all(contents.as_bytes())
         .map_err(|source| NewgitError::io(path, source))?;
+    // Plain fsync, not the F_FULLFSYNC `File::sync_all` uses on macOS: that
+    // is a cache flush of the whole drive per record, and the data reaching
+    // the drive is the guarantee this is after.
+    nix::unistd::fsync(temp.as_file())
+        .map_err(|errno| NewgitError::io(path, std::io::Error::from(errno)))?;
     temp.persist(path)
         .map_err(|error| NewgitError::io(path, error.error))?;
+    // The rename itself is durable once the directory is. Best-effort: some
+    // filesystems refuse to fsync a directory, and the record is already in
+    // place either way.
+    if let Ok(dir) = std::fs::File::open(dir) {
+        let _ = nix::unistd::fsync(&dir);
+    }
     Ok(())
 }
 
@@ -783,6 +818,8 @@ pub(crate) fn read_dir_sorted(path: &Utf8Path) -> Result<Vec<Utf8PathBuf>> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use super::*;
 
     fn store() -> (tempfile::TempDir, MetadataStore) {
@@ -790,6 +827,28 @@ mod tests {
         let root = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).expect("utf8");
         let store = MetadataStore::init(&root, "proj", SourceSubstrate::Git).expect("init");
         (temp, store)
+    }
+
+    /// A record renamed into place keeps the mode the file had, and a new
+    /// one gets what `std::fs::write` would give it — not the 0600 of the
+    /// temporary it was written to.
+    #[test]
+    fn a_record_written_atomically_keeps_the_usual_mode() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let dir = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).expect("utf8");
+        let mode =
+            |path: &Utf8Path| std::fs::metadata(path).expect("stat").permissions().mode() & 0o777;
+        let plain = dir.join("plain");
+        std::fs::write(&plain, "").expect("write");
+
+        let record = dir.join("record.toml");
+        write_toml_at(&record, "record", &BTreeMap::from([("a", 1)])).expect("new");
+        assert_eq!(mode(&record), mode(&plain));
+
+        std::fs::set_permissions(&record, std::fs::Permissions::from_mode(0o640)).expect("chmod");
+        write_toml_at(&record, "record", &BTreeMap::from([("a", 2)])).expect("rewrite");
+        assert_eq!(mode(&record), 0o640);
+        assert_eq!(std::fs::read_to_string(&record).expect("read"), "a = 2\n");
     }
 
     #[test]

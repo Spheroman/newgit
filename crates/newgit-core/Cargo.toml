@@ -18,7 +18,7 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "serd
 # Process-group signalling and reaping (see supervisor.rs), and low-level
 # socket options (see ports.rs: the port-bind probe needs SO_REUSEADDR
 # off, which std's TcpListener does not expose).
-nix = { version = "0.31", features = ["signal", "process", "net"] }
+nix = { version = "0.31", features = ["signal", "process", "net", "fs"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.11"

@@ -18,6 +18,7 @@ use std::time::{Duration, Instant};
 use camino::{Utf8Path, Utf8PathBuf};
 use newgit_core::SourceSubstrate;
 use newgit_core::branch::ResourceStatus;
+use newgit_core::cleanup::ArchivedCheckpoints;
 use newgit_core::manager::{ActionOutcome, BranchManager};
 use newgit_core::store::MetadataStore;
 
@@ -292,15 +293,18 @@ fn a_record_being_rewritten_is_never_read_half_written() {
     assert_eq!(names, vec!["x.toml"]);
 }
 
-/// A hook run under the lock is told which instance is locked and by whom,
-/// so a `newgit` it starts can refuse rather than wait for its ancestor. A
-/// `newgit run` command holds no lock and says nothing.
+/// A hook run under the lock is told which instance is locked, with the
+/// token the lock file holds while it is, so a `newgit` it starts can refuse
+/// rather than wait for its ancestor. A `newgit run` command holds no lock
+/// and adds nothing to whatever it inherited.
 #[test]
 fn hooks_run_under_the_lock_are_told_so_and_run_commands_are_not() {
     let (_guard, temp) = tempdir();
     let store = setup(&temp);
     let root = store.paths().project_root.clone();
     let seen = temp.join("seen");
+    let seen_lock = temp.join("seen-lock");
+    let lock_file = store.locks_dir().join("x.lock");
     write_resource(
         &store,
         "db",
@@ -309,17 +313,23 @@ fn hooks_run_under_the_lock_are_told_so_and_run_commands_are_not() {
 
 [checkpoint]
 mode = "command"
-command = "echo \"$NEWGIT_LOCKED\" > {seen} && echo state"
+command = "echo \"$NEWGIT_LOCKED\" > {seen} && cat {lock_file} > {seen_lock} && echo state"
 "#
         ),
     );
     let manager = manager_at(&root);
     manager.spawn("x", None).expect("spawn");
     manager.checkpoint("x", None).expect("checkpoint");
-    assert_eq!(
-        std::fs::read_to_string(&seen).expect("seen").trim(),
-        format!("x:{}", std::process::id())
+    let token = std::fs::read_to_string(&seen_lock).expect("seen lock");
+    assert!(
+        token.starts_with(&format!("{}.", std::process::id())),
+        "{token}"
     );
+    let locked = std::fs::read_to_string(&seen).expect("seen");
+    let entries: Vec<&str> = locked.trim().split(',').collect();
+    assert_eq!(entries.last(), Some(&format!("x:{token}").as_str()));
+    // Released: the token the hook saw matches nothing now.
+    assert_eq!(std::fs::read_to_string(&lock_file).expect("lock"), "");
 
     manager
         .run_command(
@@ -331,7 +341,52 @@ command = "echo \"$NEWGIT_LOCKED\" > {seen} && echo state"
             ],
         )
         .expect("run");
-    assert_eq!(std::fs::read_to_string(&seen).expect("seen").trim(), "");
+    assert_eq!(
+        std::fs::read_to_string(&seen).expect("seen").trim(),
+        std::env::var("NEWGIT_LOCKED").unwrap_or_default()
+    );
+}
+
+/// `cleanup` lists instances, then finishes the ones whose workspace is gone
+/// one at a time under each one's lock. A `remove` holding that lock when
+/// `cleanup` reaches it has torn the instance down by the time `cleanup`
+/// gets it; `cleanup` used to carry on with the record it listed, rerun the
+/// teardown, and fail the whole sweep archiving a record already archived.
+#[test]
+fn cleanup_skips_an_instance_removed_while_it_waited_for_it() {
+    let (_guard, temp) = tempdir();
+    let store = setup(&temp);
+    let root = store.paths().project_root.clone();
+    let spawned = manager_at(&root).spawn("x", None).expect("spawn");
+    manager_at(&root).spawn("y", None).expect("spawn");
+    std::fs::remove_dir_all(&spawned.branch.workspace_path).expect("rm workspace");
+
+    // Stands in for a `remove x` in flight: it holds the lock, and archives
+    // the record before letting go.
+    let held = store.lock_instance("x", "x").expect("lock");
+    let (tx, rx) = mpsc::channel();
+    let cleanup = {
+        let root = root.clone();
+        thread::spawn(move || {
+            let outcome = manager_at(&root).cleanup(false, ArchivedCheckpoints::Keep);
+            tx.send(()).expect("send");
+            outcome
+        })
+    };
+    assert!(
+        still_pending(&rx, Duration::from_millis(500)),
+        "cleanup finished `x` while another command held its lock"
+    );
+    let record = store.find_branch("x").expect("record");
+    store.archive_branch_record(&record).expect("archive");
+    drop(held);
+
+    let outcome = cleanup.join().expect("thread").expect("cleanup");
+    assert!(outcome.finalized.is_empty(), "{:?}", outcome.finalized);
+    assert!(store.find_branch("y").is_ok());
+    // `x` has no record any more, so its lock file goes too; `y`'s stays.
+    assert!(!store.locks_dir().join("x.lock").exists());
+    assert!(store.locks_dir().join("y.lock").exists());
 }
 
 /// The manager's own nested calls — `checkpoint_verify` is a checkpoint, an

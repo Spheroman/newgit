@@ -9,8 +9,9 @@
   advisory file lock the kernel releases with the process, so a crash
   leaves nothing stale) from start to finish, and a second command on the
   same instance waits, saying so. A hook run under the lock sees
-  `NEWGIT_LOCKED=<slug>:<pid>`; a `newgit` it starts that would need the
-  same lock refuses instead of waiting for its own ancestor. Records are
-  also written to a temporary file and renamed into place, so a reader —
-  `status`, `spawn`, anything that lists instances — never parses one
-  half-written, and a process dying mid-write leaves the record it found.
+  `NEWGIT_LOCKED`, the locks it runs under; a `newgit` it starts that would
+  need one of them refuses instead of waiting for its own ancestor. Records
+  are also written to a temporary file, flushed, and renamed into place, so
+  a reader — `status`, `spawn`, anything that lists instances — never
+  parses one half-written, and a crash mid-write leaves the record it
+  found.

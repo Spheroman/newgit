@@ -23,7 +23,7 @@ use crate::export::{self, ExportFilter, ExportPlan, prepare_destination};
 use crate::export_target::ExportTarget;
 use crate::exports::{RenderContext, render, unresolved_placeholder};
 use crate::installs::{Admission, InstallReport, InstallStore};
-use crate::lock::{InstanceLock, LOCKED_ENV};
+use crate::lock::{InstanceLock, LOCKED_ENV, locked_env_value};
 use crate::materializer::{
     Materializer, RealDirMaterializer, exclude_produced_paths, exclude_tracker_paths,
     unexclude_tracker_paths,
@@ -1050,6 +1050,16 @@ impl BranchManager {
         let lock = self.lock_instance(&found.slug, &found.name)?;
         let branch = self.store.find_branch(&found.slug)?;
         Ok((lock, branch))
+    }
+
+    /// Every instance lock this manager holds right now.
+    fn held_locks(&self) -> Vec<Arc<InstanceLock>> {
+        self.locks
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .values()
+            .filter_map(Weak::upgrade)
+            .collect()
     }
 
     fn held_lock(&self, slug: &str) -> Option<Arc<InstanceLock>> {
@@ -3441,14 +3451,15 @@ impl BranchManager {
             "NEWGIT_WORKSPACE".to_owned(),
             (branch.workspace_path.to_string(), EnvSource::Newgit),
         );
-        // A hook run under the instance's lock is told so, with the pid
-        // holding it, so a `newgit` it starts on this instance can refuse
+        // A hook run under the instance's lock is told which locks it runs
+        // under, so a `newgit` it starts that needs one of them can refuse
         // instead of waiting for its own ancestor (see `crate::lock`).
         if self.held_lock(&branch.slug).is_some() {
+            let held = self.held_locks();
             env.insert(
                 LOCKED_ENV.to_owned(),
                 (
-                    format!("{}:{}", branch.slug, std::process::id()),
+                    locked_env_value(held.iter().map(|lock| (lock.slug(), lock.token()))),
                     EnvSource::Newgit,
                 ),
             );
@@ -5467,8 +5478,23 @@ impl BranchManager {
             .iter()
             .partition(|branch| branch.workspace_path.is_dir());
 
+        // Stale when listed, live again by the time this got its lock.
+        let mut revived = Vec::new();
         for branch in &stale {
             let _lock = self.lock_instance(&branch.slug, &branch.name)?;
+            // Read again under the lock: a `remove` that finished while this
+            // waited has already torn it down and archived the record, and a
+            // `spawn` may have brought the name back with a new workspace.
+            let branch = match self.store.find_branch(&branch.slug) {
+                Ok(branch) if branch.workspace_path.is_dir() => {
+                    revived.push(branch);
+                    continue;
+                }
+                Ok(branch) => branch,
+                Err(NewgitError::UnknownBranchInstance(_)) => continue,
+                Err(error) => return Err(error),
+            };
+            let branch = &branch;
             let hooks = self.run_cleanup_hooks(branch, dry_run)?;
             let archived_record = if dry_run {
                 None
@@ -5488,10 +5514,13 @@ impl BranchManager {
             });
         }
 
+        let live: Vec<&BranchInstance> = live.into_iter().chain(&revived).collect();
+
         // Unclaimed workspace directories: a failed spawn, or a record
         // archived while its directory survived.
         let workspace_root = self.config.workspace_root(&self.store.paths().project_root);
-        let (orphans, unrecognized) = orphan_workspaces(&workspace_root, &branches)?;
+        let claimed = [branches.as_slice(), revived.as_slice()].concat();
+        let (orphans, unrecognized) = orphan_workspaces(&workspace_root, &claimed)?;
         outcome.warnings.extend(unrecognized);
         for orphan in orphans {
             if !dry_run {
@@ -5570,6 +5599,16 @@ impl BranchManager {
         outcome.pinned_by_archived = roots.pinned_only_by_archived_checkpoints().count();
 
         self.prune_install_store(&surviving, dry_run, &mut outcome)?;
+
+        // Lock files of instances with no record any more. Bookkeeping, not
+        // something a person would look for, so not reported; one held right
+        // now is skipped, and one whose instance is spawned meanwhile is
+        // simply made again (see `crate::lock`).
+        if !dry_run {
+            crate::lock::prune(&self.store.locks_dir(), |slug| {
+                self.store.branch_record_path(slug).exists()
+            })?;
+        }
 
         Ok(outcome)
     }
@@ -6876,6 +6915,9 @@ impl BranchManager {
     /// its own commits reach the shared branch the same way.
     pub fn merge(&self, instance: &str, into: &str) -> Result<MergeOutcome> {
         self.require_resolvable_graph()?;
+        // The instance's lock, held to the end; the project root has none.
+        let mut _lock = None;
+        let mut dropped = BTreeSet::new();
         let (name, checkpoint, head) = if instance == PROJECT_ROOT_INSTANCE {
             self.sync_project_root()?;
             let branch = std::fs::read_to_string(self.store.paths().project_branch_file())
@@ -6884,7 +6926,8 @@ impl BranchManager {
             let head = self.source.rev_parse(&format!("refs/heads/{branch}"))?;
             (PROJECT_ROOT_INSTANCE.to_owned(), String::new(), head)
         } else {
-            let (_lock, mut branch) = self.locked_branch(instance)?;
+            let (lock, mut branch) = self.locked_branch(instance)?;
+            _lock = Some(lock);
             let checkpoint = self.checkpoint_branch(
                 &mut branch,
                 Some(&format!("before `newgit merge` into {into}")),
@@ -6899,6 +6942,9 @@ impl BranchManager {
             }
             let head = checkpoint.record.source.head_rev.clone();
             self.split_instance(&branch.slug, &head)?;
+            // Only what the instance binds: a dropped tracker keeps the
+            // branch's commit, whatever the instance's history says about it.
+            dropped = branch.dropped;
             (branch.name, checkpoint.record.id, head)
         };
         if self.remote.is_some() {
@@ -6906,13 +6952,6 @@ impl BranchManager {
         }
         let root = self.store.paths().project_root.clone();
         let code = self.code_definitions();
-        // Only what the instance binds: a dropped tracker keeps the branch's
-        // commit, whatever the instance's history says about it.
-        let dropped = if instance == PROJECT_ROOT_INSTANCE {
-            BTreeSet::new()
-        } else {
-            self.store.find_branch(instance)?.dropped
-        };
         let theirs: BTreeMap<String, String> = crate::compose::read_state(&root, &head)?
             .into_iter()
             .filter(|(tracker, _)| code.iter().any(|definition| &definition.name == tracker))

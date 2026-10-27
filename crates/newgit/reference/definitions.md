@@ -1062,21 +1062,35 @@ one deliberate overlap is a `captures` entry naming its *own* resource's
 front, and the action overwrites it with the one that did not exist until it
 ran. The owner is the same resource either way.
 
-`NEWGIT_BRANCH`, `NEWGIT_WORKSPACE`, and `NEWGIT_LOCKED` are reserved.
-newgit sets them for every command it runs, so a resource declaring one is
-reported too — a declaration that could never reach the process is a
-mistake worth naming, not a silent no-op.
+`NEWGIT_BRANCH`, `NEWGIT_WORKSPACE`, and `NEWGIT_LOCKED` are reserved, so
+a resource declaring one is reported too — a declaration that could never
+reach the process is a mistake worth naming, not a silent no-op. newgit sets
+the first two for every command it runs; `NEWGIT_LOCKED` it sets only for a
+hook run under an instance's lock.
 
-`NEWGIT_LOCKED` is set only for a hook run by a command that holds the
-instance's lock — every command that changes an instance (`spawn`,
-`action`, `checkpoint`, `undo`, `tracker` binding changes, `remove`) holds
-it from start to finish, so two of them on one instance run one after the
-other rather than over each other. Its value is `<slug>:<pid>`, the locked
-instance and the process holding it. A `newgit` started from such a hook
-that would need the same lock — a `[checkpoint] command` running `newgit
-checkpoint` on its own instance — refuses at once and says so, instead of
-waiting for its own ancestor forever. `newgit run` holds no lock and does
-not set it.
+Every command that changes an instance (`spawn`, `action`, `checkpoint`,
+`undo`, `merge`, `tracker` binding changes, `remove`, `cleanup`) holds that
+instance's lock, `.newgit/local/locks/<slug>.lock`, from start to finish,
+so two of them on one instance run one after the other rather than over
+each other; the second says it is waiting. A hook it runs gets
+`NEWGIT_LOCKED`, a comma-separated list of `<slug>:<token>`, one entry per
+lock held by that command or by one it was itself started from. A `newgit`
+started from such a hook that would need one of those locks — a
+`[checkpoint] command` running `newgit checkpoint` on its own instance, or
+on another instance whose hook comes back to this one — refuses at once and
+says so, instead of waiting for its own ancestor forever. The token is
+written into the lock file when the lock is taken and cleared when it is
+let go, so a process that outlives the command which started it (a dev
+server) carries a token that matches nothing, and waits like any other
+command. Not caught: two independent commands whose hooks each run
+`newgit` on the other's instance; both wait until one is interrupted.
+`newgit run` holds no lock and does not set it.
+
+A lock file is left in place when its lock is let go, and `cleanup` deletes
+those of instances with no record. Records are written to a temporary file
+beside them and renamed into place; a command killed between the two can
+leave a `.<random>.tmp` file there, which nothing reads and which is safe
+to delete.
 
 This is why the starter templates do not ship conventional names like `PORT`
 or `DATABASE_URL`. Two services in one project cannot both publish `PORT`,
