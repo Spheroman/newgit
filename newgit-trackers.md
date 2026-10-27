@@ -110,7 +110,11 @@ At spawn, for each slot (each role, and each role-less tracker):
 `newgit tracker use <tracker>` binds a tracker into an existing instance:
 swapping out whatever filled its role, binding what it requires, and starting
 the resources it brings. `newgit tracker drop <tracker>` unbinds one, stopping
-(never cleaning up) the resources no longer brought; it is refused while
+(never cleaning up) the resources no longer brought. Both rebuild every bound
+install whose tree the binding keys (see *Installs across trackers*): the tree
+the instance holds was built for the binding it had, so it is filled from the
+store when that binding was built before, else its `prepare` runs again. A
+drop is refused while
 another bound tracker requires it, and while the tracker has uncommitted work
 unless `--stash` (brought back by the next `use`) or `--discard` (after a
 checkpoint, so `newgit undo` gets it back). `root`, `project`, and `access`

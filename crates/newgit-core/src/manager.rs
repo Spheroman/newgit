@@ -764,6 +764,11 @@ struct RestoreContext<'a> {
     /// This resource's state ref in the safety checkpoint taken moments ago:
     /// the workspace as it stood before this undo touched anything.
     pre_undo_state_ref: Option<&'a str>,
+    /// This undo restored a binding other than the one the instance had:
+    /// what `{{bound.trackers}}` and `{{bound.paths}}` render to moved, so
+    /// an install keyed on the binding is not the tree the checkpoint
+    /// describes even when its identity paths are unchanged.
+    binding_moved: bool,
     force_recompute: bool,
 }
 
@@ -3862,6 +3867,20 @@ impl BranchManager {
         tracker: &str,
         uncommitted: Uncommitted,
     ) -> Result<BindingChange> {
+        let before = self.binding_before(instance)?;
+        let mut change = self.drop_tracker_inner(instance, tracker, uncommitted)?;
+        change.rebuilt = self.rebuild_for_binding(instance, &before)?;
+        Ok(change)
+    }
+
+    /// The drop itself, without the rebuild: `use` drops whatever filled the
+    /// role it is taking, and rebuilds once for the binding it ends with.
+    fn drop_tracker_inner(
+        &self,
+        instance: &str,
+        tracker: &str,
+        uncommitted: Uncommitted,
+    ) -> Result<BindingChange> {
         let mut branch = self.store.find_branch(instance)?;
         self.require_workspace(&branch)?;
         let mut change = BindingChange {
@@ -4012,6 +4031,16 @@ impl BranchManager {
     /// stashed; a secret tracker's last content in this instance is projected
     /// back.
     pub fn use_tracker(&self, instance: &str, tracker: &str) -> Result<BindingChange> {
+        let before = self.binding_before(instance)?;
+        let mut change = self.use_tracker_inner(instance, tracker)?;
+        change.rebuilt = self.rebuild_for_binding(instance, &before)?;
+        Ok(change)
+    }
+
+    /// The use itself, without the rebuild: a tracker's `requires` are
+    /// bound through here, so one `use` rebuilds once, for the binding it
+    /// ends with, rather than once per tracker it brought.
+    fn use_tracker_inner(&self, instance: &str, tracker: &str) -> Result<BindingChange> {
         let mut branch = self.store.find_branch(instance)?;
         self.require_workspace(&branch)?;
         let mut change = BindingChange {
@@ -4044,7 +4073,7 @@ impl BranchManager {
             branch.dropped.remove(tracker);
             self.store.save_branch_record(&branch)?;
             for other in swapped {
-                if let Err(error) = self.drop_tracker(instance, &other, Uncommitted::Refuse) {
+                if let Err(error) = self.drop_tracker_inner(instance, &other, Uncommitted::Refuse) {
                     let mut branch = self.store.find_branch(instance)?;
                     branch.dropped.insert(tracker.to_owned());
                     self.store.save_branch_record(&branch)?;
@@ -4111,7 +4140,7 @@ impl BranchManager {
             if let Some(target) = target
                 && branch.dropped.contains(&target)
             {
-                self.use_tracker(instance, &target)?;
+                self.use_tracker_inner(instance, &target)?;
                 change.brought.push(target);
             }
         }
@@ -4121,6 +4150,122 @@ impl BranchManager {
         self.store.save_branch_record(&branch)?;
         change.started = outcomes.into_iter().map(|outcome| outcome.name).collect();
         Ok(change)
+    }
+
+    /// What a `use` or `drop` starts from, for [`Self::rebuild_for_binding`]
+    /// to compare against afterwards.
+    fn binding_before(&self, instance: &str) -> Result<BindingBefore> {
+        let branch = self.store.find_branch(instance)?;
+        Ok(BindingBefore {
+            bound: self.bound_vars(&branch),
+            resources: branch.resources.keys().cloned().collect(),
+        })
+    }
+
+    /// Rebuild every bound install whose tree the binding keys, after a
+    /// `use` or `drop` moved the binding from `before`.
+    ///
+    /// The install store keys a tree on the trackers the instance binds: a
+    /// shared lockfile lists every member, bound or not, and the install
+    /// builds the bound ones, named by `{{bound.paths}}` or found on disk.
+    /// So the tree an instance holds was built for the binding it had, and
+    /// once that moves it is the tree of some other binding — whatever the
+    /// lockfile says. Starting and stopping what the tracker *brings* does
+    /// not reach it, because a shared install is brought by `root`, which is
+    /// always bound.
+    ///
+    /// This is the same job a spawn does for the same tree, so it goes the
+    /// same way: filled from the store when another instance built this
+    /// binding already, else the producing action runs and publishes what it
+    /// built. A rebuild that fails is loud and leaves the resource `failed`,
+    /// as a failed `prepare` at spawn does; `newgit action <resource>.prepare`
+    /// is the retry. Only a tree that is there is rebuilt: a resource whose
+    /// install never ran, or is still blocked behind a dependency, holds
+    /// nothing the binding made stale. A long-running action that was up on
+    /// the old tree is restarted on the new one, as undo restarts what a
+    /// restore replaced beneath. A resource the change itself just bound was
+    /// prepared under the new binding and is left alone.
+    fn rebuild_for_binding(
+        &self,
+        instance: &str,
+        before: &BindingBefore,
+    ) -> Result<Vec<RebuiltInstall>> {
+        let mut branch = self.store.find_branch(instance)?;
+        if self.bound_vars(&branch) == before.bound {
+            return Ok(Vec::new());
+        }
+        let mut rebuilt = Vec::new();
+        for name in &self.graph.bind_order {
+            if !branch.resources.contains_key(name) || !before.resources.contains(name) {
+                continue;
+            }
+            let definition = self.resource_definition(name)?;
+            if definition.identity_produces().is_empty()
+                || !self.produced_present(&branch, definition)
+                || !self.blocked_dependencies(&branch, definition).is_empty()
+            {
+                continue;
+            }
+            let action_name = definition.producing_action();
+            let Some(action) = definition.actions.get(action_name) else {
+                continue;
+            };
+            let was_running = self.supervisor(&branch).running_pid(name).is_some();
+            if was_running {
+                let _ = self.supervisor(&branch).stop(name, "term");
+            }
+
+            let install_key = match self.install_key(&branch, definition) {
+                Some(Ok(key)) => Ok(key),
+                Some(Err(report)) => Err(Some(report)),
+                None => Err(None),
+            };
+            let filled = install_key
+                .as_deref()
+                .ok()
+                .and_then(|key| self.refill_from_install_store(&branch, definition, key));
+            let (ok, install, log) = match filled {
+                Some(InstallReport::Filled { key, method }) => {
+                    (true, Some(InstallReport::Filled { key, method }), None)
+                }
+                not_filled => {
+                    let log = self
+                        .store
+                        .action_log_path(&branch.slug, &format!("{name}.{action_name}"));
+                    let (code, captured) =
+                        self.run_one_shot(&branch, definition, action, action_name, &log, true)?;
+                    Self::apply_captures(&mut branch, name, captured.found);
+                    let ok = code == 0;
+                    let install = match (&install_key, not_filled) {
+                        (Ok(key), _) if ok => self.admit_to_install_store(&branch, definition, key),
+                        (Ok(_), unavailable) => unavailable,
+                        (Err(report), _) => report.clone(),
+                    };
+                    (ok, install, Some(log))
+                }
+            };
+            if let Some(binding) = branch.resources.get_mut(name) {
+                binding.status = if ok {
+                    ResourceStatus::Ready
+                } else {
+                    ResourceStatus::Failed
+                };
+            }
+            if ok && was_running {
+                self.restart_long_running(&branch, definition)?;
+            }
+            rebuilt.push(RebuiltInstall {
+                name: name.clone(),
+                ok,
+                install,
+                log,
+            });
+        }
+        if !rebuilt.is_empty() {
+            branch.updated_at = Utc::now();
+            self.store.save_branch_record(&branch)?;
+        }
+        Ok(rebuilt)
     }
 
     /// The working tree follows the binding: every dropped code tracker's
@@ -7389,6 +7534,7 @@ impl BranchManager {
         }
         let partial = !options.only.is_empty();
         let wanted = |name: &String| !partial || options.only.contains(name);
+        let mut binding_moved = false;
 
         // The message describes *when* this checkpoint was taken, and a
         // reader takes that as a description of *what is in it*. Those come
@@ -7455,6 +7601,7 @@ impl BranchManager {
             // and come back when the tracker is bound again (#210).
             let rebound = restored.dropped != branch.dropped;
             if rebound {
+                binding_moved = true;
                 for tracker in restored.dropped.difference(&branch.dropped) {
                     if let Some(definition) = self.trackers.iter().find(|d| &d.name == tracker) {
                         crate::tracker_repo::clear_owned_paths(&workspace, definition)?;
@@ -7610,6 +7757,7 @@ impl BranchManager {
                 state,
                 RestoreContext {
                     pre_undo_state_ref: pre_undo,
+                    binding_moved,
                     force_recompute: options.force_recompute,
                 },
                 &mut failures,
@@ -7754,6 +7902,14 @@ impl BranchManager {
                 // after the checkpoint and has just been rewound under a
                 // `node_modules` built from the newer one.
                 //
+                // The binding is an input too, and one the hash does not
+                // record: the install store keys a tree on the trackers the
+                // instance binds, because a shared lockfile lists every
+                // member and the install builds the bound ones. An undo that
+                // restored a different binding has changed what the tree is
+                // built from, whether or not the lockfile moved, so the skip
+                // compares the same inputs the store key does.
+                //
                 // Identity describes the inputs, not the tree: someone can
                 // delete half of `node_modules` without touching the lockfile,
                 // and then the skip is wrong. That is what `--force-recompute`
@@ -7762,6 +7918,7 @@ impl BranchManager {
                 // And only while the tree is there at all: a lockfile that did
                 // not move says nothing about a `node_modules` someone deleted.
                 if !undo.force_recompute
+                    && !undo.binding_moved
                     && self.produced_present(branch, definition)
                     && let Some(recorded) = state.state_ref.as_deref()
                     && recorded.starts_with(HASH_STATE_REF_PREFIX)
@@ -8277,6 +8434,30 @@ pub struct BindingChange {
     pub started: Vec<String>,
     /// Resources a drop stopped.
     pub stopped: Vec<String>,
+    /// Installs rebuilt because the binding is part of their identity: a
+    /// tree keyed on the trackers the instance binds was built for the
+    /// binding this change replaced.
+    pub rebuilt: Vec<RebuiltInstall>,
+}
+
+/// An instance's binding as a `use` or `drop` found it: what
+/// `{{bound…}}` rendered to, and which resources were bound.
+struct BindingBefore {
+    bound: crate::exports::Bound,
+    resources: BTreeSet<String>,
+}
+
+/// One install `tracker use` or `drop` rebuilt for the new binding.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RebuiltInstall {
+    pub name: String,
+    /// The producing action succeeded, or a stored tree was cloned in.
+    pub ok: bool,
+    /// What the install store did: filled from an entry built for this
+    /// binding before, or stored what the rebuild built.
+    pub install: Option<InstallReport>,
+    /// The action log, when the producing action ran.
+    pub log: Option<Utf8PathBuf>,
 }
 
 fn stash_message(tracker: &str) -> String {

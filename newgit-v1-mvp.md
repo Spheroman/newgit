@@ -2024,7 +2024,10 @@ else a lockfile does not record: a shared lockfile lists every member, bound
 or not, and an install builds the bound ones, whether `{{bound.paths}}` names
 them or it finds them on disk, where a dropped tracker's files are not checked
 out. It is in every resource's key, so instances that bind differently never
-share a tree, even one the binding cannot change. The fourth is because the
+share a tree, even one the binding cannot change; and when a live instance's
+binding moves (`tracker use`, `tracker drop`, an undo that restores another
+binding), every bound install holding a tree is rebuilt for the new key, filled
+from the store where that binding was built before. The fourth is because the
 *command* is an input to the tree as much as its inputs are: edit `prepare`
 and the next instance must rebuild rather than be handed what the old command
 built.

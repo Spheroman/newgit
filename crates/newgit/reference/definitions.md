@@ -370,8 +370,11 @@ runtime one does: a checkpoint record written under an older definition is not
 something reading the current file can predict.
 
 A `recompute` restore skips when this resource's `[identity]` hash is the same
-now as at the checkpoint: the tree was already built from those inputs, so the
-rebuild would change nothing. It says so rather than passing silently:
+now as at the checkpoint, and the undo restored the binding the instance
+already had: the tree was already built from those inputs, so the rebuild
+would change nothing. The binding counts because the install store keys a tree
+on it (see *Installs: use a content-addressed store*); an undo that drops or brings back a tracker
+rebuilds, lockfile or no lockfile. It says so rather than passing silently:
 
 ```
 resource: deps recompute(prepare) skipped: identity unchanged
@@ -799,7 +802,15 @@ every resource's key, whether its commands mention them or not, and the store
 never fills an instance that drops a tracker with the tree built for one that
 binds it. The cost is the same trade again: instances whose bindings differ
 never share a tree, even one the binding cannot change, so each binding
-installs once.
+installs once. And a live instance whose binding moves is at a new key:
+`newgit tracker use` and `drop` rebuild every bound install that holds a tree,
+filled from the store when that binding was built before, else by running its
+`prepare` again, and say so:
+
+```
+Bound `b` in `x`
+  deps for the new binding: rebuilt, install store: filled from 3ec46aa385bb (copy-on-write)
+```
 
 **An undo is filled from it too.** The rebuild a `recompute` restore triggers
 is the expensive one — a full reinstall in the middle of an operation someone
