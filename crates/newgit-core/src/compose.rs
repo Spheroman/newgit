@@ -49,6 +49,11 @@ const PARENT_TRAILER: &str = "Newgit-Split-Parent: ";
 /// stands for and the view commit it joins after.
 const IMPORT_TRAILER: &str = "Newgit-Import: ";
 
+/// On a tracker merge bringing in commits made outside newgit (an upstream
+/// sync): the view commit it follows, so it goes on top of the view, never
+/// under commits already there, whatever the outside commits' dates.
+pub const FOLLOWS_TRAILER: &str = "Newgit-Follows: ";
+
 /// The trailers a split or carved commit carries.
 fn split_trailers(source: &str, parent: Option<&str>) -> String {
     match parent {
@@ -297,7 +302,11 @@ pub fn compose(
     let source_parent = |event: &Event| -> Option<String> {
         match &event.commit.split_source {
             Some(_) => event.commit.split_parent.clone(),
-            None => event.first_parent.clone(),
+            None => event
+                .commit
+                .follows
+                .clone()
+                .or_else(|| event.first_parent.clone()),
         }
     };
     let mut remaining: BTreeMap<String, usize> = BTreeMap::new();
@@ -327,15 +336,17 @@ pub fn compose(
                 parent != source && remaining.get(&parent).is_some_and(|left| *left > 0)
             })
         };
-        // A join marker comes after the view commit it joins, whatever its
-        // date, and so does everything its tracker made after it.
+        // A join marker, or a merge bringing in commits from outside, comes
+        // after the view commit it names, whatever its date, and so does
+        // everything its tracker made after it.
         let blocked = |front: usize| {
-            events[front].joins.is_some()
-                && events[front]
-                    .commit
-                    .split_parent
-                    .as_ref()
-                    .is_some_and(|after| remaining.get(after).is_some_and(|left| *left > 0))
+            let event = &events[front];
+            let after = match (&event.joins, &event.commit.follows) {
+                (Some(_), _) => event.commit.split_parent.as_ref(),
+                (None, Some(follows)) => Some(follows),
+                (None, None) => None,
+            };
+            after.is_some_and(|after| remaining.get(after).is_some_and(|left| *left > 0))
         };
         let pick = fronts
             .iter()
@@ -569,10 +580,6 @@ pub fn compose(
         for &index in members {
             out.view_of.insert(events[index].id.clone(), tip.clone());
             out.state_of.insert(events[index].id.clone(), state.clone());
-        }
-        if let Some((_, under)) = &joining {
-            out.view_of.insert(under.clone(), tip.clone());
-            out.state_of.insert(under.clone(), state.clone());
         }
         next_event = members.iter().max().map_or(next_event, |last| last + 1);
     }
@@ -1718,6 +1725,9 @@ struct RawCommit {
     split_parent: Option<String>,
     /// On a join marker: the imported commit it sits on.
     import: Option<String>,
+    /// On a merge bringing in commits from outside newgit: the view commit
+    /// it follows.
+    follows: Option<String>,
 }
 
 impl RawCommit {
@@ -1731,7 +1741,17 @@ impl RawCommit {
 
     fn message_without_trailer(&self) -> String {
         match &self.split_source {
-            None => self.message.clone(),
+            None => match &self.follows {
+                Some(follows) => {
+                    let trimmed = self.message.trim_end_matches('\n');
+                    let base = trimmed
+                        .strip_suffix(&format!("{FOLLOWS_TRAILER}{follows}"))
+                        .unwrap_or(trimmed);
+                    let base = base.strip_suffix("\n\n").unwrap_or(base);
+                    format!("{base}\n")
+                }
+                None => self.message.clone(),
+            },
             Some(source) => {
                 let trimmed = self.message.trim_end_matches('\n');
                 let mut base = trimmed
@@ -1790,6 +1810,12 @@ fn parse_commit(raw: &str) -> RawCommit {
         .and_then(|seconds| seconds.parse().ok())
         .unwrap_or_default();
     let mut lines = message.trim_end_matches('\n').rsplit('\n');
+    let follows = message
+        .trim_end_matches('\n')
+        .rsplit('\n')
+        .next()
+        .and_then(|last| last.strip_prefix(FOLLOWS_TRAILER))
+        .map(ToOwned::to_owned);
     let split_source = lines
         .next()
         .and_then(|last| last.strip_prefix(SPLIT_TRAILER))
@@ -1813,6 +1839,7 @@ fn parse_commit(raw: &str) -> RawCommit {
         split_source,
         split_parent,
         import,
+        follows,
     }
 }
 

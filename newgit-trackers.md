@@ -182,6 +182,17 @@ anyone reads. The join is deterministic: author and committer `newgit
 <newgit@localhost>`, dated the later of its two parents, message `Import
 <tracker> into <paths>`.
 
+**Commits from outside come in through one merge (decided).** New commits
+made outside newgit (an upstream sync of a fork, a push straight to the
+outside repository) come into the tracker through one merge on its history,
+`git subtree pull`'s shape: first parent the tracker, second parent the
+outside commits, never laid onto the tracker's own line. The merge is marked
+`Newgit-Follows: <view commit>`, the view commit it was made on top of, and
+composing keeps it after that commit whatever its date. The outside commits'
+own dates, usually older than the project's latest work, never place
+anything, so a sync appends one commit and rewrites nothing; the outside
+commits come in through its second parent as themselves.
+
 **A view the tracker has not joined leaves it out (decided).** A branch
 forked before the import has no join, so its view has no t3code until the
 branch takes it. Placing the merge by date would give every later commit on
@@ -587,3 +598,6 @@ environment identity is simply the set of tracker commits it composes.
    rest of `main`.
 4. **`git log` and `git blame` reach through the join**: its second parent
    is the imported history itself.
+5. **Commits from outside come in through one merge** pinned to the view
+   commit it follows (`Newgit-Follows`), `git subtree pull`'s shape, never
+   laid onto the tracker's line, where their dates would rewrite the view.

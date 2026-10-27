@@ -474,3 +474,143 @@ fn walkthrough_import_take_work_merge_back() {
         git(repo, &["ls-tree", "-r", "--name-only", &merged])
     );
 }
+
+/// `main` after the import, with root work `r` on top of the join: the
+/// view an upstream sync arrives at. Returns the join and `r`'s root piece.
+fn main_with_work(
+    project: &Project,
+    root: &TrackerDefinition,
+    t3code: &TrackerDefinition,
+    all: &[TrackerDefinition],
+) -> (compose::Joined, String, String) {
+    let repo = &project.repo;
+    let joined = import(project, t3code);
+    let merge = view(
+        repo,
+        "main",
+        &tips(root, &project.b, t3code, &joined.marker),
+        all,
+    );
+    git(repo, &["checkout", "-q", "--detach", &merge]);
+    let r = commit(
+        repo,
+        &[("README.md", "after the import\n")],
+        "root work",
+        8_000,
+    );
+    let split = compose::split(repo, &merge, &r, &[root, t3code], all).expect("split");
+    let root_tip = split.state["root"].clone();
+    assert_eq!(
+        view(
+            repo,
+            "main",
+            &tips(root, &root_tip, t3code, &joined.marker),
+            all
+        ),
+        r
+    );
+    (joined, r, root_tip)
+}
+
+/// Upstream commits on top of `parent`, dated before everything in the
+/// project since the import, as a fork sync brings them.
+fn upstream(repo: &Utf8Path, parent: &str) -> (String, String) {
+    git(repo, &["checkout", "-q", "--detach", parent]);
+    let first = commit(
+        repo,
+        &[("apps/t3code/app.js", "one\ntwo\nupstream\n")],
+        "upstream: one",
+        3_500,
+    );
+    let second = commit(
+        repo,
+        &[("apps/t3code/up.js", "up\n")],
+        "upstream: two",
+        3_600,
+    );
+    (first, second)
+}
+
+#[test]
+fn an_upstream_sync_merge_goes_on_top_whatever_its_dates() {
+    let (_guard, temp) = tempdir();
+    let project = project(&temp);
+    let repo = &project.repo;
+    let (root, t3code) = definitions();
+    let all = [root.clone(), t3code.clone()];
+    let (joined, r, root_tip) = main_with_work(&project, &root, &t3code, &all);
+
+    // Upstream moved on from what was imported; the sync merges it into
+    // t3code's history, naming the view commit it follows. Its own date is
+    // skewed far into the past.
+    let under = project.imported.last().expect("tip");
+    let (_, second) = upstream(repo, under);
+    let tree = git(repo, &["rev-parse", &format!("{second}^{{tree}}")]);
+    let message = format!(
+        "Sync t3code with upstream\n\n{}{r}\n",
+        compose::FOLLOWS_TRAILER
+    );
+    let sync = git_env(
+        repo,
+        &[
+            "commit-tree",
+            &tree,
+            "-p",
+            &joined.marker,
+            "-p",
+            &second,
+            "-m",
+            &message,
+        ],
+        &who("jack", 100),
+    );
+
+    let tip = view(repo, "main", &tips(&root, &root_tip, &t3code, &sync), &all);
+    assert_eq!(
+        git(repo, &["rev-parse", &format!("{tip}^1")]),
+        r,
+        "one commit on top; `r` keeps its id"
+    );
+    assert_eq!(
+        git(repo, &["rev-parse", &format!("{tip}^2")]),
+        second,
+        "the upstream commits come in as themselves"
+    );
+    assert_eq!(
+        git(repo, &["log", "-1", "--format=%B", &tip]),
+        "Sync t3code with upstream"
+    );
+    assert_eq!(
+        git(repo, &["show", &format!("{tip}:apps/t3code/app.js")]),
+        "one\ntwo\nupstream"
+    );
+    assert_eq!(
+        git(repo, &["show", &format!("{tip}:README.md")]),
+        "after the import"
+    );
+}
+
+/// Without the rule: outside commits laid straight onto t3code's line are
+/// interleaved by their (old) dates, under work already in the view.
+#[test]
+fn outside_commits_on_the_trackers_line_rewrite_the_view() {
+    let (_guard, temp) = tempdir();
+    let project = project(&temp);
+    let repo = &project.repo;
+    let (root, t3code) = definitions();
+    let all = [root.clone(), t3code.clone()];
+    let (joined, r, root_tip) = main_with_work(&project, &root, &t3code, &all);
+
+    let (_, second) = upstream(repo, &joined.marker);
+    let tip = view(
+        repo,
+        "main",
+        &tips(&root, &root_tip, &t3code, &second),
+        &all,
+    );
+    let reachable = git(repo, &["rev-list", &tip]);
+    assert!(
+        !reachable.contains(&r),
+        "`r` was rebuilt under the upstream commits: why a sync is one merge"
+    );
+}
