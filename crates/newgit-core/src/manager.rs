@@ -3972,6 +3972,30 @@ impl BranchManager {
             change.already = true;
             return Ok(change);
         }
+        // An imported tracker is in a view only past its anchor: a branch
+        // forked before the import has nothing of it to check out.
+        if definition.imported.is_some() {
+            let mut args = vec![
+                "-C",
+                branch.workspace_path.as_str(),
+                "ls-tree",
+                "--name-only",
+                "HEAD",
+                "--",
+            ];
+            args.extend(definition.paths.iter().map(|path| path.as_str()));
+            if crate::source::run_git_env(&args, &[])
+                .unwrap_or_default()
+                .trim()
+                .is_empty()
+            {
+                return Err(NewgitError::Unsupported(format!(
+                    "`{tracker}` was imported after `{instance}` forked, so its history is not \
+                     in this instance yet: merge `main` into it first, then \
+                     `newgit tracker use {tracker}` again"
+                )));
+            }
+        }
         // One tracker per role: another bound in it makes way.
         if let Some(role) = definition.role.clone() {
             let swapped: Vec<String> = self

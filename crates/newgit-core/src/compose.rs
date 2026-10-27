@@ -3,7 +3,9 @@
 //!
 //! - [`compose`] replays every bound code tracker's history, interleaved by
 //!   committer date, into one ordinary Git history — real authors, dates, and
-//!   messages, so `git log` and `git blame` work everywhere.
+//!   messages, so `git log` and `git blame` work everywhere. A tracker
+//!   imported from outside the project joins instead through one merge on
+//!   its anchor, so adding it rewrites nothing.
 //! - [`split`] takes view commits made on top of that (an agent's work) and
 //!   splits each into one commit per tracker it touched, marked
 //!   `Newgit-Split: <view commit>`. Composing again folds those back into the
@@ -92,8 +94,34 @@ pub fn compose(
     // rebuilt merge keeps every parent.
     let mut events = Vec::new();
     let mut side: BTreeMap<String, SideCommit> = BTreeMap::new();
+    // An imported tracker's history up to its import tip joins through one
+    // merge on its anchor (newgit-trackers.md, *An imported tracker joins
+    // through one merge*); only what it made after interleaves.
+    let mut joins: Vec<Join> = Vec::new();
+    let mut imported: BTreeMap<String, String> = BTreeMap::new();
     for tip in tips {
-        let dag = full_history(repo, &tip.commit)?;
+        let mut dag = full_history(repo, &tip.commit)?;
+        if let Some(import) = &tip.definition.imported {
+            let before: BTreeSet<String> = git_lines(repo, &["rev-list", &import.tip])?
+                .into_iter()
+                .collect();
+            dag.retain(|(id, _)| !before.contains(id));
+            let tip_time = read_commits(repo, std::slice::from_ref(&import.tip))?
+                .get(&import.tip)
+                .ok_or_else(|| missing(&import.tip))?
+                .committer_time;
+            for id in before {
+                imported.insert(id, tip.definition.name.clone());
+            }
+            joins.push(Join {
+                definition: tip.definition,
+                anchor: import.anchor.clone(),
+                joins_after: Some(import.anchor.clone()),
+                anchor_time: 0,
+                tip: import.tip.clone(),
+                tip_time,
+            });
+        }
         let spine: std::collections::BTreeSet<String> = first_parent_history(repo, &tip.commit)?
             .into_iter()
             .map(|(id, _)| id)
@@ -154,6 +182,27 @@ pub fn compose(
             }
         }
     }
+    // A view without an imported tracker's anchor (a branch forked before
+    // the import) leaves the tracker out until it merges the import.
+    joins.retain_mut(|join| {
+        let anchor_time = events
+            .iter()
+            .filter(|event: &&Event| {
+                event.tracker != join.definition.name
+                    && event.commit.split_source.as_deref().unwrap_or(&event.id) == join.anchor
+            })
+            .map(|event| event.commit.committer_time)
+            .max();
+        join.anchor_time = anchor_time.unwrap_or_default();
+        let present = anchor_time.is_some();
+        if !present {
+            let name = &join.definition.name;
+            events.retain(|event| &event.tracker != name);
+            side.retain(|_, commit| &commit.tracker != name);
+            imported.retain(|_, tracker| tracker != name);
+        }
+        present
+    });
     if events.is_empty() {
         return Ok(View {
             tip: None,
@@ -234,16 +283,24 @@ pub fn compose(
                 parent != source && remaining.get(&parent).is_some_and(|left| *left > 0)
             })
         };
+        // An imported tracker's own commits come after its import, whatever
+        // their dates: never ahead of the anchor the import merges onto.
+        let blocked = |front: usize| {
+            joins.iter().any(|join| {
+                join.definition.name == events[front].tracker
+                    && remaining.get(&join.anchor).is_some_and(|left| *left > 0)
+            })
+        };
         let pick = fronts
             .iter()
             .copied()
-            .filter(|&front| ready(front) && !waits(front))
+            .filter(|&front| ready(front) && !waits(front) && !blocked(front))
             .min_by_key(|&front| order_key(front))
             .or_else(|| {
                 fronts
                     .iter()
                     .copied()
-                    .filter(|&front| ready(front))
+                    .filter(|&front| ready(front) && !blocked(front))
                     .min_by_key(|&front| order_key(front))
             });
         let members: Vec<usize> = match pick {
@@ -256,7 +313,7 @@ pub fn compose(
                 fronts
                     .iter()
                     .copied()
-                    .min_by_key(|&front| order_key(front))
+                    .min_by_key(|&front| (blocked(front), order_key(front)))
                     .expect("a front"),
             ],
         };
@@ -295,18 +352,33 @@ pub fn compose(
     // that tracker shows it as an empty commit. (A genuinely empty commit is
     // kept: none of its members is `disowned`.) Its members still map to the
     // view commit before it, so merges that name them find a parent.
+    // An imported tracker whose anchor is dropped joins where the anchor
+    // would have been: after the kept group before it (`None`: before
+    // everything).
     let mut dropped: Vec<Vec<usize>> = Vec::new();
+    let mut last_kept: Option<String> = None;
+    let mut moved_anchors: BTreeMap<String, Option<String>> = BTreeMap::new();
     let groups: Vec<Vec<usize>> = groups
         .into_iter()
         .filter_map(|members| {
+            let source = group_key(&events[members[0]]);
             if members.iter().all(|&member| events[member].disowned) {
+                if joins.iter().any(|join| join.anchor == source) {
+                    moved_anchors.insert(source, last_kept.clone());
+                }
                 dropped.push(members);
                 None
             } else {
+                last_kept = Some(source);
                 Some(members)
             }
         })
         .collect();
+    for join in &mut joins {
+        if let Some(moved) = moved_anchors.get(&join.anchor) {
+            join.joins_after = moved.clone();
+        }
+    }
     let dropped_members: std::collections::BTreeSet<usize> =
         dropped.into_iter().flatten().collect();
     if groups.is_empty() {
@@ -345,9 +417,19 @@ pub fn compose(
         canonical: Vec::new(),
         commits: 0,
     };
+    // Imported commits are in the view as themselves, reached through the
+    // merge's second parent.
+    for (id, tracker) in &imported {
+        out.view_of.insert(id.clone(), Target::Commit(id.clone()));
+        out.state_of
+            .insert(id.clone(), State::from([(tracker.clone(), id.clone())]));
+    }
     let mut tip = Target::None;
     let mut state = State::new();
     let mut next_event = 0usize;
+    for join in joins.iter().filter(|join| join.joins_after.is_none()) {
+        tip = out.join(repo, join, &tip, &mut state)?;
+    }
     for members in &groups {
         // Spine commits of dropped groups that precede this one map to the
         // view so far.
@@ -421,15 +503,42 @@ pub fn compose(
             // Recreated: the source's metadata (the member that is an original
             // commit, or any member with its trailer stripped).
             let lead = original.unwrap_or(&events[members[0]]);
-            out.write(&lead.commit, &tip, &merges, &combined, &state, &source)
+            out.write(
+                &lead.commit,
+                &tip,
+                &merges,
+                &combined,
+                &state,
+                Some(&source),
+            )
         };
         for &index in members {
             out.view_of.insert(events[index].id.clone(), tip.clone());
             out.state_of.insert(events[index].id.clone(), state.clone());
         }
         next_event = members.iter().max().map_or(next_event, |last| last + 1);
+        for join in joins
+            .iter()
+            .filter(|join| join.joins_after.as_deref() == Some(source.as_str()))
+        {
+            tip = out.join(repo, join, &tip, &mut state)?;
+        }
     }
     out.finish(repo, tip, groups.len())
+}
+
+/// Where an imported tracker joins the view.
+struct Join<'a> {
+    definition: &'a TrackerDefinition,
+    /// The view commit it joins after.
+    anchor: String,
+    /// The group it is emitted after in this view: the anchor's, or, when
+    /// this view drops the anchor, the kept group before it (`None`: first).
+    joins_after: Option<String>,
+    anchor_time: i64,
+    /// The last imported commit: the join's second parent.
+    tip: String,
+    tip_time: i64,
 }
 
 /// A tracker commit off its tracker's first-parent spine: what a merge
@@ -492,7 +601,7 @@ impl Emitter {
         merges: &[Target],
         changes: &[&Change],
         state: &State,
-        canonical: &str,
+        canonical: Option<&str>,
     ) -> Target {
         let message = commit.message_without_trailer();
         self.mark += 1;
@@ -523,10 +632,99 @@ impl Emitter {
         stream.push(b'\n');
         self.notes
             .push((format!(":{}", self.mark), render_state(state)));
-        self.canonical
-            .push((format!(":{}", self.mark), canonical.to_owned()));
+        if let Some(canonical) = canonical {
+            self.canonical
+                .push((format!(":{}", self.mark), canonical.to_owned()));
+        }
         self.commits += 1;
         Target::Mark(self.mark)
+    }
+
+    /// The merge an imported tracker joins through, on top of `from` (its
+    /// anchor): second parent the import tip as-is, and `from`'s tree with
+    /// the tracker's paths set to the tip's. Fixed identity, a date no
+    /// earlier than either parent, and a message from the tracker, so every
+    /// composer writes the same commit.
+    fn join(
+        &mut self,
+        repo: &Utf8Path,
+        join: &Join<'_>,
+        from: &Target,
+        state: &mut State,
+    ) -> Result<Target> {
+        // The tip's entry at each of the tracker's paths: `(path, mode, kind,
+        // object)`.
+        let mut entries = Vec::new();
+        for path in &join.definition.paths {
+            let entry = git(repo, &["ls-tree", "-z", &join.tip, "--", path.as_str()])?;
+            if let Some((meta, _)) = entry.trim_end_matches('\0').split_once('\t') {
+                let fields: Vec<&str> = meta.split(' ').collect();
+                if let [mode, kind, object] = fields[..] {
+                    entries.push((
+                        path.as_str(),
+                        mode.to_owned(),
+                        kind.to_owned(),
+                        object.to_owned(),
+                    ));
+                }
+            }
+        }
+        let paths: Vec<&str> = join
+            .definition
+            .paths
+            .iter()
+            .map(|path| path.as_str())
+            .collect();
+        let time = join.anchor_time.max(join.tip_time);
+        let identity = format!("newgit <newgit@localhost> {time} +0000");
+        let message = format!(
+            "Import {} into {}\n",
+            join.definition.name,
+            paths.join(", ")
+        );
+        state.insert(join.definition.name.clone(), join.tip.clone());
+        let target = match from {
+            // On an existing commit, the merge is made now, as a real commit,
+            // so what is later committed on top of it is reused as itself.
+            Target::Commit(anchor) => {
+                let merge = join_commit(repo, anchor, &join.tip, &paths, &entries, time, &message)?;
+                self.reuse(&merge, state)
+            }
+            _ => {
+                let mut changes: Vec<Change> = paths
+                    .iter()
+                    .map(|path| Change {
+                        path: (*path).to_owned(),
+                        new: None,
+                    })
+                    .collect();
+                changes.extend(entries.iter().map(|(path, mode, _, object)| Change {
+                    path: (*path).to_owned(),
+                    new: Some((mode.clone(), object.clone())),
+                }));
+                let commit = RawCommit {
+                    author: identity.clone(),
+                    committer: identity,
+                    committer_time: time,
+                    message,
+                    merge: true,
+                    split_source: None,
+                    split_parent: None,
+                };
+                let changes: Vec<&Change> = changes.iter().collect();
+                self.write(
+                    &commit,
+                    from,
+                    &[Target::Commit(join.tip.clone())],
+                    &changes,
+                    state,
+                    None,
+                )
+            }
+        };
+        self.view_of.insert(join.tip.clone(), target.clone());
+        self.state_of.insert(join.tip.clone(), state.clone());
+        Ok(target)
     }
 
     /// Where side commit `id` lands, replaying it (and whatever of its
@@ -591,7 +789,7 @@ impl Emitter {
                     &parents[1.min(parents.len())..],
                     &changes,
                     &state,
-                    &current,
+                    Some(&current),
                 )
             };
             self.view_of.insert(current.clone(), target);
@@ -682,6 +880,68 @@ impl Emitter {
             commits: self.commits,
         })
     }
+}
+
+/// An imported tracker's merge on `anchor`, made with `commit-tree` through
+/// a throwaway index: `anchor`'s tree with `paths` replaced by `entries`
+/// (the import tip's), parents `anchor` and `tip`, newgit's identity at
+/// `time`. Never signed, so it is the same commit on every machine.
+fn join_commit(
+    repo: &Utf8Path,
+    anchor: &str,
+    tip: &str,
+    paths: &[&str],
+    entries: &[(&str, String, String, String)],
+    time: i64,
+    message: &str,
+) -> Result<String> {
+    let index = repo_tmp_file(repo, "join-index");
+    let env = vec![("GIT_INDEX_FILE".to_owned(), index.to_string())];
+    let result = (|| {
+        git_env(repo, &["read-tree", anchor], &env)?;
+        let mut args = vec!["rm", "--cached", "-r", "-q", "-f", "--ignore-unmatch", "--"];
+        args.extend_from_slice(paths);
+        git_env(repo, &args, &env)?;
+        for (path, mode, kind, object) in entries {
+            if kind == "tree" {
+                let prefix = format!("--prefix={path}/");
+                git_env(repo, &["read-tree", &prefix, object], &env)?;
+            } else {
+                let info = format!("{mode},{object},{path}");
+                git_env(repo, &["update-index", "--add", "--cacheinfo", &info], &env)?;
+            }
+        }
+        let tree = git_env(repo, &["write-tree"], &env)?;
+        let mut full_env = env.clone();
+        for role in ["AUTHOR", "COMMITTER"] {
+            full_env.push((format!("GIT_{role}_NAME"), "newgit".to_owned()));
+            full_env.push((format!("GIT_{role}_EMAIL"), "newgit@localhost".to_owned()));
+            full_env.push((format!("GIT_{role}_DATE"), format!("@{time} +0000")));
+        }
+        let out = run(
+            command(
+                repo,
+                &[
+                    "-c",
+                    "commit.gpgSign=false",
+                    "commit-tree",
+                    &tree,
+                    "-p",
+                    anchor,
+                    "-p",
+                    tip,
+                    "-F",
+                    "-",
+                ],
+            )
+            .envs(full_env.iter().map(|(key, value)| (key, value))),
+            "git commit-tree",
+            Some(message.as_bytes()),
+        )?;
+        Ok(String::from_utf8_lossy(&out).trim().to_owned())
+    })();
+    let _ = std::fs::remove_file(&index);
+    result
 }
 
 /// Every commit reachable from `tip`, oldest first in topological order,

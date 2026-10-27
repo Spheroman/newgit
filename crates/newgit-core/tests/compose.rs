@@ -84,6 +84,7 @@ fn tracker(name: &str, paths: &[&str], excluded: &[&str], secret: bool) -> Track
         requires: Vec::new(),
         resources: Vec::new(),
         excluded: excluded.iter().map(Utf8PathBuf::from).collect(),
+        imported: None,
         definition_rev: "sha256:000000000000".to_owned(),
     }
 }

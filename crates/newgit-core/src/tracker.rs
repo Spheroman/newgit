@@ -44,8 +44,23 @@ pub struct TrackerDefinition {
     /// from the full set of definitions ([`resolve_ownership`]); not part of
     /// the definition file.
     pub excluded: Vec<Utf8PathBuf>,
+    /// Where a history brought in from outside the project joined it: the
+    /// view commit it joined after and the import's tip. Composing places
+    /// one merge there instead of interleaving the imported commits by date.
+    pub imported: Option<Imported>,
     /// `sha256:<hex12>` of the definition file contents.
     pub definition_rev: String,
+}
+
+/// An imported tracker's anchor (newgit-trackers.md, *An imported tracker
+/// joins through one merge*).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct Imported {
+    /// The view commit the tracker joined after.
+    pub anchor: String,
+    /// The last imported commit: the merge's second parent.
+    pub tip: String,
 }
 
 /// The tracker owning everything no other tracker claims.
@@ -88,6 +103,8 @@ pub struct TrackerDefinitionFile {
     requires: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     resources: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    imported: Option<Imported>,
 }
 
 fn is_zero(value: &i32) -> bool {
@@ -123,6 +140,7 @@ impl TrackerDefinition {
             requires: Vec::new(),
             resources: Vec::new(),
             excluded: Vec::new(),
+            imported: None,
             definition_rev: String::new(),
         };
         definition.validate()?;
@@ -157,6 +175,7 @@ impl TrackerDefinition {
             priority: file.priority,
             requires: file.requires,
             resources: file.resources,
+            imported: file.imported,
             excluded: Vec::new(),
             definition_rev: format!("sha256:{hex}"),
         };
@@ -183,6 +202,23 @@ impl TrackerDefinition {
             )));
         }
 
+        if let Some(imported) = &self.imported {
+            if self.secret || self.owns_everything() || self.paths.is_empty() {
+                return Err(self.invalid(
+                    "`imported` is for a code tracker with its own paths: `secret = false`, \
+                     and no `.`"
+                        .to_owned(),
+                ));
+            }
+            for (field, id) in [("anchor", &imported.anchor), ("tip", &imported.tip)] {
+                let full = matches!(id.len(), 40 | 64);
+                if !full || !id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                    return Err(self.invalid(format!(
+                        "`imported.{field}` must be a full commit id, not `{id}`"
+                    )));
+                }
+            }
+        }
         if self.owns_everything() && self.paths.len() > 1 {
             return Err(self.invalid(
                 "`.` owns everything not claimed elsewhere, so it must be the only path".to_owned(),
@@ -242,6 +278,7 @@ impl TrackerDefinition {
             priority: self.priority,
             requires: self.requires.clone(),
             resources: self.resources.clone(),
+            imported: self.imported.clone(),
         }
     }
 
@@ -262,6 +299,7 @@ impl TrackerDefinition {
             requires: Vec::new(),
             resources: Vec::new(),
             excluded: Vec::new(),
+            imported: None,
             definition_rev: String::new(),
         };
         definition.definition_rev = definition
@@ -287,6 +325,7 @@ impl TrackerDefinition {
             requires: Vec::new(),
             resources: Vec::new(),
             excluded: Vec::new(),
+            imported: None,
             definition_rev: String::new(),
         };
         definition.definition_rev = definition
@@ -312,6 +351,7 @@ impl TrackerDefinition {
             requires: Vec::new(),
             resources: Vec::new(),
             excluded: Vec::new(),
+            imported: None,
             definition_rev: String::new(),
         };
         definition.definition_rev = definition
@@ -536,6 +576,7 @@ mod tests {
             requires: Vec::new(),
             resources: Vec::new(),
             excluded: Vec::new(),
+            imported: None,
             definition_rev: "sha256:000000000000".to_owned(),
         }
     }
