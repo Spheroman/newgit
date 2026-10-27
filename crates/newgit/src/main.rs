@@ -869,6 +869,47 @@ fn resource_json(
     })
 }
 
+/// What the bind did to `resource`, for the `resource:` line of a spawn
+/// report: `prepare: ok`, `prepare: FAILED (...)`, `prepare: BLOCKED by ...`,
+/// or the export or render failure that kept `prepare` from running. Empty
+/// when nothing ran and nothing stopped it.
+fn prepare_label(resource: &ResourceBindOutcome) -> String {
+    match (&resource.export_error, &resource.render_error) {
+        // Both are reported where prepare would be, because that is what
+        // they prevented: a prepare run against unrendered config would
+        // start a service on the committed default port, and one against
+        // a half-resolved environment would start it pointed at a
+        // placeholder. They are named apart because they are different
+        // mistakes in different parts of the definition.
+        (Some(error), _) => format!(" export: FAILED — {error}"),
+        (None, Some(error)) => format!(" render: FAILED — {error}"),
+        (None, None) => match &resource.prepare {
+            Some((true, _)) => " prepare: ok".to_owned(),
+            Some((false, log)) => {
+                // The hook ran quietly; its last lines are usually the why.
+                let tail = newgit_core::supervisor::log_tail(log, 8)
+                    .into_iter()
+                    .map(|line| format!("\n               | {line}"))
+                    .collect::<String>();
+                format!(
+                    " prepare: FAILED (log: {log}; re-run with `newgit action {}.prepare`){tail}",
+                    resource.name
+                )
+            }
+            None if !resource.blocked_by.is_empty() => {
+                format!(" prepare: BLOCKED by {}", resource.blocked_by.join(", "))
+            }
+            // Said where prepare's result would be, because it is the
+            // answer to the same question — the tree is there. What put
+            // it there, and from which key, is on the line below.
+            None if matches!(&resource.install, Some(InstallReport::Filled { .. })) => {
+                " prepare: not needed".to_owned()
+            }
+            None => String::new(),
+        },
+    }
+}
+
 fn spawn_from_checkpoint(
     manager: &BranchManager,
     name: &str,
@@ -931,10 +972,35 @@ fn spawn_from_checkpoint(
         }
         return Ok(());
     }
-    println!(
-        "Spawned `{}` from {spec}, taken by {by}",
-        outcome.branch.name
-    );
+    // Judged by the instance the restore leaves, as `--json` above is: a
+    // resource is not up whether its restore failed or its bind did and the
+    // checkpoint held nothing to restore it with (#208).
+    let not_ready = outcome
+        .branch
+        .resources
+        .iter()
+        .filter(|(_, binding)| binding.status != ResourceStatus::Ready)
+        .map(|(name, _)| name.as_str())
+        .collect::<Vec<_>>();
+    // Lead with the verdict, as `undo` and a plain `spawn` do: "Spawned"
+    // alone reads as a clean spawn, and the lines below only say otherwise
+    // if each carries its own verdict.
+    if outcome.is_complete() {
+        println!(
+            "Spawned `{}` from {spec}, taken by {by}",
+            outcome.branch.name
+        );
+    } else {
+        println!(
+            "Spawned `{}` from {spec}, taken by {by} — but {} did not come up (see below)",
+            outcome.branch.name,
+            not_ready
+                .iter()
+                .map(|name| format!("`{name}`"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
     println!("  workspace: {}", outcome.branch.workspace_path);
     for tracker in &outcome.undo.trackers {
         match &tracker.rev {
@@ -946,10 +1012,49 @@ fn spawn_from_checkpoint(
             None => println!("  tracker:   {} (empty)", tracker.name),
         }
     }
-    for resource in &outcome.undo.resources {
-        println!("  resource:  {} {}", resource.name, resource.action);
+    // Every resource the instance has, as `--json` lists them: one the
+    // restore touched gets the restore's verdict, as `undo` prints it; one
+    // the checkpoint held no state for keeps what the bind left, so its
+    // line is the bind's, as a plain `spawn` prints it.
+    for name in outcome.branch.resources.keys() {
+        let restored = outcome
+            .undo
+            .resources
+            .iter()
+            .find(|resource| &resource.name == name);
+        let bound = outcome
+            .spawned
+            .resources
+            .iter()
+            .find(|resource| &resource.name == name);
+        match (restored, bound) {
+            (Some(restored), _) => {
+                let verdict = if restored.ok { "ok" } else { "FAILED" };
+                println!("  resource:  {name} {} {verdict}", restored.action);
+            }
+            (None, Some(bound)) => println!("  resource:  {name}{}", prepare_label(bound)),
+            (None, None) => println!("  resource:  {name}"),
+        }
     }
     print_warnings(&outcome.warnings);
+    if let Some(recovery) = &outcome.undo.recovery_record {
+        eprintln!("warning: some resource restores failed; recovery record at {recovery}");
+    }
+    if !outcome.is_complete() {
+        // As a plain `spawn` exits: the instance and its record stay, exactly
+        // as printed above, and exit 1 reports that state rather than
+        // undoing it.
+        println!(
+            "spawned with failures: {} of {} resources did not come up.",
+            not_ready.len(),
+            outcome.branch.resources.len()
+        );
+        println!(
+            "  `{}` exists but is not ready. See the FAILED/BLOCKED lines above.",
+            outcome.branch.name
+        );
+        std::process::exit(1);
+    }
     Ok(())
 }
 
@@ -1106,40 +1211,7 @@ fn spawn(args: SpawnArgs) -> Result<()> {
         } else {
             format!(" ports: {ports}")
         };
-        let prepare = match (&resource.export_error, &resource.render_error) {
-            // Both are reported where prepare would be, because that is what
-            // they prevented: a prepare run against unrendered config would
-            // start a service on the committed default port, and one against
-            // a half-resolved environment would start it pointed at a
-            // placeholder. They are named apart because they are different
-            // mistakes in different parts of the definition.
-            (Some(error), _) => format!(" export: FAILED — {error}"),
-            (None, Some(error)) => format!(" render: FAILED — {error}"),
-            (None, None) => match &resource.prepare {
-                Some((true, _)) => " prepare: ok".to_owned(),
-                Some((false, log)) => {
-                    // The hook ran quietly; its last lines are usually the why.
-                    let tail = newgit_core::supervisor::log_tail(log, 8)
-                        .into_iter()
-                        .map(|line| format!("\n               | {line}"))
-                        .collect::<String>();
-                    format!(
-                        " prepare: FAILED (log: {log}; re-run with `newgit action {}.prepare`){tail}",
-                        resource.name
-                    )
-                }
-                None if !resource.blocked_by.is_empty() => {
-                    format!(" prepare: BLOCKED by {}", resource.blocked_by.join(", "))
-                }
-                // Said where prepare's result would be, because it is the
-                // answer to the same question — the tree is there. What put
-                // it there, and from which key, is on the line below.
-                None if matches!(&resource.install, Some(InstallReport::Filled { .. })) => {
-                    " prepare: not needed".to_owned()
-                }
-                None => String::new(),
-            },
-        };
+        let prepare = prepare_label(resource);
         let captured = if resource.captured.is_empty() {
             String::new()
         } else {
