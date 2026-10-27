@@ -307,7 +307,8 @@ composed history to an ordinary repository defined in
 ["root"]`). Only `public` trackers and the ones a target names ship, so a
 public mirror and a private one can show different views, and a history that
 ever committed a secret tracker's file is refused. Exporting again
-fast-forwards, and the push uses your own Git credentials, so `gh`, GitHub
+fast-forwards, after bringing in whatever was merged on the target since,
+and the push uses your own Git credentials, so `gh`, GitHub
 Actions, and anyone cloning from GitHub keep working. With `branches =
 true`, every push from a workspace exports its branch there too, and on a
 newgit remote the workspace gets the target as the remote `gh` resolves, so
