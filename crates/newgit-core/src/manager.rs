@@ -86,6 +86,7 @@ pub struct CreateCodeTrackerOutcome {
 /// What `tracker create --code --from` did.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ImportCodeTrackerOutcome {
+    /// The definition written.
     pub path: Utf8PathBuf,
     /// The project root's branch it joined.
     pub branch: String,
@@ -1147,46 +1148,37 @@ impl BranchManager {
         })
     }
 
-    /// Create a code tracker owning `path` from another repository's
-    /// history (newgit-trackers.md, *An imported tracker joins through one
-    /// merge*): branch `branch` of `from` (its `HEAD` when `None`) is
-    /// fetched and rewritten under `path`, every commit and parent kept, and
-    /// joins the project root's branch through one merge after its tip —
-    /// the join marker on the tracker's `main` records where. The root's
-    /// branch moves to that merge, so the files are there to work on.
+    /// Create a code tracker mounted at `mount` from another repository's
+    /// history (newgit-trackers.md, *An imported tracker is stored relative
+    /// to its own root*): branch `branch` of `from` (its `HEAD` when `None`)
+    /// becomes the tracker's history unchanged, ids and signatures intact,
+    /// and joins the project root's branch through one merge after its tip,
+    /// showing it under `mount`. The join marker on the tracker's `main`
+    /// records where. The root's branch moves to that merge, so the files
+    /// are there to work on.
     ///
-    /// Refuses when the project already has anything at `path` (carve that
+    /// Refuses when the project already has anything at `mount` (carve that
     /// instead), and when the imported history adds a file a secret tracker
-    /// owns.
+    /// owns there.
     pub fn import_code_tracker(
         &self,
         name: &str,
         audience: &str,
-        paths: &[Utf8PathBuf],
+        mount: &Utf8Path,
         from: &str,
         branch: Option<&str>,
     ) -> Result<ImportCodeTrackerOutcome> {
         validate_name(name)?;
         self.refuse_root(name, "it always exists")?;
-        let [path] = paths else {
-            return Err(NewgitError::Unsupported(format!(
-                "an imported tracker goes under one path: `newgit tracker create {name} --code \
-                 --path <path> --from <repository>`"
-            )));
-        };
         let mut definition = TrackerDefinition::new(
             name,
             audience.to_owned(),
             Storage::Local,
             true,
-            paths.to_vec(),
+            vec![mount.to_path_buf()],
         )?;
         definition.secret = false;
-        if definition.owns_everything() {
-            return Err(NewgitError::Unsupported(format!(
-                "an imported tracker goes under a directory of its own, not `{path}`"
-            )));
-        }
+        let definition = definition.mounted_at(mount)?;
         let mut all: Vec<TrackerDefinition> =
             self.trackers.iter().chain(&self.code).cloned().collect();
         all.push(self.root.clone());
@@ -1207,14 +1199,14 @@ impl BranchManager {
         };
         let branch_ref = format!("refs/heads/{project_branch}");
         let tip = self.source.rev_parse(&branch_ref)?;
-        let occupied = !git(&["ls-tree", "--name-only", &tip, "--", path.as_str()])?
+        let occupied = !git(&["ls-tree", "--name-only", &tip, "--", mount.as_str()])?
             .trim()
             .is_empty();
-        if occupied || root.join(path).exists() {
+        if occupied || root.join(mount).exists() {
             return Err(NewgitError::Unsupported(format!(
-                "`{path}` already has files in the project; an imported tracker starts from an \
-                 empty path (to give what is there its own history, leave out --from and carve \
-                 it)"
+                "`{mount}` already has files in the project; an imported tracker starts from an \
+                 empty directory (to give what is there its own history, leave out --from and \
+                 carve it with --path)"
             )));
         }
 
@@ -1223,28 +1215,20 @@ impl BranchManager {
         self.sync_project_root()?;
         let after = crate::compose::canonical(&root, &tip)?;
 
-        let original = format!("refs/newgit/imported/{name}");
-        let rewritten = format!("refs/newgit/import-rewritten/{name}");
+        let fetched_ref = format!("refs/newgit/importing/{name}");
         let main = local_tracker_ref(name, "main");
-        let cleanup = || {
-            for reference in [&original, &rewritten, &main] {
-                let _ = git(&["update-ref", "-d", reference]);
-            }
-        };
         let fetched = GitSource::fetch_refs(
             &["-C", root.as_str()],
             from,
-            &[format!("+{}:{original}", branch.unwrap_or("HEAD"))],
+            &[format!("+{}:{fetched_ref}", branch.unwrap_or("HEAD"))],
             None,
         );
-        if let Err(error) = fetched {
-            cleanup();
-            return Err(error);
-        }
-        let result = (|| {
-            let imported = crate::compose::import(&root, &original, path, &rewritten)?;
+        let result = fetched.and_then(|()| {
+            let imported = self
+                .source
+                .rev_parse(&format!("{fetched_ref}^{{commit}}"))?;
             if let Some((commit, file, secret)) =
-                crate::compose::find_secret(&root, &[&imported.tip], &[], &all)?
+                crate::compose::find_secret_under(&root, &[&imported], &[], &all, Some(mount))?
             {
                 return Err(NewgitError::SplitRefused(format!(
                     "commit {} of {from} adds `{file}`, which belongs to the secret tracker \
@@ -1252,7 +1236,11 @@ impl BranchManager {
                     &commit[..commit.len().min(12)]
                 )));
             }
-            let joined = crate::compose::join(&root, &definition, &after, &imported.tip, &main)?;
+            let commits: usize = git(&["rev-list", "--count", &imported])?
+                .trim()
+                .parse()
+                .unwrap_or(0);
+            let joined = crate::compose::join(&root, &definition, &after, &imported, &main)?;
 
             // The root's view with the new tracker in it: the join on top of
             // `tip`, which the root's branch moves to.
@@ -1269,28 +1257,18 @@ impl BranchManager {
                     "`{name}` would not join on top of `{project_branch}`; nothing was imported"
                 )));
             }
-            Ok((imported, joined, view))
-        })();
-        let _ = git(&["update-ref", "-d", &rewritten]);
-        let (imported, joined, view) = match result {
+            Ok((commits, joined, view))
+        });
+        let _ = git(&["update-ref", "-d", &fetched_ref]);
+        let (commits, joined, view) = match result {
             Ok(done) => done,
             Err(error) => {
-                cleanup();
+                let _ = git(&["update-ref", "-d", &main]);
                 return Err(error);
             }
         };
 
         self.publish_code_refs(name, &["main"])?;
-        let store = self.store.paths().tracker_store.clone();
-        GitSource::fetch_refs(
-            &[&format!("--git-dir={store}")],
-            root.as_str(),
-            &[
-                format!("+{0}:{0}", crate::compose::IMPORTED_NOTES_REF),
-                format!("+{original}:refs/imported/{name}"),
-            ],
-            None,
-        )?;
         let definition_path = self.store.create_tracker_definition(&definition)?;
         let checked_out = git(&["symbolic-ref", "-q", "HEAD"]).unwrap_or_default();
         if checked_out.trim() == branch_ref {
@@ -1301,7 +1279,7 @@ impl BranchManager {
         Ok(ImportCodeTrackerOutcome {
             path: definition_path,
             branch: project_branch,
-            commits: imported.commits,
+            commits,
             join: joined.view,
             marker: joined.marker,
         })

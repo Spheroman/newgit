@@ -374,6 +374,16 @@ impl TrackerDefinition {
         definition
     }
 
+    /// This code tracker, stored relative to its own root, at `mount`: it
+    /// owns the whole mount.
+    pub fn mounted_at(mut self, mount: &Utf8Path) -> Result<Self> {
+        self.mount = Some(mount.to_path_buf());
+        self.paths = vec![mount.to_path_buf()];
+        self.validate()?;
+        self.definition_rev = self.compute_definition_rev()?;
+        Ok(self)
+    }
+
     /// A workspace path as this tracker's commits hold it: relative to its
     /// mount, or unchanged when it has none. `None` when the path is outside
     /// the mount (or is the mount itself, which no change names).

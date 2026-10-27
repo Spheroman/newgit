@@ -1,12 +1,11 @@
 //! `tracker create --code --from` (#140): another repository's history,
-//! rewritten under a path, every commit and parent kept, joining the
-//! project root's branch through one merge.
+//! unchanged, as a code tracker mounted at a directory, joining the project
+//! root's branch through one merge.
 
 use std::process::Command;
 
 use camino::{Utf8Path, Utf8PathBuf};
 use newgit_core::SourceSubstrate;
-use newgit_core::compose::IMPORTED_NOTES_REF;
 use newgit_core::config::WorkspaceSection;
 use newgit_core::manager::BranchManager;
 use newgit_core::store::MetadataStore;
@@ -109,6 +108,8 @@ fn path(path: &str) -> Vec<Utf8PathBuf> {
     vec![Utf8PathBuf::from(path)]
 }
 
+const MOUNT: &str = "apps/t3code";
+
 #[test]
 fn an_import_joins_the_root_branch_through_one_merge() {
     let (_guard, temp) = tempdir();
@@ -122,7 +123,7 @@ fn an_import_joins_the_root_branch_through_one_merge() {
         .import_code_tracker(
             "t3code",
             "project-devs",
-            &path("apps/t3code"),
+            Utf8Path::new(MOUNT),
             outside.as_str(),
             Some("newgit"),
         )
@@ -143,7 +144,8 @@ fn an_import_joins_the_root_branch_through_one_merge() {
         "one\ntwo\n"
     );
 
-    // The rewritten history: every commit and parent, authors and dates kept.
+    // The view's copy under the mount: every commit and parent, authors and
+    // dates kept.
     let log = |dir: &Utf8Path, rev: &str| {
         git(
             dir,
@@ -166,13 +168,11 @@ fn an_import_joins_the_root_branch_through_one_merge() {
         "git log under the path reaches the imported history"
     );
 
-    // The map from each original to its rewrite, which travels to the store.
+    // The tracker is the history as it came, ids unchanged, with the join
+    // marker on top; that is what reaches the store.
     assert_eq!(
-        git(
-            &repo,
-            &["notes", "--ref", IMPORTED_NOTES_REF, "show", &original]
-        ),
-        git(&repo, &["rev-parse", "HEAD^2"]),
+        git(&repo, &["rev-parse", &format!("{}^", outcome.marker)]),
+        original
     );
     let trackers = store.paths().tracker_store.clone();
     assert_eq!(
@@ -180,26 +180,19 @@ fn an_import_joins_the_root_branch_through_one_merge() {
         outcome.marker
     );
     assert_eq!(
-        git(&trackers, &["rev-parse", "refs/imported/t3code"]),
-        original
+        git(&trackers, &["ls-tree", "-r", "--name-only", &original]),
+        "app.js\nside.js",
+        "at its own root"
     );
     assert_eq!(
-        git(&trackers, &["notes", "--ref", IMPORTED_NOTES_REF, "list"])
-            .lines()
-            .count(),
-        4
+        git(&repo, &["for-each-ref", "refs/newgit/importing"]),
+        "",
+        "nothing left of the fetch"
     );
-
-    // Importing again from the same commits gives the same ids.
-    let again = temp.join("again");
-    git(&temp, &["init", "-q", "-b", "main", again.as_str()]);
-    git(&again, &["fetch", "-q", outside.as_str(), "newgit:refs/x"]);
-    newgit_core::compose::import(&again, "refs/x", Utf8Path::new("apps/t3code"), "refs/y")
-        .expect("import again");
-    assert_eq!(
-        git(&again, &["rev-parse", "refs/y"]),
-        git(&repo, &["rev-parse", "HEAD^2"])
-    );
+    let written =
+        std::fs::read_to_string(store.paths().trackers.join("t3code.toml")).expect("definition");
+    assert!(written.contains("mount = \"apps/t3code\""), "{written}");
+    assert!(written.contains("paths = [\".\"]"), "{written}");
 
     // A newgit that opens the project now composes the same branch, and
     // work on top of the join splits into the imported tracker.
@@ -231,8 +224,9 @@ fn an_import_joins_the_root_branch_through_one_merge() {
         outcome.marker
     );
     assert_eq!(
-        git(&repo, &["show", &format!("{t3code}:apps/t3code/app.js")]),
-        "one\ntwo\nthree"
+        git(&repo, &["show", &format!("{t3code}:app.js")]),
+        "one\ntwo\nthree",
+        "the work, at t3code's own root"
     );
     let manager = BranchManager::open(store).expect("reopen");
     manager.sync_project_root().expect("sync again");
@@ -260,7 +254,7 @@ fn an_import_refuses_a_path_that_has_files() {
         .import_code_tracker(
             "t3code",
             "project-devs",
-            &path("apps/t3code"),
+            Utf8Path::new(MOUNT),
             outside.as_str(),
             None,
         )
@@ -289,7 +283,7 @@ fn an_import_refuses_history_that_adds_a_secret() {
         .import_code_tracker(
             "t3code",
             "project-devs",
-            &path("apps/t3code"),
+            Utf8Path::new(MOUNT),
             outside.as_str(),
             None,
         )
@@ -307,7 +301,7 @@ fn an_import_refuses_history_that_adds_a_secret() {
             &[
                 "for-each-ref",
                 "refs/newgit/trackers/t3code",
-                "refs/newgit/imported"
+                "refs/newgit/importing"
             ]
         ),
         ""
