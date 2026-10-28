@@ -483,9 +483,14 @@ fn copy_tree(source: &Utf8Path, destination: &Utf8Path, method: CopyMethod) -> R
 /// Clone a whole tree in one call, where the platform has one. A failure
 /// (another volume, a filesystem without clones) is not an error: the
 /// caller cleans up and falls back to `cp`.
+///
+/// A produced path that is itself a symlink is left to `cp`, which copies
+/// the link. `clonefile` follows a symlink it is handed as the source, and
+/// would put a copy of whatever the link points at in its place.
 #[cfg(target_os = "macos")]
 fn clone_tree(source: &Utf8Path, destination: &Utf8Path) -> bool {
-    reflink_copy::reflink(source, destination).is_ok()
+    let is_link = std::fs::symlink_metadata(source).is_ok_and(|meta| meta.is_symlink());
+    !is_link && reflink_copy::reflink(source, destination).is_ok()
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -802,6 +807,37 @@ mod tests {
             std::fs::read_to_string(entry.join("node_modules/build.json")).expect("read"),
             "{}\n",
             "nor the store entry every later instance is cloned from"
+        );
+    }
+
+    /// `cp -R` copies a symlink operand as a link; a clone of the tree
+    /// must too, rather than copying what the link points at.
+    #[test]
+    fn a_produced_symlink_is_filled_as_a_symlink() {
+        let (_guard, root) = temp();
+        let store = InstallStore::at(root.join("installs"));
+        let built = root.join("built");
+        std::fs::create_dir_all(built.join("vendor/pkg")).expect("mkdir");
+        std::fs::write(built.join("vendor/pkg/index.js"), "module.exports = 1\n").expect("write");
+        std::os::unix::fs::symlink("vendor", built.join("node_modules")).expect("symlink");
+
+        let produces = vec![Utf8PathBuf::from("node_modules")];
+        store.admit("deps", "k", &built, &produces).expect("admit");
+        let entry = store.lookup("deps", "k").expect("entry");
+        let fresh = root.join("fresh");
+        std::fs::create_dir_all(&fresh).expect("mkdir");
+        store.fill(&entry, &fresh, &produces).expect("fill");
+
+        let filled = fresh.join("node_modules");
+        assert!(
+            std::fs::symlink_metadata(&filled)
+                .expect("filled")
+                .is_symlink(),
+            "the produced symlink must be filled as a symlink, not a copy of its target"
+        );
+        assert_eq!(
+            std::fs::read_link(&filled).expect("readlink"),
+            std::path::Path::new("vendor")
         );
     }
 
