@@ -27,5 +27,10 @@ thiserror = "2"
 toml = "1.1"
 ureq = { version = "3.4.2", features = ["json"] }
 
+# `clonefile(2)` on a whole directory tree (see installs.rs: `cp -c`
+# clones one file at a time, which is slower than the install it replaces).
+[target.'cfg(target_os = "macos")'.dependencies]
+reflink-copy = "0.1"
+
 [dev-dependencies]
 tempfile = "3"

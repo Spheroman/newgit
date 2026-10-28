@@ -438,10 +438,17 @@ pub fn identity_key(
 /// Copy a tree, preferring the filesystem's copy-on-write clone, and
 /// reporting which one actually happened.
 ///
-/// Shelling out to `cp` rather than walking the tree in process: a
-/// `node_modules` is full of symlinks and executable bits, and `cp` is the
-/// boring thing that already gets them right. It is also the only way to
-/// reach `clonefile`/`--reflink` at all without binding platform syscalls.
+/// On macOS the clone is one `clonefile(2)` on the whole tree, which the
+/// kernel walks itself. `cp -c` clones file by file from userspace, and a
+/// pnpm monorepo is hundreds of thousands of files: on T3 Code (264k files)
+/// that was 37s, slower than the install it stands in for, against 2.7s for
+/// the single call.
+///
+/// Everywhere else, and as the fallback on macOS, this shells out to `cp`
+/// rather than walking the tree in process: a `node_modules` is full of
+/// symlinks and executable bits, and `cp` is the boring thing that already
+/// gets them right. It is also how Linux reaches `--reflink` without binding
+/// platform syscalls.
 ///
 /// One thing it does *not* preserve everywhere: hardlinks. GNU `cp -a`
 /// implies `--preserve=links`, but BSD `cp` on macOS has no equivalent, so a
@@ -457,16 +464,33 @@ pub fn identity_key(
 /// fail on the way out of it. Same result either way, and the caller is told
 /// which it got.
 fn copy_tree(source: &Utf8Path, destination: &Utf8Path, method: CopyMethod) -> Result<CopyMethod> {
-    if let CopyMethod::Reflink = method
-        && run_cp(copy_args(CopyMethod::Reflink), source, destination).is_ok()
-    {
-        return Ok(CopyMethod::Reflink);
+    if let CopyMethod::Reflink = method {
+        if clone_tree(source, destination) {
+            return Ok(CopyMethod::Reflink);
+        }
+        remove_tree(destination)?;
+        if run_cp(copy_args(CopyMethod::Reflink), source, destination).is_ok() {
+            return Ok(CopyMethod::Reflink);
+        }
     }
     // A failed clone can leave a partial tree behind, and `cp` over it would
     // merge rather than replace.
     remove_tree(destination)?;
     run_cp(copy_args(CopyMethod::Full), source, destination)?;
     Ok(CopyMethod::Full)
+}
+
+/// Clone a whole tree in one call, where the platform has one. A failure
+/// (another volume, a filesystem without clones) is not an error: the
+/// caller cleans up and falls back to `cp`.
+#[cfg(target_os = "macos")]
+fn clone_tree(source: &Utf8Path, destination: &Utf8Path) -> bool {
+    reflink_copy::reflink(source, destination).is_ok()
+}
+
+#[cfg(not(target_os = "macos"))]
+fn clone_tree(_source: &Utf8Path, _destination: &Utf8Path) -> bool {
+    false
 }
 
 fn run_cp(args: &[&str], source: &Utf8Path, destination: &Utf8Path) -> Result<()> {
