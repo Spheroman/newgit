@@ -3007,6 +3007,7 @@ fn render_command(check: bool) -> Result<()> {
         );
     }
     let manager = manager_here()?;
+    warn_graph(&manager);
     let targets = manager.render_check();
     if targets.is_empty() {
         println!("No `[[render]]` targets defined.");

@@ -41,6 +41,13 @@ pub enum NewgitError {
     InvalidName(String),
 
     #[error(
+        "invalid name: {len} characters is over the {max}-character limit; names end up in \
+         Docker container names, Supabase project ids, and hostnames, which break well before \
+         a filesystem does"
+    )]
+    NameTooLong { len: usize, max: usize },
+
+    #[error(
         "branch instance `{name}` collides with existing record {path}; instance names must be unique after slugging"
     )]
     BranchInstanceExists { name: String, path: Utf8PathBuf },

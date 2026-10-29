@@ -1043,7 +1043,7 @@ environment variable handed to every later process.
 
 | variable | is |
 | --- | --- |
-| `{{branch.name}}` | the instance name as you typed it |
+| `{{branch.name}}` | the instance name as you typed it (at most 40 characters: the slug lands in container names, Supabase project ids, and hostnames) |
 | `{{branch.slug}}` | its filesystem-safe form, and the workspace directory name |
 | `{{workspace}}` | absolute path to the workspace |
 | `{{scripts}}` | absolute path to `.newgit/scripts/` in the store — use `{{scripts}}/<name>` so a hook's script is read from the store, like the definition calling it |
@@ -1175,7 +1175,7 @@ environment; it reads the same values through `{{...}}` instead.
 **A name has exactly one owner.** Three things declare an environment
 variable — an `[exports]` key, an action's `captures` entry, and a port's
 `env` — and the same name appearing in two of them is a graph problem,
-reported by `newgit resource list` and refused by `spawn`, `run`, `action`,
+reported by `newgit resource list` and `newgit render --check`, and refused by `spawn`, `run`, `action`,
 `checkpoint`, and `undo`, like a missing dependency or a cycle:
 
 ```
