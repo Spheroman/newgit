@@ -7528,7 +7528,8 @@ impl BranchManager {
         );
         tips.sort();
         tips.dedup();
-        let moved = crate::compose::repair_splits(&root, &tips)?;
+        let repair = crate::compose::repair_splits(&root, &tips)?;
+        let moved = repair.moved;
         let remap = |commit: &String| moved.get(commit).cloned().unwrap_or_else(|| commit.clone());
 
         let branches: Vec<(String, String)> = local
@@ -7550,6 +7551,7 @@ impl BranchManager {
             .collect();
         let outcome = RepairOutcome {
             rewritten: moved.len(),
+            unsigned: repair.unsigned,
             branches: branches.clone(),
             remote_branches: lists.iter().map(|(branch, _, _)| branch.clone()).collect(),
             remote: client.as_ref().map(|(_, project)| project.clone()),
@@ -9552,6 +9554,8 @@ pub struct TrackerMerge {
 pub struct RepairOutcome {
     /// Tracker commits rewritten.
     pub rewritten: usize,
+    /// How many of them lose a signature: rewritten commits are unsigned.
+    pub unsigned: usize,
     /// `(tracker, branch)` moved here.
     pub branches: Vec<(String, String)>,
     /// Branches whose list moved on the remote.

@@ -2136,6 +2136,15 @@ fn tracker(command: TrackerCommand) -> Result<()> {
             for (tracker, branch) in &outcome.branches {
                 println!("  {tracker}/{branch}");
             }
+            if outcome.unsigned > 0 {
+                println!(
+                    "  {} of them {} signed and {} not: a tracker commit's signature covers the \
+                     commit it rewrites (the commits they compose into keep theirs)",
+                    outcome.unsigned,
+                    if outcome.unsigned == 1 { "was" } else { "were" },
+                    if outcome.dry_run { "would be" } else { "is" },
+                );
+            }
             if let Some(project) = &outcome.remote {
                 if outcome.remote_branches.is_empty() {
                     println!("On {project}: no branch lists move");

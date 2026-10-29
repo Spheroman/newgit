@@ -562,7 +562,12 @@ Each step lands alone and keeps the suite green. Status as of 2026-10-28.
      them. `newgit tracker repair` rewrites each such commit's trailers
      from the original view commit, where this machine has it (trees,
      authors, and committers unchanged; a commit whose original is not
-     here keeps its message and only moves), then moves every code tracker
+     here keeps its message and only moves; a carved commit's trailers
+     follow the tracker commit it was carved from when that moves too).
+     Rewritten tracker commits are unsigned, so the same repair always
+     makes the same ids and a retry after a partial failure lands on what
+     the first attempt pushed; the commits they compose into keep their
+     signatures (*Signed commits*). It then moves every code tracker
      branch, the composed-state notes, and on the remote each branch's
      list, the way a merge moves it: its tracker repos force-pushed with a
      lease. Instance forks and checkpoints on the remote keep the commits

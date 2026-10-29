@@ -253,8 +253,9 @@ fn repaired_splits_recompose_into_the_originals_and_repairing_again_does_nothing
         "split the old way, the merge comes back as a new commit"
     );
 
-    let moved =
-        compose::repair_splits(&repo, &[teammate.clone(), electron_old.clone()]).expect("repair");
+    let moved = compose::repair_splits(&repo, &[teammate.clone(), electron_old.clone()])
+        .expect("repair")
+        .moved;
     assert_eq!(
         moved.get(&root_old),
         Some(&root_new),
@@ -288,5 +289,62 @@ fn repaired_splits_recompose_into_the_originals_and_repairing_again_does_nothing
 
     let again = compose::repair_splits(&repo, &[teammate_new.clone(), electron_new.clone()])
         .expect("repair again");
-    assert!(again.is_empty(), "nothing left to repair: {again:?}");
+    assert!(again.moved.is_empty(), "nothing left to repair: {again:?}");
+}
+
+#[test]
+fn a_carved_commit_follows_the_tracker_commit_it_was_carved_from() {
+    let guard = tempfile::tempdir().expect("tempdir");
+    let repo = Utf8PathBuf::from_path_buf(guard.path().canonicalize().expect("canonicalize"))
+        .expect("utf8 tempdir");
+    git(&repo, &["init", "-q", "-b", "main"]);
+    let empty = git(&repo, &["mktree"]);
+    let commit = |parents: &[&str], message: &str, time: i64| {
+        let mut args = vec!["commit-tree", "--no-gpg-sign", empty.as_str(), "-F", "-"];
+        for parent in parents {
+            args.extend(["-p", parent]);
+        }
+        git_env(&repo, &args, &who("ana", time), Some(message))
+    };
+    let base = commit(&[], "initial\n", 1_000);
+    // A view commit with no final newline, and root's piece of it, split
+    // the old way.
+    let view = commit(&[&base], "Fix (#1)", 2_000);
+    let split = commit(
+        &[&base],
+        &format!("Fix (#1)\n\nNewgit-Split-Parent: {base}\nNewgit-Split: {view}\n"),
+        2_000,
+    );
+    // Root's own merge on top — no trailers, so it moves only because its
+    // parent does — and a tracker carved out of root afterwards, whose
+    // commit names that merge.
+    let merge = commit(&[&split], "Merge branch 'main'\n", 3_000);
+    let carved = commit(
+        &[],
+        &format!("Merge branch 'main'\n\nNewgit-Split-Parent: {split}\nNewgit-Split: {merge}\n"),
+        3_000,
+    );
+
+    let repair = compose::repair_splits(&repo, &[merge.clone(), carved.clone()]).expect("repair");
+    let moved = &repair.moved;
+    let (split_new, merge_new, carved_new) = (
+        moved.get(&split).expect("the split moves"),
+        moved.get(&merge).expect("the merge moves onto it"),
+        moved.get(&carved).expect("the carved commit follows"),
+    );
+    assert_eq!(moved.len(), 3, "{moved:?}");
+    assert_eq!(
+        git(&repo, &["rev-parse", &format!("{merge_new}^")]),
+        *split_new
+    );
+    assert_eq!(
+        git(&repo, &["log", "-1", "--format=%B", carved_new]),
+        format!(
+            "Merge branch 'main'\n\nNewgit-Split-Parent: {split_new}\nNewgit-Split: {merge_new}"
+        ),
+        "its trailers name the commits as they are now"
+    );
+    let again = compose::repair_splits(&repo, &[merge_new.clone(), carved_new.clone()])
+        .expect("repair again");
+    assert!(again.moved.is_empty(), "{again:?}");
 }
