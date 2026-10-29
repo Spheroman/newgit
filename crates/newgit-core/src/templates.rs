@@ -121,6 +121,14 @@ key_command = "node -v && uname -sm"
 [actions.prepare]
 command = "pnpm install --frozen-lockfile"
 
+# pnpm writes this workspace's absolute path into its install state, and a
+# tree that names its own workspace is never shared. The store reverses the
+# path to `find` when it stores the tree and renders it back for each
+# instance it fills. `find` is any string that does not otherwise occur.
+[[render]]
+path = "node_modules/.pnpm-workspace-state-v1.json"
+replace = [{ find = "/__newgit_workspace__", with = "{{workspace}}" }]
+
 # Hashes `[identity] paths` above: what the install is derived from is
 # declared once, and a `recompute` restore skips when it has not moved.
 [checkpoint]

@@ -23,7 +23,10 @@
 //!   and say so — slower, never different.
 //! - **Nothing path-poisoned is admitted.** A tree that mentions the
 //!   absolute path it was built in is not relocatable, so it is declined
-//!   rather than shared. See [`InstallStore::admit`].
+//!   rather than shared. See [`InstallStore::admit`]. The exception is a
+//!   file a `[[render]]` targets: its copy of the path is reversed to the
+//!   render's `find` in the stored tree and rendered again for each
+//!   instance it fills.
 
 use std::sync::OnceLock;
 
@@ -33,11 +36,26 @@ use sha2::{Digest, Sha256};
 use crate::error::{NewgitError, Result};
 use crate::exports::Bound;
 use crate::materializer::create_dir_all;
+use crate::render::AppliedReplacement;
 
 /// Names an in-progress publish. Filtered out of [`InstallStore::entries`]
 /// so a half-copied tree is never mistaken for a usable one, and reported by
 /// [`InstallStore::staging_entries`] so gc can still reclaim it.
 const STAGING_PREFIX: &str = ".staging-";
+
+/// A `[[render]]` into a file inside the produced tree, resolved for one
+/// instance: `value` is what its `with` names there, typically
+/// `{{workspace}}`.
+///
+/// The file as a tool wrote it is treated as already rendered for the
+/// instance that built it. [`InstallStore::admit`] reverses it, so the
+/// stored copy holds each `find` where that instance's value was, and
+/// [`InstallStore::fill`] renders it forwards for the instance it fills.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TreeRender {
+    pub path: Utf8PathBuf,
+    pub applied: Vec<AppliedReplacement>,
+}
 
 /// How this filesystem copies a tree.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -83,19 +101,21 @@ impl CopyMethod {
 /// What admitting a built tree did.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Admission {
-    Stored(CopyMethod),
+    /// `unrendered` names each render whose reversal matched nothing: the
+    /// tool did not write the value there this time, so the render may be
+    /// stale. Reported, never fatal.
+    Stored {
+        method: CopyMethod,
+        unrendered: Vec<Utf8PathBuf>,
+    },
     /// Another instance published this key first. Its tree and ours are the
     /// same by construction, so nothing is overwritten.
     AlreadyStored,
     /// The tree names the workspace it was built in, so it is not
     /// relocatable. Carries the first file that proved it.
-    Declined {
-        path: Utf8PathBuf,
-    },
+    Declined { path: Utf8PathBuf },
     /// The action did not produce one of the paths it declared.
-    Incomplete {
-        path: Utf8PathBuf,
-    },
+    Incomplete { path: Utf8PathBuf },
 }
 
 /// What the store did for one resource on one instance, for display.
@@ -108,7 +128,11 @@ pub enum InstallReport {
     /// A stored tree was cloned in, and the install did not run.
     Filled { key: String, method: CopyMethod },
     /// The install ran and its tree was published for the next instance.
-    Stored { key: String, method: CopyMethod },
+    Stored {
+        key: String,
+        method: CopyMethod,
+        unrendered: Vec<Utf8PathBuf>,
+    },
     /// The install ran; another instance had already published this key.
     AlreadyStored { key: String },
     /// The install ran and its tree was not shareable.
@@ -123,15 +147,26 @@ impl InstallReport {
             Self::Filled { key, method } => {
                 format!("install store: filled from {key} ({})", method.label())
             }
-            Self::Stored { key, method } => {
-                format!("install store: stored as {key} ({})", method.label())
+            Self::Stored {
+                key,
+                method,
+                unrendered,
+            } => {
+                let mut line = format!("install store: stored as {key} ({})", method.label());
+                for path in unrendered {
+                    line.push_str(&format!(
+                        "; the render into `{path}` matched nothing, so it may be out of date"
+                    ));
+                }
+                line
             }
             Self::AlreadyStored { key } => {
                 format!("install store: {key} already stored")
             }
             Self::Declined { key, path } => format!(
                 "install store: not stored — the built tree names its own workspace in \
-                 `{path}`, so it cannot be shared (key {key})"
+                 `{path}`, so it cannot be shared (key {key}); a `[[render]]` with `with = \
+                 \"{{{{workspace}}}}\"` on that file lets the store rewrite it per instance"
             ),
             Self::Unavailable { reason } => format!("install store unavailable: {reason}"),
         }
@@ -170,7 +205,8 @@ impl InstallStore {
         entry.is_dir().then_some(entry)
     }
 
-    /// Clone a stored tree into a workspace.
+    /// Clone a stored tree into a workspace, then render each file a
+    /// [`TreeRender`] targets for this workspace.
     ///
     /// Refuses rather than merges when any produced path is already present:
     /// a half-built tree under a matching key is a state this cannot reason
@@ -180,6 +216,7 @@ impl InstallStore {
         entry: &Utf8Path,
         workspace: &Utf8Path,
         produces: &[Utf8PathBuf],
+        renders: &[TreeRender],
     ) -> Result<Option<CopyMethod>> {
         if produces.iter().any(|path| workspace.join(path).exists()) {
             return Ok(None);
@@ -195,6 +232,11 @@ impl InstallStore {
                 create_dir_all(parent)?;
             }
             method = method.min(copy_tree(&entry.join(produced), &destination, probed)?);
+        }
+        for render in renders {
+            rewrite_text(&workspace.join(&render.path), |stored| {
+                crate::render::restore(stored, &render.applied)
+            })?;
         }
         Ok(Some(method))
     }
@@ -213,6 +255,7 @@ impl InstallStore {
         entry: &Utf8Path,
         workspace: &Utf8Path,
         produces: &[Utf8PathBuf],
+        renders: &[TreeRender],
     ) -> Result<CopyMethod> {
         let mut aside = Vec::new();
         for produced in produces {
@@ -227,7 +270,7 @@ impl InstallStore {
             aside.push((current, parked));
         }
 
-        match self.fill(entry, workspace, produces) {
+        match self.fill(entry, workspace, produces, renders) {
             Ok(Some(method)) => {
                 for (_, parked) in &aside {
                     remove_tree(parked)?;
@@ -258,6 +301,11 @@ impl InstallStore {
     /// resource simply keeps installing per instance the way it did before
     /// the store existed.
     ///
+    /// A file a [`TreeRender`] targets is the exception the definition
+    /// vouches for. It is left out of the first scan, reversed in the
+    /// staged copy, and then scanned there: a path the render did not cover
+    /// (a spelling it does not name, say) still declines the tree.
+    ///
     /// Publication is a rename of a fully built temporary directory, so an
     /// entry is either absent or complete — two instances racing on the same
     /// key both build, and the loser discards its copy rather than writing
@@ -268,12 +316,27 @@ impl InstallStore {
         key: &str,
         workspace: &Utf8Path,
         produces: &[Utf8PathBuf],
+        renders: &[TreeRender],
     ) -> Result<Admission> {
         let entry = self.entry(resource, key);
         if entry.is_dir() {
             return Ok(Admission::AlreadyStored);
         }
         let spellings = workspace_spellings(workspace);
+        // Only a regular file is exempt from the scan: a render target that
+        // turned out to be a directory or a symlink is scanned like any
+        // other, because only a file's content can be reversed.
+        let rendered: Vec<&TreeRender> = renders
+            .iter()
+            .filter(|render| {
+                std::fs::symlink_metadata(workspace.join(&render.path))
+                    .is_ok_and(|meta| meta.is_file())
+            })
+            .collect();
+        let exempt: Vec<Utf8PathBuf> = rendered
+            .iter()
+            .map(|render| workspace.join(&render.path))
+            .collect();
         for produced in produces {
             let source = workspace.join(produced);
             if !source.exists() {
@@ -281,7 +344,7 @@ impl InstallStore {
                     path: produced.clone(),
                 });
             }
-            if let Some(found) = find_path_reference(&source, &spellings)? {
+            if let Some(found) = find_path_reference(&source, &spellings, &exempt)? {
                 return Ok(Admission::Declined { path: found });
             }
         }
@@ -296,6 +359,8 @@ impl InstallStore {
 
         let probed = self.copy_method();
         let mut method = probed;
+        let mut unrendered = Vec::new();
+        let mut declined = None;
         let published = (|| -> Result<bool> {
             for produced in produces {
                 let destination = staging.join(produced);
@@ -303,6 +368,19 @@ impl InstallStore {
                     create_dir_all(parent)?;
                 }
                 method = method.min(copy_tree(&workspace.join(produced), &destination, probed)?);
+            }
+            for render in &rendered {
+                let staged = staging.join(&render.path);
+                let changed = rewrite_text(&staged, |built| {
+                    crate::render::reverse(built, &render.applied)
+                })?;
+                if !changed {
+                    unrendered.push(render.path.clone());
+                }
+                if find_path_reference(&staged, &spellings, &[])?.is_some() {
+                    declined = Some(workspace.join(&render.path));
+                    return Ok(false);
+                }
             }
             // `rename` onto an existing directory fails, which is the
             // behaviour we want: whoever published first wins, and their
@@ -314,8 +392,12 @@ impl InstallStore {
             }
         })();
 
+        if let Some(path) = declined {
+            remove_tree(&staging)?;
+            return Ok(Admission::Declined { path });
+        }
         match published {
-            Ok(true) => Ok(Admission::Stored(method)),
+            Ok(true) => Ok(Admission::Stored { method, unrendered }),
             Ok(false) => {
                 remove_tree(&staging)?;
                 Ok(Admission::AlreadyStored)
@@ -583,6 +665,33 @@ fn workspace_spellings(workspace: &Utf8Path) -> Vec<String> {
     spellings
 }
 
+/// Rewrite a text file through `change`, reporting whether it changed. A
+/// path that is missing or not a regular file is left alone: a tool that
+/// stops writing the file must not break the store.
+///
+/// The result goes to a sibling and is renamed over the original, so a
+/// file that was a hardlink or a clone is replaced rather than written
+/// through, and a reader never sees half a rewrite.
+fn rewrite_text(path: &Utf8Path, change: impl FnOnce(&str) -> String) -> Result<bool> {
+    let Ok(metadata) = std::fs::symlink_metadata(path) else {
+        return Ok(false);
+    };
+    if !metadata.is_file() {
+        return Ok(false);
+    }
+    let content = std::fs::read_to_string(path).map_err(|source| NewgitError::io(path, source))?;
+    let changed = change(&content);
+    if changed == content {
+        return Ok(false);
+    }
+    let staged = Utf8PathBuf::from(format!("{path}.newgit-rendering"));
+    std::fs::write(&staged, &changed).map_err(|source| NewgitError::io(staged.clone(), source))?;
+    std::fs::set_permissions(&staged, metadata.permissions())
+        .map_err(|source| NewgitError::io(staged.clone(), source))?;
+    std::fs::rename(&staged, path).map_err(|source| NewgitError::io(path, source))?;
+    Ok(true)
+}
+
 /// The first file under `root` whose content — or, for a symlink, whose
 /// target — contains any of `needles`. `None` means the tree never mentions
 /// them.
@@ -591,7 +700,11 @@ fn workspace_spellings(workspace: &Utf8Path) -> Vec<String> {
 /// following would recurse forever through a package manager's store links,
 /// and a link *target* naming the workspace is exactly the poisoning being
 /// looked for.
-fn find_path_reference(root: &Utf8Path, needles: &[String]) -> Result<Option<Utf8PathBuf>> {
+fn find_path_reference(
+    root: &Utf8Path,
+    needles: &[String],
+    exempt: &[Utf8PathBuf],
+) -> Result<Option<Utf8PathBuf>> {
     let metadata =
         std::fs::symlink_metadata(root).map_err(|source| NewgitError::io(root, source))?;
 
@@ -605,6 +718,9 @@ fn find_path_reference(root: &Utf8Path, needles: &[String]) -> Result<Option<Utf
     }
 
     if metadata.is_file() {
+        if exempt.iter().any(|path| path == root) {
+            return Ok(None);
+        }
         return Ok(file_contains_any(root, needles)?.then(|| root.to_path_buf()));
     }
 
@@ -617,7 +733,7 @@ fn find_path_reference(root: &Utf8Path, needles: &[String]) -> Result<Option<Utf
         let Some(name) = name.to_str() else {
             return Err(NewgitError::NonUtf8Path(entry.path().display().to_string()));
         };
-        if let Some(found) = find_path_reference(&root.join(name), needles)? {
+        if let Some(found) = find_path_reference(&root.join(name), needles, exempt)? {
             return Ok(Some(found));
         }
     }
@@ -745,9 +861,12 @@ mod tests {
 
         let produces = vec![Utf8PathBuf::from("node_modules")];
         let admission = store
-            .admit("deps", "abc123", &built, &produces)
+            .admit("deps", "abc123", &built, &produces, &[])
             .expect("admit");
-        assert!(matches!(admission, Admission::Stored(_)), "{admission:?}");
+        assert!(
+            matches!(admission, Admission::Stored { .. }),
+            "{admission:?}"
+        );
         assert_eq!(
             store.entries().expect("entries"),
             vec![("deps".to_owned(), "abc123".to_owned())]
@@ -757,7 +876,7 @@ mod tests {
         std::fs::create_dir_all(&fresh).expect("mkdir");
         let entry = store.lookup("deps", "abc123").expect("entry");
         let method = store
-            .fill(&entry, &fresh, &produces)
+            .fill(&entry, &fresh, &produces, &[])
             .expect("fill")
             .expect("a fresh workspace should be filled");
         assert!(matches!(method, CopyMethod::Reflink | CopyMethod::Full));
@@ -769,7 +888,7 @@ mod tests {
         // Re-admitting the same key is not an overwrite.
         assert_eq!(
             store
-                .admit("deps", "abc123", &built, &produces)
+                .admit("deps", "abc123", &built, &produces, &[])
                 .expect("re-admit"),
             Admission::AlreadyStored
         );
@@ -785,14 +904,16 @@ mod tests {
         std::fs::create_dir_all(built.join("node_modules")).expect("mkdir");
         std::fs::write(built.join("node_modules/build.json"), "{}\n").expect("write");
         let produces = vec![Utf8PathBuf::from("node_modules")];
-        store.admit("deps", "k", &built, &produces).expect("admit");
+        store
+            .admit("deps", "k", &built, &produces, &[])
+            .expect("admit");
         let entry = store.lookup("deps", "k").expect("entry");
 
         let one = root.join("one");
         let two = root.join("two");
         for workspace in [&one, &two] {
             std::fs::create_dir_all(workspace).expect("mkdir");
-            store.fill(&entry, workspace, &produces).expect("fill");
+            store.fill(&entry, workspace, &produces, &[]).expect("fill");
         }
 
         std::fs::write(one.join("node_modules/build.json"), "{\"native\": true}\n")
@@ -822,11 +943,13 @@ mod tests {
         std::os::unix::fs::symlink("vendor", built.join("node_modules")).expect("symlink");
 
         let produces = vec![Utf8PathBuf::from("node_modules")];
-        store.admit("deps", "k", &built, &produces).expect("admit");
+        store
+            .admit("deps", "k", &built, &produces, &[])
+            .expect("admit");
         let entry = store.lookup("deps", "k").expect("entry");
         let fresh = root.join("fresh");
         std::fs::create_dir_all(&fresh).expect("mkdir");
-        store.fill(&entry, &fresh, &produces).expect("fill");
+        store.fill(&entry, &fresh, &produces, &[]).expect("fill");
 
         let filled = fresh.join("node_modules");
         assert!(
@@ -838,6 +961,86 @@ mod tests {
         assert_eq!(
             std::fs::read_link(&filled).expect("readlink"),
             std::path::Path::new("vendor")
+        );
+    }
+
+    fn workspace_render(find: &str, value: &str) -> TreeRender {
+        TreeRender {
+            path: Utf8PathBuf::from("node_modules/state.json"),
+            applied: vec![AppliedReplacement {
+                find: find.to_owned(),
+                value: value.to_owned(),
+                count: 1,
+            }],
+        }
+    }
+
+    /// The render covers one spelling. A copy of the path it did not cover
+    /// is still poison, and the stored copy is scanned to find it.
+    #[test]
+    fn a_rendered_file_still_naming_its_workspace_is_declined() {
+        let (_guard, root) = temp();
+        let store = InstallStore::at(root.join("installs"));
+        let built = root.join("built");
+        std::fs::create_dir_all(built.join("node_modules")).expect("mkdir");
+        std::fs::write(
+            built.join("node_modules/state.json"),
+            format!("{built} and again {built}"),
+        )
+        .expect("write");
+        let produces = vec![Utf8PathBuf::from("node_modules")];
+
+        let covered = store
+            .admit(
+                "deps",
+                "covered",
+                &built,
+                &produces,
+                &[workspace_render("/__ws__", built.as_str())],
+            )
+            .expect("admit");
+        assert!(matches!(covered, Admission::Stored { .. }), "{covered:?}");
+
+        let missed = store
+            .admit(
+                "deps",
+                "missed",
+                &built,
+                &produces,
+                &[workspace_render("/__ws__", "/somewhere/else")],
+            )
+            .expect("admit");
+        assert!(matches!(missed, Admission::Declined { .. }), "{missed:?}");
+        assert!(
+            store.lookup("deps", "missed").is_none(),
+            "a declined tree leaves no entry behind"
+        );
+    }
+
+    /// A render whose value the tool no longer writes is reported, not
+    /// fatal: the tree has nothing to rewrite, so it is safe to store.
+    #[test]
+    fn a_render_that_reverses_nothing_is_reported() {
+        let (_guard, root) = temp();
+        let store = InstallStore::at(root.join("installs"));
+        let built = root.join("built");
+        std::fs::create_dir_all(built.join("node_modules")).expect("mkdir");
+        std::fs::write(built.join("node_modules/state.json"), "{}").expect("write");
+        let admission = store
+            .admit(
+                "deps",
+                "k",
+                &built,
+                &[Utf8PathBuf::from("node_modules")],
+                &[workspace_render("/__ws__", built.as_str())],
+            )
+            .expect("admit");
+        assert_eq!(
+            admission,
+            Admission::Stored {
+                method: store.copy_method(),
+                unrendered: vec![Utf8PathBuf::from("node_modules/state.json")],
+            }
         );
     }
 
@@ -859,6 +1062,7 @@ mod tests {
                 "poisoned",
                 &built,
                 &[Utf8PathBuf::from("node_modules")],
+                &[],
             )
             .expect("admit");
         match admission {
@@ -885,7 +1089,13 @@ mod tests {
         std::os::unix::fs::symlink(&built, built.join("node_modules/self")).expect("symlink");
 
         let admission = store
-            .admit("deps", "loop", &built, &[Utf8PathBuf::from("node_modules")])
+            .admit(
+                "deps",
+                "loop",
+                &built,
+                &[Utf8PathBuf::from("node_modules")],
+                &[],
+            )
             .expect("a cyclic symlink must not hang the scan");
         assert!(
             matches!(admission, Admission::Declined { .. }),
@@ -902,7 +1112,13 @@ mod tests {
 
         assert_eq!(
             store
-                .admit("deps", "k", &built, &[Utf8PathBuf::from("node_modules")])
+                .admit(
+                    "deps",
+                    "k",
+                    &built,
+                    &[Utf8PathBuf::from("node_modules")],
+                    &[]
+                )
                 .expect("admit"),
             Admission::Incomplete {
                 path: Utf8PathBuf::from("node_modules")
@@ -920,13 +1136,15 @@ mod tests {
         std::fs::create_dir_all(built.join("node_modules")).expect("mkdir");
         std::fs::write(built.join("node_modules/a.js"), "a\n").expect("write");
         let produces = vec![Utf8PathBuf::from("node_modules")];
-        store.admit("deps", "k", &built, &produces).expect("admit");
+        store
+            .admit("deps", "k", &built, &produces, &[])
+            .expect("admit");
         let entry = store.lookup("deps", "k").expect("entry");
 
         let occupied = root.join("occupied");
         std::fs::create_dir_all(occupied.join("node_modules")).expect("mkdir");
         assert_eq!(
-            store.fill(&entry, &occupied, &produces).expect("fill"),
+            store.fill(&entry, &occupied, &produces, &[]).expect("fill"),
             None,
             "a workspace that already has the tree is left alone"
         );
@@ -942,7 +1160,9 @@ mod tests {
         std::fs::create_dir_all(built.join("node_modules")).expect("mkdir");
         std::fs::write(built.join("node_modules/version"), "v1\n").expect("write");
         let produces = vec![Utf8PathBuf::from("node_modules")];
-        store.admit("deps", "v1", &built, &produces).expect("admit");
+        store
+            .admit("deps", "v1", &built, &produces, &[])
+            .expect("admit");
         let entry = store.lookup("deps", "v1").expect("entry");
 
         // The instance has moved on to a newer tree, with a stray file the
@@ -953,7 +1173,7 @@ mod tests {
         std::fs::write(workspace.join("node_modules/only-in-v2"), "x\n").expect("write");
 
         store
-            .replace(&entry, &workspace, &produces)
+            .replace(&entry, &workspace, &produces, &[])
             .expect("replace");
 
         assert_eq!(
@@ -984,7 +1204,7 @@ mod tests {
         // shape as a store entry someone deleted out from under us.
         let missing = root.join("installs/deps/gone");
         let produces = vec![Utf8PathBuf::from("node_modules")];
-        let error = store.replace(&missing, &workspace, &produces);
+        let error = store.replace(&missing, &workspace, &produces, &[]);
         assert!(error.is_err(), "a failed clone must not report success");
 
         assert_eq!(
@@ -1013,7 +1233,13 @@ mod tests {
         std::fs::write(built.join("node_modules/native.node"), &blob).expect("write");
 
         let admission = store
-            .admit("deps", "k", &built, &[Utf8PathBuf::from("node_modules")])
+            .admit(
+                "deps",
+                "k",
+                &built,
+                &[Utf8PathBuf::from("node_modules")],
+                &[],
+            )
             .expect("admit");
         assert!(
             matches!(admission, Admission::Declined { .. }),
@@ -1033,14 +1259,16 @@ mod tests {
 
         let produces = vec![Utf8PathBuf::from("build/app.bin")];
         assert!(matches!(
-            store.admit("app", "k", &built, &produces).expect("admit"),
-            Admission::Stored(_)
+            store
+                .admit("app", "k", &built, &produces, &[])
+                .expect("admit"),
+            Admission::Stored { .. }
         ));
 
         let fresh = root.join("fresh");
         std::fs::create_dir_all(&fresh).expect("mkdir");
         let entry = store.lookup("app", "k").expect("entry");
-        store.fill(&entry, &fresh, &produces).expect("fill");
+        store.fill(&entry, &fresh, &produces, &[]).expect("fill");
         assert_eq!(
             std::fs::read(fresh.join("build/app.bin")).expect("read"),
             b"\x7fELF binary\n"
@@ -1048,7 +1276,9 @@ mod tests {
 
         // And replacing one works the same way `remove_dir_all` would not.
         std::fs::write(fresh.join("build/app.bin"), b"stale\n").expect("write");
-        store.replace(&entry, &fresh, &produces).expect("replace");
+        store
+            .replace(&entry, &fresh, &produces, &[])
+            .expect("replace");
         assert_eq!(
             std::fs::read(fresh.join("build/app.bin")).expect("read"),
             b"\x7fELF binary\n"

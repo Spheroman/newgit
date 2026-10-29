@@ -22,7 +22,7 @@ use crate::error::{NewgitError, Result};
 use crate::export::{self, ExportFilter, ExportPlan, prepare_destination};
 use crate::export_target::ExportTarget;
 use crate::exports::{RenderContext, STATE_REF_PLACEHOLDER, render, unresolved_placeholder};
-use crate::installs::{Admission, InstallReport, InstallStore};
+use crate::installs::{Admission, InstallReport, InstallStore, TreeRender};
 use crate::lock::{InstanceLock, LOCKED_ENV, locked_env_value};
 use crate::materializer::{
     Materializer, RealDirMaterializer, exclude_produced_paths, exclude_tracker_paths,
@@ -293,14 +293,21 @@ pub struct RenderCheckTarget {
     /// `None` when `path` could not be read from the working tree at all —
     /// distinct from every `find` failing to match inside it.
     pub checks: Option<Vec<render::FindCheck>>,
+    /// The path is inside the resource's `[identity] produces`. Its input
+    /// is a stored tree, not the working tree, so there is nothing here to
+    /// check: the store reports a render that matched nothing when it
+    /// stores one.
+    pub in_built_tree: bool,
 }
 
 impl RenderCheckTarget {
     /// The path was readable and every `find` matched its declared count.
     pub fn ok(&self) -> bool {
-        self.checks
-            .as_ref()
-            .is_some_and(|checks| checks.iter().all(render::FindCheck::ok))
+        self.in_built_tree
+            || self
+                .checks
+                .as_ref()
+                .is_some_and(|checks| checks.iter().all(render::FindCheck::ok))
     }
 }
 
@@ -2749,10 +2756,19 @@ impl BranchManager {
         let key = key.to_owned();
         let store = self.installs();
         let entry = store.lookup(&definition.name, &key)?;
+        let renders = match self.tree_renders(branch, definition) {
+            Ok(renders) => renders,
+            Err(error) => {
+                return Some(InstallReport::Unavailable {
+                    reason: format!("entry {key} could not be rendered for this instance: {error}"),
+                });
+            }
+        };
         match store.fill(
             &entry,
             &branch.workspace_path,
             definition.identity_produces(),
+            &renders,
         ) {
             Ok(Some(method)) => Some(InstallReport::Filled { key, method }),
             // The workspace already has the tree, so there is nothing to
@@ -2780,10 +2796,19 @@ impl BranchManager {
         let key = key.to_owned();
         let store = self.installs();
         let entry = store.lookup(&definition.name, &key)?;
+        let renders = match self.tree_renders(branch, definition) {
+            Ok(renders) => renders,
+            Err(error) => {
+                return Some(InstallReport::Unavailable {
+                    reason: format!("entry {key} could not be rendered for this instance: {error}"),
+                });
+            }
+        };
         match store.replace(
             &entry,
             &branch.workspace_path,
             definition.identity_produces(),
+            &renders,
         ) {
             Ok(method) => Some(InstallReport::Filled { key, method }),
             Err(error) => Some(InstallReport::Unavailable {
@@ -2813,13 +2838,26 @@ impl BranchManager {
     ) -> Option<InstallReport> {
         let key = key.to_owned();
         let store = self.installs();
+        let renders = match self.tree_renders(branch, definition) {
+            Ok(renders) => renders,
+            Err(error) => {
+                return Some(InstallReport::Unavailable {
+                    reason: format!("the built tree could not be reversed for storing: {error}"),
+                });
+            }
+        };
         match store.admit(
             &definition.name,
             &key,
             &branch.workspace_path,
             definition.identity_produces(),
+            &renders,
         ) {
-            Ok(Admission::Stored(method)) => Some(InstallReport::Stored { key, method }),
+            Ok(Admission::Stored { method, unrendered }) => Some(InstallReport::Stored {
+                key,
+                method,
+                unrendered,
+            }),
             Ok(Admission::AlreadyStored) => Some(InstallReport::AlreadyStored { key }),
             Ok(Admission::Declined { path }) => Some(InstallReport::Declined { key, path }),
             // The action reported success without building what it declared.
@@ -2831,6 +2869,50 @@ impl BranchManager {
                 reason: format!("entry {key} could not be stored: {error}"),
             }),
         }
+    }
+
+    /// The `[[render]]`s a resource declares into its own built tree,
+    /// resolved for this instance. Same values a committed-file render sees,
+    /// so `{{workspace}}` means the same thing in both.
+    fn tree_renders(
+        &self,
+        branch: &BranchInstance,
+        definition: &ResourceDefinition,
+    ) -> Result<Vec<TreeRender>> {
+        let specs: Vec<&render::RenderSpec> = definition
+            .render
+            .iter()
+            .filter(|spec| definition.renders_into_produced(spec))
+            .collect();
+        if specs.is_empty() {
+            return Ok(Vec::new());
+        }
+        let ports = branch
+            .resources
+            .get(&definition.name)
+            .map(|binding| binding.resolved_ports.clone())
+            .unwrap_or_default();
+        let exports = self.bound_exports(branch);
+        let bound = self.bound_vars(branch);
+        let context = RenderContext {
+            branch_name: &branch.name,
+            branch_slug: &branch.slug,
+            workspace: branch.workspace_path.as_str(),
+            scripts: self.scripts_dir(),
+            ports: Some(&ports),
+            exports: Some(&exports),
+            bound: Some(&bound),
+            ..RenderContext::default()
+        };
+        specs
+            .into_iter()
+            .map(|spec| {
+                Ok(TreeRender {
+                    path: spec.path.clone(),
+                    applied: render::resolve(&definition.name, spec, &context)?,
+                })
+            })
+            .collect()
     }
 
     /// Substitute this instance's values into the files a resource declares,
@@ -2862,7 +2944,14 @@ impl BranchManager {
         let mut outcomes = Vec::new();
         let mut source_owned = Vec::new();
 
-        for spec in &definition.render {
+        // A render into the resource's own built tree is the install
+        // store's: it has no committed content, and it runs when the store
+        // fills the tree (see `tree_renders`).
+        for spec in definition
+            .render
+            .iter()
+            .filter(|spec| !definition.renders_into_produced(spec))
+        {
             let owner = self.tracker_owning(&spec.path);
             let committed = self.committed_content(branch, &spec.path, owner.as_deref())?;
             let Some(committed) = committed else {
@@ -3668,16 +3757,18 @@ impl BranchManager {
         for definition in &self.resources {
             for spec in &definition.render {
                 let tracker = self.tracker_owning(&spec.path);
+                let in_built_tree = definition.renders_into_produced(spec);
                 let full = root.join(&spec.path);
                 let checks = match std::fs::read_to_string(&full) {
-                    Ok(content) => Some(render::check(spec, &content)),
-                    Err(_) => None,
+                    Ok(content) if !in_built_tree => Some(render::check(spec, &content)),
+                    _ => None,
                 };
                 targets.push(RenderCheckTarget {
                     resource: definition.name.clone(),
                     path: spec.path.clone(),
                     tracker,
                     checks,
+                    in_built_tree,
                 });
             }
         }
@@ -8363,11 +8454,8 @@ impl BranchManager {
                 let mut label = format!("recompute({action_name})");
                 if ok && let Some(key) = &install_key {
                     match self.admit_to_install_store(branch, definition, key) {
-                        Some(InstallReport::Stored { key, method }) => {
-                            label.push_str(&format!(
-                                "; install store: stored as {key} ({})",
-                                method.label()
-                            ));
+                        Some(report @ InstallReport::Stored { .. }) => {
+                            label.push_str(&format!("; {}", report.summary()));
                         }
                         Some(InstallReport::Unavailable { .. }) | None => {}
                         Some(report) => warnings.push(format!(

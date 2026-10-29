@@ -2891,6 +2891,14 @@ fn render_command(check: bool) -> Result<()> {
             Some(tracker) => format!(" (tracker `{tracker}`)"),
             None => String::new(),
         };
+        if target.in_built_tree {
+            println!(
+                "skip  {}: `{path}`{owner} — inside `[identity] produces`: the install store \
+                 renders it when it fills an instance",
+                target.resource
+            );
+            continue;
+        }
         let Some(checks) = &target.checks else {
             failed += 1;
             println!(
@@ -2917,6 +2925,7 @@ fn render_command(check: bool) -> Result<()> {
 
     let total: usize = targets
         .iter()
+        .filter(|target| !target.in_built_tree)
         .map(|target| target.checks.as_ref().map_or(1, Vec::len))
         .sum();
     if failed == 0 {

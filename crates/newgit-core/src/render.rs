@@ -34,16 +34,22 @@ pub struct RenderSpec {
 pub struct Replacement {
     pub find: String,
     pub with: String,
-    /// How many times `find` is expected to occur. Exactly one by default.
+    /// How many times `find` is expected to occur. Exactly one when not
+    /// declared — see [`Replacement::expected_count`].
     ///
     /// Not an `all` flag: a declared number keeps failing when a file changes
     /// from two occurrences to three, which is the property worth protecting.
-    #[serde(default = "one")]
-    pub count: usize,
+    /// Kept optional only so a render into a built tree can refuse it: there
+    /// the occurrences are ones the store wrote, not a committed default
+    /// that can drift.
+    #[serde(default)]
+    pub count: Option<usize>,
 }
 
-fn one() -> usize {
-    1
+impl Replacement {
+    pub fn expected_count(&self) -> usize {
+        self.count.unwrap_or(1)
+    }
 }
 
 /// What a render actually did, recorded on the binding record so capture can
@@ -80,6 +86,12 @@ struct Located {
 fn locate(content: &str, finds: &[&str]) -> Vec<Located> {
     let mut found = Vec::new();
     for (rule, find) in finds.iter().enumerate() {
+        // An empty pattern matches everywhere and never advances. A `find`
+        // cannot be empty, but [`reverse`] searches for values, and a `with`
+        // can render to nothing.
+        if find.is_empty() {
+            continue;
+        }
         let mut from = 0;
         while let Some(offset) = content[from..].find(find) {
             let start = from + offset;
@@ -120,23 +132,7 @@ pub fn apply(
     committed: &str,
     context: &RenderContext,
 ) -> Result<(String, Vec<AppliedReplacement>)> {
-    let mut applied = Vec::with_capacity(spec.replace.len());
-    for replacement in &spec.replace {
-        let value = render_template(&replacement.with, context);
-        if let Some(unresolved) = crate::exports::unresolved_placeholder(&value) {
-            return Err(NewgitError::RenderUnresolved {
-                resource: resource.to_owned(),
-                path: spec.path.clone(),
-                placeholder: unresolved.to_owned(),
-            });
-        }
-        applied.push(AppliedReplacement {
-            find: replacement.find.clone(),
-            value,
-            count: replacement.count,
-        });
-    }
-
+    let applied = resolve(resource, spec, context)?;
     let content = substitute(resource, &spec.path, committed, &applied)?;
 
     // The inverse has to be as unambiguous as the forward pass, or
@@ -158,6 +154,32 @@ pub fn apply(
     }
 
     Ok((content, applied))
+}
+
+/// Resolve every `with` against an instance, refusing one that leaves a
+/// placeholder behind — a file must not gain text nobody wrote.
+pub fn resolve(
+    resource: &str,
+    spec: &RenderSpec,
+    context: &RenderContext,
+) -> Result<Vec<AppliedReplacement>> {
+    let mut applied = Vec::with_capacity(spec.replace.len());
+    for replacement in &spec.replace {
+        let value = render_template(&replacement.with, context);
+        if let Some(unresolved) = crate::exports::unresolved_placeholder(&value) {
+            return Err(NewgitError::RenderUnresolved {
+                resource: resource.to_owned(),
+                path: spec.path.clone(),
+                placeholder: unresolved.to_owned(),
+            });
+        }
+        applied.push(AppliedReplacement {
+            find: replacement.find.clone(),
+            value,
+            count: replacement.expected_count(),
+        });
+    }
+    Ok(applied)
 }
 
 /// Apply already-resolved replacements as one simultaneous batch, enforcing
@@ -235,21 +257,46 @@ pub fn reverse(rendered: &str, applied: &[AppliedReplacement]) -> String {
         .iter()
         .map(|replacement| replacement.value.as_str())
         .collect();
-    let located = locate(rendered, &values);
+    let finds: Vec<&str> = applied
+        .iter()
+        .map(|replacement| replacement.find.as_str())
+        .collect();
+    swap_every(rendered, &values, &finds)
+}
 
-    let mut output = String::with_capacity(rendered.len());
+/// [`reverse`] run forwards: every `find` becomes this instance's value,
+/// however many times it occurs.
+///
+/// For a render into a built tree, where the input is a stored copy the
+/// install store reversed itself. Its occurrences are the ones the build
+/// wrote, so there is no declared count to hold them to.
+pub fn restore(stored: &str, applied: &[AppliedReplacement]) -> String {
+    let finds: Vec<&str> = applied
+        .iter()
+        .map(|replacement| replacement.find.as_str())
+        .collect();
+    let values: Vec<&str> = applied
+        .iter()
+        .map(|replacement| replacement.value.as_str())
+        .collect();
+    swap_every(stored, &finds, &values)
+}
+
+fn swap_every(content: &str, from: &[&str], to: &[&str]) -> String {
+    let located = locate(content, from);
+    let mut output = String::with_capacity(content.len());
     let mut cursor = 0;
     for hit in &located {
-        // Leftmost wins where two values overlap; nothing to decide between
+        // Leftmost wins where two matches overlap; nothing to decide between
         // them, and the alternative is dropping text.
         if hit.start < cursor {
             continue;
         }
-        output.push_str(&rendered[cursor..hit.start]);
-        output.push_str(&applied[hit.rule].find);
+        output.push_str(&content[cursor..hit.start]);
+        output.push_str(to[hit.rule]);
         cursor = hit.end;
     }
-    output.push_str(&rendered[cursor..]);
+    output.push_str(&content[cursor..]);
     output
 }
 
@@ -294,7 +341,7 @@ pub fn check(spec: &RenderSpec, content: &str) -> Vec<FindCheck> {
         .enumerate()
         .map(|(rule, replacement)| FindCheck {
             find: replacement.find.clone(),
-            expected: replacement.count,
+            expected: replacement.expected_count(),
             found: located.iter().filter(|hit| hit.rule == rule).count(),
         })
         .collect()
@@ -341,7 +388,7 @@ mod tests {
         Replacement {
             find: find.to_owned(),
             with: with.to_owned(),
-            count: 1,
+            count: None,
         }
     }
 
@@ -428,7 +475,7 @@ mod tests {
         let spec = spec(vec![Replacement {
             find: "\"3000:3000\"".to_owned(),
             with: "\"{{ports.api}}:3000\"".to_owned(),
-            count: 2,
+            count: Some(2),
         }]);
 
         let (rendered, _) = apply("app", &spec, committed, &context).expect("renders");
@@ -446,7 +493,7 @@ mod tests {
         let spec = spec(vec![Replacement {
             find: "x".to_owned(),
             with: "{{ports.api}}".to_owned(),
-            count: 2,
+            count: Some(2),
         }]);
 
         assert!(matches!(
@@ -641,7 +688,7 @@ mod tests {
         let spec = spec(vec![Replacement {
             find: "x".to_owned(),
             with: "{{ports.api}}".to_owned(),
-            count: 2,
+            count: Some(2),
         }]);
         let results = check(&spec, "x\nx\nx\n");
         assert!(!results[0].ok());

@@ -642,14 +642,14 @@ Repeatable: one `[[render]]` per file.
 
 | key | type | required | default | meaning |
 | --- | --- | --- | --- | --- |
-| `path` | string | yes | — | workspace-relative path to the file. Must be tracked by Git or owned by a tracker: a render substitutes into committed content, so there has to be some. Two resources rendering one path is refused at load. |
+| `path` | string | yes | — | workspace-relative path to the file. Must be tracked by Git or owned by a tracker: a render substitutes into committed content, so there has to be some. The exception is a file inside this resource's own `[identity] produces` — see *Rendering into a built tree*. Two resources rendering one path is refused at load. |
 | `replace` | array of tables | yes | — | the substitutions, below. |
 
 | key | type | required | default | meaning |
 | --- | --- | --- | --- | --- |
 | `find` | string | yes | — | **a literal string, never a regex.** May span lines. |
 | `with` | string | yes | — | what to put there; rendered with the variables below. |
-| `count` | integer | no | `1` | how many times `find` is expected to occur. |
+| `count` | integer | no | `1` | how many times `find` is expected to occur. Refused on a render into a built tree. |
 
 ```toml
 [[render]]
@@ -695,6 +695,45 @@ render should produce and compares, at `checkpoint` and before each re-render,
 naming the file and how many lines are about to go. Silence means there is
 nothing to lose. To change a rendered file for real, change it in the store
 repo.
+
+#### Rendering into a built tree
+
+Some installs write the workspace's own absolute path into their output —
+pnpm records every workspace project's path in
+`node_modules/.pnpm-workspace-state-v1.json`. A tree like that is never shared
+by the install store (see *What it costs, and what it cannot do*), unless a
+render says which file names the workspace:
+
+```toml
+[[render]]
+path = "node_modules/.pnpm-workspace-state-v1.json"
+replace = [{ find = "/__newgit_workspace__", with = "{{workspace}}" }]
+```
+
+A render whose `path` is inside the same resource's `[identity] produces`
+treats the file *as the tool wrote it* as already rendered, for the instance
+that built it. There is no committed content to read, so the stored tree takes
+its place:
+
+- **Storing reverses it.** Every occurrence of the building instance's
+  `{{workspace}}` becomes `find` in the stored copy, and that copy is then
+  scanned like the rest of the tree: a spelling of the path the render does
+  not cover still keeps the tree out of the store. `find` is any string that
+  does not otherwise occur in the file.
+- **Filling renders it forwards.** Every `find` becomes this instance's
+  value. After a real install there is nothing to do — the tool already
+  wrote the right path.
+- **`count` is refused.** The occurrences are the ones the build wrote, one
+  per workspace project here, and the number moves whenever a project is
+  added; a declared count would only break the fill. Drift is the scan's
+  job: a build that starts writing the path somewhere else is declined, and
+  one that stops writing it is reported on the store line.
+- **`render --check` skips it**: the file is not in the working tree until
+  an install builds it.
+
+`{{workspace}}` is the path as newgit spells it. A tool that records the
+*canonical* path instead (`/private/var/...` where the workspace is
+`/var/...`) is not matched, and the scan declines that tree.
 
 **Adopting a `[[render]]` means committing the default it substitutes into
 before anything can test it.** The rule above — committed content is the
@@ -794,7 +833,10 @@ relocatable, naming the file:
 ```
 
 That resource just keeps installing per instance, exactly as it did before.
-Nothing fails.
+Nothing fails. When the file only records the path as data — pnpm's
+workspace state, for one — a `[[render]]` on it lets the store rewrite it per
+instance instead; see *Rendering into a built tree*. The `pnpm` template
+declares that one.
 
 **`key_command` is not optional in practice.** A lockfile hash describes what
 was asked for, not what gets built: install scripts compile against the local

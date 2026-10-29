@@ -294,6 +294,16 @@ impl ResourceDefinition {
             .unwrap_or(&[])
     }
 
+    /// Whether a `[[render]]` targets a file inside the tree this resource
+    /// builds. Such a render is the install store's to apply: its input is
+    /// the stored tree rather than committed content, and it runs when the
+    /// store fills an instance, not when the resource binds.
+    pub fn renders_into_produced(&self, spec: &crate::render::RenderSpec) -> bool {
+        self.identity_produces()
+            .iter()
+            .any(|produced| contains_path(produced, &spec.path))
+    }
+
     /// The tree `[identity] produces`, if this resource declares one. A
     /// non-empty list is what makes the resource eligible for the install
     /// store; everything else about it is inferred from `[identity]`.
@@ -445,7 +455,20 @@ impl ResourceDefinition {
                         self.invalid(format!("render into `{}` has an empty `find`", spec.path))
                     );
                 }
-                if replacement.count == 0 {
+                // In a built tree the occurrences are the ones the build
+                // wrote and the store reversed, not a committed default that
+                // can drift: the store's scan is what notices a build that
+                // starts naming its workspace somewhere else.
+                if replacement.count.is_some() && self.renders_into_produced(spec) {
+                    return Err(self.invalid(format!(
+                        "render into `{}` declares `count` for `{}`, but `{}` is inside \
+                         `[identity] produces`: a render into a built tree replaces every \
+                         occurrence the build wrote, and the install store's scan catches one \
+                         it missed",
+                        spec.path, replacement.find, spec.path
+                    )));
+                }
+                if replacement.count == Some(0) {
                     return Err(self.invalid(format!(
                         "render into `{}` declares `count = 0` for `{}`; a replacement that \
                          matches nothing is a definition that does nothing",
@@ -1451,7 +1474,7 @@ mod tests {
             replace: vec![crate::render::Replacement {
                 find: "placeholder".to_owned(),
                 with: with.to_owned(),
-                count: 1,
+                count: None,
             }],
         }];
         definition
@@ -1880,6 +1903,35 @@ command = "npm ci"
         .expect("identity without produces should load");
         assert!(inputs_only.identity_produces().is_empty());
         assert!(inputs_only.identity_key_command().is_none());
+    }
+
+    /// A render into the built tree replaces what the build wrote, however
+    /// often; `count` guards a committed default, which is not what this is.
+    #[test]
+    fn a_render_into_the_built_tree_may_not_declare_count() {
+        let base = r#"ownership = "workspace"
+
+[identity]
+paths = ["pnpm-lock.yaml"]
+produces = ["node_modules"]
+
+[actions.prepare]
+command = "pnpm install"
+"#;
+        let without = format!(
+            "{base}\n[[render]]\npath = \"node_modules/state.json\"\nreplace = [{{ find = \"/__ws__\", with = \"{{{{workspace}}}}\" }}]\n"
+        );
+        let definition = write_and_load(&without).expect("a render into the built tree loads");
+        assert!(definition.renders_into_produced(&definition.render[0]));
+
+        let with_count = format!(
+            "{base}\n[[render]]\npath = \"node_modules/state.json\"\nreplace = [{{ find = \"/__ws__\", with = \"{{{{workspace}}}}\", count = 2 }}]\n"
+        );
+        let error = write_and_load(&with_count).expect_err("count is refused there");
+        assert!(
+            error.to_string().contains("inside `[identity] produces`"),
+            "{error}"
+        );
     }
 
     /// A spawn runs `prepare` and nothing else, so `prepare` is the only
