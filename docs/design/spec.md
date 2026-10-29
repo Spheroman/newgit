@@ -691,6 +691,20 @@ into a path the project owns. Four places they must not reach:
   the strongest argument for it: a whole-file template cannot run
   backwards. The rendered value must therefore also be unique in the file,
   checked at bind so the failure comes then and not at capture.
+
+  Capture reverses **the spans the render wrote, not every occurrence of
+  the value** (#260). A user who types `MIRROR=127.0.0.1:18002` into the
+  file has written their own text, and rewriting it would both change their
+  data and leave the tracker holding the `find` twice, so no instance could
+  render it again. The render is a pure function of committed content, so
+  where it wrote each value is recomputable: an occurrence is reversed when
+  it sits on a line the render wrote, at the same place in that line. An
+  edit on the rendered line itself still reverses when the value occurs
+  exactly as often as the render wrote it, since then it can only be one
+  thing. Anything else is not guessed. `tracker capture` refuses, naming
+  the lines, and it also refuses content that would no longer render. The
+  captures newgit takes on its own (checkpoint, re-bind, checkout) still
+  record, because refusing a safety net loses the work it exists to keep.
 - **A checkpoint's uncommitted-work commit.** It is built in a throwaway
   index, which does not carry the real index's skip-worktree bits, so newgit
   sets them there too.

@@ -253,6 +253,19 @@ pub enum NewgitError {
     },
 
     #[error(
+        "refusing to capture `{tracker}`: `{path}` {problem}. A tracker's content is what every \
+         instance renders from, so newgit takes this instance's values back out before \
+         recording it, and here it cannot do that cleanly. Edit the file so each rendered line \
+         holds this instance's value once and the committed default appears only where the \
+         render expects it, then capture again"
+    )]
+    RenderCaptureRefused {
+        tracker: String,
+        path: Utf8PathBuf,
+        problem: String,
+    },
+
+    #[error(
         "resource `{resource}` renders into `{path}`, which is neither tracked by Git nor owned \
          by a tracker; a render substitutes into committed content, so there has to be some"
     )]

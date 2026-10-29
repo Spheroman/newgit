@@ -274,6 +274,12 @@ impl ResourceBindOutcome {
 #[derive(Debug, Default)]
 struct RenderedRestore {
     files: Vec<(Utf8PathBuf, String)>,
+    /// Why capturing this content would be wrong (#260): a rendered value
+    /// newgit could not place, or content that would no longer render.
+    /// `tracker capture` refuses on it; the safety captures newgit takes on
+    /// its own (checkpoint, re-bind, checkout) record it anyway, because
+    /// refusing those would lose the work they exist to keep.
+    refusal: Option<NewgitError>,
 }
 
 impl RenderedRestore {
@@ -3184,11 +3190,36 @@ impl BranchManager {
             let Ok(current) = std::fs::read_to_string(&path) else {
                 continue;
             };
-            let applied: Vec<render::AppliedReplacement> = claims_on(branch, &relative)
-                .iter()
-                .flat_map(|claim| claim.applied.iter().cloned())
-                .collect();
-            let reversed = render::reverse(&current, &applied);
+            let claims = claims_on(branch, &relative);
+            // Against what the render wrote, not every occurrence of the
+            // value: a user's line that happens to hold the same text stays
+            // theirs.
+            let committed = self
+                .committed_content(branch, &relative, Some(tracker.name.as_str()))
+                .ok()
+                .flatten()
+                .unwrap_or_default();
+            let render::Reversed {
+                content: reversed,
+                unplaced,
+            } = render::reverse_rendered(&current, &relative, &committed, &claims);
+            if restore.refusal.is_none() {
+                let problem = if !unplaced.is_empty() {
+                    Some(format!(
+                        "still holds this instance's values where newgit could not tell what \
+                         the render wrote from text beside it: {}",
+                        unplaced.join("; ")
+                    ))
+                } else {
+                    render::unrenderable(&relative, &reversed, &claims)
+                        .map(|why| format!("would no longer render: {why}"))
+                };
+                restore.refusal = problem.map(|problem| NewgitError::RenderCaptureRefused {
+                    tracker: tracker.name.clone(),
+                    path: relative.clone(),
+                    problem,
+                });
+            }
             if reversed == current {
                 continue;
             }
@@ -3370,7 +3401,19 @@ impl BranchManager {
             let Ok(current) = std::fs::read_to_string(&path) else {
                 continue;
             };
-            let reversed = render::reverse(&current, &record.applied);
+            // Only the spans this resource wrote (#260); a value it cannot
+            // place is left for the drift report rather than guessed at.
+            let committed = self
+                .committed_content(branch, &record.path, record.tracker.as_deref())
+                .ok()
+                .flatten()
+                .unwrap_or_default();
+            let claim = [render::Claim {
+                resource: name,
+                applied: &record.applied,
+            }];
+            let reversed =
+                render::reverse_rendered(&current, &record.path, &committed, &claim).content;
             if reversed != current {
                 std::fs::write(&path, &reversed)
                     .map_err(|source| NewgitError::io(path.clone(), source))?;
@@ -4867,7 +4910,11 @@ impl BranchManager {
         // values must not enter it — but the file cannot simply be skipped
         // either, or a key added beside them would never reach the lane.
         // Reversing the substitution keeps the edits and drops the values.
-        let reversed = self.unrender_for_capture(&branch, definition)?;
+        let mut reversed = self.unrender_for_capture(&branch, definition)?;
+        if let Some(refusal) = reversed.refusal.take() {
+            reversed.restore()?;
+            return Err(refusal);
+        }
 
         let previous = branch
             .trackers

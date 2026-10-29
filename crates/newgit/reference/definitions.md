@@ -749,7 +749,12 @@ Four rules carry the rest:
   commit it; `newgit export` and a checkpoint's uncommitted-state capture take
   it from `HEAD`; and for a tracker-owned path `newgit tracker capture`
   reverses the substitution, so a key you add to `.env.local` reaches the lane
-  and your port does not.
+  and your port does not. Only the spans the render wrote are reversed: a
+  line you typed that happens to hold the same text as your port is kept as
+  typed. Where newgit cannot tell which occurrence it wrote (you duplicated
+  the rendered line), or the result would no longer render (you typed the
+  committed default somewhere else too), `tracker capture` refuses and names
+  the lines.
 
 The cost, on a source path: **hand edits to a rendered file do not survive the
 workspace.** newgit does not restate that every spawn — it recomputes what the

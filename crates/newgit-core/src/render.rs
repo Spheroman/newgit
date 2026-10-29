@@ -10,6 +10,8 @@
 //! newgit substitutes into the committed content and writes the result into
 //! one workspace. See *Render* in docs/design/spec.md.
 
+use std::collections::BTreeMap;
+
 use camino::{Utf8Path, Utf8PathBuf};
 use serde::{Deserialize, Serialize};
 
@@ -217,10 +219,31 @@ pub fn resolve(
 /// content of a rendered file is exactly this, run over the same committed
 /// content with the replacements the binding records remember.
 pub fn substitute(path: &Utf8Path, committed: &str, claims: &[Claim]) -> Result<String> {
-    let rules: Vec<(&str, &AppliedReplacement)> = claims
+    substitute_spans(path, committed, claims).map(|(output, _)| output)
+}
+
+/// Where one rule's value landed in a render's output.
+struct Span {
+    rule: usize,
+    start: usize,
+    end: usize,
+}
+
+fn rules<'a>(claims: &[Claim<'a>]) -> Vec<(&'a str, &'a AppliedReplacement)> {
+    claims
         .iter()
         .flat_map(|claim| claim.applied.iter().map(move |rule| (claim.resource, rule)))
-        .collect();
+        .collect()
+}
+
+/// [`substitute`], also returning where each value was written — what
+/// [`reverse_rendered`] needs to take back exactly those spans.
+fn substitute_spans(
+    path: &Utf8Path,
+    committed: &str,
+    claims: &[Claim],
+) -> Result<(String, Vec<Span>)> {
+    let rules = rules(claims);
     let finds: Vec<&str> = rules.iter().map(|(_, rule)| rule.find.as_str()).collect();
     let located = locate(committed, &finds);
 
@@ -242,6 +265,7 @@ pub fn substitute(path: &Utf8Path, committed: &str, claims: &[Claim]) -> Result<
     // application exists to remove. Between two resources it is an
     // ownership question, and the error says so.
     let mut output = String::with_capacity(committed.len());
+    let mut spans = Vec::with_capacity(located.len());
     let mut cursor = 0;
     let mut previous = 0;
     for hit in &located {
@@ -266,12 +290,18 @@ pub fn substitute(path: &Utf8Path, committed: &str, claims: &[Claim]) -> Result<
             });
         }
         output.push_str(&committed[cursor..hit.start]);
+        let start = output.len();
         output.push_str(&rules[hit.rule].1.value);
+        spans.push(Span {
+            rule: hit.rule,
+            start,
+            end: output.len(),
+        });
         cursor = hit.end;
         previous = hit.rule;
     }
     output.push_str(&committed[cursor..]);
-    Ok(output)
+    Ok((output, spans))
 }
 
 /// Undo a render: rewrite this instance's values back to the committed ones.
@@ -338,6 +368,174 @@ fn swap_every(content: &str, from: &[&str], to: &[&str]) -> String {
     }
     output.push_str(&content[cursor..]);
     output
+}
+
+/// What [`reverse_rendered`] did to a file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Reversed {
+    pub content: String,
+    /// Rendered values left in place, one line each: where the render wrote
+    /// a value could not be told apart from the same text written beside
+    /// it, so nothing was guessed.
+    pub unplaced: Vec<String>,
+}
+
+/// Undo a render on a file someone may have edited, taking back only the
+/// spans the render wrote (#260).
+///
+/// Reversing by value alone rewrites every occurrence of `127.0.0.1:18002`,
+/// including the one a user typed into a `MIRROR=` line, and the lane then
+/// holds two copies of the `find` and renders for nobody. The render is a
+/// pure function of committed content, so where it wrote each value is
+/// recomputable: an occurrence in the current file is reversed when it sits
+/// on a line the render wrote, at the same place in that line. That
+/// survives edits anywhere else in the file, which is the edit a lane is
+/// for.
+///
+/// Where a rendered line was itself edited, the value is still reversed when
+/// it occurs exactly as often as the render wrote it — the same uniqueness
+/// [`compose`] checks at bind, so there is only one thing it can be.
+/// Anything else is left in place and listed in [`Reversed::unplaced`].
+///
+/// If `committed` no longer takes these claims (the lane moved under a
+/// failed re-render), there is nothing to recompute from, and this falls
+/// back to [`reverse`].
+pub fn reverse_rendered(
+    current: &str,
+    path: &Utf8Path,
+    committed: &str,
+    claims: &[Claim],
+) -> Reversed {
+    let rules = rules(claims);
+    let Ok((expected, spans)) = substitute_spans(path, committed, claims) else {
+        let applied: Vec<AppliedReplacement> =
+            rules.iter().map(|(_, rule)| (*rule).clone()).collect();
+        return Reversed {
+            content: reverse(current, &applied),
+            unplaced: Vec::new(),
+        };
+    };
+
+    // A value's place: its rule, the whole line(s) it sits on, and its
+    // column there.
+    fn place(content: &str, rule: usize, start: usize, end: usize) -> (usize, String, usize) {
+        let line_start = content[..start].rfind('\n').map_or(0, |at| at + 1);
+        let line_end = content[end..]
+            .find('\n')
+            .map_or(content.len(), |at| end + at);
+        (
+            rule,
+            content[line_start..line_end].to_owned(),
+            start - line_start,
+        )
+    }
+
+    let mut written: BTreeMap<(usize, String, usize), usize> = BTreeMap::new();
+    for span in &spans {
+        *written
+            .entry(place(&expected, span.rule, span.start, span.end))
+            .or_default() += 1;
+    }
+    let values: Vec<&str> = rules.iter().map(|(_, rule)| rule.value.as_str()).collect();
+    let found = locate(current, &values);
+    let mut at: BTreeMap<(usize, String, usize), Vec<usize>> = BTreeMap::new();
+    for (index, hit) in found.iter().enumerate() {
+        at.entry(place(current, hit.rule, hit.start, hit.end))
+            .or_default()
+            .push(index);
+    }
+
+    let mut chosen = vec![false; found.len()];
+    let mut missing = vec![0usize; rules.len()];
+    for (key, &count) in &written {
+        match at.get(key) {
+            Some(hits) if hits.len() == count => {
+                for &index in hits {
+                    chosen[index] = true;
+                }
+            }
+            _ => missing[key.0] += count,
+        }
+    }
+
+    let mut unplaced = Vec::new();
+    for (rule, &count) in missing.iter().enumerate() {
+        if count == 0 {
+            continue;
+        }
+        let hits: Vec<usize> = (0..found.len())
+            .filter(|&index| found[index].rule == rule)
+            .collect();
+        if hits.len() == rules[rule].1.count {
+            for index in hits {
+                chosen[index] = true;
+            }
+            continue;
+        }
+        let lines: Vec<String> = hits
+            .iter()
+            .filter(|&&index| !chosen[index])
+            .map(|&index| line_of(current, found[index].start).to_string())
+            .collect();
+        unplaced.push(format!(
+            "resource `{}`'s value `{}` on line(s) {}",
+            rules[rule].0,
+            rules[rule].1.value,
+            if lines.is_empty() {
+                "(none: the rendered line was removed)".to_owned()
+            } else {
+                lines.join(", ")
+            }
+        ));
+    }
+
+    let mut content = String::with_capacity(current.len());
+    let mut cursor = 0;
+    for (index, hit) in found.iter().enumerate() {
+        if !chosen[index] || hit.start < cursor {
+            continue;
+        }
+        content.push_str(&current[cursor..hit.start]);
+        content.push_str(&rules[hit.rule].1.find);
+        cursor = hit.end;
+    }
+    content.push_str(&current[cursor..]);
+    Reversed { content, unplaced }
+}
+
+/// Why `content`, captured into a lane, would no longer render these
+/// claims — the check `render --check` makes, with the lines named. `None`
+/// when it would.
+pub fn unrenderable(path: &Utf8Path, content: &str, claims: &[Claim]) -> Option<String> {
+    match substitute(path, content, claims) {
+        Ok(_) => None,
+        Err(NewgitError::RenderMatchCount {
+            resource,
+            find,
+            expected,
+            found,
+            ..
+        }) => {
+            let lines: Vec<String> = content
+                .match_indices(find.as_str())
+                .map(|(at, _)| line_of(content, at).to_string())
+                .collect();
+            Some(format!(
+                "resource `{resource}`'s `{find}` would occur {found} time(s), not {expected}{}",
+                if lines.is_empty() {
+                    String::new()
+                } else {
+                    format!(" (line(s) {})", lines.join(", "))
+                }
+            ))
+        }
+        Err(other) => Some(other.to_string()),
+    }
+}
+
+/// 1-based line number of a byte offset.
+fn line_of(content: &str, offset: usize) -> usize {
+    content[..offset].matches('\n').count() + 1
 }
 
 /// One `find`'s result against a file's current content, independent of any
