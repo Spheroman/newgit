@@ -1172,6 +1172,7 @@ fn spawn(args: SpawnArgs) -> Result<()> {
                 "endpoint": outcome.branch.remote.as_ref().map(|remote| &remote.endpoint),
                 "remote_warning": outcome.remote_warning,
                 "projection_warning": outcome.projection_warning,
+                "template_warning": outcome.template_warning,
                 "resources": resources,
                 "started": stop_start_resources_json(&outcome.started),
             })
@@ -1217,6 +1218,9 @@ fn spawn(args: SpawnArgs) -> Result<()> {
         branch.short_rev()
     );
     println!("  workspace: {}", branch.workspace_path);
+    if let Some(warning) = &outcome.template_warning {
+        println!("             cloned with `git clone`: the source template failed ({warning})");
+    }
     println!("  record:    {}", outcome.record_path);
     if let Some(warning) = &outcome.projection_warning {
         println!("  trackers:  the project root's commits were not split ({warning})");

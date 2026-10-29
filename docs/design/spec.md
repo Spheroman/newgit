@@ -376,9 +376,17 @@ another volume, which `clonefile` cannot reach.
 What those two settings give up: an edit Git cannot see is one that keeps
 the file's size and the second of its mtime. Ordinary edits cannot do that.
 They are later than anything Git recorded, and Git re-hashes any entry
-written in the same second as its index. What remains is a tool that sets
-an old mtime on purpose (`cp -p`, `rsync -t`), which Git's default settings
-would catch through the ctime.
+written in the same second as its index. A copy that keeps its source's
+mtime (`cp -p`, `rsync -a`, `tar x`) carries that file's own second, not the
+one Git recorded. What remains is setting a file's mtime to the recorded
+second on purpose (`touch -r`) while keeping its size, which Git's default
+settings would catch through the ctime. Even then only the workspace's own
+`git status` misses it. A checkpoint builds its tree in an index of its own
+with no stat data, so it hashes every file and captures the edit.
+
+If the template path fails, `spawn` says why in its output
+(`template_warning` in `--json`), since a template that fails every time
+makes every spawn pay for rebuilding it on top of the clone.
 
 A dropped code tracker's files are left out of the working tree with Git's
 sparse checkout. The history still has them, so every instance of a project

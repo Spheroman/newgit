@@ -27,30 +27,50 @@ pub struct RealDirMaterializer {
     pub source_template: Option<Utf8PathBuf>,
 }
 
-impl Materializer for RealDirMaterializer {
-    fn materialize(&self, source: &GitSource, branch: &BranchInstance) -> Result<()> {
+impl RealDirMaterializer {
+    /// [`Materializer::materialize`], saying why the template was not used
+    /// when there is one and the workspace was `git clone`d instead. The
+    /// fallback gives the same workspace, only slower, so it is a warning
+    /// rather than an error; but a template that fails on every spawn costs
+    /// its own rebuild on top of the clone, and should not do that silently.
+    pub fn materialize_reporting(
+        &self,
+        source: &GitSource,
+        branch: &BranchInstance,
+    ) -> Result<Option<String>> {
         if branch.workspace_path.exists() {
             return Err(NewgitError::WorkspaceExists(branch.workspace_path.clone()));
         }
         if let Some(parent) = branch.workspace_path.parent() {
             create_dir_all(parent)?;
         }
+        let Some(template) = &self.source_template else {
+            source.clone_to(&branch.source_ref, &branch.workspace_path)?;
+            write_workspace_marker(source.root(), branch)?;
+            return Ok(None);
+        };
         // The template is only a faster way to the same clone: whatever
         // keeps it from working, `clone_to` still does.
-        let templated = self.source_template.as_ref().is_some_and(|template| {
-            source
-                .clone_via_template(
-                    template,
-                    &branch.source_ref,
-                    &branch.source_rev,
-                    &branch.workspace_path,
-                )
-                .is_ok()
-        });
-        if !templated {
+        let fallback = source
+            .clone_via_template(
+                template,
+                &branch.source_ref,
+                &branch.source_rev,
+                &branch.workspace_path,
+            )
+            .err()
+            .map(|error| error.to_string());
+        if fallback.is_some() {
             source.clone_to(&branch.source_ref, &branch.workspace_path)?;
         }
-        write_workspace_marker(source.root(), branch)
+        write_workspace_marker(source.root(), branch)?;
+        Ok(fallback)
+    }
+}
+
+impl Materializer for RealDirMaterializer {
+    fn materialize(&self, source: &GitSource, branch: &BranchInstance) -> Result<()> {
+        self.materialize_reporting(source, branch).map(|_| ())
     }
 
     fn remove(&self, branch: &BranchInstance) -> Result<()> {

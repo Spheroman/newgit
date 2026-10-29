@@ -74,6 +74,8 @@ fn a_templated_workspace_is_the_clone_it_replaces() {
         );
         assert_eq!(git(&workspace, &["config", "core.checkStat"]), "minimal");
     }
+    assert_eq!(outcome.template_warning, None);
+    assert!(!workspace.join(".git/FETCH_HEAD").exists());
 
     assert_eq!(
         git(&workspace, &["symbolic-ref", "HEAD"]),
@@ -151,4 +153,43 @@ fn cleanup_leaves_the_template_alone() {
         outcome.orphan_workspaces
     );
     assert!(outcome.warnings.is_empty(), "{:?}", outcome.warnings);
+}
+
+/// A template that cannot be used still gives a workspace, through `git
+/// clone`, and the spawn says why instead of quietly paying for both.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_failing_template_falls_back_and_says_so() {
+    let (_guard, temp) = tempdir();
+    let store = setup(&temp);
+    let m = BranchManager::open(store).expect("manager");
+    // A file where the template directory belongs: building it fails.
+    std::fs::create_dir_all(temp.join("workspaces")).expect("mkdir");
+    std::fs::write(temp.join("workspaces/.source-template"), "").expect("write");
+
+    let outcome = m.spawn("feature-a", None).expect("spawn");
+    assert!(
+        outcome.template_warning.is_some(),
+        "the fallback is reported"
+    );
+    let workspace = outcome.branch.workspace_path;
+    assert_eq!(
+        git(&workspace, &["symbolic-ref", "HEAD"]),
+        "refs/heads/feature-a"
+    );
+    assert_eq!(git(&workspace, &["status", "--porcelain"]), "");
+    let check_stat = Command::new("git")
+        .args([
+            "-C",
+            workspace.as_str(),
+            "config",
+            "--local",
+            "core.checkStat",
+        ])
+        .output()
+        .expect("git runs");
+    assert!(
+        !check_stat.status.success(),
+        "a cloned workspace keeps Git's defaults"
+    );
 }

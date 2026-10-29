@@ -10,6 +10,8 @@
   and is slower once. Workspaces are set to `core.checkStat=minimal` and
   `core.trustctime=false`, which let `git status` trust the cloned files
   instead of re-hashing every one; the only edit Git then misses is one
-  that keeps a file's size and sets its mtime back to the same second,
-  as `cp -p` can. Anything that stops the template from working, such
-  as a workspace root on another volume, falls back to `git clone`.
+  that keeps a file's size and has its mtime set to the exact second Git
+  recorded, as `touch -r` can. Checkpoints hash every file, so they
+  capture it regardless. Anything that stops the template from working,
+  such as a workspace root on another volume, falls back to `git clone`,
+  and `spawn` says why.

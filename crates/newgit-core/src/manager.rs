@@ -167,6 +167,10 @@ pub struct SpawnOutcome {
     /// branches. Spawning goes on: nothing has left the machine, and the same
     /// split runs again before anything does.
     pub projection_warning: Option<String>,
+    /// Why the workspace was `git clone`d rather than cloned from the
+    /// source template on macOS. The workspace is the same either way; the
+    /// spawn was only slower.
+    pub template_warning: Option<String>,
 }
 
 /// Checkpoint numbering is per name, and `remove` archives the binding record
@@ -2018,7 +2022,9 @@ impl BranchManager {
         }
 
         branch.dropped = dropped;
-        self.materializer().materialize(&self.source, &branch)?;
+        let template_warning = self
+            .materializer()
+            .materialize_reporting(&self.source, &branch)?;
         if !branch.dropped.is_empty() {
             self.apply_sparse(&branch)?;
         }
@@ -2082,6 +2088,7 @@ impl BranchManager {
             inherited_checkpoints,
             remote_warning,
             projection_warning,
+            template_warning,
         })
     }
 
@@ -2675,6 +2682,18 @@ impl BranchManager {
         exclude_produced_paths(&branch.workspace_path, &produced)
     }
 
+    /// How workspaces are materialized here. On macOS they are cloned from
+    /// a template checkout beside them (see
+    /// [`GitSource::clone_via_template`]); elsewhere there is no
+    /// whole-tree clone to make that faster than `git clone`.
+    fn materializer(&self) -> RealDirMaterializer {
+        let workspace_root = self.config.workspace_root(&self.store.paths().project_root);
+        RealDirMaterializer {
+            source_template: cfg!(target_os = "macos")
+                .then(|| workspace_root.join(SOURCE_TEMPLATE_DIR)),
+        }
+    }
+
     /// Make this workspace's `origin` behave like the project's real remote.
     ///
     /// A workspace is cloned from the store, so its `origin` starts as a
@@ -2689,18 +2708,6 @@ impl BranchManager {
     /// `core.hooksPath` (husky, lefthook) cannot switch it off. Idempotent,
     /// like the excludes, so it doubles as the re-sync — and follows the
     /// store if its `origin` changes.
-    /// How workspaces are materialized here. On macOS they are cloned from
-    /// a template checkout beside them (see
-    /// [`GitSource::clone_via_template`]); elsewhere there is no
-    /// whole-tree clone to make that faster than `git clone`.
-    fn materializer(&self) -> RealDirMaterializer {
-        let workspace_root = self.config.workspace_root(&self.store.paths().project_root);
-        RealDirMaterializer {
-            source_template: cfg!(target_os = "macos")
-                .then(|| workspace_root.join(SOURCE_TEMPLATE_DIR)),
-        }
-    }
-
     fn ensure_workspace_push(&self, branch: &BranchInstance) -> Result<()> {
         let outbox = self.outbox();
         self.source.ensure_outbox(&outbox)?;

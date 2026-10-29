@@ -158,9 +158,13 @@ impl GitSource {
     /// whole-second mtime only, both of which a clone keeps. That misses an
     /// edit only when it keeps the size and the mtime's second as well. An
     /// edit made now has a later mtime than anything Git recorded, and Git
-    /// re-hashes entries written in the same second as its index; what is
-    /// left is a tool that sets an old mtime on purpose (`cp -p`, `rsync
-    /// -t`), which the default settings catch through the ctime (#235).
+    /// re-hashes entries written in the same second as its index. A copy
+    /// that keeps its source's mtime (`cp -p`, `rsync -a`) carries that
+    /// file's own second, not the one recorded here. What is left is setting
+    /// the mtime to the recorded second on purpose (`touch -r`), which the
+    /// default settings would catch through the ctime. Checkpoints are not
+    /// affected either way: they build their tree in an index of their own,
+    /// with no stat data to trust, and hash every file (#235).
     ///
     /// The template sits beside the workspaces, so it is on their volume,
     /// and outside the project, where tools that crawl it would find a
@@ -214,10 +218,17 @@ impl GitSource {
                 run_git(&full).map(|_| ())
             };
             // The template's reflog is its own string of checkouts, not
-            // this branch's history.
+            // this branch's history, and its FETCH_HEAD and ORIG_HEAD are
+            // from its own fetches and checkouts.
             let logs = destination.join(".git/logs");
             if logs.exists() {
                 std::fs::remove_dir_all(&logs).map_err(|source| NewgitError::io(&logs, source))?;
+            }
+            for name in ["FETCH_HEAD", "ORIG_HEAD"] {
+                let path = destination.join(".git").join(name);
+                if path.exists() {
+                    std::fs::remove_file(&path).map_err(|source| NewgitError::io(&path, source))?;
+                }
             }
             let head = format!("refs/heads/{branch}");
             let message = format!("clone: from {}", self.root);
