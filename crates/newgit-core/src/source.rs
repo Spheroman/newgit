@@ -253,9 +253,28 @@ impl GitSource {
     /// bare repository borrowing the store's objects, so neither bringing it
     /// up to date nor receiving a push copies history the store already
     /// has.
+    ///
+    /// Made beside its path and renamed into place: the first spawns in a
+    /// project, run at once (subagents launched together), each find it
+    /// missing, and two `git init`s into one directory fail on each other's
+    /// lock files. The rename lets one of them win and the rest find it made.
     pub fn ensure_outbox(&self, outbox: &Utf8Path) -> Result<()> {
         if !outbox.join("HEAD").is_file() {
-            run_git(&["init", "--quiet", "--bare", "--", outbox.as_str()])?;
+            let parent = outbox.parent().unwrap_or(Utf8Path::new("."));
+            crate::materializer::create_dir_all(parent)?;
+            let staging = parent.join(format!(
+                ".{}.{}",
+                outbox.file_name().unwrap_or("outbox"),
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&staging);
+            run_git(&["init", "--quiet", "--bare", "--", staging.as_str()])?;
+            if let Err(error) = std::fs::rename(&staging, outbox) {
+                let _ = std::fs::remove_dir_all(&staging);
+                if !outbox.join("HEAD").is_file() {
+                    return Err(NewgitError::io(outbox, error));
+                }
+            }
         }
         let alternates = outbox.join("objects/info/alternates");
         let objects = format!("{}\n", self.objects_dir()?);

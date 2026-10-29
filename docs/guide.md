@@ -208,6 +208,31 @@ the second runs `newgit remove` when Claude Code removes the worktree.
 `--shared` writes `.claude/settings.json` instead, for a team that all has
 `newgit` on its `PATH`.
 
+The instance starts where Claude Code's own worktree would, not at
+whatever the project root has checked out (which is what a plain `newgit
+spawn` uses):
+
+- By default (`worktree.baseRef` unset or `"fresh"`), the project branch
+  as it stands. If nothing in the project root has fetched for a day, the
+  hook first fetches that branch's upstream (5 seconds at most, never
+  prompting; on failure it uses the ref already there). Then it takes
+  whichever of the root's branch and its upstream contains the other: the
+  upstream when the root's `main` is only behind (a PR merged on GitHub
+  that nobody pulled), the root's branch when it is ahead or the two have
+  diverged. The root's own branch is never moved.
+- Subagents launched together make their hooks run at once. The choice is
+  made under one store-wide lock, so one of them fetches and they all
+  start from the same commit. If that fetch fails, the hooks in the next
+  minute don't retry it. They use the ref already there, as the one that
+  failed did.
+- With `worktree.baseRef = "head"`, it starts from the root's `HEAD`. For a
+  session already in an instance, it starts from that instance's source
+  branch as the store last saw it (its last checkpoint or push).
+- A name that is already a Git branch in the project spawns on that
+  branch as it is.
+- The hook prints the base it chose on stderr, which ends up in Claude
+  Code's debug log.
+
 - Claude Code runs a project's hooks only once you have trusted the
   folder: run `claude` there once and accept the prompt before using
   `--worktree`.
