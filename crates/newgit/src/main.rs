@@ -395,6 +395,15 @@ enum TrackerCommand {
         #[arg(long)]
         discard: bool,
     },
+    /// Rewrite code tracker commits split before newgit kept each original's
+    /// message ending and signature, so clones from the remote get the
+    /// project's own commit ids. Moves every code tracker branch, and on the
+    /// remote each branch's list (a force push of tracker history)
+    Repair {
+        /// Say what would move, and move nothing
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 #[derive(Debug, Args)]
@@ -2104,6 +2113,56 @@ fn tracker(command: TrackerCommand) -> Result<()> {
                 files_label(report.files)
             );
             println!("  merge with: newgit tracker merge {tracker}");
+            Ok(())
+        }
+        TrackerCommand::Repair { dry_run } => {
+            let context = context_here()?;
+            let manager = BranchManager::open(context.store)?;
+            let outcome = manager.repair_splits(dry_run)?;
+            if outcome.rewritten == 0 {
+                println!("Nothing to repair: every split commit recomposes as its original");
+                return Ok(());
+            }
+            let verb = if outcome.dry_run {
+                "Would rewrite"
+            } else {
+                "Rewrote"
+            };
+            println!(
+                "{verb} {} tracker commit{}",
+                outcome.rewritten,
+                if outcome.rewritten == 1 { "" } else { "s" }
+            );
+            for (tracker, branch) in &outcome.branches {
+                println!("  {tracker}/{branch}");
+            }
+            if let Some(project) = &outcome.remote {
+                if outcome.remote_branches.is_empty() {
+                    println!("On {project}: no branch lists move");
+                } else {
+                    let moving = if outcome.dry_run {
+                        "would move"
+                    } else {
+                        "moved"
+                    };
+                    println!(
+                        "On {project}: {moving} {}",
+                        outcome
+                            .remote_branches
+                            .iter()
+                            .map(|branch| format!("`{branch}`"))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    );
+                    println!(
+                        "  Instance forks and checkpoints there keep the commits they were made \
+                         with; clones of a moved branch see a forced update"
+                    );
+                }
+            }
+            if outcome.dry_run {
+                println!("Run without --dry-run to move them");
+            }
             Ok(())
         }
         TrackerCommand::Merge { tracker, instance } => {

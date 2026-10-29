@@ -7483,6 +7483,129 @@ impl BranchManager {
         })
     }
 
+    /// Rewrite the code trackers' commits split before their trailers kept
+    /// the original's message ending and headers (docs/design/trackers.md,
+    /// step 3e), so they recompose into the originals anywhere — signatures,
+    /// and so ids, included. Every code tracker branch here moves onto the
+    /// rewritten commits, and so do the composed-state notes; on the remote,
+    /// each branch's list moves the way a merge moves it, its tracker repos
+    /// force-pushed with a lease on the commits they hold now. Instance forks
+    /// and checkpoints there keep the commits they were made with.
+    ///
+    /// `dry_run` works out what would move and moves nothing.
+    pub fn repair_splits(&self, dry_run: bool) -> Result<RepairOutcome> {
+        self.require_resolvable_graph()?;
+        let root = self.store.paths().project_root.clone();
+        self.fetch_code_trackers()?;
+        let code = self.code_definitions();
+
+        let mut local: Vec<(String, String, String)> = Vec::new();
+        for definition in &code {
+            for branch in self.code_branches(&definition.name)? {
+                let commit = self
+                    .source
+                    .rev_parse(&local_tracker_ref(&definition.name, &branch))?;
+                local.push((definition.name.clone(), branch, commit));
+            }
+        }
+        let client = match &self.remote {
+            Some(link) => Some((link.connect(Acting::Login)?, link.project.clone())),
+            None => None,
+        };
+        let mut remote_lists: Vec<(String, BTreeMap<String, String>)> = Vec::new();
+        if let Some((client, project)) = &client {
+            for branch in client.project(project)?.branches {
+                let list = self.branch_list(Some((client.as_ref(), project)), &branch.name)?;
+                remote_lists.push((branch.name, list));
+            }
+        }
+
+        let mut tips: Vec<String> = local.iter().map(|(_, _, commit)| commit.clone()).collect();
+        tips.extend(
+            remote_lists
+                .iter()
+                .flat_map(|(_, list)| list.values().cloned()),
+        );
+        tips.sort();
+        tips.dedup();
+        let moved = crate::compose::repair_splits(&root, &tips)?;
+        let remap = |commit: &String| moved.get(commit).cloned().unwrap_or_else(|| commit.clone());
+
+        let branches: Vec<(String, String)> = local
+            .iter()
+            .filter(|(_, _, commit)| moved.contains_key(commit))
+            .map(|(tracker, branch, _)| (tracker.clone(), branch.clone()))
+            .collect();
+        // `(branch, its list now, its list repaired)`, for the lists that move.
+        type Move = (String, BTreeMap<String, String>, BTreeMap<String, String>);
+        let lists: Vec<Move> = remote_lists
+            .into_iter()
+            .filter_map(|(branch, base)| {
+                let list: BTreeMap<String, String> = base
+                    .iter()
+                    .map(|(tracker, commit)| (tracker.clone(), remap(commit)))
+                    .collect();
+                (list != base).then_some((branch, base, list))
+            })
+            .collect();
+        let outcome = RepairOutcome {
+            rewritten: moved.len(),
+            branches: branches.clone(),
+            remote_branches: lists.iter().map(|(branch, _, _)| branch.clone()).collect(),
+            remote: client.as_ref().map(|(_, project)| project.clone()),
+            dry_run,
+        };
+        if dry_run || moved.is_empty() {
+            return Ok(outcome);
+        }
+
+        // The remote first: if it refuses, nothing here has moved either,
+        // and running the repair again picks up where it stopped.
+        if let Some((client, project)) = &client {
+            for (branch, base, list) in &lists {
+                let changed: Vec<String> = list
+                    .iter()
+                    .filter(|(tracker, commit)| base.get(*tracker) != Some(*commit))
+                    .map(|(tracker, _)| tracker.clone())
+                    .collect();
+                let pushed: Vec<&str> = changed
+                    .iter()
+                    .filter_map(|tracker| list.get(tracker).map(String::as_str))
+                    .collect();
+                self.refuse_unpublished(&pushed)?;
+                let branch_ref = format!("refs/heads/{branch}");
+                let credentials = client.begin_merge(project, branch, base, &changed)?;
+                for credential in &credentials {
+                    let Some(commit) = list.get(&credential.tracker) else {
+                        continue;
+                    };
+                    GitSource::push_leased(
+                        &["-C", root.as_str()],
+                        credential.credential.remote.as_deref().unwrap_or_default(),
+                        commit,
+                        &branch_ref,
+                        base.get(&credential.tracker).map(String::as_str),
+                        Some(&basic_auth_header(&credential.credential)),
+                    )?;
+                }
+                client.finish_merge(project, branch, base, list)?;
+            }
+        }
+        let mut by_tracker: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+        for (tracker, branch, commit) in &local {
+            if let Some(new) = moved.get(commit) {
+                self.source
+                    .update_ref(&local_tracker_ref(tracker, branch), new)?;
+                by_tracker.entry(tracker).or_default().push(branch);
+            }
+        }
+        for (tracker, branches) in &by_tracker {
+            self.publish_code_refs(tracker, branches)?;
+        }
+        crate::compose::remap_state_notes(&root, &moved)?;
+        Ok(outcome)
+    }
+
     /// After a merge into `main`, bring the project root along when it can be
     /// — a fast-forward to `main` composed — so the next spawn starts from
     /// the merged work, as `git pull` would. A project root with commits of
@@ -9422,6 +9545,20 @@ pub struct TrackerMerge {
     pub tracker: String,
     pub action: TrackerMergeAction,
     pub commit: String,
+}
+
+/// What `newgit tracker repair` rewrote, or would.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepairOutcome {
+    /// Tracker commits rewritten.
+    pub rewritten: usize,
+    /// `(tracker, branch)` moved here.
+    pub branches: Vec<(String, String)>,
+    /// Branches whose list moved on the remote.
+    pub remote_branches: Vec<String>,
+    /// The project on the remote, when there is one.
+    pub remote: Option<String>,
+    pub dry_run: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

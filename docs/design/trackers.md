@@ -556,15 +556,19 @@ Each step lands alone and keeps the suite green. Status as of 2026-10-28.
      original's; one that cannot be carries a note naming its canonical
      id. Tracker commits split before the trailers kept message endings
      and headers never come back as the original (step 3e).
-   - *3e — repairing older splits. Planned.* Tracker commits split before
+   - *3e — repairing older splits. Done.* Tracker commits split before
      the trailers recorded headers and message endings lost both, so on
      the remote they rebuild with new ids, and so does every commit after
-     them. The repair rewrites each such commit's trailers from the
-     original view commit, where this machine has it — trees and parents
-     unchanged, so only ids move — then remaps every tracker branch, the
-     composed-state notes, and on the remote each tracker's repo, branch
-     lists, and checkpoint lists. A force push of tracker history, so it
-     runs once, by hand.
+     them. `newgit tracker repair` rewrites each such commit's trailers
+     from the original view commit, where this machine has it (trees,
+     authors, and committers unchanged; a commit whose original is not
+     here keeps its message and only moves), then moves every code tracker
+     branch, the composed-state notes, and on the remote each branch's
+     list, the way a merge moves it: its tracker repos force-pushed with a
+     lease. Instance forks and checkpoints on the remote keep the commits
+     they were made with, so an old checkpoint composes as it always did.
+     A force push of tracker history, so it runs once, by hand
+     (`--dry-run` says what would move).
 4. **Roles, priority, resources, use/drop.** *Done, except a resource's
    `depends_on` naming a role.* `role`, `priority` (negative: only when
    asked), `requires`, and `resources` decide what a spawn binds (`--use`,

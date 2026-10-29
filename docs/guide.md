@@ -283,6 +283,11 @@ Definition management (noun subcommands):
   maintainers, and (inside a workspace) what is bound
 - `newgit tracker use <tracker> [instance]` / `newgit tracker drop <tracker>
   [instance] [--stash | --discard]`
+- `newgit tracker repair [--dry-run]` — rewrite code tracker commits split
+  before newgit kept each original's message ending and signature, so a
+  clone from the remote gets the project's own commit ids. Moves every code
+  tracker branch, and on the remote each branch's list: a force push of
+  tracker history, so run it once, after upgrading
 - `newgit log <tracker> [instance] [-- <git log args>]` — one tracker's
   history: an instance's branch as of its last checkpoint, or the project
   root's
