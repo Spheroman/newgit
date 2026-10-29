@@ -353,6 +353,15 @@ anything: `resume` has to find the resource where `suspend` left it. Like
 any action, either may declare `captures`, and a `resume` that hands out a
 new URL publishes it that way.
 
+`newgit tracker drop` (and a `tracker use` that switches a role) runs the
+same pair for the resources the dropped tracker brought: it *parks* each,
+stopping its process and running `suspend`, keeps its ports claimed, and
+the next `use` hands them back and runs `resume`. A resource with no
+`suspend` is parked by its `[cleanup]` instead, and `use` runs `prepare`
+on the same ports. Either way the output names the hook that ran, and
+`newgit remove` runs `[cleanup]` for a parked binding its drop did not
+already clean up.
+
 ```toml
 [actions.suspend]
 command = "docker compose -p {{branch.slug}} stop"   # not `down`: that is cleanup
@@ -529,7 +538,7 @@ against an instance you can afford to spend, not one you are mid-task on.
 
 | key | type | required | default | meaning |
 | --- | --- | --- | --- | --- |
-| `command` | string | no | none | tears the concrete resource down. Runs at `newgit remove`, and at `newgit cleanup` for an instance whose workspace is gone, dependents before dependencies. A `[cleanup]` section without one means there is nothing to do, and teardown says so. |
+| `command` | string | no | none | tears the concrete resource down. Runs at `newgit remove`, and at `newgit cleanup` for an instance whose workspace is gone, dependents before dependencies — for resources a tracker drop parked too. A `tracker drop` runs it for a resource it parks that has no `suspend`. A `[cleanup]` section without one means there is nothing to do, and teardown says so. |
 
 Three rules constrain it, all deliberately:
 

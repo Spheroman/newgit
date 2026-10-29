@@ -24,7 +24,9 @@ pub mod templates;
 pub mod tracker;
 pub mod tracker_repo;
 
-pub use branch::{BranchInstance, InstanceStatus, ResourceBinding, TrackerBinding};
+pub use branch::{
+    BranchInstance, InstanceStatus, ParkedBinding, ParkedState, ResourceBinding, TrackerBinding,
+};
 pub use config::{ProjectConfig, SourceSubstrate};
 pub use error::{NewgitError, Result};
 pub use manager::BranchManager;

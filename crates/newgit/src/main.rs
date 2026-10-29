@@ -2139,12 +2139,14 @@ fn tracker(command: TrackerCommand) -> Result<()> {
             for other in &change.replaced {
                 println!("  dropped `{other}`, which filled the same role");
             }
+            print_parked(&change.parked);
             for other in &change.brought {
                 println!("  bound `{other}` too: `{tracker}` requires it");
             }
             if !change.started.is_empty() {
                 println!("  bound what it brings: {}", change.started.join(", "));
             }
+            print_resumed(&change.resumed);
             print_rebuilt(&change.rebuilt);
             print_started(&change.autostarted);
             if change.restored_stash {
@@ -2174,9 +2176,7 @@ fn tracker(command: TrackerCommand) -> Result<()> {
                 return Ok(());
             }
             println!("Dropped `{tracker}` from `{instance}`");
-            if !change.stopped.is_empty() {
-                println!("  stopped what it brought: {}", change.stopped.join(", "));
-            }
+            print_parked(&change.parked);
             print_rebuilt(&change.rebuilt);
             if change.stashed {
                 println!(
@@ -3170,7 +3170,7 @@ fn ports_command(check: bool) -> Result<()> {
 }
 
 /// Bare `newgit ports`: every instance's claimed ports, read straight off
-/// its binding record.
+/// its binding record. A parked resource's ports are claimed too, and say so.
 fn list_claimed_ports(branches: &[newgit_core::BranchInstance]) -> Result<()> {
     if branches.is_empty() {
         println!("No branch instances yet. Create one with `newgit spawn <name>`.");
@@ -3178,13 +3178,17 @@ fn list_claimed_ports(branches: &[newgit_core::BranchInstance]) -> Result<()> {
     }
     for branch in branches {
         let entries: Vec<String> = branch
-            .resources
-            .iter()
+            .port_claims()
             .flat_map(|(resource, binding)| {
+                let parked = if branch.parked.contains_key(resource) {
+                    " (parked)"
+                } else {
+                    ""
+                };
                 binding
                     .resolved_ports
                     .iter()
-                    .map(move |(port_name, port)| format!("{resource}.{port_name}:{port}"))
+                    .map(move |(port_name, port)| format!("{resource}.{port_name}:{port}{parked}"))
             })
             .collect();
         if entries.is_empty() {
@@ -3478,6 +3482,56 @@ fn parse_storage(value: &str) -> Result<Storage> {
         "local" => Ok(Storage::Local),
         "remote" => Ok(Storage::Remote),
         _ => bail!("invalid storage `{value}`; expected local or remote"),
+    }
+}
+
+/// The resources a `tracker drop` (or the drop a `use` made) took down and
+/// parked, each with what took it down: which hook ran, or why none did.
+fn print_parked(parked: &[newgit_core::manager::ParkedResource]) {
+    for resource in parked {
+        let mut done = Vec::new();
+        if let Some(action) = &resource.stopped {
+            done.push(format!("stopped `{action}`"));
+        }
+        if let Some(hook) = &resource.hook {
+            let log = hook
+                .log
+                .as_ref()
+                .map(|log| format!(" (log: {log})"))
+                .unwrap_or_default();
+            done.push(if hook.ok {
+                format!("ran `{}`", hook.hook)
+            } else {
+                format!(
+                    "`{}` FAILED{log}; `newgit remove` runs `[cleanup]`",
+                    hook.hook
+                )
+            });
+        }
+        if let Some(note) = &resource.note {
+            done.push(note.clone());
+        }
+        if done.is_empty() {
+            done.push("nothing was running".to_owned());
+        }
+        println!("  parked `{}`: {}", resource.name, done.join("; "));
+    }
+    if !parked.is_empty() {
+        println!("    its ports stay claimed; `newgit tracker use` brings it back on them");
+    }
+}
+
+/// The parked resources a `tracker use` brought back through `resume`.
+fn print_resumed(resumed: &[(String, bool)]) {
+    for (name, ok) in resumed {
+        if *ok {
+            println!("  resumed `{name}` on the ports it had");
+        } else {
+            println!(
+                "  `{name}`'s `resume` FAILED; retry with `newgit action {name}.resume`, or \
+                 `newgit action {name}.prepare`"
+            );
+        }
     }
 }
 

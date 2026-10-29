@@ -282,7 +282,9 @@ Definition management (noun subcommands):
 - `newgit tracker list` — a tree by ownership: kind, role, priority,
   maintainers, and (inside a workspace) what is bound
 - `newgit tracker use <tracker> [instance]` / `newgit tracker drop <tracker>
-  [instance] [--stash | --discard]`
+  [instance] [--stash | --discard]` — a drop parks the resources the tracker
+  brought: taken down by `suspend` (else `[cleanup]`), ports kept, and
+  brought back on them by the next `use`; `remove` tears parked ones down
 - `newgit log <tracker> [instance] [-- <git log args>]` — one tracker's
   history: an instance's branch as of its last checkpoint, or the project
   root's

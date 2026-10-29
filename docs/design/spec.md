@@ -852,10 +852,21 @@ exit 1 if any resource failed.
 instances share, nor for one that never came up. The `supabase` template's
 pair is `supabase stop` / `supabase start`, which keeps the data.
 
+A tracker drop is the same stop, for the resources the dropped tracker
+brought (#254). Each is *parked*: taken down — its process signalled and
+its `suspend` run, or its `[cleanup]` when it has no `suspend` — and its
+binding moved to the record's `parked` table with its ports still claimed.
+`tracker use` hands those ports back and runs `resume` (or `prepare`, after
+a cleanup), so a role switch and back leaves the rendered files, the data,
+and the running stack on the same ports (#255). `newgit ports` lists parked
+claims as `(parked)`, and `ports --check` counts them as claimed. An undo to
+a checkpoint that bound less parks the same way.
+
 ### Remove
 
 `newgit remove <name>` stops what is running (dependents first), runs
-`[cleanup]` hooks where ownership allows, deletes the workspace (`rm -rf`;
+`[cleanup]` hooks where ownership allows — for parked bindings too, unless
+their drop already ran it — deletes the workspace (`rm -rf`;
 clones have no registration), and archives the binding record.
 
 **The source branch** goes too, when it holds nothing unique, and otherwise

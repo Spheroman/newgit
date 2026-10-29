@@ -128,8 +128,16 @@ At spawn, for each slot (each role, and each role-less tracker):
 
 `newgit tracker use <tracker>` binds a tracker into an existing instance:
 swapping out whatever filled its role, binding what it requires, and starting
-the resources it brings. `newgit tracker drop <tracker>` unbinds one, stopping
-(never cleaning up) the resources no longer brought. A drop is refused while
+the resources it brings. `newgit tracker drop <tracker>` unbinds one, and
+*parks* the resources no longer brought (#254, #255): each is taken down as
+`newgit stop` would take it down (its process signalled, its `suspend` run),
+or, with no `suspend`, by its `[cleanup]`, and the output names the hook that
+ran. A parked binding keeps its ports — ports are for the instance's
+lifetime — so the next `use` hands them back and runs `resume` (or `prepare`,
+when the drop cleaned it up): the files it renders, its data, and whatever
+it left behind all agree on them. `remove` tears down parked bindings too.
+Shared (`project`, `user`) resources are parked but left up. A drop is
+refused while
 another bound tracker requires it, and while the tracker has uncommitted work
 unless `--stash` (brought back by the next `use`) or `--discard` (after a
 checkpoint, so `newgit undo` gets it back). Both rebuild every bound install
