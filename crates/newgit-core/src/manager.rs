@@ -9,8 +9,8 @@ use crate::branch::{
     validate_name,
 };
 use crate::checkpoint::{
-    CheckpointLog, CheckpointReason, CheckpointRecord, HASH_STATE_REF_PREFIX, RecoveryRecord,
-    ResourceState, RestoreFailure, SourceState, TrackerState,
+    CheckpointLog, CheckpointReason, CheckpointRecord, HASH_STATE_REF_PREFIX, OffBranch,
+    RecoveryRecord, ResourceState, RestoreFailure, SourceState, TrackerState,
 };
 use crate::cleanup::{
     ArchivedCheckpoints, CleanupOutcome, FinalizedInstance, HookDetail, HookOutcome, PrunedInstall,
@@ -545,6 +545,9 @@ pub struct InstanceReport {
     pub workspace_exists: bool,
     /// Live HEAD of the workspace clone, when it can be read.
     pub live_rev: Option<String>,
+    /// What the workspace has checked out when it is not the instance's
+    /// own branch — read live, like `live_rev`.
+    pub off_branch: Option<OffBranch>,
     pub trackers: Vec<TrackerReport>,
     pub resources: Vec<ResourceReport>,
     /// How far `branch.base_ref` has moved since this instance branched,
@@ -5190,6 +5193,10 @@ impl BranchManager {
                 let live_rev = workspace_exists
                     .then(|| GitSource::workspace_short_head(&branch.workspace_path).ok())
                     .flatten();
+                let off_branch = workspace_exists
+                    .then(|| GitSource::workspace_branch(&branch.workspace_path).ok())
+                    .flatten()
+                    .and_then(|head| OffBranch::of(head.as_deref(), &branch.source_ref));
                 let trackers = self
                     .trackers
                     .iter()
@@ -5263,6 +5270,7 @@ impl BranchManager {
                     branch,
                     workspace_exists,
                     live_rev,
+                    off_branch,
                     trackers,
                     resources,
                     base,
@@ -6940,7 +6948,17 @@ impl BranchManager {
             .fetch_ref(&workspace, &workspace_ref, &store_ref);
         GitSource::workspace_delete_ref(&workspace, &workspace_ref)?;
         fetched?;
-        self.bless_store_branch(branch, &head_rev, None, &mut warnings)?;
+        // The instance's branch moves only when the workspace is on it. An
+        // agent that ran `git checkout -b try-x` is working on `try-x`, and
+        // the store's `base` taking try-x's commits would be newgit making
+        // up a merge nobody asked for. The checkpoint still holds the
+        // workspace exactly as it stands — which branch included — so undo
+        // returns to it; it just does not rename it.
+        let checked_out = GitSource::workspace_branch(&workspace)?;
+        match OffBranch::of(checked_out.as_deref(), &branch.source_ref) {
+            None => self.bless_store_branch(branch, &head_rev, None, &mut warnings)?,
+            Some(off) => warnings.push(off_branch_warning(&off, branch, &head_rev, &id)),
+        }
 
         // Resources, dependents first: a dependent's state may be derived
         // from its dependency, so it is captured before the dependency moves.
@@ -7088,6 +7106,8 @@ impl BranchManager {
                 head_rev,
                 dirty_rev,
                 store_ref,
+                detached: checked_out.is_none(),
+                checked_out,
             },
             tracker_states,
             resource_states,
@@ -7270,6 +7290,7 @@ impl BranchManager {
         // The instance's lock, held to the end; the project root has none.
         let mut _lock = None;
         let mut dropped = BTreeSet::new();
+        let mut warnings = Vec::new();
         let (name, checkpoint, head) = if instance == PROJECT_ROOT_INSTANCE {
             self.sync_project_root()?;
             let branch = std::fs::read_to_string(self.store.paths().project_branch_file())
@@ -7292,6 +7313,10 @@ impl BranchManager {
                     "`{instance}`'s work did not reach the remote, so it cannot merge there: {error}"
                 )));
             }
+            // What merges is what the checkpoint holds: the workspace as it
+            // stands, on whatever branch it is. Off the instance's branch,
+            // the checkpoint's warning says so, and that rides along.
+            warnings = checkpoint.warnings.clone();
             let head = checkpoint.record.source.head_rev.clone();
             self.split_instance(&branch.slug, &head)?;
             // Only what the instance binds: a dropped tracker keeps the
@@ -7458,6 +7483,7 @@ impl BranchManager {
             instance: name,
             into: into.to_owned(),
             checkpoint,
+            warnings,
             project_root,
             trackers,
             remote: client.map(|(_, project)| project),
@@ -8192,19 +8218,30 @@ impl BranchManager {
                 self.store.save_branch_record(&branch)?;
             }
 
+            // On the branch the checkpoint was on — the instance's own, or
+            // the `try-x` an agent checked out — not whichever one the
+            // workspace happens to be on now: undo moves the branch it
+            // restores, never a bystander.
+            self.point_workspace_head(&branch, &restored.source, &mut warnings)?;
             GitSource::workspace_restore_to(
                 &workspace,
                 &restored.source.head_rev,
                 restored.source.dirty_rev.as_deref(),
             )?;
-            // The pre-undo tip stays reachable from the safety checkpoint's
-            // ref, so moving the branch back to it is expected, not divergence.
-            self.bless_store_branch(
-                &mut branch,
-                &restored.source.head_rev,
-                Some(&safety.record.source.head_rev),
-                &mut warnings,
-            )?;
+            // The instance's branch follows only a checkpoint taken on it. Its
+            // pre-undo tip is what it was last blessed to — the safety
+            // checkpoint's, when that was taken on it — and stays reachable
+            // from that checkpoint's ref, so moving it back is expected, not
+            // divergence.
+            if restored.source.off_branch(&branch.source_ref).is_none() {
+                let blessed = branch.source_rev.clone();
+                self.bless_store_branch(
+                    &mut branch,
+                    &restored.source.head_rev,
+                    Some(&blessed),
+                    &mut warnings,
+                )?;
+            }
 
             // After the source: `prepare`, install keys and renders read
             // the restored content, not what was here before the undo.
@@ -9158,6 +9195,63 @@ impl BranchManager {
         Ok(())
     }
 
+    /// Put the workspace's HEAD where checkpoint `restored` had it — on its
+    /// branch, or detached — at the checkpoint's commit, ready for
+    /// [`GitSource::workspace_restore_to`]. The branch HEAD is on now moves
+    /// with a plain reset, as it always has: the safety checkpoint holds its
+    /// tip. Any other branch moved here may hold commits nothing else does,
+    /// so that is said, with the tip to recover them from.
+    fn point_workspace_head(
+        &self,
+        branch: &BranchInstance,
+        restored: &SourceState,
+        warnings: &mut Vec<String>,
+    ) -> Result<()> {
+        let workspace = &branch.workspace_path;
+        let target = restored.head_branch(&branch.source_ref);
+        let current = GitSource::workspace_branch(workspace)?;
+        let rev = &restored.head_rev;
+        if let Some(target) = target
+            && current.as_deref() != Some(target)
+            && let Some(old) = GitSource::workspace_branch_rev(workspace, target)
+            && &old != rev
+            && crate::source::run_git_env(
+                &[
+                    "-C",
+                    workspace.as_str(),
+                    "merge-base",
+                    "--is-ancestor",
+                    &old,
+                    rev,
+                ],
+                &[],
+            )
+            .is_err()
+        {
+            warnings.push(format!(
+                "undo moved the workspace's `{target}` back from {} to {}; its later commits \
+                 are not lost — `git branch <name> {}` keeps them",
+                short(&old),
+                short(rev),
+                short(&old)
+            ));
+        }
+        if current.as_deref() != target {
+            let from = match &current {
+                Some(current) => format!("on `{current}`"),
+                None => "detached".to_owned(),
+            };
+            let to = match target {
+                Some(target) => format!("on `{target}`"),
+                None => format!("detached at {}", short(rev)),
+            };
+            warnings.push(format!(
+                "the workspace was {from}; undo put it back {to}, as the checkpoint had it"
+            ));
+        }
+        GitSource::workspace_point_head(workspace, target, rev)
+    }
+
     fn checkpoint_log(&self, branch: &BranchInstance) -> CheckpointLog {
         CheckpointLog::new(self.store.checkpoint_dir(&branch.slug), &branch.name)
     }
@@ -9412,6 +9506,9 @@ pub struct MergeOutcome {
     /// The checkpoint taken first: what merged. Empty for the project root,
     /// whose commits are what merged.
     pub checkpoint: String,
+    /// What that checkpoint warned about — among them, a workspace that was
+    /// not on the instance's branch, whose checked-out work is what merged.
+    pub warnings: Vec<String>,
     pub trackers: Vec<TrackerMerge>,
     /// The project on the remote whose branch moved, when there is one.
     pub remote: Option<String>,
@@ -9557,6 +9654,34 @@ pub fn fork_repo(project: &str, instance: &str, tracker: &str) -> String {
 /// Where a fork keeps a checkpoint's commit for its tracker.
 pub fn fork_checkpoint_ref(id: &str) -> String {
     format!("refs/newgit/checkpoints/{id}")
+}
+
+fn short(rev: &str) -> &str {
+    &rev[..8.min(rev.len())]
+}
+
+/// What a checkpoint says when the workspace was not on the instance's
+/// branch: what it holds, and that the instance's branch did not move.
+fn off_branch_warning(
+    off: &OffBranch,
+    branch: &BranchInstance,
+    head_rev: &str,
+    id: &str,
+) -> String {
+    let own = &branch.source_ref;
+    let (here, what) = match off {
+        OffBranch::Branch(name) => (format!("is on `{name}`"), format!("`{name}`")),
+        OffBranch::Detached => (
+            format!("has HEAD detached at {}", short(head_rev)),
+            "that commit".to_owned(),
+        ),
+    };
+    format!(
+        "the workspace {here}, not `{own}`: checkpoint {id} holds {what} as it stands, and \
+         undo returns to it, but `{own}` stays at {}. `git checkout {own}` to work on the \
+         instance's branch again",
+        branch.short_rev()
+    )
 }
 
 #[cfg(test)]

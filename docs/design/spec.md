@@ -974,6 +974,31 @@ content, then resources by their restore rules in dependency order,
 restarting what was running. `undo --only <resource>` restores just that
 resource.
 
+### A workspace off its instance's branch
+
+Agents run `git checkout -b try-x` inside a workspace as a matter of
+course. A checkpoint holds the workspace as it stands, and which branch is
+checked out is part of that: the record keeps it (`checked_out`, or
+`detached` for a detached `HEAD`, mid-rebase included). The instance's
+branch in the project repository moves only when the workspace is on it.
+Moving `feature-a` to `try-x`'s commits would be a merge nobody asked for,
+so newgit leaves `feature-a` where it was and says so, naming both
+branches. Refusing instead would block the checkpoint, the push, and the
+undo exactly when an agent is experimenting, and those are the moments a
+checkpoint matters most (#259).
+
+Undo puts `HEAD` back where the checkpoint had it: on its branch at its
+commit, or detached. It moves only that branch, never the one the workspace
+happens to be on. When the branch it moves is not the current one and holds
+commits the checkpoint does not, undo prints the old tip. The instance's
+branch follows only a checkpoint taken on it.
+
+`merge` and a push to a newgit remote carry what the checkpoint holds,
+which is whatever the workspace has checked out. Both repeat the
+checkpoint's warning. `status` shows the divergence:
+`` feature-a@1a2b3c4d (workspace on `try-x`) ``, and `checkpoints` marks each
+checkpoint taken off the branch with `` [on `try-x`] ``.
+
 A resource's restore is one of `none`, `command`, `recompute` (re-run an
 action, `prepare` by default, when the identity changed), or `external`.
 `recompute` is correctness for path-dependent artifacts, not an

@@ -362,6 +362,12 @@ project's repository, and `git push` checkpoints the instance before
 forwarding the push there — succeeding only if that remote accepted it.
 `gh pr create` works from the workspace with no flags.
 
+**Branching inside a workspace is fine.** `git checkout -b try-x` in an
+instance's workspace works the way Git does. A checkpoint captures `try-x`
+as it stands, and undo returns to it, but the instance's own branch stays
+where it was until you switch back and commit there. `status` shows
+`` feature-a@1a2b3c4d (workspace on `try-x`) `` while that is the case.
+
 **`cleanup` never breaks an undo.** It finalizes instances whose workspace is
 gone, deletes unclaimed workspaces and dead process state, and prunes tracker
 snapshot revs nothing references — but never a rev a checkpoint still points

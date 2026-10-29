@@ -2755,6 +2755,7 @@ fn checkpoints(instance: Option<String>) -> Result<()> {
         );
         return Ok(());
     }
+    let own = manager.store().find_branch(&instance)?.source_ref;
     println!(
         "{:<10} {:<17} {:<12} {:<10} MESSAGE",
         "ID", "CREATED", "REASON", "SOURCE"
@@ -2783,7 +2784,14 @@ fn checkpoints(instance: Option<String>) -> Result<()> {
             record.created_at.format("%Y-%m-%d %H:%M"),
             reason,
             source,
-            record.message.as_deref().unwrap_or("-")
+            match record.source.off_branch(&own) {
+                // Taken with the workspace off the instance's branch: undo
+                // to it puts the workspace back there.
+                Some(off) => format!("[{off}] {}", record.message.as_deref().unwrap_or_default())
+                    .trim_end()
+                    .to_owned(),
+                None => record.message.as_deref().unwrap_or("-").to_owned(),
+            }
         );
     }
     println!(
@@ -3527,6 +3535,28 @@ fn plural(count: usize, noun: &str) -> String {
 }
 
 fn source_column(report: &InstanceReport) -> String {
+    use newgit_core::checkpoint::OffBranch;
+    // Off the instance's branch, the live HEAD is not `base`'s, so it is not
+    // labelled as `base`'s: the instance's branch shows where it is, and the
+    // workspace's own branch beside it.
+    match &report.off_branch {
+        Some(OffBranch::Branch(name)) => {
+            return format!(
+                "{}@{} (workspace on `{name}`)",
+                report.branch.source_ref,
+                report.branch.short_rev()
+            );
+        }
+        Some(OffBranch::Detached) => {
+            return format!(
+                "{}@{} (workspace detached at {})",
+                report.branch.source_ref,
+                report.branch.short_rev(),
+                report.live_rev.as_deref().unwrap_or("?")
+            );
+        }
+        None => {}
+    }
     let rev = report
         .live_rev
         .clone()
@@ -3614,6 +3644,7 @@ fn merge(instance: Option<String>, into: &str) -> Result<()> {
     use newgit_core::manager::TrackerMergeAction;
     let (manager, instance) = manager_and_instance(instance)?;
     let outcome = manager.merge(&instance, into)?;
+    print_warnings(&outcome.warnings);
     let moved = outcome
         .trackers
         .iter()

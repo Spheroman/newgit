@@ -429,6 +429,55 @@ impl GitSource {
         run_git(&["-C", workspace.as_str(), "rev-parse", "HEAD"])
     }
 
+    /// The branch a workspace clone has checked out, or `None` when its HEAD
+    /// is detached (a `git checkout <rev>`, or mid-rebase).
+    pub fn workspace_branch(workspace: &Utf8Path) -> Result<Option<String>> {
+        let head = run_git(&[
+            "-C",
+            workspace.as_str(),
+            "rev-parse",
+            "--symbolic-full-name",
+            "HEAD",
+        ])?;
+        Ok(head.strip_prefix("refs/heads/").map(ToOwned::to_owned))
+    }
+
+    /// A branch's tip in a workspace clone, `None` when it has no such branch.
+    pub fn workspace_branch_rev(workspace: &Utf8Path, branch: &str) -> Option<String> {
+        run_git(&[
+            "-C",
+            workspace.as_str(),
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("refs/heads/{branch}^{{commit}}"),
+        ])
+        .ok()
+        .filter(|rev| !rev.is_empty())
+    }
+
+    /// Point a workspace's HEAD at `rev` — on `branch`, moved there, or
+    /// detached when `branch` is `None` — without touching the index or the
+    /// worktree. [`Self::workspace_restore_to`] brings those along after.
+    pub fn workspace_point_head(
+        workspace: &Utf8Path,
+        branch: Option<&str>,
+        rev: &str,
+    ) -> Result<()> {
+        let ws = workspace.as_str();
+        match branch {
+            Some(branch) => {
+                let name = format!("refs/heads/{branch}");
+                run_git(&["-C", ws, "update-ref", &name, rev])?;
+                run_git(&["-C", ws, "symbolic-ref", "HEAD", &name])?;
+            }
+            None => {
+                run_git(&["-C", ws, "update-ref", "--no-deref", "HEAD", rev])?;
+            }
+        }
+        Ok(())
+    }
+
     /// Committed content of one path in a workspace clone: the blob at HEAD,
     /// not what is on disk. `None` when HEAD has no such path.
     ///
