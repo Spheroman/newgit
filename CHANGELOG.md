@@ -12,6 +12,551 @@ time by `scripts/release-changelog.sh`, which then deletes the fragments.
 Two changes never touch the same lines, so nothing queues behind whichever
 branch landed first.
 
+## [0.7.0] — 2026-10-28
+
+An instance can be put down and picked up again. `newgit stop` and
+`newgit start` take every resource of an instance down and back at once,
+`supabase` containers included, so T3 Code frees a settled thread's ports
+and memory without losing it, and `autostart` has a spawn bring up its dev
+server. Claude Code's worktrees get instances of their own, newgit installs
+with one line on any Linux distro, and a long list of fixes makes what
+`spawn`, `undo` and `status` report match what happened. See *Upgrading*.
+
+### Added
+
+- `newgit stop [instance]` and `newgit start [instance]` stop and start an
+  instance's resources at once
+  ([#157](https://github.com/Spheroman/newgit/issues/157)).
+
+  The only lever was `newgit action <resource>.<action>`, one resource at a
+  time, so a caller releasing an instance had to know every resource's
+  actions and order them itself. `stop` stops every running long-running
+  action, dependents first, and records what it stopped; `start` brings
+  back exactly that, dependencies first, and nothing nobody had started.
+  Both are idempotent and exit 0 with nothing to do, so T3 Code can call
+  them on every settle and unsettle; `--json` says which resource failed,
+  and exit 1 says that one did. Unlike `remove`, the workspace, trackers,
+  installs, and port claims stay, so the instance comes back on the same
+  ports. `remove` now stops running resources dependents first too.
+
+- `newgit stop` and `newgit start` take down and bring back a resource that
+  is not a process newgit supervises, through a `suspend` / `resume` action
+  pair it defines ([#157](https://github.com/Spheroman/newgit/issues/157)).
+
+  `stop` only signalled supervised processes, so a settled T3 Code thread
+  whose `prepare` ran `supabase start` kept a dozen containers, nine ports
+  and a gigabyte or two of memory until the thread was deleted. `stop` now
+  runs `suspend` after a resource's dependents are down, and `start` runs
+  `resume` before they come back; the `supabase` template defines the pair
+  as `supabase stop` / `supabase start`, which keeps the data. `suspend`
+  never runs for a `project` or `user` resource, which other instances
+  share, nor for one that never came up. Each needs a command, and neither
+  is accepted without the other.
+
+  `start` no longer starts a resource whose dependency did not come back in
+  the same `start`: it fails naming the dependency and stays owed, so a dev
+  server is not brought up against a database that is still down.
+
+- `autostart = true` on a long-running action has `newgit spawn` start it
+  once every `prepare` has run, dependencies first, so a spawned instance
+  comes up with its dev server running. The `process` template sets it.
+
+  Before, spawn ran only `prepare`, and a dev server waited for someone to
+  run `newgit action app.start`; T3 Code and Claude Code never did. A start
+  that fails is reported like a failed `prepare`: the spawn says which
+  resource did not come up and exits 1, and a resource that depends on it
+  is not started against it. `spawn --json` lists each attempt under
+  `started`, in the shape `newgit start --json` uses. `spawn
+  --from-checkpoint` starts them after its restore, and `newgit tracker use`
+  starts those of the resources a tracker brings, which `drop` stops. An
+  existing resource definition is unchanged until you add the key.
+
+- `newgit claude-code install` gives Claude Code's worktrees newgit
+  instances: `claude --worktree <name>`, a subagent with `isolation:
+  "worktree"`, and a background session each spawn an instance named for
+  the worktree, with its trackers projected and its resources prepared,
+  and removing the worktree runs `newgit remove`.
+
+  It writes Claude Code's `WorktreeCreate` and `WorktreeRemove` hooks into
+  `.claude/settings.local.json` (`--shared` writes `.claude/settings.json`
+  instead), and refuses beside another `WorktreeCreate` hook rather than
+  have two race to make the worktree. The hooks are `newgit claude-code
+  worktree-create` and `worktree-remove`, which read Claude Code's hook
+  input on stdin and print nothing on stdout but the workspace path. A
+  worktree name already in use resumes its instance, and each workspace
+  gets the hooks in its own Git-excluded `.claude/settings.local.json`,
+  since Claude Code reads the remove hook from the directory the session
+  ends in.
+
+- `newgit export --remote <name>` brings in what was merged on the target
+  before it pushes. When the target's branch is ahead of the export (a pull
+  request merged on GitHub, a dependabot bump), the project root
+  fast-forwards to it and it merges into `main`, as `git pull` then
+  `newgit merge main` did by hand. Before, the push was refused as not a
+  fast-forward. When the target's commits are not the project's own (the
+  project root has commits of its own, or the target withholds a tracker),
+  it refuses and says how to bring them in. `--dry-run` reports how many
+  commits would come in; `--force` still replaces the branch instead.
+
+- One-line install: `curl -fsSL https://newgit.dev/install.sh | sh` picks the
+  release binary for your platform, verifies its checksum, and installs it to
+  `~/.local/bin`. Or `brew install spheroman/newgit/newgit`; each release
+  updates the tap's formula.
+
+- `newgit remote delete <owner>/<name>` deletes a project from its newgit
+  remote: every token pinned to it is revoked, every repo under its prefix
+  deleted, and its record cleared, so the name can be linked again from
+  scratch. Owner only, from a login rather than an agent's or workspace's
+  token, and the project is typed out to confirm. It removes `[remote]` from
+  `.newgit/config.toml`.
+
+- A `[[render]]` can target a file inside its resource's own `[identity]
+  produces`, so the install store can share a tree that names its own
+  workspace.
+
+  Until now the store declined any tree that mentioned the absolute path of
+  the workspace it was built in, and pnpm writes that path into
+  `node_modules/.pnpm-workspace-state-v1.json`, so no pnpm workspace was
+  ever stored. A render into a built tree treats the file as rendered for
+  the instance that built it: storing reverses it to `find`, and filling
+  renders it forwards with the filled instance's `{{workspace}}`. The stored
+  copy is still scanned, so a path the render does not cover still keeps
+  the tree out. `count` is refused on such a render, and `render --check`
+  skips it. The `pnpm` template now declares one for the workspace state
+  file. On T3 Code, a second `newgit spawn` now takes about 5s instead of
+  50s.
+
+
+### Changed
+
+- The Linux release binaries are static musl builds
+  (`newgit-<arch>-unknown-linux-musl.tar.gz`), replacing the glibc builds.
+  Those needed glibc 2.39, so they did not run on Debian 12, Ubuntu 22.04,
+  RHEL 9, Amazon Linux 2023, or Alpine. The static builds run on all of them.
+
+
+### Fixed
+
+- The `init_in_a_workspace_is_refused` test no longer flakes on Linux
+  ([#204](https://github.com/Spheroman/newgit/issues/204)).
+
+  It walked the configured workspace root two levels deep, as if a
+  per-project directory sat between it and the workspace, and so listed the
+  workspace's own contents and ran `newgit init` from whichever entry
+  `read_dir` returned first. ext4 orders entries by filename hash, so a file
+  came first on some runs and `current_dir` failed with `ENOTDIR`. The test
+  now uses the workspace path spawn writes.
+
+- The `supabase` template allocates and renders every port `supabase init`
+  writes, so a second instance's render is no longer refused
+  ([#205](https://github.com/Spheroman/newgit/issues/205)).
+
+  The template allocated six ports, but `supabase init` writes nine in the
+  same 543xx block: the disabled pooler's `port = 54329` and the
+  commented-out `# smtp_port = 54325` and `# pop3_port = 54326` as well.
+  Once a first instance held the six, the second instance's scan landed on
+  those numbers, and the render refused: `port = 54325` also matches inside
+  `# smtp_port = 54325`, so the file would name the value twice and
+  `newgit capture` could not reverse it. The template now has `smtp`,
+  `pop3` and `pooler` lanes, rendered like the others, so those ports also
+  move per instance once enabled or uncommented. A project that added the
+  template before this has its own copy under `.newgit/resources/`, and
+  `resource add` will not overwrite it. Copy the three `[ports]` lines and
+  their three `[[render]]` rules from `newgit resource templates --show
+  supabase` into that file.
+
+- Changing a live instance's binding rebuilds the installs keyed on it
+  ([#206](https://github.com/Spheroman/newgit/issues/206)).
+
+  Since #153 the install store keys a tree on the trackers its instance
+  binds, because a shared install builds the bound members, named by
+  `{{bound.paths}}` or found on disk. Two paths changed the binding of a
+  live instance and left such a tree as it was. `tracker use` and `drop`
+  only started and stopped the resources the tracker brings, and a shared
+  install is brought by `root`, which is always bound, so an instance that
+  bound `b` kept the tree built without it until someone ran `prepare` by
+  hand. And undo's `recompute` skip compared the checkpoint's identity hash
+  with the pre-undo one, which the binding is not part of, so an undo that
+  restored a different binding kept the tree built for the one it replaced
+  and reported `skipped: identity unchanged`.
+
+  `tracker use` and `drop` now rebuild every bound install that holds a
+  tree once the binding has moved, the same way a spawn builds it: filled
+  from the store when another instance built that binding already, else by
+  running its `prepare` and publishing the result. The command reports each
+  rebuild; one that fails leaves the resource `failed` without failing the
+  command, with `newgit action <resource>.prepare` as the retry, and what
+  depends on it is reported as not rebuilt and left `pending`. A `use` that
+  brings what a tracker `requires` binds their resources once all of it is
+  bound, so they are built for the whole binding. Undo's skip now requires
+  the binding it restored to be the one the instance had, for a resource
+  that declares `[identity] produces`, so it compares the inputs the store
+  key does; an undo that drops or brings back a tracker rebuilds such a
+  tree, through the store first.
+
+- `[identity] key_command` is rendered before it runs, like an action
+  `command`, and the reference's *Template variables* tables list
+  `{{bound.trackers}}` and `{{bound.paths}}`
+  ([#207](https://github.com/Spheroman/newgit/issues/207)).
+
+  The reference said every command is rendered, but `key_command` was
+  handed to the shell verbatim, so `{{bound.paths}}` in one printed as
+  `{{bound.paths}}`. It now gets the scope an action command gets: branch,
+  workspace, scripts, this resource's ports and `{{bound.*}}`. The binding
+  is already part of every key; `{{bound.paths}}` lets the command pass it
+  to what it inspects. The reference now warns against printing
+  per-instance values like `{{workspace}}`, which would key every instance
+  apart. The two `bound` variables were described everywhere but the
+  tables that are supposed to list every variable and where it has a
+  value; they now have rows and a scope column, and the scope table has a
+  `key_command` row.
+
+- `spawn --from-checkpoint` now exits 1 when the instance it leaves is not
+  ready, and says why: each restored resource's line carries the restore's
+  verdict (`ok` or `FAILED`), as `undo` prints it, and a failed restore's
+  recovery record is named on stderr
+  ([#208](https://github.com/Spheroman/newgit/issues/208)).
+
+  #86 and #124 gave the plain `spawn` and both `--json` forms an exit code
+  that says what the summary says, and left the human-readable
+  `--from-checkpoint` behind: it printed `resource: seed command` and exited
+  0 whether the command had succeeded or not, so the only place the failure
+  showed was a later `newgit status`. It now judges by the same condition
+  `--json` does: a failed restore, or a resource the checkpoint held no
+  state for that failed to bind, both exit 1. The headline names what did
+  not come up, and every resource the instance has gets a line — one the
+  restore did not touch shows its bind's `prepare` verdict, as a plain
+  `spawn` prints it, and so does one whose restore ran nothing (no
+  `[restore]`, `none`, `external`) and left it as a failed bind had it. The
+  instance and its record are kept, as before.
+
+- A dependent with no `prepare` is reported blocked by every surface when
+  its dependency fails, `spawn --json` included
+  ([#209](https://github.com/Spheroman/newgit/issues/209)).
+
+  Such a resource is recorded `ready` on purpose (#28: nothing was withheld
+  from it, and nothing would ever rerun to move it off `pending`), and
+  `status`, `action` and the human-readable `spawn` derive blocked-ness
+  from the graph at read time instead. `spawn --json` read the record's
+  `ready` straight through with an empty `blocked_by`, so a script saw the
+  resource ready while `status` said `blocked(base)` and `action` refused
+  to start it. It now derives `blocked` and `blocked_by` the same way the
+  other surfaces do. A script that treated `ready` with a failed
+  dependency as fine will now see `blocked`.
+
+  The human-readable `spawn` also said `prepare: BLOCKED by base` for a
+  resource with no `prepare`, then counted only the failed dependency in
+  "1 of 2 resources did not bind". It now says `BLOCKED by base (no prepare
+  to run; its actions are refused until that is repaired)`, and the count
+  includes every blocked resource, as the spec already said it should.
+
+  A resource that failed itself (its export, render or `prepare`) with a
+  dependency down too is now `failed` in `status`, as it already was in
+  `spawn` and `spawn --json`, rather than `blocked(...)`: repairing the
+  dependency would not fix it.
+
+- `undo` to a checkpoint taken by `tracker drop --discard` no longer brings
+  back a file that was deleted when the checkpoint was taken
+  ([#210](https://github.com/Spheroman/newgit/issues/210)).
+
+  Undo restored the source while the tracker was still dropped, when its
+  paths were skip-worktree entries the restore leaves alone, so a deleted
+  file stayed in the index and came back from HEAD when the tracker was
+  bound again afterwards. The binding is now restored before the source,
+  so the restore sees the tracker's paths as ordinary tracked files and the
+  deletion holds, as it already did for paths outside a dropped tracker.
+
+- `undo` no longer prints a bare `ok` for a resource it leaves failed,
+  blocked or pending ([#211](https://github.com/Spheroman/newgit/issues/211)).
+
+  Since #137 a restore that runs nothing (`none`, `external`, no
+  `[restore]`) leaves a resource's status as it found it, so a `prepare`
+  that failed before the undo is still failed after it. The report's `ok`
+  is the verdict on the restore action, which could not fail; under
+  "Restored" it read as the resource being fine while `status` showed it
+  failed. The line now adds what the resource is left as, the way `status`
+  derives it — `none ok, left failed`, `none ok, left blocked by deps` — and
+  `UndoResourceOutcome` carries it as `status` and `blocked_by`. A restore
+  that was ok but whose restart failed now says `restart FAILED` and counts
+  against "N of M resources restored" and the "may be in a partial state"
+  list; before, that list could name nobody.
+
+- Two commands on one instance no longer run over each other
+  ([#212](https://github.com/Spheroman/newgit/issues/212)).
+
+  Nothing serialized them: two overlapping checkpoints minted the same id
+  and the one saved last replaced the other, and an `action` saved back the
+  whole record it had loaded before a parallel one changed it, so a failed
+  `prepare` came back as ready. Every command that changes an instance now
+  holds that instance's lock (`.newgit/local/locks/<slug>.lock`, an
+  advisory file lock the kernel releases with the process, so a crash
+  leaves nothing stale) from start to finish, and a second command on the
+  same instance waits, saying so. A hook run under the lock sees
+  `NEWGIT_LOCKED`, the locks it runs under; a `newgit` it starts that would
+  need one of them refuses instead of waiting for its own ancestor. Records
+  are also written to a temporary file, flushed, and renamed into place, so
+  a reader — `status`, `spawn`, anything that lists instances — never
+  parses one half-written, and a crash mid-write leaves the record it
+  found.
+
+- `spawn --json` now exits non-zero when a resource did not come up, and
+  says which: the follow-up to
+  [#86](https://github.com/Spheroman/newgit/issues/86), which fixed only
+  the human-readable `spawn`.
+
+  #86's check ran only after the `--json` branch had printed and returned,
+  and that branch printed nothing about resources, so a failed `prepare`
+  exited 0 with nothing in the output saying so — to a script, the caller
+  most likely to ask for JSON and the one that goes by the exit code. Each
+  resource is now listed, by name, with its `status` (`ready`, `failed`,
+  `blocked` or `pending`), its ports, its `prepare` log, any render or
+  export error, and `blocked_by`: the dependencies that are not ready, for
+  a resource that is not ready itself. The exit is the same `exit 1`,
+  after the JSON; the instance and its record are kept, as they are
+  without `--json`.
+
+  `spawn --from-checkpoint --json` had the same gap, and now judges by the
+  instance the restore leaves: a failed restore exits 1, and so does a
+  resource the checkpoint never had that failed to bind. Status and
+  `blocked_by` describe that instance, not the bind the restore ran after,
+  and `recovery_record` names the record of a failed restore. Its
+  `resources` array changed shape, which matters to a script that reads
+  it: it now lists every resource the instance has, by name rather than
+  in restore order, and `action` and `ok`, before always a string and a
+  bool, are null for a resource the restore did not touch. A script that
+  requires every `ok` to be true now fails on such a resource unless it
+  skips the nulls.
+
+- Code trackers are carved in the order they nest: `project` (`.newgit`)
+  before `access` (`.newgit/trackers`), which carves out of it. By name,
+  `access` came first and found nothing to carve, so a project whose
+  history already held `.newgit/` (a clone adopted with `newgit init`)
+  failed `remote add` with "refusing to merge unrelated histories".
+
+- A checkpoint no longer captures an instance's rendered values into a
+  secret tracker's lane, and neither does the safety capture `tracker
+  pull` takes before it re-binds. Like `tracker capture` and `tracker
+  checkout`, both now reverse the `[[render]]` substitutions in files the
+  tracker owns for the capture, so the lane gets the committed values and
+  any edit made beside them.
+
+  The lane is shared by every instance, so an instance's allocated port
+  did not stay with it: once `tracker merge` made such a rev the lane's
+  `main`, each instance spawned after that got that port in the file and
+  failed to render it. The checkpoint also records the rev as the file's
+  committed content, which the render's `find` no longer matched, so
+  `undo` to it warned that the re-render failed.
+
+  A rendered file holding exactly its committed content, which is what a
+  tracker restore leaves, is no longer reported as having "changes that
+  render will discard": a re-render loses nothing in it. With the lane
+  fixed, `undo` would have printed that after restoring such a file;
+  `tracker checkout` and `tracker pull` already returned it, in warnings
+  the CLI does not print.
+
+- Two `newgit spawn`s that overlap are no longer promised the same port.
+  Agents spawning side by side is the case newgit is built for, and the
+  instance that came up second could not bind its port, or reached the
+  other instance's service on it.
+
+  The binding records are the only claim on a port, and `spawn` wrote its
+  record only after every `prepare` had run, so a spawn that started
+  while another was still installing found no claim on the port that one
+  had been given, and nothing listening on it yet either. Each resource's
+  ports are now written into the record before its `prepare` runs, under
+  a lock (`.newgit/local/ports.lock`) held only while they are chosen, so
+  spawns still install side by side. `tracker use`, and an `undo` that
+  binds resources, claim their ports the same way.
+
+  The record is now written as soon as an instance's resources start to
+  bind, not once they are prepared: `newgit status` shows an instance
+  that is still spawning, and one whose spawn failed or was killed after
+  that point keeps its record, and with it its ports, until `newgit
+  remove`. Each resource is in that record, `Pending`, with its exports
+  and rendered files, before its `prepare` runs, so after a spawn killed
+  in `prepare`, `newgit action <resource>.prepare` runs it with the
+  resource's exports, and newgit still knows which files it rendered.
+
+  A resource is `Pending` in that record while its `prepare` runs, so
+  readiness no longer assumes a `Pending` resource is waiting on a
+  dependency, where it said it "never came up (a dependency of it did
+  not)": with no dependency blocking it, it says the resource "has not
+  been prepared" and to run `newgit action <resource>.prepare` unless
+  newgit is still preparing it.
+
+- The Git endpoint at `https://newgit.dev/<owner>/<name>.git` answers again.
+  Since the endpoint learned to sleep, its object set the container's
+  inactivity backstop in its constructor, before any container had started;
+  that throws, so every clone and fetch failed with a 500. The backstop is
+  now set once the container is running.
+
+- `newgit init` where `.newgit/` already exists adopts it instead of
+  refusing. A plain `git clone` of a newgit project, or a project set up
+  before trackers had histories, left `root` with no history, so `remote
+  add`, `merge main`, and `export --remote` failed with "its history shares
+  no commit with the trackers' histories". `init` now writes any missing
+  built-in tracker definitions and gives `root` the project's history, as a
+  fresh `init` does; that error names it.
+
+- The install store keys a tree on the trackers its instance binds, so an
+  instance is no longer filled with a tree built for a different binding:
+  one that drops a tracker got the tree built for an instance that binds
+  it, and the other way round.
+
+  A shared lockfile lists every member, bound or not, and its install
+  builds the bound ones, named by `{{bound.paths}}` or found on disk, where
+  a dropped tracker's files are not checked out. The key held the identity
+  paths' content, `key_command`'s output and the definition, and a shared
+  lockfile does not change with the binding, so the tree built for one
+  binding filled instances of another. docs/design/trackers.md already said the
+  bound set was part of the install's identity.
+
+  The binding is in every resource's key, not only those whose commands
+  mention `{{bound…}}`, because an install can read it without naming it:
+  an unfiltered `npm ci` links a workspace member only when the member is
+  checked out, and a check for the placeholder would have left that case
+  as it was. The cost is cache hits. Instances whose bindings differ no
+  longer share a tree for any resource, even one the binding cannot
+  change, such as a package's own install in its own tracker, so each
+  binding installs once. Instances that bind the same trackers still
+  share.
+
+  Every existing store entry is re-keyed, which costs one reinstall per
+  key: the first spawn at each new key installs and stores its tree, and
+  `newgit cleanup` reclaims the old entries, which nothing keys to any
+  more.
+
+- On macOS the install store clones a stored tree with one `clonefile(2)`
+  call per produced path instead of `cp -c`.
+
+  `cp -c` clones one file at a time, so on a large pnpm monorepo a cache
+  hit was slower than the install it replaced: filling T3 Code's 264k-file
+  `node_modules` took 37s, against 17s for `pnpm install`. A cache-hit
+  `newgit spawn` of that repo now takes about 5s instead of 40s. `cp` is
+  still the fallback, and Linux keeps `cp --reflink`.
+
+- `newgit remove`, and `newgit cleanup` finishing an instance whose
+  workspace is gone, no longer refuse while the resource graph does not
+  resolve. Teardown is the way out of a broken project, and 0.2.0 promised
+  that `remove` would never depend on the graph holding together.
+
+  The promise held only for instances with no `[cleanup] command` to run.
+  A hook's environment came from the same assembly as `newgit run`'s,
+  which refuses any graph that does not resolve, so one bad `depends_on`
+  anywhere made every instance with a hook impossible to remove, even one
+  that binds only valid resources. A hook now gets that environment layered
+  in whatever order the graph has. An edge that does not resolve is skipped
+  rather than fatal, so every variable is there.
+
+  The order decides only a name two declarations claim, and that is where
+  teardown still refuses: when both reach the instance with different
+  values, a hook would get whichever is layered last and could tear down
+  the wrong thing with it. An existing instance meets that when a port's
+  `env` is set or renamed onto a name another of its resources already
+  uses, since a port's `env` is read from its definition each time. The
+  refusal names the collision and leaves the instance untouched until it
+  is renamed. A collision that does not reach the instance, such as one
+  with a resource added after the spawn, does not block it. `newgit env`
+  still refuses on any graph that does not resolve, so it cannot show a
+  teardown's environment beforehand.
+
+- Tracker paths are checked by where they lead rather than how they are
+  spelled, and a code tracker may own other trackers' definitions: the
+  governance layering docs/design/trackers.md describes under "Who may change
+  what".
+
+  The check read a path's first component as written, so `./.git`, which
+  leads with `.`, got past the guard that refuses `.git`: a secret tracker
+  could claim the workspace's Git directory, and its captures would sweep
+  up the files in it. `tracker track` also kept `./.env.local` as written
+  and ignored it as `/./.env.local`, which Git matches to no file, so the
+  secret was not ignored at all. Paths are now normalized before they are
+  checked and stored, and `.git` and `.newgit` are refused in any case,
+  since a case-insensitive file system, macOS's default, opens `.GIT` as
+  `.git`. A definition that already claims such a path no longer loads,
+  and the error names the path.
+
+  The same guard refused every claim inside `.newgit/`, including the one
+  the design rests on: who may change a tracker's paths and audience is
+  whoever may change the tracker owning its definition file, so the
+  maintainers of an admin tracker owning `.newgit/trackers/web.toml`
+  decide who reads `web`. The remote resolves such a claim, but locally
+  the project would not open. Those files are all that opens up, and only
+  to code trackers, since a secret tracker would keep the definition out
+  of Git. The rest of `.newgit/` stays with `project` and `access`.
+
+- `undo` no longer runs a resource's `[restore] command` with nothing to
+  restore from, after a checkpoint that went ahead without the resource's
+  dump or handle because it was not up. With any bundled database
+  template, that restore emptied the database once it was back up. This
+  was disclosed under "Not in this PR" in
+  [#137](https://github.com/Spheroman/newgit/pull/137).
+
+  A checkpoint goes ahead without a resource that is not up and whose
+  capture fails, and `newgit checkpoint` says an undo to it "leaves them as
+  they are". The undo ran that resource's `[restore] command` all the same,
+  with `{{state_ref}}` unrendered, and every bundled database template
+  drops or resets the database before it reads the dump. `spawn
+  --from-checkpoint`, which ends in the same undo, ran it in the new
+  instance, and a redo did the same to a resource that was failed when the
+  undo it redoes began, since that undo's safety checkpoint skips it. When
+  the checkpoint is `command` or `external` and the restore is a `command`,
+  the undo now leaves that restore out: the resource keeps its state and
+  status, and a warning names it. A process it was running is still
+  stopped with the rest and started again after its dependencies, and the
+  undo reports the resource as `not restored + restarted`; a restart that
+  fails is reported like any other. That holds for checkpoints taken
+  before this fix too. A `recompute` restore still rebuilds such a
+  resource, since it ignores the ref. `newgit undo` prints no `resource:`
+  line for a resource it leaves out and did not stop, `spawn
+  --from-checkpoint --json` reports such a resource's `action` and `ok` as
+  null, and `checkpoint --verify` reports a resource it could not capture
+  as `NOT CAPTURED` when its restore runs something, and does not call the
+  instance verified.
+
+  A `command` restore whose `{{state_ref}}` has no value in the checkpoint,
+  such as one behind a `command` checkpoint that printed nothing, is now
+  refused rather than handed the literal placeholder, and the undo reports
+  it as a failed restore.
+
+- `undo` no longer marks a resource `ready` just because its restore had
+  nothing to run, so one whose `prepare` failed, or never ran behind a
+  failed dependency, stays `failed` or `pending` after an undo.
+
+  A `none` or `external` restore, a resource with no `[restore]`, and a
+  `recompute` skipped on unchanged identity all succeed without running
+  anything, and undo took that as proof the resource was up: `newgit
+  status` showed it and its instance `ready`, its dependents stopped
+  counting as blocked, and `spawn --from-checkpoint`, which ends in the
+  same undo, recorded a `prepare` that had just failed as `ready`. Such a
+  restore now leaves the status as it was; one that runs a command still
+  sets `ready` or `failed` by its result. The warning about a failed
+  resource the safety checkpoint skips no longer blames a restore when it
+  was the `prepare` that failed. A resource an earlier undo already marked
+  `ready` stays so until `newgit action <resource>.prepare` runs again.
+
+
+### Documentation
+
+- The design documents moved from the repository root into `docs/design/`:
+  `spec.md` (was `newgit-v1-mvp.md`), `trackers.md`, `remote.md` (was
+  `newgit-cloudflare.md`), `vision.md` (was `newgit-architecture.md`), and
+  `hosts.md`. `spec.md` is rewritten as the design of newgit as it is
+  rather than as a v1 plan, and leaves every key and template variable to
+  `newgit reference`. `vision.md` is labelled as the original vision, most
+  of it unbuilt. The tracker and remote docs, the README, and the guide are
+  brought in line with the code and list the open issues they know of.
+  `newgit reference` documents `[remote]` in `config.toml` and your own
+  `~/.newgit/config.toml`, shows sample tracker files, and says that
+  `merge_with_source` is stored but not yet read.
+
+- The README states the git newgit needs: 2.38 or newer, for
+  `git merge-tree --write-tree`. The install script warns when git is older.
+
+- Rewrote the README to explain what newgit is for and how to get started.
+  The full workflow, every command, and the details worth knowing moved to
+  `docs/guide.md`.
+
 ## [0.6.0] — 2026-10-26
 
 GitHub stays where it is. `newgit export --remote` pushes the trackers you
@@ -1882,6 +2427,14 @@ Binding records and checkpoints are the exception worth caring about: they
 are the only local state that is not reconstructible. A release that changes
 their format will say so here explicitly.
 
+**0.7.0 changes no formats you need to act on.** Two things cost a
+little once. The install store now keys each tree on the trackers its
+instance binds, so every existing entry misses: the first spawn at each new
+key installs again, and `newgit cleanup` reclaims the old entries. The Linux
+release archives are now `newgit-<arch>-unknown-linux-musl.tar.gz`; a
+script that downloads the old `-gnu` names needs the new ones, and
+`install.sh` picks them for you.
+
 **0.6.0 changes no formats.** Nothing new is required: export targets
 live in a new, optional `.newgit/exports/` (committed, like `trackers/`
 and `resources/`), and a project without one behaves as on 0.5.0.
@@ -1944,7 +2497,8 @@ themselves and neither of which is a reason to re-spawn:
   fresh field it has not. One successful `undo`, or one `newgit checkpoint
   --verify`, clears it for good.
 
-[Unreleased]: https://github.com/Spheroman/newgit/compare/v0.6.0...HEAD
+[Unreleased]: https://github.com/Spheroman/newgit/compare/v0.7.0...HEAD
+[0.7.0]: https://github.com/Spheroman/newgit/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/Spheroman/newgit/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/Spheroman/newgit/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/Spheroman/newgit/compare/v0.3.0...v0.4.0
