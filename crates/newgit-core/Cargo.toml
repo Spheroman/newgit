@@ -18,7 +18,13 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "serd
 # Process-group signalling and reaping (see supervisor.rs), and low-level
 # socket options (see ports.rs: the port-bind probe needs SO_REUSEADDR
 # off, which std's TcpListener does not expose).
+# Substring search for the path scan (see installs.rs): SIMD where the
+# platform has it, against a byte-by-byte window compare.
+memchr = "2"
 nix = { version = "0.31", features = ["signal", "process", "net", "fs"] }
+# The path scan reads every produced tree in full; one thread over 3.8 GB
+# took longer than the install it was vetting.
+rayon = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.11"
