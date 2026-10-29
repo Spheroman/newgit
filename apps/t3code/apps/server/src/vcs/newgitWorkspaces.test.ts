@@ -2,7 +2,9 @@
 import * as NodeChildProcess from "node:child_process";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, describe, it } from "@effect/vitest";
+import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
+import * as Fiber from "effect/Fiber";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Logger from "effect/Logger";
@@ -11,7 +13,12 @@ import * as Path from "effect/Path";
 
 import * as ServerConfig from "../config.ts";
 import * as GitVcsDriver from "./GitVcsDriver.ts";
-import { readNewgitWorkspace, spawnNewgitWorkspace } from "./newgitWorkspaces.ts";
+import {
+  readNewgitWorkspace,
+  spawnNewgitWorkspace,
+  startNewgitInstance,
+  stopNewgitInstance,
+} from "./newgitWorkspaces.ts";
 
 const newgitAvailable =
   NodeChildProcess.spawnSync(process.env.T3CODE_NEWGIT_BIN || "newgit", ["--version"]).status === 0;
@@ -48,7 +55,103 @@ const fakeNewgit = (script: string) =>
     );
   });
 
+// A newgit workspace marker for `name`, with a log the fake newgit appends its calls to.
+const fakeWorkspace = (name: string) =>
+  Effect.gen(function* () {
+    const fileSystem = yield* FileSystem.FileSystem;
+    const path = yield* Path.Path;
+    const dir = yield* fileSystem.makeTempDirectoryScoped();
+    yield* fileSystem.makeDirectory(path.join(dir, ".newgit", "local"), { recursive: true });
+    yield* fileSystem.writeFileString(
+      path.join(dir, ".newgit", "local", "instance.toml"),
+      `branch = "${name}"\nstore_root = "${dir}"\n`,
+    );
+    const log = path.join(dir, "calls.log");
+    const calls = fileSystem.readFileString(log).pipe(
+      Effect.map((text) => text.trim().split("\n")),
+      Effect.orElseSucceed(() => [] as string[]),
+    );
+    return { dir, log, calls };
+  });
+
 describe("newgit workspaces", () => {
+  it.effect("stops and starts an instance from its project root", () =>
+    Effect.gen(function* () {
+      const workspace = yield* fakeWorkspace("feature");
+      yield* fakeNewgit(
+        `echo "$(pwd -P) $*" >> '${workspace.log}'; echo '{"instance":"feature","resources":[]}'`,
+      );
+      yield* stopNewgitInstance(workspace.dir);
+      yield* startNewgitInstance(workspace.dir);
+      const root = NodeChildProcess.execSync("pwd -P", { cwd: workspace.dir }).toString().trim();
+      assert.deepEqual(yield* workspace.calls, [
+        `${root} stop feature --json`,
+        `${root} start feature --json`,
+      ]);
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+
+  it.effect("leaves plain directories alone and skips a stop the thread no longer wants", () =>
+    Effect.gen(function* () {
+      const fileSystem = yield* FileSystem.FileSystem;
+      const workspace = yield* fakeWorkspace("feature");
+      yield* fakeNewgit(`echo "$*" >> '${workspace.log}'; echo '{"resources":[]}'`);
+      yield* stopNewgitInstance(yield* fileSystem.makeTempDirectoryScoped());
+      yield* startNewgitInstance(yield* fileSystem.makeTempDirectoryScoped());
+      yield* stopNewgitInstance(workspace.dir, Effect.succeed(false));
+      assert.deepEqual(yield* workspace.calls, []);
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+
+  it.live("starts only after a stop still running finishes", () =>
+    Effect.gen(function* () {
+      const workspace = yield* fakeWorkspace("feature");
+      yield* fakeNewgit(
+        `echo "$1 begin" >> '${workspace.log}'; [ "$1" = stop ] && sleep 0.3; echo "$1 end" >> '${workspace.log}'; echo '{"resources":[]}'`,
+      );
+      // The guard runs under the instance lock, so once it fires the stop holds it.
+      const stopHoldsLock = yield* Deferred.make<void>();
+      const stopping = yield* Effect.forkChild(
+        stopNewgitInstance(
+          workspace.dir,
+          Deferred.succeed(stopHoldsLock, undefined).pipe(Effect.as(true)),
+        ),
+      );
+      yield* Deferred.await(stopHoldsLock);
+      yield* startNewgitInstance(workspace.dir);
+      yield* Fiber.join(stopping);
+      assert.deepEqual(yield* workspace.calls, [
+        "stop begin",
+        "stop end",
+        "start begin",
+        "start end",
+      ]);
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+
+  it.effect("logs resources that failed to start instead of failing", () =>
+    Effect.gen(function* () {
+      const workspace = yield* fakeWorkspace("feature");
+      const report = JSON.stringify({
+        instance: "feature",
+        resources: [
+          { name: "web", action: "dev", status: "failed", error: "port 3000 in use" },
+          { name: "db", action: "serve", status: "started" },
+        ],
+      });
+      yield* fakeNewgit(`echo '${report}'; exit 1`);
+      const logs: string[] = [];
+      yield* startNewgitInstance(workspace.dir).pipe(
+        Effect.provide(
+          Logger.layer([Logger.make(({ message }) => logs.push(JSON.stringify(message)))]),
+        ),
+      );
+      const warning = logs.find((line) => line.includes("left some resources")) ?? "";
+      assert.include(warning, "web: port 3000 in use");
+      assert.notInclude(warning, "db");
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+
   it.effect("opens the workspace when spawn exits 1 because a resource did not come up", () =>
     Effect.gen(function* () {
       const report = JSON.stringify({

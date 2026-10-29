@@ -4,9 +4,11 @@ This fork of [pingdotgg/t3code](https://github.com/pingdotgg/t3code) adds
 [newgit](https://github.com/Spheroman/newgit) support. In a project with
 `.newgit/config.toml` at its root, "New worktree" creates a newgit instance
 instead of a Git worktree: `newgit spawn <branch> --from <base> --json`
-makes the branch, its workspace, and its bound trackers and resources, and
-deleting the thread runs `newgit remove`. Every other project gets plain
-worktrees, as upstream does.
+makes the branch, its workspace, and its bound trackers and resources.
+Settling the thread runs `newgit stop`, which releases its running
+resources but keeps the workspace. Unsettling it runs `newgit start`, and so
+does every turn before the agent starts. Deleting the thread runs
+`newgit remove`. Every other project gets plain worktrees, as upstream does.
 
 ## Branches
 
@@ -54,6 +56,9 @@ upstream T3 Code, so both run at once:
 - A missing newgit workspace is not recreated on resume, and MCP
   `existing_worktree` launches reject newgit workspaces, since they are
   separate clones rather than linked worktrees.
+- `stop` and `start` need a newgit with those commands (Spheroman/newgit#157).
+  With an older one they fail, the server logs a warning, and settling and
+  turns go on as before.
 - PR review guides still use their own temporary Git worktrees.
 - Sign-in flows that return through a `t3code://` link reach upstream
   T3 Code, not this app.
@@ -63,7 +68,8 @@ upstream T3 Code, so both run at once:
 
 ## Keeping up with upstream
 
-The newgit logic lives in `apps/server/src/vcs/newgitWorkspaces.ts` and
+The newgit logic lives in `apps/server/src/vcs/newgitWorkspaces.ts`,
+`apps/server/src/orchestration-v2/NewgitLifecycleReactor.ts`, and
 `apps/desktop/src/forkIdentity.ts`. Every edit to an upstream file is marked
 `newgit fork patch`, so `git grep "newgit fork patch"` lists every hook.
 

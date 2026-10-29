@@ -24,6 +24,7 @@ import * as Option from "effect/Option";
 import * as Path from "effect/Path";
 import * as Predicate from "effect/Predicate";
 import * as Schema from "effect/Schema";
+import * as ChildProcessSpawner from "effect/process/ChildProcessSpawner";
 
 import * as ServerConfig from "../config.ts";
 import { withWorkspaceLease } from "../workspace/workspaceLease.ts";
@@ -54,6 +55,7 @@ import {
 } from "@t3tools/provider-core/server/failure";
 import * as RunExecutionService from "./RunExecutionService.ts";
 import * as RuntimePolicy from "./RuntimePolicy.ts";
+import * as NewgitWorkspaces from "../vcs/newgitWorkspaces.ts";
 import {
   isRestartNoteContinuation,
   pendingRestartCancelledBackgroundWork,
@@ -122,6 +124,9 @@ export const layer: Layer.Layer<
     const idAllocator = yield* IdAllocator.IdAllocatorV2;
     const fileSystem = yield* FileSystem.FileSystem;
     const path = yield* Path.Path;
+    // newgit fork patch: a turn brings back the resources settling stopped. The spawner is
+    // optional so upstream's tests, which don't provide one, build this layer unchanged.
+    const newgitSpawner = yield* Effect.serviceOption(ChildProcessSpawner.ChildProcessSpawner);
     const gitWorkflow = yield* GitWorkflowService.GitWorkflowService;
     const projects = yield* ProjectService.ProjectService;
     const providerAuth = yield* ProviderAuthService.ProviderAuthService;
@@ -520,6 +525,16 @@ export const layer: Layer.Layer<
             );
           }
         }
+      }
+      // newgit fork patch: the agent's first command must not hit a dev server settling stopped.
+      if (worktreePath !== null && Option.isSome(newgitSpawner)) {
+        yield* NewgitWorkspaces.startNewgitInstance(worktreePath).pipe(
+          NewgitWorkspaces.provideNewgitServices({
+            fileSystem,
+            path,
+            spawner: newgitSpawner.value,
+          }),
+        );
       }
       const selectInheritedBackgroundItems = (
         current: ProjectionStore.ProjectionRuntimeRecoveryState,

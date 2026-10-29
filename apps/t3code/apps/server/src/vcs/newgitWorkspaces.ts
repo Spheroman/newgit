@@ -11,6 +11,7 @@ import * as Option from "effect/Option";
 import * as Path from "effect/Path";
 import * as ChildProcessSpawner from "effect/process/ChildProcessSpawner";
 import * as Schema from "effect/Schema";
+import * as Semaphore from "effect/Semaphore";
 
 import * as ProcessRunner from "../processRunner.ts";
 
@@ -18,6 +19,7 @@ import * as ProcessRunner from "../processRunner.ts";
 // longer than a plain `git worktree add`.
 const SPAWN_TIMEOUT = Duration.minutes(15);
 const REMOVE_TIMEOUT = Duration.minutes(5);
+const LIFECYCLE_TIMEOUT = Duration.minutes(5);
 
 // The fields of `spawn --json` this module reads; newgit reports more.
 const SpawnResource = Schema.Struct({
@@ -200,6 +202,80 @@ export const removeNewgitWorkspace = (workspace: NewgitWorkspace) =>
     args: ["remove", workspace.name],
     timeout: REMOVE_TIMEOUT,
   }).pipe(Effect.asVoid);
+
+const decodeLifecycleOutput = Schema.decodeUnknownEffect(
+  Schema.fromJsonString(
+    Schema.Struct({
+      resources: Schema.Array(
+        Schema.Struct({
+          name: Schema.String,
+          status: Schema.String,
+          error: Schema.optional(Schema.NullOr(Schema.String)),
+        }),
+      ),
+    }),
+  ),
+);
+
+// One permit per instance, so a turn's `start` waits out a settle's `stop` still running.
+const instanceLocks = new Map<string, Semaphore.Semaphore>();
+const instanceLock = (workspace: NewgitWorkspace) => {
+  const key = `${workspace.storeRoot}\0${workspace.name}`;
+  let lock = instanceLocks.get(key);
+  if (lock === undefined) {
+    lock = Semaphore.makeUnsafe(1);
+    instanceLocks.set(key, lock);
+  }
+  return lock;
+};
+
+/**
+ * `newgit stop|start <name>` for the instance whose workspace is `worktreePath`;
+ * a no-op elsewhere. Failures are logged, never raised: settling and turns go on.
+ * `stillWanted` is checked under the instance lock, so a stale request is dropped.
+ */
+const runLifecycle = Effect.fn("newgitWorkspaces.runLifecycle")(
+  function* (verb: "stop" | "start", worktreePath: string, stillWanted: Effect.Effect<boolean>) {
+    const workspace = yield* readNewgitWorkspace(worktreePath);
+    if (workspace === null) return;
+    yield* instanceLock(workspace).withPermits(1)(
+      Effect.gen(function* () {
+        if (!(yield* stillWanted)) return;
+        const { stdout, exitCode } = yield* runNewgit({
+          operation: `newgitWorkspaces.${verb}`,
+          cwd: workspace.storeRoot,
+          args: [verb, workspace.name, "--json"],
+          timeout: LIFECYCLE_TIMEOUT,
+          reportExitCodes: [1],
+        });
+        const { resources } = yield* decodeLifecycleOutput(stdout);
+        const failed = resources.filter((resource) => resource.status === "failed");
+        if (exitCode !== 0 || failed.length > 0) {
+          yield* Effect.logWarning(`newgit ${verb} left some resources behind`, {
+            instance: workspace.name,
+            resources: failed.map((resource) => `${resource.name}: ${resource.error ?? "failed"}`),
+          });
+        }
+      }),
+    );
+  },
+  (effect, verb, worktreePath) =>
+    effect.pipe(
+      Effect.catchCause((cause) =>
+        Effect.logWarning(`newgit ${verb} failed`, { worktreePath, cause }),
+      ),
+    ),
+);
+
+/** Release a settled thread's resources, keeping its workspace. */
+export const stopNewgitInstance = (
+  worktreePath: string,
+  stillSettled: Effect.Effect<boolean> = Effect.succeed(true),
+) => runLifecycle("stop", worktreePath, stillSettled);
+
+/** Bring back what the last `stopNewgitInstance` released; cheap when nothing was. */
+export const startNewgitInstance = (worktreePath: string) =>
+  runLifecycle("start", worktreePath, Effect.succeed(true));
 
 /** Provide what this module needs from services a caller already holds. */
 export const provideNewgitServices =
