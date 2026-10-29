@@ -25,8 +25,7 @@ newgit tracker capture runtime-env --from-store   # seed the lane from the file 
 newgit resource add deps --template pnpm
 newgit resource add app --template process
 
-newgit spawn auth-refactor
-newgit action app.start auth-refactor
+newgit spawn auth-refactor                        # installs deps, starts the dev server
 newgit checkpoint auth-refactor -m "before agent"
 # an agent works in the branch workspace, and you dislike the result
 newgit undo auth-refactor

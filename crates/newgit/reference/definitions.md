@@ -285,13 +285,26 @@ clean pass.
 | `command` | string | yes, unless `signal` is set | — | shell command, run in the workspace (or `workdir`, below). |
 | `workdir` | string | no | the resource's `workdir` | replaces — does not nest under — the resource-level `workdir` for this action only. |
 | `long_running` | bool | no | `false` | supervise it: `newgit action` returns once started, output goes to a log, and the process group is tracked. Requires `command`. |
+| `autostart` | bool | no | `false` | start it at `newgit spawn`, once every `prepare` has run. Requires `long_running`; at most one action per resource. See below. |
 | `signal` | string | no | `term` for a `stop` action | makes an action signal-only. An action with `signal` and no `command` stops this resource's supervised process. The default applies to the literal name `stop` — see below, where that name is the one thing newgit reads. |
 | `captures` | array of strings | no | `[]` | names to read out of the command's stdout and publish as this resource's exports. See *Captures*. |
 
 **Actions are not lifecycle hooks.** Only `prepare` runs on its own — at
-`spawn`, and again for a `recompute` restore. Every other action is something
-you invoke: `newgit action <resource>.<action> [instance]`. Add `--dry-run`
-to print the rendered command and its directory without running it.
+`spawn`, and again for a `recompute` restore — plus the one action a
+resource marks `autostart`. Every other action is something you invoke:
+`newgit action <resource>.<action> [instance]`. Add `--dry-run` to print the
+rendered command and its directory without running it.
+
+**`autostart` starts a process at spawn.** Once every resource is bound and
+prepared, `newgit spawn` starts each `autostart` action, dependencies
+first, exactly as `newgit action` would. One that is not ready, is blocked,
+or depends on a resource whose start failed is not started, and the spawn
+says so and exits 1, as it does for a failed `prepare`; `spawn --json`
+lists each attempt under `started`. A dependent starts once its
+dependency's process exists, not once it answers (#54).
+`spawn --from-checkpoint` starts them after its restore. Nothing else
+autostarts: `newgit start` brings back what `newgit stop` stopped, and a
+resource that `newgit tracker use` brings is prepared but not started.
 
 **`stop` is the one name newgit reads for signals.** Names are otherwise
 inert — `start` is pure convention, made real by `long_running` and not by

@@ -116,6 +116,11 @@ pub struct ActionSpec {
     pub workdir: Option<Utf8PathBuf>,
     #[serde(default)]
     pub long_running: bool,
+    /// Start this long-running action when an instance is spawned, once
+    /// every `prepare` has run. At most one per resource: a resource
+    /// supervises one process.
+    #[serde(default)]
+    pub autostart: bool,
     /// Signal sent by `stop` for a long-running sibling `start`.
     #[serde(default)]
     pub signal: Option<String>,
@@ -262,6 +267,15 @@ impl ResourceDefinition {
 
     pub fn has_long_running_action(&self) -> bool {
         self.actions.values().any(|action| action.long_running)
+    }
+
+    /// The long-running action spawn starts for this resource, if one is
+    /// marked `autostart`.
+    pub fn autostart_action(&self) -> Option<(&str, &ActionSpec)> {
+        self.actions
+            .iter()
+            .find(|(_, action)| action.autostart)
+            .map(|(name, action)| (name.as_str(), action))
     }
 
     /// The `prepare` spawn would run for this resource, if there is one: a
@@ -424,11 +438,35 @@ impl ResourceDefinition {
                     "action `{action_name}` is long_running but has no command"
                 )));
             }
+            if action.autostart && !action.long_running {
+                return Err(self.invalid(format!(
+                    "action `{action_name}` has autostart but is not long_running: only a \
+                     process newgit supervises is started at spawn, and a command that \
+                     finishes belongs in `prepare`"
+                )));
+            }
             if let Some(workdir) = &action.workdir {
                 self.check_workdir_is_workspace_relative(workdir)?;
             }
         }
         self.check_suspend_resume_pairing()?;
+        let autostarts: Vec<&str> = self
+            .actions
+            .iter()
+            .filter(|(_, action)| action.autostart)
+            .map(|(name, _)| name.as_str())
+            .collect();
+        if autostarts.len() > 1 {
+            return Err(self.invalid(format!(
+                "actions {} all have autostart, but a resource supervises one process: \
+                 give it to one of them",
+                autostarts
+                    .iter()
+                    .map(|name| format!("`{name}`"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )));
+        }
         for spec in &self.render {
             if spec.replace.is_empty() {
                 return Err(self.invalid(format!(
@@ -1380,6 +1418,7 @@ mod tests {
                 command: Some("true".to_owned()),
                 workdir: None,
                 long_running: false,
+                autostart: false,
                 signal: None,
                 captures: captures.iter().map(ToString::to_string).collect(),
             },

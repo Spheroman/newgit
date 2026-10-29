@@ -56,6 +56,9 @@ app = { start = 3100, env = "RESOURCE_PORT" }
 # Edit to your dev command, e.g. "pnpm dev" or "bin/rails server".
 command = "npm run dev"
 long_running = true
+# Started at spawn, once every `prepare` has run. Remove it to start the dev
+# server only when you ask, with `newgit action <resource>.start`.
+autostart = true
 
 [actions.stop]
 signal = "term"

@@ -61,8 +61,7 @@ newgit tracker capture runtime-env --from-store   # seed it from the file you al
 newgit resource add deps --template pnpm
 newgit resource add app --template process
 
-newgit spawn auth-refactor
-newgit action app.start auth-refactor
+newgit spawn auth-refactor                        # deps installed, dev server up
 ```
 
 When you like the result, run a plain `git push` from the workspace. It

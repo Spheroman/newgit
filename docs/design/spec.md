@@ -472,7 +472,8 @@ something to newgit:
   true`: the process starts detached in its own process group, its output
   goes to `.newgit/logs/`, its PID to `.newgit/state/`, and `stop` sends the
   configured signal (TERM by default) to the group. No daemon, no restart
-  policy.
+  policy. `autostart = true` has `spawn` start it; the `process` template
+  sets it.
 - **`suspend` and `resume`** take down and bring back something newgit does
   not supervise, such as a Supabase stack or a Compose project. `newgit
   stop` and `start` run them (see *Stop and start*). Each needs a command,
@@ -778,16 +779,25 @@ store.
 workspace, chooses the binding, writes the excludes and the push route,
 projects the bound trackers' content, then binds resources in order:
 allocate ports, write the record, render, export, and run `prepare`, or
-fill from the install store. With a remote, it registers the instance
-there. Spawn starts no long-running process; `prepare` is a command that
-finishes.
+fill from the install store. Then it starts each long-running action marked
+`autostart`, dependencies first, so a dev server is up when the agent
+arrives. With a remote, it registers the instance there.
+
+Autostart comes after every `prepare`, not interleaved with them, because
+`prepare` is a command that finishes and a dependent's `prepare` may need
+its dependency's files but never its process. A start that fails is
+reported per resource, and a dependent of a resource that did not start is
+not started against it. Starting is not waiting: the dependent starts once
+its dependency's process exists, not once that process answers (#54).
 
 `spawn --from-checkpoint <instance>/<checkpoint>` brings up someone else's
 checkpoint, from the remote: their source and uncommitted work, the
 trackers you may read (your own copy of per-user ones), and resources
 restored from the checkpoint, such as a database loaded from its dump. It
 is built from parts that already exist: fetch, spawn at the checkpoint's
-head, then undo to the checkpoint.
+head, then undo to the checkpoint. Its `autostart` actions start after the
+undo, since the restore stops and restarts processes to match the
+checkpoint.
 
 #### An incomplete spawn must say so
 
@@ -809,8 +819,9 @@ Every surface (`spawn`, `spawn --json`, `status`, `action`) derives
 "blocked" the same way, from the graph at read time, so a script and a
 person see one instance (#209). A resource that failed itself is `failed`
 even with a dependency down too, because repairing the dependency would not
-fix it. The instance is not rolled back. `--from-checkpoint` judges by the
-instance the restore leaves (#208).
+fix it. An `autostart` action that did not start counts too: an instance
+whose dev server is down is not up. The instance is not rolled back.
+`--from-checkpoint` judges by the instance the restore leaves (#208).
 
 ### Run and env
 
@@ -825,7 +836,7 @@ command environment*).
 an instance someone is not using right now: a settled T3 Code thread, say
 (#157). It stops every running long-running action, dependents first, runs
 each `suspend` once that resource's dependents are down, and records what
-it took down in `.newgit/state/<instance>/stopped.toml`. `newgit start`
+it took down in `.newgit/state/<slug>/stopped.toml`. `newgit start`
 brings back exactly that, dependencies first, running `resume` before a
 resource's dependents come back. A resource nobody had started stays
 stopped. A resource whose dependency did not come back in the same `start`
@@ -1088,10 +1099,10 @@ Git repository per tracker. It gives you:
 
 Open issues that change what this document can promise:
 
-- **#54: nothing starts a runtime dependency.** `depends_on` orders
-  `prepare` and `newgit start`, but `start` only brings back what `stop`
-  stopped. Spawn starts nothing, and `newgit action app.start` does not
-  start the database it needs.
+- **#54: starting is not waiting.** `depends_on` orders `prepare`,
+  autostart, and `newgit start`, but a dependent starts once its
+  dependency's process exists, not once it answers. `newgit action
+  app.start` by hand does not start the database it needs.
 - **#64: rendered files are hidden, not filtered.** `--skip-worktree` makes
   hand edits to a rendered file die with the workspace. A clean/smudge
   filter would make them ordinary, committable edits.

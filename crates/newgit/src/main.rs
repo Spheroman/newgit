@@ -12,7 +12,7 @@ use newgit_core::manager::{
     ActionOutcome, ActionPlan, BaseReport, BindOrigin, BranchManager, DiffPair, ExportReason,
     InstanceReport, KeptBranch, MismatchCause, RemoteExportOptions, RemoveOutcome,
     ResourceBindOutcome, SourceBranchOutcome, SourceBranchPolicy, StopStartOutcome,
-    TrackerBindOutcome, UndoOptions, VerifyResource,
+    StopStartResource, StopStartStatus, TrackerBindOutcome, UndoOptions, VerifyResource,
 };
 use newgit_core::resource::{CheckpointMode, ResourceDefinition};
 use newgit_core::source::{RefUpdate, find_repo_root};
@@ -1009,6 +1009,7 @@ fn spawn_from_checkpoint(
                     "name": tracker.name, "rev": tracker.rev, "files": tracker.files,
                 })).collect::<Vec<_>>(),
                 "resources": resources,
+                "started": stop_start_resources_json(&outcome.started),
                 "recovery_record": outcome.undo.recovery_record,
                 "warnings": outcome.warnings,
             })
@@ -1023,13 +1024,18 @@ fn spawn_from_checkpoint(
     // Judged by the instance the restore leaves, as `--json` above is: a
     // resource is not up whether its restore failed or its bind did and the
     // checkpoint held nothing to restore it with (#208).
-    let not_ready = outcome
+    let mut not_ready = outcome
         .branch
         .resources
         .iter()
         .filter(|(_, binding)| binding.status != ResourceStatus::Ready)
         .map(|(name, _)| name.as_str())
         .collect::<Vec<_>>();
+    for start in &outcome.started {
+        if start.status == StopStartStatus::Failed && !not_ready.contains(&start.name.as_str()) {
+            not_ready.push(&start.name);
+        }
+    }
     // Lead with the verdict, as `undo` and a plain `spawn` do: "Spawned"
     // alone reads as a clean spawn, and the lines below only say otherwise
     // if each carries its own verdict.
@@ -1097,6 +1103,7 @@ fn spawn_from_checkpoint(
             (None, None) => println!("  resource:  {name}"),
         }
     }
+    print_started(&outcome.started);
     print_warnings(&outcome.warnings);
     if let Some(recovery) = &outcome.undo.recovery_record {
         eprintln!("warning: some resource restores failed; recovery record at {recovery}");
@@ -1166,6 +1173,7 @@ fn spawn(args: SpawnArgs) -> Result<()> {
                 "remote_warning": outcome.remote_warning,
                 "projection_warning": outcome.projection_warning,
                 "resources": resources,
+                "started": stop_start_resources_json(&outcome.started),
             })
         );
         // The exit the human-readable summary below gives, for the same
@@ -1307,6 +1315,7 @@ fn spawn(args: SpawnArgs) -> Result<()> {
         }
         print_warnings(&resource.missing_captures);
     }
+    print_started(&outcome.started);
     if !outcome.is_complete() {
         let failed = outcome.failed_resources();
         // A blocked prepare is named alongside a failed one: both mean the
@@ -1624,8 +1633,16 @@ fn stop_start(instance: Option<String>, json: bool, which: StopStart) -> Result<
 }
 
 fn stop_start_json(outcome: &StopStartOutcome) -> serde_json::Value {
-    let resources = outcome
-        .resources
+    serde_json::json!({
+        "instance": outcome.instance,
+        "resources": stop_start_resources_json(&outcome.resources),
+    })
+}
+
+/// `{"name", "action", "status", "error"}` per resource, as `stop`,
+/// `start`, and a spawn's `started` all print it.
+fn stop_start_resources_json(resources: &[StopStartResource]) -> serde_json::Value {
+    resources
         .iter()
         .map(|resource| {
             let mut entry = serde_json::json!({
@@ -1638,11 +1655,18 @@ fn stop_start_json(outcome: &StopStartOutcome) -> serde_json::Value {
             }
             entry
         })
-        .collect::<Vec<_>>();
-    serde_json::json!({
-        "instance": outcome.instance,
-        "resources": resources,
-    })
+        .collect()
+}
+
+/// A spawn's line for each `autostart` action it tried.
+fn print_started(started: &[StopStartResource]) {
+    for resource in started {
+        let spec = format!("{}.{}", resource.name, resource.action);
+        match &resource.error {
+            None => println!("  started:   `{spec}`"),
+            Some(error) => println!("  started:   `{spec}` FAILED: {error}"),
+        }
+    }
 }
 
 fn print_stop_start(outcome: &StopStartOutcome, which: StopStart) {
