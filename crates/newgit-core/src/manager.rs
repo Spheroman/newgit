@@ -4565,6 +4565,15 @@ impl BranchManager {
             .and_then(|binding| binding.content_rev.clone())
         {
             change.files = self.lane(tracker).restore(&workspace, &definition, &rev)?;
+        } else {
+            // No content of its own here — never bound, dropped at spawn for
+            // another in its role — so it comes in as a spawn would bind it:
+            // from its main, recorded as the binding's rev. Before the
+            // resources it brings bind, so their renders have a file to land
+            // in. A main with nothing in it yet binds empty, as at spawn.
+            let outcome = self.bind_tracker(&mut branch, &definition, false)?;
+            change.files = outcome.files;
+            change.seeded = outcome.content_rev.is_some();
         }
         branch.updated_at = Utc::now();
         self.store.save_branch_record(&branch)?;
@@ -9456,6 +9465,9 @@ pub struct BindingChange {
     pub captured: Option<String>,
     /// Files a secret tracker's use projected back.
     pub files: usize,
+    /// Those files are the tracker's main, the instance having no content
+    /// of its own for it, rather than what it held when it was dropped.
+    pub seeded: bool,
     /// Trackers in the same role a use dropped to make way.
     pub replaced: Vec<String>,
     /// Trackers a use bound because it requires them.

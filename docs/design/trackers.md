@@ -128,7 +128,9 @@ At spawn, for each slot (each role, and each role-less tracker):
 
 `newgit tracker use <tracker>` binds a tracker into an existing instance:
 swapping out whatever filled its role, binding what it requires, and starting
-the resources it brings. `newgit tracker drop <tracker>` unbinds one, stopping
+the resources it brings. A secret tracker comes back with the content it had
+when it was dropped, or, if the instance never bound it, with its main, as a
+spawn would bind it. `newgit tracker drop <tracker>` unbinds one, stopping
 (never cleaning up) the resources no longer brought. A drop is refused while
 another bound tracker requires it, and while the tracker has uncommitted work
 unless `--stash` (brought back by the next `use`) or `--discard` (after a
