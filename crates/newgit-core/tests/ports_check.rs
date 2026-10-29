@@ -48,6 +48,8 @@ fn branch(name: &str, workspace: &str, ports: &[(&str, u16)]) -> BranchInstance 
                 rendered: Vec::new(),
                 status: ResourceStatus::Ready,
                 restore_proven: false,
+                render_error: None,
+                export_error: None,
             },
         );
     }

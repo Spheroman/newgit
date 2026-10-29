@@ -37,7 +37,7 @@ use crate::resource::{
 };
 use crate::source::{GitSource, RefUpdate};
 use crate::store::MetadataStore;
-use crate::supervisor::{StopOutcome, Supervisor, run_captured, run_foreground};
+use crate::supervisor::{ProcessState, StopOutcome, Supervisor, run_captured, run_foreground};
 use crate::templates::{instantiate, resource_template};
 use crate::tracker::{
     Storage, TrackerDefinition, collect_files, collect_owned_files, content_rev, normalize_path,
@@ -408,6 +408,39 @@ fn long_running_action(
         .iter()
         .find(|(_, action)| action.long_running)
         .map(|(name, action)| (name.as_str(), action))
+}
+
+/// The action that retries a resource whose own run failed, naming only
+/// actions it defines (#262): the one that builds its tree (`prepare`, or
+/// the recompute action), else its long-running action. `None` when it has
+/// neither, as a resource with only a `[restore]` does.
+fn retry_command(definition: &ResourceDefinition) -> Option<String> {
+    let name = &definition.name;
+    let builds = definition.producing_action();
+    if definition
+        .actions
+        .get(builds)
+        .is_some_and(|action| action.command.is_some() && !action.long_running)
+    {
+        return Some(format!("newgit action {name}.{builds}"));
+    }
+    if let Some((action, _)) = definition
+        .autostart_action()
+        .or_else(|| long_running_action(definition))
+    {
+        return Some(format!("newgit action {name}.{action}"));
+    }
+    None
+}
+
+/// What `newgit resource rebind` did.
+#[derive(Debug, Clone)]
+pub struct RebindOutcome {
+    pub instance: String,
+    /// The bind, reported as spawn reports each resource.
+    pub bound: ResourceBindOutcome,
+    /// Its `autostart` action, when it has one and bound ready.
+    pub started: Vec<StopStartResource>,
 }
 
 /// What `newgit action <resource>.<action>` would do, without doing it.
@@ -1882,14 +1915,39 @@ impl BranchManager {
             let Ok(definition) = self.resource_definition(name) else {
                 continue;
             };
+            let logs = self.store.paths().logs.join(&branch.slug);
             match binding.status {
                 ResourceStatus::Ready => {}
-                ResourceStatus::Failed => {
+                // The retry follows from what failed (#262). A render or an
+                // export is fixed in a file or the definition and then bound
+                // again; no action of the resource would redo it.
+                ResourceStatus::Failed if binding.export_error.is_some() => {
                     problems.push(format!(
-                        "`{name}` failed — retry with `newgit action {name}.prepare`; its logs are \
-                         under {}",
-                        self.store.paths().logs.join(&branch.slug)
+                        "`{name}` failed to bind: {} — fix `[exports]` in \
+                         .newgit/resources/{name}.toml, then `newgit resource rebind {name}`",
+                        binding.export_error.as_deref().unwrap_or_default()
                     ));
+                    continue;
+                }
+                ResourceStatus::Failed if binding.render_error.is_some() => {
+                    problems.push(format!(
+                        "`{name}` failed to render: {} — fix that file's committed content or \
+                         the `[[render]]` in .newgit/resources/{name}.toml, then \
+                         `newgit resource rebind {name}`",
+                        binding.render_error.as_deref().unwrap_or_default()
+                    ));
+                    continue;
+                }
+                ResourceStatus::Failed => {
+                    problems.push(match retry_command(definition) {
+                        Some(retry) => format!(
+                            "`{name}` failed — retry with `{retry}`; its logs are under {logs}"
+                        ),
+                        None => format!(
+                            "`{name}` failed, and defines no action that retries it; its logs \
+                             are under {logs}"
+                        ),
+                    });
                     continue;
                 }
                 // Not always a dependency's doing: ports are claimed in the
@@ -1901,7 +1959,9 @@ impl BranchManager {
                 {
                     problems.push(format!(
                         "`{name}` has not been prepared — unless newgit is still preparing it, \
-                         run `newgit action {name}.prepare`"
+                         run `{}`",
+                        retry_command(definition)
+                            .unwrap_or_else(|| format!("newgit resource rebind {name}"))
                     ));
                     continue;
                 }
@@ -1915,9 +1975,26 @@ impl BranchManager {
             for path in definition.identity_produces() {
                 if !branch.workspace_path.join(path).exists() {
                     problems.push(format!(
-                        "`{name}`'s {path} is missing — rebuild with `newgit action {name}.prepare`"
+                        "`{name}`'s {path} is missing — rebuild with `{}`",
+                        retry_command(definition)
+                            .unwrap_or_else(|| format!("newgit resource rebind {name}"))
                     ));
                 }
+            }
+            // What spawn starts is part of the instance being up. One that
+            // ended without newgit stopping it is down, whatever its record
+            // says (#261). One newgit stopped is not a problem: that is what
+            // `newgit stop` is for.
+            if let Some((action_name, _)) = definition.autostart_action()
+                && let ProcessState::Died(death) = supervisor.state(name)
+            {
+                problems.push(format!(
+                    "`{name}.{action_name}` {} without being stopped — restart it with \
+                     `newgit action {name}.{action_name}` or `newgit start`; its logs are under \
+                     {logs}",
+                    death.describe()
+                ));
+                continue;
             }
             if supervisor.running_pid(name).is_some() {
                 let ports: BTreeMap<String, u16> = binding
@@ -2498,6 +2575,8 @@ impl BranchManager {
                     rendered: Vec::new(),
                     status: ResourceStatus::Pending,
                     restore_proven: false,
+                    render_error: None,
+                    export_error: None,
                 },
             );
 
@@ -2517,6 +2596,8 @@ impl BranchManager {
             if render_error.is_some() || export_error.is_some() {
                 if let Some(binding) = branch.resources.get_mut(&definition.name) {
                     binding.status = ResourceStatus::Failed;
+                    binding.render_error.clone_from(&render_error);
+                    binding.export_error.clone_from(&export_error);
                 }
                 outcomes.push(ResourceBindOutcome {
                     name: definition.name.clone(),
@@ -2711,6 +2792,8 @@ impl BranchManager {
                 rendered: Vec::new(),
                 status: ResourceStatus::Pending,
                 restore_proven: false,
+                render_error: None,
+                export_error: None,
             },
         );
         claim.updated_at = Utc::now();
@@ -3471,6 +3554,55 @@ impl BranchManager {
             }
         }
         warnings
+    }
+
+    /// `newgit resource rebind`: bind `resource` again in `instance`, as
+    /// spawn bound it: claim its ports, resolve its exports, render its
+    /// files, run its `prepare`, then start its `autostart` action. The
+    /// retry for a bind that failed where no action reaches, a render or an
+    /// export, once the file or the definition is fixed (#262).
+    ///
+    /// Refused while its process runs: binding again moves the values that
+    /// process was started with.
+    pub fn rebind_resource(&self, instance: &str, resource: &str) -> Result<RebindOutcome> {
+        self.require_resolvable_graph()?;
+        let (_lock, mut branch) = self.locked_branch(instance)?;
+        self.require_workspace(&branch)?;
+        let definition = self.resource_definition(resource)?;
+        if !self.resource_active(&branch, resource) {
+            return Err(NewgitError::Unsupported(format!(
+                "resource `{resource}` is not bound in `{}`: the tracker that brings it is dropped",
+                branch.name
+            )));
+        }
+        if let Some(pid) = self.supervisor(&branch).running_pid(resource) {
+            return Err(NewgitError::Unsupported(format!(
+                "resource `{resource}` is running (pid {pid}); stop it first with \
+                 `newgit stop` or its stop action"
+            )));
+        }
+        let autostart = definition.autostart_action().is_some();
+        branch.resources.remove(resource);
+        self.store.save_branch_record(&branch)?;
+        let outcome = self
+            .bind_resources(&mut branch)?
+            .into_iter()
+            .find(|outcome| outcome.name == resource)
+            .ok_or_else(|| {
+                NewgitError::Unsupported(format!("resource `{resource}` did not bind"))
+            })?;
+        self.store.save_branch_record(&branch)?;
+        let only = BTreeSet::from([resource]);
+        let started = if autostart && outcome.status == ResourceStatus::Ready {
+            self.autostart(&branch, Some(&only))
+        } else {
+            Vec::new()
+        };
+        Ok(RebindOutcome {
+            instance: branch.name,
+            bound: outcome,
+            started,
+        })
     }
 
     /// Run `<resource>.<action>` for an instance.
@@ -5279,22 +5411,23 @@ impl BranchManager {
                         let state = match branch.resources.get(&definition.name) {
                             None => "—".to_owned(),
                             Some(binding) => {
-                                if supervisor.running_pid(&definition.name).is_some() {
+                                let process = supervisor.state(&definition.name);
+                                if let ProcessState::Running(_) = process {
                                     // Something newgit started is alive right now:
                                     // the one signal worth trusting over anything
                                     // in the record.
                                     "running".to_owned()
-                                } else if supervisor.has_ever_started(&definition.name) {
-                                    // A supervised process existed and is not
-                                    // alive now — "stopped" is honest here in a
-                                    // way it is not for an action newgit never
-                                    // ran. Which of possibly several
-                                    // `long_running` actions it was is not
-                                    // something the supervisor records (it
+                                } else if process == ProcessState::Stopped {
+                                    // newgit stopped it. Which of possibly
+                                    // several `long_running` actions it was is
+                                    // not something the supervisor records (it
                                     // tracks one process per resource, not per
-                                    // action), so this can't and doesn't claim
-                                    // more than "it ran, and isn't running now."
+                                    // action).
                                     "stopped".to_owned()
+                                } else if let ProcessState::Died(death) = process {
+                                    // It ended without newgit asking: shown
+                                    // apart from a stop, with how (#261).
+                                    death.label()
                                 } else if binding.status == ResourceStatus::Failed {
                                     // Its own failure (export, render or
                                     // prepare) comes first, as it does in
@@ -9029,8 +9162,9 @@ impl BranchManager {
     }
 
     /// `newgit start`: bring back what the instance's stopped record names,
-    /// dependencies first, and drop each from the record once it is up. A
-    /// resource nobody had started stays stopped. A resource's `resume` runs
+    /// dependencies first, and drop each from the record once it is up, with
+    /// any `autostart` action that died on its own since (#261). A resource
+    /// nobody had started stays stopped. A resource's `resume` runs
     /// before its long-running action starts again.
     ///
     /// One that fails stays in the record, so the next `start` tries it
@@ -9041,6 +9175,31 @@ impl BranchManager {
     pub fn start_instance(&self, instance: &str) -> Result<StopStartOutcome> {
         let (_lock, mut branch) = self.locked_branch(instance)?;
         let mut record = self.load_stopped_record(&branch)?;
+        // What spawn started and that has since died on its own is owed as
+        // much as what `newgit stop` stopped (#261). Owed from here on like
+        // anything in the record: one that fails to come back stays in it
+        // for the next `start`.
+        {
+            let supervisor = self.supervisor(&branch);
+            for definition in &self.resources {
+                let Some((action, _)) = definition.autostart_action() else {
+                    continue;
+                };
+                let owed = record
+                    .resources
+                    .iter()
+                    .any(|entry| entry.name == definition.name && !entry.is_resume());
+                if !owed
+                    && branch.resources.contains_key(&definition.name)
+                    && matches!(supervisor.state(&definition.name), ProcessState::Died(_))
+                {
+                    record.resources.push(StoppedResource {
+                        name: definition.name.clone(),
+                        action: action.to_owned(),
+                    });
+                }
+            }
+        }
         if record.resources.is_empty() {
             return Ok(StopStartOutcome {
                 instance: branch.name,

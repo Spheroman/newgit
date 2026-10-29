@@ -122,7 +122,8 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Start again exactly what the last `newgit stop` stopped
+    /// Start again what the last `newgit stop` stopped, and any `autostart`
+    /// action that died on its own
     ///
     /// A resource nobody had started stays stopped. Exits 0 when there is
     /// nothing to start, and 1 when anything failed to; a failed one is
@@ -450,6 +451,17 @@ enum ResourceCommand {
     },
     /// List defined resources
     List,
+    /// Bind a resource again in an instance, as spawn bound it: ports,
+    /// exports, render, `prepare`, then its `autostart` action
+    ///
+    /// The retry for a resource that failed to render or to resolve an
+    /// export, once the file or the definition is fixed. Refused while its
+    /// process is running. Exits 1 when it does not come up.
+    Rebind {
+        name: String,
+        /// Instance (inferred when run inside a workspace)
+        instance: Option<String>,
+    },
     /// List available resource starter templates
     Templates {
         /// Print one template's TOML in full, instead of instantiating it
@@ -900,8 +912,12 @@ fn resource_json(
         "ports": binding.resolved_ports,
         "prepare_log": bound.and_then(|bound| bound.prepare.as_ref()).map(|(_, log)| log),
         "blocked_by": blocked_by,
-        "render_error": bound.and_then(|bound| bound.render_error.as_ref()),
-        "export_error": bound.and_then(|bound| bound.export_error.as_ref()),
+        "render_error": bound
+            .and_then(|bound| bound.render_error.as_ref())
+            .or(binding.render_error.as_ref()),
+        "export_error": bound
+            .and_then(|bound| bound.export_error.as_ref())
+            .or(binding.export_error.as_ref()),
     })
 }
 
@@ -1119,6 +1135,7 @@ fn spawn_from_checkpoint(
                 not_ready.len(),
                 outcome.branch.resources.len()
             ),
+            &manager.readiness(&outcome.branch),
         );
     }
     Ok(())
@@ -1127,9 +1144,20 @@ fn spawn_from_checkpoint(
 /// The footer both spawns end on when a resource is not up, and their exit.
 /// The instance is not rolled back — it exists, with a record on disk,
 /// exactly as printed above. Exit 1 reports that state; it does not undo it.
-fn exit_spawned_with_failures(name: &str, summary: &str) -> ! {
+///
+/// The "see below" of the first line is this: what is wrong, each with the
+/// error behind it and the command that fixes it, as `status` says it
+/// (#262).
+fn exit_spawned_with_failures(name: &str, summary: &str, readiness: &Readiness) -> ! {
     println!("spawned with failures: {summary}.");
-    println!("  `{name}` exists but is not ready. See the FAILED/BLOCKED lines above.");
+    if readiness.problems.is_empty() {
+        println!("  `{name}` exists but is not ready. See the FAILED/BLOCKED lines above.");
+    } else {
+        println!("  `{name}` exists but is not ready:");
+        for problem in &readiness.problems {
+            println!("  - {problem}");
+        }
+    }
     std::process::exit(1);
 }
 
@@ -1285,44 +1313,7 @@ fn spawn(args: SpawnArgs) -> Result<()> {
         println!("  tracker:   {}", bind_line(tracker, deposit_only));
     }
     for resource in &outcome.resources {
-        let ports = resource
-            .ports
-            .iter()
-            .map(|(name, port)| format!("{name}={port}"))
-            .collect::<Vec<_>>()
-            .join(" ");
-        let ports = if ports.is_empty() {
-            String::new()
-        } else {
-            format!(" ports: {ports}")
-        };
-        let prepare = prepare_label(resource);
-        let captured = if resource.captured.is_empty() {
-            String::new()
-        } else {
-            format!(" captured: {}", resource.captured.join(", "))
-        };
-        let rendered = if resource.rendered.is_empty() {
-            String::new()
-        } else {
-            format!(
-                " rendered: {}",
-                resource
-                    .rendered
-                    .iter()
-                    .map(|file| format!("{} ({})", file.path, file.replacements))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            )
-        };
-        println!(
-            "  resource:  `{}`{ports}{prepare}{captured}{rendered}",
-            resource.name
-        );
-        if let Some(install) = &resource.install {
-            println!("             {}", install.summary());
-        }
-        print_warnings(&resource.missing_captures);
+        print_bound_resource(resource);
     }
     print_started(&outcome.started);
     if !outcome.is_complete() {
@@ -1338,6 +1329,7 @@ fn spawn(args: SpawnArgs) -> Result<()> {
                 failed.len(),
                 outcome.resources.len()
             ),
+            &manager.readiness(branch),
         );
     }
     if readiness.is_ready() && !readiness.is_starting() {
@@ -1452,6 +1444,23 @@ fn resource(command: ResourceCommand) -> Result<()> {
             );
             for instance in &outcome.unbound_instances {
                 println!("  dropped binding: `{instance}` (its allocated ports are released)");
+            }
+            Ok(())
+        }
+        ResourceCommand::Rebind { name, instance } => {
+            let (manager, instance) = manager_and_instance(instance)?;
+            let outcome = manager.rebind_resource(&instance, &name)?;
+            println!("Bound `{name}` again in `{}`", outcome.instance);
+            print_bound_resource(&outcome.bound);
+            print_started(&outcome.started);
+            let failed = outcome.bound.status == ResourceStatus::Failed
+                || outcome.bound.is_blocked()
+                || outcome
+                    .started
+                    .iter()
+                    .any(|start| start.status == StopStartStatus::Failed);
+            if failed {
+                std::process::exit(1);
             }
             Ok(())
         }
@@ -1686,6 +1695,49 @@ fn starting_json(readiness: &Readiness) -> serde_json::Value {
         .collect()
 }
 
+/// A resource's `resource:` line in a spawn or rebind report, with its
+/// install summary and capture warnings under it.
+fn print_bound_resource(resource: &ResourceBindOutcome) {
+    let ports = resource
+        .ports
+        .iter()
+        .map(|(name, port)| format!("{name}={port}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let ports = if ports.is_empty() {
+        String::new()
+    } else {
+        format!(" ports: {ports}")
+    };
+    let prepare = prepare_label(resource);
+    let captured = if resource.captured.is_empty() {
+        String::new()
+    } else {
+        format!(" captured: {}", resource.captured.join(", "))
+    };
+    let rendered = if resource.rendered.is_empty() {
+        String::new()
+    } else {
+        format!(
+            " rendered: {}",
+            resource
+                .rendered
+                .iter()
+                .map(|file| format!("{} ({})", file.path, file.replacements))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    };
+    println!(
+        "  resource:  `{}`{ports}{prepare}{captured}{rendered}",
+        resource.name
+    );
+    if let Some(install) = &resource.install {
+        println!("             {}", install.summary());
+    }
+    print_warnings(&resource.missing_captures);
+}
+
 /// A spawn's line for each `autostart` action it tried.
 fn print_started(started: &[StopStartResource]) {
     for resource in started {
@@ -1702,7 +1754,10 @@ fn print_stop_start(outcome: &StopStartOutcome, which: StopStart) {
     if outcome.resources.is_empty() {
         match which {
             StopStart::Stop => println!("Nothing running for `{instance}`"),
-            StopStart::Start => println!("Nothing stopped by `newgit stop` for `{instance}`"),
+            StopStart::Start => println!(
+                "Nothing stopped by `newgit stop`, and no `autostart` action down, for \
+                 `{instance}`"
+            ),
         }
         return;
     }

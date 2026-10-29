@@ -809,9 +809,27 @@ but broken". So `spawn` exits 1 whenever any resource did not bind, and its
 last line says so:
 
 ```text
+Spawned branch instance `perf-a` — but `web` did not come up (see below)
+  ...
 spawned with failures: 1 of 4 resources did not bind.
-  `perf-a` exists but is not ready. See the FAILED/BLOCKED lines above.
+  `perf-a` exists but is not ready:
+  - `web` failed to render: resource `web` renders into `app.conf`, but
+    `127.0.0.1:8000` occurs 2 time(s) there, not 1; ... — fix that file's
+    committed content or the `[[render]]` in .newgit/resources/web.toml,
+    then `newgit resource rebind web`
 ```
+
+What is under that last line is what `status` says about the instance:
+each problem with the error behind it and the command that fixes it. The
+fix follows from what failed, and never names an action the resource does
+not define (#262). A failed render or export is fixed in the file or the
+definition, then bound again with `newgit resource rebind <resource>
+[instance]`, which binds it as spawn did (ports, exports, render, `prepare`,
+then its `autostart` action) and refuses while its process runs. A failed
+`prepare` is retried with `newgit action <resource>.prepare`; a resource
+with no `prepare` is pointed at the action that builds its tree or its
+long-running action, and one with neither (a `[restore]` alone) at its
+logs.
 
 A blocked resource counts. Its `prepare` never ran, so it is no more usable
 than one whose `prepare` failed; only where the failure started differs.
@@ -846,6 +864,29 @@ checked at read time, so it clears on its own once the port answers.
 have not answered) and exits 0 as for a ready instance. The wait is fixed;
 a server that takes longer simply shows as starting.
 
+#### Died is not stopped
+
+A dev server that crashes, is OOM-killed, or is `kill`ed used to read
+`stopped`, exactly like one `newgit stop` took down, and the instance stayed
+`ready` on a dead port (#261). The supervisor keeps how a process ended.
+Each long-running action runs under a small `sh` wrapper that waits on it;
+when the command ends the wrapper appends `[newgit] exited 1` or `[newgit]
+killed by SIGKILL` to the action's log and writes the status to
+`.newgit/state/<slug>/<resource>.exit`. Before newgit signals a process
+(`stop`, a signal action, `remove`, `undo`) it leaves a
+`<resource>.stopping` marker, so an ending newgit asked for logs `[newgit]
+stopped by newgit` and reads `stopped`.
+
+`status` shows one that ended on its own as `exited(1)`, `killed(SIGKILL)`,
+or `crashed` when nothing recorded how (the whole group was killed at once,
+or it outlived a reboot). An `autostart` action in that state makes the
+instance `not ready`, with `newgit action <resource>.<action>` as the retry,
+and `newgit start` starts it again along with what `newgit stop` stopped.
+Severity runs ready < starting < not ready: a died process is a problem, a
+process that is up but not answering yet is not. `newgit cleanup` retires a
+dead process's pid to `exited`, not `stopped`, so it does not erase a
+crash.
+
 ### Run and env
 
 `newgit run [instance] -- <command>` runs a command in the workspace with
@@ -861,7 +902,8 @@ an instance someone is not using right now: a settled T3 Code thread, say
 each `suspend` once that resource's dependents are down, and records what
 it took down in `.newgit/state/<slug>/stopped.toml`. `newgit start`
 brings back exactly that, dependencies first, running `resume` before a
-resource's dependents come back. A resource nobody had started stays
+resource's dependents come back, and with it any `autostart` action that
+died on its own since (#261). A resource nobody had started stays
 stopped. A resource whose dependency did not come back in the same `start`
 is not started, and stays owed, so a dev server is not brought up against a
 database that is still down.
