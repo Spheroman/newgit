@@ -154,8 +154,10 @@ Port claims are kept, so the instance returns on the same ports. With
 `--json` each prints `{"instance", "resources": [{"name", "action",
 "status", "error"}]}`, listing only what it acted on, and still exits 1 if
 anything failed; a resource that failed to start stays recorded for the
-next `start`. Supervised processes are all they touch: a `supabase` or
-`external` resource is not stopped.
+next `start`. A resource that is not a process newgit supervises — a
+Supabase stack, a Compose project — is taken down only if it defines a
+`suspend` / `resume` pair (`newgit reference actions`); the `supabase`
+template does.
 ([Spheroman/t3code#2](https://github.com/Spheroman/t3code/issues/2) wires
 them to settle and unsettle; `remove` stays for delete.)
 
@@ -244,9 +246,10 @@ inside a workspace):
 - `newgit action <resource>.<action> [instance] [--dry-run]` — `--dry-run`
   prints the rendered command and its directory, and runs nothing
 - `newgit stop [instance] [--json]` / `start [instance] [--json]` — stop
-  every running long-running action, dependents first, and later start
-  exactly what that stopped; ports, workspace, trackers, and installs stay
-  as they are. Both exit 0 with nothing to do and 1 if any resource failed
+  every running long-running action and run each `suspend`, dependents
+  first, and later bring back exactly what that took down; ports,
+  workspace, trackers, and installs stay as they are. Both exit 0 with
+  nothing to do and 1 if any resource failed
 - `newgit checkpoint [instance] [-m <msg>]` / `undo [instance] [--to <id>]` /
   `checkpoints [instance]`
 - `newgit export [instance] --to <dir> [--include <path>] [--exclude <path>]`

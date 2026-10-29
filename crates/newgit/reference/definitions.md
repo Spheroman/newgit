@@ -299,6 +299,38 @@ to `term`. Precisely:
   `signal = "term"` is a perfectly good signal-only action; it just is not
   what newgit looks up when it stops things by itself.
 
+**`suspend` and `resume` are read by `newgit stop` and `newgit start`.**
+`newgit stop [instance]` takes an instance's resources down without removing
+anything, dependents first: it signals each supervised process (as above),
+then runs `suspend`. `newgit start [instance]` brings back exactly what the
+last stop took down, dependencies first: it runs `resume`, then starts the
+long-running action again. A resource that was not running at the stop stays
+down, and one whose dependency did not come back is not started against it.
+The workspace, trackers, port claims and installs are left alone, so the
+instance comes back on the same ports with its rendered config still valid.
+
+`suspend` / `resume` are for a resource that keeps running without a
+process newgit supervises: a `prepare` that starts a Supabase stack, a
+Compose project, a container, or a cloud machine that bills while it idles.
+Each must have a `command`, cannot be `long_running`, and neither is
+accepted without the other. `suspend` runs only for a resource that is
+`ready` and whose ownership lets per-instance teardown touch it (see
+*Ownership*), so stopping one instance never suspends something other
+instances share. A failed `suspend` is reported and not recorded, and the
+next `stop` tries again; a failed `resume` stays recorded, and the next
+`start` tries again. Unlike `[cleanup]`, `suspend` must not destroy
+anything: `resume` has to find the resource where `suspend` left it. Like
+any action, either may declare `captures`, and a `resume` that hands out a
+new URL publishes it that way.
+
+```toml
+[actions.suspend]
+command = "docker compose -p {{branch.slug}} stop"   # not `down`: that is cleanup
+
+[actions.resume]
+command = "docker compose -p {{branch.slug}} start"
+```
+
 ### `[checkpoint]`
 
 What this resource records when `newgit checkpoint` runs.

@@ -428,6 +428,7 @@ impl ResourceDefinition {
                 self.check_workdir_is_workspace_relative(workdir)?;
             }
         }
+        self.check_suspend_resume_pairing()?;
         for spec in &self.render {
             if spec.replace.is_empty() {
                 return Err(self.invalid(format!(
@@ -670,6 +671,38 @@ impl ResourceDefinition {
             ));
         }
         self.check_state_ref_is_recordable()
+    }
+
+    /// `newgit stop` runs `suspend` and `newgit start` runs `resume`, so each
+    /// is a command that finishes, and neither makes sense alone: a suspend
+    /// with no resume takes a resource down that `start` can never bring
+    /// back, and a resume with no suspend is never run.
+    fn check_suspend_resume_pairing(&self) -> Result<()> {
+        let suspend = self.actions.get("suspend");
+        let resume = self.actions.get("resume");
+        for (name, action) in [("suspend", suspend), ("resume", resume)] {
+            let Some(action) = action else { continue };
+            if action.command.is_none() || action.long_running {
+                return Err(self.invalid(format!(
+                    "action `{name}` is run by `newgit {}` and waited on, so it needs a command \
+                     and cannot be long_running",
+                    if name == "suspend" { "stop" } else { "start" }
+                )));
+            }
+        }
+        match (suspend, resume) {
+            (Some(_), None) => Err(self.invalid(
+                "action `suspend` has no `resume`: `newgit stop` would take this resource down \
+                 and `newgit start` could not bring it back"
+                    .to_owned(),
+            )),
+            (None, Some(_)) => Err(self.invalid(
+                "action `resume` has no `suspend`: `newgit start` only resumes what `newgit \
+                 stop` suspended, so it would never run"
+                    .to_owned(),
+            )),
+            _ => Ok(()),
+        }
     }
 
     /// An absent `[checkpoint]` records exactly what `mode = "none"` does.

@@ -443,6 +443,15 @@ command = "supabase start"
 [actions.reset]
 command = "supabase db reset"
 
+# `newgit stop` and `newgit start`: the stack is not a process newgit
+# supervises, so these are how it comes down and back up. `supabase stop`
+# keeps the database volumes, so `resume` finds the data where it was.
+[actions.suspend]
+command = "supabase stop"
+
+[actions.resume]
+command = "supabase start"
+
 [checkpoint]
 mode = "command"
 # `--data-only`, because the schema comes from migrations rather than from
