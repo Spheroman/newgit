@@ -6,3 +6,6 @@
   `newgit reference`. `vision.md` is labelled as the original vision, most
   of it unbuilt. The tracker and remote docs, the README, and the guide are
   brought in line with the code and list the open issues they know of.
+  `newgit reference` documents `[remote]` in `config.toml` and your own
+  `~/.newgit/config.toml`, shows sample tracker files, and says that
+  `merge_with_source` is stored but not yet read.

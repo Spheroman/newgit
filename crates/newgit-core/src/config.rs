@@ -46,14 +46,14 @@ pub struct WorkspaceSection {
 /// ```toml
 /// [remote]
 /// url = "https://newgit.example.workers.dev"
-/// project = "acme"   # optional; defaults to [project] name
+/// project = "acme/widget"   # without it, the project is not linked
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct RemoteSection {
     pub url: String,
-    /// The project's name on the remote, which also names its repos. Only
-    /// needed when it differs from `[project] name`.
+    /// The project on the remote, `<owner>/<name>`, which also names its
+    /// repos. Without it the project is not linked.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project: Option<String>,
 }

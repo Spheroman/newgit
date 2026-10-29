@@ -55,11 +55,26 @@ into the tracker's history and never committed to Git. Code content
 owned them. You commit to a code tracker with Git; `newgit tracker capture`
 and `track` refuse it.
 
+```toml
+# .newgit/trackers/runtime-env.toml — secret: each user's own .env.local
+audience = "user"
+storage = "local"
+paths = [".env.local"]
+
+# .newgit/trackers/staging-db.toml — one of two trackers filling a role
+audience = "project-devs"
+storage = "remote"
+role = "db"
+priority = 10
+paths = [".env.db"]
+resources = ["staging-tunnel"]
+```
+
 | key | type | required | default | meaning |
 | --- | --- | --- | --- | --- |
-| `audience` | string | yes | — | who may read the lane. `public`, `project-devs`, `user`, or `user:<name>`. Only `public` ships in an `export` without an explicit `--include`. |
+| `audience` | string | yes | — | who may read it. `public`, `project-devs`, `user` (each user gets their own copy), or `user:<login>`. Only `public` ships in an `export --to` without an explicit `--include`, or to an export target that does not name it. |
 | `storage` | string | yes | — | `local` or `remote` — where synced state lives. `remote` needs a `[remote]` in `config.toml`; checkpoint sync then pushes the tracker there. |
-| `merge_with_source` | bool | no | `false` | whether a real source merge carries this tracker's bound state with it. |
+| `merge_with_source` | bool | no | `false` | meant to say whether a source merge carries this tracker's state with it. Accepted and stored, but nothing reads it yet: `newgit merge` merges every tracker the instance changed. |
 | `paths` | array of strings | no | `[]` | workspace-relative paths the lane owns, normalized first (`./.env.local` is `.env.local`). Must not be absolute, contain `..`, or reach into `.git` or `.newgit` in any case (`.GIT` too), except that a code tracker may own other trackers' definitions, `.newgit/trackers/<name>.toml` (see `maintainers`); the rest of `.newgit` is `project`'s and `access`'s. `.` must be a tracker's only path. May be empty for a tracker that only receives resource deposits (`into_tracker`). |
 | `secret` | bool | no | `true` | `false` makes a code tracker: committed with Git rather than captured. Written only when `false`. |
 | `role` | string | no | — | the slot it fills: trackers sharing a role are alternatives (`dev-db`, `staging-db`) and may claim the same paths; an instance binds one of them. |
@@ -1288,6 +1303,17 @@ Written by `newgit init`.
 | key | type | required | default | meaning |
 | --- | --- | --- | --- | --- |
 | `project.name` | string | yes | the repository directory name | used in the default workspace root. |
-| `project.source` | string | yes | detected | `git` or `jj` (a colocated `.git` is required in v1). |
+| `project.source` | string | yes | detected | `git`, or `jj` for a jj repository colocated with Git. newgit drives source through Git either way, and refuses a jj repository with no `.git`. |
 | `workspace.root` | string | no | `~/.newgit/workspaces/<name>-<hash>/` | where workspaces are materialized. `~` expands. Omitted from the generated file so a committed config never bakes in one user's absolute paths. |
-| `workspace.materializer` | string | no | real directories | reserved; v1 materializes full clones. |
+| `workspace.materializer` | string | no | real directories | reserved; every workspace is a full clone. |
+| `remote.url` | string | yes, in `[remote]` | — | the newgit remote, e.g. `https://newgit.dev`. Must be `https://`, except `http://localhost` and `http://127.0.0.1` for a local `wrangler dev`. Written by `newgit remote add`. |
+| `remote.project` | string | yes, to link | — | the project on the remote, `<owner>/<name>`. Without it the project is not linked: newgit acts as if there were no `[remote]`. Written by `newgit remote add`. |
+
+Your own settings live in `~/.newgit/config.toml`, which newgit never
+writes. The one it reads is your default tracker per role, which beats the
+role's `priority` when you spawn. `<project>` is the `[project] name`:
+
+```toml
+[projects.<project>.roles]
+db = "staging-db"
+```
