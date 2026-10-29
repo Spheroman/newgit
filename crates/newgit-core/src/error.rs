@@ -106,6 +106,46 @@ pub enum NewgitError {
     #[error("tracker `{0}` owns no paths; there is nothing to capture from a workspace")]
     TrackerHasNoPaths(String),
 
+    /// Capture found a symlink at a tracked path that points outside the
+    /// directory being captured. Following it would copy a file from
+    /// anywhere on the machine into a lane that may sync to a remote.
+    #[error(
+        "refusing to capture `{path}` into tracker `{tracker}`: it is a symlink to `{target}`, \
+         which is outside the workspace. newgit never copies what a link points at; it keeps \
+         a link only when it is relative and stays inside the workspace. Replace `{path}` with \
+         a regular file, or with a link that stays inside"
+    )]
+    SymlinkLeavesWorkspace {
+        tracker: String,
+        path: Utf8PathBuf,
+        target: Utf8PathBuf,
+    },
+
+    /// A tracked path lies under a directory that is a symlink, so what is
+    /// "at" the path is really somewhere else.
+    #[error(
+        "refusing to read `{path}`: `{link}` is a symlink to `{target}`, so `{path}` is not in \
+         the workspace but wherever that link leads. Replace `{link}` with a real directory"
+    )]
+    SymlinkedParent {
+        path: Utf8PathBuf,
+        link: Utf8PathBuf,
+        target: Utf8PathBuf,
+    },
+
+    /// A lane holds a link whose target leaves the workspace. Written out, it
+    /// would point the workspace at whatever the lane's author chose.
+    #[error(
+        "refusing to check out tracker `{tracker}` at `{rev}`: `{path}` is a symlink to \
+         `{target}`, which is outside the workspace"
+    )]
+    LaneLinkLeavesWorkspace {
+        tracker: String,
+        rev: String,
+        path: Utf8PathBuf,
+        target: String,
+    },
+
     #[error(
         "tracker `{tracker}` owns nothing on disk in the store repo, so there is nothing to \
          seed from: {paths}"

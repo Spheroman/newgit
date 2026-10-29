@@ -274,6 +274,29 @@ as Git: tracking a path does not invent content for it.
 Because a secret tracker is pure content, capture and restore need no
 modes. If something needs a command to capture or restore, it is a resource.
 
+**Capture never follows a symlink.** A lane holds this workspace's files
+and syncs as far as its audience reaches, so a link at a tracked path must
+not turn capture into "copy any file I can read into the lane". A link is
+judged with `lstat`, never `stat`:
+
+- A link whose target is relative and stays inside the workspace (by its
+  text, and resolved on disk) is stored as a link — mode `120000`, the
+  target's text as the blob — as Git stores one. A linked directory is kept
+  as a link and not walked into.
+- A link that leaves the workspace — an absolute target, `..`s that climb
+  out, or a path through another link that leads out — is refused, naming
+  the path and its target, and nothing is committed. So is a tracked path
+  under a symlinked directory: what is "at" it is wherever that link leads.
+- Checkout writes a stored link back as a link. A rev holding a link whose
+  target leaves the workspace is refused before the workspace is touched,
+  whoever wrote the lane: written out, it would point a workspace path at a
+  file of the lane author's choosing.
+
+The same applies to every path that reads tracked content: `checkpoint`,
+the safety capture before a checkout, dropping a secret tracker,
+`--from-store`, a resource deposit, install-key hashing (a link hashes as
+its target's text), and export (a link is exported as a link).
+
 Secret content is kept in its own repository, not the project's. The
 project repository is what a local `git clone` hardlinks into every
 workspace and what a push publishes from; the tracker repository lives

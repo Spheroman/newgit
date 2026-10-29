@@ -279,6 +279,10 @@ Definition management (noun subcommands):
 - `newgit tracker capture|merge|pull|checkout <tracker> [instance]`
 - `newgit tracker capture <tracker> --from-store` — seed a lane from the store
   repo's working tree, so the first `spawn` comes up with the content
+- Capture never follows a symlink: a link that stays inside the workspace is
+  kept as a link, as Git keeps one; a link out of the workspace, or a tracked
+  path under a symlinked directory, is refused by name
+  ([spec](design/spec.md#secret-trackers))
 - `newgit tracker list` — a tree by ownership: kind, role, priority,
   maintainers, and (inside a workspace) what is bound
 - `newgit tracker use <tracker> [instance]` / `newgit tracker drop <tracker>

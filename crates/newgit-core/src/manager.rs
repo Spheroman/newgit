@@ -3154,6 +3154,12 @@ impl BranchManager {
                     continue;
                 }
                 let path = branch.workspace_path.join(&record.path);
+                // Only a regular file is un-rendered in place. Through a
+                // symlink this would read, and then write, wherever it leads;
+                // capture keeps or refuses the link itself.
+                if !std::fs::symlink_metadata(&path).is_ok_and(|meta| meta.is_file()) {
+                    continue;
+                }
                 let Ok(current) = std::fs::read_to_string(&path) else {
                     continue;
                 };
