@@ -1058,11 +1058,14 @@ fn spawn_from_checkpoint(
     println!("  workspace: {}", outcome.branch.workspace_path);
     for tracker in &outcome.undo.trackers {
         match &tracker.rev {
-            Some(rev) => println!(
-                "  tracker:   {} @ {rev} ({})",
-                tracker.name,
-                files_label(tracker.files)
-            ),
+            Some(rev) => {
+                let count = if tracker_is_deposit_only(manager, &tracker.name) {
+                    "deposit-only".to_owned()
+                } else {
+                    files_label(tracker.files)
+                };
+                println!("  tracker:   {} @ {rev} ({count})", tracker.name);
+            }
             None => println!("  tracker:   {} (empty)", tracker.name),
         }
     }
@@ -2001,6 +2004,15 @@ fn tracker(command: TrackerCommand) -> Result<()> {
                 &parent_of,
                 &mut ordered,
             );
+            // A tracker with no paths sits nowhere in the ownership tree, but
+            // it is still a tracker `--use` accepts: list it after the tree.
+            let mut pathless: Vec<&TrackerDefinition> = definitions
+                .iter()
+                .filter(|definition| !ordered.iter().any(|(_, d)| d.name == definition.name))
+                .copied()
+                .collect();
+            pathless.sort_by_key(|definition| (definition.role.clone(), definition.name.clone()));
+            ordered.extend(pathless.into_iter().map(|definition| (0, definition)));
             let rows: Vec<_> = ordered
                 .iter()
                 .map(|(depth, definition)| {
@@ -2024,7 +2036,7 @@ fn tracker(command: TrackerCommand) -> Result<()> {
                     let paths = if definition.owns_everything() {
                         "(everything no other tracker claims)".to_owned()
                     } else if definition.paths.is_empty() {
-                        "-".to_owned()
+                        pathless_summary(&manager, definition)
                     } else {
                         definition
                             .paths
@@ -3463,6 +3475,36 @@ fn bind_line(outcome: &TrackerBindOutcome, deposit_only: bool) -> String {
             )
         }
         BindOrigin::Nothing => format!("`{}` bound (no captured content)", outcome.name),
+    }
+}
+
+/// What a tracker with no `paths` is for, since it owns nothing in the
+/// workspace: the resources whose checkpoints deposit into it, and the ones it
+/// brings when bound.
+fn pathless_summary(manager: &BranchManager, definition: &TrackerDefinition) -> String {
+    let depositors: Vec<&str> = manager
+        .resource_definitions()
+        .iter()
+        .filter(|resource| {
+            resource
+                .checkpoint
+                .as_ref()
+                .and_then(|spec| spec.into_tracker.as_deref())
+                == Some(definition.name.as_str())
+        })
+        .map(|resource| resource.name.as_str())
+        .collect();
+    let mut parts = Vec::new();
+    if !depositors.is_empty() {
+        parts.push(format!("deposits from {}", depositors.join(", ")));
+    }
+    if !definition.resources.is_empty() {
+        parts.push(format!("brings {}", definition.resources.join(", ")));
+    }
+    if parts.is_empty() {
+        "(no paths)".to_owned()
+    } else {
+        format!("(no paths; {})", parts.join("; "))
     }
 }
 

@@ -280,7 +280,9 @@ Definition management (noun subcommands):
 - `newgit tracker capture <tracker> --from-store` — seed a lane from the store
   repo's working tree, so the first `spawn` comes up with the content
 - `newgit tracker list` — a tree by ownership: kind, role, priority,
-  maintainers, and (inside a workspace) what is bound
+  maintainers, and (inside a workspace) what is bound. Trackers with no
+  `paths` come after the tree, with what deposits into them and what they
+  bring
 - `newgit tracker use <tracker> [instance]` / `newgit tracker drop <tracker>
   [instance] [--stash | --discard]`
 - `newgit log <tracker> [instance] [-- <git log args>]` — one tracker's

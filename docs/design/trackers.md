@@ -137,8 +137,16 @@ whose tree the binding keys (see *Installs across trackers*): the tree the
 instance holds was built for the binding it had, so it is filled from the store
 when that binding was built before, else its `prepare` runs again. A rebuild
 that fails leaves the resource `failed` without failing the command, since the
-binding has changed by then. `root`, `project`, and `access`
-cannot be dropped. A checkpoint records the binding, and undo restores it.
+binding has changed by then. A secret tracker's content is captured into its
+lane before its files leave the workspace; a tracker with no `paths` (one that
+only receives `into_tracker` deposits, or only brings resources) has nothing in
+the workspace, so there is no capture step and `--stash`/`--discard` have
+nothing to act on — its deposits are already in its lane, and a checkpoint
+covers them. (An explicit `newgit tracker capture` of such a tracker is still
+an error: asked for directly, it should say there is nothing to capture.)
+`root`, `project`, and `access` cannot be dropped. A checkpoint records the
+binding, and undo restores it; `newgit status` lists the trackers the binding
+binds, not every tracker in a role.
 
 `{{bound.trackers}}` and `{{bound.paths}}` give a resource's commands what the
 instance binds, so a shared install builds only the bound members.
