@@ -462,7 +462,15 @@ replace = [
 [actions.prepare]
 # Reads the rendered config.toml, so it starts this instance's own stack.
 # Ports and exports are bound before a resource's own `prepare` runs.
-command = "supabase start"
+#
+# The `stop` comes first because `supabase start` against a stack that is
+# still running from an earlier binding (same `project_id`) prints its status
+# and exits 0 without re-reading the rendered ports, so the instance would
+# report ready on ports nothing listens on. `stop` keeps the database volume
+# (only `--no-backup`, used in `cleanup`, deletes it), so the branch's data
+# comes back on the new ports. Its output and exit code are ignored: there is
+# nothing to stop on a first start.
+command = "supabase stop >/dev/null 2>&1; supabase start"
 
 # A convenience command, not a lifecycle hook: nothing runs this for you.
 [actions.reset]
