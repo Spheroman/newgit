@@ -25,9 +25,12 @@ jobs:
             os: macos-latest
           - target: x86_64-apple-darwin
             os: macos-latest
-          - target: x86_64-unknown-linux-gnu
+          # Static musl, not glibc: a glibc build only runs on distros at
+          # least as new as the runner (2.39 on ubuntu-24.04), which left out
+          # Debian 12, Ubuntu 22.04, RHEL 9, and Alpine entirely.
+          - target: x86_64-unknown-linux-musl
             os: ubuntu-latest
-          - target: aarch64-unknown-linux-gnu
+          - target: aarch64-unknown-linux-musl
             os: ubuntu-24.04-arm
     runs-on: ${{ matrix.os }}
     steps:
@@ -36,6 +39,11 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
+
+      - name: Install musl-gcc
+        # ring compiles C, and the cc crate finds musl-gcc for musl targets.
+        if: endsWith(matrix.target, '-musl')
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
 
       - uses: Swatinem/rust-cache@v2
         with:
@@ -69,9 +77,16 @@ jobs:
           echo "archive=$name.tar.gz" >> "$GITHUB_OUTPUT"
 
       - name: Verify the packaged binary runs
-        # Skipped when cross-architecture: this runner cannot execute it.
-        if: matrix.target != 'aarch64-unknown-linux-gnu' || runner.arch == 'ARM64'
         run: ./target/${{ matrix.target }}/release/newgit --version
+
+      - name: Verify the Linux binary is static
+        # A dynamic link to any libc brings back "runs on some distros".
+        if: endsWith(matrix.target, '-musl')
+        run: |
+          set -euo pipefail
+          info="$(file target/${{ matrix.target }}/release/newgit)"
+          echo "$info"
+          echo "$info" | grep -q "statically linked"
 
       - uses: actions/upload-artifact@v7
         with:

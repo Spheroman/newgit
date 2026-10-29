@@ -26,14 +26,8 @@ target() {
   arch="$(uname -m)"
   case "$os" in
     Darwin) os=apple-darwin ;;
-    Linux)
-      # The release binaries link glibc; on musl they install and then fail
-      # to start with a baffling "not found".
-      if ls /lib/ld-musl-* >/dev/null 2>&1; then
-        die "no prebuilt binary for musl (Alpine); try \`cargo install newgit --locked\`"
-      fi
-      os=unknown-linux-gnu
-      ;;
+    # Static musl binaries: they run on any distro, whatever its libc.
+    Linux) os=unknown-linux-musl ;;
     *) die "no prebuilt binary for $os; try \`cargo install newgit --locked\`" ;;
   esac
   case "$arch" in
@@ -70,6 +64,19 @@ sha256() {
   fi
 }
 
+# `newgit merge` runs `git merge-tree --write-tree`, new in git 2.38.
+check_git() {
+  if ! command -v git >/dev/null 2>&1; then
+    say "warning: newgit needs git 2.38 or newer on your PATH"
+    return
+  fi
+  ver="$(git --version | sed -n 's/^git version \([0-9]*\)\.\([0-9]*\).*/\1 \2/p')"
+  set -- $ver
+  if [ $# -eq 2 ] && { [ "$1" -lt 2 ] || { [ "$1" -eq 2 ] && [ "$2" -lt 38 ]; }; }; then
+    say "warning: newgit needs git 2.38 or newer; this is $(git --version)"
+  fi
+}
+
 main() {
   need uname
   need tar
@@ -90,7 +97,21 @@ main() {
   trap 'rm -rf "$tmp"' EXIT INT TERM
 
   say "downloading $name ($version)"
-  fetch "$base/$name.tar.gz" "$tmp/$name.tar.gz" || die "download failed: $base/$name.tar.gz"
+  if ! fetch "$base/$name.tar.gz" "$tmp/$name.tar.gz" 2>/dev/null; then
+    case "$target" in
+      *-linux-musl)
+        # Releases up to v0.6.0 shipped only glibc builds, linked against
+        # glibc 2.39: they run on recent distros and nowhere else.
+        if ls /lib/ld-musl-* >/dev/null 2>&1; then
+          die "$version has no build for musl (Alpine); try \`cargo install newgit --locked\`"
+        fi
+        name="newgit-${target%-musl}-gnu"
+        say "no static build in $version; trying $name, which needs glibc 2.39 or newer"
+        fetch "$base/$name.tar.gz" "$tmp/$name.tar.gz" || die "download failed: $base/$name.tar.gz"
+        ;;
+      *) die "download failed: $base/$name.tar.gz" ;;
+    esac
+  fi
   fetch "$base/$name.tar.gz.sha256" "$tmp/$name.tar.gz.sha256" || die "download failed: $base/$name.tar.gz.sha256"
 
   # The checksum file is `<hex>  <file>`; compare the hex, not the name.
@@ -100,6 +121,10 @@ main() {
     die "checksum mismatch for $name.tar.gz (expected $expected, got $actual)"
 
   tar -xzf "$tmp/$name.tar.gz" -C "$tmp"
+  # Run it before installing it, so a binary that cannot start here never
+  # replaces one that can.
+  installed="$("$tmp/$name/newgit" --version 2>&1)" ||
+    die "$name does not run on this machine: $installed"
   mkdir -p "$dir"
   # Copy then rename, so a newgit that is running right now keeps its inode
   # and never sees a half-written file.
@@ -107,8 +132,8 @@ main() {
   chmod 755 "$dir/.newgit.tmp"
   mv -f "$dir/.newgit.tmp" "$dir/newgit"
 
-  say "installed $("$dir/newgit" --version 2>/dev/null || echo newgit) to $dir/newgit"
-  command -v git >/dev/null 2>&1 || say "warning: newgit needs \`git\` on your PATH"
+  say "installed $installed to $dir/newgit"
+  check_git
   case ":$PATH:" in
     *":$dir:"*) ;;
     *)

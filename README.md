@@ -128,9 +128,11 @@ brew install spheroman/newgit/newgit
 
 Or download an archive from the
 [releases](https://github.com/Spheroman/newgit/releases) page (macOS and Linux,
-arm64 and x86_64), or build from source: `cargo install newgit --locked`.
+arm64 and x86_64), or build from source: `cargo install newgit --locked`. The
+Linux binaries are static, so they run on any distro, Alpine included.
 
-You'll need `git` on your `PATH` and a Unix-like OS. Windows isn't supported.
+You'll need git 2.38 or newer on your `PATH` and a Unix-like OS. Windows isn't
+supported.
 newgit is `0.x` and moves fast. `newgit --version` prints the commit you're
 running.
 
