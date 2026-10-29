@@ -8,6 +8,8 @@
   // The UI and the API, at the apex. Previews get <id>.newgit.dev (newgit-cloudflare.md, *Auth*).
   "routes": [{ "pattern": "newgit.dev", "custom_domain": true }],
   "workers_dev": true,
+  // scripts/install.sh, served at /install.sh.
+  "rules": [{ "type": "Text", "globs": ["**/*.sh"] }],
   // One namespace for every project; repo names carry the project as a
   // prefix. A binding names exactly one namespace (newgit-cloudflare.md).
   "artifacts": [{ "binding": "ARTIFACTS", "namespace": "newgit" }],

@@ -112,20 +112,23 @@ scripts/fork/install-mac.sh
 
 ## Install
 
-Prebuilt binaries for macOS and Linux (arm64 and x86_64) are attached to each
-[release](https://github.com/Spheroman/newgit/releases):
-
 ```sh
-TARGET=aarch64-apple-darwin   # or x86_64-apple-darwin, {x86_64,aarch64}-unknown-linux-gnu
-VERSION=v0.6.0
-BASE=https://github.com/Spheroman/newgit/releases/download/$VERSION
-curl -fsSLO $BASE/newgit-$TARGET.tar.gz -O $BASE/newgit-$TARGET.tar.gz.sha256
-shasum -a 256 -c newgit-$TARGET.tar.gz.sha256
-tar -xzf newgit-$TARGET.tar.gz
-install -m755 newgit-$TARGET/newgit ~/.local/bin/newgit
+curl -fsSL https://newgit.dev/install.sh | sh
 ```
 
-Or from source: `cargo install newgit --locked`.
+The script picks the prebuilt binary for your OS and architecture, verifies
+its checksum, and puts it in `~/.local/bin`. Set `NEWGIT_VERSION=v0.6.0` to
+pin a release or `NEWGIT_INSTALL_DIR` to put it elsewhere.
+
+Or with Homebrew, on macOS or Linux:
+
+```sh
+brew install spheroman/newgit/newgit
+```
+
+Or download an archive from the
+[releases](https://github.com/Spheroman/newgit/releases) page (macOS and Linux,
+arm64 and x86_64), or build from source: `cargo install newgit --locked`.
 
 You'll need `git` on your `PATH` and a Unix-like OS. Windows isn't supported.
 newgit is `0.x` and moves fast. `newgit --version` prints the commit you're

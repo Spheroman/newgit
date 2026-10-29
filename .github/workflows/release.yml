@@ -150,6 +150,52 @@ jobs:
             --verify-tag \
             artifacts/*
 
+  homebrew:
+    name: update the Homebrew tap
+    # After publish: the formula points at the release's archives, so they
+    # must exist before `brew install` can find them.
+    needs: [build, publish]
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/download-artifact@v8
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Check the deploy key
+        env:
+          HOMEBREW_TAP_DEPLOY_KEY: ${{ secrets.HOMEBREW_TAP_DEPLOY_KEY }}
+        run: |
+          if [ -z "${HOMEBREW_TAP_DEPLOY_KEY:-}" ]; then
+            echo "HOMEBREW_TAP_DEPLOY_KEY is not set: a write deploy key on Spheroman/homebrew-newgit." >&2
+            echo "Repair by hand: scripts/homebrew-formula.sh <version> <dir of .sha256 files>" >&2
+            exit 1
+          fi
+
+      - uses: actions/checkout@v7
+        with:
+          repository: Spheroman/homebrew-newgit
+          ssh-key: ${{ secrets.HOMEBREW_TAP_DEPLOY_KEY }}
+          path: tap
+
+      - name: Commit the formula
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          scripts/homebrew-formula.sh "$version" artifacts > tap/Formula/newgit.rb
+          cd tap
+          if git diff --quiet; then
+            echo "Formula/newgit.rb is already at $version"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -am "newgit $version"
+          git push
+
   crates-io:
     name: publish to crates.io
     # Deliberately last. A GitHub release can be deleted and a tag can be

@@ -5,6 +5,9 @@
 
 import { parse as parseToml } from "smol-toml";
 
+// The one-line installer, bundled as text (the `rules` in wrangler.jsonc).
+import installScript from "../../scripts/install.sh";
+
 import { type Repos, ArtifactsRepos } from "./artifacts";
 import {
 	AGENT_TTL_MAX_SECONDS,
@@ -123,6 +126,12 @@ async function route(request: Request, env: Env, deps: Deps): Promise<Response> 
 	const url = new URL(request.url);
 	const path = url.pathname.replace(/\/+$/, "");
 	const method = request.method;
+
+	// ── Install (`curl -fsSL https://newgit.dev/install.sh | sh`) ──────────
+	if ((method === "GET" || method === "HEAD") && (path === "/install.sh" || path === "/install"))
+		return new Response(method === "HEAD" ? null : installScript, {
+			headers: { "content-type": "text/x-shellscript; charset=utf-8", "cache-control": "public, max-age=300" },
+		});
 
 	// ── Login (no token yet) ───────────────────────────────────────────────
 	if (method === "POST" && path === "/v1/login/device") {

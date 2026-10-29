@@ -5,6 +5,7 @@
   "main": "src/index.ts",
   "compatibility_date": "2026-10-05",
   "compatibility_flags": ["nodejs_compat"],
+  "rules": [{ "type": "Text", "globs": ["**/*.sh"] }],
   "durable_objects": { "bindings": [{ "class_name": "ProjectDO", "name": "PROJECTS" }, { "class_name": "UserDO", "name": "USERS" }] },
   "migrations": [{ "tag": "v1", "new_sqlite_classes": ["ProjectDO"] }, { "tag": "v2", "new_sqlite_classes": ["UserDO"] }],
   "vars": { "GITHUB_CLIENT_ID": "test-client", "ARTIFACTS_GIT_BASE": "https://acct.artifacts.example/git/newgit", "TOKEN_KEY": "test-signing-key-not-secret", "ALLOWED_LOGINS": "*" }
