@@ -40,11 +40,13 @@ const SPLIT_TRAILER: &str = "Newgit-Split: ";
 /// commits, so a composer that has only them (the remote) orders them too.
 const PARENT_TRAILER: &str = "Newgit-Split-Parent: ";
 
-/// One header of the commit split, kept verbatim: what Git stores after
-/// the committer line — a signature (`gpgsig`), a merged tag (`mergetag`),
-/// an `encoding`. A header's continuation lines already start with a space,
-/// which is a trailer's continuation syntax too, so they are kept as they
-/// are. Composing gives the header back when, with it, the rebuilt commit is
+/// One line of the headers of the commit split, kept verbatim: what Git
+/// stores after the committer line — a signature (`gpgsig`), a merged tag
+/// (`mergetag`), an `encoding`. One trailer per line, continuation lines
+/// included: a PGP signature has a line holding only a space, which Git's
+/// trailer parser takes for a blank line, so continuation lines left as
+/// they are would hide every trailer from `git log --format=%(trailers)`.
+/// Composing gives the headers back when, with them, the rebuilt commit is
 /// byte for byte the original (`restore_originals`).
 const HEADER_TRAILER: &str = "Newgit-Split-Header: ";
 
@@ -57,10 +59,8 @@ fn with_split_trailers(message: &str, source: &str, parent: Option<&str>, header
     let body = message.trim_end_matches('\n');
     let ending = &message[body.len()..];
     let mut block = String::new();
-    for line in headers.lines() {
-        if !line.starts_with(' ') {
-            block.push_str(HEADER_TRAILER);
-        }
+    for line in headers.split_terminator('\n') {
+        block.push_str(HEADER_TRAILER);
         block.push_str(line);
         block.push('\n');
     }
@@ -79,8 +79,8 @@ struct SplitFrom {
 }
 
 /// The reverse of [`with_split_trailers`]: `None` when `message` is not a
-/// split commit's. The trailers are the last paragraph — none of their lines
-/// is blank, continuation lines included.
+/// split commit's. The trailers are the last paragraph: none of their lines
+/// is blank.
 fn parse_split(message: &str) -> Option<SplitFrom> {
     let trimmed = message.trim_end_matches('\n');
     let ending = &message[trimmed.len()..];
@@ -98,16 +98,12 @@ fn parse_split(message: &str) -> Option<SplitFrom> {
         }
         None => None,
     };
-    let recognized = lines
-        .first()
-        .is_none_or(|first| first.starts_with(HEADER_TRAILER))
-        && lines
-            .iter()
-            .all(|line| line.starts_with(HEADER_TRAILER) || line.starts_with(' '));
+    let recognized = lines.iter().all(|line| line.starts_with(HEADER_TRAILER));
     let (message, headers) = if recognized {
         let headers: String = lines
             .iter()
-            .map(|line| format!("{}\n", line.strip_prefix(HEADER_TRAILER).unwrap_or(line)))
+            .filter_map(|line| line.strip_prefix(HEADER_TRAILER))
+            .map(|line| format!("{line}\n"))
             .collect();
         (format!("{body}{ending}"), headers)
     } else {
@@ -498,7 +494,16 @@ pub fn compose(
         } else {
             // Recreated: the source's metadata (the member that is an original
             // commit, or any member with its trailer stripped).
-            let lead = original.unwrap_or(&events[members[0]]);
+            // A piece that recorded the original's headers, if any did:
+            // pieces split before they were recorded have none.
+            let lead = original
+                .or_else(|| {
+                    members
+                        .iter()
+                        .map(|&index| &events[index])
+                        .find(|event| !event.commit.original_headers.is_empty())
+                })
+                .unwrap_or(&events[members[0]]);
             out.write(&lead.commit, &tip, &merges, &combined, &state, &source)
         };
         for &index in members {
@@ -720,11 +725,6 @@ impl Emitter {
             Some(moved.get(&id).cloned().unwrap_or(id))
         };
         let tip = tip.reference().and_then(|reference| resolve(&reference));
-        if let Some(tip) = &tip
-            && !moved.is_empty()
-        {
-            git(repo, &["update-ref", &self.view_ref, tip])?;
-        }
 
         // The notes: one commit on NOTES_REF holding every view commit's
         // state, with a fixed identity and date so it is deterministic too.
@@ -791,6 +791,12 @@ impl Emitter {
             "git fast-import",
             Some(&stream),
         )?;
+        // Last, so the view never points at commits without their notes.
+        if let Some(tip) = &tip
+            && !moved.is_empty()
+        {
+            git(repo, &["update-ref", &self.view_ref, tip])?;
+        }
         let _ = groups;
         Ok(View {
             tip,
@@ -870,7 +876,7 @@ fn restore_originals(
             .unwrap_or(object.len());
         let (head, message) = object.split_at(split);
         let mut rebuilt = Vec::with_capacity(object.len() + headers.len());
-        for line in String::from_utf8_lossy(head).lines() {
+        for line in String::from_utf8_lossy(head).split('\n') {
             match line.strip_prefix("parent ") {
                 Some(parent) => {
                     let parent = moved.get(parent).map_or(parent, String::as_str);
@@ -1656,7 +1662,9 @@ fn parse_commit(raw: &str) -> RawCommit {
     let mut committer = String::new();
     let mut parents = 0;
     let mut extra = String::new();
-    for line in headers.lines() {
+    // `split`, not `lines`: a header's `\r` is part of what its signature
+    // covers.
+    for line in headers.split('\n') {
         if !committer.is_empty() {
             extra.push_str(line);
             extra.push('\n');
@@ -1891,5 +1899,55 @@ fn run(command: &mut Command, description: &str, stdin: Option<&[u8]>) -> Result
             command: description.to_owned(),
             stderr: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn round_trip(message: &str, headers: &str) {
+        let split = with_split_trailers(message, "source", Some("parent"), headers);
+        let back = parse_split(&split).expect("a split commit's message");
+        assert_eq!(back.source, "source");
+        assert_eq!(back.parent.as_deref(), Some("parent"));
+        assert_eq!(back.message, message, "message of {split:?}");
+        assert_eq!(back.headers, headers, "headers of {split:?}");
+    }
+
+    #[test]
+    fn split_trailers_give_back_the_exact_message_and_headers() {
+        for message in [
+            "",
+            "\n",
+            "subject",
+            "subject\n",
+            "subject\n\n",
+            "subject\n\nbody\n\nCo-authored-by: Bo <bo@example.com>",
+            "subject\r\n\r\nbody\r\n",
+            "subject\n\n  indented last paragraph\n",
+            "subject\n\nNewgit-Split: in the body\n",
+        ] {
+            round_trip(message, "");
+            round_trip(
+                message,
+                "gpgsig -----BEGIN PGP SIGNATURE-----\n \n wsFc\r\n -----END PGP SIGNATURE-----\n",
+            );
+            round_trip(
+                message,
+                "encoding ISO-8859-1\nmergetag object abc\n type commit\n",
+            );
+        }
+    }
+
+    #[test]
+    fn a_split_from_before_headers_were_kept_reads_as_it_always_did() {
+        let old =
+            parse_split("subject\n\nNewgit-Split-Parent: p\nNewgit-Split: s\n").expect("split");
+        assert_eq!(old.source, "s");
+        assert_eq!(old.parent.as_deref(), Some("p"));
+        assert_eq!(old.message, "subject\n");
+        assert_eq!(old.headers, "");
+        assert!(parse_split("subject\n\nCo-authored-by: Bo\n").is_none());
     }
 }

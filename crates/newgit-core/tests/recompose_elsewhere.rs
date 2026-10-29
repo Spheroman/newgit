@@ -386,3 +386,47 @@ fn a_view_without_every_tracker_gets_rebuilt_commits_unsigned() {
         "the rebuilt commit names the original it stands for"
     );
 }
+
+#[test]
+fn a_github_merge_comes_back_with_its_pgp_signature() {
+    let project = Project::new();
+    std::fs::write(project.repo.join("README.md"), "merged\n").expect("write");
+    git(&project.repo, &["add", "-A"]);
+    let tree = git(&project.repo, &["write-tree"]);
+    // As GitHub writes a merge: PGP armor, whose blank line Git stores as a
+    // lone space, and no final newline. The signature need not verify for
+    // the id to come back; the bytes have to.
+    let object = format!(
+        "tree {tree}\nparent {}\nauthor DJ <dj@example.com> 2000 -0700\n\
+         committer GitHub <noreply@github.com> 2000 -0700\n\
+         gpgsig -----BEGIN PGP SIGNATURE-----\n \n wsFcBAABCAAQBQJq39A0CRC1aQ7uu5UhlAAACnEQAH4X\n \
+         =6GVQ\n -----END PGP SIGNATURE-----\n \n\n\
+         Fix the endpoint (#136)\n\nCo-authored-by: Bo <bo@example.com>",
+        project.base
+    );
+    let merge = git_env(
+        &project.repo,
+        &["hash-object", "-t", "commit", "-w", "--stdin"],
+        &[],
+        Some(&object),
+    );
+    git(&project.repo, &["reset", "-q", "--soft", &merge]);
+
+    let (root, electron) = project.split_to_remote(&merge);
+    assert_eq!(
+        git(
+            &project.repo,
+            &[
+                "log",
+                "-1",
+                "--format=%(trailers:key=Newgit-Split,valueonly)",
+                &root
+            ],
+        ),
+        merge,
+        "Git's own trailer parser still finds the split source"
+    );
+    let rebuilt = project.compose_on_remote(&root, Some(&electron));
+    assert_eq!(rebuilt, merge, "the merge comes back as itself");
+    assert_eq!(raw_commit(&project.remote, &merge), object);
+}

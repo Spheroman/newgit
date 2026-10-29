@@ -198,11 +198,12 @@ per code tracker it touched, on that tracker's instance branch: same author,
 date, and message, plus trailers: `Newgit-Split: <view commit>`;
 `Newgit-Split-Parent: <commit>` naming the commit it followed in the view, so
 trackers' commits interleave back in the order they were made rather than
-merely by date; and a `Newgit-Split-Header:` for each header Git stored
-after the committer line (a signature, a merged tag, an encoding), verbatim
-— a header's continuation lines start with a space, which is trailer
-continuation syntax too. The split commit's message ends the way the
-original's did, final newline or none (GitHub writes merges without one).
+merely by date; and a `Newgit-Split-Header:` for each line of the headers
+Git stored after the committer line (a signature, a merged tag, an
+encoding), verbatim. One trailer per line, continuation lines included: a
+PGP signature holds a line that is only a space, which Git's trailer parser
+reads as blank. The split commit's message ends the way the original's did,
+final newline or none (GitHub writes merges without one).
 On replay, tracker commits sharing a split source fold back into one view
 commit with the trailers stripped — so a commit split and recomposed is
 *the same commit*: same tree, parent, author, date, message, and headers,
