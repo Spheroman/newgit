@@ -8,7 +8,7 @@
   a dropped tracker's files are not checked out. The key held the identity
   paths' content, `key_command`'s output and the definition, and a shared
   lockfile does not change with the binding, so the tree built for one
-  binding filled instances of another. newgit-trackers.md already said the
+  binding filled instances of another. docs/design/trackers.md already said the
   bound set was part of the install's identity.
 
   The binding is in every resource's key, not only those whose commands

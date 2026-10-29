@@ -1,4 +1,4 @@
-//! Hazards in the projection found in review (newgit-trackers.md, step 3c):
+//! Hazards in the projection found in review (docs/design/trackers.md, step 3c):
 //! a note written before a carve, a secret hidden behind a merge, deleting a
 //! secret, the project root's own branch, an instance named `main`, and a
 //! removed instance's commits collected away.

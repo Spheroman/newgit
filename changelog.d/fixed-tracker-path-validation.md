@@ -1,6 +1,6 @@
 - Tracker paths are checked by where they lead rather than how they are
   spelled, and a code tracker may own other trackers' definitions: the
-  governance layering newgit-trackers.md describes under "Who may change
+  governance layering docs/design/trackers.md describes under "Who may change
   what".
 
   The check read a path's first component as written, so `./.git`, which

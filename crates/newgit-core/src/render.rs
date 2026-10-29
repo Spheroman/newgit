@@ -8,7 +8,7 @@
 //! There is no template file. `port = 54321` is not a placeholder, it is the
 //! project's working default — a clone without newgit still starts on it.
 //! newgit substitutes into the committed content and writes the result into
-//! one workspace. See *Render* in newgit-v1-mvp.md.
+//! one workspace. See *Render* in docs/design/spec.md.
 
 use camino::{Utf8Path, Utf8PathBuf};
 use serde::{Deserialize, Serialize};

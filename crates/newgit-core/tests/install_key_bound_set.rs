@@ -1,5 +1,5 @@
 //! The install store keys a built tree on the trackers its instance binds,
-//! as newgit-trackers.md promises under "Installs across trackers": a shared
+//! as docs/design/trackers.md promises under "Installs across trackers": a shared
 //! lockfile lists every member, bound or not, its install builds only the
 //! bound ones, "and the bound set is part of the install's identity, so
 //! copy-on-write installs are keyed correctly".

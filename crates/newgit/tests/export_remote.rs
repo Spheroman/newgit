@@ -1,4 +1,4 @@
-//! `newgit export --remote <name>` (newgit-trackers.md, step 6): the
+//! `newgit export --remote <name>` (docs/design/trackers.md, step 6): the
 //! trackers' `main`s, composed with their history, pushed to an ordinary Git
 //! repository defined in `.newgit/exports/<name>.toml`. A bare repository
 //! stands in for GitHub.

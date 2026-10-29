@@ -3,10 +3,10 @@
 How newgit works and how to drive it, in more depth than the
 [README](../README.md). For every tracker and resource key, its default, and
 which template variables each hook sees, run `newgit reference`: the
-definition format travels with the binary. The design documents,
-[`newgit-v1-mvp.md`](../newgit-v1-mvp.md) and
-[`newgit-architecture.md`](../newgit-architecture.md), explain why it is
-shaped the way it is.
+definition format travels with the binary. The design documents in
+[`design/`](design/) explain why it is shaped the way it is:
+[the design](design/spec.md), [the tracker model](design/trackers.md), and
+[the remote](design/remote.md).
 
 The central idea shows up in the code shape: branch instances bind source
 state to user-defined trackers and resources, instead of baking env files,
@@ -15,8 +15,7 @@ lanes.
 
 ## The workflow
 
-All eight v1 milestones are implemented. The workflow the MVP set out to make
-feel normal now runs end to end:
+The whole loop, on one machine:
 
 ```sh
 newgit init
@@ -91,9 +90,9 @@ newgit init
 `init` prints what to commit. Run it again where `.newgit/` already exists
 (a plain `git clone` of a newgit project, or one set up by an older newgit)
 and it adopts what is there: it writes any missing built-in tracker
-definitions and gives `root` the project's history. The split matters: `.newgit/config.toml`,
-`trackers/`, `resources/`, and `scripts/` are the control plane and belong in
-Git, so teammates and CI see the same orchestration. Everything else under
+definitions and gives `root` the project's history. The split matters:
+`.newgit/config.toml`, `trackers/`, `resources/`, `scripts/`, and `exports/`
+are the control plane and belong in Git, so teammates and CI see the same orchestration. Everything else under
 `.newgit/` — branch bindings, captured content, checkpoints, logs, runtime
 state — is local and is gitignored for you.
 
@@ -112,26 +111,29 @@ tip is already on another branch, a tag, or the remote (asked live; an
 unreachable remote keeps the branch). Otherwise it is
 kept, and `remove` says why (`--keep-branch` / `--delete-branch` override).
 
-### What your package manager will cost you
+### What installs cost
 
-Every branch instance gets its own installed dependencies. That is what makes
-instances independent — two branches with different lockfiles must not share
-a dependency tree, or one branch's install silently rewrites the other's —
-and it is why installs are resources rather than trackers.
+Every branch instance gets its own dependency tree. Two branches with
+different lockfiles must not share one, or one branch's install silently
+rewrites the other's, which is why installs are resources rather than
+trackers.
 
-How much that costs is set by your package manager, not by newgit. **pnpm**
-hardlinks packages from one shared store into each tree, so a tenth instance
-adds directory entries rather than gigabytes; Yarn PnP skips the tree
-entirely, and `uv` does the same for Python. **npm** expands a full copy per
-instance — its cache holds tarballs, so `npm ci` re-expands every time, and
-ten instances of a monorepo means ten full copies of `node_modules`. `pip`
-into a per-instance venv behaves the same way.
+Two instances at the *same* lockfile are one tree built twice, though. An
+install that declares what it produces (`[identity] produces`) is built once
+and published to the install store in `.newgit/installs/`; every later
+instance with the same key is filled from it with a copy-on-write clone and
+never runs the install. The key covers the lockfile, the definition file,
+the `key_command` output, and which trackers the instance binds. Where the
+filesystem cannot clone (APFS, btrfs, and XFS can), newgit takes a full copy
+and says so. A tree that names its own workspace in a file is not shared,
+unless a `[[render]]` on that file lets the store rewrite it per instance;
+the `pnpm` template does this for pnpm's workspace state.
 
-This is the one place where newgit multiplies a cost you already had instead
-of absorbing it, and there is no lever on newgit's side: a shared installed
-tree is the thing that would be wrong. If you run many instances of a large
-repository, a package manager with a content-addressed store is worth more
-here than it is on plain Git.
+On a miss, the cost is your package manager's. **pnpm**, uv, and bun
+hardlink from a shared cache, so a new tree is mostly directory entries.
+**npm** and `pip` into a venv expand a full copy each time. `newgit reference
+installs` covers the store in full: what goes into the key, what `cleanup`
+prunes, and how `undo --force-recompute` drops an entry it no longer trusts.
 
 ## Using it with T3 Code
 
@@ -148,7 +150,7 @@ project gets plain worktrees, as before.
 settling and unsettling a thread
 ([#157](https://github.com/Spheroman/newgit/issues/157)): `stop` stops every
 running long-running action, dependents first, and records what it stopped
-in `.newgit/state/<instance>/stopped.toml`; `start` brings back exactly
+in `.newgit/state/<slug>/stopped.toml`; `start` brings back exactly
 that, dependencies first, so a resource nobody had started stays stopped.
 Port claims are kept, so the instance returns on the same ports. With
 `--json` each prints `{"instance", "resources": [{"name", "action",
@@ -157,9 +159,10 @@ anything failed; a resource that failed to start stays recorded for the
 next `start`. A resource that is not a process newgit supervises — a
 Supabase stack, a Compose project — is taken down only if it defines a
 `suspend` / `resume` pair (`newgit reference actions`); the `supabase`
-template does.
-([Spheroman/t3code#2](https://github.com/Spheroman/t3code/issues/2) wires
-them to settle and unsettle; `remove` stays for delete.)
+template does. The fork runs `stop` when you settle a thread and `start`
+when you unsettle it or send it a message
+([Spheroman/t3code#2](https://github.com/Spheroman/t3code/issues/2));
+`remove` stays for delete.
 
 On macOS it installs as "T3 Code (newgit)", beside upstream T3 Code: its
 own app ID, state in `~/.t3-newgit`, and no auto-update.
@@ -235,11 +238,13 @@ the second runs `newgit remove` when Claude Code removes the worktree.
 Branch-instance lifecycle (top-level verbs; `[instance]` is inferred when run
 inside a workspace):
 
-- `newgit init` / `spawn <name> [--use <tracker>] [--drop <tracker>] [--private]` /
-  `status [name]` / `remove <name> [--purge] [--keep-branch | --delete-branch]` —
-  `status` says whether each instance is ready, and why not
+- `newgit init [--name <name>]` / `spawn <name> [--from <rev>] [--use
+  <tracker>] [--drop <tracker>] [--private] [--json]` / `status [name]` /
+  `remove <name> [--purge] [--keep-branch | --delete-branch]` — `status`
+  says whether each instance is ready, and why not
 - `newgit status <instance> --path` — just the workspace path, for scripts
-- `newgit reference` — the definition format, every key and default
+- `newgit reference [section | all]` — the definition format, every key and
+  default; bare, it lists the sections
 - `newgit run [instance] -- <command>` — run with exports and ports loaded
 - `newgit env [instance]` — the environment `run` and every hook get, each
   variable labeled with the declaration it came from
@@ -250,8 +255,10 @@ inside a workspace):
   first, and later bring back exactly what that took down; ports,
   workspace, trackers, and installs stay as they are. Both exit 0 with
   nothing to do and 1 if any resource failed
-- `newgit checkpoint [instance] [-m <msg>]` / `undo [instance] [--to <id>]` /
-  `checkpoints [instance]`
+- `newgit checkpoint [instance] [-m <msg>] [--verify]` / `undo [instance]
+  [--to <id>] [--only <resource>] [--force-recompute]` / `checkpoints
+  [instance]` — `--verify` proves the restore works by running a real undo;
+  `--only` restores one resource and leaves everything else alone
 - `newgit export [instance] --to <dir> [--include <path>] [--exclude <path>]`
 - `newgit export --remote <name> [--dry-run] [--force]` — push the trackers'
   `main`s, history and all, to the target in `.newgit/exports/<name>.toml`
@@ -259,6 +266,8 @@ inside a workspace):
 - `newgit cleanup [--dry-run] [--purge-archived]`
 - `newgit ports [--check]` — claimed ports, or detect a listening one nothing
   claims
+- `newgit render [--check]` — resolve every `[[render]]`; `--check` tests
+  each `find` against the working tree without spawning, for adoption and CI
 
 Definition management (noun subcommands):
 
@@ -266,7 +275,8 @@ Definition management (noun subcommands):
   [--merge-with-source]`
 - `newgit tracker create <name> --code --path <path>...` — a committed code
   tracker, carved with its history out of whichever tracker owns the paths
-- `newgit tracker track <tracker> <path>...`
+- `newgit tracker track <tracker> <path>...` — secret trackers only
+- `newgit tracker remove <name>`
 - `newgit tracker capture|merge|pull|checkout <tracker> [instance]`
 - `newgit tracker capture <tracker> --from-store` — seed a lane from the store
   repo's working tree, so the first `spawn` comes up with the content
@@ -278,17 +288,21 @@ Definition management (noun subcommands):
   history: an instance's branch as of its last checkpoint, or the project
   root's
 - `newgit resource add <name> --template <template>` / `list` / `templates`
+- `newgit resource remove <name> [--force]` — `--force` drops it from live
+  instances and releases their ports instead of refusing
 
 Remote:
 
 - `newgit login` / `logout` / `whoami`
-- `newgit remote add [--url <url>] [--project <owner>/<name>]` / `remote show`
+- `newgit remote add [--url <url>] [--project <name> | <owner>/<name>]
+  [--json]` / `remote show [--json]` — a bare name creates the project under
+  your account; `owner/name` joins one that exists
 - `newgit remote delete <owner>/<name>` — the owner deletes the project
   from the remote: every repo, record, and token pinned to it. Not undoable
-- `newgit clone <owner>/<name> [dir]`
+- `newgit clone <owner>/<name> [dir] [--url <url>]`
 - `newgit merge [instance] [--into <branch>]` — `newgit merge main` merges
   the project root
-- `newgit members add|remove <github-login>` / `members list`
+- `newgit members add|remove <github-login>` / `members list [--json]`
 - `newgit spawn <name> --from-checkpoint <instance>/<checkpoint>`
 
 Resource templates: `process`, `pnpm`, `install`, `command-snapshot`,
@@ -339,6 +353,11 @@ so at bind. For a tracker-owned file, `tracker capture` reverses the
 substitution, so edits you make beside the rendered value reach the lane and
 your port does not.
 
+A render can also target a file inside a resource's own `[identity]
+produces`, a built tree rather than source. That is how an install whose
+tree records its workspace path can still be shared through the install
+store (`newgit reference render`).
+
 **A workspace's `origin` is the real remote.** `git pull` and `gh` see the
 project's repository, and `git push` checkpoints the instance before
 forwarding the push there — succeeding only if that remote accepted it.
@@ -384,7 +403,7 @@ tests by nature.
 - `remote/` is the hosted remote: a Cloudflare Worker with Durable Objects
   over Artifacts repos, deployed at `https://newgit.dev`.
 - `.newgit/` is created by `newgit init`. Committed: `config.toml`,
-  `trackers/`, `resources/`, `scripts/`. Gitignored local state: `branches/`,
+  `trackers/`, `resources/`, `scripts/`, `exports/`. Gitignored local state: `branches/`,
   `checkpoints/`, `logs/`, `state/`, `installs/`, and `local/` — which holds
   `trackers.git`, every tracker's history (bare repo).
 

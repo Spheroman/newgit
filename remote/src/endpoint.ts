@@ -1,5 +1,5 @@
 // The Git endpoint's container: one per project, running real `git` and the
-// `newgit` binary (newgit-trackers.md, *The Git endpoint*). The Worker decides
+// `newgit` binary (docs/design/trackers.md, *The Git endpoint*). The Worker decides
 // who may read what and sends a plan; this composes it (`newgit
 // endpoint-compose`, cached by plan) and answers Git's smart-HTTP request by
 // piping it through `git upload-pack --stateless-rpc`. The container runs no
@@ -8,7 +8,7 @@
 // It sleeps after `IDLE_MS` without a request: an alarm snapshots anything
 // composed since the last snapshot, then stops it. It comes back from that
 // snapshot, so a cold fetch costs a restore, not a re-clone
-// (newgit-cloudflare.md, *Measurements*). The runtime's inactivity timeout
+// (docs/design/remote.md, *Measurements*). The runtime's inactivity timeout
 // is the backstop, in case the alarm never runs.
 
 import { DurableObject } from "cloudflare:workers";

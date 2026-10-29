@@ -5,13 +5,13 @@
   "compatibility_date": "2026-10-05",
   "compatibility_flags": ["nodejs_compat"],
   "observability": { "enabled": true },
-  // The UI and the API, at the apex. Previews get <id>.newgit.dev (newgit-cloudflare.md, *Auth*).
+  // The UI and the API, at the apex. Previews get <id>.newgit.dev (docs/design/remote.md, *Auth*).
   "routes": [{ "pattern": "newgit.dev", "custom_domain": true }],
   "workers_dev": true,
   // scripts/install.sh, served at /install.sh.
   "rules": [{ "type": "Text", "globs": ["**/*.sh"] }],
   // One namespace for every project; repo names carry the project as a
-  // prefix. A binding names exactly one namespace (newgit-cloudflare.md).
+  // prefix. A binding names exactly one namespace (docs/design/remote.md).
   "artifacts": [{ "binding": "ARTIFACTS", "namespace": "newgit" }],
   "durable_objects": {
     "bindings": [

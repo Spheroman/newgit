@@ -2,7 +2,7 @@
 //! spelled: each is normalized first, so `./.git` is `.git`, and `.git` and
 //! `.newgit` are refused in any case. Inside `.newgit/`, a code tracker may
 //! own other trackers' definitions, `.newgit/trackers/<name>.toml`: the
-//! governance layering newgit-trackers.md documents under "Who may change
+//! governance layering docs/design/trackers.md documents under "Who may change
 //! what", and the one the remote resolves (`loadDefinitions` in
 //! remote/src/index.ts). Nothing else in `.newgit/` opens up.
 //!
@@ -140,7 +140,7 @@ paths = [".newgit/trackers/web.toml"]
     if let Err(error) = BranchManager::open(MetadataStore::at(root)) {
         panic!(
             "a code tracker owning another tracker's definition — the governance layering of \
-             newgit-trackers.md's \"Who may change what\", which the remote resolves — makes \
+             docs/design/trackers.md's \"Who may change what\", which the remote resolves — makes \
              the project unopenable: {error}"
         );
     }

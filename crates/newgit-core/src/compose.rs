@@ -1,5 +1,5 @@
 //! A workspace's Git is a view composed from tracker repos
-//! (newgit-trackers.md, step 3). Two operations, both deterministic:
+//! (docs/design/trackers.md, step 3). Two operations, both deterministic:
 //!
 //! - [`compose`] replays every bound code tracker's history, interleaved by
 //!   committer date, into one ordinary Git history — real authors, dates, and

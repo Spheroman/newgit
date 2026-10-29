@@ -1,4 +1,4 @@
-//! Step 3c (newgit-trackers.md): the project root is the instance `main`,
+//! Step 3c (docs/design/trackers.md): the project root is the instance `main`,
 //! its commits split into its tracker branches before anything is composed;
 //! code trackers get their history the first time it is needed; a history
 //! that once committed a now-secret file composes unchanged; and split

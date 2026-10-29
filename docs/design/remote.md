@@ -27,18 +27,24 @@ Trackers and `spawn --from-checkpoint` are the core. The remote is how
 checkpoints and tracker content travel; previews are how a human tries an
 attempt without spawning it.
 
-**Agents run newgit; humans get a window.** Every operation is a CLI command
-with machine-readable output (`--json`). The web UI is a window for humans
-and never the only way to do anything.
+**Agents run newgit; humans get a window.** Every operation is a CLI
+command, and the goal is machine-readable output (`--json`) on every one;
+today `spawn`, `whoami`, `remote add|show|delete`, `members list`, `stop`,
+and `start` have it, and `status`, `merge`, `checkpoint`, `clone`, `login`,
+and `logout`, among others, do not ([#165] proposes one `--json`
+contract). The web UI is a window for humans and never the only way to do
+anything.
 
 ---
 
-## Status (2026-10-21)
+## Status (2026-10-28)
 
 Deployed at `newgit.dev`: the Worker (`remote/`, TypeScript), its Durable
 Objects, the Git endpoint's container, and Artifacts.
 `.github/workflows/deploy-remote.yml` deploys it after CI passes on
-`main`, or by hand from the Actions tab.
+`main`, or by hand from the Actions tab. newgit itself is developed on it:
+this repository is `spheroman/newgit` on newgit.dev, and GitHub's
+`Spheroman/newgit` is its export target (`.newgit/exports/github.toml`).
 
 **Built, and run live:**
 
@@ -46,7 +52,10 @@ Objects, the Git endpoint's container, and Artifacts.
   individually revocable token for every login, agent, and instance.
 - Invite-only: only the GitHub logins in `ALLOWED_LOGINS` may use it.
 - `newgit remote add`: a project as `<owner>/<name>`, one Artifacts repo per
-  code tracker, seeded with its history; branch `main`.
+  code tracker, seeded with its history; branch `main`. `newgit remote show
+  [--json]` names the project and its members.
+- `newgit members add|remove <login>` (the owner, from a login) and
+  `members list [--json]`.
 - `spawn` (forks nothing), checkpoint and `git push` (split into trackers;
   only changed trackers are forked), `newgit merge` (every tracker on the
   branch moves together, or none does).
@@ -59,15 +68,25 @@ Objects, the Git endpoint's container, and Artifacts.
 - `newgit remote delete <owner>/<name>`: the owner deletes the project —
   every token pinned to it revoked first, then every repo under its prefix,
   then its record — so the name can be linked again from scratch.
+- GitHub export (0.6.0): `newgit export --remote <NAME>` pushes the chosen
+  trackers' `main`s, history and all, to the target defined in
+  `.newgit/exports/<NAME>.toml`; `--dry-run` composes and checks without
+  pushing, and `--force` replaces the target branch. When the target is
+  ahead with the project's own commits (a pull request merged on GitHub),
+  the export brings them in first instead of refusing. A target with
+  `branches = true` also receives each instance's branch on every
+  workspace push, so `git push` then `gh pr create` opens a real pull
+  request on a newgit remote. Definitions:
+  [definitions.md](../../crates/newgit/reference/definitions.md), *Export*.
 
-**Not built yet** (order in *What's next*):
+**Not built yet** (more in *What's Next*):
 
-- GitHub export.
 - Overlap reporting between live instances.
 - Previews, environment snapshots, and CI on push.
 - The web UI.
-- CLI commands for things the API already does: by-hand agent tokens, and
-  creating branches or changing the default one.
+- Forge features: pull requests, reviews, issues, checks, releases.
+- CLI commands for things the API already does: by-hand agent tokens
+  (create, list, revoke), and creating branches or changing the default one.
 - Merge stacking (`merge --only`), and resources that depend on a role.
 
 ---
@@ -124,8 +143,8 @@ Facts from the docs (2026-10), because the design leans on each one.
  newgit CLI ── HTTPS + newgit token ─────────► Worker  (API; later the web UI and previews)
    remote add / spawn / checkpoint /             │
    merge / clone / spawn --from-checkpoint       ├─► ProjectDO (Durable Object, SQLite)
-                                                 │     members, instances, binding records,
- workspace                                       │     checkpoints, branches (as lists)
+                                                 │     members, branches (as lists),
+ workspace                                       │     instances, forks, checkpoints
    git push ─► outbox ─► checkpoint ─┐           │
    git credential helper ── tokens ──┼──────────►├─► UserDO: each user's recorded tokens
                                      │           │
@@ -140,9 +159,11 @@ Facts from the docs (2026-10), because the design leans on each one.
 ```
 
 - **Artifacts** holds every byte of history. It is the only content store.
-- **ProjectDO** holds everything *about* history: members, instances, binding
-  records, checkpoints, and branches. One per project, so concurrent writes
-  are serialized.
+- **ProjectDO** holds everything *about* history: members, branches,
+  instances, which trackers each instance has forked, and checkpoints (its
+  tables are in `remote/src/project.ts`). One per project, so concurrent
+  writes are serialized. Binding records stay local, in each machine's
+  `.newgit/`; a checkpoint records what its instance had bound.
 - **The Worker** is the only thing that mints Artifacts tokens, and (once
   previews exist) the only way into a preview. That makes it the place
   audience becomes enforcement.
@@ -159,7 +180,11 @@ Facts from the docs (2026-10), because the design leans on each one.
 > trackers it changes.** A project is `<owner>/<name>`, like GitHub. On the
 > remote, Artifacts tokens are repo-scoped, so a permission boundary *must*
 > be a repo boundary, and a tracker is the unit audience is declared on
-> (newgit-trackers.md, *On the remote*).
+> ([trackers.md](trackers.md), *On the remote*).
+>
+> [#201] proposes dropping projects as a structure: trackers all the way
+> down, rooted at the user, with an instance rooted at whichever tracker it
+> spawns at. This topology assumes projects until that is decided.
 
 - `<owner>.<name>.t.<tracker>` — a code tracker's history: one Git branch per
   newgit branch (`main`), the entry in that branch's list. Readable by the
@@ -178,7 +203,8 @@ Facts from the docs (2026-10), because the design leans on each one.
 - **The Git endpoint**, `https://newgit.dev/<owner>/<name>.git`, is what
   `git clone`, `git pull`, and a workspace's `origin` fetch: each branch
   composed, in the project's container, from the trackers the caller may
-  read (*The Git endpoint* in newgit-trackers.md; *Measurements* below).
+  read (*The Git endpoint* in [trackers.md](trackers.md#on-the-remote);
+  [measured](remote-measurements.md#a-git-endpoint-in-a-container-2026-10-05)).
 
 Real properties, not simulations:
 
@@ -195,7 +221,8 @@ Not provided, and the docs must say so:
   helper. Sandboxes give per-agent identity.
 - Hunk-level privacy. Trackers are path-granular.
 - Carving does not hide the past: a narrower code tracker's earlier versions
-  stay readable in root's history (newgit-trackers.md, *On the remote*).
+  stay readable in root's history ([trackers.md](trackers.md), *On the
+  remote*).
 
 ---
 
@@ -210,8 +237,10 @@ Not provided, and the docs must say so:
 
 Identity is the GitHub login (`newgit login`, GitHub's device flow, like
 `gh`), so `audience = "user:jack"` means GitHub user `jack`. Membership
-(`project-devs`) is a list in ProjectDO: `newgit members add <login>`. The
-creator is the first member.
+(`project-devs`) is a list in ProjectDO: `newgit members add <login>`,
+which only the project's owner may run, and only from their login (an
+agent's or instance's token is refused). The creator is the first member
+and cannot be removed.
 
 **Invite-only (decided).** Who may use a remote at all is the Worker's
 `ALLOWED_LOGINS` secret: GitHub logins separated by commas or whitespace, or
@@ -250,13 +279,17 @@ instance token matters wherever a workspace leaves the machine.
 |---|---|---|---|
 | Created by | `newgit login` | `spawn` | `POST /v1/tokens` (no CLI command yet) |
 | Lifetime | 30 days | 7 days, renewed while the instance lives | 7 days by default, at most 30 |
-| Writes | everything the user may | its own instance | everything its owner may, in its project |
+| Writes | everything the user may | its own instance | everything its owner may: in one project if pinned (`project`), else in every project of the owner's |
 | Creates tokens, projects, members, instances | yes | **no** | tokens/projects/members **no**; instances yes |
 | Revoked by | the user | `newgit remove`, the owner, itself | the owner, itself |
 
 A by-hand agent token is the escape hatch for an agent not tied to one
-instance (an orchestrator in CI). Records name the agent either way
-(`agent` on instances and checkpoints).
+instance (an orchestrator in CI). Its `project` is optional: a token minted
+without one reaches every project its owner may, so pin it unless the agent
+really spans projects. Records name the agent either way (`agent` on
+instances and checkpoints). Tokens are listed with `GET /v1/tokens` and
+revoked with `DELETE /v1/tokens/<id>`; there is no CLI for minting,
+listing, or revoking them yet (*What's Next*).
 
 **Revocation is immediate, Git included.** A revoked newgit token is refused
 on its next request, and every repo password it was handed is revoked at
@@ -268,17 +301,33 @@ routine and cancelling them could break a push in flight.
 
 ### The credential helper
 
+`spawn` configures a remote workspace's Git to ask newgit for passwords,
+for the endpoint's host only (an empty `helper` entry first clears helpers
+configured elsewhere, so a global keychain never caches a token):
+
 ```
+credential.https://newgit.dev.helper =
 credential.https://newgit.dev.helper = !newgit credential
-credential.https://<account>.artifacts.cloudflare.net.helper = !newgit credential
-credential.https://<account>.artifacts.cloudflare.net.useHttpPath = true
+credential.https://newgit.dev.useHttpPath = true
 ```
 
-Git calls `newgit credential get`. For the endpoint (`<owner>/<name>.git`)
-the password is the newgit token itself — a workspace's own inside a
-workspace. For an Artifacts repo, newgit asks the Worker for a password for
-the repo in the URL path; the Worker checks the rules and mints a 15-minute
-one. `useHttpPath` is required — without it Git omits the repo path.
+Git calls `newgit credential get`, and for the endpoint
+(`<owner>/<name>.git`) the password is the newgit token itself: the
+workspace's own inside a workspace, the login outside one. Nothing else in a workspace talks to
+Artifacts with plain Git.
+
+newgit's own Artifacts traffic (seeding, checkpoint pushes, merges,
+`clone`, `spawn --from-checkpoint`) does not go through the helper. For
+each repo it asks the Worker for a password (`POST
+/v1/projects/<o>/<p>/credentials`, naming the repo and `read` or
+`write`); the Worker checks the rules and mints a 15-minute one, and
+newgit hands it to that one `git` command as an `http.extraHeader`, in the
+environment so it never shows in the process list, with the helper
+cleared so nothing caches it. `newgit credential` can still answer for an
+Artifacts URL (asking for write, settling for read) if someone points Git
+at it by hand; that needs `useHttpPath`, or Git omits the repo path.
+
+Who the Worker mints a password for:
 
 | Repo | read | write |
 |---|---|---|
@@ -300,17 +349,31 @@ The push succeeds exactly when that reached the remote. Nothing is forwarded
 as one history; the endpoint composes views, and `newgit merge` moves
 branches.
 
+Export targets with `branches = true` ride the same push: the instance's
+branch is exported to each of them, and on a newgit remote the target is the
+workspace remote `gh` resolves, so `gh pr create` opens a pull request
+there. The workspace's `refs/remotes/<target>/` holds the commit the target
+really has; when the target withholds a tracker the branch touches, those
+commits differ, and the push says to use `gh pr create --head <branch>`. A
+push straight to the target's own remote is refused, since it would carry
+trackers the target withholds. (`gh` resolves to the first `branches = true`
+target, not the one an instance's work belongs to: [#143].)
+
 > **Decision:** in remote mode, newgit's remote is the project's remote;
-> GitHub is an export (newgit-trackers.md, step 6). Keeping GitHub primary
-> puts trunk outside enforced audience.
+> GitHub is an export ([trackers.md](trackers.md), *Build order* step 6).
+> Keeping GitHub primary puts trunk outside enforced audience.
 
 ---
 
 ## Spawn From A Checkpoint
 
 ```
-newgit spawn review-a3 --from-checkpoint ckpt_017 [--project acme] [--json]
+newgit spawn review-a3 --from-checkpoint fix-login/ckpt_017 [--json]
 ```
+
+The checkpoint is named `<instance>/<checkpoint>`, the id `newgit
+checkpoints` shows where it was made, in the project the current directory
+is linked to. It cannot be combined with `--from` or `--private`.
 
 1. **Record:** read the checkpoint from ProjectDO — the list of tracker
    commits it froze, the secret tracker revs it bound, its resource states.
@@ -369,10 +432,13 @@ run`. Trackers never export env.
 
 ## Merge
 
-`newgit merge <instance>` runs on the merger's machine, tracker by tracker:
-fast-forward where the branch has not moved, `git merge-tree` where both
-sides changed a tracker, nothing at all on a conflict (newgit-trackers.md,
-*Checkpoints, merges, and coherence*). On the remote it begins under a short
+`newgit merge [instance] [--into main]` (the instance is inferred inside a
+workspace) runs on the merger's machine, tracker by tracker: fast-forward
+where the branch has not moved, `git merge-tree` where both sides changed a
+tracker, nothing at all on a conflict ([trackers.md](trackers.md),
+*Checkpoints, merges, and coherence*). `newgit merge main` merges the
+project root instead, which is how trackers made after `remote add` reach
+the remote. On the remote it begins under a short
 lock with the list it was based on, pushes each moved tracker's commit with
 passwords minted for that merge, and finishes with a compare-and-swap of the
 branch's list in the project's Durable Object — every tracker moves
@@ -389,10 +455,18 @@ from the branch's own `access` before any credential is minted. A merge
 moves only the trackers the merger's instance binds; a dropped tracker stays
 where the branch had it.
 
+**Known hole ([#228]):** nothing checks a *new* claim on a definition file
+against that file's current holder, so a tracker handed one definition can
+claim `access`'s, and with it every definition in the project, and lock the
+owner out. The fix is a check in `loadDefinitions` (and the same rule in the
+CLI) that lets delegation only go downward.
+
 **Overlap reporting** *(not built)*: on each push, ProjectDO compares the
 paths the instance touched with every other live instance's and reports
-overlaps in `newgit status --json` and the web UI. No queue UI, no review
-threads.
+overlaps in `newgit status --json` and the web UI. `status` has no `--json`
+yet, so that comes first. Pull requests, reviews, checks, and the rest of a
+forge are the open *Forge parity with gh* milestone ([#160]–[#181]); their
+pages in the browser are the *Web frontend* milestone ([#182]–[#200]).
 
 Undo stays as it is in v1, local only.
 
@@ -407,20 +481,28 @@ under `refs/trackers/<tracker>/`: `main`, `instances/<instance>`, and
 `pins/<rev>` keeping what bindings and checkpoints name. Captures are real
 commits with parents, authors, and messages; equal content is an equal
 tree on any machine. Cleanup drops unrooted pins and runs
-`gc --prune=now`. The full model is in `newgit-trackers.md`.
+`gc --prune=now`. The full model is in [trackers.md](trackers.md).
 
 A checkpoint syncs a tracker by pushing its pin and the instance's branch
 (and, for a per-user tracker, its `main`) to that tracker's repo. A push
 sends only objects reachable from the refs pushed, so no other tracker's
-content can ride along.
+content can ride along. That checkpoint is the only way a per-user
+tracker's `main` reaches the remote today: `tracker capture --from-store`
+and `tracker merge` move it locally only, and a tracker no instance binds
+cannot be pushed at all ([#224]).
 
 ---
 
 ## Previews *(designed, not built)*
 
 A human clicks **Open preview** on a checkpoint in the web UI (or an agent
-runs `newgit preview ckpt_017 --json`) and gets a link to the running app.
-The spikes behind this design are in *Measurements*.
+would run `newgit preview fix-login/ckpt_017 --json`, the same
+`<instance>/<checkpoint>` form as `spawn --from-checkpoint`; no `preview`
+command exists yet) and gets a link to the running app. The spikes behind
+this design are in [remote-measurements.md](remote-measurements.md).
+
+[#229] (open, "preview = role replaced by container remote?") may replace
+this design; until it is settled, Decisions 5–7 stand.
 
 ### One sandbox per distinct environment
 
@@ -463,8 +545,10 @@ restores only onto its own image); those projects fall back to the
 environment snapshot.
 
 **Snapshots are incremental:** one taken from a restored sandbox stores only
-its delta. So layer them — environment snapshot, then CI's or the
-checkpoint's on top — and each layer costs only what changed.
+its delta (9 s and 35 MB, against 41 s and 995 MB for the first:
+[round 2](remote-measurements.md#round-2-custom-images-docker-and-captured-builds)).
+So layer them — environment snapshot, then CI's or the checkpoint's on top
+— and each layer costs only what changed.
 
 **Builds are captured, not rebuilt on preview.** A production build is a
 path-dependent resource keyed on source rev, lockfile, and build-time env; CI
@@ -487,8 +571,9 @@ snapshots.
 - **A running app has one environment.** "Preview as me" means a sandbox
   started for me. The UI labels a preview with whose environment it runs.
 - **Docker-based resources** need `/proc/sys` remounted read-write before
-  `dockerd` starts (*Measurements*, round 3). With that, Supabase runs in a
-  preview.
+  `dockerd` starts
+  ([round 3](remote-measurements.md#round-3-making-docker-and-supabase-work)).
+  With that, Supabase runs in a preview.
 
 ### Auth
 
@@ -502,10 +587,17 @@ nothing else — no real app's cookies can reach agent-written preview code.
 
 Previews and the UI are the *same site* to a browser, so preview code could
 send requests to the UI with the user's cookies or plant a domain-wide
-cookie. Two rules close that: **every newgit cookie is `__Host-` prefixed**
-(host-only; no subdomain can set or overwrite it), and **every
-state-changing request to the UI or API must carry a matching `Origin`**.
-A preview gets its viewer through a redirect to `newgit.dev`, which
+cookie. **Web sign-in is planned in [#185]:** GitHub's OAuth web flow
+producing a recorded token like any other login, held in an `HttpOnly;
+Secure; SameSite=Lax` session cookie, and a **CSRF token on every mutating
+request**. `SameSite=Lax` alone does not help here, because a preview *is*
+same-site, so the CSRF token is what stops a preview from acting as its
+viewer. This section first proposed two more rules, which #185 does not
+mention yet and which are still proposed on top of it:
+**every newgit cookie is `__Host-` prefixed** (host-only; no subdomain can
+set or overwrite it, which a CSRF token does not prevent), and **a
+state-changing request must carry a matching `Origin`** (a cheap second
+check). A preview gets its viewer through a redirect to `newgit.dev`, which
 returns a short-lived signed ticket; the preview host then sets its own
 `__Host-` session cookie.
 
@@ -527,7 +619,9 @@ code cannot read another's cookies or storage).
 
 ## Web UI *(designed, not built)*
 
-Served by the Worker. Every action is also a CLI command.
+Served by the Worker. Every action is also a CLI command. Tracked as the
+*Web frontend* milestone ([#182]–[#200]); the views below are [#190]
+(project and checkpoint), [#196] (audience), and [#200] (**Open preview**).
 
 - **Project view:** live instances and checkpoints, by owner (human or
   agent), with overlap warnings.
@@ -540,24 +634,39 @@ Served by the Worker. Every action is also a CLI command.
 
 ## What's Next
 
-In order. Each lands alone and keeps the suite green.
+Grouped, not strictly ordered; the milestones on GitHub hold the detail.
+Each piece lands alone and keeps the suite green.
 
-1. **GitHub export** (newgit-trackers.md, step 6). Nobody moves their code
-   off GitHub to try a tool; newgit has to sit beside it. `newgit export
-   --github <repo>` pushes a composed projection of the chosen trackers'
-   `main`s, so a project can live in newgit while its public face stays on
-   GitHub.
-2. **CLI gaps.** `newgit token create` for by-hand agent tokens, and
-   `newgit branch create` / `branch default` over the API that already
-   exists.
+1. **CLI gaps** over API that already exists: `newgit token create|list|
+   revoke` (`POST`/`GET /v1/tokens`, `DELETE /v1/tokens/<id>`), and `newgit
+   branch create` / `branch default`. `--json` on the commands that lack it,
+   `status` first, under one contract ([#165]).
+2. **Known holes:** a definition claim that locks the owner out ([#228]); a
+   per-user tracker's `main` reaching the remote only through a checkpoint
+   ([#224]); the push outbox never garbage-collected ([#107]).
 3. **Overlap reporting** in `newgit status --json`.
-4. **Previews:** the base image and environment snapshots keyed on resource
+4. **Export follow-ups** (*Outside repositories as trackers*): mount
+   imported trackers through one merge commit ([#139]), import an outside
+   repository unchanged as a code tracker ([#140]), export a tracker as its
+   own root ([#141]), pull a target's new commits back into its trackers
+   ([#142]), and resolve `gh` to the right target ([#143]).
+5. **Forge parity with `gh`** ([#160]–[#181]): latency budgets, `newgit
+   api`, `pr create|list|view|diff|checkout|review|merge`, checks on
+   checkpoints, an event stream, issues, labels, forks, search, an inbox,
+   and releases. Alongside it, a published benchmark of the remote under
+   agent-shaped load ([#148]).
+6. **Previews:** the base image and environment snapshots keyed on resource
    versions; preview orchestration (resolve trackers, share-or-start,
    restore, project per-user trackers, start resources, serve through the
    Worker with auth) and `newgit preview --json`; checkpoint snapshots
    inside sandboxes; CI on push with the preview-ready snapshot step.
-5. **The web UI** (project, checkpoint, audience views), built after
-   previews so its centerpiece, **Open preview**, works on day one.
+   Subject to [#229].
+7. **The web UI** ([#182]–[#200]): sign-in ([#185]), the project,
+   checkpoint, and audience views, and the forge's pages. **Open preview**
+   ([#200]) waits for previews, so it works on day one.
+8. **Beyond one owner:** orgs, with group owners, group audiences, and
+   membership as a tracker ([#227]); and whether projects survive at all
+   ([#201]).
 
 ---
 
@@ -567,8 +676,9 @@ Resolved loudly; each is reversible.
 
 1. **The core is `spawn --from-checkpoint` plus trackers;** previews are the
    human window onto it.
-2. **CLI-first:** every operation is a command with `--json`; the web UI
-   never has an action the CLI lacks.
+2. **CLI-first:** every operation is a command, and the web UI never has an
+   action the CLI lacks. `--json` on every command is the goal, not yet the
+   fact ([#165]).
 3. **Repo per tracker (per user for `user` trackers) + a fork per instance
    per changed tracker;** one Artifacts namespace, project-prefixed names.
 4. **Spawning someone else's checkpoint uses your own per-user tracker
@@ -578,10 +688,12 @@ Resolved loudly; each is reversible.
 6. **Previews start from the best snapshot available:** the checkpoint's own,
    then CI's, then the environment snapshot for its resource versions.
 7. **The Worker is the preview auth layer;** every request passes through it.
+   (5–7 are open again in [#229].)
 8. **Worker in TypeScript; CLI stays Rust.**
-9. **ProjectDO is the source of truth** for binding records, checkpoints, and
-   branches when a remote is configured.
-10. **Artifacts is the project remote** in remote mode; GitHub is an export.
+9. **ProjectDO is the source of truth** for members, branches, instances,
+   and checkpoints when a remote is configured. Binding records stay local.
+10. **Artifacts is the project remote** in remote mode; GitHub is an export
+    (`newgit export --remote`).
 11. **Identity is GitHub login**, via device flow. **Agents act as their
     owner.**
 12. **Tracker history is Git** (`refs/trackers/<tracker>/*`), in a tracker repo
@@ -601,174 +713,66 @@ Resolved loudly; each is reversible.
 - **Wildcard DNS for `newgit.dev`** has to be added (a proxied `*` record)
   before own-hostname previews; the Wrangler OAuth token cannot read or
   write DNS. Jack adds it, or a token scoped to DNS edit on that zone.
-- **Cold restores.** The first restore of a multi-GB snapshot on a host is
-  slow (70–100 s seen); repeats are fast (5 s). Running CI and actions from
-  the snapshot right after it is built warms it as a side effect, but
-  placement is not ours, so a later preview can still land cold. Show
-  progress; do not promise a warm start.
+- **Cold restores** of multi-GB snapshots, and placement we do not control:
+  show progress, do not promise a warm start (*Measurements*).
 - **If `/proc/sys` stops being remountable,** fall back to userspace
   networking (rootless Docker or Podman with `slirp4netns`/`pasta`), which
   never writes kernel sysctls.
 - **Snapshot pricing** is unlisted while snapshots are in beta.
-- **Fork latency** (5–22 s): the first checkpoint of an instance that
-  changes a large tracker waits on its fork.
+- **Fork latency:** the first checkpoint that changes a large tracker waits
+  on its fork (*Measurements*).
 - **The 1 GB repo cap** for large `db-snapshots` trackers.
 - **Merges inside an instance's work are flattened** when it is split into
-  trackers (newgit-trackers.md, build order step 5).
+  trackers ([trackers.md](trackers.md), *Build order* step 5).
+- **Networks that filter `newgit.dev`** reset TLS; explain it, and consider
+  a fallback host ([#130]).
+
+Known gaps, tracked: [#224] (per-user `main` reaches the remote only
+through a checkpoint), [#107] (the push outbox is never garbage-collected),
+[#130] (TLS resets), [#143] (`gh` resolves to the first `branches = true`
+target), [#228] (a definition claim can lock the owner out).
 
 ---
 
 ## Measurements
 
-Spikes run while designing the remote, and the first live run. Kept because
-the design leans on the numbers.
+The spikes behind this design (2026-10-04 and 05) and the first live run
+are kept in full, dated, in
+[remote-measurements.md](remote-measurements.md). The numbers the design
+leans on:
 
-### Artifacts (2026-10-04)
-
-Run against namespace `newgit-spike` with a tiny repo and an import of
-`honojs/hono` (2,866 commits, 41 MB packed).
-
-| Question | Answer | Consequence |
+| What | Measured | So |
 |---|---|---|
-| Basic loop | Works. Push ~1 s. Tokens are `art_v2_…?expires=` (docs say `v1`); a create-time token lasts ~24 h. | Parse tokens by the `?expires=` split, never by prefix. |
-| Custom refs | `refs/newgit/*`, `refs/notes/*` push and list. | Tracker history as Git works on the remote. |
-| Fork copies refs? | **All refs, even with `default_branch_only: true`.** | Nothing in a repo a fork's owner may not read. |
-| Fork speed | Tiny ~2.4 s. Hono **5–22 s**, high variance. | Fork only what changed, and only when it changes. |
-| Clone speed | Hono full clone **9–38 s** vs GitHub 1.8 s; `--depth 1` 1.1 s; fetch 0.7 s; push 1 s. | Clone from the local store; Artifacts is a push target and a delta source. |
-| Token isolation | Fork token on another repo → 403; read token push → 403; write tokens may force-push. | Enforcement claims hold. |
-| Credential helper | Works for fetch and push. **Requires `credential.useHttpPath=true`.** | `spawn` sets both. |
-| Merge in a Worker | Tiny repo 1.7 s; hono full history **fails (1102, memory)**; hono at `depth: 10` 3.9 s; conflicts reported per file. | Merges run on the merger's machine with real Git. |
-| Push events | Per-repo `pushed` subscriptions work **only via REST**; ~5.5 s lag. Account-level `repo.forked` never arrived. | Outbox is the primary signal; events are the backstop and the CI trigger. |
+| Artifacts fork (hono, 41 MB) | 5–22 s | fork only the trackers an instance changes |
+| Artifacts full clone (hono) | 9–38 s, against 1.8 s from GitHub | clone from the local store |
+| Merge in a Worker (isomorphic-git) | fails on full history (memory) | merges run on the merger's machine |
+| Sandbox boot, fresh / from a snapshot | 0.2–0.3 s / ~0.6 s (one 13.6 s outlier) | starting is cheap; building the environment is not |
+| Environment from nothing (Postgres + Next.js) | 215 s | what every snapshot saves |
+| Snapshot, first / on top of a restore | 41 s for 995 MB / 9 s for 35 MB | snapshots are incremental: layer them |
+| First page, captured production build | 5.7 s, against 10–20 s for a dev compile | capture builds in the snapshot |
+| Supabase restored, containers stopped not removed | database 4.9 s, API 13.3 s | Docker works once `/proc/sys` is remounted |
+| Multi-GB snapshot, cold / warm restore | 70–100 s / 5 s | warm it; show progress |
+| Endpoint clone (6,173 commits), warm / restored from snapshot | 1.3–1.8 s / 1.75–2.3 s | a project's endpoint can sleep when idle |
+| Live on newgit.dev: `spawn` / checkpoint with forks / `merge` / `spawn --from-checkpoint` | 0.8 s / 10.4 s / 6.4 s / 8.4 s | the same commit id comes back out |
 
-### Sandboxes (2026-10-05)
-
-A spike Worker (key-gated) with one Durable Object class on the
-`durable_object` scheduling policy, the managed `cloudflare/debian-trixie`
-image (Node 24, x86_64, root, no `curl`/`wget`), instance `standard-2`. The
-"realistic app": Postgres with `pgbench -s 20` (2 M rows, 580 MB on disk) and
-a fresh `create-next-app` (457 MB of `node_modules`).
-
-| Question | Answer | Consequence |
-|---|---|---|
-| Fresh sandbox boot | 0.2–0.3 s to accept a command. | Starting a sandbox is not the cost; building the environment is. |
-| Building the environment from nothing | **215 s**: apt 86 s, Postgres init + data 16 s, `npm` 112 s. | This is what every snapshot saves. |
-| Snapshot | **41 s for 995 MB** (Postgres stopped cleanly first). Returns `{id, size}`. | Taking one is too slow to sit inside an agent's checkpoint synchronously; do it in the background or at CI's step. |
-| Restore boot | **0.56–0.6 s** in 4 of 5 runs; one outlier at **13.6 s**. | Plan for ~1 s, tolerate ~15 s, and show progress. |
-| Restored state | Files intact: 2 M rows queryable 0.75 s after boot; Postgres up in 0.3 s. | Restoring a database from a snapshot is near-instant, unlike replaying a dump. |
-| `/run` after restore | **Empty — it is a tmpfs, not in the snapshot.** Postgres failed until `/run/postgresql` was recreated. | Resources' `start` hooks must recreate runtime directories; templates should do it. |
-| App ready | Next.js **dev** server: first page **10–20 s** (compile on 1 vCPU). | Previews should serve a production build, or use a bigger instance; the dev compile dominates. |
-| Through the Worker | First request 0.69 s, warm 0.31 s, from outside via `getTcpPort().fetch`. | The Worker-as-front-door preview path works without a domain (path-based). |
-
-End to end, a preview from a snapshot is **~1 s boot + ~0.3 s database +
-the app's own start time**, against **215 s+** to build the same environment
-from nothing.
-
-#### Round 2: custom images, Docker, and captured builds
-
-Two named images built by Wrangler from local Dockerfiles: `base` (Node 24 on
-Debian, git, Postgres, and newgit cross-compiled for x86_64 in a build stage)
-and `dind` (Cloudflare's documented `docker:dind` setup plus the Supabase
-CLI).
-
-| Question | Answer | Consequence |
-|---|---|---|
-| newgit in a sandbox | **Works.** A full session — init, seed a tracker, spawn with a Postgres `command-snapshot` resource, checkpoint, wreck the database and `.env.local`, undo — in **4.4 s**. First boot of a custom image 5–9 s. | The base image is real; newgit needs no changes to run in a sandbox. |
-| Docker in a sandbox | Docker runs. `--network=host` containers work; the default bridge network **fails** (`failed to disable IPv6 on container's interface`). | Fixed in round 3. |
-| Supabase in a sandbox | Fails as configured: its database container dies on that bridge-network error. **Fixed in round 3.** | — |
-| Snapshot of a restored sandbox | **Incremental:** 9 s and 35 MB, against 41 s and 995 MB for the first. | A checkpoint snapshot taken on top of an environment snapshot costs only its delta. Layer snapshots: environment → checkpoint. |
-| Capturing the production build | `next build` 61 s once, captured in the snapshot. A preview restored from it serves its first page **5.7 s** after boot (including Postgres), against 10–20 s for a dev compile. | Capture builds in the snapshot. A build is a *path-dependent resource*: its identity is the source rev, lockfile, and build-time env; it is recomputed when those change and restored from the snapshot when they do not. |
-
-#### Round 3: making Docker (and Supabase) work
-
-Root cause of the bridge failure: **`/proc/sys` is a separate read-only mount**
-over a read-writable `/proc`, so every sysctl write fails — including the
-per-interface IPv6 write Docker 26+ makes for each container. Bridges and
-veth pairs can be created; only the sysctl writes were blocked. The sandbox's
-root holds `CAP_SYS_ADMIN` and `CAP_NET_ADMIN`, and **`mount -o remount,rw
-/proc/sys` succeeds**; after it, sysctl writes work, inside new network
-namespaces too.
-
-A Debian image with Docker's static binaries installed at runtime
-(`docker-at <version>`), the Supabase CLI native (glibc):
-
-| Step | Result |
-|---|---|
-| Remount `/proc/sys`, start Docker 29.8.2 (`--iptables=false`) | Docker up in 5 s; **bridge networking works** |
-| `supabase start` from nothing | **All 12 services healthy in 122 s**, image pulls included |
-| Snapshot (stopped, images + volumes, 50 k rows added) | 5.1 GB in 54 s |
-| Restore, `supabase start` | 47 s (37 s with unused services excluded); data intact; REST API answers **through the Worker in 0.3–0.4 s** |
-| Snapshot with containers **stopped, not removed**; restore, `docker start` | **+3 MB** delta. Database ready **4.9 s**, API healthy **13.3 s** after boot |
-| Cold vs warm restore of a large snapshot | First restore of the ~5 GB chain on a host: **70–100 s**. A repeat: **5 s**. |
-
-Consequences:
-
-- **Docker resources work in sandboxes**, Supabase included. The base image
-  remounts `/proc/sys` before starting `dockerd`. This depends on the
-  sandbox's current capabilities; if Cloudflare tightens them, it breaks, so
-  CI should exercise it.
-- **Snapshot Docker resources stopped, not removed.** `docker start` on
-  restore is ~10× faster than recreating containers.
-- **Big snapshots need warming.** The first restore of a multi-GB snapshot on
-  a host is slow; warm the environment snapshot right after it is built
-  (restore it once in the background) so the first human preview does not pay.
-- **Bake images into the environment snapshot.** Registries rate-limit
-  anonymous pulls (seen in round 2); a snapshot that already holds the images
-  pulls nothing.
-
-**Caveat on captured builds:** a build inlines build-time public env vars
-(`NEXT_PUBLIC_*`). Built with project-audience trackers (CI is not a person),
-a viewer whose own public values differ sees the build's values until it
-rebuilds with theirs. Server-side secrets are read at runtime and are
-unaffected.
-
-### A Git endpoint in a container (2026-10-05)
-
-A spike Worker in front of a Durable Object-managed container (Debian, real
-`git`, `newgit` cross-compiled for x86_64), `standard-1`. The Worker pipes
-Git's smart-HTTP requests into `git upload-pack --stateless-rpc` through the
-Containers `exec` API, stdin and stdout streamed; the container runs no
-server. Stand-in for "fetch the tracker repos from Artifacts": a clone of
-Express from GitHub (6,173 commits), adopted by newgit, `lib` carved out as
-a code tracker, the view composed and served.
-
-| Question | Answer |
-|---|---|
-| Cold start from the image | Boot 6.0 s; clone 2.6 s, adopt and carve 3.2 s, compose 3.1 s, publish 3.1 s — 18.7 s, 41 MB |
-| The composed view | **Identical to Express's own `HEAD`** (`7ef9844`), carved tracker included |
-| Plain `git clone` through the Worker, warm | **1.3–1.8 s** for all 6,173 commits; same ids; `git fsck` clean |
-| Snapshot | 7.5 s, 38 MB |
-| Cold clone: container stopped, restored from the snapshot | **1.75–2.3 s**, restore included (three rounds) |
-
-Consequences:
-
-- **The endpoint is viable as designed.** A stopped endpoint costs about
-  half a second over a warm one, so per-project containers can sleep when
-  idle and snapshot after each change.
-- **Composing per request is cheap** — the whole 6k-commit history in about
-  3 s, once, when the set of trackers changes; after that a fetch touches
-  only new commits.
-- No HTTP server in the container: `exec` with streamed stdin and stdout
-  is the whole transport.
-
-### Live: the whole flow on newgit.dev (2026-10-05)
-
-A three-tracker project (root, `web` carved out of `apps/web`, project) plus
-a per-user secret `.env.local` tracker, against the deployed Worker, its
-endpoint container, and Artifacts.
-
-| Step | Time | Result |
-|---|---|---|
-| `newgit remote add` | 9.4 s | a repo per code tracker, seeded; `main` created |
-| `git clone https://newgit.dev/<owner>/<name>.git` (plain Git), cold container | 10.8 s | `HEAD` identical to the project's |
-| The same, warm (view cached) | 2.6 s | |
-| `spawn` | 0.8 s | nothing forked |
-| Checkpoint: split, fork `root` and `web`, push | 10.4 s | |
-| `git push` | 5.0 s | |
-| `newgit merge` | 6.4 s | `root` and `web` fast-forward; the project root follows |
-| Plain `git clone` after the merge | 7.1 s | `HEAD` is the agent's own commit id; no `.env.local` |
-| `newgit clone` | 4.9 s | |
-| `spawn --from-checkpoint` | 8.4 s | the same commit id, and the uncommitted work |
-
-The commit an agent made in its workspace is the commit a plain `git clone`
-gets after the merge, on another machine: split into trackers, forked,
-merged per tracker, and composed back — with the same id.
+[#107]: https://github.com/Spheroman/newgit/issues/107
+[#130]: https://github.com/Spheroman/newgit/issues/130
+[#139]: https://github.com/Spheroman/newgit/issues/139
+[#140]: https://github.com/Spheroman/newgit/issues/140
+[#141]: https://github.com/Spheroman/newgit/issues/141
+[#142]: https://github.com/Spheroman/newgit/issues/142
+[#143]: https://github.com/Spheroman/newgit/issues/143
+[#148]: https://github.com/Spheroman/newgit/issues/148
+[#160]: https://github.com/Spheroman/newgit/issues/160
+[#165]: https://github.com/Spheroman/newgit/issues/165
+[#181]: https://github.com/Spheroman/newgit/issues/181
+[#182]: https://github.com/Spheroman/newgit/issues/182
+[#185]: https://github.com/Spheroman/newgit/issues/185
+[#190]: https://github.com/Spheroman/newgit/issues/190
+[#196]: https://github.com/Spheroman/newgit/issues/196
+[#200]: https://github.com/Spheroman/newgit/issues/200
+[#201]: https://github.com/Spheroman/newgit/issues/201
+[#224]: https://github.com/Spheroman/newgit/issues/224
+[#227]: https://github.com/Spheroman/newgit/issues/227
+[#228]: https://github.com/Spheroman/newgit/issues/228
+[#229]: https://github.com/Spheroman/newgit/issues/229

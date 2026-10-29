@@ -1,6 +1,30 @@
-# newgit — Architecture
+# newgit — the original vision
 
 *A git-compatible orchestration layer for agentic development workflows.*
+
+> **This is the vision newgit started from (2026-07), not a description of
+> what exists.** Much of it was never built, and some of it the
+> implementation chose against. It is kept because the thesis and the
+> tracker/resource split still hold, and because the rest records where the
+> project might go. For newgit as it is, read [spec.md](spec.md) (the
+> design), [trackers.md](trackers.md) (the tracker model), and
+> [remote.md](remote.md) (newgit.dev).
+>
+> - **Built:** wrapping Git rather than replacing it; trackers and resources
+>   and the reasons for the split; the install store keyed on identity;
+>   checkpoints that deposit into a tracker; a failed dependency blocking its
+>   dependents; embargo as `spawn --private`; an export that fails closed and
+>   ships only `public` content; `git push` intercepted (through the
+>   workspace's push URL, not a PATH shim).
+> - **Chosen against:** gitoxide, libgit2, or jj as the engine (newgit drives
+>   the `git` CLI); hunk-level privacy (trackers own paths); repos as only an
+>   output (the remote keeps a repo per tracker); the native remote as a dumb
+>   store of client-computed bundles (the remote composes branches itself).
+> - **Not built:** FUSE and content-API projections (workspaces are real
+>   directories), PATH shims, hermetic build-in-store, per-branch network
+>   namespaces (each instance claims its own ports instead), capture on every
+>   write, the policy language and transforms, the CI tripwire, and the
+>   encrypted-blob substrate.
 
 ---
 
@@ -73,7 +97,7 @@ A tracker is a named, versioned lane of file content — a partition over the si
 
 `source` is simply the default tracker: audience = everyone, mechanism = the vendored `jj` engine. The `jj` engine covers exactly **one** tracker (source); every other tracker's source-merge behavior is policy you define in the binding layer.
 
-> **Superseded (2026-10):** `newgit-trackers.md` replaces the single `source` tracker. Every tracker is its own Git history; `root` owns whatever no other tracker claims, code trackers are committed, and a workspace's Git history is composed from the bound code trackers.
+> **Superseded (2026-10):** [trackers.md](trackers.md) replaces the single `source` tracker. Every tracker is its own Git history; `root` owns whatever no other tracker claims, code trackers are committed, and a workspace's Git history is composed from the bound code trackers.
 
 ### Resources
 

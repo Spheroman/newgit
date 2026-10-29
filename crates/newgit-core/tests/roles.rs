@@ -1,5 +1,5 @@
 //! Roles, priority, `requires`, and trackers that bring resources
-//! (newgit-trackers.md, step 4): what an instance binds by default, what it
+//! (docs/design/trackers.md, step 4): what an instance binds by default, what it
 //! binds when asked, and what follows from that.
 
 use std::process::Command;

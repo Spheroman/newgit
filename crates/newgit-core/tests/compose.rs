@@ -1,4 +1,4 @@
-//! The composed view (newgit-trackers.md, step 3): replaying tracker
+//! The composed view (docs/design/trackers.md, step 3): replaying tracker
 //! histories gives an ordinary history with real authors, dates, and
 //! messages, and splitting then recomposing gives back the identical commits.
 

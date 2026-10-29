@@ -1,2654 +1,1149 @@
-# newgit v1 MVP
+# newgit design
 
-*A practical first version of newgit that proves the orchestration thesis without trying to solve every systems problem at once.*
+*Why newgit is shaped the way it is: the model, the decisions behind it, and
+what they cost.*
 
----
+This document describes newgit as it exists on `main`. It explains the
+design, not the commands. For those, and for the rest of the documentation:
 
-## Purpose
-
-The v1 MVP should answer one question:
-
-> Can newgit make parallel agent branches feel effortless by letting a developer define the branch-bound trackers and resources that should move together?
-
-v1 is not a security product, a new VCS, a FUSE filesystem, a Nix replacement, or a privacy-preserving publishing system. It is a local orchestration layer around an existing Git-compatible source tracker.
-
-The product promise is:
-
-> Given a source revision and a set of tracker and resource definitions, newgit can materialize a consistent branch instance with the right workspace, tracked content, running resources, ports, environment exports, and checkpoint/undo behavior.
-
-If that feels good, the larger architecture earns the right to exist.
-
----
-
-## The Two Primitives
-
-Earlier drafts conflated two different things under the single name "tracker". v1 splits them.
-
-> A **tracker** is a named, versioned lane of file content, with its own audience, storage, and source-merge policy.
->
-> A **resource** is a lifecycle unit that re-establishes the per-branch state that cannot be carried as content.
-
-The dividing line:
-
-> **Trackers hold state that can travel across space and time** — synced to a remote, restored from a checkpoint. **Resources re-establish the state that can't make that trip** — because it is alive, lives in another system, or is only valid where it was built.
-
-### Trackers
-
-There is no fixed set of trackers and no limit on how many a project defines. `root` holds whatever no other tracker claims, and its history is the project's Git history (see *Root, Project, and Code Trackers* below). A user should be able to create a tracker called `jack-env`, set its audience to a single user, and (in a later version) push it to a remote and pull it from another authenticated machine.
-
-Every tracker carries three settings:
-
-- **audience** — who may read it (`public`, `project-devs`, a single user). v1 records this but does not enforce it beyond keeping non-public tracker content out of ordinary Git history.
-- **merge_with_source** — whether a real source merge should carry this tracker's bound state with it. Env files usually say no; generated code, feature assets, and sub-repo snapshots often say yes.
-- **storage** — where synced state lives: `local` for v1, `remote` later.
-
-### Resources
-
-Resources exist for exactly three irreducible reasons:
-
-- **Liveness.** A running process cannot be copied, only started. A port cannot be snapshotted, only freshly allocated per instance. A daemon's state can only be captured consistently through the daemon.
-- **Externality.** The state lives in another system; the local filesystem holds at most a handle, and an API call is the only interface.
-- **Path-dependence.** Installed artifacts (`node_modules`, venvs, native builds) hardcode machine and path. The true state is the identity (the lockfile), and the artifact is recomputed from it — never copied from an instance whose identity differs. Instances whose identity *agrees* are a different case: the tree is the same by construction, so it is cloned copy-on-write from the install store rather than rebuilt. See *Installs: use a content-addressed store*.
-
-If a thing is purely files that copy correctly, it is a tracker, not a resource.
-
-The two primitives cooperate at exactly one seam: **a resource's checkpoint hook may deposit its output into a tracker** (`pg_dump` → a `db-snapshots` tracker), turning daemon-owned state into carryable, versioned content.
-
-### Why the split matters
-
-Real projects have odd branch-bound things:
-
-- a local Redis namespace
-- a Stripe webhook tunnel
-- a seeded search index
-- a vector database collection
-- a generated SDK
-- a cloud preview environment
-- a mock auth tenant
-- a checked-out sibling repo
-- a feature flag set
-
-newgit should not need a new internal subsystem for each one. It needs a tracker definition or a resource definition — and an agent reading the config should know, from the noun alone, whether a thing syncs across machines (tracker) or gets re-established on each one (resource).
-
-v1 ships resource templates for common lifecycle units: `process`, `pnpm`
-(install/deps, wired to a shared content-addressed store), `install` (the
-same shape for any other package manager, with the lockfile and command left
-as `EDIT ME`), `command-snapshot` (a daemon-owned database on the host),
-`command-snapshot-migrations` (the same, where the schema comes from
-migrations rather than from the dump), `supabase` (a per-instance Supabase
-stack, driven through the CLI and `docker exec` rather than host Postgres
-binaries), and `external` (a resource another system owns). Every template
-states the host tools it assumes, since "ready to adapt" and "ready to adapt
-*if your database is on the host*" are different claims. A template may
-bring companions it needs —
-the resource definitions it `depends_on`, and the tracker lanes its
-checkpoint deposits into — created only when absent, so an existing
-definition is never overwritten.
-
-Trackers are created through CLI verbs instead of templates: create the lane,
-add paths to it, capture content.
+- [The guide](../guide.md) covers how to use newgit, command by command.
+- [`definitions.md`](../../crates/newgit/reference/definitions.md), which
+  `newgit reference` prints, lists every key in a tracker, resource, or
+  export definition, with its default and the template variables each hook
+  sees. Run `newgit resource templates --show <name>` to read a starter
+  template in full.
+- [`trackers.md`](trackers.md) covers the tracker model in depth: root,
+  project, access, and code trackers, how a workspace history is composed
+  from them and split back, roles, binding, and merge.
+- [`remote.md`](remote.md) covers the newgit.dev remote.
+- [`vision.md`](vision.md) is the original long-range architecture. Most of
+  it is not built.
 
 ---
 
-## Core Bet
+## What newgit is for
 
-The architecture document says repositories are outputs from a deeper store. v1 should keep that direction, but implement it modestly:
+newgit answers one question:
 
-- Source history remains Git-compatible through `jj` or Git.
-- Source is special because Git/jj owns history.
-- Everything else is a user-defined tracker or resource.
-- The "store" is a local metadata directory plus content snapshots and references to existing substrate stores.
-- A workspace is a materialized cache, not the source of truth.
-- Branch state is a binding record: source revision plus tracker revisions plus resource bindings.
-- Exported repositories and branches are derived artifacts, not the internal coordination primitive.
+> Can parallel agent branches feel effortless if a developer defines, once,
+> everything a branch needs to run, and newgit makes it move together?
 
-The MVP should prove the binding layer before investing in FUSE, hermetic builds, hunk privacy, or a native remote.
+Git tracks the code. Everything else a branch needs to run lives outside
+Git: the `.env.local`, the installed dependencies, the dev server, the
+database, the ports. With one branch checked out at a time, that is fine.
+With five agents working in parallel, they all share it, and it breaks.
 
----
+newgit turns a branch into an **instance**: a source branch, a workspace, the
+files Git should not hold, and the things that have to be running. All of it
+is spawned, checkpointed, undone, shared, and torn down as one unit.
 
-## Target User
-
-The first user is an individual developer running multiple local coding agents against the same project.
-
-Assumptions:
+The first user is a developer running several coding agents against one
+project on one machine. The design assumes:
 
 - Agents are trusted enough to run as the local user.
-- The project already uses Git.
-- The developer wants many branch variants active at once.
-- Branches need separate state: env files, ports, services, databases, caches, cloud handles, or other project-specific things.
-- The main pain is coordination friction, not adversarial security.
+- The project already uses Git, and keeps using it. GitHub stays where it
+  is.
+- The pain is coordination, not an adversary.
 
-Non-assumptions:
+So newgit makes no security claims. Instances are not isolated from each
+other, a tracker's audience is not enforced against local code, and ports
+are allocated per instance, not sandboxed. The newgit remote does enforce
+audience, on the server, because there it can (see *The remote*).
 
-- v1 does not assume hostile agents.
-- v1 does not promise secret containment from malicious local code.
-- v1 does not promise reproducible builds.
-- v1 does not need a custom remote.
-- v1 does not know every tracker or resource type in advance.
-
----
-
-## MVP Scope
-
-v1 should include seven things:
-
-1. Branch workspace creation
-2. A user-defined tracker model (content lanes with audience, storage, source-merge policy)
-3. A user-defined resource model (lifecycle hooks, ports, exports, dependencies)
-4. Resource lifecycle actions
-5. Exports for env vars, ports, paths, URLs, and opaque state references
-6. Checkpoint and undo across source plus trackers plus resources
-7. Starter templates for common trackers and resources
-
-Everything else is a later milestone.
+newgit is also not a VCS, a filesystem, or a build system. Source history is
+Git's. Workspaces are ordinary directories. Installs call the package
+manager the project already uses; a Nix project's resource calls Nix. newgit
+binds those substrates together and replaces none of them.
 
 ---
 
-## Non-Goals
+## The model
 
-### No FUSE
-
-v1 should not mount a filesystem. It should use ordinary directories as materialized workspace caches.
-
-The architecture should still have a materializer boundary:
+An instance is:
 
 ```text
-Store + binding record -> materializer -> workspace directory
+source branch
++ the trackers it binds, each at a revision
++ the resources those trackers bring, each with its ports, exports, status
++ a workspace directory
++ its checkpoints
 ```
 
-But the first materializer should be boring:
-
-```text
-RealDirMaterializer
-```
-
-This keeps editors, file watchers, package managers, test runners, and language servers on familiar ground.
-
-Every materializer satisfies the same contract (see *Materialization*): a workspace presents a full, real, verifiable Git repo plus every tracker's paths, and nothing else in newgit may care how that presentation is produced. A future `FuseMaterializer` replaces the clone rather than running on top of it — a projection that answers every read exactly as a real clone would. Anything less is emulation.
-
-### No Hardcoded Worldview
-
-v1 should not have bespoke internal systems named `EnvTracker`, `DbTracker`, `InstallTracker`, and so on.
-
-It can ship templates with those names, but the core should see:
-
-```text
-TrackerDefinition
-TrackerBinding
-ResourceDefinition
-ResourceBinding
-ResourceAction
-```
-
-The test for the design is simple:
-
-> Can a user model a tracker or resource the newgit author did not anticipate?
-
-### No Native Remote
-
-v1 should not implement a new remote protocol. It can push and pull through the project's existing Git remote — and does push through it: a `git push` from a workspace publishes to the store's `origin` (see *`git push` Publishes*). Tracker `storage = "remote"` is declared in the model but not implemented. The native remote is being built on Cloudflare (see `newgit-cloudflare.md`); so far a project can name it in `config.toml` (`[remote] url = "https://..."`, optional `project`), and `tracker create --storage remote` is refused until one is configured, rather than quietly behaving as local.
-
-### No Hunk-Level Privacy
-
-v1 should not attempt object/hunk-level tracker partitioning. Path-level tracker membership is enough for early export experiments.
-
-### No Security Claims
-
-v1 should not say branches are isolated from each other, and it should not claim tracker audiences are enforced against local code. `audience` in v1 is a declared intent: it keeps non-public content out of Git history and shapes future remote auth, nothing more. v1 can prevent port collisions and organize services, but it should not claim sandboxing.
-
-### No Nix Reinvention
-
-v1 should not define a derivation language, package store, binary cache, or hermetic builder. If a project already uses Nix, newgit can call it. If it uses pnpm, cargo, uv, or another ecosystem store, newgit can call that.
-
-newgit binds those substrates together. It does not replace them.
-
----
-
-## Mental Model
-
-newgit manages branch instances.
-
-A branch instance is not just a Git branch. It is:
-
-```text
-source revision
-+ tracker bindings (which content revision of each tracker)
-+ resource bindings (which concrete instance of each resource)
-+ exports
-+ workspace path
-+ checkpoint history
-```
-
-The binding record is the central object.
-
-```text
-BranchInstance {
-  id
-  name
-  source_ref
-  source_rev
-  workspace_path
-  trackers: Map<TrackerName, TrackerBinding>
-  resources: Map<ResourceName, ResourceBinding>
-  created_at
-  updated_at
-}
-
-TrackerBinding {
-  tracker_name
-  definition_rev
-  content_rev
-  status
-}
-
-ResourceBinding {
-  resource_name
-  definition_rev
-  state_ref
-  resolved_ports
-  resolved_exports
-  status
-}
-```
-
-The workspace directory is disposable. The binding record is not.
-
----
-
-## The Tracker Primitive
-
-A tracker is a project-defined content lane. It tells newgit:
-
-- which workspace paths it owns
-- who may read it (audience)
-- whether content should merge along with source changes (`merge_with_source`)
-- where synced state lives (storage)
-
-Trackers deliberately rhyme with Git tracking. They are not copy recipes, env
-systems, database systems, or command-environment providers. A tracker says
-"this lane owns these paths"; capture records the current workspace content in
-that lane; projection/restore puts captured lane content back into a workspace.
-
-### Tracker Definition
-
-```text
-TrackerDefinition {
-  name
-  audience      # public | project-devs | user:<name>
-  storage       # local | remote (v1: local only)
-  merge_with_source # true | false
-  paths         # workspace paths this tracker owns
-  secret        # true (default): content stays out of Git | false: a code tracker
-}
-```
-
-The tracker file is CLI-managed. Users should not need to hand-edit TOML to
-understand or change which paths a tracker owns.
-
-### Capture, Merge, Pull, And Checkout
-
-Tracker capture is always the same operation: snapshot the tracker's content into the store and bind the current branch instance to that rev. The "store" is each tracker's history in a bare Git repo at `.newgit/local/trackers.git`, under `refs/trackers/<tracker>/`: `main` is the lane head/default for future instances and explicit pulls, `instances/<instance>` holds each instance's captures as ordinary commits (parent, author, message), and `pins/<rev>` keeps every rev a binding or checkpoint names alive. `<rev>` is a 12-hex prefix of the commit id; capturing content identical to the parent's makes no commit. (*Lane* is the v1 word for a tracker's history; `newgit-trackers.md` retires it in favor of "the tracker's repo".)
-
-The lanes repo is deliberately *not* the store repo. Lane content includes secrets, and the store repo is the one a `git push --mirror` publishes and a local `git clone` hardlinks wholesale into every workspace's object store. It lives under `local/`, which every project's `.newgit/.gitignore` already ignores. Lanes being Git is also what lets a tracker sync to a remote (see `newgit-cloudflare.md`).
-
-Capture alone is branch-local. `newgit tracker merge` promotes the current instance's bound tracker rev to the lane head. `newgit tracker pull` checks the lane head into the current instance. `newgit tracker checkout --rev <rev>` checks out a specific captured rev. Checkout clears owned paths first so it reproduces the captured state exactly; before overwriting, the current content is auto-captured, so checkout is always undoable.
-
-A lane starts empty, so a project adopting newgit would otherwise have to
-spawn an instance that comes up *without* its env files, copy them in, capture,
-and merge — round-tripping content that already sits in the store repo at the
-same relative paths. `newgit tracker capture <tracker> --from-store` reads the
-tracker's owned paths from the store repo's working tree instead, and sets the
-lane head directly: there is no binding record to promote from, and the point
-is that the next `spawn` works. Declared paths with nothing behind them are
-reported; a tracker with nothing at all on disk is an error rather than an
-empty lane head. `newgit tracker track` points at this when the paths it just
-added already have content.
-
-Because tracker state is pure content, capture and checkout need no per-tracker modes. If a thing needs a command to capture or restore, it is a resource.
-
-`merge_with_source` does not change what capture means. It answers the global merge question: when a real Git/`jj` source merge is accepted, should this tracker binding be merged with it? If true, the merge/checkpoint shim should promote the branch's tracker rev alongside the source merge. If false, the tracker remains branch-local/user-local unless explicitly merged.
-
-If a tracker has never captured content, including it in a branch instance
-projects nothing. This is the same boring rule Git users already know: tracking
-a path does not invent content for it.
-
-### Tracker Paths and Git
-
-Non-source tracker paths live inside a Git clone, so an agent could `git add`
-them into source history. The rule:
-
-> **A path owned by a secret tracker must be ignored by Git.**
-
-`newgit tracker track` checks this and appends to `.gitignore`, loudly.
-Ownership nests: the most specific claim wins, so `root` owns `.` while
-`runtime-env` owns `.env.local`. Two trackers claiming the identical path is a
-config error, refused at load.
-
-The `.gitignore` append is not sufficient on its own: it is an *uncommitted*
-edit in the store worktree, so a workspace clone does not inherit the rule
-until the user commits it. In the gap, a lane's content sits in the workspace
-as ordinary untracked files that `git add -A` sweeps into source history.
-So `spawn` also writes every tracker-owned path into the workspace clone's
-`.git/info/exclude`, before any lane content is projected. Audience only
-keeps content out of Git *by construction* if the construction reaches every
-workspace.
-
-`info/exclude` rather than the workspace's own `.gitignore`: the latter is
-tracked content owned by source, and newgit does not rewrite the user's
-committed files. This is the one place newgit writes a file under `.git`
-instead of going through a Git command, because Git exposes no plumbing that
-writes it.
-
-This is "audience keeps content out of Git history by construction" made
-concrete. It is not enforcement against a hostile agent force-adding a file;
-v1 does not claim that, and a v2 `git commit` shim is the natural place to
-catch it.
-
-### Root, Project, and Code Trackers
-
-v1 shipped with `source` as an implicit default tracker. `newgit-trackers.md`
-replaces it, and the code now follows that design:
-
-- **`root`** owns `.` — everything no more specific tracker claims. `newgit
-  init` writes `trackers/root.toml` and copies the project's Git history into
-  root's `main`. Its history engine is Git (see *Source Tracker* below).
-- **`project`** owns `.newgit`, so the definitions travel as their own
-  tracker.
-- **Code trackers** (`secret = false`) are committed content with their own
-  history: `newgit tracker create electron --code --path apps/electron`
-  carves those paths, history included, out of whichever tracker owned them.
-  You commit to them with Git; `capture` refuses them.
-- **Secret trackers** (the default, `secret = true`) are the lanes this
-  section describes: captured, never committed.
-
----
-
-## The Resource Primitive
-
-A resource is a project-defined lifecycle lane. It tells newgit:
-
-- what resource exists
-- how to create or prepare it for a branch
-- how to run actions against it
-- how to expose values to commands
-- how to checkpoint it (often into a tracker)
-- how to restore or recompute it
-- how to clean it up
-- what it depends on
-
-Not every resource implements every hook.
-
-### Resource Definition
-
-```text
-ResourceDefinition {
-  name
-  ownership
-  depends_on
-  identity
-  ports
-  exports
-  render
-  actions
-  checkpoint
-  restore
-  cleanup
-}
-```
-
-`ownership` is operational. It tells newgit who owns the concrete resource instance and what cleanup/checkpoint boundary it follows. It is not a security label.
-
-```text
-branch      one instance per branch; branch cleanup may delete it
-workspace   lives under or depends on the workspace; workspace cleanup may delete it
-project     shared by branch instances in this project; per-branch cleanup must not delete it
-user        shared outside this project; newgit never deletes it
-external    owned outside newgit; cleanup only does what the resource explicitly says
-```
-
-The ownership rules should be conservative:
-
-| Ownership | Cleanup | Checkpoint / restore |
-|-----------|---------|----------------------|
-| `branch` | Branch cleanup deletes the concrete branch instance. | Checkpoint/restore may mutate it freely. |
-| `workspace` | Deleted with the workspace. | Recreatable; restore may recompute rather than restore a captured blob. |
-| `project` | Never deleted by per-branch cleanup; only explicit project-level teardown may delete it. | Capture should avoid branch-specific mutation unless the resource defines locking or namespacing. |
-| `user` | newgit never deletes it, ever. | Capture records identity only; restore is recompute or no-op. |
-| `external` | Cleanup runs the defined cleanup command or nothing. | newgit holds a handle and never assumes deletion semantics it did not author. |
-
-`project` and `user` ownership are the easiest places to create destructive defaults by accident. For example, a pnpm store is user-owned: deleting or rewriting it would affect every project on the machine, not just the current branch.
-
-### Lifecycle Hooks
-
-v1 should support a small hook set:
-
-```text
-init          create project-level resource metadata
-prepare       make the resource ready to use
-start         start a long-running process, if any
-stop          stop a long-running process, if any
-checkpoint    capture branch-local resource state
-restore       restore branch-local resource state
-status        report resource state
-cleanup       remove branch-local resource state
-```
-
-The hooks can be command-based in v1. A plugin API can come later.
-
-### Checkpoint Modes
-
-Resources capture in a few modes:
-
-```text
-none       no state to capture
-hash       record hashes of identity files (lockfiles); restore is recompute
-command    run a command that emits state; may deposit into a tracker
-external   record an opaque external resource ID
-```
-
-The `command` mode's output can target a tracker with `into_tracker`. This is the seam: a Postgres resource's checkpoint runs `pg_dump` and the dump becomes versioned content in a `db-snapshots` tracker, restorable and (later) syncable like any other tracked content.
-
-### Restore Modes
-
-```text
-none
-command
-recompute
-external
-```
-
-`recompute` is for resources where the captured state is an identity, not a blob. For example, a deps resource records a lockfile hash and reruns the install command when needed. Recompute is correctness for path-dependent artifacts, not just an optimization.
-
-### Exports
-
-Trackers and resources can export values that `newgit run` and resource actions can consume:
-
-```text
-env vars
-env files
-ports
-paths
-URLs
-opaque state refs
-```
-
-This is how a database resource can expose `DATABASE_URL`, a service resource can expose `APP_URL`, and a cloud preview resource can expose `PREVIEW_ID`.
-
-Two ways a value becomes an export:
-
-- **`[exports]`** renders templates at bind time (`APP_URL =
-  "http://127.0.0.1:{{ports.app}}"`). Good for anything newgit can compute.
-- **`captures`** on an action reads names out of its stdout and merges them
-  into the binding's exports. This is how a resource whose handle is minted
-  by another system publishes it — newgit cannot compute a preview id, only
-  ask for one and remember the answer.
-
-```toml
-[actions.prepare]
-command = "cloudctl preview create --branch {{branch.name}} --json"
-captures = ["PREVIEW_ID", "PREVIEW_URL"]
-```
-
-Two output shapes are accepted, because both are what real commands already
-emit: stdout whose first non-whitespace character is `{` is parsed as a flat
-JSON object, and anything else is read as `KEY=VALUE` lines. Only declared
-names are taken.
-
-**When `captures` is set, stdout belongs to newgit.** Send anything else the
-command prints to stderr: a chatty CLI's progress output interleaved with the
-values will not parse, and the result is an action that exits 0, reports
-`prepare: ok`, marks the resource ready, and publishes an empty handle that
-nobody notices until an API call returns 401. A declared name the command did
-not emit stays absent rather than becoming an error — a resource may
-legitimately publish a handle only on some runs — but newgit warns for each
-one, naming the capture and the log to look in. Silence there costs a
-debugging cycle, and newgit already knows both the names it wanted and the
-stdout it scanned. Captured
-values land on the binding record, so they survive the process, reach
-`newgit run`, and are available to checkpoint and cleanup hooks. An action
-with `captures` runs captured — its output goes to the log rather than the
-terminal, because newgit has to read stdout.
-
-Port allocation is deterministic in the useful sense: **an instance's port
-never changes once allocated.** Ports are allocated at resource-bind time
-(spawn), taking the first port scanning up from the requested `start` that is
-neither recorded in any other instance's binding nor claimed, right now, on
-any of 127.0.0.1, 0.0.0.0, ::1, or :: — probed with `SO_REUSEADDR` off so a
-wildcard bind (e.g. a Docker-published container port on macOS) can't hide
-behind a loopback-only check (#93) — and are persisted in the binding
-record. The binding records are the single source of truth — removing an
-instance frees its ports automatically, with no separate ledger to drift.
-The probe only covers TCP and is a point-in-time check like any bind probe;
-see `crates/newgit-core/src/ports.rs` for exactly what it does and does not
-guarantee.
-
-#### `newgit ports --check`: the inverse of `render --check`
-
-*An instance's ports live in its binding record* is correct and does not
-change. But that record can only ever be as complete as `spawn`'s own bind
-probe, and a container a resource brought up can end up publishing a host
-port the record never learned about — the 54324/54327 case that motivated
-this command (#92). `render --check` catches "my definition claims something
-the file no longer has"; `newgit ports --check` catches the mirror drift:
-"something publishes a port nothing in my records claims."
-
-It runs `lsof -nP -iTCP -sTCP:LISTEN`, keeps only the ports that fall inside
-some resource's allocatable range (`start` up through the same 1000-port
-window `allocate` itself scans before giving up), and reports every one of
-those that no binding record claims:
-
-```
-$ newgit ports --check
-ok    54321 — claimed by `newgit-trial`
-FAIL  `newgit-trial` publishes 54324, 54327 — claimed by no binding record
-      undeclared ports are not allocated, so another instance may be handed them
-
-1 of 3 check(s) failed.
-```
-
-This is deliberately the *cheap* mitigation, not a fix for the allocator.
-`bindable` — the check `allocate` uses at `spawn` to decide whether a port is
-free — only tries binding `127.0.0.1`, so a port Docker Desktop has published
-on `0.0.0.0` looks free to it and `spawn` hands it out anyway. Getting that
-probe right for Docker on macOS is its own, harder problem. `--check` does
-not touch `bindable` at all; it reads the real socket table `lsof` reports,
-regardless of which address a listener chose, so it catches the drift after
-the fact — later than a correct bind probe would, but without needing one.
-
-Attribution — naming *which* instance publishes an unclaimed port — is
-honest rather than complete, on purpose. An instance is named only when its
-name or workspace path genuinely appears in the listening process's command
-line. That bar is not always clearable: on macOS, a Docker Desktop
-container's published port is fronted by Docker's own VM proxy, and that
-proxy's command line says nothing about the instance whose container it is
-fronting. Most Docker-caused conflicts — exactly the case this command
-exists to catch — therefore come back unattributed:
-
-```
-FAIL  54330 — claimed by no binding record; could not attribute to an instance
-      undeclared ports are not allocated, so another instance may be handed them
-```
-
-An unattributed conflict is still the useful finding. A confidently wrong
-instance name would not be, and newgit does not do that: see *We will be
-lying to agents* in AGENTS.md — the filesystem and the network are fair game
-to project, never a fact about what actually holds a port.
-
-If `lsof` is missing, or exits with anything other than the exit code it
-itself uses for "nothing was listening," `--check` says it could not check
-rather than silently reporting every port free — a clean pass here is
-exactly the false confidence #93 was filed over.
-
-Bare `newgit ports` (no `--check`) lists every instance's claimed ports read
-straight off its binding record. Unlike `render`, which refuses without
-`--check` because there is nothing else for it to do, `ports` has a second
-thing worth doing that costs no probing at all: showing the ledger itself.
-
-### Render
-
-Ports and exports reach a command two ways: `{{ports.x}}` in its command line
-and an env var in `newgit run`. Both assume the tool takes the value on argv
-or from the environment. Most tools do not. Supabase reads its ports from
-`supabase/config.toml`, Expo from `.env`, Compose from `compose.yaml`, Rails
-from `database.yml`, Vite from `vite.config.ts` — a file the project commits
-and reviews. Without a first-class answer, every project that hits this writes
-the same section-aware config rewriter inside its `prepare` hook, and the
-interesting part of the resource stops being `supabase start`.
-
-`[[render]]` is that answer, declared on the resource that owns the values:
-
-```toml
-# .newgit/resources/supabase.toml
-[[render]]
-path = "packages/db/supabase/config.toml"
-replace = [
-  { find = 'project_id = "faretable"', with = 'project_id = "faretable-{{branch.slug}}"' },
-  { find = "port = 54321",             with = "port = {{ports.api}}" },
-  { find = "port = 54322",             with = "port = {{ports.db}}" },
-  { find = "shadow_port = 54320",      with = "shadow_port = {{ports.shadow}}" },
-]
-```
-
-#### The committed file is the template
-
-There is no template file. `port = 54321` is not a placeholder, it is
-Supabase's working default: someone who clones the repo without newgit and
-runs `supabase start` gets a working stack on 54321. Under newgit the same
-file gets `54321` → `54400` in this workspace and nowhere else.
-
-This is the whole design, and the reason it is find/replace rather than
-rendering a template over the target. A template means a second copy of
-`config.toml` under `.newgit/`, kept in sync with upstream's defaults forever,
-and a base repo whose real config has been hollowed out into placeholders.
-Substituting into the committed file has neither problem: nothing is
-duplicated, nothing is degraded, and there is no template-versus-file diff to
-reconcile when the branch merges back.
-
-`find` is a **literal string, never a regex.** Regex reintroduces exactly the
-"did it match what I meant" doubt that the uniqueness rule below exists to
-remove, and it would make the inverse (below) undefined.
-
-#### Replacements are simultaneous, not sequential
-
-> **Every `find` is located in the committed content, and all replacements
-> then apply as one batch. A replacement's output is never a match target.**
-
-Rewriting in declaration order — re-matching each rule against the
-partially-rewritten text — would make a rule mean different things depending
-on what ran before it. A `find` that happens to equal an earlier rule's output
-would either report a spurious second match, failing the exactly-once check
-below for a duplicate the committed file does not contain, or silently rewrite
-that output. Neither is a thing the definition says.
-
-The property to hold onto: **declaration order is cosmetic.** Reordering the
-`replace` array cannot change the result, so a reader does not have to
-simulate the list to know what it does.
-
-Two rules claiming overlapping text have no batch answer — whichever won would
-be an accident of order — so that is refused at render time, naming both
-strings.
-
-#### A find must match exactly once
-
-> **Each `find` must match exactly once in the committed content, or the
-> render refuses and names the file and the string.**
-
-One rule, doing four jobs:
-
-- **Ambiguity is impossible.** A bare `54321` that also appears in a comment
-  or an unrelated key is caught before anything runs, rather than producing a
-  file that is wrong in a second place.
-- **Drift is loud.** Upstream bumps its default port, or a teammate edits the
-  committed config — the `find` stops matching and bind fails with `no match
-  for "port = 54321" in packages/db/supabase/config.toml`. This is what
-  replaces diffing a template against a file: the check *is* the drift
-  detector, it runs on every bind, and it costs nothing.
-- **Disambiguation needs no parser.** When two sections share a default value,
-  `find` goes multi-line and regains its uniqueness:
-
-  ```toml
-  find = """
-  [api]
-  port = 54321"""
-  ```
-
-  newgit never learns what TOML is, which is what lets the same mechanism
-  serve `.env`, YAML, and `vite.config.ts`.
-- **The inverse stays well-defined** — see below.
-
-For a value that is genuinely repeated (Compose publishing `"3000:3000"`
-twice), `count = 2` opts into a declared number of matches. Not `all`: a
-declared count keeps failing when the file changes from two occurrences to
-three, which is the property worth protecting.
-
-#### Render is a function of committed content, not of the working file
-
-> **A render reads the *committed* content of the path, substitutes, and
-> writes the result. It never reads what is currently on disk.**
-
-For a source-owned path that is the blob at `HEAD`; for a tracker-owned path
-it is the bound lane rev. Without this rule the second render looks for
-`port = 54321`, finds `port = 54400`, and fails — so re-running would have
-needed its own state tracking. With it, render is idempotent and pure:
-`undo` re-renders from the binding record with no extra machinery, a `pull`
-that moves the lane head re-renders from the new content, and the rendered
-values can never compound.
-
-Render runs during resource bind, after ports are allocated and after
-dependencies are bound, immediately before `prepare` — and again before any
-`recompute` restore. Trackers project before resources bind, so a render may
-target a tracker-owned path.
-
-#### Available variables
-
-A render template sees **exactly what a command in this instance would see in
-its environment**: this resource's `{{ports.*}}`, `{{branch.name}}`,
-`{{branch.slug}}`, `{{workspace}}`, and `{{exports.*}}` from every resource
-bound so far, in dependency order. Anything narrower and the common
-cross-resource case — an Expo `.env` that needs the Supabase resource's URL —
-would need a second mechanism.
-
-#### Keeping instance values out of everything downstream
-
-A render writes per-instance values into a path the project otherwise owns.
-Four places that value must not escape to:
-
-- **`git status` and `git commit`, for source-owned paths.** newgit marks
-  rendered source paths `--skip-worktree` in the workspace clone. Not a
-  per-render flag: a render target that shows up as a modification is simply
-  broken, and an agent running `git add -A` must not be able to commit this
-  instance's port. This is the same job `.git/info/exclude` does for
-  tracker-owned paths (*Tracker Paths and Git*), and the same v1 stand-in for
-  the projection a v2 FUSE layer does properly — the declaration outlives the
-  mechanism.
-- **`newgit export`.** `--skip-worktree` does not remove a path from
-  `git ls-files`, and export copies the workspace's tracked files *as they
-  stand on disk*. Export must therefore take rendered paths from `HEAD`
-  rather than from the working tree, or an exported repo ships `port = 54400`.
-- **`newgit capture`, for tracker-owned paths.** Here the file cannot simply
-  be skipped: the lane is how the `.env` reaches other instances, and the user
-  may have legitimately added a key to it. Instead capture **reverses the
-  substitution** — rewrites `54400` back to `54321` — and records that. The
-  user's real edits survive; the instance's values never enter the lane.
-
-  This is available only because the substitution is literal, and it is the
-  strongest argument for this design over a template file: a whole-file
-  template cannot be run backwards at all. The inverse needs the same
-  guarantee in the other direction — the rendered value must be unique in the
-  file too — checked at bind, so the failure surfaces then and not at capture.
-- **A checkpoint's uncommitted-state capture.** This one looks like it needs
-  nothing — `--skip-worktree` keeps the change uncommitted, so a checkpoint of
-  *committed* state never sees it. But `workspace_dirty_commit` builds its
-  tree in a throwaway `GIT_INDEX_FILE` seeded from `read-tree HEAD`, and a
-  fresh index does not carry the real index's skip-worktree bits. Without
-  re-setting them there, `git add -A` sweeps the rendered ports into the
-  checkpoint. The one place skip-worktree does not protect on its own.
-
-#### What it costs, and saying so
-
-On a source-owned path, `--skip-worktree` means **real edits to that file in
-this workspace are invisible to newgit and die with the workspace.** That is
-correct for values newgit generates and wrong for the `[auth]` block someone
-adds by hand.
-
-newgit reports this **precisely, not as a caveat.** A warning at bind time
-would fire when nothing is wrong yet — at bind the edit does not exist — and
-then stay silent at the moment the work is actually lost. Since a render is a
-pure function of committed content and the binding record, the expected bytes
-of a rendered file are recomputable at any time. So newgit recomputes them and
-compares, at the two moments that matter:
-
-- **at checkpoint**, because a checkpoint is the promise that this state can
-  be returned to, and a hand edit to a rendered file is the one thing it
-  cannot carry;
-- **before a re-render** (undo, `tracker pull`, `tracker checkout`), because
-  that is the moment the edit is overwritten.
-
-The report names the file and the size of the change —
-`packages/db/supabase/config.toml has changes that render will discard (4
-line(s) differ)` — and says nothing at all when the file is what the render
-produced. *Report missing captures and incomplete undos honestly* applies
-here: the generic version of this warning is not honesty, it is noise that
-trains people to ignore the specific one. To edit a rendered file for real,
-edit it in the store repo.
-
-Tracker-owned render targets do not pay this cost: they are already outside
-Git, capture reverses the substitution, and hand edits round-trip.
-
-#### Rules
-
-- A render path must lie inside the workspace. v1 does not render into
-  user-level or system config.
-- A render path that no tracker owns must be tracked by Git. A path that is
-  neither tracked nor tracker-owned has no committed content to render *from*,
-  which the purity rule above makes a contradiction, not an edge case.
-- Two resources rendering the same path is a config error, refused at load.
-- A `find` that matches zero times, or more times than `count` declares, fails
-  the bind rather than rendering partially. The resource is marked `failed`
-  and its dependents `blocked`, exactly as a failed `prepare` would.
-
-#### `render --check`: the adoption dry run
-
-*Render is a function of committed content, not of the working file* is
-correct and does not change. But it has a cost at exactly one moment: the
-first hour of adopting a `[[render]]`, when the `find` strings being written
-do not exist in the content newgit would render, because they have not been
-committed yet. The loop without any other tool is edit the committed
-default, commit it, spawn, read the failure, edit again, commit again.
-
-`newgit render --check` resolves every `[[render]]` against the *working
-tree* instead — no instance, no spawn, no commit — and reports, per file,
-which `find` matched and which did not, naming the file and the string on
-any mismatch. It changes nothing and substitutes nothing; `with` is not even
-resolved, because whether a `find` matches does not depend on what it would
-be replaced with. Run outside adoption, it is a drift detector: a project's
-own CI can run `render --check` and fail the build the moment an upstream
-tool's default moves, instead of failing the next `spawn`.
-
-A narrower, spawn-time affordance (`spawn --render-from-worktree`, rendering
-against the workspace's on-disk content instead of `HEAD` for one spawn) was
-considered and not built for v1. It costs a full spawn to learn one string is
-wrong, where `--check` costs nothing, and it would be a second rule for when
-render reads committed content versus the working tree — one more thing to
-hold in your head for a narrower win. The adoption-docs fix (*commit the
-defaults you are introducing before the first spawn that renders them*, in
-the `[[render]]` reference) covers the same case at zero implementation cost.
-Revisit only if `--check` proves not enough in practice.
-
-### Dependencies
-
-Resources can depend on trackers and other resources:
-
-```text
-app-service depends_on ["deps", "runtime-env", "dev-db"]
-```
-
-`depends_on` is a *lifecycle* claim. Needing another resource's value is a
-separate, weaker thing, and it is not declared at all: a `{{exports.<name>}}`
-in an `[exports]` value or a `[[render]]` replacement already names what it
-needs, so newgit reads the edge out of the template. That gives two orders:
-
-- **bind order** — `depends_on` plus the inferred data edges. Materializing
-  trackers, preparing resources, rendering, assembling the environment, and
-  restoring all walk this, because a value has to exist before the template
-  that reads it renders.
-- **lifecycle order** — `depends_on` alone. Checkpoint and cleanup walk it in
-  reverse, so needing one string out of a resource never claims anything
-  about the order the two are torn down in.
-
-Within that:
-
-- if a resource dependency fails to prepare, leave the branch instance spawned
-  but mark dependents `blocked` rather than running their prepare hooks or
-  other command actions
-- checkpoint dependents first when needed
-- restore dependencies before starting dependents
-- cleanup dependents before dependencies
-
-An unresolvable graph — a `depends_on` naming something that is neither a
-tracker nor a resource, or a cycle — is reported, not raised at load. Commands
-that *act* on the graph (`spawn`, `run`, `action`, `checkpoint`, `undo`) refuse
-with the offending name. Commands that *build* it (`tracker create`,
-`tracker track`, `resource add`) and commands that inspect it (`tracker list`,
-`resource list`, `status`) run anyway and print the problem as a warning: they
-are how an incomplete graph gets completed, so they must not be the first
-casualty of one. `remove` also stays reachable, because teardown must never
-depend on the graph holding together.
-
-The exact ordering rules should stay boring and visible. During `spawn`, a
-prepare failure does not roll back the workspace, tracker bindings, resource
-bindings, allocated ports, or logs; it leaves the instance available for
-inspection and repair. A blocked resource can be prepared after its failed
-dependency is repaired; command actions such as `start` stay blocked until
-then, while signal-only actions such as `stop` remain available.
-
----
-
-## Local Layout
-
-v1 can use a simple `.newgit/` directory in the project root:
+That record lives in `.newgit/branches/<instance>.toml` and is the central
+object. The workspace is disposable; the record is not.
+
+### Two primitives
+
+Everything an instance carries is one of two things.
+
+> A **tracker** is a named, versioned set of paths: file content with its
+> own history and its own audience.
+>
+> A **resource** is a lifecycle unit: it re-establishes per-instance state
+> that cannot be carried as content.
+
+The line between them:
+
+> **Trackers hold state that can travel**: to another machine, or back from
+> a checkpoint. **Resources re-establish the state that cannot**, because it
+> is alive, lives in another system, or is only valid where it was built.
+
+Resources exist for exactly three reasons:
+
+- **Liveness.** A running process cannot be copied, only started. A port
+  cannot be snapshotted, only allocated. A daemon's state can only be
+  captured consistently through the daemon.
+- **Externality.** The state lives in another system. Locally there is at
+  most a handle, and an API call is the only interface.
+- **Path-dependence.** Installed artifacts (`node_modules`, a venv, a native
+  build) are tied to a machine and a path. The truth is the identity, the
+  lockfile, and the artifact is derived from it. Instances whose identity
+  agrees can share the derived tree through the install store (see
+  *Installs*); instances whose identity differs never do.
+
+If something is just files that copy correctly, it is a tracker.
+
+The two meet at one seam: **a resource's checkpoint can deposit its output
+into a tracker.** A Postgres resource's `[checkpoint]` runs `pg_dump`, and
+the dump becomes versioned content in a `db-snapshots` tracker, restorable
+and syncable like any other.
+
+### No hardcoded worldview
+
+Real projects have odd per-branch things: a Redis namespace, a Stripe
+webhook tunnel, a seeded search index, a cloud preview, a mock auth tenant.
+newgit should not need a subsystem for each one. The core has no env
+system, no database system, no package manager support. It has tracker
+definitions and resource definitions, and an agent reading the config can
+tell from the noun alone whether a thing travels (tracker) or is rebuilt on
+each machine (resource).
+
+The test of the design:
+
+> Can a user model a tracker or resource the newgit authors did not
+> anticipate?
+
+The starter templates (`process`, `pnpm`, `install`, `command-snapshot`,
+`command-snapshot-migrations`, `supabase`, `external`) are definitions like
+any other, written to `.newgit/resources/` and owned by the project from
+then on. Each states the host tools it assumes, since "ready to adapt" and
+"ready to adapt if your database runs on the host" are different claims. A
+template may bring the companions it needs, such as the `pnpm-store`
+resource it depends on or the `db-snapshots` tracker its checkpoint
+deposits into. They are created only when absent, so `resource add` never
+overwrites a definition.
+
+### Committed definitions, local state
+
+`.newgit/` splits into a control plane and a data plane:
 
 ```text
 .newgit/
-  config.toml              # committed if it contains no secrets
-  trackers/                # committed tracker definitions
-    runtime-env.toml
-    dev-db.toml
-    db-snapshots.toml
-  resources/               # committed resource definitions
-    deps.toml
-    app-service.toml
-    postgres-db.toml
-  scripts/                 # committed scripts resource commands call
-    db-up.sh               #   as {{scripts}}/db-up.sh
-  local/                   # gitignored local state
-    trackers.git/          #   every tracker's history (bare Git repo)
-    tracker-checkouts/     #   tracker revs materialized for commands; a cache
-  branches/                # gitignored branch bindings
-    feature-a.toml
-    feature-b.toml
-  installs/                # gitignored built trees, keyed by identity
-  logs/                    # gitignored action logs
-  state/                   # gitignored runtime state
+  config.toml            [project], and [remote] once linked   committed
+  trackers/              tracker definitions                    committed
+  resources/             resource definitions                   committed
+  exports/               export targets                         committed
+  scripts/               scripts resource commands call         committed
+  branches/              binding records, one per instance      local
+  checkpoints/           checkpoint records                     local
+  installs/              the install store                      local
+  logs/  state/          action logs, PID files                 local
+  local/trackers.git     every tracker's history (bare repo)    local
+  local/publish/         the push outbox                        local
+  local/locks/           one lock per instance                  local
 ```
 
-Workspaces can live outside the repo:
+Definitions are committed, so teammates and CI see the same orchestration.
+Concrete state stays local: bindings, captured content, snapshots,
+allocated ports, logs, external handles. Secret tracker content stays out of
+Git by construction, and travels only through a newgit remote.
 
-```text
-~/.newgit/workspaces/<project>-<hash>/<branch-instance>/
-```
+Definitions are one per file, named by the filename. That gives clean diffs,
+matches what `tracker create` and `resource add` produce, and avoids TOML's
+array-of-tables footgun. An unknown key is an error naming the file and the
+key, never a line quietly skipped: a misspelled `ownership` would otherwise
+decide what `remove` may delete.
 
-`<hash>` is a short hash of the repo root path, so two projects that are both
-named `api` do not collide. This is the runtime default; `[workspace].root`
-in `config.toml` is optional and omitted from the generated file, since a
-committed config should not bake in one user's absolute path.
-
-This avoids cluttering the source repository and makes cleanup simple.
-
-### Committed Config vs Local State
-
-v1 should distinguish the control plane from the data plane.
-
-Committed to Git:
-
-- tracker and resource definitions
-- action names and commands
-- scripts those commands call (`.newgit/scripts/`)
-- non-secret defaults
-- templates that contain no private values
-- documentation of expected trackers and resources
-
-Not committed to Git by default:
-
-- concrete branch bindings
-- captured tracker content
-- database snapshots
-- ports assigned to a branch instance
-- action logs
-- generated env files
-- secrets
-- user-specific tracker resolution
-- external resource handles, unless explicitly safe
-
-This means v1 can commit newgit project configuration without committing arbitrary state outside source. The source tree still owns source history; `.newgit` committed files describe how branch trackers and resources are orchestrated. Content of trackers whose audience is narrower than the repo's stays out of Git by construction.
-
-### Per-User Tracker Content
-
-The architecture should support assigning different concrete tracker content to
-different users, but the assignment should happen through tracker storage and
-local branch bindings rather than committed person-specific materialization
-recipes.
-
-For example, a project can commit one env tracker definition:
-
-```toml
-# .newgit/trackers/runtime-env.toml
-audience = "user"
-storage = "local"
-merge_with_source = false
-paths = [".env.local"]
-```
-
-Each user can then capture their own `.env.local` content into their local
-tracker lane. A new branch includes the tracker if its profile asks for it; if
-that user has never captured content, the file simply does not appear.
-
-Committed profiles are still useful when they describe roles rather than people:
-
-```toml
-[profiles.frontend]
-trackers = ["runtime-env"]
-resources = ["deps", "app"]
-
-[profiles.fullstack]
-trackers = ["runtime-env", "dev-db"]
-resources = ["deps", "app", "worker"]
-```
-
-The safe default is:
-
-> Commit tracker and resource definitions and role profiles. Keep concrete
-> tracker content local unless it is deliberately pushed to a tracker remote.
-
-### Future Remote-Backed Trackers
-
-The local-only v1 rule should not rule out the larger goal: trackers, especially env and secret trackers, should eventually be pushable to a secure newgit remote with per-user authentication. This is what `audience` and `storage` exist for. A tracker called `jack-env` with `audience = "user:jack"` and `storage = "remote"` should sync across Jack's machines and be invisible to everyone else.
-
-The compatibility rule is:
-
-> v1 keeps concrete tracker content out of Git, not out of newgit forever.
-
-For v1, an env tracker is just a local content lane:
-
-```toml
-# .newgit/trackers/jack-env.toml
-audience = "user:jack"
-storage = "local"
-merge_with_source = false
-paths = [".env.local"]
-```
-
-A future version can keep the same tracker and change only the state backend:
-
-```toml
-# .newgit/trackers/jack-env.toml
-audience = "user:jack"
-storage = "remote"
-merge_with_source = false
-paths = [".env.local"]
-
-[remote]
-auth = "per-user"
-encryption = "recipient"
-```
-
-That future remote should store tracker content as authenticated, access-controlled newgit data, not as plaintext Git commits. Git can still contain the tracker definition and policy, while the env values live in the newgit remote under per-user auth.
-
-This keeps the upgrade path clean:
-
-- v1: tracker definition in Git, concrete env content local
-- later: tracker definition in Git, encrypted/authenticated env content in newgit remote
-- never: secret env values committed directly to ordinary Git history
-
-Resource state references should likewise avoid assuming a local file path:
-
-```text
-local:lanes/runtime-env@3bd17e8ba807
-external:op://Team/myapp-dev-env
-remote:newgit://project/runtime-env/ckpt_017
-```
-
-Checkpoint, restore, and materialization should operate on state references through a storage backend. That is the bridge from v1 local state to future secure tracker remotes.
+Workspaces live outside the project, under
+`~/.newgit/workspaces/<project>-<hash>/<instance>/`. The hash is of the
+project's path, so two projects named `api` do not collide. The committed
+config never names a workspace root, so it never bakes in one user's paths.
 
 ---
 
-## CLI
+## Rules that recur
 
-The CLI should be small, but tracker- and resource-oriented.
+A handful of rules decide most of the questions below. They are listed here
+so the later sections can point at them.
 
-Two conventions hold across all commands:
+**Interpose, don't emulate.** Run the real command and add newgit's side
+effects. Never make a command secretly do something else. A workspace is a
+real Git repository, `git push` is Git's own push, and `.git` passes `git
+fsck`. A 95%-correct illusion is worse than none: an agent that notices it
+will debug it, decide the repo is corrupt, and start "fixing" it. Everything
+the environment claims must be checkable with the tools in that environment.
 
-- **Grammar:** branch-instance lifecycle commands are top-level verbs
-  (`spawn`, `status`, `run`, `checkpoint`, `undo`, `remove`, `cleanup`);
-  definition management uses noun subcommands (`tracker create`,
-  `tracker track`, `resource add`).
-- **Name inference:** `<name>` is optional when a command runs inside a
-  workspace — newgit chose the workspace path, so it can always map cwd →
-  branch instance. `<name>` is required only outside a workspace. Agents
-  inside a workspace will reflexively type `newgit status`, not
-  `newgit status feature-a`; both must work.
+**An incomplete operation must say so.** A spawn, undo, or restore that did
+not fully work leads with that verdict and exits non-zero. It does not say
+"Restored" on the first line and "FAILED" on the fourth. A caller that only
+checks the exit code must be able to tell "ready" from "spawned but broken".
 
-### `newgit reference`
+**Report precisely, not generically.** A warning that fires when nothing is
+wrong trains people to ignore the one that matters. newgit warns when it
+knows something specific (this file has changes a re-render will discard;
+this capture was declared and never printed) and stays quiet otherwise.
 
-Prints the definition format: every key in a tracker or resource definition
-with its type and default, the checkpoint/restore/ownership tables, and which
-template variables are in scope for which hook. It is `crates/newgit/reference/
-definitions.md`, compiled into the binary.
+**Destructive writes fail closed.** Rendering leaves an unknown `{{...}}` in
+a command verbatim, because `{{.Field}}` may belong to another tool and the
+reader can tell. But a `[cleanup]` command, a `[[render]]`, an `[exports]`
+value, and a `[restore]` command's `{{state_ref}}` each write something that
+outlives the command, so an unresolved variable there refuses the run. A
+destructive command with a literal placeholder is not a no-op; it is a wrong
+argument.
 
-This document is a design narrative and does not substitute for a lookup
-table. More to the point, it does not travel: `cargo install newgit` puts a
-binary and a README on disk and nothing else, so a relative link from the
-README to a repository file resolves to nothing on crates.io, on docs.rs, and
-in the registry directory. The reference ships inside the thing that reads the
-definitions, which is the only copy guaranteed to be wherever the definitions
-are. `init`, `tracker create`, and `resource add` each name it, since handing
-someone a file to hand-edit is exactly the moment the legal values matter.
+**Never break an undo.** Nothing newgit does on its own initiative deletes
+what a checkpoint points at. Discarding history happens only when someone
+asks for it by name.
 
-### `newgit init`
+**Teardown never depends on the graph.** A broken definition is reported,
+not raised at load. Commands that act on the graph (`spawn`, `run`,
+`action`, `checkpoint`, `undo`) refuse with the offending name. Commands
+that build or inspect it (`tracker create`, `resource add`, `status`) warn
+and run, since they are how a broken graph gets fixed. `remove` and
+`cleanup` always work.
 
-Initializes `.newgit/` and detects project substrates:
+**Name-inference.** Lifecycle commands are top-level verbs; definition
+management uses nouns (`tracker create`, `resource add`). An instance
+argument is optional inside a workspace, because newgit chose the workspace
+path and can always map the current directory to its instance. Agents
+standing in a workspace type `newgit status`, not `newgit status
+feature-a`, and both work.
 
-- Git or `jj`
-- package manager
-- lockfile
-- env files
-- common dev scripts
-- database hints
-- likely services
+---
 
-It can offer resource templates and suggested tracker paths, but should not
-pretend detection is certainty.
+## Trackers
 
-### `newgit tracker create <name>`
+A tracker is a definition in `.newgit/trackers/<name>.toml`: the paths it
+owns, who may read it, which resources it brings, and which role it fills.
+Its history is a Git repository: locally, refs under
+`refs/trackers/<name>/` in `.newgit/local/trackers.git`, with a `main` (what
+new instances get) and a branch per instance that changed it. On the
+remote, it is that tracker's own repository.
 
-Creates an empty tracker lane. Policy can be supplied with flags; defaults are
-boring (`audience = "project-devs"`, `storage = "local"`,
-`merge_with_source = false`).
+The full model is in [`trackers.md`](trackers.md). The short version:
 
-```sh
-newgit tracker create runtime-env --audience user
-newgit tracker create dev-db --audience project-devs
-newgit tracker create generated-sdk --merge-with-source
+- **Every path has exactly one owner**, the most specific claim. `root`
+  owns `.`, everything nothing else claims. `project` owns `.newgit`.
+  `access` owns `.newgit/trackers/`, which decides who may read what, and by
+  default only the project's owner may change it (`maintainers = "owner"`).
+  `newgit init` creates all three and copies the project's Git history into
+  `root`.
+- **Code trackers** (`secret = false`) are committed content with their own
+  history. `newgit tracker create electron --code --path apps/electron`
+  carves those paths, history included, out of whichever tracker owned
+  them. You commit to them with Git. When work leaves the machine, newgit
+  splits each commit into per-tracker commits, and composing them back
+  gives the same commit, with the same id.
+- **Secret trackers** (the default) are files that never belong in Git: an
+  `.env.local`, an agent's notes, a SQLite file. They are captured by
+  newgit, never committed.
+- **Binding** decides what an instance works on. Trackers sharing a `role`
+  are alternatives (`local-db`, `staging-db`), and an instance binds one per
+  role: `spawn --use`/`--drop` first, then your own default in
+  `[projects.<project>.roles]` in `~/.newgit/config.toml`, then `priority`.
+  A negative priority is never bound unless asked. `newgit tracker use` and
+  `drop` change a live instance's binding. A tracker brings resources, and
+  they run only while it is bound.
+
+### Secret trackers
+
+Capture snapshots a secret tracker's paths into a new revision on the
+instance's branch. `newgit tracker merge` promotes that revision to the
+tracker's `main`; `tracker pull` brings `main` into an instance; `tracker
+checkout --rev` restores an exact revision. Checkout clears the owned paths
+first, so it reproduces the captured state exactly, and captures the
+current content before overwriting it, so it is always undoable.
+
+A tracker starts empty, so adopting newgit would mean spawning an instance
+without its env file, copying the file in, capturing, and merging. `tracker
+capture <tracker> --from-store` reads the owned paths from the project's own
+checkout and sets `main` directly instead, so the next spawn comes up with
+them. A tracker that has never captured anything projects nothing, the same
+as Git: tracking a path does not invent content for it.
+
+Because a secret tracker is pure content, capture and restore need no
+modes. If something needs a command to capture or restore, it is a resource.
+
+Secret content is kept in its own repository, not the project's. The
+project repository is what a local `git clone` hardlinks into every
+workspace and what a push publishes from; the tracker repository lives
+under `local/`, which is gitignored.
+
+### Keeping secret paths out of Git
+
+A secret tracker's files sit inside a Git clone, so an agent could `git add`
+them. The rule:
+
+> **A path owned by a secret tracker must be ignored by Git.**
+
+`tracker track` appends the path to `.gitignore`, loudly. That is not
+enough on its own: the edit is uncommitted in the project checkout, so a
+workspace cloned from it does not inherit the rule, and the files would sit
+there as untracked content that `git add -A` sweeps up. So `spawn` also
+writes every tracker-owned path, and every path an install produces, into
+the workspace's `.git/info/exclude` before any content lands. `info/exclude`
+rather than the workspace's `.gitignore`, because that is a committed file
+and newgit does not rewrite the user's files.
+
+That still does not stop `git add -f`. The backstop is at the point where
+work leaves the machine: a push or a checkpoint sync that would carry a
+commit adding or changing a secret tracker's file is refused, naming the
+commit and the file. History from before `newgit init` is exempt, so an old
+committed `.env` does not block a first push; removing it is a history
+rewrite, which is not newgit's to do silently.
+
+### Audience and storage
+
+Every tracker has an `audience` (`public`, `project-devs`, `user`, or
+`user:<login>`) and a `storage` (`local` or `remote`).
+
+Locally, audience decides what `newgit export` ships and nothing else. On
+the newgit remote it is enforced: the remote mints tokens per tracker, so a
+reader gets only the trackers they may read, and a branch composed for them
+holds only those code trackers.
+
+`storage = "remote"` makes a secret tracker sync. A checkpoint pushes its
+revisions to the remote; `spawn --from-checkpoint` fetches them. A tracker
+with `audience = "user"` is per user: each person's content is their own
+repository on the remote, so spawning a teammate's checkpoint gives you
+your own `.env.local`, never theirs. `tracker create --storage remote`
+is refused until the project has a remote, rather than quietly behaving as
+local.
+
+`merge_with_source` is written to every definition but nothing reads it
+yet. `newgit merge` merges code trackers, and secret trackers move only
+through `tracker merge`. [`trackers.md`](trackers.md) plans to replace it
+with `merge = "with-change" | "explicit"`.
+
+---
+
+## The workspace
+
+The materializer contract:
+
+> A workspace presents a full, real, verifiable Git repository at the
+> binding record's revision, plus every bound tracker's paths. Nothing else
+> in newgit may care how that is produced.
+
+### Independent clones, not worktrees
+
+newgit does not use `git worktree`. Worktree friction is one of the pains
+that motivated the project, and it is structural: worktrees share one
+gitdir (refs, config, hooks, gc), each branch can be checked out in only
+one of them, their lifecycle is registered in the main repository (delete
+the directory and you owe a `git worktree prune`), and their
+`.git`-as-a-file breaks real tools.
+
+Instead, `spawn` makes the workspace a complete, standalone clone of the
+project repository:
+
+- A local `git clone` hardlinks objects, so it is fast. Hardlinked objects
+  are safe, since gc never rewrites an object file in place. `--shared` and
+  `--reference` are not safe, because the other repository's gc can delete
+  what they borrow, and newgit never uses them.
+- The agent gets a fully real repository. `.git` is a directory, and `git
+  fsck`, `git log`, and everything else check out.
+- Deleting a workspace is `rm -rf`. Nothing to register, prune, or lock.
+- Nothing is shared between workspaces, so two instances of the same base
+  branch is a non-event.
+
+A dropped code tracker's files are left out of the working tree with Git's
+sparse checkout. The history still has them, so every instance of a project
+has the same commit ids.
+
+Sync is newgit's job, and it runs one way: a checkpoint **fetches** from the
+workspace into the project repository. Fetching avoids the
+push-to-checked-out-branch problem and keeps workspaces passive. The project
+repository only learns about a workspace's commits when a checkpoint
+records them, so an agent can commit, rebase, and make a mess in its clone
+without touching anything else.
+
+### `git push` publishes
+
+A workspace is cloned from the project repository, so its `origin` would
+start as a local path. Left that way, `git push` would land in the project
+repository, move a branch behind checkpoint's back, reach nobody, and
+report success; `git pull` would read the wrong place; and `gh` cannot map
+a path to a repository at all. So `spawn` routes `origin`:
+
+- **Fetching reads the real remote**: the project's own `origin`, or the
+  project's newgit endpoint when it has one. `git pull` and `gh` see the
+  real repository.
+- **Pushing goes through newgit's outbox**, a bare repository in
+  `.newgit/local/publish/outbox.git`. Before Git advertises anything to the
+  pusher, newgit brings the outbox up to date with the real remote, so the
+  pushing Git judges fast-forward and `--force-with-lease` against what that
+  remote holds now. Then the outbox's `pre-receive` hook:
+  1. **refuses secrets**, as above;
+  2. **checkpoints the instance**, because `undo` cannot take back a push,
+     so the push is the one moment a checkpoint has to exist (it is listed
+     with reason `push`);
+  3. **forwards the push** and succeeds exactly when the real remote
+     accepted it. A store with no `origin` refuses every push: nothing was
+     published, so nothing may look published.
+
+Why an outbox and not the project repository: checkpoint and undo move the
+project repository's branch to the workspace's head, so after any
+checkpoint a `--force-with-lease` push judged against it would fail as
+stale. The outbox holds exactly what the real remote holds.
+
+Why not push to the real remote directly: then nothing could checkpoint
+first. A workspace's own hooks are skipped by `--no-verify` and replaced by
+husky's `core.hooksPath`.
+
+The route is Git's own receiving side, not a shim. The workspace's
+`remote.origin.receivepack` runs `newgit push-receive-pack`, which hands
+over to `git receive-pack` with the outbox's hook selected through `-c
+core.hooksPath`, so nothing is written to the developer's hooks and a
+global `core.hooksPath` cannot switch it off. The route is per-clone
+config, and every checkpoint reinstalls it.
+
+On a newgit remote, `origin` is the newgit endpoint, which `gh` cannot read.
+An export target with `branches = true` adds itself as a remote in each
+workspace and as the one `gh` resolves, so `git push` then `gh pr create`
+opens a real pull request there (see *Export*).
+
+### The materializer is replaceable
+
+Clone is the first materializer, not the last. Each later step keeps the
+contract fixed:
+
+1. **Now:** an eager local clone.
+2. **Later:** a Git partial clone with the project repository as the
+   promisor remote, so objects arrive on demand through Git's own lazy
+   mechanism. Big repositories spawn fast without newgit touching a
+   filesystem.
+3. **Eventually:** a projected filesystem (FUSE) that replaces the clone
+   and answers every read exactly as a clone would. A projection that cuts
+   a corner, such as a `.git` that fails `fsck`, is emulation, and that is
+   the line it must not cross.
+
+So nothing else may assume a workspace is a clone. Checkpoint reads source
+through Git's interface (a fetch), never by reaching into `.git`, and
+works the same against either.
+
+---
+
+## Resources
+
+A resource is a definition in `.newgit/resources/<name>.toml`: its
+ownership, dependencies, identity, ports, exports, renders, actions, and its
+checkpoint, restore, and cleanup hooks. Not every resource uses every part.
+Every key is in [`definitions.md`](../../crates/newgit/reference/definitions.md).
+
+### Ownership
+
+`ownership` says who owns the concrete thing and what teardown may touch.
+It is operational, not a security label.
+
+| ownership | means | per-instance teardown |
+| --- | --- | --- |
+| `branch` | one per instance (a database named after the branch) | runs its hook |
+| `workspace` | lives in the workspace (`node_modules`) | runs its hook |
+| `project` | shared by this project's instances | never |
+| `user` | shared beyond this project (a pnpm store) | never |
+| `external` | another system owns it; newgit holds a handle | exactly the `[cleanup] command`, nothing else |
+
+`project` and `user` are where destructive defaults would be easiest to
+write by accident. A pnpm store is shared with every project on the
+machine, so newgit never deletes or rewrites one, at `remove` or at
+`cleanup`.
+
+### Actions
+
+Actions are named commands: `newgit action <resource>.<action> [instance]`.
+The resource comes first and the instance last, so an agent in its
+workspace types `newgit action app.start`. Most names are free. A few mean
+something to newgit:
+
+- **`prepare`** makes the resource ready. `spawn` runs it, in dependency
+  order.
+- **`start` and `stop`** are a convention made real by `long_running =
+  true`: the process starts detached in its own process group, its output
+  goes to `.newgit/logs/`, its PID to `.newgit/state/`, and `stop` sends the
+  configured signal (TERM by default) to the group. No daemon, no restart
+  policy.
+- **`suspend` and `resume`** take down and bring back something newgit does
+  not supervise, such as a Supabase stack or a Compose project. `newgit
+  stop` and `start` run them (see *Stop and start*). Each needs a command,
+  and neither is accepted without the other.
+
+A hook is not an action: `[checkpoint]`, `[restore]`, and `[cleanup]` each
+run at one moment and against state only that moment has, so none can be
+invoked by name.
+
+`--dry-run` prints the rendered command, the directory it runs in, any
+captures, and whether it would be supervised, and runs nothing. It shares
+its resolution with the real run, so it refuses for exactly the same
+reasons. A `{{...}}` left in the rendered command is called out, since only
+the reader can tell a typo from another tool's syntax.
+
+**Captures.** Some handles are minted by another system: newgit cannot
+compute a preview id, only ask for one and remember the answer. An action's
+`captures` reads declared names from its stdout (a flat JSON object, or
+`KEY=VALUE` lines) into the binding's exports, where `run`, later hooks, and
+`cleanup` can use them. When `captures` is set, stdout belongs to newgit,
+so the action's output goes to its log. A declared name the command never
+printed stays absent rather than failing, since a resource may publish a
+handle only on some runs, but newgit warns, naming the capture and the log.
+Otherwise the result is an action that exits 0, reports `ok`, and publishes
+an empty handle nobody notices until an API call returns 401.
+
+### Where a resource's script lives
+
+A resource definition is read from the project checkout, not the
+workspace. If the scripts it called were read from the workspace, the two
+halves of one definition would follow different rules: the TOML editable in
+place, the script needing a commit before any spawn could see it.
+
+So `{{scripts}}` resolves to `.newgit/scripts/` in the project checkout.
+Edit either half and the next `newgit action` uses it, with nothing to
+commit first. Scripts still run with the workspace as their working
+directory. The directory is control plane and belongs in Git. A script the
+*application* runs stays in the project tree and is read from the
+workspace.
+
+### Dependencies
+
+`depends_on` is a lifecycle claim. Needing another resource's value is a
+separate, weaker thing that is not declared at all: a
+`{{exports.<name>}}` in an `[exports]` value or a `[[render]]` already
+names what it needs, so newgit reads the edge out of the template. That
+gives two orders:
+
+- **Bind order**, `depends_on` plus those data edges. Binding trackers,
+  preparing, rendering, assembling the environment, and restoring all walk
+  it, because a value must exist before a template that reads it renders.
+- **Lifecycle order**, `depends_on` alone. Checkpoint, stop, and cleanup
+  walk it in reverse, so needing one string from a resource claims nothing
+  about the order the two are torn down in.
+
+If a dependency fails to prepare, the instance still spawns. Its dependents
+are `blocked`: their `prepare` does not run, and their command actions are
+refused until the dependency is repaired, while signal-only actions such as
+`stop` stay available. Nothing is rolled back, so the failure stays there
+to inspect and the action can be re-run.
+
+A name in the environment belongs to exactly one declaration. Two
+resources exporting the same name is a graph error, not a last-one-wins
+surprise found as a wrong variable in a subprocess.
+
+### Ports
+
+**An instance's port never changes once allocated.** At bind time newgit
+takes the first port scanning up from the declared `start` that no other
+instance's record claims and that is free right now. "Free" means it binds
+on all of 127.0.0.1, 0.0.0.0, ::1, and ::, with `SO_REUSEADDR` off, so a
+Docker container published on a wildcard address cannot hide behind a
+loopback-only check (#93).
+
+The binding records are the only ledger. Removing an instance frees its
+ports, with nothing separate to drift. A resource's ports are written into
+the instance's record before its `prepare` runs, under a short lock held
+only while they are chosen, so two spawns installing side by side are never
+handed the same port.
+
+A record can only be as complete as the bind probe, and a container a
+resource starts can publish a port the record never learned about (#92).
+`newgit ports --check` catches that from the other side: it reads the real
+socket table (`lsof`), keeps listening ports inside some resource's range,
+and reports any that no record claims. It names an instance only when the
+instance's name or workspace really appears in the listener's command
+line. On macOS, Docker Desktop fronts container ports with its own proxy,
+so most Docker conflicts come back unattributed. An unattributed conflict is
+still the useful finding; a confidently wrong instance name would not be.
+If `lsof` is missing or fails, `--check` says it could not check rather
+than reporting every port free.
+
+### Exports and the command environment
+
+Every command newgit runs for an instance, whether `newgit run`, an action,
+or a `[checkpoint]`, `[restore]`, or `[cleanup]` hook, gets one
+environment: each resource's `[exports]` in dependency order, the ports'
+`env` variables, captured values, and `NEWGIT_BRANCH` and
+`NEWGIT_WORKSPACE`. It is one assembly, not one per hook, because the hook
+it matters most for is the one you least want to guess at: a `[restore]`
+that resets a database picks *which* database from that environment, and
+one missing a variable falls back to the developer's shared default.
+
+`newgit env` prints that assembly, one `export NAME=value  # declaration`
+line per variable. It is the same code path the hooks use, not a
+reconstruction that could drift from it, and the single-owner rule is what
+makes each label honest. It is one command rather than a `--resource`
+filter, because the environment does not vary by resource. Values print
+verbatim, credentials included. Redacting them would be simulated security:
+anything that can run `newgit env` can run a hook that echoes the value.
+
+### Render
+
+Ports reach a command as `{{ports.x}}` on its command line or as a variable
+in its environment. Most tools take neither. Supabase reads its ports from
+`supabase/config.toml`, Expo from `.env`, Compose from `compose.yaml`,
+Rails from `database.yml`: a file the project commits. Without a first-class
+answer, every project writes the same config rewriter inside its `prepare`,
+and the interesting part of the resource stops being `supabase start`.
+
+`[[render]]` is that answer, declared on the resource that owns the
+values:
+
+```toml
+[[render]]
+path = "supabase/config.toml"
+replace = [
+  { find = 'project_id = "faretable"', with = 'project_id = "faretable-{{branch.slug}}"' },
+  { find = "port = 54321",             with = "port = {{ports.api}}" },
+]
 ```
 
-`--code --path <path>` (repeatable) creates a code tracker instead: committed
-content carved, history included, out of whichever tracker owns those paths
-now. Its paths are fixed at creation.
+The exact rules are in the reference's `[[render]]` section. The decisions
+behind them:
 
-```sh
-newgit tracker create electron --code --path apps/electron
-```
+**The committed file is the template.** There is no template file. `port =
+54321` is not a placeholder; it is Supabase's working default, so someone
+who clones without newgit still gets a working stack. A template would mean
+a second copy of the config under `.newgit/`, kept in sync with upstream
+forever, and a project whose real config has been hollowed out into
+placeholders. Substituting into the committed file has neither problem.
 
-### `newgit tracker track <tracker> <path>...`
+**`find` is literal, never a regex.** A pattern language brings back the
+"did it match what I meant" doubt the next rule removes, and it would make
+the inverse undefined.
 
-Adds workspace paths to a tracker lane and appends those paths to `.gitignore`
-loudly, unless they are already ignored or deliberately dual-tracked.
+**A `find` must match exactly once** (or a declared `count`), or the bind
+fails, naming the file and the string. One rule does four jobs:
 
-```sh
-newgit tracker track runtime-env .env.local
-newgit tracker track dev-db data/dev.sqlite
-newgit tracker track generated-sdk src/generated
-```
+- Ambiguity is impossible. A bare `54321` that also appears in a comment is
+  caught before anything runs.
+- Drift is loud. When upstream changes its default, the `find` stops
+  matching and the bind fails by name. The check *is* the drift detector,
+  and it runs on every bind for free.
+- Disambiguation needs no parser. When two sections share a value, `find`
+  goes multi-line (`[api]\nport = 54321`). newgit never learns TOML, which is
+  what lets the same mechanism serve `.env`, YAML, and `vite.config.ts`.
+- The inverse stays well-defined (below).
 
-### Remote commands
+`count` is a number, not `all`, so it keeps failing when two occurrences
+become three.
 
-Beyond v1, newgit talks to the hosted remote described in
-`newgit-cloudflare.md`: `newgit login` / `logout` / `whoami` (GitHub device
-flow), `newgit remote add [--url <url>] [--project <owner>/<name>]` /
-`remote show`, `newgit members add|remove <github-login>` / `members list`,
-`newgit clone <owner>/<name>`, `newgit merge [instance] [--into <branch>]`,
-`newgit tracker use|drop <tracker>` (binding, newgit-trackers.md),
-and `newgit spawn --from-checkpoint <instance>/<checkpoint>`, which brings
-up someone else's checkpoint locally — source, uncommitted work, your own
-copy of their trackers, and resources restored.
+**Replacements are simultaneous.** Every `find` is located in the committed
+content, then all replacements apply as one batch, and a replacement's
+output is never a match target. So the order of the `replace` array is
+cosmetic, and a reader does not have to simulate the list to know what it
+does. Two rules claiming overlapping text have no batch answer and are
+refused.
 
-### `newgit resource add <name> --template <template>`
+**Render reads committed content, never the working file.** For a path
+Git tracks, that is the blob at `HEAD`; for a tracker-owned path, the bound
+tracker revision. Otherwise the second render would look for `port =
+54321`, find `port = 54400`, and fail. With this rule, render is pure and
+idempotent: `undo` and `tracker pull` re-render from the record, and values
+can never compound. Render runs at bind, after ports are allocated and
+dependencies are bound, just before `prepare`, and again before a
+`recompute` restore. A template sees exactly what a command in the instance
+would see in its environment, so an Expo `.env` can name the Supabase
+resource's URL.
 
-Creates a resource definition from a starter template.
+**Instance values must not leak.** A render writes one instance's values
+into a path the project owns. Four places they must not reach:
 
-```sh
-newgit resource add deps --template pnpm
-newgit resource add app --template process
-newgit resource add postgres-db --template command-snapshot
-```
+- **`git status` and `git commit`.** Rendered files Git tracks are marked
+  `--skip-worktree` in the workspace, so `git add -A` cannot commit this
+  instance's port. It is the same job `info/exclude` does for tracker paths.
+- **`newgit export`**, which copies tracked files as they stand on disk.
+  It takes rendered paths from `HEAD` instead.
+- **Tracker captures.** A tracker-owned file cannot be skipped: the tracker
+  is how the `.env` reaches other instances, and the user may have added a
+  key to it. So every capture, including a checkpoint's and the one `tracker
+  pull` takes first, **reverses the substitution** (`54400` back to
+  `54321`). Real edits survive; the instance's values never enter the
+  tracker. This works only because the substitution is literal, and it is
+  the strongest argument for it: a whole-file template cannot run
+  backwards. The rendered value must therefore also be unique in the file,
+  checked at bind so the failure comes then and not at capture.
+- **A checkpoint's uncommitted-work commit.** It is built in a throwaway
+  index, which does not carry the real index's skip-worktree bits, so newgit
+  sets them there too.
 
-The user can then edit the generated resource TOML. Tracker definitions should
-normally be edited through the CLI.
+**What it costs, said precisely.** On a file Git tracks, skip-worktree
+means real edits to it in the workspace are invisible to newgit and die
+with the workspace. That is right for values newgit generates and wrong for
+an `[auth]` block someone adds by hand. A warning at bind would fire when
+nothing is wrong and stay silent when the work is lost. Since a render is a
+pure function of committed content and the record, the expected bytes can
+be recomputed any time, so newgit compares at the two moments that matter:
+at checkpoint, because a checkpoint cannot carry that edit, and before a
+re-render, because that is when it is overwritten. The report names the
+file and how many lines differ, and says nothing when the file is what the
+render produced. To change a rendered file for real, change it in the
+project checkout and commit it. Tracker-owned targets do not pay this cost.
+Replacing skip-worktree with a clean/smudge filter would remove it (#64).
 
-Tracker content moves through plumbing subcommands — the same machinery
-`checkpoint`/`undo` orchestrate in M5, not a second code path:
+**Rendering into a built tree.** A render may target a file inside its own
+resource's `[identity] produces`. That is how the install store shares a
+tree that records its own workspace path as data: storing reverses the
+render, and filling renders it forward for the new instance. The `pnpm`
+template uses it for `node_modules/.pnpm-workspace-state-v1.json`.
 
-```sh
-newgit tracker capture <tracker> [instance]      # snapshot content → lane
-newgit tracker capture <tracker> --from-store    # seed the lane from the store repo, and set the lane head
-newgit tracker merge <tracker> [instance]        # promote this instance's rev to lane head
-newgit tracker pull <tracker> [instance]         # pull lane head into this instance
-newgit tracker checkout <tracker> [--rev <rev>]  # check out an exact rev (auto-saves current first)
-newgit tracker list
-```
+**`render --check` is the adoption dry run.** Reading committed content has
+one cost: while you are writing a `find`, the string is not committed yet,
+so learning that it is wrong would take a commit and a spawn.
+`newgit render --check` matches every `find` against the working tree
+instead, with no instance and nothing substituted. Outside adoption, it is a
+drift check a project's CI can run. A `spawn --render-from-worktree` was
+considered and not built: it costs a full spawn to learn one string is
+wrong, and it adds a second rule for what render reads.
 
-`[instance]` is inferred when run inside a workspace.
+### Installs
 
-### `newgit spawn <name>`
+An install is a resource, not a tracker. The installed tree is
+path-dependent and derived; its truth is the lockfile. Two instances with
+different lockfiles must never share a tree, or one branch's install
+silently rewrites the other's dependencies.
 
-Creates a branch instance:
+But two instances at the *same* lockfile are not two derivations. They are
+one tree, built twice. A resource that declares `[identity] produces` joins
+the **install store** (#50): the first instance at a key installs and
+publishes its tree to `.newgit/installs/<resource>/<key>/`, and every later
+instance at that key is filled from it and does not run `prepare` at all.
+On T3 Code's own monorepo, that takes a second spawn from about 50 seconds
+to about 5.
 
-- creates or selects a source branch/change in the store repo
-- rejects a name whose slug collides with an existing instance
-- clones the store repo into a fresh workspace directory (see *Materialization*)
-- resolves the selected user/profile overlay
-- instantiates tracker bindings and projects captured tracker content
-- instantiates resource bindings
-- allocates requested ports
-- runs resource prepare hooks
-- records initial tracker revisions and resource state references
+The key is the inputs, never the tree:
 
-This is the flagship command.
+- **`[identity] paths`**, what the tree is derived from (lockfile and
+  manifest).
+- **`key_command`'s output**, what the lockfile cannot see. A lockfile says
+  what was asked for, and install scripts compile against a platform and a
+  toolchain it never names (`node -v && uname -sm`).
+- **The trackers the instance binds.** A shared lockfile lists every
+  workspace member, bound or not, and the install builds the bound ones.
+  So instances that bind differently never share a tree, and when a live
+  instance's binding changes (`tracker use`, `drop`, or an undo to another
+  binding), its installs are rebuilt for the new key, from the store where
+  possible (#206).
+- **The definition file.** The command that builds a tree is as much an
+  input as the lockfile. Any edit moves the key, which costs one reinstall;
+  being wrong the other way would hand out a tree the old command built.
 
-```sh
-newgit spawn auth-refactor --profile fullstack
-```
+What keeps sharing safe:
 
-#### An Incomplete Spawn Must Say So
+- **Copies fork on write.** Fills use `clonefile` on APFS and `--reflink`
+  on btrfs/XFS, never hardlinks. `node_modules` is not read-only after
+  install: native builds write into it, and under hardlinks one instance's
+  build would rewrite every other instance's tree. Where the filesystem
+  cannot clone, newgit takes a full copy and says so. Same behaviour, worse
+  performance.
+- **A tree that names its own workspace is not shared**, unless a render
+  covers the file. Copy-on-write cannot fix a path already baked into the
+  content, so admission scans the tree and declines it, naming the file.
+  That resource keeps installing per instance. Nothing fails.
+- **`prepare` is the only thing an entry stands in for.** A definition
+  where something else builds the tree (a `long_running` or command-less
+  `prepare`, `captures` it would stop publishing, a `recompute` restore
+  naming another action) is refused rather than left never to fill.
+  `newgit action <resource>.prepare` always runs the command, since someone
+  asked for it by name, and publishes the result.
+- **Entries are a cache.** `newgit cleanup` drops entries no live instance
+  keys to, and anything a killed spawn left half-copied. The cost of being
+  wrong is an install. `undo --force-recompute` means "do not trust the
+  identity to describe the tree", so it bypasses the store and drops the
+  entry too.
 
-`prepare` failures are loud but do not abort the spawn — the instance is
-still created, with a record on disk, so its logs can be inspected and the
-action re-run. That is the right default: a half-bound instance is more
-useful than none. But it means the printed summary can carry a `FAILED` or
-`BLOCKED` line for a resource that never came up, the same shape #11 fixed
-for `undo` — "a failed undo reports as Restored" — and the same argument
-applies here: a caller that only checks the exit code cannot tell "ready"
-from "spawned but broken."
+Produced paths go into each workspace's `info/exclude`, so a checkpoint's
+`git add -A` never sweeps an install into source history.
 
-So `spawn` exits non-zero whenever any resource did not bind cleanly, and
-the closing line says so in the reporter's terms rather than leaving the
-verdict implicit in the `FAILED` lines above:
+The package manager still sets what a miss costs. pnpm, uv, and bun
+hardlink from a shared store; npm and pip into a venv expand a full copy
+per instance. The reference has the table, and the `pnpm` template ships a
+`user`-owned `pnpm-store` resource so newgit never touches the shared
+store.
 
-```
+---
+
+## An instance's life
+
+### Spawn
+
+`newgit spawn <name>` creates or adopts the source branch, clones the
+workspace, chooses the binding, writes the excludes and the push route,
+projects the bound trackers' content, then binds resources in order:
+allocate ports, write the record, render, export, and run `prepare`, or
+fill from the install store. With a remote, it registers the instance
+there. Spawn starts no long-running process; `prepare` is a command that
+finishes.
+
+`spawn --from-checkpoint <instance>/<checkpoint>` brings up someone else's
+checkpoint, from the remote: their source and uncommitted work, the
+trackers you may read (your own copy of per-user ones), and resources
+restored from the checkpoint, such as a database loaded from its dump. It
+is built from parts that already exist: fetch, spawn at the checkpoint's
+head, then undo to the checkpoint.
+
+#### An incomplete spawn must say so
+
+A failed `prepare` does not abort the spawn. A half-bound instance with a
+record, a workspace, and logs is more useful than none. But then the
+summary can contain a `FAILED` line for a resource that never came up, and
+a caller that checks only the exit code cannot tell "ready" from "spawned
+but broken". So `spawn` exits 1 whenever any resource did not bind, and its
+last line says so:
+
+```text
 spawned with failures: 1 of 4 resources did not bind.
   `perf-a` exists but is not ready. See the FAILED/BLOCKED lines above.
 ```
 
-A resource counts as not bound whenever its line would read `export:
-FAILED`, `render: FAILED`, `prepare: FAILED`, `prepare: BLOCKED by ...`, or
-`BLOCKED by ...` (a dependent with no `prepare` to withhold, whose command
-actions are refused all the same). The blocked case is included on purpose:
-a blocked `prepare` never ran, so the resource is no more usable than one
-whose `prepare` ran and failed — only *where* the failure originated
-differs. `spawn --json` reports the same resource as `blocked` with its
-`blocked_by`, whatever the record stores for it, so a script and `status`
-describe one instance. A resource that failed itself (its export, render or
-`prepare`) is `failed` on every surface even with a dependency down too —
-repairing the dependency would not fix it — and `spawn --json` still names
-the dependency in its `blocked_by`. The instance is not rolled
-back on exit 1; the record and workspace from the successful part of the
-spawn are exactly as printed, matching the plain `exit 1` `undo` and
-`checkpoint --verify` already use for the same "spawned/restored with
-failures" shape (not a distinct code) — a caller can `if newgit spawn x;
-then ...` and branch on it directly.
-
-### `newgit run [name] -- <command>`
-
-Runs a command inside the branch instance with the environment assembled
-from:
-
-1. resource exports, in dependency order
-2. port env vars (`PORT=3107`)
-3. `NEWGIT_BRANCH`, `NEWGIT_WORKSPACE` context vars
-
-A name belongs to exactly one declaration. Two resources claiming one name
-is a graph problem reported when the graph loads, not a last-one-wins
-resolution discovered as a missing variable in a subprocess.
-
-The workspace is the cwd; output is captured to `.newgit/logs/` as well as
-the terminal.
-
-```sh
-newgit run feature-a -- pnpm test
-```
-
-### `newgit env [instance]`
-
-Prints the environment `newgit run` and every hook — actions,
-`key_command`, `[checkpoint]`, `[restore]`, `[cleanup]` — get, one
-`export NAME=value  # <declaration>` line per variable:
-
-```
-export DB_PORT=5434                            # db [ports.pg]
-export DATABASE_URL=postgres://...:5434/feat-x # db [exports]
-export NEWGIT_BRANCH=feature/x                 # newgit
-```
-
-The question it answers — "which database does this hook talk to?" — used
-to be answerable only by firing the hook. It prints the output of the one
-assembly every command uses, with each variable's origin carried through,
-rather than a second computation that could drift from it. The single-owner
-rule is what makes the label honest: each name has exactly one declaration
-to name.
-
-It is one command and not a filter on `run` or `action` because the
-environment does not vary by resource: there is no `--resource` flag,
-since narrowing the listing to one resource's declarations would hide
-variables that resource's hooks receive. The output is valid shell, so `eval
-"$(newgit env)"` reproduces it — `export`ed, because a hook's environment is
-what the programs it starts inherit, not shell-local variables. A name no
-shell can assign (`NEXT-PUBLIC-URL`) is listed commented out, with its
-origin, instead of being dropped or printed as a line `eval` would run as a
-command. newgit does set it for the hook's `sh`, but whether it reaches the
-programs that `sh` starts depends on the shell: bash passes it on, dash (the
-`/bin/sh` on Debian and Ubuntu) drops it.
-
-Values are printed verbatim, credentials included — the same values `newgit
-run -- env` would show. Redacting here would be simulated security: anything
-that can run `newgit env` can run a hook that echoes the value. The help text
-says so, rather than letting someone learn it from a pasted log. The
-inherited environment of the caller, which every command gets underneath, is
-not printed.
-
-Template variables available in exports, action commands, and `key_command`
-are kept minimal: `{{ports.<name>}}`, `{{branch.name}}`, `{{branch.slug}}`,
-`{{workspace}}`, `{{scripts}}`, `{{bound.trackers}}`, `{{bound.paths}}`.
-Checkpoint and restore commands additionally see `{{exports.<name>}}`,
-`{{snapshot.path}}` (the staging dir for `into_tracker` deposits), and
-`{{state_ref}}` (the checkpointed state reference) — nowhere else. `newgit
-reference` prints the full scope table.
-
-### Where A Resource's Script Lives
-
-A resource definition is read from the store, but anything its commands shell
-out to is read from the workspace, where it is subject to source
-materialization. That split the two halves of one definition across different
-rules: the TOML was editable in place, while the script it called had to be
-committed before the first spawn could see it. Iterating on a `prepare` meant
-committing every attempt, or copying the script into the workspace by hand
-between runs.
-
-`{{scripts}}` resolves to `.newgit/scripts/` **in the store**, the same rule
-the definitions in `.newgit/resources/` already follow:
-
-```toml
-[actions.prepare]
-command = "{{scripts}}/db-up.sh {{branch.slug}}"
-```
-
-Both halves of the definition now live under one rule — edit either and the
-next `newgit action` picks it up, with nothing to commit first. The directory
-is control plane and belongs in Git alongside `config.toml`, `trackers/`, and
-`resources/`; a teammate or CI without it cannot bind the resource. `init`
-writes a `README.md` there, both because Git will not track an empty
-directory and because that is where someone looks first.
-
-Scripts run with the workspace as their working directory, so relative paths
-inside one address the instance being prepared. Nothing is copied into the
-workspace — the script executes from the store.
-
-This does not change where a *project's* own scripts live. Something the
-application itself runs stays in the project tree, is read from the
-workspace, and must be committed before a spawn that calls it. The rule is
-about ownership: `.newgit/scripts/` is for scripts that exist to serve a
-resource definition.
-
-### `newgit action <resource>.<action> [instance]`
-
-Runs a named resource action. The instance comes last (and is inferred
-inside a workspace) — an agent standing in its workspace types
-`newgit action app.start`. This deliberately deviates from an earlier
-`action <name> <resource>.<action>` draft for consistency with the
-`tracker` subcommands.
-
-```sh
-newgit action deps.prepare feature-a
-newgit action app.start          # inside a workspace
-newgit action app.stop
-newgit action postgres-db.migrate
-```
-
-Actions with `long_running = true` run under a minimal PID-file supervisor:
-the process starts detached in its own process group with output to a log
-file under `.newgit/logs/`, the PID is recorded in `.newgit/state/`, `stop`
-sends the action's configured signal (default TERM) to the group, and
-`status` checks liveness. No daemon, no restart policy — boring.
-
-`--dry-run` prints what would happen and runs nothing: the rendered
-command, the directory it runs in, any `captures`, whether it would start
-supervised, or which signal a command-less action sends. It refuses for
-exactly the reasons a real run refuses (unknown action, missing workspace or
-`workdir`, a failed dependency), because it shares that resolution with the
-real run rather than repeating it. A `{{...}}` left in the rendered command
-is called out: rendering leaves unknown variables verbatim, which is right
-for `{{.Field}}` meant for another tool and wrong for a typo, and only the
-person reading it can tell which. The environment is `newgit env`'s, and is
-pointed to rather than repeated.
-
-`--dry-run` covers actions only, which is a known gap rather than a
-decision. The hooks are not actions — `newgit action db.cleanup` is not a
-thing a run can do, so a dry run must not pretend it is — and each one
-renders against state only its own command has: `[restore]` against the
-checkpoint being restored, `[cleanup]` against the latest checkpoint's
-`{{state_ref}}`. Their dry runs belong to `undo` and `remove`. Today only
-`newgit cleanup --dry-run` shows a rendered `[cleanup]`, and only for an
-instance whose workspace is already gone. Their *environment*, the half
-most likely to aim a hook at the wrong database, is `newgit env`'s already.
-
-Convenience shorthands can come later, but the primitive should be resource actions.
-
-### `newgit checkpoint [instance] [-m <message>]`
-
-Records the current branch state (instance inferred inside a workspace, like
-the other subcommands):
-
-- source snapshot through Git, captured by fetching from the workspace clone
-  into the store repo (`refs/newgit/checkpoints/<slug>/<id>`); the store
-  branch ref is blessed to the workspace head, warning loudly on divergence
-- **uncommitted and untracked state too**, as a dangling commit on top of
-  HEAD (built via a throwaway index — worktree, HEAD, and real index are
-  untouched); a checkpoint protects the worktree as it stands, not just what
-  the agent remembered to commit
-- content snapshot of every tracker, as one coherent record
-- resource checkpoint outputs, dependents first (identity hashes, external
-  refs, deposits into trackers); a failed checkpoint command aborts the
-  checkpoint loudly — a checkpoint that silently missed a resource is not
-  coherent. A resource that is not up is the exception when its capture
-  fails: the checkpoint goes ahead without it, records `mode = "none"` for
-  it, and names it on a `degraded:` line
-- resolved exports, port allocations, and which processes were running
-
-#### An Unproven Restore Must Say So
-
-`[checkpoint]` runs the day it is written; `[restore]` runs the day it is
-needed — by definition the day the instance is already in trouble. A
-checkpoint record looks identical whether or not the restore behind it has
-ever actually worked, and a checkpoint wrongly trusted is worse than no
-checkpoint, because the trust is what licenses the risky change taken
-behind it.
-
-Each resource line therefore names its own proof: when the resource's
-`[restore]` is `command` or `recompute` — the modes that run something that
-can fail — and it has never completed successfully on this instance, the
-line ends `— restore never exercised`. `none` and `external` restores run
-nothing, so nothing needs proving. The record is per branch instance
-(`ResourceBinding.restore_proven`), sticky once true: it answers "has this
-ever completed", not "would it complete right now", so a later failed
-restore does not erase an earlier proof. A `recompute` restore that
-*skips* because `[identity]` is unchanged does not count either — the
-command that could fail never ran.
-
-`newgit checkpoint --verify <instance>` proves it on demand instead of
-waiting for the day of a real rollback: checkpoint, restore that checkpoint
-with a real `undo`, checkpoint again, and compare the two checkpoints'
-resource state refs. Agreement across every resource whose restore could
-fail is what "verified" means; disagreement is reported even when every
-restore command exited `0`, because exiting `0` and reproducing the
-checkpointed state are different claims — the whole reason a byte-level
-comparison is worth running at all.
-
-A mismatch is never called verified, but it is explained. Its two causes
-need opposite fixes — a `[restore]` that lands on the wrong state, or a
-`[checkpoint]` that never produces the same ref twice (`pg_dump`'s
-per-run `\restrict` token) — and two refs alone cannot tell them apart. So
-for each exercised resource that disagrees, verify runs that resource's
-checkpoint once more with nothing restored in between (a *control*, not
-recorded as a checkpoint, logged as `<resource>.checkpoint-control`; any
-deposit it makes is left for `cleanup`). A control that does not reproduce
-the second ref blames `[checkpoint]`. One that does only proves the
-checkpoint reproduces itself back to back, so it says `[restore]` most
-likely landed on a different state. A restore that failed outright skips
-the control. The cost — one more checkpoint command, possibly a slow dump —
-is paid only on a mismatch, which is already a failure. Where the refs are
-deposits, it also diffs two snapshot directories and prints the command for
-the full diff: `before` → `after` normally, `after` → control for an
-unstable checkpoint, whose every differing line is then pure noise. The
-diff is bounded however large the dump — one `git diff --numstat` for the
-counts, one patch streamed only until a few changed lines are in hand — and
-control characters in those lines are escaped before they reach the
-terminal.
-
-Destructive and expensive on purpose:
-it is a real `undo`, stopping and restarting whatever the instance's
-resources run, so it is a separate, explicitly named command rather than
-something `checkpoint` runs on its own, and it prints what it is about to
-do — restore-over-live-state, no simulated safety net — before it does it.
-
-### `newgit undo [instance] [--to <ckpt_id>]`
-
-Restores the branch instance to a checkpoint (the latest unless `--to`).
-
-Before restoring anything, the current state is checkpointed
-(`reason = "before-undo"`), so undo is always undoable and running `undo`
-twice is redo — same shape as `jj undo`. Then: running processes are
-stopped, source is restored through Git (hard reset + clean of non-ignored
-untracked files, then the dirty snapshot reapplied as uncommitted changes),
-tracker content is restored exactly, and resources run their restore rules
-in dependency order, restarting what was running. A resource restore failure
-does not abort the rest: it is collected into a recovery record next to the
-checkpoint (`<id>.recovery.toml`) with logs and a retry command, and the
-resource is marked failed.
-
-A resource the checkpoint holds no state for, such as one it went ahead
-without because the resource was not up, keeps its state and status when
-its restore is a `command` reading what a `command` or `external`
-checkpoint records: the undo does not run that restore, as `newgit
-checkpoint` said when it named the resource `degraded`. It would have
-nothing to restore from, and the bundled database restores drop or reset
-the database before they read the dump. A process the resource was running
-is still stopped with the others, and started again after its
-dependencies, and the undo reports it as `not restored + restarted`. Any
-other restore runs as usual: a `recompute` rebuilds from the restored
-source and ignores the ref. A `command` restore whose `{{state_ref}}` has
-no value in the checkpoint is not run either, and counts as a failed
-restore.
-
-Source restore is pure Git in v1; `jj` delegation can come with the jj
-substrate work.
-
-#### An Incomplete Undo Must Say So
-
-A restore command is not transactional. One that does two things — rebuild a
-schema, then load the captured rows — and fails on the second leaves its
-resource in neither the pre-undo state nor the checkpoint state. newgit
-cannot fix that; non-transactional resources are inherent. What it must not
-do is describe the instance as restored anyway.
-
-So the summary leads with the verdict. A clean undo reports `Restored`; one
-with any failed resource reports `Undo of <instance> ... INCOMPLETE: N of M
-resources restored`, names the resources that may be in a partial state, and
-exits non-zero. Saying `Restored` on the first line and `FAILED` on the
-fourth sends the reader to look at their script instead of at the resource.
-
-The safety checkpoint is annotated once the undo finishes, with
-`undo_completed = true|false`. A pre-undo snapshot taken before an undo that
-failed captures a state the instance never cleanly left: it is not a redo
-point, and three failed attempts otherwise leave three entries
-indistinguishable from checkpoints a human chose to keep, each pinning its
-tracker revs. It is recorded rather than acted on — newgit cannot know at
-save time whether the undo will succeed, and deleting the only record of a
-state is the one thing checkpoints exist to prevent. Releasing those revs is
-a `cleanup` concern.
-
-The annotation alone is not enough, because it lands on the *wrong*
-checkpoint to warn a reader off. `undo_completed` marks the pre-undo
-snapshot that an undo attempt *preceded*; the state a failed undo actually
-leaves behind is captured by the *next* undo's safety checkpoint, which by
-construction is a legitimate redo point (the undo it preceded succeeded) and
-so is never marked. Its message — `state before undo to ckpt_001` —
-describes when it was taken, which a reader takes as a description of what
-is in it. When the instance's last operation was an incomplete undo, that
-message says so: `state before undo to ckpt_001 (captured after an
-incomplete undo; contents may be partial)`. The same reasoning applies per
-resource: a safety checkpoint does not re-run a resource's checkpoint
-command against a resource whose last prepare or restore did not succeed —
-it is known-broken, not merely unobserved, and dumping it produces exactly
-the rubble the message warns about, for a redo point nobody is likely to
-want. That resource's entry records `mode = "none"` instead, and a warning
-names it. Explicit checkpoints are unaffected either way: a person asked
-for that one on purpose.
-
-### `newgit checkpoints [instance]`
-
-Lists an instance's checkpoints (id, created, reason, source rev, message) —
-what makes `undo --to` usable. The reason distinguishes `explicit` (a human
-named it), `push` (auto-saved as a `git push` from the workspace published —
-see *`git push` Publishes*), `before-undo` (auto-saved, and a real redo
-point), and `failed-undo` (auto-saved before an undo that did not complete).
-
-### `newgit status`
-
-Shows branch instances with tracker and resource status:
-
-```text
-NAME        SOURCE        STATUS        TRACKERS                RESOURCES
-feature-a   abc123        ok, main +2   env:r3 db:s17           deps:ready app:running
-feature-b   def456        ok            env:r1 db:s18           deps:ready app:stopped
-```
-
-`STATUS` also reports when an instance's base has moved: `ok, main +2` means
-`main` — the branch `spawn --from` named, or whatever `HEAD` pointed at when
-`--from` was omitted — has gained 2 commits since this instance branched.
-That comparison is the one fact nothing else in the stack can make: the
-binding record keeps the base branch's name and the revision it pointed at
-when this instance was spawned (fixed then, never touched again — v1 has no
-rebase, so the branch point does not move even as `source_rev` does at
-`checkpoint`), and the store knows where that branch sits now. `status`
-computes the gap fresh from the store's own refs on every call rather than
-caching it, so the number is exactly as current as the store's last fetch of
-upstream and never a stale comparison presented as a live one. An instance
-spawned onto a branch that already existed has no recorded base and reports
-none — newgit never chose a base for it, so there is nothing to compare.
-
-`newgit status <instance> --path` prints that instance's workspace path on
-stdout and nothing else. A workspace path is the one piece of newgit state
-that scripts, editor integrations, and READMEs actually need
-(`W=$(newgit status auth-refactor --path)`), and the alternatives — parsing
-the table or reading `.newgit/branches/<name>.toml` — make the store layout
-someone else's API. Warnings still go to stderr, so stdout stays a path.
-
-### `newgit remove <name>`
-
-Deletes a single branch instance: stops its resources, deletes the workspace
-(just `rm -rf` — clones have no registration), and archives the binding
-record. Workspaces are disposable; this is the command that proves it, and it
-belongs in Milestone 1 — the two-branch success criterion is not really
-testable without teardown.
-
-#### The Source Branch
-
-`remove` deletes the source branch too when it holds nothing unique, and
-otherwise keeps it and says which reason applied. The branch goes only when
-all of these hold:
-
-- **`spawn` created it.** A branch that already existed (`newgit spawn
-  develop`) was adopted, and stays the user's. The binding record carries
-  `created_source_branch` for exactly this.
-- **Nothing has it checked out** in the store, in its main checkout or any
-  `git worktree` — deleting it would leave that checkout on an unborn
-  branch.
-- **Its tip is on some other ref**: another local branch (merged, or the
-  instance never committed), a remote-tracking ref, a tag, or a branch the
-  real remote has *right now*. newgit's checkpoint refs do not count: they
-  are undo history, not a place anyone looks for their work.
-
-The remote is asked only when no local ref holds the tip, and asked live:
-`remove` refreshes the outbox from `origin` first, because a push from a
-workspace never updates the store's own `refs/remotes`, and the outbox
-otherwise mirrors the remote only as of the last push — after which a PR
-can be closed and its branch deleted. If the refresh fails (offline, auth),
-the remote is not counted, and the branch is kept with the reason
-("couldn't reach origin to confirm it has this commit"). Keeping is always
-the safe direction.
-
-Teardown runs between the decision and the deletion, and cleanup hooks can
-be slow, so `remove` asks again immediately before deleting and keeps the
-branch if the other ref has moved or gone — two parallel removals of
-branches sharing a tip would otherwise each count the other. The deletion
-itself is guarded on the tip it decided about; a branch that moved anyway is
-kept and reported, never an error, since by then the removal has happened.
-
-`--keep-branch` keeps it regardless; `--delete-branch` deletes it
-regardless, and then prints the tip and the `git branch <name> <tip>` that
-brings it back — saying whether a checkpoint ref still pins it, or only the
-next `git gc` stands between it and deletion. A `--delete-branch` that
-cannot be honoured (the branch is checked out) refuses before anything is
-torn down, not after.
-
-The default deletes because the alternative inverted the asymmetry: removal
-already destroys the workspace and every resource it can tear down, and the
-branch is the one artifact that is both cheap to keep and certain to change
-the next `spawn` of the same name — which silently adopts a leftover branch
-instead of starting from `HEAD`. Every check runs against what Git can show
-at the moment of deletion, not a guess at intent. What it can show is still
-only what refs say: a remote-tracking ref is as current as the store's last
-`git fetch`, the same trust `git branch -d` places in it. A squash-merged
-branch whose remote branch was then deleted looks unique and is kept — the
-safe miss, named in the output with the command to finish the job.
-
-Deleting the branch breaks no undo and no archived record. A checkpoint
-pins its source commits through `refs/newgit/checkpoints/<slug>/*`, not the
-branch, and `undo` re-points the branch from the checkpoint; a re-spawned
-instance of the same name recreates it. The archived record only names the
-branch.
-
-What `remove` does not protect is work in the workspace since its last
-checkpoint — the workspace is disposable, and `remove` does not checkpoint
-first. It does say so: when no ref in the store contains the workspace's
-`HEAD`, the output names it as lost, so "nothing unique" about the store's
-branch never reads as "nothing lost".
-
-`newgit cleanup`, when it finalizes an instance whose workspace is gone,
-leaves the source branch alone: a garbage collector deleting branches is a
-surprise in a way that an explicit `remove` is not.
-
-#### Checkpoints
-
-Checkpoints outlive removal: they pin the tracker revs their undo would need,
-and newgit never breaks an undo on its own initiative. That leaves retained
-disk for an instance nobody can undo any more, so removal reports how many
-checkpoints it kept, and `--purge` discards them instead — the one flag that
-says the undo will never be wanted.
-
-### `newgit cleanup`
-
-Garbage collection across everything; `remove` targets one instance. Takes
-`--dry-run`, which reports exactly what a real run would remove. Four jobs:
-
-- **Finalizes instances whose workspace is gone.** Such an instance cannot
-  run, checkpoint, or undo, and its name stays taken — so cleanup runs its
-  resource cleanup hooks, deletes its runtime state, and archives its binding
-  record, which frees the name for `newgit spawn` again.
-- **Deletes unclaimed workspace directories** — a failed spawn, or a record
-  archived while its directory survived. Narrower than "unclaimed": a
-  directory is removed only if it carries a newgit workspace marker (proof
-  newgit created it) or is empty. `[workspace] root` is user-configurable and
-  might point somewhere shared, and "newgit deleted a directory it did not
-  create" is not a failure mode worth risking to reclaim disk. Anything else
-  is reported and left alone.
-- **Clears dead process state**: PID files whose process group has exited,
-  and state directories belonging to no live instance.
-- **Prunes tracker lane revs nothing references**: their refs in the lanes
-  repo are deleted and the repo is garbage-collected at once, so pruned
-  content (which may be a secret) is gone rather than merely unreachable.
-  Roots are the surviving instances' bindings,
-  every checkpoint record (including archived instances'), and each lane's
-  head. It never deletes a checkpoint record, and never a rev a checkpoint
-  still points at — the count of revs retained for that reason is reported,
-  so kept disk is explained rather than mysterious.
-
-#### Releasing an Archived Instance's History
-
-That conservatism is right for a live instance and a dead end for an archived
-one: once the binding record is gone, `newgit undo` cannot reach those
-checkpoints at all, yet they keep pinning revs forever. `newgit cleanup
---purge-archived` discards the checkpoint logs of instances that have no
-binding record — and their `refs/newgit/checkpoints/<slug>/*` store refs, so
-the source commits stop being rooted too — which lets the same pass prune what
-those logs were the only claim on. A purging `--dry-run` reports exactly what
-the real run would remove, including those revs.
-
-It stays opt-in, and it never touches a live instance's checkpoints whatever
-the flag says. Deleting the only record of a state is the one thing
-checkpoints exist to prevent, so it happens when the user says so and not
-because a garbage collector inferred it. To make that reachable rather than
-folklore, the ordinary `cleanup` report says how many of the pinned revs are
-held only by archived instances, and `remove` names the flag when it keeps
-checkpoints behind.
-
-### Resource Cleanup Hooks
-
-A resource's `[cleanup] command` runs during both `newgit remove` and
-`newgit cleanup`, dependents before dependencies, while the workspace still
-exists. Without this, a resource newgit does not own — a cloud preview, a
-database — would outlive every trace of the instance that asked for it.
-
-Ownership decides whether a hook may run at all, not the presence of a
-command:
-
-| Ownership | Per-branch teardown |
-|-----------|---------------------|
-| `branch`, `workspace` | hook runs |
-| `external` | hook runs — exactly the defined command and nothing else |
-| `project`, `user` | **never**; shared beyond this instance, skipped loudly |
-
-A hook's command may use `{{state_ref}}` (the most recent checkpointed state
-reference for that resource, which is how `cloudctl preview delete
-{{state_ref}}` gets its argument) and `{{exports.<name>}}` from the binding.
-If rendering leaves any `{{...}}` unresolved, the hook is **refused, not
-run**: a destructive command with a literal placeholder is not a no-op, it is
-a wrong argument. Rendering elsewhere deliberately leaves unknown variables
-verbatim so misconfiguration is visible; cleanup, `[[render]]`,
-`[exports]`, and a `[restore]` command's `{{state_ref}}` are the places that
-must fail closed instead — each writes something durable that outlives the
-command that got it wrong.
+A blocked resource counts. Its `prepare` never ran, so it is no more usable
+than one whose `prepare` failed; only where the failure started differs.
+Every surface (`spawn`, `spawn --json`, `status`, `action`) derives
+"blocked" the same way, from the graph at read time, so a script and a
+person see one instance (#209). A resource that failed itself is `failed`
+even with a dependency down too, because repairing the dependency would not
+fix it. The instance is not rolled back. `--from-checkpoint` judges by the
+instance the restore leaves (#208).
+
+### Run and env
+
+`newgit run [instance] -- <command>` runs a command in the workspace with
+the instance's environment, logging its output to `.newgit/logs/` as well
+as the terminal. `newgit env` prints that environment (see *Exports and the
+command environment*).
+
+### Stop and start
+
+`newgit stop` takes an instance's resources down without removing it, for
+an instance someone is not using right now: a settled T3 Code thread, say
+(#157). It stops every running long-running action, dependents first, runs
+each `suspend` once that resource's dependents are down, and records what
+it took down in `.newgit/state/<instance>/stopped.toml`. `newgit start`
+brings back exactly that, dependencies first, running `resume` before a
+resource's dependents come back. A resource nobody had started stays
+stopped. A resource whose dependency did not come back in the same `start`
+is not started, and stays owed, so a dev server is not brought up against a
+database that is still down.
+
+The workspace, trackers, installs, and port claims stay, so the instance
+comes back on the same ports. Both commands do nothing and exit 0 when
+there is nothing to do, so they can run on every settle and unsettle. Both
+exit 1 if any resource failed.
+
+`suspend` never runs for a `project` or `user` resource, which other
+instances share, nor for one that never came up. The `supabase` template's
+pair is `supabase stop` / `supabase start`, which keeps the data.
+
+### Remove
+
+`newgit remove <name>` stops what is running (dependents first), runs
+`[cleanup]` hooks where ownership allows, deletes the workspace (`rm -rf`;
+clones have no registration), and archives the binding record.
+
+**The source branch** goes too, when it holds nothing unique, and otherwise
+stays with the reason printed. It is deleted only when all of these hold:
+
+- `spawn` created it. A branch that already existed was adopted, and stays
+  the user's.
+- Nothing has it checked out, in the project checkout or any worktree.
+- Its tip is on another ref: a local branch, a remote-tracking ref, a tag,
+  or a branch the real remote has right now. newgit's checkpoint refs do
+  not count; they are undo history, not where anyone looks for work.
+
+The remote is asked live, only when no local ref has the tip, because a
+pull request can be merged and its branch deleted after the last push. If
+it cannot be reached, the branch is kept. `remove` re-checks just before
+deleting, since cleanup hooks can be slow and two parallel removals of
+branches sharing a tip would otherwise each count the other.
+
+Deleting by default is deliberate. `remove` already destroys the
+workspace and every resource it can, and a leftover branch is the one
+artifact certain to change the next `spawn` of the same name, which would
+silently adopt it. A squash-merged branch whose remote branch was deleted
+looks unique and is kept: the safe miss, named with the command to finish
+the job. `--keep-branch` and `--delete-branch` override.
+
+What `remove` cannot protect is work done since the last checkpoint. When
+no ref holds the workspace's `HEAD`, it says that work is lost, so "nothing
+unique on the branch" never reads as "nothing lost".
+
+**Checkpoints outlive removal.** They pin what their undo would need, and
+newgit never breaks an undo on its own initiative. `remove` reports how
+many it kept; `--purge` discards them.
+
+### Cleanup
+
+`newgit cleanup` is garbage collection across the project. `--dry-run`
+reports exactly what a real run would do. It:
+
+- **finalizes instances whose workspace is gone**: runs their cleanup
+  hooks, deletes their runtime state, and archives their records, freeing
+  their names. It leaves their source branches alone: a garbage collector
+  deleting branches is a surprise in a way an explicit `remove` is not.
+- **deletes unclaimed workspace directories**, but only ones carrying a
+  newgit workspace marker or empty. A configured workspace root might point
+  somewhere shared, and "newgit deleted a directory it did not create" is
+  not worth risking for disk space.
+- **clears dead process state** and lock files of instances with no record.
+- **prunes tracker revisions nothing references**, and garbage-collects at
+  once, so pruned content (possibly a secret) is gone rather than merely
+  unreachable. It never deletes a checkpoint record or a revision a
+  checkpoint points at, and reports how many it kept for that reason, so
+  retained disk is explained.
+- **prunes the install store** (see *Installs*).
+
+That conservatism is a dead end for archived instances: `undo` needs a
+binding record, so their checkpoints can never be restored, yet they pin
+revisions forever. `cleanup --purge-archived` discards them, with their
+checkpoint refs. It is opt-in and never touches a live instance. The
+ordinary report says how many retained revisions it would free.
+
+### One command per instance at a time
+
+Every command that changes an instance holds that instance's lock from
+start to finish (`.newgit/local/locks/<slug>.lock`), and a second command
+waits, saying so (#212). Before, two overlapping checkpoints minted the
+same id, and an action could save back a record loaded before a parallel
+one changed it. The lock is an advisory `flock`, which the kernel drops
+when the process exits, so a crash leaves nothing stale. A hook running
+under the lock gets `NEWGIT_LOCKED`, so a `newgit` it starts on the same
+instance refuses instead of waiting forever for its own ancestor. Records
+are written to a temporary file and renamed into place, so no reader sees a
+half-written one.
 
 ---
 
-## Command Shims
+## Checkpoints and undo
 
-Agents arrive with reflexes: `git commit`, `npm install`, `pnpm dev`. The failure mode is not that they misunderstand newgit — it is that they bypass it, because the workspace looks enough like a normal repo that the old muscle memory fires. Rather than fight those reflexes with documentation, newgit can intercept them: `newgit run` (and the workspace env generally) prepends a shim directory to `PATH`, so every reflex an agent arrives with becomes a valid move.
-
-The design principle is:
-
-> **Interpose, don't emulate.** Run the real command and add newgit side effects. Never make a command secretly do something else — a shim that fakes `git commit` must then fake `git log`, `git status`, and `.git` itself, and an agent that notices a 95%-correct illusion will debug it, decide the repo is corrupt, and start "fixing" it. Everything the environment claims must be verifiable by the tools in that environment.
-
-Shims announce themselves in output rather than hiding:
-
-```text
-$ git commit -m "add payment flow"
-[main abc1234] add payment flow
-[newgit] checkpoint ckpt_018: also captured jack-env, supabase → db-snapshots
-[newgit] undo anytime with: newgit undo payment-flow
-```
-
-Agents read command output more reliably than any README, so each intercepted command doubles as onboarding — by the third shim message the agent has learned the native interface from the training wheels themselves.
-
-The interception modes:
-
-| Mode | Example | Behavior |
-|------|---------|----------|
-| Enrich | `git commit`, `npm install` | run the real command, add checkpoint/identity side effects |
-| Inject | `pnpm dev` | run the real command through the matching resource, ports and env injected before the process binds |
-| Advise | `git checkout -b` | let it happen, print the better newgit move (`newgit spawn`) |
-| Emulate | — | never |
-
-`Advise` exists because a few commands semantically diverge: `git checkout -b` expects a new branch in this directory, while `newgit spawn` creates a workspace elsewhere. Silently redirecting would break the agent's model of where it is standing. Intercept effects freely; redirect semantics never.
-
-Shims are a post-MVP milestone (see *What To Defer Until v2*), but `newgit run` should be built so that shimming is only a `PATH` entry away, and shim messages should reuse the same exports/checkpoint machinery — not a second code path.
-
----
-
-## Source Tracker
-
-Source is the one special tracker in v1 because Git compatibility is non-negotiable. (`root` and the code trackers are what it became; their histories are Git's.)
-
-v1 should prefer `jj` if available, because its working-copy model and operation log match the project.
-
-But the implementation should not block on deep `jj` internals. Start by shelling out to `jj` or Git:
-
-- `jj new`
-- `jj status`
-- `jj describe`
-- `jj op log`
-- `jj undo`
-- Git fallback where needed
-
-Do not fork `jj` for v1.
-
-Workspace creation itself belongs to the materializer (a clone of the store
-repo — see *Materialization*); the source tracker handles history operations
-against the store and workspaces.
-
-The first source tracker abstraction can be tiny:
-
-```text
-SourceTracker {
-  create_branch_instance(name, base)
-  snapshot(message)
-  current_revision()
-  restore(revision)
-  status()
-}
-```
-
----
-
-## Materialization
-
-v1 uses normal directories, materialized per tracker.
-
-The materializer contract:
-
-> A workspace presents a full, real, verifiable Git repo at the binding
-> record's revision, plus every tracker's paths materialized — and nothing
-> else in newgit is allowed to care how that presentation is produced.
-
-### Workspaces Are Independent Clones, Not Worktrees
-
-newgit does not use `git worktree` or `jj workspace`. Worktree friction is one
-of the pain points that motivated this project, and the friction is
-structural: worktrees share one gitdir (refs, config, hooks, gc — cross-branch
-bleed by construction), they lock a branch to a single worktree, their
-lifecycle is registered in the main repo (delete the directory and you owe a
-`git worktree prune`), and their `.git`-as-a-file breaks real tools.
-
-Instead, `spawn` materializes a workspace as a complete standalone clone of
-the store repo:
-
-- A local `git clone` hardlinks objects; on macOS an APFS `clonefile` of the
-  whole repo is effectively instant. Hardlink clones are safe (gc never
-  mutates object files in place); `git clone --shared` and `--reference` are
-  not, and must never be used.
-- The agent inside gets a fully real repo — `.git` is a real directory, and
-  `git fsck`, `git log`, anything checks out.
-- Deleting a workspace is `rm -rf`. No registration, no prune, no
-  coordination. True disposability.
-- Nothing is shared between workspaces, so there is nothing to lock and
-  nothing to bleed. Two instances of the same base branch is a non-event.
-
-Sync is newgit's job: checkpoint captures source by **fetching from the
-workspace clone into the store repo**. Fetch avoids the
-push-to-checked-out-branch problem and keeps workspaces passive. The store
-only learns about workspace commits when a checkpoint fetches them, so the
-undo staging boundary falls out for free: an agent can commit, rebase, and
-make a mess inside its clone, and none of it touches the store until a
-checkpoint blesses it.
-
-#### `git push` Publishes
-
-A workspace is cloned from the store, so its `origin` starts as a local
-path. Left that way, everything an agent does with `origin` goes subtly
-wrong: `git push` lands in the store — moving the branch ref behind
-checkpoint's back, reaching nothing anyone else can see, and reporting
-success — `git pull` reads the store instead of the remote, and `gh` cannot
-map a path to a repository at all. So `spawn` makes the workspace's `origin`
-behave like the project's real remote, which the store already has because
-`newgit init` runs in place:
-
-- **Fetching reads the real remote.** `remote.origin.url` is the store's
-  `origin`, as Git would resolve it (`insteadOf` applied). `git pull`, `git
-  fetch`, and `gh`'s repository detection all see the real repository.
-- **Pushing goes to newgit's outbox**, `remote.origin.pushurl`: a bare
-  repository in `.newgit/local/publish/outbox.git` that borrows the store's
-  objects. Before Git advertises anything to the pusher, newgit brings the
-  outbox's branches and tags up to date with the real remote — so the
-  pushing Git decides fast-forward, checks `--force-with-lease`, and refuses
-  an existing tag against what that remote has *now*. Then the outbox's
-  `pre-receive` hook:
-  1. **checkpoints the instance.** `undo` cannot take back a push, so the
-     push is the one moment a checkpoint has to exist. It is listed with
-     reason `push`, and captures uncommitted work like any checkpoint.
-  2. **forwards the push to the real remote**, each ref as a force guarded
-     by a lease on the value the outbox advertised — the push the agent's
-     Git would have made there directly. Deleting the instance's own branch
-     is refused (`newgit remove` is how an instance ends).
-  3. **succeeds exactly when the real remote accepted it.** A rejection
-     there refuses the push, and the agent sees the remote's own message. A
-     store with no `origin` refuses every workspace push rather than keep
-     it: nothing was published, so nothing may look published.
-
-Why an outbox rather than the store: the store's branch ref belongs to
-checkpoint and undo, which move it to the workspace's head. A push into the
-store would be judged against that — so after any checkpoint,
-`--force-with-lease` would fail as stale, because the store no longer holds
-what the workspace last saw on the real remote. The outbox holds exactly
-what the real remote holds.
-
-Why not let the workspace push to the real remote directly: then nothing
-would checkpoint first, and nothing could make it — a workspace's own hooks
-are skipped by `--no-verify` and replaced by husky's `core.hooksPath`. The
-outbox is where the push has to pass through.
-
-The mechanism is Git's own receiving side, not a shim: the workspace's
-`remote.origin.receivepack` runs `newgit push-receive-pack`, which updates
-the outbox and hands over to `git receive-pack` with `-c core.hooksPath`
-selecting the outbox's hook. Nothing is written to the developer's hooks,
-and a global `core.hooksPath` cannot switch it off. The route is per-clone
-config, so `checkpoint` re-installs it; a workspace spawned before it
-existed picks it up at its next checkpoint. The route names the bare
-`newgit` when that finds the running binary on `PATH`, so an upgrade that
-moves the binary is found by the next push; a build that is not on `PATH`
-(a `cargo run`, a checkout under test) is named by its full path instead,
-so its pushes call that same build.
-
-Git runs a receiving hook with `GIT_DIR` set and the push's objects in a
-quarantine that forbids ref updates in any repository; the hook clears both
-before newgit runs (a checkpoint updates the store's refs), and hands the
-quarantine directory to the forwarded push as an alternate, since the pushed
-objects are not in the outbox yet.
-
-Divergence is policy, not mechanism: a branch bound to an instance is owned
-by that instance, and the store treats it as read-mostly. If both the store
-and a workspace advance the same branch, newgit warns loudly rather than
-hard-refusing — the same safety worktree branch-locking provided, as legible
-policy instead of inherited jank.
-
-Clone is only the **source tracker's** projection step. After it, every
-included tracker projects its captured paths into the workspace. If a tracker
-has no captured content, it projects nothing.
-
-### The Path To Projection
-
-Clone and projection are two implementations of the same materializer
-contract; a projection replaces the clone rather than running on top of it. A
-projected workspace answers every read exactly as a real clone would — the
-same repo with lazier I/O, computed on read instead of at spawn. The moment a
-projection cuts a corner (a `.git` that fails `fsck`), that's emulation, and
-that's the line a `FuseMaterializer` must never cross.
-
-The migration is gradual, and each step keeps the contract fixed:
-
-1. **v1:** eager local clone (hardlinks / APFS clonefile / plain copy).
-2. **Later:** Git *partial clone* with the store repo as promisor remote —
-   objects fetched on demand through Git's own sanctioned lazy mechanism.
-   Big-repo spawn gets fast without newgit touching a filesystem.
-3. **v2:** `FuseMaterializer` projects worktree files (checkout-on-read,
-   write capture, dedupe across workspaces). A first FUSE version can project
-   only the working tree and keep `.git` a small real directory in the
-   overlay — Git's lock/rename/fsync behavior on `.git` internals is the
-   fussiest thing to reproduce, so it can be deferred within the deferral.
-
-Tracker paths get *easier* under projection, not harder — serving `.env.local`
-from a snapshot on read is trivial compared to the Git case.
-
-The key architectural rule is:
-
-> The materializer is replaceable.
-
-Do not let the rest of the code assume that a workspace is the canonical
-store. Checkpoint captures source by fetching through Git's interface, not by
-reaching into `.git` directly — so it works identically against a clone or a
-projection.
-
----
-
-## Common Definitions
-
-### Env File Tracker
-
-A branch-local env file: pure content, so a tracker.
-
-```sh
-newgit tracker create runtime-env --audience user
-newgit tracker track runtime-env .env.local
-newgit tracker capture runtime-env --from-store   # the file is already here
-```
-
-`--from-store` is the adoption path: it seeds the lane from the env file the
-project already has, so the first `spawn` comes up with it. Without existing
-content, capture from an instance workspace once you have written one there.
-
-This is not a privileged env system. It is a content tracker that owns an env
-file. Loading that file into `newgit run` is a separate command-environment
-policy, not part of tracking.
-
-One lane, one file, but each instance needs its own port inside it. That is
-`[[render]]`, declared on the resource that owns the port:
-
-```toml
-# .newgit/resources/supabase.toml
-[[render]]
-path = ".env.local"
-replace = [
-  { find = "SUPABASE_URL=http://127.0.0.1:54321",
-    with = "SUPABASE_URL=http://127.0.0.1:{{ports.api}}" },
-]
-```
-
-The lane keeps `54321`, the instance gets its own, and `newgit capture`
-reverses the substitution before recording — so a key you add to `.env.local`
-reaches the lane and this instance's port does not.
-
-The resulting tracker file is intentionally small:
-
-```toml
-# .newgit/trackers/runtime-env.toml
-audience = "user"
-storage = "local"
-merge_with_source = false
-paths = [".env.local"]
-```
-
-### File Tracker
-
-Any branch-local file or directory that should checkpoint and restore as content.
-
-```sh
-newgit tracker create generated-sdk --merge-with-source
-newgit tracker track generated-sdk src/generated
-```
-
-The same shape covers SQLite, because a (stopped) SQLite database is just a file:
-
-```sh
-newgit tracker create dev-db
-newgit tracker track dev-db data/dev.sqlite
-```
-
-### Install Resource
-
-Dependency preparation through an existing package manager. This is a resource, not a tracker: the installed artifacts are path-dependent and must be recomputed, not copied, and the shared package store is user-owned — newgit must never delete or rewrite it.
-
-#### What Independence Costs
-
-Every branch instance gets its own installed artifacts. That is what makes
-instances independent — two branches with different lockfiles must not share
-a dependency tree, or one branch's install silently rewrites the other's
-dependencies — and it is why installs are resources rather than trackers.
-
-What that independence *costs* is set by the package manager, not by newgit,
-and the right unit to share is the package store rather than the installed
-tree:
-
-- **pnpm** hardlinks each package from one content-addressed store into every
-  tree that needs it, so a tenth instance adds directory entries rather than
-  gigabytes. (Hardlinks cannot cross filesystems: if `[workspace] root` is on
-  a different volume from the store, pnpm falls back to copying.) Yarn PnP
-  avoids the tree entirely. `uv` does the same for Python.
-- **npm** expands a full copy per instance. Its cache holds tarballs, so
-  `npm ci` re-expands every time; ten instances of a monorepo means ten full
-  copies of `node_modules`. `pip` into a per-instance venv behaves the same
-  way.
-
-This is the one place where newgit multiplies an existing cost instead of
-absorbing it, so it is worth stating plainly rather than leaving for an
-adopter to discover by watching a disk fill. newgit has no lever here — a
-shared installed tree is the thing that would be wrong.
-
-```toml
-# .newgit/resources/pnpm-store.toml
-ownership = "user"
-
-[checkpoint]
-mode = "hash"
-paths = ["pnpm-lock.yaml"]
-
-[restore]
-mode = "none"
-```
-
-```toml
-# .newgit/resources/deps.toml
-ownership = "workspace"
-depends_on = ["pnpm-store"]
-
-[identity]
-paths = ["package.json", "pnpm-lock.yaml"]
-produces = ["node_modules"]
-key_command = "node -v && uname -sm"
-
-[actions.prepare]
-command = "pnpm install --frozen-lockfile"
-
-[checkpoint]
-mode = "hash"
-
-[restore]
-mode = "recompute"
-action = "prepare"
-```
-
-`produces` names the tree `prepare` builds, which puts this resource in the
-**install store**: the first instance at a given identity installs and its
-tree is published to `.newgit/installs/<resource>/<key>/`; every later
-instance at that key is filled from it with a copy-on-write clone and does not
-run `prepare` at all.
-
-The key is the content of `paths`, the stdout of `key_command`, the trackers
-the instance binds, and the definition file itself. The first is what the
-resource declares it is derived from. The second is what that cannot see — a
-lockfile hash describes what was *asked for*, and install scripts compile
-against a platform and a toolchain it never names. The third is something
-else a lockfile does not record: a shared lockfile lists every member, bound
-or not, and an install builds the bound ones, whether `{{bound.paths}}` names
-them or it finds them on disk, where a dropped tracker's files are not checked
-out. It is in every resource's key, so instances that bind differently never
-share a tree, even one the binding cannot change; and when a live instance's
-binding moves (`tracker use`, `tracker drop`, an undo that restores another
-binding), every bound install holding a tree is rebuilt for the new key, filled
-from the store where that binding was built before. The fourth is because the
-*command* is an input to the tree as much as its inputs are: edit `prepare`
-and the next instance must rebuild rather than be handed what the old command
-built.
-
-Three properties make this safe rather than the shared-tree bug the design
-exists to prevent:
-
-- **Copies fork on write.** Clones are copy-on-write (`clonefile` on APFS,
-  `--reflink` on btrfs/XFS), never hardlinks. `node_modules` is not read-only
-  after install — native builds write into it — and under hardlinks one
-  instance's build would rewrite every other instance's tree. Where the
-  filesystem cannot clone, newgit takes a full copy and says which it did:
-  same behaviour everywhere, worse performance.
-- **A tree that names its own workspace is never shared.** A postinstall that
-  bakes in its absolute location produces a tree copy-on-write cannot fix, so
-  admission scans for it and declines, naming the file. That resource simply
-  keeps installing per instance.
-- **Entries are a cache, not data.** `newgit cleanup` drops any entry no live
-  instance's identity still keys to, per resource, along with anything an
-  interrupted publish left behind. The tree is rebuildable from the inputs
-  that key it, so the cost of being wrong is an install.
-- **`prepare` is the only command an entry stands in for.** A spawn runs
-  `prepare` and nothing else, so a definition where something else builds the
-  tree — a `[restore] action` naming another action, a `long_running` or
-  command-less `prepare`, or one declaring `captures` it would no longer
-  publish — is refused rather than left to silently never fill.
-
-A `recompute` restore consults it too. Undo restores source before resources,
-so the workspace already holds the checkpoint's inputs by then and the store's
-entry under that key is the tree the rebuild would produce — the existing tree
-is moved aside, the clone lands, and only then is the old one discarded.
-`newgit undo --force-recompute` bypasses the store *and drops the entry*: that
-flag means the identity is not to be trusted to describe the tree, and a cache
-keyed on the identity is under the same suspicion.
-
-`newgit action <resource>.prepare` always runs the command — the store stands
-in for a *spawn*, never for a command someone asked for by name — but
-publishes what it built.
-
-Declared `produces` paths are added to each workspace's `.git/info/exclude`
-alongside tracker-owned paths. Derived content is not source, and without the
-rule a checkpoint's `git add -A` would sweep an entire install into source
-history.
-
-For Nix projects, this template should call Nix rather than imitate it:
-
-```toml
-# .newgit/resources/dev-shell.toml
-ownership = "workspace"
-
-[identity]
-paths = ["flake.nix", "flake.lock"]
-
-[actions.prepare]
-command = "nix develop --command true"
-
-[actions.run]
-command = "nix develop --command {{command}}"
-```
-
-v1 does not need universal reproducibility. It needs to make resource identity and preparation explicit.
-
-### Process Resource
-
-A branch-local long-running process: alive, so a resource.
-
-```toml
-# .newgit/resources/app.toml
-ownership = "branch"
-depends_on = ["deps", "runtime-env"]
-
-[ports]
-app = { start = 3100, env = "PORT" }
-
-[actions.start]
-command = "pnpm dev"
-long_running = true
-
-[actions.stop]
-signal = "term"
-
-[exports]
-APP_URL = "http://127.0.0.1:{{ports.app}}"
-```
-
-This solves port collisions without claiming network isolation.
-
-Optional later improvements:
-
-- local reverse proxy
-- branch hostnames
-- loopback aliases
-- Linux network namespaces
-
-### Command-Snapshot Resource (Postgres)
-
-A daemon-owned database: state can only be captured consistently through the daemon, so a resource — whose checkpoint deposits into a tracker.
-
-```toml
-# .newgit/trackers/db-snapshots.toml
-audience = "project-devs"
-storage = "local"
-merge_with_source = false
-paths = []
-```
-
-```toml
-# .newgit/resources/postgres-db.toml
-ownership = "branch"
-
-[actions.prepare]
-command = "createdb {{branch.slug}} || true"
-
-[actions.migrate]
-command = "pnpm db:migrate"
-
-[checkpoint]
-mode = "command"
-command = "pg_dump --restrict-key=newgit {{branch.slug}} > {{snapshot.path}}/db.sql && echo {{snapshot.path}}/db.sql"
-into_tracker = "db-snapshots"
-
-[restore]
-mode = "command"
-command = "dropdb {{branch.slug}} --if-exists && createdb {{branch.slug}} && psql {{branch.slug}} < {{state_ref}}"
-
-[exports]
-DATABASE_URL = "postgres://localhost/{{branch.slug}}"
-```
-
-This is enough for Postgres-like workflows without making Postgres a first-class architecture concept — and the dump, once in a tracker, checkpoints and (later) syncs like any other content.
-
-### External Resource
-
-A resource newgit does not own.
-
-```toml
-# .newgit/resources/preview.toml
-ownership = "external"
-
-[actions.prepare]
-command = "cloudctl preview create --branch {{branch.name}} --json"
-captures = ["PREVIEW_ID", "PREVIEW_URL"]
-
-[checkpoint]
-mode = "external"
-state_ref = "{{exports.PREVIEW_ID}}"
-
-[cleanup]
-command = "cloudctl preview delete {{state_ref}}"
-```
-
-This is why resources must be abstract. The world is full of things newgit should orchestrate but not own.
-
----
-
-## Checkpoints And Undo
-
-Checkpointing is the emotional center of v1 for agent work.
-
-The developer should be able to say:
+Checkpointing is the center of newgit for agent work:
 
 ```sh
 newgit checkpoint feature-a -m "before auth refactor"
-```
-
-Then let an agent work, and later say:
-
-```sh
+# an agent works, and you dislike the result
 newgit undo feature-a
 ```
 
-v1 checkpoints record:
+A checkpoint records, as one coherent record in
+`.newgit/checkpoints/<instance>/`:
 
-- source revision, plus a dirty-state commit when the worktree had
-  uncommitted or untracked changes
-- one content snapshot per tracker (a lane rev — identical content dedupes),
-  written as a single coherent record
-- tracker and resource definition revisions
-- one checkpoint output per resource (identity hash, external ref, or tracker
-  deposit), captured dependents-first
-- resolved ports and exports, and whether each long-running resource was
-  running
+- **Source**: the workspace's `HEAD`, fetched into the project repository
+  under `refs/newgit/checkpoints/<instance>/<id>`, plus a commit of
+  uncommitted and untracked work when there is any. That commit is built in
+  a throwaway index, leaving the worktree, `HEAD`, and real index alone. A
+  checkpoint protects the worktree as it stands, not just what the agent
+  remembered to commit.
+- **Trackers**: a revision of every bound secret tracker (identical content
+  makes no new revision), and the binding itself.
+- **Resources**, dependents first: an identity hash, an external handle, or
+  a command's output, often deposited into a tracker. Also resolved ports
+  and exports, and which processes were running.
 
-The format, as implemented (`.newgit/checkpoints/<slug>/ckpt_NNN.toml`):
+A failing `[checkpoint]` command aborts the checkpoint, since a checkpoint
+that silently missed a resource is not coherent. The exception is a
+resource that is not up: the checkpoint goes ahead without it and names it
+on a `degraded:` line.
 
-```toml
-id = "ckpt_017"
-branch = "feature-a"
-created_at = "..."
-message = "before auth refactor"
-reason = "explicit"                  # or "before-undo" (undo's safety checkpoint)
-undo_completed = true                # before-undo only: was that undo complete?
+With a remote, a checkpoint also syncs: the instance's commits are split
+into their trackers and pushed, and so are `storage = "remote"` tracker
+revisions. A `git push` from the workspace checkpoints first, so what
+reaches any remote is always something `undo` can return to.
 
-[source]
-head_rev = "..."                     # workspace HEAD
-dirty_rev = "..."                    # optional: dangling commit of uncommitted state
-store_ref = "refs/newgit/checkpoints/feature-a/ckpt_017"
+Undo first checkpoints the current state (reason `before-undo`), so undo is
+always undoable and running it twice is redo, as with `jj undo`. Then it
+stops running processes, restores the binding, then source (a hard reset,
+then the uncommitted work reapplied as uncommitted changes), then tracker
+content, then resources by their restore rules in dependency order,
+restarting what was running. `undo --only <resource>` restores just that
+resource.
 
-[[tracker_states]]
-name = "runtime-env"
-definition_rev = "sha256:..."
-content_rev = "3bd17e8ba807"         # rev: refs/trackers/runtime-env/pins/3bd17e8ba807
+A resource's restore is one of `none`, `command`, `recompute` (re-run an
+action, `prepare` by default, when the identity changed), or `external`.
+`recompute` is correctness for path-dependent artifacts, not an
+optimization, and it fills from the install store when it can.
 
-[[resource_states]]
-name = "deps"
-definition_rev = "sha256:..."
-mode = "hash"
-state_ref = "hash:9921aa04d2e1"
-was_running = false
+A resource the checkpoint holds no state for (one it went ahead without)
+keeps its state when its restore is a `command`. Running the restore with
+nothing to restore from would be worse than nothing: every bundled database
+template drops or resets the database before reading the dump. Its process
+is still stopped and restarted with the rest, reported as `not restored +
+restarted`.
 
-[[resource_states]]
-name = "postgres-db"
-definition_rev = "sha256:..."
-mode = "command"
-state_ref = "tracker:db-snapshots@77e10b2c4451"
-state_path = ".../.newgit/local/tracker-checkouts/db-snapshots/77e10b2c4451/db.sql"
-was_running = false
-```
+### An incomplete undo must say so
 
-`state_path` is how the seam closes at restore time: when a checkpoint
-command deposited into a tracker and echoed a path under `{{snapshot.path}}`,
-that path is rebased onto the rev's directory in the lane checkout cache, and
-the restore command's `{{state_ref}}` renders to it. The cache is disposable:
-restore re-materializes the rev from the lanes repo before rendering.
+A restore command is not transactional. One that rebuilds a schema and then
+fails loading the rows leaves its resource in neither state. newgit cannot
+fix that; what it must not do is call the instance restored.
 
-Checkpoint refs keep the commits alive and checkpoints reference lane revs,
-so lane pruning (a `cleanup`/M6 concern) must never delete a rev a
-checkpoint still points at.
+So the summary leads with the verdict. A clean undo says `Restored`. One
+with any failed resource says `INCOMPLETE: N of M resources restored`,
+names the resources that may be partial, writes a recovery record with logs
+and a retry command next to the checkpoint, and exits 1. A restore that ran
+nothing does not make a resource `ready`: a resource that was failed before
+the undo is still failed after it, and the report says what each resource
+is left as (#211).
 
-Do not snapshot every write in v1. Use explicit checkpoints plus source tracker snapshots.
+The safety checkpoint taken before an undo is annotated with whether that
+undo completed. A pre-undo snapshot before a failed undo is not a real
+redo point, and `newgit checkpoints` lists it as `failed-undo` rather than
+`before-undo`. The annotation is recorded, not acted on: newgit cannot know
+at save time whether the undo will succeed, and deleting the only record of
+a state is the one thing checkpoints exist to prevent. The *next* undo's
+safety checkpoint captures what a failed undo left behind, so its message
+says so (`captured after an incomplete undo; contents may be partial`), and
+it records nothing for a resource known to be broken rather than dumping
+its rubble.
 
-Undo restores in two moves: put every tracker's content back (source through
-Git's public interface, others from lane snapshots), then re-establish
-resources via their restore rules. Tracker restore is plain content and
-should not partially fail in interesting ways; if a resource restore hook
-fails, newgit reports it clearly and leaves a recovery record next to the
-checkpoint.
+### An unproven restore must say so
+
+`[checkpoint]` runs the day it is written; `[restore]` runs the day it is
+needed, which is by definition the day the instance is already in trouble.
+A checkpoint record looks the same whether or not its restore has ever
+worked, and a checkpoint wrongly trusted is worse than none, because the
+trust is what licenses the risky change taken behind it.
+
+So when a resource's restore runs something that can fail (`command` or
+`recompute`) and has never completed on this instance, its checkpoint line
+ends `restore never exercised`. The proof is sticky: it answers "has this
+ever completed", not "would it now". A `recompute` skipped because the
+identity was unchanged does not count, since the command that could fail
+never ran.
+
+`newgit checkpoint --verify` proves it on demand: checkpoint, restore that
+checkpoint with a real undo, checkpoint again, and compare the resource
+state. Agreement is what "verified" means. A mismatch is reported even when
+every restore exited 0, since exiting 0 and reproducing the state are
+different claims. A mismatch has two possible causes with opposite fixes: a
+restore that lands on the wrong state, or a checkpoint that never produces
+the same output twice (`pg_dump`'s per-run `\restrict` token). So verify
+runs that resource's checkpoint once more with nothing in between, and says
+which. For deposits it prints a bounded diff and the command for the full
+one. It is destructive and expensive on purpose (a real undo, stopping and
+restarting processes), so it is its own flag and says what it is about to
+do before it does it.
 
 ---
 
-## Export
+## Leaving the machine
 
-```sh
-newgit export feature-a --to ../public-export
-newgit export feature-a --to ../public-export --include data/seed.sql --exclude notes/
-```
+### Export
 
-This produces a normal Git repository from the branch workspace. Rules
-unchanged from the original intent: path-level include/exclude only, honoring
-tracker audience as the default filter; no hunk privacy, no AST rewriting, no
-native remote, no concealment claims.
+`newgit export [instance] --to <dir>` writes a normal Git repository:
 
-As implemented:
-
-- **Source always ships**, because source's audience is everyone. Content is
-  the workspace's Git-tracked files *as they stand on disk*, so uncommitted
-  agent work is included and ignored junk never is. The one exception is
-  rendered paths (*Render*), which are taken from `HEAD`: on disk they hold
-  this instance's ports, and `--skip-worktree` does not keep them out of
-  `git ls-files`.
-- **Tracker audience is the default filter, and it fails closed.** Only
-  `audience = "public"` lanes are included. `project-devs` and `user` lanes
-  are withheld and listed, with the flag that would ship them. A tracker
-  created without `--audience` is `project-devs`, so the boring default is
-  the safe one.
-- **`--include <path>`** overrides audience for exactly that path (it may
-  also name something no tracker owns and Git does not track — a build
-  output). **`--exclude <path>`** is applied last and beats everything,
-  including `--include`.
-- **What ships is what is committed.** The export's commit holds exactly
-  the plan, added with `git add --force`: every tracker path is gitignored
-  (`tracker track` put it there) and that `.gitignore` ships with the
-  source tree, so a plain `git add -A` dropped every public or `--include`d
-  lane file onto disk and out of the repository — invisible to `git status`
-  and to a clone. Lane content entering an export is not lane content
-  entering source history: the export is a new repository, and its content
-  was chosen by audience or by an explicit flag. The shipped `.gitignore` is
-  left as it is — it is a source file, its patterns do no harm to a file Git
-  already tracks, and it is what keeps a recipient's own `.env.local` out of
-  their commits. The CLI names each committed file it still matches
-  (`gitignored but committed:`), since a *new* file beside one would be
-  ignored.
+- **Files Git tracks ship as they stand on disk**, so uncommitted agent
+  work is included and ignored junk never is. Rendered paths come from
+  `HEAD`. That includes every code tracker's files, whatever its audience:
+  this export filters only secret trackers.
+- **Secret trackers are filtered by audience, failing closed.** Only
+  `public` trackers ship. The rest are withheld and listed, with the flag
+  that would ship them. A tracker created without `--audience` is
+  `project-devs`, so the default is the safe one. `--include` overrides for
+  a path; `--exclude` beats everything.
 - **One commit, never history.** Exporting the branch's commits would carry
-  any file those commits contain, including the content the audience filter
-  just withheld. The export is a single commit on a branch named after the
-  instance, in a fresh repository with no remotes and no `refs/newgit/*`.
-- The destination must be empty or nonexistent, and an export that would
-  contain nothing is an error rather than an empty repository.
+  any file they ever contained, including withheld ones.
 
-The CLI prints both the withheld paths and the two load-bearing caveats (one
-commit; a path filter is not concealment) on every run, because this is the
-one command whose output leaves the machine.
+It prints the withheld paths and both caveats (one commit; a path filter is
+not concealment) on every run, because this is the command whose output
+leaves the machine.
 
-This keeps the "repositories are outputs" idea alive without making it the first hard dependency.
+`newgit export --remote <name>` pushes the project's trackers, history and
+all, to an ordinary repository defined in `.newgit/exports/<name>.toml`,
+typically a GitHub mirror. Only `public` trackers and the ones the target
+names ship, so a public mirror and a private one can show different views,
+and a history that ever committed a secret tracker's file is refused. It
+pushes with your own Git credentials, so GitHub Actions and `gh` keep
+working. When the target's branch has moved ahead (a pull request merged on
+GitHub), export brings that in first. With `branches = true`, every push
+from a workspace exports its branch there too.
 
----
+### The remote
 
-## Configuration
+The newgit remote, at [newgit.dev](https://newgit.dev) or self-hosted from
+`remote/`, is how an instance travels. It is a Cloudflare Worker holding one
+Git repository per tracker. It gives you:
 
-Definitions live one per file, not inlined in `config.toml`:
+- GitHub login, project members, and a recorded, revocable token for every
+  login, agent, and instance.
+- Audience enforced server-side: tokens are minted per tracker, so a reader
+  can read only what they may, and `git clone` of the endpoint composes a
+  branch from the code trackers you may read.
+- Checkpoints that sync, and `spawn --from-checkpoint` to bring one up
+  anywhere, with your own copy of per-user trackers.
+- `newgit merge [instance] [--into <branch>]`, which merges tracker by
+  tracker and moves all of them or none.
+- `spawn --private`, an embargo: only you see the instance until `merge`
+  publishes it.
 
-- `config.toml` holds only `[project]` and (optionally) `[workspace]` and
-  `[remote]`.
-- Each tracker is a file in `.newgit/trackers/`; each resource is a file in
-  `.newgit/resources/`. The definition's name comes from the filename.
-
-One definition per file gives clean diffs, matches what `tracker create`,
-`tracker track`, and `resource add` produce, and avoids the TOML
-array-of-tables footgun.
-
-The generated `config.toml` is minimal:
-
-```toml
-[project]
-name = "myapp"
-source = "jj"    # detected at init; "git" fallback; error if neither
-```
-
-`[workspace]` is available for overrides but omitted by default (see *Local
-Layout* for the runtime defaults):
-
-```toml
-[workspace]
-root = "/data/newgit-workspaces/myapp"
-materializer = "real-dir"
-```
-
-A project then looks like:
-
-```text
-.newgit/
-  config.toml
-  trackers/
-    runtime-env.toml
-    dev-db.toml
-  resources/
-    pnpm-store.toml
-    deps.toml
-    app.toml
-```
-
-with each tracker definition file kept deliberately small:
-
-```toml
-# .newgit/trackers/dev-db.toml
-audience = "project-devs"
-storage = "local"
-merge_with_source = false
-paths = ["data/dev.sqlite"]
-```
-
-The exact config syntax can change. The important part is that content lanes are declared as trackers, lifecycle units as resources, and neither is a hardcoded subsystem.
+[`remote.md`](remote.md) has the design and its status.
 
 ---
 
-## Implementation Shape
+## Known gaps
 
-v1 can be a Rust CLI, but it should keep hard boundaries:
+Open issues that change what this document can promise:
 
-```text
-cli
-config
-metadata store
-source tracker
-materializer
-tracker registry
-resource registry
-binding store
-resource action runner
-port allocator
-process supervisor
-checkpoint manager
-exporter
-```
-
-The internal APIs should be boring.
-
-```text
-BranchManager.spawn(name)
-BranchManager.status()
-TrackerRegistry.load()
-TrackerStore.capture(branch, tracker)
-TrackerStore.restore(branch, tracker, content_rev)
-ResourceRegistry.load()
-ResourceRunner.run(branch, resource, action)
-ResourceRunner.checkpoint(branch, resource)
-ResourceRunner.restore(branch, resource, state_ref)
-CheckpointManager.create(branch)
-CheckpointManager.restore(branch, checkpoint)
-```
-
-Avoid clever generality. The abstractions exist to model ordinary project trackers and resources cleanly, not to build a full distributed workflow engine on day one.
+- **#54: nothing starts a runtime dependency.** `depends_on` orders
+  `prepare` and `newgit start`, but `start` only brings back what `stop`
+  stopped. Spawn starts nothing, and `newgit action app.start` does not
+  start the database it needs.
+- **#64: rendered files are hidden, not filtered.** `--skip-worktree` makes
+  hand edits to a rendered file die with the workspace. A clean/smudge
+  filter would make them ordinary, committable edits.
+- **#83: gitignored secrets do not reach a workspace** unless a tracker owns
+  them, and nothing at spawn says so.
+- **#85: no reconcile.** A live instance does not pick up a changed
+  resource definition (a new port, say), and nothing says it is stale.
+- **#87: no preflight.** A definition that calls a missing binary (`pg_dump`
+  on a host without Postgres) fails at the first checkpoint or, worse, the
+  first restore.
+- **#89: a failed `prepare` can destroy its own evidence**, when the tool
+  tears down its containers before exiting.
+- **#59: port allocation order within a resource is unspecified**, which
+  matters when a tool's default ports are consecutive.
+- **Install store follow-ups:** sub-path exclusions in `produces` for native
+  build output (#91), seeding an entry from the project checkout (#88), and
+  build trees that need a relocate step (#128).
+- **#107: the push outbox is never garbage-collected**, and the project
+  repository's gc can break the objects it borrows.
+- **#224: a per-user tracker's `main` reaches the remote only through some
+  instance's checkpoint.**
+- **#225: restoring a dirty checkpoint can write into a dropped tracker's
+  sparse-excluded paths.**
+- **#228: on the remote, a tracker handed one definition can claim
+  `access`'s**, and lock the owner out.
 
 ---
 
-## Suggested Build Order
+## Not yet
 
-All seven milestones are implemented. Each success criterion below is covered
-by integration tests in `crates/newgit-core/tests/`.
+Ideas that are still deferred, and the shape they should take:
 
-### Milestone 1: Branch Instances
-
-- `newgit init`
-- `newgit spawn`
-- clone-based workspace creation (see *Materialization*)
-- branch metadata files
-- `newgit status`
-- `newgit remove`
-
-Success criterion:
-
-> I can create two branch instances of the same repo without thinking about paths — and tear one down without thinking about anything.
-
-### Milestone 2: Tracker Definitions And Bindings
-
-- parse tracker definitions
-- project the lane head into new workspaces
-- capture, merge, pull, and checkout tracker content
-- show tracker status, distinguishing never-pulled (`^`) from
-  diverged-from-head (`~`) — direction is unknowable without rev ancestry,
-  so status must not advise one
-
-Success criterion:
-
-> I can create a tracker, track a path, capture and merge it, and see later branch instances project that content.
-
-### Milestone 3: Resources, Actions, Exports, And Ports
-
-- parse resource definitions
-- command-based resource actions
-- minimal PID-file process supervision for `long_running` actions
-- resource exports loaded into `newgit run`
-- deterministic port allocation
-- logs per action
-- process resource template (pulled forward from Milestone 4)
-- spawn runs `prepare` hooks in dependency order; failures are loud but
-  leave the instance spawned; resources whose dependencies failed are marked
-  `blocked` and are not prepared or started until the dependency is repaired
-
-Success criterion:
-
-> A resource can request a port, export it, and run a command that uses it.
-
-### Milestone 4: Starter Definitions
-
-- CLI-managed tracker creation and path tracking
-- process resource template
-- pnpm install resource template
-
-Success criterion:
-
-> I can model a normal web app without writing TOML from scratch.
-
-### Milestone 5: Checkpoints
-
-- source snapshot integration
-- tracker content capture and restore
-- resource checkpoint and restore, including `into_tracker`
-- explicit checkpoint
-- undo
-
-Success criterion:
-
-> I can let an agent work, dislike the result, and restore the previous coherent branch state.
-
-### Milestone 6: Database And External Resources
-
-- SQLite through a normal file tracker — no special support: a database that
-  is just a file is a tracker, and binary content round-trips byte-for-byte
-  through capture, checkpoint, and undo
-- Postgres through the `command-snapshot` resource template depositing into a
-  tracker; the template brings its `db-snapshots` lane with it, since a
-  checkpoint whose `into_tracker` names a missing tracker fails at checkpoint
-  time
-- the `external` resource template, which needed `captures` to exist: newgit
-  cannot compute a preview id, only ask for one and remember the answer
-- resource `[cleanup]` hooks, so a resource newgit does not own can be torn
-  down (see *Resource Cleanup Hooks*)
-
-Success criterion:
-
-> I can model a branch-local resource that newgit does not natively understand.
-
-### Milestone 7: Basic Export
-
-- path-level export honoring tracker audience, failing closed at `public`
-- normal Git output: one commit, a branch, no remotes, no newgit refs
-- no privacy claims, stated in the command's own output
-
-Success criterion:
-
-> A branch instance can produce a clean ordinary Git branch/repo as an output artifact.
-
-### Milestone 8: Render
-
-- `[[render]]` on resource definitions: literal `find`/`with` substitution
-  into a committed path, run at bind before `prepare` and before a
-  `recompute` restore
-- the exactly-once match rule, `count = N`, and multi-line `find`; a
-  zero-match or wrong-count render fails the resource and blocks dependents
-- render reads the committed blob (`HEAD`, or the bound lane rev), never the
-  working file
-- simultaneous location and batch application, so declaration order is
-  cosmetic; overlapping finds refused
-- `--skip-worktree` for source-owned targets; export takes rendered paths
-  from `HEAD`
-- drift detection: the expected render recomputed and compared at checkpoint
-  and before every re-render, naming the file and how much of it a re-render
-  will discard
-- reverse substitution on `newgit capture` for tracker-owned targets, with
-  the rendered value's uniqueness checked at bind
-
-Success criterion:
-
-> A per-instance Supabase stack needs no config-rewriting code in its `prepare`
-> hook, and the un-rendered repo still starts on its own defaults.
-
----
-
-## What To Defer Until v2
-
-Command shims:
-
-- only after `newgit run` proves the exports and checkpoint machinery they reuse
-- start with `git commit` (enrich) and `pnpm dev` / `npm run dev` (inject), the two highest-frequency reflexes
-- `advise` shims for branch-creation commands next
-- never emulate; every shim passes through to the real command and announces itself in output
-
-Command environment policy:
-
-- add `[run] env_files = [".env.local"]` and/or `newgit run --env-file .env.local`
-- keep this outside trackers: trackers own file content; run policy decides which files become process environment
-- this restores the useful `newgit run -- psql $DATABASE_URL` workflow without making tracker definitions export env
-
-FUSE:
-
-- only after real directory materialization is too slow or too leaky
-- intermediate step first: Git partial clone with the store repo as promisor remote — lazy objects through Git's own mechanism, no filesystem needed
-- add as `FuseMaterializer`, not as a rewrite — it replaces the clone and satisfies the same materializer contract
-
-Hermetic builds:
-
-- only after resource-based install/cache handling proves valuable
-- delegate to Nix/Bazel where available
-
-Network isolation:
-
-- start with ports as resource exports
-- add reverse proxy and hostnames next
-- add Linux namespaces only for untrusted-agent use cases
-
-Remote-backed trackers:
-
-- the `audience`/`storage` fields exist from day one
-- per-user authenticated sync only after export semantics are stable
-- no security positioning until audited and battle-tested
-
-Projection policy:
-
-- start with path-level export
-- add deterministic transforms later
-- add coherence shims only when real projects demand them
-
-Hunk privacy:
-
-- research track, not MVP
-- requires a patch/overlay semantic model
-
----
-
-## The v1 Standard
-
-v1 is successful if this workflow feels normal:
-
-```sh
-newgit init
-newgit tracker create runtime-env --audience user
-newgit tracker track runtime-env .env.local
-newgit tracker create dev-db
-newgit tracker track dev-db data/dev.sqlite
-newgit resource add deps --template pnpm
-newgit resource add app --template process
-
-newgit spawn auth-refactor
-newgit action auth-refactor deps.prepare
-newgit action auth-refactor app.start
-newgit checkpoint auth-refactor -m "before agent"
-
-# agent works in the branch workspace
-
-newgit status
-newgit undo auth-refactor
-# or keep it: from the workspace, `git push` checkpoints and publishes
-newgit cleanup
-```
-
-The magic is not that newgit invented an env system, a DB system, or a package manager. The magic is that a user can teach newgit which trackers and resources matter for a branch, and newgit makes them move together.
-
-That is the MVP.
+- **Command shims.** Agents arrive with reflexes: `git commit`, `pnpm dev`.
+  A shim directory on `PATH` could make each one a valid move: *enrich*
+  (`git commit` also checkpoints), *inject* (`pnpm dev` gets the instance's
+  ports), or *advise* (`git checkout -b` suggests `newgit spawn`), and never
+  *emulate*. Each shim runs the real command and announces itself in its
+  output, which doubles as onboarding.
+- **Env files in the command environment.** `[run] env_files =
+  [".env.local"]` or `newgit run --env-file`. It belongs to run policy, not
+  trackers: a tracker owns a file's content, and which files become process
+  environment is a separate decision.
+- **Lazy materialization.** A partial clone first, then FUSE, each
+  replacing the clone under the same contract (see *The materializer is
+  replaceable*).
+- **Network isolation.** Ports are per-instance values today. A reverse
+  proxy and branch hostnames come next; Linux namespaces only for untrusted
+  agents.
+- **Hermetic builds.** Delegated to Nix or Bazel where a project uses them,
+  never reimplemented.
+- **Richer export.** Deterministic transforms beyond path filters, and
+  hunk-level privacy, which needs a patch-level model and is research, not
+  a feature.
+- **Running on another machine.** [`hosts.md`](hosts.md) sketches `spawn
+  --on <host>`.

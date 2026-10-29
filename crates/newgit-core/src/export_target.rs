@@ -1,5 +1,5 @@
 //! Where `newgit export --remote <name>` pushes: one definition per file in
-//! `.newgit/exports/<name>.toml` (newgit-trackers.md, *Git and GitHub*).
+//! `.newgit/exports/<name>.toml` (docs/design/trackers.md, *Git and GitHub*).
 //!
 //! GitHub is an export, not the project's remote: a target receives a
 //! composed projection of chosen trackers' `main`s, with their history, as an

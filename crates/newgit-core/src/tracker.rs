@@ -236,7 +236,7 @@ impl TrackerDefinition {
             }
             // Except a tracker's definition: whoever may change the tracker
             // owning `web.toml` decides who may read `web`, so governance
-            // layers by owning definitions (newgit-trackers.md, "Who may
+            // layers by owning definitions (docs/design/trackers.md, "Who may
             // change what"). Only a code tracker may: a secret one would
             // keep the definition out of Git.
             if is_definition_file(path) {

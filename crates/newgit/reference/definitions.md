@@ -8,7 +8,7 @@ to. Printed by `newgit reference`, so it is on disk wherever the binary is.
 whole document.
 
 The design narrative — why trackers and resources are the only two
-primitives, what each one is for — lives in `newgit-v1-mvp.md` at
+primitives, what each one is for — lives in `docs/design/spec.md` at
 <https://github.com/Spheroman/newgit>. This page is the lookup table.
 
 Definitions are TOML. The name of a tracker, resource, or export target
@@ -278,10 +278,11 @@ clean pass.
 you invoke: `newgit action <resource>.<action> [instance]`. Add `--dry-run`
 to print the rendered command and its directory without running it.
 
-**`stop` is the one name newgit reads.** Names are otherwise inert —
-`start` is pure convention, made real by `long_running` and not by the name —
-but when newgit needs to stop this resource's supervised process on its own
-(during `remove`, `undo`, and `resource remove --force`) it signals, and it
+**`stop` is the one name newgit reads for signals.** Names are otherwise
+inert — `start` is pure convention, made real by `long_running` and not by
+the name, and `suspend` / `resume` are covered below — but when newgit needs
+to stop this resource's supervised process on its own (during `remove`,
+`undo`, `newgit stop`, and `resource remove --force`) it signals, and it
 looks up `[actions.stop] signal` to decide which signal to send, defaulting
 to `term`. Precisely:
 

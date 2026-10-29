@@ -101,10 +101,6 @@ settle them, so that's where the resources go:
   agent starts.
 - **Delete** it and the workspace goes too.
 
-Settle and unsettle are still being wired up
-([Spheroman/t3code#2](https://github.com/Spheroman/t3code/issues/2)). Today,
-resources are released only when you delete the thread.
-
 ```sh
 git clone https://github.com/Spheroman/t3code && cd t3code
 scripts/fork/install-mac.sh
@@ -153,13 +149,14 @@ running.
   covers adopting newgit in an existing project, every command, the T3 Code
   integration in detail, exporting to GitHub, and the sharp edges worth
   knowing about.
-- **`newgit reference`** prints every tracker and resource key, its default,
-  and which template variables each hook sees.
-- **The design docs**,
-  [`newgit-v1-mvp.md`](https://github.com/Spheroman/newgit/blob/main/newgit-v1-mvp.md)
-  and
-  [`newgit-architecture.md`](https://github.com/Spheroman/newgit/blob/main/newgit-architecture.md),
-  explain why it's shaped this way.
+- **`newgit reference`** documents every tracker and resource key, its
+  default, and which template variables each hook sees. Run it bare for the
+  sections, or `newgit reference all` for everything.
+- **[The design docs](https://github.com/Spheroman/newgit/tree/main/docs/design)**
+  explain why it's shaped this way:
+  [the design](https://github.com/Spheroman/newgit/blob/main/docs/design/spec.md),
+  [the tracker model](https://github.com/Spheroman/newgit/blob/main/docs/design/trackers.md),
+  and [the remote](https://github.com/Spheroman/newgit/blob/main/docs/design/remote.md).
 
 ## License
 

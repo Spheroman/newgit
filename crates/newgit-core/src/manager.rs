@@ -73,7 +73,7 @@ pub struct BranchManager {
     /// is the project's own Git history, committed with Git.
     root: TrackerDefinition,
     /// Committed trackers with their own histories, composed into workspaces
-    /// (newgit-trackers.md, step 3): `project` and any carved-out code.
+    /// (docs/design/trackers.md, step 3): `project` and any carved-out code.
     code: Vec<TrackerDefinition>,
     /// The instance locks this manager holds right now, by slug (see
     /// [`crate::lock`]). A nested call for an instance already locked gets
@@ -1694,7 +1694,7 @@ impl BranchManager {
         self.refuse_secrets(&root, &args, &[])
     }
 
-    /// The project root is the instance `main` (newgit-trackers.md): bring
+    /// The project root is the instance `main` (docs/design/trackers.md): bring
     /// its tracker branches up to its own branch — the one `newgit init`
     /// found checked out — not whatever it has checked out now.
     pub fn sync_project_root(&self) -> Result<usize> {
@@ -7198,7 +7198,7 @@ impl BranchManager {
         Ok(list)
     }
 
-    /// Merge an instance's committed work into branch `into` (newgit-trackers.md,
+    /// Merge an instance's committed work into branch `into` (docs/design/trackers.md,
     /// *Checkpoints, merges, and coherence*), tracker by tracker: a tracker the
     /// instance did not change stays; one `into` has not moved on since takes
     /// the instance's commit; one both changed gets a real Git merge in that
