@@ -204,5 +204,9 @@ fn spawn_waits_for_a_server_that_answers_within_the_wait() {
 
     let status = newgit(&repo, &["status"]);
     assert!(status.stdout.contains("ready"), "{}", status.stdout);
-    assert!(!status.stdout.contains("still starting"), "{}", status.stdout);
+    assert!(
+        !status.stdout.contains("still starting"),
+        "{}",
+        status.stdout
+    );
 }
