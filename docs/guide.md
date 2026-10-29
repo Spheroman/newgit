@@ -352,6 +352,11 @@ so at bind. For a tracker-owned file, `tracker capture` reverses the
 substitution, so edits you make beside the rendered value reach the lane and
 your port does not.
 
+Several resources may render one file — `db` its URL and `web` its port into
+the app's `.env.local` — each declaring only the values it owns. They apply
+as one batch, so the order they bind in does not matter; two resources
+claiming the same text are refused, naming both.
+
 A render can also target a file inside a resource's own `[identity]
 produces`, a built tree rather than source. That is how an install whose
 tree records its workspace path can still be shared through the install

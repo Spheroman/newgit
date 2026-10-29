@@ -239,11 +239,16 @@ pub enum NewgitError {
     },
 
     #[error(
-        "resources `{left}` and `{right}` both render into `{path}`; render targets must be disjoint"
+        "resources `{left}` and `{right}` both claim the same text in `{path}` (`{left}` finds \
+         {left_find:?}, `{right}` finds {right_find:?}); several resources may render one file, \
+         but each piece of text has one owner. Keep the rule in one of them, and if the other \
+         needs it, have it export the value and reach it with `{{{{exports.NAME}}}}`"
     )]
     RenderPathConflict {
         left: String,
+        left_find: String,
         right: String,
+        right_find: String,
         path: Utf8PathBuf,
     },
 

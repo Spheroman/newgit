@@ -643,6 +643,26 @@ cosmetic, and a reader does not have to simulate the list to know what it
 does. Two rules claiming overlapping text have no batch answer and are
 refused.
 
+**Several resources may render one file** (#245). An app's `.env.local`
+wants its own port, the database's URL, and another service's address, and
+each value belongs to the resource it comes from. With one owner per file,
+every rule had to live on whichever resource got the file, so `db`'s
+definition ended up knowing every app's env files and the apps' definitions
+did not mention their own config. Now each resource declares its own
+`[[render]]` on the shared path, and the file is the same simultaneous batch
+over every resource's rules: all located in the committed content, every
+count and the uniqueness of every rendered value checked against the whole
+file. Rendering them one after another in dependency order was the other
+way to do it, and it would have brought back exactly what simultaneous
+replacement removes: a later resource's `find` matching an earlier one's
+output, and a file that depends on which resource bound first. So there is
+no order, and capture, drift, and undo all work on every claim on the file
+at once. Unbinding a resource (`tracker drop`) reverses only its values.
+What stays refused is two resources claiming the same text: identical
+`find`s or one inside the other at load, and an overlap only the content
+reveals at render. Each piece of text has one owner; the other resource
+reaches its value through `{{exports.*}}`.
+
 **Render reads committed content, never the working file.** For a path
 Git tracks, that is the blob at `HEAD`; for a tracker-owned path, the bound
 tracker revision. Otherwise the second render would look for `port =
