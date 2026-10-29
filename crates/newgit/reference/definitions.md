@@ -75,6 +75,75 @@ newgit resource templates           # what each template is for
 | a hard-coded port in a committed config file | a `[[render]]` on that resource (`newgit reference render`) |
 | a GitHub remote and `gh` in use | nothing to add. `git push` and `gh pr create` work from a workspace |
 
+### Be creative
+
+The table above is a starting point, not the whole menu. newgit is a new kind
+of tool, and neither you nor the user will have habits for most of what it
+can do. Don't stop at copying a setup you'd build with worktrees and a
+`.env` file. **Shape the tools to the project, not the project to a
+preconceived notion of what the tool can do.** Trackers, roles, priorities,
+audiences, and resources combine freely. Look for where this project hurts
+and build the setup around that. Some patterns:
+
+- **A shared database by default, a branch database when you need one.** If
+  the database stack is slow or expensive to spin up, giving every branch its
+  own wastes most of that. Make two trackers that fill the `db` role. The
+  default points every instance at one shared database. The other brings a
+  per-branch stack, for schema changes, migrations, or tests that need
+  isolation:
+
+  ```toml
+  # .newgit/trackers/shared-db.toml — what a spawn gets unless asked
+  audience = "project-devs"
+  storage = "local"
+  role = "db"
+  priority = 10
+  paths = [".env.db"]              # points at the one shared database
+
+  # .newgit/trackers/branch-db.toml — `--use branch-db`, or swap in later
+  audience = "project-devs"
+  storage = "local"
+  role = "db"
+  paths = [".env.db"]              # points at 127.0.0.1:54322
+  resources = ["supabase"]         # a stack of its own, started only here
+  ```
+
+  Both trackers own `.env.db`, which is allowed because they share a role and
+  are never bound together. The branch copy names a default port, and a
+  `[[render]]` in the `supabase` resource replaces it with the instance's own
+  (`{{ports.db}}`), so each branch's `.env.db` points at its own stack.
+
+  A branch that turns out to need its own database runs `newgit tracker use
+  branch-db`. That swaps the role over and starts the stack, with no respawn.
+- **Live keys you only get when you ask.** Put test and live API keys in two
+  trackers sharing a role, and give the live one a negative `priority`. Then
+  no spawn, and so no unattended agent, binds live credentials unless someone
+  passes `--use`.
+- **A monorepo where each branch carries only what it touches.** Make each app
+  a code tracker with a negative `priority`. A spawn checks out only the apps
+  it binds. An install that builds `{{bound.paths}}` installs only those, and
+  the install store keys on the binding, so branches working on the same app
+  share one tree.
+- **Agent notes that move with the branch.** A `user` tracker over
+  `CLAUDE.local.md` or a `notes/` directory keeps an agent's plans and
+  scratch work with its branch. They're checkpointed and undone with the
+  code, and never show up in a diff.
+- **Data you can rewind.** A database resource that snapshots on checkpoint
+  makes `undo` restore the data along with the code. That makes it safe to
+  let an agent run a destructive migration.
+- **Anything with a handle.** The `external` template wraps whatever another
+  system owns, like a preview deploy, a tunnel, or a cloud sandbox. Its URL
+  becomes an export every other resource can read, and `remove` tears it down.
+- **Different people, different views.** Audiences go down to `user:<login>`.
+  The ops credentials one person holds can be a tracker only they ever
+  receive, inside a project everyone else works on too.
+
+Check each idea against the reference before you propose it, and run it
+through *Prove it works* like everything else. If the project needs something
+newgit can't express, say so plainly rather than bending the project to fit.
+Proposing one of these is also the best way to show a new user why newgit is
+worth keeping.
+
 ### Explain it, then ask
 
 **We highly recommend explaining what newgit does before you ask the user
