@@ -119,6 +119,7 @@ other ledger: a port is free the moment nothing claims it).
 | `ownership` | string | yes | — | `branch`, `workspace`, `project`, `user`, or `external`. See *Ownership*. |
 | `depends_on` | array of strings | no | `[]` | resource or tracker names whose *lifecycle* this one depends on. Orders `prepare` at spawn and cleanup hooks in reverse. A name that is neither is an error the graph reports. Needing another resource's *value* is not this — see *Data edges*. |
 | `workdir` | string | no | workspace root | where every command this resource runs is spawned, relative to the workspace root. Overridable per action — see `[actions.<name>]`. |
+| `reads` | array of strings | no | unset | files and directories this resource's running process reads, workspace-relative (a directory covers everything in it). When `tracker use` or `drop` changes the bytes of a rendered file it covers, the process is restarted. See *Rendered files under a running process*. |
 
 `workdir` is applied as the spawned process's working directory, never as a
 `cd` prefix on the command string — so it cannot silently change what `&&`
@@ -757,6 +758,28 @@ render should produce and compares, at `checkpoint` and before each re-render,
 naming the file and how many lines are about to go. Silence means there is
 nothing to lose. To change a rendered file for real, change it in the store
 repo.
+
+#### Rendered files under a running process
+
+A process reads its config when it starts. When `newgit tracker use` or `drop`
+changes the bytes of a rendered file — binding a tracker's `db` writes its port
+into `apps/admin/.env.local` — every process that was already running is
+checked against the resource's `reads`:
+
+| `reads` | the process |
+| --- | --- |
+| covers a changed file | is restarted (stopped with its `stop` signal, started again with its `autostart` action, else its first long-running one), and listed under `restarted:` |
+| set, but covers none | is left alone, and not mentioned |
+| unset | is left running, with a warning naming it and the command that restarts it |
+
+```toml
+reads = ["apps/admin"]   # next dev, run from apps/admin, reads apps/admin/.env.local
+```
+
+`reads = []` says the process reads no rendered file. A change that leaves
+every rendered file's bytes as they were says nothing. `undo` stops every
+process before it moves content and restarts what was running at checkpoint
+time, so it does not need `reads`.
 
 #### Rendering into a built tree
 

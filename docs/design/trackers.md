@@ -137,8 +137,11 @@ whose tree the binding keys (see *Installs across trackers*): the tree the
 instance holds was built for the binding it had, so it is filled from the store
 when that binding was built before, else its `prepare` runs again. A rebuild
 that fails leaves the resource `failed` without failing the command, since the
-binding has changed by then. `root`, `project`, and `access`
-cannot be dropped. A checkpoint records the binding, and undo restores it.
+binding has changed by then. A process already running when a use or drop
+rewrites a rendered file is restarted if its resource declares `reads`
+covering that file, and otherwise named as possibly stale, with the command
+that restarts it (#249; see *Render* in [spec.md](spec.md)). `root`,
+`project`, and `access` cannot be dropped. A checkpoint records the binding, and undo restores it.
 
 `{{bound.trackers}}` and `{{bound.paths}}` give a resource's commands what the
 instance binds, so a shared install builds only the bound members.

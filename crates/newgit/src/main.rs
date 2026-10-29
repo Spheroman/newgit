@@ -2153,6 +2153,7 @@ fn tracker(command: TrackerCommand) -> Result<()> {
             if change.files > 0 {
                 println!("  {} restored", plural(change.files, "file"));
             }
+            print_stale_render(&change.stale);
             Ok(())
         }
         TrackerCommand::Drop {
@@ -2193,6 +2194,7 @@ fn tracker(command: TrackerCommand) -> Result<()> {
                     "  its content was captured first ({rev}); `newgit tracker use {tracker}` brings it back"
                 );
             }
+            print_stale_render(&change.stale);
             Ok(())
         }
         TrackerCommand::Pull { tracker, instance } => {
@@ -3511,6 +3513,38 @@ fn print_rebuilt(rebuilt: &[newgit_core::manager::RebuiltInstall]) {
             line
         };
         println!("{line}");
+    }
+}
+
+/// What a `tracker use` or `drop` rewrote under processes already running:
+/// the files, the processes restarted because they declare `reads` covering
+/// one, and a warning for each that declares nothing and may be stale. Silent
+/// when no rendered file's bytes changed.
+fn print_stale_render(stale: &newgit_core::manager::StaleRender) {
+    if stale.is_empty() {
+        return;
+    }
+    let files = stale
+        .changed
+        .iter()
+        .map(|path| escape_control(path.as_str()))
+        .collect::<Vec<_>>()
+        .join(", ");
+    println!("  rendered files changed: {files}");
+    for resource in &stale.restarted {
+        let spec = format!("{}.{}", resource.name, resource.action);
+        match &resource.error {
+            None => println!("  restarted: `{spec}`, which reads them"),
+            Some(error) => println!("  restarted: `{spec}` FAILED: {error}"),
+        }
+    }
+    for process in &stale.may_be_stale {
+        eprintln!(
+            "warning: `{}.{}` is still running on what it read before {files} changed; \
+             restart it with `{}`, or declare `reads` in its resource definition so newgit \
+             restarts it when they change",
+            process.name, process.action, process.restart_with
+        );
     }
 }
 

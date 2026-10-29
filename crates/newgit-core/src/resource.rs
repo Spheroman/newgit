@@ -31,6 +31,13 @@ pub struct ResourceDefinition {
     /// Files this resource substitutes per-instance values into, before
     /// `prepare`. See [`crate::render`].
     pub render: Vec<RenderSpec>,
+    /// Files and directories this resource's running process reads, when
+    /// declared: a `tracker use` or `drop` that rewrites a rendered file
+    /// under one restarts the process, and one that declares this and reads
+    /// nothing that changed is left alone in silence. `None` means newgit
+    /// cannot tell, so a change that rewrote a rendered file names the
+    /// process as possibly stale. Workspace-relative, like `[[render]].path`.
+    pub reads: Option<Vec<Utf8PathBuf>>,
     pub actions: BTreeMap<String, ActionSpec>,
     pub checkpoint: Option<CheckpointSpec>,
     pub restore: Option<RestoreSpec>,
@@ -213,6 +220,8 @@ struct ResourceDefinitionFile {
     #[serde(default)]
     render: Vec<RenderSpec>,
     #[serde(default)]
+    reads: Option<Vec<Utf8PathBuf>>,
+    #[serde(default)]
     actions: BTreeMap<String, ActionSpec>,
     #[serde(default)]
     checkpoint: Option<CheckpointSpec>,
@@ -247,6 +256,7 @@ impl ResourceDefinition {
             ports: file.ports,
             exports: file.exports,
             render: file.render,
+            reads: file.reads,
             actions: file.actions,
             checkpoint: file.checkpoint,
             restore: file.restore,
@@ -316,6 +326,20 @@ impl ResourceDefinition {
         self.identity_produces()
             .iter()
             .any(|produced| contains_path(produced, &spec.path))
+    }
+
+    /// Whether `reads` covers `path`: names it, or names a directory it is
+    /// in. `None` when the definition does not declare `reads`, since then
+    /// nobody has said.
+    pub fn reads_path(&self, path: &Utf8Path) -> Option<bool> {
+        let reads = self.reads.as_ref()?;
+        Some(reads.iter().any(|read| {
+            let read: Utf8PathBuf = read
+                .components()
+                .filter(|part| !matches!(part, camino::Utf8Component::CurDir))
+                .collect();
+            contains_path(&read, path)
+        }))
     }
 
     /// The tree `[identity] produces`, if this resource declares one. A
@@ -466,6 +490,18 @@ impl ResourceDefinition {
                     .collect::<Vec<_>>()
                     .join(", ")
             )));
+        }
+        for path in self.reads.iter().flatten() {
+            if path.is_absolute()
+                || path
+                    .components()
+                    .any(|part| matches!(part, camino::Utf8Component::ParentDir))
+            {
+                return Err(self.invalid(format!(
+                    "`reads` entry `{path}` must be workspace-relative: it names a file a \
+                     render writes, and renders only write inside the workspace"
+                )));
+            }
         }
         for spec in &self.render {
             if spec.replace.is_empty() {
@@ -1307,6 +1343,7 @@ mod tests {
             ports: BTreeMap::new(),
             exports: BTreeMap::new(),
             render: Vec::new(),
+            reads: None,
             actions: BTreeMap::new(),
             checkpoint: None,
             restore: None,

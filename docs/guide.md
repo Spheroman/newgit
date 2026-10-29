@@ -352,6 +352,17 @@ so at bind. For a tracker-owned file, `tracker capture` reverses the
 substitution, so edits you make beside the rendered value reach the lane and
 your port does not.
 
+A file rendered once is not read again by a process already running on it.
+When `tracker use` or `drop` changes a rendered file's bytes (binding a
+per-branch database writes its port into `apps/admin/.env.local`, say), each
+process that was running before restarts if its resource declares `reads`
+covering the file, and is named with the command that restarts it if it
+declares nothing:
+
+```toml
+reads = ["apps/admin"]   # a dev server run from apps/admin reads its .env.local
+```
+
 A render can also target a file inside a resource's own `[identity]
 produces`, a built tree rather than source. That is how an install whose
 tree records its workspace path can still be shared through the install

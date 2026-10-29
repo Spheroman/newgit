@@ -654,6 +654,33 @@ dependencies are bound, just before `prepare`, and again before a
 would see in its environment, so an Expo `.env` can name the Supabase
 resource's URL.
 
+**A re-render does not reach a process already running.** A dev server
+reads `.env.local` when it starts. When `tracker use` binds a resource whose
+render rewrites that file, or a `drop` removes it with its tracker, the
+server keeps what it read. newgit cannot know which process reads which
+file, so a resource says: `reads = ["apps/admin"]` lists the files and
+directories its running process reads, workspace-relative. `use` and `drop`
+read the bytes of every rendered path before the change and compare after,
+and only a path whose bytes changed counts — a re-render that wrote what was
+already there leaves nothing stale and says nothing. For each process that
+was running before the change and still is after it:
+
+- its `reads` covers a changed path: it is stopped and started again with
+  the action `autostart` names (else its first long-running one), as `undo`
+  restarts what it restores. A failed restart is reported, not raised: the
+  binding has changed by then.
+- its `reads` covers none of them: left alone, silently.
+- it declares no `reads`: left running, with a warning naming it and the
+  command that restarts it. A guess from `workdir` was considered and not
+  taken: a resource run from the workspace root would cover every file, and
+  restarting a database because a dev server's `.env.local` changed is worse
+  than the warning.
+
+`undo` needs none of this: it stops every running process before it moves
+any content and restarts what was running at checkpoint time after the
+re-render. `tracker pull` and `tracker checkout` re-render under running
+processes too and do not yet say so.
+
 **Instance values must not leak.** A render writes one instance's values
 into a path the project owns. Four places they must not reach:
 

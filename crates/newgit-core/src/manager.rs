@@ -47,6 +47,9 @@ use crate::tracker_repo::{
     pinned_revs, prune_unreferenced,
 };
 
+mod stale_render;
+pub use stale_render::{PossiblyStale, StaleRender};
+
 /// The store remote a workspace's `git push` is forwarded to.
 const PUBLISH_REMOTE: &str = "origin";
 
@@ -4294,8 +4297,10 @@ impl BranchManager {
         // the inner change takes the same lock again.
         let (_lock, _) = self.locked_branch(instance)?;
         let before = self.binding_before(instance)?;
+        let rendered = self.render_before(instance)?;
         let mut change = self.drop_tracker_inner(instance, tracker, uncommitted)?;
         change.rebuilt = self.rebuild_for_binding(instance, &before)?;
+        change.stale = self.settle_stale_render(instance, &rendered)?;
         Ok(change)
     }
 
@@ -4461,6 +4466,7 @@ impl BranchManager {
         // the inner change takes the same lock again.
         let (_lock, _) = self.locked_branch(instance)?;
         let before = self.binding_before(instance)?;
+        let rendered = self.render_before(instance)?;
         let mut change = self.use_tracker_inner(instance, tracker, true)?;
         change.rebuilt = self.rebuild_for_binding(instance, &before)?;
         // A drop stopped what the tracker brings; using it again starts
@@ -4472,6 +4478,9 @@ impl BranchManager {
             let only: BTreeSet<&str> = change.started.iter().map(String::as_str).collect();
             change.autostarted = self.autostart(&branch, Some(&only));
         }
+        // Last, so what the use started is not mistaken for something left
+        // running on the old values.
+        change.stale = self.settle_stale_render(instance, &rendered)?;
         Ok(change)
     }
 
@@ -9471,6 +9480,9 @@ pub struct BindingChange {
     /// tree keyed on the trackers the instance binds was built for the
     /// binding this change replaced.
     pub rebuilt: Vec<RebuiltInstall>,
+    /// Rendered files the change rewrote under processes already running,
+    /// and which of those it restarted or left possibly stale.
+    pub stale: StaleRender,
 }
 
 /// An instance's binding as a `use` or `drop` found it: what
