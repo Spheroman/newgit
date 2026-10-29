@@ -22,6 +22,7 @@ use newgit_core::templates::{RESOURCE_TEMPLATES, resource_template, resource_tem
 use newgit_core::tracker::{Storage, TrackerDefinition};
 use newgit_core::{MetadataStore, ProjectConfig};
 
+mod claude_code;
 mod remote_cmd;
 
 /// `0.1.0 (a1b2c3d4e5f6)` — the release plus the commit it was built from.
@@ -267,6 +268,12 @@ enum Command {
     Credential {
         /// get, store, or erase (only get does anything)
         operation: String,
+    },
+    /// Give Claude Code's worktrees (`claude --worktree`, subagents,
+    /// background sessions) newgit instances instead of bare Git worktrees
+    ClaudeCode {
+        #[command(subcommand)]
+        command: claude_code::ClaudeCodeCommand,
     },
     /// The outbox's `pre-receive` hook, never run by hand: reads the ref
     /// updates on stdin, checkpoints the instance, and forwards the push to
@@ -562,6 +569,7 @@ fn main() -> Result<()> {
         }
         Command::Members { command } => remote_cmd::members(command),
         Command::Credential { operation } => remote_cmd::credential(&operation),
+        Command::ClaudeCode { command } => claude_code::run(command),
     }
 }
 

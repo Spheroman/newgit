@@ -110,6 +110,17 @@ git clone https://github.com/Spheroman/t3code && cd t3code
 scripts/fork/install-mac.sh
 ```
 
+## Works with Claude Code
+
+```sh
+newgit claude-code install
+claude --worktree auth-refactor   # a newgit instance, not a bare worktree
+```
+
+Every `claude --worktree` session, background session, and subagent with
+`isolation: "worktree"` gets its own instance, with its env in place, its
+dependencies installed, and its own ports.
+
 ## Install
 
 Prebuilt binaries for macOS and Linux (arm64 and x86_64) are attached to each

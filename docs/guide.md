@@ -180,6 +180,35 @@ The fork is a small patch stack rebased onto a fast-moving upstream; its
 [`FORK.md`](https://github.com/Spheroman/t3code/blob/newgit/FORK.md) lists
 every change, its limits, and how to rebase.
 
+## Using it with Claude Code
+
+Claude Code makes a Git worktree for `claude --worktree <name>`, for a
+subagent with `isolation: "worktree"`, and for each background session.
+In a newgit project, one command makes each of those a newgit instance,
+with its trackers bound and its resources prepared:
+
+```sh
+newgit claude-code install            # writes .claude/settings.local.json
+claude --worktree auth-refactor       # spawns instance `auth-refactor`
+```
+
+`install` adds Claude Code's `WorktreeCreate` and `WorktreeRemove` hooks:
+the first runs `newgit spawn <name>` and hands Claude Code the workspace,
+the second runs `newgit remove` when Claude Code removes the worktree.
+`--shared` writes `.claude/settings.json` instead, for a team that all has
+`newgit` on its `PATH`.
+
+- A hook replaces Claude Code's worktree handling entirely, so
+  `.worktreeinclude` is not read. Trackers are how files Git shouldn't hold
+  reach the workspace.
+- Claude Code keeps a subagent's worktree when the subagent ends and never
+  runs the remove hook for it. `newgit status` lists those instances;
+  `newgit remove` them when you're done.
+- `install` refuses when the settings file already has a `WorktreeCreate`
+  hook, since only one hook can make the worktree.
+- A spawn whose resources did not all come up still hands Claude Code the
+  workspace, and says so on stderr; `newgit status <name>` shows which.
+
 ## Commands
 
 Branch-instance lifecycle (top-level verbs; `[instance]` is inferred when run
