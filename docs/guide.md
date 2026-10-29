@@ -144,14 +144,20 @@ opens the thread in that workspace, with its trackers bound and its
 resources prepared. Deleting the thread runs `newgit remove`. Every other
 project gets plain worktrees, as before.
 
-Settling a thread does not touch its instance yet. Running resources stay up
-until the thread is deleted, which in T3 Code is rare. The plan
-([Spheroman/t3code#2](https://github.com/Spheroman/t3code/issues/2), which
-needs an instance-wide `newgit stop` / `newgit start`,
-[#157](https://github.com/Spheroman/newgit/issues/157)) is to stop resources
-on settle, start them again on unsettle or a new message, and keep `remove`
-for delete. Until then, `newgit action <resource>.stop <instance>` releases
-one by hand.
+`newgit stop <instance>` and `newgit start <instance>` are the pair for
+settling and unsettling a thread
+([#157](https://github.com/Spheroman/newgit/issues/157)): `stop` stops every
+running long-running action, dependents first, and records what it stopped
+in `.newgit/state/<instance>/stopped.toml`; `start` brings back exactly
+that, dependencies first, so a resource nobody had started stays stopped.
+Port claims are kept, so the instance returns on the same ports. With
+`--json` each prints `{"instance", "resources": [{"name", "action",
+"status", "error"}]}`, listing only what it acted on, and still exits 1 if
+anything failed; a resource that failed to start stays recorded for the
+next `start`. Supervised processes are all they touch: a `supabase` or
+`external` resource is not stopped.
+([Spheroman/t3code#2](https://github.com/Spheroman/t3code/issues/2) wires
+them to settle and unsettle; `remove` stays for delete.)
 
 On macOS it installs as "T3 Code (newgit)", beside upstream T3 Code: its
 own app ID, state in `~/.t3-newgit`, and no auto-update.
@@ -237,6 +243,10 @@ inside a workspace):
   variable labeled with the declaration it came from
 - `newgit action <resource>.<action> [instance] [--dry-run]` — `--dry-run`
   prints the rendered command and its directory, and runs nothing
+- `newgit stop [instance] [--json]` / `start [instance] [--json]` — stop
+  every running long-running action, dependents first, and later start
+  exactly what that stopped; ports, workspace, trackers, and installs stay
+  as they are. Both exit 0 with nothing to do and 1 if any resource failed
 - `newgit checkpoint [instance] [-m <msg>]` / `undo [instance] [--to <id>]` /
   `checkpoints [instance]`
 - `newgit export [instance] --to <dir> [--include <path>] [--exclude <path>]`

@@ -11,8 +11,8 @@ use newgit_core::installs::InstallReport;
 use newgit_core::manager::{
     ActionOutcome, ActionPlan, BaseReport, BindOrigin, BranchManager, DiffPair, ExportReason,
     InstanceReport, KeptBranch, MismatchCause, RemoteExportOptions, RemoveOutcome,
-    ResourceBindOutcome, SourceBranchOutcome, SourceBranchPolicy, TrackerBindOutcome, UndoOptions,
-    VerifyResource,
+    ResourceBindOutcome, SourceBranchOutcome, SourceBranchPolicy, StopStartOutcome,
+    TrackerBindOutcome, UndoOptions, VerifyResource,
 };
 use newgit_core::resource::{CheckpointMode, ResourceDefinition};
 use newgit_core::source::{RefUpdate, find_repo_root};
@@ -108,6 +108,31 @@ enum Command {
         /// and run nothing. Refuses for the same reasons a real run would.
         #[arg(long)]
         dry_run: bool,
+    },
+    /// Stop every running long-running action of an instance, dependents
+    /// first, and remember what was running for `newgit start`
+    ///
+    /// The workspace, trackers, port claims, and installs are left alone:
+    /// the instance comes back on the same ports. Exits 0 when nothing was
+    /// running, and 1 when anything failed to stop.
+    Stop {
+        /// Instance (inferred when run inside a workspace)
+        instance: Option<String>,
+        /// Print one JSON document: each resource stopped, and its status
+        #[arg(long)]
+        json: bool,
+    },
+    /// Start again exactly what the last `newgit stop` stopped
+    ///
+    /// A resource nobody had started stays stopped. Exits 0 when there is
+    /// nothing to start, and 1 when anything failed to; a failed one is
+    /// tried again by the next `newgit start`.
+    Start {
+        /// Instance (inferred when run inside a workspace)
+        instance: Option<String>,
+        /// Print one JSON document: each resource started, and its status
+        #[arg(long)]
+        json: bool,
     },
     /// Record one coherent snapshot across source, trackers, and resources
     Checkpoint {
@@ -504,6 +529,8 @@ fn main() -> Result<()> {
             instance,
             dry_run: true,
         } => action_dry_run(&spec, instance),
+        Command::Stop { instance, json } => stop_start(instance, json, StopStart::Stop),
+        Command::Start { instance, json } => stop_start(instance, json, StopStart::Start),
         Command::Checkpoint {
             instance,
             message,
@@ -1567,6 +1594,83 @@ fn action(spec: &str, instance: Option<String>) -> Result<()> {
                 std::process::exit(code);
             }
             Ok(())
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum StopStart {
+    Stop,
+    Start,
+}
+
+/// `newgit stop` / `newgit start`. Exit 1 when any resource failed, after
+/// the full report — with `--json`, stdout is still one complete document.
+fn stop_start(instance: Option<String>, json: bool, which: StopStart) -> Result<()> {
+    let (manager, instance) = manager_and_instance(instance)?;
+    let outcome = match which {
+        StopStart::Stop => manager.stop_instance(&instance)?,
+        StopStart::Start => manager.start_instance(&instance)?,
+    };
+    if json {
+        println!("{}", stop_start_json(&outcome));
+    } else {
+        print_stop_start(&outcome, which);
+    }
+    if !outcome.ok() {
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
+fn stop_start_json(outcome: &StopStartOutcome) -> serde_json::Value {
+    let resources = outcome
+        .resources
+        .iter()
+        .map(|resource| {
+            let mut entry = serde_json::json!({
+                "name": resource.name,
+                "action": resource.action,
+                "status": resource.status.as_str(),
+            });
+            if let Some(error) = &resource.error {
+                entry["error"] = serde_json::json!(error);
+            }
+            entry
+        })
+        .collect::<Vec<_>>();
+    serde_json::json!({
+        "instance": outcome.instance,
+        "resources": resources,
+    })
+}
+
+fn print_stop_start(outcome: &StopStartOutcome, which: StopStart) {
+    let instance = &outcome.instance;
+    if outcome.resources.is_empty() {
+        match which {
+            StopStart::Stop => println!("Nothing running for `{instance}`"),
+            StopStart::Start => println!("Nothing stopped by `newgit stop` for `{instance}`"),
+        }
+        return;
+    }
+    for resource in &outcome.resources {
+        let spec = format!("{}.{}", resource.name, resource.action);
+        match &resource.error {
+            None => println!(
+                "{} `{spec}` for `{instance}`",
+                match which {
+                    StopStart::Stop => "Stopped",
+                    StopStart::Start => "Started",
+                }
+            ),
+            Some(error) => eprintln!(
+                "[newgit] could not {} `{spec}` for `{instance}`: {error}",
+                match which {
+                    StopStart::Stop => "stop",
+                    StopStart::Start => "start",
+                }
+            ),
         }
     }
 }

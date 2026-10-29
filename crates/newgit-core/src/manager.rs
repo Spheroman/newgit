@@ -373,6 +373,18 @@ fn action_signal(definition: &ResourceDefinition, action: &crate::resource::Acti
         .unwrap_or_else(|| definition.stop_signal())
 }
 
+/// The long-running action `undo` and `start` bring a resource back with:
+/// the first one it defines, by name.
+fn long_running_action(
+    definition: &ResourceDefinition,
+) -> Option<(&str, &crate::resource::ActionSpec)> {
+    definition
+        .actions
+        .iter()
+        .find(|(_, action)| action.long_running)
+        .map(|(name, action)| (name.as_str(), action))
+}
+
 /// What `newgit action <resource>.<action>` would do, without doing it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ActionPlan {
@@ -409,6 +421,67 @@ pub enum ActionOutcome {
         /// produces`, and so had a tree worth publishing.
         install: Option<InstallReport>,
     },
+}
+
+/// What `newgit stop` or `newgit start` did to an instance: one entry per
+/// resource it acted on, none when there was nothing to do.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StopStartOutcome {
+    pub instance: String,
+    pub resources: Vec<StopStartResource>,
+}
+
+impl StopStartOutcome {
+    /// Whether every resource it acted on ended up as asked.
+    pub fn ok(&self) -> bool {
+        self.resources
+            .iter()
+            .all(|resource| resource.status != StopStartStatus::Failed)
+    }
+}
+
+/// One resource `newgit stop` or `newgit start` acted on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StopStartResource {
+    pub name: String,
+    /// The long-running action stopped or started — the one `start` runs
+    /// again, so a stop and the start after it name the same action.
+    pub action: String,
+    pub status: StopStartStatus,
+    /// Why, when `status` is `Failed`.
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StopStartStatus {
+    Stopped,
+    Started,
+    Failed,
+}
+
+impl StopStartStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Stopped => "stopped",
+            Self::Started => "started",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+/// What `newgit stop` stopped and `newgit start` has not yet brought back,
+/// at `.newgit/state/<slug>/stopped.toml`. Living in the state directory,
+/// it goes with the instance on `remove`.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+struct StoppedRecord {
+    #[serde(default)]
+    resources: Vec<StoppedResource>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct StoppedResource {
+    name: String,
+    action: String,
 }
 
 /// How a tracker's content landed in a workspace.
@@ -5095,10 +5168,8 @@ impl BranchManager {
 
         // Stop anything still running before the workspace disappears.
         let supervisor = self.supervisor(&branch);
-        for definition in &self.resources {
-            if supervisor.running_pid(&definition.name).is_some() {
-                supervisor.stop(&definition.name, &definition.stop_signal())?;
-            }
+        for definition in self.running_resources(&branch) {
+            supervisor.stop(&definition.name, &definition.stop_signal())?;
         }
 
         let hooks = self.run_cleanup_hooks(&branch, false)?;
@@ -8458,21 +8529,228 @@ impl BranchManager {
         branch: &BranchInstance,
         definition: &ResourceDefinition,
     ) -> Result<bool> {
-        let Some((action_name, action)) = definition
-            .actions
-            .iter()
-            .find(|(_, action)| action.long_running)
-        else {
+        let Some((action_name, action)) = long_running_action(definition) else {
             return Ok(false);
         };
+        self.start_supervised(branch, definition, action, action_name)?;
+        Ok(true)
+    }
+
+    /// Start one long-running action under supervision, invoked exactly as
+    /// `newgit action <resource>.<action>` invokes it.
+    fn start_supervised(
+        &self,
+        branch: &BranchInstance,
+        definition: &ResourceDefinition,
+        action: &crate::resource::ActionSpec,
+        action_name: &str,
+    ) -> Result<u32> {
         let log = self
             .store
             .action_log_path(&branch.slug, &format!("{}.{action_name}", definition.name));
         let (command, cwd) = self.action_invocation(branch, definition, action, action_name)?;
         let env = self.assemble_env(branch)?;
         self.supervisor(branch)
-            .start(&definition.name, &command, &cwd, &env, &log)?;
-        Ok(true)
+            .start(&definition.name, &command, &cwd, &env, &log)
+    }
+
+    /// Every defined resource in lifecycle order: dependencies before
+    /// dependents over `depends_on`. A resource the order leaves out — a
+    /// graph with problems skips what it cannot place — follows, in
+    /// declaration order, so nothing is missed.
+    fn lifecycle_definitions(&self) -> Vec<&ResourceDefinition> {
+        let mut ordered: Vec<&ResourceDefinition> = self
+            .graph
+            .lifecycle_order
+            .iter()
+            .filter_map(|name| {
+                self.resources
+                    .iter()
+                    .find(|definition| &definition.name == name)
+            })
+            .collect();
+        for definition in &self.resources {
+            if !ordered.iter().any(|placed| placed.name == definition.name) {
+                ordered.push(definition);
+            }
+        }
+        ordered
+    }
+
+    /// The resources with a supervised process alive right now, dependents
+    /// first: the order to stop them in. `remove` and `stop` share it.
+    fn running_resources(&self, branch: &BranchInstance) -> Vec<&ResourceDefinition> {
+        let supervisor = self.supervisor(branch);
+        let mut running: Vec<&ResourceDefinition> = self
+            .lifecycle_definitions()
+            .into_iter()
+            .filter(|definition| supervisor.running_pid(&definition.name).is_some())
+            .collect();
+        running.reverse();
+        running
+    }
+
+    fn stopped_record_path(&self, branch: &BranchInstance) -> Utf8PathBuf {
+        self.store
+            .instance_state_dir(&branch.slug)
+            .join("stopped.toml")
+    }
+
+    fn load_stopped_record(&self, branch: &BranchInstance) -> Result<StoppedRecord> {
+        let path = self.stopped_record_path(branch);
+        if !path.is_file() {
+            return Ok(StoppedRecord::default());
+        }
+        crate::store::read_toml_at(&path)
+    }
+
+    /// Write the record, or delete it once nothing is left in it.
+    fn save_stopped_record(&self, branch: &BranchInstance, record: &StoppedRecord) -> Result<()> {
+        let path = self.stopped_record_path(branch);
+        if record.resources.is_empty() {
+            return match std::fs::remove_file(&path) {
+                Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+                    Err(NewgitError::io(path, error))
+                }
+                _ => Ok(()),
+            };
+        }
+        crate::materializer::create_dir_all(&self.store.instance_state_dir(&branch.slug))?;
+        crate::store::write_toml_at(&path, "stopped resources", record)
+    }
+
+    /// `newgit stop`: stop every running long-running action of the
+    /// instance, dependents first, and add what it stopped to the instance's
+    /// stopped record for [`Self::start_instance`]. The workspace, trackers,
+    /// port claims, and installs are left as they are.
+    ///
+    /// Every running resource is attempted even when one fails. One whose
+    /// process ignored the signal is reported failed but still recorded:
+    /// it was running, so `start` should bring it back once it is gone. A
+    /// second `stop` adds to the record rather than replacing it, so
+    /// starting something by hand between two stops does not make `start`
+    /// forget what the first one stopped.
+    pub fn stop_instance(&self, instance: &str) -> Result<StopStartOutcome> {
+        let (_lock, branch) = self.locked_branch(instance)?;
+        let supervisor = self.supervisor(&branch);
+        let mut record = self.load_stopped_record(&branch)?;
+        let mut resources = Vec::new();
+        for definition in self.running_resources(&branch) {
+            // The action `start` will run again. A process whose definition
+            // no longer has one is still stopped; there is just nothing to
+            // record for it.
+            let restartable = long_running_action(definition).map(|(name, _)| name.to_owned());
+            let action = restartable.clone().unwrap_or_else(|| "stop".to_owned());
+            let signal = definition.stop_signal();
+            let (status, error) = match supervisor.stop(&definition.name, &signal) {
+                Ok(StopOutcome::Stopped(_)) => (StopStartStatus::Stopped, None),
+                // Exited on its own between the check and the signal: not
+                // something this stop did, and not running to bring back.
+                Ok(StopOutcome::NotRunning) => continue,
+                Ok(StopOutcome::StillRunning(pid)) => (
+                    StopStartStatus::Failed,
+                    Some(format!(
+                        "pid {pid} ignored `{signal}`; escalate with `kill -9 -- -{pid}` if needed"
+                    )),
+                ),
+                Err(error) => (StopStartStatus::Failed, Some(error.to_string())),
+            };
+            if let Some(action) = restartable {
+                record
+                    .resources
+                    .retain(|entry| entry.name != definition.name);
+                record.resources.push(StoppedResource {
+                    name: definition.name.clone(),
+                    action,
+                });
+            }
+            resources.push(StopStartResource {
+                name: definition.name.clone(),
+                action,
+                status,
+                error,
+            });
+        }
+        self.save_stopped_record(&branch, &record)?;
+        Ok(StopStartOutcome {
+            instance: branch.name,
+            resources,
+        })
+    }
+
+    /// `newgit start`: start again what the instance's stopped record names,
+    /// dependencies first, and drop each from the record once it is up. A
+    /// resource nobody had started stays stopped.
+    ///
+    /// One that fails to start stays in the record, so the next `start`
+    /// tries it again. One already running — started by hand since — or no
+    /// longer defined is dropped without being reported: there is nothing
+    /// to do for it.
+    pub fn start_instance(&self, instance: &str) -> Result<StopStartOutcome> {
+        let (_lock, branch) = self.locked_branch(instance)?;
+        let mut record = self.load_stopped_record(&branch)?;
+        if record.resources.is_empty() {
+            return Ok(StopStartOutcome {
+                instance: branch.name,
+                resources: Vec::new(),
+            });
+        }
+        self.require_resolvable_graph()?;
+        self.require_workspace(&branch)?;
+        let supervisor = self.supervisor(&branch);
+
+        let mut resources = Vec::new();
+        let mut still_stopped = Vec::new();
+        for definition in self.lifecycle_definitions() {
+            let Some(entry) = record
+                .resources
+                .iter()
+                .find(|entry| entry.name == definition.name)
+            else {
+                continue;
+            };
+            if supervisor.running_pid(&definition.name).is_some() {
+                continue;
+            }
+            // The action the stop recorded, unless the definition has since
+            // dropped it; then whichever long-running action it has now.
+            let action = definition
+                .actions
+                .get_key_value(entry.action.as_str())
+                .filter(|(_, action)| action.long_running)
+                .map(|(name, action)| (name.as_str(), action))
+                .or_else(|| long_running_action(definition));
+            let result = match action {
+                None => Err(format!(
+                    "resource `{}` no longer has a long-running action to start",
+                    definition.name
+                )),
+                Some((action_name, action)) => self
+                    .refuse_if_blocked(&branch, definition)
+                    .and_then(|()| self.start_supervised(&branch, definition, action, action_name))
+                    .map_err(|error| error.to_string()),
+            };
+            let action = action.map_or_else(|| entry.action.clone(), |(name, _)| name.to_owned());
+            let (status, error) = match result {
+                Ok(_) => (StopStartStatus::Started, None),
+                Err(error) => {
+                    still_stopped.push(entry.clone());
+                    (StopStartStatus::Failed, Some(error))
+                }
+            };
+            resources.push(StopStartResource {
+                name: definition.name.clone(),
+                action,
+                status,
+                error,
+            });
+        }
+        record.resources = still_stopped;
+        self.save_stopped_record(&branch, &record)?;
+        Ok(StopStartOutcome {
+            instance: branch.name,
+            resources,
+        })
     }
 
     /// Point the store's branch ref at the checkpointed head. The branch is
