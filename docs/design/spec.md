@@ -357,6 +357,29 @@ project repository:
 - Nothing is shared between workspaces, so two instances of the same base
   branch is a non-event.
 
+On macOS the clone is not made by `git clone`, which spends almost all of
+its time checking files out (2.3s of 2.5s on T3 Code's 28.6k files).
+newgit keeps one clean checkout of the project repository beside the
+workspaces, `<workspace root>/.source-template`, with no local branches.
+`spawn` fetches it from the project repository, checks out the instance's
+revision, and copies the whole tree with one `clonefile(2)`. Then the copy
+gets its own branch, with the upstream `git clone --branch` would set, and
+`core.checkStat=minimal` plus `core.trustctime=false`. Without those two
+settings Git would re-hash every file on the first `git status`, because
+every inode and ctime is new. With them it compares a file's size and
+whole-second mtime only, both of which the copy keeps. The result is the
+same repository a clone produces, in 0.67s instead of 2.7–3.1s. The first
+spawn builds the template and takes longer once. If anything in this path
+fails, `spawn` falls back to `git clone`. That includes a workspace root on
+another volume, which `clonefile` cannot reach.
+
+What those two settings give up: an edit Git cannot see is one that keeps
+the file's size and the second of its mtime. Ordinary edits cannot do that.
+They are later than anything Git recorded, and Git re-hashes any entry
+written in the same second as its index. What remains is a tool that sets
+an old mtime on purpose (`cp -p`, `rsync -t`), which Git's default settings
+would catch through the ctime.
+
 A dropped code tracker's files are left out of the working tree with Git's
 sparse checkout. The history still has them, so every instance of a project
 has the same commit ids.
@@ -418,7 +441,8 @@ opens a real pull request there (see *Export*).
 Clone is the first materializer, not the last. Each later step keeps the
 contract fixed:
 
-1. **Now:** an eager local clone.
+1. **Now:** an eager local clone (on macOS, a `clonefile` of a template
+   checkout).
 2. **Later:** a Git partial clone with the project repository as the
    promisor remote, so objects arrive on demand through Git's own lazy
    mechanism. Big repositories spawn fast without newgit touching a

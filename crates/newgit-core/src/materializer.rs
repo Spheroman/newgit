@@ -16,8 +16,16 @@ pub trait Materializer {
     fn remove(&self, branch: &BranchInstance) -> Result<()>;
 }
 
-#[derive(Debug, Clone, Copy, Default)]
-pub struct RealDirMaterializer;
+/// The checkout workspaces are cloned from on macOS, under the workspace
+/// root. A slug never starts with a dot, so it cannot name an instance.
+pub const SOURCE_TEMPLATE_DIR: &str = ".source-template";
+
+#[derive(Debug, Clone, Default)]
+pub struct RealDirMaterializer {
+    /// The checkout to clone workspaces from (see
+    /// [`GitSource::clone_via_template`]). `None` clones from the store.
+    pub source_template: Option<Utf8PathBuf>,
+}
 
 impl Materializer for RealDirMaterializer {
     fn materialize(&self, source: &GitSource, branch: &BranchInstance) -> Result<()> {
@@ -27,7 +35,21 @@ impl Materializer for RealDirMaterializer {
         if let Some(parent) = branch.workspace_path.parent() {
             create_dir_all(parent)?;
         }
-        source.clone_to(&branch.source_ref, &branch.workspace_path)?;
+        // The template is only a faster way to the same clone: whatever
+        // keeps it from working, `clone_to` still does.
+        let templated = self.source_template.as_ref().is_some_and(|template| {
+            source
+                .clone_via_template(
+                    template,
+                    &branch.source_ref,
+                    &branch.source_rev,
+                    &branch.workspace_path,
+                )
+                .is_ok()
+        });
+        if !templated {
+            source.clone_to(&branch.source_ref, &branch.workspace_path)?;
+        }
         write_workspace_marker(source.root(), branch)
     }
 

@@ -5,7 +5,7 @@ use camino::{Utf8Path, Utf8PathBuf};
 use crate::branch::BranchInstance;
 use crate::checkpoint::CheckpointLog;
 use crate::error::{NewgitError, Result};
-use crate::materializer::workspace_marker_path;
+use crate::materializer::{SOURCE_TEMPLATE_DIR, workspace_marker_path};
 use crate::resource::Ownership;
 use crate::store::{MetadataStore, read_subdirs_sorted};
 use crate::tracker_repo::{parse_tracker_state_ref, tracker_names};
@@ -292,7 +292,7 @@ pub fn orphan_workspaces(
     let mut orphans = Vec::new();
     let mut warnings = Vec::new();
     for dir in read_subdirs_sorted(workspace_root)? {
-        if claimed.contains(dir.as_path()) {
+        if claimed.contains(dir.as_path()) || dir.file_name() == Some(SOURCE_TEMPLATE_DIR) {
             continue;
         }
         if workspace_marker_path(&dir).is_file() || is_empty_dir(&dir)? {

@@ -25,8 +25,8 @@ use crate::exports::{RenderContext, STATE_REF_PLACEHOLDER, render, unresolved_pl
 use crate::installs::{Admission, InstallReport, InstallStore, TreeRender};
 use crate::lock::{InstanceLock, LOCKED_ENV, locked_env_value};
 use crate::materializer::{
-    Materializer, RealDirMaterializer, exclude_produced_paths, exclude_tracker_paths,
-    unexclude_tracker_paths,
+    Materializer, RealDirMaterializer, SOURCE_TEMPLATE_DIR, exclude_produced_paths,
+    exclude_tracker_paths, unexclude_tracker_paths,
 };
 use crate::ports;
 use crate::remote::{Acting, Remote, RemoteLink, Scope, basic_auth_header};
@@ -2018,7 +2018,7 @@ impl BranchManager {
         }
 
         branch.dropped = dropped;
-        RealDirMaterializer.materialize(&self.source, &branch)?;
+        self.materializer().materialize(&self.source, &branch)?;
         if !branch.dropped.is_empty() {
             self.apply_sparse(&branch)?;
         }
@@ -2689,6 +2689,18 @@ impl BranchManager {
     /// `core.hooksPath` (husky, lefthook) cannot switch it off. Idempotent,
     /// like the excludes, so it doubles as the re-sync — and follows the
     /// store if its `origin` changes.
+    /// How workspaces are materialized here. On macOS they are cloned from
+    /// a template checkout beside them (see
+    /// [`GitSource::clone_via_template`]); elsewhere there is no
+    /// whole-tree clone to make that faster than `git clone`.
+    fn materializer(&self) -> RealDirMaterializer {
+        let workspace_root = self.config.workspace_root(&self.store.paths().project_root);
+        RealDirMaterializer {
+            source_template: cfg!(target_os = "macos")
+                .then(|| workspace_root.join(SOURCE_TEMPLATE_DIR)),
+        }
+    }
+
     fn ensure_workspace_push(&self, branch: &BranchInstance) -> Result<()> {
         let outbox = self.outbox();
         self.source.ensure_outbox(&outbox)?;
@@ -5347,7 +5359,7 @@ impl BranchManager {
             _ => None,
         };
 
-        RealDirMaterializer.remove(&branch)?;
+        self.materializer().remove(&branch)?;
         // Its branches go with it; pins keep whatever its archived
         // checkpoints still name.
         for definition in &self.trackers {
