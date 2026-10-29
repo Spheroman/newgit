@@ -75,15 +75,31 @@ newgit resource templates           # what each template is for
 | a hard-coded port in a committed config file | a `[[render]]` on that resource (`newgit reference render`) |
 | a GitHub remote and `gh` in use | nothing to add. `git push` and `gh pr create` work from a workspace |
 
-### Pitch it, then ask
+### Explain it, then ask
 
-Tell the user what you found and what each piece gets them, in terms of their
-project rather than newgit's vocabulary. Keep it short. For example:
+**We highly recommend explaining what newgit does before you ask the user
+anything.** Someone who has never heard of a tracker can't tell you which
+trackers they want. Asked cold, they will either guess or say "whatever you
+think", and you lose the one input only they can give. Ask them before
+they understand newgit and the questions read as busywork.
 
-> newgit gives each branch its own copy of the project, ready to run. I'd set
-> up:
-> - your `.env.local`, copied into every branch and versioned, but never
->   committed, so a branch an agent broke can be undone env and all;
+Start with what newgit is, in a few sentences. Each branch becomes an
+*instance*: its own workspace with everything it needs to run. *Trackers*
+hold the files Git shouldn't, like env files and local config. Each has its
+own history and is never committed. *Resources* are what each branch has to
+rebuild or run, like installs, dev servers and databases. A *checkpoint*
+saves all of it, and `undo` puts it all back. Use these words. The user will
+see them in every command, so this is when to learn them.
+
+Then tell them what you found and what each piece gets them. Keep it short.
+For example:
+
+> newgit gives each branch its own copy of the project, ready to run. Files
+> Git shouldn't hold go in *trackers*, and the things each branch has to
+> install or run are *resources*. For this project I'd set up:
+> - a tracker for your `.env.local`, copied into every branch and versioned
+>   but never committed, so a branch an agent broke can be undone env and
+>   all;
 > - `pnpm install`, built once per lockfile and shared, so a new branch
 >   doesn't reinstall;
 > - `pnpm dev` on its own port in each branch, so five can run side by side;
@@ -93,7 +109,8 @@ project rather than newgit's vocabulary. Keep it short. For example:
 > point at a staging database sometimes? I can make that a second env you
 > pick at spawn time.
 
-Then **ask about trackers**, because those are the ones you can't infer:
+Only then **ask about trackers**, because those are the ones you can't
+infer:
 
 - Which ignored files does a branch need in order to run? You will have found
   some of them. Ask whether there are others, such as files that live outside
@@ -126,6 +143,12 @@ marked `EDIT ME`, such as the dev command and the lockfile. A template's
 defaults are guesses, and a wrong guess shows up as a failed spawn later. `newgit
 reference <section>` has every key. If a resource needs a `[[render]]`, run
 `newgit render --check`.
+
+Make sure an install resource declares `[identity] produces`, the directory
+the install writes (`node_modules`, `.venv`). That is what lets later
+instances with the same lockfile be cloned from the install store instead of
+installing again. The `pnpm` template sets it; the `install` template leaves
+it as `EDIT ME`, and an install without it is never shared.
 
 Commit `.newgit/` the way `init` says to, on a branch if the project works
 that way. A spawn reads definitions from the store, but teammates and CI only
@@ -177,9 +200,11 @@ the commands they will use every day: `spawn`, `status`, `checkpoint`,
   add`, `export --remote`.
 - newgit does not rewrite history, so don't work around it by doing so
   yourself.
-- Be honest about the limits. newgit needs git 2.38+ and a Unix-like OS. A
-  package manager that copies instead of hardlinking (npm, pip) costs disk
-  per install (`newgit reference installs`).
+- Be honest about the limits. newgit needs git 2.38+ and a Unix-like OS.
+  An install whose lockfile no other instance has built runs the package
+  manager for real: npm and pip copy a full tree each time, while pnpm, uv,
+  and bun mostly hardlink. Later instances with the same lockfile are cloned
+  from the install store (`newgit reference installs`).
 
 ---
 
