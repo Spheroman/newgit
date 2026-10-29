@@ -2060,7 +2060,7 @@ impl BranchManager {
         let resource_outcomes = self.bind_resources(&mut branch)?;
         self.store.save_branch_record(&branch)?;
         let started = if autostart {
-            self.autostart(&branch)
+            self.autostart(&branch, None)
         } else {
             Vec::new()
         };
@@ -2279,7 +2279,7 @@ impl BranchManager {
         branch = self.store.find_branch(&branch.name)?;
         // After the restore, which leaves running what the checkpoint had
         // running; anything already up is skipped.
-        let started = self.autostart(&branch);
+        let started = self.autostart(&branch, None);
 
         Ok(SpawnFromCheckpointOutcome {
             branch,
@@ -4463,6 +4463,15 @@ impl BranchManager {
         let before = self.binding_before(instance)?;
         let mut change = self.use_tracker_inner(instance, tracker, true)?;
         change.rebuilt = self.rebuild_for_binding(instance, &before)?;
+        // A drop stopped what the tracker brings; using it again starts
+        // them, after the rebuild, so they start on the binding they now
+        // have. Only those: what this instance runs otherwise is left as
+        // it is, stopped or not.
+        if !change.started.is_empty() {
+            let branch = self.store.find_branch(instance)?;
+            let only: BTreeSet<&str> = change.started.iter().map(String::as_str).collect();
+            change.autostarted = self.autostart(&branch, Some(&only));
+        }
         Ok(change)
     }
 
@@ -8705,12 +8714,21 @@ impl BranchManager {
     ///
     /// Starting is not waiting: a dependent is started once its dependency's
     /// process exists, not once it answers (#54).
-    fn autostart(&self, branch: &BranchInstance) -> Vec<StopStartResource> {
+    ///
+    /// `only`, when given, limits it to those resources.
+    fn autostart(
+        &self,
+        branch: &BranchInstance,
+        only: Option<&BTreeSet<&str>>,
+    ) -> Vec<StopStartResource> {
         let supervisor = self.supervisor(branch);
         let mut failed_here = BTreeSet::new();
         let mut started = Vec::new();
         for definition in self.lifecycle_definitions() {
             let name = &definition.name;
+            if only.is_some_and(|only| !only.contains(name.as_str())) {
+                continue;
+            }
             let Some((action_name, action)) = definition.autostart_action() else {
                 continue;
             };
@@ -9442,8 +9460,11 @@ pub struct BindingChange {
     pub replaced: Vec<String>,
     /// Trackers a use bound because it requires them.
     pub brought: Vec<String>,
-    /// Resources a use started.
+    /// Resources a use bound and prepared.
     pub started: Vec<String>,
+    /// The `autostart` actions of those resources, started once the use
+    /// was done.
+    pub autostarted: Vec<StopStartResource>,
     /// Resources a drop stopped.
     pub stopped: Vec<String>,
     /// Installs rebuilt because the binding is part of their identity: a

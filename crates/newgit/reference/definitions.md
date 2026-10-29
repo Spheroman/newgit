@@ -80,7 +80,7 @@ resources = ["staging-tunnel"]
 | `role` | string | no | — | the slot it fills: trackers sharing a role are alternatives (`dev-db`, `staging-db`) and may claim the same paths; an instance binds one of them. |
 | `priority` | integer | no | `0` | which tracker of a role an instance binds by default (the highest), unless your own default says otherwise (`[projects.<project>.roles]` in `~/.newgit/config.toml`). Negative means only when asked for (`--use`), for a role-less tracker too. |
 | `requires` | array of strings | no | `[]` | trackers or roles it cannot do without: binding it binds them, and they cannot be dropped while it is bound. |
-| `resources` | array of strings | no | `[]` | resources it brings: they bind only while it is bound, start on `newgit tracker use`, and stop on `drop`. |
+| `resources` | array of strings | no | `[]` | resources it brings: they bind only while it is bound. `newgit tracker use` binds and prepares them and starts their `autostart` action; `drop` stops them and releases their binding. |
 | `maintainers` | string | no | its `audience` | who may merge changes to it on a remote: `owner` (the project's owner), `project-devs`, or `user:<login>`. Changing a tracker's definition is changing the tracker that owns its file in `.newgit/trackers/` — `access` unless a more specific code tracker claims it — so governance layers: an `admin` tracker claiming `.newgit/trackers/web.toml` decides who changes `web`'s paths, audience, and maintainers. |
 
 A secret tracker's paths stay out of Git: `newgit tracker track` adds them to
@@ -302,9 +302,10 @@ or depends on a resource whose start failed is not started, and the spawn
 says so and exits 1, as it does for a failed `prepare`; `spawn --json`
 lists each attempt under `started`. A dependent starts once its
 dependency's process exists, not once it answers (#54).
-`spawn --from-checkpoint` starts them after its restore. Nothing else
-autostarts: `newgit start` brings back what `newgit stop` stopped, and a
-resource that `newgit tracker use` brings is prepared but not started.
+`spawn --from-checkpoint` starts them after its restore, and `newgit
+tracker use` starts those of the resources the tracker brings, which `drop`
+stopped. Nothing else autostarts: `newgit start` brings back exactly what
+`newgit stop` stopped.
 
 **`stop` is the one name newgit reads for signals.** Names are otherwise
 inert — `start` is pure convention, made real by `long_running` and not by

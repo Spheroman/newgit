@@ -8,5 +8,6 @@
   resource did not come up and exits 1, and a resource that depends on it
   is not started against it. `spawn --json` lists each attempt under
   `started`, in the shape `newgit start --json` uses. `spawn
-  --from-checkpoint` starts them after its restore. An existing resource
-  definition is unchanged until you add the key.
+  --from-checkpoint` starts them after its restore, and `newgit tracker use`
+  starts those of the resources a tracker brings, which `drop` stops. An
+  existing resource definition is unchanged until you add the key.

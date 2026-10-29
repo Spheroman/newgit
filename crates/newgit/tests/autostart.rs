@@ -277,3 +277,36 @@ fn only_one_action_per_resource_may_autostart() {
     assert!(!run.status.success(), "{}", run.stdout);
     assert!(run.stderr.contains("all have autostart"), "{}", run.stderr);
 }
+
+#[test]
+fn using_a_tracker_again_starts_what_it_brings() {
+    let (_guard, temp) = tempdir();
+    let store = setup(&temp);
+    write_resource(&store, "db", DB);
+    std::fs::write(
+        store.paths().trackers.join("local-db.toml"),
+        "audience = \"user\"\nstorage = \"local\"\npaths = [\".db-env\"]\nresources = [\"db\"]\n",
+    )
+    .expect("write tracker");
+    let repo = store.paths().project_root.clone();
+
+    let (code, spawned) = json_run(&repo, "spawn");
+    assert_eq!(code, Some(0), "{spawned}");
+    assert!(running(&store, "db"));
+
+    let run = newgit(&repo, &["tracker", "drop", "local-db", "x"]);
+    assert!(run.status.success(), "{}\n{}", run.stdout, run.stderr);
+    assert!(
+        !running(&store, "db"),
+        "a drop stops what the tracker brings"
+    );
+
+    let run = newgit(&repo, &["tracker", "use", "local-db", "x"]);
+    assert!(run.status.success(), "{}\n{}", run.stdout, run.stderr);
+    assert!(
+        run.stdout.contains("started:   `db.start`"),
+        "{}",
+        run.stdout
+    );
+    assert!(running(&store, "db"), "and using it again starts them");
+}

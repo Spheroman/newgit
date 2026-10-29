@@ -2143,9 +2143,10 @@ fn tracker(command: TrackerCommand) -> Result<()> {
                 println!("  bound `{other}` too: `{tracker}` requires it");
             }
             if !change.started.is_empty() {
-                println!("  started what it brings: {}", change.started.join(", "));
+                println!("  bound what it brings: {}", change.started.join(", "));
             }
             print_rebuilt(&change.rebuilt);
+            print_started(&change.autostarted);
             if change.restored_stash {
                 println!("  its uncommitted work, stashed when it was dropped, is back");
             }
