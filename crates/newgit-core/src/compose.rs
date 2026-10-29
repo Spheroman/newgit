@@ -40,11 +40,18 @@ const SPLIT_TRAILER: &str = "Newgit-Split: ";
 /// commits, so a composer that has only them (the remote) orders them too.
 const PARENT_TRAILER: &str = "Newgit-Split-Parent: ";
 
-/// The trailers a split or carved commit carries.
-fn split_trailers(source: &str, parent: Option<&str>) -> String {
+/// `message` with the trailers a split or carved commit carries. It ends
+/// the way `message` did — the same run of newlines, often none (GitHub's
+/// merge commits have no final newline) — so composing it back gives the
+/// original message byte for byte, and so the original id.
+fn with_split_trailers(message: &str, source: &str, parent: Option<&str>) -> String {
+    let body = message.trim_end_matches('\n');
+    let ending = &message[body.len()..];
     match parent {
-        Some(parent) => format!("\n\n{PARENT_TRAILER}{parent}\n{SPLIT_TRAILER}{source}\n"),
-        None => format!("\n\n{SPLIT_TRAILER}{source}\n"),
+        Some(parent) => {
+            format!("{body}\n\n{PARENT_TRAILER}{parent}\n{SPLIT_TRAILER}{source}{ending}")
+        }
+        None => format!("{body}\n\n{SPLIT_TRAILER}{source}{ending}"),
     }
 }
 
@@ -843,10 +850,10 @@ pub fn carve(
         // so all of that view commit's pieces still fold back together.
         let message = match &commit.split_source {
             Some(_) => commit.message.clone(),
-            None => format!(
-                "{}{}",
-                commit.message.trim_end_matches('\n'),
-                split_trailers(id, parents.get(id).cloned().flatten().as_deref())
+            None => with_split_trailers(
+                &commit.message,
+                id,
+                parents.get(id).cloned().flatten().as_deref(),
             ),
         };
         mark += 1;
@@ -976,10 +983,10 @@ pub fn split(
                 }));
             }
         }
-        let message = format!(
-            "{}{}",
-            commit.message.trim_end_matches('\n'),
-            split_trailers(id, parents.get(id).cloned().flatten().as_deref())
+        let message = with_split_trailers(
+            &commit.message,
+            id,
+            parents.get(id).cloned().flatten().as_deref(),
         );
         let identity = commit.identity_env();
         let sign = signs_for(repo, &commit.author);
@@ -1369,7 +1376,10 @@ impl RawCommit {
         match &self.split_source {
             None => self.message.clone(),
             Some(source) => {
+                // The newlines it ends with are the original's
+                // (`with_split_trailers`).
                 let trimmed = self.message.trim_end_matches('\n');
+                let ending = &self.message[trimmed.len()..];
                 let mut base = trimmed
                     .strip_suffix(&format!("{SPLIT_TRAILER}{source}"))
                     .unwrap_or(trimmed);
@@ -1379,7 +1389,7 @@ impl RawCommit {
                         .unwrap_or(base);
                 }
                 let base = base.strip_suffix("\n\n").unwrap_or(base);
-                format!("{base}\n")
+                format!("{base}{ending}")
             }
         }
     }
