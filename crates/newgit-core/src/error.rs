@@ -179,7 +179,8 @@ pub enum NewgitError {
     #[error(
         "resource `{resource}` renders into `{path}`, but `{find}` occurs {found} time(s) there, \
          not {expected}; the committed file changed under the definition, or the string is not \
-         unique — a multi-line `find` disambiguates, and `count` declares a repeat"
+         unique — a multi-line `find` disambiguates, and `count` declares a repeat{hint}",
+        hint = no_match_hint(*found)
     )]
     RenderMatchCount {
         resource: String,
@@ -271,5 +272,19 @@ impl NewgitError {
             path: path.into(),
             source,
         }
+    }
+}
+
+/// When a `find` matches nothing, the likeliest cause is that the file has no
+/// line for that setting at all (a `config.toml` without an `[inbucket]`
+/// section). The tool then uses its own built-in default, and every instance
+/// shares it, so say that rather than leaving "0 time(s)" to be decoded.
+fn no_match_hint(found: usize) -> &'static str {
+    if found == 0 {
+        ". If the file has no line for this setting, the tool falls back to its own default, \
+         which every instance shares: add the line to the committed file so there is one to \
+         rewrite. Deleting the rule only hides the collision"
+    } else {
+        ""
     }
 }

@@ -133,6 +133,16 @@ resource it depends on or the `db-snapshots` tracker its checkpoint
 deposits into. They are created only when absent, so `resource add` never
 overwrites a definition.
 
+The `process` template's port is optional: a process that listens on none of
+its own (a worker, a watcher, `supabase functions serve`) deletes `[ports]`,
+`[exports]` and `[[render]]`. There is no separate `worker` template, since
+it would differ only by those deletions. The `supabase` and `process`
+templates carry a commented `workdir` for monorepos (the `supabase` one notes
+that `[[render]] path` changes with it). A render `find` that matches 0 times
+often means the file lacks that setting, so the tool uses its own default and
+every instance shares it; the error says so, and the fix is to add the line,
+not to delete the rule.
+
 ### Committed definitions, local state
 
 `.newgit/` splits into a control plane and a data plane:

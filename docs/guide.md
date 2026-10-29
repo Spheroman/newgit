@@ -306,7 +306,10 @@ Remote:
 
 Resource templates: `process`, `pnpm`, `install`, `command-snapshot`,
 `command-snapshot-migrations`, `supabase`, `external`. `newgit resource
-templates --show <name>` prints one in full without creating anything.
+templates --show <name>` prints one in full without creating anything. Their
+comments say what to edit: `process` works without a port (delete `[ports]`,
+`[exports]` and `[[render]]`), and `supabase` needs every service's section
+in `config.toml` and has a commented `workdir` for monorepos.
 
 ## Behavior worth knowing
 

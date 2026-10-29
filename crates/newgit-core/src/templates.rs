@@ -45,6 +45,13 @@ depends_on = []
 # workspace root; uncomment and every command runs from there instead.
 # workdir = "packages/app"
 
+# THE PORT IS OPTIONAL. This template assumes a dev server with a port of its
+# own. If yours listens on none (a worker, a queue consumer, a file watcher
+# like `tsc --watch`, or `supabase functions serve`, which is served through
+# the `supabase` resource's `api` port), delete `[ports]`, `[exports]` and
+# `[[render]]` below and keep only the actions. Name what it needs in
+# `depends_on` above (`supabase functions serve` wants ["supabase"]).
+
 [ports]
 # `env` is the variable your dev server reads its port from. Every resource's
 # environment lands in one process environment, so the name has to be unique
@@ -365,6 +372,21 @@ RESOURCE_URL = "postgres://localhost/{{branch.slug}}"
 # instead of starting its own. A mismatched `find` refuses at spawn naming
 # the file and the string, which is the failure you want; a *missing* render
 # would silently share a database between branches.
+#
+# The same goes for every port below. The CLI uses a built-in default for a
+# service whose section is missing from config.toml, and every instance
+# shares that default. A fresh `supabase init` file has all six sections; an
+# older or trimmed one may lack `[inbucket]` or `[analytics]`. Newgit cannot
+# rewrite a line that is not there, so that bind fails naming the string it
+# did not find. Add the section to config.toml (`[inbucket]` with `port =
+# 54324`, `[analytics]` with `port = 54327`). Do not delete the rule to make
+# the bind pass: the port would then collide between instances.
+
+# In a monorepo, `supabase` usually lives in a package, not the workspace
+# root. Uncomment and every action below runs from there. Change `path` in
+# the [[render]] along with it ("apps/db/supabase/config.toml"), or the
+# render rewrites a file the CLI never reads.
+# workdir = "apps/db"
 
 [ports]
 # Supabase's committed defaults, one lane each. `start` is where scanning

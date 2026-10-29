@@ -736,6 +736,12 @@ Four rules carry the rest:
   `count = 2` rather than reaching for an "all" flag — a declared number keeps
   failing when the file changes from two occurrences to three. Where two
   sections share a default, make `find` multi-line.
+
+  A `find` that occurs 0 times often means the file has no line for that
+  setting at all, such as a `supabase/config.toml` without `[inbucket]`. The
+  tool then uses its own built-in default, and every instance shares it. The
+  error says so. Add the line to the committed file so there is one to
+  rewrite; deleting the rule makes the bind pass and leaves the collision.
 - **Replacements are simultaneous.** Every `find` is located in the committed
   content and the whole batch applies at once, so a replacement's output is
   never a match target and reordering `replace` cannot change the result. Two
