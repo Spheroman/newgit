@@ -9,9 +9,9 @@ use newgit_core::export::{ExportFilter, Reason};
 use newgit_core::exports::unresolved_placeholder;
 use newgit_core::installs::InstallReport;
 use newgit_core::manager::{
-    ActionOutcome, ActionPlan, BaseReport, BindOrigin, BranchManager, DiffPair, ExportReason,
-    InstanceReport, KeptBranch, MismatchCause, RemoteExportOptions, RemoveOutcome,
-    ResourceBindOutcome, SourceBranchOutcome, SourceBranchPolicy, StopStartOutcome,
+    ActionOutcome, ActionPlan, BaseReport, BindOrigin, BranchManager, DEFAULT_READY_WAIT, DiffPair,
+    ExportReason, InstanceReport, KeptBranch, MismatchCause, Readiness, RemoteExportOptions,
+    RemoveOutcome, ResourceBindOutcome, SourceBranchOutcome, SourceBranchPolicy, StopStartOutcome,
     StopStartResource, StopStartStatus, TrackerBindOutcome, UndoOptions, VerifyResource,
 };
 use newgit_core::resource::{CheckpointMode, ResourceDefinition};
@@ -1148,6 +1148,14 @@ fn spawn(args: SpawnArgs) -> Result<()> {
             private: args.private,
         },
     )?;
+    // After the autostart, which is the only thing that leaves a process up
+    // with its port not yet answering: give it a few seconds, then say what
+    // is still starting. Not worth waiting on a spawn that did not come up.
+    let readiness = if outcome.is_complete() {
+        manager.readiness_after(&outcome.branch, DEFAULT_READY_WAIT)
+    } else {
+        Readiness::default()
+    };
     if args.json {
         let resources = outcome
             .branch
@@ -1174,6 +1182,7 @@ fn spawn(args: SpawnArgs) -> Result<()> {
                 "projection_warning": outcome.projection_warning,
                 "resources": resources,
                 "started": stop_start_resources_json(&outcome.started),
+                "starting": starting_json(&readiness),
             })
         );
         // The exit the human-readable summary below gives, for the same
@@ -1331,14 +1340,21 @@ fn spawn(args: SpawnArgs) -> Result<()> {
             ),
         );
     }
-    let readiness = manager.readiness(branch);
-    if readiness.is_ready() {
+    if readiness.is_ready() && !readiness.is_starting() {
         println!("ready: `{}`", branch.name);
+    } else if readiness.is_ready() {
+        println!("starting: `{}`", branch.name);
     } else {
         println!("not ready: `{}`", branch.name);
         for problem in &readiness.problems {
             println!("  - {problem}");
         }
+    }
+    for starting in &readiness.starting {
+        println!("  - {}", starting.message());
+    }
+    if readiness.is_starting() {
+        println!("  `newgit status` shows when it is up.");
     }
     Ok(())
 }
@@ -1654,6 +1670,18 @@ fn stop_start_resources_json(resources: &[StopStartResource]) -> serde_json::Val
                 entry["error"] = serde_json::json!(error);
             }
             entry
+        })
+        .collect()
+}
+
+/// `{"resource", "ports"}` per running resource whose ports have not answered
+/// yet. Not a failure: `spawn` exits 0 with these, as it does for `ready`.
+fn starting_json(readiness: &Readiness) -> serde_json::Value {
+    readiness
+        .starting
+        .iter()
+        .map(|starting| {
+            serde_json::json!({ "resource": starting.resource, "ports": starting.ports })
         })
         .collect()
 }
@@ -2273,6 +2301,15 @@ fn status(name: Option<&str>, path_only: bool) -> Result<()> {
             println!("  - {problem}");
         }
     }
+    for report in reports
+        .iter()
+        .filter(|report| report.workspace_exists && report.readiness.is_starting())
+    {
+        println!("\n`{}` is still starting:", report.branch.name);
+        for starting in &report.readiness.starting {
+            println!("  - {}", starting.message());
+        }
+    }
     if any_never_pulled {
         println!(
             "\n^ = its `main` has content this instance never pulled; catch up with `newgit tracker pull <tracker> [instance]`"
@@ -2298,10 +2335,12 @@ fn status_column(report: &InstanceReport) -> String {
     if !report.workspace_exists {
         return "ws-missing".to_owned();
     }
-    let health = if report.readiness.is_ready() {
-        "ready"
-    } else {
+    let health = if !report.readiness.is_ready() {
         "not ready"
+    } else if report.readiness.is_starting() {
+        "starting"
+    } else {
+        "ready"
     };
     let health = if report.branch.private {
         format!("{health}, private")

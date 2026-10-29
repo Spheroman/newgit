@@ -302,6 +302,10 @@ or depends on a resource whose start failed is not started, and the spawn
 says so and exits 1, as it does for a failed `prepare`; `spawn --json`
 lists each attempt under `started`. A dependent starts once its
 dependency's process exists, not once it answers (#54).
+After starting them, `spawn` waits up to five seconds for the ports of what
+is running to answer. A server still compiling after that is `starting`, not
+a failure: `spawn` exits 0, says so, and `spawn --json` lists it under
+`starting`; `newgit status` shows `starting` until the port answers.
 `spawn --from-checkpoint` starts them after its restore, and `newgit
 tracker use` starts those of the resources the tracker brings, which `drop`
 stopped. Nothing else autostarts: `newgit start` brings back exactly what

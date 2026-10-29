@@ -823,6 +823,29 @@ fix it. An `autostart` action that did not start counts too: an instance
 whose dev server is down is not up. The instance is not rolled back.
 `--from-checkpoint` judges by the instance the restore leaves (#208).
 
+#### Starting is not failing
+
+A dev server that compiles before it listens (Next.js) is doing what it
+should, and a spawn that called it a problem looked like a failure. A running
+process whose port is not answering yet is `starting`, a state of its own:
+not a problem, not "not ready". After the autostart, `spawn` polls the ports
+of what is running for up to five seconds and returns as soon as they answer,
+so a fast server costs nothing. What is still unanswered is then reported as
+starting, not as a failure, with a pointer to `newgit status`:
+
+```text
+starting: `feature-a`
+  - `app` is still starting: not answering yet on web (3000)
+  `newgit status` shows when it is up.
+```
+
+`status` shows the same state: the STATUS column says `starting` (a real
+problem still says `not ready`, and wins), with the lines under it. It is
+checked at read time, so it clears on its own once the port answers.
+`spawn --json` lists them under `starting` (`resource` and the `ports` that
+have not answered) and exits 0 as for a ready instance. The wait is fixed;
+a server that takes longer simply shows as starting.
+
 ### Run and env
 
 `newgit run [instance] -- <command>` runs a command in the workspace with

@@ -558,17 +558,63 @@ pub struct InstanceReport {
 /// Whether an instance works right now — checked, not remembered: each
 /// resource bound, each tree it builds present, each port of a running one
 /// answering. What `status` and the end of `spawn` say.
+///
+/// A running process whose port is not answering *yet* is not a problem: a
+/// dev server that compiles before it listens is doing what it should. It is
+/// `starting`, a state of its own that neither fails `is_ready` nor counts as
+/// a problem, and that clears by itself once the port answers.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Readiness {
     /// What is wrong, one line each; empty when ready.
     pub problems: Vec<String>,
+    /// Running processes whose ports have not answered yet.
+    pub starting: Vec<Starting>,
 }
 
 impl Readiness {
+    /// Nothing is wrong. A process that is still starting is not wrong.
     pub fn is_ready(&self) -> bool {
         self.problems.is_empty()
     }
+
+    pub fn is_starting(&self) -> bool {
+        !self.starting.is_empty()
+    }
 }
+
+/// A running resource process whose ports are not answering yet.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Starting {
+    pub resource: String,
+    /// The ports that have not answered, by name.
+    pub ports: BTreeMap<String, u16>,
+}
+
+impl Starting {
+    /// One line, for `status` and the end of `spawn`.
+    pub fn message(&self) -> String {
+        let ports = self
+            .ports
+            .iter()
+            .map(|(name, port)| format!("{name} ({port})"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!(
+            "`{}` is still starting: not answering yet on {ports}",
+            self.resource
+        )
+    }
+}
+
+/// Whether something accepts connections on `port` of this machine.
+fn port_answers(port: u16) -> bool {
+    let address = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+    std::net::TcpStream::connect_timeout(&address, std::time::Duration::from_millis(300)).is_ok()
+}
+
+/// How long `spawn` waits for the ports of what it started to answer before
+/// it reports them as still starting.
+pub const DEFAULT_READY_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BaseReport {
@@ -1825,8 +1871,12 @@ impl BranchManager {
                 "its workspace is missing ({})",
                 branch.workspace_path
             ));
-            return Readiness { problems };
+            return Readiness {
+                problems,
+                starting: Vec::new(),
+            };
         }
+        let mut starting = Vec::new();
         let supervisor = self.supervisor(branch);
         for (name, binding) in &branch.resources {
             let Ok(definition) = self.resource_definition(name) else {
@@ -1870,23 +1920,35 @@ impl BranchManager {
                 }
             }
             if supervisor.running_pid(name).is_some() {
-                for (port_name, port) in &binding.resolved_ports {
-                    let address = std::net::SocketAddr::from(([127, 0, 0, 1], *port));
-                    let answering = std::net::TcpStream::connect_timeout(
-                        &address,
-                        std::time::Duration::from_millis(300),
-                    )
-                    .is_ok();
-                    if !answering {
-                        problems.push(format!(
-                            "`{name}` is running but its port {port_name} ({port}) is not \
-                             answering yet"
-                        ));
-                    }
+                let ports: BTreeMap<String, u16> = binding
+                    .resolved_ports
+                    .iter()
+                    .filter(|(_, port)| !port_answers(**port))
+                    .map(|(port_name, port)| (port_name.clone(), *port))
+                    .collect();
+                if !ports.is_empty() {
+                    starting.push(Starting {
+                        resource: name.clone(),
+                        ports,
+                    });
                 }
             }
         }
-        Readiness { problems }
+        Readiness { problems, starting }
+    }
+
+    /// [`Self::readiness`], after giving what is still starting up to `wait`
+    /// to answer. Returns as soon as nothing is starting, so a spawn that
+    /// started nothing, or whose servers are already up, waits not at all.
+    pub fn readiness_after(&self, branch: &BranchInstance, wait: std::time::Duration) -> Readiness {
+        let deadline = std::time::Instant::now() + wait;
+        loop {
+            let readiness = self.readiness(branch);
+            if !readiness.is_starting() || std::time::Instant::now() >= deadline {
+                return readiness;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
     }
 
     /// Whether every tree `definition` builds is in the workspace.

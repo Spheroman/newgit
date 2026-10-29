@@ -71,7 +71,7 @@ An instance works on what it binds:
 newgit spawn fix-db --use staging-db --drop electron   # one per role; the rest as you say
 newgit tracker drop electron --stash   # out of the working tree, history untouched
 newgit tracker use electron            # back, with the stashed work
-newgit status                          # ready / not ready, and why
+newgit status                          # ready / starting / not ready, and why
 ```
 
 Trackers sharing a `role` are alternatives (`dev-db`, `staging-db`); a spawn
@@ -240,7 +240,8 @@ inside a workspace):
 - `newgit init [--name <name>]` / `spawn <name> [--from <rev>] [--use
   <tracker>] [--drop <tracker>] [--private] [--json]` / `status [name]` /
   `remove <name> [--purge] [--keep-branch | --delete-branch]` — `status`
-  says whether each instance is ready, and why not
+  says whether each instance is ready, still starting (a dev server that is
+  not listening yet), or not ready, and why
 - `newgit status <instance> --path` — just the workspace path, for scripts
 - `newgit reference [section | all]` — the definition format, every key and
   default; bare, it lists the sections
