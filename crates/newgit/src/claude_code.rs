@@ -59,11 +59,37 @@ fn install(shared: bool) -> Result<()> {
     }
     let root = context.store.paths().project_root.clone();
     let file = root.join(if shared {
-        ".claude/settings.json"
+        SHARED_SETTINGS
     } else {
-        ".claude/settings.local.json"
+        LOCAL_SETTINGS
     });
-    let mut settings: Value = match std::fs::read_to_string(&file) {
+    if !write_hooks(&file)? {
+        println!(
+            "Claude Code already uses newgit here ({})",
+            display(&root, &file)
+        );
+        return Ok(());
+    }
+    if !shared {
+        exclude_local_settings(&root)?;
+    }
+    println!(
+        "Wrote the WorktreeCreate and WorktreeRemove hooks to {}",
+        display(&root, &file)
+    );
+    println!("  `claude --worktree <name>` now spawns a newgit instance named <name>");
+    println!("  subagents with `isolation: \"worktree\"` get one each; Claude Code keeps");
+    println!("  those when the subagent ends, so `newgit remove` them when you're done");
+    Ok(())
+}
+
+const SHARED_SETTINGS: &str = ".claude/settings.json";
+const LOCAL_SETTINGS: &str = ".claude/settings.local.json";
+
+/// Add both hooks to the Claude Code settings file at `file`, keeping
+/// whatever else it holds. False when they were there already.
+fn write_hooks(file: &Utf8Path) -> Result<bool> {
+    let mut settings: Value = match std::fs::read_to_string(file) {
         Ok(text) => serde_json::from_str(&text).with_context(|| format!("{file} is not JSON"))?,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => json!({}),
         Err(error) => return Err(error).with_context(|| format!("reading {file}")),
@@ -86,48 +112,96 @@ fn install(shared: bool) -> Result<()> {
             .or_insert_with(|| Value::Array(Vec::new()))
             .as_array_mut()
             .with_context(|| format!("`hooks.{event}` in {file} is not an array"))?;
-        let present = entries.iter().any(|entry| {
-            entry["hooks"].as_array().is_some_and(|handlers| {
-                handlers
-                    .iter()
-                    .any(|handler| handler["command"].as_str() == Some(command))
-            })
-        });
-        if !present {
-            // One handler per event: Claude Code runs every WorktreeCreate
-            // hook it finds, and two of them would race to make the worktree.
-            if !entries.is_empty() {
-                bail!(
-                    "{file} already has a {event} hook; remove it, then run this again \
-                     (only one hook can create the worktree)"
-                );
-            }
-            entries.push(json!({ "hooks": [{ "type": "command", "command": command }] }));
-            changed = true;
+        if has_hook(entries, command) {
+            continue;
         }
+        // One handler per event: Claude Code runs every WorktreeCreate hook
+        // it finds, and two of them would race to make the worktree.
+        if !entries.is_empty() {
+            bail!(
+                "{file} already has a {event} hook; remove it, then run this again \
+                 (only one hook can create the worktree)"
+            );
+        }
+        entries.push(json!({ "hooks": [{ "type": "command", "command": command }] }));
+        changed = true;
     }
-    if !changed {
-        println!(
-            "Claude Code already uses newgit here ({})",
-            display(&root, &file)
-        );
+    if changed {
+        std::fs::create_dir_all(file.parent().expect("settings file has a parent"))
+            .with_context(|| format!("creating the directory for {file}"))?;
+        std::fs::write(
+            file,
+            format!("{}\n", serde_json::to_string_pretty(&settings)?),
+        )
+        .with_context(|| format!("writing {file}"))?;
+    }
+    Ok(changed)
+}
+
+fn has_hook(entries: &[Value], command: &str) -> bool {
+    entries.iter().any(|entry| {
+        entry["hooks"].as_array().is_some_and(|handlers| {
+            handlers
+                .iter()
+                .any(|handler| handler["command"].as_str() == Some(command))
+        })
+    })
+}
+
+/// Whether the settings file at `file` already runs both hooks.
+fn hooks_present(file: &Utf8Path) -> bool {
+    let Ok(text) = std::fs::read_to_string(file) else {
+        return false;
+    };
+    let Ok(settings) = serde_json::from_str::<Value>(&text) else {
+        return false;
+    };
+    [
+        ("WorktreeCreate", CREATE_HOOK),
+        ("WorktreeRemove", REMOVE_HOOK),
+    ]
+    .iter()
+    .all(|(event, command)| {
+        settings["hooks"][event]
+            .as_array()
+            .is_some_and(|entries| has_hook(entries, command))
+    })
+}
+
+/// Keep `.claude/settings.local.json` out of Git in the checkout at `dir`,
+/// through its `info/exclude` rather than a `.gitignore` someone would have
+/// to commit. Nothing to do when something already ignores it.
+fn exclude_local_settings(dir: &Utf8Path) -> Result<()> {
+    let ignored = Command::new("git")
+        .args(["check-ignore", "-q", LOCAL_SETTINGS])
+        .current_dir(dir)
+        .status()
+        .context("running git check-ignore")?;
+    if ignored.success() {
         return Ok(());
     }
-    std::fs::create_dir_all(file.parent().expect("settings file has a parent"))
-        .with_context(|| format!("creating the directory for {file}"))?;
-    std::fs::write(
-        &file,
-        format!("{}\n", serde_json::to_string_pretty(&settings)?),
-    )
-    .with_context(|| format!("writing {file}"))?;
-    println!(
-        "Wrote the WorktreeCreate and WorktreeRemove hooks to {}",
-        display(&root, &file)
-    );
-    println!("  `claude --worktree <name>` now spawns a newgit instance named <name>");
-    println!("  subagents with `isolation: \"worktree\"` get one each; Claude Code keeps");
-    println!("  those when the subagent ends, so `newgit remove` them when you're done");
-    Ok(())
+    let output = Command::new("git")
+        .args([
+            "rev-parse",
+            "--path-format=absolute",
+            "--git-path",
+            "info/exclude",
+        ])
+        .current_dir(dir)
+        .output()
+        .context("running git rev-parse")?;
+    if !output.status.success() {
+        bail!("{dir} is not a Git checkout");
+    }
+    let exclude = Utf8PathBuf::from(String::from_utf8_lossy(&output.stdout).trim());
+    let mut contents = std::fs::read_to_string(&exclude).unwrap_or_default();
+    if !contents.is_empty() && !contents.ends_with('\n') {
+        contents.push('\n');
+    }
+    contents.push_str(&format!("/{LOCAL_SETTINGS}\n"));
+    std::fs::create_dir_all(exclude.parent().expect("exclude file has a parent"))
+        .with_context(|| format!("creating the directory for {exclude}"))?;
+    std::fs::write(&exclude, contents).with_context(|| format!("writing {exclude}"))
 }
 
 fn display(root: &Utf8Path, path: &Utf8Path) -> String {
@@ -161,12 +235,25 @@ fn worktree_create() -> Result<()> {
     let cwd = Utf8PathBuf::from(input_str(&input, "cwd")?);
     // From inside a workspace, `discover` resolves to its store, so a session
     // already running in an instance spawns a sibling, not a nested one.
-    let root = MetadataStore::discover(&cwd)
+    let store = MetadataStore::discover(&cwd)
         .with_context(|| format!("{cwd} is not in a newgit project; run `newgit init` there"))?
-        .store
-        .paths()
-        .project_root
-        .clone();
+        .store;
+    // `claude --worktree <name>` with a name it has used before resumes that
+    // worktree, as it does a Git one: the instance is already there, so hand
+    // back its workspace rather than fail to spawn a second.
+    if let Ok(existing) = store.find_branch(name) {
+        if !existing.workspace_path.is_dir() {
+            bail!(
+                "instance {name} exists but its workspace {} is gone; \
+                 `newgit remove {name}` it first",
+                existing.workspace_path
+            );
+        }
+        eprintln!("newgit: resuming instance {name}");
+        hand_back(&existing.workspace_path);
+        return Ok(());
+    }
+    let root = store.paths().project_root.clone();
     let output = newgit(&root, &["spawn", name, "--json"])?
         .stderr(Stdio::inherit())
         .output()
@@ -187,8 +274,28 @@ fn worktree_create() -> Result<()> {
             "newgit: instance {name} spawned with resources down; `newgit status {name}` says which"
         );
     }
-    println!("{workspace}");
+    hand_back(Utf8Path::new(&workspace));
     Ok(())
+}
+
+/// Print `workspace` for Claude Code, having made sure its removal will run
+/// `newgit remove`.
+///
+/// Claude Code reads the WorktreeRemove hook from the settings of the session
+/// it is ending, which runs in the workspace. The store's local settings
+/// never reach it, so without its own copy, removing the worktree would fall
+/// back to `git worktree remove` and leave the instance behind.
+fn hand_back(workspace: &Utf8Path) {
+    if !hooks_present(&workspace.join(SHARED_SETTINGS))
+        && let Err(error) = write_hooks(&workspace.join(LOCAL_SETTINGS))
+            .and_then(|_| exclude_local_settings(workspace))
+    {
+        eprintln!(
+            "newgit: could not add the hooks to {workspace}/{LOCAL_SETTINGS}, so removing \
+             this worktree from Claude Code will leave the instance: {error:#}"
+        );
+    }
+    println!("{workspace}");
 }
 
 fn worktree_remove() -> Result<()> {

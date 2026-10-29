@@ -198,12 +198,25 @@ the second runs `newgit remove` when Claude Code removes the worktree.
 `--shared` writes `.claude/settings.json` instead, for a team that all has
 `newgit` on its `PATH`.
 
+- Claude Code runs a project's hooks only once you have trusted the
+  folder: run `claude` there once and accept the prompt before using
+  `--worktree`.
+- `claude --worktree <name>` with a name already in use resumes that
+  instance, as it would a Git worktree.
+- Each workspace gets the two hooks in its own
+  `.claude/settings.local.json`, kept out of Git through its
+  `.git/info/exclude`. Claude Code reads the remove hook from the
+  directory the session ends in, so without it, choosing "Remove worktree"
+  on exit would leave the instance behind.
 - A hook replaces Claude Code's worktree handling entirely, so
   `.worktreeinclude` is not read. Trackers are how files Git shouldn't hold
   reach the workspace.
 - Claude Code keeps a subagent's worktree when the subagent ends and never
-  runs the remove hook for it. `newgit status` lists those instances;
-  `newgit remove` them when you're done.
+  runs the remove hook for it. `newgit status` lists those instances (named
+  `agent-<id>`); `newgit remove` them when you're done.
+- `claude rm` on a background session refuses while it has unpushed
+  commits, and a workspace's commits stay in its own clone until pushed.
+  Discarding them there discards them for good.
 - `install` refuses when the settings file already has a `WorktreeCreate`
   hook, since only one hook can make the worktree.
 - A spawn whose resources did not all come up still hands Claude Code the

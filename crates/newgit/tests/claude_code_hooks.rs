@@ -180,3 +180,56 @@ fn remove_refuses_the_store_itself() {
     assert!(!output.status.success());
     assert!(repo.join("README.md").is_file());
 }
+
+/// Claude Code reads the WorktreeRemove hook from the session's own
+/// directory, the workspace, so each workspace carries the hooks itself, in
+/// a settings file Git never sees.
+#[test]
+fn create_gives_the_workspace_the_hooks_out_of_git() {
+    let (_guard, temp) = tempdir();
+    let repo = setup(&temp);
+
+    let input = serde_json::json!({ "cwd": repo, "name": "feat" });
+    let created = newgit(
+        &repo,
+        &["claude-code", "worktree-create"],
+        &input.to_string(),
+    );
+    assert!(created.status.success(), "{created:?}");
+    let workspace = Utf8PathBuf::from(String::from_utf8(created.stdout).expect("utf8").trim());
+
+    let settings: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(workspace.join(".claude/settings.local.json"))
+            .expect("workspace settings"),
+    )
+    .expect("json");
+    assert_eq!(
+        settings["hooks"]["WorktreeRemove"][0]["hooks"][0]["command"],
+        "newgit claude-code worktree-remove"
+    );
+    let status = Command::new("git")
+        .args(["status", "--porcelain"])
+        .current_dir(workspace.as_str())
+        .output()
+        .expect("git status");
+    assert_eq!(
+        String::from_utf8_lossy(&status.stdout),
+        "",
+        "the hooks file is not untracked work"
+    );
+}
+
+/// `claude --worktree <name>` twice resumes the first instance instead of
+/// failing to spawn a second one with the same name.
+#[test]
+fn create_resumes_an_existing_instance() {
+    let (_guard, temp) = tempdir();
+    let repo = setup(&temp);
+    let input = serde_json::json!({ "cwd": repo, "name": "feat" }).to_string();
+
+    let first = newgit(&repo, &["claude-code", "worktree-create"], &input);
+    assert!(first.status.success(), "{first:?}");
+    let second = newgit(&repo, &["claude-code", "worktree-create"], &input);
+    assert!(second.status.success(), "{second:?}");
+    assert_eq!(first.stdout, second.stdout);
+}
