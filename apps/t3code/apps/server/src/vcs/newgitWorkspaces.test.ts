@@ -5,11 +5,13 @@ import { assert, describe, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
+import * as Logger from "effect/Logger";
+import * as Option from "effect/Option";
 import * as Path from "effect/Path";
 
 import * as ServerConfig from "../config.ts";
 import * as GitVcsDriver from "./GitVcsDriver.ts";
-import { readNewgitWorkspace } from "./newgitWorkspaces.ts";
+import { readNewgitWorkspace, spawnNewgitWorkspace } from "./newgitWorkspaces.ts";
 
 const newgitAvailable =
   NodeChildProcess.spawnSync(process.env.T3CODE_NEWGIT_BIN || "newgit", ["--version"]).status === 0;
@@ -24,7 +26,101 @@ const run = (cwd: string, command: string, args: ReadonlyArray<string>) => {
   if (result.status !== 0) throw new Error(`${command} ${args.join(" ")}: ${result.stderr}`);
 };
 
+// Point T3CODE_NEWGIT_BIN at a script standing in for newgit for the scope's lifetime.
+const fakeNewgit = (script: string) =>
+  Effect.gen(function* () {
+    const fileSystem = yield* FileSystem.FileSystem;
+    const path = yield* Path.Path;
+    const bin = path.join(yield* fileSystem.makeTempDirectoryScoped(), "newgit");
+    yield* fileSystem.writeFileString(bin, `#!/bin/sh\n${script}\n`);
+    yield* fileSystem.chmod(bin, 0o755);
+    yield* Effect.acquireRelease(
+      Effect.sync(() => {
+        const previous = process.env.T3CODE_NEWGIT_BIN;
+        process.env.T3CODE_NEWGIT_BIN = bin;
+        return previous;
+      }),
+      (previous) =>
+        Effect.sync(() => {
+          if (previous === undefined) delete process.env.T3CODE_NEWGIT_BIN;
+          else process.env.T3CODE_NEWGIT_BIN = previous;
+        }),
+    );
+  });
+
 describe("newgit workspaces", () => {
+  it.effect("opens the workspace when spawn exits 1 because a resource did not come up", () =>
+    Effect.gen(function* () {
+      const report = JSON.stringify({
+        workspace: "/tmp/ws/feature",
+        resources: [
+          { name: "db", status: "failed", blocked_by: [], prepare_log: "/tmp/db.log" },
+          { name: "web", status: "blocked", blocked_by: ["db"], prepare_log: null },
+        ],
+      });
+      yield* fakeNewgit(`echo '${report}'; echo 'db: prepare failed' >&2; exit 1`);
+      const logs: string[] = [];
+      const workspace = yield* spawnNewgitWorkspace({
+        cwd: process.cwd(),
+        name: "feature",
+        from: "main",
+      }).pipe(
+        Effect.provide(
+          Logger.layer([Logger.make(({ message }) => logs.push(JSON.stringify(message)))]),
+        ),
+      );
+      assert.deepEqual(workspace, Option.some("/tmp/ws/feature"));
+      const warning = logs.find((line) => line.includes("not ready")) ?? "";
+      assert.include(warning, "db (failed): see /tmp/db.log");
+      assert.include(warning, "web (blocked): blocked by db");
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+
+  it.effect("still fails when spawn exits 1 without a report", () =>
+    Effect.gen(function* () {
+      yield* fakeNewgit("echo 'no such ref: nope' >&2; exit 1");
+      const error = yield* spawnNewgitWorkspace({
+        cwd: process.cwd(),
+        name: "feature",
+        from: "nope",
+      }).pipe(Effect.flip);
+      assert.equal(error.detail, "no such ref: nope");
+      assert.equal(error.exitCode, 1);
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+
+  it.effect("still fails on exit codes other than 1", () =>
+    Effect.gen(function* () {
+      yield* fakeNewgit(`echo '{"workspace":"/tmp/ws/feature"}'; exit 2`);
+      const error = yield* spawnNewgitWorkspace({
+        cwd: process.cwd(),
+        name: "feature",
+        from: "main",
+      }).pipe(Effect.flip);
+      assert.equal(error.exitCode, 2);
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+
+  it.effect("falls back to a git worktree when newgit cannot run", () =>
+    Effect.gen(function* () {
+      const previous = process.env.T3CODE_NEWGIT_BIN;
+      process.env.T3CODE_NEWGIT_BIN = "/nonexistent/newgit";
+      const workspace = yield* spawnNewgitWorkspace({
+        cwd: process.cwd(),
+        name: "feature",
+        from: "main",
+      }).pipe(
+        Effect.ensuring(
+          Effect.sync(() => {
+            if (previous === undefined) delete process.env.T3CODE_NEWGIT_BIN;
+            else process.env.T3CODE_NEWGIT_BIN = previous;
+          }),
+        ),
+      );
+      assert.deepEqual(workspace, Option.none());
+    }).pipe(Effect.provide(NodeServices.layer)),
+  );
+
   it.effect("reads the instance marker and ignores plain directories", () =>
     Effect.gen(function* () {
       const fileSystem = yield* FileSystem.FileSystem;

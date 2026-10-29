@@ -19,8 +19,22 @@ import * as ProcessRunner from "../processRunner.ts";
 const SPAWN_TIMEOUT = Duration.minutes(15);
 const REMOVE_TIMEOUT = Duration.minutes(5);
 
+// The fields of `spawn --json` this module reads; newgit reports more.
+const SpawnResource = Schema.Struct({
+  name: Schema.String,
+  status: Schema.String,
+  blocked_by: Schema.optional(Schema.NullOr(Schema.Array(Schema.String))),
+  prepare_log: Schema.optional(Schema.NullOr(Schema.String)),
+  render_error: Schema.optional(Schema.NullOr(Schema.String)),
+  export_error: Schema.optional(Schema.NullOr(Schema.String)),
+});
 const decodeSpawnOutput = Schema.decodeUnknownEffect(
-  Schema.fromJsonString(Schema.Struct({ workspace: Schema.NonEmptyString })),
+  Schema.fromJsonString(
+    Schema.Struct({
+      workspace: Schema.NonEmptyString,
+      resources: Schema.optional(Schema.Array(SpawnResource)),
+    }),
+  ),
 );
 const isSpawnError = Schema.is(ProcessRunner.ProcessSpawnError);
 
@@ -74,11 +88,19 @@ export const readNewgitWorkspace = Effect.fn("newgitWorkspaces.readNewgitWorkspa
     );
 });
 
+interface NewgitOutput {
+  readonly stdout: string;
+  readonly stderr: string;
+  readonly exitCode: number;
+}
+
 const runNewgit = Effect.fn("newgitWorkspaces.runNewgit")(function* (input: {
   readonly operation: string;
   readonly cwd: string;
   readonly args: ReadonlyArray<string>;
   readonly timeout: Duration.Duration;
+  /** Exit codes after which stdout is still the command's report, besides 0. */
+  readonly reportExitCodes?: ReadonlyArray<number>;
 }) {
   const runner = yield* ProcessRunner.make();
   const command = `newgit ${input.args[0] ?? ""}`.trim();
@@ -95,27 +117,41 @@ const runNewgit = Effect.fn("newgitWorkspaces.runNewgit")(function* (input: {
       Effect.mapError((cause) => fail(`${command} could not run: ${cause.message}`, { cause })),
     );
   if (result.timedOut) return yield* fail(`${command} timed out`);
-  if (result.code !== 0) {
+  const exitCode = result.code === null ? null : Number(result.code);
+  if (exitCode === null || (exitCode !== 0 && !input.reportExitCodes?.includes(exitCode))) {
     return yield* fail(
       result.stderr.trim() || `${command} failed`,
-      result.code === null ? {} : { exitCode: Number(result.code) },
+      exitCode === null ? {} : { exitCode },
     );
   }
-  return result.stdout;
+  const output: NewgitOutput = { stdout: result.stdout, stderr: result.stderr, exitCode };
+  return output;
 });
 
+const describeResource = (resource: typeof SpawnResource.Type) => {
+  const reason =
+    resource.render_error ??
+    resource.export_error ??
+    (resource.blocked_by?.length ? `blocked by ${resource.blocked_by.join(", ")}` : null) ??
+    (resource.prepare_log ? `see ${resource.prepare_log}` : null);
+  return reason
+    ? `${resource.name} (${resource.status}): ${reason}`
+    : `${resource.name} (${resource.status})`;
+};
+
 /**
- * `newgit spawn <name> --from <ref>` in the project at `cwd`. Returns the new
- * workspace path, or None when newgit is not installed, so the caller can fall
- * back to a git worktree rather than fail the thread.
+ * `newgit spawn <name> --from <ref>` in the project at `cwd`. Returns the workspace
+ * path, or None when newgit can't run so the caller falls back to a git worktree.
+ * Exit 1 with a report means a resource didn't come up: open the workspace anyway.
  */
 export const spawnNewgitWorkspace = Effect.fn("newgitWorkspaces.spawnNewgitWorkspace")(
   function* (input: { readonly cwd: string; readonly name: string; readonly from: string }) {
-    const stdout = yield* runNewgit({
+    const output = yield* runNewgit({
       operation: "newgitWorkspaces.spawn",
       cwd: input.cwd,
       args: ["spawn", input.name, "--from", input.from, "--json"],
       timeout: SPAWN_TIMEOUT,
+      reportExitCodes: [1],
     }).pipe(
       Effect.asSome,
       Effect.catchIf(
@@ -124,22 +160,34 @@ export const spawnNewgitWorkspace = Effect.fn("newgitWorkspaces.spawnNewgitWorks
           Effect.logWarning("newgit is not runnable; using a git worktree instead", {
             cwd: input.cwd,
             detail: error.detail,
-          }).pipe(Effect.as(Option.none<string>())),
+          }).pipe(Effect.as(Option.none<NewgitOutput>())),
       ),
     );
-    if (Option.isNone(stdout)) return Option.none<string>();
-    const { workspace } = yield* decodeSpawnOutput(stdout.value).pipe(
+    if (Option.isNone(output)) return Option.none<string>();
+    const { stdout, stderr, exitCode } = output.value;
+    const { workspace, resources = [] } = yield* decodeSpawnOutput(stdout).pipe(
       Effect.mapError(
         (cause) =>
           new GitCommandError({
             operation: "newgitWorkspaces.spawn",
             command: "newgit spawn",
             cwd: input.cwd,
-            detail: "newgit spawn did not report a workspace path",
+            detail:
+              exitCode === 0
+                ? "newgit spawn did not report a workspace path"
+                : stderr.trim() || "newgit spawn failed",
+            ...(exitCode === 0 ? {} : { exitCode }),
             cause,
           }),
       ),
     );
+    const notReady = resources.filter((resource) => resource.status !== "ready");
+    if (exitCode !== 0 || notReady.length > 0) {
+      yield* Effect.logWarning("newgit spawned the workspace, but some resources are not ready", {
+        workspace,
+        resources: notReady.map(describeResource),
+      });
+    }
     return Option.some(workspace);
   },
 );
