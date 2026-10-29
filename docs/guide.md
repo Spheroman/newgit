@@ -122,11 +122,13 @@ install that declares what it produces (`[identity] produces`) is built once
 and published to the install store in `.newgit/installs/`; every later
 instance with the same key is filled from it with a copy-on-write clone and
 never runs the install. The key covers the lockfile, the definition file,
-the `key_command` output, and which trackers the instance binds. Where the
-filesystem cannot clone (APFS, btrfs, and XFS can), newgit takes a full copy
-and says so. A tree that names its own workspace in a file is not shared,
-unless a `[[render]]` on that file lets the store rewrite it per instance;
-the `pnpm` template does this for pnpm's workspace state.
+the `key_command` output, and which paths the instance checks out (plus
+which trackers it binds, when the install is told them through
+`{{bound…}}`). Where the filesystem cannot clone (APFS, btrfs, and XFS
+can), newgit takes a full copy and says so. A tree that names its own
+workspace in a file is not shared, unless a `[[render]]` on that file lets
+the store rewrite it per instance; the `pnpm` template does this for pnpm's
+workspace state.
 
 On a miss, the cost is your package manager's. **pnpm**, uv, and bun
 hardlink from a shared cache, so a new tree is mostly directory entries.

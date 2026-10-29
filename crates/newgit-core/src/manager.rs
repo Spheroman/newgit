@@ -917,11 +917,11 @@ struct RestoreContext<'a> {
     /// This resource's state ref in the safety checkpoint taken moments ago:
     /// the workspace as it stood before this undo touched anything.
     pre_undo_state_ref: Option<&'a str>,
-    /// This undo restored a binding other than the one the instance had:
-    /// what `{{bound.trackers}}` and `{{bound.paths}}` render to moved, so
-    /// an install keyed on the binding is not the tree the checkpoint
+    /// What the instance dropped before this undo, when the undo restored
+    /// a different binding. An install whose store key that move reaches
+    /// ([`BranchManager::install_binding`]) is not the tree the checkpoint
     /// describes even when its identity paths are unchanged.
-    binding_moved: bool,
+    dropped_before: Option<&'a BTreeSet<String>>,
     force_recompute: bool,
 }
 
@@ -2865,9 +2865,43 @@ impl BranchManager {
         Some(Ok(crate::installs::identity_key(
             &rev,
             material.as_deref(),
-            &self.bound_vars(branch),
+            &self.install_binding(&branch.dropped, definition),
             &definition.definition_rev,
         )))
+    }
+
+    /// What of an instance's binding can reach `definition`'s install, for
+    /// its store key: the part of the binding that changes the tree it
+    /// builds. See [`crate::installs::identity_key`] for why each part is
+    /// there and why nothing else is.
+    ///
+    /// - Which paths the install can see: the sparse checkout the dropped
+    ///   code trackers leave, which is what an unfiltered `npm ci` reads
+    ///   when it finds workspace members on disk. Empty when no code
+    ///   tracker is dropped, so binding a secret tracker, or one that owns
+    ///   no paths, or creating or renaming a tracker that is bound, leaves
+    ///   it alone.
+    /// - What `{{bound.trackers}}` and `{{bound.paths}}` render to, only
+    ///   when the install can be told them: its own commands, `key_command`,
+    ///   exports or renders name one, or any resource's export or render
+    ///   does (every command's environment carries every export, and a
+    ///   render writes into the workspace).
+    fn install_binding(
+        &self,
+        dropped: &BTreeSet<String>,
+        definition: &ResourceDefinition,
+    ) -> String {
+        let mut material = self.sparse_patterns(dropped).join("\n");
+        let told = definition.mentions_bound()
+            || self.resources.iter().any(ResourceDefinition::spreads_bound);
+        if told {
+            let bound = self.bound_vars_for(dropped);
+            material.push('\0');
+            material.push_str(&bound.trackers);
+            material.push('\0');
+            material.push_str(&bound.paths);
+        }
+        material
     }
 
     /// Clone a stored tree in instead of building one, when the key hits.
@@ -4097,10 +4131,15 @@ impl BranchManager {
 
     /// `{{bound.trackers}}` and `{{bound.paths}}` for `branch`.
     fn bound_vars(&self, branch: &BranchInstance) -> crate::exports::Bound {
+        self.bound_vars_for(&branch.dropped)
+    }
+
+    /// [`Self::bound_vars`] for an instance that drops `dropped`.
+    fn bound_vars_for(&self, dropped: &BTreeSet<String>) -> crate::exports::Bound {
         let bound: Vec<&TrackerDefinition> = self
             .selectable()
             .into_iter()
-            .filter(|definition| !branch.dropped.contains(&definition.name))
+            .filter(|definition| !dropped.contains(&definition.name))
             .collect();
         crate::exports::Bound {
             trackers: bound
@@ -4611,7 +4650,7 @@ impl BranchManager {
     fn binding_before(&self, instance: &str) -> Result<BindingBefore> {
         let branch = self.store.find_branch(instance)?;
         Ok(BindingBefore {
-            bound: self.bound_vars(&branch),
+            dropped: branch.dropped.clone(),
             resources: branch.resources.keys().cloned().collect(),
         })
     }
@@ -4619,16 +4658,19 @@ impl BranchManager {
     /// Rebuild every bound install whose tree the binding keys, after a
     /// `use` or `drop` moved the binding from `before`.
     ///
-    /// The install store keys a tree on the trackers the instance binds: a
-    /// shared lockfile lists every member, bound or not, and the install
-    /// builds the bound ones, named by `{{bound.paths}}` or found on disk.
-    /// So the tree an instance holds was built for the binding it had, and
-    /// once that moves it is the tree of some other binding — whatever the
-    /// lockfile says. Starting and stopping what the tracker *brings* does
-    /// not reach it, because a shared install is brought by `root`, which is
-    /// always bound. The binding here is the store key's: secret trackers
-    /// count (`{{bound.trackers}}` names them), so binding or dropping one
-    /// rebuilds too, through the store like any other.
+    /// The install store keys a tree on the part of the binding that can
+    /// reach it ([`Self::install_binding`]): a shared lockfile lists every
+    /// member, bound or not, and the install builds the ones it can see,
+    /// found on disk or named by `{{bound.paths}}`. So when that part moves,
+    /// the tree an instance holds is the tree of some other binding —
+    /// whatever the lockfile says. Starting and stopping what the tracker
+    /// *brings* does not reach it, because a shared install is brought by
+    /// `root`, which is always bound.
+    ///
+    /// When that part has not moved, the install is left alone and not
+    /// reported: binding a secret tracker, or one that owns no paths,
+    /// cannot change what `npm ci` sees, and rebuilding for it was a full
+    /// install for an identical tree (#248).
     ///
     /// This is the same job a spawn does for the same tree, so it goes the
     /// same way: filled from the store when another instance built this
@@ -4654,7 +4696,7 @@ impl BranchManager {
         before: &BindingBefore,
     ) -> Result<Vec<RebuiltInstall>> {
         let mut branch = self.store.find_branch(instance)?;
-        if self.bound_vars(&branch) == before.bound {
+        if branch.dropped == before.dropped {
             return Ok(Vec::new());
         }
         let mut rebuilt = Vec::new();
@@ -4680,6 +4722,8 @@ impl BranchManager {
             };
             if definition.identity_produces().is_empty()
                 || !self.produced_present(&branch, definition)
+                || self.install_binding(&before.dropped, definition)
+                    == self.install_binding(&branch.dropped, definition)
             {
                 continue;
             }
@@ -4757,14 +4801,28 @@ impl BranchManager {
     /// inside one put back.
     fn apply_sparse(&self, branch: &BranchInstance) -> Result<()> {
         let workspace = branch.workspace_path.as_str();
+        let patterns = self.sparse_patterns(&branch.dropped);
+        if patterns.is_empty() {
+            crate::source::run_git_env(&["-C", workspace, "sparse-checkout", "disable"], &[])?;
+            return Ok(());
+        }
+        let mut args = vec!["-C", workspace, "sparse-checkout", "set", "--no-cone"];
+        args.extend(patterns.iter().map(String::as_str));
+        crate::source::run_git_env(&args, &[])?;
+        Ok(())
+    }
+
+    /// The sparse-checkout patterns for an instance that drops `dropped`:
+    /// every dropped code tracker's paths left out, with any bound tracker
+    /// nested inside one put back. Empty when nothing is left out.
+    fn sparse_patterns(&self, dropped_names: &BTreeSet<String>) -> Vec<String> {
         let dropped: Vec<&TrackerDefinition> = self
             .code
             .iter()
-            .filter(|definition| branch.dropped.contains(&definition.name))
+            .filter(|definition| dropped_names.contains(&definition.name))
             .collect();
-        if dropped.is_empty() {
-            crate::source::run_git_env(&["-C", workspace, "sparse-checkout", "disable"], &[])?;
-            return Ok(());
+        if dropped.iter().all(|definition| definition.paths.is_empty()) {
+            return Vec::new();
         }
         let mut patterns = vec!["/*".to_owned()];
         for definition in &dropped {
@@ -4774,7 +4832,7 @@ impl BranchManager {
             }
         }
         for definition in &self.code {
-            if branch.dropped.contains(&definition.name) {
+            if dropped_names.contains(&definition.name) {
                 continue;
             }
             for path in &definition.paths {
@@ -4790,10 +4848,7 @@ impl BranchManager {
                 }
             }
         }
-        let mut args = vec!["-C", workspace, "sparse-checkout", "set", "--no-cone"];
-        args.extend(patterns.iter().map(String::as_str));
-        crate::source::run_git_env(&args, &[])?;
-        Ok(())
+        patterns
     }
 
     pub fn capture_tracker(&self, instance: &str, tracker: &str) -> Result<CaptureReport> {
@@ -8060,7 +8115,7 @@ impl BranchManager {
         }
         let partial = !options.only.is_empty();
         let wanted = |name: &String| !partial || options.only.contains(name);
-        let mut binding_moved = false;
+        let mut dropped_before: Option<BTreeSet<String>> = None;
 
         // The message describes *when* this checkpoint was taken, and a
         // reader takes that as a description of *what is in it*. Those come
@@ -8153,7 +8208,7 @@ impl BranchManager {
             // and come back when the tracker is bound again (#210).
             let rebound = restored.dropped != branch.dropped;
             if rebound {
-                binding_moved = true;
+                dropped_before = Some(branch.dropped.clone());
                 for tracker in restored.dropped.difference(&branch.dropped) {
                     if let Some(definition) = self.trackers.iter().find(|d| &d.name == tracker) {
                         crate::tracker_repo::clear_owned_paths(&workspace, definition)?;
@@ -8326,7 +8381,7 @@ impl BranchManager {
                     state,
                     RestoreContext {
                         pre_undo_state_ref: pre_undo,
-                        binding_moved,
+                        dropped_before: dropped_before.as_ref(),
                         force_recompute: options.force_recompute,
                     },
                     &mut failures,
@@ -8478,15 +8533,15 @@ impl BranchManager {
                 // `node_modules` built from the newer one.
                 //
                 // The binding is an input too, and one the hash does not
-                // record: the install store keys a tree on the trackers the
-                // instance binds, because a shared lockfile lists every
-                // member and the install builds the bound ones. An undo that
-                // restored a different binding has changed what the tree is
-                // built from, whether or not the lockfile moved, so the skip
-                // compares the same inputs the store key does. Only for a
-                // resource the store keys at all, one that declares
-                // `[identity] produces`: a codegen step keyed on its inputs
-                // alone skips on them alone, as it did.
+                // record: the install store keys a tree on what of the
+                // binding can reach it, because a shared lockfile lists every
+                // member and the install builds the ones it can see. An undo
+                // that restored a binding that moves that has changed what
+                // the tree is built from, whether or not the lockfile moved,
+                // so the skip compares the same inputs the store key does.
+                // Only for a resource the store keys at all, one that
+                // declares `[identity] produces`: a codegen step keyed on its
+                // inputs alone skips on them alone, as it did.
                 //
                 // Identity describes the inputs, not the tree: someone can
                 // delete half of `node_modules` without touching the lockfile,
@@ -8495,7 +8550,11 @@ impl BranchManager {
                 // passing silently.
                 // And only while the tree is there at all: a lockfile that did
                 // not move says nothing about a `node_modules` someone deleted.
-                let key_moved = undo.binding_moved && !definition.identity_produces().is_empty();
+                let key_moved = !definition.identity_produces().is_empty()
+                    && undo.dropped_before.is_some_and(|before| {
+                        self.install_binding(before, definition)
+                            != self.install_binding(&branch.dropped, definition)
+                    });
                 if !undo.force_recompute
                     && !key_moved
                     && self.produced_present(branch, definition)
@@ -9468,15 +9527,16 @@ pub struct BindingChange {
     /// Resources a drop stopped.
     pub stopped: Vec<String>,
     /// Installs rebuilt because the binding is part of their identity: a
-    /// tree keyed on the trackers the instance binds was built for the
-    /// binding this change replaced.
+    /// tree keyed on what of the binding can reach it was built for the
+    /// binding this change replaced. One the change cannot reach is kept
+    /// and not listed.
     pub rebuilt: Vec<RebuiltInstall>,
 }
 
-/// An instance's binding as a `use` or `drop` found it: what
-/// `{{bound…}}` rendered to, and which resources were bound.
+/// An instance's binding as a `use` or `drop` found it: the trackers it
+/// dropped, and which resources were bound.
 struct BindingBefore {
-    bound: crate::exports::Bound,
+    dropped: BTreeSet<String>,
     resources: BTreeSet<String>,
 }
 

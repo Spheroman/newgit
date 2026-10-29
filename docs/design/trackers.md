@@ -133,9 +133,11 @@ the resources it brings. `newgit tracker drop <tracker>` unbinds one, stopping
 another bound tracker requires it, and while the tracker has uncommitted work
 unless `--stash` (brought back by the next `use`) or `--discard` (after a
 checkpoint, so `newgit undo` gets it back). Both rebuild every bound install
-whose tree the binding keys (see *Installs across trackers*): the tree the
+whose store key the change moves (see *Installs across trackers*): the tree the
 instance holds was built for the binding it had, so it is filled from the store
-when that binding was built before, else its `prepare` runs again. A rebuild
+when that binding was built before, else its `prepare` runs again. Binding a
+secret tracker, or one with no paths, moves no install's key unless the
+install is told the tracker names through `{{bound…}}`. A rebuild
 that fails leaves the resource `failed` without failing the command, since the
 binding has changed by then. `root`, `project`, and `access`
 cannot be dropped. A checkpoint records the binding, and undo restores it.
@@ -320,9 +322,10 @@ resolves versions — that would be emulating npm or pip.
   is owned by whoever owns it — usually root — and lists every member, bound
   or not. Its install resource installs only the bound members (`pnpm install
   --filter …`, `uv sync --frozen --package …`) through a `{{bound…}}`
-  template variable naming the bound trackers' paths, and the bound set is
-  part of the install's identity, so copy-on-write installs are keyed
-  correctly. (Step 4.)
+  template variable naming the bound trackers' paths. What of the binding
+  can reach the install is part of its identity, so copy-on-write installs
+  are keyed correctly: which paths the checkout leaves out, and the bound
+  set itself when a `{{bound…}}` tells the install it. (Step 4.)
 - **Python environments are flat**, so code sharing one venv needs one
   resolution — the shared lockfile, where conflicts surface when locking,
   not at spawn.

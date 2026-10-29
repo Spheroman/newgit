@@ -726,11 +726,16 @@ The key is the inputs, never the tree:
 - **`key_command`'s output**, what the lockfile cannot see. A lockfile says
   what was asked for, and install scripts compile against a platform and a
   toolchain it never names (`node -v && uname -sm`).
-- **The trackers the instance binds.** A shared lockfile lists every
-  workspace member, bound or not, and the install builds the bound ones.
-  So instances that bind differently never share a tree, and when a live
-  instance's binding changes (`tracker use`, `drop`, or an undo to another
-  binding), its installs are rebuilt for the new key, from the store where
+- **What of the binding can reach the install.** A shared lockfile lists
+  every workspace member, bound or not, and the install builds the ones it
+  can see. So the key holds which paths the dropped code trackers leave out
+  of the checkout, and, only when the install is told them through
+  `{{bound…}}` (in its own definition, or in any resource's exports or
+  renders), the bound tracker names and paths. Binding a secret tracker, or
+  one with no paths, moves neither, so it shares a tree with the binding
+  without it (#248). When a live instance's binding changes (`tracker use`,
+  `drop`, or an undo to another binding) in a way that moves an install's
+  key, that install is rebuilt for the new key, from the store where
   possible (#206).
 - **The definition file.** The command that builds a tree is as much an
   input as the lockfile. Any edit moves the key, which costs one reinstall;

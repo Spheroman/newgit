@@ -446,11 +446,12 @@ rebuilds from the restored source and ignores the ref.
 
 A `recompute` restore skips when this resource's `[identity]` hash is the same
 now as at the checkpoint and, for a resource that declares `[identity]
-produces`, the undo restored the binding the instance already had: the tree was
-already built from those inputs, so the rebuild would change nothing. The
-binding counts because the install store keys a tree on it (see *Installs: use
-a content-addressed store*); an undo that drops or brings back a tracker
-rebuilds such a tree, lockfile or no lockfile. It says so rather than passing
+produces`, the undo did not move the part of the binding its store key holds:
+the tree was already built from those inputs, so the rebuild would change
+nothing. That part counts because the install store keys a tree on it (see
+*Installs: use a content-addressed store*); an undo that drops or brings back
+a code tracker rebuilds such a tree, lockfile or no lockfile, while one that
+only rebinds a secret tracker does not. It says so rather than passing
 silently:
 
 ```
@@ -912,28 +913,42 @@ as much an input as the lockfile it reads, so editing `npm ci` to `npm ci
 entries built before it. That is the right way to be wrong: a stale entry
 costs one reinstall and `newgit cleanup` reclaims it.
 
-**So are the trackers the instance binds.** A shared lockfile lists every
-member, bound or not, and its install builds the bound ones: named by
-`{{bound.paths}}`, or found on disk, where a dropped tracker's files are not
-checked out (an unfiltered `npm ci` links a workspace member only when it is
-there). So what `{{bound.trackers}}` and `{{bound.paths}}` render to is in
-every resource's key, whether its commands mention them or not, and the store
-never fills an instance that drops a tracker with the tree built for one that
-binds it. The cost is the same trade again: instances whose bindings differ
-never share a tree, even one the binding cannot change, so each binding
-installs once. And a live instance whose binding moves is at a new key:
-`newgit tracker use` and `drop` rebuild every bound install that holds a tree,
-filled from the store when that binding was built before, else by running its
-`prepare` again, and say so:
+**So is what of the binding can reach the install.** A shared lockfile lists
+every member, bound or not, and its install builds the ones it can see: found
+on disk, where a dropped code tracker's files are not checked out (an
+unfiltered `npm ci` links a workspace member only when it is there), or named
+by `{{bound.paths}}`. So two things are in the key:
+
+- **Which paths are checked out**, in every resource's key: the paths the
+  instance's dropped code trackers leave out. Nothing is left out when no
+  code tracker is dropped.
+- **What `{{bound.trackers}}` and `{{bound.paths}}` render to**, only when
+  the install can be told: its own commands, `key_command`, exports or
+  `[[render]]`s name one, or any resource's export or `[[render]]` does
+  (every command's environment carries every bound resource's exports, and a
+  render writes into a file the install can read).
+
+The store never fills an instance that drops a member with the tree built for
+one that binds it. And the rest of the binding stays out: binding a secret
+tracker, or one that owns no paths (a branch database, say), or creating or
+renaming a tracker the instance binds, leaves an install that is not told the
+names at the key it had, so instances that differ only in that share one
+tree. A secret tracker's files are projected into the workspace but are not
+in the key; an install that reads one (an `.npmrc` it owns, say) names it in
+`[identity] paths`, whose content is hashed like the lockfile's.
+
+A live instance whose key moves needs a new tree: `newgit tracker use` and
+`drop` rebuild every bound install that holds a tree and whose key the change
+moved, filled from the store when that binding was built before, else by
+running its `prepare` again, and say so. An install the change cannot reach
+is left alone and not listed:
 
 ```
 Bound `b` in `x`
   deps for the new binding: rebuilt, install store: filled from 3ec46aa385bb (copy-on-write)
 ```
 
-The binding is the store key's, so binding or dropping a secret tracker
-rebuilds too: `{{bound.trackers}}` names it. Running processes are left as
-they are, as under `newgit action deps.prepare`. The binding has changed by
+Running processes are left as they are, as under `newgit action deps.prepare`. The binding has changed by
 the time an install rebuilds, so a rebuild that fails does not fail the
 command. It leaves the resource `failed`, and what depends on it is not
 rebuilt but left `pending` behind it, each with its retry:
@@ -1067,10 +1082,10 @@ Scope — which of them have a value where:
 | `[restore] command` | yes | yes | yes | yes | — | yes |
 | `[cleanup] command` | yes | yes | yes | yes | — | yes |
 
-A `key_command` is rendered exactly like an action `command`. The binding is
-already part of every key (see *Installs: use a content-addressed store*), so
-`{{bound.*}}` is not there to make the key depend on it: it lets the command
-pass the binding to whatever it inspects, as in `git hash-object
+A `key_command` is rendered exactly like an action `command`. Naming
+`{{bound.*}}` in it puts what it renders to in the key (see *Installs: use a
+content-addressed store*), as naming it in `prepare` does; mostly it lets the
+command pass the binding to whatever it inspects, as in `git hash-object
 {{bound.paths}}`. Keep per-instance values —
 `{{workspace}}`, `{{branch.*}}`, `{{ports.*}}` — out of what it prints. Every
 instance would key differently, and the shared store would never hit.

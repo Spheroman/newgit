@@ -334,6 +334,40 @@ impl ResourceDefinition {
             .and_then(|spec| spec.key_command.as_deref())
     }
 
+    /// Whether anything this resource renders names `{{bound.trackers}}`
+    /// or `{{bound.paths}}`: an action, `key_command`, a `workdir`, an
+    /// export, or a `[[render]]`. Its install can then be told which
+    /// trackers are bound, so the install store keys it on them (see
+    /// [`crate::installs::identity_key`]).
+    pub fn mentions_bound(&self) -> bool {
+        self.spreads_bound()
+            || self.identity_key_command().is_some_and(names_bound)
+            || self
+                .workdir
+                .as_ref()
+                .is_some_and(|workdir| names_bound(workdir.as_str()))
+            || self.actions.values().any(|action| {
+                action.command.as_deref().is_some_and(names_bound)
+                    || action
+                        .workdir
+                        .as_ref()
+                        .is_some_and(|workdir| names_bound(workdir.as_str()))
+            })
+    }
+
+    /// Whether this resource hands `{{bound…}}` to *other* resources'
+    /// commands: through an export, which every command's environment
+    /// carries, or a `[[render]]`, which writes it into a file any install
+    /// can read.
+    pub fn spreads_bound(&self) -> bool {
+        self.exports.values().any(|value| names_bound(value))
+            || self
+                .render
+                .iter()
+                .flat_map(|spec| &spec.replace)
+                .any(|replacement| names_bound(&replacement.with))
+    }
+
     /// The action that builds `[identity] produces`. A store entry is filled
     /// from whatever a `recompute` restore would re-run to rebuild the same
     /// tree — those are the same job, and letting them name different actions
@@ -824,6 +858,11 @@ impl ResourceDefinition {
 /// The one action a spawn runs, and so the only one an install-store entry
 /// can stand in for.
 pub const PRODUCING_ACTION: &str = "prepare";
+
+/// Whether a template names either `{{bound…}}` placeholder.
+fn names_bound(template: &str) -> bool {
+    template.contains("{{bound.trackers}}") || template.contains("{{bound.paths}}")
+}
 
 /// Whether `outer` is `inner` or a directory containing it, compared by
 /// path component so `node_modules` does not appear to contain
