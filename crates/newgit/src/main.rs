@@ -31,6 +31,10 @@ const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), " (", env!("NEWGIT_BUIL
 #[derive(Debug, Parser)]
 #[command(name = "newgit")]
 #[command(about = "Branch-bound resource orchestration for agentic workflows")]
+// An agent asked to "set newgit up" reads `--help` first, and on its own
+// would stop at `init`: the guide to a setup worth keeping has to be on the
+// path it already takes.
+#[command(after_help = "Setting newgit up for someone? Read `newgit reference agents` first.")]
 #[command(version = VERSION)]
 struct Cli {
     #[command(subcommand)]
@@ -851,6 +855,7 @@ fn init(args: InitArgs) -> Result<()> {
     );
     println!("      newgit spawn <branch>");
     println!("\n{REFERENCE_POINTER}");
+    println!("Setting this up for someone else: newgit reference agents");
     Ok(())
 }
 

@@ -7,6 +7,8 @@ to. Printed by `newgit reference`, so it is on disk wherever the binary is.
 (`resource` brings its subsections with it); `newgit reference all` prints the
 whole document.
 
+An agent setting newgit up for someone: read `newgit reference agents` first.
+
 The design narrative — why trackers and resources are the only two
 primitives, what each one is for — lives in `docs/design/spec.md` at
 <https://github.com/Spheroman/newgit>. This page is the lookup table.
@@ -31,6 +33,153 @@ whether a lane travels with a merge — both by defaulting, silently.
   local/trackers.git     every tracker's history   local, gitignored
   installs/              built trees, shared       local, gitignored
 ```
+
+---
+
+## Agents — setting newgit up for someone
+
+You are probably here because someone installed newgit and asked you to set
+it up. Assume they know nothing about it beyond the name. They are relying on
+you to find out what newgit can do for *their* project and to show them.
+
+**`newgit init` is not the setup.** On its own it leaves the three built-in
+trackers and no resources. Every spawn then gets the code and nothing else:
+no `.env.local`, no installed dependencies, no dev server, no database. That
+is `git worktree` with extra steps, and anyone who only sees that will
+reasonably decide newgit isn't worth keeping. A useful setup gives every
+instance what the project needs to run. Spawn should give them a branch they
+can run right away, and undo should put back the env and data as well as the
+code.
+
+### Look before you ask
+
+Read the project before you propose anything. Most of what a setup needs is
+already visible:
+
+```sh
+git status --short --ignored        # ignored files the project needs: tracker candidates
+ls -a; cat package.json             # or pyproject.toml, Cargo.toml, Makefile, …
+newgit resource templates           # what each template is for
+```
+
+| you find | it becomes |
+| --- | --- |
+| `.env`, `.env.local`, `.envrc`, `config/*.local.*`, a credentials file that is gitignored | a secret tracker: `audience = "user"` if each person has their own, `project-devs` if the team shares one |
+| a lockfile (`pnpm-lock.yaml`, `package-lock.json`, `uv.lock`, `Cargo.lock`, …) | an install resource: `--template pnpm` for pnpm, `--template install` for anything else |
+| a `dev` / `start` script, a server entry point | `--template process`: its own port, started for each instance |
+| `supabase/` | `--template supabase`: its own stack and ports per instance, with snapshots on checkpoint |
+| Postgres/MySQL in Docker or Compose, migrations | `--template command-snapshot` or `command-snapshot-migrations` |
+| two env files for one thing (`.env.staging`, `.env.local-db`) | two trackers sharing a `role`, so each spawn picks one (`--use`) |
+| an app or package in a monorepo that only some branches touch | a code tracker (`--code --path apps/x`), dropped from a spawn with `--drop` |
+| local agent notes or settings (`CLAUDE.local.md`, scratch plans) | a `user` tracker, so the notes go with each branch and come back on undo |
+| a hard-coded port in a committed config file | a `[[render]]` on that resource (`newgit reference render`) |
+| a GitHub remote and `gh` in use | nothing to add. `git push` and `gh pr create` work from a workspace |
+
+### Pitch it, then ask
+
+Tell the user what you found and what each piece gets them, in terms of their
+project rather than newgit's vocabulary. Keep it short. For example:
+
+> newgit gives each branch its own copy of the project, ready to run. I'd set
+> up:
+> - your `.env.local`, copied into every branch and versioned, but never
+>   committed, so a branch an agent broke can be undone env and all;
+> - `pnpm install`, built once per lockfile and shared, so a new branch
+>   doesn't reinstall;
+> - `pnpm dev` on its own port in each branch, so five can run side by side;
+> - your Supabase database, one per branch, snapshotted on checkpoint.
+>
+> Should `.env.local` be per-person, or shared with your team? Do you also
+> point at a staging database sometimes? I can make that a second env you
+> pick at spawn time.
+
+Then **ask about trackers**, because those are the ones you can't infer:
+
+- Which ignored files does a branch need in order to run? You will have found
+  some of them. Ask whether there are others, such as files that live outside
+  the repository today and get copied in by hand.
+- Who should see each one: just them (`user`), the team (`project-devs`), or
+  everyone (`public`, which ships in exports)? Default to `user` for anything
+  with credentials in it.
+- Are there alternatives they switch between, like a local and a staging
+  database or a test and a live API key? Those become trackers sharing a
+  `role`.
+- Is there anything they would want undo to bring back that Git doesn't
+  hold?
+
+If they don't care to choose, set up what you found with the safe defaults and
+tell them what you picked.
+
+### Build it
+
+```sh
+newgit init
+newgit tracker create runtime-env --audience user
+newgit tracker track runtime-env .env.local
+newgit tracker capture runtime-env --from-store   # seed it from the file that's already there
+newgit resource add deps --template pnpm
+newgit resource add app --template process
+```
+
+Then open every generated file in `.newgit/resources/` and fix the lines
+marked `EDIT ME`, such as the dev command and the lockfile. A template's
+defaults are guesses, and a wrong guess shows up as a failed spawn later. `newgit
+reference <section>` has every key. If a resource needs a `[[render]]`, run
+`newgit render --check`.
+
+Commit `.newgit/` the way `init` says to, on a branch if the project works
+that way. A spawn reads definitions from the store, but teammates and CI only
+see what is committed.
+
+### Prove it works
+
+Don't hand it over until a real spawn comes up:
+
+```sh
+newgit spawn newgit-try
+newgit status newgit-try          # every resource ready; if not, it says why
+newgit env newgit-try             # ports and exports, labeled by where they came from
+newgit run newgit-try -- <the project's test or health check>
+newgit checkpoint newgit-try --verify
+newgit remove newgit-try
+```
+
+Fix what fails and run it again. A setup that fails on its first spawn is
+worse than not setting it up at all.
+
+### Wire up the tools they already use
+
+- **Claude Code:** `newgit claude-code install`. Then every `claude
+  --worktree`, background session, and worktree-isolated subagent gets a full
+  instance instead of a bare worktree.
+- **T3 Code:** the `Spheroman/t3code` fork turns each thread into an instance
+  and stops its resources when the thread is settled. Mention it if they use
+  T3 Code.
+- **A newgit remote** (`newgit login`, `newgit remote add`) lets checkpoints
+  travel, so a teammate's or cloud agent's branch comes up locally with its
+  uncommitted work. The hosted one is invite-only, so offer it but don't
+  assume they have access.
+
+### Show them
+
+Finish with a demonstration rather than just a summary. Spawn two instances
+side by side and show that they run on different ports at once. Checkpoint
+one, break something in it, and `undo` it. Then leave them a short list of
+the commands they will use every day: `spawn`, `status`, `checkpoint`,
+`undo`, `remove`. Also say what you set up and what you chose not to.
+
+### Guardrails
+
+- Secret by default is the point. Never move tracker content into Git, never
+  give a credentials file a `public` audience, and never widen an audience
+  without asking.
+- Ask before anything that leaves the machine: `newgit remote add`, `members
+  add`, `export --remote`.
+- newgit does not rewrite history, so don't work around it by doing so
+  yourself.
+- Be honest about the limits. newgit needs git 2.38+ and a Unix-like OS. A
+  package manager that copies instead of hardlinking (npm, pip) costs disk
+  per install (`newgit reference installs`).
 
 ---
 
