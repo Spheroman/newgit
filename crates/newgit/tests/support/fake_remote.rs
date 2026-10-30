@@ -54,6 +54,9 @@ struct State {
     private: std::collections::BTreeSet<String>,
     /// Behave like a remote from before private instances.
     ignores_private: bool,
+    /// Trackers whose definition is not on the default branch yet: like the
+    /// real remote, it gives no credential for their repos.
+    undefined_trackers: std::collections::BTreeSet<String>,
 }
 
 /// Ana's login token; every other login token is jack's.
@@ -371,6 +374,12 @@ fn route(
                 return (
                     403,
                     json!({ "error": format!("{repo} is {}'s own; each user reads only their own", parts[4]) }),
+                );
+            }
+            if parts.len() >= 4 && parts[2] == "t" && state.undefined_trackers.contains(parts[3]) {
+                return (
+                    403,
+                    json!({ "error": format!("tracker `{}` is not defined on {}/{}'s default branch", parts[3], parts[0], parts[1]) }),
                 );
             }
             if !exists(repo) {

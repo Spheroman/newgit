@@ -349,6 +349,14 @@ The push succeeds exactly when that reached the remote. Nothing is forwarded
 as one history; the endpoint composes views, and `newgit merge` moves
 branches.
 
+A secret tracker the remote will not give a credential for is left out of
+the sync instead of failing it, with a warning that names it and quotes
+why. The common case is a new one: the remote reads its audience from its
+definition on the default branch, and the push that carries the definition
+is the one being checkpointed. The record that goes up leaves the tracker
+out too, so it never names a rev the remote does not have, and the first
+checkpoint after the remote takes it brings it.
+
 Export targets with `branches = true` ride the same push: the instance's
 branch is exported to each of them, and on a newgit remote the target is the
 workspace remote `gh` resolves, so `gh pr create` opens a pull request

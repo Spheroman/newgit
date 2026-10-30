@@ -2585,7 +2585,19 @@ fn checkpoint(instance: Option<String>, message: Option<&str>) -> Result<()> {
     }
     if let Some(link) = manager.remote_link() {
         match &outcome.sync_error {
-            None => println!("  remote:   synced to {}", link.project),
+            None if outcome.left_out.is_empty() => {
+                println!("  remote:   synced to {}", link.project)
+            }
+            None => println!(
+                "  remote:   synced to {}, without {} (the warning above says why)",
+                link.project,
+                outcome
+                    .left_out
+                    .iter()
+                    .map(|name| format!("`{name}`"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
             Some(_) => println!("  remote:   not synced (the warning above says why)"),
         }
     }
