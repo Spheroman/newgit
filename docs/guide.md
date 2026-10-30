@@ -284,7 +284,9 @@ Definition management (noun subcommands):
   `paths` come after the tree, with what deposits into them and what they
   bring
 - `newgit tracker use <tracker> [instance]` / `newgit tracker drop <tracker>
-  [instance] [--stash | --discard]`
+  [instance] [--stash | --discard]` — a drop parks the resources the tracker
+  brought: taken down by `suspend` (else `[cleanup]`), ports kept, and
+  brought back on them by the next `use`; `remove` tears parked ones down
 - `newgit log <tracker> [instance] [-- <git log args>]` — one tracker's
   history: an instance's branch as of its last checkpoint, or the project
   root's

@@ -49,6 +49,15 @@ pub struct BranchInstance {
     /// secret tracker keeps its binding's content for when it is used again.
     #[serde(default, skip_serializing_if = "std::collections::BTreeSet::is_empty")]
     pub dropped: std::collections::BTreeSet<String>,
+    /// Resources a dropped tracker brought, set aside rather than released
+    /// (#254, #255): taken down when the tracker was dropped, their ports
+    /// still claimed, and handed back by `newgit tracker use`. Ports are for
+    /// the instance's lifetime, so the files a resource renders and whatever
+    /// it left running or on disk agree with its binding when it comes back.
+    /// `remove` tears these down too. Never in `resources`: everything that
+    /// reads that map reads what the instance binds now.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub parked: BTreeMap<String, ParkedBinding>,
     /// Where this instance lives on the project's remote, once registered.
     /// `None` for a project without a remote, or when registration has not
     /// succeeded yet (it is retried at the next checkpoint).
@@ -103,6 +112,42 @@ pub struct ResourceBinding {
     pub restore_proven: bool,
 }
 
+/// A binding a tracker drop set aside: the binding as it was, and how far
+/// the drop took the resource down.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ParkedBinding {
+    pub binding: ResourceBinding,
+    pub state: ParkedState,
+}
+
+/// What a parked resource's drop left behind, which decides what bringing
+/// it back and removing the instance each run.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum ParkedState {
+    /// Its `suspend` ran: `use` runs `resume`, `remove` runs `[cleanup]`.
+    Suspended,
+    /// Its `[cleanup]` ran: `use` runs `prepare`, and `remove` has nothing
+    /// left to tear down.
+    CleanedUp,
+    /// Nothing took it down beyond stopping its supervised process: it has
+    /// no hook to, its hook failed, or it is shared with other instances.
+    /// `use` runs `prepare`, on the same ports; `remove` runs `[cleanup]`.
+    Untouched,
+}
+
+impl BranchInstance {
+    /// Every binding holding ports: what the instance binds, and what it
+    /// parked. The port ledger is this, across every record.
+    pub fn port_claims(&self) -> impl Iterator<Item = (&String, &ResourceBinding)> {
+        self.resources.iter().chain(
+            self.parked
+                .iter()
+                .map(|(name, parked)| (name, &parked.binding)),
+        )
+    }
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum ResourceStatus {
@@ -155,6 +200,7 @@ impl BranchInstance {
             trackers: BTreeMap::new(),
             resources: BTreeMap::new(),
             dropped: Default::default(),
+            parked: BTreeMap::new(),
             private: false,
             created_at: now,
             remote: None,

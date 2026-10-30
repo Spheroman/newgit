@@ -5,8 +5,8 @@ use camino::{Utf8Path, Utf8PathBuf};
 use chrono::Utc;
 
 use crate::branch::{
-    BranchInstance, RemoteBinding, ResourceBinding, ResourceStatus, TrackerBinding, branch_slug,
-    validate_name,
+    BranchInstance, ParkedBinding, ParkedState, RemoteBinding, ResourceBinding, ResourceStatus,
+    TrackerBinding, branch_slug, validate_name,
 };
 use crate::checkpoint::{
     CheckpointLog, CheckpointReason, CheckpointRecord, HASH_STATE_REF_PREFIX, RecoveryRecord,
@@ -25,8 +25,8 @@ use crate::exports::{RenderContext, STATE_REF_PLACEHOLDER, render, unresolved_pl
 use crate::installs::{Admission, InstallReport, InstallStore, TreeRender};
 use crate::lock::{InstanceLock, LOCKED_ENV, locked_env_value};
 use crate::materializer::{
-    Materializer, RealDirMaterializer, exclude_produced_paths, exclude_tracker_paths,
-    unexclude_tracker_paths,
+    Materializer, RealDirMaterializer, SOURCE_TEMPLATE_DIR, exclude_produced_paths,
+    exclude_tracker_paths, unexclude_tracker_paths,
 };
 use crate::ports;
 use crate::remote::{Acting, Remote, RemoteLink, Scope, basic_auth_header};
@@ -167,6 +167,10 @@ pub struct SpawnOutcome {
     /// branches. Spawning goes on: nothing has left the machine, and the same
     /// split runs again before anything does.
     pub projection_warning: Option<String>,
+    /// Why the workspace was `git clone`d rather than cloned from the
+    /// source template on macOS. The workspace is the same either way; the
+    /// spawn was only slower.
+    pub template_warning: Option<String>,
 }
 
 /// Checkpoint numbering is per name, and `remove` archives the binding record
@@ -255,6 +259,9 @@ pub struct ResourceBindOutcome {
     /// What the install store did, when this resource declares a tree it
     /// produces. `None` means the resource is not eligible for it.
     pub install: Option<InstallReport>,
+    /// A binding a tracker drop parked came back through `resume` rather
+    /// than `prepare`; `prepare` then holds that action's result.
+    pub resumed: bool,
 }
 
 impl ResourceBindOutcome {
@@ -2018,7 +2025,9 @@ impl BranchManager {
         }
 
         branch.dropped = dropped;
-        RealDirMaterializer.materialize(&self.source, &branch)?;
+        let template_warning = self
+            .materializer()
+            .materialize_reporting(&self.source, &branch)?;
         if !branch.dropped.is_empty() {
             self.apply_sparse(&branch)?;
         }
@@ -2082,6 +2091,7 @@ impl BranchManager {
             inherited_checkpoints,
             remote_warning,
             projection_warning,
+            template_warning,
         })
     }
 
@@ -2382,7 +2392,23 @@ impl BranchManager {
             }
             let definition = self.resource_definition(name)?;
 
-            let resolved_ports = self.claim_ports(branch, definition)?;
+            // One a drop parked comes back on the ports it had (#255): the
+            // files it renders and whatever its `suspend` left on disk or
+            // still running agree on them. Only a definition that has since
+            // changed which ports it declares gets a fresh allocation.
+            let parked = branch.parked.remove(name);
+            let kept_ports = parked.as_ref().and_then(|parked| {
+                parked
+                    .binding
+                    .resolved_ports
+                    .keys()
+                    .eq(definition.ports.keys())
+                    .then(|| parked.binding.resolved_ports.clone())
+            });
+            let resolved_ports = match kept_ports {
+                Some(ports) => ports,
+                None => self.claim_ports(branch, definition)?,
+            };
 
             // An export may compose a dependency's export, the same way a
             // `[[render]]` already can. Bindings happen in dependency order,
@@ -2424,8 +2450,22 @@ impl BranchManager {
             });
             let resolved_exports = match export_error {
                 Some(_) => BTreeMap::new(),
-                None => resolved_exports,
+                // What a parked binding captured stays, under what resolves
+                // now: a `resume` prints no captures, and the stack it
+                // brings back still has the keys its `prepare` printed.
+                None => match &parked {
+                    Some(parked) => {
+                        let mut kept = parked.binding.resolved_exports.clone();
+                        kept.extend(resolved_exports);
+                        kept
+                    }
+                    None => resolved_exports,
+                },
             };
+            let resume = parked
+                .as_ref()
+                .is_some_and(|parked| parked.state == ParkedState::Suspended)
+                && definition.actions.contains_key("resume");
 
             branch.resources.insert(
                 definition.name.clone(),
@@ -2435,7 +2475,9 @@ impl BranchManager {
                     resolved_exports,
                     rendered: Vec::new(),
                     status: ResourceStatus::Pending,
-                    restore_proven: false,
+                    restore_proven: parked
+                        .as_ref()
+                        .is_some_and(|parked| parked.binding.restore_proven),
                 },
             );
 
@@ -2469,6 +2511,41 @@ impl BranchManager {
                     render_error,
                     export_error,
                     install: None,
+                    resumed: false,
+                });
+                continue;
+            }
+
+            // A parked resource whose drop ran its `suspend` comes back
+            // through `resume`, as `newgit start` brings it back, not through
+            // `prepare`: it was never torn down, only taken down. A blocked
+            // one is withheld below like any `prepare`, which brings it back
+            // when its dependency does.
+            if resume && blocked_by.is_empty() {
+                self.store.save_branch_record(branch)?;
+                let (code, log, _) = self.run_lifecycle_action(branch, definition, "resume")?;
+                let status = if code == 0 {
+                    ResourceStatus::Ready
+                } else {
+                    ResourceStatus::Failed
+                };
+                if let Some(binding) = branch.resources.get_mut(&definition.name) {
+                    binding.status = status;
+                }
+                outcomes.push(ResourceBindOutcome {
+                    name: definition.name.clone(),
+                    ports: resolved_ports,
+                    status,
+                    prepare: Some((code == 0, log)),
+                    blocked_by,
+                    prepare_withheld: false,
+                    captured: Vec::new(),
+                    missing_captures: Vec::new(),
+                    rendered,
+                    render_error: None,
+                    export_error: None,
+                    install: None,
+                    resumed: true,
                 });
                 continue;
             }
@@ -2599,6 +2676,7 @@ impl BranchManager {
                 render_error: None,
                 export_error: None,
                 install,
+                resumed: false,
             });
         }
         branch.updated_at = Utc::now();
@@ -2673,6 +2751,18 @@ impl BranchManager {
             .flat_map(|definition| definition.identity_produces().iter().cloned())
             .collect();
         exclude_produced_paths(&branch.workspace_path, &produced)
+    }
+
+    /// How workspaces are materialized here. On macOS they are cloned from
+    /// a template checkout beside them (see
+    /// [`GitSource::clone_via_template`]); elsewhere there is no
+    /// whole-tree clone to make that faster than `git clone`.
+    fn materializer(&self) -> RealDirMaterializer {
+        let workspace_root = self.config.workspace_root(&self.store.paths().project_root);
+        RealDirMaterializer {
+            source_template: cfg!(target_os = "macos")
+                .then(|| workspace_root.join(SOURCE_TEMPLATE_DIR)),
+        }
     }
 
     /// Make this workspace's `origin` behave like the project's real remote.
@@ -3943,7 +4033,9 @@ impl BranchManager {
         let branches = self.store.load_branches()?;
         let bound: Vec<BranchInstance> = branches
             .into_iter()
-            .filter(|branch| branch.resources.contains_key(name))
+            .filter(|branch| {
+                branch.resources.contains_key(name) || branch.parked.contains_key(name)
+            })
             .collect();
 
         if !bound.is_empty() && !force {
@@ -3962,6 +4054,12 @@ impl BranchManager {
         let mut unbound_instances = Vec::new();
         for branch in bound {
             let (_lock, mut branch) = self.locked_branch(&branch.slug)?;
+            if branch.parked.remove(name).is_some() && !branch.resources.contains_key(name) {
+                branch.updated_at = Utc::now();
+                self.store.save_branch_record(&branch)?;
+                unbound_instances.push(branch.name);
+                continue;
+            }
             if !branch.resources.contains_key(name) {
                 continue;
             }
@@ -4435,22 +4533,9 @@ impl BranchManager {
             }
             branch.dropped.insert(tracker.to_owned());
         }
-        // The resources it brought stop with it (stopped, not cleaned up:
-        // using it again starts them on what they left).
-        let supervisor = self.supervisor(&branch);
-        let gone: Vec<String> = branch
-            .resources
-            .keys()
-            .filter(|name| !self.resource_active(&branch, name))
-            .cloned()
-            .collect();
-        for name in gone {
-            if supervisor.running_pid(&name).is_some() {
-                let _ = supervisor.stop(&name, "term");
-            }
-            branch.resources.remove(&name);
-            change.stopped.push(name);
-        }
+        // The resources it brought are taken down and parked with it: using
+        // it again brings them back on the same ports.
+        change.parked = self.park_unbrought(&mut branch)?;
         branch.updated_at = Utc::now();
         self.store.save_branch_record(&branch)?;
         Ok(change)
@@ -4527,11 +4612,14 @@ impl BranchManager {
             branch.dropped.remove(tracker);
             self.store.save_branch_record(&branch)?;
             for other in swapped {
-                if let Err(error) = self.drop_tracker_inner(instance, &other, Uncommitted::Refuse) {
-                    let mut branch = self.store.find_branch(instance)?;
-                    branch.dropped.insert(tracker.to_owned());
-                    self.store.save_branch_record(&branch)?;
-                    return Err(error);
+                match self.drop_tracker_inner(instance, &other, Uncommitted::Refuse) {
+                    Ok(dropped) => change.parked.extend(dropped.parked),
+                    Err(error) => {
+                        let mut branch = self.store.find_branch(instance)?;
+                        branch.dropped.insert(tracker.to_owned());
+                        self.store.save_branch_record(&branch)?;
+                        return Err(error);
+                    }
                 }
                 change.replaced.push(other);
             }
@@ -4606,6 +4694,14 @@ impl BranchManager {
         let mut branch = self.store.find_branch(instance)?;
         let outcomes = self.bind_resources(&mut branch)?;
         self.store.save_branch_record(&branch)?;
+        change.resumed = outcomes
+            .iter()
+            .filter(|outcome| outcome.resumed)
+            .map(|outcome| {
+                let ok = outcome.prepare.as_ref().is_some_and(|(ok, _)| *ok);
+                (outcome.name.clone(), ok)
+            })
+            .collect();
         change.started = outcomes.into_iter().map(|outcome| outcome.name).collect();
         Ok(change)
     }
@@ -5354,7 +5450,7 @@ impl BranchManager {
             _ => None,
         };
 
-        RealDirMaterializer.remove(&branch)?;
+        self.materializer().remove(&branch)?;
         // Its branches go with it; pins keep whatever its archived
         // checkpoints still name.
         for definition in &self.trackers {
@@ -5648,6 +5744,10 @@ impl BranchManager {
     /// Reverses the *lifecycle* order, not the bind order: reading one string
     /// out of a resource says nothing about what has to be torn down first
     /// (#43). Only `depends_on` claims that.
+    ///
+    /// A binding a tracker drop parked counts too, unless the drop already
+    /// ran its `[cleanup]` (#254): it was this instance's, and nothing else
+    /// will ever tear it down.
     fn run_cleanup_hooks(
         &self,
         branch: &BranchInstance,
@@ -5655,135 +5755,145 @@ impl BranchManager {
     ) -> Result<Vec<HookOutcome>> {
         let mut outcomes = Vec::new();
         for name in self.graph.lifecycle_order.iter().rev() {
-            if !branch.resources.contains_key(name) {
-                continue;
-            }
+            let binding = match (branch.resources.get(name), branch.parked.get(name)) {
+                (Some(binding), _) => binding,
+                (None, Some(parked)) if parked.state != ParkedState::CleanedUp => &parked.binding,
+                _ => continue,
+            };
             let definition = self.resource_definition(name)?;
-            let ownership = definition.ownership;
+            outcomes.push(self.run_cleanup_hook(branch, definition, binding, dry_run)?);
+        }
+        Ok(outcomes)
+    }
 
-            if !may_tear_down(ownership) {
-                outcomes.push(HookOutcome {
-                    resource: name.clone(),
-                    ownership,
-                    detail: HookDetail::SkippedOwnership,
-                });
-                continue;
-            }
-
-            let Some(template) = definition
-                .cleanup
-                .as_ref()
-                .and_then(|spec| spec.command.as_deref())
-            else {
-                outcomes.push(HookOutcome {
-                    resource: name.clone(),
-                    ownership,
-                    detail: HookDetail::NoHook,
-                });
-                continue;
-            };
-
-            let binding = branch.resources.get(name);
-            let state_ref = self.checkpointed_state_ref(branch, name)?;
-            let bound = self.bound_vars(branch);
-            let context = RenderContext {
-                branch_name: &branch.name,
-                branch_slug: &branch.slug,
-                workspace: branch.workspace_path.as_str(),
-                scripts: self.scripts_dir(),
-                ports: binding.map(|binding| &binding.resolved_ports),
-                exports: binding.map(|binding| &binding.resolved_exports),
-                snapshot_path: None,
-                state_ref: state_ref.as_deref(),
-                bound: Some(&bound),
-            };
-            let command = render(template, &context);
-
-            if let Some(placeholder) = unresolved_placeholder(&command) {
-                outcomes.push(HookOutcome {
-                    resource: name.clone(),
-                    ownership,
-                    detail: HookDetail::SkippedUnresolved {
-                        command: command.clone(),
-                        placeholder: placeholder.to_owned(),
-                    },
-                });
-                continue;
-            }
-
-            // Not `assemble_env`: it refuses a graph that does not resolve,
-            // and teardown is the way out of one. An edge that does not is
-            // skipped rather than fatal, so every bound resource is still
-            // layered and the hook gets every variable. The order decides
-            // only a name two declarations claim, which a resolvable graph
-            // refuses. Where both reach this instance with different values,
-            // the hook would get whichever is layered last and could tear
-            // down the wrong thing with it, so it is refused, in a dry run
-            // too. Every hook gets the same environment, so the first one to
-            // get here refuses before any has run.
-            let (env, clashing) = self.layered_env(branch);
-            let collision = self
-                .graph
-                .problems
-                .iter()
-                .find_map(|problem| match problem {
-                    GraphProblem::EnvNameCollision { name: variable, .. }
-                        if clashing.contains(variable) =>
-                    {
-                        Some((variable, problem))
-                    }
-                    _ => None,
-                });
-            if let Some((variable, problem)) = collision {
-                return Err(NewgitError::Unsupported(format!(
-                    "refusing to tear down `{}`, whose `[cleanup]` hooks would get either of two \
-                     values for `{variable}`: {problem}",
-                    branch.name
-                )));
-            }
-
-            if dry_run {
-                outcomes.push(HookOutcome {
-                    resource: name.clone(),
-                    ownership,
-                    detail: HookDetail::WouldRun(command),
-                });
-                continue;
-            }
-
-            // The workspace is usually still here; when cleanup is finishing
-            // an instance whose workspace is already gone, the hook runs
-            // from the store root so an external teardown can still reach
-            // its own API. `workdir` is workspace-relative, so it has
-            // nothing to resolve against once the workspace itself is gone.
-            let cwd = if branch.workspace_path.is_dir() {
-                resource_cwd(
-                    &branch.workspace_path,
-                    name,
-                    "cleanup",
-                    definition.workdir_for(None),
-                )?
-            } else {
-                self.store.paths().project_root.clone()
-            };
-
-            let log = self
-                .store
-                .action_log_path(&branch.slug, &format!("{name}.cleanup"));
-            let env: Vec<(String, String)> =
-                env.into_iter().map(|var| (var.name, var.value)).collect();
-            let (code, _) = run_captured(&command, &cwd, &env, &log)?;
-            outcomes.push(HookOutcome {
+    /// One resource's `[cleanup] command`, for [`Self::run_cleanup_hooks`]
+    /// and for a tracker drop parking what it brought, rendered against
+    /// `binding`: the resource's ports and exports, wherever it is held.
+    fn run_cleanup_hook(
+        &self,
+        branch: &BranchInstance,
+        definition: &ResourceDefinition,
+        binding: &ResourceBinding,
+        dry_run: bool,
+    ) -> Result<HookOutcome> {
+        let name = &definition.name;
+        let ownership = definition.ownership;
+        if !may_tear_down(ownership) {
+            return Ok(HookOutcome {
                 resource: name.clone(),
                 ownership,
-                detail: HookDetail::Ran {
-                    command,
-                    ok: code == 0,
-                    log,
+                detail: HookDetail::SkippedOwnership,
+            });
+        }
+
+        let Some(template) = definition
+            .cleanup
+            .as_ref()
+            .and_then(|spec| spec.command.as_deref())
+        else {
+            return Ok(HookOutcome {
+                resource: name.clone(),
+                ownership,
+                detail: HookDetail::NoHook,
+            });
+        };
+
+        let binding = Some(binding);
+        let state_ref = self.checkpointed_state_ref(branch, name)?;
+        let bound = self.bound_vars(branch);
+        let context = RenderContext {
+            branch_name: &branch.name,
+            branch_slug: &branch.slug,
+            workspace: branch.workspace_path.as_str(),
+            scripts: self.scripts_dir(),
+            ports: binding.map(|binding| &binding.resolved_ports),
+            exports: binding.map(|binding| &binding.resolved_exports),
+            snapshot_path: None,
+            state_ref: state_ref.as_deref(),
+            bound: Some(&bound),
+        };
+        let command = render(template, &context);
+
+        if let Some(placeholder) = unresolved_placeholder(&command) {
+            return Ok(HookOutcome {
+                resource: name.clone(),
+                ownership,
+                detail: HookDetail::SkippedUnresolved {
+                    command: command.clone(),
+                    placeholder: placeholder.to_owned(),
                 },
             });
         }
-        Ok(outcomes)
+
+        // Not `assemble_env`: it refuses a graph that does not resolve,
+        // and teardown is the way out of one. An edge that does not is
+        // skipped rather than fatal, so every bound resource is still
+        // layered and the hook gets every variable. The order decides
+        // only a name two declarations claim, which a resolvable graph
+        // refuses. Where both reach this instance with different values,
+        // the hook would get whichever is layered last and could tear
+        // down the wrong thing with it, so it is refused, in a dry run
+        // too. Every hook gets the same environment, so the first one to
+        // get here refuses before any has run.
+        let (env, clashing) = self.layered_env(branch);
+        let collision = self
+            .graph
+            .problems
+            .iter()
+            .find_map(|problem| match problem {
+                GraphProblem::EnvNameCollision { name: variable, .. }
+                    if clashing.contains(variable) =>
+                {
+                    Some((variable, problem))
+                }
+                _ => None,
+            });
+        if let Some((variable, problem)) = collision {
+            return Err(NewgitError::Unsupported(format!(
+                "refusing to tear down `{}`, whose `[cleanup]` hooks would get either of two \
+                     values for `{variable}`: {problem}",
+                branch.name
+            )));
+        }
+
+        if dry_run {
+            return Ok(HookOutcome {
+                resource: name.clone(),
+                ownership,
+                detail: HookDetail::WouldRun(command),
+            });
+        }
+
+        // The workspace is usually still here; when cleanup is finishing
+        // an instance whose workspace is already gone, the hook runs
+        // from the store root so an external teardown can still reach
+        // its own API. `workdir` is workspace-relative, so it has
+        // nothing to resolve against once the workspace itself is gone.
+        let cwd = if branch.workspace_path.is_dir() {
+            resource_cwd(
+                &branch.workspace_path,
+                name,
+                "cleanup",
+                definition.workdir_for(None),
+            )?
+        } else {
+            self.store.paths().project_root.clone()
+        };
+
+        let log = self
+            .store
+            .action_log_path(&branch.slug, &format!("{name}.cleanup"));
+        let env: Vec<(String, String)> = env.into_iter().map(|var| (var.name, var.value)).collect();
+        let (code, _) = run_captured(&command, &cwd, &env, &log)?;
+        Ok(HookOutcome {
+            resource: name.clone(),
+            ownership,
+            detail: HookDetail::Ran {
+                command,
+                ok: code == 0,
+                log,
+            },
+        })
     }
 
     /// The most recent checkpointed state reference for one resource, which
@@ -8181,18 +8291,12 @@ impl BranchManager {
                 }
                 branch.dropped = restored.dropped.clone();
                 self.apply_sparse(&branch)?;
-                let supervisor = self.supervisor(&branch);
-                let gone: Vec<String> = branch
-                    .resources
-                    .keys()
-                    .filter(|name| !self.resource_active(&branch, name))
-                    .cloned()
-                    .collect();
-                for name in gone {
-                    if supervisor.running_pid(&name).is_some() {
-                        let _ = supervisor.stop(&name, "term");
+                // As a drop does: parked, so the bind below hands back the
+                // ports of what the checkpoint bound and this did not.
+                for parked in self.park_unbrought(&mut branch)? {
+                    if let Some(note) = parked.problem() {
+                        warnings.push(note);
                     }
-                    branch.resources.remove(&name);
                 }
                 // The workspace now has the checkpoint's binding, so the
                 // record says so too, before anything below can fail.
@@ -9133,6 +9237,143 @@ impl BranchManager {
         Ok((code, log, changed))
     }
 
+    /// Take down and park every bound resource no bound tracker brings any
+    /// more, dependents first (#254): what a tracker drop, or an undo to a
+    /// checkpoint that bound less, leaves the instance without.
+    ///
+    /// Parked, not released (#255): its binding moves to
+    /// [`BranchInstance::parked`] with its ports still claimed, and
+    /// [`Self::bind_resources`] hands them back when a `use` brings the
+    /// tracker back. The teardown is `newgit stop`'s, so a role switch is a
+    /// stop of the resources the role brought: the supervised process is
+    /// signalled, and `suspend` runs, so `resume` brings the resource back
+    /// with its data. One with no `suspend` (or one that never came up) runs
+    /// its `[cleanup]` instead, as `remove` would, and `prepare` builds it
+    /// again on `use`. Ownership gates both, as it does for `stop` and
+    /// `remove`: a `project` or `user` resource is shared, and is left up.
+    ///
+    /// Nothing here fails the drop, which has already happened by the time
+    /// this runs: a hook that fails is reported, the resource is parked
+    /// `untouched`, and `remove` runs its `[cleanup]` later.
+    fn park_unbrought(&self, branch: &mut BranchInstance) -> Result<Vec<ParkedResource>> {
+        let supervisor = self.supervisor(branch);
+        let mut stopped = self.load_stopped_record(branch)?;
+        let mut teardown = self.lifecycle_definitions();
+        teardown.reverse();
+        let mut parked = Vec::new();
+        for definition in teardown {
+            let name = &definition.name;
+            if !branch.resources.contains_key(name) || self.resource_active(branch, name) {
+                continue;
+            }
+            let mut report = ParkedResource {
+                name: name.clone(),
+                stopped: None,
+                hook: None,
+                state: ParkedState::Untouched,
+                note: None,
+            };
+            if supervisor.running_pid(name).is_some() {
+                let action = long_running_action(definition)
+                    .map_or_else(|| "process".to_owned(), |(action, _)| action.to_owned());
+                let signal = definition.stop_signal();
+                match supervisor.stop(name, &signal) {
+                    Ok(StopOutcome::Stopped(_)) => report.stopped = Some(action),
+                    Ok(StopOutcome::NotRunning) => {}
+                    Ok(StopOutcome::StillRunning(pid)) => {
+                        report.note = Some(format!(
+                            "its `{action}` (pid {pid}) ignored `{signal}`; escalate with \
+                             `kill -9 -- -{pid}` if needed"
+                        ));
+                    }
+                    Err(error) => report.note = Some(error.to_string()),
+                }
+            }
+            // What `newgit stop` took down, it no longer owes `start`: the
+            // resource is parked now, and `use` brings it back.
+            let suspended_by_stop = stopped
+                .resources
+                .iter()
+                .any(|entry| &entry.name == name && entry.is_resume());
+            stopped.resources.retain(|entry| &entry.name != name);
+
+            let binding = branch.resources.get(name).cloned();
+            let ready = binding
+                .as_ref()
+                .is_some_and(|binding| binding.status == ResourceStatus::Ready);
+            if !may_tear_down(definition.ownership) {
+                report.note = Some(format!(
+                    "left up: ownership `{}` is shared beyond this instance",
+                    definition.ownership.label()
+                ));
+            } else if suspended_by_stop {
+                report.state = ParkedState::Suspended;
+                report.note = Some("already suspended by `newgit stop`".to_owned());
+            } else if ready && definition.actions.contains_key("suspend") {
+                match self.run_lifecycle_action(branch, definition, "suspend") {
+                    Ok((code, log, _)) => {
+                        if code == 0 {
+                            report.state = ParkedState::Suspended;
+                        }
+                        report.hook = Some(ParkHook {
+                            hook: "suspend".to_owned(),
+                            ok: code == 0,
+                            log: Some(log),
+                        });
+                    }
+                    Err(error) => report.note = Some(format!("`suspend` did not run: {error}")),
+                }
+            } else if let Some(binding) = &binding {
+                match self.run_cleanup_hook(branch, definition, binding, false) {
+                    Ok(HookOutcome {
+                        detail: HookDetail::Ran { ok, log, .. },
+                        ..
+                    }) => {
+                        if ok {
+                            report.state = ParkedState::CleanedUp;
+                        }
+                        report.hook = Some(ParkHook {
+                            hook: "cleanup".to_owned(),
+                            ok,
+                            log: Some(log),
+                        });
+                    }
+                    Ok(HookOutcome {
+                        detail: HookDetail::SkippedUnresolved { placeholder, .. },
+                        ..
+                    }) => {
+                        report.note = Some(format!(
+                            "its `[cleanup]` did not run: `{placeholder}` does not resolve"
+                        ));
+                    }
+                    Ok(_)
+                        if report.stopped.is_none()
+                            && ready
+                            && definition.runnable_prepare().is_some() =>
+                    {
+                        report.note =
+                            Some("it has no `suspend` or `[cleanup]` to take it down".to_owned());
+                    }
+                    Ok(_) => {}
+                    Err(error) => report.note = Some(format!("`[cleanup]` did not run: {error}")),
+                }
+            }
+
+            if let Some(binding) = branch.resources.remove(name) {
+                branch.parked.insert(
+                    name.clone(),
+                    ParkedBinding {
+                        binding,
+                        state: report.state,
+                    },
+                );
+            }
+            parked.push(report);
+        }
+        self.save_stopped_record(branch, &stopped)?;
+        Ok(parked)
+    }
+
     /// Point the store's branch ref at the checkpointed head. The branch is
     /// owned by this instance — divergence is policy, not mechanism — so a
     /// store-side advance is warned about loudly, never hard-refused.
@@ -9447,6 +9688,53 @@ pub enum Uncommitted {
     Discard,
 }
 
+/// One resource a tracker drop took down and parked, and how.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParkedResource {
+    pub name: String,
+    /// The supervised process it stopped, by its long-running action's name.
+    pub stopped: Option<String>,
+    /// The hook that ran to take the rest down: `suspend`, else `cleanup`.
+    pub hook: Option<ParkHook>,
+    /// What the parked binding records, which decides what `use` and
+    /// `remove` run for it.
+    pub state: ParkedState,
+    /// Why it was not taken down, or not all the way: shared ownership, a
+    /// process that ignored its signal, a hook that could not run.
+    pub note: Option<String>,
+}
+
+/// A hook a park ran.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParkHook {
+    pub hook: String,
+    pub ok: bool,
+    pub log: Option<Utf8PathBuf>,
+}
+
+impl ParkedResource {
+    /// Something a reader should know went wrong: a hook that failed, or a
+    /// note other than a shared resource being left up on purpose.
+    pub fn problem(&self) -> Option<String> {
+        if let Some(hook) = self.hook.as_ref().filter(|hook| !hook.ok) {
+            let log = hook
+                .log
+                .as_ref()
+                .map(|log| format!("; log: {log}"))
+                .unwrap_or_default();
+            return Some(format!(
+                "`{}`'s `{}` failed while parking it{log}",
+                self.name, hook.hook
+            ));
+        }
+        self.note
+            .as_ref()
+            .filter(|_| self.state == ParkedState::Untouched && self.hook.is_none())
+            .filter(|note| !note.starts_with("left up"))
+            .map(|note| format!("`{}`: {note}", self.name))
+    }
+}
+
 /// What `newgit tracker use` or `drop` did.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct BindingChange {
@@ -9472,8 +9760,12 @@ pub struct BindingChange {
     /// The `autostart` actions of those resources, started once the use
     /// was done.
     pub autostarted: Vec<StopStartResource>,
-    /// Resources a drop stopped.
-    pub stopped: Vec<String>,
+    /// Of `started`, the parked ones that came back through `resume`, with
+    /// whether it succeeded.
+    pub resumed: Vec<(String, bool)>,
+    /// Resources the change took down and parked: those of the tracker a
+    /// drop dropped, or of those a use replaced.
+    pub parked: Vec<ParkedResource>,
     /// Installs rebuilt because the binding is part of their identity: a
     /// tree keyed on the trackers the instance binds was built for the
     /// binding this change replaced.

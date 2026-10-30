@@ -28,7 +28,8 @@
 //!   render's `find` in the stored tree and rendered again for each
 //!   instance it fills.
 
-use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Mutex, OnceLock};
 
 use camino::{Utf8Path, Utf8PathBuf};
 use sha2::{Digest, Sha256};
@@ -692,14 +693,20 @@ fn rewrite_text(path: &Utf8Path, change: impl FnOnce(&str) -> String) -> Result<
     Ok(true)
 }
 
-/// The first file under `root` whose content — or, for a symlink, whose
-/// target — contains any of `needles`. `None` means the tree never mentions
-/// them.
+/// A file under `root` whose content — or, for a symlink, whose target —
+/// contains any of `needles`. `None` means the tree never mentions them.
 ///
 /// Symlinks are read rather than followed: a `node_modules` is full of them,
 /// following would recurse forever through a package manager's store links,
 /// and a link *target* naming the workspace is exactly the poisoning being
 /// looked for.
+///
+/// This reads every byte of every produced tree on every install that might
+/// be stored — 3.8 GB in 264k files for T3 Code — so it runs in parallel:
+/// one task per directory and per file, on rayon's pool. Single-threaded it
+/// took ~28s on that tree, longer than the install it was vetting (#235).
+/// The walk stops at the first match, so *which* match is reported is not
+/// deterministic when there are several; any one declines the tree.
 fn find_path_reference(
     root: &Utf8Path,
     needles: &[String],
@@ -707,37 +714,105 @@ fn find_path_reference(
 ) -> Result<Option<Utf8PathBuf>> {
     let metadata =
         std::fs::symlink_metadata(root).map_err(|source| NewgitError::io(root, source))?;
-
-    if metadata.is_symlink() {
-        let target = std::fs::read_link(root).map_err(|source| NewgitError::io(root, source))?;
-        let target = target.to_string_lossy();
-        let names = needles
+    let scan = ReferenceScan {
+        finders: needles
             .iter()
-            .any(|needle| target.contains(needle.as_str()));
-        return Ok(names.then(|| root.to_path_buf()));
+            .filter(|needle| !needle.is_empty())
+            .map(|needle| memchr::memmem::Finder::new(needle.as_bytes()).into_owned())
+            .collect(),
+        exempt,
+        stop: AtomicBool::new(false),
+        outcome: Mutex::new(None),
+    };
+    rayon::scope(|scope| scan.visit(scope, root.to_path_buf(), metadata.file_type()));
+    match scan.outcome.into_inner() {
+        Ok(outcome) => outcome.transpose(),
+        Err(poisoned) => poisoned.into_inner().transpose(),
+    }
+}
+
+/// The shared state of one [`find_path_reference`] walk.
+struct ReferenceScan<'a> {
+    finders: Vec<memchr::memmem::Finder<'static>>,
+    exempt: &'a [Utf8PathBuf],
+    /// Set by the first match or error: every task still queued returns
+    /// without touching the disk.
+    stop: AtomicBool,
+    /// The first match or error, whichever came first.
+    outcome: Mutex<Option<Result<Utf8PathBuf>>>,
+}
+
+impl<'a> ReferenceScan<'a> {
+    fn visit<'s>(&'s self, scope: &rayon::Scope<'s>, path: Utf8PathBuf, kind: std::fs::FileType)
+    where
+        'a: 's,
+    {
+        if self.stop.load(Ordering::Relaxed) {
+            return;
+        }
+        match self.check(scope, &path, kind) {
+            Ok(false) => {}
+            Ok(true) => self.finish(Ok(path)),
+            Err(error) => self.finish(Err(error)),
+        }
     }
 
-    if metadata.is_file() {
-        if exempt.iter().any(|path| path == root) {
-            return Ok(None);
+    /// Whether `path` itself names a needle. A directory never does: its
+    /// entries are queued as tasks of their own.
+    fn check<'s>(
+        &'s self,
+        scope: &rayon::Scope<'s>,
+        path: &Utf8Path,
+        kind: std::fs::FileType,
+    ) -> Result<bool>
+    where
+        'a: 's,
+    {
+        if kind.is_symlink() {
+            let target =
+                std::fs::read_link(path).map_err(|source| NewgitError::io(path, source))?;
+            let target = target.as_os_str().as_encoded_bytes();
+            return Ok(self
+                .finders
+                .iter()
+                .any(|finder| finder.find(target).is_some()));
         }
-        return Ok(file_contains_any(root, needles)?.then(|| root.to_path_buf()));
+        if kind.is_file() {
+            if self.exempt.iter().any(|exempt| exempt == path) {
+                return Ok(false);
+            }
+            return file_contains_any(path, &self.finders);
+        }
+        if !kind.is_dir() {
+            return Ok(false);
+        }
+        for entry in std::fs::read_dir(path).map_err(|source| NewgitError::io(path, source))? {
+            let entry = entry.map_err(|source| NewgitError::io(path, source))?;
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else {
+                return Err(NewgitError::NonUtf8Path(entry.path().display().to_string()));
+            };
+            let child = path.join(name);
+            // `DirEntry::file_type` comes from the directory listing itself
+            // on macOS and Linux, so the walk costs no `lstat` per entry.
+            let kind = entry
+                .file_type()
+                .map_err(|source| NewgitError::io(child.clone(), source))?;
+            scope.spawn(move |scope| self.visit(scope, child, kind));
+        }
+        Ok(false)
     }
 
-    if !metadata.is_dir() {
-        return Ok(None);
-    }
-    for entry in std::fs::read_dir(root).map_err(|source| NewgitError::io(root, source))? {
-        let entry = entry.map_err(|source| NewgitError::io(root, source))?;
-        let name = entry.file_name();
-        let Some(name) = name.to_str() else {
-            return Err(NewgitError::NonUtf8Path(entry.path().display().to_string()));
-        };
-        if let Some(found) = find_path_reference(&root.join(name), needles, exempt)? {
-            return Ok(Some(found));
+    fn finish(&self, outcome: Result<Utf8PathBuf>) {
+        self.stop.store(true, Ordering::Relaxed);
+        let mut slot = self
+            .outcome
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if slot.is_none() {
+            *slot = Some(outcome);
         }
     }
-    Ok(None)
 }
 
 /// Whether a file contains any needle, read in fixed-size chunks.
@@ -747,55 +822,50 @@ fn find_path_reference(
 /// several gigabytes for a real monorepo, including individual native
 /// artifacts large enough that reading one into a single allocation is its
 /// own problem. Consecutive chunks overlap by `len - 1` bytes so a match
-/// straddling a boundary is still found.
-fn file_contains_any(path: &Utf8Path, needles: &[String]) -> Result<bool> {
-    let longest = needles.iter().map(String::len).max().unwrap_or(0);
+/// straddling a boundary is still found. The buffer is per thread, so the
+/// walk does not allocate one per file.
+fn file_contains_any(path: &Utf8Path, finders: &[memchr::memmem::Finder<'_>]) -> Result<bool> {
+    let longest = finders
+        .iter()
+        .map(|finder| finder.needle().len())
+        .max()
+        .unwrap_or(0);
     if longest == 0 {
         return Ok(false);
     }
     const CHUNK: usize = 64 * 1024;
+    thread_local! {
+        static BUFFER: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
 
-    let file = std::fs::File::open(path).map_err(|source| NewgitError::io(path, source))?;
-    let mut reader = std::io::BufReader::new(file);
+    let mut file = std::fs::File::open(path).map_err(|source| NewgitError::io(path, source))?;
     let overlap = longest - 1;
-    let mut buffer = vec![0u8; overlap + CHUNK];
-    let mut filled = 0;
+    let matches = |window: &[u8]| finders.iter().any(|finder| finder.find(window).is_some());
 
-    loop {
-        let read = std::io::Read::read(&mut reader, &mut buffer[filled..])
-            .map_err(|source| NewgitError::io(path, source))?;
-        if read == 0 {
-            break;
+    BUFFER.with_borrow_mut(|buffer| {
+        buffer.resize(overlap + CHUNK, 0);
+        let mut filled = 0;
+        loop {
+            let read = std::io::Read::read(&mut file, &mut buffer[filled..])
+                .map_err(|source| NewgitError::io(path, source))?;
+            if read == 0 {
+                break;
+            }
+            filled += read;
+            if filled < buffer.len() {
+                // Short read: go around rather than scanning a half-filled
+                // window, so a boundary match is never split by an artifact
+                // of how the bytes arrived.
+                continue;
+            }
+            if matches(&buffer[..filled]) {
+                return Ok(true);
+            }
+            buffer.copy_within(filled - overlap..filled, 0);
+            filled = overlap;
         }
-        filled += read;
-        if filled < buffer.len() {
-            // Short read: go around rather than scanning a half-filled
-            // window, so a boundary match is never split by an artifact of
-            // how the bytes arrived.
-            continue;
-        }
-        if needles
-            .iter()
-            .any(|needle| contains_bytes(&buffer[..filled], needle.as_bytes()))
-        {
-            return Ok(true);
-        }
-        buffer.copy_within(filled - overlap..filled, 0);
-        filled = overlap;
-    }
-
-    Ok(needles
-        .iter()
-        .any(|needle| contains_bytes(&buffer[..filled], needle.as_bytes())))
-}
-
-fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
-    if needle.is_empty() || haystack.len() < needle.len() {
-        return false;
-    }
-    haystack
-        .windows(needle.len())
-        .any(|window| window == needle)
+        Ok(matches(&buffer[..filled]))
+    })
 }
 
 /// Remove whatever is at `path` — a directory, a file, or a symlink.
@@ -1213,6 +1283,48 @@ mod tests {
             "the instance keeps the tree it had"
         );
         assert!(!workspace.join("node_modules.newgit-replacing").exists());
+    }
+
+    /// The scan fans out over a wide, deep tree. One poisoned file among
+    /// hundreds of clean ones is still found, and a clean tree of the same
+    /// shape is stored.
+    #[test]
+    fn the_parallel_scan_finds_one_poisoned_file_in_a_wide_tree() {
+        let (_guard, root) = temp();
+        let store = InstallStore::at(root.join("installs"));
+        for (key, poisoned) in [("clean", false), ("poisoned", true)] {
+            let built = root.join(key);
+            for package in 0..40 {
+                let dir = built.join(format!("node_modules/.pnpm/pkg{package}/lib/deep"));
+                std::fs::create_dir_all(&dir).expect("mkdir");
+                for file in 0..10 {
+                    std::fs::write(dir.join(format!("f{file}.js")), "module.exports = 1;\n")
+                        .expect("write");
+                }
+            }
+            let target = built.join("node_modules/.pnpm/pkg23/lib/deep/f7.js");
+            if poisoned {
+                std::fs::write(&target, format!("require(\"{built}/x\");\n")).expect("write");
+            }
+
+            let admission = store
+                .admit(
+                    "deps",
+                    key,
+                    &built,
+                    &[Utf8PathBuf::from("node_modules")],
+                    &[],
+                )
+                .expect("admit");
+            if poisoned {
+                assert_eq!(admission, Admission::Declined { path: target });
+            } else {
+                assert!(
+                    matches!(admission, Admission::Stored { .. }),
+                    "{admission:?}"
+                );
+            }
+        }
     }
 
     /// The scan runs over whole trees, so it reads in chunks — a match must

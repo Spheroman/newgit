@@ -128,8 +128,16 @@ At spawn, for each slot (each role, and each role-less tracker):
 
 `newgit tracker use <tracker>` binds a tracker into an existing instance:
 swapping out whatever filled its role, binding what it requires, and starting
-the resources it brings. `newgit tracker drop <tracker>` unbinds one, stopping
-(never cleaning up) the resources no longer brought. A drop is refused while
+the resources it brings. `newgit tracker drop <tracker>` unbinds one, and
+*parks* the resources no longer brought (#254, #255): each is taken down as
+`newgit stop` would take it down (its process signalled, its `suspend` run),
+or, with no `suspend`, by its `[cleanup]`, and the output names the hook that
+ran. A parked binding keeps its ports — ports are for the instance's
+lifetime — so the next `use` hands them back and runs `resume` (or `prepare`,
+when the drop cleaned it up): the files it renders, its data, and whatever
+it left behind all agree on them. `remove` tears down parked bindings too.
+Shared (`project`, `user`) resources are parked but left up. A drop is
+refused while
 another bound tracker requires it, and while the tracker has uncommitted work
 unless `--stash` (brought back by the next `use`) or `--discard` (after a
 checkpoint, so `newgit undo` gets it back). Both rebuild every bound install
@@ -203,13 +211,19 @@ histories really differ.
 
 **Splitting (decided).** A view commit is split by ownership into one commit
 per code tracker it touched, on that tracker's instance branch: same author,
-date, and message, plus two trailers: `Newgit-Split: <view commit>`, and
+date, and message, plus trailers: `Newgit-Split: <view commit>`;
 `Newgit-Split-Parent: <commit>` naming the commit it followed in the view, so
 trackers' commits interleave back in the order they were made rather than
-merely by date. On replay, tracker commits sharing a split source fold back
-into one view commit with the trailers stripped — so a commit split and
-recomposed is *the same commit*: same tree, parent, author, date, and
-message, same id. Commit ids do not change under an agent, on any machine,
+merely by date; and a `Newgit-Split-Header:` for each line of the headers
+Git stored after the committer line (a signature, a merged tag, an
+encoding), verbatim. One trailer per line, continuation lines included: a
+PGP signature holds a line that is only a space, which Git's trailer parser
+reads as blank. The split commit's message ends the way the original's did,
+final newline or none (GitHub writes merges without one).
+On replay, tracker commits sharing a split source fold back into one view
+commit with the trailers stripped — so a commit split and recomposed is
+*the same commit*: same tree, parent, author, date, message, and headers,
+same id. Commit ids do not change under an agent, on any machine,
 with two exceptions today: split follows the first parent, so a merge
 *inside* the work being split is flattened and its commit recomposes
 differently; and a history imported from outside the project is
@@ -227,19 +241,29 @@ diff spans whatever the merged branch changed); history already split is not
 checked again, so a teammate's published work never blocks your sync.
 
 **Signed commits (decided).** A signature covers a commit's exact content,
-so a recomposed commit cannot carry the original's. Three rules:
+so it can only ever sit on the commit it was made for. Three rules:
 
 1. **Locally, the original is reused.** When a group would recompose into
    content identical to the view commit it was split from (same parent,
    same changes), compose emits that original object — signature and id
    intact. An agent's own workspace never sees its commits change.
-2. **Split commits are signed as their author** when the author configured
+2. **Elsewhere, the original is rebuilt, signature included.** A composer
+   with only the tracker commits — the remote, a teammate, `spawn
+   --from-checkpoint` — rebuilds each view commit (Git's `fast-import`
+   writes no signature), then puts back the headers the trailers recorded
+   and keeps the result only if it hashes to the `Newgit-Split` id. The id
+   is the proof: a matching commit is byte for byte the one its author
+   made, so its signature verifies with `git verify-commit` like any other,
+   and the commits after it move onto it. Whoever can read every tracker a
+   commit touched gets the same ids as the project's own history, GitHub
+   included. Someone who cannot gets a different tree, so the id cannot
+   match, and their commit stays rebuilt and unsigned: a signature is never
+   put on content it does not cover. The same holds for commits the forge
+   makes when it merges: unsigned ones rebuild exactly, and ones it signs
+   carry their signature in the trailer like anyone's.
+3. **Split commits are signed as their author** when the author configured
    signing (`commit.gpgSign`): newgit signs the per-tracker commits on that
    person's machine, with their key.
-3. **The limit, stated plainly:** a teammate composing your trackers, or a
-   GitHub export, receives tracker commits, not your combined commit. Their
-   composed commit is newly made and unsigned; your tracker commits stay
-   signed by you.
 
 **Splitting happens when work leaves the machine (decided):** sync, push,
 merge. Local history is left alone, and local undo works on the view.
@@ -479,7 +503,9 @@ it onward. Two layers keep that from mattering:
   spanning audiences, under* One commit, one audience*.)*
 - **When it does, every commit has a canonical id:** the commit as its author
   made it, which every tracker commit split from it already carries as
-  `Newgit-Split: <id>`. The endpoint notes it on each rebuilt commit, in
+  `Newgit-Split: <id>`. A commit given back as its original (*Signed
+  commits*, rule 2) is its canonical id. The endpoint notes it on each
+  commit that stays rebuilt, in
   `refs/notes/newgit-canonical`, served to Git clients as
   `refs/notes/commits` so `git log` shows it; newgit commands accept either
   id, and newgit's own
@@ -541,8 +567,20 @@ Each step lands alone and keeps the suite green. Status as of 2026-10-28.
      when an instance changes a tracker, checkpoints synced as lists and
      composed by `spawn --from-checkpoint`, `newgit clone`, and the Git
      endpoint at `newgit.dev/<owner>/<name>.git` (a per-project container
-     composing each reader's view). Rebuilt commits carry a note naming
-     their canonical id.
+     composing each reader's view). A rebuilt commit is given back as its
+     original, signature included, when its id comes out as the
+     original's; one that cannot be carries a note naming its canonical
+     id. Tracker commits split before the trailers kept message endings
+     and headers never come back as the original (step 3e).
+   - *3e — repairing older splits. Planned.* Tracker commits split before
+     the trailers recorded headers and message endings lost both, so on
+     the remote they rebuild with new ids, and so does every commit after
+     them. The repair rewrites each such commit's trailers from the
+     original view commit, where this machine has it — trees and parents
+     unchanged, so only ids move — then remaps every tracker branch, the
+     composed-state notes, and on the remote each tracker's repo, branch
+     lists, and checkpoint lists. A force push of tracker history, so it
+     runs once, by hand.
 4. **Roles, priority, resources, use/drop.** *Done, except a resource's
    `depends_on` naming a role.* `role`, `priority` (negative: only when
    asked), `requires`, and `resources` decide what a spawn binds (`--use`,

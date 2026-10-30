@@ -146,6 +146,147 @@ impl GitSource {
         .map(|_| ())
     }
 
+    /// Materialize `branch` at `destination` by cloning `template`, a
+    /// checkout of the store kept for this, with one `clonefile(2)`.
+    ///
+    /// `clone_to` spends ~2.3s of its ~2.5s on T3 Code (28.6k files)
+    /// checking files out. Cloning a checkout that already exists takes
+    /// 0.25s; the rest is keeping Git from re-hashing every file on the
+    /// first `git status`, which it otherwise would because a clone has new
+    /// inodes and ctimes. So the workspace gets `core.checkStat=minimal` and
+    /// `core.trustctime=false`: Git then compares a file's size and
+    /// whole-second mtime only, both of which a clone keeps. That misses an
+    /// edit only when it keeps the size and the mtime's second as well. An
+    /// edit made now has a later mtime than anything Git recorded, and Git
+    /// re-hashes entries written in the same second as its index. A copy
+    /// that keeps its source's mtime (`cp -p`, `rsync -a`) carries that
+    /// file's own second, not the one recorded here. What is left is setting
+    /// the mtime to the recorded second on purpose (`touch -r`), which the
+    /// default settings would catch through the ctime. Checkpoints are not
+    /// affected either way: they build their tree in an index of their own,
+    /// with no stat data to trust, and hash every file (#235).
+    ///
+    /// The template sits beside the workspaces, so it is on their volume,
+    /// and outside the project, where tools that crawl it would find a
+    /// second copy of the source. It has no local branches: each workspace
+    /// gets only its own, with the upstream `clone --branch` would have
+    /// set. One lock covers bringing it to `rev` and cloning it, so two
+    /// spawns never clone it mid-checkout.
+    ///
+    /// An error leaves nothing at `destination` and the caller falls back
+    /// to `clone_to`. A template a Git command failed on is deleted and
+    /// rebuilt by the next spawn.
+    pub fn clone_via_template(
+        &self,
+        template: &Utf8Path,
+        branch: &str,
+        rev: &str,
+        destination: &Utf8Path,
+    ) -> Result<()> {
+        if let (Some(from), Some(to)) = (template.parent(), destination.parent())
+            && !same_device(from, to)?
+        {
+            return Err(NewgitError::Unsupported(format!(
+                "{template} and {destination} are on different volumes, which clonefile cannot \
+                 cross"
+            )));
+        }
+        let lock_path = Utf8PathBuf::from(format!("{template}.lock"));
+        let lock = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&lock_path)
+            .map_err(|source| NewgitError::io(&lock_path, source))?;
+        lock.lock()
+            .map_err(|source| NewgitError::io(&lock_path, source))?;
+
+        if let Err(error) = self.prepare_template(template, rev) {
+            let _ = std::fs::remove_dir_all(template);
+            return Err(error);
+        }
+        if let Err(source) = clone_dir(template, destination) {
+            let _ = std::fs::remove_dir_all(destination);
+            return Err(NewgitError::io(destination, source));
+        }
+        drop(lock);
+
+        let configured = (|| {
+            let git = |args: &[&str]| {
+                let mut full = vec!["-C", destination.as_str()];
+                full.extend_from_slice(args);
+                run_git(&full).map(|_| ())
+            };
+            // The template's reflog is its own string of checkouts, not
+            // this branch's history, and its FETCH_HEAD and ORIG_HEAD are
+            // from its own fetches and checkouts.
+            let logs = destination.join(".git/logs");
+            if logs.exists() {
+                std::fs::remove_dir_all(&logs).map_err(|source| NewgitError::io(&logs, source))?;
+            }
+            for name in ["FETCH_HEAD", "ORIG_HEAD"] {
+                let path = destination.join(".git").join(name);
+                if path.exists() {
+                    std::fs::remove_file(&path).map_err(|source| NewgitError::io(&path, source))?;
+                }
+            }
+            let head = format!("refs/heads/{branch}");
+            let message = format!("clone: from {}", self.root);
+            git(&["update-ref", "-m", &message, &head, rev])?;
+            git(&["symbolic-ref", "-m", &message, "HEAD", &head])?;
+            git(&["config", &format!("branch.{branch}.remote"), "origin"])?;
+            git(&["config", &format!("branch.{branch}.merge"), &head])?;
+            git(&["config", "core.checkStat", "minimal"])?;
+            git(&["config", "core.trustctime", "false"])
+        })();
+        if configured.is_err() {
+            let _ = std::fs::remove_dir_all(destination);
+        }
+        configured
+    }
+
+    /// Bring the template to `rev`, cloning it from the store first if it
+    /// does not exist yet.
+    fn prepare_template(&self, template: &Utf8Path, rev: &str) -> Result<()> {
+        let git = |args: &[&str]| {
+            let mut full = vec!["-C", template.as_str()];
+            full.extend_from_slice(args);
+            run_git(&full)
+        };
+        let fresh = !template.join(".git").is_dir();
+        if !fresh {
+            // A refspec fetch, so the remote-tracking refs a workspace
+            // inherits match what a fresh clone would have.
+            git(&["fetch", "--quiet", "--prune", "--tags", "origin"])?;
+        } else {
+            if template.exists() {
+                std::fs::remove_dir_all(template)
+                    .map_err(|source| NewgitError::io(template, source))?;
+            }
+            run_git(&[
+                "clone",
+                "--quiet",
+                "--no-checkout",
+                "--",
+                self.root.as_str(),
+                template.as_str(),
+            ])?;
+        }
+        git(&["checkout", "--quiet", "--force", "--detach", rev])?;
+        if fresh {
+            settle_index(template)?;
+        }
+        let heads = git(&["for-each-ref", "--format=%(refname)", "refs/heads"])?;
+        for head in heads.lines().map(str::trim).filter(|head| !head.is_empty()) {
+            git(&["update-ref", "-d", head])?;
+            if let Some(name) = head.strip_prefix("refs/heads/") {
+                // Absent when the branch never had an upstream.
+                let _ = git(&["config", "--remove-section", &format!("branch.{name}")]);
+            }
+        }
+        Ok(())
+    }
+
     /// Fetch a ref from another repository (typically a workspace clone)
     /// into the store. Fetch, never push: the store pulls commits in when a
     /// checkpoint blesses them, and workspaces stay passive. (A workspace's
@@ -901,6 +1042,54 @@ pub fn run_git_env(args: &[&str], env: &[(String, String)]) -> Result<String> {
             stderr: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
         })
     }
+}
+
+/// Make a fresh checkout's index trust every file it records.
+///
+/// Git cannot tell a file written in the same second as its index from one
+/// edited just after, so it records those entries as unverified and hashes
+/// them again on its next look. A full checkout writes thousands of files in
+/// its last second; on T3 Code that cost every workspace cloned from a new
+/// template ~2s on its first `git status`. Refreshing once the clock has
+/// moved past the index's second hashes them now, once, and records them
+/// as clean. A later checkout of the template only rewrites the files that
+/// changed, so this is only worth doing when it is created.
+fn settle_index(repo: &Utf8Path) -> Result<()> {
+    let index = repo.join(".git/index");
+    let written = std::fs::metadata(&index)
+        .and_then(|meta| meta.modified())
+        .map_err(|source| NewgitError::io(&index, source))?;
+    let second = |time: std::time::SystemTime| {
+        time.duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_secs())
+            .unwrap_or(0)
+    };
+    while second(std::time::SystemTime::now()) <= second(written) {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    run_git(&["-C", repo.as_str(), "update-index", "-q", "--refresh"]).map(|_| ())
+}
+
+/// Whether two existing directories are on the same filesystem.
+fn same_device(a: &Utf8Path, b: &Utf8Path) -> Result<bool> {
+    use std::os::unix::fs::MetadataExt;
+    let device = |path: &Utf8Path| {
+        std::fs::metadata(path)
+            .map(|meta| meta.dev())
+            .map_err(|source| NewgitError::io(path, source))
+    };
+    Ok(device(a)? == device(b)?)
+}
+
+/// Clone a whole directory tree in one call: `clonefile(2)` on macOS.
+#[cfg(target_os = "macos")]
+fn clone_dir(source: &Utf8Path, destination: &Utf8Path) -> std::io::Result<()> {
+    reflink_copy::reflink(source, destination)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn clone_dir(_source: &Utf8Path, _destination: &Utf8Path) -> std::io::Result<()> {
+    Err(std::io::ErrorKind::Unsupported.into())
 }
 
 fn spawn_error(args: &[&str], source: &std::io::Error) -> NewgitError {

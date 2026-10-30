@@ -357,6 +357,37 @@ project repository:
 - Nothing is shared between workspaces, so two instances of the same base
   branch is a non-event.
 
+On macOS the clone is not made by `git clone`, which spends almost all of
+its time checking files out (2.3s of 2.5s on T3 Code's 28.6k files).
+newgit keeps one clean checkout of the project repository beside the
+workspaces, `<workspace root>/.source-template`, with no local branches.
+`spawn` fetches it from the project repository, checks out the instance's
+revision, and copies the whole tree with one `clonefile(2)`. Then the copy
+gets its own branch, with the upstream `git clone --branch` would set, and
+`core.checkStat=minimal` plus `core.trustctime=false`. Without those two
+settings Git would re-hash every file on the first `git status`, because
+every inode and ctime is new. With them it compares a file's size and
+whole-second mtime only, both of which the copy keeps. The result is the
+same repository a clone produces, in 0.67s instead of 2.7–3.1s. The first
+spawn builds the template and takes longer once. If anything in this path
+fails, `spawn` falls back to `git clone`. That includes a workspace root on
+another volume, which `clonefile` cannot reach.
+
+What those two settings give up: an edit Git cannot see is one that keeps
+the file's size and the second of its mtime. Ordinary edits cannot do that.
+They are later than anything Git recorded, and Git re-hashes any entry
+written in the same second as its index. A copy that keeps its source's
+mtime (`cp -p`, `rsync -a`, `tar x`) carries that file's own second, not the
+one Git recorded. What remains is setting a file's mtime to the recorded
+second on purpose (`touch -r`) while keeping its size, which Git's default
+settings would catch through the ctime. Even then only the workspace's own
+`git status` misses it. A checkpoint builds its tree in an index of its own
+with no stat data, so it hashes every file and captures the edit.
+
+If the template path fails, `spawn` says why in its output
+(`template_warning` in `--json`), since a template that fails every time
+makes every spawn pay for rebuilding it on top of the clone.
+
 A dropped code tracker's files are left out of the working tree with Git's
 sparse checkout. The history still has them, so every instance of a project
 has the same commit ids.
@@ -418,7 +449,8 @@ opens a real pull request there (see *Export*).
 Clone is the first materializer, not the last. Each later step keeps the
 contract fixed:
 
-1. **Now:** an eager local clone.
+1. **Now:** an eager local clone (on macOS, a `clonefile` of a template
+   checkout).
 2. **Later:** a Git partial clone with the project repository as the
    promisor remote, so objects arrive on demand through Git's own lazy
    mechanism. Big repositories spawn fast without newgit touching a
@@ -852,10 +884,21 @@ exit 1 if any resource failed.
 instances share, nor for one that never came up. The `supabase` template's
 pair is `supabase stop` / `supabase start`, which keeps the data.
 
+A tracker drop is the same stop, for the resources the dropped tracker
+brought (#254). Each is *parked*: taken down — its process signalled and
+its `suspend` run, or its `[cleanup]` when it has no `suspend` — and its
+binding moved to the record's `parked` table with its ports still claimed.
+`tracker use` hands those ports back and runs `resume` (or `prepare`, after
+a cleanup), so a role switch and back leaves the rendered files, the data,
+and the running stack on the same ports (#255). `newgit ports` lists parked
+claims as `(parked)`, and `ports --check` counts them as claimed. An undo to
+a checkpoint that bound less parks the same way.
+
 ### Remove
 
 `newgit remove <name>` stops what is running (dependents first), runs
-`[cleanup]` hooks where ownership allows, deletes the workspace (`rm -rf`;
+`[cleanup]` hooks where ownership allows — for parked bindings too, unless
+their drop already ran it — deletes the workspace (`rm -rf`;
 clones have no registration), and archives the binding record.
 
 **The source branch** goes too, when it holds nothing unique, and otherwise
