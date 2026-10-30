@@ -329,6 +329,13 @@ impl TrackerRepo {
         // rev leaves the workspace as it was.
         self.refuse_escaping_links(rev, &commit, &files)?;
 
+        // Excluded from the workspace's Git before anything is written, by
+        // every caller: a workspace spawned before this tracker was defined
+        // has no exclude for it, and a plain `git add -A` in between would
+        // commit secret content into source history.
+        if definition.secret {
+            crate::materializer::exclude_tracker_paths(workspace, &definition.paths)?;
+        }
         clear_owned_paths(workspace, definition)?;
         self.check_out(&commit, workspace, &files)?;
         Ok(files.len())
