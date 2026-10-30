@@ -38,7 +38,11 @@
     // A public value: GitHub's device flow identifies the app by it.
     "GITHUB_CLIENT_ID": "Ov23liKp3f44HWjSOE9L",
     // Where the namespace's repos are served; not a secret.
-    "ARTIFACTS_GIT_BASE": "https://bce0b38de721f350c8d8a51d0520337d.artifacts.cloudflare.net/git/newgit"
+    "ARTIFACTS_GIT_BASE": "https://bce0b38de721f350c8d8a51d0520337d.artifacts.cloudflare.net/git/newgit",
+    // Served at /: this file of this tracker, at its trunk. The tracker is
+    // secret, so naming it here is what publishes the page (src/index.ts,
+    // `landingPage`).
+    "LANDING_PAGE": { "project": "spheroman/newgit", "tracker": "site", "path": "remote/site/index.html" }
   }
   // Secrets: TOKEN_KEY (signs newgit tokens), ALLOWED_LOGINS (who may use
   // this remote; unset admits no one).

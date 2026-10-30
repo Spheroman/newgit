@@ -85,7 +85,14 @@ const json = (body: unknown, status = 200) => Response.json(body, { status });
 
 export default {
 	async fetch(request, env, ctx): Promise<Response> {
-		return handle(request, env, {
+		// The landing page is read from a tracker on every miss, so the edge
+		// keeps it for as long as it says it may (`landingPage`).
+		const landing = request.method === "GET" && new URL(request.url).pathname === "/";
+		if (landing) {
+			const cached = await caches.default.match(request);
+			if (cached) return cached;
+		}
+		const response = await handle(request, env, {
 			repos: new ArtifactsRepos(env.ARTIFACTS, env.ARTIFACTS_GIT_BASE),
 			fetcher: fetch,
 			waitUntil: (promise) => ctx.waitUntil(promise),
@@ -100,6 +107,8 @@ export default {
 				);
 			},
 		});
+		if (landing && response.status === 200) ctx.waitUntil(caches.default.put(request, response.clone()));
+		return response;
 	},
 } satisfies ExportedHandler<Env>;
 
@@ -135,6 +144,9 @@ async function route(request: Request, env: Env, deps: Deps): Promise<Response> 
 		return new Response(method === "HEAD" ? null : installScript, {
 			headers: { "content-type": "text/x-shellscript; charset=utf-8", "cache-control": "public, max-age=300" },
 		});
+
+	// ── The landing page ───────────────────────────────────────────────────
+	if ((method === "GET" || method === "HEAD") && path === "") return landingPage(method, env, deps.repos);
 
 	// ── Login (no token yet) ───────────────────────────────────────────────
 	if (method === "POST" && path === "/v1/login/device") {
@@ -673,6 +685,27 @@ async function gitEndpoint(request: Request, env: Env, deps: Deps, match: RegExp
 		plan.repos[tracker] = { url: deps.repos.url(name), auth: `Authorization: Basic ${btoa(`x:${minted.password}`)}` };
 	}
 	return deps.endpoint(key, service === match[3] ? "upload-pack" : "advertise", plan, request);
+}
+
+/** Where `/` sends a visitor when this remote publishes no landing page. */
+const REPOSITORY = "https://github.com/Spheroman/newgit";
+
+/**
+ * The landing page: one file of one tracker, at that tracker's trunk, named
+ * by `LANDING_PAGE` in wrangler.jsonc. newgit.dev's is in `site`, a secret
+ * tracker, so this route is the one place its content is published, and
+ * only the file the config names. Publishing a change is `newgit tracker
+ * merge site` and a checkpoint, not a deploy.
+ */
+async function landingPage(method: string, env: Env, repos: Repos): Promise<Response> {
+	const page = env.LANDING_PAGE;
+	const project = page ? parseProjectKey(page.project) : null;
+	const html =
+		page && project ? await repos.readFile(repoName({ kind: "tracker", project, tracker: page.tracker }), "HEAD", page.path) : null;
+	if (html === null) return Response.redirect(REPOSITORY, 302);
+	return new Response(method === "HEAD" ? null : html, {
+		headers: { "content-type": "text/html; charset=utf-8", "cache-control": "public, max-age=60" },
+	});
 }
 
 /** Where a project's Git endpoint is: `https://<host>/<owner>/<name>.git`. */

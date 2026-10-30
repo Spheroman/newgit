@@ -68,6 +68,13 @@ this repository is `spheroman/newgit` on newgit.dev, and GitHub's
 - `newgit remote delete <owner>/<name>`: the owner deletes the project —
   every token pinned to it revoked first, then every repo under its prefix,
   then its record — so the name can be linked again from scratch.
+- The landing page at `/`: one file of one tracker, at its trunk, named by
+  `LANDING_PAGE` in `wrangler.jsonc`. newgit.dev's is
+  `remote/site/index.html` in `site`, a secret `project-devs` tracker, so
+  the page is never committed and naming it in the config is what
+  publishes it. A change goes live with `newgit tracker merge site` and a
+  checkpoint, within a minute (the edge caches it), with no deploy. With
+  no page to serve, `/` redirects to the GitHub repository.
 - GitHub export (0.6.0): `newgit export --remote <NAME>` pushes the chosen
   trackers' `main`s, history and all, to the target defined in
   `.newgit/exports/<NAME>.toml`; `--dry-run` composes and checks without
