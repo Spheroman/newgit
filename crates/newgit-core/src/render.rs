@@ -477,15 +477,17 @@ pub fn reverse_rendered(
             .filter(|&&index| !chosen[index])
             .map(|&index| line_of(current, found[index].start).to_string())
             .collect();
+        // A value that is gone altogether was not misplaced: the file no
+        // longer renders, and the caller's render check says that in its
+        // own words.
+        if lines.is_empty() {
+            continue;
+        }
         unplaced.push(format!(
             "resource `{}`'s value `{}` on line(s) {}",
             rules[rule].0,
             rules[rule].1.value,
-            if lines.is_empty() {
-                "(none: the rendered line was removed)".to_owned()
-            } else {
-                lines.join(", ")
-            }
+            lines.join(", ")
         ));
     }
 

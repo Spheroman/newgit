@@ -1022,7 +1022,7 @@ Four rules carry the rest:
   typed. Where newgit cannot tell which occurrence it wrote (you duplicated
   the rendered line), or the result would no longer render (you typed the
   committed default somewhere else too), `tracker capture` refuses and names
-  the lines.
+  the lines, and so does `tracker drop`, leaving the file in place.
 
 The cost, on a source path: **hand edits to a rendered file do not survive the
 workspace.** newgit does not restate that every spawn — it recomputes what the

@@ -794,9 +794,12 @@ into a path the project owns. Four places they must not reach:
   edit on the rendered line itself still reverses when the value occurs
   exactly as often as the render wrote it, since then it can only be one
   thing. Anything else is not guessed. `tracker capture` refuses, naming
-  the lines, and it also refuses content that would no longer render. The
-  captures newgit takes on its own (checkpoint, re-bind, checkout) still
-  record, because refusing a safety net loses the work it exists to keep.
+  the lines, and it also refuses content that would no longer render.
+  `tracker drop` of a secret tracker refuses the same way: it takes the
+  files out of the workspace, so its capture is the last copy, and the
+  file is left as it was to be fixed. The captures newgit takes on its own
+  (checkpoint, re-bind, checkout) still record, because refusing a safety
+  net loses the work it exists to keep.
 - **A checkpoint's uncommitted-work commit.** It is built in a throwaway
   index, which does not carry the real index's skip-worktree bits, so newgit
   sets them there too.

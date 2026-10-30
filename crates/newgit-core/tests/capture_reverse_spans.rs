@@ -212,3 +212,18 @@ fn content_that_would_no_longer_render_refuses_the_capture() {
     assert!(message.contains("line(s) 2, 3"), "{message}");
     assert_eq!(std::fs::read_to_string(&env).expect("env"), content);
 }
+
+#[test]
+fn a_removed_rendered_line_says_it_would_no_longer_render() {
+    let (_guard, temp) = tempdir();
+    let m = project(&temp);
+    let (workspace, _) = spawn(&m, "rev");
+
+    let env = workspace.join(".env.local");
+    std::fs::write(&env, "SECRET=one\n").expect("edit");
+
+    let error = m.capture_tracker("rev", "env").expect_err("refused");
+    let message = error.to_string();
+    assert!(message.contains("would no longer render"), "{message}");
+    assert!(!message.contains("still holds"), "{message}");
+}
