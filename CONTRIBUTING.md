@@ -25,6 +25,9 @@ If you're contributing as part of your job, your employer may own what you
 write. Check before you sign, and if they need to sign for you, open an
 issue first.
 
+newgit's founders don't sign: what they write goes to the company by IP
+assignment instead.
+
 ## Why there is a CLA
 
 The CLI is MIT or Apache-2.0, and the remote is AGPL-3.0-only. Some of newgit
