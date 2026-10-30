@@ -508,8 +508,91 @@ pub fn resolve_ownership(definitions: &mut [TrackerDefinition]) -> Result<()> {
     Ok(())
 }
 
+/// Whether a symlink at `link` (relative to `root`) whose target is written
+/// `target` stays inside `root`, judged from the text alone: the target is
+/// relative and its `..`s never climb above `root`. This is what a stored
+/// link means on any machine, which is why checkout judges a lane's links
+/// by it; capture additionally resolves the link on disk
+/// ([`link_resolves_inside`]).
+pub fn link_target_inside(link: &Utf8Path, target: &Utf8Path) -> bool {
+    if target.as_str().is_empty() {
+        return false;
+    }
+    let mut depth: Vec<&str> = link
+        .parent()
+        .into_iter()
+        .flat_map(|parent| parent.components())
+        .filter_map(|component| match component {
+            Utf8Component::Normal(part) => Some(part),
+            _ => None,
+        })
+        .collect();
+    for component in target.components() {
+        match component {
+            Utf8Component::CurDir => {}
+            Utf8Component::Normal(part) => depth.push(part),
+            Utf8Component::ParentDir => {
+                if depth.pop().is_none() {
+                    return false;
+                }
+            }
+            Utf8Component::RootDir | Utf8Component::Prefix(_) => return false,
+        }
+    }
+    true
+}
+
+/// Whether the symlink at `root/link` resolves inside `root` on disk, as
+/// well as by its text: a relative target can still leave through another
+/// link along the way. A dangling link is judged by its text alone.
+pub fn link_resolves_inside(root: &Utf8Path, link: &Utf8Path, target: &Utf8Path) -> bool {
+    if !link_target_inside(link, target) {
+        return false;
+    }
+    match (
+        std::fs::canonicalize(root.join(link)),
+        std::fs::canonicalize(root),
+    ) {
+        (Ok(resolved), Ok(root)) => resolved.starts_with(root),
+        _ => true,
+    }
+}
+
+/// The first directory along `relative` (excluding `relative` itself) that
+/// is a symlink, with its target. Anything found "under" such a directory is
+/// really wherever the link leads, so a walk must not go through it.
+pub fn symlinked_parent(
+    root: &Utf8Path,
+    relative: &Utf8Path,
+) -> Option<(Utf8PathBuf, Utf8PathBuf)> {
+    let mut prefix = Utf8PathBuf::new();
+    let parent = relative.parent()?;
+    for component in parent.components() {
+        prefix.push(component);
+        let absolute = root.join(&prefix);
+        let metadata = std::fs::symlink_metadata(&absolute).ok()?;
+        if metadata.is_symlink() {
+            let target = std::fs::read_link(&absolute)
+                .ok()
+                .and_then(|target| Utf8PathBuf::from_path_buf(target).ok())
+                .unwrap_or_else(|| Utf8PathBuf::from("?"));
+            return Some((prefix, target));
+        }
+        if !metadata.is_dir() {
+            return None;
+        }
+    }
+    None
+}
+
 /// Files a tracker owns inside a workspace, as (relative, absolute) pairs,
 /// sorted by relative path. Missing paths are simply absent.
+///
+/// A symlink is listed as itself — the absolute path is the link, never what
+/// it points at — and a symlink to a directory is not descended into, as
+/// Git does. Callers that read content check [`std::fs::symlink_metadata`]
+/// and must not follow it. A tracked path under a symlinked directory is
+/// refused ([`NewgitError::SymlinkedParent`]).
 pub fn collect_owned_files(
     workspace: &Utf8Path,
     definition: &TrackerDefinition,
@@ -532,6 +615,13 @@ pub fn collect_files(
 ) -> Result<Vec<(Utf8PathBuf, Utf8PathBuf)>> {
     let mut files = Vec::new();
     for relative in paths {
+        if let Some((link, target)) = symlinked_parent(root, relative) {
+            return Err(NewgitError::SymlinkedParent {
+                path: relative.clone(),
+                link,
+                target,
+            });
+        }
         walk(root, relative, &mut files)?;
     }
     files.sort();
@@ -559,11 +649,16 @@ fn walk(
     files: &mut Vec<(Utf8PathBuf, Utf8PathBuf)>,
 ) -> Result<()> {
     let absolute = workspace.join(relative);
-    if absolute.is_file() {
+    // `symlink_metadata`, never `metadata`: a link is listed as itself and
+    // never descended into, so nothing outside the root is ever walked.
+    let Ok(metadata) = std::fs::symlink_metadata(&absolute) else {
+        return Ok(());
+    };
+    if metadata.is_file() || metadata.is_symlink() {
         files.push((relative.to_path_buf(), absolute));
         return Ok(());
     }
-    if !absolute.is_dir() {
+    if !metadata.is_dir() {
         return Ok(());
     }
     for entry in
@@ -584,7 +679,18 @@ fn walk(
 pub fn content_rev(files: &[(Utf8PathBuf, Utf8PathBuf)]) -> Result<String> {
     let mut hasher = Sha256::new();
     for (relative, absolute) in files {
-        let bytes = std::fs::read(absolute).map_err(|source| NewgitError::io(absolute, source))?;
+        // A link is its target's text, as Git stores it: hashing what it
+        // points at would read outside the workspace.
+        let is_link = std::fs::symlink_metadata(absolute).is_ok_and(|meta| meta.is_symlink());
+        let bytes = if is_link {
+            let target =
+                std::fs::read_link(absolute).map_err(|source| NewgitError::io(absolute, source))?;
+            let mut bytes = b"\0symlink\0".to_vec();
+            bytes.extend_from_slice(target.as_os_str().as_encoded_bytes());
+            bytes
+        } else {
+            std::fs::read(absolute).map_err(|source| NewgitError::io(absolute, source))?
+        };
         hasher.update(relative.as_str().as_bytes());
         hasher.update([0]);
         hasher.update((bytes.len() as u64).to_le_bytes());

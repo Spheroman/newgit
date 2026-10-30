@@ -71,7 +71,7 @@ An instance works on what it binds:
 newgit spawn fix-db --use staging-db --drop electron   # one per role; the rest as you say
 newgit tracker drop electron --stash   # out of the working tree, history untouched
 newgit tracker use electron            # back, with the stashed work
-newgit status                          # ready / not ready, and why
+newgit status                          # ready / starting / not ready, and why
 ```
 
 Trackers sharing a `role` are alternatives (`dev-db`, `staging-db`); a spawn
@@ -122,11 +122,13 @@ install that declares what it produces (`[identity] produces`) is built once
 and published to the install store in `.newgit/installs/`; every later
 instance with the same key is filled from it with a copy-on-write clone and
 never runs the install. The key covers the lockfile, the definition file,
-the `key_command` output, and which trackers the instance binds. Where the
-filesystem cannot clone (APFS, btrfs, and XFS can), newgit takes a full copy
-and says so. A tree that names its own workspace in a file is not shared,
-unless a `[[render]]` on that file lets the store rewrite it per instance;
-the `pnpm` template does this for pnpm's workspace state.
+the `key_command` output, and which paths the instance checks out (plus
+which trackers it binds, when the install is told them through
+`{{bound…}}`). Where the filesystem cannot clone (APFS, btrfs, and XFS
+can), newgit takes a full copy and says so. A tree that names its own
+workspace in a file is not shared, unless a `[[render]]` on that file lets
+the store rewrite it per instance; the `pnpm` template does this for pnpm's
+workspace state.
 
 On a miss, the cost is your package manager's. **pnpm**, uv, and bun
 hardlink from a shared cache, so a new tree is mostly directory entries.
@@ -208,6 +210,31 @@ the second runs `newgit remove` when Claude Code removes the worktree.
 `--shared` writes `.claude/settings.json` instead, for a team that all has
 `newgit` on its `PATH`.
 
+The instance starts where Claude Code's own worktree would, not at
+whatever the project root has checked out (which is what a plain `newgit
+spawn` uses):
+
+- By default (`worktree.baseRef` unset or `"fresh"`), the project branch
+  as it stands. If nothing in the project root has fetched for a day, the
+  hook first fetches that branch's upstream (5 seconds at most, never
+  prompting; on failure it uses the ref already there). Then it takes
+  whichever of the root's branch and its upstream contains the other: the
+  upstream when the root's `main` is only behind (a PR merged on GitHub
+  that nobody pulled), the root's branch when it is ahead or the two have
+  diverged. The root's own branch is never moved.
+- Subagents launched together make their hooks run at once. The choice is
+  made under one store-wide lock, so one of them fetches and they all
+  start from the same commit. If that fetch fails, the hooks in the next
+  minute don't retry it. They use the ref already there, as the one that
+  failed did.
+- With `worktree.baseRef = "head"`, it starts from the root's `HEAD`. For a
+  session already in an instance, it starts from that instance's source
+  branch as the store last saw it (its last checkpoint or push).
+- A name that is already a Git branch in the project spawns on that
+  branch as it is.
+- The hook prints the base it chose on stderr, which ends up in Claude
+  Code's debug log.
+
 - Claude Code runs a project's hooks only once you have trusted the
   folder: run `claude` there once and accept the prompt before using
   `--worktree`.
@@ -240,7 +267,8 @@ inside a workspace):
 - `newgit init [--name <name>]` / `spawn <name> [--from <rev>] [--use
   <tracker>] [--drop <tracker>] [--private] [--json]` / `status [name]` /
   `remove <name> [--purge] [--keep-branch | --delete-branch]` — `status`
-  says whether each instance is ready, and why not
+  says whether each instance is ready, still starting (a dev server that is
+  not listening yet), or not ready, and why
 - `newgit status <instance> --path` — just the workspace path, for scripts
 - `newgit reference [section | all]` — the definition format, every key and
   default; bare, it lists the sections
@@ -279,10 +307,16 @@ Definition management (noun subcommands):
 - `newgit tracker capture|merge|pull|checkout <tracker> [instance]`
 - `newgit tracker capture <tracker> --from-store` — seed a lane from the store
   repo's working tree, so the first `spawn` comes up with the content
+- Capture never follows a symlink: a link that stays inside the workspace is
+  kept as a link, as Git keeps one; a link out of the workspace, or a tracked
+  path under a symlinked directory, is refused by name
+  ([spec](design/spec.md#secret-trackers))
 - `newgit tracker list` — a tree by ownership: kind, role, priority,
   maintainers, and (inside a workspace) what is bound
 - `newgit tracker use <tracker> [instance]` / `newgit tracker drop <tracker>
-  [instance] [--stash | --discard]`
+  [instance] [--stash | --discard]` — a drop parks the resources the tracker
+  brought: taken down by `suspend` (else `[cleanup]`), ports kept, and
+  brought back on them by the next `use`; `remove` tears parked ones down
 - `newgit tracker repair [--dry-run]` — rewrite code tracker commits split
   before newgit kept each original's message ending and signature, so a
   clone from the remote gets the project's own commit ids. Moves every code
@@ -311,7 +345,10 @@ Remote:
 
 Resource templates: `process`, `pnpm`, `install`, `command-snapshot`,
 `command-snapshot-migrations`, `supabase`, `external`. `newgit resource
-templates --show <name>` prints one in full without creating anything.
+templates --show <name>` prints one in full without creating anything. Their
+comments say what to edit: `process` works without a port (delete `[ports]`,
+`[exports]` and `[[render]]`), and `supabase` needs every service's section
+in `config.toml` and has a commented `workdir` for monorepos.
 
 ## Behavior worth knowing
 
@@ -357,6 +394,17 @@ so at bind. For a tracker-owned file, `tracker capture` reverses the
 substitution, so edits you make beside the rendered value reach the lane and
 your port does not.
 
+A file rendered once is not read again by a process already running on it.
+When `tracker use` or `drop` changes a rendered file's bytes (binding a
+per-branch database writes its port into `apps/admin/.env.local`, say), each
+process that was running before restarts if its resource declares `reads`
+covering the file, and is named with the command that restarts it if it
+declares nothing:
+
+```toml
+reads = ["apps/admin"]   # a dev server run from apps/admin reads its .env.local
+```
+
 A render can also target a file inside a resource's own `[identity]
 produces`, a built tree rather than source. That is how an install whose
 tree records its workspace path can still be shared through the install
@@ -366,6 +414,12 @@ store (`newgit reference render`).
 project's repository, and `git push` checkpoints the instance before
 forwarding the push there — succeeding only if that remote accepted it.
 `gh pr create` works from the workspace with no flags.
+
+**Branching inside a workspace is fine.** `git checkout -b try-x` in an
+instance's workspace works the way Git does. A checkpoint captures `try-x`
+as it stands, and undo returns to it, but the instance's own branch stays
+where it was until you switch back and commit there. `status` shows
+`` feature-a@1a2b3c4d (workspace on `try-x`) `` while that is the case.
 
 **`cleanup` never breaks an undo.** It finalizes instances whose workspace is
 gone, deletes unclaimed workspaces and dead process state, and prunes tracker

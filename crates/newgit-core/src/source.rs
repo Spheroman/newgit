@@ -394,9 +394,28 @@ impl GitSource {
     /// bare repository borrowing the store's objects, so neither bringing it
     /// up to date nor receiving a push copies history the store already
     /// has.
+    ///
+    /// Made beside its path and renamed into place: the first spawns in a
+    /// project, run at once (subagents launched together), each find it
+    /// missing, and two `git init`s into one directory fail on each other's
+    /// lock files. The rename lets one of them win and the rest find it made.
     pub fn ensure_outbox(&self, outbox: &Utf8Path) -> Result<()> {
         if !outbox.join("HEAD").is_file() {
-            run_git(&["init", "--quiet", "--bare", "--", outbox.as_str()])?;
+            let parent = outbox.parent().unwrap_or(Utf8Path::new("."));
+            crate::materializer::create_dir_all(parent)?;
+            let staging = parent.join(format!(
+                ".{}.{}",
+                outbox.file_name().unwrap_or("outbox"),
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&staging);
+            run_git(&["init", "--quiet", "--bare", "--", staging.as_str()])?;
+            if let Err(error) = std::fs::rename(&staging, outbox) {
+                let _ = std::fs::remove_dir_all(&staging);
+                if !outbox.join("HEAD").is_file() {
+                    return Err(NewgitError::io(outbox, error));
+                }
+            }
         }
         let alternates = outbox.join("objects/info/alternates");
         let objects = format!("{}\n", self.objects_dir()?);
@@ -568,6 +587,55 @@ impl GitSource {
     /// Live HEAD of a workspace clone, full form.
     pub fn workspace_head(workspace: &Utf8Path) -> Result<String> {
         run_git(&["-C", workspace.as_str(), "rev-parse", "HEAD"])
+    }
+
+    /// The branch a workspace clone has checked out, or `None` when its HEAD
+    /// is detached (a `git checkout <rev>`, or mid-rebase).
+    pub fn workspace_branch(workspace: &Utf8Path) -> Result<Option<String>> {
+        let head = run_git(&[
+            "-C",
+            workspace.as_str(),
+            "rev-parse",
+            "--symbolic-full-name",
+            "HEAD",
+        ])?;
+        Ok(head.strip_prefix("refs/heads/").map(ToOwned::to_owned))
+    }
+
+    /// A branch's tip in a workspace clone, `None` when it has no such branch.
+    pub fn workspace_branch_rev(workspace: &Utf8Path, branch: &str) -> Option<String> {
+        run_git(&[
+            "-C",
+            workspace.as_str(),
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("refs/heads/{branch}^{{commit}}"),
+        ])
+        .ok()
+        .filter(|rev| !rev.is_empty())
+    }
+
+    /// Point a workspace's HEAD at `rev` — on `branch`, moved there, or
+    /// detached when `branch` is `None` — without touching the index or the
+    /// worktree. [`Self::workspace_restore_to`] brings those along after.
+    pub fn workspace_point_head(
+        workspace: &Utf8Path,
+        branch: Option<&str>,
+        rev: &str,
+    ) -> Result<()> {
+        let ws = workspace.as_str();
+        match branch {
+            Some(branch) => {
+                let name = format!("refs/heads/{branch}");
+                run_git(&["-C", ws, "update-ref", &name, rev])?;
+                run_git(&["-C", ws, "symbolic-ref", "HEAD", &name])?;
+            }
+            None => {
+                run_git(&["-C", ws, "update-ref", "--no-deref", "HEAD", rev])?;
+            }
+        }
+        Ok(())
     }
 
     /// Committed content of one path in a workspace clone: the blob at HEAD,

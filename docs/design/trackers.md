@@ -128,17 +128,30 @@ At spawn, for each slot (each role, and each role-less tracker):
 
 `newgit tracker use <tracker>` binds a tracker into an existing instance:
 swapping out whatever filled its role, binding what it requires, and starting
-the resources it brings. `newgit tracker drop <tracker>` unbinds one, stopping
-(never cleaning up) the resources no longer brought. A drop is refused while
+the resources it brings. `newgit tracker drop <tracker>` unbinds one, and
+*parks* the resources no longer brought (#254, #255): each is taken down as
+`newgit stop` would take it down (its process signalled, its `suspend` run),
+or, with no `suspend`, by its `[cleanup]`, and the output names the hook that
+ran. A parked binding keeps its ports — ports are for the instance's
+lifetime — so the next `use` hands them back and runs `resume` (or `prepare`,
+when the drop cleaned it up): the files it renders, its data, and whatever
+it left behind all agree on them. `remove` tears down parked bindings too.
+Shared (`project`, `user`) resources are parked but left up. A drop is
+refused while
 another bound tracker requires it, and while the tracker has uncommitted work
 unless `--stash` (brought back by the next `use`) or `--discard` (after a
 checkpoint, so `newgit undo` gets it back). Both rebuild every bound install
-whose tree the binding keys (see *Installs across trackers*): the tree the
+whose store key the change moves (see *Installs across trackers*): the tree the
 instance holds was built for the binding it had, so it is filled from the store
-when that binding was built before, else its `prepare` runs again. A rebuild
+when that binding was built before, else its `prepare` runs again. Binding a
+secret tracker, or one with no paths, moves no install's key unless the
+install is told the tracker names through `{{bound…}}`. A rebuild
 that fails leaves the resource `failed` without failing the command, since the
-binding has changed by then. `root`, `project`, and `access`
-cannot be dropped. A checkpoint records the binding, and undo restores it.
+binding has changed by then. A process already running when a use or drop
+rewrites a rendered file is restarted if its resource declares `reads`
+covering that file, and otherwise named as possibly stale, with the command
+that restarts it (#249; see *Render* in [spec.md](spec.md)). `root`,
+`project`, and `access` cannot be dropped. A checkpoint records the binding, and undo restores it.
 
 `{{bound.trackers}}` and `{{bound.paths}}` give a resource's commands what the
 instance binds, so a shared install builds only the bound members.
@@ -336,9 +349,10 @@ resolves versions — that would be emulating npm or pip.
   is owned by whoever owns it — usually root — and lists every member, bound
   or not. Its install resource installs only the bound members (`pnpm install
   --filter …`, `uv sync --frozen --package …`) through a `{{bound…}}`
-  template variable naming the bound trackers' paths, and the bound set is
-  part of the install's identity, so copy-on-write installs are keyed
-  correctly. (Step 4.)
+  template variable naming the bound trackers' paths. What of the binding
+  can reach the install is part of its identity, so copy-on-write installs
+  are keyed correctly: which paths the checkout leaves out, and the bound
+  set itself when a `{{bound…}}` tells the install it. (Step 4.)
 - **Python environments are flat**, so code sharing one venv needs one
   resolution — the shared lockfile, where conflicts surface when locking,
   not at spawn.
