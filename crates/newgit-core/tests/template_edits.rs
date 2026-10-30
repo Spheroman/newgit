@@ -11,6 +11,9 @@ use newgit_core::manager::BranchManager;
 use newgit_core::store::MetadataStore;
 use newgit_core::templates::{instantiate, resource_template};
 
+mod common;
+use common::add_supabase_without_starting_it;
+
 /// A trimmed config: no `[inbucket]`, no `[analytics]`.
 const TRIMMED_CONFIG: &str = r#"project_id = "EDIT_ME_PROJECT"
 
@@ -72,10 +75,7 @@ fn a_config_missing_a_section_fails_the_bind_and_says_why() {
     let store = setup(&temp, "supabase/config.toml", TRIMMED_CONFIG);
     let repo = store.paths().project_root.clone();
 
-    BranchManager::open(MetadataStore::at(repo.clone()))
-        .expect("manager")
-        .add_resource("supabase", "supabase")
-        .expect("add supabase");
+    add_supabase_without_starting_it(&repo);
 
     let spawned = BranchManager::open(MetadataStore::at(repo))
         .expect("reopen")

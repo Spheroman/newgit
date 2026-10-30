@@ -12,6 +12,9 @@ use newgit_core::SourceSubstrate;
 use newgit_core::manager::BranchManager;
 use newgit_core::store::MetadataStore;
 
+mod common;
+use common::add_supabase_without_starting_it;
+
 /// `supabase init` output from CLI 2.111.0, verbatim apart from `project_id`,
 /// which the CLI sets to the directory name and the template's `find` expects
 /// as `EDIT_ME_PROJECT`.
@@ -60,31 +63,6 @@ fn setup(temp: &Utf8Path) -> MetadataStore {
     });
     store.write_config(&config).expect("write config");
     store
-}
-
-/// Add the `supabase` resource from its template, with `prepare` swapped for
-/// a no-op. These tests check what spawn renders and binds, which happens
-/// before `prepare` runs; left as `supabase start` it brings up a real stack
-/// per instance on any machine with the CLI and Docker, and the tempdir going
-/// away does not take the containers with it.
-fn add_supabase_without_starting_it(repo: &Utf8Path) {
-    let outcome = BranchManager::open(MetadataStore::at(repo.to_owned()))
-        .expect("manager")
-        .add_resource("supabase", "supabase")
-        .expect("add supabase");
-
-    let definition = std::fs::read_to_string(&outcome.path).expect("read definition");
-    let (head, prepare) = definition
-        .split_once("[actions.prepare]")
-        .expect("the template has a prepare action");
-    let (before, after) = prepare
-        .split_once(r#"command = "supabase start""#)
-        .expect("prepare runs `supabase start`");
-    std::fs::write(
-        &outcome.path,
-        format!("{head}[actions.prepare]{before}command = \"true\"{after}"),
-    )
-    .expect("write definition");
 }
 
 /// `(section, key) -> port`, so an assertion can name the line it means
