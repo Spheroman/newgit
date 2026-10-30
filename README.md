@@ -173,3 +173,6 @@ it.
 
 A directory with its own `LICENSE` file is under that license, and a file
 with its own license notice keeps it.
+
+Contributions need a signed [Contributor License Agreement](CLA.md); see
+[CONTRIBUTING.md](CONTRIBUTING.md).

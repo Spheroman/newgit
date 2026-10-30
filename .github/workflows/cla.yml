@@ -1,0 +1,37 @@
+name: CLA
+
+# A pull request merges only once its author has signed CLA.md, by adding a
+# line to .github/cla/signatures.txt. The first pull request may add that
+# line itself, so the check reads the pull request's own copy of the file.
+# Nothing here runs the pull request's code: it only reads a text file.
+
+on:
+  pull_request:
+    types: [opened, reopened, synchronize, edited]
+
+permissions:
+  contents: read
+
+jobs:
+  cla:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Check the author signed the CLA
+        env:
+          AUTHOR: ${{ github.event.pull_request.user.login }}
+          # The owner holds the copyright already; bots author no original work.
+          EXEMPT: Spheroman
+        run: |
+          if [[ "$AUTHOR" == *"[bot]" ]] || [[ " $EXEMPT " == *" $AUTHOR "* ]]; then
+            echo "$AUTHOR does not need to sign the CLA."
+            exit 0
+          fi
+          if grep -v '^#' .github/cla/signatures.txt | cut -d'|' -f1 | tr -d ' ' | grep -qixF -- "$AUTHOR"; then
+            echo "$AUTHOR has signed the CLA."
+            exit 0
+          fi
+          echo "::error::$AUTHOR has not signed the CLA. Add this line to the end of .github/cla/signatures.txt in this pull request (see CONTRIBUTING.md):"
+          echo "$AUTHOR | Your Full Name | $(date -u +%F) | 1"
+          exit 1

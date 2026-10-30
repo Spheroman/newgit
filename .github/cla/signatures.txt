@@ -1,0 +1,7 @@
+# Signatures of the newgit Contributor License Agreement (CLA.md).
+#
+# One line per signer: GitHub login, full name, date (YYYY-MM-DD), CLA version.
+# Add yours in your first pull request; the commit that adds it is your
+# signature. The CLA check matches the login, ignoring case.
+#
+# login | name | date | version
