@@ -12,6 +12,362 @@ time by `scripts/release-changelog.sh`, which then deletes the fragments.
 Two changes never touch the same lines, so nothing queues behind whichever
 branch landed first.
 
+## [0.8.0] — 2026-10-29
+
+Binding a tracker now costs only what it changes. Switching on a branch
+database no longer reinstalls anything, a drop takes down what the tracker
+brought, a re-bind gets its old ports back, and several resources can
+render into one file. `status` tells a crashed dev server from a stopped one
+and a compiling one from a broken one. newgit.dev gives a clone the
+project's own commit ids, signatures included, and `newgit tracker repair`
+fixes history split before that. On macOS, `spawn` clones source with
+`clonefile`, and capture no longer follows a symlink out of the workspace.
+See *Upgrading*.
+
+### Added
+
+- `newgit tracker repair [--dry-run]` rewrites code tracker commits split
+  before newgit kept each original's message ending and signature, so a
+  clone from newgit.dev gets the project's own commit ids again.
+
+  It moves every code tracker branch here and, on the remote, each
+  branch's list, the way a merge does: a force push of tracker history.
+  Instance forks and checkpoints there keep the commits they were made
+  with. Run it once after upgrading; running it again changes nothing.
+
+
+### Changed
+
+- On macOS, `spawn` clones a workspace's source from a template checkout
+  with `clonefile` instead of running `git clone`
+  ([#235](https://github.com/Spheroman/newgit/issues/235)).
+
+  `git clone` spent almost all of its time checking files out: 2.7–3.1s
+  per spawn on T3 Code's 28.6k files. newgit now keeps one clean checkout
+  of the project beside the workspaces (`.source-template` under the
+  workspace root), brings it to the instance's revision, and clones the
+  whole tree in one call, in 0.67s. The first spawn builds the template
+  and is slower once. Workspaces are set to `core.checkStat=minimal` and
+  `core.trustctime=false`, which let `git status` trust the cloned files
+  instead of re-hashing every one; the only edit Git then misses is one
+  that keeps a file's size and has its mtime set to the exact second Git
+  recorded, as `touch -r` can. Checkpoints hash every file, so they
+  capture it regardless. Anything that stops the template from working,
+  such as a workspace root on another volume, falls back to `git clone`,
+  and `spawn` says why.
+
+- Checking a built tree for its workspace path, before it is stored, now
+  reads the tree in parallel
+  ([#235](https://github.com/Spheroman/newgit/issues/235)).
+
+  Every install that could be stored is scanned for the workspace's path
+  first, and the scan read the whole tree on one thread: on T3 Code's
+  3.8 GB of `node_modules` that took 17–34s, longer than the install it
+  was checking. It now walks the tree on every core and searches with
+  `memchr`, and takes 3.4–3.8s on the same tree, about what
+  `rg -uuu -F` takes.
+
+- Several resources may now `[[render]]` into the same file, each declaring
+  only the values it owns
+  ([#245](https://github.com/Spheroman/newgit/issues/245)).
+
+  One file often needs values from several resources: an app's `.env.local`
+  wants its own port and the database's URL. With one owner per file, every
+  rule had to live on whichever resource got the file, so a `db` definition
+  ended up knowing every app's env files. Now the file is one simultaneous
+  batch over every resource's rules, located in committed content, so it
+  does not depend on which resource bound first; capture, undo, and drift
+  work on all of them, and `tracker drop` takes back only the dropped
+  resource's values. Two resources claiming the same text are still refused,
+  and the error now names both resources and both `find`s and points at
+  `{{exports.NAME}}`.
+
+
+### Fixed
+
+- The `supabase` template says what to do about a `config.toml` that lacks
+  a service's section, and offers a monorepo `workdir`
+  ([#242](https://github.com/Spheroman/newgit/issues/242)).
+
+  The Supabase CLI uses a built-in default port for a service with no
+  section, so every instance shared it. A render `find` that matches 0 times
+  now says so in its error and says to add the line rather than delete the
+  rule. The template comments explain it, and a commented `workdir` notes
+  that `[[render]] path` changes with it.
+
+- A dev server that is still compiling is no longer reported as not ready
+  ([#243](https://github.com/Spheroman/newgit/issues/243)).
+
+  `spawn` and `status` used to call a running process whose port had not
+  answered yet a problem, so a healthy Next.js spawn looked like a
+  failure. That is now its own state, `starting`: it does not count as not
+  ready, and the message says the process is still starting and that
+  `newgit status` shows when it is up. After the autostart, `spawn` waits up
+  to five seconds for the ports to answer and reports only what is still
+  unanswered; `spawn --json` lists it under `starting`.
+
+- The `process` template says its port is optional
+  ([#244](https://github.com/Spheroman/newgit/issues/244)).
+
+  A worker, watcher, or `supabase functions serve` has no port of its own.
+  The template comments now say to delete `[ports]`, `[exports]` and
+  `[[render]]` for those, instead of leaving you to work it out.
+
+- `tracker drop`, and `tracker use` on a role alternative, work for a
+  tracker with no `paths`, and `status` lists only the trackers an instance
+  binds ([#246](https://github.com/Spheroman/newgit/issues/246)).
+
+  Dropping a secret tracker captured it from the workspace first, and a
+  tracker with no `paths` (deposit-only, or one that only brings resources)
+  has nothing there, so the capture refused and the tracker could be bound
+  but never unbound — the branch database you switch on for a migration and
+  off afterwards needed a `remove` and respawn. There is now no capture step
+  for such a tracker: its deposits are already in its lane, and a checkpoint
+  covers them. `drop` stops what it brings, and `--stash`/`--discard` have
+  nothing to act on. An explicit `tracker capture` still says there is
+  nothing to capture. `status` showed every tracker in a role, including the
+  dropped alternatives; it now shows what the binding record binds.
+
+- `tracker list` shows trackers with no `paths`
+  ([#247](https://github.com/Spheroman/newgit/issues/247)).
+
+  The list is a tree by ownership, and a tracker that owns no paths had no
+  place in it, so it was silently left out — although the list is where you
+  check what `--use` accepts, and the `supabase` template creates one. Such
+  trackers now come after the tree with their role, and PATHS says what they
+  are for: `(no paths; deposits from db; brings db, functions)`. A spawn
+  from a checkpoint also says `deposit-only` for them rather than
+  `(0 files)`, matching `spawn` and `tracker pull`.
+
+- Binding a tracker that cannot change an install no longer rebuilds it
+  ([#248](https://github.com/Spheroman/newgit/issues/248)).
+
+  Since #153 the install store keyed a tree on the whole binding, and since
+  #206 `tracker use`/`drop` rebuilt every install when the binding moved.
+  So switching on a branch database (a secret tracker with `paths = []`)
+  cost a full `npm ci` for an identical tree, `--use branch-db` and the
+  default binding each installed once at spawn, and creating or renaming
+  any tracker re-keyed every install.
+
+  The key now holds only what of the binding can reach the install: which
+  paths the dropped code trackers leave out of the checkout (what an
+  unfiltered `npm ci` reads by finding members on disk), plus the bound
+  tracker names and paths only when the install is told them through
+  `{{bound…}}`, in its own definition or in any resource's exports or
+  renders. `use`/`drop` and undo's `recompute` skip compare that same
+  material, so an install the change cannot reach is kept and not listed.
+
+  An install that reads a secret tracker's file (an `.npmrc`, say) should
+  name it in `[identity] paths`. Store entries keyed under the old scheme
+  stop matching, which costs one reinstall per key; `newgit cleanup`
+  reclaims them.
+
+- `tracker use` and `drop` no longer leave a running dev server on a
+  rendered file they rewrote without saying so
+  ([#249](https://github.com/Spheroman/newgit/issues/249)).
+
+  Binding a tracker binds the resources it brings, and their `[[render]]`
+  rewrites files such as `apps/admin/.env.local` that a process already
+  running read when it started. That process kept the old port, and the
+  output gave no hint. A resource can now declare `reads = [...]`, the
+  files and directories its process reads; when a use or drop changes the
+  bytes of one, the process is restarted, as `undo` restarts what it
+  restores. A running process whose resource declares nothing is named in
+  a warning with the command that restarts it. A re-render that writes the
+  same bytes says nothing.
+
+- Dropping a tracker takes down the resources it brings, and `remove`
+  tears down what a drop left behind
+  ([#254](https://github.com/Spheroman/newgit/issues/254)).
+
+  A drop, or a `tracker use` switching a role, used to stop supervised
+  processes and forget the rest: a Supabase stack or Compose project a
+  dropped tracker brought kept running, and `remove` only cleaned up what
+  was still bound, so it leaked them for good. A drop now *parks* each
+  resource it takes away, the way `newgit stop` takes one down: its process
+  is signalled and its `suspend` runs (or its `[cleanup]`, when it has no
+  `suspend`), and the output names the hook that ran, or why none could.
+  `remove` and `cleanup` run `[cleanup]` for parked bindings too.
+
+- Binding a resource again hands back the ports it had, so a resource
+  whose `prepare` finds its old stack still up is not reported ready on
+  ports nothing listens on
+  ([#255](https://github.com/Spheroman/newgit/issues/255)).
+
+  A drop used to release a resource's ports and the next `use` allocated
+  new ones, re-rendered, and ran `prepare`; `supabase start` saw the old
+  stack and exited 0 without reading the new config. Ports are for the
+  instance's lifetime now: a parked binding keeps its claim (`newgit ports`
+  shows it as `(parked)`, and `ports --check` counts it), and `use` brings
+  the resource back on it, through `resume` when the drop ran `suspend`.
+
+- The `supabase` template's `prepare` stops the stack before starting it
+  ([#255](https://github.com/Spheroman/newgit/issues/255)).
+
+  `supabase start` against a stack still running from an earlier binding
+  exits 0 without re-reading the rendered ports, so the resource reported
+  ready on ports nothing listened on. `supabase stop` keeps the volume, so
+  the branch's data comes back on the new ports.
+
+- Claude Code worktrees start from the project branch as it stands, not
+  the project root's checked-out `HEAD`
+  ([#256](https://github.com/Spheroman/newgit/issues/256)).
+
+  The `WorktreeCreate` hook ran a plain `newgit spawn`, so every subagent
+  started from the root's local `main`. When nobody had pulled, that was
+  stale: in one run it was 20 commits behind `origin/main`, and each agent
+  rebased itself by hand. The hook now does what Claude Code's own
+  worktrees do. By default it uses the project branch, fetching its
+  upstream if the root has not fetched in a day, and takes whichever of
+  the two is newer. A root branch that is ahead or has diverged wins. The
+  choice is made under a store-wide lock, so subagents launched together
+  start from the same commit. A failed fetch is not retried by the rest
+  of the burst. `worktree.baseRef = "head"` keeps the old behaviour.
+
+  The first spawns in a project, run at once, no longer fail on each
+  other while creating the publish outbox.
+
+- A checkpoint taken while the workspace is on another branch no longer
+  moves the instance's branch to it, and undo no longer resets whichever
+  branch happens to be checked out
+  ([#259](https://github.com/Spheroman/newgit/issues/259)).
+
+  Agents `git checkout -b try-x` inside a workspace all the time. A
+  checkpoint used to treat `try-x`'s HEAD as the instance's source and
+  silently move the instance's branch in the project repository to it, and
+  `undo` then reset `try-x` to the instance's old commit. Now a checkpoint
+  holds the workspace as it stands and records which branch was checked
+  out (or that HEAD was detached). The instance's branch moves only when
+  the workspace is on it, and the checkpoint says so when it is not,
+  naming both branches. Undo puts HEAD back on the checkpoint's branch and
+  moves only that one. `merge` repeats the warning, `status` shows
+  ``feature-a@1a2b3c4d (workspace on `try-x`)``, and `checkpoints` marks
+  the checkpoints taken off the branch. Refusing the checkpoint instead
+  would have blocked `git push` and `undo` exactly while an agent is
+  experimenting, which is when they matter most.
+
+- `tracker capture` no longer rewrites text you typed that happens to equal
+  a rendered value
+  ([#260](https://github.com/Spheroman/newgit/issues/260)).
+
+  Capture reversed every occurrence of a rendered value, so a
+  `MIRROR=127.0.0.1:18002` line written by hand came back as `:8000`. The
+  tracker then held the `find` twice, and every instance spawned from it
+  failed to render until someone fixed the lane by hand. Capture now
+  reverses only the spans the render wrote, recomputed from committed
+  content. Where it cannot tell which occurrence it wrote, or the captured
+  content would no longer render, `tracker capture` refuses and names the
+  lines instead of recording a lane nobody can use.
+
+- A dev server that crashes is no longer shown as `stopped` on a `ready`
+  instance ([#261](https://github.com/Spheroman/newgit/issues/261)).
+
+  Nothing waited on a supervised process, so one that exited, was
+  OOM-killed or was `kill`ed looked exactly like one `newgit stop` took
+  down, and an agent waiting for `ready` would test against a dead port.
+  Each long-running action now runs under a small `sh` wrapper that waits
+  on it and appends how it ended to its log (`[newgit] exited 1`,
+  `[newgit] killed by SIGKILL`, or `[newgit] stopped by newgit`). `status`
+  shows one that ended on its own as `exited(1)`, `killed(SIGKILL)` or
+  `crashed`; an `autostart` action in that state makes the instance not
+  ready, with `newgit action <resource>.<action>` as the retry; and
+  `newgit start` restarts it along with what `newgit stop` stopped.
+  `newgit cleanup` now retires a dead pid to `exited` rather than
+  `stopped`.
+
+- `spawn` and `status` say why a resource failed to render or to resolve an
+  export, and no longer suggest an action it does not have
+  ([#262](https://github.com/Spheroman/newgit/issues/262)).
+
+  The reason was only in `spawn --json`, and the retry hint always named
+  `<resource>.prepare`, which a resource without one refuses. The error is
+  now kept in the binding record and printed by `status` and under the
+  last line of a failed `spawn`, which used to promise "see below" with
+  nothing below it. The hint follows the failure: a render or export
+  points at the file or the definition and the new `newgit resource
+  rebind <resource> [instance]`, which binds it again as spawn did; any
+  other hint names only an action the resource defines.
+
+- Instance names are limited to 40 characters, and `render --check` now
+  reports environment-name collisions
+  ([#263](https://github.com/Spheroman/newgit/issues/263)).
+
+  A 300-character name used to fail with a raw "File name too long" from the
+  lock file, and a 200-character one spawned and then broke Docker container
+  names and Supabase `project_id`s built from `{{branch.slug}}`. The limit is
+  40, which leaves 23 characters of prefix under a 63-character DNS label.
+  `render --check` said nothing when two resources declared the same port
+  `env` or export name; it now prints the same warning as `resource list`,
+  from the same check `spawn` refuses on.
+
+- A deploy now reaches a project's Git endpoint that had already slept.
+
+  The endpoint came back from a snapshot of its whole container, old `newgit`
+  binary and composed views included, so newgit.dev kept serving views
+  composed by whatever `newgit` it first started with. A snapshot or running
+  container from an earlier image is now dropped, and the endpoint starts
+  fresh from the image deployed now.
+
+- A commit split into trackers comes back from newgit.dev, a clone, or
+  `spawn --from-checkpoint` as the commit it was made as, signature and id
+  included, for anyone who can read every tracker it touched.
+
+  Composing a split commit back always ended its message with a newline,
+  and never had the original's signature to put back. GitHub writes merge
+  commits without a final newline and signs them, so everything cloned
+  from newgit.dev had a new id from the first such merge on, and looked
+  diverged from the same history on GitHub. Split commits now keep the
+  original's message ending and its headers in their trailers, and a
+  rebuilt commit takes the signature back only when its id comes out as
+  the original's, so a signature only ever sits on what it covers. Commits
+  split before this fix keep their rebuilt ids until their history is
+  repaired.
+
+- The remote logs an unexpected error's code and stack, not only its
+  message, so a failing Artifacts call says which call it was.
+
+- `newgit tracker use` puts a secret tracker's content in the workspace
+  when the instance has never bound it, as `newgit spawn --use` does.
+
+  A tracker dropped at spawn, because another tracker filled its role, has
+  no content of its own in the instance, and `use` restored only content
+  the instance held. So it bound the tracker with none of its files, and a
+  resource the tracker brings failed: its render had nothing to land in.
+  `use` now checks out the tracker's main first, records it as the
+  binding's revision, and the resources it brings come up ready, rendered,
+  in the one command. If you worked around it with `newgit tracker pull`
+  and `newgit action <resource>.prepare`, you no longer need to.
+
+
+### Security
+
+- Capture no longer follows a symlink at a tracked path
+  ([#258](https://github.com/Spheroman/newgit/issues/258)).
+
+  A link at a tracked path was read through, so `tracker capture` and the
+  capture inside `checkpoint` stored the target's contents — even a file
+  from outside the workspace — in a lane that may sync to a remote. Anything
+  that could plant a link (a script, a tool, a force-added path) could copy
+  any file you can read into the lane, silently. Now a link that stays
+  inside the workspace is stored as a link (mode `120000`), as Git stores
+  one, and checked out as one; a link that leaves the workspace, or a
+  tracked path under a symlinked directory, is refused with the path and
+  its target. Checkout likewise refuses a lane rev holding a link out of
+  the workspace, whoever wrote it. The safety capture, `tracker drop`,
+  `--from-store`, deposits, install keys, and export follow the same rule.
+  If a capture now fails on a link you meant, replace it with the file or
+  with a relative link inside the workspace.
+
+
+### Documentation
+
+- `newgit reference agents` is a guide for an agent asked to set newgit up.
+  It covers reading the project for tracker and resource candidates,
+  explaining them to the user, asking which trackers they want, and proving
+  the setup with a real spawn. `newgit --help` and `newgit init` point to it.
+  Otherwise an agent tends to stop at `init`, and the user never sees what
+  newgit is for.
+
 ## [0.7.0] — 2026-10-28
 
 An instance can be put down and picked up again. `newgit stop` and
@@ -2427,6 +2783,17 @@ Binding records and checkpoints are the exception worth caring about: they
 are the only local state that is not reconstructible. A release that changes
 their format will say so here explicitly.
 
+**0.8.0 changes no formats you need to act on.** Binding records and
+checkpoints gain fields that older ones simply lack. A few things cost a
+little once. The install store re-keys again, on only what of the binding
+can reach an install, so each key installs once more and `newgit cleanup`
+reclaims the old entries. On a newgit remote, a project whose code trackers
+were split before 0.8.0 keeps serving rebuilt commit ids until you run
+`newgit tracker repair` once; it force-moves those branches there. The
+first `spawn` on macOS builds a `.source-template` checkout beside the
+workspaces. And a capture now refuses a symlink that leaves the workspace:
+replace it with the file, or with a relative link inside.
+
 **0.7.0 changes no formats you need to act on.** Two things cost a
 little once. The install store now keys each tree on the trackers its
 instance binds, so every existing entry misses: the first spawn at each new
@@ -2497,7 +2864,8 @@ themselves and neither of which is a reason to re-spawn:
   fresh field it has not. One successful `undo`, or one `newgit checkpoint
   --verify`, clears it for good.
 
-[Unreleased]: https://github.com/Spheroman/newgit/compare/v0.7.0...HEAD
+[Unreleased]: https://github.com/Spheroman/newgit/compare/v0.8.0...HEAD
+[0.8.0]: https://github.com/Spheroman/newgit/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/Spheroman/newgit/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/Spheroman/newgit/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/Spheroman/newgit/compare/v0.4.0...v0.5.0
