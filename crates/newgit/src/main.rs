@@ -400,6 +400,15 @@ enum TrackerCommand {
         #[arg(long)]
         discard: bool,
     },
+    /// Rewrite code tracker commits split before newgit kept each original's
+    /// message ending and signature, so clones from the remote get the
+    /// project's own commit ids. Moves every code tracker branch, and on the
+    /// remote each branch's list (a force push of tracker history)
+    Repair {
+        /// Say what would move, and move nothing
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 #[derive(Debug, Args)]
@@ -1079,11 +1088,14 @@ fn spawn_from_checkpoint(
     println!("  workspace: {}", outcome.branch.workspace_path);
     for tracker in &outcome.undo.trackers {
         match &tracker.rev {
-            Some(rev) => println!(
-                "  tracker:   {} @ {rev} ({})",
-                tracker.name,
-                files_label(tracker.files)
-            ),
+            Some(rev) => {
+                let count = if tracker_is_deposit_only(manager, &tracker.name) {
+                    "deposit-only".to_owned()
+                } else {
+                    files_label(tracker.files)
+                };
+                println!("  tracker:   {} @ {rev} ({count})", tracker.name);
+            }
             None => println!("  tracker:   {} (empty)", tracker.name),
         }
     }
@@ -2093,6 +2105,15 @@ fn tracker(command: TrackerCommand) -> Result<()> {
                 &parent_of,
                 &mut ordered,
             );
+            // A tracker with no paths sits nowhere in the ownership tree, but
+            // it is still a tracker `--use` accepts: list it after the tree.
+            let mut pathless: Vec<&TrackerDefinition> = definitions
+                .iter()
+                .filter(|definition| !ordered.iter().any(|(_, d)| d.name == definition.name))
+                .copied()
+                .collect();
+            pathless.sort_by_key(|definition| (definition.role.clone(), definition.name.clone()));
+            ordered.extend(pathless.into_iter().map(|definition| (0, definition)));
             let rows: Vec<_> = ordered
                 .iter()
                 .map(|(depth, definition)| {
@@ -2116,7 +2137,7 @@ fn tracker(command: TrackerCommand) -> Result<()> {
                     let paths = if definition.owns_everything() {
                         "(everything no other tracker claims)".to_owned()
                     } else if definition.paths.is_empty() {
-                        "-".to_owned()
+                        pathless_summary(&manager, definition)
                     } else {
                         definition
                             .paths
@@ -2192,6 +2213,65 @@ fn tracker(command: TrackerCommand) -> Result<()> {
                 files_label(report.files)
             );
             println!("  merge with: newgit tracker merge {tracker}");
+            Ok(())
+        }
+        TrackerCommand::Repair { dry_run } => {
+            let context = context_here()?;
+            let manager = BranchManager::open(context.store)?;
+            let outcome = manager.repair_splits(dry_run)?;
+            if outcome.rewritten == 0 {
+                println!("Nothing to repair: every split commit recomposes as its original");
+                return Ok(());
+            }
+            let verb = if outcome.dry_run {
+                "Would rewrite"
+            } else {
+                "Rewrote"
+            };
+            println!(
+                "{verb} {} tracker commit{}",
+                outcome.rewritten,
+                if outcome.rewritten == 1 { "" } else { "s" }
+            );
+            for (tracker, branch) in &outcome.branches {
+                println!("  {tracker}/{branch}");
+            }
+            if outcome.unsigned > 0 {
+                println!(
+                    "  {} of them {} signed and {} not: a tracker commit's signature covers the \
+                     commit it rewrites (the commits they compose into keep theirs)",
+                    outcome.unsigned,
+                    if outcome.unsigned == 1 { "was" } else { "were" },
+                    if outcome.dry_run { "would be" } else { "is" },
+                );
+            }
+            if let Some(project) = &outcome.remote {
+                if outcome.remote_branches.is_empty() {
+                    println!("On {project}: no branch lists move");
+                } else {
+                    let moving = if outcome.dry_run {
+                        "would move"
+                    } else {
+                        "moved"
+                    };
+                    println!(
+                        "On {project}: {moving} {}",
+                        outcome
+                            .remote_branches
+                            .iter()
+                            .map(|branch| format!("`{branch}`"))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    );
+                    println!(
+                        "  Instance forks and checkpoints there keep the commits they were made \
+                         with; clones of a moved branch see a forced update"
+                    );
+                }
+            }
+            if outcome.dry_run {
+                println!("Run without --dry-run to move them");
+            }
             Ok(())
         }
         TrackerCommand::Merge { tracker, instance } => {
@@ -3586,6 +3666,36 @@ fn bind_line(outcome: &TrackerBindOutcome, deposit_only: bool) -> String {
             )
         }
         BindOrigin::Nothing => format!("`{}` bound (no captured content)", outcome.name),
+    }
+}
+
+/// What a tracker with no `paths` is for, since it owns nothing in the
+/// workspace: the resources whose checkpoints deposit into it, and the ones it
+/// brings when bound.
+fn pathless_summary(manager: &BranchManager, definition: &TrackerDefinition) -> String {
+    let depositors: Vec<&str> = manager
+        .resource_definitions()
+        .iter()
+        .filter(|resource| {
+            resource
+                .checkpoint
+                .as_ref()
+                .and_then(|spec| spec.into_tracker.as_deref())
+                == Some(definition.name.as_str())
+        })
+        .map(|resource| resource.name.as_str())
+        .collect();
+    let mut parts = Vec::new();
+    if !depositors.is_empty() {
+        parts.push(format!("deposits from {}", depositors.join(", ")));
+    }
+    if !definition.resources.is_empty() {
+        parts.push(format!("brings {}", definition.resources.join(", ")));
+    }
+    if parts.is_empty() {
+        "(no paths)".to_owned()
+    } else {
+        format!("(no paths; {})", parts.join("; "))
     }
 }
 

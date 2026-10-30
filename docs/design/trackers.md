@@ -153,8 +153,17 @@ that fails leaves the resource `failed` without failing the command, since the
 binding has changed by then. A process already running when a use or drop
 rewrites a rendered file is restarted if its resource declares `reads`
 covering that file, and otherwise named as possibly stale, with the command
-that restarts it (#249; see *Render* in [spec.md](spec.md)). `root`,
-`project`, and `access` cannot be dropped. A checkpoint records the binding, and undo restores it.
+that restarts it (#249; see *Render* in [spec.md](spec.md)). A secret
+tracker's content is captured into its lane before its files leave the
+workspace; a tracker with no `paths` (one that only receives `into_tracker`
+deposits, or only brings resources) has nothing in the workspace, so there is
+no capture step and `--stash`/`--discard` have nothing to act on — its
+deposits are already in its lane, and a checkpoint covers them. (An explicit
+`newgit tracker capture` of such a tracker is still an error: asked for
+directly, it should say there is nothing to capture.) `root`, `project`, and
+`access` cannot be dropped. A checkpoint records the binding, and undo
+restores it; `newgit status` lists the trackers the binding binds, not every
+tracker in a role.
 
 `{{bound.trackers}}` and `{{bound.paths}}` give a resource's commands what the
 instance binds, so a shared install builds only the bound members.
@@ -573,15 +582,24 @@ Each step lands alone and keeps the suite green. Status as of 2026-10-28.
      original's; one that cannot be carries a note naming its canonical
      id. Tracker commits split before the trailers kept message endings
      and headers never come back as the original (step 3e).
-   - *3e — repairing older splits. Planned.* Tracker commits split before
+   - *3e — repairing older splits. Done.* Tracker commits split before
      the trailers recorded headers and message endings lost both, so on
      the remote they rebuild with new ids, and so does every commit after
-     them. The repair rewrites each such commit's trailers from the
-     original view commit, where this machine has it — trees and parents
-     unchanged, so only ids move — then remaps every tracker branch, the
-     composed-state notes, and on the remote each tracker's repo, branch
-     lists, and checkpoint lists. A force push of tracker history, so it
-     runs once, by hand.
+     them. `newgit tracker repair` rewrites each such commit's trailers
+     from the original view commit, where this machine has it (trees,
+     authors, and committers unchanged; a commit whose original is not
+     here keeps its message and only moves; a carved commit's trailers
+     follow the tracker commit it was carved from when that moves too).
+     Rewritten tracker commits are unsigned, so the same repair always
+     makes the same ids and a retry after a partial failure lands on what
+     the first attempt pushed; the commits they compose into keep their
+     signatures (*Signed commits*). It then moves every code tracker
+     branch, the composed-state notes, and on the remote each branch's
+     list, the way a merge moves it: its tracker repos force-pushed with a
+     lease. Instance forks and checkpoints on the remote keep the commits
+     they were made with, so an old checkpoint composes as it always did.
+     A force push of tracker history, so it runs once, by hand
+     (`--dry-run` says what would move).
 4. **Roles, priority, resources, use/drop.** *Done, except a resource's
    `depends_on` naming a role.* `role`, `priority` (negative: only when
    asked), `requires`, and `resources` decide what a spawn binds (`--use`,

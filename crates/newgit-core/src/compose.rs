@@ -1296,6 +1296,210 @@ impl std::fmt::Display for SplitError {
     }
 }
 
+/// What [`repair_splits`] rewrote.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Repair {
+    /// Each rewritten commit's new id, keyed by its old one.
+    pub moved: BTreeMap<String, String>,
+    /// How many of them were signed. A rewritten commit is left unsigned,
+    /// so the same repair always makes the same ids — a retry after a
+    /// partial failure lands on what the first attempt pushed.
+    pub unsigned: usize,
+}
+
+/// Rewrite tracker commits split before their trailers kept the original's
+/// message ending and headers (docs/design/trackers.md, step 3e), so that
+/// they recompose into the original anywhere. Each commit reachable from
+/// `tips` whose split source is here gets its trailers written again from
+/// that source; its tree, author, and committer stay, and its parents move
+/// onto the rewritten ones. A commit whose source is not here (a teammate's
+/// work) keeps its message and only moves. A carved commit's source is
+/// another tracker's commit, which may move too, so the trailers follow it:
+/// passes repeat until nothing moves. Running it again changes nothing.
+pub fn repair_splits(repo: &Utf8Path, tips: &[String]) -> Result<Repair> {
+    let mut repair = Repair::default();
+    let mut current = tips.to_vec();
+    // Each pass can only move commits whose source moved in the one before,
+    // and a source is never downstream of the commit naming it.
+    for _ in 0..16 {
+        let (moved, signed) = repair_pass(repo, &current, &repair.moved)?;
+        if moved.is_empty() {
+            return Ok(repair);
+        }
+        let intermediate: BTreeSet<String> = repair.moved.values().cloned().collect();
+        for new in repair.moved.values_mut() {
+            if let Some(newer) = moved.get(new) {
+                *new = newer.clone();
+            }
+        }
+        for (old, new) in moved {
+            if !intermediate.contains(&old) {
+                if signed.contains(&old) {
+                    repair.unsigned += 1;
+                }
+                repair.moved.insert(old, new);
+            }
+        }
+        current = tips
+            .iter()
+            .map(|tip| {
+                repair
+                    .moved
+                    .get(tip)
+                    .cloned()
+                    .unwrap_or_else(|| tip.clone())
+            })
+            .collect();
+    }
+    Err(NewgitError::Unsupported(
+        "the repair kept finding commits to rewrite; nothing was moved".to_owned(),
+    ))
+}
+
+/// One pass of [`repair_splits`]: the commits that move, and which of them
+/// were signed. `renamed` is what earlier passes moved, so trailers naming
+/// those commits name their new ids.
+fn repair_pass(
+    repo: &Utf8Path,
+    tips: &[String],
+    renamed: &BTreeMap<String, String>,
+) -> Result<(BTreeMap<String, String>, BTreeSet<String>)> {
+    let mut moved: BTreeMap<String, String> = BTreeMap::new();
+    let mut signed = BTreeSet::new();
+    if tips.is_empty() {
+        return Ok((moved, signed));
+    }
+    let rename = |id: &String| renamed.get(id).cloned().unwrap_or_else(|| id.clone());
+    let mut args = vec!["rev-list", "--topo-order", "--reverse", "--parents"];
+    args.extend(tips.iter().map(String::as_str));
+    let history: Vec<(String, Vec<String>)> = git_lines(repo, &args)?
+        .into_iter()
+        .map(|line| {
+            let mut fields = line.split(' ').map(ToOwned::to_owned);
+            let id = fields.next().unwrap_or_default();
+            (id, fields.collect())
+        })
+        .collect();
+    let ids: Vec<String> = history.iter().map(|(id, _)| id.clone()).collect();
+    let raw = read_commits(repo, &ids)?;
+    let sources: Vec<String> = raw
+        .values()
+        .filter_map(|commit| commit.split_source.as_ref().map(rename))
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let present = existing_commits(repo, &sources)?;
+    let originals = read_commits(repo, &present.into_iter().collect::<Vec<_>>())?;
+    for (id, parents) in &history {
+        let commit = raw.get(id).ok_or_else(|| missing(id))?;
+        // The source is a view commit, or for a carved commit another
+        // tracker's: its own message and headers are what the trailers
+        // should have kept.
+        let original = commit
+            .split_source
+            .as_ref()
+            .map(rename)
+            .and_then(|source| Some((originals.get(&source)?, source)))
+            .filter(|(original, _)| original.split_source.is_none());
+        let message = match original {
+            Some((original, source)) => with_split_trailers(
+                &original.message,
+                &source,
+                commit.split_parent.as_ref().map(rename).as_deref(),
+                &original.headers,
+            ),
+            None => commit.message.clone(),
+        };
+        let new_parents: Vec<String> = parents
+            .iter()
+            .map(|parent| moved.get(parent).cloned().unwrap_or_else(|| parent.clone()))
+            .collect();
+        if message == commit.message && &new_parents == parents {
+            continue;
+        }
+        let tree = git(repo, &["rev-parse", &format!("{id}^{{tree}}")])?;
+        let mut args = vec![
+            "-c".to_owned(),
+            "commit.gpgSign=false".to_owned(),
+            "commit-tree".to_owned(),
+            tree,
+            "-F".to_owned(),
+            "-".to_owned(),
+        ];
+        for parent in &new_parents {
+            args.extend(["-p".to_owned(), parent.clone()]);
+        }
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        let out = run(
+            command(repo, &args).envs(commit.identity_env()),
+            "git commit-tree",
+            Some(message.as_bytes()),
+        )?;
+        if commit.headers.contains("gpgsig") {
+            signed.insert(id.clone());
+        }
+        moved.insert(id.clone(), String::from_utf8_lossy(&out).trim().to_owned());
+    }
+    Ok((moved, signed))
+}
+
+/// Which of `ids` are commits here.
+fn existing_commits(repo: &Utf8Path, ids: &[String]) -> Result<BTreeSet<String>> {
+    if ids.is_empty() {
+        return Ok(BTreeSet::new());
+    }
+    let input: String = ids.iter().map(|id| format!("{id}\n")).collect();
+    let out = run(
+        &mut command(
+            repo,
+            &["cat-file", "--batch-check=%(objectname) %(objecttype)"],
+        ),
+        "git cat-file --batch-check",
+        Some(input.as_bytes()),
+    )?;
+    Ok(String::from_utf8_lossy(&out)
+        .lines()
+        .filter(|line| line.ends_with(" commit"))
+        .filter_map(|line| line.split(' ').next().map(ToOwned::to_owned))
+        .collect())
+}
+
+/// Move the tracker commits the composed-state notes name onto the ones
+/// [`repair_splits`] rewrote them as: the view commits keep their notes,
+/// and each note names the rewritten tracker commits.
+pub fn remap_state_notes(repo: &Utf8Path, moved: &BTreeMap<String, String>) -> Result<usize> {
+    if moved.is_empty() {
+        return Ok(0);
+    }
+    let listing = git_lines(repo, &["notes", "--ref", NOTES_REF, "list"]).unwrap_or_default();
+    let mut notes = Vec::new();
+    for line in listing {
+        let Some((_, commit)) = line.split_once(' ') else {
+            continue;
+        };
+        let state = read_state(repo, commit)?;
+        if !state
+            .values()
+            .any(|tracker_commit| moved.contains_key(tracker_commit))
+        {
+            continue;
+        }
+        let state: State = state
+            .into_iter()
+            .map(|(tracker, tracker_commit)| {
+                let tracker_commit = moved
+                    .get(&tracker_commit)
+                    .cloned()
+                    .unwrap_or(tracker_commit);
+                (tracker, tracker_commit)
+            })
+            .collect();
+        notes.push((commit.to_owned(), render_state(&state)));
+    }
+    write_notes(repo, &notes)?;
+    Ok(notes.len())
+}
+
 /// The tracker state noted on a view commit.
 pub fn read_state(repo: &Utf8Path, view_commit: &str) -> Result<State> {
     let note = git(repo, &["notes", "--ref", NOTES_REF, "show", view_commit]).unwrap_or_default();

@@ -88,7 +88,10 @@ while True: time.sleep(60)' "$port" >/dev/null 2>&1 &
 esac
 "#;
 
-fn setup(temp: &Utf8Path) -> MetadataStore {
+/// `port` is where the stack's port search starts. Each test gets its own:
+/// tests run in parallel, and one test's listener answering on another's
+/// port reads as a teardown that leaked.
+fn setup(temp: &Utf8Path, port: u16) -> MetadataStore {
     let repo = temp.join("store");
     std::fs::create_dir_all(&repo).expect("mkdir");
     git(&repo, &["init", "-q", "-b", "main"]);
@@ -115,7 +118,7 @@ fn setup(temp: &Utf8Path) -> MetadataStore {
             r#"ownership = "branch"
 
 [ports.api]
-start = 47310
+start = {port}
 
 [actions.prepare]
 command = "{stack} up {{{{ports.api}}}}"
@@ -214,7 +217,7 @@ fn db_port(store: &MetadataStore) -> u16 {
 #[test]
 fn a_role_switch_parks_the_resources_it_takes_away_and_remove_tears_them_down() {
     let (_guard, temp) = tempdir();
-    let store = setup(&temp);
+    let store = setup(&temp, 47310);
     let repo = store.paths().project_root.clone();
 
     newgit(&repo, &["spawn", "x", "--use", "branch-db"]);
@@ -265,7 +268,7 @@ fn a_role_switch_parks_the_resources_it_takes_away_and_remove_tears_them_down() 
 #[test]
 fn without_suspend_a_drop_cleans_up_and_use_prepares_on_the_same_ports() {
     let (_guard, temp) = tempdir();
-    let store = setup(&temp);
+    let store = setup(&temp, 47330);
     let repo = store.paths().project_root.clone();
     let path = store.paths().resources.join("db.toml");
     let definition = std::fs::read_to_string(&path).expect("read");
