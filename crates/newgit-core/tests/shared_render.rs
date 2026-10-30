@@ -398,7 +398,8 @@ fn a_stale_claim_does_not_block_another_resources_render() {
     );
     std::fs::write(workspace.join(".env.local"), moved).expect("write");
     git(&workspace, &["commit", "-q", "-am", "no PORT"]);
-    m.checkpoint("feature-a", Some("moved")).expect("checkpoint");
+    m.checkpoint("feature-a", Some("moved"))
+        .expect("checkpoint");
 
     let undone = m.undo("feature-a", &UndoOptions::default()).expect("undo");
     assert!(

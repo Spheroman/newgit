@@ -214,28 +214,43 @@ fn a_use_that_rewrites_a_rendered_file_restarts_readers_and_names_the_rest() {
 }
 
 #[test]
-fn a_use_or_drop_that_leaves_every_rendered_file_as_it_was_says_nothing() {
+fn a_drop_that_takes_a_rendered_value_out_restarts_its_readers() {
     let (_guard, temp) = tempdir();
     let manager = setup(&temp);
-    manager.spawn("x", None).expect("spawn x");
+    let spawned = manager.spawn("x", None).expect("spawn x");
     let _stop = Stop(&manager);
+    let workspace = spawned.branch.workspace_path;
     let admin = pid(&manager, "x", "admin").expect("admin autostarted");
+    let quiet = pid(&manager, "x", "quiet").expect("quiet autostarted");
 
-    // A drop does not unrender, and binding `db` again renders the same
-    // port into the same file: bytes identical, nothing to restart or name.
+    // Parking `db` takes its port back out of the file, so `admin` would
+    // otherwise go on talking to a database that is down.
     let dropped = manager
         .drop_tracker("x", "branch-db", Uncommitted::Refuse)
         .expect("drop branch-db");
-    assert!(dropped.stale.is_empty(), "{:?}", dropped.stale);
-    let used = manager
-        .use_tracker("x", "branch-db")
-        .expect("use branch-db");
-    assert!(used.stale.is_empty(), "{:?}", used.stale);
-
     assert_eq!(
-        pid(&manager, "x", "admin"),
-        Some(admin),
-        "nothing restarted"
+        std::fs::read_to_string(workspace.join("apps/admin/.env.local")).expect("env"),
+        ENV,
+        "back to the committed default"
+    );
+    assert_eq!(
+        dropped.stale.changed,
+        [Utf8PathBuf::from("apps/admin/.env.local")]
+    );
+    assert!(
+        dropped
+            .stale
+            .restarted
+            .iter()
+            .any(|resource| resource.name == "admin"),
+        "{:?}",
+        dropped.stale
+    );
+    assert_ne!(pid(&manager, "x", "admin"), Some(admin), "restarted");
+    assert_eq!(
+        pid(&manager, "x", "quiet"),
+        Some(quiet),
+        "`quiet` reads none of it"
     );
 }
 
