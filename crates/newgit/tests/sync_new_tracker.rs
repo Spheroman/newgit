@@ -152,3 +152,56 @@ fn a_push_publishes_the_code_that_defines_a_new_tracker() {
     assert!(output.status.success(), "{stderr}");
     assert!(stderr.contains("`site` is not in checkpoint"), "{stderr}");
 }
+
+#[test]
+fn a_tracker_the_remote_refuses_fails_the_checkpoint_sync() {
+    // Only an absence is left for later. A real "no" (out of the audience,
+    // removed from the project) would never sync, so it must not be passed
+    // off as one that will.
+    let (_guard, temp) = tempdir();
+    let fixture = setup(&temp);
+    fixture.ok(
+        &fixture.store,
+        &[
+            "tracker",
+            "create",
+            "site",
+            "--audience",
+            "project-devs",
+            "--storage",
+            "remote",
+        ],
+    );
+    fixture.ok(&fixture.store, &["tracker", "track", "site", "site"]);
+    fixture
+        .remote
+        .state
+        .lock()
+        .expect("state")
+        .denied_trackers
+        .insert("site".to_owned());
+
+    fixture.ok(&fixture.store, &["spawn", "landing"]);
+    let workspace = workspace_of(&fixture, "landing");
+    std::fs::create_dir_all(workspace.join("site")).expect("mkdir");
+    std::fs::write(workspace.join("site/index.html"), "<h1>hi</h1>\n").expect("write");
+
+    let output = fixture.newgit(&workspace, &["checkpoint"]);
+    let (stdout, stderr) = (
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert!(
+        !stdout.contains("synced to jack/store"),
+        "a refusal is not a sync: {stdout}"
+    );
+    assert!(stderr.contains("not in `site`'s audience"), "{stderr}");
+    assert!(!stderr.contains("is not in checkpoint"), "{stderr}");
+    let state = fixture.remote.state.lock().expect("state");
+    assert!(
+        !state
+            .checkpoints
+            .contains_key(&("landing".to_owned(), "ckpt_001".to_owned())),
+        "nothing went up with the tracker missing"
+    );
+}

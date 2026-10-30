@@ -715,6 +715,11 @@ async function credential(
 		facts.instancePrivate = instance?.private;
 	}
 	facts.tracker = await definitionFacts(deps.repos, ref.project, defaultBranch, ref.tracker, await listedTrackers(project));
+	// Not a refusal but an absence, as on the fork route: a client may wait
+	// for the definition to land (a checkpoint leaves the tracker for later),
+	// while a 403 is a "no" it must not wait out.
+	if (facts.tracker === undefined)
+		throw new HttpError(404, `tracker \`${ref.tracker}\` is not defined on ${projectKey(ref.project)}'s default branch`);
 
 	const decision = decide(ref, scope, who, facts);
 	if (!decision.ok) throw new HttpError(403, decision.reason);

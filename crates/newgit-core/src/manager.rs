@@ -7665,9 +7665,10 @@ impl BranchManager {
             Ok(refused) => {
                 for (tracker, reason) in refused {
                     warnings.push(format!(
-                        "`{tracker}` is not in checkpoint {} on the remote, which refused it: \
-                         {reason}. The rest synced, and a later checkpoint brings `{tracker}` \
-                         once the remote takes it",
+                        "`{tracker}` is not in checkpoint {} on the remote, which has no \
+                         definition for it yet: {reason}. The rest synced, and the first \
+                         checkpoint after its definition reaches the default branch brings \
+                         `{tracker}`",
                         record.id
                     ));
                     left_out.push(tracker);
@@ -8571,8 +8572,12 @@ impl BranchManager {
             );
             let credential = match remote.credential(&binding.project, &repo, Scope::Write) {
                 Ok(credential) => credential,
+                // 404 is a tracker whose definition is not on the default
+                // branch yet, which a later checkpoint can still bring. A 403
+                // is a real refusal (not a member, not in the audience):
+                // waiting will not change it, so it fails the sync.
                 Err(NewgitError::Remote {
-                    status: 403 | 404,
+                    status: 404,
                     message,
                 }) => {
                     left_out.push((state.name.clone(), message));

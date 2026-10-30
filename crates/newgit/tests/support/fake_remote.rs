@@ -55,8 +55,10 @@ struct State {
     /// Behave like a remote from before private instances.
     ignores_private: bool,
     /// Trackers whose definition is not on the default branch yet: like the
-    /// real remote, it gives no credential for their repos.
+    /// real remote, it answers 404 for their repos' credentials.
     undefined_trackers: std::collections::BTreeSet<String>,
+    /// Trackers the caller may not write: the real remote's 403.
+    denied_trackers: std::collections::BTreeSet<String>,
 }
 
 /// Ana's login token; every other login token is jack's.
@@ -376,9 +378,15 @@ fn route(
                     json!({ "error": format!("{repo} is {}'s own; each user reads only their own", parts[4]) }),
                 );
             }
-            if parts.len() >= 4 && parts[2] == "t" && state.undefined_trackers.contains(parts[3]) {
+            if parts.len() >= 4 && parts[2] == "t" && state.denied_trackers.contains(parts[3]) {
                 return (
                     403,
+                    json!({ "error": format!("jack may not write {repo}: not in `{}`'s audience", parts[3]) }),
+                );
+            }
+            if parts.len() >= 4 && parts[2] == "t" && state.undefined_trackers.contains(parts[3]) {
+                return (
+                    404,
                     json!({ "error": format!("tracker `{}` is not defined on {}/{}'s default branch", parts[3], parts[0], parts[1]) }),
                 );
             }
