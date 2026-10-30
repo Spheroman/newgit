@@ -2281,6 +2281,9 @@ fn tracker(command: TrackerCommand) -> Result<()> {
                 "Merged `{}` @ {} from `{instance}` into its `main`",
                 outcome.tracker, outcome.rev
             );
+            if let Some(project) = &outcome.published {
+                println!("  remote:   `main` moved on {project} too");
+            }
             Ok(())
         }
         TrackerCommand::Checkout {

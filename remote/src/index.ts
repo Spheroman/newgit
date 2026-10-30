@@ -691,17 +691,21 @@ async function gitEndpoint(request: Request, env: Env, deps: Deps, match: RegExp
 const REPOSITORY = "https://github.com/Spheroman/newgit";
 
 /**
- * The landing page: one file of one tracker, at that tracker's trunk, named
+ * The landing page: one file of one tracker, at that tracker's `main`, named
  * by `LANDING_PAGE` in wrangler.jsonc. newgit.dev's is in `site`, a secret
  * tracker, so this route is the one place its content is published, and
  * only the file the config names. Publishing a change is `newgit tracker
- * merge site` and a checkpoint, not a deploy.
+ * merge site`, which moves the repo's branch `main`; no deploy.
+ *
+ * Read by that branch's name, never `HEAD`: Artifacts resolves a branch, a
+ * tag, or a commit id, so the `refs/trackers/…` refs a checkpoint syncs are
+ * invisible here, and a repo whose `main` nobody merged yet serves nothing.
  */
 async function landingPage(method: string, env: Env, repos: Repos): Promise<Response> {
 	const page = env.LANDING_PAGE;
 	const project = page ? parseProjectKey(page.project) : null;
 	const html =
-		page && project ? await repos.readFile(repoName({ kind: "tracker", project, tracker: page.tracker }), "HEAD", page.path) : null;
+		page && project ? await repos.readFile(repoName({ kind: "tracker", project, tracker: page.tracker }), "main", page.path) : null;
 	if (html === null) return Response.redirect(REPOSITORY, 302);
 	return new Response(method === "HEAD" ? null : html, {
 		headers: { "content-type": "text/html; charset=utf-8", "cache-control": "public, max-age=60" },
