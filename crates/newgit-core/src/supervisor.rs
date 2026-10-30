@@ -268,7 +268,9 @@ impl Supervisor {
         Ok(pid)
     }
 
-    /// Signal the process group and wait up to ~5s for it to exit.
+    /// Signal the process group and wait up to ~5s for it to exit. On macOS
+    /// each poll also sweeps the group for a process the signal missed
+    /// (`signal_group`).
     ///
     /// The pid file is deliberately left on disk once a process has actually
     /// exited — retired to `stopped` rather than deleted — because its
@@ -279,12 +281,14 @@ impl Supervisor {
         let Some(pid) = self.running_pid(resource) else {
             return Ok(StopOutcome::NotRunning);
         };
+        let parsed = parse_signal(signal)?;
 
         // Before the signal, so the wrapper finds it when the command ends.
         let stopping = self.stopping_path(resource);
         std::fs::write(&stopping, format!("{signal}\n"))
             .map_err(|source| NewgitError::io(stopping, source))?;
-        signal_group(pid, signal)?;
+        let mut signalled = Signalled::default();
+        signal_group(pid, parsed, &mut signalled)?;
         for _ in 0..50 {
             if !group_alive(pid) {
                 self.mark_stopped(resource)?;
@@ -292,6 +296,8 @@ impl Supervisor {
                 return Ok(StopOutcome::Stopped(pid));
             }
             std::thread::sleep(Duration::from_millis(100));
+            // Whatever joined the group since the last sweep.
+            signal_group(pid, parsed, &mut signalled)?;
         }
         Ok(StopOutcome::StillRunning(pid))
     }
@@ -413,17 +419,99 @@ fn reap_group(pid: u32) {
     }
 }
 
-fn signal_group(pid: u32, signal: &str) -> Result<()> {
-    let parsed = parse_signal(signal)?;
-    let group = Pid::from_raw(pid as i32);
-    match signal::killpg(group, parsed) {
-        // Already gone is the outcome `stop` wanted, not a failure.
-        Ok(()) | Err(Errno::ESRCH) => Ok(()),
-        Err(errno) => Err(NewgitError::SourceCommand {
-            command: format!("killpg(-{pid}, {parsed})"),
-            stderr: errno.to_string(),
-        }),
+/// What one `stop` has signalled so far, so a later sweep signals nobody
+/// twice.
+#[derive(Debug, Default)]
+struct Signalled {
+    pids: Vec<u32>,
+    /// The group was signalled whole, by `killpg`: there is no list of
+    /// members to sweep against, so a later sweep would signal them again.
+    whole_group: bool,
+}
+
+/// Send `signal` to the processes in the group led by `pid`, and record them
+/// in `signalled`. `stop` calls this again on every poll.
+///
+/// One `killpg` is enough on Linux, which holds back a fork that a group
+/// signal lands in the middle of and retries it once the signal is handled.
+/// macOS does not: a child still being forked when the signal goes out
+/// joins the group just after it and never gets it, while its parent dies.
+/// For the wrapper, that child is the command itself, which then lives on
+/// orphaned while `stop` waits out its timeout. Dropping the wrapper's trap
+/// (#288) made that rarer but did not close it, and a command that forks
+/// (`npm run dev` starting node) has the same window. So on macOS each
+/// member is signalled by pid, and each later sweep catches a process that
+/// joined since but whose parent is no longer alive in the group: exactly
+/// what that race leaves behind. One whose parent is still in the group was
+/// started by it after the signal, like a shutdown handler running `docker
+/// compose down`, and is left alone, as `killpg` leaves it on Linux. Every
+/// process gets the signal at most once, as under `killpg`, so a command
+/// that takes a second SIGTERM as "force quit" sees no change.
+fn signal_group(pid: u32, signal: Signal, signalled: &mut Signalled) -> Result<()> {
+    if signalled.whole_group {
+        return Ok(());
     }
+    let Some(members) = group_members(pid) else {
+        signalled.whole_group = true;
+        return match signal::killpg(Pid::from_raw(pid as i32), signal) {
+            // Already gone is the outcome `stop` wanted, not a failure.
+            Ok(()) | Err(Errno::ESRCH) => Ok(()),
+            Err(errno) => Err(NewgitError::SourceCommand {
+                command: format!("killpg(-{pid}, {signal})"),
+                stderr: errno.to_string(),
+            }),
+        };
+    };
+    let first = signalled.pids.is_empty();
+    for &(member, parent) in &members {
+        if signalled.pids.contains(&member) {
+            continue;
+        }
+        // After the first signal, only an orphan: its parent died, or was
+        // never in the group. A child of a live member is its own business.
+        if !first && members.iter().any(|&(other, _)| other == parent) {
+            continue;
+        }
+        signalled.pids.push(member);
+        // ESRCH: it exited since the listing. EPERM: alive but not ours to
+        // signal, which `group_alive` still counts, so `stop` says so.
+        let _ = signal::kill(Pid::from_raw(member as i32), signal);
+    }
+    Ok(())
+}
+
+/// Each process in group `pgid` with its parent, where `signal_group` needs
+/// them, or `None` to leave the group to one `killpg`. `ps` rather than
+/// `proc_listpgrppids`, which would take the workspace's only `unsafe`; and
+/// rather than `pgrep -g`, which does not say who the parent is.
+#[cfg(target_os = "macos")]
+fn group_members(pgid: u32) -> Option<Vec<(u32, u32)>> {
+    let output = Command::new("ps")
+        .args(["-A", "-o", "pid=,ppid=,pgid="])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    Some(
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter_map(|line| {
+                let mut fields = line
+                    .split_whitespace()
+                    .map(|field| field.parse::<u32>().ok());
+                let (pid, parent, group) = (fields.next()??, fields.next()??, fields.next()??);
+                (group == pgid).then_some((pid, parent))
+            })
+            .collect(),
+    )
+}
+
+#[cfg(not(target_os = "macos"))]
+fn group_members(_pgid: u32) -> Option<Vec<(u32, u32)>> {
+    None
 }
 
 /// Accept what a user would write in a resource definition: `term`, `TERM`,
@@ -724,14 +812,115 @@ mod tests {
             }
             std::thread::sleep(Duration::from_millis(100));
         }
-        let _ = signal_group(pid, "kill");
+        let _ = signal_group(pid, Signal::SIGKILL, &mut Signalled::default());
         assert!(gone, "the command started after the stop, out of its reach");
+    }
+
+    /// What macOS does to a fork a group signal lands in the middle of: the
+    /// child joins the group after the signal and never gets it. The next
+    /// sweep must catch it — and only it, since the leader already had its
+    /// signal. Here the leader ignores TERM so the group outlives the first
+    /// sweep, and the late member is put into the group by hand.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_process_that_joins_the_group_after_the_signal_gets_it_on_the_next_sweep() {
+        use std::os::unix::process::CommandExt as _;
+        let mut leader = Command::new("sh")
+            .args(["-c", "trap '' TERM; exec sleep 30"])
+            .process_group(0)
+            .spawn()
+            .expect("spawn leader");
+        let pid = leader.id();
+        // Until the trap is set, TERM would kill the leader.
+        std::thread::sleep(Duration::from_millis(300));
+
+        let mut signalled = Signalled::default();
+        signal_group(pid, Signal::SIGTERM, &mut signalled).expect("first sweep");
+        assert_eq!(signalled.pids, [pid]);
+
+        let mut late = Command::new("sleep")
+            .arg("30")
+            .process_group(pid as i32)
+            .spawn()
+            .expect("spawn late member");
+        signal_group(pid, Signal::SIGTERM, &mut signalled).expect("second sweep");
+        assert_eq!(signalled.pids, [pid, late.id()]);
+        let status = late.wait().expect("wait late member");
+
+        let _ = signal_group(pid, Signal::SIGKILL, &mut Signalled::default());
+        let _ = leader.wait();
+        assert!(
+            !status.success(),
+            "the late member was signalled, not left to run: {status}"
+        );
+    }
+
+    /// A process a group member starts after the signal, the way a shutdown
+    /// handler runs a cleanup command, is that member's business: a sweep
+    /// leaves it alone, as `killpg` does on Linux.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_sweep_leaves_alone_what_a_live_member_starts_after_the_signal() {
+        use std::os::unix::process::CommandExt as _;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let helper_file = dir.path().join("helper");
+        let script = format!(
+            "trap 'sleep 30 & echo $! > {}; wait' TERM; sleep 30 & wait",
+            helper_file.display()
+        );
+        let mut leader = Command::new("sh")
+            .args(["-c", &script])
+            .process_group(0)
+            .spawn()
+            .expect("spawn leader");
+        let pid = leader.id();
+        // Until the trap and the first `sleep` are there.
+        let started = || group_members(pid).is_some_and(|members| members.len() >= 2);
+        for _ in 0..50 {
+            if started() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        let mut signalled = Signalled::default();
+        signal_group(pid, Signal::SIGTERM, &mut signalled).expect("first sweep");
+        let mut helper = None;
+        for _ in 0..100 {
+            helper = std::fs::read_to_string(&helper_file)
+                .ok()
+                .and_then(|text| text.trim().parse::<u32>().ok());
+            if helper.is_some() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let helper = helper.expect("the TERM handler started its helper");
+        signal_group(pid, Signal::SIGTERM, &mut signalled).expect("second sweep");
+        let alive = signal::kill(Pid::from_raw(helper as i32), None).is_ok();
+
+        let _ = signal::killpg(Pid::from_raw(pid as i32), Signal::SIGKILL);
+        let _ = leader.wait();
+        assert!(!signalled.pids.contains(&helper), "{signalled:?}");
+        assert!(alive, "the shutdown helper was left to run");
+    }
+
+    /// A group signalled whole by `killpg` is not signalled again by a later
+    /// sweep, even one that can list its members.
+    #[test]
+    fn a_group_signalled_whole_is_not_signalled_again() {
+        let mut signalled = Signalled {
+            pids: Vec::new(),
+            whole_group: true,
+        };
+        assert!(signal_group(999_999, Signal::SIGTERM, &mut signalled).is_ok());
+        assert!(signalled.pids.is_empty());
     }
 
     /// Signalling a group that is already gone is the outcome `stop` wanted.
     #[test]
     fn signalling_a_dead_group_is_not_an_error() {
-        assert!(signal_group(999_999, "term").is_ok());
+        assert!(signal_group(999_999, Signal::SIGTERM, &mut Signalled::default()).is_ok());
         assert!(!group_alive(999_999));
     }
 
