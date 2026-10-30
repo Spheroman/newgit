@@ -1,16 +1,18 @@
 name: CLA
 
-# A pull request merges only once its author has signed CLA.md, by adding a
-# line to .github/cla/signatures.txt. The first pull request may add that
-# line itself, so the check reads the pull request's own copy of the file.
-# Nothing here runs the pull request's code: it only reads a text file.
+# A pull request merges only once everyone who wrote it has signed CLA.md,
+# by adding a line to .github/cla/signatures.txt: its author and the author
+# of every commit in it. The first pull request may add that line itself, so
+# the check reads the pull request's own copy of the file. Nothing here runs
+# the pull request's code: it reads a text file and asks the API for authors.
 
 on:
   pull_request:
-    types: [opened, reopened, synchronize, edited]
+    types: [opened, reopened, synchronize]
 
 permissions:
   contents: read
+  pull-requests: read
 
 jobs:
   cla:
@@ -18,20 +20,38 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - name: Check the author signed the CLA
+      - name: Check everyone who wrote the pull request signed the CLA
         env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
           AUTHOR: ${{ github.event.pull_request.user.login }}
           # The owner holds the copyright already; bots author no original work.
           EXEMPT: Spheroman
         run: |
-          if [[ "$AUTHOR" == *"[bot]" ]] || [[ " $EXEMPT " == *" $AUTHOR "* ]]; then
-            echo "$AUTHOR does not need to sign the CLA."
-            exit 0
-          fi
-          if grep -v '^#' .github/cla/signatures.txt | cut -d'|' -f1 | tr -d ' ' | grep -qixF -- "$AUTHOR"; then
-            echo "$AUTHOR has signed the CLA."
-            exit 0
-          fi
-          echo "::error::$AUTHOR has not signed the CLA. Add this line to the end of .github/cla/signatures.txt in this pull request (see CONTRIBUTING.md):"
-          echo "$AUTHOR | Your Full Name | $(date -u +%F) | 1"
-          exit 1
+          version=$(sed -n 's/^Version \([0-9][0-9]*\),.*/\1/p' CLA.md | head -n1)
+          # Logins that signed the current version, lowercased.
+          signed=$(awk -F'|' -v v="$version" '/^#/ { next } { gsub(/[ \t]/, "", $1); gsub(/[ \t]/, "", $4) } $1 != "" && $4 == v { print tolower($1) }' .github/cla/signatures.txt)
+
+          # "<login or empty>|<what to call it>" for the author and every commit.
+          # `|`, not a tab: `read` would collapse a leading tab, losing an empty login.
+          people=$(printf '%s|the pull request\n' "$AUTHOR"
+            gh api "repos/$REPO/pulls/$PR/commits" --paginate \
+              --jq '.[] | "\(.author.login // "")|commit \(.sha[0:7]) (\(.commit.author.email))"')
+
+          missing=0
+          while IFS='|' read -r login what; do
+            if [ -z "$login" ]; then
+              echo "::error::$what: its author email is not linked to a GitHub account, so the CLA check can't tell who wrote it. Link the email on GitHub, or rewrite the commit with one that is."
+              missing=1
+            elif [[ "$login" == *"[bot]" ]] || [[ " $EXEMPT " == *" $login "* ]]; then
+              :
+            elif ! grep -qxF -- "$(printf '%s' "$login" | tr '[:upper:]' '[:lower:]')" <<<"$signed"; then
+              echo "::error::$login ($what) has not signed version $version of the CLA. Add this line to the end of .github/cla/signatures.txt (see CONTRIBUTING.md):"
+              echo "$login | Your Full Name | $(date -u +%F) | $version"
+              missing=1
+            fi
+          done <<<"$people"
+
+          [ "$missing" = 0 ] && echo "Everyone who wrote this pull request has signed version $version of the CLA."
+          exit "$missing"

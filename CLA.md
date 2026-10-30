@@ -2,10 +2,10 @@
 
 Version 1, 2026-10-30
 
-This agreement is between you and the newgit maintainers, together with any
-legal entity they form to develop newgit and that entity's successors and
-assigns ("newgit"). It covers every Contribution you submit to newgit. It
-does not cover anything else.
+This agreement is between you and Jack Wen, together with any legal entity
+he forms or joins to develop newgit and his and its successors and assigns
+("newgit"). It covers every Contribution you submit to newgit. It does not
+cover anything else.
 
 You sign it by adding a line to
 [`.github/cla/signatures.txt`](.github/cla/signatures.txt) in a pull request
@@ -29,16 +29,18 @@ ownership to newgit.
 
 ## 3. Copyright license
 
-You grant newgit, and recipients of software distributed by newgit, a
-perpetual, worldwide, non-exclusive, no-charge, royalty-free, irrevocable
-license to reproduce, prepare derivative works of, publicly display,
-publicly perform, sublicense, and distribute your Contributions and
-derivative works of them, under any license terms, including proprietary
-terms.
+You grant newgit a perpetual, worldwide, non-exclusive, no-charge,
+royalty-free, irrevocable license to reproduce, prepare derivative works of,
+publicly display, publicly perform, sublicense, and distribute your
+Contributions and derivative works of them, under any license terms,
+including proprietary terms.
 
 This is what lets newgit change the license a project is published under,
 and use a Contribution in software it does not publish. Contributions to the
 open projects will still be published under those projects' licenses.
+
+This section grants nothing to anyone but newgit. Everyone else receives
+your Contributions under the license newgit publishes them under.
 
 ## 4. Patent license
 
