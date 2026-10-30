@@ -203,3 +203,62 @@ fn using_a_tracker_whose_main_is_empty_binds_it_empty() {
         "nothing to bind, as at spawn"
     );
 }
+
+/// A tracker bound only on `--use` (negative priority, no role) whose paths
+/// already hold a hand-written file: `use` brings its main, but captures
+/// the file to the instance's branch first, so nothing is lost.
+#[test]
+fn using_a_tracker_keeps_what_was_already_at_its_paths() {
+    let (_guard, temp) = tempdir();
+    let repo = temp.join("store");
+    std::fs::create_dir_all(&repo).expect("mkdir");
+    git(&repo, &["init", "-q", "-b", "main"]);
+    std::fs::write(repo.join("README.md"), "hello\n").expect("write");
+    std::fs::write(repo.join(".gitignore"), "/.env.local\n").expect("write");
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-q", "-m", "initial"]);
+
+    let store = MetadataStore::init(&repo, "proj", SourceSubstrate::Git).expect("init");
+    let mut config = store.load_config().expect("config");
+    config.workspace = Some(WorkspaceSection {
+        root: Some(temp.join("workspaces")),
+        materializer: None,
+    });
+    store.write_config(&config).expect("write config");
+    std::fs::write(
+        store.paths().trackers.join("local-env.toml"),
+        "audience = \"user\"\nstorage = \"local\"\npaths = [\".env.local\"]\npriority = -1\n",
+    )
+    .expect("write");
+    let manager = BranchManager::open(store).expect("manager");
+    std::fs::write(repo.join(".env.local"), "FROM_MAIN=1\n").expect("write");
+    manager.seed_tracker_from_store("local-env").expect("seed");
+    std::fs::remove_file(repo.join(".env.local")).expect("remove");
+
+    let spawned = manager.spawn("c", None).expect("spawn c");
+    assert!(!spawned.branch.trackers.contains_key("local-env"));
+    let env = spawned.branch.workspace_path.join(".env.local");
+    std::fs::write(&env, "BY_HAND=1\n").expect("write");
+
+    let change = manager.use_tracker("c", "local-env").expect("use");
+    assert!(change.seeded);
+    assert_eq!(
+        std::fs::read_to_string(&env).expect("read"),
+        "FROM_MAIN=1\n"
+    );
+
+    let (lanes, branch) = manager
+        .tracker_log_target("local-env", Some("c"))
+        .expect("log target");
+    let shown = Command::new("git")
+        .arg("-C")
+        .arg(lanes.as_str())
+        .args(["show", &format!("{branch}:.env.local")])
+        .output()
+        .expect("git runs");
+    assert_eq!(
+        String::from_utf8_lossy(&shown.stdout),
+        "BY_HAND=1\n",
+        "the hand-written file is on c's branch of the tracker"
+    );
+}
