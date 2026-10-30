@@ -9,9 +9,9 @@ use newgit_core::export::{ExportFilter, Reason};
 use newgit_core::exports::unresolved_placeholder;
 use newgit_core::installs::InstallReport;
 use newgit_core::manager::{
-    ActionOutcome, ActionPlan, BaseReport, BindOrigin, BranchManager, DiffPair, ExportReason,
-    InstanceReport, KeptBranch, MismatchCause, RemoteExportOptions, RemoveOutcome,
-    ResourceBindOutcome, SourceBranchOutcome, SourceBranchPolicy, StopStartOutcome,
+    ActionOutcome, ActionPlan, BaseReport, BindOrigin, BranchManager, DEFAULT_READY_WAIT, DiffPair,
+    ExportReason, InstanceReport, KeptBranch, MismatchCause, Readiness, RemoteExportOptions,
+    RemoveOutcome, ResourceBindOutcome, SourceBranchOutcome, SourceBranchPolicy, StopStartOutcome,
     StopStartResource, StopStartStatus, TrackerBindOutcome, UndoOptions, VerifyResource,
 };
 use newgit_core::resource::{CheckpointMode, ResourceDefinition};
@@ -31,6 +31,10 @@ const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), " (", env!("NEWGIT_BUIL
 #[derive(Debug, Parser)]
 #[command(name = "newgit")]
 #[command(about = "Branch-bound resource orchestration for agentic workflows")]
+// An agent asked to "set newgit up" reads `--help` first, and on its own
+// would stop at `init`: the guide to a setup worth keeping has to be on the
+// path it already takes.
+#[command(after_help = "Setting newgit up for someone? Read `newgit reference agents` first.")]
 #[command(version = VERSION)]
 struct Cli {
     #[command(subcommand)]
@@ -122,7 +126,8 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Start again exactly what the last `newgit stop` stopped
+    /// Start again what the last `newgit stop` stopped, and any `autostart`
+    /// action that died on its own
     ///
     /// A resource nobody had started stays stopped. Exits 0 when there is
     /// nothing to start, and 1 when anything failed to; a failed one is
@@ -450,6 +455,17 @@ enum ResourceCommand {
     },
     /// List defined resources
     List,
+    /// Bind a resource again in an instance, as spawn bound it: ports,
+    /// exports, render, `prepare`, then its `autostart` action
+    ///
+    /// The retry for a resource that failed to render or to resolve an
+    /// export, once the file or the definition is fixed. Refused while its
+    /// process is running. Exits 1 when it does not come up.
+    Rebind {
+        name: String,
+        /// Instance (inferred when run inside a workspace)
+        instance: Option<String>,
+    },
     /// List available resource starter templates
     Templates {
         /// Print one template's TOML in full, instead of instantiating it
@@ -851,6 +867,7 @@ fn init(args: InitArgs) -> Result<()> {
     );
     println!("      newgit spawn <branch>");
     println!("\n{REFERENCE_POINTER}");
+    println!("Setting this up for someone else: newgit reference agents");
     Ok(())
 }
 
@@ -900,8 +917,12 @@ fn resource_json(
         "ports": binding.resolved_ports,
         "prepare_log": bound.and_then(|bound| bound.prepare.as_ref()).map(|(_, log)| log),
         "blocked_by": blocked_by,
-        "render_error": bound.and_then(|bound| bound.render_error.as_ref()),
-        "export_error": bound.and_then(|bound| bound.export_error.as_ref()),
+        "render_error": bound
+            .and_then(|bound| bound.render_error.as_ref())
+            .or(binding.render_error.as_ref()),
+        "export_error": bound
+            .and_then(|bound| bound.export_error.as_ref())
+            .or(binding.export_error.as_ref()),
     })
 }
 
@@ -1119,6 +1140,7 @@ fn spawn_from_checkpoint(
                 not_ready.len(),
                 outcome.branch.resources.len()
             ),
+            &manager.readiness(&outcome.branch),
         );
     }
     Ok(())
@@ -1127,9 +1149,20 @@ fn spawn_from_checkpoint(
 /// The footer both spawns end on when a resource is not up, and their exit.
 /// The instance is not rolled back — it exists, with a record on disk,
 /// exactly as printed above. Exit 1 reports that state; it does not undo it.
-fn exit_spawned_with_failures(name: &str, summary: &str) -> ! {
+///
+/// The "see below" of the first line is this: what is wrong, each with the
+/// error behind it and the command that fixes it, as `status` says it
+/// (#262).
+fn exit_spawned_with_failures(name: &str, summary: &str, readiness: &Readiness) -> ! {
     println!("spawned with failures: {summary}.");
-    println!("  `{name}` exists but is not ready. See the FAILED/BLOCKED lines above.");
+    if readiness.problems.is_empty() {
+        println!("  `{name}` exists but is not ready. See the FAILED/BLOCKED lines above.");
+    } else {
+        println!("  `{name}` exists but is not ready:");
+        for problem in &readiness.problems {
+            println!("  - {problem}");
+        }
+    }
     std::process::exit(1);
 }
 
@@ -1148,6 +1181,14 @@ fn spawn(args: SpawnArgs) -> Result<()> {
             private: args.private,
         },
     )?;
+    // After the autostart, which is the only thing that leaves a process up
+    // with its port not yet answering: give it a few seconds, then say what
+    // is still starting. Not worth waiting on a spawn that did not come up.
+    let readiness = if outcome.is_complete() {
+        manager.readiness_after(&outcome.branch, DEFAULT_READY_WAIT)
+    } else {
+        Readiness::default()
+    };
     if args.json {
         let resources = outcome
             .branch
@@ -1172,8 +1213,10 @@ fn spawn(args: SpawnArgs) -> Result<()> {
                 "endpoint": outcome.branch.remote.as_ref().map(|remote| &remote.endpoint),
                 "remote_warning": outcome.remote_warning,
                 "projection_warning": outcome.projection_warning,
+                "template_warning": outcome.template_warning,
                 "resources": resources,
                 "started": stop_start_resources_json(&outcome.started),
+                "starting": starting_json(&readiness),
             })
         );
         // The exit the human-readable summary below gives, for the same
@@ -1217,6 +1260,9 @@ fn spawn(args: SpawnArgs) -> Result<()> {
         branch.short_rev()
     );
     println!("  workspace: {}", branch.workspace_path);
+    if let Some(warning) = &outcome.template_warning {
+        println!("             cloned with `git clone`: the source template failed ({warning})");
+    }
     println!("  record:    {}", outcome.record_path);
     if let Some(warning) = &outcome.projection_warning {
         println!("  trackers:  the project root's commits were not split ({warning})");
@@ -1276,44 +1322,7 @@ fn spawn(args: SpawnArgs) -> Result<()> {
         println!("  tracker:   {}", bind_line(tracker, deposit_only));
     }
     for resource in &outcome.resources {
-        let ports = resource
-            .ports
-            .iter()
-            .map(|(name, port)| format!("{name}={port}"))
-            .collect::<Vec<_>>()
-            .join(" ");
-        let ports = if ports.is_empty() {
-            String::new()
-        } else {
-            format!(" ports: {ports}")
-        };
-        let prepare = prepare_label(resource);
-        let captured = if resource.captured.is_empty() {
-            String::new()
-        } else {
-            format!(" captured: {}", resource.captured.join(", "))
-        };
-        let rendered = if resource.rendered.is_empty() {
-            String::new()
-        } else {
-            format!(
-                " rendered: {}",
-                resource
-                    .rendered
-                    .iter()
-                    .map(|file| format!("{} ({})", file.path, file.replacements))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            )
-        };
-        println!(
-            "  resource:  `{}`{ports}{prepare}{captured}{rendered}",
-            resource.name
-        );
-        if let Some(install) = &resource.install {
-            println!("             {}", install.summary());
-        }
-        print_warnings(&resource.missing_captures);
+        print_bound_resource(resource);
     }
     print_started(&outcome.started);
     if !outcome.is_complete() {
@@ -1329,16 +1338,24 @@ fn spawn(args: SpawnArgs) -> Result<()> {
                 failed.len(),
                 outcome.resources.len()
             ),
+            &manager.readiness(branch),
         );
     }
-    let readiness = manager.readiness(branch);
-    if readiness.is_ready() {
+    if readiness.is_ready() && !readiness.is_starting() {
         println!("ready: `{}`", branch.name);
+    } else if readiness.is_ready() {
+        println!("starting: `{}`", branch.name);
     } else {
         println!("not ready: `{}`", branch.name);
         for problem in &readiness.problems {
             println!("  - {problem}");
         }
+    }
+    for starting in &readiness.starting {
+        println!("  - {}", starting.message());
+    }
+    if readiness.is_starting() {
+        println!("  `newgit status` shows when it is up.");
     }
     Ok(())
 }
@@ -1436,6 +1453,23 @@ fn resource(command: ResourceCommand) -> Result<()> {
             );
             for instance in &outcome.unbound_instances {
                 println!("  dropped binding: `{instance}` (its allocated ports are released)");
+            }
+            Ok(())
+        }
+        ResourceCommand::Rebind { name, instance } => {
+            let (manager, instance) = manager_and_instance(instance)?;
+            let outcome = manager.rebind_resource(&instance, &name)?;
+            println!("Bound `{name}` again in `{}`", outcome.instance);
+            print_bound_resource(&outcome.bound);
+            print_started(&outcome.started);
+            let failed = outcome.bound.status == ResourceStatus::Failed
+                || outcome.bound.is_blocked()
+                || outcome
+                    .started
+                    .iter()
+                    .any(|start| start.status == StopStartStatus::Failed);
+            if failed {
+                std::process::exit(1);
             }
             Ok(())
         }
@@ -1658,6 +1692,61 @@ fn stop_start_resources_json(resources: &[StopStartResource]) -> serde_json::Val
         .collect()
 }
 
+/// `{"resource", "ports"}` per running resource whose ports have not answered
+/// yet. Not a failure: `spawn` exits 0 with these, as it does for `ready`.
+fn starting_json(readiness: &Readiness) -> serde_json::Value {
+    readiness
+        .starting
+        .iter()
+        .map(|starting| {
+            serde_json::json!({ "resource": starting.resource, "ports": starting.ports })
+        })
+        .collect()
+}
+
+/// A resource's `resource:` line in a spawn or rebind report, with its
+/// install summary and capture warnings under it.
+fn print_bound_resource(resource: &ResourceBindOutcome) {
+    let ports = resource
+        .ports
+        .iter()
+        .map(|(name, port)| format!("{name}={port}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let ports = if ports.is_empty() {
+        String::new()
+    } else {
+        format!(" ports: {ports}")
+    };
+    let prepare = prepare_label(resource);
+    let captured = if resource.captured.is_empty() {
+        String::new()
+    } else {
+        format!(" captured: {}", resource.captured.join(", "))
+    };
+    let rendered = if resource.rendered.is_empty() {
+        String::new()
+    } else {
+        format!(
+            " rendered: {}",
+            resource
+                .rendered
+                .iter()
+                .map(|file| format!("{} ({})", file.path, file.replacements))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    };
+    println!(
+        "  resource:  `{}`{ports}{prepare}{captured}{rendered}",
+        resource.name
+    );
+    if let Some(install) = &resource.install {
+        println!("             {}", install.summary());
+    }
+    print_warnings(&resource.missing_captures);
+}
+
 /// A spawn's line for each `autostart` action it tried.
 fn print_started(started: &[StopStartResource]) {
     for resource in started {
@@ -1674,7 +1763,10 @@ fn print_stop_start(outcome: &StopStartOutcome, which: StopStart) {
     if outcome.resources.is_empty() {
         match which {
             StopStart::Stop => println!("Nothing running for `{instance}`"),
-            StopStart::Start => println!("Nothing stopped by `newgit stop` for `{instance}`"),
+            StopStart::Start => println!(
+                "Nothing stopped by `newgit stop`, and no `autostart` action down, for \
+                 `{instance}`"
+            ),
         }
         return;
     }
@@ -2139,20 +2231,28 @@ fn tracker(command: TrackerCommand) -> Result<()> {
             for other in &change.replaced {
                 println!("  dropped `{other}`, which filled the same role");
             }
+            print_parked(&change.parked);
             for other in &change.brought {
                 println!("  bound `{other}` too: `{tracker}` requires it");
             }
             if !change.started.is_empty() {
                 println!("  bound what it brings: {}", change.started.join(", "));
             }
+            print_resumed(&change.resumed);
             print_rebuilt(&change.rebuilt);
             print_started(&change.autostarted);
             if change.restored_stash {
                 println!("  its uncommitted work, stashed when it was dropped, is back");
             }
-            if change.files > 0 {
+            if change.files > 0 && change.seeded {
+                println!(
+                    "  {} put in place from its main",
+                    plural(change.files, "file")
+                );
+            } else if change.files > 0 {
                 println!("  {} restored", plural(change.files, "file"));
             }
+            print_stale_render(&change.stale);
             Ok(())
         }
         TrackerCommand::Drop {
@@ -2174,9 +2274,7 @@ fn tracker(command: TrackerCommand) -> Result<()> {
                 return Ok(());
             }
             println!("Dropped `{tracker}` from `{instance}`");
-            if !change.stopped.is_empty() {
-                println!("  stopped what it brought: {}", change.stopped.join(", "));
-            }
+            print_parked(&change.parked);
             print_rebuilt(&change.rebuilt);
             if change.stashed {
                 println!(
@@ -2193,6 +2291,7 @@ fn tracker(command: TrackerCommand) -> Result<()> {
                     "  its content was captured first ({rev}); `newgit tracker use {tracker}` brings it back"
                 );
             }
+            print_stale_render(&change.stale);
             Ok(())
         }
         TrackerCommand::Pull { tracker, instance } => {
@@ -2273,6 +2372,15 @@ fn status(name: Option<&str>, path_only: bool) -> Result<()> {
             println!("  - {problem}");
         }
     }
+    for report in reports
+        .iter()
+        .filter(|report| report.workspace_exists && report.readiness.is_starting())
+    {
+        println!("\n`{}` is still starting:", report.branch.name);
+        for starting in &report.readiness.starting {
+            println!("  - {}", starting.message());
+        }
+    }
     if any_never_pulled {
         println!(
             "\n^ = its `main` has content this instance never pulled; catch up with `newgit tracker pull <tracker> [instance]`"
@@ -2298,10 +2406,12 @@ fn status_column(report: &InstanceReport) -> String {
     if !report.workspace_exists {
         return "ws-missing".to_owned();
     }
-    let health = if report.readiness.is_ready() {
-        "ready"
-    } else {
+    let health = if !report.readiness.is_ready() {
         "not ready"
+    } else if report.readiness.is_starting() {
+        "starting"
+    } else {
+        "ready"
     };
     let health = if report.branch.private {
         format!("{health}, private")
@@ -2755,6 +2865,7 @@ fn checkpoints(instance: Option<String>) -> Result<()> {
         );
         return Ok(());
     }
+    let own = manager.store().find_branch(&instance)?.source_ref;
     println!(
         "{:<10} {:<17} {:<12} {:<10} MESSAGE",
         "ID", "CREATED", "REASON", "SOURCE"
@@ -2783,7 +2894,14 @@ fn checkpoints(instance: Option<String>) -> Result<()> {
             record.created_at.format("%Y-%m-%d %H:%M"),
             reason,
             source,
-            record.message.as_deref().unwrap_or("-")
+            match record.source.off_branch(&own) {
+                // Taken with the workspace off the instance's branch: undo
+                // to it puts the workspace back there.
+                Some(off) => format!("[{off}] {}", record.message.as_deref().unwrap_or_default())
+                    .trim_end()
+                    .to_owned(),
+                None => record.message.as_deref().unwrap_or("-").to_owned(),
+            }
         );
     }
     println!(
@@ -3007,6 +3125,7 @@ fn render_command(check: bool) -> Result<()> {
         );
     }
     let manager = manager_here()?;
+    warn_graph(&manager);
     let targets = manager.render_check();
     if targets.is_empty() {
         println!("No `[[render]]` targets defined.");
@@ -3170,7 +3289,7 @@ fn ports_command(check: bool) -> Result<()> {
 }
 
 /// Bare `newgit ports`: every instance's claimed ports, read straight off
-/// its binding record.
+/// its binding record. A parked resource's ports are claimed too, and say so.
 fn list_claimed_ports(branches: &[newgit_core::BranchInstance]) -> Result<()> {
     if branches.is_empty() {
         println!("No branch instances yet. Create one with `newgit spawn <name>`.");
@@ -3178,13 +3297,17 @@ fn list_claimed_ports(branches: &[newgit_core::BranchInstance]) -> Result<()> {
     }
     for branch in branches {
         let entries: Vec<String> = branch
-            .resources
-            .iter()
+            .port_claims()
             .flat_map(|(resource, binding)| {
+                let parked = if branch.parked.contains_key(resource) {
+                    " (parked)"
+                } else {
+                    ""
+                };
                 binding
                     .resolved_ports
                     .iter()
-                    .map(move |(port_name, port)| format!("{resource}.{port_name}:{port}"))
+                    .map(move |(port_name, port)| format!("{resource}.{port_name}:{port}{parked}"))
             })
             .collect();
         if entries.is_empty() {
@@ -3481,6 +3604,56 @@ fn parse_storage(value: &str) -> Result<Storage> {
     }
 }
 
+/// The resources a `tracker drop` (or the drop a `use` made) took down and
+/// parked, each with what took it down: which hook ran, or why none did.
+fn print_parked(parked: &[newgit_core::manager::ParkedResource]) {
+    for resource in parked {
+        let mut done = Vec::new();
+        if let Some(action) = &resource.stopped {
+            done.push(format!("stopped `{action}`"));
+        }
+        if let Some(hook) = &resource.hook {
+            let log = hook
+                .log
+                .as_ref()
+                .map(|log| format!(" (log: {log})"))
+                .unwrap_or_default();
+            done.push(if hook.ok {
+                format!("ran `{}`", hook.hook)
+            } else {
+                format!(
+                    "`{}` FAILED{log}; `newgit remove` runs `[cleanup]`",
+                    hook.hook
+                )
+            });
+        }
+        if let Some(note) = &resource.note {
+            done.push(note.clone());
+        }
+        if done.is_empty() {
+            done.push("nothing was running".to_owned());
+        }
+        println!("  parked `{}`: {}", resource.name, done.join("; "));
+    }
+    if !parked.is_empty() {
+        println!("    its ports stay claimed; `newgit tracker use` brings it back on them");
+    }
+}
+
+/// The parked resources a `tracker use` brought back through `resume`.
+fn print_resumed(resumed: &[(String, bool)]) {
+    for (name, ok) in resumed {
+        if *ok {
+            println!("  resumed `{name}` on the ports it had");
+        } else {
+            println!(
+                "  `{name}`'s `resume` FAILED; retry with `newgit action {name}.resume`, or \
+                 `newgit action {name}.prepare`"
+            );
+        }
+    }
+}
+
 /// The installs a `tracker use` or `drop` rebuilt, because the binding is
 /// part of their identity. The binding has changed either way; a failed or
 /// blocked rebuild says what to run once the cause is fixed.
@@ -3514,6 +3687,38 @@ fn print_rebuilt(rebuilt: &[newgit_core::manager::RebuiltInstall]) {
     }
 }
 
+/// What a `tracker use` or `drop` rewrote under processes already running:
+/// the files, the processes restarted because they declare `reads` covering
+/// one, and a warning for each that declares nothing and may be stale. Silent
+/// when no rendered file's bytes changed.
+fn print_stale_render(stale: &newgit_core::manager::StaleRender) {
+    if stale.is_empty() {
+        return;
+    }
+    let files = stale
+        .changed
+        .iter()
+        .map(|path| escape_control(path.as_str()))
+        .collect::<Vec<_>>()
+        .join(", ");
+    println!("  rendered files changed: {files}");
+    for resource in &stale.restarted {
+        let spec = format!("{}.{}", resource.name, resource.action);
+        match &resource.error {
+            None => println!("  restarted: `{spec}`, which reads them"),
+            Some(error) => println!("  restarted: `{spec}` FAILED: {error}"),
+        }
+    }
+    for process in &stale.may_be_stale {
+        eprintln!(
+            "warning: `{}.{}` is still running on what it read before {files} changed; \
+             restart it with `{}`, or declare `reads` in its resource definition so newgit \
+             restarts it when they change",
+            process.name, process.action, process.restart_with
+        );
+    }
+}
+
 fn files_label(count: usize) -> String {
     plural(count, "file")
 }
@@ -3527,6 +3732,28 @@ fn plural(count: usize, noun: &str) -> String {
 }
 
 fn source_column(report: &InstanceReport) -> String {
+    use newgit_core::checkpoint::OffBranch;
+    // Off the instance's branch, the live HEAD is not `base`'s, so it is not
+    // labelled as `base`'s: the instance's branch shows where it is, and the
+    // workspace's own branch beside it.
+    match &report.off_branch {
+        Some(OffBranch::Branch(name)) => {
+            return format!(
+                "{}@{} (workspace on `{name}`)",
+                report.branch.source_ref,
+                report.branch.short_rev()
+            );
+        }
+        Some(OffBranch::Detached) => {
+            return format!(
+                "{}@{} (workspace detached at {})",
+                report.branch.source_ref,
+                report.branch.short_rev(),
+                report.live_rev.as_deref().unwrap_or("?")
+            );
+        }
+        None => {}
+    }
     let rev = report
         .live_rev
         .clone()
@@ -3614,6 +3841,7 @@ fn merge(instance: Option<String>, into: &str) -> Result<()> {
     use newgit_core::manager::TrackerMergeAction;
     let (manager, instance) = manager_and_instance(instance)?;
     let outcome = manager.merge(&instance, into)?;
+    print_warnings(&outcome.warnings);
     let moved = outcome
         .trackers
         .iter()

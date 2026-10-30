@@ -48,6 +48,8 @@ fn branch(name: &str, workspace: &str, ports: &[(&str, u16)]) -> BranchInstance 
                 rendered: Vec::new(),
                 status: ResourceStatus::Ready,
                 restore_proven: false,
+                render_error: None,
+                export_error: None,
             },
         );
     }
@@ -67,6 +69,7 @@ fn resource_declaring(name: &str, port_name: &str, start: u16) -> ResourceDefini
         ports: BTreeMap::from([(port_name.to_owned(), PortRequest { start, env: None })]),
         exports: BTreeMap::new(),
         render: Vec::new(),
+        reads: None,
         actions: BTreeMap::new(),
         checkpoint: None,
         restore: None,

@@ -41,6 +41,13 @@ pub enum NewgitError {
     InvalidName(String),
 
     #[error(
+        "invalid name: {len} characters is over the {max}-character limit; names end up in \
+         Docker container names, Supabase project ids, and hostnames, which break well before \
+         a filesystem does"
+    )]
+    NameTooLong { len: usize, max: usize },
+
+    #[error(
         "branch instance `{name}` collides with existing record {path}; instance names must be unique after slugging"
     )]
     BranchInstanceExists { name: String, path: Utf8PathBuf },
@@ -105,6 +112,46 @@ pub enum NewgitError {
 
     #[error("tracker `{0}` owns no paths; there is nothing to capture from a workspace")]
     TrackerHasNoPaths(String),
+
+    /// Capture found a symlink at a tracked path that points outside the
+    /// directory being captured. Following it would copy a file from
+    /// anywhere on the machine into a lane that may sync to a remote.
+    #[error(
+        "refusing to capture `{path}` into tracker `{tracker}`: it is a symlink to `{target}`, \
+         which is outside the workspace. newgit never copies what a link points at; it keeps \
+         a link only when it is relative and stays inside the workspace. Replace `{path}` with \
+         a regular file, or with a link that stays inside"
+    )]
+    SymlinkLeavesWorkspace {
+        tracker: String,
+        path: Utf8PathBuf,
+        target: Utf8PathBuf,
+    },
+
+    /// A tracked path lies under a directory that is a symlink, so what is
+    /// "at" the path is really somewhere else.
+    #[error(
+        "refusing to read `{path}`: `{link}` is a symlink to `{target}`, so `{path}` is not in \
+         the workspace but wherever that link leads. Replace `{link}` with a real directory"
+    )]
+    SymlinkedParent {
+        path: Utf8PathBuf,
+        link: Utf8PathBuf,
+        target: Utf8PathBuf,
+    },
+
+    /// A lane holds a link whose target leaves the workspace. Written out, it
+    /// would point the workspace at whatever the lane's author chose.
+    #[error(
+        "refusing to check out tracker `{tracker}` at `{rev}`: `{path}` is a symlink to \
+         `{target}`, which is outside the workspace"
+    )]
+    LaneLinkLeavesWorkspace {
+        tracker: String,
+        rev: String,
+        path: Utf8PathBuf,
+        target: String,
+    },
 
     #[error(
         "tracker `{tracker}` owns nothing on disk in the store repo, so there is nothing to \
@@ -179,7 +226,8 @@ pub enum NewgitError {
     #[error(
         "resource `{resource}` renders into `{path}`, but `{find}` occurs {found} time(s) there, \
          not {expected}; the committed file changed under the definition, or the string is not \
-         unique — a multi-line `find` disambiguates, and `count` declares a repeat"
+         unique — a multi-line `find` disambiguates, and `count` declares a repeat{hint}",
+        hint = no_match_hint(*found)
     )]
     RenderMatchCount {
         resource: String,
@@ -276,5 +324,19 @@ impl NewgitError {
             path: path.into(),
             source,
         }
+    }
+}
+
+/// When a `find` matches nothing, the likeliest cause is that the file has no
+/// line for that setting at all (a `config.toml` without an `[inbucket]`
+/// section). The tool then uses its own built-in default, and every instance
+/// shares it, so say that rather than leaving "0 time(s)" to be decoded.
+fn no_match_hint(found: usize) -> &'static str {
+    if found == 0 {
+        ". If the file has no line for this setting, the tool falls back to its own default, \
+         which every instance shares: add the line to the committed file so there is one to \
+         rewrite. Deleting the rule only hides the collision"
+    } else {
+        ""
     }
 }
