@@ -67,6 +67,7 @@ fn resource_declaring(name: &str, port_name: &str, start: u16) -> ResourceDefini
         ports: BTreeMap::from([(port_name.to_owned(), PortRequest { start, env: None })]),
         exports: BTreeMap::new(),
         render: Vec::new(),
+        reads: None,
         actions: BTreeMap::new(),
         checkpoint: None,
         restore: None,

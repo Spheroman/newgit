@@ -240,8 +240,23 @@ pub fn branch_slug(name: &str) -> String {
     slug.trim_matches('-').to_owned()
 }
 
+/// The longest instance name. The slug is spliced into other systems' names
+/// (`faretable-{{branch.slug}}` as a Supabase `project_id`, which Supabase
+/// prefixes again for its containers, e.g. `supabase_realtime_`; a Docker
+/// Compose project; a preview or remote hostname, where a DNS label is 63).
+/// 40 leaves 23 characters of prefix before the 63 runs out, and is still
+/// room for `fix/1234-some-descriptive-title`. The filesystem's own limit
+/// (255, hit at the lock file) was never the real one.
+pub const MAX_NAME_LEN: usize = 40;
+
 /// Names double as Git branch names, so stay well inside ref-name rules.
 pub fn validate_name(name: &str) -> Result<()> {
+    if name.len() > MAX_NAME_LEN {
+        return Err(NewgitError::NameTooLong {
+            len: name.len(),
+            max: MAX_NAME_LEN,
+        });
+    }
     let starts_ok = name
         .chars()
         .next()

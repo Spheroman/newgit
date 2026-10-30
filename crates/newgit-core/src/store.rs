@@ -85,6 +85,8 @@ pub struct NewgitPaths {
     /// The file [`MetadataStore::lock_ports`] locks. Always empty: only the
     /// lock on it means anything.
     pub ports_lock: Utf8PathBuf,
+    /// The file [`MetadataStore::lock_fresh_base`] locks, the same way.
+    pub fresh_base_lock: Utf8PathBuf,
     pub logs: Utf8PathBuf,
     pub state: Utf8PathBuf,
     pub checkpoints: Utf8PathBuf,
@@ -352,7 +354,22 @@ impl MetadataStore {
     /// holding it lets go as it dies, and the file it leaves behind locks
     /// nothing.
     pub fn lock_ports(&self) -> Result<std::fs::File> {
-        let path = &self.paths.ports_lock;
+        self.lock_store_file(&self.paths.ports_lock)
+    }
+
+    /// Take the store's fresh-base lock, held until the returned file is
+    /// dropped: the same kind of lock as [`MetadataStore::lock_ports`].
+    ///
+    /// It covers choosing the base a Claude Code worktree starts from
+    /// ([`crate::fresh_base`]), which may fetch the project branch's
+    /// upstream. Subagents launched together run their hooks at once; under
+    /// this lock the first fetches and the rest find that fetch fresh and
+    /// read the ref it left, so they all start from the same commit.
+    pub fn lock_fresh_base(&self) -> Result<std::fs::File> {
+        self.lock_store_file(&self.paths.fresh_base_lock)
+    }
+
+    fn lock_store_file(&self, path: &Utf8Path) -> Result<std::fs::File> {
         create_dir_all(&self.paths.local)?;
         let file = std::fs::OpenOptions::new()
             .create(true)
@@ -725,6 +742,7 @@ impl NewgitPaths {
             tracker_store: metadata_root.join("local/trackers.git"),
             tracker_checkouts: metadata_root.join("local/tracker-checkouts"),
             ports_lock: metadata_root.join("local/ports.lock"),
+            fresh_base_lock: metadata_root.join("local/fresh-base.lock"),
             logs: metadata_root.join("logs"),
             state: metadata_root.join("state"),
             checkpoints: metadata_root.join("checkpoints"),

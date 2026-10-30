@@ -9,6 +9,7 @@ pub mod error;
 pub mod export;
 pub mod export_target;
 pub mod exports;
+pub mod fresh_base;
 pub mod installs;
 pub mod lock;
 pub mod manager;
