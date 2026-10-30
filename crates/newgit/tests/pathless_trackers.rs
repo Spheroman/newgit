@@ -172,7 +172,7 @@ fn a_tracker_with_no_paths_can_be_used_and_dropped() {
 
     let dropped = newgit_ok(&repo, &["tracker", "drop", "branch-db", "try-db"]);
     assert!(
-        dropped.contains("stopped what it brought: db, functions"),
+        dropped.contains("parked `db`") && dropped.contains("parked `functions`"),
         "{dropped}"
     );
     assert!(
