@@ -218,6 +218,8 @@ http = { start = 47700 }
             rendered: Vec::new(),
             status: ResourceStatus::Pending,
             restore_proven: false,
+            render_error: None,
+            export_error: None,
         },
     );
     store

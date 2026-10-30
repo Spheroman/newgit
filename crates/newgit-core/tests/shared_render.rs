@@ -374,3 +374,52 @@ fn unbinding_one_resource_takes_only_its_values_out() {
         rendered(db, web)
     );
 }
+
+/// When the committed file moves under one resource's `find`, that
+/// resource's render fails on its own; the other resource on the file still
+/// renders its value instead of failing with it.
+#[test]
+fn a_stale_claim_does_not_block_another_resources_render() {
+    let (_guard, temp) = tempdir();
+    let store = setup(&temp, ENV);
+    write_resource(&store, "db", DB);
+    write_resource(&store, "web", WEB);
+    let m = BranchManager::open(store).expect("manager");
+
+    let spawned = m.spawn("feature-a", None).expect("spawn");
+    let workspace = spawned.branch.workspace_path.clone();
+    let (db, _) = ports(&m, "feature-a");
+
+    // Commit a `.env.local` with no `PORT=3000` for `web` to find.
+    let moved = "DATABASE_URL=postgres://127.0.0.1:54322/app\nDEBUG=1\n";
+    git(
+        &workspace,
+        &["update-index", "--no-skip-worktree", ".env.local"],
+    );
+    std::fs::write(workspace.join(".env.local"), moved).expect("write");
+    git(&workspace, &["commit", "-q", "-am", "no PORT"]);
+    m.checkpoint("feature-a", Some("moved"))
+        .expect("checkpoint");
+
+    let undone = m.undo("feature-a", &UndoOptions::default()).expect("undo");
+    assert!(
+        undone
+            .warnings
+            .iter()
+            .any(|w| w.contains("`web`") && w.contains("PORT=3000")),
+        "{:?}",
+        undone.warnings
+    );
+    assert!(
+        !undone
+            .warnings
+            .iter()
+            .any(|w| w.contains("re-render for resource `db` failed")),
+        "{:?}",
+        undone.warnings
+    );
+    assert_eq!(
+        std::fs::read_to_string(workspace.join(".env.local")).expect("env"),
+        format!("DATABASE_URL=postgres://127.0.0.1:{db}/app\nDEBUG=1\n")
+    );
+}

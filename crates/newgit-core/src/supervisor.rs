@@ -15,10 +15,111 @@ use crate::materializer::create_dir_all;
 /// Minimal PID-file supervision for `long_running` actions: start detached
 /// in a fresh process group with output to a log file, record the PID, stop
 /// by signaling the group. No daemon, no restart policy.
+///
+/// The command runs under a small `sh` wrapper ([`WRAPPER`]) that waits on
+/// it, so how it ended is not lost the way a detached child's exit status
+/// otherwise is: the wrapper appends `[newgit] exited 1` or `[newgit] killed
+/// by SIGKILL` to the log and writes the status to `<resource>.exit`. Before
+/// it signals, `stop` leaves a `<resource>.stopping` marker, which is how
+/// the wrapper and [`Supervisor::state`] tell a stop newgit asked for from a
+/// crash (#261). Once the group is gone, `stop` itself appends `[newgit]
+/// stopped by newgit` to the log `start` recorded in `<resource>.logpath`.
 #[derive(Debug, Clone)]
 pub struct Supervisor {
     state_dir: Utf8PathBuf,
 }
+
+/// What became of the process newgit last started for a resource.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProcessState {
+    /// newgit has never started one.
+    NeverStarted,
+    Running(u32),
+    /// newgit stopped it: `newgit stop`, a signal action, remove, undo.
+    Stopped,
+    /// It ended without newgit asking.
+    Died(Death),
+}
+
+/// How a supervised process ended on its own.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Death {
+    /// It exited with this code.
+    Exited(i32),
+    /// A signal killed it, by name (`SIGKILL`).
+    Killed(String),
+    /// Nothing recorded how: the whole group went at once (`kill -9 --
+    /// -<pgid>`, a reboot), or an older newgit started it.
+    Unknown,
+}
+
+impl Death {
+    /// The way `status` shows it, in the shape of `blocked(deps)`:
+    /// `exited(1)`, `killed(SIGKILL)`, `crashed`.
+    pub fn label(&self) -> String {
+        match self {
+            Death::Exited(code) => format!("exited({code})"),
+            Death::Killed(signal) => format!("killed({signal})"),
+            Death::Unknown => "crashed".to_owned(),
+        }
+    }
+
+    /// As a clause: `exited 1`, `was killed by SIGKILL`, `crashed`.
+    pub fn describe(&self) -> String {
+        match self {
+            Death::Exited(code) => format!("exited {code}"),
+            Death::Killed(signal) => format!("was killed by {signal}"),
+            Death::Unknown => "crashed".to_owned(),
+        }
+    }
+
+    /// From the status a shell reports: above 128 is a signal's number plus
+    /// 128, the convention the wrapper's log line follows too.
+    fn from_shell_status(status: i32) -> Self {
+        if status > 128
+            && let Ok(signal) = Signal::try_from(status - 128)
+        {
+            return Death::Killed(signal.as_str().to_owned());
+        }
+        Death::Exited(status)
+    }
+}
+
+/// The wrapper a supervised command runs under. It takes its arguments from
+/// the environment and clears them before the command sees them. It does
+/// not `exec` the command: it stays to wait on it, writes how it ended, and
+/// exits.
+///
+/// It sets no `trap`, so every process in the group keeps the default
+/// disposition for the signal `stop` sends, and the group goes down as it
+/// did before the wrapper existed. A trap would break `stop`: a signal that
+/// lands after the trap is set but before the command is forked, or between
+/// fork and exec while the child still runs the parent's handler, is
+/// swallowed, and the command then starts with nothing left to stop it.
+/// That window is wide enough on a slow macOS runner, where `sh` is bash
+/// 3.2, to fail `stop` (#288).
+///
+/// So when newgit stops the group the wrapper usually dies with it and
+/// writes nothing; `stop` writes the log line itself. When the wrapper does
+/// live on (a command that handles the signal and exits), the marker tells
+/// it to leave the log to `stop`. Only an ending nobody asked for is the
+/// wrapper's to describe. SIGKILL to the whole group leaves nothing
+/// written; `state` calls that `crashed`.
+const WRAPPER: &str = r#"c=$NEWGIT_SUPERVISED_COMMAND
+f=$NEWGIT_SUPERVISED_EXIT
+m=$NEWGIT_SUPERVISED_STOPPING
+unset NEWGIT_SUPERVISED_COMMAND NEWGIT_SUPERVISED_EXIT NEWGIT_SUPERVISED_STOPPING
+sh -c "$c"
+s=$?
+if [ -e "$m" ]; then
+  :
+elif [ "$s" -gt 128 ] && n=$(kill -l "$s" 2>/dev/null) && [ -n "$n" ]; then
+  echo "[newgit] killed by SIG${n#SIG}"
+else
+  echo "[newgit] exited $s"
+fi
+echo "$s" > "$f"
+"#;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StopOutcome {
@@ -62,6 +163,33 @@ impl Supervisor {
         self.pid_path(resource).is_file()
     }
 
+    /// What became of the process newgit last started for `resource`:
+    /// running, stopped by newgit, or dead on its own and how.
+    pub fn state(&self, resource: &str) -> ProcessState {
+        let Ok(text) = std::fs::read_to_string(self.pid_path(resource)) else {
+            return ProcessState::NeverStarted;
+        };
+        let text = text.trim();
+        if text == "stopped" {
+            return ProcessState::Stopped;
+        }
+        if let Ok(pid) = text.parse::<u32>()
+            && group_alive(pid)
+        {
+            return ProcessState::Running(pid);
+        }
+        // Dead, as a number or retired to `exited`. A marker means newgit
+        // signalled it: a stop that outlasted `stop`'s wait, then finished.
+        if self.stopping_path(resource).is_file() {
+            return ProcessState::Stopped;
+        }
+        let death = std::fs::read_to_string(self.exit_path(resource))
+            .ok()
+            .and_then(|text| text.trim().parse::<i32>().ok())
+            .map_or(Death::Unknown, Death::from_shell_status);
+        ProcessState::Died(death)
+    }
+
     pub fn start(
         &self,
         resource: &str,
@@ -88,14 +216,32 @@ impl Supervisor {
             .try_clone()
             .map_err(|source| NewgitError::io(log_path, source))?;
 
+        // What the last run left, how it ended and whether newgit stopped
+        // it, is not about this one.
+        create_dir_all(&self.state_dir)?;
+        for path in [self.exit_path(resource), self.stopping_path(resource)] {
+            match std::fs::remove_file(&path) {
+                Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+                    return Err(NewgitError::io(path, error));
+                }
+                _ => {}
+            }
+        }
+
         let mut cmd = Command::new("sh");
         cmd.arg("-c")
-            .arg(command)
+            .arg(WRAPPER)
             .current_dir(cwd)
             .stdin(Stdio::null())
             .stdout(Stdio::from(log))
             .stderr(Stdio::from(stderr_log));
         cmd.envs(env.iter().map(|(key, value)| (key, value)));
+        cmd.env("NEWGIT_SUPERVISED_COMMAND", command)
+            .env("NEWGIT_SUPERVISED_EXIT", self.exit_path(resource).as_str())
+            .env(
+                "NEWGIT_SUPERVISED_STOPPING",
+                self.stopping_path(resource).as_str(),
+            );
         #[cfg(unix)]
         {
             use std::os::unix::process::CommandExt as _;
@@ -109,9 +255,13 @@ impl Supervisor {
         })?;
         let pid = child.id();
         // Deliberately not waited on: the process outlives this invocation.
+        // The wrapper waits on the command instead.
         drop(child);
 
-        create_dir_all(&self.state_dir)?;
+        // Where `stop` says it stopped this run.
+        let log_record = self.log_record_path(resource);
+        std::fs::write(&log_record, format!("{log_path}\n"))
+            .map_err(|source| NewgitError::io(log_record, source))?;
         let pid_path = self.pid_path(resource);
         std::fs::write(&pid_path, format!("{pid}\n"))
             .map_err(|source| NewgitError::io(pid_path, source))?;
@@ -130,10 +280,15 @@ impl Supervisor {
             return Ok(StopOutcome::NotRunning);
         };
 
+        // Before the signal, so the wrapper finds it when the command ends.
+        let stopping = self.stopping_path(resource);
+        std::fs::write(&stopping, format!("{signal}\n"))
+            .map_err(|source| NewgitError::io(stopping, source))?;
         signal_group(pid, signal)?;
         for _ in 0..50 {
             if !group_alive(pid) {
                 self.mark_stopped(resource)?;
+                self.log_stopped(resource, signal);
                 return Ok(StopOutcome::Stopped(pid));
             }
             std::thread::sleep(Duration::from_millis(100));
@@ -142,7 +297,8 @@ impl Supervisor {
     }
 
     /// Retire pid files whose process group is gone — a process that died on
-    /// its own, or outlived a reboot — to `stopped`, in place. This is not a
+    /// its own, or outlived a reboot — to `exited`, in place: not `stopped`,
+    /// which says newgit stopped it and would hide a crash (#261). This is not a
     /// deletion: `newgit cleanup` is the one place a stale pid number is a
     /// real hazard (an OS can reuse it, and a leftover number would then read
     /// as alive), but the fact that newgit once started this resource is the
@@ -158,7 +314,7 @@ impl Supervisor {
                 .ok()
                 .and_then(|text| text.trim().parse::<u32>().ok())
             else {
-                // Already `stopped` (not a raw pid), or unreadable: nothing
+                // Already `stopped` or `exited` (not a raw pid), or unreadable: nothing
                 // new to retire.
                 continue;
             };
@@ -166,7 +322,7 @@ impl Supervisor {
                 continue;
             }
             if !dry_run {
-                std::fs::write(&path, "stopped\n")
+                std::fs::write(&path, "exited\n")
                     .map_err(|source| NewgitError::io(&path, source))?;
             }
             retired.push(path);
@@ -181,6 +337,35 @@ impl Supervisor {
 
     fn pid_path(&self, resource: &str) -> Utf8PathBuf {
         self.state_dir.join(format!("{resource}.pid"))
+    }
+
+    /// The wrapper's record of how the command ended: its shell status.
+    fn exit_path(&self, resource: &str) -> Utf8PathBuf {
+        self.state_dir.join(format!("{resource}.exit"))
+    }
+
+    /// The log of the run `start` last began, for `stop`'s line.
+    fn log_record_path(&self, resource: &str) -> Utf8PathBuf {
+        self.state_dir.join(format!("{resource}.logpath"))
+    }
+
+    /// Append `[newgit] stopped by newgit (SIGTERM)` to the run's log.
+    /// Best-effort: the log is for reading, and the stop already happened.
+    fn log_stopped(&self, resource: &str, signal: &str) {
+        let Ok(text) = std::fs::read_to_string(self.log_record_path(resource)) else {
+            return;
+        };
+        let Ok(mut log) = std::fs::OpenOptions::new().append(true).open(text.trim()) else {
+            return;
+        };
+        let signal = parse_signal(signal)
+            .map_or_else(|_| signal.to_owned(), |parsed| parsed.as_str().to_owned());
+        let _ = writeln!(log, "[newgit] stopped by newgit ({signal})");
+    }
+
+    /// Left by `stop` before it signals: newgit asked for this ending.
+    fn stopping_path(&self, resource: &str) -> Utf8PathBuf {
+        self.state_dir.join(format!("{resource}.stopping"))
     }
 }
 
@@ -504,6 +689,45 @@ mod tests {
         assert!(parse_signal("banana").is_err());
     }
 
+    /// #288: a stop that lands before the wrapper has forked the command
+    /// must still take the group down. With a `trap` in the wrapper, the
+    /// signal was swallowed there and the command started anyway, beyond
+    /// the stop's reach — on a slow macOS runner, every time. This puts the
+    /// signal exactly in that window rather than hoping for the timing.
+    #[test]
+    fn a_stop_before_the_command_is_forked_still_stops_the_group() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let dir = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).expect("utf8");
+        let script = WRAPPER.replacen("sh -c \"$c\"", "kill -TERM $$\nsh -c \"$c\"", 1);
+        assert_ne!(script, WRAPPER, "the wrapper still runs the command");
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c")
+            .arg(script)
+            .env("NEWGIT_SUPERVISED_COMMAND", "sleep 30")
+            .env("NEWGIT_SUPERVISED_EXIT", dir.join("app.exit").as_str())
+            .env(
+                "NEWGIT_SUPERVISED_STOPPING",
+                dir.join("app.stopping").as_str(),
+            )
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        {
+            use std::os::unix::process::CommandExt as _;
+            cmd.process_group(0);
+        }
+        let pid = cmd.spawn().expect("spawn").id();
+        let mut gone = false;
+        for _ in 0..30 {
+            if !group_alive(pid) {
+                gone = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let _ = signal_group(pid, "kill");
+        assert!(gone, "the command started after the stop, out of its reach");
+    }
+
     /// Signalling a group that is already gone is the outcome `stop` wanted.
     #[test]
     fn signalling_a_dead_group_is_not_an_error() {
@@ -533,8 +757,13 @@ mod tests {
         assert_eq!(retired, [dir.join("ghost.pid")]);
         assert_eq!(
             std::fs::read_to_string(dir.join("ghost.pid")).expect("read"),
-            "stopped\n"
+            "exited\n"
         );
+        assert_eq!(
+            supervisor.state("ghost"),
+            ProcessState::Died(Death::Unknown)
+        );
+        assert_eq!(supervisor.state("done"), ProcessState::Stopped);
         assert_eq!(supervisor.running_pid("app"), Some(alive));
         supervisor.stop("app", "term").expect("stop");
     }

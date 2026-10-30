@@ -62,6 +62,31 @@ fn setup(temp: &Utf8Path) -> MetadataStore {
     store
 }
 
+/// Add the `supabase` resource from its template, with `prepare` swapped for
+/// a no-op. These tests check what spawn renders and binds, which happens
+/// before `prepare` runs; left as `supabase start` it brings up a real stack
+/// per instance on any machine with the CLI and Docker, and the tempdir going
+/// away does not take the containers with it.
+fn add_supabase_without_starting_it(repo: &Utf8Path) {
+    let outcome = BranchManager::open(MetadataStore::at(repo.to_owned()))
+        .expect("manager")
+        .add_resource("supabase", "supabase")
+        .expect("add supabase");
+
+    let definition = std::fs::read_to_string(&outcome.path).expect("read definition");
+    let (head, prepare) = definition
+        .split_once("[actions.prepare]")
+        .expect("the template has a prepare action");
+    let (before, after) = prepare
+        .split_once(r#"command = "supabase start""#)
+        .expect("prepare runs `supabase start`");
+    std::fs::write(
+        &outcome.path,
+        format!("{head}[actions.prepare]{before}command = \"true\"{after}"),
+    )
+    .expect("write definition");
+}
+
 /// `(section, key) -> port`, so an assertion can name the line it means
 /// rather than substring-matching a number that appears in several places.
 fn parse_ports(config: &str) -> std::collections::BTreeMap<(String, String), u16> {
@@ -91,10 +116,7 @@ fn the_supabase_template_renders_against_the_clis_committed_defaults() {
     let store = setup(&temp);
     let repo = store.paths().project_root.clone();
 
-    BranchManager::open(MetadataStore::at(repo.clone()))
-        .expect("manager")
-        .add_resource("supabase", "supabase")
-        .expect("add supabase");
+    add_supabase_without_starting_it(&repo);
 
     let manager = BranchManager::open(MetadataStore::at(repo)).expect("reopen");
     let spawned = manager.spawn("feature-a", None).expect("spawn");
@@ -204,10 +226,7 @@ fn two_instances_get_different_ports_and_different_project_ids() {
     let store = setup(&temp);
     let repo = store.paths().project_root.clone();
 
-    BranchManager::open(MetadataStore::at(repo.clone()))
-        .expect("manager")
-        .add_resource("supabase", "supabase")
-        .expect("add supabase");
+    add_supabase_without_starting_it(&repo);
 
     let manager = BranchManager::open(MetadataStore::at(repo)).expect("reopen");
     let first = manager.spawn("feature-a", None).expect("spawn a");

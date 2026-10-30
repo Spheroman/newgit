@@ -117,7 +117,10 @@ export async function handle(request: Request, env: Env, deps: Deps): Promise<Re
 					error.status === 401 ? { "www-authenticate": 'Basic realm="newgit"' } : { "content-type": "text/plain" },
 			});
 		if (error instanceof HttpError) return json({ error: error.message }, error.status);
-		console.error(error);
+		// A bare error logs only its message; an ArtifactsError's code and the
+		// stack are what say which call failed and why.
+		const { name, code, message, stack } = error as { name?: string; code?: string; message?: string; stack?: string };
+		console.error(JSON.stringify({ path: new URL(request.url).pathname, name, code, message, stack }));
 		return json({ error: "internal error" }, 500);
 	}
 }

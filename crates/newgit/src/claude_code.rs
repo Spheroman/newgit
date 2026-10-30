@@ -235,9 +235,9 @@ fn worktree_create() -> Result<()> {
     let cwd = Utf8PathBuf::from(input_str(&input, "cwd")?);
     // From inside a workspace, `discover` resolves to its store, so a session
     // already running in an instance spawns a sibling, not a nested one.
-    let store = MetadataStore::discover(&cwd)
-        .with_context(|| format!("{cwd} is not in a newgit project; run `newgit init` there"))?
-        .store;
+    let context = MetadataStore::discover(&cwd)
+        .with_context(|| format!("{cwd} is not in a newgit project; run `newgit init` there"))?;
+    let store = context.store;
     // `claude --worktree <name>` with a name it has used before resumes that
     // worktree, as it does a Git one: the instance is already there, so hand
     // back its workspace rather than fail to spawn a second.
@@ -254,7 +254,15 @@ fn worktree_create() -> Result<()> {
         return Ok(());
     }
     let root = store.paths().project_root.clone();
-    let output = newgit(&root, &["spawn", name, "--json"])?
+    let mut args = vec!["spawn", name, "--json"];
+    // A Git branch of this name already in the project is the work the name
+    // means: `spawn` takes it up as it is (and refuses `--from` for it).
+    let from;
+    if !branch_exists(&root, name)? {
+        from = worktree_base(&store, &root, context.current_branch.as_deref())?;
+        args.extend(["--from", from.as_str()]);
+    }
+    let output = newgit(&root, &args)?
         .stderr(Stdio::inherit())
         .output()
         .context("running newgit spawn")?;
@@ -276,6 +284,67 @@ fn worktree_create() -> Result<()> {
     }
     hand_back(Utf8Path::new(&workspace));
     Ok(())
+}
+
+fn branch_exists(root: &Utf8Path, name: &str) -> Result<bool> {
+    Ok(Command::new("git")
+        .args(["-C", root.as_str(), "rev-parse", "--verify", "--quiet"])
+        .arg(format!("refs/heads/{name}"))
+        .stdout(Stdio::null())
+        .status()
+        .context("running git rev-parse")?
+        .success())
+}
+
+/// What the new worktree's instance starts from, as Claude Code's own
+/// worktrees would (its `worktree.baseRef` setting):
+///
+/// - `"fresh"`, the default: the project branch as it stands, fetched if the
+///   root has not fetched for a day — see [`newgit_core::fresh_base`]. Never
+///   the project root's checked-out `HEAD`, which may be a stale `main` or
+///   someone's topic branch, and never something that differs between
+///   subagents launched together.
+/// - `"head"`: the session's own `HEAD` — the project root's, or, for a
+///   session already in an instance, that instance's source branch as the
+///   store last saw it (its last checkpoint or push).
+fn worktree_base(store: &MetadataStore, root: &Utf8Path, instance: Option<&str>) -> Result<String> {
+    if base_ref_setting(root).as_deref() == Some("head") {
+        let from = match instance {
+            Some(instance) => store.find_branch(instance)?.source_ref,
+            None => "HEAD".to_owned(),
+        };
+        eprintln!("newgit: starting from {from} (worktree.baseRef = \"head\")");
+        return Ok(from);
+    }
+    let base = newgit_core::fresh_base::fresh_base(store)?;
+    if let Some(warning) = &base.fetch_warning {
+        eprintln!("newgit: could not refresh the project branch ({warning}); using what is here");
+    }
+    eprintln!(
+        "newgit: starting from {} ({})",
+        base.label,
+        &base.from[..base.from.len().min(12)]
+    );
+    Ok(base.from)
+}
+
+/// Claude Code's `worktree.baseRef`, from the settings files that can set it
+/// for this project: the user's, then the project's shared and local ones,
+/// the last that sets it winning, as Claude Code layers them.
+fn base_ref_setting(root: &Utf8Path) -> Option<String> {
+    let user = std::env::var_os("HOME")
+        .map(|home| std::path::PathBuf::from(home).join(".claude/settings.json"));
+    let files = [
+        Some(root.join(LOCAL_SETTINGS).into_std_path_buf()),
+        Some(root.join(SHARED_SETTINGS).into_std_path_buf()),
+        user,
+    ];
+    files.into_iter().flatten().find_map(|file| {
+        let settings: Value = serde_json::from_str(&std::fs::read_to_string(file).ok()?).ok()?;
+        settings["worktree"]["baseRef"]
+            .as_str()
+            .map(ToOwned::to_owned)
+    })
 }
 
 /// Print `workspace` for Claude Code, having made sure its removal will run
