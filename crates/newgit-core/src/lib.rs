@@ -9,6 +9,7 @@ pub mod error;
 pub mod export;
 pub mod export_target;
 pub mod exports;
+pub mod fresh_base;
 pub mod installs;
 pub mod lock;
 pub mod manager;
@@ -24,7 +25,9 @@ pub mod templates;
 pub mod tracker;
 pub mod tracker_repo;
 
-pub use branch::{BranchInstance, InstanceStatus, ResourceBinding, TrackerBinding};
+pub use branch::{
+    BranchInstance, InstanceStatus, ParkedBinding, ParkedState, ResourceBinding, TrackerBinding,
+};
 pub use config::{ProjectConfig, SourceSubstrate};
 pub use error::{NewgitError, Result};
 pub use manager::BranchManager;

@@ -133,6 +133,16 @@ resource it depends on or the `db-snapshots` tracker its checkpoint
 deposits into. They are created only when absent, so `resource add` never
 overwrites a definition.
 
+The `process` template's port is optional: a process that listens on none of
+its own (a worker, a watcher, `supabase functions serve`) deletes `[ports]`,
+`[exports]` and `[[render]]`. There is no separate `worker` template, since
+it would differ only by those deletions. The `supabase` and `process`
+templates carry a commented `workdir` for monorepos (the `supabase` one notes
+that `[[render]] path` changes with it). A render `find` that matches 0 times
+often means the file lacks that setting, so the tool uses its own default and
+every instance shares it; the error says so, and the fix is to add the line,
+not to delete the rule.
+
 ### Committed definitions, local state
 
 `.newgit/` splits into a control plane and a data plane:
@@ -274,6 +284,29 @@ as Git: tracking a path does not invent content for it.
 Because a secret tracker is pure content, capture and restore need no
 modes. If something needs a command to capture or restore, it is a resource.
 
+**Capture never follows a symlink.** A lane holds this workspace's files
+and syncs as far as its audience reaches, so a link at a tracked path must
+not turn capture into "copy any file I can read into the lane". A link is
+judged with `lstat`, never `stat`:
+
+- A link whose target is relative and stays inside the workspace (by its
+  text, and resolved on disk) is stored as a link — mode `120000`, the
+  target's text as the blob — as Git stores one. A linked directory is kept
+  as a link and not walked into.
+- A link that leaves the workspace — an absolute target, `..`s that climb
+  out, or a path through another link that leads out — is refused, naming
+  the path and its target, and nothing is committed. So is a tracked path
+  under a symlinked directory: what is "at" it is wherever that link leads.
+- Checkout writes a stored link back as a link. A rev holding a link whose
+  target leaves the workspace is refused before the workspace is touched,
+  whoever wrote the lane: written out, it would point a workspace path at a
+  file of the lane author's choosing.
+
+The same applies to every path that reads tracked content: `checkpoint`,
+the safety capture before a checkout, dropping a secret tracker,
+`--from-store`, a resource deposit, install-key hashing (a link hashes as
+its target's text), and export (a link is exported as a link).
+
 Secret content is kept in its own repository, not the project's. The
 project repository is what a local `git clone` hardlinks into every
 workspace and what a push publishes from; the tracker repository lives
@@ -357,6 +390,37 @@ project repository:
 - Nothing is shared between workspaces, so two instances of the same base
   branch is a non-event.
 
+On macOS the clone is not made by `git clone`, which spends almost all of
+its time checking files out (2.3s of 2.5s on T3 Code's 28.6k files).
+newgit keeps one clean checkout of the project repository beside the
+workspaces, `<workspace root>/.source-template`, with no local branches.
+`spawn` fetches it from the project repository, checks out the instance's
+revision, and copies the whole tree with one `clonefile(2)`. Then the copy
+gets its own branch, with the upstream `git clone --branch` would set, and
+`core.checkStat=minimal` plus `core.trustctime=false`. Without those two
+settings Git would re-hash every file on the first `git status`, because
+every inode and ctime is new. With them it compares a file's size and
+whole-second mtime only, both of which the copy keeps. The result is the
+same repository a clone produces, in 0.67s instead of 2.7–3.1s. The first
+spawn builds the template and takes longer once. If anything in this path
+fails, `spawn` falls back to `git clone`. That includes a workspace root on
+another volume, which `clonefile` cannot reach.
+
+What those two settings give up: an edit Git cannot see is one that keeps
+the file's size and the second of its mtime. Ordinary edits cannot do that.
+They are later than anything Git recorded, and Git re-hashes any entry
+written in the same second as its index. A copy that keeps its source's
+mtime (`cp -p`, `rsync -a`, `tar x`) carries that file's own second, not the
+one Git recorded. What remains is setting a file's mtime to the recorded
+second on purpose (`touch -r`) while keeping its size, which Git's default
+settings would catch through the ctime. Even then only the workspace's own
+`git status` misses it. A checkpoint builds its tree in an index of its own
+with no stat data, so it hashes every file and captures the edit.
+
+If the template path fails, `spawn` says why in its output
+(`template_warning` in `--json`), since a template that fails every time
+makes every spawn pay for rebuilding it on top of the clone.
+
 A dropped code tracker's files are left out of the working tree with Git's
 sparse checkout. The history still has them, so every instance of a project
 has the same commit ids.
@@ -418,7 +482,8 @@ opens a real pull request there (see *Export*).
 Clone is the first materializer, not the last. Each later step keeps the
 contract fixed:
 
-1. **Now:** an eager local clone.
+1. **Now:** an eager local clone (on macOS, a `clonefile` of a template
+   checkout).
 2. **Later:** a Git partial clone with the project repository as the
    promisor remote, so objects arrive on demand through Git's own lazy
    mechanism. Big repositories spawn fast without newgit touching a
@@ -654,6 +719,33 @@ dependencies are bound, just before `prepare`, and again before a
 would see in its environment, so an Expo `.env` can name the Supabase
 resource's URL.
 
+**A re-render does not reach a process already running.** A dev server
+reads `.env.local` when it starts. When `tracker use` binds a resource whose
+render rewrites that file, or a `drop` removes it with its tracker, the
+server keeps what it read. newgit cannot know which process reads which
+file, so a resource says: `reads = ["apps/admin"]` lists the files and
+directories its running process reads, workspace-relative. `use` and `drop`
+read the bytes of every rendered path before the change and compare after,
+and only a path whose bytes changed counts — a re-render that wrote what was
+already there leaves nothing stale and says nothing. For each process that
+was running before the change and still is after it:
+
+- its `reads` covers a changed path: it is stopped and started again with
+  the action `autostart` names (else its first long-running one), as `undo`
+  restarts what it restores. A failed restart is reported, not raised: the
+  binding has changed by then.
+- its `reads` covers none of them: left alone, silently.
+- it declares no `reads`: left running, with a warning naming it and the
+  command that restarts it. A guess from `workdir` was considered and not
+  taken: a resource run from the workspace root would cover every file, and
+  restarting a database because a dev server's `.env.local` changed is worse
+  than the warning.
+
+`undo` needs none of this: it stops every running process before it moves
+any content and restarts what was running at checkpoint time after the
+re-render. `tracker pull` and `tracker checkout` re-render under running
+processes too and do not yet say so.
+
 **Instance values must not leak.** A render writes one instance's values
 into a path the project owns. Four places they must not reach:
 
@@ -726,11 +818,16 @@ The key is the inputs, never the tree:
 - **`key_command`'s output**, what the lockfile cannot see. A lockfile says
   what was asked for, and install scripts compile against a platform and a
   toolchain it never names (`node -v && uname -sm`).
-- **The trackers the instance binds.** A shared lockfile lists every
-  workspace member, bound or not, and the install builds the bound ones.
-  So instances that bind differently never share a tree, and when a live
-  instance's binding changes (`tracker use`, `drop`, or an undo to another
-  binding), its installs are rebuilt for the new key, from the store where
+- **What of the binding can reach the install.** A shared lockfile lists
+  every workspace member, bound or not, and the install builds the ones it
+  can see. So the key holds which paths the dropped code trackers leave out
+  of the checkout, and, only when the install is told them through
+  `{{bound…}}` (in its own definition, or in any resource's exports or
+  renders), the bound tracker names and paths. Binding a secret tracker, or
+  one with no paths, moves neither, so it shares a tree with the binding
+  without it (#248). When a live instance's binding changes (`tracker use`,
+  `drop`, or an undo to another binding) in a way that moves an install's
+  key, that install is rebuilt for the new key, from the store where
   possible (#206).
 - **The definition file.** The command that builds a tree is as much an
   input as the lockfile. Any edit moves the key, which costs one reinstall;
@@ -823,6 +920,29 @@ fix it. An `autostart` action that did not start counts too: an instance
 whose dev server is down is not up. The instance is not rolled back.
 `--from-checkpoint` judges by the instance the restore leaves (#208).
 
+#### Starting is not failing
+
+A dev server that compiles before it listens (Next.js) is doing what it
+should, and a spawn that called it a problem looked like a failure. A running
+process whose port is not answering yet is `starting`, a state of its own:
+not a problem, not "not ready". After the autostart, `spawn` polls the ports
+of what is running for up to five seconds and returns as soon as they answer,
+so a fast server costs nothing. What is still unanswered is then reported as
+starting, not as a failure, with a pointer to `newgit status`:
+
+```text
+starting: `feature-a`
+  - `app` is still starting: not answering yet on web (3000)
+  `newgit status` shows when it is up.
+```
+
+`status` shows the same state: the STATUS column says `starting` (a real
+problem still says `not ready`, and wins), with the lines under it. It is
+checked at read time, so it clears on its own once the port answers.
+`spawn --json` lists them under `starting` (`resource` and the `ports` that
+have not answered) and exits 0 as for a ready instance. The wait is fixed;
+a server that takes longer simply shows as starting.
+
 ### Run and env
 
 `newgit run [instance] -- <command>` runs a command in the workspace with
@@ -852,10 +972,21 @@ exit 1 if any resource failed.
 instances share, nor for one that never came up. The `supabase` template's
 pair is `supabase stop` / `supabase start`, which keeps the data.
 
+A tracker drop is the same stop, for the resources the dropped tracker
+brought (#254). Each is *parked*: taken down — its process signalled and
+its `suspend` run, or its `[cleanup]` when it has no `suspend` — and its
+binding moved to the record's `parked` table with its ports still claimed.
+`tracker use` hands those ports back and runs `resume` (or `prepare`, after
+a cleanup), so a role switch and back leaves the rendered files, the data,
+and the running stack on the same ports (#255). `newgit ports` lists parked
+claims as `(parked)`, and `ports --check` counts them as claimed. An undo to
+a checkpoint that bound less parks the same way.
+
 ### Remove
 
 `newgit remove <name>` stops what is running (dependents first), runs
-`[cleanup]` hooks where ownership allows, deletes the workspace (`rm -rf`;
+`[cleanup]` hooks where ownership allows — for parked bindings too, unless
+their drop already ran it — deletes the workspace (`rm -rf`;
 clones have no registration), and archives the binding record.
 
 **The source branch** goes too, when it holds nothing unique, and otherwise
@@ -973,6 +1104,31 @@ then the uncommitted work reapplied as uncommitted changes), then tracker
 content, then resources by their restore rules in dependency order,
 restarting what was running. `undo --only <resource>` restores just that
 resource.
+
+### A workspace off its instance's branch
+
+Agents run `git checkout -b try-x` inside a workspace as a matter of
+course. A checkpoint holds the workspace as it stands, and which branch is
+checked out is part of that: the record keeps it (`checked_out`, or
+`detached` for a detached `HEAD`, mid-rebase included). The instance's
+branch in the project repository moves only when the workspace is on it.
+Moving `feature-a` to `try-x`'s commits would be a merge nobody asked for,
+so newgit leaves `feature-a` where it was and says so, naming both
+branches. Refusing instead would block the checkpoint, the push, and the
+undo exactly when an agent is experimenting, and those are the moments a
+checkpoint matters most (#259).
+
+Undo puts `HEAD` back where the checkpoint had it: on its branch at its
+commit, or detached. It moves only that branch, never the one the workspace
+happens to be on. When the branch it moves is not the current one and holds
+commits the checkpoint does not, undo prints the old tip. The instance's
+branch follows only a checkpoint taken on it.
+
+`merge` and a push to a newgit remote carry what the checkpoint holds,
+which is whatever the workspace has checked out. Both repeat the
+checkpoint's warning. `status` shows the divergence:
+`` feature-a@1a2b3c4d (workspace on `try-x`) ``, and `checkpoints` marks each
+checkpoint taken off the branch with `` [on `try-x`] ``.
 
 A resource's restore is one of `none`, `command`, `recompute` (re-run an
 action, `prepare` by default, when the identity changed), or `external`.

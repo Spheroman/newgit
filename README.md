@@ -67,6 +67,10 @@ newgit spawn auth-refactor                        # deps installed, dev server u
 When you like the result, run a plain `git push` from the workspace. It
 checkpoints the instance and publishes to your real remote.
 
+Or hand the setup to your coding agent: tell it to set newgit up, and it
+will find `newgit reference agents`, which walks it through finding what your
+project needs, asking you about it, and proving the result with a real spawn.
+
 ## Bring the whole branch with you
 
 With a newgit remote, a checkpoint travels too. When a teammate's branch, or

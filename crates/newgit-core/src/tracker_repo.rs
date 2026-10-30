@@ -5,7 +5,10 @@ use camino::{Utf8Path, Utf8PathBuf};
 
 use crate::error::{NewgitError, Result};
 use crate::materializer::create_dir_all;
-use crate::tracker::{TrackerDefinition, collect_all_files, collect_owned_files};
+use crate::tracker::{
+    TrackerDefinition, collect_all_files, collect_files, collect_owned_files, link_resolves_inside,
+    link_target_inside, symlinked_parent,
+};
 
 /// Length of the rev string newgit shows and records: a prefix of the
 /// commit id, the way Git abbreviates.
@@ -122,31 +125,66 @@ impl TrackerRepo {
             return Err(NewgitError::TrackerHasNoPaths(self.tracker.clone()));
         }
         let files = collect_owned_files(workspace, definition)?;
-        self.commit_files(&files, at)
+        self.commit_files(workspace, &files, at)
     }
 
     /// Commit an arbitrary directory's contents — how a resource checkpoint
     /// deposits into a deposit-only tracker (one with no owned paths).
     pub fn deposit(&self, dir: &Utf8Path, at: CaptureAt<'_>) -> Result<CaptureOutcome> {
         let files = collect_all_files(dir)?;
-        self.commit_files(&files, at)
+        self.commit_files(dir, &files, at)
     }
 
+    /// Commit `files`, read from under `root`.
+    ///
+    /// A symlink is never followed. One that stays inside `root` is stored
+    /// as a link (mode `120000`, its target's text as the blob), as Git
+    /// stores one; one that leaves `root` is refused, naming the path and
+    /// target, and nothing is committed. The file walk does not descend
+    /// into a linked directory or through a linked parent, so every regular
+    /// file hashed here is really under `root`.
     fn commit_files(
         &self,
+        root: &Utf8Path,
         files: &[(Utf8PathBuf, Utf8PathBuf)],
         at: CaptureAt<'_>,
     ) -> Result<CaptureOutcome> {
+        // Decide every entry before writing anything, so a refused link
+        // leaves the store exactly as it was.
+        let mut kinds = Vec::with_capacity(files.len());
+        for (relative, absolute) in files {
+            let metadata = std::fs::symlink_metadata(absolute)
+                .map_err(|source| NewgitError::io(absolute, source))?;
+            if metadata.is_symlink() {
+                let target = std::fs::read_link(absolute)
+                    .map_err(|source| NewgitError::io(absolute, source))?;
+                let target = Utf8PathBuf::from_path_buf(target)
+                    .map_err(|target| NewgitError::NonUtf8Path(target.display().to_string()))?;
+                if !link_resolves_inside(root, relative, &target) {
+                    return Err(NewgitError::SymlinkLeavesWorkspace {
+                        tracker: self.tracker.clone(),
+                        path: relative.clone(),
+                        target,
+                    });
+                }
+                kinds.push(Entry::Link(target));
+            } else {
+                kinds.push(Entry::File(file_mode(&metadata)));
+            }
+        }
+
         ensure_repo(&self.git_dir)?;
 
-        // Blobs: hashed straight from the files, bytes exactly as they are
-        // (`--no-filters`), following symlinks as the file walk does.
+        // Blobs: regular files hashed straight from disk, bytes exactly as
+        // they are (`--no-filters`); links hashed from their target's text.
         let mut paths = String::new();
-        for (_, absolute) in files {
-            paths.push_str(absolute.as_str());
-            paths.push('\n');
+        for ((_, absolute), kind) in files.iter().zip(&kinds) {
+            if matches!(kind, Entry::File(_)) {
+                paths.push_str(absolute.as_str());
+                paths.push('\n');
+            }
         }
-        let blobs = if files.is_empty() {
+        let file_blobs = if paths.is_empty() {
             String::new()
         } else {
             git_stdin(
@@ -156,14 +194,31 @@ impl TrackerRepo {
                 paths.as_bytes(),
             )?
         };
+        let mut file_blobs = file_blobs.lines();
 
         // Tree: through a throwaway index, so nothing here touches a
         // working tree or an index anyone else is using.
         let mut entries = Vec::new();
-        for ((relative, absolute), blob) in files.iter().zip(blobs.lines()) {
-            entries.extend_from_slice(
-                format!("{} {blob}\t{relative}\0", file_mode(absolute)?).as_bytes(),
-            );
+        for ((relative, _), kind) in files.iter().zip(&kinds) {
+            let (mode, blob) = match kind {
+                Entry::File(mode) => (
+                    *mode,
+                    file_blobs
+                        .next()
+                        .expect("git hashes one blob per path")
+                        .to_owned(),
+                ),
+                Entry::Link(target) => (
+                    "120000",
+                    git_stdin(
+                        &self.git_dir,
+                        &["hash-object", "-w", "--no-filters", "--stdin"],
+                        &[],
+                        target.as_str().as_bytes(),
+                    )?,
+                ),
+            };
+            entries.extend_from_slice(format!("{mode} {blob}\t{relative}\0").as_bytes());
         }
         let index = TempIndex::new(&self.git_dir);
         git_stdin(
@@ -240,8 +295,9 @@ impl TrackerRepo {
             std::fs::remove_dir_all(&staging)
                 .map_err(|source| NewgitError::io(&staging, source))?;
         }
-        create_dir_all(&staging)?;
         let files = self.tree_files(&commit, &[])?;
+        self.refuse_escaping_links(rev, &commit, &files)?;
+        create_dir_all(&staging)?;
         self.check_out(&commit, &staging, &files)?;
         std::fs::rename(&staging, &dir).map_err(|source| NewgitError::io(&dir, source))?;
         Ok(dir)
@@ -264,15 +320,60 @@ impl TrackerRepo {
             return Ok(0);
         }
 
-        clear_owned_paths(workspace, definition)?;
-
         // Only what the definition owns *now*: a rev captured before a path
         // was untracked — or before a more specific tracker took part of it —
         // must not write that path back.
         let mut files = self.tree_files(&commit, &definition.paths)?;
         files.retain(|file| definition.owns(Utf8Path::new(file)));
+        // Judged before anything in the workspace is touched, so a refused
+        // rev leaves the workspace as it was.
+        self.refuse_escaping_links(rev, &commit, &files)?;
+
+        clear_owned_paths(workspace, definition)?;
         self.check_out(&commit, workspace, &files)?;
         Ok(files.len())
+    }
+
+    /// Refuse a rev holding a link whose target leaves the directory it is
+    /// written into. A lane can be written by anyone its audience includes,
+    /// or arrive from a remote; checked out as-is, such a link would point a
+    /// workspace path at whatever its author chose, and the next tool to
+    /// write that path would write through it. Judged by the target's text,
+    /// which is all a stored link is.
+    fn refuse_escaping_links(&self, rev: &str, commit: &str, files: &[String]) -> Result<()> {
+        if files.is_empty() {
+            return Ok(());
+        }
+        let listing = git(&self.git_dir, &["ls-tree", "-r", "-z", commit])?;
+        for entry in listing.split('\0').filter(|entry| !entry.is_empty()) {
+            let Some((meta, path)) = entry.split_once('\t') else {
+                continue;
+            };
+            let mut fields = meta.split(' ');
+            let (Some(mode), Some(_), Some(oid)) = (fields.next(), fields.next(), fields.next())
+            else {
+                continue;
+            };
+            if mode != "120000" || !files.iter().any(|file| file == path) {
+                continue;
+            }
+            let args = ["cat-file", "blob", oid];
+            let target = run(
+                &mut command(&self.git_dir, &args, &[]),
+                &describe(&args),
+                None,
+            )?;
+            let target = String::from_utf8_lossy(&target).into_owned();
+            if !link_target_inside(Utf8Path::new(path), Utf8Path::new(&target)) {
+                return Err(NewgitError::LaneLinkLeavesWorkspace {
+                    tracker: self.tracker.clone(),
+                    rev: rev.to_owned(),
+                    path: Utf8PathBuf::from(path),
+                    target,
+                });
+            }
+        }
+        Ok(())
     }
 
     /// Paths in a rev's tree, limited to `paths` when it is non-empty.
@@ -495,20 +596,27 @@ fn short(commit: &str) -> String {
     commit[..REV_LEN.min(commit.len())].to_owned()
 }
 
+/// What one captured path is, decided from `symlink_metadata` alone.
+enum Entry {
+    /// A regular file, with its Git mode.
+    File(&'static str),
+    /// A symlink that stays inside the root, with its target's text.
+    Link(Utf8PathBuf),
+}
+
 #[cfg(unix)]
-fn file_mode(path: &Utf8Path) -> Result<&'static str> {
+fn file_mode(metadata: &std::fs::Metadata) -> &'static str {
     use std::os::unix::fs::PermissionsExt as _;
-    let metadata = std::fs::metadata(path).map_err(|source| NewgitError::io(path, source))?;
-    Ok(if metadata.permissions().mode() & 0o111 != 0 {
+    if metadata.permissions().mode() & 0o111 != 0 {
         "100755"
     } else {
         "100644"
-    })
+    }
 }
 
 #[cfg(not(unix))]
-fn file_mode(_path: &Utf8Path) -> Result<&'static str> {
-    Ok("100644")
+fn file_mode(_metadata: &std::fs::Metadata) -> &'static str {
+    "100644"
 }
 
 /// An index file of our own, removed on drop.
@@ -620,32 +728,62 @@ fn run(command: &mut Command, description: &str, stdin: Option<&[u8]>) -> Result
 /// content" means file absence, not leftovers.
 pub fn clear_owned_paths(workspace: &Utf8Path, definition: &TrackerDefinition) -> Result<()> {
     for owned in &definition.paths {
+        // Under a symlinked directory, nothing at this path is in the
+        // workspace: there is nothing of this tracker's to remove, and
+        // removing "through" the link would delete files wherever it leads.
+        if symlinked_parent(workspace, owned).is_some() {
+            continue;
+        }
         // A more specific tracker owns something inside: remove this
-        // tracker's files one by one and leave that tracker's alone.
+        // tracker's files one by one and leave that tracker's alone. A link
+        // is removed as itself (`remove_file` never follows one).
         if definition
             .excluded
             .iter()
             .any(|inner| inner.starts_with(owned))
         {
-            for (_, absolute) in collect_owned_files(workspace, definition)? {
+            for (relative, absolute) in collect_files(workspace, std::slice::from_ref(owned))? {
+                if definition
+                    .excluded
+                    .iter()
+                    .any(|inner| relative.starts_with(inner))
+                {
+                    continue;
+                }
                 std::fs::remove_file(&absolute)
                     .map_err(|source| NewgitError::io(&absolute, source))?;
             }
             continue;
         }
         let target = workspace.join(owned);
-        if target.is_dir() {
+        let Ok(metadata) = std::fs::symlink_metadata(&target) else {
+            continue;
+        };
+        if metadata.is_dir() {
             std::fs::remove_dir_all(&target).map_err(|source| NewgitError::io(&target, source))?;
-        } else if target.is_file() {
+        } else {
             std::fs::remove_file(&target).map_err(|source| NewgitError::io(&target, source))?;
         }
     }
     Ok(())
 }
 
+/// Copy one file for an export. A symlink is copied as a link, never as
+/// what it points at — the same thing Git does with one.
 pub fn copy_file(from: &Utf8Path, to: &Utf8Path) -> Result<()> {
     if let Some(parent) = to.parent() {
         create_dir_all(parent)?;
+    }
+    let is_link = std::fs::symlink_metadata(from).is_ok_and(|meta| meta.is_symlink());
+    if is_link {
+        let target = std::fs::read_link(from).map_err(|source| NewgitError::io(from, source))?;
+        #[cfg(unix)]
+        return std::os::unix::fs::symlink(&target, to)
+            .map_err(|source| NewgitError::io(to.to_path_buf(), source));
+        #[cfg(not(unix))]
+        return Err(NewgitError::Unsupported(format!(
+            "`{from}` is a symlink, which this platform cannot export as one"
+        )));
     }
     std::fs::copy(from, to)
         .map(|_| ())

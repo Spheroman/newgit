@@ -7,6 +7,8 @@ to. Printed by `newgit reference`, so it is on disk wherever the binary is.
 (`resource` brings its subsections with it); `newgit reference all` prints the
 whole document.
 
+An agent setting newgit up for someone: read `newgit reference agents` first.
+
 The design narrative — why trackers and resources are the only two
 primitives, what each one is for — lives in `docs/design/spec.md` at
 <https://github.com/Spheroman/newgit>. This page is the lookup table.
@@ -31,6 +33,247 @@ whether a lane travels with a merge — both by defaulting, silently.
   local/trackers.git     every tracker's history   local, gitignored
   installs/              built trees, shared       local, gitignored
 ```
+
+---
+
+## Agents — setting newgit up for someone
+
+You are probably here because someone installed newgit and asked you to set
+it up. Assume they know nothing about it beyond the name. They are relying on
+you to find out what newgit can do for *their* project and to show them.
+
+**`newgit init` is not the setup.** On its own it leaves the three built-in
+trackers and no resources. Every spawn then gets the code and nothing else:
+no `.env.local`, no installed dependencies, no dev server, no database. That
+is `git worktree` with extra steps, and anyone who only sees that will
+reasonably decide newgit isn't worth keeping. A useful setup gives every
+instance what the project needs to run. Spawn should give them a branch they
+can run right away, and undo should put back the env and data as well as the
+code.
+
+### Look before you ask
+
+Read the project before you propose anything. Most of what a setup needs is
+already visible:
+
+```sh
+git status --short --ignored        # ignored files the project needs: tracker candidates
+ls -a; cat package.json             # or pyproject.toml, Cargo.toml, Makefile, …
+newgit resource templates           # what each template is for
+```
+
+| you find | it becomes |
+| --- | --- |
+| `.env`, `.env.local`, `.envrc`, `config/*.local.*`, a credentials file that is gitignored | a secret tracker: `audience = "user"` if each person has their own, `project-devs` if the team shares one |
+| a lockfile (`pnpm-lock.yaml`, `package-lock.json`, `uv.lock`, `Cargo.lock`, …) | an install resource: `--template pnpm` for pnpm, `--template install` for anything else |
+| a `dev` / `start` script, a server entry point | `--template process`: its own port, started for each instance |
+| `supabase/` | `--template supabase`: its own stack and ports per instance, with snapshots on checkpoint |
+| Postgres/MySQL in Docker or Compose, migrations | `--template command-snapshot` or `command-snapshot-migrations` |
+| two env files for one thing (`.env.staging`, `.env.local-db`) | two trackers sharing a `role`, so each spawn picks one (`--use`) |
+| an app or package in a monorepo that only some branches touch | a code tracker (`--code --path apps/x`), dropped from a spawn with `--drop` |
+| local agent notes or settings (`CLAUDE.local.md`, scratch plans) | a `user` tracker, so the notes go with each branch and come back on undo |
+| a hard-coded port in a committed config file | a `[[render]]` on that resource (`newgit reference render`) |
+| a GitHub remote and `gh` in use | nothing to add. `git push` and `gh pr create` work from a workspace |
+
+### Be creative
+
+The table above is a starting point, not the whole menu. newgit is a new kind
+of tool, and neither you nor the user will have habits for most of what it
+can do. Don't stop at copying a setup you'd build with worktrees and a
+`.env` file. **Shape the tools to the project, not the project to a
+preconceived notion of what the tool can do.** Trackers, roles, priorities,
+audiences, and resources combine freely. Look for where this project hurts
+and build the setup around that. Some patterns:
+
+- **A shared database by default, a branch database when you need one.** If
+  the database stack is slow or expensive to spin up, giving every branch its
+  own wastes most of that. Make two trackers that fill the `db` role. The
+  default points every instance at one shared database. The other brings a
+  per-branch stack, for schema changes, migrations, or tests that need
+  isolation:
+
+  ```toml
+  # .newgit/trackers/shared-db.toml — what a spawn gets unless asked
+  audience = "project-devs"
+  storage = "local"
+  role = "db"
+  priority = 10
+  paths = [".env.db"]              # points at the one shared database
+
+  # .newgit/trackers/branch-db.toml — `--use branch-db`, or swap in later
+  audience = "project-devs"
+  storage = "local"
+  role = "db"
+  paths = [".env.db"]              # points at 127.0.0.1:54322
+  resources = ["supabase"]         # a stack of its own, started only here
+  ```
+
+  Both trackers own `.env.db`, which is allowed because they share a role and
+  are never bound together. The branch copy names a default port, and a
+  `[[render]]` in the `supabase` resource replaces it with the instance's own
+  (`{{ports.db}}`), so each branch's `.env.db` points at its own stack.
+
+  A branch that turns out to need its own database runs `newgit tracker use
+  branch-db`. That swaps the role over and starts the stack, with no respawn.
+- **Live keys you only get when you ask.** Put test and live API keys in two
+  trackers sharing a role, and give the live one a negative `priority`. Then
+  no spawn, and so no unattended agent, binds live credentials unless someone
+  passes `--use`.
+- **A monorepo where each branch carries only what it touches.** Make each app
+  a code tracker with a negative `priority`. A spawn checks out only the apps
+  it binds. An install that builds `{{bound.paths}}` installs only those, and
+  the install store keys on the binding, so branches working on the same app
+  share one tree.
+- **Agent notes that move with the branch.** A `user` tracker over
+  `CLAUDE.local.md` or a `notes/` directory keeps an agent's plans and
+  scratch work with its branch. They're checkpointed and undone with the
+  code, and never show up in a diff.
+- **Data you can rewind.** A database resource that snapshots on checkpoint
+  makes `undo` restore the data along with the code. That makes it safe to
+  let an agent run a destructive migration.
+- **Anything with a handle.** The `external` template wraps whatever another
+  system owns, like a preview deploy, a tunnel, or a cloud sandbox. Its URL
+  becomes an export every other resource can read, and `remove` tears it down.
+- **Different people, different views.** Audiences go down to `user:<login>`.
+  The ops credentials one person holds can be a tracker only they ever
+  receive, inside a project everyone else works on too.
+
+Check each idea against the reference before you propose it, and run it
+through *Prove it works* like everything else. If the project needs something
+newgit can't express, say so plainly rather than bending the project to fit.
+Proposing one of these is also the best way to show a new user why newgit is
+worth keeping.
+
+### Explain it, then ask
+
+**We highly recommend explaining what newgit does before you ask the user
+anything.** Someone who has never heard of a tracker can't tell you which
+trackers they want. Asked cold, they will either guess or say "whatever you
+think", and you lose the one input only they can give. Ask them before
+they understand newgit and the questions read as busywork.
+
+Start with what newgit is, in a few sentences. Each branch becomes an
+*instance*: its own workspace with everything it needs to run. *Trackers*
+hold the files Git shouldn't, like env files and local config. Each has its
+own history and is never committed. *Resources* are what each branch has to
+rebuild or run, like installs, dev servers and databases. A *checkpoint*
+saves all of it, and `undo` puts it all back. Use these words. The user will
+see them in every command, so this is when to learn them.
+
+Then tell them what you found and what each piece gets them. Keep it short.
+For example:
+
+> newgit gives each branch its own copy of the project, ready to run. Files
+> Git shouldn't hold go in *trackers*, and the things each branch has to
+> install or run are *resources*. For this project I'd set up:
+> - a tracker for your `.env.local`, copied into every branch and versioned
+>   but never committed, so a branch an agent broke can be undone env and
+>   all;
+> - `pnpm install`, built once per lockfile and shared, so a new branch
+>   doesn't reinstall;
+> - `pnpm dev` on its own port in each branch, so five can run side by side;
+> - your Supabase database, one per branch, snapshotted on checkpoint.
+>
+> Should `.env.local` be per-person, or shared with your team? Do you also
+> point at a staging database sometimes? I can make that a second env you
+> pick at spawn time.
+
+Only then **ask about trackers**, because those are the ones you can't
+infer:
+
+- Which ignored files does a branch need in order to run? You will have found
+  some of them. Ask whether there are others, such as files that live outside
+  the repository today and get copied in by hand.
+- Who should see each one: just them (`user`), the team (`project-devs`), or
+  everyone (`public`, which ships in exports)? Default to `user` for anything
+  with credentials in it.
+- Are there alternatives they switch between, like a local and a staging
+  database or a test and a live API key? Those become trackers sharing a
+  `role`.
+- Is there anything they would want undo to bring back that Git doesn't
+  hold?
+
+If they don't care to choose, set up what you found with the safe defaults and
+tell them what you picked.
+
+### Build it
+
+```sh
+newgit init
+newgit tracker create runtime-env --audience user
+newgit tracker track runtime-env .env.local
+newgit tracker capture runtime-env --from-store   # seed it from the file that's already there
+newgit resource add deps --template pnpm
+newgit resource add app --template process
+```
+
+Then open every generated file in `.newgit/resources/` and fix the lines
+marked `EDIT ME`, such as the dev command and the lockfile. A template's
+defaults are guesses, and a wrong guess shows up as a failed spawn later. `newgit
+reference <section>` has every key. If a resource needs a `[[render]]`, run
+`newgit render --check`.
+
+Make sure an install resource declares `[identity] produces`, the directory
+the install writes (`node_modules`, `.venv`). That is what lets later
+instances with the same lockfile be cloned from the install store instead of
+installing again. The `pnpm` template sets it; the `install` template leaves
+it as `EDIT ME`, and an install without it is never shared.
+
+Commit `.newgit/` the way `init` says to, on a branch if the project works
+that way. A spawn reads definitions from the store, but teammates and CI only
+see what is committed.
+
+### Prove it works
+
+Don't hand it over until a real spawn comes up:
+
+```sh
+newgit spawn newgit-try
+newgit status newgit-try          # every resource ready; if not, it says why
+newgit env newgit-try             # ports and exports, labeled by where they came from
+newgit run newgit-try -- <the project's test or health check>
+newgit checkpoint newgit-try --verify
+newgit remove newgit-try
+```
+
+Fix what fails and run it again. A setup that fails on its first spawn is
+worse than not setting it up at all.
+
+### Wire up the tools they already use
+
+- **Claude Code:** `newgit claude-code install`. Then every `claude
+  --worktree`, background session, and worktree-isolated subagent gets a full
+  instance instead of a bare worktree.
+- **T3 Code:** the `Spheroman/t3code` fork turns each thread into an instance
+  and stops its resources when the thread is settled. Mention it if they use
+  T3 Code.
+- **A newgit remote** (`newgit login`, `newgit remote add`) lets checkpoints
+  travel, so a teammate's or cloud agent's branch comes up locally with its
+  uncommitted work. The hosted one is invite-only, so offer it but don't
+  assume they have access.
+
+### Show them
+
+Finish with a demonstration rather than just a summary. Spawn two instances
+side by side and show that they run on different ports at once. Checkpoint
+one, break something in it, and `undo` it. Then leave them a short list of
+the commands they will use every day: `spawn`, `status`, `checkpoint`,
+`undo`, `remove`. Also say what you set up and what you chose not to.
+
+### Guardrails
+
+- Secret by default is the point. Never move tracker content into Git, never
+  give a credentials file a `public` audience, and never widen an audience
+  without asking.
+- Ask before anything that leaves the machine: `newgit remote add`, `members
+  add`, `export --remote`.
+- newgit does not rewrite history, so don't work around it by doing so
+  yourself.
+- Be honest about the limits. newgit needs git 2.38+ and a Unix-like OS.
+  An install whose lockfile no other instance has built runs the package
+  manager for real: npm and pip copy a full tree each time, while pnpm, uv,
+  and bun mostly hardlink. Later instances with the same lockfile are cloned
+  from the install store (`newgit reference installs`).
 
 ---
 
@@ -119,6 +362,7 @@ other ledger: a port is free the moment nothing claims it).
 | `ownership` | string | yes | — | `branch`, `workspace`, `project`, `user`, or `external`. See *Ownership*. |
 | `depends_on` | array of strings | no | `[]` | resource or tracker names whose *lifecycle* this one depends on. Orders `prepare` at spawn and cleanup hooks in reverse. A name that is neither is an error the graph reports. Needing another resource's *value* is not this — see *Data edges*. |
 | `workdir` | string | no | workspace root | where every command this resource runs is spawned, relative to the workspace root. Overridable per action — see `[actions.<name>]`. |
+| `reads` | array of strings | no | unset | files and directories this resource's running process reads, workspace-relative (a directory covers everything in it). When `tracker use` or `drop` changes the bytes of a rendered file it covers, the process is restarted. See *Rendered files under a running process*. |
 
 `workdir` is applied as the spawned process's working directory, never as a
 `cd` prefix on the command string — so it cannot silently change what `&&`
@@ -302,6 +546,10 @@ or depends on a resource whose start failed is not started, and the spawn
 says so and exits 1, as it does for a failed `prepare`; `spawn --json`
 lists each attempt under `started`. A dependent starts once its
 dependency's process exists, not once it answers (#54).
+After starting them, `spawn` waits up to five seconds for the ports of what
+is running to answer. A server still compiling after that is `starting`, not
+a failure: `spawn` exits 0, says so, and `spawn --json` lists it under
+`starting`; `newgit status` shows `starting` until the port answers.
 `spawn --from-checkpoint` starts them after its restore, and `newgit
 tracker use` starts those of the resources the tracker brings, which `drop`
 stopped. Nothing else autostarts: `newgit start` brings back exactly what
@@ -352,6 +600,15 @@ next `stop` tries again; a failed `resume` stays recorded, and the next
 anything: `resume` has to find the resource where `suspend` left it. Like
 any action, either may declare `captures`, and a `resume` that hands out a
 new URL publishes it that way.
+
+`newgit tracker drop` (and a `tracker use` that switches a role) runs the
+same pair for the resources the dropped tracker brought: it *parks* each,
+stopping its process and running `suspend`, keeps its ports claimed, and
+the next `use` hands them back and runs `resume`. A resource with no
+`suspend` is parked by its `[cleanup]` instead, and `use` runs `prepare`
+on the same ports. Either way the output names the hook that ran, and
+`newgit remove` runs `[cleanup]` for a parked binding its drop did not
+already clean up.
 
 ```toml
 [actions.suspend]
@@ -446,11 +703,12 @@ rebuilds from the restored source and ignores the ref.
 
 A `recompute` restore skips when this resource's `[identity]` hash is the same
 now as at the checkpoint and, for a resource that declares `[identity]
-produces`, the undo restored the binding the instance already had: the tree was
-already built from those inputs, so the rebuild would change nothing. The
-binding counts because the install store keys a tree on it (see *Installs: use
-a content-addressed store*); an undo that drops or brings back a tracker
-rebuilds such a tree, lockfile or no lockfile. It says so rather than passing
+produces`, the undo did not move the part of the binding its store key holds:
+the tree was already built from those inputs, so the rebuild would change
+nothing. That part counts because the install store keys a tree on it (see
+*Installs: use a content-addressed store*); an undo that drops or brings back
+a code tracker rebuilds such a tree, lockfile or no lockfile, while one that
+only rebinds a secret tracker does not. It says so rather than passing
 silently:
 
 ```
@@ -529,7 +787,7 @@ against an instance you can afford to spend, not one you are mid-task on.
 
 | key | type | required | default | meaning |
 | --- | --- | --- | --- | --- |
-| `command` | string | no | none | tears the concrete resource down. Runs at `newgit remove`, and at `newgit cleanup` for an instance whose workspace is gone, dependents before dependencies. A `[cleanup]` section without one means there is nothing to do, and teardown says so. |
+| `command` | string | no | none | tears the concrete resource down. Runs at `newgit remove`, and at `newgit cleanup` for an instance whose workspace is gone, dependents before dependencies — for resources a tracker drop parked too. A `tracker drop` runs it for a resource it parks that has no `suspend`. A `[cleanup]` section without one means there is nothing to do, and teardown says so. |
 
 Three rules constrain it, all deliberately:
 
@@ -736,6 +994,12 @@ Four rules carry the rest:
   `count = 2` rather than reaching for an "all" flag — a declared number keeps
   failing when the file changes from two occurrences to three. Where two
   sections share a default, make `find` multi-line.
+
+  A `find` that occurs 0 times often means the file has no line for that
+  setting at all, such as a `supabase/config.toml` without `[inbucket]`. The
+  tool then uses its own built-in default, and every instance shares it. The
+  error says so. Add the line to the committed file so there is one to
+  rewrite; deleting the rule makes the bind pass and leaves the collision.
 - **Replacements are simultaneous.** Every `find` is located in the committed
   content and the whole batch applies at once, so a replacement's output is
   never a match target and reordering `replace` cannot change the result. Two
@@ -757,6 +1021,28 @@ render should produce and compares, at `checkpoint` and before each re-render,
 naming the file and how many lines are about to go. Silence means there is
 nothing to lose. To change a rendered file for real, change it in the store
 repo.
+
+#### Rendered files under a running process
+
+A process reads its config when it starts. When `newgit tracker use` or `drop`
+changes the bytes of a rendered file — binding a tracker's `db` writes its port
+into `apps/admin/.env.local` — every process that was already running is
+checked against the resource's `reads`:
+
+| `reads` | the process |
+| --- | --- |
+| covers a changed file | is restarted (stopped with its `stop` signal, started again with its `autostart` action, else its first long-running one), and listed under `restarted:` |
+| set, but covers none | is left alone, and not mentioned |
+| unset | is left running, with a warning naming it and the command that restarts it |
+
+```toml
+reads = ["apps/admin"]   # next dev, run from apps/admin, reads apps/admin/.env.local
+```
+
+`reads = []` says the process reads no rendered file. A change that leaves
+every rendered file's bytes as they were says nothing. `undo` stops every
+process before it moves content and restarts what was running at checkpoint
+time, so it does not need `reads`.
 
 #### Rendering into a built tree
 
@@ -912,28 +1198,42 @@ as much an input as the lockfile it reads, so editing `npm ci` to `npm ci
 entries built before it. That is the right way to be wrong: a stale entry
 costs one reinstall and `newgit cleanup` reclaims it.
 
-**So are the trackers the instance binds.** A shared lockfile lists every
-member, bound or not, and its install builds the bound ones: named by
-`{{bound.paths}}`, or found on disk, where a dropped tracker's files are not
-checked out (an unfiltered `npm ci` links a workspace member only when it is
-there). So what `{{bound.trackers}}` and `{{bound.paths}}` render to is in
-every resource's key, whether its commands mention them or not, and the store
-never fills an instance that drops a tracker with the tree built for one that
-binds it. The cost is the same trade again: instances whose bindings differ
-never share a tree, even one the binding cannot change, so each binding
-installs once. And a live instance whose binding moves is at a new key:
-`newgit tracker use` and `drop` rebuild every bound install that holds a tree,
-filled from the store when that binding was built before, else by running its
-`prepare` again, and say so:
+**So is what of the binding can reach the install.** A shared lockfile lists
+every member, bound or not, and its install builds the ones it can see: found
+on disk, where a dropped code tracker's files are not checked out (an
+unfiltered `npm ci` links a workspace member only when it is there), or named
+by `{{bound.paths}}`. So two things are in the key:
+
+- **Which paths are checked out**, in every resource's key: the paths the
+  instance's dropped code trackers leave out. Nothing is left out when no
+  code tracker is dropped.
+- **What `{{bound.trackers}}` and `{{bound.paths}}` render to**, only when
+  the install can be told: its own commands, `key_command`, exports or
+  `[[render]]`s name one, or any resource's export or `[[render]]` does
+  (every command's environment carries every bound resource's exports, and a
+  render writes into a file the install can read).
+
+The store never fills an instance that drops a member with the tree built for
+one that binds it. And the rest of the binding stays out: binding a secret
+tracker, or one that owns no paths (a branch database, say), or creating or
+renaming a tracker the instance binds, leaves an install that is not told the
+names at the key it had, so instances that differ only in that share one
+tree. A secret tracker's files are projected into the workspace but are not
+in the key; an install that reads one (an `.npmrc` it owns, say) names it in
+`[identity] paths`, whose content is hashed like the lockfile's.
+
+A live instance whose key moves needs a new tree: `newgit tracker use` and
+`drop` rebuild every bound install that holds a tree and whose key the change
+moved, filled from the store when that binding was built before, else by
+running its `prepare` again, and say so. An install the change cannot reach
+is left alone and not listed:
 
 ```
 Bound `b` in `x`
   deps for the new binding: rebuilt, install store: filled from 3ec46aa385bb (copy-on-write)
 ```
 
-The binding is the store key's, so binding or dropping a secret tracker
-rebuilds too: `{{bound.trackers}}` names it. Running processes are left as
-they are, as under `newgit action deps.prepare`. The binding has changed by
+Running processes are left as they are, as under `newgit action deps.prepare`. The binding has changed by
 the time an install rebuilds, so a rebuild that fails does not fail the
 command. It leaves the resource `failed`, and what depends on it is not
 rebuilt but left `pending` behind it, each with its retry:
@@ -1043,7 +1343,7 @@ environment variable handed to every later process.
 
 | variable | is |
 | --- | --- |
-| `{{branch.name}}` | the instance name as you typed it |
+| `{{branch.name}}` | the instance name as you typed it (at most 40 characters: the slug lands in container names, Supabase project ids, and hostnames) |
 | `{{branch.slug}}` | its filesystem-safe form, and the workspace directory name |
 | `{{workspace}}` | absolute path to the workspace |
 | `{{scripts}}` | absolute path to `.newgit/scripts/` in the store — use `{{scripts}}/<name>` so a hook's script is read from the store, like the definition calling it |
@@ -1067,10 +1367,10 @@ Scope — which of them have a value where:
 | `[restore] command` | yes | yes | yes | yes | — | yes |
 | `[cleanup] command` | yes | yes | yes | yes | — | yes |
 
-A `key_command` is rendered exactly like an action `command`. The binding is
-already part of every key (see *Installs: use a content-addressed store*), so
-`{{bound.*}}` is not there to make the key depend on it: it lets the command
-pass the binding to whatever it inspects, as in `git hash-object
+A `key_command` is rendered exactly like an action `command`. Naming
+`{{bound.*}}` in it puts what it renders to in the key (see *Installs: use a
+content-addressed store*), as naming it in `prepare` does; mostly it lets the
+command pass the binding to whatever it inspects, as in `git hash-object
 {{bound.paths}}`. Keep per-instance values —
 `{{workspace}}`, `{{branch.*}}`, `{{ports.*}}` — out of what it prints. Every
 instance would key differently, and the shared store would never hit.
@@ -1175,7 +1475,7 @@ environment; it reads the same values through `{{...}}` instead.
 **A name has exactly one owner.** Three things declare an environment
 variable — an `[exports]` key, an action's `captures` entry, and a port's
 `env` — and the same name appearing in two of them is a graph problem,
-reported by `newgit resource list` and refused by `spawn`, `run`, `action`,
+reported by `newgit resource list` and `newgit render --check`, and refused by `spawn`, `run`, `action`,
 `checkpoint`, and `undo`, like a missing dependency or a cycle:
 
 ```
