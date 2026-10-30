@@ -12,6 +12,164 @@ time by `scripts/release-changelog.sh`, which then deletes the fragments.
 Two changes never touch the same lines, so nothing queues behind whichever
 branch landed first.
 
+## [0.8.1] — 2026-10-30
+
+Publishing a shared secret tracker is now one merge: `newgit tracker
+merge` moves its `main` on the remote, which is what newgit.dev's landing
+page serves. A secret tracker's files are excluded from Git before they are
+written, a push that defines a new tracker no longer fails, and checkpoints
+and `undo` stop losing or misplacing what is in a dropped tracker's paths.
+On macOS, `stop` no longer misses a command that was still being forked.
+The remote is now AGPL-3.0-only, and outside contributions need a signed
+CLA.
+
+Nothing needs migrating. `tracker merge` on a shared tracker with `storage
+= "remote"` now needs a login and the network, and fails rather than
+merging on this machine only.
+
+### Changed
+
+- The remote (`remote/`) is now AGPL-3.0-only; the CLI stays MIT or
+  Apache-2.0.
+
+  Anyone can still self-host and change the remote. What the AGPL adds is
+  that a changed copy run as a service has to offer its source to its
+  users, so the remote cannot be taken closed and resold as a competing
+  hosted service. Nothing changes for anyone who only uses the CLI.
+
+
+### Fixed
+
+- `undo` no longer writes a checkpoint's uncommitted changes into the paths
+  of a code tracker it leaves dropped
+  ([#225](https://github.com/Spheroman/newgit/issues/225)).
+
+  Undo reapplied the uncommitted state by checking the snapshot's tree out
+  over the whole workspace. That writes each path where the tree differs
+  from the index, outside the sparse checkout too, and clears that path's
+  skip-worktree bit, so a change the snapshot held in a dropped tracker's
+  paths came back as an ordinary tracked file of a tracker the instance
+  does not bind. A snapshot holds one when, for instance, the dropped
+  tracker's definition has since taken over a path the checkpoint changed.
+  What the sparse checkout leaves out is now reapplied as the checkpoint's
+  HEAD has it, so it stays out of the working tree; the rest of the
+  snapshot, a bound tracker nested in a dropped one included, is reapplied
+  as before. `spawn --from-checkpoint` ends in the same undo. Nothing
+  either command prints changes.
+
+- A secret tracker's paths are excluded from a workspace's Git before its
+  content is written there
+  ([#296](https://github.com/Spheroman/newgit/issues/296)).
+
+  `tracker pull`, `checkout`, and `use` wrote a tracker's files into a
+  workspace spawned before that tracker was defined without excluding them,
+  so Git listed them as untracked and a plain `git add -A` could commit
+  secret content until the next checkpoint added the exclude. Now the one
+  function every such write goes through excludes first. New paths also
+  join the existing block in `.git/info/exclude` instead of adding a second
+  copy of its header.
+
+- A checkpoint no longer fails on a new file in a dropped code tracker's
+  paths, and `newgit undo` no longer removes an edit there that no
+  checkpoint holds.
+
+  A dropped tracker's paths are outside the workspace's sparse checkout,
+  where the `git add -A` that a checkpoint snapshots with skips an edited
+  file without a word and fails on a new one. So a file written into a
+  dropped tracker's directory made `newgit checkpoint` fail with Git's
+  "outside of your sparse-checkout definition" advice, and with it each
+  command that takes a checkpoint first: `undo`, `merge`, `checkpoint
+  --verify`, a `git push` from the workspace, and a `tracker drop --discard`
+  with work to discard. An edit to one of that tracker's files was left out
+  of the checkpoint without a word, and the next `undo` that restored the
+  source removed it. The snapshot now leaves the dropped trackers' paths out
+  by name, and still holds the changes to a bound tracker nested in one. A
+  checkpoint that leaves changes out warns, naming each under its tracker,
+  which `newgit checkpoint`, `merge`, `undo --only` and `git push` print; a
+  file a resource renders is not counted, since undo renders it again.
+  `undo` without `--only` refuses while there are any, before it changes
+  anything, since it would remove them; it says to bind the tracker again
+  with `newgit tracker use`, after which a checkpoint holds them.
+
+- `stop` on macOS no longer leaves a command running when the stop lands
+  while a process in its group is forking.
+
+  macOS lets a child still being forked join the process group just after a
+  group signal goes out, so the child never gets it. Most often the child is
+  the command itself, forked by newgit's wrapper right after a start: the
+  wrapper died, the command lived on orphaned, and `stop` timed out with
+  "ignored `term`". Removing the wrapper's trap (#288) made this rarer but
+  did not close it. On macOS, `stop` now signals each process in the group,
+  then keeps sweeping until the group is gone and signals any process that
+  joined late with no live parent in the group, which is what the race
+  leaves. A process a member starts after the signal, like a shutdown
+  handler running `docker compose down`, is left to finish, as on Linux.
+  Each process still gets the signal at most once. Linux was never affected
+  and still uses a single `killpg`.
+
+- A push that defines a new secret tracker with `storage = "remote"` is no
+  longer refused. The remote reads a tracker's audience from its definition
+  on the default branch, and only that push would put it there, so the
+  checkpoint's sync used to fail on the tracker and take the whole push
+  with it. Now a tracker the remote has no definition for is left out of
+  that sync, with a warning that says why and `remote: synced to …,
+  without` it, and the first checkpoint after the definition lands brings
+  it. The remote answers 404 for such a tracker, and a real refusal (403)
+  still fails the push.
+
+- `spawn --from-checkpoint` now refuses `--use` and `--drop`, as it already
+  refused `--from` and `--private`, rather than taking them and ignoring
+  them.
+
+  The instance binds what the checkpoint bound, because the undo that
+  finishes the spawn restores the checkpoint's binding. So `--drop` left a
+  tracker the checkpoint had bound in the working tree, with any
+  uncommitted work the author had in it; `--use` left one it had not bound
+  out; and a tracker name that does not exist, which a plain `spawn`
+  refuses, was accepted. The spawn went ahead, `--json` too, with nothing
+  in its output saying so. Either flag with `--from-checkpoint` is now a
+  usage error, as the other two are: exit 2 before anything runs, a
+  message on stderr naming both flags, and nothing on stdout. To bind
+  otherwise, spawn without them, then `newgit tracker use` or `newgit
+  tracker drop` in the new instance.
+
+- `newgit tracker merge` on a shared secret tracker with
+  `storage = "remote"` now moves its `main` on the remote too.
+
+  A checkpoint's sync carries only such a tracker's pins and instance
+  branches, and the merge moved `main` on this machine only, so the remote
+  never had one: newgit.dev's landing page, which reads it, redirected to
+  GitHub. The merge now pushes it first, as the tracker repo's branch
+  `main` (where a code tracker's `main` lives too), and fails whole if that
+  push does, so merging such a tracker now needs a login and the network.
+  Publishing the page is `newgit tracker merge site`. Other machines don't
+  read that `main` back yet; `tracker pull` there still takes their own.
+
+
+### Documentation
+
+- The CLA check now requires every commit author in a pull request to have
+  signed, not only the person who opened it, and to have signed the current
+  version.
+
+  Checking only the opener let a signed contributor bring in commits written
+  by someone who never agreed to anything. CLA.md also now grants its broad
+  license to newgit alone: as first written it extended "any terms,
+  including proprietary" to everyone who received the software, which would
+  have let anyone take contributions closed.
+
+- newgit's founders are exempt from the CLA check: what they write goes to
+  the company by IP assignment instead, which covers more than the CLA
+  would.
+
+- Contributions now need a signed Contributor License Agreement
+  ([CLA.md](CLA.md)); CONTRIBUTING.md says how to sign.
+
+  The remote is AGPL and parts of newgit are not published at all, so
+  without the CLA an outside contribution could only ever be used under the
+  license it arrived with. Signing is one line in
+  `.github/cla/signatures.txt` in your first pull request, checked by CI.
+
 ## [0.8.0] — 2026-10-29
 
 Binding a tracker now costs only what it changes. Switching on a branch
@@ -2864,7 +3022,8 @@ themselves and neither of which is a reason to re-spawn:
   fresh field it has not. One successful `undo`, or one `newgit checkpoint
   --verify`, clears it for good.
 
-[Unreleased]: https://github.com/Spheroman/newgit/compare/v0.8.0...HEAD
+[Unreleased]: https://github.com/Spheroman/newgit/compare/v0.8.1...HEAD
+[0.8.1]: https://github.com/Spheroman/newgit/compare/v0.8.0...v0.8.1
 [0.8.0]: https://github.com/Spheroman/newgit/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/Spheroman/newgit/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/Spheroman/newgit/compare/v0.5.0...v0.6.0
