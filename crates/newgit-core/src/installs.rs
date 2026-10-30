@@ -12,8 +12,9 @@
 //! Three things keep it honest:
 //!
 //! - **The key is the inputs, never the tree.** `[identity] paths` plus
-//!   whatever `key_command` reports, and the trackers the instance binds. A
-//!   tree is only ever handed to an instance whose inputs hash the same.
+//!   whatever `key_command` reports, and what of the instance's binding can
+//!   reach the install. A tree is only ever handed to an instance whose inputs
+//!   hash the same.
 //! - **Copies fork on write.** Hardlinking *between instances* would be
 //!   faster and is what package managers do, but it is wrong here:
 //!   post-install build output lands inside these trees (`.cxx` caches,
@@ -28,13 +29,13 @@
 //!   render's `find` in the stored tree and rendered again for each
 //!   instance it fills.
 
-use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Mutex, OnceLock};
 
 use camino::{Utf8Path, Utf8PathBuf};
 use sha2::{Digest, Sha256};
 
 use crate::error::{NewgitError, Result};
-use crate::exports::Bound;
 use crate::materializer::create_dir_all;
 use crate::render::AppliedReplacement;
 
@@ -456,8 +457,8 @@ impl InstallStore {
 }
 
 /// The key a built tree is stored under: the content of the resource's
-/// identity paths, whatever `key_command` reported, the trackers the instance
-/// binds, and the definition that built it.
+/// identity paths, whatever `key_command` reported, what of the instance's
+/// binding can reach the install, and the definition that built it.
 ///
 /// The definition is in the key because the *command* is an input to the
 /// tree, not just its declared inputs. Edit `npm ci` to `npm ci --omit=dev`
@@ -476,20 +477,31 @@ impl InstallStore {
 ///
 /// The binding is in the key because it is an input too, and one a shared
 /// lockfile does not record: the lockfile lists every member, bound or not,
-/// and its install builds the bound ones, named by `{{bound.paths}}` or
-/// found on disk, where a dropped tracker's files are not checked out.
-/// Without it, an instance that drops a member would be filled with the tree
-/// built for one that binds it. What is mixed in is what
-/// `{{bound.trackers}}` and `{{bound.paths}}` render to, so the key moves
-/// whenever either would render differently.
+/// and its install builds the ones it can see, found on disk or named by
+/// `{{bound.paths}}`, where a dropped code tracker's files are not checked
+/// out. Without it, an instance that drops a member would be filled with
+/// the tree built for one that binds it.
 ///
-/// It is in every resource's key, not only those whose commands mention
-/// `{{bound…}}`, because an install can read the binding without naming it:
-/// an unfiltered `npm ci` links a workspace member only when the member is
-/// checked out. So instances that bind differently never share a tree, even
-/// one the binding cannot change, such as a package's own install in its own
-/// tracker. That is the definition's trade again: a miss costs an install,
-/// where a wrong hit hands over the wrong tree.
+/// `binding` is only the part of the binding that can reach the install
+/// (`BranchManager::install_binding`), not all of it:
+///
+/// - Always, which paths the checkout leaves out: the sparse checkout the
+///   instance's dropped code trackers make. That is how an install reads
+///   the binding without naming it — an unfiltered `npm ci` links a
+///   workspace member only when the member is checked out — so it is in
+///   every resource's key.
+/// - What `{{bound.trackers}}` and `{{bound.paths}}` render to, only when
+///   the install can be told: its own commands, `key_command`, exports or
+///   renders name one, or any resource's export or render does.
+///
+/// A secret tracker puts no paths into the sparse checkout, and neither
+/// does one that owns none, so binding or dropping either leaves the key
+/// alone unless the install is told the names. Before, the whole binding
+/// was in every key, and switching on a branch database (a secret tracker
+/// with `paths = []`) cost a full `npm ci` for an identical tree (#248).
+/// An install that does read a secret tracker's file — an `.npmrc` it
+/// projects, say — names that file in `[identity] paths`, whose content is
+/// hashed like any other input.
 ///
 /// Everything is mixed rather than concatenated into the path, so adding a
 /// `key_command` later does not collide with entries built before it — the
@@ -497,7 +509,7 @@ impl InstallStore {
 pub fn identity_key(
     inputs_rev: &str,
     key_material: Option<&str>,
-    bound: &Bound,
+    binding: &str,
     definition_rev: &str,
 ) -> String {
     let mut hasher = Sha256::new();
@@ -505,9 +517,7 @@ pub fn identity_key(
     hasher.update([0]);
     hasher.update(key_material.unwrap_or_default().as_bytes());
     hasher.update([0]);
-    hasher.update(bound.trackers.as_bytes());
-    hasher.update([0]);
-    hasher.update(bound.paths.as_bytes());
+    hasher.update(binding.as_bytes());
     hasher.update([0]);
     hasher.update(definition_rev.as_bytes());
     let digest = hasher.finalize();
@@ -692,14 +702,20 @@ fn rewrite_text(path: &Utf8Path, change: impl FnOnce(&str) -> String) -> Result<
     Ok(true)
 }
 
-/// The first file under `root` whose content — or, for a symlink, whose
-/// target — contains any of `needles`. `None` means the tree never mentions
-/// them.
+/// A file under `root` whose content — or, for a symlink, whose target —
+/// contains any of `needles`. `None` means the tree never mentions them.
 ///
 /// Symlinks are read rather than followed: a `node_modules` is full of them,
 /// following would recurse forever through a package manager's store links,
 /// and a link *target* naming the workspace is exactly the poisoning being
 /// looked for.
+///
+/// This reads every byte of every produced tree on every install that might
+/// be stored — 3.8 GB in 264k files for T3 Code — so it runs in parallel:
+/// one task per directory and per file, on rayon's pool. Single-threaded it
+/// took ~28s on that tree, longer than the install it was vetting (#235).
+/// The walk stops at the first match, so *which* match is reported is not
+/// deterministic when there are several; any one declines the tree.
 fn find_path_reference(
     root: &Utf8Path,
     needles: &[String],
@@ -707,37 +723,105 @@ fn find_path_reference(
 ) -> Result<Option<Utf8PathBuf>> {
     let metadata =
         std::fs::symlink_metadata(root).map_err(|source| NewgitError::io(root, source))?;
-
-    if metadata.is_symlink() {
-        let target = std::fs::read_link(root).map_err(|source| NewgitError::io(root, source))?;
-        let target = target.to_string_lossy();
-        let names = needles
+    let scan = ReferenceScan {
+        finders: needles
             .iter()
-            .any(|needle| target.contains(needle.as_str()));
-        return Ok(names.then(|| root.to_path_buf()));
+            .filter(|needle| !needle.is_empty())
+            .map(|needle| memchr::memmem::Finder::new(needle.as_bytes()).into_owned())
+            .collect(),
+        exempt,
+        stop: AtomicBool::new(false),
+        outcome: Mutex::new(None),
+    };
+    rayon::scope(|scope| scan.visit(scope, root.to_path_buf(), metadata.file_type()));
+    match scan.outcome.into_inner() {
+        Ok(outcome) => outcome.transpose(),
+        Err(poisoned) => poisoned.into_inner().transpose(),
+    }
+}
+
+/// The shared state of one [`find_path_reference`] walk.
+struct ReferenceScan<'a> {
+    finders: Vec<memchr::memmem::Finder<'static>>,
+    exempt: &'a [Utf8PathBuf],
+    /// Set by the first match or error: every task still queued returns
+    /// without touching the disk.
+    stop: AtomicBool,
+    /// The first match or error, whichever came first.
+    outcome: Mutex<Option<Result<Utf8PathBuf>>>,
+}
+
+impl<'a> ReferenceScan<'a> {
+    fn visit<'s>(&'s self, scope: &rayon::Scope<'s>, path: Utf8PathBuf, kind: std::fs::FileType)
+    where
+        'a: 's,
+    {
+        if self.stop.load(Ordering::Relaxed) {
+            return;
+        }
+        match self.check(scope, &path, kind) {
+            Ok(false) => {}
+            Ok(true) => self.finish(Ok(path)),
+            Err(error) => self.finish(Err(error)),
+        }
     }
 
-    if metadata.is_file() {
-        if exempt.iter().any(|path| path == root) {
-            return Ok(None);
+    /// Whether `path` itself names a needle. A directory never does: its
+    /// entries are queued as tasks of their own.
+    fn check<'s>(
+        &'s self,
+        scope: &rayon::Scope<'s>,
+        path: &Utf8Path,
+        kind: std::fs::FileType,
+    ) -> Result<bool>
+    where
+        'a: 's,
+    {
+        if kind.is_symlink() {
+            let target =
+                std::fs::read_link(path).map_err(|source| NewgitError::io(path, source))?;
+            let target = target.as_os_str().as_encoded_bytes();
+            return Ok(self
+                .finders
+                .iter()
+                .any(|finder| finder.find(target).is_some()));
         }
-        return Ok(file_contains_any(root, needles)?.then(|| root.to_path_buf()));
+        if kind.is_file() {
+            if self.exempt.iter().any(|exempt| exempt == path) {
+                return Ok(false);
+            }
+            return file_contains_any(path, &self.finders);
+        }
+        if !kind.is_dir() {
+            return Ok(false);
+        }
+        for entry in std::fs::read_dir(path).map_err(|source| NewgitError::io(path, source))? {
+            let entry = entry.map_err(|source| NewgitError::io(path, source))?;
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else {
+                return Err(NewgitError::NonUtf8Path(entry.path().display().to_string()));
+            };
+            let child = path.join(name);
+            // `DirEntry::file_type` comes from the directory listing itself
+            // on macOS and Linux, so the walk costs no `lstat` per entry.
+            let kind = entry
+                .file_type()
+                .map_err(|source| NewgitError::io(child.clone(), source))?;
+            scope.spawn(move |scope| self.visit(scope, child, kind));
+        }
+        Ok(false)
     }
 
-    if !metadata.is_dir() {
-        return Ok(None);
-    }
-    for entry in std::fs::read_dir(root).map_err(|source| NewgitError::io(root, source))? {
-        let entry = entry.map_err(|source| NewgitError::io(root, source))?;
-        let name = entry.file_name();
-        let Some(name) = name.to_str() else {
-            return Err(NewgitError::NonUtf8Path(entry.path().display().to_string()));
-        };
-        if let Some(found) = find_path_reference(&root.join(name), needles, exempt)? {
-            return Ok(Some(found));
+    fn finish(&self, outcome: Result<Utf8PathBuf>) {
+        self.stop.store(true, Ordering::Relaxed);
+        let mut slot = self
+            .outcome
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if slot.is_none() {
+            *slot = Some(outcome);
         }
     }
-    Ok(None)
 }
 
 /// Whether a file contains any needle, read in fixed-size chunks.
@@ -747,55 +831,50 @@ fn find_path_reference(
 /// several gigabytes for a real monorepo, including individual native
 /// artifacts large enough that reading one into a single allocation is its
 /// own problem. Consecutive chunks overlap by `len - 1` bytes so a match
-/// straddling a boundary is still found.
-fn file_contains_any(path: &Utf8Path, needles: &[String]) -> Result<bool> {
-    let longest = needles.iter().map(String::len).max().unwrap_or(0);
+/// straddling a boundary is still found. The buffer is per thread, so the
+/// walk does not allocate one per file.
+fn file_contains_any(path: &Utf8Path, finders: &[memchr::memmem::Finder<'_>]) -> Result<bool> {
+    let longest = finders
+        .iter()
+        .map(|finder| finder.needle().len())
+        .max()
+        .unwrap_or(0);
     if longest == 0 {
         return Ok(false);
     }
     const CHUNK: usize = 64 * 1024;
+    thread_local! {
+        static BUFFER: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
 
-    let file = std::fs::File::open(path).map_err(|source| NewgitError::io(path, source))?;
-    let mut reader = std::io::BufReader::new(file);
+    let mut file = std::fs::File::open(path).map_err(|source| NewgitError::io(path, source))?;
     let overlap = longest - 1;
-    let mut buffer = vec![0u8; overlap + CHUNK];
-    let mut filled = 0;
+    let matches = |window: &[u8]| finders.iter().any(|finder| finder.find(window).is_some());
 
-    loop {
-        let read = std::io::Read::read(&mut reader, &mut buffer[filled..])
-            .map_err(|source| NewgitError::io(path, source))?;
-        if read == 0 {
-            break;
+    BUFFER.with_borrow_mut(|buffer| {
+        buffer.resize(overlap + CHUNK, 0);
+        let mut filled = 0;
+        loop {
+            let read = std::io::Read::read(&mut file, &mut buffer[filled..])
+                .map_err(|source| NewgitError::io(path, source))?;
+            if read == 0 {
+                break;
+            }
+            filled += read;
+            if filled < buffer.len() {
+                // Short read: go around rather than scanning a half-filled
+                // window, so a boundary match is never split by an artifact
+                // of how the bytes arrived.
+                continue;
+            }
+            if matches(&buffer[..filled]) {
+                return Ok(true);
+            }
+            buffer.copy_within(filled - overlap..filled, 0);
+            filled = overlap;
         }
-        filled += read;
-        if filled < buffer.len() {
-            // Short read: go around rather than scanning a half-filled
-            // window, so a boundary match is never split by an artifact of
-            // how the bytes arrived.
-            continue;
-        }
-        if needles
-            .iter()
-            .any(|needle| contains_bytes(&buffer[..filled], needle.as_bytes()))
-        {
-            return Ok(true);
-        }
-        buffer.copy_within(filled - overlap..filled, 0);
-        filled = overlap;
-    }
-
-    Ok(needles
-        .iter()
-        .any(|needle| contains_bytes(&buffer[..filled], needle.as_bytes())))
-}
-
-fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
-    if needle.is_empty() || haystack.len() < needle.len() {
-        return false;
-    }
-    haystack
-        .windows(needle.len())
-        .any(|window| window == needle)
+        Ok(matches(&buffer[..filled]))
+    })
 }
 
 /// Remove whatever is at `path` — a directory, a file, or a symlink.
@@ -1215,6 +1294,48 @@ mod tests {
         assert!(!workspace.join("node_modules.newgit-replacing").exists());
     }
 
+    /// The scan fans out over a wide, deep tree. One poisoned file among
+    /// hundreds of clean ones is still found, and a clean tree of the same
+    /// shape is stored.
+    #[test]
+    fn the_parallel_scan_finds_one_poisoned_file_in_a_wide_tree() {
+        let (_guard, root) = temp();
+        let store = InstallStore::at(root.join("installs"));
+        for (key, poisoned) in [("clean", false), ("poisoned", true)] {
+            let built = root.join(key);
+            for package in 0..40 {
+                let dir = built.join(format!("node_modules/.pnpm/pkg{package}/lib/deep"));
+                std::fs::create_dir_all(&dir).expect("mkdir");
+                for file in 0..10 {
+                    std::fs::write(dir.join(format!("f{file}.js")), "module.exports = 1;\n")
+                        .expect("write");
+                }
+            }
+            let target = built.join("node_modules/.pnpm/pkg23/lib/deep/f7.js");
+            if poisoned {
+                std::fs::write(&target, format!("require(\"{built}/x\");\n")).expect("write");
+            }
+
+            let admission = store
+                .admit(
+                    "deps",
+                    key,
+                    &built,
+                    &[Utf8PathBuf::from("node_modules")],
+                    &[],
+                )
+                .expect("admit");
+            if poisoned {
+                assert_eq!(admission, Admission::Declined { path: target });
+            } else {
+                assert!(
+                    matches!(admission, Admission::Stored { .. }),
+                    "{admission:?}"
+                );
+            }
+        }
+    }
+
     /// The scan runs over whole trees, so it reads in chunks — a match must
     /// still be found when it straddles a chunk boundary, and when the file
     /// is binary.
@@ -1310,58 +1431,37 @@ mod tests {
     #[test]
     fn the_key_moves_when_any_part_of_it_does() {
         let rev = "sha256:000000000000";
-        let both = Bound {
-            trackers: "a b".to_owned(),
-            paths: "apps/a apps/b".to_owned(),
-        };
-        let base = identity_key("aaaa", None, &both, rev);
-        assert_eq!(
-            base,
-            identity_key("aaaa", None, &both, rev),
-            "and is stable"
-        );
+        let both = "";
+        let base = identity_key("aaaa", None, both, rev);
+        assert_eq!(base, identity_key("aaaa", None, both, rev), "and is stable");
         assert_ne!(
             base,
-            identity_key("bbbb", None, &both, rev),
+            identity_key("bbbb", None, both, rev),
             "inputs move the key"
         );
         assert_ne!(
             base,
-            identity_key("aaaa", Some("v24.3.0 Darwin arm64"), &both, rev),
+            identity_key("aaaa", Some("v24.3.0 Darwin arm64"), both, rev),
             "adding key material moves it too, so old entries stop matching"
         );
         assert_ne!(
-            identity_key("aaaa", Some("v24.3.0 Darwin arm64"), &both, rev),
-            identity_key("aaaa", Some("v22.1.0 Darwin arm64"), &both, rev),
+            identity_key("aaaa", Some("v24.3.0 Darwin arm64"), both, rev),
+            identity_key("aaaa", Some("v22.1.0 Darwin arm64"), both, rev),
             "a toolchain bump is a different tree"
         );
         // A shared lockfile lists every member, bound or not: the same
-        // inputs build less for an instance that binds less.
-        let only_a = Bound {
-            trackers: "a".to_owned(),
-            paths: "apps/a".to_owned(),
-        };
+        // inputs build less for an instance that checks out less.
+        let without_b = "/*\n!/apps/b/\n!/apps/b";
         assert_ne!(
             base,
-            identity_key("aaaa", None, &only_a, rev),
-            "binding fewer trackers is a different tree"
-        );
-        // `{{bound.paths}}` can render differently over the same trackers,
-        // when one of them is redefined to own somewhere else.
-        let moved = Bound {
-            trackers: "a b".to_owned(),
-            paths: "apps/a packages/b".to_owned(),
-        };
-        assert_ne!(
-            base,
-            identity_key("aaaa", None, &moved, rev),
-            "a tracker's paths are part of what the install sees"
+            identity_key("aaaa", None, without_b, rev),
+            "checking out fewer members is a different tree"
         );
         // The command that builds the tree is as much an input as the
         // lockfile it reads: same inputs, edited `prepare`, different tree.
         assert_ne!(
             base,
-            identity_key("aaaa", None, &both, "sha256:111111111111"),
+            identity_key("aaaa", None, both, "sha256:111111111111"),
             "an edited definition must not reuse the tree the old one built"
         );
     }

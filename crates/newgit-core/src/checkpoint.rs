@@ -84,6 +84,65 @@ pub struct SourceState {
     pub dirty_rev: Option<String>,
     /// Ref in the store repo keeping these commits alive.
     pub store_ref: String,
+    /// The branch the workspace had checked out — normally the instance's
+    /// own, but an agent that ran `git checkout -b try-x` was on `try-x`,
+    /// and undo puts it back there. Absent when HEAD was detached, and in
+    /// records from before it was kept (those were on the instance's own).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checked_out: Option<String>,
+    /// HEAD was detached at `head_rev`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub detached: bool,
+}
+
+impl SourceState {
+    /// The branch HEAD was on, `None` when it was detached. `own` is the
+    /// instance's branch, which a record from before `checked_out` was on.
+    pub fn head_branch<'a>(&'a self, own: &'a str) -> Option<&'a str> {
+        if self.detached {
+            None
+        } else {
+            Some(self.checked_out.as_deref().unwrap_or(own))
+        }
+    }
+
+    /// What HEAD was on instead of the instance's branch `own`, if anything.
+    pub fn off_branch(&self, own: &str) -> Option<OffBranch> {
+        OffBranch::of(self.head_branch(own), own)
+    }
+}
+
+/// What a workspace has checked out when it is not the instance's own
+/// branch. newgit does not pretend otherwise: a checkpoint holds the
+/// workspace as it stands, and the instance's branch moves only with
+/// commits made on it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OffBranch {
+    /// Some other branch: `git checkout -b try-x`.
+    Branch(String),
+    /// No branch at all: `git checkout <rev>`, or a rebase in progress.
+    Detached,
+}
+
+impl OffBranch {
+    /// `head` is the workspace's branch (`None` when detached), `own` the
+    /// instance's.
+    pub fn of(head: Option<&str>, own: &str) -> Option<Self> {
+        match head {
+            Some(head) if head == own => None,
+            Some(head) => Some(Self::Branch(head.to_owned())),
+            None => Some(Self::Detached),
+        }
+    }
+}
+
+impl std::fmt::Display for OffBranch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Branch(branch) => write!(f, "on `{branch}`"),
+            Self::Detached => f.write_str("detached"),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -294,6 +353,8 @@ mod tests {
                 head_rev: "abc".to_owned(),
                 dirty_rev: None,
                 store_ref: "refs/newgit/checkpoints/feature-a/ckpt_001".to_owned(),
+                checked_out: Some("feature-a".to_owned()),
+                detached: false,
             },
             tracker_states: vec![],
             resource_states: vec![],
