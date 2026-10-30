@@ -6,7 +6,10 @@
   the command itself, forked by newgit's wrapper right after a start: the
   wrapper died, the command lived on orphaned, and `stop` timed out with
   "ignored `term`". Removing the wrapper's trap (#288) made this rarer but
-  did not close it. On macOS, `stop` now signals each process in the group
-  and keeps sweeping until the group is gone, so anything that joins late
-  is caught. Each process still gets the signal once. Linux was never
-  affected and still uses a single `killpg`.
+  did not close it. On macOS, `stop` now signals each process in the group,
+  then keeps sweeping until the group is gone and signals any process that
+  joined late with no live parent in the group, which is what the race
+  leaves. A process a member starts after the signal, like a shutdown
+  handler running `docker compose down`, is left to finish, as on Linux.
+  Each process still gets the signal at most once. Linux was never affected
+  and still uses a single `killpg`.
