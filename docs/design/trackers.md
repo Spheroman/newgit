@@ -418,6 +418,10 @@ records that one instance was built on another.)* Every merge moves the
 affected `main`s only after all of them succeeded: the remote's ProjectDO
 serializes merges and flips them together.
 
+The same check governs trying a change before merging it: a review is a
+trial merge of the change onto `main`, and it may leave out a tracker only
+where a merge could (see *Reviewing a change* in [remote.md](remote.md)).
+
 **`requires` governs binding too (built).** An instance cannot bind
 `electron` without `supabase` (or, for a role, some tracker filling it):
 `newgit tracker use electron` brings in what it requires, and dropping a
@@ -688,7 +692,8 @@ warning, and `depends_on` naming a role. Open issues on Spheroman/newgit:
   lock the owner out (#228). No orgs: owners are always logins, and
   `project-devs` is the only group (#227).
 - **Resources.** Nothing orders `start`, so a runtime dependency (functions
-  needing supabase running) cannot be expressed (#54). Whether the
-  `preview` role gives way to a container remote (#229).
+  needing supabase running) cannot be expressed (#54). Reviewing a change
+  places each tracker it touched locally or in the preview; settled in
+  [remote.md](remote.md), *Reviewing a change* (#229).
 - **The model itself.** Dropping projects as a structure: every tracker the
   same kind of thing, rooted at the user (#201).

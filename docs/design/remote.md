@@ -526,8 +526,57 @@ would run `newgit preview fix-login/ckpt_017 --json`, the same
 command exists yet) and gets a link to the running app. The spikes behind
 this design are in [remote-measurements.md](remote-measurements.md).
 
-[#229] (open, "preview = role replaced by container remote?") may replace
-this design; until it is settled, Decisions 5–7 stand.
+A preview is one end of reviewing a change: everything runs in the sandbox.
+The general case, where some of a change runs on the reviewer's machine, is
+below.
+
+### Reviewing a change: each tracker runs here or there *(decided, planned)*
+
+A reviewer wants to try a change against their own environment — their
+data, their env, the roles they normally bind — with only what the change
+touched swapped in. So a review is decided per tracker the change touched:
+does it run **here** (on the reviewer's machine) or **there** (in the
+preview sandbox)? This settles [#229] ("preview = role replaced by container
+remote?"): what a preview replaces is not a role but where a tracker's
+resources run.
+
+- **The list is a trial merge.** The review's branch is your `main` with the
+  change merged in, tracker by tracker, as `newgit merge` does it: trackers
+  the change did not touch stay at `main`. The same `requires` check as
+  `merge --only` applies — `electron` cannot be tried without the
+  `supabase` it requires when the change touched both
+  ([trackers.md](trackers.md), *Merges stack by tracker*).
+- **Clients run here.** A tracker whose resources are local processes the
+  reviewer drives (an Electron app, a CLI, a mobile build) can only be tried
+  on the reviewer's machine: an Electron-only change is a local trial merge
+  and nothing more, against your usual backend.
+- **Services can run there.** A tracker whose resources export URLs (a
+  database, an API, a web server) can be *placed* in the preview: the
+  tracker is bound at the change's commit as usual, but its resources run in
+  the sandbox, and their exports (`SUPABASE_URL`, `DATABASE_URL`) render into
+  the reviewer's files as the preview's addresses, the way ports render
+  today. The role, its `requires`, and binding are untouched; only placement
+  changes. A placed resource is in effect `external`: another system owns
+  it.
+- **A web-only change needs nothing here:** open the preview.
+
+So a change touching `supabase` and `electron` runs `supabase` in the
+preview and `electron` locally, pointed at it — something like `newgit spawn
+review --from <instance> --remote supabase` (the command shape is not
+settled). The reviewer also sees the data the author's agent actually
+produced, not a fresh database, because the preview's database is shared
+(*One sandbox per distinct environment*).
+
+**Networking.** HTTP to a placed resource goes through the Worker, with the
+same per-request auth as any preview request. Raw TCP (a direct Postgres
+connection) needs newgit to run a local forwarder tunnelled through the
+Worker, so the rendered `DATABASE_URL` is a `127.0.0.1` port newgit carries,
+like `cloudflared access tcp`.
+
+**Missing before any of this works:** `merge --into` a throwaway branch and
+`spawn --from` a newgit branch rather than a Git revision; `merge --only`
+and its `requires` check; resource placement and the TCP forwarder; and
+previews themselves.
 
 ### One sandbox per distinct environment
 
@@ -685,7 +734,8 @@ Each piece lands alone and keeps the suite green.
    restore, project per-user trackers, start resources, serve through the
    Worker with auth) and `newgit preview --json`; checkpoint snapshots
    inside sandboxes; CI on push with the preview-ready snapshot step.
-   Subject to [#229].
+   Reviews that place a change's services in the preview and run its
+   clients locally, through a trial merge (*Reviewing a change*, [#229]).
 7. **The web UI** ([#182]–[#200]): sign-in ([#185]), the project,
    checkpoint, and audience views, and the forge's pages. **Open preview**
    ([#200]) waits for previews, so it works on day one.
@@ -713,7 +763,6 @@ Resolved loudly; each is reversible.
 6. **Previews start from the best snapshot available:** the checkpoint's own,
    then CI's, then the environment snapshot for its resource versions.
 7. **The Worker is the preview auth layer;** every request passes through it.
-   (5–7 are open again in [#229].)
 8. **Worker in TypeScript; CLI stays Rust.**
 9. **ProjectDO is the source of truth** for members, branches, instances,
    and checkpoints when a remote is configured. Binding records stay local.
@@ -723,6 +772,10 @@ Resolved loudly; each is reversible.
     owner.**
 12. **Tracker history is Git** (`refs/trackers/<tracker>/*`), in a tracker repo
     separate from the store.
+13. **A review decides each touched tracker's placement:** a trial merge of
+    the change onto `main`, with clients run locally and services
+    optionally run in the preview, their exports rendered locally. A preview
+    replaces where a tracker's resources run, never a role ([#229]).
 
 ## Open Questions
 
