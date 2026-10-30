@@ -38,11 +38,7 @@ export class FakeRepos implements Repos {
 		this.revokedTokens.add(tokenId);
 		return true;
 	}
-	/** Every `readFile`, in order: which repo, at which ref, which path. */
-	readonly reads: { name: string; ref: string; path: string }[] = [];
-
-	async readFile(name: string, ref: string, path: string) {
-		this.reads.push({ name, ref, path });
+	async readFile(name: string, _ref: string, path: string) {
 		return this.repos.get(name)?.get(path) ?? null;
 	}
 

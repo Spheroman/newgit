@@ -5560,9 +5560,13 @@ impl BranchManager {
     /// On the remote a tracker repo's `main` is its branch `main`, as a code
     /// tracker's is: the repo's default branch, what the Worker's
     /// `LANDING_PAGE` reads, and what anything reading a tracker by branch
-    /// gets. Forced, as `main` moves here: a merge promotes a rev, and the
-    /// rev it replaces stays on the remote under its pin and its instance
-    /// branch. A per-user tracker's `main` already rides every checkpoint.
+    /// gets. A per-user tracker's `main` already rides every checkpoint.
+    ///
+    /// Forced, so of two merges at once the last wins; the rev it replaces
+    /// stays on the remote under its pin and its instance branch. A lease
+    /// would refuse instead, but nothing fetches the remote's `main` back
+    /// into this machine's yet, so a refused merge would have no way to
+    /// catch up. The lease comes with that fetch.
     fn publish_tracker_main(
         &self,
         branch: &BranchInstance,
