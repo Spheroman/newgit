@@ -1,0 +1,4 @@
+audience = "project-devs"
+storage = "remote"
+merge_with_source = false
+paths = ["remote/site"]

@@ -906,6 +906,9 @@ pub struct CheckpointOutcome {
     /// Why the checkpoint is not on the remote, when there is one and syncing
     /// failed. (Also among `warnings`.)
     pub sync_error: Option<String>,
+    /// Trackers the remote refused, so left out of a sync that otherwise
+    /// went through. (Each is also among `warnings`, with why.)
+    pub left_out: Vec<String>,
     /// Resources that were not up, so not captured.
     pub degraded: Vec<String>,
 }
@@ -1144,6 +1147,9 @@ pub struct RestoreReport {
 pub struct MergeTrackerOutcome {
     pub tracker: String,
     pub rev: String,
+    /// The remote project whose copy of the tracker's `main` moved too, for
+    /// a tracker stored there.
+    pub published: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -5538,11 +5544,56 @@ impl BranchManager {
                 rev,
             });
         }
+        // The remote first: a merge that did not reach it fails whole,
+        // rather than leaving `main` moved on this machine only.
+        let published = self.publish_tracker_main(&branch, definition, &rev)?;
         lane.set_main(&rev)?;
         Ok(MergeTrackerOutcome {
             tracker: definition.name.clone(),
             rev,
+            published,
         })
+    }
+
+    /// Move the remote's `main` for a shared tracker whose synced state lives
+    /// there (`storage = "remote"`) to `rev`. A checkpoint's sync pushes only
+    /// such a tracker's pins and instance branches, never its `main`, so this
+    /// is the one way that `main` moves.
+    ///
+    /// On the remote a tracker repo's `main` is its branch `main`, as a code
+    /// tracker's is: the repo's default branch, what the Worker's
+    /// `LANDING_PAGE` reads, and what anything reading a tracker by branch
+    /// gets. A per-user tracker's `main` already rides every checkpoint.
+    ///
+    /// Forced, so of two merges at once the last wins; the rev it replaces
+    /// stays on the remote under its pin and its instance branch. A lease
+    /// would refuse instead, but nothing fetches the remote's `main` back
+    /// into this machine's yet, so a refused merge would have no way to
+    /// catch up. The lease comes with that fetch.
+    fn publish_tracker_main(
+        &self,
+        branch: &BranchInstance,
+        definition: &TrackerDefinition,
+        rev: &str,
+    ) -> Result<Option<String>> {
+        if definition.storage != Storage::Remote || definition.audience == "user" {
+            return Ok(None);
+        }
+        let Some(link) = &self.remote else {
+            return Ok(None);
+        };
+        let remote = link.connect(Acting::Workspace(&branch.workspace_path))?;
+        let repo = tracker_repo(&link.project, definition, "");
+        let credential = remote.credential(&link.project, &repo, Scope::Write)?;
+        let url = credential.remote.clone().unwrap_or_default();
+        let pin = format!("refs/trackers/{}/pins/{rev}", definition.name);
+        GitSource::push_refs(
+            &[&format!("--git-dir={}", self.store.paths().tracker_store)],
+            &url,
+            &[format!("{pin}:{pin}"), format!("+{pin}:refs/heads/main")],
+            Some(&basic_auth_header(&credential)),
+        )?;
+        Ok(Some(link.project.clone()))
     }
 
     pub fn create_tracker(
@@ -7657,8 +7708,21 @@ impl BranchManager {
 
         // The checkpoint exists locally now, whatever happens next; syncing
         // it is what lets another machine spawn it.
+        let mut left_out = Vec::new();
         let sync_error = match self.sync_checkpoint(branch, &record) {
-            Ok(()) => None,
+            Ok(refused) => {
+                for (tracker, reason) in refused {
+                    warnings.push(format!(
+                        "`{tracker}` is not in checkpoint {} on the remote, which has no \
+                         definition for it yet: {reason}. The rest synced, and the first \
+                         checkpoint after its definition reaches the default branch brings \
+                         `{tracker}`",
+                        record.id
+                    ));
+                    left_out.push(tracker);
+                }
+                None
+            }
             Err(error) => {
                 warnings.push(format!(
                     "checkpoint {} is saved here but not on the remote: {error}",
@@ -7673,6 +7737,7 @@ impl BranchManager {
             record_path,
             warnings,
             sync_error,
+            left_out,
             degraded,
         })
     }
@@ -8501,17 +8566,25 @@ impl BranchManager {
     ///
     /// Registers the instance first if an earlier attempt failed. Runs on
     /// the workspace's own token, so it works where only that token exists.
+    ///
+    /// A secret tracker the remote will not take a credential for is left
+    /// out, and returned with the remote's reason, rather than failing the
+    /// sync: most often it is new, and the remote reads its audience from
+    /// its definition on the default branch, which only this very push or
+    /// merge would put there. The record that goes up leaves it out too, so
+    /// it never names a rev the remote does not have. Any other failure
+    /// still fails the sync.
     fn sync_checkpoint(
         &self,
         branch: &mut BranchInstance,
         record: &CheckpointRecord,
-    ) -> Result<()> {
+    ) -> Result<Vec<(String, String)>> {
         let Some(link) = &self.remote else {
-            return Ok(());
+            return Ok(Vec::new());
         };
         self.register_remote(branch)?;
         let Some(binding) = branch.remote.clone() else {
-            return Ok(());
+            return Ok(Vec::new());
         };
         // Nothing is uploaded until everything it would carry is checked:
         // the checkpoint ref — the uncommitted-work commit included — and
@@ -8528,6 +8601,7 @@ impl BranchManager {
         record.code = code;
 
         let mut login = None;
+        let mut left_out = Vec::new();
         for state in &record.tracker_states {
             let Some(rev) = &state.content_rev else {
                 continue;
@@ -8544,7 +8618,21 @@ impl BranchManager {
                 definition,
                 login.as_deref().unwrap_or_default(),
             );
-            let credential = remote.credential(&binding.project, &repo, Scope::Write)?;
+            let credential = match remote.credential(&binding.project, &repo, Scope::Write) {
+                Ok(credential) => credential,
+                // 404 is a tracker whose definition is not on the default
+                // branch yet, which a later checkpoint can still bring. A 403
+                // is a real refusal (not a member, not in the audience):
+                // waiting will not change it, so it fails the sync.
+                Err(NewgitError::Remote {
+                    status: 404,
+                    message,
+                }) => {
+                    left_out.push((state.name.clone(), message));
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
             let url = credential.remote.clone().unwrap_or_default();
             let prefix = format!("refs/trackers/{}", state.name);
             let pin = format!("{prefix}/pins/{rev}");
@@ -8567,12 +8655,16 @@ impl BranchManager {
             )?;
         }
 
+        record
+            .tracker_states
+            .retain(|state| !left_out.iter().any(|(name, _)| *name == state.name));
         let value = serde_json::to_value(&record).map_err(|error| NewgitError::Remote {
             status: 0,
             message: format!("could not encode checkpoint {}: {error}", record.id),
         })?;
         remote.put_checkpoint(&binding.project, &branch.slug, &record.id, &value)?;
-        remote.set_head(&binding.project, &branch.slug, &record.source.head_rev)
+        remote.set_head(&binding.project, &branch.slug, &record.source.head_rev)?;
+        Ok(left_out)
     }
 
     /// `log_name` labels the action log: `checkpoint` for a real checkpoint,

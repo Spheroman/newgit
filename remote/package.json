@@ -1,6 +1,7 @@
 {
   "name": "newgit-remote",
   "private": true,
+  "license": "AGPL-3.0-only",
   "type": "module",
   "scripts": {
     "dev": "wrangler dev",

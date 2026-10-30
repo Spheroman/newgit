@@ -500,6 +500,12 @@ admins); and a tracker of yours owning the admin tracker's. Everything else
 in `.newgit/` — resources, scripts, config — is the `project` tracker, which
 anyone who merges may change. The remote reads each definition from the
 tracker that owns its file, at the default branch, to a fixed point.
+*(Not enforced for secret trackers yet, and open: the remote gives a write
+credential for a secret tracker's repo to anyone in its audience, and that
+credential can push the repo's `main` directly. For `site`, that is the page
+newgit.dev serves. Credentials are scoped to a repo, not a ref, so enforcing
+`maintainers` there means a secret tracker's merge has to go through the
+Worker, as a code tracker's `newgit merge` does.)*
 
 **One name for a commit, whoever reads it (decided).** A Git commit id is the
 hash of the commit's contents and its parent's id, so someone whose view

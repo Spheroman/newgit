@@ -154,12 +154,27 @@ fn exclude_paths(workspace: &Utf8Path, note: &str, paths: &[Utf8PathBuf]) -> Res
     if wanted.is_empty() {
         return Ok(());
     }
-    if !contents.is_empty() && !contents.ends_with('\n') {
+    // New paths join the block under this note when there is one, at its
+    // end; a second header for the same note only says the file was
+    // written twice.
+    let header = format!("# newgit: {note}");
+    let mut lines: Vec<String> = contents.lines().map(ToOwned::to_owned).collect();
+    if let Some(start) = lines.iter().position(|line| line.trim() == header) {
+        let end = lines[start + 1..]
+            .iter()
+            .position(|line| line.trim().is_empty() || line.trim_start().starts_with('#'))
+            .map_or(lines.len(), |offset| start + 1 + offset);
+        lines.splice(end..end, wanted);
+        contents = lines.join("\n");
         contents.push('\n');
-    }
-    contents.push_str(&format!("\n# newgit: {note}\n"));
-    for pattern in wanted {
-        contents.push_str(&format!("{pattern}\n"));
+    } else {
+        if !contents.is_empty() && !contents.ends_with('\n') {
+            contents.push('\n');
+        }
+        contents.push_str(&format!("\n{header}\n"));
+        for pattern in wanted {
+            contents.push_str(&format!("{pattern}\n"));
+        }
     }
     std::fs::write(&exclude, contents).map_err(|source| NewgitError::io(exclude, source))
 }

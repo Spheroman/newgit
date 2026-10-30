@@ -177,8 +177,9 @@ describe("the API", () => {
 		await credential("jack", repo("t.db-snapshots"), "write");
 		expect((await credential("eve", repo("t.db-snapshots"))).status).toBe(403);
 
-		// A tracker the project tracker does not define, and another project's repo.
-		expect((await credential("jack", repo("t.ghost"), "write")).status).toBe(403);
+		// A tracker the project tracker does not define (absent, not refused),
+		// and another project's repo.
+		expect((await credential("jack", repo("t.ghost"), "write")).status).toBe(404);
 		expect((await credential("jack", "other.proj.t.root")).status).toBe(400);
 		expect((await credential("jack", "jack.acme")).status).toBe(400);
 	});

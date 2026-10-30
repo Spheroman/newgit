@@ -163,4 +163,16 @@ running.
 
 ## License
 
-MIT or Apache-2.0, at your option.
+The CLI, and everything else here unless it says otherwise, is MIT or
+Apache-2.0, at your option.
+
+The remote ([`remote/`](remote/), the Worker behind newgit.dev) is
+[AGPL-3.0-only](remote/LICENSE). Self-host it and change it as you like; if
+you run a changed copy as a service, offer its source to the people who use
+it.
+
+A directory with its own `LICENSE` file is under that license, and a file
+with its own license notice keeps it.
+
+Contributions need a signed [Contributor License Agreement](CLA.md); see
+[CONTRIBUTING.md](CONTRIBUTING.md).

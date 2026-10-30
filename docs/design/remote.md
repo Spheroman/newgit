@@ -68,6 +68,20 @@ this repository is `spheroman/newgit` on newgit.dev, and GitHub's
 - `newgit remote delete <owner>/<name>`: the owner deletes the project —
   every token pinned to it revoked first, then every repo under its prefix,
   then its record — so the name can be linked again from scratch.
+- The landing page at `/`: one file of one tracker, at its trunk, named by
+  `LANDING_PAGE` in `wrangler.jsonc`. newgit.dev's is
+  `remote/site/index.html` in `site`, a secret `project-devs` tracker, so
+  the page is never committed and naming it in the config is what
+  publishes it. A change goes live with `newgit tracker merge site`, within
+  a minute (the edge caches it), with no deploy. A shared secret tracker
+  stored on the remote (`storage = "remote"`) has its `main` there as the
+  repo's branch `main`, as a code tracker does, and `/` reads it.
+  `newgit tracker merge` pushes it before moving `main` here, and fails
+  whole if the push does, so merging such a tracker needs a login and the
+  network. A checkpoint's sync carries only pins and instance branches
+  (`refs/trackers/<tracker>/…`), so a tracker never merged serves nothing
+  and `/` redirects to the GitHub repository. Nothing reads that `main`
+  back into another machine yet: `tracker pull` there still takes its own.
 - GitHub export (0.6.0): `newgit export --remote <NAME>` pushes the chosen
   trackers' `main`s, history and all, to the target defined in
   `.newgit/exports/<NAME>.toml`; `--dry-run` composes and checks without
@@ -348,6 +362,17 @@ commit pushed to the instance's fork of it — forked then, the first time.
 The push succeeds exactly when that reached the remote. Nothing is forwarded
 as one history; the endpoint composes views, and `newgit merge` moves
 branches.
+
+A secret tracker the remote has no definition for yet is left out of the
+sync instead of failing it, with a warning that names it and quotes why.
+That is a new tracker: the remote reads its audience from its definition on
+the default branch, and the push that carries the definition is the one
+being checkpointed. The remote answers 404 for it, not 403, because it is
+an absence a later checkpoint can fill; a 403 (not a member, not in the
+audience) still fails the sync. The record that goes up leaves the tracker
+out too, so it never names a rev the remote does not have, and the first
+checkpoint after the definition lands brings it. The local record keeps
+it, so `undo` on this machine still restores it.
 
 Export targets with `branches = true` ride the same push: the instance's
 branch is exported to each of them, and on a newgit remote the target is the

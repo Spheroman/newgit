@@ -431,10 +431,18 @@ struct SpawnArgs {
     from_checkpoint: Option<String>,
     /// Bind this tracker (repeatable): over its role's default, or one that
     /// is only bound when asked for
-    #[arg(long = "use", value_name = "TRACKER")]
+    #[arg(
+        long = "use",
+        value_name = "TRACKER",
+        conflicts_with = "from_checkpoint"
+    )]
     uses: Vec<String>,
     /// Do not bind this tracker (repeatable)
-    #[arg(long = "drop", value_name = "TRACKER")]
+    #[arg(
+        long = "drop",
+        value_name = "TRACKER",
+        conflicts_with = "from_checkpoint"
+    )]
     drops: Vec<String>,
     /// On the remote, only you see this instance — its checkpoints and its
     /// forks of the code trackers — until `newgit merge` publishes its work:
@@ -1182,6 +1190,8 @@ fn spawn(args: SpawnArgs) -> Result<()> {
     let manager = manager_here()?;
     warn_gitignore(&manager);
     if let Some(spec) = &args.from_checkpoint {
+        // No `--use` or `--drop` reach here (clap refuses them with it): the
+        // undo that finishes the spawn restores the checkpoint's binding.
         return spawn_from_checkpoint(&manager, &args.name, spec, args.json);
     }
     let outcome = manager.spawn_binding(
@@ -2281,6 +2291,9 @@ fn tracker(command: TrackerCommand) -> Result<()> {
                 "Merged `{}` @ {} from `{instance}` into its `main`",
                 outcome.tracker, outcome.rev
             );
+            if let Some(project) = &outcome.published {
+                println!("  remote:   `main` moved on {project} too");
+            }
             Ok(())
         }
         TrackerCommand::Checkout {
@@ -2585,7 +2598,19 @@ fn checkpoint(instance: Option<String>, message: Option<&str>) -> Result<()> {
     }
     if let Some(link) = manager.remote_link() {
         match &outcome.sync_error {
-            None => println!("  remote:   synced to {}", link.project),
+            None if outcome.left_out.is_empty() => {
+                println!("  remote:   synced to {}", link.project)
+            }
+            None => println!(
+                "  remote:   synced to {}, without {} (the warning above says why)",
+                link.project,
+                outcome
+                    .left_out
+                    .iter()
+                    .map(|name| format!("`{name}`"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
             Some(_) => println!("  remote:   not synced (the warning above says why)"),
         }
     }
