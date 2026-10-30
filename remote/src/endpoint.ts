@@ -10,6 +10,11 @@
 // snapshot, so a cold fetch costs a restore, not a re-clone
 // (docs/design/remote.md, *Measurements*). The runtime's inactivity timeout
 // is the backstop, in case the alarm never runs.
+//
+// A snapshot is the whole container, the `newgit` binary included, and the
+// views it composed. So a snapshot, or a running container, from an image
+// other than the one deployed now is dropped: otherwise a deploy would never
+// reach a project whose endpoint had been snapshotted.
 
 import { DurableObject } from "cloudflare:workers";
 
@@ -43,6 +48,26 @@ const BUSY_RETRY_MS = 60_000;
 
 export const PLAN_HEADER = "x-newgit-plan";
 
+export type StartDecision = "running" | "replace" | "from-snapshot" | "from-image";
+
+/**
+ * How to get a container on `image`, the one deployed now. Pure, so the tests
+ * can check it without a container. A container from another image is
+ * replaced unless another response is still streaming from it (`inFlight`
+ * counts this request too); the next request replaces it then.
+ */
+export function decideStart(state: {
+	image: string;
+	running: boolean;
+	runningImage?: string;
+	inFlight: number;
+	snapshot?: string;
+	snapshotImage?: string;
+}): StartDecision {
+	if (state.running) return state.runningImage === state.image || state.inFlight > 1 ? "running" : "replace";
+	return state.snapshot && state.snapshotImage === state.image ? "from-snapshot" : "from-image";
+}
+
 export type SleepDecision = "not-running" | "busy" | "too-soon" | "snapshot-then-stop" | "stop";
 
 /** What the idle alarm should do. Pure, so the tests can check it without a container. */
@@ -70,6 +95,8 @@ export class GitEndpoint extends DurableObject<Env> {
 	 * constructor that failed every request the object ever got.
 	 */
 	private backstopSet = false;
+	/** The start under way, which concurrent requests share. */
+	private starting?: Promise<Container>;
 
 	private async sleepDecision(): Promise<SleepDecision> {
 		const storage = this.ctx.storage;
@@ -125,22 +152,49 @@ export class GitEndpoint extends DurableObject<Env> {
 		return container;
 	}
 
-	/** Start the container — from its last snapshot when there is one. */
-	private async startContainer(): Promise<Container> {
+	/**
+	 * Start the container — from its last snapshot when that was taken on the
+	 * image deployed now. One start at a time: a request arriving while another
+	 * replaces or starts the container waits for that, rather than starting it
+	 * twice or using it before it is up.
+	 */
+	private startContainer(): Promise<Container> {
+		this.starting ??= this.bringUp().finally(() => {
+			this.starting = undefined;
+		});
+		return this.starting;
+	}
+
+	private async bringUp(): Promise<Container> {
 		const container = this.container();
-		if (container.running) return container;
+		const storage = this.ctx.storage;
+		const image = container.images.endpoint;
+		let decision = decideStart({
+			image,
+			running: container.running,
+			runningImage: await storage.get<string>("running_image"),
+			inFlight: this.inFlight,
+			snapshot: await storage.get<string>("snapshot"),
+			snapshotImage: await storage.get<string>("snapshot_image"),
+		});
+		if (decision === "running") return container;
+		if (decision === "replace") {
+			await container.destroy("replaced by a deploy");
+			decision = (await storage.get<string>("snapshot_image")) === image ? "from-snapshot" : "from-image";
+		}
 		this.backstopSet = false;
-		const snapshot = await this.ctx.storage.get<string>("snapshot");
-		const image = { image: container.images.endpoint, enableInternet: true } as const;
-		if (snapshot) {
+		const snapshot = await storage.get<string>("snapshot");
+		await storage.put("running_image", image);
+		if (decision === "from-snapshot" && snapshot) {
 			try {
 				container.start({ containerSnapshot: { id: snapshot }, enableInternet: true });
 			} catch {
-				await this.ctx.storage.delete("snapshot");
-				container.start(image);
+				await storage.delete(["snapshot", "snapshot_image"]);
+				container.start({ image, enableInternet: true });
 			}
 		} else {
-			container.start(image);
+			await storage.delete(["snapshot", "snapshot_image"]);
+			container.start({ image, enableInternet: true });
 		}
 		const deadline = Date.now() + 60_000;
 		for (;;) {
@@ -153,7 +207,7 @@ export class GitEndpoint extends DurableObject<Env> {
 			if (Date.now() > deadline) {
 				// A snapshot that cannot come up is dropped, so the next
 				// request starts from the image instead of failing forever.
-				await this.ctx.storage.delete("snapshot");
+				await this.ctx.storage.delete(["snapshot", "snapshot_image"]);
 				await container.destroy().catch(() => {});
 				throw new Error("the Git endpoint's container did not start");
 			}
@@ -164,8 +218,9 @@ export class GitEndpoint extends DurableObject<Env> {
 	/** Snapshot the container now; `snapshot_at` is when it began, so a compose during it is not missed. */
 	private async takeSnapshot(): Promise<void> {
 		const startedAt = Date.now();
+		const image = await this.ctx.storage.get<string>("running_image");
 		const snapshot = await this.container().snapshotContainer({ name: "endpoint" });
-		await this.ctx.storage.put({ snapshot: snapshot.id, snapshot_at: startedAt });
+		await this.ctx.storage.put({ snapshot: snapshot.id, snapshot_image: image, snapshot_at: startedAt });
 	}
 
 	private async snapshotSoon(): Promise<void> {

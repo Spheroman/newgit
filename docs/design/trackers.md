@@ -478,7 +478,10 @@ from it, so `git pull` shows `main`. Each person's view holds only what they
 may read, enforced by the server; nothing is pre-built, so nothing is
 rebuilt on merge. When the sandbox goes idle, an alarm snapshots its tracker
 repos and composed views (if anything was composed since the last snapshot)
-and then stops it, so a cold start restores rather than re-clones. Read-only
+and then stops it, so a cold start restores rather than re-clones. A
+snapshot is the whole container, the `newgit` binary included, so one taken
+on an earlier image is dropped and the next start is from the image: a
+deploy reaches every project, at the cost of one re-clone each. Read-only
 in step 3d: pushes go through a newgit workspace, which splits locally.
 
 Why a sandbox and not the Worker: a Worker cannot run Git, and composing in
