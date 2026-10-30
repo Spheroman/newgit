@@ -279,12 +279,14 @@ impl Supervisor {
         let Some(pid) = self.running_pid(resource) else {
             return Ok(StopOutcome::NotRunning);
         };
+        let parsed = parse_signal(signal)?;
 
         // Before the signal, so the wrapper finds it when the command ends.
         let stopping = self.stopping_path(resource);
         std::fs::write(&stopping, format!("{signal}\n"))
             .map_err(|source| NewgitError::io(stopping, source))?;
-        signal_group(pid, signal)?;
+        let mut signalled = Vec::new();
+        signal_group(pid, parsed, &mut signalled)?;
         for _ in 0..50 {
             if !group_alive(pid) {
                 self.mark_stopped(resource)?;
@@ -292,6 +294,8 @@ impl Supervisor {
                 return Ok(StopOutcome::Stopped(pid));
             }
             std::thread::sleep(Duration::from_millis(100));
+            // Whatever joined the group since the last sweep.
+            signal_group(pid, parsed, &mut signalled)?;
         }
         Ok(StopOutcome::StillRunning(pid))
     }
@@ -413,17 +417,74 @@ fn reap_group(pid: u32) {
     }
 }
 
-fn signal_group(pid: u32, signal: &str) -> Result<()> {
-    let parsed = parse_signal(signal)?;
-    let group = Pid::from_raw(pid as i32);
-    match signal::killpg(group, parsed) {
-        // Already gone is the outcome `stop` wanted, not a failure.
-        Ok(()) | Err(Errno::ESRCH) => Ok(()),
-        Err(errno) => Err(NewgitError::SourceCommand {
-            command: format!("killpg(-{pid}, {parsed})"),
-            stderr: errno.to_string(),
-        }),
+/// Send `signal` to every process in the group led by `pid` that is not in
+/// `signalled` yet, and add it there. `stop` calls this again on every poll.
+///
+/// One `killpg` is enough on Linux, which holds back a fork that a group
+/// signal lands in the middle of and retries it once the signal is handled.
+/// macOS does not: a child still being forked when the signal goes out
+/// joins the group just after it and never gets it, while its parent dies.
+/// For the wrapper, that child is the command itself, which then lives on
+/// orphaned while `stop` waits out its timeout. Dropping the wrapper's trap
+/// (#288) made that rarer but did not close it, and a command that forks
+/// (`npm run dev` starting node) has the same window. So on macOS each
+/// member is signalled by pid, and each sweep catches what joined since the
+/// last one. Every process still gets the signal once, as under `killpg`,
+/// so a command that takes a second SIGTERM as "force quit" sees no change.
+fn signal_group(pid: u32, signal: Signal, signalled: &mut Vec<u32>) -> Result<()> {
+    let Some(members) = group_members(pid) else {
+        if signalled.contains(&pid) {
+            return Ok(());
+        }
+        signalled.push(pid);
+        return match signal::killpg(Pid::from_raw(pid as i32), signal) {
+            // Already gone is the outcome `stop` wanted, not a failure.
+            Ok(()) | Err(Errno::ESRCH) => Ok(()),
+            Err(errno) => Err(NewgitError::SourceCommand {
+                command: format!("killpg(-{pid}, {signal})"),
+                stderr: errno.to_string(),
+            }),
+        };
+    };
+    for member in members {
+        if signalled.contains(&member) {
+            continue;
+        }
+        signalled.push(member);
+        // ESRCH: it exited since the listing. EPERM: alive but not ours to
+        // signal, which `group_alive` still counts, so `stop` says so.
+        let _ = signal::kill(Pid::from_raw(member as i32), signal);
     }
+    Ok(())
+}
+
+/// The pids in process group `pgid`, where `signal_group` needs them, or
+/// `None` to leave the group to one `killpg`. `pgrep` rather than
+/// `proc_listpgrppids`, which would take the workspace's only `unsafe`.
+#[cfg(target_os = "macos")]
+fn group_members(pgid: u32) -> Option<Vec<u32>> {
+    let output = Command::new("pgrep")
+        .args(["-g", &pgid.to_string()])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    // 1 is "nothing matched": the group is gone, and there is nobody to
+    // signal. Anything else, `pgrep` could not tell us.
+    if !matches!(output.status.code(), Some(0 | 1)) {
+        return None;
+    }
+    Some(
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter_map(|line| line.trim().parse().ok())
+            .collect(),
+    )
+}
+
+#[cfg(not(target_os = "macos"))]
+fn group_members(_pgid: u32) -> Option<Vec<u32>> {
+    None
 }
 
 /// Accept what a user would write in a resource definition: `term`, `TERM`,
@@ -724,14 +785,53 @@ mod tests {
             }
             std::thread::sleep(Duration::from_millis(100));
         }
-        let _ = signal_group(pid, "kill");
+        let _ = signal_group(pid, Signal::SIGKILL, &mut Vec::new());
         assert!(gone, "the command started after the stop, out of its reach");
+    }
+
+    /// What macOS does to a fork a group signal lands in the middle of: the
+    /// child joins the group after the signal and never gets it. The next
+    /// sweep must catch it — and only it, since the leader already had its
+    /// signal. Here the leader ignores TERM so the group outlives the first
+    /// sweep, and the late member is put into the group by hand.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_process_that_joins_the_group_after_the_signal_gets_it_on_the_next_sweep() {
+        use std::os::unix::process::CommandExt as _;
+        let mut leader = Command::new("sh")
+            .args(["-c", "trap '' TERM; exec sleep 30"])
+            .process_group(0)
+            .spawn()
+            .expect("spawn leader");
+        let pid = leader.id();
+        // Until the trap is set, TERM would kill the leader.
+        std::thread::sleep(Duration::from_millis(300));
+
+        let mut signalled = Vec::new();
+        signal_group(pid, Signal::SIGTERM, &mut signalled).expect("first sweep");
+        assert_eq!(signalled, [pid]);
+
+        let mut late = Command::new("sleep")
+            .arg("30")
+            .process_group(pid as i32)
+            .spawn()
+            .expect("spawn late member");
+        signal_group(pid, Signal::SIGTERM, &mut signalled).expect("second sweep");
+        assert_eq!(signalled, [pid, late.id()]);
+        let status = late.wait().expect("wait late member");
+
+        let _ = signal_group(pid, Signal::SIGKILL, &mut Vec::new());
+        let _ = leader.wait();
+        assert!(
+            !status.success(),
+            "the late member was signalled, not left to run: {status}"
+        );
     }
 
     /// Signalling a group that is already gone is the outcome `stop` wanted.
     #[test]
     fn signalling_a_dead_group_is_not_an_error() {
-        assert!(signal_group(999_999, "term").is_ok());
+        assert!(signal_group(999_999, Signal::SIGTERM, &mut Vec::new()).is_ok());
         assert!(!group_alive(999_999));
     }
 
