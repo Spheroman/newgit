@@ -10,8 +10,9 @@ newgit run --on devbox -- claude ...
 
 A **host** is where an instance runs: this machine, a machine reachable over
 SSH (or a tailnet), or a Cloudflare sandbox. Three backends for one concept.
-Whether the Cloudflare backend is a host at all, or the container remote
-replacing the `preview` role, is open (#229); see [remote.md](remote.md).
+A review can also place one tracker's resources on another machine while
+the rest run here (#229; *Reviewing a change* in [remote.md](remote.md));
+a host is the natural target for that placement, as the preview sandbox is.
 The motivating case: steer eight agents from a laptop while they run on a
 desktop, and open their dev servers in the laptop's browser.
 
