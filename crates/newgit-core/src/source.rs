@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::process::Command;
 
 use camino::{Utf8Path, Utf8PathBuf};
@@ -690,6 +691,32 @@ impl GitSource {
         run_git(&args).map(|_| ())
     }
 
+    /// The paths among `paths` that a workspace clone's index holds. A record
+    /// of what was rendered can outlive a file's place there (a commit that
+    /// deletes it), and [`Self::workspace_skip_worktree`] marks none of a
+    /// list that names one path the index does not hold.
+    pub fn workspace_indexed(
+        workspace: &Utf8Path,
+        paths: &[Utf8PathBuf],
+    ) -> Result<Vec<Utf8PathBuf>> {
+        if paths.is_empty() {
+            return Ok(Vec::new());
+        }
+        let pathspecs: Vec<String> = paths
+            .iter()
+            .map(|path| format!(":(literal){path}"))
+            .collect();
+        let mut args = vec!["-C", workspace.as_str(), "ls-files", "-z", "--"];
+        args.extend(pathspecs.iter().map(String::as_str));
+        let listing = run_git(&args)?;
+        let indexed: BTreeSet<&str> = listing.split('\0').collect();
+        Ok(paths
+            .iter()
+            .filter(|path| indexed.contains(path.as_str()))
+            .cloned()
+            .collect())
+    }
+
     /// Snapshot uncommitted and untracked (non-ignored) workspace state as a
     /// dangling commit on top of HEAD, without touching HEAD, the real
     /// index, or the worktree. Returns `None` when the worktree is clean.
@@ -703,6 +730,12 @@ impl GitSource {
     /// HEAD does not, so without this `git add -A` would sweep the instance's
     /// rendered ports into the checkpoint — the one place skip-worktree does
     /// not protect on its own.
+    ///
+    /// In a sparse checkout, Git clears that bit from every file it finds on
+    /// disk as it reads an index, unless `sparse.expectFilesOutsideOfPatterns`
+    /// is set. The workspace sets it (`BranchManager::apply_sparse`); this
+    /// sets it again for each `git add -A`, so the marks hold here even in a
+    /// workspace that does not yet.
     ///
     /// `left_out` is what the binding leaves out of the working tree, and
     /// `put_back` the bound paths nested in it (see
@@ -729,19 +762,31 @@ impl GitSource {
             args.extend(rendered.iter().map(|path| path.as_str()));
             run_git_env(&args, &env)?;
         }
+        let add_all = [
+            "-C",
+            ws,
+            "-c",
+            "sparse.expectFilesOutsideOfPatterns=true",
+            "add",
+            "-A",
+        ];
         // Named rather than left to the sparse checkout, outside which `git
         // add -A` skips an edited file without a word and fails on a new one.
         let excluded: Vec<String> = left_out
             .iter()
             .map(|path| format!(":(exclude,literal){path}"))
             .collect();
-        let mut add = vec!["-C", ws, "add", "-A", "--", "."];
+        let mut add = add_all.to_vec();
+        add.extend(["--", "."]);
         add.extend(excluded.iter().map(String::as_str));
         run_git_env(&add, &env)?;
         // That took a bound tracker nested in a dropped one out too, though
         // it is back in the working tree. `git add` refuses a path that
         // matches nothing, so one with nothing on disk or at HEAD — nothing
-        // to snapshot — is not named.
+        // to snapshot — is not named. It also refuses one that matches only
+        // skip-worktree files, as a nested tracker with nothing but a
+        // rendered file does, unless given `--sparse`; a marked file stays
+        // skipped all the same.
         let nested: Vec<String> = put_back
             .iter()
             .filter(|path| {
@@ -751,7 +796,8 @@ impl GitSource {
             .map(|path| format!(":(literal){path}"))
             .collect();
         if !nested.is_empty() {
-            let mut add = vec!["-C", ws, "add", "-A", "--"];
+            let mut add = add_all.to_vec();
+            add.extend(["--sparse", "--"]);
             add.extend(nested.iter().map(String::as_str));
             run_git_env(&add, &env)?;
         }
@@ -782,6 +828,13 @@ impl GitSource {
     /// What `git status` reports under `paths` and outside `except` in a
     /// workspace clone: changed tracked files, and untracked (non-ignored)
     /// ones, a directory with nothing tracked in it as one entry.
+    ///
+    /// Read as Git reads it without `sparse.expectFilesOutsideOfPatterns`,
+    /// which the workspace sets (`BranchManager::apply_sparse`): with it, a
+    /// file the sparse checkout leaves out keeps its skip-worktree bit when
+    /// something writes it again, and `git status` does not report it.
+    /// `--no-optional-locks` keeps the bits that read clears, rendered files'
+    /// among them, from being written back to the index.
     pub fn workspace_changes(
         workspace: &Utf8Path,
         paths: &[&Utf8Path],
@@ -802,6 +855,9 @@ impl GitSource {
         let mut args = vec![
             "-C",
             workspace.as_str(),
+            "--no-optional-locks",
+            "-c",
+            "sparse.expectFilesOutsideOfPatterns=false",
             "status",
             "--porcelain=v2",
             "-z",

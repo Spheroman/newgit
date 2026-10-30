@@ -772,6 +772,10 @@ into a path the project owns. Four places they must not reach:
 - **`git status` and `git commit`.** Rendered files Git tracks are marked
   `--skip-worktree` in the workspace, so `git add -A` cannot commit this
   instance's port. It is the same job `info/exclude` does for tracker paths.
+  While the binding leaves a code tracker's paths out, the workspace is a
+  sparse checkout, which works that bit out from its patterns, so they leave
+  the rendered files out too, and `sparse.expectFilesOutsideOfPatterns`
+  keeps Git from clearing it on a file it finds on disk.
 - **`newgit export`**, which copies tracked files as they stand on disk.
   It takes rendered paths from `HEAD` instead.
 - **Tracker captures.** A tracker-owned file cannot be skipped: the tracker

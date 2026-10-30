@@ -349,11 +349,16 @@ fn a_rendered_file_in_a_dropped_trackers_paths_is_not_named() {
     let (_guard, temp) = tempdir();
     let manager = setup(&temp, &[("b", "apps/b")], &[("svc", RENDERS_INTO_B)]);
     let workspace = dropped_b(&manager);
-    // The render stays on disk, and Git, with the sparse checkout on, takes
-    // its skip-worktree bit off: it reports this instance's port as a change.
+    // The render stays on disk and skip-worktree, out of `git status`. What
+    // a checkpoint names is read past that bit, as a dropped tracker's file
+    // written again needs, and that sees this instance's port as a change.
+    assert_eq!(
+        git(&workspace, &["ls-files", "-t", "--", "apps/b/config.toml"]),
+        "S apps/b/config.toml"
+    );
     assert_eq!(
         git(&workspace, &["status", "--porcelain", "--", "apps/b"]),
-        " M apps/b/config.toml"
+        ""
     );
 
     let checkpoint = manager.checkpoint("x", None).expect("checkpoint");

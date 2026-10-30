@@ -3450,6 +3450,11 @@ impl BranchManager {
         if let Some(binding) = branch.resources.get_mut(&definition.name) {
             binding.rendered = records;
         }
+        // While the workspace is a sparse checkout, its patterns decide
+        // those marks (see `apply_sparse`), so they take these in.
+        if !source_owned.is_empty() && !self.sparse_patterns(&branch.dropped).is_empty() {
+            self.apply_sparse(branch)?;
+        }
         Ok(outcomes)
     }
 
@@ -3810,9 +3815,10 @@ impl BranchManager {
     /// checkpoint taken while those trackers are dropped holds none of it.
     ///
     /// Rendered files aside: they are kept out of snapshots by design, undo
-    /// renders them again, and `render_drift` names an edit to one. With
-    /// sparse checkout on, Git takes the skip-worktree bit off a file on
-    /// disk, so it reports one under a dropped tracker's paths as changed
+    /// renders them again, and `render_drift` names an edit to one.
+    /// `workspace_changes` looks past the skip-worktree bit of a file on
+    /// disk, which is how it sees a dropped tracker's file written again,
+    /// so it would report one under a dropped tracker's paths as changed
     /// all the same.
     fn changes_left_out(
         &self,
@@ -5313,12 +5319,45 @@ impl BranchManager {
     /// The working tree follows the binding: every dropped code tracker's
     /// paths left out (Git's sparse checkout), with any bound tracker nested
     /// inside one put back.
+    ///
+    /// The sparse checkout also decides the skip-worktree bit that keeps a
+    /// rendered file out of `git status` and `git add -A`: `set` and
+    /// `disable` work every file's bit out again from the patterns, and so
+    /// do Git commands that update the working tree (`reset --hard`,
+    /// `stash`, `checkout`). So the patterns leave the rendered files out
+    /// too, after everything else, and `disable` is followed by marking them
+    /// again. Git clears the bit of a marked file on disk that the patterns
+    /// leave out whenever it reads the index, unless
+    /// `sparse.expectFilesOutsideOfPatterns` says such files are expected.
+    /// The marks go on before `set`, which deletes a file it newly leaves
+    /// out if the file holds what the index does.
     fn apply_sparse(&self, branch: &BranchInstance) -> Result<()> {
         let workspace = branch.workspace_path.as_str();
-        let patterns = self.sparse_patterns(&branch.dropped);
+        let rendered = GitSource::workspace_indexed(
+            &branch.workspace_path,
+            &self.rendered_source_paths(branch),
+        )?;
+        let mut patterns = self.sparse_patterns(&branch.dropped);
         if patterns.is_empty() {
             crate::source::run_git_env(&["-C", workspace, "sparse-checkout", "disable"], &[])?;
-            return Ok(());
+            return GitSource::workspace_skip_worktree(&branch.workspace_path, &rendered);
+        }
+        crate::source::run_git_env(
+            &[
+                "-C",
+                workspace,
+                "config",
+                "sparse.expectFilesOutsideOfPatterns",
+                "true",
+            ],
+            &[],
+        )?;
+        GitSource::workspace_skip_worktree(&branch.workspace_path, &rendered)?;
+        // Here rather than in `sparse_patterns`, which also keys installs
+        // (`install_binding`): a rendered file stays on disk either way, so
+        // what an install reads is the same.
+        for path in &rendered {
+            patterns.push(format!("!/{path}"));
         }
         let mut args = vec!["-C", workspace, "sparse-checkout", "set", "--no-cone"];
         args.extend(patterns.iter().map(String::as_str));
