@@ -12,8 +12,8 @@ use newgit_core::store::MetadataStore;
 
 #[path = "support/supabase.rs"]
 mod supabase_stub;
-use supabase_stub::add_supabase_without_starting_it;
 use newgit_core::templates::{instantiate, resource_template};
+use supabase_stub::add_supabase_without_starting_it;
 
 /// A trimmed config: no `[inbucket]`, no `[analytics]`.
 const TRIMMED_CONFIG: &str = r#"project_id = "EDIT_ME_PROJECT"
