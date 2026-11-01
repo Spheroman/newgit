@@ -13,6 +13,10 @@ use newgit_core::SourceSubstrate;
 use newgit_core::manager::BranchManager;
 use newgit_core::store::MetadataStore;
 
+#[path = "support/supabase.rs"]
+mod supabase_stub;
+use supabase_stub::add_supabase_without_starting_it;
+
 /// `supabase init` output from CLI 2.111.0, verbatim apart from `project_id`.
 /// A hand-trimmed fixture is how #205 survived its first fix: it left out the
 /// commented `# smtp_port = 54325`, which `port = 54325` matches inside.
@@ -78,10 +82,7 @@ fn every_port_supabase_init_writes_is_one_the_template_renders() {
     let store = setup(&temp);
     let repo = store.paths().project_root.clone();
 
-    BranchManager::open(MetadataStore::at(repo.clone()))
-        .expect("manager")
-        .add_resource("supabase", "supabase")
-        .expect("add supabase");
+    add_supabase_without_starting_it(&repo);
 
     let definitions = MetadataStore::at(repo)
         .load_resource_definitions()
@@ -114,10 +115,7 @@ fn a_second_supabase_instance_renders_against_supabase_init_output() {
     let store = setup(&temp);
     let repo = store.paths().project_root.clone();
 
-    BranchManager::open(MetadataStore::at(repo.clone()))
-        .expect("manager")
-        .add_resource("supabase", "supabase")
-        .expect("add supabase");
+    add_supabase_without_starting_it(&repo);
 
     let manager = BranchManager::open(MetadataStore::at(repo)).expect("reopen");
     let first = manager.spawn("feature-a", None).expect("spawn a");

@@ -9,6 +9,10 @@ use camino::{Utf8Path, Utf8PathBuf};
 use newgit_core::SourceSubstrate;
 use newgit_core::manager::BranchManager;
 use newgit_core::store::MetadataStore;
+
+#[path = "support/supabase.rs"]
+mod supabase_stub;
+use supabase_stub::add_supabase_without_starting_it;
 use newgit_core::templates::{instantiate, resource_template};
 
 /// A trimmed config: no `[inbucket]`, no `[analytics]`.
@@ -72,10 +76,7 @@ fn a_config_missing_a_section_fails_the_bind_and_says_why() {
     let store = setup(&temp, "supabase/config.toml", TRIMMED_CONFIG);
     let repo = store.paths().project_root.clone();
 
-    BranchManager::open(MetadataStore::at(repo.clone()))
-        .expect("manager")
-        .add_resource("supabase", "supabase")
-        .expect("add supabase");
+    add_supabase_without_starting_it(&repo);
 
     let spawned = BranchManager::open(MetadataStore::at(repo))
         .expect("reopen")
