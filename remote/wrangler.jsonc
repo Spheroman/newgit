@@ -45,5 +45,7 @@
     "LANDING_PAGE": { "project": "spheroman/newgit", "tracker": "site", "path": "remote/site/index.html" }
   }
   // Secrets: TOKEN_KEY (signs newgit tokens), ALLOWED_LOGINS (who may use
-  // this remote; unset admits no one).
+  // this remote; unset admits no one), BLOCKED_LOGINS (who may not, even
+  // under `*`), ADMIN_LOGINS (may delete any project, and are not capped),
+  // PROJECTS_PER_LOGIN (unset is 5). See docs/design/remote.md, *Identity And Tokens*.
 }

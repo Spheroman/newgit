@@ -178,13 +178,13 @@ export async function pollDeviceFlow(
 }
 
 /**
- * Whether `login` may use this remote at all. `allowed` is the
- * `ALLOWED_LOGINS` secret: GitHub logins separated by commas or whitespace,
- * or `*` for anyone. Unset admits no one, so a deployment that forgot it is
- * closed rather than open to every GitHub account.
+ * Whether `list` names `login`. Lists are the `*_LOGINS` secrets: GitHub
+ * logins separated by commas or whitespace, or `*` for anyone. An unset
+ * list names no one, so a deployment that forgot `ALLOWED_LOGINS` is closed
+ * rather than open to every GitHub account.
  */
-export function invited(allowed: string | undefined, login: string): boolean {
-	const entries = (allowed ?? "")
+export function listed(list: string | undefined, login: string): boolean {
+	const entries = (list ?? "")
 		.split(/[\s,]+/)
 		.map((entry) => entry.trim().toLowerCase())
 		.filter(Boolean);

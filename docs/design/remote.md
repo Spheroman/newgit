@@ -50,7 +50,9 @@ this repository is `spheroman/newgit` on newgit.dev, and GitHub's
 
 - GitHub login (device flow), project members, and a recorded,
   individually revocable token for every login, agent, and instance.
-- Invite-only: only the GitHub logins in `ALLOWED_LOGINS` may use it.
+- Open to any GitHub account (`ALLOWED_LOGINS = "*"`, since 2026-11-02),
+  with guardrails: at most `PROJECTS_PER_LOGIN` projects per login,
+  `BLOCKED_LOGINS` shut out, and `ADMIN_LOGINS` able to delete any project.
 - `newgit remote add`: a project as `<owner>/<name>`, one Artifacts repo per
   code tracker, seeded with its history; branch `main`. `newgit remote show
   [--json]` names the project and its members.
@@ -256,7 +258,7 @@ which only the project's owner may run, and only from their login (an
 agent's or instance's token is refused). The creator is the first member
 and cannot be removed.
 
-**Invite-only (decided).** Who may use a remote at all is the Worker's
+**Who may use it (decided).** Who may use a remote at all is the Worker's
 `ALLOWED_LOGINS` secret: GitHub logins separated by commas or whitespace, or
 `*` for anyone. Unset admits no one, so a deployment that forgot it is
 closed, not open to every GitHub account. It is checked at login and on
@@ -267,6 +269,21 @@ until they expire (≤ 15 min). Changing it is `wrangler secret put
 ALLOWED_LOGINS`; no deploy is needed. Being on the list grants nothing in
 any project: membership still decides that, and adding a member who is not
 on the list gives them nothing until they are.
+
+newgit.dev runs with `*`, so three more secrets, in the same format and
+changed the same way, keep an open remote affordable and cleanable:
+
+- `BLOCKED_LOGINS`: shut out even under `*`, checked on every request, so
+  it cuts off an abuser's tokens as removing them from the list would.
+- `PROJECTS_PER_LOGIN`: how many projects one login may own (unset is 5).
+  Counted in that login's UserDO when a project is created and released
+  when it is deleted; projects made before the count existed are not in it.
+- `ADMIN_LOGINS`: the operators. They are not capped, and may delete any
+  project, member or not, which is the only takedown there is.
+
+Nothing caps instances, forks, or storage within a project yet; the cap on
+projects bounds the number of Git endpoint containers and repos per login,
+not their size.
 
 **Every workspace gets its own token, automatically** (decided). Nobody
 creates tokens by hand in the normal flow:

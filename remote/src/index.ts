@@ -13,7 +13,7 @@ import {
 	AGENT_TTL_MAX_SECONDS,
 	AGENT_TTL_SECONDS,
 	LOGIN_TTL_SECONDS,
-	invited,
+	listed,
 	type NewToken,
 	pollDeviceFlow,
 	signToken,
@@ -230,15 +230,24 @@ async function route(request: Request, env: Env, deps: Deps): Promise<Response> 
 			throw new HttpError(400, "trackers is required: the code trackers whose repos to create (root, project, …)");
 		for (const tracker of trackers) requirePart("tracker name", tracker);
 		const id: ProjectId = { owner: login, name };
+		const key = projectKey(id);
 		const project = projectStub(env, id);
-		if (!(await project.init(name, login)))
-			throw new HttpError(409, `project \`${projectKey(id)}\` already exists`);
+		const owner = userStub(env, login);
+		if (!listed(env.ADMIN_LOGINS, login)) {
+			const cap = projectCap(env);
+			if (!(await owner.claimProject(key, cap)))
+				throw new HttpError(
+					403,
+					`${login} already owns ${cap} projects, the most one login may on this remote: delete one with \`newgit remote delete\``,
+				);
+		}
+		if (!(await project.init(name, login))) throw new HttpError(409, `project \`${key}\` already exists`);
 		// The one write to a code tracker's repo outside a merge: the creator's
 		// initial push of its history. Only here, only once, only briefly.
 		const seeds = [];
 		for (const tracker of trackers) seeds.push(await seed(env, deps, caller, { kind: "tracker", project: id, tracker }));
 		return json(
-			{ owner: login, name, key: projectKey(id), endpoint: endpointUrl(url, id), seeds },
+			{ owner: login, name, key, endpoint: endpointUrl(url, id), seeds },
 			201,
 		);
 	}
@@ -270,6 +279,27 @@ async function route(request: Request, env: Env, deps: Deps): Promise<Response> 
 		return json(await credential(env, deps, project, info.defaultBranch, ref, scope, caller, member));
 	}
 
+	// Deleting a project takes everything with it. Its record goes first, so
+	// every request after this one finds no project; then the tokens pinned
+	// to it; then its repos, and with each repo every password minted for it.
+	if (method === "DELETE" && rest === "") {
+		requireHuman(caller, "delete projects");
+		// An admin may too, member or not, so the operator can take down what
+		// should not be here.
+		if (!listed(env.ADMIN_LOGINS, login)) requireOwner(info.owner, login, `delete ${key}`);
+		const holders = new Set([
+			...(await project.members()).map((m) => m.login),
+			...(await project.instances()).map((i) => i.owner),
+		]);
+		await project.destroy();
+		await userStub(env, info.owner).releaseProject(key);
+		for (const holder of holders) await revokeRepoTokens(deps, await userStub(env, holder).revokeProject(key));
+		// Parts never contain dots, so this prefix is this project's and no other's.
+		const names = await deps.repos.names(`${id.owner}.${id.name}.`);
+		for (const name of names) await deps.repos.delete(name);
+		return json({ key, deleted: true, repos_deleted: names.length });
+	}
+
 	if (!member) throw new HttpError(403, `${login} is not a member of ${key}`);
 
 	if (method === "GET" && rest === "") {
@@ -280,24 +310,6 @@ async function route(request: Request, env: Env, deps: Deps): Promise<Response> 
 			members: await project.members(),
 			branches: await project.branches(),
 		});
-	}
-
-	// Deleting a project takes everything with it. Its record goes first, so
-	// every request after this one finds no project; then the tokens pinned
-	// to it; then its repos, and with each repo every password minted for it.
-	if (method === "DELETE" && rest === "") {
-		requireHuman(caller, "delete projects");
-		requireOwner(info.owner, login, `delete ${key}`);
-		const holders = new Set([
-			...(await project.members()).map((m) => m.login),
-			...(await project.instances()).map((i) => i.owner),
-		]);
-		await project.destroy();
-		for (const holder of holders) await revokeRepoTokens(deps, await userStub(env, holder).revokeProject(key));
-		// Parts never contain dots, so this prefix is this project's and no other's.
-		const names = await deps.repos.names(`${id.owner}.${id.name}.`);
-		for (const name of names) await deps.repos.delete(name);
-		return json({ key, deleted: true, repos_deleted: names.length });
 	}
 
 	// ── Members ────────────────────────────────────────────────────────────
@@ -957,8 +969,16 @@ async function callerFor(token: string, env: Env): Promise<Caller> {
 function requireInvited(env: Env, login: string) {
 	if (!env.ALLOWED_LOGINS)
 		throw new HttpError(503, "this remote admits no one yet: its operator has not set ALLOWED_LOGINS (`*` for anyone)");
-	if (!invited(env.ALLOWED_LOGINS, login))
+	if (!listed(env.ALLOWED_LOGINS, login))
 		throw new HttpError(403, `this remote is invite-only, and GitHub user \`${login}\` is not invited`);
+	if (listed(env.BLOCKED_LOGINS, login))
+		throw new HttpError(403, `GitHub user \`${login}\` is blocked from this remote`);
+}
+
+/** How many projects one login may own: `PROJECTS_PER_LOGIN`, 5 when unset. */
+function projectCap(env: Env): number {
+	const cap = Number.parseInt(env.PROJECTS_PER_LOGIN ?? "", 10);
+	return Number.isFinite(cap) && cap >= 0 ? cap : 5;
 }
 
 /** Sign a token and record it with its user, so it can later be revoked. */

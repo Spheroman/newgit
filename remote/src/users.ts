@@ -46,6 +46,9 @@ export class UserDO extends DurableObject<Env> {
 				token_id TEXT NOT NULL, repo TEXT NOT NULL, artifacts_id TEXT NOT NULL, expires_at TEXT NOT NULL,
 				PRIMARY KEY (token_id, artifacts_id));
 		`);
+		// The projects this login owns, so the remote can cap how many one
+		// login makes. Projects made before this table existed are not here.
+		this.sql.exec(`CREATE TABLE IF NOT EXISTS projects (key TEXT PRIMARY KEY, created_at TEXT NOT NULL);`);
 		const columns = this.sql.exec<{ name: string }>("PRAGMA table_info(tokens)").toArray();
 		if (!columns.some((column) => column.name === "instance")) this.sql.exec("ALTER TABLE tokens ADD COLUMN instance TEXT");
 	}
@@ -114,6 +117,24 @@ export class UserDO extends DurableObject<Env> {
 			.toArray()
 			.map((row) => row.id);
 		return ids.flatMap((id) => this.revoke(id).repoTokens);
+	}
+
+	/**
+	 * Count `key` among this login's projects, unless that would make more
+	 * than `cap`. Runs inside the Durable Object, so two creations at once
+	 * cannot both slip under the cap.
+	 */
+	claimProject(key: string, cap: number): boolean {
+		if (this.sql.exec("SELECT 1 FROM projects WHERE key = ?", key).toArray().length > 0) return true;
+		const { owned } = this.sql.exec<{ owned: number }>("SELECT COUNT(*) AS owned FROM projects").one();
+		if (owned >= cap) return false;
+		this.sql.exec("INSERT OR IGNORE INTO projects (key, created_at) VALUES (?, ?)", key, new Date().toISOString());
+		return true;
+	}
+
+	/** Stop counting `key`: it was deleted, or never made. */
+	releaseProject(key: string): void {
+		this.sql.exec("DELETE FROM projects WHERE key = ?", key);
 	}
 
 	/**
