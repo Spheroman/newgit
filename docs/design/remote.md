@@ -53,6 +53,8 @@ this repository is `spheroman/newgit` on newgit.dev, and GitHub's
 - Open to any GitHub account (`ALLOWED_LOGINS = "*"`, since 2026-11-02),
   with guardrails: at most `PROJECTS_PER_LOGIN` projects per login,
   `BLOCKED_LOGINS` shut out, and `ADMIN_LOGINS` able to delete any project.
+- A spend kill switch: an hourly cron pauses the remote for everyone but
+  its admins while the last 7 days' bill is over `SPEND_LIMIT_WEEKLY_USD`.
 - `newgit remote add`: a project as `<owner>/<name>`, one Artifacts repo per
   code tracker, seeded with its history; branch `main`. `newgit remote show
   [--json]` names the project and its members.
@@ -284,6 +286,26 @@ changed the same way, keep an open remote affordable and cleanable:
 Nothing caps instances, forks, or storage within a project yet; the cap on
 projects bounds the number of Git endpoint containers and repos per login,
 not their size.
+
+**The spend kill switch (decided).** Cloudflare has no hard spending cap,
+only a budget alert that emails. So the remote keeps its own: an hourly cron
+(`src/budget.ts`) reads the account's bill from the Billable Usage API,
+sums `ContractedCost` (what is billed beyond the plan's included usage, not
+the $5 plan itself) over today and the 6 days before it, and while that is
+over `SPEND_LIMIT_WEEKLY_USD` (unset is $10) the remote is *paused*: every
+request from anyone not in `ADMIN_LOGINS` is a 503 that says how much was
+spent against what budget. A rolling window means it reopens on its own as
+the expensive days age out; raising the budget reopens it at the next check.
+The state lives in one `BudgetDO`, and each isolate caches it for 30 s.
+
+- It needs `BILLING_TOKEN`, an API token with *Account → Billing → Read*;
+  without one the switch is off. A failed read changes nothing.
+- It lags. Cloudflare processes usage daily, so the switch trips about a day
+  after the line is crossed, and storage already held keeps costing while
+  paused. It bounds a runaway, it does not stop at the cent.
+- The API selects rows by billing period and returns nothing for a range
+  that starts after the period does, so the request reaches back 46 days
+  and the window is applied to the rows.
 
 **Every workspace gets its own token, automatically** (decided). Nobody
 creates tokens by hand in the normal flow:

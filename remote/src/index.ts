@@ -36,10 +36,12 @@ import {
 	projectKey,
 	repoName,
 } from "./names";
+import { checkBudget, pausedBy } from "./budget";
 import { type EndpointKind, type EndpointPlan, PLAN_HEADER } from "./endpoint";
 import type { Instance, ProjectDO } from "./project";
 import type { UserDO } from "./users";
 
+export { BudgetDO } from "./budget";
 export { GitEndpoint } from "./endpoint";
 export { ProjectDO } from "./project";
 export { UserDO } from "./users";
@@ -110,6 +112,10 @@ export default {
 		if (landing && response.status === 200) ctx.waitUntil(caches.default.put(request, response.clone()));
 		return response;
 	},
+
+	async scheduled(_controller, env, ctx) {
+		ctx.waitUntil(checkBudget(env, fetch));
+	},
 } satisfies ExportedHandler<Env>;
 
 export async function handle(request: Request, env: Env, deps: Deps): Promise<Response> {
@@ -158,7 +164,7 @@ async function route(request: Request, env: Env, deps: Deps): Promise<Response> 
 		if (!device_code) throw new HttpError(400, "device_code is required");
 		const result = await pollDeviceFlow(env.GITHUB_CLIENT_ID, device_code, deps.fetcher);
 		if (result.status !== "done") return json(result, result.status === "pending" ? 202 : 401);
-		requireInvited(env, result.login);
+		await requireInvited(env, result.login);
 		const issued = await issue(env, { kind: "login", login: result.login, ttlSeconds: LOGIN_TTL_SECONDS });
 		return json({ status: "done", login: result.login, token: issued.token, token_id: issued.id });
 	}
@@ -953,7 +959,7 @@ async function callerFor(token: string, env: Env): Promise<Caller> {
 	if (claims === null) throw new HttpError(401, "not logged in: run `newgit login`");
 	// On every request, not only at login: taking someone off the list shuts
 	// out the tokens they already hold, agents' included.
-	requireInvited(env, claims.sub);
+	await requireInvited(env, claims.sub);
 	if (!(await userStub(env, claims.sub).check(claims.jti)))
 		throw new HttpError(401, "this token was revoked: run `newgit login`, or ask its owner for a new agent token");
 	return {
@@ -966,13 +972,20 @@ async function callerFor(token: string, env: Env): Promise<Caller> {
 	};
 }
 
-function requireInvited(env: Env, login: string) {
+async function requireInvited(env: Env, login: string) {
 	if (!env.ALLOWED_LOGINS)
 		throw new HttpError(503, "this remote admits no one yet: its operator has not set ALLOWED_LOGINS (`*` for anyone)");
 	if (!listed(env.ALLOWED_LOGINS, login))
 		throw new HttpError(403, `this remote is invite-only, and GitHub user \`${login}\` is not invited`);
 	if (listed(env.BLOCKED_LOGINS, login))
 		throw new HttpError(403, `GitHub user \`${login}\` is blocked from this remote`);
+	if (listed(env.ADMIN_LOGINS, login)) return;
+	const paused = await pausedBy(env);
+	if (paused)
+		throw new HttpError(
+			503,
+			`this remote is paused: it was billed $${paused.spent.toFixed(2)} in the last 7 days, over its $${paused.limit} weekly budget (as of ${paused.checkedAt}). It reopens on its own once that falls under the budget.`,
+		);
 }
 
 /** How many projects one login may own: `PROJECTS_PER_LOGIN`, 5 when unset. */

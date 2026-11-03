@@ -22,6 +22,13 @@ interface SecretEnv {
 	ADMIN_LOGINS?: string;
 	/** How many projects one login may own. Unset is 5. */
 	PROJECTS_PER_LOGIN?: string;
+	/**
+	 * A Cloudflare API token with Billing: Read, for the spend kill switch
+	 * (src/budget.ts). Unset turns the switch off.
+	 */
+	BILLING_TOKEN?: string;
+	/** Past this many dollars billed in 7 days, the remote pauses. Unset is 10. */
+	SPEND_LIMIT_WEEKLY_USD?: string;
 }
 interface Env extends SecretEnv {}
 declare namespace Cloudflare {
