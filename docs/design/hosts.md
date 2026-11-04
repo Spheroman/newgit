@@ -47,11 +47,11 @@ Build against a tailnet first; forwarding comes second.
 
 ## Secrets (do not simulate security)
 
-A host's root can read every secret tracker an instance binds there. So hosts
+A host's root can read every tracker outside Git an instance binds there. So hosts
 are declared, and trust is explicit:
 
 - `--mine`: the host is yours; your `user`-audience trackers go there.
-- Otherwise spawn withholds `user`-audience secret trackers and names each
+- Otherwise spawn withholds `user`-audience trackers outside Git and names each
   one, the same way `user:<login>` refusals work on the remote.
 
 ## Open questions

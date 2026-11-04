@@ -97,7 +97,7 @@ A tracker is a named, versioned lane of file content — a partition over the si
 
 `source` is simply the default tracker: audience = everyone, mechanism = the vendored `jj` engine. The `jj` engine covers exactly **one** tracker (source); every other tracker's source-merge behavior is policy you define in the binding layer.
 
-> **Superseded (2026-10):** [trackers.md](trackers.md) replaces the single `source` tracker. Every tracker is its own Git history; `root` owns whatever no other tracker claims, code trackers are committed, and a workspace's Git history is composed from the bound code trackers.
+> **Superseded (2026-10):** [trackers.md](trackers.md) replaces the single `source` tracker. Every tracker is its own Git history; `root` owns whatever no other tracker claims, trackers in Git are committed, and a workspace's Git history is composed from the bound trackers in Git.
 
 ### Resources
 

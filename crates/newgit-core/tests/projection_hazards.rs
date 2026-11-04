@@ -111,11 +111,11 @@ fn split_source(store: &MetadataStore, reference: &str) -> String {
     )
 }
 
-/// The project root's view, composed from every code tracker's
-/// `instances/main` — what `HEAD` must be, commit for commit.
+/// The project root's view, composed from the `instances/main` of every
+/// tracker in Git — what `HEAD` must be, commit for commit.
 fn recompose(manager: &BranchManager, repo: &Utf8Path, slug: &str) -> Option<String> {
     let definitions: Vec<&TrackerDefinition> = std::iter::once(manager.root_tracker())
-        .chain(manager.code_trackers())
+        .chain(manager.carved_trackers())
         .collect();
     let tips: Vec<TrackerTip<'_>> = definitions
         .into_iter()
@@ -138,7 +138,7 @@ fn recompose(manager: &BranchManager, repo: &Utf8Path, slug: &str) -> Option<Str
         repo,
         "refs/newgit/views/check",
         &tips,
-        manager.code_trackers(),
+        manager.carved_trackers(),
     )
     .expect("compose")
     .tip
@@ -180,7 +180,7 @@ fn work_split_before_a_carve_keeps_every_file_after_it() {
         .expect("split as root");
 
     manager
-        .create_code_tracker(
+        .create_git_tracker(
             "electron",
             "project-devs",
             &[Utf8PathBuf::from("apps/electron")],
@@ -252,9 +252,10 @@ fn a_secret_behind_a_merge_is_found() {
         vec![Utf8PathBuf::from(".env.local")],
     )
     .expect("definition");
-    env.secret = true;
+    env.git = false;
     all.push(env);
-    let found = compose::find_secret(&repo, &["HEAD", "--not", &base], &[], &all).expect("scan");
+    let found =
+        compose::find_outside_git(&repo, &["HEAD", "--not", &base], &[], &all).expect("scan");
     assert_eq!(
         found.map(|(_, path, tracker)| (path, tracker)),
         Some((".env.local".to_owned(), "env".to_owned())),
@@ -262,7 +263,7 @@ fn a_secret_behind_a_merge_is_found() {
     );
     // Deleting a secret is how it comes out: never refused.
     let removal = git(&repo, &["rev-parse", "side"]);
-    let found = compose::find_secret(
+    let found = compose::find_outside_git(
         &repo,
         &[&removal, "--not", &format!("{removal}~1")],
         &[],

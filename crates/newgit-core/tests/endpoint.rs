@@ -37,7 +37,7 @@ fn tempdir() -> (tempfile::TempDir, Utf8PathBuf) {
     (temp, path)
 }
 
-/// A project with a secret-feeling code tracker carved out, its trackers
+/// A project with a tracker in Git carved out, its trackers
 /// published as bare repos the way the remote holds them. Returns the
 /// project's HEAD and each tracker's (repo, main).
 fn published(temp: &Utf8Path) -> (String, BTreeMap<String, (Utf8PathBuf, String)>) {
@@ -51,7 +51,7 @@ fn published(temp: &Utf8Path) -> (String, BTreeMap<String, (Utf8PathBuf, String)
     let store = MetadataStore::init(&repo, "proj", SourceSubstrate::Git).expect("init");
     BranchManager::open(store.clone())
         .expect("manager")
-        .create_code_tracker(
+        .create_git_tracker(
             "payments",
             "user:jack",
             &[Utf8PathBuf::from("apps/payments")],

@@ -44,7 +44,7 @@ resources restored.
 
 ```sh
 newgit login                      # GitHub device flow
-newgit remote add                 # create <you>/<project>: a repo per code tracker
+newgit remote add                 # create <you>/<project>: a repo per tracker in Git
 newgit members add octocat
 newgit spawn --from-checkpoint auth-refactor/ckpt_003
 newgit merge auth-refactor        # into main, tracker by tracker, all at once
@@ -53,17 +53,17 @@ newgit merge auth-refactor        # into main, tracker by tracker, all at once
 newgit clone jack/widget          # or plain: git clone https://newgit.dev/jack/widget.git
 ```
 
-Plain `git clone` works too: the remote composes each branch from the code
-trackers you may read, so two people can read different parts of one
+Plain `git clone` works too: the remote composes each branch from the trackers in
+Git you may read, so two people can read different parts of one
 project.
 
 Every tracker is its own history. `root` owns `.` — whatever no more specific
 tracker claims — and starts as your project's Git history; `project` owns
 `.newgit` (resources, scripts, config), and `access` owns `.newgit/trackers/`,
 who may read what, which only the project's owner changes by default
-(`maintainers = "owner"`). Carve out a code tracker, history included, with
-`newgit tracker create electron --code --path apps/electron`. Trackers are
-secret by default: captured, never committed.
+(`maintainers = "owner"`). Carve out a tracker in Git, history included, with
+`newgit tracker create electron --git --path apps/electron`. Without `--git`
+a tracker stays outside Git: captured, never committed.
 
 An instance works on what it binds:
 
@@ -303,9 +303,9 @@ Definition management (noun subcommands):
 
 - `newgit tracker create <name> [--audience <a>] [--storage <s>]
   [--merge-with-source]`
-- `newgit tracker create <name> --code --path <path>...` — a committed code
-  tracker, carved with its history out of whichever tracker owns the paths
-- `newgit tracker track <tracker> <path>...` — secret trackers only
+- `newgit tracker create <name> --git --path <path>...` — a tracker in Git,
+  committed and carved with its history out of whichever tracker owns the paths
+- `newgit tracker track <tracker> <path>...` — trackers outside Git only
 - `newgit tracker remove <name>`
 - `newgit tracker capture|merge|pull|checkout <tracker> [instance]`
 - `newgit tracker capture <tracker> --from-store` — seed a lane from the store
@@ -313,8 +313,8 @@ Definition management (noun subcommands):
 - Capture never follows a symlink: a link that stays inside the workspace is
   kept as a link, as Git keeps one; a link out of the workspace, or a tracked
   path under a symlinked directory, is refused by name
-  ([spec](design/spec.md#secret-trackers))
-- `newgit tracker list` — a tree by ownership: kind, role, priority,
+  ([spec](design/spec.md#trackers-outside-git))
+- `newgit tracker list` — a tree by ownership: whether it is in Git, role, priority,
   maintainers, and (inside a workspace) what is bound. Trackers with no
   `paths` come after the tree, with what deposits into them and what they
   bring
@@ -322,10 +322,10 @@ Definition management (noun subcommands):
   [instance] [--stash | --discard]` — a drop parks the resources the tracker
   brought: taken down by `suspend` (else `[cleanup]`), ports kept, and
   brought back on them by the next `use`; `remove` tears parked ones down
-- `newgit tracker repair [--dry-run]` — rewrite code tracker commits split
+- `newgit tracker repair [--dry-run]` — rewrite the commits of trackers in Git split
   before newgit kept each original's message ending and signature, so a
-  clone from the remote gets the project's own commit ids. Moves every code
-  tracker branch, and on the remote each branch's list: a force push of
+  clone from the remote gets the project's own commit ids. Moves every branch of
+  a tracker in Git, and on the remote each branch's list: a force push of
   tracker history, so run it once, after upgrading
 - `newgit log <tracker> [instance] [-- <git log args>]` — one tracker's
   history: an instance's branch as of its last checkpoint, or the project
@@ -370,7 +370,7 @@ composed history to an ordinary repository defined in
 `.newgit/exports/github.toml` (`url = "acme/widget"`, `trackers =
 ["root"]`). Only `public` trackers and the ones a target names ship, so a
 public mirror and a private one can show different views, and a history that
-ever committed a secret tracker's file is refused. Exporting again
+ever committed the file of a tracker outside Git is refused. Exporting again
 fast-forwards, after bringing in whatever was merged on the target since,
 and the push uses your own Git credentials, so `gh`, GitHub
 Actions, and anyone cloning from GitHub keep working. With `branches =

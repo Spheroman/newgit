@@ -333,7 +333,7 @@ impl TrackerRepo {
         // every caller: a workspace spawned before this tracker was defined
         // has no exclude for it, and a plain `git add -A` in between would
         // commit secret content into source history.
-        if definition.secret {
+        if !definition.git {
             crate::materializer::exclude_tracker_paths(workspace, &definition.paths)?;
         }
         clear_owned_paths(workspace, definition)?;

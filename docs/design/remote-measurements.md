@@ -114,7 +114,7 @@ Git's smart-HTTP requests into `git upload-pack --stateless-rpc` through the
 Containers `exec` API, stdin and stdout streamed; the container runs no
 server. Stand-in for "fetch the tracker repos from Artifacts": a clone of
 Express from GitHub (6,173 commits), adopted by newgit, `lib` carved out as
-a code tracker, the view composed and served.
+a tracker in Git, the view composed and served.
 
 | Question | Answer |
 |---|---|
@@ -138,12 +138,12 @@ Consequences:
 ## Live: the whole flow on newgit.dev (2026-10-05)
 
 A three-tracker project (root, `web` carved out of `apps/web`, project) plus
-a per-user secret `.env.local` tracker, against the deployed Worker, its
+a per-user `.env.local` tracker outside Git, against the deployed Worker, its
 endpoint container, and Artifacts.
 
 | Step | Time | Result |
 |---|---|---|
-| `newgit remote add` | 9.4 s | a repo per code tracker, seeded; `main` created |
+| `newgit remote add` | 9.4 s | a repo per tracker in Git, seeded; `main` created |
 | `git clone https://newgit.dev/<owner>/<name>.git` (plain Git), cold container | 10.8 s | `HEAD` identical to the project's |
 | The same, warm (view cached) | 2.6 s | |
 | `spawn` | 0.8 s | nothing forked |

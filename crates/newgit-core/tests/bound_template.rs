@@ -56,7 +56,7 @@ fn setup(temp: &Utf8Path) -> BranchManager {
     git(&repo, &["commit", "-q", "-m", "newgit"]);
     BranchManager::open(store.clone())
         .expect("manager")
-        .create_code_tracker(
+        .create_git_tracker(
             "electron",
             "project-devs",
             &[Utf8PathBuf::from("apps/electron")],

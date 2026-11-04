@@ -49,9 +49,9 @@ async function setUp() {
 	expect((await call("jack", "POST", `/v1/projects/${project}/members`, { login: "Ana" })).status).toBe(200);
 	// The project tracker's committed definitions are what audiences and kinds are read from.
 	const define = (name: string, text: string) => repos.write(repo("t.access"), `.newgit/trackers/${name}.toml`, text);
-	define("root", 'audience = "project-devs"\nsecret = false\n');
-	define("project", 'audience = "project-devs"\nsecret = false\n');
-	define("web", 'audience = "public"\nsecret = false\n');
+	define("root", 'audience = "project-devs"\ngit = true\n');
+	define("project", 'audience = "project-devs"\ngit = true\n');
+	define("web", 'audience = "public"\ngit = true\n');
 	define("runtime-env", 'audience = "user"\n');
 	define("jack-env", 'audience = "user:jack"\n');
 	define("db-snapshots", 'audience = "project-devs"\n');
@@ -78,7 +78,7 @@ describe("the API", () => {
 		});
 		expect(created.body.seeds.map((seed: { tracker: string }) => seed.tracker)).toEqual(["root", "access", "project"]);
 		const [root] = created.body.seeds;
-		// The creator's one write to each code tracker's repo, for the initial push.
+		// The creator's one write to the repo of each tracker in Git, for the initial push.
 		expect(root).toMatchObject({
 			repo: repo("t.root"),
 			remote: repos.url(repo("t.root")),
@@ -144,13 +144,13 @@ describe("the API", () => {
 		await call("ana", "POST", `/v1/projects/${project}/instances`, { name: "fix-login", base_rev: "abc" });
 		await call("ana", "POST", `/v1/projects/${project}/instances/fix-login/trackers/root/fork`);
 
-		// A code tracker: its audience reads, nobody writes.
+		// A tracker in Git: its audience reads, nobody writes.
 		expect((await credential("jack", repo("t.root"))).body.password).toBe(fakePassword(repo("t.root"), "read"));
 		const noWrite = await credential("jack", repo("t.root"), "write");
 		expect(noWrite.status).toBe(403);
 		expect(noWrite.body.error).toContain("newgit merge");
 		expect((await credential("eve", repo("t.root"))).status).toBe(403);
-		// A public code tracker reads for anyone logged in.
+		// A public tracker in Git reads for anyone logged in.
 		expect((await credential("eve", repo("t.web"))).status).toBe(200);
 
 		// A fork: only its owner pushes. A credential helper passes a URL.
@@ -184,7 +184,7 @@ describe("the API", () => {
 		expect((await credential("jack", "jack.acme")).status).toBe(400);
 	});
 
-	it("never creates a code tracker repo or a fork through the credential route", async () => {
+	it("never creates a tracker in Git repo or a fork through the credential route", async () => {
 		await setUp();
 		await call("ana", "POST", `/v1/projects/${project}/instances`, { name: "fix-login", base_rev: "abc" });
 		// web was never created as a repo here: delete it to see the refusal.
@@ -204,8 +204,8 @@ describe("the API", () => {
 		// A merged definition change is what opens it up.
 		repos.write(repo("t.access"), ".newgit/trackers/jack-env.toml", 'audience = "project-devs"\n');
 		expect((await credential("ana", repo("t.jack-env"))).status).toBe(200);
-		// Turning a tracker into a code tracker takes its write away.
-		repos.write(repo("t.access"), ".newgit/trackers/jack-env.toml", 'audience = "project-devs"\nsecret = false\n');
+		// Turning a tracker into a tracker in Git takes its write away.
+		repos.write(repo("t.access"), ".newgit/trackers/jack-env.toml", 'audience = "project-devs"\ngit = true\n');
 		expect((await credential("jack", repo("t.jack-env"), "write")).status).toBe(403);
 	});
 
@@ -231,9 +231,9 @@ describe("the API", () => {
 		expect((await call("ana", "GET", `/v1/projects/${project}/checkpoints`)).body.checkpoints).toHaveLength(0);
 	});
 
-	it("creates and seeds a code tracker repo carved later, once, for its owner only", async () => {
+	it("creates and seeds a tracker in Git repo carved later, once, for its owner only", async () => {
 		await setUp();
-		// Definitions decide every audience, so adding a code tracker is the owner's.
+		// Definitions decide every audience, so adding a tracker in Git is the owner's.
 		const member = await call("ana", "POST", `/v1/projects/${project}/trackers`, { name: "docs" });
 		expect(member.status).toBe(403);
 		const created = await call("jack", "POST", `/v1/projects/${project}/trackers`, { name: "docs" });
@@ -253,7 +253,7 @@ describe("the API", () => {
 		expect((await call("jack", "POST", `/v1/projects/${project}/trackers`, { name: "root" })).status).toBe(409);
 		expect((await call("jack", "POST", `/v1/projects/${project}/trackers`, {})).status).toBe(400);
 		expect((await call("jack", "POST", `/v1/projects/${project}/trackers`, { name: "a.b" })).status).toBe(400);
-		// Never a secret tracker's repo: that is made by its first sync.
+		// Never the repo of a tracker outside Git: that is made by its first sync.
 		expect(
 			(await call("jack", "POST", `/v1/projects/${project}/trackers`, { name: "runtime-env" })).status,
 		).toBe(400);

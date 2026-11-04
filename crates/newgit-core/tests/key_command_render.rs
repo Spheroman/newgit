@@ -37,7 +37,7 @@ fn tempdir() -> (tempfile::TempDir, Utf8PathBuf) {
     (temp, path)
 }
 
-/// A project with one code tracker, `app`, owning `apps/a`, so the
+/// A project with one tracker in Git, `app`, owning `apps/a`, so the
 /// instance's `{{bound.*}}` has something to render.
 fn setup(temp: &Utf8Path) -> MetadataStore {
     let repo = temp.join("store");
@@ -61,7 +61,7 @@ fn setup(temp: &Utf8Path) -> MetadataStore {
 
     BranchManager::open(store.clone())
         .expect("manager")
-        .create_code_tracker("app", "project-devs", &[Utf8PathBuf::from("apps/a")])
+        .create_git_tracker("app", "project-devs", &[Utf8PathBuf::from("apps/a")])
         .expect("carve");
     git(&repo, &["add", "-A"]);
     git(&repo, &["commit", "-q", "-m", "trackers"]);

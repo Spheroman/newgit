@@ -70,14 +70,14 @@ fn tempdir() -> (tempfile::TempDir, Utf8PathBuf) {
     (temp, path)
 }
 
-fn tracker(name: &str, paths: &[&str], excluded: &[&str], secret: bool) -> TrackerDefinition {
+fn tracker(name: &str, paths: &[&str], excluded: &[&str], git: bool) -> TrackerDefinition {
     TrackerDefinition {
         name: name.to_owned(),
         audience: "project-devs".to_owned(),
         storage: Storage::Local,
         merge_with_source: true,
         paths: paths.iter().map(Utf8PathBuf::from).collect(),
-        secret,
+        git,
         maintainers: None,
         role: None,
         priority: 0,
@@ -214,8 +214,8 @@ fn a_carved_tracker_composes_back_into_the_original_history() {
     let (_guard, temp) = tempdir();
     let (repo, commits) = project(&temp);
     let electron_tip = carve_electron(&repo, &commits);
-    let root = tracker("root", &["."], &["apps/electron"], false);
-    let electron = tracker("electron", &["apps/electron"], &[], false);
+    let root = tracker("root", &["."], &["apps/electron"], true);
+    let electron = tracker("electron", &["apps/electron"], &[], true);
 
     let view = compose::compose(
         &repo,
@@ -277,8 +277,8 @@ fn splitting_an_agents_work_and_recomposing_gives_back_the_same_commits() {
     let (_guard, temp) = tempdir();
     let (repo, commits) = project(&temp);
     let electron_tip = carve_electron(&repo, &commits);
-    let root = tracker("root", &["."], &["apps/electron"], false);
-    let electron = tracker("electron", &["apps/electron"], &[], false);
+    let root = tracker("root", &["."], &["apps/electron"], true);
+    let electron = tracker("electron", &["apps/electron"], &[], true);
     let tips = |root_commit: &str, electron_commit: &str| {
         vec![
             TrackerTip {
@@ -349,8 +349,8 @@ fn splitting_an_agents_work_and_recomposing_gives_back_the_same_commits() {
 fn a_secret_file_in_a_commit_is_found_where_it_would_leave() {
     let (_guard, temp) = tempdir();
     let (repo, commits) = project(&temp);
-    let root = tracker("root", &["."], &[".env.local"], false);
-    let env = tracker("runtime-env", &[".env.local"], &[], true);
+    let root = tracker("root", &["."], &[".env.local"], true);
+    let env = tracker("runtime-env", &[".env.local"], &[], false);
     let base = compose::compose(
         &repo,
         VIEW,
@@ -373,7 +373,7 @@ fn a_secret_file_in_a_commit_is_found_where_it_would_leave() {
     );
     let tip = git(&repo, &["rev-parse", "HEAD"]);
     // Splitting is ownership only; the secret check runs over what leaves.
-    let found = compose::find_secret(
+    let found = compose::find_outside_git(
         &repo,
         &[&tip, "--not", &base],
         &[],
@@ -390,8 +390,8 @@ fn a_secret_file_in_a_commit_is_found_where_it_would_leave() {
 fn a_path_owned_by_an_unbound_tracker_is_refused_with_the_fix() {
     let (_guard, temp) = tempdir();
     let (repo, commits) = project(&temp);
-    let root = tracker("root", &["."], &["apps/electron"], false);
-    let electron = tracker("electron", &["apps/electron"], &[], false);
+    let root = tracker("root", &["."], &["apps/electron"], true);
+    let electron = tracker("electron", &["apps/electron"], &[], true);
     let base = compose::compose(
         &repo,
         VIEW,
@@ -467,8 +467,8 @@ fn merge_commits_survive_composition_whole() {
     let head = git(&repo, &["rev-parse", "HEAD"]);
     // The real carve: it diffs every commit, merges included, against its
     // first parent.
-    let root = tracker("root", &["."], &["apps/electron"], false);
-    let electron = tracker("electron", &["apps/electron"], &[], false);
+    let root = tracker("root", &["."], &["apps/electron"], true);
+    let electron = tracker("electron", &["apps/electron"], &[], true);
     let electron_tip = compose::carve(
         &repo,
         &head,
@@ -510,8 +510,8 @@ fn merge_commits_survive_composition_whole() {
 fn a_merge_after_trackers_diverge_keeps_every_parent() {
     let (_guard, temp) = tempdir();
     let (repo, commits) = project(&temp);
-    let root = tracker("root", &["."], &["apps/electron"], false);
-    let electron = tracker("electron", &["apps/electron"], &[], false);
+    let root = tracker("root", &["."], &["apps/electron"], true);
+    let electron = tracker("electron", &["apps/electron"], &[], true);
     let carved = compose::compose(
         &repo,
         VIEW,

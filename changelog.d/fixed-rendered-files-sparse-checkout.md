@@ -1,8 +1,8 @@
 - A rendered file stays out of `git status`, `git add -A` and checkpoints
-  while a code tracker is dropped.
+  while a tracker in Git is dropped.
 
   newgit keeps an instance's values out of Git by marking each rendered
-  file `--skip-worktree`. Dropping a code tracker that owns paths makes
+  file `--skip-worktree`. Dropping a tracker in Git that owns paths makes
   the workspace a sparse checkout, and a sparse checkout decides that bit
   itself: `sparse-checkout set` and `disable` work every file's bit out
   again from the patterns, Git commands that update the working tree
@@ -16,13 +16,13 @@
   and an undo to that checkpoint printed `+ uncommitted changes
   reapplied`. An agent's `git reset --hard` put the committed value back
   on disk, and `git rebase` refused over unstaged changes. And while one
-  code tracker was dropped, `tracker drop` refused another whose paths
+  tracker in Git was dropped, `tracker drop` refused another whose paths
   held a rendered file, as uncommitted work.
 
   The sparse patterns now leave the rendered files out too, the workspace
   sets `sparse.expectFilesOutsideOfPatterns` so that Git keeps the bit of
   such a file, and a checkpoint sets it again for its own `git add -A`. An
-  instance whose code tracker an earlier newgit dropped gets the patterns
+  instance whose tracker in Git an earlier newgit dropped gets the patterns
   and the setting at its next `tracker drop` or `tracker use` of a code
   tracker, or the next undo (without `--only`), `tracker checkout` or
   `tracker pull`, which render again. Until then `git status` there still

@@ -5,8 +5,8 @@
 //! composed projection of chosen trackers' `main`s, with their history, as an
 //! ordinary Git repository. Which trackers is the definition's to say, so a
 //! public mirror and a private one can show different views of one project.
-//! `public` code trackers always ship; `trackers` adds others by name. A
-//! secret tracker never ships.
+//! `public` trackers in Git always ship; `trackers` adds others by name. A
+//! tracker outside Git never ships.
 
 use camino::Utf8Path;
 use serde::{Deserialize, Serialize};
@@ -20,7 +20,7 @@ pub struct ExportTarget {
     pub url: String,
     /// The branch the export is pushed to.
     pub branch: String,
-    /// Code trackers shipped besides the `public` ones.
+    /// Trackers in Git shipped besides the `public` ones.
     pub trackers: Vec<String>,
     /// Instances' branches go here too, each time a workspace pushes one —
     /// so a pull request can be opened against the target.

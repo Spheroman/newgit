@@ -53,7 +53,7 @@ const BOUND_INSTALL: &str =
 const DISCOVERING_INSTALL: &str = "mkdir -p node_modules && ls apps > node_modules/members.txt";
 
 /// A workspace-style monorepo: one root lockfile listing two members, each
-/// member carved into its own code tracker, and a shared install keyed on
+/// member carved into its own tracker in Git, and a shared install keyed on
 /// the lockfile that runs `prepare`.
 fn setup(temp: &Utf8Path, prepare: &str) -> BranchManager {
     let repo = temp.join("store");
@@ -80,7 +80,7 @@ fn setup(temp: &Utf8Path, prepare: &str) -> BranchManager {
     for (name, path) in [("a", "apps/a"), ("b", "apps/b")] {
         BranchManager::open(store.clone())
             .expect("manager")
-            .create_code_tracker(name, "project-devs", &[Utf8PathBuf::from(path)])
+            .create_git_tracker(name, "project-devs", &[Utf8PathBuf::from(path)])
             .expect("carve");
     }
     git(&repo, &["add", "-A"]);

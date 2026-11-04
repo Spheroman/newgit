@@ -9,7 +9,7 @@ include!("support/fake_remote.rs");
 // ── Tests ──────────────────────────────────────────────────────────────────
 
 #[test]
-fn remote_add_creates_the_project_with_a_repo_per_code_tracker_and_main() {
+fn remote_add_creates_the_project_with_a_repo_per_git_tracker_and_main() {
     let (_guard, temp) = tempdir();
     let fixture = setup(&temp);
     let root = fixture.remote.repo("jack.store.t.root");
@@ -223,7 +223,7 @@ fn a_checkpoint_syncs_changed_trackers_remote_trackers_and_then_the_record() {
     assert!(!output.contains("not on the remote"), "{output}");
 
     // The uncommitted work is in root's fork, at the checkpoint's ref — and
-    // no secret tracker's file is.
+    // no file of a tracker outside Git is.
     let fork = fixture.remote.repo("jack.store.i.feature-a.root");
     let files = files_at(&fork, "refs/newgit/checkpoints/ckpt_001");
     assert!(files.contains("wip.txt"), "{files}");
@@ -247,7 +247,7 @@ fn a_checkpoint_syncs_changed_trackers_remote_trackers_and_then_the_record() {
         "local trackers stay local"
     );
 
-    // The record names each code tracker's commits, and was written last.
+    // The record names the commits of each tracker in Git, and was written last.
     let state = fixture.remote.state.lock().expect("state");
     let record = &state.checkpoints[&("feature-a".to_owned(), "ckpt_001".to_owned())];
     assert!(record["code"]["tip"]["root"].is_string(), "{record}");
@@ -295,7 +295,7 @@ fn merge_moves_the_remote_branch_and_brings_new_trackers_with_it() {
         "and main's list says so"
     );
 
-    // A code tracker carved after `remote add` reaches the remote by merging
+    // A tracker in Git carved after `remote add` reaches the remote by merging
     // the project root, which made it.
     std::fs::create_dir_all(fixture.store.join("docs")).expect("mkdir");
     std::fs::write(fixture.store.join("docs/guide.md"), "guide\n").expect("write");
@@ -303,7 +303,7 @@ fn merge_moves_the_remote_branch_and_brings_new_trackers_with_it() {
     git(&fixture.store, &["commit", "-q", "-m", "docs"]);
     fixture.ok(
         &fixture.store,
-        &["tracker", "create", "docs", "--code", "--path", "docs"],
+        &["tracker", "create", "docs", "--git", "--path", "docs"],
     );
     git(&fixture.store, &["add", "-A"]);
     git(&fixture.store, &["commit", "-q", "-m", "docs is a tracker"]);
@@ -315,7 +315,7 @@ fn merge_moves_the_remote_branch_and_brings_new_trackers_with_it() {
     assert_eq!(list["docs"], git(&docs, &["rev-parse", "main"]));
 }
 
-/// A secret tracker owning `.env.local`, its definition committed.
+/// A tracker outside Git owning `.env.local`, its definition committed.
 fn with_env_tracker(fixture: &Fixture) {
     fixture.ok(
         &fixture.store,

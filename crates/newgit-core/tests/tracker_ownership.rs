@@ -72,7 +72,7 @@ fn init_gives_root_its_own_copy_of_the_project_history() {
     );
     let manager = BranchManager::open(store.clone()).expect("manager");
     let root = manager.root_tracker();
-    assert!(root.owns_everything() && !root.secret);
+    assert!(root.owns_everything() && root.git);
     assert!(
         manager
             .tracker_definitions()

@@ -2,7 +2,7 @@
 //! snapshot's tree out over the workspace. Its removal reaches only entries
 //! that are not skip-worktree, but it wrote each path where the tree
 //! differs from the index, outside the sparse patterns too, and cleared its
-//! skip-worktree bit, so a dropped code tracker's files came back on disk as
+//! skip-worktree bit, so the files of a dropped tracker in Git came back on disk as
 //! ordinary tracked files (#225). The restore now checks out a tree with
 //! the paths the binding leaves out as HEAD has them, so they stay out.
 //!
@@ -146,7 +146,7 @@ fn a_restore_reapplies_a_bound_tracker_nested_in_a_dropped_one() {
     assert_eq!(status(&ws), " M a/f\n M b/inner/x\n?? b/inner/y");
 }
 
-/// Code trackers over the given paths, created in order, in a store whose
+/// Trackers in Git over the given paths, created in order, in a store whose
 /// root owns `lib/` and everything else.
 fn setup(temp: &Utf8Path, trackers: &[(&str, &str)]) -> MetadataStore {
     let repo = temp.join("store");
@@ -176,7 +176,7 @@ fn setup(temp: &Utf8Path, trackers: &[(&str, &str)]) -> MetadataStore {
     for (name, path) in trackers {
         BranchManager::open(store.clone())
             .expect("manager")
-            .create_code_tracker(name, "project-devs", &[Utf8PathBuf::from(*path)])
+            .create_git_tracker(name, "project-devs", &[Utf8PathBuf::from(*path)])
             .expect("carve");
     }
     git(&repo, &["add", "-A"]);
@@ -215,8 +215,8 @@ fn undo_leaves_out_what_a_dropped_tracker_owns_though_the_checkpoint_has_it_chan
     let checkpoint = manager.checkpoint("x", None).expect("checkpoint").record.id;
     manager.use_tracker("x", "b").expect("use b");
 
-    // `b` takes `lib` over. Only an edited definition does that — a code
-    // tracker's paths are set when it is created — but the definitions are
+    // `b` takes `lib` over. Only an edited definition does that — a
+    // tracker in Git's paths are set when it is created — but the definitions are
     // the project's committed files, and a pull brings a teammate's edit.
     let definition = store.paths().trackers.join("b.toml");
     let before = std::fs::read_to_string(&definition).expect("read");

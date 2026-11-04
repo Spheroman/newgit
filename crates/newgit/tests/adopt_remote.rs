@@ -9,7 +9,7 @@
 include!("support/fake_remote.rs");
 
 #[test]
-fn an_adopted_clone_links_with_every_code_tracker_carved_and_the_same_commits() {
+fn an_adopted_clone_links_with_every_git_tracker_carved_and_the_same_commits() {
     let (_guard, temp) = tempdir();
     let fixture = setup(&temp);
 

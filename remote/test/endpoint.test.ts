@@ -24,10 +24,10 @@ beforeEach(async () => {
 		(await api(jack.token, "POST", "/v1/projects", { name, trackers: ["root", "access", "project", "payments"] })).status,
 	).toBe(201);
 	const defs = `jack.${name}.t.access`;
-	repos.write(defs, ".newgit/trackers/root.toml", 'audience = "project-devs"\nsecret = false\n');
-	repos.write(defs, ".newgit/trackers/project.toml", 'audience = "project-devs"\nsecret = false\n');
-	// A code tracker only Jack may read, and a secret tracker: neither is Ana's.
-	repos.write(defs, ".newgit/trackers/payments.toml", 'audience = "user:jack"\nsecret = false\n');
+	repos.write(defs, ".newgit/trackers/root.toml", 'audience = "project-devs"\ngit = true\n');
+	repos.write(defs, ".newgit/trackers/project.toml", 'audience = "project-devs"\ngit = true\n');
+	// A tracker in Git only Jack may read, and a tracker outside Git: neither is Ana's.
+	repos.write(defs, ".newgit/trackers/payments.toml", 'audience = "user:jack"\ngit = true\n');
 	repos.write(defs, ".newgit/trackers/env.toml", 'audience = "project-devs"\n');
 	expect(
 		(
@@ -83,7 +83,7 @@ describe("the Git endpoint", () => {
 		expect(await response.text()).toContain("newgit workspace");
 	});
 
-	it("composes every code tracker its reader may read, and nothing else", async () => {
+	it("composes every tracker in Git its reader may read, and nothing else", async () => {
 		expect((await git(jack.token, "/info/refs?service=git-upload-pack")).status).toBe(200);
 		expect((await git(jack.token, "/git-upload-pack", "POST")).status).toBe(200);
 		expect(served.map((call) => call.kind)).toEqual(["advertise", "upload-pack"]);
@@ -96,7 +96,7 @@ describe("the Git endpoint", () => {
 		expect(plan.repos.root.auth.startsWith("Authorization: Basic ")).toBe(true);
 	});
 
-	it("leaves out a tracker its reader may not read — the secret one never enters", async () => {
+	it("leaves out a tracker its reader may not read — the one outside Git never enters", async () => {
 		expect((await git(ana, "/info/refs?service=git-upload-pack")).status).toBe(200);
 		const plan = served[0].plan;
 		expect(plan.branches.main).toEqual({ root: sha("a"), project: sha("b"), access: sha("e") });

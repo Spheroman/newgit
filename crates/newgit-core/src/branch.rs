@@ -42,11 +42,11 @@ pub struct BranchInstance {
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub resources: BTreeMap<String, ResourceBinding>,
     /// Trackers this instance does not bind (`newgit tracker drop`); every
-    /// other is bound. A dropped code tracker stays in the instance's history
+    /// other is bound. A dropped tracker in Git stays in the instance's history
     /// — which is composed from everything its user may read — but not in its
     /// working tree (sparse checkout), and its work is out of scope: nothing
     /// splits into it, and a merge leaves it at the branch's commit. A dropped
-    /// secret tracker keeps its binding's content for when it is used again.
+    /// tracker outside Git keeps its binding's content for when it is used again.
     #[serde(default, skip_serializing_if = "std::collections::BTreeSet::is_empty")]
     pub dropped: std::collections::BTreeSet<String>,
     /// Resources a dropped tracker brought, set aside rather than released
@@ -73,7 +73,7 @@ pub struct BranchInstance {
 }
 
 /// An instance's place on the remote. Nothing is forked when it is
-/// registered: it forks a code tracker the first time it changes it.
+/// registered: it forks a tracker in Git the first time it changes it.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RemoteBinding {
     /// `<owner>/<name>`.

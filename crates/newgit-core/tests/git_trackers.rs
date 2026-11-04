@@ -1,4 +1,4 @@
-//! Code trackers (docs/design/trackers.md, step 3b): committed content with its
+//! Trackers in Git (docs/design/trackers.md, step 3b): committed content with its
 //! own history, carved out of whichever tracker owned its paths, so composing
 //! still reproduces the project's history exactly.
 
@@ -95,7 +95,7 @@ fn init_writes_the_project_tracker_which_carries_newgit() {
     assert!(store.paths().trackers.join("project.toml").is_file());
     let manager = BranchManager::open(store).expect("manager");
     let project = manager
-        .code_trackers()
+        .carved_trackers()
         .iter()
         .find(|definition| definition.name == "project")
         .expect("project");
@@ -110,13 +110,13 @@ fn init_writes_the_project_tracker_which_carries_newgit() {
 }
 
 #[test]
-fn a_carved_code_tracker_composes_back_into_the_project_history() {
+fn a_carved_git_tracker_composes_back_into_the_project_history() {
     let (_guard, temp) = tempdir();
     let store = setup(&temp);
     let repo = store.paths().project_root.clone();
     let manager = BranchManager::open(store.clone()).expect("manager");
     let outcome = manager
-        .create_code_tracker(
+        .create_git_tracker(
             "electron",
             "project-devs",
             &[Utf8PathBuf::from("apps/electron")],
@@ -148,7 +148,7 @@ fn a_carved_code_tracker_composes_back_into_the_project_history() {
     // Composing root and electron reproduces the project's exact commits.
     let manager = BranchManager::open(store.clone()).expect("reopen");
     let electron = manager
-        .code_trackers()
+        .carved_trackers()
         .iter()
         .find(|definition| definition.name == "electron")
         .expect("electron");
@@ -180,12 +180,12 @@ fn a_carved_code_tracker_composes_back_into_the_project_history() {
 }
 
 #[test]
-fn a_code_tracker_is_committed_to_not_captured() {
+fn a_git_tracker_is_committed_to_not_captured() {
     let (_guard, temp) = tempdir();
     let store = setup(&temp);
     let manager = BranchManager::open(store.clone()).expect("manager");
     manager
-        .create_code_tracker(
+        .create_git_tracker(
             "electron",
             "project-devs",
             &[Utf8PathBuf::from("apps/electron")],
@@ -196,9 +196,9 @@ fn a_code_tracker_is_committed_to_not_captured() {
     let capture = manager
         .capture_tracker("feature-a", "electron")
         .expect_err("not captured");
-    assert!(capture.to_string().contains("code tracker"), "{capture}");
+    assert!(capture.to_string().contains("tracker in Git"), "{capture}");
     let track = manager
         .track_paths("electron", &[Utf8PathBuf::from("apps/desktop")])
         .expect_err("paths are set at creation");
-    assert!(track.to_string().contains("code tracker"), "{track}");
+    assert!(track.to_string().contains("tracker in Git"), "{track}");
 }

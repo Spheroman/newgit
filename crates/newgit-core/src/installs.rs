@@ -478,7 +478,7 @@ impl InstallStore {
 /// The binding is in the key because it is an input too, and one a shared
 /// lockfile does not record: the lockfile lists every member, bound or not,
 /// and its install builds the ones it can see, found on disk or named by
-/// `{{bound.paths}}`, where a dropped code tracker's files are not checked
+/// `{{bound.paths}}`, where the files of a dropped tracker in Git are not checked
 /// out. Without it, an instance that drops a member would be filled with
 /// the tree built for one that binds it.
 ///
@@ -486,7 +486,7 @@ impl InstallStore {
 /// (`BranchManager::install_binding`), not all of it:
 ///
 /// - Always, which paths the checkout leaves out: the sparse checkout the
-///   instance's dropped code trackers make. That is how an install reads
+///   instance's dropped trackers in Git make. That is how an install reads
 ///   the binding without naming it — an unfiltered `npm ci` links a
 ///   workspace member only when the member is checked out — so it is in
 ///   every resource's key.
@@ -494,12 +494,12 @@ impl InstallStore {
 ///   the install can be told: its own commands, `key_command`, exports or
 ///   renders name one, or any resource's export or render does.
 ///
-/// A secret tracker puts no paths into the sparse checkout, and neither
+/// A tracker outside Git puts no paths into the sparse checkout, and neither
 /// does one that owns none, so binding or dropping either leaves the key
 /// alone unless the install is told the names. Before, the whole binding
-/// was in every key, and switching on a branch database (a secret tracker
+/// was in every key, and switching on a branch database (a tracker outside Git
 /// with `paths = []`) cost a full `npm ci` for an identical tree (#248).
-/// An install that does read a secret tracker's file — an `.npmrc` it
+/// An install that does read the file of a tracker outside Git — an `.npmrc` it
 /// projects, say — names that file in `[identity] paths`, whose content is
 /// hashed like any other input.
 ///

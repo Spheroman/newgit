@@ -73,8 +73,8 @@ fn newgit_ok(dir: &Utf8Path, args: &[&str]) {
     );
 }
 
-/// A project pushing to a stand-in for GitHub, with `billing/` in a code
-/// tracker only `jack` may read, and `docs/` in one with root's audience.
+/// A project pushing to a stand-in for GitHub, with `billing/` in a tracker
+/// in Git only `jack` may read, and `docs/` in one with root's audience.
 /// Returns the store, the stand-in, and `feature-a`'s workspace.
 fn setup(temp: &Utf8Path) -> (Utf8PathBuf, Utf8PathBuf, Utf8PathBuf) {
     let remote = temp.join("github.git");
@@ -111,7 +111,7 @@ fn setup(temp: &Utf8Path) -> (Utf8PathBuf, Utf8PathBuf, Utf8PathBuf) {
             "tracker",
             "create",
             "billing",
-            "--code",
+            "--git",
             "--path",
             "billing",
             "--audience",
@@ -120,7 +120,7 @@ fn setup(temp: &Utf8Path) -> (Utf8PathBuf, Utf8PathBuf, Utf8PathBuf) {
     );
     newgit_ok(
         &repo,
-        &["tracker", "create", "docs", "--code", "--path", "docs"],
+        &["tracker", "create", "docs", "--git", "--path", "docs"],
     );
     newgit_ok(&repo, &["spawn", "feature-a"]);
     let path = newgit(&repo, &["status", "feature-a", "--path"]);

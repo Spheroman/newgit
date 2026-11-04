@@ -45,7 +45,7 @@ const begin = (token: string, trackers: string[]) =>
 
 describe("maintainers", () => {
 	it("decide who merges a tracker — the owner too", async () => {
-		define("access", "web", 'audience = "project-devs"\nsecret = false\nmaintainers = "user:ana"\n');
+		define("access", "web", 'audience = "project-devs"\ngit = true\nmaintainers = "user:ana"\n');
 		const owner = await begin(jack, ["web"]);
 		expect(owner.status).toBe(403);
 		expect(owner.body.error).toContain("only ana maintains `web`");
@@ -53,7 +53,7 @@ describe("maintainers", () => {
 	});
 
 	it("default to the audience: anyone who may read a tracker may change it", async () => {
-		define("access", "web", 'audience = "project-devs"\nsecret = false\n');
+		define("access", "web", 'audience = "project-devs"\ngit = true\n');
 		expect((await begin(ana, ["web"])).status).toBe(200);
 	});
 
@@ -70,12 +70,12 @@ describe("maintainers", () => {
 		define(
 			"access",
 			"admin",
-			'audience = "project-devs"\nsecret = false\nmaintainers = "user:ana"\npaths = [".newgit/trackers/web.toml", ".newgit/trackers/docs.toml"]\n',
+			'audience = "project-devs"\ngit = true\nmaintainers = "user:ana"\npaths = [".newgit/trackers/web.toml", ".newgit/trackers/docs.toml"]\n',
 		);
-		define("admin", "web", 'audience = "project-devs"\nsecret = false\nmaintainers = "project-devs"\n');
+		define("admin", "web", 'audience = "project-devs"\ngit = true\nmaintainers = "project-devs"\n');
 		// A stale copy in `access` is not what counts: admin owns the file now.
-		define("access", "web", 'audience = "user:jack"\nsecret = false\n');
-		define("admin", "docs", 'audience = "project-devs"\nsecret = false\n');
+		define("access", "web", 'audience = "user:jack"\ngit = true\n');
+		define("admin", "docs", 'audience = "project-devs"\ngit = true\n');
 
 		// web's definition is read from admin: ana, a member, may read and merge it.
 		expect((await begin(ana, ["web"])).status).toBe(200);

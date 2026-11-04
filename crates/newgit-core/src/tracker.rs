@@ -18,10 +18,12 @@ pub struct TrackerDefinition {
     /// `db-snapshots`). `.` means everything no more specific tracker owns —
     /// the `root` tracker.
     pub paths: Vec<Utf8PathBuf>,
-    /// Kept out of Git entirely: excluded in every workspace, never committed,
-    /// captured by newgit from the files. True unless a definition says
-    /// otherwise — fails closed, like export's audience filter.
-    pub secret: bool,
+    /// Whether its content is committed to Git (and split into the tracker's
+    /// own history). False unless a definition says otherwise: the content
+    /// is then kept out of Git entirely — excluded in every workspace, never
+    /// committed, captured by newgit from the files — which fails closed,
+    /// like export's audience filter.
+    pub git: bool,
     /// Who may merge changes to it: an audience (`project-devs`,
     /// `user:<login>`) or `owner`, the project's owner. `None` means its
     /// audience — anyone who may read it may change it. Changing a tracker's
@@ -77,8 +79,8 @@ pub struct TrackerDefinitionFile {
     merge_with_source: bool,
     #[serde(default)]
     paths: Vec<Utf8PathBuf>,
-    #[serde(default = "secret_by_default", skip_serializing_if = "is_true")]
-    secret: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    git: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     maintainers: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -95,12 +97,8 @@ fn is_zero(value: &i32) -> bool {
     *value == 0
 }
 
-fn secret_by_default() -> bool {
-    true
-}
-
-fn is_true(value: &bool) -> bool {
-    *value
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 impl TrackerDefinition {
@@ -117,7 +115,7 @@ impl TrackerDefinition {
             storage,
             merge_with_source,
             paths: paths.iter().map(|path| normalize_path(path)).collect(),
-            secret: true,
+            git: false,
             maintainers: None,
             role: None,
             priority: 0,
@@ -131,18 +129,18 @@ impl TrackerDefinition {
         Ok(definition)
     }
 
-    /// A code tracker as `newgit tracker create --code` writes it: committed,
+    /// A tracker in Git as `newgit tracker create --git` writes it: committed,
     /// merged with the work that changes it. Checked as one from the start,
-    /// since a code tracker may own what a secret one may not: another
+    /// since a tracker in Git may own what one outside Git may not: another
     /// tracker's definition.
-    pub fn code(name: &str, audience: String, paths: &[Utf8PathBuf]) -> Result<Self> {
+    pub fn in_git(name: &str, audience: String, paths: &[Utf8PathBuf]) -> Result<Self> {
         let mut definition = Self {
             name: name.to_owned(),
             audience,
             storage: Storage::Local,
             merge_with_source: true,
             paths: paths.iter().map(|path| normalize_path(path)).collect(),
-            secret: false,
+            git: true,
             maintainers: None,
             role: None,
             priority: 0,
@@ -177,7 +175,7 @@ impl TrackerDefinition {
             storage: file.storage,
             merge_with_source: file.merge_with_source,
             paths: file.paths.iter().map(|path| normalize_path(path)).collect(),
-            secret: file.secret,
+            git: file.git,
             maintainers: file.maintainers,
             role: file.role,
             priority: file.priority,
@@ -237,14 +235,14 @@ impl TrackerDefinition {
             // Except a tracker's definition: whoever may change the tracker
             // owning `web.toml` decides who may read `web`, so governance
             // layers by owning definitions (docs/design/trackers.md, "Who may
-            // change what"). Only a code tracker may: a secret one would
+            // change what"). Only a tracker in Git may: one outside Git would
             // keep the definition out of Git.
             if is_definition_file(path) {
-                if self.is_code() {
+                if self.carved() {
                     continue;
                 }
                 return Err(self.invalid(format!(
-                    "path `{path}` is a tracker definition, which only a code tracker may own"
+                    "path `{path}` is a tracker definition, which only a tracker in Git may own"
                 )));
             }
             // Regardless of case: a case-insensitive file system opens `.GIT`
@@ -284,7 +282,7 @@ impl TrackerDefinition {
             storage: self.storage,
             merge_with_source: self.merge_with_source,
             paths: self.paths.clone(),
-            secret: self.secret,
+            git: self.git,
             maintainers: self.maintainers.clone(),
             role: self.role.clone(),
             priority: self.priority,
@@ -303,7 +301,7 @@ impl TrackerDefinition {
             storage: Storage::Local,
             merge_with_source: true,
             paths: vec![Utf8PathBuf::from(".")],
-            secret: false,
+            git: true,
             maintainers: None,
             role: None,
             priority: 0,
@@ -328,7 +326,7 @@ impl TrackerDefinition {
             storage: Storage::Local,
             merge_with_source: true,
             paths: vec![Utf8PathBuf::from(".newgit/trackers")],
-            secret: false,
+            git: true,
             maintainers: Some("owner".to_owned()),
             role: None,
             priority: 0,
@@ -353,7 +351,7 @@ impl TrackerDefinition {
             storage: Storage::Local,
             merge_with_source: true,
             paths: vec![Utf8PathBuf::from(".newgit")],
-            secret: false,
+            git: true,
             maintainers: None,
             role: None,
             priority: 0,
@@ -369,9 +367,9 @@ impl TrackerDefinition {
     }
 
     /// Committed content with its own history, composed into workspaces
-    /// rather than captured from files — every non-secret tracker but root.
-    pub fn is_code(&self) -> bool {
-        !self.secret && !self.owns_everything()
+    /// rather than captured from files — every tracker in Git but root.
+    pub fn carved(&self) -> bool {
+        self.git && !self.owns_everything()
     }
 
     /// Owns `.`: everything no more specific tracker claims.
@@ -716,7 +714,7 @@ mod tests {
             storage: Storage::Local,
             merge_with_source: false,
             paths: paths.iter().map(Utf8PathBuf::from).collect(),
-            secret: true,
+            git: false,
             maintainers: None,
             role: None,
             priority: 0,
@@ -763,9 +761,9 @@ mod tests {
     }
 
     #[test]
-    fn code_trackers_and_the_project_tracker_are_committed() {
-        assert!(TrackerDefinition::project().is_code());
-        assert!(!TrackerDefinition::root().is_code() && !TrackerDefinition::root().secret);
+    fn git_trackers_and_the_project_tracker_are_committed() {
+        assert!(TrackerDefinition::project().carved());
+        assert!(!TrackerDefinition::root().carved() && TrackerDefinition::root().git);
         // Only the project tracker may own `.newgit`.
         let error = TrackerDefinition::new(
             "sneaky",

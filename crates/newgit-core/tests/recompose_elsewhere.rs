@@ -81,7 +81,7 @@ fn tracker(name: &str, paths: &[&str], excluded: &[&str]) -> TrackerDefinition {
         storage: Storage::Local,
         merge_with_source: true,
         paths: paths.iter().map(Utf8PathBuf::from).collect(),
-        secret: false,
+        git: true,
         maintainers: None,
         role: None,
         priority: 0,

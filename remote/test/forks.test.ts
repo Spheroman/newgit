@@ -22,8 +22,8 @@ beforeEach(async () => {
 	expect((await call(jack, "POST", "/v1/projects", { name: slug, trackers: ["root", "access", "project", "web"] })).status).toBe(201);
 	expect((await call(jack, "POST", `/v1/projects/${project}/members`, { login: "ana" })).status).toBe(200);
 	const define = (name: string, text: string) => repos.write(repo("t.access"), `.newgit/trackers/${name}.toml`, text);
-	define("root", 'audience = "project-devs"\nsecret = false\n');
-	define("web", 'audience = "project-devs"\nsecret = false\n');
+	define("root", 'audience = "project-devs"\ngit = true\n');
+	define("web", 'audience = "project-devs"\ngit = true\n');
 	define("runtime-env", 'audience = "user"\n');
 	repos.write(repo("t.root"), "README.md", "hello\n");
 });
@@ -49,7 +49,7 @@ const spawn = async (token: string, name: string) => {
 const fork = (token: string, instance: string, tracker: string) =>
 	call(token, "POST", `/v1/projects/${project}/instances/${instance}/trackers/${tracker}/fork`);
 
-describe("forking a code tracker", () => {
+describe("forking a tracker in Git", () => {
 	it("creates the instance's fork of that tracker, with its content", async () => {
 		await spawn(ana, "fix-login");
 		const forked = await fork(ana, "fix-login", "root");
@@ -87,11 +87,11 @@ describe("forking a code tracker", () => {
 		expect(listed.body.instances[0].forks).toEqual(["root", "web"]);
 	});
 
-	it("is refused for a secret tracker, and for one the project does not define", async () => {
+	it("is refused for a tracker outside Git, and for one the project does not define", async () => {
 		await spawn(ana, "fix-login");
-		const secret = await fork(ana, "fix-login", "runtime-env");
-		expect(secret.status).toBe(400);
-		expect(secret.body.error).toContain("secret tracker");
+		const outside = await fork(ana, "fix-login", "runtime-env");
+		expect(outside.status).toBe(400);
+		expect(outside.body.error).toContain("is not in Git");
 		expect((await fork(ana, "fix-login", "ghost")).status).toBe(404);
 		expect(repos.repos.has(repo("i.fix-login.runtime-env"))).toBe(false);
 		expect((await call(ana, "GET", `/v1/projects/${project}/instances/fix-login`)).body.forks).toEqual([]);
@@ -151,7 +151,7 @@ describe("removing an instance", () => {
 		expect(repos.repos.has(repo("i.attempt-1.root"))).toBe(false);
 		expect(repos.repos.has(repo("i.attempt-1.web"))).toBe(false);
 		expect(repos.repos.has(repo("i.attempt-2.root"))).toBe(true);
-		// The code trackers themselves are untouched.
+		// The trackers in Git themselves are untouched.
 		expect(repos.repos.has(repo("t.root"))).toBe(true);
 		expect(repos.revokedTokens.has(minted)).toBe(true);
 		expect((await call(one.token, "GET", "/v1/me")).status).toBe(401);

@@ -35,7 +35,7 @@ pub struct CheckpointRecord {
     pub tracker_states: Vec<TrackerState>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub resource_states: Vec<ResourceState>,
-    /// The checkpoint as a list: one commit per code tracker, for the
+    /// The checkpoint as a list: one commit per tracker in Git, for the
     /// committed work (`head`) and with the uncommitted work too (`tip`).
     /// Filled in when the checkpoint syncs to a remote; another machine
     /// composes its source from these.

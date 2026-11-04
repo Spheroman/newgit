@@ -321,7 +321,7 @@ fn a_secret_in_the_history_refuses_the_export() {
 }
 
 #[test]
-fn a_secret_tracker_cannot_be_named() {
+fn a_tracker_outside_git_cannot_be_named() {
     let (_guard, temp) = tempdir();
     let fixture = setup(&temp, &[]);
     succeeds(&fixture.store, &["tracker", "create", "runtime-env"]);
@@ -334,7 +334,7 @@ fn a_secret_tracker_cannot_be_named() {
         ),
     );
     let stderr = fails(&fixture.store, &["export", "--remote", "github"]);
-    assert!(stderr.contains("is secret"), "{stderr}");
+    assert!(stderr.contains("is not in Git"), "{stderr}");
 
     define(
         &fixture,

@@ -19,7 +19,7 @@ beforeEach(async () => {
 	jack = (await issue(env, { kind: "login", login: "jack", ttlSeconds: LOGIN_TTL_SECONDS })).token;
 	expect((await call(jack, "POST", "/v1/projects", { name: slug, trackers: ["root", "access", "project"] })).status).toBe(201);
 	const define = (name: string, text: string) => repos.write(`jack.${slug}.t.access`, `.newgit/trackers/${name}.toml`, text);
-	define("root", 'audience = "project-devs"\nsecret = false\n');
+	define("root", 'audience = "project-devs"\ngit = true\n');
 	define("runtime-env", 'audience = "user"\n');
 });
 
@@ -69,7 +69,7 @@ describe("instance tokens", () => {
 		expect((await call(one.token, "PUT", `/v1/projects/${project}/checkpoints/attempt-1/ckpt_001`, { record: {} })).status).toBe(201);
 		expect((await call(one.token, "PUT", `/v1/projects/${project}/instances/attempt-1/head`, { head_rev: "def" })).status).toBe(200);
 
-		// Acting as jack, it may still read the code tracker and use jack's own lanes.
+		// Acting as jack, it may still read the tracker in Git and use jack's own lanes.
 		expect((await credential(one.token, `jack.${slug}.t.root`)).status).toBe(200);
 		expect((await credential(one.token, `jack.${slug}.t.runtime-env.jack`, "write")).status).toBe(200);
 

@@ -11,7 +11,7 @@
 
 include!("support/fake_remote.rs");
 
-/// A code tracker `b` owning `apps/b`, merged into `main` so the remote has
+/// A tracker in Git `b` owning `apps/b`, merged into `main` so the remote has
 /// it, and `feature-a` spawned with it bound.
 fn spawned_with_tracker_b(fixture: &Fixture) -> Utf8PathBuf {
     std::fs::create_dir_all(fixture.store.join("apps/b")).expect("mkdir");
@@ -20,7 +20,7 @@ fn spawned_with_tracker_b(fixture: &Fixture) -> Utf8PathBuf {
     git(&fixture.store, &["commit", "-q", "-m", "apps/b"]);
     fixture.ok(
         &fixture.store,
-        &["tracker", "create", "b", "--code", "--path", "apps/b"],
+        &["tracker", "create", "b", "--git", "--path", "apps/b"],
     );
     git(&fixture.store, &["add", "-A"]);
     git(&fixture.store, &["commit", "-q", "-m", "b is a tracker"]);

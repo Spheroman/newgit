@@ -1,11 +1,11 @@
 //! A rendered file is marked `--skip-worktree`, so this instance's values
 //! never show in `git status` and `git add -A` cannot commit them. Dropping
-//! a code tracker that owns paths turns the workspace into a sparse
+//! a tracker in Git that owns paths turns the workspace into a sparse
 //! checkout, and a sparse checkout decides that bit itself:
 //! `sparse-checkout set` and `disable` work every file's bit out again from
 //! the patterns, Git commands that update the working tree do too, and
 //! reading the index clears the bit of every marked file Git finds on disk.
-//! So once a code tracker was dropped, the rendered file showed as
+//! So once a tracker in Git was dropped, the rendered file showed as
 //! modified, an agent's `git add -A && git commit` committed its port, and
 //! a checkpoint held it.
 //!
@@ -89,7 +89,7 @@ const RENDERS: &[Render] = &[
     ("web", "web", 47400, "apps/a/config.toml", "port = 2"),
 ];
 
-/// `RENDERS`, with code trackers over the given paths created in order.
+/// `RENDERS`, with trackers in Git over the given paths created in order.
 fn setup(temp: &Utf8Path, trackers: &[(&str, &str)]) -> BranchManager {
     setup_with(temp, trackers, RENDERS)
 }
@@ -135,7 +135,7 @@ fn setup_with(temp: &Utf8Path, trackers: &[(&str, &str)], renders: &[Render]) ->
     for (name, path) in trackers {
         BranchManager::open(store.clone())
             .expect("manager")
-            .create_code_tracker(name, "project-devs", &[Utf8PathBuf::from(*path)])
+            .create_git_tracker(name, "project-devs", &[Utf8PathBuf::from(*path)])
             .expect("carve");
     }
     git(&repo, &["add", "-A"]);
@@ -179,7 +179,7 @@ fn dropped_b(manager: &BranchManager) -> Utf8PathBuf {
 }
 
 #[test]
-fn a_rendered_file_stays_out_of_git_status_and_git_add_once_a_code_tracker_is_dropped() {
+fn a_rendered_file_stays_out_of_git_status_and_git_add_once_a_git_tracker_is_dropped() {
     let (_guard, temp) = tempdir();
     let manager = setup(&temp, AB);
     let workspace = dropped_b(&manager);
@@ -197,7 +197,7 @@ fn a_rendered_file_stays_out_of_git_status_and_git_add_once_a_code_tracker_is_dr
 }
 
 #[test]
-fn a_checkpoint_taken_while_a_code_tracker_is_dropped_holds_no_rendered_value() {
+fn a_checkpoint_taken_while_a_git_tracker_is_dropped_holds_no_rendered_value() {
     let (_guard, temp) = tempdir();
     let manager = setup(&temp, AB);
     let workspace = dropped_b(&manager);
@@ -454,7 +454,7 @@ fn git_commands_that_update_the_working_tree_keep_a_rendered_file_while_a_tracke
 }
 
 #[test]
-fn undo_while_a_code_tracker_is_dropped_leaves_the_rendered_file_marked() {
+fn undo_while_a_git_tracker_is_dropped_leaves_the_rendered_file_marked() {
     let (_guard, temp) = tempdir();
     let manager = setup(&temp, AB);
     let workspace = dropped_b(&manager);
@@ -503,7 +503,7 @@ fn tracker_drop_goes_ahead_once_a_rendered_file_has_left_the_index() {
     assert_eq!(status(&workspace), "");
 }
 
-/// A rendered file inside a code tracker's paths is no uncommitted work of
+/// A rendered file inside the paths of a tracker in Git is no uncommitted work of
 /// that tracker's. While another tracker was dropped, its cleared bit made
 /// `tracker drop a` refuse over it.
 #[test]

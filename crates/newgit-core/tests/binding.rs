@@ -1,5 +1,5 @@
 //! Binding (docs/design/trackers.md, step 4): `newgit tracker use` and `drop`. An
-//! instance's history holds every code tracker its user may read; dropping one
+//! instance's history holds every tracker in Git its user may read; dropping one
 //! takes it out of the working tree (sparse checkout) and out of the instance's
 //! scope, never out of its history.
 
@@ -58,7 +58,7 @@ fn setup(temp: &Utf8Path) -> BranchManager {
     git(&repo, &["commit", "-q", "-m", "newgit"]);
     BranchManager::open(store.clone())
         .expect("manager")
-        .create_code_tracker(
+        .create_git_tracker(
             "electron",
             "project-devs",
             &[Utf8PathBuf::from("apps/electron")],
@@ -99,7 +99,7 @@ fn spawn(manager: &BranchManager, name: &str) -> Utf8PathBuf {
 }
 
 #[test]
-fn a_dropped_code_tracker_leaves_the_working_tree_but_not_the_history() {
+fn a_dropped_git_tracker_leaves_the_working_tree_but_not_the_history() {
     let (_guard, temp) = tempdir();
     let manager = setup(&temp);
     let workspace = spawn(&manager, "feature-a");
@@ -190,7 +190,7 @@ fn a_merge_leaves_a_dropped_tracker_at_the_branchs_commit() {
 }
 
 #[test]
-fn a_dropped_secret_tracker_is_captured_then_removed_and_comes_back() {
+fn a_dropped_tracker_outside_git_is_captured_then_removed_and_comes_back() {
     let (_guard, temp) = tempdir();
     let manager = setup(&temp);
     let workspace = spawn(&manager, "feature-a");

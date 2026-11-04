@@ -1,6 +1,6 @@
 //! Tracker paths are checked by where they lead, not by how they are
 //! spelled: each is normalized first, so `./.git` is `.git`, and `.git` and
-//! `.newgit` are refused in any case. Inside `.newgit/`, a code tracker may
+//! `.newgit` are refused in any case. Inside `.newgit/`, a tracker in Git may
 //! own other trackers' definitions, `.newgit/trackers/<name>.toml`: the
 //! governance layering docs/design/trackers.md documents under "Who may change
 //! what", and the one the remote resolves (`loadDefinitions` in
@@ -111,18 +111,18 @@ fn an_admin_tracker_may_own_another_trackers_definition() {
     let root = store.paths().project_root.clone();
     let trackers = store.paths().trackers.clone();
 
-    // A project code tracker on its own opens fine.
+    // A project tracker in Git on its own opens fine.
     std::fs::write(
         trackers.join("web.toml"),
         r#"audience = "project-devs"
 storage = "local"
-secret = false
+git = true
 paths = ["apps/web"]
 "#,
     )
     .expect("write web");
     BranchManager::open(MetadataStore::at(root.clone()))
-        .expect("precondition: a plain code tracker definition opens");
+        .expect("precondition: a plain tracker in Git definition opens");
 
     // The next layer: a tracker owning `web`'s definition, maintained by the
     // project's owner, so only they may change who can read `web`.
@@ -130,7 +130,7 @@ paths = ["apps/web"]
         trackers.join("admin.toml"),
         r#"audience = "project-devs"
 storage = "local"
-secret = false
+git = true
 maintainers = "owner"
 paths = [".newgit/trackers/web.toml"]
 "#,
@@ -139,7 +139,7 @@ paths = [".newgit/trackers/web.toml"]
 
     if let Err(error) = BranchManager::open(MetadataStore::at(root)) {
         panic!(
-            "a code tracker owning another tracker's definition — the governance layering of \
+            "a tracker in Git owning another tracker's definition — the governance layering of \
              docs/design/trackers.md's \"Who may change what\", which the remote resolves — makes \
              the project unopenable: {error}"
         );
@@ -176,14 +176,14 @@ fn a_tracked_path_is_stored_and_ignored_as_the_path_it_names() {
 }
 
 /// A definition is the one thing in `.newgit/` a tracker may claim, however
-/// it is spelled, and only a code tracker may: a secret one would keep the
+/// it is spelled, and only a tracker in Git may: one outside Git would keep the
 /// definition out of Git. The rest of `.newgit/` stays `project`'s and
 /// `access`'s, and `.git` stays closed in any case, since a case-insensitive
 /// file system, macOS's default, opens `.GIT` as the Git directory.
 #[test]
-fn only_a_code_tracker_may_own_a_definition_and_nothing_else_in_newgit_opens() {
+fn only_a_git_tracker_may_own_a_definition_and_nothing_else_in_newgit_opens() {
     let code = |path: &str| {
-        TrackerDefinition::code(
+        TrackerDefinition::in_git(
             "admin",
             "project-devs".to_owned(),
             &[Utf8PathBuf::from(path)],
@@ -208,8 +208,11 @@ fn only_a_code_tracker_may_own_a_definition_and_nothing_else_in_newgit_opens() {
         false,
         vec![Utf8PathBuf::from(".newgit/trackers/web.toml")],
     )
-    .expect_err("a secret tracker may not own a definition");
-    assert!(error.to_string().contains("only a code tracker"), "{error}");
+    .expect_err("a tracker outside Git may not own a definition");
+    assert!(
+        error.to_string().contains("only a tracker in Git"),
+        "{error}"
+    );
 
     for path in [
         ".newgit",
@@ -231,22 +234,22 @@ fn only_a_code_tracker_may_own_a_definition_and_nothing_else_in_newgit_opens() {
     }
 }
 
-/// What `newgit tracker create admin --code --path .newgit/trackers/web.toml`
-/// runs. A code tracker used to be checked while it was still a secret one,
-/// the default, so it could not claim a definition even with the check
+/// What `newgit tracker create admin --git --path .newgit/trackers/web.toml`
+/// runs. A tracker in Git used to be checked while it was still one outside
+/// Git, the default, so it could not claim a definition even with the check
 /// fixed.
 #[test]
-fn an_admin_tracker_is_created_and_composed_like_any_code_tracker() {
+fn an_admin_tracker_is_created_and_composed_like_any_git_tracker() {
     let (_guard, temp) = tempdir();
     let store = setup(&temp);
     let root = store.paths().project_root.clone();
     BranchManager::open(store)
         .expect("manager")
-        .create_code_tracker("web", "project-devs", &[Utf8PathBuf::from("apps/web")])
+        .create_git_tracker("web", "project-devs", &[Utf8PathBuf::from("apps/web")])
         .expect("create web");
     let outcome = BranchManager::open(MetadataStore::at(root.clone()))
         .expect("reopen")
-        .create_code_tracker(
+        .create_git_tracker(
             "admin",
             "project-devs",
             &[Utf8PathBuf::from(".newgit/trackers/web.toml")],
@@ -258,10 +261,10 @@ fn an_admin_tracker_is_created_and_composed_like_any_code_tracker() {
 
     let m = BranchManager::open(MetadataStore::at(root)).expect("reopen");
     let access = m
-        .code_trackers()
+        .carved_trackers()
         .iter()
         .find(|definition| definition.name == "access")
-        .expect("access is a code tracker");
+        .expect("access is a tracker in Git");
     assert_eq!(
         access.excluded,
         [Utf8PathBuf::from(".newgit/trackers/web.toml")]

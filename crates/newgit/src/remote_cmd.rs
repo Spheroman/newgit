@@ -214,7 +214,7 @@ fn add(url: Option<String>, project: Option<String>, json: bool) -> Result<()> {
             })
         );
     } else if let Some(list) = created {
-        println!("Created `{key}` on {url}, with one repo per code tracker");
+        println!("Created `{key}` on {url}, with one repo per tracker in Git");
         for (tracker, commit) in &list {
             println!("  {tracker:<12} {}", &commit[..commit.len().min(12)]);
         }
@@ -231,7 +231,7 @@ fn add(url: Option<String>, project: Option<String>, json: bool) -> Result<()> {
     Ok(())
 }
 
-/// `newgit clone <owner>/<name> [dir]`: every code tracker you may read is
+/// `newgit clone <owner>/<name> [dir]`: every tracker in Git you may read is
 /// fetched into a new tracker store, the default branch's list composed from
 /// them into an ordinary Git repository, and newgit set up around it — so
 /// the clone spawns, checkpoints, and syncs like the project it came from.
@@ -301,7 +301,7 @@ fn clone_into(
     };
     git(&["init", "-q", "-b", &view.default_branch])?;
 
-    // Every code tracker you may read, into the tracker store.
+    // Every tracker in Git you may read, into the tracker store.
     let paths = MetadataStore::at(dir).paths().clone();
     newgit_core::tracker_repo::ensure_store(&paths.tracker_store)?;
     let prefix = project.replace('/', ".");
@@ -392,7 +392,7 @@ fn clone_into(
 
     println!("Cloned `{}` into {dir}", view.key);
     println!(
-        "  {}: {} ({} code trackers)",
+        "  {}: {} ({} trackers in Git)",
         view.default_branch,
         &head[..head.len().min(12)],
         fetched.len()
@@ -619,7 +619,7 @@ pub fn credential(operation: &str) -> Result<()> {
         None => remote::login_remote(&url)?,
     };
     // Git does not say whether it will read or write. Ask for write, and
-    // settle for read where write is refused (a code tracker's repo always is).
+    // settle for read where write is refused (the repo of a tracker in Git always is).
     let credential = match client.credential(&project, repo, Scope::Write) {
         Ok(credential) => credential,
         Err(NewgitError::Remote { status: 403, .. }) => {

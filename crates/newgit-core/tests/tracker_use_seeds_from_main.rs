@@ -1,4 +1,4 @@
-//! `tracker use` of a secret tracker the instance has never bound — dropped
+//! `tracker use` of a tracker outside Git the instance has never bound — dropped
 //! at spawn because another tracker filled its role — puts the tracker's
 //! main in the workspace, as `spawn --use` does. It used to restore only a
 //! rev the instance already held for it, so it bound the tracker with no
@@ -41,7 +41,7 @@ fn tempdir() -> (tempfile::TempDir, Utf8PathBuf) {
 const SHARED_ENV: &str = "DATABASE_URL=postgres://shared.example.com:5432/app\n";
 const BRANCH_ENV: &str = "DATABASE_URL=postgres://127.0.0.1:54322/app\n";
 
-/// Two secret trackers in the `db` role: `shared-db` wins it by priority,
+/// Two trackers outside Git in the `db` role: `shared-db` wins it by priority,
 /// `branch-db` brings `fakedb`, whose render points `.env.db` at its port.
 /// With `seed`, each lane's main holds its own `.env.db`; without, neither
 /// has any content yet.

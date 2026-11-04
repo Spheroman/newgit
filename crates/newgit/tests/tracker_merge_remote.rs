@@ -1,6 +1,6 @@
 //! `newgit tracker merge` on a shared tracker stored on the remote moves the
-//! remote's `main` too: the tracker repo's branch `main`, as a code
-//! tracker's is. A checkpoint's sync never pushes a shared tracker's `main`,
+//! remote's `main` too: the tracker repo's branch `main`, as that of a
+//! tracker in Git is. A checkpoint's sync never pushes a shared tracker's `main`,
 //! so without this a merge reached nobody but this machine.
 
 #![allow(dead_code)]

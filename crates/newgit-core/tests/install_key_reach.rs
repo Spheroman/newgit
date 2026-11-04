@@ -9,7 +9,7 @@
 //! creating or renaming a tracker anywhere in the project.
 //!
 //! What can reach an install is which paths are checked out (the sparse
-//! checkout a dropped code tracker makes, which an unfiltered `npm ci`
+//! checkout a dropped tracker in Git makes, which an unfiltered `npm ci`
 //! reads by finding workspace members on disk), and the tracker names, only
 //! when something tells the install them through `{{bound…}}`.
 
@@ -61,7 +61,7 @@ const TOLD_INSTALL: &str = "echo run >> runs.txt && mkdir -p node_modules && ls 
                             node_modules/trackers.txt";
 
 /// A workspace-style monorepo: one root lockfile listing two members, each
-/// carved into its own code tracker, a secret tracker `branch-db` that owns
+/// carved into its own tracker in Git, a tracker outside Git `branch-db` that owns
 /// no paths (it only brings a database), and a shared install keyed on the
 /// lockfile.
 fn setup(temp: &Utf8Path, prepare: &str) -> BranchManager {
@@ -89,13 +89,13 @@ fn setup(temp: &Utf8Path, prepare: &str) -> BranchManager {
     for (name, path) in [("a", "apps/a"), ("b", "apps/b")] {
         BranchManager::open(store.clone())
             .expect("manager")
-            .create_code_tracker(name, "project-devs", &[Utf8PathBuf::from(path)])
+            .create_git_tracker(name, "project-devs", &[Utf8PathBuf::from(path)])
             .expect("carve");
     }
     BranchManager::open(store.clone())
         .expect("manager")
         .create_tracker("branch-db", "project-devs", Storage::Local, false)
-        .expect("secret tracker");
+        .expect("tracker outside Git");
     git(&repo, &["add", "-A"]);
     git(&repo, &["commit", "-q", "-m", "trackers"]);
     let manager = BranchManager::open(store).expect("manager");
@@ -180,10 +180,10 @@ fn runs(workspace: &Utf8Path) -> usize {
 }
 
 /// The issue's case: switching a branch database on is `tracker use` of a
-/// secret tracker that owns no paths. Nothing `npm ci` sees changes, so the
+/// tracker outside Git that owns no paths. Nothing `npm ci` sees changes, so the
 /// install is kept, and not reported as rebuilt.
 #[test]
-fn using_a_pathless_secret_tracker_keeps_the_install() {
+fn using_a_pathless_tracker_outside_git_keeps_the_install() {
     let (_guard, temp) = tempdir();
     let manager = setup(&temp, DISCOVERING_INSTALL);
     let spawned = manager
@@ -197,10 +197,10 @@ fn using_a_pathless_secret_tracker_keeps_the_install() {
     assert_eq!(runs(&workspace), 1, "the use did not reinstall");
 }
 
-/// The same for `drop`, of a secret tracker that owns a file the install
+/// The same for `drop`, of a tracker outside Git that owns a file the install
 /// never reads: its files leave the workspace, but no code path does.
 #[test]
-fn dropping_a_secret_tracker_keeps_the_install() {
+fn dropping_a_tracker_outside_git_keeps_the_install() {
     let (_guard, temp) = tempdir();
     let manager = setup(&temp, DISCOVERING_INSTALL);
     manager
@@ -225,7 +225,7 @@ fn dropping_a_secret_tracker_keeps_the_install() {
 /// At spawn, the default binding and `--use branch-db` (here: dropping it)
 /// are the same tree, so the second is filled from the first.
 #[test]
-fn instances_that_differ_only_in_a_secret_tracker_share_one_tree() {
+fn instances_that_differ_only_in_a_tracker_outside_git_share_one_tree() {
     let (_guard, temp) = tempdir();
     let manager = setup(&temp, DISCOVERING_INSTALL);
     let with = manager.spawn("with", None).expect("spawn with");
@@ -259,11 +259,11 @@ fn creating_a_tracker_does_not_move_the_key() {
     assert_eq!(filled_key(deps(&second.resources)), key);
 }
 
-/// Dropping a code tracker still moves the key, and still rebuilds: its
+/// Dropping a tracker in Git still moves the key, and still rebuilds: its
 /// files leave the checkout, so an install that finds its members on disk
 /// builds less, without ever naming `{{bound…}}`.
 #[test]
-fn dropping_a_code_tracker_still_rebuilds_an_install_that_reads_the_disk() {
+fn dropping_a_git_tracker_still_rebuilds_an_install_that_reads_the_disk() {
     let (_guard, temp) = tempdir();
     let manager = setup(&temp, DISCOVERING_INSTALL);
     let spawned = manager.spawn("x", None).expect("spawn x");
@@ -281,7 +281,7 @@ fn dropping_a_code_tracker_still_rebuilds_an_install_that_reads_the_disk() {
 }
 
 /// An install told the tracker names builds something that depends on
-/// them, so a secret tracker moves its key after all.
+/// them, so a tracker outside Git moves its key after all.
 #[test]
 fn an_install_that_names_the_binding_is_still_keyed_on_it() {
     let (_guard, temp) = tempdir();
@@ -328,9 +328,9 @@ BOUND_TRACKERS = "{{bound.trackers}}"
 }
 
 /// Undo's `recompute` skip compares what the store key does: an undo that
-/// rebinds only a pathless secret tracker leaves the install as it is.
+/// rebinds only a pathless tracker outside Git leaves the install as it is.
 #[test]
-fn undo_across_a_secret_tracker_binding_skips_the_recompute() {
+fn undo_across_a_tracker_outside_git_binding_skips_the_recompute() {
     let (_guard, temp) = tempdir();
     let manager = setup(&temp, DISCOVERING_INSTALL);
     let spawned = manager

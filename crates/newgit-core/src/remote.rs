@@ -38,7 +38,7 @@ pub struct RepoLocation {
     pub remote: Option<String>,
 }
 
-/// A project just created: `<owner>/<name>`, and one repo per code tracker.
+/// A project just created: `<owner>/<name>`, and one repo per tracker in Git.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct CreatedProject {
     pub name: String,
@@ -47,7 +47,7 @@ pub struct CreatedProject {
     pub key: String,
     /// Its Git endpoint, `https://<remote>/<owner>/<name>.git`.
     pub endpoint: String,
-    /// The one write to each code tracker's repo outside a merge: for pushing
+    /// The one write to the repo of each tracker in Git outside a merge: for pushing
     /// its existing history.
     pub seeds: Vec<SeedCredential>,
 }
@@ -64,7 +64,7 @@ pub struct Member {
     pub login: String,
 }
 
-/// A branch: one commit per code tracker.
+/// A branch: one commit per tracker in Git.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct RemoteBranch {
     pub name: String,
@@ -114,7 +114,7 @@ pub struct RemoteInstance {
     pub base_rev: String,
     #[serde(default)]
     pub head_rev: Option<String>,
-    /// The code trackers it has forked: the ones it changed.
+    /// The trackers in Git it has forked: the ones it changed.
     #[serde(default)]
     pub forks: Vec<String>,
     /// Only its owner sees it until its work is merged.
@@ -186,7 +186,7 @@ impl Scope {
 pub trait Remote {
     fn url(&self) -> &str;
     fn me(&self) -> Result<Me>;
-    /// Create `<you>/<name>` with one repo per code tracker in `trackers`.
+    /// Create `<you>/<name>` with one repo per tracker in Git in `trackers`.
     fn create_project(&self, name: &str, trackers: &[String]) -> Result<CreatedProject>;
     fn project(&self, project: &str) -> Result<ProjectView>;
     /// Create a branch from a list; refused if it exists (branches move by merge).
@@ -196,9 +196,9 @@ pub trait Remote {
         branch: &str,
         list: &std::collections::BTreeMap<String, String>,
     ) -> Result<()>;
-    /// An instance's fork of one code tracker, made the first time it is asked for.
+    /// An instance's fork of one tracker in Git, made the first time it is asked for.
     fn fork(&self, project: &str, instance: &str, tracker: &str) -> Result<RepoLocation>;
-    /// Create the repo of a code tracker carved after the project was, and
+    /// Create the repo of a tracker in Git carved after the project was, and
     /// the one write that seeds it.
     fn create_tracker_repo(&self, project: &str, tracker: &str) -> Result<SeedCredential>;
     /// Start merging into `branch`, whose list must still be `base`: write

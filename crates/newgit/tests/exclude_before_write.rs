@@ -1,4 +1,4 @@
-//! #296: a secret tracker's paths are excluded from a workspace's Git before
+//! #296: the paths of a tracker outside Git are excluded from a workspace's Git before
 //! its content is written there, by every command that writes it — even in
 //! a workspace spawned before the tracker was defined.
 
@@ -115,7 +115,7 @@ fn ok(dir: &Utf8Path, args: &[&str]) -> String {
     stdout
 }
 
-const HEADER: &str = "# newgit: tracker-owned paths — secret trackers own this content";
+const HEADER: &str = "# newgit: tracker-owned paths — trackers outside Git own this content";
 
 /// Spawn `early` while only `env` exists, then define `site` and give it
 /// merged content: `early` predates `site` and has no exclude for it.

@@ -169,13 +169,13 @@ impl MetadataStore {
             .output()
             .is_ok_and(|output| output.status.success());
         // A fresh `init` vouches for the history it finds: nothing could have
-        // been secret yet. Here secret trackers may already be defined, and
+        // been secret yet. Here trackers outside Git may already be defined, and
         // unpublished commits may touch their paths, so the secret gate keeps
         // checking every commit unless none are.
         let vouch = !store
             .load_tracker_definitions()?
             .iter()
-            .any(|definition| definition.secret);
+            .any(|definition| !definition.git);
         if !seeded && store.adopt_root_history(vouch)? {
             done.push("gave `root` this project's history as its `main`".to_owned());
         }

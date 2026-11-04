@@ -1,6 +1,6 @@
 //! Step 3c (docs/design/trackers.md): the project root is the instance `main`,
 //! its commits split into its tracker branches before anything is composed;
-//! code trackers get their history the first time it is needed; a history
+//! trackers in Git get their history the first time it is needed; a history
 //! that once committed a now-secret file composes unchanged; and split
 //! commits are signed when you sign your commits.
 
@@ -112,11 +112,11 @@ fn split_source(store: &MetadataStore, reference: &str) -> String {
     )
 }
 
-/// The project root's view, composed from every code tracker's
-/// `instances/main` — what `HEAD` must be, commit for commit.
+/// The project root's view, composed from the `instances/main` of every
+/// tracker in Git — what `HEAD` must be, commit for commit.
 fn recompose(manager: &BranchManager, repo: &Utf8Path) -> Option<String> {
     let definitions: Vec<&TrackerDefinition> = std::iter::once(manager.root_tracker())
-        .chain(manager.code_trackers())
+        .chain(manager.carved_trackers())
         .collect();
     let tips: Vec<TrackerTip<'_>> = definitions
         .into_iter()
@@ -139,7 +139,7 @@ fn recompose(manager: &BranchManager, repo: &Utf8Path) -> Option<String> {
         repo,
         "refs/newgit/views/check",
         &tips,
-        manager.code_trackers(),
+        manager.carved_trackers(),
     )
     .expect("compose")
     .tip
@@ -187,7 +187,7 @@ fn a_reset_in_the_project_root_moves_its_branches_back() {
 }
 
 #[test]
-fn a_code_tracker_defined_by_hand_is_carved_the_first_time_it_is_needed() {
+fn a_git_tracker_defined_by_hand_is_carved_the_first_time_it_is_needed() {
     let (_guard, temp) = tempdir();
     let (store, _repo) = setup(&temp);
     let mut electron = TrackerDefinition::new(
@@ -198,7 +198,7 @@ fn a_code_tracker_defined_by_hand_is_carved_the_first_time_it_is_needed() {
         vec![Utf8PathBuf::from("apps/electron")],
     )
     .expect("definition");
-    electron.secret = false;
+    electron.git = true;
     store
         .create_tracker_definition(&electron)
         .expect("write definition");
@@ -235,7 +235,7 @@ fn carving_after_the_project_root_split_still_recomposes_its_commits() {
         .expect("spawn");
     BranchManager::open(store.clone())
         .expect("manager")
-        .create_code_tracker(
+        .create_git_tracker(
             "electron",
             "project-devs",
             &[Utf8PathBuf::from("apps/electron")],
@@ -254,7 +254,7 @@ fn carving_after_the_project_root_split_still_recomposes_its_commits() {
 }
 
 #[test]
-fn history_that_once_committed_a_now_secret_file_composes_unchanged() {
+fn history_that_once_committed_a_file_now_outside_git_composes_unchanged() {
     let (_guard, temp) = tempdir();
     let repo = temp.join("store");
     std::fs::create_dir_all(&repo).expect("mkdir");

@@ -28,7 +28,7 @@ after the tenth time:
 
 - **Trackers** are versioned lanes for files that never belonged in Git:
   env files, local config, an agent's notes. Each has its own history and
-  its own audience. They're secret by default, so they're captured and
+  its own audience. They stay outside Git by default, so they're captured and
   checkpointed but never committed.
 - **Resources** are the things each branch has to rebuild: installs,
   processes, databases, external services. You declare them once in
@@ -42,8 +42,8 @@ after the tenth time:
 1. **Your repo stays yours.** Nothing changes until you ask, and no command
    rewrites history. `git push`, `gh pr create`, and plain `git clone` keep
    working, and GitHub stays where it is.
-2. **Secret by default.** Trackers are never committed, and `export` fails
-   closed: anything not marked public is withheld and reported.
+2. **Outside Git by default.** A tracker's files are never committed unless
+   it says `git = true`, and `export` fails closed: anything not marked public is withheld and reported.
 3. **Never break an undo.** `cleanup` reclaims disk without deleting anything
    a checkpoint still points at.
 4. **No special lanes.** newgit doesn't have built-in handling for npm,

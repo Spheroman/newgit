@@ -46,7 +46,7 @@ fn tempdir() -> (tempfile::TempDir, Utf8PathBuf) {
 }
 
 /// A workspace-style monorepo: one root lockfile listing two members, each
-/// member carved into its own code tracker, and a shared install keyed on
+/// member carved into its own tracker in Git, and a shared install keyed on
 /// the lockfile whose `prepare` builds the bound members, named by
 /// `{{bound.paths}}`. It checkpoints by identity hash and restores by
 /// recomputing `prepare`, as `node_modules` would.
@@ -54,7 +54,7 @@ fn setup(temp: &Utf8Path) -> BranchManager {
     setup_with(temp, &["a", "b"])
 }
 
-/// [`setup`], with one member and code tracker per name.
+/// [`setup`], with one member and tracker in Git per name.
 fn setup_with(temp: &Utf8Path, names: &[&str]) -> BranchManager {
     let repo = temp.join("store");
     git_init(&repo);
@@ -86,7 +86,7 @@ fn setup_with(temp: &Utf8Path, names: &[&str]) -> BranchManager {
     for name in names {
         BranchManager::open(store.clone())
             .expect("manager")
-            .create_code_tracker(
+            .create_git_tracker(
                 name,
                 "project-devs",
                 &[Utf8PathBuf::from(format!("apps/{name}"))],
@@ -147,7 +147,7 @@ fn define_resource(manager: &BranchManager, name: &str, toml: &str) -> BranchMan
     BranchManager::open(manager.store().clone()).expect("reopen")
 }
 
-/// Add lines to a code tracker's definition and reopen the manager on it.
+/// Add lines to the definition of a tracker in Git and reopen the manager on it.
 fn extend_tracker(manager: &BranchManager, name: &str, lines: &str) -> BranchManager {
     let path = manager
         .store()

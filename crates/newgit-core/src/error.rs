@@ -322,8 +322,8 @@ pub enum NewgitError {
     #[error("{0}")]
     Unsupported(String),
 
-    /// Work that may not leave this machine as it is: a secret tracker's
-    /// file committed, or a path whose tracker the instance has not bound.
+    /// Work that may not leave this machine as it is: a file of a tracker
+    /// outside Git committed, or a path whose tracker the instance has not bound.
     #[error("refusing to send this work anywhere: {0}")]
     SplitRefused(String),
 

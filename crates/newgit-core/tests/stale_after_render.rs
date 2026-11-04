@@ -68,7 +68,7 @@ fn setup(temp: &Utf8Path) -> BranchManager {
 
     BranchManager::open(store.clone())
         .expect("manager")
-        .create_code_tracker("branch-db", "project-devs", &[Utf8PathBuf::from("apps/db")])
+        .create_git_tracker("branch-db", "project-devs", &[Utf8PathBuf::from("apps/db")])
         .expect("carve");
     let tracker = store.paths().trackers.join("branch-db.toml");
     let mut definition = std::fs::read_to_string(&tracker).expect("tracker definition");

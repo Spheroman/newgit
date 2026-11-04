@@ -56,7 +56,7 @@ this repository is `spheroman/newgit` on newgit.dev, and GitHub's
 - A spend kill switch: an hourly cron pauses the remote for everyone but
   its admins while the last 7 days' bill is over `SPEND_LIMIT_WEEKLY_USD`.
 - `newgit remote add`: a project as `<owner>/<name>`, one Artifacts repo per
-  code tracker, seeded with its history; branch `main`. `newgit remote show
+  tracker in Git, seeded with its history; branch `main`. `newgit remote show
   [--json]` names the project and its members.
 - `newgit members add|remove <login>` (the owner, from a login) and
   `members list [--json]`.
@@ -74,12 +74,12 @@ this repository is `spheroman/newgit` on newgit.dev, and GitHub's
   then its record — so the name can be linked again from scratch.
 - The landing page at `/`: one file of one tracker, at its trunk, named by
   `LANDING_PAGE` in `wrangler.jsonc`. newgit.dev's is
-  `remote/site/index.html` in `site`, a secret `project-devs` tracker, so
+  `remote/site/index.html` in `site`, a `project-devs` tracker outside Git, so
   the page is never committed and naming it in the config is what
   publishes it. A change goes live with `newgit tracker merge site`, within
-  a minute (the edge caches it), with no deploy. A shared secret tracker
+  a minute (the edge caches it), with no deploy. A shared tracker outside Git
   stored on the remote (`storage = "remote"`) has its `main` there as the
-  repo's branch `main`, as a code tracker does, and `/` reads it.
+  repo's branch `main`, as a tracker in Git does, and `/` reads it.
   `newgit tracker merge` pushes it before moving `main` here, and fails
   whole if the push does, so merging such a tracker needs a login and the
   network. A checkpoint's sync carries only pins and instance branches
@@ -204,19 +204,19 @@ Facts from the docs (2026-10), because the design leans on each one.
 > down, rooted at the user, with an instance rooted at whichever tracker it
 > spawns at. This topology assumes projects until that is decided.
 
-- `<owner>.<name>.t.<tracker>` — a code tracker's history: one Git branch per
+- `<owner>.<name>.t.<tracker>` — the history of a tracker in Git: one Git branch per
   newgit branch (`main`), the entry in that branch's list. Readable by the
   tracker's audience; written only when it is seeded and by `newgit merge`.
-  Also a shared secret tracker's content.
-- `<owner>.<name>.t.<tracker>.<login>` — one user's per-user secret tracker.
-- `<owner>.<name>.i.<instance>.<tracker>` — an instance's fork of one code
-  tracker, made the first time the instance changes it; its branch is
+  Also the content of a shared tracker outside Git.
+- `<owner>.<name>.t.<tracker>.<login>` — one user's per-user tracker outside Git.
+- `<owner>.<name>.i.<instance>.<tracker>` — an instance's fork of one tracker
+  in Git, made the first time the instance changes it; its branch is
   `refs/heads/<instance>` and each checkpoint's commit
   `refs/newgit/checkpoints/<id>`. Written only by that instance. Deleted by
   `newgit remove`. A private instance's forks (`newgit spawn --private`) are
   readable only by its owner, and its record and checkpoints are hidden
   from everyone else until its work is merged.
-- **Branches** are lists — one commit per code tracker — in the project's
+- **Branches** are lists — one commit per tracker in Git — in the project's
   Durable Object, where a merge moves one by compare-and-swap.
 - **The Git endpoint**, `https://newgit.dev/<owner>/<name>.git`, is what
   `git clone`, `git pull`, and a workspace's `origin` fetch: each branch
@@ -238,8 +238,8 @@ Not provided, and the docs must say so:
 - Isolation *within* a machine: agents under one OS user share the credential
   helper. Sandboxes give per-agent identity.
 - Hunk-level privacy. Trackers are path-granular.
-- Carving does not hide the past: a narrower code tracker's earlier versions
-  stay readable in root's history ([trackers.md](trackers.md), *On the
+- Carving does not hide the past: the earlier versions of a narrower tracker in
+  Git stay readable in root's history ([trackers.md](trackers.md), *On the
   remote*).
 
 ---
@@ -384,8 +384,8 @@ Who the Worker mints a password for:
 
 | Repo | read | write |
 |---|---|---|
-| `<o>.<p>.t.<code tracker>` | its audience | nobody (seeding; `newgit merge`) |
-| `<o>.<p>.t.<secret tracker>` | its audience | its audience |
+| `<o>.<p>.t.<tracker in Git>` | its audience | nobody (seeding; `newgit merge`) |
+| `<o>.<p>.t.<tracker outside Git>` | its audience | its audience |
 | `<o>.<p>.t.<tracker>.<login>` | `<login>` | `<login>` |
 | `<o>.<p>.i.<inst>.<tracker>` | the tracker's audience | the instance owner |
 
@@ -396,13 +396,13 @@ Who the Worker mints a password for:
 A push from a workspace goes to newgit's outbox, which checkpoints the
 instance. On a newgit remote the checkpoint's sync *is* the push: the
 instance's work is split into its trackers, every commit it sends checked
-for secret files, and each changed tracker's branch and the checkpoint's
+for files a tracker outside Git owns (secrets among them), and each changed tracker's branch and the checkpoint's
 commit pushed to the instance's fork of it — forked then, the first time.
 The push succeeds exactly when that reached the remote. Nothing is forwarded
 as one history; the endpoint composes views, and `newgit merge` moves
 branches.
 
-A secret tracker the remote has no definition for yet is left out of the
+A tracker outside Git the remote has no definition for yet is left out of the
 sync instead of failing it, with a warning that names it and quotes why.
 That is a new tracker: the remote reads its audience from its definition on
 the default branch, and the push that carries the definition is the one
@@ -440,12 +440,12 @@ checkpoints` shows where it was made, in the project the current directory
 is linked to. It cannot be combined with `--from` or `--private`.
 
 1. **Record:** read the checkpoint from ProjectDO — the list of tracker
-   commits it froze, the secret tracker revs it bound, its resource states.
-2. **Source:** fetch each code tracker's commit from the author's fork of it
+   commits it froze, the tracker outside Git revs it bound, its resource states.
+2. **Source:** fetch the commit of each tracker in Git from the author's fork of it
    (or the tracker's own repo, where the instance never forked it), compose
    them into the workspace's history, and clone the workspace from the
    store as v1 does. The commit id is the author's.
-3. **Trackers:** resolve each secret tracker for *this* user (below), fetch
+3. **Trackers:** resolve each tracker outside Git for *this* user (below), fetch
    the resolved revs from the tracker repos, project them into the
    workspace.
 4. **Resources:** run this machine's `prepare`/`restore` from the same
@@ -760,7 +760,7 @@ Each piece lands alone and keeps the suite green.
 3. **Overlap reporting** in `newgit status --json`.
 4. **Export follow-ups** (*Outside repositories as trackers*): mount
    imported trackers through one merge commit ([#139]), import an outside
-   repository unchanged as a code tracker ([#140]), export a tracker as its
+   repository unchanged as a tracker in Git ([#140]), export a tracker as its
    own root ([#141]), pull a target's new commits back into its trackers
    ([#142]), and resolve `gh` to the right target ([#143]).
 5. **Forge parity with `gh`** ([#160]–[#181]): latency budgets, `newgit

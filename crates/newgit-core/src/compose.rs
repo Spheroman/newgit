@@ -1,7 +1,7 @@
 //! A workspace's Git is a view composed from tracker repos
 //! (docs/design/trackers.md, step 3). Two operations, both deterministic:
 //!
-//! - [`compose`] replays every bound code tracker's history, interleaved by
+//! - [`compose`] replays the history of every bound tracker in Git, interleaved by
 //!   committer date, into one ordinary Git history — real authors, dates, and
 //!   messages, so `git log` and `git blame` work everywhere.
 //! - [`split`] takes view commits made on top of that (an agent's work) and
@@ -142,9 +142,9 @@ pub type State = BTreeMap<String, String>;
 /// Replay every tracker's history into one view history at `view_ref`.
 ///
 /// `all` is every tracker definition. Which tracker a change belongs to is
-/// decided among the *code* trackers only: a secret tracker is never in a
+/// decided among the trackers in Git only: a tracker outside Git is never in a
 /// view, so a path it owns now that history once committed (a `.env` later
-/// gitignored) stays in the history of the code tracker that held it then.
+/// gitignored) stays in the history of the tracker in Git that held it then.
 /// Rewriting that away would change every commit after it.
 pub fn compose(
     repo: &Utf8Path,
@@ -154,11 +154,11 @@ pub fn compose(
 ) -> Result<View> {
     let mut code: Vec<&TrackerDefinition> = tips.iter().map(|tip| tip.definition).collect();
     for definition in all {
-        if !definition.secret && !code.iter().any(|known| known.name == definition.name) {
+        if definition.git && !code.iter().any(|known| known.name == definition.name) {
             code.push(definition);
         }
     }
-    let owner_of = |path: &Utf8Path| code_owner(&code, path).map(|owner| owner.name.as_str());
+    let owner_of = |path: &Utf8Path| carved_owner(&code, path).map(|owner| owner.name.as_str());
     // Each tracker's whole history: its first-parent spine, interleaved with
     // the other trackers' spines into the view's main line, and its side
     // branches (what its merges brought in), replayed as real commits so a
@@ -1013,13 +1013,13 @@ fn describe_sources(repo: &Utf8Path, sources: &[String]) -> Result<BTreeMap<Stri
 }
 
 /// Why a change cannot be split into a tracker. (Secrets are not split's
-/// concern: [`find_secret`] checks exactly what leaves the machine, with
+/// concern: [`find_outside_git`] checks exactly what leaves the machine, with
 /// the exemptions that belong to where it is going.)
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Refusal {
     /// The path's owner is not bound in this view.
     Unbound { path: String, tracker: String },
-    /// One commit changes code trackers with different audiences. Its message
+    /// One commit changes trackers in Git with different audiences. Its message
     /// would be copied into each, so everyone who may read any of them would
     /// read a message about work some of them may not see.
     MixedAudience {
@@ -1070,7 +1070,7 @@ pub struct SplitOutcome {
     pub made: Vec<(String, String)>,
 }
 
-/// Carve a new code tracker's history out of `source` (the history of
+/// Carve the history of a new tracker in Git out of `source` (the history of
 /// whatever owned its paths until now, usually root): every commit that
 /// touched `definition`'s paths becomes a commit of the new tracker — only
 /// those paths, the original author, date, and message, marked
@@ -1156,9 +1156,9 @@ pub fn carve(
 }
 
 /// Split the view commits after `base` up to `tip` (first parent) into
-/// tracker commits. `bound` are the code trackers this view composes; `all`
+/// tracker commits. `bound` are the trackers in Git this view composes; `all`
 /// is every definition, to name the owner of a path nothing bound owns.
-/// Ownership is decided among code trackers, as composing decides it.
+/// Ownership is decided among trackers in Git, as composing decides it.
 ///
 /// Each view commit is noted with the state it leaves, so a later split, or
 /// a recompose, picks up where this one stopped.
@@ -1191,7 +1191,7 @@ pub fn split(
     }
     let mut code: Vec<&TrackerDefinition> = bound.to_vec();
     for definition in all {
-        if !definition.secret && !code.iter().any(|known| known.name == definition.name) {
+        if definition.git && !code.iter().any(|known| known.name == definition.name) {
             code.push(definition);
         }
     }
@@ -1207,7 +1207,7 @@ pub fn split(
         let mut by_tracker: BTreeMap<String, Vec<Change>> = BTreeMap::new();
         for change in changes.get(id).cloned().unwrap_or_default() {
             let path = Utf8Path::new(&change.path);
-            let owner = code_owner(&code, path).map(|owner| owner.name.clone());
+            let owner = carved_owner(&code, path).map(|owner| owner.name.clone());
             match owner {
                 Some(owner) if bound.iter().any(|definition| definition.name == owner) => {
                     by_tracker.entry(owner).or_default().push(change);
@@ -1511,7 +1511,7 @@ pub fn read_state(repo: &Utf8Path, view_commit: &str) -> Result<State> {
 }
 
 /// The most specific of `code` claiming `path` (root claims everything).
-fn code_owner<'a>(
+fn carved_owner<'a>(
     code: &[&'a TrackerDefinition],
     path: &Utf8Path,
 ) -> Option<&'a TrackerDefinition> {
@@ -1521,11 +1521,11 @@ fn code_owner<'a>(
         .max_by_key(|definition| specificity(definition, path))
 }
 
-/// The paths more specific code trackers carved out of `definition`: what
+/// The paths more specific trackers in Git carved out of `definition`: what
 /// its new commits must not carry forward from history before the carve.
 fn carved_out(definition: &TrackerDefinition, all: &[TrackerDefinition]) -> Vec<Utf8PathBuf> {
     all.iter()
-        .filter(|other| !other.secret && other.name != definition.name)
+        .filter(|other| other.git && other.name != definition.name)
         .flat_map(|other| other.paths.iter())
         .filter(|path| {
             path.as_str() != "."
@@ -1538,11 +1538,11 @@ fn carved_out(definition: &TrackerDefinition, all: &[TrackerDefinition]) -> Vec<
 
 /// The first commit among `rev_list` (arguments to `git log`, so a caller
 /// says what is new: `<tip> --not --all`) that adds or changes a path a
-/// secret tracker owns, with that path and tracker. Every parent of a merge
+/// tracker outside Git owns, with that path and tracker. Every parent of a merge
 /// is diffed, so a secret cannot ride in on one; deleting a secret file is
 /// what removing it looks like, so it is never refused. `env` lets the
 /// caller see objects Git is still holding in quarantine.
-pub fn find_secret(
+pub fn find_outside_git(
     repo: &Utf8Path,
     rev_list: &[&str],
     env: &[(String, String)],
@@ -1581,7 +1581,7 @@ pub fn find_secret(
             .iter()
             .filter(|definition| definition.owns_everything() || claims(definition, path))
             .max_by_key(|definition| specificity(definition, path));
-        if let Some(owner) = owner.filter(|owner| owner.secret) {
+        if let Some(owner) = owner.filter(|owner| !owner.git) {
             return Ok(Some((commit, field.to_owned(), owner.name.clone())));
         }
     }

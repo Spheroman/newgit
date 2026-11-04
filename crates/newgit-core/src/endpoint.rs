@@ -125,7 +125,7 @@ pub fn compose_view(plan: &Plan) -> Result<Utf8PathBuf> {
     let definitions = definitions_at(&store, &plan.definitions, &plan.dir)?;
     let code: Vec<&TrackerDefinition> = definitions
         .iter()
-        .filter(|definition| !definition.secret)
+        .filter(|definition| definition.git)
         .collect();
     for (branch, list) in &plan.branches {
         let tips: Vec<TrackerTip<'_>> = code

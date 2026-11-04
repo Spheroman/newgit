@@ -64,13 +64,13 @@ newgit resource templates           # what each template is for
 
 | you find | it becomes |
 | --- | --- |
-| `.env`, `.env.local`, `.envrc`, `config/*.local.*`, a credentials file that is gitignored | a secret tracker: `audience = "user"` if each person has their own, `project-devs` if the team shares one |
+| `.env`, `.env.local`, `.envrc`, `config/*.local.*`, a credentials file that is gitignored | a tracker outside Git: `audience = "user"` if each person has their own, `project-devs` if the team shares one |
 | a lockfile (`pnpm-lock.yaml`, `package-lock.json`, `uv.lock`, `Cargo.lock`, …) | an install resource: `--template pnpm` for pnpm, `--template install` for anything else |
 | a `dev` / `start` script, a server entry point | `--template process`: its own port, started for each instance |
 | `supabase/` | `--template supabase`: its own stack and ports per instance, with snapshots on checkpoint |
 | Postgres/MySQL in Docker or Compose, migrations | `--template command-snapshot` or `command-snapshot-migrations` |
 | two env files for one thing (`.env.staging`, `.env.local-db`) | two trackers sharing a `role`, so each spawn picks one (`--use`) |
-| an app or package in a monorepo that only some branches touch | a code tracker (`--code --path apps/x`), dropped from a spawn with `--drop` |
+| an app or package in a monorepo that only some branches touch | a tracker in Git (`--git --path apps/x`), dropped from a spawn with `--drop` |
 | local agent notes or settings (`CLAUDE.local.md`, scratch plans) | a `user` tracker, so the notes go with each branch and come back on undo |
 | a hard-coded port in a committed config file | a `[[render]]` on that resource (`newgit reference render`) |
 | a GitHub remote and `gh` in use | nothing to add. `git push` and `gh pr create` work from a workspace |
@@ -120,7 +120,7 @@ and build the setup around that. Some patterns:
   no spawn, and so no unattended agent, binds live credentials unless someone
   passes `--use`.
 - **A monorepo where each branch carries only what it touches.** Make each app
-  a code tracker with a negative `priority`. A spawn checks out only the apps
+  a tracker in Git with a negative `priority`. A spawn checks out only the apps
   it binds. An install that builds `{{bound.paths}}` installs only those, and
   the install store keys on the binding, so branches working on the same app
   share one tree.
@@ -262,9 +262,9 @@ the commands they will use every day: `spawn`, `status`, `checkpoint`,
 
 ### Guardrails
 
-- Secret by default is the point. Never move tracker content into Git, never
-  give a credentials file a `public` audience, and never widen an audience
-  without asking.
+- Out of Git by default is the point. Never set `git = true` on a tracker
+  that owns a credentials file, never give one a `public` audience, and never
+  widen an audience without asking.
 - Ask before anything that leaves the machine: `newgit remote add`, `members
   add`, `export --remote`.
 - newgit does not rewrite history, so don't work around it by doing so
@@ -290,16 +290,20 @@ tracker claims — and its history starts as the project's Git history;
 `root` owning `.` and `runtime-env` owning `.env.local` do not conflict. Two
 trackers claiming the identical path is an error.
 
-A tracker is *secret* (the default) or *code*. Secret content is captured
-into the tracker's history and never committed to Git. Code content
-(`secret = false`) is ordinary committed source with its own history — `root`,
-`project`, and anything made with `newgit tracker create <name> --code --path
-<path>`, which carves those paths, history included, out of whichever tracker
-owned them. You commit to a code tracker with Git; `newgit tracker capture`
-and `track` refuse it.
+Every tracker has a history, and `git` says where it lives. By default
+(`git = false`) a tracker is outside Git: its files are never committed, and
+newgit captures them into the tracker's own history. That is where a `.env`
+belongs, and also where content that is not sensitive but is not source
+either (agent notes, db snapshots) goes. A tracker with `git = true` is
+committed with Git, as ordinary source with its own history — `root`,
+`project`, `access`, and anything made with `newgit tracker create <name> --git
+--path <path>`, which carves those paths, history included, out of whichever
+tracker owned them. You commit to a tracker in Git with Git; `newgit tracker
+capture` and `track` refuse it. How sensitive a tracker's content is has
+nothing to do with this; that is its `audience`.
 
 ```toml
-# .newgit/trackers/runtime-env.toml — secret: each user's own .env.local
+# .newgit/trackers/runtime-env.toml — outside Git: each user's own .env.local
 audience = "user"
 storage = "local"
 paths = [".env.local"]
@@ -318,22 +322,22 @@ resources = ["staging-tunnel"]
 | `audience` | string | yes | — | who may read it. `public`, `project-devs`, `user` (each user gets their own copy), or `user:<login>`. Only `public` ships in an `export --to` without an explicit `--include`, or to an export target that does not name it. |
 | `storage` | string | yes | — | `local` or `remote` — where synced state lives. `remote` needs a `[remote]` in `config.toml`; checkpoint sync then pushes the tracker there. |
 | `merge_with_source` | bool | no | `false` | meant to say whether a source merge carries this tracker's state with it. Accepted and stored, but nothing reads it yet: `newgit merge` merges every tracker the instance changed. |
-| `paths` | array of strings | no | `[]` | workspace-relative paths the lane owns, normalized first (`./.env.local` is `.env.local`). Must not be absolute, contain `..`, or reach into `.git` or `.newgit` in any case (`.GIT` too), except that a code tracker may own other trackers' definitions, `.newgit/trackers/<name>.toml` (see `maintainers`); the rest of `.newgit` is `project`'s and `access`'s. `.` must be a tracker's only path. May be empty for a tracker that only receives resource deposits (`into_tracker`) or only brings `resources`: such a tracker has nothing in the workspace, so `tracker drop` (and `tracker use` swapping it out of its role) skips the capture, and `tracker list` shows it after the ownership tree with what deposits into it and what it brings. |
-| `secret` | bool | no | `true` | `false` makes a code tracker: committed with Git rather than captured. Written only when `false`. |
+| `paths` | array of strings | no | `[]` | workspace-relative paths the lane owns, normalized first (`./.env.local` is `.env.local`). Must not be absolute, contain `..`, or reach into `.git` or `.newgit` in any case (`.GIT` too), except that a tracker in Git may own other trackers' definitions, `.newgit/trackers/<name>.toml` (see `maintainers`); the rest of `.newgit` is `project`'s and `access`'s. `.` must be a tracker's only path. May be empty for a tracker that only receives resource deposits (`into_tracker`) or only brings `resources`: such a tracker has nothing in the workspace, so `tracker drop` (and `tracker use` swapping it out of its role) skips the capture, and `tracker list` shows it after the ownership tree with what deposits into it and what it brings. |
+| `git` | bool | no | `false` | `true` makes a tracker in Git: committed with Git rather than captured by newgit. The default keeps its files out of Git, so a new tracker fails closed. Written only when `true`. |
 | `role` | string | no | — | the slot it fills: trackers sharing a role are alternatives (`dev-db`, `staging-db`) and may claim the same paths; an instance binds one of them. |
 | `priority` | integer | no | `0` | which tracker of a role an instance binds by default (the highest), unless your own default says otherwise (`[projects.<project>.roles]` in `~/.newgit/config.toml`). Negative means only when asked for (`--use`), for a role-less tracker too. |
 | `requires` | array of strings | no | `[]` | trackers or roles it cannot do without: binding it binds them, and they cannot be dropped while it is bound. |
 | `resources` | array of strings | no | `[]` | resources it brings: they bind only while it is bound. `newgit tracker use` binds and prepares them and starts their `autostart` action; `drop` stops them and releases their binding. |
-| `maintainers` | string | no | its `audience` | who may merge changes to it on a remote: `owner` (the project's owner), `project-devs`, or `user:<login>`. Changing a tracker's definition is changing the tracker that owns its file in `.newgit/trackers/` — `access` unless a more specific code tracker claims it — so governance layers: an `admin` tracker claiming `.newgit/trackers/web.toml` decides who changes `web`'s paths, audience, and maintainers. |
+| `maintainers` | string | no | its `audience` | who may merge changes to it on a remote: `owner` (the project's owner), `project-devs`, or `user:<login>`. Changing a tracker's definition is changing the tracker that owns its file in `.newgit/trackers/` — `access` unless a more specific tracker in Git claims it — so governance layers: an `admin` tracker claiming `.newgit/trackers/web.toml` decides who changes `web`'s paths, audience, and maintainers. |
 
-A secret tracker's paths stay out of Git: `newgit tracker track` adds them to
+The paths of a tracker outside Git stay out of Git: `newgit tracker track` adds them to
 the store's `.gitignore`, and each workspace's Git is told to ignore them too,
 so their content never lands in source history.
 
 `newgit tracker remove <name>` deletes the definition and reverses both of
 those: the `.gitignore` block and each live workspace's ignore entries. It
 refuses while any live instance still has the tracker bound (`newgit remove
-<instance>` first) and refuses outright for `root` and the code trackers, whose
+<instance>` first) and refuses outright for `root` and the trackers in Git, whose
 histories are Git's. Captured history in `.newgit/local/trackers.git` is left
 in place — it becomes unreferenced, and `newgit cleanup` reclaims it once
 nothing else (a checkpoint that captured it) still pins a rev.
@@ -711,8 +715,8 @@ produces`, the undo did not move the part of the binding its store key holds:
 the tree was already built from those inputs, so the rebuild would change
 nothing. That part counts because the install store keys a tree on it (see
 *Installs: use a content-addressed store*); an undo that drops or brings back
-a code tracker rebuilds such a tree, lockfile or no lockfile, while one that
-only rebinds a secret tracker does not. It says so rather than passing
+a tracker in Git rebuilds such a tree, lockfile or no lockfile, while one that
+only rebinds a tracker outside Git does not. It says so rather than passing
 silently:
 
 ```
@@ -1242,13 +1246,13 @@ costs one reinstall and `newgit cleanup` reclaims it.
 
 **So is what of the binding can reach the install.** A shared lockfile lists
 every member, bound or not, and its install builds the ones it can see: found
-on disk, where a dropped code tracker's files are not checked out (an
+on disk, where the files of a dropped tracker in Git are not checked out (an
 unfiltered `npm ci` links a workspace member only when it is there), or named
 by `{{bound.paths}}`. So two things are in the key:
 
 - **Which paths are checked out**, in every resource's key: the paths the
-  instance's dropped code trackers leave out. Nothing is left out when no
-  code tracker is dropped.
+  instance's dropped trackers in Git leave out. Nothing is left out when no
+  tracker in Git is dropped.
 - **What `{{bound.trackers}}` and `{{bound.paths}}` render to**, only when
   the install can be told: its own commands, `key_command`, exports or
   `[[render]]`s name one, or any resource's export or `[[render]]` does
@@ -1256,11 +1260,11 @@ by `{{bound.paths}}`. So two things are in the key:
   render writes into a file the install can read).
 
 The store never fills an instance that drops a member with the tree built for
-one that binds it. And the rest of the binding stays out: binding a secret
-tracker, or one that owns no paths (a branch database, say), or creating or
+one that binds it. And the rest of the binding stays out: binding a tracker
+outside Git, or one that owns no paths (a branch database, say), or creating or
 renaming a tracker the instance binds, leaves an install that is not told the
 names at the key it had, so instances that differ only in that share one
-tree. A secret tracker's files are projected into the workspace but are not
+tree. The files of a tracker outside Git are projected into the workspace but are not
 in the key; an install that reads one (an `.npmrc` it owns, say) names it in
 `[identity] paths`, whose content is hashed like the lockfile's.
 
@@ -1394,7 +1398,7 @@ environment variable handed to every later process.
 | `{{snapshot.path}}` | directory to write checkpoint output into |
 | `{{state_ref}}` | the handle the last checkpoint recorded, or the path of the snapshot it deposited. A `hash` checkpoint records neither, so it has no value |
 | `{{bound.trackers}}` | the trackers the instance binds, space-separated — every selectable tracker it has not dropped (`root`, `project`, and `access` are always bound and not listed) |
-| `{{bound.paths}}` | the paths those trackers own, code trackers only, space-separated — what a shared install should build |
+| `{{bound.paths}}` | the paths those trackers own, trackers in Git only, space-separated — what a shared install should build |
 
 Scope — which of them have a value where:
 
@@ -1591,15 +1595,15 @@ trackers = ["root"]
 | --- | --- | --- | --- | --- |
 | `url` | string | yes | — | where to push. `owner/repo` means `https://github.com/owner/repo.git`; anything else (an `https://` or `git@` URL, a path) is used as written. Pushed with plain `git push`, so your own Git credentials apply (`gh auth setup-git` sets them up for GitHub). |
 | `branch` | string | no | `main` | the branch the export is pushed to. |
-| `trackers` | array of strings | no | `[]` | code trackers to ship besides the `public` ones. A secret tracker here is an error: secrets never leave through Git. |
+| `trackers` | array of strings | no | `[]` | trackers in Git to ship besides the `public` ones. A tracker outside Git here is an error: what it owns (a `.env`, say) never leaves through Git. |
 | `branches` | bool | no | `false` | also export each instance's branch, every time its workspace pushes, so a pull request can be opened against the target (see below). |
 
-What ships fails closed. Only code trackers whose audience is `public` ship
+What ships fails closed. Only trackers in Git whose audience is `public` ship
 unless `trackers` names them, and `root`, `project`, and `access` are
 `project-devs`. So `trackers = ["root"]` mirrors the project's code without
 `.newgit/`, and adding `"project", "access"` mirrors that too. A path owned
 by a tracker that does not ship stays out of every exported commit. A
-history that ever adds a path a secret tracker owns, such as a `.env`
+history that ever adds a path a tracker outside Git owns, such as a `.env`
 committed before it was tracked, refuses the whole export before anything
 is pushed.
 

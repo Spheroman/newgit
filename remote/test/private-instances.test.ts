@@ -21,7 +21,7 @@ beforeEach(async () => {
 	[jack, ana] = await Promise.all([login("jack"), login("ana")]);
 	expect((await call(jack, "POST", "/v1/projects", { name: slug, trackers: ["root", "access", "project"] })).status).toBe(201);
 	expect((await call(jack, "POST", `/v1/projects/${project}/members`, { login: "ana" })).status).toBe(200);
-	repos.write(repo("t.access"), ".newgit/trackers/root.toml", 'audience = "project-devs"\nsecret = false\n');
+	repos.write(repo("t.access"), ".newgit/trackers/root.toml", 'audience = "project-devs"\ngit = true\n');
 	repos.write(repo("t.root"), "README.md", "hello\n");
 });
 

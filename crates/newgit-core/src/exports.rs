@@ -27,7 +27,7 @@ pub struct RenderContext<'a> {
     pub bound: Option<&'a Bound>,
 }
 
-/// The trackers an instance binds, and the paths of the code trackers among
+/// The trackers an instance binds, and the paths of the trackers in Git among
 /// them (`root`, `project`, and `access` aside, since they are always there),
 /// each space-separated.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]

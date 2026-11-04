@@ -268,7 +268,7 @@ enum Command {
         into: String,
     },
     /// Clone a project from a newgit remote: its default branch composed from
-    /// the code trackers you may read, set up for newgit
+    /// the trackers in Git you may read, set up for newgit
     Clone {
         /// The project, `<owner>/<name>`
         project: String,
@@ -317,7 +317,7 @@ enum Command {
 
 #[derive(Debug, Subcommand)]
 enum TrackerCommand {
-    /// Create a tracker: secret (captured, never committed) unless --code
+    /// Create a tracker: outside Git (captured, never committed) unless --git
     Create {
         name: String,
         /// Who may read this tracker's content
@@ -329,15 +329,15 @@ enum TrackerCommand {
         /// Where synced state lives: local or remote
         #[arg(long, default_value = "local")]
         storage: String,
-        /// A code tracker: committed content with its own history, carved out
+        /// A tracker in Git: committed content with its own history, carved out
         /// of whichever tracker owns its paths now (usually root)
         #[arg(long, requires = "path")]
-        code: bool,
-        /// A path a code tracker owns (repeatable; set at creation)
+        git: bool,
+        /// A path a tracker in Git owns (repeatable; set at creation)
         #[arg(long = "path", value_name = "PATH")]
         path: Vec<Utf8PathBuf>,
     },
-    /// Add workspace paths to a secret tracker
+    /// Add workspace paths to a tracker outside Git
     Track {
         tracker: String,
         paths: Vec<Utf8PathBuf>,
@@ -378,8 +378,8 @@ enum TrackerCommand {
         /// Instance (inferred when run inside a workspace)
         instance: Option<String>,
     },
-    /// Bind a tracker in an instance again: its files come back (a code
-    /// tracker's history never left), with any work a drop stashed
+    /// Bind a tracker in an instance again: its files come back (a tracker
+    /// in Git's history never left), with any work a drop stashed
     Use {
         tracker: String,
         /// Instance (inferred when run inside a workspace)
@@ -400,9 +400,9 @@ enum TrackerCommand {
         #[arg(long)]
         discard: bool,
     },
-    /// Rewrite code tracker commits split before newgit kept each original's
+    /// Rewrite the commits of trackers in Git split before newgit kept each original's
     /// message ending and signature, so clones from the remote get the
-    /// project's own commit ids. Moves every code tracker branch, and on the
+    /// project's own commit ids. Moves every branch of a tracker in Git, and on the
     /// remote each branch's list (a force push of tracker history)
     Repair {
         /// Say what would move, and move nothing
@@ -445,7 +445,7 @@ struct SpawnArgs {
     )]
     drops: Vec<String>,
     /// On the remote, only you see this instance — its checkpoints and its
-    /// forks of the code trackers — until `newgit merge` publishes its work:
+    /// forks of the trackers in Git — until `newgit merge` publishes its work:
     /// an embargo, for a fix the rest of the project must not see yet
     #[arg(long, conflicts_with = "from_checkpoint")]
     private: bool,
@@ -1922,15 +1922,15 @@ fn tracker(command: TrackerCommand) -> Result<()> {
         TrackerCommand::Create {
             name,
             audience,
-            code: true,
+            git: true,
             path,
             ..
         } => {
             let manager = manager_here()?;
-            let outcome = manager.create_code_tracker(&name, &audience, &path)?;
+            let outcome = manager.create_git_tracker(&name, &audience, &path)?;
             let root = manager.store().paths().project_root.clone();
             println!(
-                "Created code tracker `{name}` at {}",
+                "Created `{name}`, a tracker in Git, at {}",
                 display_path(&root, &outcome.path)
             );
             println!(
@@ -2051,11 +2051,11 @@ fn tracker(command: TrackerCommand) -> Result<()> {
                 .and_then(|name| manager.store().find_branch(name).ok())
                 .map(|branch| branch.dropped);
             let definitions: Vec<&TrackerDefinition> = std::iter::once(manager.root_tracker())
-                .chain(manager.code_trackers())
+                .chain(manager.carved_trackers())
                 .chain(manager.tracker_definitions())
                 .collect();
             // A tree by ownership: each tracker under the tracker whose paths
-            // hold its own — root at the top, carved trackers and secret ones
+            // hold its own — root at the top, carved trackers and those outside Git
             // beneath whatever they were carved from.
             let parent_of = |child: &TrackerDefinition| -> Option<String> {
                 if child.owns_everything() {
@@ -2103,7 +2103,7 @@ fn tracker(command: TrackerCommand) -> Result<()> {
                     .iter()
                     .filter(|child| parent_of(child).as_deref() == Some(name))
                     .collect();
-                children.sort_by_key(|child| (child.secret, child.name.clone()));
+                children.sort_by_key(|child| (!child.git, child.name.clone()));
                 for child in children {
                     walk(&child.name, depth + 1, definitions, parent_of, out);
                 }
@@ -2133,7 +2133,7 @@ fn tracker(command: TrackerCommand) -> Result<()> {
                         None => "",
                     };
                     let name = format!("{mark}{}{}", "  ".repeat(*depth), definition.name);
-                    let kind = if definition.secret { "secret" } else { "code" };
+                    let in_git = if definition.git { "yes" } else { "no" };
                     let mut role = definition.role.clone().unwrap_or_else(|| "-".to_owned());
                     if definition.priority != 0 {
                         role.push_str(&format!(" ({})", definition.priority));
@@ -2158,7 +2158,7 @@ fn tracker(command: TrackerCommand) -> Result<()> {
                     };
                     (
                         name,
-                        kind.to_owned(),
+                        in_git.to_owned(),
                         role,
                         format!("{:?}", definition.storage).to_lowercase(),
                         audience,
@@ -2167,17 +2167,17 @@ fn tracker(command: TrackerCommand) -> Result<()> {
                 })
                 .collect();
             let name_width = column_width(rows.iter().map(|r| r.0.len()), "NAME");
-            let kind_width = column_width(rows.iter().map(|r| r.1.len()), "KIND");
+            let git_width = column_width(rows.iter().map(|r| r.1.len()), "GIT");
             let role_width = column_width(rows.iter().map(|r| r.2.len()), "ROLE");
             let storage_width = column_width(rows.iter().map(|r| r.3.len()), "STORAGE");
             let audience_width = column_width(rows.iter().map(|r| r.4.len()), "AUDIENCE");
             println!(
-                "{:<name_width$} {:<kind_width$} {:<role_width$} {:<storage_width$} {:<audience_width$} PATHS",
-                "NAME", "KIND", "ROLE", "STORAGE", "AUDIENCE"
+                "{:<name_width$} {:<git_width$} {:<role_width$} {:<storage_width$} {:<audience_width$} PATHS",
+                "NAME", "GIT", "ROLE", "STORAGE", "AUDIENCE"
             );
-            for (name, kind, role, storage, audience, paths) in &rows {
+            for (name, in_git, role, storage, audience, paths) in &rows {
                 println!(
-                    "{name:<name_width$} {kind:<kind_width$} {role:<role_width$} {storage:<storage_width$} {audience:<audience_width$} {paths}"
+                    "{name:<name_width$} {in_git:<git_width$} {role:<role_width$} {storage:<storage_width$} {audience:<audience_width$} {paths}"
                 );
             }
             if let Some(current) = &current {

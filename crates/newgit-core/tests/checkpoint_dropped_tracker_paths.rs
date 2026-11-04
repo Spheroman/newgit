@@ -1,5 +1,5 @@
 //! A checkpoint snapshots uncommitted work with `git add -A` into a
-//! throwaway index. A dropped code tracker's paths are outside the
+//! throwaway index. The paths of a dropped tracker in Git are outside the
 //! workspace's sparse checkout, where `git add -A` skips an edited file
 //! without a word and fails on a new one. So a file written into a dropped
 //! tracker's directory made `checkpoint` fail, and `undo` with it, through
@@ -78,7 +78,7 @@ fn snapshot(workspace: &Utf8Path, record: &CheckpointRecord) -> String {
     }
 }
 
-/// Code trackers over the given paths, created in order, in a store whose
+/// Trackers in Git over the given paths, created in order, in a store whose
 /// root owns `README.md`, with a resource `r` whose restore does nothing and
 /// the other resources given.
 fn setup(temp: &Utf8Path, trackers: &[(&str, &str)], resources: &[(&str, &str)]) -> BranchManager {
@@ -120,7 +120,7 @@ fn setup(temp: &Utf8Path, trackers: &[(&str, &str)], resources: &[(&str, &str)])
     for (name, path) in trackers {
         BranchManager::open(store.clone())
             .expect("manager")
-            .create_code_tracker(name, "project-devs", &[Utf8PathBuf::from(*path)])
+            .create_git_tracker(name, "project-devs", &[Utf8PathBuf::from(*path)])
             .expect("carve");
     }
     git(&repo, &["add", "-A"]);

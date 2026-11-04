@@ -1,4 +1,4 @@
-//! A capture into a secret tracker's lane keeps this instance's rendered
+//! A capture into the lane of a tracker outside Git keeps this instance's rendered
 //! values out of it, as `capture_tracker` and `checkout_tracker` do. These
 //! pin the two captures that did not: a checkpoint's, and the safety capture
 //! `tracker pull` takes before it re-binds the lane head.
@@ -128,7 +128,7 @@ fn read(path: &Utf8Path) -> String {
 }
 
 #[test]
-fn a_checkpoint_keeps_this_instances_ports_out_of_a_secret_tracker_lane() {
+fn a_checkpoint_keeps_this_instances_ports_out_of_a_tracker_outside_git() {
     let (_guard, temp) = tempdir();
     let store = setup_env_tracker(&temp);
     let m = BranchManager::open(store).expect("manager");

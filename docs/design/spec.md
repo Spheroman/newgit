@@ -13,7 +13,7 @@ design, not the commands. For those, and for the rest of the documentation:
   sees. Run `newgit resource templates --show <name>` to read a starter
   template in full.
 - [`trackers.md`](trackers.md) covers the tracker model in depth: root,
-  project, access, and code trackers, how a workspace history is composed
+  project, access, and trackers in Git, how a workspace history is composed
   from them and split back, roles, binding, and merge.
 - [`remote.md`](remote.md) covers the newgit.dev remote.
 - [`vision.md`](vision.md) is the original long-range architecture. Most of
@@ -165,7 +165,7 @@ not to delete the rule.
 
 Definitions are committed, so teammates and CI see the same orchestration.
 Concrete state stays local: bindings, captured content, snapshots,
-allocated ports, logs, external handles. Secret tracker content stays out of
+allocated ports, logs, external handles. The content of trackers outside Git stays out of
 Git by construction, and travels only through a newgit remote.
 
 Definitions are one per file, named by the filename. That gives clean diffs,
@@ -248,15 +248,18 @@ The full model is in [`trackers.md`](trackers.md). The short version:
   default only the project's owner may change it (`maintainers = "owner"`).
   `newgit init` creates all three and copies the project's Git history into
   `root`.
-- **Code trackers** (`secret = false`) are committed content with their own
-  history. `newgit tracker create electron --code --path apps/electron`
+- **There is one kind of tracker.** Its `git` key says whether its files are
+  committed with Git. It says nothing about sensitivity; that is the
+  `audience`.
+- **A tracker in Git** (`git = true`) is committed content with its own
+  history. `newgit tracker create electron --git --path apps/electron`
   carves those paths, history included, out of whichever tracker owned
   them. You commit to them with Git. When work leaves the machine, newgit
   splits each commit into per-tracker commits, and composing them back
   gives the same commit, with the same id.
-- **Secret trackers** (the default) are files that never belong in Git: an
-  `.env.local`, an agent's notes, a SQLite file. They are captured by
-  newgit, never committed.
+- **A tracker outside Git** (`git = false`, the default) owns files that
+  never belong in Git: an `.env.local`, an agent's notes, a SQLite file, a
+  public page. They are captured by newgit, never committed.
 - **Binding** decides what an instance works on. Trackers sharing a `role`
   are alternatives (`local-db`, `staging-db`), and an instance binds one per
   role: `spawn --use`/`--drop` first, then your own default in
@@ -265,9 +268,9 @@ The full model is in [`trackers.md`](trackers.md). The short version:
   `drop` change a live instance's binding. A tracker brings resources, and
   they run only while it is bound.
 
-### Secret trackers
+### Trackers outside Git
 
-Capture snapshots a secret tracker's paths into a new revision on the
+Capture snapshots the paths of a tracker outside Git into a new revision on the
 instance's branch. `newgit tracker merge` promotes that revision to the
 tracker's `main`; `tracker pull` brings `main` into an instance; `tracker
 checkout --rev` restores an exact revision. Checkout clears the owned paths
@@ -281,7 +284,7 @@ checkout and sets `main` directly instead, so the next spawn comes up with
 them. A tracker that has never captured anything projects nothing, the same
 as Git: tracking a path does not invent content for it.
 
-Because a secret tracker is pure content, capture and restore need no
+Because a tracker outside Git is pure content, capture and restore need no
 modes. If something needs a command to capture or restore, it is a resource.
 
 **Capture never follows a symlink.** A lane holds this workspace's files
@@ -303,21 +306,21 @@ judged with `lstat`, never `stat`:
   file of the lane author's choosing.
 
 The same applies to every path that reads tracked content: `checkpoint`,
-the safety capture before a checkout, dropping a secret tracker,
+the safety capture before a checkout, dropping a tracker outside Git,
 `--from-store`, a resource deposit, install-key hashing (a link hashes as
 its target's text), and export (a link is exported as a link).
 
-Secret content is kept in its own repository, not the project's. The
-project repository is what a local `git clone` hardlinks into every
+The content of a tracker outside Git is kept in its own repository, not the
+project's. The project repository is what a local `git clone` hardlinks into every
 workspace and what a push publishes from; the tracker repository lives
 under `local/`, which is gitignored.
 
-### Keeping secret paths out of Git
+### Keeping a tracker's paths out of Git
 
-A secret tracker's files sit inside a Git clone, so an agent could `git add`
+The files of a tracker outside Git sit inside a Git clone, so an agent could `git add`
 them. The rule:
 
-> **A path owned by a secret tracker must be ignored by Git.**
+> **A path owned by a tracker outside Git must be ignored by Git.**
 
 `tracker track` appends the path to `.gitignore`, loudly. That is not
 enough on its own: the edit is uncommitted in the project checkout, so a
@@ -330,7 +333,7 @@ and newgit does not rewrite the user's files.
 
 That still does not stop `git add -f`. The backstop is at the point where
 work leaves the machine: a push or a checkpoint sync that would carry a
-commit adding or changing a secret tracker's file is refused, naming the
+commit adding or changing a file a tracker outside Git owns is refused, naming the
 commit and the file. History from before `newgit init` is exempt, so an old
 committed `.env` does not block a first push; removing it is a history
 rewrite, which is not newgit's to do silently.
@@ -343,9 +346,9 @@ Every tracker has an `audience` (`public`, `project-devs`, `user`, or
 Locally, audience decides what `newgit export` ships and nothing else. On
 the newgit remote it is enforced: the remote mints tokens per tracker, so a
 reader gets only the trackers they may read, and a branch composed for them
-holds only those code trackers.
+holds only those trackers in Git.
 
-`storage = "remote"` makes a secret tracker sync. A checkpoint pushes its
+`storage = "remote"` makes a tracker outside Git sync. A checkpoint pushes its
 revisions to the remote; `spawn --from-checkpoint` fetches them. A tracker
 with `audience = "user"` is per user: each person's content is their own
 repository on the remote, so spawning a teammate's checkpoint gives you
@@ -354,7 +357,7 @@ is refused until the project has a remote, rather than quietly behaving as
 local.
 
 `merge_with_source` is written to every definition but nothing reads it
-yet. `newgit merge` merges code trackers, and secret trackers move only
+yet. `newgit merge` merges trackers in Git, and trackers outside Git move only
 through `tracker merge`. [`trackers.md`](trackers.md) plans to replace it
 with `merge = "with-change" | "explicit"`.
 
@@ -421,8 +424,8 @@ If the template path fails, `spawn` says why in its output
 (`template_warning` in `--json`), since a template that fails every time
 makes every spawn pay for rebuilding it on top of the clone.
 
-A dropped code tracker's files are left out of the working tree with Git's
-sparse checkout. The history still has them, so every instance of a project
+The files of a dropped tracker in Git are left out of the working tree with
+Git's sparse checkout. The history still has them, so every instance of a project
 has the same commit ids.
 
 Sync is newgit's job, and it runs one way: a checkpoint **fetches** from the
@@ -448,7 +451,7 @@ a path to a repository at all. So `spawn` routes `origin`:
   pusher, newgit brings the outbox up to date with the real remote, so the
   pushing Git judges fast-forward and `--force-with-lease` against what that
   remote holds now. Then the outbox's `pre-receive` hook:
-  1. **refuses secrets**, as above;
+  1. **refuses what trackers outside Git own**, as above;
   2. **checkpoints the instance**, because `undo` cannot take back a push,
      so the push is the one moment a checkpoint has to exist (it is listed
      with reason `push`);
@@ -772,7 +775,7 @@ into a path the project owns. Four places they must not reach:
 - **`git status` and `git commit`.** Rendered files Git tracks are marked
   `--skip-worktree` in the workspace, so `git add -A` cannot commit this
   instance's port. It is the same job `info/exclude` does for tracker paths.
-  While the binding leaves a code tracker's paths out, the workspace is a
+  While the binding leaves the paths of a tracker in Git out, the workspace is a
   sparse checkout, which works that bit out from its patterns, so they leave
   the rendered files out too, and `sparse.expectFilesOutsideOfPatterns`
   keeps Git from clearing it on a file it finds on disk.
@@ -799,7 +802,7 @@ into a path the project owns. Four places they must not reach:
   exactly as often as the render wrote it, since then it can only be one
   thing. Anything else is not guessed. `tracker capture` refuses, naming
   the lines, and it also refuses content that would no longer render.
-  `tracker drop` of a secret tracker refuses the same way: it takes the
+  `tracker drop` of a tracker outside Git refuses the same way: it takes the
   files out of the workspace, so its capture is the last copy, and the
   file is left as it was to be fixed. The captures newgit takes on its own
   (checkpoint, re-bind, checkout) still record, because refusing a safety
@@ -861,10 +864,10 @@ The key is the inputs, never the tree:
   toolchain it never names (`node -v && uname -sm`).
 - **What of the binding can reach the install.** A shared lockfile lists
   every workspace member, bound or not, and the install builds the ones it
-  can see. So the key holds which paths the dropped code trackers leave out
+  can see. So the key holds which paths the dropped trackers in Git leave out
   of the checkout, and, only when the install is told them through
   `{{bound…}}` (in its own definition, or in any resource's exports or
-  renders), the bound tracker names and paths. Binding a secret tracker, or
+  renders), the bound tracker names and paths. Binding a tracker outside Git, or
   one with no paths, moves neither, so it shares a tree with the binding
   without it (#248). When a live instance's binding changes (`tracker use`,
   `drop`, or an undo to another binding) in a way that moves an install's
@@ -1164,7 +1167,7 @@ A checkpoint records, as one coherent record in
   a throwaway index, leaving the worktree, `HEAD`, and real index alone. A
   checkpoint protects the worktree as it stands, not just what the agent
   remembered to commit.
-- **Trackers**: a revision of every bound secret tracker (identical content
+- **Trackers**: a revision of every bound tracker outside Git (identical content
   makes no new revision), and the binding itself.
 - **Resources**, dependents first: an identity hash, an external handle, or
   a command's output, often deposited into a tracker. Also resolved ports
@@ -1288,9 +1291,9 @@ do before it does it.
 
 - **Files Git tracks ship as they stand on disk**, so uncommitted agent
   work is included and ignored junk never is. Rendered paths come from
-  `HEAD`. That includes every code tracker's files, whatever its audience:
-  this export filters only secret trackers.
-- **Secret trackers are filtered by audience, failing closed.** Only
+  `HEAD`. That includes the files of every tracker in Git, whatever its audience:
+  this export filters only trackers outside Git.
+- **Trackers outside Git are filtered by audience, failing closed.** Only
   `public` trackers ship. The rest are withheld and listed, with the flag
   that would ship them. A tracker created without `--audience` is
   `project-devs`, so the default is the safe one. `--include` overrides for
@@ -1306,7 +1309,7 @@ leaves the machine.
 all, to an ordinary repository defined in `.newgit/exports/<name>.toml`,
 typically a GitHub mirror. Only `public` trackers and the ones the target
 names ship, so a public mirror and a private one can show different views,
-and a history that ever committed a secret tracker's file is refused. It
+and a history that ever committed a file a tracker outside Git owns is refused. It
 pushes with your own Git credentials, so GitHub Actions and `gh` keep
 working. When the target's branch has moved ahead (a pull request merged on
 GitHub), export brings that in first. With `branches = true`, every push
@@ -1322,7 +1325,7 @@ Git repository per tracker. It gives you:
   login, agent, and instance.
 - Audience enforced server-side: tokens are minted per tracker, so a reader
   can read only what they may, and `git clone` of the endpoint composes a
-  branch from the code trackers you may read.
+  branch from the trackers in Git you may read.
 - Checkpoints that sync, and `spawn --from-checkpoint` to bring one up
   anywhere, with your own copy of per-user trackers.
 - `newgit merge [instance] [--into <branch>]`, which merges tracker by

@@ -20,8 +20,8 @@ beforeEach(async () => {
 	ana = (await issue(env, { kind: "login", login: "ana", ttlSeconds: LOGIN_TTL_SECONDS })).token;
 	await call(jack, "POST", "/v1/projects", { name, trackers: ["root", "access", "project"] });
 	const defs = `jack.${name}.t.access`;
-	repos.write(defs, ".newgit/trackers/root.toml", 'audience = "project-devs"\nsecret = false\n');
-	repos.write(defs, ".newgit/trackers/project.toml", 'audience = "project-devs"\nsecret = false\n');
+	repos.write(defs, ".newgit/trackers/root.toml", 'audience = "project-devs"\ngit = true\n');
+	repos.write(defs, ".newgit/trackers/project.toml", 'audience = "project-devs"\ngit = true\n');
 	repos.write(defs, ".newgit/trackers/env.toml", 'audience = "project-devs"\n');
 	await call(jack, "PUT", path("/branches/main"), { list: main });
 	await call(jack, "POST", path("/members"), { login: "ana" });
@@ -115,9 +115,9 @@ describe("merging into a branch", () => {
 		expect(refused.body.error).toContain("project's owner");
 	});
 
-	it("never carries a secret tracker", async () => {
+	it("never carries a tracker outside Git", async () => {
 		const refused = await call(jack, "POST", path("/branches/main/merge"), { base: main, trackers: ["env"] });
 		expect(refused.status).toBe(400);
-		expect(refused.body.error).toContain("secret tracker");
+		expect(refused.body.error).toContain("is not in Git");
 	});
 });

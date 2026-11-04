@@ -98,16 +98,16 @@ describe("audiences", () => {
 });
 
 describe("who may hold which token", () => {
-	const tracker = (audience: Audience, code: boolean, login?: string) => ({
+	const tracker = (audience: Audience, git: boolean, login?: string) => ({
 		ref: { kind: "tracker", project: acme, tracker: "env", login } as RepoRef,
-		facts: { tracker: { audience, code } } as Facts,
+		facts: { tracker: { audience, git } } as Facts,
 	});
-	const fork = (audience: Audience, code: boolean, instanceOwner: string | undefined) => ({
+	const fork = (audience: Audience, git: boolean, instanceOwner: string | undefined) => ({
 		ref: { kind: "fork", project: acme, instance: "fix-login", tracker: "root" } as RepoRef,
-		facts: { instanceOwner, tracker: { audience, code } } as Facts,
+		facts: { instanceOwner, tracker: { audience, git } } as Facts,
 	});
 
-	it("a code tracker: its audience reads, nobody writes", () => {
+	it("a tracker in Git: its audience reads, nobody writes", () => {
 		const devs = tracker({ kind: "project-devs" }, true);
 		expect(decide(devs.ref, "read", teammate, devs.facts).ok).toBe(true);
 		expect(decide(devs.ref, "read", outsider, devs.facts).ok).toBe(false);
@@ -122,7 +122,7 @@ describe("who may hold which token", () => {
 		expect(decide(open.ref, "write", member, open.facts).ok).toBe(false);
 	});
 
-	it("a shared secret tracker: its audience reads and writes", () => {
+	it("a shared tracker outside Git: its audience reads and writes", () => {
 		const devs = tracker({ kind: "project-devs" }, false);
 		expect(decide(devs.ref, "read", teammate, devs.facts).ok).toBe(true);
 		expect(decide(devs.ref, "write", teammate, devs.facts).ok).toBe(true);
@@ -130,14 +130,14 @@ describe("who may hold which token", () => {
 		expect(decide(devs.ref, "write", outsider, devs.facts).ok).toBe(false);
 	});
 
-	it("a public secret tracker: anyone reads, members write", () => {
+	it("a public tracker outside Git: anyone reads, members write", () => {
 		const open = tracker({ kind: "public" }, false);
 		expect(decide(open.ref, "read", outsider, open.facts).ok).toBe(true);
 		expect(decide(open.ref, "write", outsider, open.facts)).toMatchObject({ ok: false });
 		expect(decide(open.ref, "write", teammate, open.facts).ok).toBe(true);
 	});
 
-	it("a named secret tracker: only that user", () => {
+	it("a named tracker outside Git: only that user", () => {
 		const named = tracker({ kind: "named", login: "jack" }, false);
 		expect(decide(named.ref, "read", member, named.facts).ok).toBe(true);
 		expect(decide(named.ref, "write", member, named.facts).ok).toBe(true);
@@ -148,7 +148,7 @@ describe("who may hold which token", () => {
 		expect(decide(named.ref, "write", teammate, named.facts).ok).toBe(false);
 	});
 
-	it("a per-user secret tracker: each user reads and writes only their own repo", () => {
+	it("a per-user tracker outside Git: each user reads and writes only their own repo", () => {
 		const own = tracker({ kind: "user" }, false, "jack");
 		expect(decide(own.ref, "read", member, own.facts).ok).toBe(true);
 		expect(decide(own.ref, "write", member, own.facts).ok).toBe(true);
@@ -181,16 +181,16 @@ describe("who may hold which token", () => {
 		expect(decide(open.ref, "write", outsider, open.facts).ok).toBe(false);
 	});
 
-	it("a fork needs an instance, and only code trackers have forks", () => {
+	it("a fork needs an instance, and only trackers in Git have forks", () => {
 		const orphan = fork({ kind: "project-devs" }, true, undefined);
 		expect(decide(orphan.ref, "read", member, orphan.facts)).toMatchObject({
 			ok: false,
 			reason: expect.stringContaining("no instance"),
 		});
-		const secret = fork({ kind: "project-devs" }, false, "jack");
-		expect(decide(secret.ref, "read", member, secret.facts)).toMatchObject({
+		const outside = fork({ kind: "project-devs" }, false, "jack");
+		expect(decide(outside.ref, "read", member, outside.facts)).toMatchObject({
 			ok: false,
-			reason: expect.stringContaining("secret tracker"),
+			reason: expect.stringContaining("is not in Git"),
 		});
 	});
 

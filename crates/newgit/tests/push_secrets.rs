@@ -1,5 +1,5 @@
 //! Step 3c: work is split into its trackers when it leaves the machine, and
-//! a secret tracker's file never leaves with it — on any branch a push sends.
+//! The file of a tracker outside Git never leaves with it — on any branch a push sends.
 
 use std::process::{Command, Output};
 
@@ -125,8 +125,8 @@ fn git_fails(dir: &Utf8Path, args: &[&str]) -> String {
     String::from_utf8_lossy(&output.stderr).into_owned()
 }
 
-/// A project with a secret tracker owning `.env.local`.
-fn with_secret_tracker(fixture: &Fixture) {
+/// A project with a tracker outside Git owning `.env.local`.
+fn with_tracker_outside_git(fixture: &Fixture) {
     for args in [
         &["tracker", "create", "env", "--audience", "user"][..],
         &["tracker", "track", "env", ".env.local"][..],
@@ -151,7 +151,7 @@ fn remote_branches(fixture: &Fixture) -> String {
 fn a_push_of_the_instances_branch_holding_a_secret_is_refused() {
     let (_guard, temp) = tempdir();
     let fixture = setup(&temp);
-    with_secret_tracker(&fixture);
+    with_tracker_outside_git(&fixture);
     let (workspace, _) = spawn(&fixture, "feature-a");
 
     std::fs::write(workspace.join(".env.local"), "TOKEN=sk_live_do_not_leak\n").expect("write");
@@ -169,7 +169,7 @@ fn a_push_of_the_instances_branch_holding_a_secret_is_refused() {
 fn a_push_of_any_other_branch_holding_a_secret_is_refused_too() {
     let (_guard, temp) = tempdir();
     let fixture = setup(&temp);
-    with_secret_tracker(&fixture);
+    with_tracker_outside_git(&fixture);
     let (workspace, _) = spawn(&fixture, "feature-a");
 
     git(&workspace, &["checkout", "-q", "-b", "side"]);
@@ -187,7 +187,7 @@ fn a_push_of_any_other_branch_holding_a_secret_is_refused_too() {
 fn a_clean_push_is_split_into_the_instances_tracker_branches() {
     let (_guard, temp) = tempdir();
     let fixture = setup(&temp);
-    with_secret_tracker(&fixture);
+    with_tracker_outside_git(&fixture);
     let (workspace, _) = spawn(&fixture, "feature-a");
 
     let pushed = commit(&workspace, "feature.txt", "work\n");
@@ -245,7 +245,7 @@ fn history_from_before_newgit_never_blocks_a_push_to_a_fresh_remote() {
         store: repo,
         remote,
     };
-    with_secret_tracker(&fixture);
+    with_tracker_outside_git(&fixture);
     let (workspace, _) = spawn(&fixture, "feature-a");
 
     commit(&workspace, "feature.txt", "work\n");

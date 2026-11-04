@@ -76,8 +76,8 @@ pub struct BranchManager {
     /// is the project's own Git history, committed with Git.
     root: TrackerDefinition,
     /// Committed trackers with their own histories, composed into workspaces
-    /// (docs/design/trackers.md, step 3): `project` and any carved-out code.
-    code: Vec<TrackerDefinition>,
+    /// (docs/design/trackers.md, step 3): `project` and any tracker carved out of root.
+    carved: Vec<TrackerDefinition>,
     /// The instance locks this manager holds right now, by slug (see
     /// [`crate::lock`]). A nested call for an instance already locked gets
     /// the held lock back instead of waiting on its own process; the entry
@@ -96,7 +96,7 @@ impl HeldLock {
     }
 }
 
-/// What creating a code tracker did.
+/// What creating a tracker in Git did.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CreateCodeTrackerOutcome {
     pub path: Utf8PathBuf,
@@ -823,7 +823,7 @@ pub struct ExportOutcome {
     pub still_gitignored: Vec<Utf8PathBuf>,
 }
 
-/// Why a code tracker is in a remote export, or that it is not.
+/// Why a tracker in Git is in a remote export, or that it is not.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExportReason {
     /// Its audience is `public`.
@@ -866,7 +866,7 @@ pub struct BranchExported {
     /// The target's branch is the pushed commit itself — every tracker the
     /// history touched ships — so `gh pr create` finds it with no flags.
     pub same_commits: bool,
-    /// Code trackers this target does not ship.
+    /// Trackers in Git this target does not ship.
     pub withheld: Vec<String>,
 }
 
@@ -883,7 +883,7 @@ pub struct RemoteExportOutcome {
     pub target: ExportTarget,
     /// Where Git pushed (or would have).
     pub url: String,
-    /// Every code tracker, shipped or withheld.
+    /// Every tracker in Git, shipped or withheld.
     pub trackers: Vec<ExportedTracker>,
     /// The composed history's tip.
     pub tip: String,
@@ -1225,10 +1225,10 @@ impl BranchManager {
                 .position(TrackerDefinition::owns_everything)
                 .expect("root was just ensured"),
         );
-        // Code trackers are composed into workspaces; the rest are captured
+        // Trackers in Git are composed into workspaces; the rest are captured
         // from files.
-        let (code, trackers): (Vec<_>, Vec<_>) =
-            trackers.into_iter().partition(TrackerDefinition::is_code);
+        let (carved, trackers): (Vec<_>, Vec<_>) =
+            trackers.into_iter().partition(TrackerDefinition::carved);
         let resources = store.load_resource_definitions()?;
         let tracker_names: BTreeSet<String> = trackers.iter().map(|t| t.name.clone()).collect();
         let graph = resolve_graph(&resources, &tracker_names);
@@ -1258,7 +1258,7 @@ impl BranchManager {
             graph,
             remote,
             root,
-            code,
+            carved,
             locks: Mutex::new(BTreeMap::new()),
         })
     }
@@ -1374,17 +1374,17 @@ impl BranchManager {
         &self.root
     }
 
-    /// Code trackers: committed, with their own histories, composed into
+    /// Trackers in Git: committed, with their own histories, composed into
     /// workspaces. `project` is always one.
-    pub fn code_trackers(&self) -> &[TrackerDefinition] {
-        &self.code
+    pub fn carved_trackers(&self) -> &[TrackerDefinition] {
+        &self.carved
     }
 
-    /// Create a code tracker owning `paths`, its history carved out of
+    /// Create a tracker in Git owning `paths`, its history carved out of
     /// whichever tracker owns them now (usually root): every commit that
     /// touched them, marked with its source, so composing the two still
     /// reproduces the original history.
-    pub fn create_code_tracker(
+    pub fn create_git_tracker(
         &self,
         name: &str,
         audience: &str,
@@ -1394,18 +1394,18 @@ impl BranchManager {
         self.refuse_root(name, "it always exists")?;
         if paths.is_empty() {
             return Err(NewgitError::Unsupported(format!(
-                "a code tracker's paths are set when it is created: `newgit tracker create {name} \
-                 --code --path <path>`"
+                "The paths of a tracker in Git are set when it is created: `newgit tracker create {name} \
+                 --git --path <path>`"
             )));
         }
-        let definition = TrackerDefinition::code(name, audience.to_owned(), paths)?;
+        let definition = TrackerDefinition::in_git(name, audience.to_owned(), paths)?;
 
         // Who owns these paths now: one tracker, so there is one history to
         // carve from.
         let mut owners = BTreeSet::new();
         for path in &definition.paths {
             let owner = self
-                .code
+                .carved
                 .iter()
                 .chain(std::iter::once(&self.root))
                 .filter(|candidate| candidate.owns(path))
@@ -1427,7 +1427,7 @@ impl BranchManager {
         let source = owners.into_iter().next().expect("one owner");
 
         let mut all: Vec<TrackerDefinition> =
-            self.trackers.iter().chain(&self.code).cloned().collect();
+            self.trackers.iter().chain(&self.carved).cloned().collect();
         all.push(self.root.clone());
         all.push(definition.clone());
         crate::tracker::resolve_ownership(&mut all)?;
@@ -1457,10 +1457,10 @@ impl BranchManager {
     ///
     /// Returns the carved `main`'s tip.
     fn carve_from(&self, source: &str, definition: &TrackerDefinition) -> Result<Option<String>> {
-        self.fetch_code_trackers()?;
+        self.fetch_carved_trackers()?;
         let mut carved_main = None;
         let mut carved = Vec::new();
-        for branch in self.code_branches(source)? {
+        for branch in self.carved_branches(source)? {
             let source_tip = self.source.rev_parse(&local_tracker_ref(source, &branch))?;
             let target = local_tracker_ref(&definition.name, &branch);
             let tip = crate::compose::carve(
@@ -1478,21 +1478,21 @@ impl BranchManager {
         }
         if !carved.is_empty() {
             let branches: Vec<&str> = carved.iter().map(String::as_str).collect();
-            self.publish_code_refs(&definition.name, &branches)?;
+            self.publish_carved_refs(&definition.name, &branches)?;
         }
         Ok(carved_main)
     }
 
-    /// Bring every code tracker's branches from the store into the project
+    /// Bring the branches of every tracker in Git from the store into the project
     /// repo (`refs/newgit/trackers/<tracker>/…`), where composing and
-    /// splitting run — one fetch. Code trackers only: a secret tracker's
-    /// content never enters the project repo, which is the one `git push
+    /// splitting run — one fetch. Trackers in Git only: the content of a tracker
+    /// outside Git never enters the project repo, which is the one `git push
     /// --mirror` publishes and every workspace clone hardlinks.
-    fn fetch_code_trackers(&self) -> Result<()> {
+    fn fetch_carved_trackers(&self) -> Result<()> {
         let store = self.store.paths().tracker_store.clone();
         crate::tracker_repo::ensure_store(&store)?;
         let refspecs: Vec<String> = self
-            .code_definitions()
+            .carved_definitions()
             .iter()
             .map(|definition| {
                 format!(
@@ -1509,9 +1509,9 @@ impl BranchManager {
         )
     }
 
-    /// A code tracker's branches in the project repo: `main`,
+    /// The branches of a tracker in Git in the project repo: `main`,
     /// `instances/<slug>`.
-    fn code_branches(&self, tracker: &str) -> Result<Vec<String>> {
+    fn carved_branches(&self, tracker: &str) -> Result<Vec<String>> {
         let prefix = format!("refs/newgit/trackers/{tracker}/");
         Ok(crate::source::run_git_env(
             &[
@@ -1529,19 +1529,19 @@ impl BranchManager {
         .collect())
     }
 
-    /// One code tracker branch, brought from the store into the project
+    /// One tracker in Git branch, brought from the store into the project
     /// repo: its commit there, or `None` when the store has no such branch.
-    fn fetch_code_ref(&self, tracker: &str, branch: &str) -> Result<Option<String>> {
-        self.fetch_code_trackers()?;
+    fn fetch_carved_ref(&self, tracker: &str, branch: &str) -> Result<Option<String>> {
+        self.fetch_carved_trackers()?;
         Ok(self
             .source
             .rev_parse(&local_tracker_ref(tracker, branch))
             .ok())
     }
 
-    /// The reverse: a code tracker's branches, made in the project repo,
+    /// The reverse: the branches of a tracker in Git, made in the project repo,
     /// fetched into the store under the tracker's own refs.
-    fn publish_code_refs(&self, tracker: &str, branches: &[&str]) -> Result<()> {
+    fn publish_carved_refs(&self, tracker: &str, branches: &[&str]) -> Result<()> {
         let store = self.store.paths().tracker_store.clone();
         crate::tracker_repo::ensure_store(&store)?;
         let refspecs: Vec<String> = branches
@@ -1561,24 +1561,24 @@ impl BranchManager {
         )
     }
 
-    /// Root and every code tracker: what a view composes.
-    fn code_definitions(&self) -> Vec<TrackerDefinition> {
+    /// Root and every tracker in Git: what a view composes.
+    fn carved_definitions(&self) -> Vec<TrackerDefinition> {
         std::iter::once(self.root.clone())
-            .chain(self.code.iter().cloned())
+            .chain(self.carved.iter().cloned())
             .collect()
     }
 
-    /// Every definition, secret trackers included: what names the owner of
+    /// Every definition, trackers outside Git included: what names the owner of
     /// a path nothing bound owns.
     fn all_definitions(&self) -> Vec<TrackerDefinition> {
-        self.code_definitions()
+        self.carved_definitions()
             .into_iter()
             .chain(self.trackers.iter().cloned())
             .collect()
     }
 
-    /// The code tracker `definition`'s paths belong to until it is carved:
-    /// the most specific other code tracker claiming them, usually root.
+    /// The tracker in Git `definition`'s paths belong to until it is carved:
+    /// the most specific other tracker in Git claiming them, usually root.
     fn carve_source(&self, definition: &TrackerDefinition) -> String {
         let Some(path) = definition.paths.first() else {
             return self.root.name.clone();
@@ -1591,7 +1591,7 @@ impl BranchManager {
                 .map(|owned| owned.as_str().len())
                 .max()
         };
-        self.code
+        self.carved
             .iter()
             .filter(|other| other.name != definition.name)
             .filter_map(|other| claim(other).map(|length| (length, other)))
@@ -1599,18 +1599,18 @@ impl BranchManager {
             .map_or_else(|| self.root.name.clone(), |(_, other)| other.name.clone())
     }
 
-    /// Get the project repo ready to compose or split: the code trackers'
-    /// branches are in the project repo, every code tracker has its history
+    /// Get the project repo ready to compose or split: the branches of the trackers in Git
+    /// are in the project repo, every tracker in Git has its history
     /// (carved out of its owner the first time it is needed — a tracker
     /// defined by hand, or `project`), and every view's commits carry notes
     /// saying which tracker commits they stand for — recomposed when there
-    /// are none yet, or when the set of code trackers with history changed.
+    /// are none yet, or when the set of trackers in Git with history changed.
     fn prepare_projection(&self) -> Result<()> {
-        self.fetch_code_trackers()?;
+        self.fetch_carved_trackers()?;
         // A tracker carves out of the one claiming a strict prefix of its
         // path, so shorter claims go first: `project` (`.newgit`) has its
         // history before `access` (`.newgit/trackers`) carves out of it.
-        let mut by_claim: Vec<&TrackerDefinition> = self.code.iter().collect();
+        let mut by_claim: Vec<&TrackerDefinition> = self.carved.iter().collect();
         by_claim.sort_by_key(|definition| {
             definition
                 .paths
@@ -1618,7 +1618,7 @@ impl BranchManager {
                 .map_or(0, |path| path.as_str().len())
         });
         for definition in by_claim {
-            if !self.code_branches(&definition.name)?.is_empty() {
+            if !self.carved_branches(&definition.name)?.is_empty() {
                 continue;
             }
             // Carving reads the whole history: once is enough. A tracker it
@@ -1628,7 +1628,7 @@ impl BranchManager {
                 continue;
             }
             let source = self.carve_source(definition);
-            let Some(source_main) = self.fetch_code_ref(&source, "main")? else {
+            let Some(source_main) = self.fetch_carved_ref(&source, "main")? else {
                 continue;
             };
             self.carve_from(&source, definition)?;
@@ -1636,8 +1636,8 @@ impl BranchManager {
         }
 
         let mut names = String::new();
-        for definition in self.code_definitions() {
-            if !self.code_branches(&definition.name)?.is_empty() {
+        for definition in self.carved_definitions() {
+            if !self.carved_branches(&definition.name)?.is_empty() {
                 names.push_str(&format!("{}\n", definition.name));
             }
         }
@@ -1658,10 +1658,10 @@ impl BranchManager {
     /// nothing is written but their notes, which now name every tracker.
     fn recompose_views(&self) -> Result<()> {
         let project = self.store.paths().project_root.clone();
-        let code = self.code_definitions();
+        let code = self.carved_definitions();
         let mut slugs = BTreeSet::from(["main".to_owned()]);
         for definition in &code {
-            for branch in self.code_branches(&definition.name)? {
+            for branch in self.carved_branches(&definition.name)? {
                 if let Some(slug) = branch.strip_prefix("instances/") {
                     slugs.insert(slug.to_owned());
                 }
@@ -1702,7 +1702,7 @@ impl BranchManager {
     ///
     /// A path whose tracker this instance has not bound refuses the whole
     /// split, naming it. Secrets are checked where work leaves, by
-    /// [`Self::refuse_secrets`], against exactly what is sent.
+    /// [`Self::refuse_outside_git`], against exactly what is sent.
     fn split_instance(&self, slug: &str, tip: &str) -> Result<usize> {
         let project = self.store.paths().project_root.clone();
         self.prepare_projection()?;
@@ -1714,7 +1714,7 @@ impl BranchManager {
                 &tip[..tip.len().min(12)]
             ))
         })?;
-        let code = self.code_definitions();
+        let code = self.carved_definitions();
         let dropped = if slug == PROJECT_ROOT_INSTANCE {
             BTreeSet::new()
         } else {
@@ -1743,27 +1743,27 @@ impl BranchManager {
             }
             self.source
                 .update_ref(&local_tracker_ref(tracker, &branch), commit)?;
-            self.publish_code_refs(tracker, &[&branch])?;
+            self.publish_carved_refs(tracker, &[&branch])?;
         }
         Ok(outcome.made.len())
     }
 
     /// Refuse when any commit `rev_list` selects (in `repo`) adds or changes
-    /// a file a secret tracker owns — every commit, every parent of a merge.
-    /// The one gate for secrets: a push runs it over everything it sends,
+    /// a file a tracker outside Git owns — every commit, every parent of a merge.
+    /// The one gate for what trackers outside Git own: a push runs it over everything it sends,
     /// a sync over everything it uploads.
-    fn refuse_secrets(
+    fn refuse_outside_git(
         &self,
         repo: &Utf8Path,
         rev_list: &[&str],
         env: &[(String, String)],
     ) -> Result<()> {
         let all = self.all_definitions();
-        match crate::compose::find_secret(repo, rev_list, env, &all)? {
+        match crate::compose::find_outside_git(repo, rev_list, env, &all)? {
             None => Ok(()),
             Some((commit, path, tracker)) => Err(NewgitError::SplitRefused(format!(
-                "commit {} changes `{path}`, which belongs to the secret tracker `{tracker}`, \
-                 and secrets never leave this machine through Git. Take it out of that commit \
+                "commit {} changes `{path}`, which belongs to `{tracker}`, a tracker outside \
+                 Git: its files (secrets among them) never leave this machine through Git. Take it out of that commit \
                  (`git rm --cached {path}` then `git commit --amend`, or an interactive rebase \
                  if the commit is older) and try again",
                 &commit[..commit.len().min(12)]
@@ -1771,7 +1771,7 @@ impl BranchManager {
         }
     }
 
-    /// Put branch `branch` here, composed from the code trackers' `main`s in
+    /// Put branch `branch` here, composed from the `main`s of the trackers in Git in
     /// the tracker store: the project repo's `refs/heads/<branch>` and its
     /// working tree become the composed view, and that branch is the project
     /// root's own. What `newgit clone` ends with. Returns the view's commit.
@@ -1799,7 +1799,7 @@ impl BranchManager {
     /// Refuse when anything about to be published from `rev` — every commit
     /// behind it, every parent of every merge, back to the history newgit
     /// adopted (as `newgit init` found it, or a clone received it) — adds or
-    /// changes a secret tracker's file. Every commit pushed is checked, view
+    /// changes a file of a tracker outside Git. Every commit pushed is checked, view
     /// commits and tracker commits alike: a tracker's `main` can hold work
     /// merged here that no branch of the project root has. The
     /// one gate every path that sends work to the remote passes: sync, push,
@@ -1813,7 +1813,7 @@ impl BranchManager {
         let mut args = revs.to_vec();
         args.push("--not");
         args.extend(adopted.as_deref());
-        self.refuse_secrets(&root, &args, &[])
+        self.refuse_outside_git(&root, &args, &[])
     }
 
     /// The project root is the instance `main` (docs/design/trackers.md): bring
@@ -1861,7 +1861,7 @@ impl BranchManager {
         let store = self.store.paths().tracker_store.clone();
         let known = tracker == self.root.name
             || self
-                .code
+                .carved
                 .iter()
                 .any(|definition| definition.name == tracker)
             || self
@@ -1871,15 +1871,15 @@ impl BranchManager {
         if !known {
             return Err(NewgitError::UnknownTracker(tracker.to_owned()));
         }
-        let is_code = tracker == self.root.name
+        let in_git = tracker == self.root.name
             || self
-                .code
+                .carved
                 .iter()
                 .any(|definition| definition.name == tracker);
         let reference = match instance {
             Some(instance) => {
                 let branch = self.store.find_branch(instance)?;
-                if is_code {
+                if in_git {
                     let tip = self
                         .source
                         .rev_parse(&format!("refs/heads/{}", branch.source_ref))?;
@@ -1888,7 +1888,7 @@ impl BranchManager {
                 format!("refs/trackers/{tracker}/instances/{}", branch.slug)
             }
             None => {
-                if is_code {
+                if in_git {
                     self.sync_project_root()?;
                     format!("refs/trackers/{tracker}/instances/main")
                 } else {
@@ -1899,16 +1899,16 @@ impl BranchManager {
         Ok((store, reference))
     }
 
-    /// Refuse a tracker command aimed at root or a code tracker, saying what
+    /// Refuse a tracker command aimed at root or a tracker in Git, saying what
     /// to do instead: both are committed with Git.
     fn refuse_root(&self, tracker: &str, action: &str) -> Result<()> {
         if self
-            .code
+            .carved
             .iter()
             .any(|definition| definition.name == tracker)
         {
             return Err(NewgitError::Unsupported(format!(
-                "`{tracker}` is a code tracker: its content is committed, and newgit splits your \
+                "`{tracker}` is a tracker in Git: its content is committed, and newgit splits your \
                  commits into it — {action}"
             )));
         }
@@ -2254,7 +2254,7 @@ impl BranchManager {
 
     /// Put an instance on the project's remote, if it has one and the instance
     /// is not there yet: register it (which forks nothing — an instance forks
-    /// a code tracker the first time it changes it — and mints the
+    /// a tracker in Git the first time it changes it — and mints the
     /// workspace's own token), keep the token in the workspace's `.git/`, and
     /// point the workspace's `origin` at the project's Git endpoint.
     ///
@@ -2336,7 +2336,7 @@ impl BranchManager {
             })?;
         let mut warnings = Vec::new();
 
-        // Source: the checkpoint's list, composed here from the code trackers
+        // Source: the checkpoint's list, composed here from the trackers in Git
         // this person may read — the author's exact commits when they read
         // everything the author did.
         let imported = self.import_code(
@@ -2390,7 +2390,7 @@ impl BranchManager {
             let instance_branch = format!("instances/{}", branch.slug);
             self.source
                 .update_ref(&local_tracker_ref(tracker, &instance_branch), commit)?;
-            self.publish_code_refs(tracker, &[&instance_branch])?;
+            self.publish_carved_refs(tracker, &[&instance_branch])?;
         }
 
         // The record joins the new instance's own history, rewritten to
@@ -3129,9 +3129,9 @@ impl BranchManager {
     /// there and why nothing else is.
     ///
     /// - Which paths the install can see: the sparse checkout the dropped
-    ///   code trackers leave, which is what an unfiltered `npm ci` reads
-    ///   when it finds workspace members on disk. Empty when no code
-    ///   tracker is dropped, so binding a secret tracker, or one that owns
+    ///   trackers in Git leave, which is what an unfiltered `npm ci` reads
+    ///   when it finds workspace members on disk. Empty when no tracker
+    ///   in Git is dropped, so binding a tracker outside Git, or one that owns
     ///   no paths, or creating or renaming a tracker that is bound, leaves
     ///   it alone.
     /// - What `{{bound.trackers}}` and `{{bound.paths}}` render to, only
@@ -3838,7 +3838,7 @@ impl BranchManager {
         for path in GitSource::workspace_changes(&branch.workspace_path, &left_out, &except)? {
             // Its most specific claimant, as ownership goes.
             let owner = self
-                .code
+                .carved
                 .iter()
                 .filter(|definition| branch.dropped.contains(&definition.name))
                 .flat_map(|definition| {
@@ -4650,17 +4650,17 @@ impl BranchManager {
                 .join(" "),
             paths: bound
                 .iter()
-                .filter(|definition| !definition.secret)
+                .filter(|definition| definition.git)
                 .flat_map(|definition| definition.paths.iter().map(|path| path.as_str()))
                 .collect::<Vec<_>>()
                 .join(" "),
         }
     }
 
-    /// Trackers an instance may bind or drop: every code and secret tracker
+    /// Trackers an instance may bind or drop: every tracker, in Git or not,
     /// but `root`, `project`, and `access`, which are always bound.
     fn selectable(&self) -> Vec<&TrackerDefinition> {
-        self.code
+        self.carved
             .iter()
             .filter(|definition| {
                 definition.name != crate::tracker::PROJECT_TRACKER
@@ -4818,11 +4818,11 @@ impl BranchManager {
                 .any(|definition| !branch.dropped.contains(&definition.name))
     }
 
-    /// Stop binding `tracker` in `instance` (`newgit tracker drop`). A code
-    /// tracker leaves the working tree (sparse checkout) but not the history;
+    /// Stop binding `tracker` in `instance` (`newgit tracker drop`). A tracker
+    /// in Git leaves the working tree (sparse checkout) but not the history;
     /// uncommitted work in it refuses the drop unless `uncommitted` says to
     /// stash it (`use` brings it back) or discard it (after a checkpoint, so
-    /// it can be undone). A secret tracker's content is captured first, then
+    /// it can be undone). The content of a tracker outside Git is captured first, then
     /// its files removed; `use` projects that content back.
     pub fn drop_tracker(
         &self,
@@ -4905,7 +4905,7 @@ impl BranchManager {
         }
         let workspace = branch.workspace_path.clone();
         if let Some(definition) = self
-            .code
+            .carved
             .iter()
             .find(|definition| definition.name == tracker)
         {
@@ -4985,10 +4985,10 @@ impl BranchManager {
         Ok(change)
     }
 
-    /// Bind `tracker` in `instance` again (`newgit tracker use`): a code
-    /// tracker's files come back into the working tree, with whatever a drop
-    /// stashed; a secret tracker's last content in this instance is projected
-    /// back.
+    /// Bind `tracker` in `instance` again (`newgit tracker use`): a tracker
+    /// in Git has its files come back into the working tree, with whatever a drop
+    /// stashed; the last content of a tracker outside Git in this instance is
+    /// projected back.
     pub fn use_tracker(&self, instance: &str, tracker: &str) -> Result<BindingChange> {
         // Held through the rebuild too, which saves the record it loads;
         // the inner change takes the same lock again.
@@ -5034,7 +5034,7 @@ impl BranchManager {
             tracker: tracker.to_owned(),
             ..BindingChange::default()
         };
-        let definition = if let Some(code) = self.code.iter().find(|d| d.name == tracker) {
+        let definition = if let Some(code) = self.carved.iter().find(|d| d.name == tracker) {
             code.clone()
         } else {
             self.definition(tracker)?.clone()
@@ -5075,7 +5075,7 @@ impl BranchManager {
         }
         branch.dropped.remove(tracker);
         let workspace = branch.workspace_path.clone();
-        if !definition.secret {
+        if definition.git {
             self.apply_sparse(&branch)?;
             let listing = crate::source::run_git_env(
                 &[
@@ -5188,7 +5188,7 @@ impl BranchManager {
     /// `root`, which is always bound.
     ///
     /// When that part has not moved, the install is left alone and not
-    /// reported: binding a secret tracker, or one that owns no paths,
+    /// reported: binding a tracker outside Git, or one that owns no paths,
     /// cannot change what `npm ci` sees, and rebuilding for it was a full
     /// install for an identical tree (#248).
     ///
@@ -5316,8 +5316,8 @@ impl BranchManager {
         Ok((ok, install, Some(log)))
     }
 
-    /// The working tree follows the binding: every dropped code tracker's
-    /// paths left out (Git's sparse checkout), with any bound tracker nested
+    /// The working tree follows the binding: the paths of every dropped tracker in
+    /// Git left out (Git's sparse checkout), with any bound tracker nested
     /// inside one put back.
     ///
     /// The sparse checkout also decides the skip-worktree bit that keeps a
@@ -5366,7 +5366,7 @@ impl BranchManager {
     }
 
     /// The sparse-checkout patterns for an instance that drops `dropped`:
-    /// every dropped code tracker's paths left out, with any bound tracker
+    /// the paths of every dropped tracker in Git left out, with any bound tracker
     /// nested inside one put back. Empty when nothing is left out.
     fn sparse_patterns(&self, dropped_names: &BTreeSet<String>) -> Vec<String> {
         let (left_out, put_back) = self.sparse_paths(dropped_names);
@@ -5387,11 +5387,11 @@ impl BranchManager {
 
     /// The paths behind [`Self::sparse_patterns`]: what an instance that
     /// drops `dropped_names` leaves out of its working tree — every dropped
-    /// code tracker's paths — and what it puts back inside them, the paths
+    /// tracker in Git's paths — and what it puts back inside them, the paths
     /// of any bound tracker nested there.
     fn sparse_paths(&self, dropped_names: &BTreeSet<String>) -> (Vec<&Utf8Path>, Vec<&Utf8Path>) {
         let dropped: Vec<&TrackerDefinition> = self
-            .code
+            .carved
             .iter()
             .filter(|definition| dropped_names.contains(&definition.name))
             .collect();
@@ -5401,7 +5401,7 @@ impl BranchManager {
             .map(Utf8PathBuf::as_path)
             .collect();
         let mut put_back = Vec::new();
-        for definition in &self.code {
+        for definition in &self.carved {
             if dropped_names.contains(&definition.name) {
                 continue;
             }
@@ -5660,8 +5660,8 @@ impl BranchManager {
     /// such a tracker's pins and instance branches, never its `main`, so this
     /// is the one way that `main` moves.
     ///
-    /// On the remote a tracker repo's `main` is its branch `main`, as a code
-    /// tracker's is: the repo's default branch, what the Worker's
+    /// On the remote a tracker repo's `main` is its branch `main`, as that of a
+    /// tracker in Git is: the repo's default branch, what the Worker's
     /// `LANDING_PAGE` reads, and what anything reading a tracker by branch
     /// gets. A per-user tracker's `main` already rides every checkpoint.
     ///
@@ -6035,7 +6035,7 @@ impl BranchManager {
         for definition in &self.trackers {
             self.lane(&definition.name).drop_instance(&branch.slug)?;
         }
-        for definition in self.code_definitions() {
+        for definition in self.carved_definitions() {
             self.lane(&definition.name).drop_instance(&branch.slug)?;
             let _ = self.source.delete_ref(&local_tracker_ref(
                 &definition.name,
@@ -6835,9 +6835,9 @@ impl BranchManager {
     /// Push a composed projection of the trackers' `main`s to export target
     /// `name` (`.newgit/exports/<name>.toml`), history and all.
     ///
-    /// Fails closed: only `public` code trackers and the ones the target
-    /// names ship, a secret tracker cannot be named, and a composed history
-    /// that ever adds a path a secret tracker owns is refused before anything
+    /// Fails closed: only `public` trackers in Git and the ones the target
+    /// names ship, a tracker outside Git cannot be named, and a composed history
+    /// that ever adds a path a tracker outside Git owns is refused before anything
     /// is pushed. Composing is deterministic, so exporting again
     /// fast-forwards the target; a different tracker set is a different
     /// history, which needs `force`.
@@ -7054,10 +7054,10 @@ impl BranchManager {
     }
 
     /// Every export target, each checked against this project's trackers:
-    /// a target naming a secret tracker, or none at all, is an error.
+    /// a target naming a tracker outside Git, or none at all, is an error.
     fn export_targets(&self) -> Result<Vec<ExportTarget>> {
         let targets = self.store.load_export_targets()?;
-        let code = self.code_definitions();
+        let code = self.carved_definitions();
         for target in &targets {
             for listed in &target.trackers {
                 if code.iter().any(|definition| &definition.name == listed) {
@@ -7068,7 +7068,7 @@ impl BranchManager {
                     .iter()
                     .any(|definition| &definition.name == listed)
                 {
-                    "is secret, and a secret tracker never leaves this machine through Git"
+                    "is not in Git, and a tracker outside Git never leaves this machine through Git"
                 } else {
                     "is not a tracker in this project"
                 };
@@ -7084,7 +7084,7 @@ impl BranchManager {
 
     /// Compose `list` (tracker → commit) as `target` sees it — its trackers
     /// only — at `refs/newgit/exports/<target>/<branch>`, and refuse a
-    /// history that ever adds a path a secret tracker owns: a path made
+    /// history that ever adds a path a tracker outside Git owns: a path made
     /// secret later stays in the commits that once held it.
     fn compose_export(
         &self,
@@ -7092,7 +7092,7 @@ impl BranchManager {
         list: &BTreeMap<String, String>,
         branch: &str,
     ) -> Result<(Vec<ExportedTracker>, ComposedExport)> {
-        let code = self.code_definitions();
+        let code = self.carved_definitions();
         let trackers: Vec<ExportedTracker> = code
             .iter()
             .map(|definition| ExportedTracker {
@@ -7122,7 +7122,7 @@ impl BranchManager {
             .collect();
         if tips.is_empty() {
             return Err(NewgitError::Unsupported(format!(
-                "nothing to export to `{}`: no public code tracker has history on `{branch}`, \
+                "nothing to export to `{}`: no public tracker in Git has history on `{branch}`, \
                  and the target names none. Name the trackers to ship in \
                  .newgit/exports/{}.toml — `trackers = [\"root\"]` mirrors the project's own \
                  code",
@@ -7140,12 +7140,12 @@ impl BranchManager {
             ))
         })?;
         if let Some((commit, path, tracker)) =
-            crate::compose::find_secret(&root, &[&tip], &[], &all)?
+            crate::compose::find_outside_git(&root, &[&tip], &[], &all)?
         {
             return Err(NewgitError::SplitRefused(format!(
                 "the export to `{}` would carry commit {}, which adds `{path}`, and `{path}` \
-                 belongs to the secret tracker `{tracker}`. Secrets never leave this machine \
-                 through Git, so this history cannot be exported as it is",
+                 belongs to `{tracker}`, a tracker outside Git, whose files (secrets among them) \
+                 never leave this machine through Git, so this history cannot be exported as it is",
                 target.name,
                 &commit[..commit.len().min(12)]
             )));
@@ -7209,7 +7209,7 @@ impl BranchManager {
             }
         };
         let mut list = BTreeMap::new();
-        for definition in self.code_definitions() {
+        for definition in self.carved_definitions() {
             let commit = [format!("instances/{}", branch.slug), "main".to_owned()]
                 .iter()
                 .find_map(|name| {
@@ -7366,7 +7366,7 @@ impl BranchManager {
         if !rev_list.is_empty() {
             rev_list.extend(["--not", "--all"]);
             rev_list.extend(history.as_deref());
-            self.refuse_secrets(&outbox, &rev_list, &quarantine)?;
+            self.refuse_outside_git(&outbox, &rev_list, &quarantine)?;
         }
 
         let mut checkpoint = self.checkpoint_branch(
@@ -7856,8 +7856,8 @@ impl BranchManager {
         })
     }
 
-    /// Create this project on a remote as `<you>/<name>`: one repo per code
-    /// tracker, each seeded with its history, and branch `main` naming each
+    /// Create this project on a remote as `<you>/<name>`: one repo per
+    /// tracker in Git, each seeded with its history, and branch `main` naming each
     /// tracker's commit. Its first publication, so it publishes the project
     /// root's work as it stands — split into its trackers first — and each
     /// tracker's `main` here becomes what was pushed. After this, `main`
@@ -7873,7 +7873,7 @@ impl BranchManager {
         self.merge(PROJECT_ROOT_INSTANCE, "main")?;
         let root = self.store.paths().project_root.clone();
         let mut list = BTreeMap::new();
-        for definition in self.code_definitions() {
+        for definition in self.carved_definitions() {
             if let Ok(tip) = self
                 .source
                 .rev_parse(&local_tracker_ref(&definition.name, "main"))
@@ -7939,7 +7939,7 @@ impl BranchManager {
 
     /// Branch `branch`'s list — tracker → commit — with every commit in the
     /// project repo: on the remote, its list there (commits fetched from each
-    /// tracker's repo); otherwise each code tracker's branch here.
+    /// tracker's repo); otherwise the branch of each tracker in Git here.
     fn branch_list(
         &self,
         client: Option<(&dyn Remote, &str)>,
@@ -7947,9 +7947,9 @@ impl BranchManager {
     ) -> Result<BTreeMap<String, String>> {
         let root = self.store.paths().project_root.clone();
         let Some((client, project)) = client else {
-            self.fetch_code_trackers()?;
+            self.fetch_carved_trackers()?;
             return Ok(self
-                .code_definitions()
+                .carved_definitions()
                 .iter()
                 .filter_map(|definition| {
                     self.source
@@ -8044,7 +8044,7 @@ impl BranchManager {
             self.refuse_unpublished(&[&head])?;
         }
         let root = self.store.paths().project_root.clone();
-        let code = self.code_definitions();
+        let code = self.carved_definitions();
         let theirs: BTreeMap<String, String> = crate::compose::read_state(&root, &head)?
             .into_iter()
             .filter(|(tracker, _)| code.iter().any(|definition| &definition.name == tracker))
@@ -8157,7 +8157,7 @@ impl BranchManager {
                 .collect();
             if names.is_empty() {
                 return Err(NewgitError::Unsupported(format!(
-                    "a new code tracker joins `{into}` with the change to the definitions that \
+                    "a new tracker in Git joins `{into}` with the change to the definitions that \
                      made it: merge that too (`newgit merge main` from the project root)"
                 )));
             }
@@ -8181,7 +8181,7 @@ impl BranchManager {
         for (tracker, commit) in &list {
             self.source
                 .update_ref(&local_tracker_ref(tracker, into), commit)?;
-            self.publish_code_refs(tracker, &[into])?;
+            self.publish_carved_refs(tracker, &[into])?;
         }
         // The merge is done; bringing the project root along is a courtesy,
         // and its failing is said, not mistaken for the merge failing.
@@ -8206,10 +8206,10 @@ impl BranchManager {
         })
     }
 
-    /// Rewrite the code trackers' commits split before their trailers kept
+    /// Rewrite the commits of trackers in Git split before their trailers kept
     /// the original's message ending and headers (docs/design/trackers.md,
     /// step 3e), so they recompose into the originals anywhere — signatures,
-    /// and so ids, included. Every code tracker branch here moves onto the
+    /// and so ids, included. Every branch of a tracker in Git here moves onto the
     /// rewritten commits, and so do the composed-state notes; on the remote,
     /// each branch's list moves the way a merge moves it, its tracker repos
     /// force-pushed with a lease on the commits they hold now. Instance forks
@@ -8219,12 +8219,12 @@ impl BranchManager {
     pub fn repair_splits(&self, dry_run: bool) -> Result<RepairOutcome> {
         self.require_resolvable_graph()?;
         let root = self.store.paths().project_root.clone();
-        self.fetch_code_trackers()?;
-        let code = self.code_definitions();
+        self.fetch_carved_trackers()?;
+        let code = self.carved_definitions();
 
         let mut local: Vec<(String, String, String)> = Vec::new();
         for definition in &code {
-            for branch in self.code_branches(&definition.name)? {
+            for branch in self.carved_branches(&definition.name)? {
                 let commit = self
                     .source
                     .rev_parse(&local_tracker_ref(&definition.name, &branch))?;
@@ -8329,7 +8329,7 @@ impl BranchManager {
             }
         }
         for (tracker, branches) in &by_tracker {
-            self.publish_code_refs(tracker, branches)?;
+            self.publish_carved_refs(tracker, branches)?;
         }
         Ok(outcome)
     }
@@ -8340,7 +8340,7 @@ impl BranchManager {
     /// its own is left alone. Says what happened.
     fn catch_up_project_root(&self, list: &BTreeMap<String, String>) -> Result<Option<String>> {
         let root = self.store.paths().project_root.clone();
-        let code = self.code_definitions();
+        let code = self.carved_definitions();
         let tips: Vec<crate::compose::TrackerTip<'_>> = code
             .iter()
             .filter_map(|definition| {
@@ -8463,7 +8463,7 @@ impl BranchManager {
 
     /// Publish an instance's work for checkpoint `record`, tracker by tracker:
     /// its committed work (split already) and its uncommitted work (split
-    /// here, off the branch) as one commit per code tracker. A tracker the
+    /// here, off the branch) as one commit per tracker in Git. A tracker the
     /// instance changed — its commit is not the default branch's — is forked
     /// the first time and gets its branch (`refs/heads/<instance>`) and the
     /// checkpoint's commit pushed there. Returns the checkpoint as lists.
@@ -8475,7 +8475,7 @@ impl BranchManager {
         record: &CheckpointRecord,
     ) -> Result<crate::checkpoint::CodeState> {
         let root = self.store.paths().project_root.clone();
-        let code = self.code_definitions();
+        let code = self.carved_definitions();
         let code_only = |state: crate::compose::State| -> BTreeMap<String, String> {
             state
                 .into_iter()
@@ -8516,7 +8516,7 @@ impl BranchManager {
             if !main.contains_key(tracker) {
                 return Err(NewgitError::Unsupported(format!(
                     "`{tracker}` is not on {project}'s `{}` yet, so this instance has no fork of \
-                     it to push to: a code tracker made after the project reached the remote \
+                     it to push to: a tracker in Git made after the project reached the remote \
                      joins it through `newgit merge`",
                     view.default_branch
                 )));
@@ -8536,7 +8536,7 @@ impl BranchManager {
         Ok(crate::checkpoint::CodeState { head, tip })
     }
 
-    /// Bring a checkpoint's code here and compose it: each code tracker this
+    /// Bring a checkpoint's code here and compose it: each tracker in Git this
     /// person may read is fetched — from the author's fork when the author
     /// changed it, from the tracker's own repo otherwise — and the lists
     /// composed into two views, the committed work and the checkpoint's tip.
@@ -8552,27 +8552,27 @@ impl BranchManager {
     ) -> Result<ImportedCode> {
         if code.is_empty() {
             return Err(NewgitError::Unsupported(format!(
-                "checkpoint {from_slug}/{checkpoint_id} carries no code trackers' commits, so it \
+                "checkpoint {from_slug}/{checkpoint_id} carries no commits of trackers in Git, so it \
                  cannot be composed here; checkpoint it again with this newgit"
             )));
         }
         let root = self.store.paths().project_root.clone();
         let forks = remote.instance(project, from_slug)?.forks;
-        let code_definitions = self.code_definitions();
+        let carved_definitions = self.carved_definitions();
         for tracker in code.tip.keys() {
-            if !code_definitions
+            if !carved_definitions
                 .iter()
                 .any(|definition| &definition.name == tracker)
             {
                 warnings.push(format!(
-                    "code tracker `{tracker}` is not defined here, so it is left out: bring this \
+                    "the tracker in Git `{tracker}` is not defined here, so it is left out: bring this \
                      project's definitions up to date (`git pull` in the project root) and spawn \
                      again"
                 ));
             }
         }
         let mut readable = Vec::new();
-        for definition in &code_definitions {
+        for definition in &carved_definitions {
             let tracker = &definition.name;
             if !code.tip.contains_key(tracker) {
                 continue;
@@ -8586,7 +8586,9 @@ impl BranchManager {
             let credential = match remote.credential(project, &repo, Scope::Read) {
                 Ok(credential) => credential,
                 Err(error) => {
-                    warnings.push(format!("code tracker `{tracker}` is left out: {error}"));
+                    warnings.push(format!(
+                        "the tracker in Git `{tracker}` is left out: {error}"
+                    ));
                     continue;
                 }
             };
@@ -8681,7 +8683,7 @@ impl BranchManager {
     /// Registers the instance first if an earlier attempt failed. Runs on
     /// the workspace's own token, so it works where only that token exists.
     ///
-    /// A secret tracker the remote will not take a credential for is left
+    /// A tracker outside Git the remote will not take a credential for is left
     /// out, and returned with the remote's reason, rather than failing the
     /// sync: most often it is new, and the remote reads its audience from
     /// its definition on the default branch, which only this very push or
@@ -9060,8 +9062,8 @@ impl BranchManager {
             // once the source is back. Nothing is lost: the safety checkpoint
             // above holds what was here.
             //
-            // Before the source restore, not after: a dropped code tracker's
-            // paths are skip-worktree entries, which the restore leaves alone
+            // Before the source restore, not after: the paths of a dropped tracker in
+            // Git are skip-worktree entries, which the restore leaves alone
             // — so a file the checkpoint had deleted would stay in the index
             // and come back when the tracker is bound again (#210).
             let rebound = restored.dropped != branch.dropped;
@@ -9071,10 +9073,10 @@ impl BranchManager {
                     if let Some(definition) = self.trackers.iter().find(|d| &d.name == tracker) {
                         crate::tracker_repo::clear_owned_paths(&workspace, definition)?;
                     }
-                    // A code tracker's paths go back to HEAD, as a discarding
+                    // The paths of a tracker in Git go back to HEAD, as a discarding
                     // drop leaves them, so the sparse checkout below takes
                     // its files and their directories out of the tree.
-                    if let Some(definition) = self.code.iter().find(|d| &d.name == tracker) {
+                    if let Some(definition) = self.carved.iter().find(|d| &d.name == tracker) {
                         let paths: Vec<&str> =
                             definition.paths.iter().map(|path| path.as_str()).collect();
                         let mut restore = vec!["-C", workspace.as_str(), "checkout", "HEAD", "--"];
@@ -10668,7 +10670,7 @@ pub struct BindingChoice {
     pub private: bool,
 }
 
-/// What to do with uncommitted work in a code tracker being dropped.
+/// What to do with uncommitted work in a tracker in Git being dropped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Uncommitted {
     /// Refuse the drop, saying what to do.
@@ -10738,9 +10740,9 @@ pub struct BindingChange {
     pub restored_stash: bool,
     /// The checkpoint a discarding drop took first.
     pub checkpoint: Option<String>,
-    /// A secret tracker's content, captured before its files were removed.
+    /// The content of a tracker outside Git, captured before its files were removed.
     pub captured: Option<String>,
-    /// Files a secret tracker's use projected back.
+    /// Files projected back by using a tracker outside Git.
     pub files: usize,
     /// Those files are the tracker's main, the instance having no content
     /// of its own for it, rather than what it held when it was dropped.
@@ -10806,19 +10808,19 @@ pub struct PublishedProject {
     /// `<owner>/<name>`.
     pub key: String,
     pub endpoint: String,
-    /// Branch `main`: one commit per code tracker.
+    /// Branch `main`: one commit per tracker in Git.
     pub list: BTreeMap<String, String>,
 }
 
 /// A checkpoint's code, composed here: its committed work, its tip, and the
-/// committed commit of each code tracker that was readable.
+/// committed commit of each tracker in Git that was readable.
 struct ImportedCode {
     head: String,
     tip: String,
     trackers: Vec<(String, String)>,
 }
 
-/// Where the project repo keeps a code tracker's `branch` (`main`,
+/// Where the project repo keeps the `branch` of a tracker in Git (`main`,
 /// `instances/<slug>`): its own refs, so what it composes from is never
 /// borrowed.
 /// Where an export target's view of `branch` is composed in the project repo.
@@ -10846,7 +10848,7 @@ pub fn tracker_repo(project: &str, definition: &TrackerDefinition, login: &str) 
     }
 }
 
-/// An instance's fork of one code tracker on the remote.
+/// An instance's fork of one tracker in Git on the remote.
 pub fn fork_repo(project: &str, instance: &str, tracker: &str) -> String {
     format!("{}.i.{instance}.{tracker}", project.replace('/', "."))
 }

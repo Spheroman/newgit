@@ -1,7 +1,7 @@
 // One Durable Object per project (`<owner>/<name>`): the records *about*
 // history. Artifacts holds the history itself, one repo per tracker; this
 // holds who is in the project, its branches — each a list of one commit per
-// code tracker — which instances exist and which trackers they forked, and
+// tracker in Git — which instances exist and which trackers they forked, and
 // every checkpoint. A Durable Object handles one request at a time, so two
 // agents writing at once queue rather than race, and a branch's list moves in
 // one write: every tracker together, or none.
@@ -15,7 +15,7 @@ export interface ProjectInfo {
 	defaultBranch: string;
 }
 
-/** A branch: one commit per code tracker, by tracker name. */
+/** A branch: one commit per tracker in Git, by tracker name. */
 export type TrackerList = Record<string, string>;
 
 interface MergeLock {
@@ -59,7 +59,7 @@ export interface Instance {
 	agent: string | null;
 	baseRev: string;
 	headRev: string | null;
-	/** The code trackers this instance has forked: the ones it changed. */
+	/** The trackers in Git this instance has forked: the ones it changed. */
 	forks: string[];
 	/**
 	 * Only its owner sees it — its record, its checkpoints, its forks —

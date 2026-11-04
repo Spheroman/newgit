@@ -43,7 +43,7 @@ struct State {
     requests: Vec<(String, String, String)>,
     /// Project key → branch name → list.
     branches: BTreeMap<String, BTreeMap<String, Value>>,
-    /// Instance name → the code trackers it forked.
+    /// Instance name → the trackers in Git it forked.
     forks: BTreeMap<String, Vec<String>>,
     checkpoints: BTreeMap<(String, String), Value>,
     /// Who checkpointed what, for `createdBy`.
@@ -391,8 +391,8 @@ fn route(
                 );
             }
             if !exists(repo) {
-                // A secret tracker's repo is created on first write; code
-                // tracker repos are seeded and forks made by the fork route.
+                // The repo of a tracker outside Git is created on first write; the repos
+                // of trackers in Git are seeded and forks made by the fork route.
                 if parts.get(2) == Some(&"t") && body["scope"] == "write" {
                     git(repos, &["init", "-q", "--bare", &repo_url(repo)]);
                 } else {

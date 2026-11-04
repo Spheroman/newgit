@@ -42,7 +42,7 @@ fn tempdir() -> (tempfile::TempDir, Utf8PathBuf) {
     (temp, path)
 }
 
-/// Code trackers `a` and `b` over `apps/a` and `apps/b`. `b` brings a
+/// Trackers in Git `a` and `b` over `apps/a` and `apps/b`. `b` brings a
 /// resource `app` whose `prepare` appends what `apps/a/index.js` holds to
 /// `temp/witness`, outside every workspace.
 fn setup(temp: &Utf8Path) -> BranchManager {
@@ -69,7 +69,7 @@ fn setup(temp: &Utf8Path) -> BranchManager {
     for app in ["a", "b"] {
         BranchManager::open(store.clone())
             .expect("manager")
-            .create_code_tracker(
+            .create_git_tracker(
                 app,
                 "project-devs",
                 &[Utf8PathBuf::from(format!("apps/{app}"))],

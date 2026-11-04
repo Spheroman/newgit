@@ -1,4 +1,4 @@
-//! A secret tracker the remote does not know yet: its definition reaches the
+//! A tracker outside Git the remote does not know yet: its definition reaches the
 //! default branch only through the very push whose checkpoint would sync it.
 //! The checkpoint syncs everything else and leaves that tracker for later.
 

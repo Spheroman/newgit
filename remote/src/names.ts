@@ -3,11 +3,11 @@
 // Every project shares one Artifacts namespace (a binding names exactly one),
 // so a repo's name carries its owner, project, and role:
 //
-//   <owner>.<project>.t.<tracker>             a tracker's history: a code
-//                                             tracker's, or a shared secret one
-//   <owner>.<project>.t.<tracker>.<login>     one user's per-user secret tracker
-//   <owner>.<project>.i.<instance>.<tracker>  an instance's fork of one code
-//                                             tracker, made the first time the
+//   <owner>.<project>.t.<tracker>             a tracker's history: one in
+//                                             Git, or a shared one outside it
+//   <owner>.<project>.t.<tracker>.<login>     one user's per-user tracker outside Git
+//   <owner>.<project>.i.<instance>.<tracker>  an instance's fork of one tracker
+//                                             in Git, made the first time the
 //                                             instance changes it
 //
 // A project is `<owner>/<project>`, like a GitHub repository: the owner is
@@ -131,10 +131,10 @@ export interface Facts {
 	instancePrivate?: boolean;
 	/**
 	 * The tracker's definition on the project's default branch — its
-	 * audience, and whether it is a code tracker (committed) or a secret one.
+	 * audience, and whether it is in Git (committed) or outside it.
 	 * Undefined when that branch does not define it.
 	 */
-	tracker?: { audience: Audience; code: boolean };
+	tracker?: { audience: Audience; git: boolean };
 }
 
 export type Decision = { ok: true } | { ok: false; reason: string };
@@ -169,7 +169,7 @@ export function decide(ref: RepoRef, scope: Scope, who: Requester, facts: Facts)
 
 	switch (ref.kind) {
 		case "fork": {
-			if (!tracker.code) return deny(`\`${ref.tracker}\` is a secret tracker; instances do not fork it`);
+			if (!tracker.git) return deny(`\`${ref.tracker}\` is not in Git; instances do not fork it`);
 			// A private instance is not there for anyone but its owner: the
 			// same answer as no instance at all.
 			if (facts.instanceOwner === undefined || (facts.instancePrivate && facts.instanceOwner !== who.login))
@@ -198,12 +198,12 @@ export function decide(ref: RepoRef, scope: Scope, who: Requester, facts: Facts)
 			const read = mayRead(audience, who, project);
 			if (!read.ok) return read;
 			if (scope === "read") return allow;
-			// A code tracker's history moves only through `newgit merge`; an
-			// instance's work goes to its fork. A shared secret tracker is
+			// The history of a tracker in Git moves only through `newgit merge`; an
+			// instance's work goes to its fork. A shared tracker outside Git is
 			// written by its audience, as its content is captured.
-			if (tracker.code)
+			if (tracker.git)
 				return deny(
-					`nobody pushes to ${name}: a code tracker's history moves only through \`newgit merge\`; an instance pushes to its fork`,
+					`nobody pushes to ${name}: the history of a tracker in Git moves only through \`newgit merge\`; an instance pushes to its fork`,
 				);
 			if (audience.kind === "public" && !who.member) return deny(`${who.login} is not a member of ${project}`);
 			return allow;

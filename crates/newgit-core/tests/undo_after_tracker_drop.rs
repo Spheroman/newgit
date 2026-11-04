@@ -1,4 +1,4 @@
-//! `tracker drop --discard` checkpoints a code tracker's uncommitted work so
+//! `tracker drop --discard` checkpoints the uncommitted work of a tracker in Git so
 //! `newgit undo` gets it back. That has to hold for a deleted file too: the
 //! checkpoint records the deletion, and undoing to it must leave the file
 //! deleted, not bring it back from HEAD.
@@ -69,7 +69,7 @@ fn setup(temp: &Utf8Path) -> BranchManager {
     for app in ["a", "b"] {
         BranchManager::open(store.clone())
             .expect("manager")
-            .create_code_tracker(
+            .create_git_tracker(
                 app,
                 "project-devs",
                 &[Utf8PathBuf::from(format!("apps/{app}"))],

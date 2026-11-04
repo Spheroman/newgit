@@ -233,7 +233,7 @@ async function route(request: Request, env: Env, deps: Deps): Promise<Response> 
 		if (!name) throw new HttpError(400, "name is required");
 		requirePart("project name", name);
 		if (!Array.isArray(trackers) || trackers.length === 0)
-			throw new HttpError(400, "trackers is required: the code trackers whose repos to create (root, project, …)");
+			throw new HttpError(400, "trackers is required: the trackers in Git whose repos to create (root, project, …)");
 		for (const tracker of trackers) requirePart("tracker name", tracker);
 		const id: ProjectId = { owner: login, name };
 		const key = projectKey(id);
@@ -248,7 +248,7 @@ async function route(request: Request, env: Env, deps: Deps): Promise<Response> 
 				);
 		}
 		if (!(await project.init(name, login))) throw new HttpError(409, `project \`${key}\` already exists`);
-		// The one write to a code tracker's repo outside a merge: the creator's
+		// The one write to the repo of a tracker in Git outside a merge: the creator's
 		// initial push of its history. Only here, only once, only briefly.
 		const seeds = [];
 		for (const tracker of trackers) seeds.push(await seed(env, deps, caller, { kind: "tracker", project: id, tracker }));
@@ -337,20 +337,20 @@ async function route(request: Request, env: Env, deps: Deps): Promise<Response> 
 		return json({ login: removed, removed: await project.removeMember(removed) });
 	}
 
-	// ── Code trackers ──────────────────────────────────────────────────────
-	// A code tracker carved after the project was created gets its repo here,
+	// ── Trackers in Git ──────────────────────────────────────────────────────
+	// A tracker in Git carved after the project was created gets its repo here,
 	// seeded once by whoever carved it. It joins a branch only by a merge.
 	if (method === "POST" && rest === "/trackers") {
-		// A new code tracker comes with its definition, which is a change to
+		// A new tracker in Git comes with its definition, which is a change to
 		// the tracker that owns its file: only that tracker's maintainers add it.
-		requireHuman(caller, "create code tracker repos");
+		requireHuman(caller, "create tracker in Git repos");
 		const { name: tracker } = await body<{ name?: string }>(request);
 		if (!tracker) throw new HttpError(400, "name is required");
 		requirePart("tracker name", tracker);
 		await requireGovernor(deps, id, info, { login, member }, tracker, await listedTrackers(project));
 		const defined = await definitionFacts(deps.repos, id, info.defaultBranch, tracker, await listedTrackers(project));
-		if (defined !== undefined && !defined.code)
-			throw new HttpError(400, `\`${tracker}\` is a secret tracker; its repo is made by its first sync`);
+		if (defined !== undefined && !defined.git)
+			throw new HttpError(400, `\`${tracker}\` is not in Git; its repo is made by its first sync`);
 		const ref: RepoRef = { kind: "tracker", project: id, tracker };
 		if ((await deps.repos.remote(repoName(ref))) !== null) {
 			// Made before by a merge or a first publication that did not
@@ -391,9 +391,9 @@ async function route(request: Request, env: Env, deps: Deps): Promise<Response> 
 			if (facts === undefined)
 				throw new HttpError(
 					400,
-					`\`${tracker}\` is not defined on \`${info.defaultBranch}\`: a new code tracker joins by its own seeded repo`,
+					`\`${tracker}\` is not defined on \`${info.defaultBranch}\`: a new tracker in Git joins by its own seeded repo`,
 				);
-			if (!facts.code) throw new HttpError(400, `\`${tracker}\` is a secret tracker; \`newgit merge\` never carries it`);
+			if (!facts.git) throw new HttpError(400, `\`${tracker}\` is not in Git; \`newgit merge\` never carries it`);
 			const read = decide({ kind: "tracker", project: id, tracker }, "read", who, { tracker: facts });
 			if (!read.ok) throw new HttpError(403, read.reason);
 			// `access` (`.newgit/trackers/`) decides every tracker's paths and
@@ -452,7 +452,7 @@ async function route(request: Request, env: Env, deps: Deps): Promise<Response> 
 				request,
 			);
 			if (!list || typeof list !== "object" || Object.keys(list).length === 0)
-				throw new HttpError(400, "list is required: one commit per code tracker, by tracker name");
+				throw new HttpError(400, "list is required: one commit per tracker in Git, by tracker name");
 			for (const [tracker, commit] of Object.entries(list)) {
 				requirePart("tracker name", tracker);
 				if (typeof commit !== "string" || !/^[0-9a-f]{40}$/.test(commit))
@@ -470,7 +470,7 @@ async function route(request: Request, env: Env, deps: Deps): Promise<Response> 
 					if (!(tracker in base)) {
 						const defined = await definitionFacts(deps.repos, id, info.defaultBranch, tracker, await listedTrackers(project));
 						const governs = await governs_(deps, id, info, { login, member }, tracker, await listedTrackers(project));
-						if (governs && (defined === undefined || defined.code)) continue;
+						if (governs && (defined === undefined || defined.git)) continue;
 					}
 					throw new HttpError(400, `this merge did not declare \`${tracker}\`, so it cannot move it`);
 				}
@@ -537,7 +537,7 @@ async function route(request: Request, env: Env, deps: Deps): Promise<Response> 
 		requireThisInstance(caller, name);
 		const facts = await definitionFacts(deps.repos, id, info.defaultBranch, tracker, await listedTrackers(project));
 		if (facts === undefined) throw new HttpError(404, `tracker \`${tracker}\` is not defined on ${key}'s default branch`);
-		if (!facts.code) throw new HttpError(400, `\`${tracker}\` is a secret tracker; instances do not fork it`);
+		if (!facts.git) throw new HttpError(400, `\`${tracker}\` is not in Git; instances do not fork it`);
 		const fork = repoName({ kind: "fork", project: id, instance: name, tracker });
 		let remote = await deps.repos.remote(fork);
 		if (remote === null) {
@@ -673,7 +673,7 @@ async function gitEndpoint(request: Request, env: Env, deps: Deps, match: RegExp
 	const definitions: Record<string, string> = { access: main.access };
 	for (const { source } of facts.values()) if (main[source]) definitions[source] = main[source];
 
-	// Each branch, cut down to the code trackers this caller may read.
+	// Each branch, cut down to the trackers in Git this caller may read.
 	const plan: EndpointPlan = {
 		dir: "/work",
 		branches: {},
@@ -686,7 +686,7 @@ async function gitEndpoint(request: Request, env: Env, deps: Deps, match: RegExp
 		const list: Record<string, string> = {};
 		for (const [tracker, commit] of Object.entries(branch.list)) {
 			const tracker_facts = facts.get(tracker);
-			if (!tracker_facts?.code) continue;
+			if (!tracker_facts?.git) continue;
 			if (!decide({ kind: "tracker", project: id, tracker }, "read", who, { tracker: tracker_facts }).ok) continue;
 			list[tracker] = commit;
 			needed.add(tracker);
@@ -710,8 +710,8 @@ const REPOSITORY = "https://github.com/Spheroman/newgit";
 
 /**
  * The landing page: one file of one tracker, at that tracker's `main`, named
- * by `LANDING_PAGE` in wrangler.jsonc. newgit.dev's is in `site`, a secret
- * tracker, so this route is the one place its content is published, and
+ * by `LANDING_PAGE` in wrangler.jsonc. newgit.dev's is in `site`, a tracker
+ * outside Git, so this route is the one place its content is published, and
  * only the file the config names. Publishing a change is `newgit tracker
  * merge site`, which moves the repo's branch `main` (its default branch, so
  * what `HEAD` reads); no deploy. Only a merge creates that branch, so a
@@ -733,7 +733,7 @@ function endpointUrl(url: URL, id: ProjectId): string {
 	return `${url.origin}/${id.owner}/${id.name}.git`;
 }
 
-/** Create a code tracker's repo and mint the one short write that seeds it. */
+/** Create the repo of a tracker in Git and mint the one short write that seeds it. */
 async function seed(env: Env, deps: Deps, caller: Caller, ref: RepoRef, create = true) {
 	const name = repoName(ref);
 	const remote = create ? (await deps.repos.create(name)).remote : deps.repos.url(name);
@@ -780,9 +780,9 @@ async function credential(
 	const name = repoName(ref);
 	let remote = await deps.repos.remote(name);
 	if (remote === null) {
-		// A secret tracker's repo is created on its first write. Code tracker
-		// repos are seeded with the project, and forks made by the fork route.
-		if (ref.kind !== "tracker" || scope !== "write" || facts.tracker?.code)
+		// The repo of a tracker outside Git is created on its first write. The repos of
+		// trackers in Git are seeded with the project, and forks made by the fork route.
+		if (ref.kind !== "tracker" || scope !== "write" || facts.tracker?.git)
 			throw new HttpError(404, `${name} does not exist yet`);
 		remote = (await deps.repos.create(name)).remote;
 	}
@@ -794,7 +794,7 @@ async function credential(
 /** A tracker's committed definition, as the remote reads it. */
 export interface TrackerFacts {
 	audience: Audience;
-	code: boolean;
+	git: boolean;
 	maintainers: Maintainers;
 	/** The paths it owns, for working out which tracker owns which definition. */
 	paths: string[];
@@ -808,18 +808,18 @@ const DEFINITIONS = ".newgit/trackers";
 function implicitFacts(tracker: string): TrackerFacts | undefined {
 	switch (tracker) {
 		case "root":
-			return { audience: { kind: "project-devs" }, code: true, maintainers: { kind: "project-devs" }, paths: ["."], source: "access" };
+			return { audience: { kind: "project-devs" }, git: true, maintainers: { kind: "project-devs" }, paths: ["."], source: "access" };
 		case "project":
-			return { audience: { kind: "project-devs" }, code: true, maintainers: { kind: "project-devs" }, paths: [".newgit"], source: "access" };
+			return { audience: { kind: "project-devs" }, git: true, maintainers: { kind: "project-devs" }, paths: [".newgit"], source: "access" };
 		case "access":
-			return { audience: { kind: "project-devs" }, code: true, maintainers: { kind: "owner" }, paths: [DEFINITIONS], source: "access" };
+			return { audience: { kind: "project-devs" }, git: true, maintainers: { kind: "owner" }, paths: [DEFINITIONS], source: "access" };
 		default:
 			return undefined;
 	}
 }
 
 function parseFacts(text: string, source: string): TrackerFacts | undefined {
-	let definition: { audience?: unknown; secret?: unknown; maintainers?: unknown; paths?: unknown };
+	let definition: { audience?: unknown; git?: unknown; maintainers?: unknown; paths?: unknown };
 	try {
 		definition = parseToml(text) as typeof definition;
 	} catch {
@@ -834,14 +834,14 @@ function parseFacts(text: string, source: string): TrackerFacts | undefined {
 			: parseMaintainers(typeof definition.audience === "string" ? definition.audience : "");
 	if (maintainers === null) return undefined;
 	const paths = Array.isArray(definition.paths) ? definition.paths.filter((path) => typeof path === "string") : [];
-	// `secret` defaults to true, and is written only when false.
-	return { audience, code: definition.secret === false, maintainers, paths, source };
+	// `git` defaults to false, and is written only when true.
+	return { audience, git: definition.git === true, maintainers, paths, source };
 }
 
 /**
  * Every named tracker's committed definition on the project's default
  * branch, each read from the tracker that owns its file: `access` owns
- * `.newgit/trackers/` unless a more specific code tracker claims a file in it
+ * `.newgit/trackers/` unless a more specific tracker in Git claims a file in it
  * — which is how governance layers: changing a tracker's definition is
  * changing the tracker that owns its file, and only that tracker's
  * maintainers merge it. Resolved to a fixed point, a few reads per round.
@@ -873,7 +873,7 @@ async function loadDefinitions(
 			let owner = "access";
 			let claim = DEFINITIONS.length;
 			for (const [candidate, candidateFacts] of facts) {
-				if (!candidateFacts.code) continue;
+				if (!candidateFacts.git) continue;
 				for (const path of candidateFacts.paths) {
 					const covers = file === path || file.startsWith(`${path}/`);
 					if (covers && path.startsWith(DEFINITIONS) && path.length > claim) {

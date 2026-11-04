@@ -55,7 +55,7 @@ fn tempdir() -> (tempfile::TempDir, Utf8PathBuf) {
     (temp, path)
 }
 
-/// A project whose `.env.local` belongs to the secret tracker `env`, and a
+/// A project whose `.env.local` belongs to the tracker outside Git `env`, and a
 /// `web` resource rendering its port into it.
 fn project(temp: &Utf8Path) -> BranchManager {
     let repo = temp.join("store");

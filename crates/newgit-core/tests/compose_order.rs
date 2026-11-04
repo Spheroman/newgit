@@ -70,14 +70,14 @@ fn tempdir() -> (tempfile::TempDir, Utf8PathBuf) {
     (temp, path)
 }
 
-fn tracker(name: &str, paths: &[&str], excluded: &[&str], secret: bool) -> TrackerDefinition {
+fn tracker(name: &str, paths: &[&str], excluded: &[&str], git: bool) -> TrackerDefinition {
     TrackerDefinition {
         name: name.to_owned(),
         audience: "project-devs".to_owned(),
         storage: Storage::Local,
         merge_with_source: true,
         paths: paths.iter().map(Utf8PathBuf::from).collect(),
-        secret,
+        git,
         maintainers: None,
         role: None,
         priority: 0,
@@ -115,7 +115,7 @@ fn a_history_whose_dates_go_backwards_composes_into_itself() {
     commit(&repo, &[("c.txt", "4\n")], "fourth", "ana", 500);
     let head = git(&repo, &["rev-parse", "HEAD"]);
 
-    let root = tracker("root", &["."], &[], false);
+    let root = tracker("root", &["."], &[], true);
     let view = compose::compose(
         &repo,
         VIEW,
@@ -133,11 +133,11 @@ fn a_history_whose_dates_go_backwards_composes_into_itself() {
     );
 
     // And carved into two trackers, it still folds back into itself.
-    let apps = tracker("apps", &["apps/x"], &[], false);
+    let apps = tracker("apps", &["apps/x"], &[], true);
     let carved = compose::carve(&repo, &head, &apps, "refs/newgit/trackers/apps/main")
         .expect("carve")
         .expect("apps has history");
-    let root = tracker("root", &["."], &["apps/x"], false);
+    let root = tracker("root", &["."], &["apps/x"], true);
     let view = compose::compose(
         &repo,
         VIEW,
@@ -176,8 +176,8 @@ fn split_work_whose_dates_go_backwards_across_trackers_recomposes_into_itself() 
     commit(&repo, &[("apps/x/y", "2\n")], "x work", "ana", 3_000);
     let tip = commit(&repo, &[("README.md", "2\n")], "readme work", "ana", 2_000);
 
-    let root = tracker("root", &["."], &["apps/x"], false);
-    let apps = tracker("apps", &["apps/x"], &[], false);
+    let root = tracker("root", &["."], &["apps/x"], true);
+    let apps = tracker("apps", &["apps/x"], &[], true);
     // Both trackers start from the base view commit.
     let carved = compose::carve(&repo, &base, &apps, "refs/newgit/trackers/apps/main")
         .expect("carve")
