@@ -272,10 +272,25 @@ fn graft(objects: &mut Objects, tree: &str, mount: &str, child: &str) -> Result<
 }
 
 /// `tree` with whatever is at `mount` replaced by `child`: a replayed
-/// commit's mount holds exactly that child commit's files.
-fn replace(objects: &mut Objects, tree: &str, mount: &str, child: &str) -> Result<String> {
+/// commit's mount holds exactly that child commit's files. At `.` the mount
+/// is the whole tree, so the files of `previous` (the child commit before
+/// it, what `tree` holds of it) come out first, or a deletion would never
+/// show.
+fn replace(
+    objects: &mut Objects,
+    tree: &str,
+    mount: &str,
+    child: &str,
+    previous: Option<&str>,
+) -> Result<String> {
     if mount == "." {
-        return objects.overlay(tree, child);
+        let mut base = tree.to_owned();
+        if let Some(previous) = previous {
+            for file in objects.files(previous)?.into_keys() {
+                base = objects.set_path(&base, &file, None)?;
+            }
+        }
+        return objects.overlay(&base, child);
     }
     let entry = (child != EMPTY_TREE).then(|| (TREE_MODE.to_vec(), child.to_owned()));
     objects.set_path(tree, mount, entry)
@@ -318,6 +333,8 @@ struct Composer<'a> {
     options: &'a ComposeOptions<'a>,
     /// Tracker commit → its view commit.
     views: HashMap<String, Composed>,
+    /// Tracker commit → the children its view expanded.
+    expanded: HashMap<String, BTreeSet<String>>,
     /// View commit → its parents and its tree: the view graph, every
     /// tracker's.
     graph: HashMap<String, (Vec<String>, String)>,
@@ -346,6 +363,7 @@ pub fn compose(
         objects: Objects::open(repo)?,
         options,
         views: HashMap::new(),
+        expanded: HashMap::new(),
         graph: HashMap::new(),
         position: HashMap::new(),
         next_position: 0,
@@ -448,15 +466,13 @@ impl Composer<'_> {
                 if !(self.options.readable)(child) {
                     continue;
                 }
-                if let Some(admit) = self.options.admit
-                    && !admit(child, pin)
-                {
-                    return Err(NewgitError::Unsupported(format!(
-                        "commit {} of `{name}` pins `{child}` at {}, which is not in `{child}`'s \
-                         history",
-                        short(id),
-                        short(pin)
-                    )));
+                // A pin its tracker's own history does not hold (another
+                // tracker's commit under this name, or one never pushed) is
+                // left out at this commit, as for a reader who may not read
+                // it: what the reader gets is never someone else's content.
+                let admitted = self.options.admit.is_none_or(|admit| admit(child, pin));
+                if !admitted || !self.objects.has_commit(pin)? {
+                    continue;
                 }
                 readable.insert(child.clone(), pin.clone());
                 child_tips
@@ -530,11 +546,15 @@ impl Composer<'_> {
                 .chain(parent_pins.keys())
                 .filter(|child| all_pins.get(*child) != parent_pins.get(*child))
                 .collect();
+            let parent_expanded = self.expanded.get(&parent.id).cloned().unwrap_or_default();
             if parent_own == own
                 && !moved.is_empty()
-                && moved.iter().all(|child| !(self.options.readable)(child))
+                && moved
+                    .iter()
+                    .all(|child| !mounts.contains_key(*child) && !parent_expanded.contains(*child))
                 && let Some(view) = self.views.get(&parent.id).cloned()
             {
+                self.expanded.insert(commit.id.clone(), parent_expanded);
                 self.views.insert(commit.id.clone(), view);
                 return Ok(());
             }
@@ -560,6 +580,10 @@ impl Composer<'_> {
             for parent in &parent_commits {
                 let parent_pins = pins_in(&mut self.objects, &parent.tree)?;
                 if let Some(pin) = parent_pins.get(*child)
+                    && self
+                        .expanded
+                        .get(&parent.id)
+                        .is_some_and(|expanded| expanded.contains(*child))
                     && let Some(view) = self.views.get(pin)
                     && !before.contains(&view.id)
                 {
@@ -576,7 +600,8 @@ impl Composer<'_> {
             let same_work = new.len() == 1 && {
                 let only = self.objects.commit(&new[0])?;
                 only.parents == before
-                    && (commit.parents.len() > 1 || only.committer == commit.committer)
+                    && (commit.parents.len() > 1
+                        || (only.committer == commit.committer && only.message == commit.message))
             };
             if split.is_some() || same_work {
                 inline.push(((*mount).clone(), tip, new));
@@ -662,6 +687,8 @@ impl Composer<'_> {
         }
         self.notes
             .push((id.clone(), format!("{name} {}\n", commit.id)));
+        self.expanded
+            .insert(commit.id.clone(), mounts.keys().cloned().collect());
         self.views.insert(commit.id.clone(), Composed { id, tree });
         Ok(())
     }
@@ -766,7 +793,17 @@ impl Composer<'_> {
                 None => None,
             }
             .unwrap_or_else(|| EMPTY_TREE.to_owned());
-            let tree = replace(&mut self.objects, &base, mount, &child_tree)?;
+            let previous = parents
+                .first()
+                .and_then(|parent| self.graph.get(parent))
+                .map(|(_, tree)| tree.clone());
+            let tree = replace(
+                &mut self.objects,
+                &base,
+                mount,
+                &child_tree,
+                previous.as_deref(),
+            )?;
             let original = self.objects.commit(&current)?;
             let mut deduped: Vec<String> = Vec::new();
             for parent in mapped {
@@ -1285,7 +1322,8 @@ impl Splitter<'_> {
             carriers.insert(0, root.clone());
         }
         carriers.dedup();
-        if commit.parents.len() <= 1 && self.options.newgit_made != Some(view) {
+        let stock_merge = commit.parents.len() > 1 && stock_merge_message(&commit.message);
+        if !stock_merge && self.options.newgit_made != Some(view) {
             let audiences: Vec<(String, String)> = carriers
                 .iter()
                 .map(|name| {
@@ -1790,6 +1828,44 @@ impl Splitter<'_> {
     }
 }
 
+/// Whether a merge's message is one nobody wrote: Git's own (`Merge branch
+/// 'x'`, `Merge remote-tracking branch 'origin/x'`, with an optional ` into
+/// y`) or newgit's (`Merge `x` into y`), one line. A merge exempt from the
+/// one-audience rule says nothing its parents do not; one with words of its
+/// own is refused like any commit.
+pub(crate) fn stock_merge_message(message: &[u8]) -> bool {
+    let Ok(text) = std::str::from_utf8(message) else {
+        return false;
+    };
+    let text = text.trim_end_matches('\n');
+    if text.contains('\n') {
+        return false;
+    }
+    let quoted = |rest: &str, open: char, close: char| -> bool {
+        let Some(rest) = rest.strip_prefix(open) else {
+            return false;
+        };
+        let Some(end) = rest.find(close) else {
+            return false;
+        };
+        let after = &rest[end + close.len_utf8()..];
+        after.is_empty()
+            || after
+                .strip_prefix(" into ")
+                .is_some_and(|branch| !branch.is_empty() && !branch.contains(' '))
+    };
+    if let Some(rest) = text.strip_prefix("Merge branch ") {
+        return quoted(rest, '\'', '\'');
+    }
+    if let Some(rest) = text.strip_prefix("Merge remote-tracking branch ") {
+        return quoted(rest, '\'', '\'');
+    }
+    if let Some(rest) = text.strip_prefix("Merge ") {
+        return quoted(rest, '`', '`') && rest.contains(" into ");
+    }
+    false
+}
+
 /// A commit made by `git commit-tree -S`, signed with this machine's key.
 fn sign_commit(
     repo: &Utf8Path,
@@ -1997,6 +2073,35 @@ mod tests {
             round_trip(
                 message,
                 b"encoding ISO-8859-1\nmergetag object abc\n type commit\n",
+            );
+        }
+    }
+
+    #[test]
+    fn only_a_merge_message_nobody_wrote_is_stock() {
+        for stock in [
+            &b"Merge branch 'main'"[..],
+            b"Merge branch 'feature' into main\n",
+            b"Merge remote-tracking branch 'origin/main'\n",
+            b"Merge `feature-a` into main",
+        ] {
+            assert!(
+                stock_merge_message(stock),
+                "{}",
+                String::from_utf8_lossy(stock)
+            );
+        }
+        for written in [
+            &b"merge with private details"[..],
+            b"Merge branch 'main'\n\nwhy: the refund bypass\n",
+            b"Merge branch 'main' into main, fixing the bypass",
+            b"Merge pull request #3 from x/y",
+            b"Merge `x` because",
+        ] {
+            assert!(
+                !stock_merge_message(written),
+                "{}",
+                String::from_utf8_lossy(written)
             );
         }
     }
