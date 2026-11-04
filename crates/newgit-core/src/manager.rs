@@ -860,7 +860,13 @@ struct ComposedExport {
 pub struct BranchExport {
     pub target: String,
     pub url: String,
+    /// The repository as the target names it (`owner/repo`, or the URL as
+    /// written): what `gh pr create -R` takes.
+    pub repo: String,
     pub branch: String,
+    /// `gh` in the workspace resolves to this target, so `gh pr create`
+    /// needs no `-R`. False when the work belongs to more than one target.
+    pub gh_resolved: bool,
     pub result: std::result::Result<BranchExported, String>,
 }
 
@@ -2917,9 +2923,11 @@ impl BranchManager {
 
     /// On a newgit remote, `origin` is the project's Git endpoint, which
     /// `gh` cannot map to a GitHub repository. So each `branches = true`
-    /// target is a remote in the workspace too, named after it, and the
-    /// first is the one `gh` resolves (`gh-resolved = base`): `gh pr create`
-    /// opens a pull request there, against the branch newgit exported.
+    /// target is a remote in the workspace too, named after it, and `gh`
+    /// resolves (`gh-resolved = base`) the one the instance's work belongs to
+    /// (see [`Self::route_branch`]): `gh pr create` opens a pull request
+    /// there, against the branch newgit exported. When the work belongs to
+    /// more than one, `gh` resolves none and `-R` picks.
     ///
     /// Pushing to it directly is refused, naming `origin`: a direct push
     /// would carry trackers the target withholds, and skip the checkpoint.
@@ -2929,7 +2937,6 @@ impl BranchManager {
             crate::source::run_git_env(&["-C", workspace, "config", key, value], &[]).map(|_| ())
         };
         let targets = self.export_targets()?;
-        let mut resolved = false;
         for target in targets.iter().filter(|target| target.branches) {
             let remote = &target.name;
             config(&format!("remote.{remote}.url"), &target.push_url())?;
@@ -2948,10 +2955,6 @@ impl BranchManager {
                     sh_quote(&branch.name),
                 ),
             )?;
-            if !resolved {
-                config(&format!("remote.{remote}.gh-resolved"), "base")?;
-                resolved = true;
-            }
             // What the target's own branch holds, as of the last export from
             // here, so `gh pr create --fill` can list the PR's commits.
             let main = export_ref(&target.name, PROJECT_ROOT_INSTANCE);
@@ -2968,6 +2971,74 @@ impl BranchManager {
                     ],
                     &[],
                 )?;
+            }
+        }
+        self.resolve_gh(branch, &targets)
+    }
+
+    /// The trackers in Git the instance's work touched: those whose
+    /// `instances/<slug>` has commits their `main` does not.
+    fn touched_trackers(&self, branch: &BranchInstance) -> Vec<String> {
+        let instance = format!("instances/{}", branch.slug);
+        self.carved_definitions()
+            .into_iter()
+            .filter(|definition| {
+                let Ok(tip) = self
+                    .source
+                    .rev_parse(&local_tracker_ref(&definition.name, &instance))
+                else {
+                    return false;
+                };
+                match self
+                    .source
+                    .rev_parse(&local_tracker_ref(&definition.name, "main"))
+                {
+                    Ok(main) => !self.source.is_ancestor(&tip, &main).unwrap_or(true),
+                    Err(_) => true,
+                }
+            })
+            .map(|definition| definition.name)
+            .collect()
+    }
+
+    /// Which `branches = true` targets this instance's work belongs to: the
+    /// ones that ship a tracker it touched. `gh` resolves to the target when
+    /// there is exactly one.
+    fn route_branch<'a>(
+        &self,
+        branch: &BranchInstance,
+        targets: &'a [ExportTarget],
+    ) -> ExportRouting<'a> {
+        let definitions = self.carved_definitions();
+        route_to_targets(
+            targets,
+            &self.touched_trackers(branch),
+            |target, tracker| {
+                definitions
+                    .iter()
+                    .find(|definition| definition.name == tracker)
+                    .is_some_and(|definition| {
+                        export_reason(target, definition) != ExportReason::Withheld
+                    })
+            },
+        )
+    }
+
+    /// Point `gh` in the workspace at the target the work belongs to, and at
+    /// none of the others.
+    fn resolve_gh(&self, branch: &BranchInstance, targets: &[ExportTarget]) -> Result<()> {
+        let resolved = self.route_branch(branch, targets).resolved;
+        let workspace = branch.workspace_path.as_str();
+        for target in targets.iter().filter(|target| target.branches) {
+            let key = format!("remote.{}.gh-resolved", target.name);
+            if resolved == Some(target.name.as_str()) {
+                crate::source::run_git_env(&["-C", workspace, "config", &key, "base"], &[])?;
+            } else {
+                // Exit 5 is "was not set", which is the state wanted.
+                let _ = crate::source::run_git_env(
+                    &["-C", workspace, "config", "--unset-all", &key],
+                    &[],
+                );
             }
         }
         Ok(())
@@ -7025,13 +7096,7 @@ impl BranchManager {
             .map(|definition| ExportedTracker {
                 name: definition.name.clone(),
                 audience: definition.audience.clone(),
-                reason: if definition.audience == "public" {
-                    ExportReason::Public
-                } else if target.trackers.contains(&definition.name) {
-                    ExportReason::Listed
-                } else {
-                    ExportReason::Withheld
-                },
+                reason: export_reason(target, definition),
                 commit: list.get(&definition.name).cloned(),
                 unmerged: false,
             })
@@ -7139,6 +7204,8 @@ impl BranchManager {
                 return vec![BranchExport {
                     target: String::new(),
                     url: String::new(),
+                    repo: String::new(),
+                    gh_resolved: false,
                     branch: branch.source_ref.clone(),
                     result: Err(error.to_string()),
                 }];
@@ -7157,9 +7224,10 @@ impl BranchManager {
                 list.insert(definition.name.clone(), commit);
             }
         }
-        targets
+        let routing = self.route_branch(branch, &targets);
+        let exports: Vec<BranchExport> = routing
+            .exporting
             .iter()
-            .filter(|target| target.branches)
             .map(|target| {
                 let result = (|| {
                     let (trackers, view) =
@@ -7194,6 +7262,8 @@ impl BranchManager {
                 BranchExport {
                     target: target.name.clone(),
                     url: target.push_url(),
+                    repo: target.url.clone(),
+                    gh_resolved: routing.resolved == Some(target.name.as_str()),
                     branch: branch.source_ref.clone(),
                     result: result.map_err(|error| match error {
                         NewgitError::SourceCommand { stderr, .. } if rejected(&stderr) => format!(
@@ -7205,7 +7275,13 @@ impl BranchManager {
                     }),
                 }
             })
-            .collect()
+            .collect();
+        // The work is split into trackers by now, so this is where `gh`
+        // learns which target it belongs to.
+        if branch.remote.is_some() {
+            let _ = self.resolve_gh(branch, &targets);
+        }
+        exports
     }
 
     /// Record one coherent snapshot across source, trackers, and resources.
@@ -10966,9 +11042,58 @@ struct ImportedCode {
     trackers: Vec<(String, String)>,
 }
 
-/// Where the project repo keeps the `branch` of a tracker in Git (`main`,
-/// `instances/<slug>`): its own refs, so what it composes from is never
-/// borrowed.
+/// Whether `target` ships a tracker in Git, and why: the one place that is
+/// decided, for composing an export and for routing `gh` alike. A target that
+/// ships a tracker as its own root (docs/design/roots.md) plugs in here.
+fn export_reason(target: &ExportTarget, definition: &TrackerDefinition) -> ExportReason {
+    if definition.audience == "public" {
+        ExportReason::Public
+    } else if target.trackers.contains(&definition.name) {
+        ExportReason::Listed
+    } else {
+        ExportReason::Withheld
+    }
+}
+
+/// Which `branches = true` targets an instance's work belongs to, and which
+/// of them `gh` resolves to.
+struct ExportRouting<'a> {
+    /// Where the branch is exported: the targets that ship a tracker the work
+    /// touched. When none does, every target that takes branches.
+    exporting: Vec<&'a ExportTarget>,
+    /// The one target `gh pr create` opens a pull request against — only when
+    /// the work belongs to exactly one.
+    resolved: Option<&'a str>,
+}
+
+/// Where the work in `touched` belongs among `targets`' `branches = true`
+/// ones. `ships` says whether a target ships a tracker.
+fn route_to_targets<'a>(
+    targets: &'a [ExportTarget],
+    touched: &[String],
+    ships: impl Fn(&ExportTarget, &str) -> bool,
+) -> ExportRouting<'a> {
+    let taking: Vec<&ExportTarget> = targets.iter().filter(|target| target.branches).collect();
+    let covering: Vec<&ExportTarget> = taking
+        .iter()
+        .copied()
+        .filter(|target| touched.iter().any(|tracker| ships(target, tracker)))
+        .collect();
+    let exporting = if covering.is_empty() {
+        taking
+    } else {
+        covering
+    };
+    let resolved = match exporting.as_slice() {
+        [only] => Some(only.name.as_str()),
+        _ => None,
+    };
+    ExportRouting {
+        exporting,
+        resolved,
+    }
+}
+
 /// Where an export target's view of `branch` is composed in the project repo.
 fn export_ref(target: &str, branch: &str) -> String {
     format!("refs/newgit/exports/{target}/{branch}")
@@ -10979,6 +11104,9 @@ fn rejected(stderr: &str) -> bool {
     stderr.contains("non-fast-forward") || stderr.contains("[rejected]")
 }
 
+/// Where the project repo keeps the `branch` of a tracker in Git (`main`,
+/// `instances/<slug>`): its own refs, so what it composes from is never
+/// borrowed.
 fn local_tracker_ref(tracker: &str, branch: &str) -> String {
     format!("refs/newgit/trackers/{tracker}/{branch}")
 }

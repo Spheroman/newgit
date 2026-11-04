@@ -2675,19 +2675,35 @@ fn push_pre_receive(instance: &str) -> Result<()> {
     println!("newgit: undo the workspace with `newgit undo {instance}` (a push cannot be undone)");
     for export in &outcome.exports {
         match &export.result {
-            Ok(exported) if exported.same_commits => println!(
-                "newgit: exported `{}` to `{}` ({}); `gh pr create` opens a pull request there",
-                export.branch, export.target, export.url
-            ),
-            Ok(exported) => println!(
-                "newgit: exported `{}` to `{}` ({}) without {}, so its commits there are not \
-                 these ones; open a pull request with `gh pr create --head {}`",
-                export.branch,
-                export.target,
-                export.url,
-                exported.withheld.join(", "),
-                export.branch
-            ),
+            Ok(exported) => {
+                let without = if exported.withheld.is_empty() || exported.same_commits {
+                    String::new()
+                } else {
+                    format!(
+                        " without {}, so its commits there are not these ones",
+                        exported.withheld.join(", ")
+                    )
+                };
+                let next = if !export.gh_resolved {
+                    // `gh` resolves no target here: the work belongs to
+                    // several, so each is named.
+                    format!(
+                        "open a pull request there with `gh pr create -R {} --head {}`",
+                        export.repo, export.branch
+                    )
+                } else if exported.same_commits {
+                    "`gh pr create` opens a pull request there".to_owned()
+                } else {
+                    format!(
+                        "open a pull request with `gh pr create --head {}`",
+                        export.branch
+                    )
+                };
+                println!(
+                    "newgit: exported `{}` to `{}` ({}){without}; {next}",
+                    export.branch, export.target, export.url
+                );
+            }
             Err(error) if export.target.is_empty() => {
                 println!("newgit: warning: this branch was not exported: {error}");
             }

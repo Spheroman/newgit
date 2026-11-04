@@ -1652,14 +1652,21 @@ that gap:
   itself has succeeded. A failure there is a warning in the push's output,
   not a failed push. A force-push follows a force-push.
 - **On a newgit remote, the target is a remote in every workspace**, named
-  after it, and the first such target is the one `gh` resolves
-  (`gh-resolved = base`). `refs/remotes/<target>/<branch>` is set to the
-  commit the target really holds. A non-interactive `gh pr create` finds the
-  branch only when that ref is `HEAD`. That is true when the target ships
-  every tracker the branch's history touches, and then the push says
-  `gh pr create` works as is. Otherwise the commits there are rebuilt
-  without the withheld trackers, and the push says to run
-  `gh pr create --head <branch>`.
+  after it, and `gh` resolves (`gh-resolved = base`) the target the
+  instance's work belongs to: the one that ships a tracker the work touched.
+  `refs/remotes/<target>/<branch>` is set to the commit the target really
+  holds. A non-interactive `gh pr create` finds the branch only when that ref
+  is `HEAD`. That is true when the target ships every tracker the branch's
+  history touches, and then the push says `gh pr create` works as is.
+  Otherwise the commits there are rebuilt without the withheld trackers, and
+  the push says to run `gh pr create --head <branch>`.
+- **Work that belongs to several targets goes to each, and `gh` resolves
+  none of them.** Only the targets that ship a tracker the work touched get
+  the branch. When more than one does, the push names the command to run for
+  each: `gh pr create -R <repo> --head <branch>`, `<repo>` being the
+  target's `url`. Before any work, and when no target ships a tracker the
+  work touched, every `branches = true` target takes the branch, and `gh`
+  resolves the target only if it is the sole one.
 - **Pushing to the target's remote directly is refused**, naming `git push
   origin`: it would skip the checkpoint and could carry trackers the target
   withholds.

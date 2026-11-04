@@ -484,8 +484,8 @@ config, and every checkpoint reinstalls it.
 
 On a newgit remote, `origin` is the newgit endpoint, which `gh` cannot read.
 An export target with `branches = true` adds itself as a remote in each
-workspace and as the one `gh` resolves, so `git push` then `gh pr create`
-opens a real pull request there (see *Export*).
+workspace, and `gh` resolves the one the instance's work belongs to, so `git
+push` then `gh pr create` opens a real pull request there (see *Export*).
 
 ### The materializer is replaceable
 

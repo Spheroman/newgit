@@ -914,7 +914,8 @@ named and skipped.
   t3code's `main`, then `newgit pull t3code`. For Spheroman/newgit, its
   commits are view commits: ours are recognised by the canonical notes, and
   the rest are split as ordinary work.
-- **#143 (`gh` per target):** unchanged.
+- **#143 (`gh` per target):** done: a push resolves `gh` to the target that
+  ships a tracker the work touched.
 - **#144 (bring t3code in):** Spheroman/newgit's export *includes* t3code
   (decided), so it stays a true mirror with the project's own ids, and
   `git pull` from GitHub in the project root keeps working. FORK.md:
@@ -952,7 +953,7 @@ headers were recorded — is replaced by the steps below and deleted.
 4. **Delete the old engine.** *Done:* date interleave, group scheduler,
    `Newgit-Split-Parent`, carving with history, `tracker repair`,
    workspace-path storage, `project`.
-5. **The t3code milestone** on the new engine: #140, #141, #142, #143, #144.
+5. **The t3code milestone** on the new engine: #140, #141, #142, #144 (#143 is done).
 6. **Later:** spawning at a tracker (`spawn --root`), `.gitignore` as
    definition, moving `role`/`priority`/`requires` to the mounting parent,
    `spawn --from <instance>` with `requires` checked between instances,
@@ -1092,9 +1093,8 @@ CLI, the narrow-audience warning, `.gitignore` as definition, and
   tracker in Git, `tracker create --git --from` (#140). Exporting a tracker
   as its own root, for a fork that keeps its files at the top (#141).
   Pulling a target's new commits back into its trackers, `newgit pull
-  --remote` (#142). Resolving `gh` to the export target an instance's work
-  belongs to, not the first `branches = true` one (#143). The engine for
-  them is built (step 2); #139 is closed by it.
+  --remote` (#142). The engine for them is built (step 2); #139 is closed
+  by it.
 - **Per-user trackers.** A per-user tracker's `main` reaches the remote only
   as a side effect of some instance's checkpoint (#224).
 - **Sparse checkouts.** Restoring a dirty checkpoint writes files into a

@@ -417,14 +417,15 @@ checkpoint after the definition lands brings it. The local record keeps
 it, so `undo` on this machine still restores it.
 
 Export targets with `branches = true` ride the same push: the instance's
-branch is exported to each of them, and on a newgit remote the target is the
-workspace remote `gh` resolves, so `gh pr create` opens a pull request
-there. The workspace's `refs/remotes/<target>/` holds the commit the target
+branch is exported to each target that ships a tracker its work touched, and
+on a newgit remote the target is a workspace remote, the one `gh` resolves
+when the work belongs to it alone, so `gh pr create` opens a pull request
+there. Work that spans several targets goes to each, `gh` resolves none, and
+the push names `gh pr create -R <repo> --head <branch>` for each. The workspace's `refs/remotes/<target>/` holds the commit the target
 really has; when the target withholds a tracker the branch touches, those
 commits differ, and the push says to use `gh pr create --head <branch>`. A
 push straight to the target's own remote is refused, since it would carry
-trackers the target withholds. (`gh` resolves to the first `branches = true`
-target, not the one an instance's work belongs to: [#143].)
+trackers the target withholds.
 
 > **Decision:** in remote mode, newgit's remote is the project's remote;
 > GitHub is an export ([trackers.md](trackers.md), *Build order* step 6).
@@ -775,7 +776,7 @@ Each piece lands alone and keeps the suite green.
    imported trackers through one merge commit ([#139]), import an outside
    repository unchanged as a tracker in Git ([#140]), export a tracker as its
    own root ([#141]), pull a target's new commits back into its trackers
-   ([#142]), and resolve `gh` to the right target ([#143]).
+   ([#142]).
 5. **Forge parity with `gh`** ([#160]–[#181]): latency budgets, `newgit
    api`, `pr create|list|view|diff|checkout|review|merge`, checks on
    checkpoints, an event stream, issues, labels, forks, search, an inbox,
@@ -859,8 +860,7 @@ Resolved loudly; each is reversible.
 
 Known gaps, tracked: [#224] (per-user `main` reaches the remote only
 through a checkpoint), [#107] (the push outbox is never garbage-collected),
-[#130] (TLS resets), [#143] (`gh` resolves to the first `branches = true`
-target), [#228] (a definition claim can lock the owner out).
+[#130] (TLS resets), [#228] (a definition claim can lock the owner out).
 
 ---
 
@@ -891,7 +891,6 @@ leans on:
 [#140]: https://github.com/Spheroman/newgit/issues/140
 [#141]: https://github.com/Spheroman/newgit/issues/141
 [#142]: https://github.com/Spheroman/newgit/issues/142
-[#143]: https://github.com/Spheroman/newgit/issues/143
 [#148]: https://github.com/Spheroman/newgit/issues/148
 [#160]: https://github.com/Spheroman/newgit/issues/160
 [#165]: https://github.com/Spheroman/newgit/issues/165
