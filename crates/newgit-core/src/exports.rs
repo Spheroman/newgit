@@ -28,7 +28,7 @@ pub struct RenderContext<'a> {
 }
 
 /// The trackers an instance binds, and the paths of the trackers in Git among
-/// them (`root`, `project`, and `access` aside, since they are always there),
+/// them (`root` and `access` aside, since they are always there),
 /// each space-separated.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Bound {

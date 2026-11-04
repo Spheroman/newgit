@@ -507,11 +507,13 @@ commit, so a merger's signed merge comes back as itself
 ([trackers.md](trackers.md), *Checkpoints, merges, and pull*). `newgit merge
 main` merges the project root instead, which is how trackers made after
 `remote add` reach the remote. On the remote it begins under a short lock
-with the list it was based on, telling the Worker which trackers' pins move
-to a commit not on their own `main` (`off_main`: those need their
-maintainers, and root always needs its own; the Worker cannot run Git, so it
-takes that list from the client, and the Git endpoint serves only pins found
-in each tracker's own repo). It pushes each moved tracker's commit with
+with the index it was based on and the index it will make. The Worker has
+the Git endpoint's container (which runs Git) say how each child's pin moves
+along that child's history: forward along its `main` needs only root's
+maintainers; back, sideways, or off `main` needs the child's, who get a
+write password for its `main`. Root always needs its own. Before the new
+index is written, the container checks root's pushed commit pins exactly
+that, and the merge may finish only with the index it began with. It pushes each moved tracker's commit with
 passwords minted for that merge, moves root's ref by one compare-and-swap,
 catches each child's `main` up with what root now pins, and finishes by
 writing the branch's list in the project's Durable Object as an index. (The

@@ -430,8 +430,10 @@ message about work only some may read would land in a tracker everyone else
 reads ("Fix the refund bypass" landing in `root`). The split refuses it,
 naming the commit and each tracker's audience: make one commit per audience.
 A refusal, not a warning, because the split is where work leaves the
-machine. Exempt: merge commits (their message is Git's or newgit's own), and
-the carve commit newgit makes (`Create tracker `x` at <path>`, which says
+machine. Exempt: a merge whose message nobody wrote — Git's own one line
+(`Merge branch 'x'`, `Merge remote-tracking branch 'origin/x'`, optionally
+`into y`) or newgit's (`Merge `x` into y`); a merge with words of its own is
+refused like any commit — and the carve commit newgit makes (`Create tracker `x` at <path>`, which says
 nothing the definition it adds does not; without this, carving a
 narrow-audience tracker out of root would always be refused). History
 already split is not checked again, so a teammate's published work never
@@ -589,11 +591,16 @@ root tracker's repository. Its view follows from that one commit, and on the
 remote, ProjectDO's list for the branch is an index written after the ref
 moves (see *On the remote*).
 
-1. Before anything is pushed, the Worker is told every tracker whose pin
-   moves to a commit not on that tracker's `main` (`off_main`), and refuses
-   a merger who doesn't maintain it, or root. A pin moving to a commit
-   already on the child's `main` changes only root, so it needs only root's
-   maintainers.
+1. Before anything is pushed, the merge names the index it will make, and
+   the Worker asks Git — in the Git endpoint's container, which runs it —
+   how each child's pin moves along that child's own history. A move forward
+   along the child's `main` changes only root, so root's maintainers may
+   make it. Any other move — back, sideways, or to a commit `main` does not
+   have — is the child's maintainers' to make, and a commit off `main` gets
+   them a write password for the child's `main`, which catches up (step 3).
+   Root always needs its own maintainers. A tracker leaving the index needs
+   its maintainers, unless nothing defines it any more (the migration
+   dropping `project`); one joining needs whoever governs its definition.
 2. The root's ref moves by one compare-and-swap. If it loses the race,
    nothing has changed and the merge reruns on the new tip.
 3. Each child's `main` then moves to include what the root now pins, also by
@@ -603,11 +610,16 @@ moves (see *On the remote*).
    The views are coherent throughout: the root pins exactly what was merged,
    and a view rooted at the child lags until its `main` catches up.
 
-**What the Worker trusts.** The Worker cannot run Git, so `off_main` is the
-client's word. The backstop is the Git endpoint's container, which expands
-only pins found in the tracker's own repo: a pin a merger could not have
-pushed is never served. The check is enforced in the Worker and not in the
-client, because it is the only place pin moves are checked.
+**What the Worker checks, and what it still trusts.** Nothing about a pin
+is the client's word. The index the merge begins with is the only one it may
+finish with, and before writing it the Worker has the container recompute
+the index from root's pushed commit — every gitlink, recursively — and
+refuses one that differs. The container expands only pins found in each
+tracker's own repo, so a pin nobody pushed is never served. What the Worker
+still takes on faith: that its container's answers are Git's (it runs the
+image the Worker deploys), and, for merges into a branch other than `main`,
+nothing more — a child's commit there lands on the child's branch of that
+name, by the child's maintainers when it is not forward along `main`.
 
 **`--only` is dropped (decided).** Merge stacking by tracker (`newgit merge
 <instance> --only supabase`, once planned) is not coming. With the root as
@@ -853,9 +865,13 @@ commit, no view history is rewritten **(decided)**:
 3. **Gate:** every branch and checkpoint is recomposed in a fresh repository
    holding only the new tracker commits (the remote's situation), and
    nothing moves unless each comes out with the id it has here, signatures
-   included, since most of `main` is signed by GitHub. A check run against
-   the local repo would pass trivially, because local compose reuses
-   originals.
+   included. Everything from before the carve pins nothing and is its own
+   root commit, so it reproduces by construction, GitHub's signatures with
+   it; what proves the engine is what is rebuilt from a split. So the gate
+   also splits a test commit on top of the carve, changing a file of root's
+   and one of `access`'s and made the way you make commits (signed, if you
+   sign), and recomposes it there. Its message says how many views it
+   rebuilt and how many it reused.
 
 Nothing old is deleted: the store's old tracker refs move under
 `refs/newgit-premigration/`, and the project repo's old notes with them. On
@@ -994,8 +1010,9 @@ this is the list.
   parent commit is a merge or the two share a committer line. Child commits
   carry no trailers, and a nested child's pin-only commits have nothing else
   to say they belong to the same split.
-- **Two exemptions from one-audience.** Merge commits stay exempt (their
-  message is Git's or newgit's own). So is the carve commit newgit makes,
+- **Two exemptions from one-audience.** A merge is exempt only when its
+  message is one nobody wrote: Git's own one-line form or newgit's. So is
+  the carve commit newgit makes,
   `Create tracker `x` at <path>`: without that, carving a narrow-audience
   tracker out of root would always be refused.
 - **No replay cache.** The design noted a cache keyed by the child's commits
@@ -1026,17 +1043,23 @@ this is the list.
 - **Exporting root ships `.newgit/`** (config, resources, scripts, exports),
   because `project` folded into root. Only `.newgit/trackers/` follows
   `access`'s audience.
-- **What the Worker trusts.** `begin_merge` takes `off_main`, the trackers
-  whose pin moves to a commit not on their own `main`, and requires their
-  maintainers and root's. The Worker cannot run Git, so it takes that list
-  from the client. The backstop is the endpoint container, which expands
-  only pins found in each tracker's own repo. The hole that leaves: a maintainer
-  of root who does not maintain `t3code` can leave it out of `off_main` and
-  pin any commit already in `t3code`'s repo — an older commit on its `main`
-  among them, rolling it back under the parent. They cannot put content in
-  `t3code` that is not already there, or move its `main`. Closing it means
-  deciding whether moving a pin backwards needs the child's maintainers
-  (and then checking it in the container, which can run Git).
+- **The Worker checks pins with Git.** It cannot run Git itself, so the
+  endpoint's container answers two questions it asks: before a merge, how
+  each child's pin moves along that child's history (forward along `main`
+  needs root's maintainers; back, sideways, or off `main` needs the
+  child's), and before an index is written, whether root's pushed commit
+  pins exactly that. Nothing about pins is the client's word.
+- **A merge into a branch other than `main`** keeps a child's new commit on
+  the child's branch of that name; only a merge into `main` moves a child's
+  `main`.
+- **A pin its tracker's repo does not have** leaves that tracker out at that
+  commit, as for a reader who may not read it, rather than failing the view.
+- **Replays of a tracker mounted at `.`** take the previous commit's files
+  out before laying the next one over, so a deletion shows.
+- **During the move to mounts the Worker reads both layouts** of `access`
+  (`<name>.toml`, and `.newgit/trackers/<name>.toml` from before), so a
+  remote deployed before a project migrates still reads its definitions.
+  The old read goes once every project on the remote has migrated.
 - **The migration folds every tracker in Git,** not only `project` and
   `access`, and mounts each of the others again at the path it owned.
 
