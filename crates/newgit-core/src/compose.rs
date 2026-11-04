@@ -258,6 +258,22 @@ fn graft(objects: &mut Objects, tree: &str, mount: &str, child: &str) -> Result<
     if mount == "." {
         return objects.overlay(tree, child);
     }
+    // Two trackers mounted at one path (each claiming its own files there)
+    // share the directory.
+    let merged = match objects.subtree(tree, mount)? {
+        Some(existing) => objects.overlay(&existing, child)?,
+        None => child.to_owned(),
+    };
+    let entry = (merged != EMPTY_TREE).then(|| (TREE_MODE.to_vec(), merged));
+    objects.set_path(tree, mount, entry)
+}
+
+/// `tree` with whatever is at `mount` replaced by `child`: a replayed
+/// commit's mount holds exactly that child commit's files.
+fn replace(objects: &mut Objects, tree: &str, mount: &str, child: &str) -> Result<String> {
+    if mount == "." {
+        return objects.overlay(tree, child);
+    }
     let entry = (child != EMPTY_TREE).then(|| (TREE_MODE.to_vec(), child.to_owned()));
     objects.set_path(tree, mount, entry)
 }
@@ -741,7 +757,7 @@ impl Composer<'_> {
                 None => None,
             }
             .unwrap_or_else(|| EMPTY_TREE.to_owned());
-            let tree = graft(&mut self.objects, &base, mount, &child_tree)?;
+            let tree = replace(&mut self.objects, &base, mount, &child_tree)?;
             let original = self.objects.commit(&current)?;
             let mut deduped: Vec<String> = Vec::new();
             for parent in mapped {
@@ -814,6 +830,40 @@ fn view_tree_cached(
     }
     cache.insert(commit.to_owned(), tree.clone());
     Ok(tree)
+}
+
+/// Whether commit `commit`'s own definitions mount a tracker in Git that it
+/// does not pin: a view commit, which only a split makes a root commit of.
+/// One that mounts nothing is its own root commit.
+pub fn defines_mounts(repo: &Utf8Path, commit: &str) -> Result<bool> {
+    let mut objects = Objects::open(repo)?;
+    defines_mounts_in(&mut objects, commit)
+}
+
+fn defines_mounts_in(objects: &mut Objects, commit: &str) -> Result<bool> {
+    let found = objects.commit(commit)?;
+    let pins = pins_in(objects, &found.tree)?;
+    let Some(directory) = objects.subtree(&found.tree, DEFINITIONS_DIR)? else {
+        return Ok(false);
+    };
+    for entry in objects.tree(&directory)? {
+        let name = String::from_utf8_lossy(&entry.name).into_owned();
+        let Some(tracker) = name.strip_suffix(".toml") else {
+            continue;
+        };
+        if entry.is_tree() || pins.contains_key(tracker) {
+            continue;
+        }
+        let text = read_blob_text(objects, &entry.id)?;
+        let Ok(table) = toml::from_str::<toml::Table>(&text) else {
+            continue;
+        };
+        let git = table.get("git").and_then(toml::Value::as_bool) == Some(true);
+        if git && mount_in(&text).is_some_and(|mount| mount != ".") {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// The commits a root commit holds, by tracker: itself, and every pin,
@@ -992,6 +1042,10 @@ pub struct SplitOptions<'a> {
     /// Each tracker's audience, from policy (`access`'s `main`), when known;
     /// otherwise the definition in the commit is used.
     pub audience: &'a dyn Fn(&str) -> Option<String>,
+    /// A view commit newgit made itself whose message may be carried by
+    /// trackers of different audiences: a carve, `Create tracker `x``, which
+    /// says nothing the definition it adds does not.
+    pub newgit_made: Option<&'a str>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1145,11 +1199,12 @@ impl Splitter<'_> {
             self.mapped.insert(view.to_owned(), root.clone());
             return Ok(Some(root));
         }
-        if self
+        if (self
             .root_history
             .as_ref()
             .is_some_and(|history| history.contains(view))
-            || self.from_before_mounts(view)?
+            || self.from_before_mounts(view)?)
+            && !defines_mounts_in(&mut self.objects, view)?
         {
             self.mapped.insert(view.to_owned(), view.to_owned());
             return Ok(Some(view.to_owned()));
@@ -1221,7 +1276,7 @@ impl Splitter<'_> {
             carriers.insert(0, root.clone());
         }
         carriers.dedup();
-        if commit.parents.len() <= 1 {
+        if commit.parents.len() <= 1 && self.options.newgit_made != Some(view) {
             let audiences: Vec<(String, String)> = carriers
                 .iter()
                 .map(|name| {
@@ -1420,8 +1475,9 @@ impl Splitter<'_> {
     ) -> std::result::Result<(String, BTreeMap<String, String>), SplitError> {
         let definitions = self.definitions_in(tree)?;
         let mut children: Vec<TrackerDefinition> = definitions
-            .into_iter()
+            .iter()
             .filter(|definition| definition.git && definition.name != tracker)
+            .cloned()
             .collect();
         children.sort_by(|left, right| {
             depth(right.mount.as_str())
@@ -1437,21 +1493,14 @@ impl Splitter<'_> {
         let mut pins = BTreeMap::new();
         for child in &children {
             let mount = child.mount.as_str();
-            let part = if mount == "." {
-                // An overlay beside this tracker's files: what it claims.
-                let mut part = EMPTY_TREE.to_owned();
-                for claim in &child.paths {
-                    if let Some(entry) = self.objects.entry_at(tree, claim.as_str())? {
-                        part = self.objects.set_path(
-                            &part,
-                            claim.as_str(),
-                            Some((entry.mode, entry.id)),
-                        )?;
-                        own = self.objects.set_path(&own, claim.as_str(), None)?;
-                    }
-                }
-                (part != EMPTY_TREE).then_some(part)
-            } else {
+            let shares_mount = definitions.iter().any(|other| {
+                other.name != child.name && other.name != tracker && other.mount == child.mount
+            });
+            let whole = mount != "."
+                && !shares_mount
+                && child.exclusions.is_empty()
+                && child.paths == [child.mount.clone()];
+            let part = if whole {
                 let part = self.objects.subtree(tree, mount)?;
                 own = self.objects.set_path(&own, mount, None)?;
                 // A sibling mounted deeper inside this mount is its own.
@@ -1467,6 +1516,71 @@ impl Splitter<'_> {
                     }
                 }
                 part
+            } else {
+                // What it claims at its mount, beside whatever else is
+                // mounted there: the longest claim wins, and its
+                // exclusions are nobody's.
+                let relative = |path: &Utf8Path| -> String {
+                    if mount == "." {
+                        return path.to_string();
+                    }
+                    match path.strip_prefix(&child.mount) {
+                        Ok(inner) if inner.as_str().is_empty() => ".".to_owned(),
+                        Ok(inner) => inner.to_string(),
+                        Err(_) => path.to_string(),
+                    }
+                };
+                let base = if mount == "." {
+                    Some(tree.to_owned())
+                } else {
+                    self.objects.subtree(tree, mount)?
+                };
+                let mut part = EMPTY_TREE.to_owned();
+                if let Some(base) = &base {
+                    for claim in &child.paths {
+                        let at = relative(claim);
+                        if at == "." {
+                            part = self.objects.overlay(&part, base)?;
+                        } else if let Some(entry) = self.objects.entry_at(base, &at)? {
+                            part =
+                                self.objects
+                                    .set_path(&part, &at, Some((entry.mode, entry.id)))?;
+                        }
+                    }
+                }
+                let mut out: Vec<String> =
+                    child.exclusions.iter().map(|path| relative(path)).collect();
+                for other in definitions.iter().filter(|other| {
+                    other.name != child.name && other.name != tracker && other.mount == child.mount
+                }) {
+                    for claim in &other.paths {
+                        if other.claim_on(claim) > child.claim_on(claim) {
+                            out.push(relative(claim));
+                        }
+                    }
+                }
+                for other in &children {
+                    if other.name != child.name
+                        && other.mount != child.mount
+                        && (mount == "." || other.mount.starts_with(&child.mount))
+                    {
+                        out.push(relative(&other.mount));
+                    }
+                }
+                for path in out {
+                    if path != "." {
+                        part = self.objects.set_path(&part, &path, None)?;
+                    }
+                }
+                for file in self.objects.files(&part)?.into_keys() {
+                    let at = if mount == "." {
+                        file
+                    } else {
+                        format!("{mount}/{file}")
+                    };
+                    own = self.objects.set_path(&own, &at, None)?;
+                }
+                (part != EMPTY_TREE).then_some(part)
             };
             let mut before: Vec<String> = Vec::new();
             for pins_then in &parent_pins {

@@ -1,6 +1,6 @@
 //! Step 3c (docs/design/trackers.md): the project root is the instance `main`,
 //! its commits split into its tracker branches before anything is composed;
-//! trackers in Git get their history the first time it is needed; a history
+//! a tracker in Git gets its history from the commit that defines it; a history
 //! that once committed a now-secret file composes unchanged; and split
 //! commits are signed when you sign your commits.
 
@@ -8,7 +8,7 @@ use std::process::Command;
 
 use camino::{Utf8Path, Utf8PathBuf};
 use newgit_core::SourceSubstrate;
-use newgit_core::compose::{self, TrackerTip};
+use newgit_core::compose;
 use newgit_core::config::WorkspaceSection;
 use newgit_core::manager::BranchManager;
 use newgit_core::store::MetadataStore;
@@ -112,36 +112,25 @@ fn split_source(store: &MetadataStore, reference: &str) -> String {
     )
 }
 
-/// The project root's view, composed from the `instances/main` of every
-/// tracker in Git — what `HEAD` must be, commit for commit.
-fn recompose(manager: &BranchManager, repo: &Utf8Path) -> Option<String> {
-    let definitions: Vec<&TrackerDefinition> = std::iter::once(manager.root_tracker())
-        .chain(manager.carved_trackers())
-        .collect();
-    let tips: Vec<TrackerTip<'_>> = definitions
-        .into_iter()
-        .filter_map(|definition| {
-            let output = Command::new("git")
-                .args(["-C", repo.as_str(), "rev-parse", "--verify", "-q"])
-                .arg(format!(
-                    "refs/newgit/trackers/{}/instances/main",
-                    definition.name
-                ))
-                .output()
-                .expect("git runs");
-            output.status.success().then(|| TrackerTip {
-                definition,
-                commit: String::from_utf8_lossy(&output.stdout).trim().to_owned(),
-            })
-        })
-        .collect();
+/// The project root's view, composed from root's `instances/main` alone —
+/// what `HEAD` must be, commit for commit.
+fn recompose(_manager: &BranchManager, repo: &Utf8Path) -> Option<String> {
+    let root = git(
+        repo,
+        &["rev-parse", "refs/newgit/trackers/root/instances/main"],
+    );
+    let everything = |_: &str| true;
     compose::compose(
         repo,
-        "refs/newgit/views/check",
-        &tips,
-        manager.carved_trackers(),
+        "root",
+        &[("refs/newgit/views/check".to_owned(), root)],
+        &compose::ComposeOptions {
+            readable: &everything,
+            admit: None,
+        },
     )
     .expect("compose")
+    .remove(0)
     .tip
 }
 
@@ -187,21 +176,15 @@ fn a_reset_in_the_project_root_moves_its_branches_back() {
 }
 
 #[test]
-fn a_git_tracker_defined_by_hand_is_carved_the_first_time_it_is_needed() {
+fn a_git_tracker_defined_by_hand_is_carved_by_the_commit_that_defines_it() {
     let (_guard, temp) = tempdir();
-    let (store, _repo) = setup(&temp);
-    let mut electron = TrackerDefinition::new(
-        "electron",
-        "project-devs".to_owned(),
-        Storage::Local,
-        true,
-        vec![Utf8PathBuf::from("apps/electron")],
+    let (store, repo) = setup(&temp);
+    std::fs::write(
+        store.paths().trackers.join("electron.toml"),
+        "audience = \"project-devs\"\nstorage = \"local\"\ngit = true\nmount = \"apps/electron\"\npaths = [\".\"]\n",
     )
-    .expect("definition");
-    electron.git = true;
-    store
-        .create_tracker_definition(&electron)
-        .expect("write definition");
+    .expect("write definition");
+    commit(&repo, &[], "define electron", 3_000);
     let manager = BranchManager::open(store.clone()).expect("manager");
     manager.spawn("feature-a", None).expect("spawn");
     assert_eq!(
@@ -211,10 +194,15 @@ fn a_git_tracker_defined_by_hand_is_carved_the_first_time_it_is_needed() {
                 "ls-tree",
                 "-r",
                 "--name-only",
-                "refs/trackers/electron/main"
+                "refs/trackers/electron/instances/main"
             ],
         ),
-        "apps/electron/main.js"
+        "main.js",
+        "its files, at its own root"
+    );
+    assert_eq!(
+        recompose(&manager, &repo),
+        Some(git(&repo, &["rev-parse", "HEAD"]))
     );
 }
 
@@ -228,7 +216,6 @@ fn carving_after_the_project_root_split_still_recomposes_its_commits() {
         "both at once",
         2_000,
     );
-    let head = git(&repo, &["rev-parse", "HEAD"]);
     BranchManager::open(store.clone())
         .expect("manager")
         .spawn("feature-a", None)
@@ -241,14 +228,23 @@ fn carving_after_the_project_root_split_still_recomposes_its_commits() {
             &[Utf8PathBuf::from("apps/electron")],
         )
         .expect("carve");
+    let head = git(&repo, &["rev-parse", "HEAD"]);
 
     let manager = BranchManager::open(store.clone()).expect("reopen");
     let outcome = manager.spawn("feature-b", None).expect("spawn");
     assert_eq!(outcome.projection_warning, None);
     assert_eq!(
-        split_source(&store, "refs/trackers/electron/instances/main"),
+        split_source(&store, "refs/trackers/root/instances/main"),
         head,
-        "the project root's unmerged commit reached the carved tracker"
+        "the carve is one root commit"
+    );
+    assert_eq!(
+        git(
+            &trackers(&store),
+            &["show", "refs/trackers/electron/instances/main:main.js"]
+        ),
+        "v2",
+        "the unmerged commit's content reached the carved tracker"
     );
     assert_eq!(recompose(&manager, &repo).as_deref(), Some(head.as_str()));
 }

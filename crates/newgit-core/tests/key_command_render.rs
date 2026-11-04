@@ -64,7 +64,7 @@ fn setup(temp: &Utf8Path) -> MetadataStore {
         .create_git_tracker("app", "project-devs", &[Utf8PathBuf::from("apps/a")])
         .expect("carve");
     git(&repo, &["add", "-A"]);
-    git(&repo, &["commit", "-q", "-m", "trackers"]);
+    git(&repo, &["commit", "-q", "--allow-empty", "-m", "trackers"]);
     // The project root's own commits reach `main` like anyone's.
     BranchManager::open(store.clone())
         .expect("manager")

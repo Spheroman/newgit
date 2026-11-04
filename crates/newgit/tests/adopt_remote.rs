@@ -1,8 +1,8 @@
 //! A project whose history already holds `.newgit/` — a plain `git clone`,
-//! adopted with `newgit init` — linked to a newgit remote. `access` carves
-//! out of `project`, which carves out of `root`; carved in the wrong order,
-//! `access` had no history yet when the root's work was split, and `remote
-//! add` failed merging unrelated histories.
+//! adopted with `newgit init` — linked to a newgit remote. Root adopts the
+//! history up to the commit that first mounts `access`; split makes root
+//! commits of the rest, pinning `access`, and gives back the same view
+//! commits.
 
 #![allow(dead_code)]
 
@@ -39,11 +39,14 @@ fn an_adopted_clone_links_with_every_git_tracker_carved_and_the_same_commits() {
     fixture.ok(&clone, &["remote", "add", "--url", &fixture.remote.url]);
 
     let access = files_at(&fixture.remote.repo("jack.adopted.t.access"), "main");
-    assert!(access.contains(".newgit/trackers/root.toml"), "{access}");
+    assert!(access.contains("root.toml"), "{access}");
     let state = fixture.remote.state.lock().expect("state");
-    let list = &state.branches["jack/adopted"]["main"];
+    let list = state.branches["jack/adopted"]["main"].clone();
+    drop(state);
     assert_eq!(
-        list["root"], head,
-        "root's main is the adopted history itself"
+        split_source(&fixture.remote.repo("jack.adopted.t.root"), "main"),
+        head,
+        "root's main is the adopted history, its last commit split from the clone's own"
     );
+    assert!(list.get("access").is_some(), "{list:?}");
 }

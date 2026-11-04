@@ -69,7 +69,7 @@ fn project(temp: &Utf8Path) -> (BranchManager, Utf8PathBuf) {
         .track_paths("runtime-env", &[Utf8PathBuf::from(".env.local")])
         .expect("track");
     git(&repo, &["add", "."]);
-    git(&repo, &["commit", "-q", "-m", "trackers"]);
+    git(&repo, &["commit", "-q", "--allow-empty", "-m", "trackers"]);
 
     let manager = BranchManager::open(MetadataStore::at(repo)).expect("reopen");
     let workspace = manager

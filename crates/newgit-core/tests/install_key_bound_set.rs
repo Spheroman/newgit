@@ -84,7 +84,7 @@ fn setup(temp: &Utf8Path, prepare: &str) -> BranchManager {
             .expect("carve");
     }
     git(&repo, &["add", "-A"]);
-    git(&repo, &["commit", "-q", "-m", "trackers"]);
+    git(&repo, &["commit", "-q", "--allow-empty", "-m", "trackers"]);
     let manager = BranchManager::open(store).expect("manager");
     // The project root's own commits reach `main` like anyone's.
     manager

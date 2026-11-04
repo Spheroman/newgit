@@ -339,7 +339,7 @@ fn clone_into(
         }
         fetched.push(tracker.clone());
     }
-    for needed in ["project", "access"] {
+    for needed in ["root", "access"] {
         if !fetched.iter().any(|tracker| tracker == needed) {
             bail!(
                 "cannot clone `{project}` without its `{needed}` tracker, which holds its \
@@ -348,9 +348,10 @@ fn clone_into(
         }
     }
 
-    // Its definitions first, so newgit knows what composes the rest: `.newgit/`
-    // from `project`, and `.newgit/trackers/` from `access`, which owns it.
-    for tracker in ["project", "access"] {
+    // Its definitions first, so newgit knows what composes the rest:
+    // `.newgit/` from root (its pins left out), and `.newgit/trackers/` from
+    // `access`, which is mounted there and keeps them at its own root.
+    for tracker in ["root", "access"] {
         git(&[
             "fetch",
             "-q",
@@ -360,24 +361,42 @@ fn clone_into(
     }
     git(&[
         "checkout",
-        "refs/newgit/trackers/project/main",
+        "refs/newgit/trackers/root/main",
         "--",
         ".newgit",
+        ":(exclude).newgit/pins",
     ])?;
-    git(&[
-        "checkout",
-        "refs/newgit/trackers/access/main",
-        "--",
-        ".newgit/trackers",
-    ])?;
-    // A tracker left out stays absent: never carved out of root's older
-    // history here, which would invent content for it.
-    for tracker in list.keys().filter(|tracker| !fetched.contains(tracker)) {
-        git(&[
-            "update-ref",
-            &format!("refs/newgit/carve-checked/{tracker}"),
-            "refs/newgit/trackers/project/main",
-        ])?;
+    let definitions = dir.join(".newgit/trackers");
+    std::fs::create_dir_all(&definitions)?;
+    let archive = std::process::Command::new("git")
+        .arg("-C")
+        .arg(dir.as_str())
+        .args([
+            "archive",
+            "--format=tar",
+            "refs/newgit/trackers/access/main",
+        ])
+        .output()?;
+    if !archive.status.success() {
+        bail!(
+            "could not read `access`'s definitions: {}",
+            String::from_utf8_lossy(&archive.stderr).trim()
+        );
+    }
+    let mut untar = std::process::Command::new("tar")
+        .args(["-x", "-C", definitions.as_str()])
+        .stdin(std::process::Stdio::piped())
+        .spawn()?;
+    {
+        use std::io::Write as _;
+        untar
+            .stdin
+            .take()
+            .expect("piped")
+            .write_all(&archive.stdout)?;
+    }
+    if !untar.wait()?.success() {
+        bail!("could not unpack `access`'s definitions");
     }
     let store = MetadataStore::adopt(dir)?;
     let manager = BranchManager::open(store.clone())?;

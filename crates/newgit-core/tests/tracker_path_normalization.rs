@@ -186,7 +186,7 @@ fn only_a_git_tracker_may_own_a_definition_and_nothing_else_in_newgit_opens() {
         TrackerDefinition::in_git(
             "admin",
             "project-devs".to_owned(),
-            &[Utf8PathBuf::from(path)],
+            camino::Utf8Path::new(path),
         )
     };
     for spelling in [
@@ -234,32 +234,30 @@ fn only_a_git_tracker_may_own_a_definition_and_nothing_else_in_newgit_opens() {
     }
 }
 
-/// What `newgit tracker create admin --git --path .newgit/trackers/web.toml`
-/// runs. A tracker in Git used to be checked while it was still one outside
-/// Git, the default, so it could not claim a definition even with the check
-/// fixed.
+/// Governance layers by mounting: an `admin` tracker mounted beside
+/// `access` at `.newgit/trackers`, claiming `web.toml`, owns that file (the
+/// longest claim at a mount wins), so only admin's maintainers change `web`'s
+/// definition. Split puts the file in admin's history at its own root.
 #[test]
-fn an_admin_tracker_is_created_and_composed_like_any_git_tracker() {
+fn an_admin_tracker_mounted_beside_access_owns_the_definition_it_claims() {
     let (_guard, temp) = tempdir();
     let store = setup(&temp);
     let root = store.paths().project_root.clone();
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-q", "-m", "newgit"]);
     BranchManager::open(store)
         .expect("manager")
         .create_git_tracker("web", "project-devs", &[Utf8PathBuf::from("apps/web")])
         .expect("create web");
-    let outcome = BranchManager::open(MetadataStore::at(root.clone()))
-        .expect("reopen")
-        .create_git_tracker(
-            "admin",
-            "project-devs",
-            &[Utf8PathBuf::from(".newgit/trackers/web.toml")],
-        )
-        .expect("create admin");
-    assert_eq!(outcome.source, "access", "carved out of the file's owner");
+    std::fs::write(
+        root.join(".newgit/trackers/admin.toml"),
+        "audience = \"project-devs\"\nstorage = \"local\"\ngit = true\nmount = \".newgit/trackers\"\npaths = [\"web.toml\", \"admin.toml\"]\nmaintainers = \"owner\"\n",
+    )
+    .expect("write admin");
     git(&root, &["add", "."]);
     git(&root, &["commit", "-q", "-m", "web, governed by admin"]);
 
-    let m = BranchManager::open(MetadataStore::at(root)).expect("reopen");
+    let m = BranchManager::open(MetadataStore::at(root.clone())).expect("reopen");
     let access = m
         .carved_trackers()
         .iter()
@@ -267,17 +265,36 @@ fn an_admin_tracker_is_created_and_composed_like_any_git_tracker() {
         .expect("access is a tracker in Git");
     assert_eq!(
         access.excluded,
-        [Utf8PathBuf::from(".newgit/trackers/web.toml")]
+        [
+            Utf8PathBuf::from(".newgit/trackers/admin.toml"),
+            Utf8PathBuf::from(".newgit/trackers/web.toml")
+        ]
     );
-    // With `access` no longer holding the file, only `admin`'s history can
-    // put it in a workspace.
+    m.sync_project_root().expect("split");
+    let store_git = m.store().paths().tracker_store.clone();
+    let files = |tracker: &str| {
+        let output = Command::new("git")
+            .args([
+                &format!("--git-dir={store_git}"),
+                "ls-tree",
+                "--name-only",
+                &format!("refs/trackers/{tracker}/instances/main"),
+            ])
+            .output()
+            .expect("git");
+        String::from_utf8_lossy(&output.stdout).trim().to_owned()
+    };
+    assert_eq!(files("admin"), "admin.toml\nweb.toml");
+    let access_files = files("access");
+    assert!(!access_files.contains("web.toml"), "{access_files}");
+    assert!(access_files.contains("root.toml"), "{access_files}");
+    // And the view is the project's own history, composed from all three.
     let spawned = m.spawn("feature-a", None).expect("spawn");
     assert!(
         spawned
             .branch
             .workspace_path
             .join(".newgit/trackers/web.toml")
-            .is_file(),
-        "`web`'s definition is composed from `admin`"
+            .is_file()
     );
 }

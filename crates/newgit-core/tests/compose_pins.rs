@@ -124,6 +124,7 @@ impl Repo {
                 root: "root",
                 bound: &bound,
                 audience: &audience,
+                newgit_made: None,
             },
         )
         .unwrap_or_else(|error| panic!("split {tip}: {error}"))
@@ -139,6 +140,7 @@ impl Repo {
                 root: "root",
                 bound: &bound,
                 audience: &audience,
+                newgit_made: None,
             },
         )
         .map_err(|error| error.to_string())

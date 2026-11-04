@@ -219,10 +219,24 @@ impl MetadataStore {
             std::fs::write(&file, format!("{branch}\n"))
                 .map_err(|source| NewgitError::io(&file, source))?;
         }
+        // Root's history is the view's history up to the first commit whose
+        // definitions mount a tracker in Git: from there on, a view commit
+        // is a split's to make into a root commit (with its pins), which
+        // gives the same view commits back.
+        let mut adopted = git(&["rev-parse", "HEAD"]).unwrap_or_default();
+        while !adopted.is_empty()
+            && crate::compose::defines_mounts(&self.paths.project_root, &adopted).unwrap_or(false)
+        {
+            adopted =
+                git(&["rev-parse", "-q", "--verify", &format!("{adopted}^")]).unwrap_or_default();
+        }
+        if adopted.is_empty() {
+            return Ok(true);
+        }
         crate::tracker_repo::import_history(
             &self.paths.tracker_store,
             &self.paths.project_root,
-            "HEAD",
+            &adopted,
             &root.name,
         )?;
         // The history newgit adopted: published already, wherever it went,

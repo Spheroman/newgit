@@ -7,7 +7,7 @@ use std::process::Command;
 
 use camino::{Utf8Path, Utf8PathBuf};
 use newgit_core::SourceSubstrate;
-use newgit_core::compose::{self, TrackerTip};
+use newgit_core::compose;
 use newgit_core::config::WorkspaceSection;
 use newgit_core::manager::BranchManager;
 use newgit_core::store::MetadataStore;
@@ -111,36 +111,28 @@ fn split_source(store: &MetadataStore, reference: &str) -> String {
     )
 }
 
-/// The project root's view, composed from the `instances/main` of every
-/// tracker in Git — what `HEAD` must be, commit for commit.
-fn recompose(manager: &BranchManager, repo: &Utf8Path, slug: &str) -> Option<String> {
-    let definitions: Vec<&TrackerDefinition> = std::iter::once(manager.root_tracker())
-        .chain(manager.carved_trackers())
-        .collect();
-    let tips: Vec<TrackerTip<'_>> = definitions
-        .into_iter()
-        .filter_map(|definition| {
-            let output = Command::new("git")
-                .args(["-C", repo.as_str(), "rev-parse", "--verify", "-q"])
-                .arg(format!(
-                    "refs/newgit/trackers/{}/instances/{slug}",
-                    definition.name
-                ))
-                .output()
-                .expect("git runs");
-            output.status.success().then(|| TrackerTip {
-                definition,
-                commit: String::from_utf8_lossy(&output.stdout).trim().to_owned(),
-            })
-        })
-        .collect();
+/// An instance's view, composed from root's `instances/<slug>` alone — what
+/// its branch must be, commit for commit.
+fn recompose(_manager: &BranchManager, repo: &Utf8Path, slug: &str) -> Option<String> {
+    let root = git(
+        repo,
+        &[
+            "rev-parse",
+            &format!("refs/newgit/trackers/root/instances/{slug}"),
+        ],
+    );
+    let everything = |_: &str| true;
     compose::compose(
         repo,
-        "refs/newgit/views/check",
-        &tips,
-        manager.carved_trackers(),
+        "root",
+        &[("refs/newgit/views/check".to_owned(), root)],
+        &compose::ComposeOptions {
+            readable: &everything,
+            admit: None,
+        },
     )
     .expect("compose")
+    .remove(0)
     .tip
 }
 
@@ -163,10 +155,14 @@ fn tree(repo: &Utf8Path, reference: &str) -> String {
     git(repo, &["ls-tree", "-r", "--name-only", reference])
 }
 
+/// Carving is a commit on the project root's branch: an instance forked
+/// before it keeps the carved files in root, as its history has them, until
+/// it merges that commit — and then the tracker holds every file, at its own
+/// root, the instance's work included.
 #[test]
-fn work_split_before_a_carve_keeps_every_file_after_it() {
+fn work_from_before_a_carve_moves_to_the_tracker_when_the_carve_is_merged() {
     let (_guard, temp) = tempdir();
-    let (store, _repo) = setup(&temp);
+    let (store, repo) = setup(&temp);
     let manager = BranchManager::open(store.clone()).expect("manager");
     manager.spawn("feature-a", None).expect("spawn");
     workspace_commit(
@@ -187,6 +183,22 @@ fn work_split_before_a_carve_keeps_every_file_after_it() {
         )
         .expect("carve");
     let manager = BranchManager::open(store.clone()).expect("reopen");
+    let trackers = trackers(&store);
+    assert!(
+        tree(&trackers, "refs/trackers/root/instances/feature-a").contains("apps/electron/new.js"),
+        "before it takes the carve, the instance's work is root's"
+    );
+    let workspace = manager
+        .store()
+        .find_branch("feature-a")
+        .expect("instance")
+        .workspace_path;
+    git(&workspace, &["fetch", "-q", repo.as_str(), "main"]);
+    git_env(
+        &workspace,
+        &["merge", "-q", "--no-edit", "FETCH_HEAD"],
+        &[("GIT_COMMITTER_DATE", "@6000 +0000".to_owned())],
+    );
     workspace_commit(
         &manager,
         "feature-a",
@@ -200,15 +212,14 @@ fn work_split_before_a_carve_keeps_every_file_after_it() {
         .tracker_log_target("electron", Some("feature-a"))
         .expect("split again");
 
-    let trackers = trackers(&store);
     assert_eq!(
         tree(&trackers, "refs/trackers/electron/instances/feature-a"),
-        "apps/electron/main.js\napps/electron/new.js\napps/electron/other.js",
-        "electron's branch carries every file: the work split before it existed too"
+        "main.js\nnew.js\nother.js",
+        "electron holds every file at its own root, the work from before the carve too"
     );
     assert!(
         !tree(&trackers, "refs/trackers/root/instances/feature-a").contains("apps/electron"),
-        "and root's no longer does"
+        "and root no longer does"
     );
     let head = git(
         &store.paths().project_root,
@@ -217,7 +228,7 @@ fn work_split_before_a_carve_keeps_every_file_after_it() {
     assert_eq!(
         recompose(&manager, &store.paths().project_root, "feature-a").as_deref(),
         Some(head.as_str()),
-        "the instance's trackers compose back into its exact commits"
+        "root's branch composes back into the instance's exact commits"
     );
 }
 
@@ -289,8 +300,11 @@ fn the_project_roots_branches_follow_its_own_branch_not_a_checkout() {
         &trackers,
         &["rev-parse", "refs/trackers/root/instances/main"],
     );
-    let view = compose::read_state(&repo, &main).expect("state");
-    assert_eq!(view.get("root"), Some(&root_tip), "still main's state");
+    // `main` is history newgit adopted, its own root commit, or one split.
+    let expected = compose::read_root(&repo, &main)
+        .expect("note")
+        .map_or(main, |(_, commit)| commit);
+    assert_eq!(root_tip, expected, "still main's state");
 }
 
 #[test]

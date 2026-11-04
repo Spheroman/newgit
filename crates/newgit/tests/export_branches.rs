@@ -55,7 +55,7 @@ fn pushed(workspace: &Utf8Path) -> String {
 fn the_workspace_gets_the_target_as_the_remote_gh_resolves() {
     let (_guard, temp) = tempdir();
     let fixture = setup(&temp);
-    let github = mirror(&fixture, "github", &["root", "project", "access"]);
+    let github = mirror(&fixture, "github", &["root", "access"]);
     fixture.ok(&fixture.store, &["export", "--remote", "github"]);
     fixture.ok(&fixture.store, &["spawn", "feature-a"]);
     let workspace = workspace_of(&fixture, "feature-a");
@@ -79,7 +79,7 @@ fn the_workspace_gets_the_target_as_the_remote_gh_resolves() {
 fn a_push_exports_the_branch_as_the_agents_own_commits_when_every_tracker_ships() {
     let (_guard, temp) = tempdir();
     let fixture = setup(&temp);
-    let github = mirror(&fixture, "github", &["root", "project", "access"]);
+    let github = mirror(&fixture, "github", &["root", "access"]);
     fixture.ok(&fixture.store, &["spawn", "feature-a"]);
     let workspace = workspace_of(&fixture, "feature-a");
 
@@ -114,7 +114,7 @@ fn a_filtered_target_gets_other_commits_and_the_push_says_head() {
         "`.newgit` is withheld, so the commits differ"
     );
     assert!(files_at(&public, "feature-a").contains("change.txt"));
-    assert!(!files_at(&public, "feature-a").contains(".newgit"));
+    assert!(!files_at(&public, "feature-a").contains(".newgit/trackers"));
     // The tracking ref is what the target holds, never a claim it is `HEAD`.
     assert_eq!(
         git(&workspace, &["rev-parse", "refs/remotes/public/feature-a"]),

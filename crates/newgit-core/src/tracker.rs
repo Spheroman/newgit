@@ -313,11 +313,15 @@ impl TrackerDefinition {
 
         // Every path here is already normalized, so `./.git` meets the
         // checks as `.git`.
-        for path in self
-            .paths
-            .iter()
-            .chain(&self.exclusions)
-            .chain(std::iter::once(&self.mount).filter(|mount| mount.as_str() != "."))
+        for path in
+            self.paths
+                .iter()
+                .chain(&self.exclusions)
+                .chain(std::iter::once(&self.mount).filter(|mount| {
+                    // A tracker in Git may sit beside `access`, claiming the
+                    // definitions it governs.
+                    mount.as_str() != "." && !(self.git && mount.as_str() == DEFINITIONS_DIR)
+                }))
         {
             if path.as_str() == "." || is_project {
                 continue;
@@ -989,11 +993,8 @@ mod tests {
             path,
             "audience = \"user\"\nstorage = \"local\"\nmount = \"apps\"\npaths = [\".env\"]\n",
         )
-        .expect_err("only a tracker in Git is mounted");
-        assert!(
-            outside.to_string().contains("only a tracker in Git"),
-            "{outside}"
-        );
+        .expect("a tracker outside Git is mounted too, and never pinned");
+        assert_eq!(outside.paths, vec![Utf8PathBuf::from("apps/.env")]);
     }
 
     #[test]

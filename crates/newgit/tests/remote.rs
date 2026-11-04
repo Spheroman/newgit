@@ -13,19 +13,26 @@ fn remote_add_creates_the_project_with_a_repo_per_git_tracker_and_main() {
     let (_guard, temp) = tempdir();
     let fixture = setup(&temp);
     let root = fixture.remote.repo("jack.store.t.root");
-    let project = fixture.remote.repo("jack.store.t.project");
+    let access = fixture.remote.repo("jack.store.t.access");
     assert!(files_at(&root, "main").contains("README.md"));
     assert!(
-        !files_at(&root, "main").contains(".newgit"),
-        "root holds what no other tracker claims"
+        files_at(&root, "main").contains(".newgit/config.toml"),
+        "root holds what no other tracker claims, `.newgit` included"
     );
-    assert!(files_at(&project, "main").contains(".newgit/config.toml"));
+    assert!(
+        !files_at(&root, "main").contains(".newgit/trackers"),
+        "but not `access`'s mount"
+    );
+    assert!(
+        files_at(&access, "main").contains("root.toml"),
+        "`access` holds the definitions at its own root"
+    );
 
     // `main` names each tracker's commit, and they are what was pushed.
     let state = fixture.remote.state.lock().expect("state");
     let list = &state.branches["jack/store"]["main"];
     assert_eq!(list["root"], git(&root, &["rev-parse", "main"]));
-    assert_eq!(list["project"], git(&project, &["rev-parse", "main"]));
+    assert_eq!(list["access"], git(&access, &["rev-parse", "main"]));
     drop(state);
 
     let config =
@@ -306,11 +313,14 @@ fn merge_moves_the_remote_branch_and_brings_new_trackers_with_it() {
         &["tracker", "create", "docs", "--git", "--path", "docs"],
     );
     git(&fixture.store, &["add", "-A"]);
-    git(&fixture.store, &["commit", "-q", "-m", "docs is a tracker"]);
+    git(
+        &fixture.store,
+        &["commit", "-q", "--allow-empty", "-m", "docs is a tracker"],
+    );
     let published = fixture.ok(&fixture.store, &["merge", "main"]);
     assert!(published.contains("new"), "{published}");
     let docs = fixture.remote.repo("jack.store.t.docs");
-    assert!(files_at(&docs, "main").contains("docs/guide.md"));
+    assert!(files_at(&docs, "main").contains("guide.md"));
     let list = fixture.remote.state.lock().expect("state").branches["jack/store"]["main"].clone();
     assert_eq!(list["docs"], git(&docs, &["rev-parse", "main"]));
 }

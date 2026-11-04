@@ -71,7 +71,7 @@ fn setup(temp: &Utf8Path) -> BranchManager {
         .track_paths("env", &[Utf8PathBuf::from(".env.local")])
         .expect("track");
     git(&repo, &["add", "-A"]);
-    git(&repo, &["commit", "-q", "-m", "trackers"]);
+    git(&repo, &["commit", "-q", "--allow-empty", "-m", "trackers"]);
     let manager = BranchManager::open(store).expect("manager");
     // The project root's own commits reach `main` like anyone's.
     let published = manager
@@ -81,7 +81,7 @@ fn setup(temp: &Utf8Path) -> BranchManager {
         published
             .trackers
             .iter()
-            .any(|merge| merge.tracker == "project" && merge.action == TrackerMergeAction::New),
+            .any(|merge| merge.tracker == "access" && merge.action == TrackerMergeAction::New),
         "{:?}",
         published.trackers
     );

@@ -1,12 +1,12 @@
-//! Trackers in Git (docs/design/trackers.md, step 3b): committed content with its
-//! own history, carved out of whichever tracker owned its paths, so composing
-//! still reproduces the project's history exactly.
+//! Trackers in Git: committed content with its own history, at its own root.
+//! Carving is a commit (docs/design/trackers.md, *Carving is a commit*), so
+//! composing still reproduces the project's history exactly.
 
 use std::process::Command;
 
 use camino::{Utf8Path, Utf8PathBuf};
 use newgit_core::SourceSubstrate;
-use newgit_core::compose::{self, TrackerTip};
+use newgit_core::compose;
 use newgit_core::config::WorkspaceSection;
 use newgit_core::manager::BranchManager;
 use newgit_core::store::MetadataStore;
@@ -89,31 +89,38 @@ fn setup(temp: &Utf8Path) -> MetadataStore {
 }
 
 #[test]
-fn init_writes_the_project_tracker_which_carries_newgit() {
+fn init_mounts_access_at_the_definitions_and_root_holds_the_rest_of_newgit() {
     let (_guard, temp) = tempdir();
     let store = setup(&temp);
-    assert!(store.paths().trackers.join("project.toml").is_file());
+    assert!(!store.paths().trackers.join("project.toml").exists());
     let manager = BranchManager::open(store).expect("manager");
-    let project = manager
+    assert!(
+        manager
+            .carved_trackers()
+            .iter()
+            .all(|definition| definition.name != "project"),
+        "`project` folds into root"
+    );
+    let access = manager
         .carved_trackers()
         .iter()
-        .find(|definition| definition.name == "project")
-        .expect("project");
-    assert_eq!(project.paths, vec![Utf8PathBuf::from(".newgit")]);
+        .find(|definition| definition.name == "access")
+        .expect("access");
+    assert_eq!(access.mount, Utf8PathBuf::from(".newgit/trackers"));
     assert!(
         manager
             .root_tracker()
-            .excluded
-            .contains(&Utf8PathBuf::from(".newgit")),
-        "root does not own .newgit"
+            .owns(camino::Utf8Path::new(".newgit/config.toml")),
+        "root owns .newgit"
     );
 }
 
 #[test]
-fn a_carved_git_tracker_composes_back_into_the_project_history() {
+fn carving_is_one_commit_and_the_view_keeps_every_id() {
     let (_guard, temp) = tempdir();
     let store = setup(&temp);
     let repo = store.paths().project_root.clone();
+    let before = git(&repo, &["rev-parse", "HEAD"]);
     let manager = BranchManager::open(store.clone()).expect("manager");
     let outcome = manager
         .create_git_tracker(
@@ -123,59 +130,55 @@ fn a_carved_git_tracker_composes_back_into_the_project_history() {
         )
         .expect("carve");
     assert_eq!(outcome.source, "root");
+    assert_eq!(outcome.commits, 1, "one first commit, holding the files");
+    let head = git(&repo, &["rev-parse", "HEAD"]);
     assert_eq!(
-        outcome.commits, 2,
-        "the two commits that touched apps/electron"
+        git(&repo, &["rev-parse", "HEAD^"]),
+        before,
+        "one commit on top"
+    );
+    assert_eq!(
+        git(&repo, &["log", "-1", "--format=%s"]),
+        "Create tracker `electron` at apps/electron"
     );
 
-    // The tracker's own history: only its files, each commit marked with its source.
+    // The tracker's history starts at the carve, its files at its root.
     let trackers = store.paths().tracker_store.clone();
-    let main = "refs/trackers/electron/main";
+    let electron = "refs/trackers/electron/instances/main";
     assert_eq!(
-        git(&trackers, &["ls-tree", "-r", "--name-only", main]),
-        "apps/electron/main.js"
+        git(&trackers, &["ls-tree", "-r", "--name-only", electron]),
+        "main.js"
     );
-    let trailers = git(
+    assert_eq!(git(&trackers, &["rev-list", "--count", electron]), "1");
+    // Root's commit removes the files and pins it.
+    let root = git(
         &trackers,
-        &[
-            "log",
-            "--format=%(trailers:key=Newgit-Split,valueonly)",
-            main,
-        ],
+        &["rev-parse", "refs/trackers/root/instances/main"],
     );
-    assert_eq!(trailers.lines().filter(|line| !line.is_empty()).count(), 2);
+    let root_files = git(&trackers, &["ls-tree", "-r", "--name-only", &root]);
+    assert!(!root_files.contains("apps/electron"), "{root_files}");
+    assert!(root_files.contains(".newgit/pins/electron"), "{root_files}");
 
-    // Composing root and electron reproduces the project's exact commits.
+    // Composing root alone, anywhere, reproduces the project's commits.
     let manager = BranchManager::open(store.clone()).expect("reopen");
-    let electron = manager
-        .carved_trackers()
-        .iter()
-        .find(|definition| definition.name == "electron")
-        .expect("electron");
     assert!(
         manager
             .root_tracker()
             .excluded
             .contains(&Utf8PathBuf::from("apps/electron"))
     );
-    let head = git(&repo, &["rev-parse", "HEAD"]);
-    let electron_tip = git(&repo, &["rev-parse", "refs/newgit/trackers/electron/main"]);
+    let everything = |_: &str| true;
     let view = compose::compose(
         &repo,
-        "refs/newgit/views/check",
-        &[
-            TrackerTip {
-                definition: manager.root_tracker(),
-                commit: head.clone(),
-            },
-            TrackerTip {
-                definition: electron,
-                commit: electron_tip,
-            },
-        ],
-        &[],
+        "root",
+        &[("refs/newgit/views/check".to_owned(), root)],
+        &compose::ComposeOptions {
+            readable: &everything,
+            admit: None,
+        },
     )
-    .expect("compose");
+    .expect("compose")
+    .remove(0);
     assert_eq!(view.tip.as_deref(), Some(head.as_str()));
 }
 

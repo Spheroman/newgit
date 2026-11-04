@@ -72,7 +72,7 @@ fn setup(temp: &Utf8Path) -> BranchManager {
         .track_paths("env", &[Utf8PathBuf::from(".env.local")])
         .expect("track");
     git(&repo, &["add", "-A"]);
-    git(&repo, &["commit", "-q", "-m", "trackers"]);
+    git(&repo, &["commit", "-q", "--allow-empty", "-m", "trackers"]);
     let manager = BranchManager::open(store).expect("manager");
     // The project root's own commits reach `main` like anyone's.
     let published = manager
@@ -82,7 +82,7 @@ fn setup(temp: &Utf8Path) -> BranchManager {
         published
             .trackers
             .iter()
-            .any(|merge| merge.tracker == "project" && merge.action == TrackerMergeAction::New),
+            .any(|merge| merge.tracker == "access" && merge.action == TrackerMergeAction::New),
         "{:?}",
         published.trackers
     );
@@ -211,11 +211,11 @@ fn a_dropped_tracker_outside_git_is_captured_then_removed_and_comes_back() {
 }
 
 #[test]
-fn root_project_and_access_cannot_be_dropped() {
+fn root_and_access_cannot_be_dropped() {
     let (_guard, temp) = tempdir();
     let manager = setup(&temp);
     spawn(&manager, "feature-a");
-    for tracker in ["root", "project", "access"] {
+    for tracker in ["root", "access"] {
         let refused = manager
             .drop_tracker("feature-a", tracker, Uncommitted::Refuse)
             .expect_err(tracker);

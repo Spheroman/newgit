@@ -161,13 +161,15 @@ fn named_trackers_ship_with_their_history_and_others_stay_out() {
     );
 
     let stdout = succeeds(&fixture.store, &["export", "--remote", "github"]);
-    assert!(stdout.contains("withheld: project"), "{stdout}");
+    assert!(stdout.contains("withheld: access"), "{stdout}");
     let files = files_at(&fixture.mirror, "main");
     assert!(files.contains(&"README.md".to_owned()), "{files:?}");
     assert!(files.contains(&"src/lib.rs".to_owned()), "{files:?}");
     assert!(
-        files.iter().all(|path| !path.starts_with(".newgit")),
-        "`project` was not named, so `.newgit` stays out: {files:?}"
+        files
+            .iter()
+            .all(|path| !path.starts_with(".newgit/trackers")),
+        "`access` was not named, so `.newgit/trackers` stays out: {files:?}"
     );
     let subjects = git(&fixture.mirror, &["log", "--format=%s", "main"]);
     assert_eq!(subjects, "add lib\ninitial", "history, not one commit");
@@ -226,7 +228,7 @@ fn a_tracker_set_that_rewrites_history_needs_force() {
         &fixture,
         "github",
         &format!(
-            "url = \"{}\"\ntrackers = [\"root\", \"project\", \"access\"]\n",
+            "url = \"{}\"\ntrackers = [\"root\", \"access\"]\n",
             fixture.mirror
         ),
     );
@@ -260,7 +262,9 @@ fn a_tracker_set_that_rewrites_history_needs_force() {
     succeeds(&fixture.store, &["export", "--remote", "github", "--force"]);
     let files = files_at(&fixture.mirror, "main");
     assert!(
-        files.iter().all(|path| !path.starts_with(".newgit")),
+        files
+            .iter()
+            .all(|path| !path.starts_with(".newgit/trackers")),
         "{files:?}"
     );
 }
@@ -288,15 +292,23 @@ fn per_target_views_differ() {
     define(
         &fixture,
         "private",
-        &format!("url = \"{private}\"\ntrackers = [\"root\", \"project\"]\n"),
+        &format!("url = \"{private}\"\ntrackers = [\"root\", \"access\"]\n"),
     );
     succeeds(&fixture.store, &["export", "--remote", "public"]);
     succeeds(&fixture.store, &["export", "--remote", "private"]);
 
     let public = files_at(&fixture.mirror, "trunk");
     let private = files_at(&private, "main");
-    assert!(public.iter().all(|path| !path.starts_with(".newgit")));
-    assert!(private.iter().any(|path| path.starts_with(".newgit")));
+    assert!(
+        public
+            .iter()
+            .all(|path| !path.starts_with(".newgit/trackers"))
+    );
+    assert!(
+        private
+            .iter()
+            .any(|path| path.starts_with(".newgit/trackers"))
+    );
 }
 
 #[test]
@@ -482,7 +494,7 @@ fn a_target_shipping_every_tracker_pulls_with_newgit_committed() {
         &fixture,
         "github",
         &format!(
-            "url = \"{}\"\ntrackers = [\"root\", \"project\", \"access\"]\n",
+            "url = \"{}\"\ntrackers = [\"root\", \"access\"]\n",
             fixture.mirror
         ),
     );

@@ -23,7 +23,10 @@ fn spawned_with_tracker_b(fixture: &Fixture) -> Utf8PathBuf {
         &["tracker", "create", "b", "--git", "--path", "apps/b"],
     );
     git(&fixture.store, &["add", "-A"]);
-    git(&fixture.store, &["commit", "-q", "-m", "b is a tracker"]);
+    git(
+        &fixture.store,
+        &["commit", "-q", "--allow-empty", "-m", "b is a tracker"],
+    );
     fixture.ok(&fixture.store, &["merge", "main"]);
     fixture.ok(&fixture.store, &["spawn", "feature-a"]);
     workspace_of(fixture, "feature-a")

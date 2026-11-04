@@ -45,7 +45,7 @@ fn published(temp: &Utf8Path) -> (String, BTreeMap<String, (Utf8PathBuf, String)
     std::fs::create_dir_all(repo.join("apps/payments")).expect("mkdir");
     git(&repo, &["init", "-q", "-b", "main"]);
     std::fs::write(repo.join("README.md"), "hello\n").expect("write");
-    std::fs::write(repo.join("apps/payments/key.txt"), "PAYMENTS-ONLY\n").expect("write");
+    std::fs::write(repo.join("apps/payments/README.md"), "payments\n").expect("write");
     git(&repo, &["add", "-A"]);
     git(&repo, &["commit", "-q", "-m", "initial"]);
     let store = MetadataStore::init(&repo, "proj", SourceSubstrate::Git).expect("init");
@@ -59,12 +59,17 @@ fn published(temp: &Utf8Path) -> (String, BTreeMap<String, (Utf8PathBuf, String)
         .expect("carve");
     git(&repo, &["add", "-A"]);
     git(&repo, &["commit", "-q", "-m", "newgit"]);
+    // Made after the carve: only payments' history has it. (What was
+    // committed before stays in root's history, readable by root's readers.)
+    std::fs::write(repo.join("apps/payments/key.txt"), "PAYMENTS-ONLY\n").expect("write");
+    git(&repo, &["add", "-A"]);
+    git(&repo, &["commit", "-q", "-m", "the key"]);
     let manager = BranchManager::open(store.clone()).expect("reopen");
     manager.sync_project_root().expect("split");
 
     let trackers_git = store.paths().tracker_store.clone();
     let mut out = BTreeMap::new();
-    for tracker in ["root", "project", "access", "payments"] {
+    for tracker in ["root", "access", "payments"] {
         let bare = temp.join(format!("remote/{tracker}.git"));
         git(temp, &["init", "-q", "--bare", "-b", "main", bare.as_str()]);
         let tip = ["instances/main", "main"]
@@ -112,7 +117,6 @@ fn plan(
         dir: dir.to_path_buf(),
         branches: BTreeMap::from([("main".to_owned(), list)]),
         default_branch: "main".to_owned(),
-        definitions: BTreeMap::from([("access".to_owned(), trackers["access"].1.clone())]),
         repos: trackers
             .iter()
             .map(|(tracker, (repo, _))| {
@@ -135,7 +139,7 @@ fn a_reader_of_everything_gets_the_projects_own_commits() {
     let view = compose_view(&plan(
         &temp.join("container"),
         &trackers,
-        &["root", "project", "access", "payments"],
+        &["root", "access", "payments"],
     ))
     .expect("compose");
     assert_eq!(git(&view, &["rev-parse", "main"]), head);
@@ -143,7 +147,7 @@ fn a_reader_of_everything_gets_the_projects_own_commits() {
     let again = compose_view(&plan(
         &temp.join("container"),
         &trackers,
-        &["root", "project", "access", "payments"],
+        &["root", "access", "payments"],
     ))
     .expect("compose again");
     assert_eq!(again, view);
@@ -158,11 +162,11 @@ fn a_tracker_left_out_of_the_plan_leaves_not_one_object_behind() {
     compose_view(&plan(
         &container,
         &trackers,
-        &["root", "project", "access", "payments"],
+        &["root", "access", "payments"],
     ))
     .expect("full view");
-    let view = compose_view(&plan(&container, &trackers, &["root", "project", "access"]))
-        .expect("restricted view");
+    let view =
+        compose_view(&plan(&container, &trackers, &["root", "access"])).expect("restricted view");
 
     let files = git(&view, &["ls-tree", "-r", "--name-only", "main"]);
     assert!(!files.contains("apps/payments"), "{files}");
@@ -202,12 +206,12 @@ fn a_branch_naming_another_trackers_commit_is_not_served() {
     compose_view(&plan(
         &container,
         &trackers,
-        &["root", "project", "access", "payments"],
+        &["root", "access", "payments"],
     ))
     .expect("full view");
 
     // A branch that names payments' commit as `root`'s.
-    let mut forged = plan(&container, &trackers, &["root", "project", "access"]);
+    let mut forged = plan(&container, &trackers, &["root", "access"]);
     let mut leak = forged.branches["main"].clone();
     leak.insert("root".to_owned(), trackers["payments"].1.clone());
     forged.branches.insert("leak".to_owned(), leak);

@@ -77,7 +77,7 @@ fn setup(temp: &Utf8Path) -> BranchManager {
             .expect("carve");
     }
     git(&repo, &["add", "-A"]);
-    git(&repo, &["commit", "-q", "-m", "trackers"]);
+    git(&repo, &["commit", "-q", "--allow-empty", "-m", "trackers"]);
     let manager = BranchManager::open(store).expect("manager");
     let published = manager
         .merge("main", "main")
@@ -86,7 +86,7 @@ fn setup(temp: &Utf8Path) -> BranchManager {
         published
             .trackers
             .iter()
-            .any(|merge| merge.tracker == "project" && merge.action == TrackerMergeAction::New),
+            .any(|merge| merge.tracker == "access" && merge.action == TrackerMergeAction::New),
         "{:?}",
         published.trackers
     );

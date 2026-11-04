@@ -97,7 +97,7 @@ fn setup(temp: &Utf8Path, prepare: &str) -> BranchManager {
         .create_tracker("branch-db", "project-devs", Storage::Local, false)
         .expect("tracker outside Git");
     git(&repo, &["add", "-A"]);
-    git(&repo, &["commit", "-q", "-m", "trackers"]);
+    git(&repo, &["commit", "-q", "--allow-empty", "-m", "trackers"]);
     let manager = BranchManager::open(store).expect("manager");
     manager
         .merge("main", "main")

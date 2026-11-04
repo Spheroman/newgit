@@ -180,7 +180,7 @@ fn setup(temp: &Utf8Path, trackers: &[(&str, &str)]) -> MetadataStore {
             .expect("carve");
     }
     git(&repo, &["add", "-A"]);
-    git(&repo, &["commit", "-q", "-m", "trackers"]);
+    git(&repo, &["commit", "-q", "--allow-empty", "-m", "trackers"]);
     let published = BranchManager::open(store.clone())
         .expect("manager")
         .merge("main", "main")
@@ -189,7 +189,7 @@ fn setup(temp: &Utf8Path, trackers: &[(&str, &str)]) -> MetadataStore {
         published
             .trackers
             .iter()
-            .any(|merge| merge.tracker == "project" && merge.action == TrackerMergeAction::New),
+            .any(|merge| merge.tracker == "access" && merge.action == TrackerMergeAction::New),
         "{:?}",
         published.trackers
     );
@@ -220,7 +220,10 @@ fn undo_leaves_out_what_a_dropped_tracker_owns_though_the_checkpoint_has_it_chan
     // the project's committed files, and a pull brings a teammate's edit.
     let definition = store.paths().trackers.join("b.toml");
     let before = std::fs::read_to_string(&definition).expect("read");
-    let after = before.replace(r#"paths = ["apps/b"]"#, r#"paths = ["apps/b", "lib"]"#);
+    let after = before.replace(
+        "mount = \"apps/b\"\npaths = [\".\"]",
+        "paths = [\n    \"apps/b\",\n    \"lib\",\n]",
+    );
     assert_ne!(before, after, "precondition: {before}");
     std::fs::write(&definition, after).expect("write");
     git(&temp.join("store"), &["commit", "-q", "-am", "b owns lib"]);

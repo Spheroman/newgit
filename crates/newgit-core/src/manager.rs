@@ -1409,18 +1409,8 @@ impl BranchManager {
                 "`{name}` would be mounted at `.`, beside root: carve a directory (`--path apps/{name}`)"
             )));
         }
-        // Inside another tracker's mount, the definition belongs to that
-        // tracker's own `.newgit/trackers/`, which is a commit in it.
-        if let Some(inside) = self
-            .carved
-            .iter()
-            .find(|other| other.mounted() && definition.mount.starts_with(&other.mount))
-        {
-            return Err(NewgitError::Unsupported(format!(
-                "`{}` is inside `{}`'s mount (`{}`): carve it from `{}`'s own root",
-                definition.mount, inside.name, inside.mount, inside.name
-            )));
-        }
+        // Inside another tracker's mount is a deeper mount of root's: the
+        // deepest mount wins, so the outer tracker gives those files up.
         let mut all: Vec<TrackerDefinition> =
             self.trackers.iter().chain(&self.carved).cloned().collect();
         all.push(self.root.clone());
@@ -1474,7 +1464,14 @@ impl BranchManager {
             return Err(error);
         }
         let tip = self.source.rev_parse(&format!("refs/heads/{branch}"))?;
-        self.split_instance(PROJECT_ROOT_INSTANCE, &tip)?;
+        self.prepare_projection()?;
+        let outcome = self.split_view_made(&tip, &BTreeSet::new(), Some(&tip))?;
+        let instance_branch = format!("instances/{PROJECT_ROOT_INSTANCE}");
+        for (tracker, commit) in &outcome.index {
+            self.source
+                .update_ref(&local_tracker_ref(tracker, &instance_branch), commit)?;
+            self.publish_carved_refs(tracker, &[&instance_branch])?;
+        }
         let pinned = self
             .source
             .rev_parse(&local_tracker_ref(
@@ -1619,6 +1616,15 @@ impl BranchManager {
         tip: &str,
         dropped: &BTreeSet<String>,
     ) -> Result<crate::compose::SplitOutcome> {
+        self.split_view_made(tip, dropped, None)
+    }
+
+    fn split_view_made(
+        &self,
+        tip: &str,
+        dropped: &BTreeSet<String>,
+        newgit_made: Option<&str>,
+    ) -> Result<crate::compose::SplitOutcome> {
         let project = self.store.paths().project_root.clone();
         let bound = |tracker: &str| !dropped.contains(tracker);
         let definitions = self.carved_definitions();
@@ -1635,6 +1641,7 @@ impl BranchManager {
                 root: &self.root.name,
                 bound: &bound,
                 audience: &audience,
+                newgit_made,
             },
         )?)
     }
@@ -7997,10 +8004,21 @@ impl BranchManager {
                 )? {
                     Ok(merged) => merged,
                     Err(files) => {
+                        let all = self.all_definitions();
+                        let mut by_tracker: BTreeMap<String, Vec<String>> = BTreeMap::new();
+                        for file in files {
+                            let owner = crate::tracker::owner_of(&all, Utf8Path::new(&file))
+                                .map_or_else(|| self.root.name.clone(), |owner| owner.name.clone());
+                            by_tracker.entry(owner).or_default().push(file);
+                        }
+                        let listed: Vec<String> = by_tracker
+                            .iter()
+                            .map(|(tracker, files)| format!("`{tracker}`: {}", files.join(", ")))
+                            .collect();
                         return Err(NewgitError::Unsupported(format!(
                             "`{instance}` conflicts with `{into}`, so nothing moved — {}. Bring \
                              `{into}` into the instance's workspace, resolve there, and merge again",
-                            files.join(", ")
+                            listed.join("; ")
                         )));
                     }
                 };
@@ -8008,6 +8026,7 @@ impl BranchManager {
             }
         };
         let list = crate::compose::index(&project, &self.root.name, &merged_root)?;
+        let incoming = crate::compose::index(&project, &self.root.name, &theirs)?;
 
         // Each tracker: what happened to it.
         let mut trackers = Vec::new();
@@ -8015,9 +8034,7 @@ impl BranchManager {
             let action = match base.get(tracker) {
                 None => TrackerMergeAction::New,
                 Some(before) if before == commit => TrackerMergeAction::Unchanged,
-                Some(before) if self.source.is_ancestor(before, commit)? => {
-                    TrackerMergeAction::FastForward
-                }
+                Some(_) if incoming.get(tracker) == Some(commit) => TrackerMergeAction::FastForward,
                 Some(_) => TrackerMergeAction::Merged,
             };
             trackers.push(TrackerMerge {
