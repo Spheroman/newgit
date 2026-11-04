@@ -696,4 +696,8 @@ warning, and `depends_on` naming a role. Open issues on Spheroman/newgit:
   places each tracker it touched locally or in the preview; settled in
   [remote.md](remote.md), *Reviewing a change* (#229).
 - **The model itself.** Dropping projects as a structure: every tracker the
-  same kind of thing, rooted at the user (#201).
+  same kind of thing, rooted at the user (#201). Designed in
+  [roots.md](roots.md) (decided 2026-11-04, not built yet): parents pin their
+  children's commits, and the root's history is the view's shape. It
+  replaces composing by date, `Newgit-Split-Parent`, and carving with
+  history, and covers the imported-history issues above (#139–#142).
