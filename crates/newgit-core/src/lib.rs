@@ -14,6 +14,7 @@ pub mod installs;
 pub mod lock;
 pub mod manager;
 pub mod materializer;
+pub mod objects;
 pub mod ports;
 pub mod remote;
 pub mod render;

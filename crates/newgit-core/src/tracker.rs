@@ -13,11 +13,24 @@ pub struct TrackerDefinition {
     pub storage: Storage,
     /// Whether a source merge should carry this tracker binding with it.
     pub merge_with_source: bool,
-    /// Workspace-relative paths this tracker owns, as [`normalize_path`]
-    /// spells them. May be empty for lanes that only receive deposits (e.g.
-    /// `db-snapshots`). `.` means everything no more specific tracker owns —
-    /// the `root` tracker.
+    /// Workspace-relative paths this tracker claims, as [`normalize_path`]
+    /// spells them: its claims (`paths` in the file, relative to its mount)
+    /// joined onto its mount. May be empty for lanes that only receive
+    /// deposits (e.g. `db-snapshots`). `.` means everything no more specific
+    /// tracker owns — the `root` tracker.
     pub paths: Vec<Utf8PathBuf>,
+    /// Where its own root sits in the workspace (`mount`, default `.`). A
+    /// tracker in Git stores its files relative to it, so `apps/t3code/x.ts`
+    /// is `x.ts` in t3code's history.
+    pub mount: Utf8PathBuf,
+    /// The ref `newgit pull <tracker>` brings in (`follow`, default `main`).
+    pub follow: String,
+    /// Its claims as the file writes them, relative to the mount, `!`
+    /// exclusions included: what [`Self::to_file`] writes back.
+    pub claims: Vec<String>,
+    /// Workspace-relative paths its claims exclude (`!node_modules/`): owned
+    /// only by a tracker that claims them at the same mount, or by nothing.
+    pub exclusions: Vec<Utf8PathBuf>,
     /// Whether its content is committed to Git (and split into the tracker's
     /// own history). False unless a definition says otherwise: the content
     /// is then kept out of Git entirely — excluded in every workspace, never
@@ -54,13 +67,19 @@ pub struct TrackerDefinition {
 /// The tracker owning everything no other tracker claims.
 pub const ROOT_TRACKER: &str = "root";
 
-/// The tracker carrying the project's committed definitions, `.newgit/`.
+/// The tracker that carried `.newgit/` before it folded into the root
+/// tracker (docs/design/trackers.md, *Migration*). Only `newgit tracker
+/// migrate` still knows it.
 pub const PROJECT_TRACKER: &str = "project";
 
 /// The tracker carrying `.newgit/trackers/`: which tracker owns which paths
-/// and who may read each. Its own tracker so that only the project's owner
-/// changes it, while anyone who merges may change resources and scripts.
+/// and who may read each. Its own tracker, mounted at `.newgit/trackers`, so
+/// that only the project's owner changes it, while anyone who merges may
+/// change resources and scripts.
 pub const ACCESS_TRACKER: &str = "access";
+
+/// Where `access` is mounted: the definitions.
+pub const DEFINITIONS_DIR: &str = ".newgit/trackers";
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
@@ -77,8 +96,12 @@ pub struct TrackerDefinitionFile {
     storage: Storage,
     #[serde(default)]
     merge_with_source: bool,
+    #[serde(default, skip_serializing_if = "is_default_mount")]
+    mount: Option<Utf8PathBuf>,
+    #[serde(default, skip_serializing_if = "is_default_follow")]
+    follow: Option<String>,
     #[serde(default)]
-    paths: Vec<Utf8PathBuf>,
+    paths: Vec<String>,
     #[serde(default, skip_serializing_if = "is_false")]
     git: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -101,6 +124,46 @@ fn is_false(value: &bool) -> bool {
     !*value
 }
 
+fn is_default_mount(mount: &Option<Utf8PathBuf>) -> bool {
+    mount
+        .as_ref()
+        .is_none_or(|mount| normalize_path(mount).as_str() == ".")
+}
+
+fn is_default_follow(follow: &Option<String>) -> bool {
+    follow.as_deref().is_none_or(|follow| follow == "main")
+}
+
+/// Claims as written (`apps/web`, `!dist/`) laid onto `mount`: the paths
+/// claimed, and the paths excluded, both workspace-relative.
+fn place_claims(mount: &Utf8Path, claims: &[String]) -> (Vec<Utf8PathBuf>, Vec<Utf8PathBuf>) {
+    let mut paths = Vec::new();
+    let mut exclusions = Vec::new();
+    for claim in claims {
+        let (excluded, claim) = match claim.strip_prefix('!') {
+            Some(rest) => (true, rest),
+            None => (false, claim.as_str()),
+        };
+        let relative = normalize_path(Utf8Path::new(claim.trim_end_matches('/')));
+        let placed = if mount.as_str() == "." {
+            relative
+        } else if relative.as_str() == "." {
+            mount.to_path_buf()
+        } else if relative.is_absolute() || relative.components().any(|c| c.as_str() == "..") {
+            // Left as written, for validation to refuse.
+            relative
+        } else {
+            mount.join(relative)
+        };
+        if excluded {
+            exclusions.push(placed);
+        } else {
+            paths.push(placed);
+        }
+    }
+    (paths, exclusions)
+}
+
 impl TrackerDefinition {
     pub fn new(
         name: &str,
@@ -109,12 +172,17 @@ impl TrackerDefinition {
         merge_with_source: bool,
         paths: Vec<Utf8PathBuf>,
     ) -> Result<Self> {
+        let paths: Vec<Utf8PathBuf> = paths.iter().map(|path| normalize_path(path)).collect();
         let mut definition = Self {
             name: name.to_owned(),
             audience,
             storage,
             merge_with_source,
-            paths: paths.iter().map(|path| normalize_path(path)).collect(),
+            claims: paths.iter().map(ToString::to_string).collect(),
+            paths,
+            mount: Utf8PathBuf::from("."),
+            follow: "main".to_owned(),
+            exclusions: Vec::new(),
             git: false,
             maintainers: None,
             role: None,
@@ -129,17 +197,23 @@ impl TrackerDefinition {
         Ok(definition)
     }
 
-    /// A tracker in Git as `newgit tracker create --git` writes it: committed,
+    /// A tracker in Git as `newgit tracker create --git --path <mount>`
+    /// writes it: mounted at `mount`, claiming everything under it, committed,
     /// merged with the work that changes it. Checked as one from the start,
     /// since a tracker in Git may own what one outside Git may not: another
     /// tracker's definition.
-    pub fn in_git(name: &str, audience: String, paths: &[Utf8PathBuf]) -> Result<Self> {
+    pub fn in_git(name: &str, audience: String, mount: &Utf8Path) -> Result<Self> {
+        let mount = normalize_path(mount);
         let mut definition = Self {
             name: name.to_owned(),
             audience,
             storage: Storage::Local,
             merge_with_source: true,
-            paths: paths.iter().map(|path| normalize_path(path)).collect(),
+            paths: vec![mount.clone()],
+            mount,
+            follow: "main".to_owned(),
+            claims: vec![".".to_owned()],
+            exclusions: Vec::new(),
             git: true,
             maintainers: None,
             role: None,
@@ -157,8 +231,13 @@ impl TrackerDefinition {
     pub fn from_file(name: &str, path: &Utf8Path) -> Result<Self> {
         let contents =
             std::fs::read_to_string(path).map_err(|source| NewgitError::io(path, source))?;
+        Self::from_text(name, path, &contents)
+    }
+
+    /// A definition from its file's text; `path` names it in errors.
+    pub fn from_text(name: &str, path: &Utf8Path, contents: &str) -> Result<Self> {
         let file: TrackerDefinitionFile =
-            toml::from_str(&contents).map_err(|source| NewgitError::TomlRead {
+            toml::from_str(contents).map_err(|source| NewgitError::TomlRead {
                 path: path.to_path_buf(),
                 source,
             })?;
@@ -169,12 +248,21 @@ impl TrackerDefinition {
             .map(|byte| format!("{byte:02x}"))
             .collect();
 
+        let mount = file
+            .mount
+            .as_deref()
+            .map_or_else(|| Utf8PathBuf::from("."), normalize_path);
+        let (paths, exclusions) = place_claims(&mount, &file.paths);
         let definition = Self {
             name: name.to_owned(),
             audience: file.audience,
             storage: file.storage,
             merge_with_source: file.merge_with_source,
-            paths: file.paths.iter().map(|path| normalize_path(path)).collect(),
+            paths,
+            mount,
+            follow: file.follow.unwrap_or_else(|| "main".to_owned()),
+            claims: file.paths,
+            exclusions,
             git: file.git,
             maintainers: file.maintainers,
             role: file.role,
@@ -212,17 +300,25 @@ impl TrackerDefinition {
                 "`.` owns everything not claimed elsewhere, so it must be the only path".to_owned(),
             ));
         }
-        // `.newgit` holds the project's own definitions: `project` carries
-        // them, and `access` the tracker definitions among them. Anyone else
-        // claiming part of it would split the definitions across trackers.
+        // `.newgit` holds the project's own definitions: the root tracker
+        // carries them, and `access` the tracker definitions among them.
+        // Anyone else claiming part of it would split the definitions across
+        // trackers. (`project` is only ever read, by the migration.)
         let is_project = (self.name == PROJECT_TRACKER
             && self.paths == [Utf8PathBuf::from(".newgit")])
-            || (self.name == ACCESS_TRACKER
-                && self.paths == [Utf8PathBuf::from(".newgit/trackers")]);
+            || (self.name == ACCESS_TRACKER && self.paths == [Utf8PathBuf::from(DEFINITIONS_DIR)]);
+        if self.follow.is_empty() || self.follow.starts_with('-') || self.follow.contains("..") {
+            return Err(self.invalid(format!("follow `{}` is not a ref name", self.follow)));
+        }
 
         // Every path here is already normalized, so `./.git` meets the
         // checks as `.git`.
-        for path in &self.paths {
+        for path in self
+            .paths
+            .iter()
+            .chain(&self.exclusions)
+            .chain(std::iter::once(&self.mount).filter(|mount| mount.as_str() != "."))
+        {
             if path.as_str() == "." || is_project {
                 continue;
             }
@@ -267,10 +363,12 @@ impl TrackerDefinition {
         for path in paths {
             let path = normalize_path(path);
             if !updated.paths.contains(&path) {
-                updated.paths.push(path);
+                updated.paths.push(path.clone());
+                updated.claims.push(path.to_string());
             }
         }
         updated.paths.sort();
+        updated.claims.sort();
         updated.validate()?;
         updated.definition_rev = updated.compute_definition_rev()?;
         Ok(updated)
@@ -281,7 +379,9 @@ impl TrackerDefinition {
             audience: self.audience.clone(),
             storage: self.storage,
             merge_with_source: self.merge_with_source,
-            paths: self.paths.clone(),
+            mount: (self.mount.as_str() != ".").then(|| self.mount.clone()),
+            follow: (self.follow != "main").then(|| self.follow.clone()),
+            paths: self.claims.clone(),
             git: self.git,
             maintainers: self.maintainers.clone(),
             role: self.role.clone(),
@@ -301,6 +401,10 @@ impl TrackerDefinition {
             storage: Storage::Local,
             merge_with_source: true,
             paths: vec![Utf8PathBuf::from(".")],
+            mount: Utf8PathBuf::from("."),
+            follow: "main".to_owned(),
+            claims: vec![".".to_owned()],
+            exclusions: Vec::new(),
             git: true,
             maintainers: None,
             role: None,
@@ -316,16 +420,21 @@ impl TrackerDefinition {
         definition
     }
 
-    /// The access tracker as `newgit init` writes it: `.newgit/trackers/`,
-    /// every tracker's paths and audience. Carved out of `project` so the
-    /// remote can make changing it the owner's alone.
+    /// The access tracker as `newgit init` writes it: mounted at
+    /// `.newgit/trackers/`, every tracker's paths and audience, at its own
+    /// root. Its own tracker so the remote can make changing it the owner's
+    /// alone.
     pub fn access() -> Self {
         let mut definition = Self {
             name: ACCESS_TRACKER.to_owned(),
             audience: "project-devs".to_owned(),
             storage: Storage::Local,
             merge_with_source: true,
-            paths: vec![Utf8PathBuf::from(".newgit/trackers")],
+            paths: vec![Utf8PathBuf::from(DEFINITIONS_DIR)],
+            mount: Utf8PathBuf::from(DEFINITIONS_DIR),
+            follow: "main".to_owned(),
+            claims: vec![".".to_owned()],
+            exclusions: Vec::new(),
             git: true,
             maintainers: Some("owner".to_owned()),
             role: None,
@@ -341,31 +450,6 @@ impl TrackerDefinition {
         definition
     }
 
-    /// The project tracker as `newgit init` writes it: the committed parts of
-    /// `.newgit/` (its local state is gitignored, so never committed), read
-    /// by the project's developers, merged with the work that changes it.
-    pub fn project() -> Self {
-        let mut definition = Self {
-            name: PROJECT_TRACKER.to_owned(),
-            audience: "project-devs".to_owned(),
-            storage: Storage::Local,
-            merge_with_source: true,
-            paths: vec![Utf8PathBuf::from(".newgit")],
-            git: true,
-            maintainers: None,
-            role: None,
-            priority: 0,
-            requires: Vec::new(),
-            resources: Vec::new(),
-            excluded: Vec::new(),
-            definition_rev: String::new(),
-        };
-        definition.definition_rev = definition
-            .compute_definition_rev()
-            .expect("the project definition serializes");
-        definition
-    }
-
     /// Committed content with its own history, composed into workspaces
     /// rather than captured from files — every tracker in Git but root.
     pub fn carved(&self) -> bool {
@@ -377,14 +461,24 @@ impl TrackerDefinition {
         self.paths.iter().any(|path| path.as_str() == ".")
     }
 
-    /// Whether `relative` is this tracker's: under one of its paths and not
-    /// under a more specific tracker's.
+    /// Whether `relative` is this tracker's: under one of its paths, not
+    /// under one of its exclusions, and not under a more specific tracker's.
     pub fn owns(&self, relative: &Utf8Path) -> bool {
         let claimed = self
             .paths
             .iter()
             .any(|path| path.as_str() == "." || relative.starts_with(path));
-        claimed && !self.excluded.iter().any(|path| relative.starts_with(path))
+        claimed
+            && !self
+                .exclusions
+                .iter()
+                .any(|path| relative.starts_with(path))
+            && !self.excluded.iter().any(|path| relative.starts_with(path))
+    }
+
+    /// Mounted somewhere other than the workspace's root.
+    pub fn mounted(&self) -> bool {
+        self.mount.as_str() != "."
     }
 
     fn compute_definition_rev(&self) -> Result<String> {
@@ -443,6 +537,69 @@ fn is_definition_file(path: &Utf8Path) -> bool {
         && components.next().is_none()
 }
 
+/// Whether `mount` holds `path`: `.` holds everything.
+fn mount_holds(mount: &Utf8Path, path: &Utf8Path) -> bool {
+    mount.as_str() == "." || path.starts_with(mount)
+}
+
+fn mount_depth(mount: &Utf8Path) -> usize {
+    if mount.as_str() == "." {
+        0
+    } else {
+        mount.components().count()
+    }
+}
+
+impl TrackerDefinition {
+    /// How specifically this tracker's own claims take `path`: the length of
+    /// its longest claim covering it, or `None` when none does or one of its
+    /// exclusions takes it out.
+    pub fn claim_on(&self, path: &Utf8Path) -> Option<usize> {
+        if self
+            .exclusions
+            .iter()
+            .any(|excluded| path.starts_with(excluded))
+        {
+            return None;
+        }
+        self.paths
+            .iter()
+            .filter(|claim| claim.as_str() == "." || path.starts_with(claim))
+            .map(|claim| {
+                if claim.as_str() == "." {
+                    0
+                } else {
+                    claim.as_str().len()
+                }
+            })
+            .max()
+    }
+}
+
+/// The owner of `path` among `definitions`, by the ownership rules
+/// (docs/design/trackers.md, *Ownership*): the deepest mount holding the path
+/// decides, a parent's claim of `.` not reaching into it; among the trackers
+/// mounted there, the longest claim wins; a path every claim there excludes
+/// is owned by nothing.
+pub fn owner_of<'a>(
+    definitions: &'a [TrackerDefinition],
+    path: &Utf8Path,
+) -> Option<&'a TrackerDefinition> {
+    let deepest = definitions
+        .iter()
+        .filter(|definition| mount_holds(&definition.mount, path))
+        .map(|definition| mount_depth(&definition.mount))
+        .max()?;
+    definitions
+        .iter()
+        .filter(|definition| {
+            mount_holds(&definition.mount, path) && mount_depth(&definition.mount) == deepest
+        })
+        .filter_map(|definition| definition.claim_on(path).map(|claim| (claim, definition)))
+        .max_by(|(left, a), (right, b)| left.cmp(right).then_with(|| b.name.cmp(&a.name)))
+        .map(|(_, definition)| definition)
+}
+
 /// Settle who owns what across every tracker. A path's owner is its most
 /// specific claimant, so trackers may nest — `apps` can hold `apps/electron`
 /// for another tracker — but no two may claim the identical path, and only
@@ -488,17 +645,39 @@ pub fn resolve_ownership(definitions: &mut [TrackerDefinition]) -> Result<()> {
                 .map(|path| (definition.name.clone(), path.clone()))
         })
         .collect();
+    // A tracker mounted deeper takes its whole mount, whatever it claims
+    // there: a parent's claim does not reach into a mount.
+    let mounts: Vec<(String, Utf8PathBuf)> = definitions
+        .iter()
+        .filter(|definition| definition.mounted())
+        .map(|definition| (definition.name.clone(), definition.mount.clone()))
+        .collect();
     for definition in definitions.iter_mut() {
+        let own_depth = mount_depth(&definition.mount);
+        let inside = |inner: &Utf8Path, outer: &Utf8PathBuf| {
+            outer.as_str() == "." || (inner != outer && inner.starts_with(outer))
+        };
         definition.excluded = claims
             .iter()
             .filter(|(name, inner)| {
                 name != &definition.name
                     && inner.as_str() != "."
-                    && definition.paths.iter().any(|outer| {
-                        outer.as_str() == "." || (inner != outer && inner.starts_with(outer))
-                    })
+                    && definition.paths.iter().any(|outer| inside(inner, outer))
             })
             .map(|(_, inner)| inner.clone())
+            .chain(
+                mounts
+                    .iter()
+                    .filter(|(name, mount)| {
+                        name != &definition.name
+                            && mount_depth(mount) > own_depth
+                            && definition
+                                .paths
+                                .iter()
+                                .any(|outer| outer.as_str() == "." || mount.starts_with(outer))
+                    })
+                    .map(|(_, mount)| mount.clone()),
+            )
             .collect();
         definition.excluded.sort();
         definition.excluded.dedup();
@@ -714,6 +893,10 @@ mod tests {
             storage: Storage::Local,
             merge_with_source: false,
             paths: paths.iter().map(Utf8PathBuf::from).collect(),
+            mount: Utf8PathBuf::from("."),
+            follow: "main".to_owned(),
+            claims: paths.iter().map(|path| (*path).to_owned()).collect(),
+            exclusions: Vec::new(),
             git: false,
             maintainers: None,
             role: None,
@@ -761,10 +944,12 @@ mod tests {
     }
 
     #[test]
-    fn git_trackers_and_the_project_tracker_are_committed() {
-        assert!(TrackerDefinition::project().carved());
+    fn access_is_mounted_at_the_definitions_and_root_owns_the_rest() {
+        let access = TrackerDefinition::access();
+        assert!(access.carved() && access.mounted());
+        assert_eq!(access.paths, vec![Utf8PathBuf::from(".newgit/trackers")]);
         assert!(!TrackerDefinition::root().carved() && TrackerDefinition::root().git);
-        // Only the project tracker may own `.newgit`.
+        // Nobody else may own `.newgit`: the root tracker holds it.
         let error = TrackerDefinition::new(
             "sneaky",
             "project-devs".to_owned(),
@@ -772,8 +957,43 @@ mod tests {
             false,
             vec![Utf8PathBuf::from(".newgit")],
         )
-        .expect_err("`.newgit` is the project tracker's");
+        .expect_err("`.newgit` is the root tracker's");
         assert!(error.to_string().contains("may not reach into"), "{error}");
+    }
+
+    #[test]
+    fn claims_are_relative_to_the_mount_and_can_exclude() {
+        let path = Utf8Path::new(".newgit/trackers/t3code.toml");
+        let definition = TrackerDefinition::from_text(
+            "t3code",
+            path,
+            "audience = \"public\"\nstorage = \"remote\"\ngit = true\nmount = \"apps/t3code\"\nfollow = \"newgit\"\npaths = [\".\", \"!node_modules/\"]\n",
+        )
+        .expect("a mounted definition");
+        assert_eq!(definition.mount, Utf8PathBuf::from("apps/t3code"));
+        assert_eq!(definition.follow, "newgit");
+        assert_eq!(definition.paths, vec![Utf8PathBuf::from("apps/t3code")]);
+        assert_eq!(
+            definition.exclusions,
+            vec![Utf8PathBuf::from("apps/t3code/node_modules")]
+        );
+        assert!(definition.owns(Utf8Path::new("apps/t3code/src/x.ts")));
+        assert!(!definition.owns(Utf8Path::new("apps/t3code/node_modules/react/index.js")));
+        // What it writes back is what it read.
+        let text = toml::to_string_pretty(&definition.to_file()).expect("serializes");
+        assert!(text.contains("mount = \"apps/t3code\""), "{text}");
+        assert!(text.contains("\"!node_modules/\""), "{text}");
+
+        let outside = TrackerDefinition::from_text(
+            "env",
+            path,
+            "audience = \"user\"\nstorage = \"local\"\nmount = \"apps\"\npaths = [\".env\"]\n",
+        )
+        .expect_err("only a tracker in Git is mounted");
+        assert!(
+            outside.to_string().contains("only a tracker in Git"),
+            "{outside}"
+        );
     }
 
     #[test]

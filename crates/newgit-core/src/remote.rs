@@ -201,14 +201,18 @@ pub trait Remote {
     /// Create the repo of a tracker in Git carved after the project was, and
     /// the one write that seeds it.
     fn create_tracker_repo(&self, project: &str, tracker: &str) -> Result<SeedCredential>;
-    /// Start merging into `branch`, whose list must still be `base`: write
-    /// passwords for the trackers that move.
+    /// Start merging into `branch`, whose index must still be `base`:
+    /// `trackers` are the ones whose pin moves (root always), and `off_main`
+    /// those among them whose pin moves to a commit not on that tracker's
+    /// `main` — the remote refuses a merger who does not maintain one, and
+    /// hands write passwords for root and for each of them.
     fn begin_merge(
         &self,
         project: &str,
         branch: &str,
         base: &std::collections::BTreeMap<String, String>,
         trackers: &[String],
+        off_main: &[String],
     ) -> Result<Vec<SeedCredential>>;
     /// Finish it: `branch`'s list moves from `base` to `list` in one write.
     fn finish_merge(
@@ -470,6 +474,7 @@ impl Remote for HttpRemote {
         branch: &str,
         base: &std::collections::BTreeMap<String, String>,
         trackers: &[String],
+        off_main: &[String],
     ) -> Result<Vec<SeedCredential>> {
         #[derive(Deserialize)]
         struct Started {
@@ -482,7 +487,7 @@ impl Remote for HttpRemote {
                 project_path(project),
                 segment(branch)
             ),
-            Some(serde_json::json!({ "base": base, "trackers": trackers })),
+            Some(serde_json::json!({ "base": base, "trackers": trackers, "off_main": off_main })),
         )?;
         Ok(started.credentials)
     }

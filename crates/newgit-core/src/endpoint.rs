@@ -1,9 +1,12 @@
 //! The Git endpoint's work inside its container (docs/design/trackers.md, *The Git
 //! endpoint*). The Worker decides who may read what and hands the container a
-//! plan: each branch's list, cut down to the trackers this reader may read,
-//! and where to fetch every tracker. This composes those lists into a bare
-//! repository holding exactly that — nothing a tracker the reader may not read
-//! put there — for `git upload-pack` to serve.
+//! plan: each branch's index (root's commit and every pin), cut down to the
+//! trackers this reader may read, and where to fetch every tracker. This
+//! composes each branch from its root commit, expanding only those trackers,
+//! into a bare repository holding exactly that — nothing a tracker the reader
+//! may not read put there — for `git upload-pack` to serve. A pin is
+//! expanded only if its commit is in that tracker's own repo: a parent
+//! cannot pin another tracker's commit under a name its reader may read.
 //!
 //! Views are cached by plan: the same lists compose to the same repository,
 //! so a second fetch of an unchanged branch serves at once.
@@ -14,24 +17,23 @@ use camino::{Utf8Path, Utf8PathBuf};
 use serde::Deserialize;
 use sha2::{Digest as _, Sha256};
 
-use crate::compose::{self, TrackerTip};
+use crate::compose;
 use crate::error::{NewgitError, Result};
 use crate::source::{GitSource, run_git_env};
-use crate::tracker::{ACCESS_TRACKER, PROJECT_TRACKER, TrackerDefinition, resolve_ownership};
+use crate::tracker::ROOT_TRACKER;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Plan {
     /// Where the container keeps its repositories.
     pub dir: Utf8PathBuf,
-    /// Branch → tracker → commit: only the trackers this reader may read.
+    /// Branch → tracker → commit: each branch's index, only the trackers
+    /// this reader may read, root among them.
     pub branches: BTreeMap<String, BTreeMap<String, String>>,
     pub default_branch: String,
-    /// The trackers holding definitions — `access`, and any tracker owning a
-    /// file in `.newgit/trackers/` — at the default branch's commits. Always
-    /// fetched — the server reads them even when the reader may not — and
-    /// never served unless listed above.
-    pub definitions: BTreeMap<String, String>,
-    /// Tracker → where to fetch it.
+    /// Tracker → where to fetch it: every tracker listed above, and `access`
+    /// always — where each pin is mounted is in its content, which the
+    /// server reads even when the reader may not, and never serves unless
+    /// listed above.
     pub repos: BTreeMap<String, Source>,
 }
 
@@ -62,13 +64,14 @@ pub fn compose_view(plan: &Plan) -> Result<Utf8PathBuf> {
             wanted.entry(tracker).or_default().push(commit);
         }
     }
-    for (tracker, commit) in &plan.definitions {
-        wanted.entry(tracker).or_default().push(commit);
+    for tracker in plan.repos.keys() {
+        wanted.entry(tracker).or_default();
     }
     for (tracker, commits) in &wanted {
-        if commits
-            .iter()
-            .all(|commit| in_tracker(&store, tracker, commit))
+        if !commits.is_empty()
+            && commits
+                .iter()
+                .all(|commit| in_tracker(&store, tracker, commit))
         {
             continue;
         }
@@ -82,18 +85,6 @@ pub fn compose_view(plan: &Plan) -> Result<Utf8PathBuf> {
             Some(&source.auth),
         )?;
     }
-    if !plan.definitions.contains_key(ACCESS_TRACKER) {
-        return Err(NewgitError::Unsupported(
-            "the plan names no `access` commit to read definitions from".to_owned(),
-        ));
-    }
-    for (tracker, commit) in &plan.definitions {
-        if !in_tracker(&store, tracker, commit) {
-            return Err(NewgitError::Unsupported(format!(
-                "the definitions commit {commit} is not in `{tracker}`'s history"
-            )));
-        }
-    }
     // A branch naming a commit its tracker does not have is left out —
     // logged, not served, and not allowed to take the others down with it.
     let mut plan = plan.clone();
@@ -106,7 +97,7 @@ pub fn compose_view(plan: &Plan) -> Result<Utf8PathBuf> {
         if !bad.is_empty() {
             eprintln!("newgit: branch `{branch}` names commits its trackers do not have: {bad:?}");
         }
-        bad.is_empty()
+        bad.is_empty() && list.contains_key(ROOT_TRACKER)
     });
     if !plan.branches.contains_key(&plan.default_branch) {
         return Err(NewgitError::Unsupported(format!(
@@ -122,29 +113,41 @@ pub fn compose_view(plan: &Plan) -> Result<Utf8PathBuf> {
         return Ok(view);
     }
 
-    let definitions = definitions_at(&store, &plan.definitions, &plan.dir)?;
-    let code: Vec<&TrackerDefinition> = definitions
-        .iter()
-        .filter(|definition| definition.git)
-        .collect();
+    // Each tracker's own history, once: what a pin may name.
+    let mut histories: BTreeMap<String, std::collections::HashSet<String>> = BTreeMap::new();
+    for tracker in plan.repos.keys() {
+        let commits = run_git_env(
+            &[
+                &format!("--git-dir={store}"),
+                "rev-list",
+                &format!("--glob=refs/trackers/{tracker}/*"),
+            ],
+            &[],
+        )
+        .unwrap_or_default();
+        histories.insert(
+            tracker.clone(),
+            commits.lines().map(ToOwned::to_owned).collect(),
+        );
+    }
     for (branch, list) in &plan.branches {
-        let tips: Vec<TrackerTip<'_>> = code
-            .iter()
-            .filter_map(|definition| {
-                list.get(&definition.name).map(|commit| TrackerTip {
-                    definition,
-                    commit: commit.clone(),
-                })
-            })
-            .collect();
-        if tips.is_empty() {
-            continue;
-        }
+        let readable = |tracker: &str| list.contains_key(tracker);
+        let admit = |tracker: &str, commit: &str| {
+            histories
+                .get(tracker)
+                .is_some_and(|history| history.contains(commit))
+        };
         compose::compose(
             &store,
-            &format!("refs/views/{key}/heads/{branch}"),
-            &tips,
-            &definitions,
+            ROOT_TRACKER,
+            &[(
+                format!("refs/views/{key}/heads/{branch}"),
+                list[ROOT_TRACKER].clone(),
+            )],
+            &compose::ComposeOptions {
+                readable: &readable,
+                admit: Some(&admit),
+            },
         )?;
     }
 
@@ -302,9 +305,6 @@ fn in_tracker(store: &Utf8Path, tracker: &str, commit: &str) -> bool {
 fn plan_key(plan: &Plan) -> String {
     let mut hasher = Sha256::new();
     hasher.update(plan.default_branch.as_bytes());
-    for (tracker, commit) in &plan.definitions {
-        hasher.update(format!("{tracker}={commit};").as_bytes());
-    }
     for (branch, list) in &plan.branches {
         hasher.update(format!("\n{branch}").as_bytes());
         for (tracker, commit) in list {
@@ -317,79 +317,4 @@ fn plan_key(plan: &Plan) -> String {
         .take(16)
         .map(|byte| format!("{byte:02x}"))
         .collect()
-}
-
-/// The tracker definitions, read from the trackers that hold them: `access`'s
-/// `.newgit/trackers/` first, then each tracker owning files in it on top —
-/// the layering the remote enforces. `root`, `project`, and `access` are
-/// there whether or not they have files.
-fn definitions_at(
-    store: &Utf8Path,
-    holders: &BTreeMap<String, String>,
-    scratch: &Utf8Path,
-) -> Result<Vec<TrackerDefinition>> {
-    let key: String = holders
-        .values()
-        .map(|commit| &commit[..commit.len().min(12)])
-        .collect::<Vec<_>>()
-        .join("-");
-    let dir = scratch.join(format!("definitions-{key}"));
-    std::fs::create_dir_all(&dir).map_err(|source| NewgitError::io(&dir, source))?;
-    let order = holders
-        .iter()
-        .filter(|(tracker, _)| tracker.as_str() == ACCESS_TRACKER)
-        .chain(
-            holders
-                .iter()
-                .filter(|(tracker, _)| tracker.as_str() != ACCESS_TRACKER),
-        );
-    let mut files: BTreeMap<String, String> = BTreeMap::new();
-    for (_, commit) in order {
-        let listing = run_git_env(
-            &[
-                &format!("--git-dir={store}"),
-                "ls-tree",
-                "--name-only",
-                &format!("{commit}:.newgit/trackers"),
-            ],
-            &[],
-        )
-        .unwrap_or_default();
-        for file in listing.lines().filter(|file| file.ends_with(".toml")) {
-            let text = run_git_env(
-                &[
-                    &format!("--git-dir={store}"),
-                    "show",
-                    &format!("{commit}:.newgit/trackers/{file}"),
-                ],
-                &[],
-            )?;
-            files.insert(file.to_owned(), text);
-        }
-    }
-    let mut definitions = Vec::new();
-    for (file, text) in &files {
-        let path = dir.join(file);
-        std::fs::write(&path, format!("{text}\n"))
-            .map_err(|source| NewgitError::io(&path, source))?;
-        let name = file.trim_end_matches(".toml");
-        definitions.push(TrackerDefinition::from_file(name, &path)?);
-    }
-    if !definitions.iter().any(TrackerDefinition::owns_everything) {
-        definitions.push(TrackerDefinition::root());
-    }
-    if !definitions
-        .iter()
-        .any(|definition| definition.name == PROJECT_TRACKER)
-    {
-        definitions.push(TrackerDefinition::project());
-    }
-    if !definitions
-        .iter()
-        .any(|definition| definition.name == ACCESS_TRACKER)
-    {
-        definitions.push(TrackerDefinition::access());
-    }
-    resolve_ownership(&mut definitions)?;
-    Ok(definitions)
 }

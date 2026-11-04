@@ -267,6 +267,16 @@ enum Command {
         #[arg(long, default_value = "main")]
         into: String,
     },
+    /// Move a mounted tracker's pin to its `follow` ref (default `main`): one
+    /// commit, `Pull <tracker>: N commits from <ref>`, that brings its new
+    /// history in as a merge. Nothing else moves a pin on anyone's behalf
+    Pull {
+        /// The mounted tracker in Git to bring up to date
+        tracker: String,
+        /// Instance (inferred when run inside a workspace; the project root
+        /// otherwise)
+        instance: Option<String>,
+    },
     /// Clone a project from a newgit remote: its default branch composed from
     /// the trackers in Git you may read, set up for newgit
     Clone {
@@ -400,12 +410,16 @@ enum TrackerCommand {
         #[arg(long)]
         discard: bool,
     },
-    /// Rewrite the commits of trackers in Git split before newgit kept each original's
-    /// message ending and signature, so clones from the remote get the
-    /// project's own commit ids. Moves every branch of a tracker in Git, and on the
-    /// remote each branch's list (a force push of tracker history)
-    Repair {
-        /// Say what would move, and move nothing
+    /// Move a project laid out before mounts — a `project` tracker holding
+    /// `.newgit/`, `access` unmounted, histories carved by date — onto roots
+    /// and mounts: `project` and `access` fold into root, whose history
+    /// becomes the view's history commit for commit, and `access` is carved
+    /// again at the tip of `main`, mounted at `.newgit/trackers`. Every
+    /// branch and checkpoint is recomposed in a fresh repository first, and
+    /// nothing moves unless each comes out with the same id
+    Migrate {
+        /// Do everything but move anything: say what would move, and run the
+        /// check
         #[arg(long)]
         dry_run: bool,
     },
@@ -621,6 +635,7 @@ fn main() -> Result<()> {
         Command::Remote { command } => remote_cmd::remote_command(command),
         Command::Clone { project, dir, url } => remote_cmd::clone(&project, dir, url),
         Command::Merge { instance, into } => merge(instance, &into),
+        Command::Pull { tracker, instance } => pull(instance, &tracker),
         Command::EndpointCompose => {
             let plan: newgit_core::endpoint::Plan = serde_json::from_reader(std::io::stdin())
                 .context("the plan on stdin is not JSON newgit can read")?;
@@ -1235,6 +1250,9 @@ fn spawn(args: SpawnArgs) -> Result<()> {
                 "endpoint": outcome.branch.remote.as_ref().map(|remote| &remote.endpoint),
                 "remote_warning": outcome.remote_warning,
                 "projection_warning": outcome.projection_warning,
+                "behind": outcome.behind.iter().map(|(tracker, count, follow)| serde_json::json!({
+                    "tracker": tracker, "commits": count, "follow": follow,
+                })).collect::<Vec<_>>(),
                 "template_warning": outcome.template_warning,
                 "resources": resources,
                 "started": stop_start_resources_json(&outcome.started),
@@ -1288,6 +1306,12 @@ fn spawn(args: SpawnArgs) -> Result<()> {
     println!("  record:    {}", outcome.record_path);
     if let Some(warning) = &outcome.projection_warning {
         println!("  trackers:  the project root's commits were not split ({warning})");
+    }
+    for (tracker, count, follow) in &outcome.behind {
+        println!(
+            "  behind:    `{tracker}` is {count} commit{} behind its `{follow}`: `newgit pull {tracker}`",
+            if *count == 1 { "" } else { "s" }
+        );
     }
     // The workspace's `origin` is the store, a local path. An agent reaching
     // for `git push` should know before it does where that push will go.
@@ -2225,62 +2249,12 @@ fn tracker(command: TrackerCommand) -> Result<()> {
             println!("  merge with: newgit tracker merge {tracker}");
             Ok(())
         }
-        TrackerCommand::Repair { dry_run } => {
+        TrackerCommand::Migrate { dry_run } => {
             let context = context_here()?;
             let manager = BranchManager::open(context.store)?;
-            let outcome = manager.repair_splits(dry_run)?;
-            if outcome.rewritten == 0 {
-                println!("Nothing to repair: every split commit recomposes as its original");
-                return Ok(());
-            }
-            let verb = if outcome.dry_run {
-                "Would rewrite"
-            } else {
-                "Rewrote"
-            };
-            println!(
-                "{verb} {} tracker commit{}",
-                outcome.rewritten,
-                if outcome.rewritten == 1 { "" } else { "s" }
-            );
-            for (tracker, branch) in &outcome.branches {
-                println!("  {tracker}/{branch}");
-            }
-            if outcome.unsigned > 0 {
-                println!(
-                    "  {} of them {} signed and {} not: a tracker commit's signature covers the \
-                     commit it rewrites (the commits they compose into keep theirs)",
-                    outcome.unsigned,
-                    if outcome.unsigned == 1 { "was" } else { "were" },
-                    if outcome.dry_run { "would be" } else { "is" },
-                );
-            }
-            if let Some(project) = &outcome.remote {
-                if outcome.remote_branches.is_empty() {
-                    println!("On {project}: no branch lists move");
-                } else {
-                    let moving = if outcome.dry_run {
-                        "would move"
-                    } else {
-                        "moved"
-                    };
-                    println!(
-                        "On {project}: {moving} {}",
-                        outcome
-                            .remote_branches
-                            .iter()
-                            .map(|branch| format!("`{branch}`"))
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    );
-                    println!(
-                        "  Instance forks and checkpoints there keep the commits they were made \
-                         with; clones of a moved branch see a forced update"
-                    );
-                }
-            }
-            if outcome.dry_run {
-                println!("Run without --dry-run to move them");
+            let outcome = manager.migrate(dry_run)?;
+            for line in &outcome.lines {
+                println!("{line}");
             }
             Ok(())
         }
@@ -4035,6 +4009,28 @@ fn tracker_log(tracker: &str, instance: Option<String>, git_args: &[String]) -> 
         .context("could not run git log")?;
     if !status.success() {
         bail!("`{tracker}` has no history here yet");
+    }
+    Ok(())
+}
+
+fn pull(instance: Option<String>, tracker: &str) -> Result<()> {
+    let context = context_here()?;
+    let instance = instance.or_else(|| context.current_branch.clone());
+    let manager = BranchManager::open(context.store)?;
+    let outcome = manager.pull(instance.as_deref(), tracker)?;
+    match &outcome.view {
+        None => println!(
+            "`{}` is up to date with its `{}`",
+            outcome.tracker, outcome.follow
+        ),
+        Some(view) => println!(
+            "Pulled `{}`: {} commit{} from {} ({})",
+            outcome.tracker,
+            outcome.commits,
+            if outcome.commits == 1 { "" } else { "s" },
+            outcome.follow,
+            &view[..view.len().min(12)]
+        ),
     }
     Ok(())
 }
