@@ -21,18 +21,18 @@ beforeEach(async () => {
 	jack = await issue(env, { kind: "login", login: "jack", ttlSeconds: LOGIN_TTL_SECONDS });
 	ana = (await issue(env, { kind: "login", login: "ana", ttlSeconds: LOGIN_TTL_SECONDS })).token;
 	expect(
-		(await api(jack.token, "POST", "/v1/projects", { name, trackers: ["root", "access", "project", "payments"] })).status,
+		(await api(jack.token, "POST", "/v1/projects", { name, trackers: ["root", "access", "t3code", "payments"] })).status,
 	).toBe(201);
 	const defs = `jack.${name}.t.access`;
-	repos.write(defs, ".newgit/trackers/root.toml", 'audience = "project-devs"\ngit = true\n');
-	repos.write(defs, ".newgit/trackers/project.toml", 'audience = "project-devs"\ngit = true\n');
+	repos.write(defs, "root.toml", 'audience = "project-devs"\ngit = true\n');
+	repos.write(defs, "t3code.toml", 'audience = "project-devs"\ngit = true\nmount = "apps/t3code"\n');
 	// A tracker in Git only Jack may read, and a tracker outside Git: neither is Ana's.
-	repos.write(defs, ".newgit/trackers/payments.toml", 'audience = "user:jack"\ngit = true\n');
-	repos.write(defs, ".newgit/trackers/env.toml", 'audience = "project-devs"\n');
+	repos.write(defs, "payments.toml", 'audience = "user:jack"\ngit = true\n');
+	repos.write(defs, "env.toml", 'audience = "project-devs"\n');
 	expect(
 		(
 			await api(jack.token, "PUT", `/v1/projects/jack/${name}/branches/main`, {
-				list: { root: sha("a"), project: sha("b"), payments: sha("c"), env: sha("d"), access: sha("e") },
+				list: { root: sha("a"), t3code: sha("b"), payments: sha("c"), env: sha("d"), access: sha("e") },
 			})
 		).status,
 	).toBe(201);
@@ -89,9 +89,10 @@ describe("the Git endpoint", () => {
 		expect(served.map((call) => call.kind)).toEqual(["advertise", "upload-pack"]);
 		const plan = served[0].plan;
 		expect(served[0].project).toBe(`jack/${name}`);
-		expect(plan.branches.main).toEqual({ root: sha("a"), project: sha("b"), payments: sha("c"), access: sha("e") });
-		expect(plan.definitions).toEqual({ access: sha("e") });
-		expect(Object.keys(plan.repos).sort()).toEqual(["access", "payments", "project", "root"]);
+		expect(plan.branches.main).toEqual({ root: sha("a"), t3code: sha("b"), payments: sha("c"), access: sha("e") });
+		// Shape is the container's to read from the commits: no definitions.
+		expect(plan).not.toHaveProperty("definitions");
+		expect(Object.keys(plan.repos).sort()).toEqual(["access", "payments", "root", "t3code"]);
 		expect(plan.repos.root.url).toBe(repos.url(`jack.${name}.t.root`));
 		expect(plan.repos.root.auth.startsWith("Authorization: Basic ")).toBe(true);
 	});
@@ -99,9 +100,26 @@ describe("the Git endpoint", () => {
 	it("leaves out a tracker its reader may not read — the one outside Git never enters", async () => {
 		expect((await git(ana, "/info/refs?service=git-upload-pack")).status).toBe(200);
 		const plan = served[0].plan;
-		expect(plan.branches.main).toEqual({ root: sha("a"), project: sha("b"), access: sha("e") });
+		expect(plan.branches.main).toEqual({ root: sha("a"), t3code: sha("b"), access: sha("e") });
 		expect(plan.repos.payments).toBeUndefined();
 		expect(plan.repos.env).toBeUndefined();
+	});
+
+	it("always hands the container access's repo, even to a reader who may not read access", async () => {
+		repos.write(`jack.${name}.t.access`, "access.toml", 'audience = "user:jack"\ngit = true\nmount = ".newgit/trackers"\npaths = ["."]\n');
+		expect((await git(ana, "/info/refs?service=git-upload-pack")).status).toBe(200);
+		const plan = served[0].plan;
+		// Not served to ana — not in her branch — but there to read mounts from.
+		expect(plan.branches.main).toEqual({ root: sha("a"), t3code: sha("b") });
+		expect(plan.repos.access.url).toBe(repos.url(`jack.${name}.t.access`));
+	});
+
+	it("serves no branch whose root its reader may not read", async () => {
+		repos.write(`jack.${name}.t.access`, "root.toml", 'audience = "user:jack"\ngit = true\n');
+		await api(jack.token, "PUT", `/v1/projects/jack/${name}/branches/side`, { list: { root: sha("9"), t3code: sha("8") } });
+		expect((await git(ana, "/info/refs?service=git-upload-pack")).status).toBe(403);
+		expect((await git(jack.token, "/info/refs?service=git-upload-pack")).status).toBe(200);
+		expect(Object.keys(served[0].plan.branches).sort()).toEqual(["main", "side"]);
 	});
 
 	it("is closed to someone who is not a member", async () => {

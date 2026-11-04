@@ -21,10 +21,10 @@ import { DurableObject } from "cloudflare:workers";
 /** What the Worker hands the container: `newgit endpoint-compose`'s input. */
 export interface EndpointPlan {
 	dir: string;
+	/** Each branch's index as this reader may see it: `root`'s commit and the pins they may read. */
 	branches: Record<string, Record<string, string>>;
 	default_branch: string;
-	/** The trackers holding definitions, at the default branch's commits. */
-	definitions: Record<string, string>;
+	/** Every tracker a branch lists, and `access` always: mounts are read from its content. */
 	repos: Record<string, { url: string; auth: string }>;
 }
 

@@ -19,7 +19,7 @@ beforeEach(async () => {
 	slug = `acme-${crypto.randomUUID().slice(0, 8)}`;
 	project = `jack/${slug}`;
 	[jack, ana, eve] = await Promise.all([login("jack"), login("ana"), login("eve")]);
-	expect((await call(jack, "POST", "/v1/projects", { name: slug, trackers: ["root", "access", "project"] })).status).toBe(201);
+	expect((await call(jack, "POST", "/v1/projects", { name: slug, trackers: ["root", "access"] })).status).toBe(201);
 	expect((await call(jack, "POST", `/v1/projects/${project}/members`, { login: "ana" })).status).toBe(200);
 });
 
@@ -46,7 +46,7 @@ describe("branches", () => {
 	});
 
 	it("are created from a list of one commit per tracker, and read back", async () => {
-		const list = { root: commit("a"), project: commit("b") };
+		const list = { root: commit("a"), access: commit("b") };
 		const created = await put(ana, "main", list);
 		expect(created.status).toBe(201);
 		expect(created.body).toMatchObject({ name: "main", list, createdBy: "ana" });

@@ -44,13 +44,12 @@ async function call(login: string | null, method: string, path: string, body?: u
 const repo = (suffix: string) => `jack.${slug}.${suffix}`;
 
 async function setUp() {
-	const created = await call("jack", "POST", "/v1/projects", { name: slug, trackers: ["root", "access", "project", "web"] });
+	const created = await call("jack", "POST", "/v1/projects", { name: slug, trackers: ["root", "access", "web"] });
 	expect(created.status).toBe(201);
 	expect((await call("jack", "POST", `/v1/projects/${project}/members`, { login: "Ana" })).status).toBe(200);
-	// The project tracker's committed definitions are what audiences and kinds are read from.
-	const define = (name: string, text: string) => repos.write(repo("t.access"), `.newgit/trackers/${name}.toml`, text);
+	// The definitions committed to `access` are what audiences and kinds are read from.
+	const define = (name: string, text: string) => repos.write(repo("t.access"), `${name}.toml`, text);
 	define("root", 'audience = "project-devs"\ngit = true\n');
-	define("project", 'audience = "project-devs"\ngit = true\n');
 	define("web", 'audience = "public"\ngit = true\n');
 	define("runtime-env", 'audience = "user"\n');
 	define("jack-env", 'audience = "user:jack"\n');
@@ -68,7 +67,7 @@ describe("the API", () => {
 	});
 
 	it("creates a project owned by its creator, with one repo and one seed per tracker", async () => {
-		const created = await call("Jack", "POST", "/v1/projects", { name: slug, trackers: ["root", "access", "project"] });
+		const created = await call("Jack", "POST", "/v1/projects", { name: slug, trackers: ["root", "access"] });
 		expect(created.status).toBe(201);
 		expect(created.body).toMatchObject({
 			owner: "jack",
@@ -76,7 +75,7 @@ describe("the API", () => {
 			key: project,
 			endpoint: `https://newgit.dev/jack/${slug}.git`,
 		});
-		expect(created.body.seeds.map((seed: { tracker: string }) => seed.tracker)).toEqual(["root", "access", "project"]);
+		expect(created.body.seeds.map((seed: { tracker: string }) => seed.tracker)).toEqual(["root", "access"]);
 		const [root] = created.body.seeds;
 		// The creator's one write to the repo of each tracker in Git, for the initial push.
 		expect(root).toMatchObject({
@@ -86,7 +85,7 @@ describe("the API", () => {
 			password: fakePassword(repo("t.root"), "write"),
 		});
 		expect(root.expires_at).toBeTruthy();
-		expect([...repos.repos.keys()].sort()).toEqual([repo("t.access"), repo("t.project"), repo("t.root")]);
+		expect([...repos.repos.keys()].sort()).toEqual([repo("t.access"), repo("t.root")]);
 		expect((await call("jack", "GET", `/v1/projects/${project}`)).body).toMatchObject({ owner: "jack", name: slug });
 	});
 
@@ -177,7 +176,7 @@ describe("the API", () => {
 		await credential("jack", repo("t.db-snapshots"), "write");
 		expect((await credential("eve", repo("t.db-snapshots"))).status).toBe(403);
 
-		// A tracker the project tracker does not define (absent, not refused),
+		// A tracker `access` does not define (absent, not refused),
 		// and another project's repo.
 		expect((await credential("jack", repo("t.ghost"), "write")).status).toBe(404);
 		expect((await credential("jack", "other.proj.t.root")).status).toBe(400);
@@ -197,15 +196,15 @@ describe("the API", () => {
 		expect(repos.repos.has(repo("i.fix-login.root"))).toBe(false);
 	});
 
-	it("takes a definition change only from the project tracker", async () => {
+	it("takes a definition change only from `access`", async () => {
 		await setUp();
 		await credential("jack", repo("t.jack-env"), "write");
 		expect((await credential("ana", repo("t.jack-env"))).status).toBe(403);
 		// A merged definition change is what opens it up.
-		repos.write(repo("t.access"), ".newgit/trackers/jack-env.toml", 'audience = "project-devs"\n');
+		repos.write(repo("t.access"), "jack-env.toml", 'audience = "project-devs"\n');
 		expect((await credential("ana", repo("t.jack-env"))).status).toBe(200);
 		// Turning a tracker into a tracker in Git takes its write away.
-		repos.write(repo("t.access"), ".newgit/trackers/jack-env.toml", 'audience = "project-devs"\ngit = true\n');
+		repos.write(repo("t.access"), "jack-env.toml", 'audience = "project-devs"\ngit = true\n');
 		expect((await credential("jack", repo("t.jack-env"), "write")).status).toBe(403);
 	});
 

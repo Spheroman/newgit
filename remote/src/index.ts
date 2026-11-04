@@ -233,7 +233,7 @@ async function route(request: Request, env: Env, deps: Deps): Promise<Response> 
 		if (!name) throw new HttpError(400, "name is required");
 		requirePart("project name", name);
 		if (!Array.isArray(trackers) || trackers.length === 0)
-			throw new HttpError(400, "trackers is required: the trackers in Git whose repos to create (root, project, …)");
+			throw new HttpError(400, "trackers is required: the trackers in Git whose repos to create (root, access, …)");
 		for (const tracker of trackers) requirePart("tracker name", tracker);
 		const id: ProjectId = { owner: login, name };
 		const key = projectKey(id);
@@ -379,9 +379,24 @@ async function route(request: Request, env: Env, deps: Deps): Promise<Response> 
 		// Merging is a person's decision: an agent proposes, a member merges.
 		requireHuman(caller, "merge");
 		const branch = decodeURIComponent(mergeMatch[1]);
-		const { base, trackers } = await body<{ base?: Record<string, string>; trackers?: string[] }>(request);
+		const { base, trackers, off_main = [] } = await body<{
+			base?: Record<string, string>;
+			trackers?: string[];
+			off_main?: string[];
+		}>(request);
 		if (!base || !Array.isArray(trackers) || trackers.length === 0)
 			throw new HttpError(400, "base (the list you merged onto) and trackers (the ones that move) are required");
+		if (!trackers.includes("root"))
+			throw new HttpError(400, "a merge moves `root`: the branch is root's ref, so `root` must be among trackers");
+		if (!Array.isArray(off_main) || off_main.some((tracker) => typeof tracker !== "string" || !trackers.includes(tracker)))
+			throw new HttpError(400, "off_main names trackers in trackers: those whose pin moves off their own `main`");
+		// Who must maintain what: root, whose ref is the commit point, and
+		// every tracker whose own `main` this merge pushes. A pin moving to a
+		// commit already on that tracker's `main` changes only root, so only
+		// needs root's maintainers. The Worker cannot run Git: `off_main` is
+		// the client's word, and the Git endpoint is the backstop (it expands
+		// only pins found in the tracker's own repo).
+		const writes = trackers.filter((tracker) => tracker === "root" || off_main.includes(tracker));
 		// Everything is checked before the lock is taken: a refused merge
 		// holds nothing.
 		const who = { login, member };
@@ -396,13 +411,10 @@ async function route(request: Request, env: Env, deps: Deps): Promise<Response> 
 			if (!facts.git) throw new HttpError(400, `\`${tracker}\` is not in Git; \`newgit merge\` never carries it`);
 			const read = decide({ kind: "tracker", project: id, tracker }, "read", who, { tracker: facts });
 			if (!read.ok) throw new HttpError(403, read.reason);
-			// `access` (`.newgit/trackers/`) decides every tracker's paths and
-			// audience: changing it is the owner's. Everything else in
-			// `.newgit/` — resources, scripts, config — is the `project`
-			// tracker, which anyone who merges may change.
 			// Merging a tracker is its maintainers' (by default, its readers'):
 			// `access`, which holds every definition, is the owner's unless the
 			// definitions say otherwise.
+			if (!writes.includes(tracker)) continue;
 			const may = mayMaintain(facts.maintainers, who, info.owner, tracker);
 			if (!may.ok) throw new HttpError(403, may.reason);
 		}
@@ -416,7 +428,7 @@ async function route(request: Request, env: Env, deps: Deps): Promise<Response> 
 		await revokeRepoTokens(deps, started.stale);
 		const credentials = [];
 		const handed = [];
-		for (const tracker of trackers) {
+		for (const tracker of writes) {
 			const ref: RepoRef = { kind: "tracker", project: id, tracker };
 			const name = repoName(ref);
 			if ((await deps.repos.remote(name)) === null) throw new HttpError(404, `${name} does not exist`);
@@ -458,6 +470,8 @@ async function route(request: Request, env: Env, deps: Deps): Promise<Response> 
 				if (typeof commit !== "string" || !/^[0-9a-f]{40}$/.test(commit))
 					throw new HttpError(400, `\`${tracker}\` must name a full commit id`);
 			}
+			if (!("root" in list))
+				throw new HttpError(400, "a branch is root's ref: its list must name `root`'s commit");
 			if (base !== undefined) {
 				// The end of a merge: the list moves from `base`, all at once.
 				requireHuman(caller, "merge");
@@ -474,8 +488,12 @@ async function route(request: Request, env: Env, deps: Deps): Promise<Response> 
 					}
 					throw new HttpError(400, `this merge did not declare \`${tracker}\`, so it cannot move it`);
 				}
+				// A tracker may leave the index (a merge that unmounts it, or the
+				// migration folding `project` into root), but only one the merge
+				// declared.
 				for (const tracker of Object.keys(base))
-					if (!(tracker in list)) throw new HttpError(400, `a merge cannot drop \`${tracker}\` from a branch`);
+					if (!(tracker in list) && !(await project.mergeDeclares(branch, tracker)))
+						throw new HttpError(400, `this merge did not declare \`${tracker}\`, so it cannot drop it`);
 				const finished = await project.finishMerge(branch, base, list, login);
 				if (!finished.ok) {
 					if (finished.reason === "missing") throw new HttpError(404, `no branch \`${branch}\` in ${key}`);
@@ -659,39 +677,40 @@ async function gitEndpoint(request: Request, env: Env, deps: Deps, match: RegExp
 
 	const branches = await project.branches();
 	const main = branches.find((branch) => branch.name === info.defaultBranch)?.list;
-	if (!main?.access) throw new HttpError(404, `${key} has no \`${info.defaultBranch}\` branch yet`);
+	if (!main?.root) throw new HttpError(404, `${key} has no \`${info.defaultBranch}\` branch yet`);
 
-	// The definitions, layered as the remote reads them: each held by the
-	// tracker that owns its file. The container reads them from the same
-	// trackers, at the default branch's commits, whoever is reading.
+	// Policy, read as the remote reads it: each definition from the tracker
+	// that owns its file, at the default branch. Shape (pins, mounts) is the
+	// container's to read from the commits themselves.
 	const facts = await loadDefinitions(
 		deps.repos,
 		id,
 		info.defaultBranch,
 		branches.flatMap((branch) => Object.keys(branch.list)),
 	);
-	const definitions: Record<string, string> = { access: main.access };
-	for (const { source } of facts.values()) if (main[source]) definitions[source] = main[source];
-
-	// Each branch, cut down to the trackers in Git this caller may read.
-	const plan: EndpointPlan = {
-		dir: "/work",
-		branches: {},
-		default_branch: info.defaultBranch,
-		definitions,
-		repos: {},
+	const readable = (tracker: string) => {
+		const tracker_facts = facts.get(tracker);
+		return (
+			tracker_facts?.git === true &&
+			decide({ kind: "tracker", project: id, tracker }, "read", who, { tracker: tracker_facts }).ok
+		);
 	};
-	const needed = new Set<string>(Object.keys(definitions));
+
+	// Each branch, cut down to the trackers in Git this caller may read. A
+	// branch is root's ref, so one whose root they cannot read is not served.
+	const plan: EndpointPlan = { dir: "/work", branches: {}, default_branch: info.defaultBranch, repos: {} };
+	// `access` always: the container reads every mount from its content,
+	// even for a reader who may not read it. It is served only where listed.
+	const needed = new Set<string>(["access"]);
 	for (const branch of branches) {
+		if (!branch.list.root || !readable("root")) continue;
 		const list: Record<string, string> = {};
 		for (const [tracker, commit] of Object.entries(branch.list)) {
-			const tracker_facts = facts.get(tracker);
-			if (!tracker_facts?.git) continue;
-			if (!decide({ kind: "tracker", project: id, tracker }, "read", who, { tracker: tracker_facts }).ok) continue;
+			if (!readable(tracker)) continue;
 			list[tracker] = commit;
 			needed.add(tracker);
 		}
-		if (Object.keys(list).length > 0) plan.branches[branch.name] = list;
+		plan.branches[branch.name] = list;
 	}
 	if (Object.keys(plan.branches).length === 0)
 		throw new HttpError(who.member ? 403 : 404, who.member ? `nothing in ${key} is yours to read` : `no project \`${key}\``);
@@ -796,30 +815,45 @@ export interface TrackerFacts {
 	audience: Audience;
 	git: boolean;
 	maintainers: Maintainers;
-	/** The paths it owns, for working out which tracker owns which definition. */
+	/** Where its root sits in the view: `.` unless the definition says. */
+	mount: string;
+	/** Its claims as written, relative to `mount`; `!` excludes. */
 	paths: string[];
 	/** The tracker whose history holds this definition's file. */
 	source: string;
 }
 
-const DEFINITIONS = ".newgit/trackers";
+/** Where `access` is mounted: every definition is `<name>.toml` at its root. */
+const ACCESS_MOUNT = ".newgit/trackers";
 
 /** Trackers that always exist, file or not. */
 function implicitFacts(tracker: string): TrackerFacts | undefined {
 	switch (tracker) {
 		case "root":
-			return { audience: { kind: "project-devs" }, git: true, maintainers: { kind: "project-devs" }, paths: ["."], source: "access" };
-		case "project":
-			return { audience: { kind: "project-devs" }, git: true, maintainers: { kind: "project-devs" }, paths: [".newgit"], source: "access" };
+			return {
+				audience: { kind: "project-devs" },
+				git: true,
+				maintainers: { kind: "project-devs" },
+				mount: ".",
+				paths: ["."],
+				source: "access",
+			};
 		case "access":
-			return { audience: { kind: "project-devs" }, git: true, maintainers: { kind: "owner" }, paths: [DEFINITIONS], source: "access" };
+			return {
+				audience: { kind: "project-devs" },
+				git: true,
+				maintainers: { kind: "owner" },
+				mount: ACCESS_MOUNT,
+				paths: ["."],
+				source: "access",
+			};
 		default:
 			return undefined;
 	}
 }
 
 function parseFacts(text: string, source: string): TrackerFacts | undefined {
-	let definition: { audience?: unknown; git?: unknown; maintainers?: unknown; paths?: unknown };
+	let definition: { audience?: unknown; git?: unknown; maintainers?: unknown; mount?: unknown; paths?: unknown };
 	try {
 		definition = parseToml(text) as typeof definition;
 	} catch {
@@ -833,18 +867,83 @@ function parseFacts(text: string, source: string): TrackerFacts | undefined {
 			? parseMaintainers(definition.maintainers)
 			: parseMaintainers(typeof definition.audience === "string" ? definition.audience : "");
 	if (maintainers === null) return undefined;
+	const mount = normalizePath(typeof definition.mount === "string" ? definition.mount : ".");
 	const paths = Array.isArray(definition.paths) ? definition.paths.filter((path) => typeof path === "string") : [];
 	// `git` defaults to false, and is written only when true.
-	return { audience, git: definition.git === true, maintainers, paths, source };
+	return { audience, git: definition.git === true, maintainers, mount, paths, source };
+}
+
+/** `./a/b/` → `a/b`; the empty path is `.`. */
+function normalizePath(path: string): string {
+	const parts = path.split("/").filter((part) => part !== "" && part !== ".");
+	return parts.length === 0 ? "." : parts.join("/");
+}
+
+/** Whether `path` is `prefix` or under it, by whole segments; `.` holds everything. */
+function holds(prefix: string, path: string): boolean {
+	return prefix === "." || path === prefix || path.startsWith(`${prefix}/`);
+}
+
+/** A workspace path relative to the mount holding it (see [`holds`]). */
+function relativeTo(mount: string, path: string): string {
+	return mount === "." ? path : path === mount ? "." : path.slice(mount.length + 1);
+}
+
+/** A claim as written, laid onto its tracker's mount. */
+function placeClaim(mount: string, claim: string): string {
+	const relative = normalizePath(claim);
+	return mount === "." ? relative : relative === "." ? mount : `${mount}/${relative}`;
+}
+
+/**
+ * How specifically `facts` claims workspace `path`: its longest claim
+ * covering it (`.` counting 0), or undefined when none does or one of its
+ * exclusions takes it out.
+ */
+function claimOn(facts: TrackerFacts, path: string): number | undefined {
+	let best: number | undefined;
+	for (const written of facts.paths) {
+		const excluded = written.startsWith("!");
+		const claim = placeClaim(facts.mount, excluded ? written.slice(1) : written);
+		if (!holds(claim, path)) continue;
+		if (excluded) return undefined;
+		const length = claim === "." ? 0 : claim.length;
+		if (best === undefined || length > best) best = length;
+	}
+	return best;
+}
+
+/**
+ * The tracker in Git owning workspace `path`, by the ownership rules
+ * (docs/design/roots.md, *Ownership*), as the client's `owner_of` decides it:
+ * the deepest mount holding the path decides, a parent's claim not reaching
+ * into it; among the trackers mounted there the longest claim wins, ties to
+ * the lesser name; a path every claim there excludes is owned by nothing.
+ */
+function ownerOf(facts: Map<string, TrackerFacts>, path: string): string | undefined {
+	const depth = (mount: string) => (mount === "." ? 0 : mount.split("/").length);
+	const inGit = [...facts].filter(([, candidate]) => candidate.git && holds(candidate.mount, path));
+	if (inGit.length === 0) return undefined;
+	const deepest = Math.max(...inGit.map(([, candidate]) => depth(candidate.mount)));
+	let owner: { name: string; claim: number } | undefined;
+	for (const [name, candidate] of inGit) {
+		if (depth(candidate.mount) !== deepest) continue;
+		const claim = claimOn(candidate, path);
+		if (claim === undefined) continue;
+		if (owner === undefined || claim > owner.claim || (claim === owner.claim && name < owner.name))
+			owner = { name, claim };
+	}
+	return owner?.name;
 }
 
 /**
  * Every named tracker's committed definition on the project's default
- * branch, each read from the tracker that owns its file: `access` owns
- * `.newgit/trackers/` unless a more specific tracker in Git claims a file in it
+ * branch. A definition is the view's `.newgit/trackers/<name>.toml`: `access`'s
+ * `<name>.toml`, unless a tracker in Git owns that path by the ownership rules
  * — which is how governance layers: changing a tracker's definition is
  * changing the tracker that owns its file, and only that tracker's
- * maintainers merge it. Resolved to a fixed point, a few reads per round.
+ * maintainers merge it. The file is read from its owner's repo, relative to
+ * the owner's mount. Resolved to a fixed point, a few reads per round.
  */
 async function loadDefinitions(
 	repos: Repos,
@@ -852,38 +951,29 @@ async function loadDefinitions(
 	branch: string,
 	names: Iterable<string>,
 ): Promise<Map<string, TrackerFacts>> {
-	const all = new Set<string>(["root", "project", "access", ...names]);
-	const source = new Map<string, string>([...all].map((name) => [name, "access"]));
+	const all = new Set<string>(["root", "access", ...names]);
+	const file = (name: string) => `${ACCESS_MOUNT}/${name}.toml`;
+	const source = new Map<string, { tracker: string; mount: string }>(
+		[...all].map((name) => [name, { tracker: "access", mount: ACCESS_MOUNT }]),
+	);
 	let facts = new Map<string, TrackerFacts>();
 	for (let round = 0; round < 4; round++) {
 		facts = new Map();
 		for (const name of all) {
 			const from = source.get(name)!;
-			const text = await repos.readFile(
-				repoName({ kind: "tracker", project, tracker: from }),
-				branch,
-				`${DEFINITIONS}/${name}.toml`,
-			);
-			const read = text === null ? implicitFacts(name) : parseFacts(text, from);
-			if (read !== undefined) facts.set(name, { ...read, source: from });
+			const path = relativeTo(from.mount, file(name));
+			const text =
+				path === "." ? null : await repos.readFile(repoName({ kind: "tracker", project, tracker: from.tracker }), branch, path);
+			const read = text === null ? implicitFacts(name) : parseFacts(text, from.tracker);
+			if (read !== undefined) facts.set(name, { ...read, source: from.tracker });
 		}
 		let moved = false;
 		for (const name of all) {
-			const file = `${DEFINITIONS}/${name}.toml`;
-			let owner = "access";
-			let claim = DEFINITIONS.length;
-			for (const [candidate, candidateFacts] of facts) {
-				if (!candidateFacts.git) continue;
-				for (const path of candidateFacts.paths) {
-					const covers = file === path || file.startsWith(`${path}/`);
-					if (covers && path.startsWith(DEFINITIONS) && path.length > claim) {
-						owner = candidate;
-						claim = path.length;
-					}
-				}
-			}
-			if (source.get(name) !== owner) {
-				source.set(name, owner);
+			const owner = ownerOf(facts, file(name)) ?? "access";
+			const mount = facts.get(owner)?.mount ?? ACCESS_MOUNT;
+			const was = source.get(name)!;
+			if (was.tracker !== owner || was.mount !== mount) {
+				source.set(name, { tracker: owner, mount });
 				moved = true;
 			}
 		}

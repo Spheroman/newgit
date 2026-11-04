@@ -19,9 +19,9 @@ beforeEach(async () => {
 	slug = `acme-${crypto.randomUUID().slice(0, 8)}`;
 	project = `jack/${slug}`;
 	[jack, ana] = await Promise.all([login("jack"), login("ana")]);
-	expect((await call(jack, "POST", "/v1/projects", { name: slug, trackers: ["root", "access", "project"] })).status).toBe(201);
+	expect((await call(jack, "POST", "/v1/projects", { name: slug, trackers: ["root", "access"] })).status).toBe(201);
 	expect((await call(jack, "POST", `/v1/projects/${project}/members`, { login: "ana" })).status).toBe(200);
-	repos.write(repo("t.access"), ".newgit/trackers/root.toml", 'audience = "project-devs"\ngit = true\n');
+	repos.write(repo("t.access"), "root.toml", 'audience = "project-devs"\ngit = true\n');
 });
 
 async function call(token: string, method: string, path: string, body?: unknown) {
@@ -58,7 +58,7 @@ describe("deleting a project", () => {
 	it("takes its repos, its record, and every token pinned to it", async () => {
 		const deleted = await call(jack, "DELETE", `/v1/projects/${project}`);
 		expect(deleted.status).toBe(200);
-		expect(deleted.body.repos_deleted).toBe(4);
+		expect(deleted.body.repos_deleted).toBe(3);
 		expect([...repos.repos.keys()]).toEqual([`jack.${slug}x.t.root`]);
 		expect((await call(jack, "GET", `/v1/projects/${project}`)).status).toBe(404);
 		expect((await call(instanceToken, "GET", `/v1/projects/${project}/instances/fix`)).status).toBe(401);
