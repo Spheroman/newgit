@@ -567,9 +567,10 @@ fn cleanup_deletes_unclaimed_workspaces_and_retires_dead_pids() {
     );
     assert_eq!(
         std::fs::read_to_string(state_dir.join("app.pid")).expect("read"),
-        "stopped\n",
+        "exited\n",
         "the file survives so `status` still knows this resource ran once, \
-         but the reusable pid number is gone"
+         but the reusable pid number is gone; `exited`, not `stopped`, since \
+         newgit did not stop it (#261)"
     );
     assert!(!ghost_state.exists(), "state for a gone instance removed");
     assert!(

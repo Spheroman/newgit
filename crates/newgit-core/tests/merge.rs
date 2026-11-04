@@ -1,4 +1,4 @@
-//! `newgit merge` (newgit-trackers.md, step 5), on one machine: an instance's
+//! `newgit merge` (docs/design/trackers.md, step 5), on one machine: an instance's
 //! committed work into `main`, tracker by tracker — a fast-forward where
 //! `main` has not moved, a real merge where both changed a tracker, and
 //! nothing at all when anything conflicts.

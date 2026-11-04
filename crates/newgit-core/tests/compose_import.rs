@@ -1,4 +1,4 @@
-//! An imported tracker (newgit-trackers.md, *An imported tracker joins
+//! An imported tracker (docs/design/trackers.md, *An imported tracker joins
 //! through one merge*): a history from outside the project joins each view
 //! through one merge, marked on its history, rather than interleaving by
 //! date, so taking it rewrites nothing — on `main` at the import, and on a
@@ -814,4 +814,41 @@ fn the_copy_under_the_mount_keeps_header_bytes() {
     let copy = git(repo, &["rev-parse", &format!("{tip}^2")]);
     assert_ne!(copy, latin);
     assert_eq!(raw_headers(repo, &copy), raw_headers(repo, &latin));
+}
+
+/// `tracker repair` rewrites split commits from their sources; a join
+/// marker's source is its join, but the marker is `join`'s, and rewritten
+/// from the join it would lose `Newgit-Import` and stop joining.
+#[test]
+fn repair_leaves_a_join_marker_alone() {
+    let (_guard, temp) = tempdir();
+    let project = project(&temp);
+    let repo = &project.repo;
+    let (root, t3code) = definitions();
+    let all = [root.clone(), t3code.clone()];
+    let joined = import(&project, &t3code);
+    let merge = view(
+        repo,
+        "main",
+        &tips(&root, &project.b, &t3code, &joined.marker),
+        &all,
+    );
+
+    let repair = compose::repair_splits(repo, &[project.b.clone(), joined.marker.clone()])
+        .expect("repair");
+    assert!(
+        !repair.moved.contains_key(&joined.marker),
+        "the marker is left as it is"
+    );
+    git(repo, &["update-ref", "-d", "refs/newgit/views/main"]);
+    assert_eq!(
+        view(
+            repo,
+            "main",
+            &tips(&root, &project.b, &t3code, &joined.marker),
+            &all,
+        ),
+        merge,
+        "and still joins"
+    );
 }

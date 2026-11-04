@@ -5,25 +5,32 @@
   "compatibility_date": "2026-10-05",
   "compatibility_flags": ["nodejs_compat"],
   "observability": { "enabled": true },
-  // The UI and the API, at the apex. Previews get <id>.newgit.dev (newgit-cloudflare.md, *Auth*).
+  // The UI and the API, at the apex. Previews get <id>.newgit.dev (docs/design/remote.md, *Auth*).
   "routes": [{ "pattern": "newgit.dev", "custom_domain": true }],
   "workers_dev": true,
+  // scripts/install.sh, served at /install.sh.
+  "rules": [{ "type": "Text", "globs": ["**/*.sh"] }],
   // One namespace for every project; repo names carry the project as a
-  // prefix. A binding names exactly one namespace (newgit-cloudflare.md).
+  // prefix. A binding names exactly one namespace (docs/design/remote.md).
   "artifacts": [{ "binding": "ARTIFACTS", "namespace": "newgit" }],
   "durable_objects": {
     "bindings": [
       { "class_name": "ProjectDO", "name": "PROJECTS" },
       { "class_name": "UserDO", "name": "USERS" },
       // One per project: the Git endpoint's container (src/endpoint.ts).
-      { "class_name": "GitEndpoint", "name": "ENDPOINTS" }
+      { "class_name": "GitEndpoint", "name": "ENDPOINTS" },
+      // One instance: the spend kill switch's state (src/budget.ts).
+      { "class_name": "BudgetDO", "name": "BUDGET" }
     ]
   },
   "migrations": [
     { "tag": "v1", "new_sqlite_classes": ["ProjectDO"] },
     { "tag": "v2", "new_sqlite_classes": ["UserDO"] },
-    { "tag": "v3", "new_sqlite_classes": ["GitEndpoint"] }
+    { "tag": "v3", "new_sqlite_classes": ["GitEndpoint"] },
+    { "tag": "v4", "new_sqlite_classes": ["BudgetDO"] }
   ],
+  // Hourly: check the last 7 days' spend against the weekly budget (src/budget.ts).
+  "triggers": { "crons": ["0 * * * *"] },
   // Real git and newgit, built from this repository (endpoint.Dockerfile).
   "containers": [
     {
@@ -36,8 +43,18 @@
     // A public value: GitHub's device flow identifies the app by it.
     "GITHUB_CLIENT_ID": "Ov23liKp3f44HWjSOE9L",
     // Where the namespace's repos are served; not a secret.
-    "ARTIFACTS_GIT_BASE": "https://bce0b38de721f350c8d8a51d0520337d.artifacts.cloudflare.net/git/newgit"
+    // The account the spend kill switch reads billing for; not a secret.
+    "CLOUDFLARE_ACCOUNT_ID": "bce0b38de721f350c8d8a51d0520337d",
+    "ARTIFACTS_GIT_BASE": "https://bce0b38de721f350c8d8a51d0520337d.artifacts.cloudflare.net/git/newgit",
+    // Served at /: this file of this tracker, at its trunk. The tracker is
+    // secret, so naming it here is what publishes the page (src/index.ts,
+    // `landingPage`).
+    "LANDING_PAGE": { "project": "spheroman/newgit", "tracker": "site", "path": "remote/site/index.html" }
   }
   // Secrets: TOKEN_KEY (signs newgit tokens), ALLOWED_LOGINS (who may use
-  // this remote; unset admits no one).
+  // this remote; unset admits no one), BLOCKED_LOGINS (who may not, even
+  // under `*`), ADMIN_LOGINS (may delete any project, and are not capped),
+  // PROJECTS_PER_LOGIN (unset is 5). See docs/design/remote.md, *Identity And Tokens*.
+  // BILLING_TOKEN (an API token with Billing: Read; unset turns the spend
+  // kill switch off), SPEND_LIMIT_WEEKLY_USD (unset is 10).
 }

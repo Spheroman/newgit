@@ -12,8 +12,9 @@
 //! Three things keep it honest:
 //!
 //! - **The key is the inputs, never the tree.** `[identity] paths` plus
-//!   whatever `key_command` reports. A tree is only ever handed to an
-//!   instance whose declared inputs hash the same.
+//!   whatever `key_command` reports, and what of the instance's binding can
+//!   reach the install. A tree is only ever handed to an instance whose inputs
+//!   hash the same.
 //! - **Copies fork on write.** Hardlinking *between instances* would be
 //!   faster and is what package managers do, but it is wrong here:
 //!   post-install build output lands inside these trees (`.cxx` caches,
@@ -23,20 +24,39 @@
 //!   and say so — slower, never different.
 //! - **Nothing path-poisoned is admitted.** A tree that mentions the
 //!   absolute path it was built in is not relocatable, so it is declined
-//!   rather than shared. See [`InstallStore::admit`].
+//!   rather than shared. See [`InstallStore::admit`]. The exception is a
+//!   file a `[[render]]` targets: its copy of the path is reversed to the
+//!   render's `find` in the stored tree and rendered again for each
+//!   instance it fills.
 
-use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Mutex, OnceLock};
 
 use camino::{Utf8Path, Utf8PathBuf};
 use sha2::{Digest, Sha256};
 
 use crate::error::{NewgitError, Result};
 use crate::materializer::create_dir_all;
+use crate::render::AppliedReplacement;
 
 /// Names an in-progress publish. Filtered out of [`InstallStore::entries`]
 /// so a half-copied tree is never mistaken for a usable one, and reported by
 /// [`InstallStore::staging_entries`] so gc can still reclaim it.
 const STAGING_PREFIX: &str = ".staging-";
+
+/// A `[[render]]` into a file inside the produced tree, resolved for one
+/// instance: `value` is what its `with` names there, typically
+/// `{{workspace}}`.
+///
+/// The file as a tool wrote it is treated as already rendered for the
+/// instance that built it. [`InstallStore::admit`] reverses it, so the
+/// stored copy holds each `find` where that instance's value was, and
+/// [`InstallStore::fill`] renders it forwards for the instance it fills.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TreeRender {
+    pub path: Utf8PathBuf,
+    pub applied: Vec<AppliedReplacement>,
+}
 
 /// How this filesystem copies a tree.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -82,19 +102,21 @@ impl CopyMethod {
 /// What admitting a built tree did.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Admission {
-    Stored(CopyMethod),
+    /// `unrendered` names each render whose reversal matched nothing: the
+    /// tool did not write the value there this time, so the render may be
+    /// stale. Reported, never fatal.
+    Stored {
+        method: CopyMethod,
+        unrendered: Vec<Utf8PathBuf>,
+    },
     /// Another instance published this key first. Its tree and ours are the
     /// same by construction, so nothing is overwritten.
     AlreadyStored,
     /// The tree names the workspace it was built in, so it is not
     /// relocatable. Carries the first file that proved it.
-    Declined {
-        path: Utf8PathBuf,
-    },
+    Declined { path: Utf8PathBuf },
     /// The action did not produce one of the paths it declared.
-    Incomplete {
-        path: Utf8PathBuf,
-    },
+    Incomplete { path: Utf8PathBuf },
 }
 
 /// What the store did for one resource on one instance, for display.
@@ -107,7 +129,11 @@ pub enum InstallReport {
     /// A stored tree was cloned in, and the install did not run.
     Filled { key: String, method: CopyMethod },
     /// The install ran and its tree was published for the next instance.
-    Stored { key: String, method: CopyMethod },
+    Stored {
+        key: String,
+        method: CopyMethod,
+        unrendered: Vec<Utf8PathBuf>,
+    },
     /// The install ran; another instance had already published this key.
     AlreadyStored { key: String },
     /// The install ran and its tree was not shareable.
@@ -122,15 +148,26 @@ impl InstallReport {
             Self::Filled { key, method } => {
                 format!("install store: filled from {key} ({})", method.label())
             }
-            Self::Stored { key, method } => {
-                format!("install store: stored as {key} ({})", method.label())
+            Self::Stored {
+                key,
+                method,
+                unrendered,
+            } => {
+                let mut line = format!("install store: stored as {key} ({})", method.label());
+                for path in unrendered {
+                    line.push_str(&format!(
+                        "; the render into `{path}` matched nothing, so it may be out of date"
+                    ));
+                }
+                line
             }
             Self::AlreadyStored { key } => {
                 format!("install store: {key} already stored")
             }
             Self::Declined { key, path } => format!(
                 "install store: not stored — the built tree names its own workspace in \
-                 `{path}`, so it cannot be shared (key {key})"
+                 `{path}`, so it cannot be shared (key {key}); a `[[render]]` with `with = \
+                 \"{{{{workspace}}}}\"` on that file lets the store rewrite it per instance"
             ),
             Self::Unavailable { reason } => format!("install store unavailable: {reason}"),
         }
@@ -169,7 +206,8 @@ impl InstallStore {
         entry.is_dir().then_some(entry)
     }
 
-    /// Clone a stored tree into a workspace.
+    /// Clone a stored tree into a workspace, then render each file a
+    /// [`TreeRender`] targets for this workspace.
     ///
     /// Refuses rather than merges when any produced path is already present:
     /// a half-built tree under a matching key is a state this cannot reason
@@ -179,6 +217,7 @@ impl InstallStore {
         entry: &Utf8Path,
         workspace: &Utf8Path,
         produces: &[Utf8PathBuf],
+        renders: &[TreeRender],
     ) -> Result<Option<CopyMethod>> {
         if produces.iter().any(|path| workspace.join(path).exists()) {
             return Ok(None);
@@ -194,6 +233,11 @@ impl InstallStore {
                 create_dir_all(parent)?;
             }
             method = method.min(copy_tree(&entry.join(produced), &destination, probed)?);
+        }
+        for render in renders {
+            rewrite_text(&workspace.join(&render.path), |stored| {
+                crate::render::restore(stored, &render.applied)
+            })?;
         }
         Ok(Some(method))
     }
@@ -212,6 +256,7 @@ impl InstallStore {
         entry: &Utf8Path,
         workspace: &Utf8Path,
         produces: &[Utf8PathBuf],
+        renders: &[TreeRender],
     ) -> Result<CopyMethod> {
         let mut aside = Vec::new();
         for produced in produces {
@@ -226,7 +271,7 @@ impl InstallStore {
             aside.push((current, parked));
         }
 
-        match self.fill(entry, workspace, produces) {
+        match self.fill(entry, workspace, produces, renders) {
             Ok(Some(method)) => {
                 for (_, parked) in &aside {
                     remove_tree(parked)?;
@@ -257,6 +302,11 @@ impl InstallStore {
     /// resource simply keeps installing per instance the way it did before
     /// the store existed.
     ///
+    /// A file a [`TreeRender`] targets is the exception the definition
+    /// vouches for. It is left out of the first scan, reversed in the
+    /// staged copy, and then scanned there: a path the render did not cover
+    /// (a spelling it does not name, say) still declines the tree.
+    ///
     /// Publication is a rename of a fully built temporary directory, so an
     /// entry is either absent or complete — two instances racing on the same
     /// key both build, and the loser discards its copy rather than writing
@@ -267,12 +317,27 @@ impl InstallStore {
         key: &str,
         workspace: &Utf8Path,
         produces: &[Utf8PathBuf],
+        renders: &[TreeRender],
     ) -> Result<Admission> {
         let entry = self.entry(resource, key);
         if entry.is_dir() {
             return Ok(Admission::AlreadyStored);
         }
         let spellings = workspace_spellings(workspace);
+        // Only a regular file is exempt from the scan: a render target that
+        // turned out to be a directory or a symlink is scanned like any
+        // other, because only a file's content can be reversed.
+        let rendered: Vec<&TreeRender> = renders
+            .iter()
+            .filter(|render| {
+                std::fs::symlink_metadata(workspace.join(&render.path))
+                    .is_ok_and(|meta| meta.is_file())
+            })
+            .collect();
+        let exempt: Vec<Utf8PathBuf> = rendered
+            .iter()
+            .map(|render| workspace.join(&render.path))
+            .collect();
         for produced in produces {
             let source = workspace.join(produced);
             if !source.exists() {
@@ -280,7 +345,7 @@ impl InstallStore {
                     path: produced.clone(),
                 });
             }
-            if let Some(found) = find_path_reference(&source, &spellings)? {
+            if let Some(found) = find_path_reference(&source, &spellings, &exempt)? {
                 return Ok(Admission::Declined { path: found });
             }
         }
@@ -295,6 +360,8 @@ impl InstallStore {
 
         let probed = self.copy_method();
         let mut method = probed;
+        let mut unrendered = Vec::new();
+        let mut declined = None;
         let published = (|| -> Result<bool> {
             for produced in produces {
                 let destination = staging.join(produced);
@@ -302,6 +369,19 @@ impl InstallStore {
                     create_dir_all(parent)?;
                 }
                 method = method.min(copy_tree(&workspace.join(produced), &destination, probed)?);
+            }
+            for render in &rendered {
+                let staged = staging.join(&render.path);
+                let changed = rewrite_text(&staged, |built| {
+                    crate::render::reverse(built, &render.applied)
+                })?;
+                if !changed {
+                    unrendered.push(render.path.clone());
+                }
+                if find_path_reference(&staged, &spellings, &[])?.is_some() {
+                    declined = Some(workspace.join(&render.path));
+                    return Ok(false);
+                }
             }
             // `rename` onto an existing directory fails, which is the
             // behaviour we want: whoever published first wins, and their
@@ -313,8 +393,12 @@ impl InstallStore {
             }
         })();
 
+        if let Some(path) = declined {
+            remove_tree(&staging)?;
+            return Ok(Admission::Declined { path });
+        }
         match published {
-            Ok(true) => Ok(Admission::Stored(method)),
+            Ok(true) => Ok(Admission::Stored { method, unrendered }),
             Ok(false) => {
                 remove_tree(&staging)?;
                 Ok(Admission::AlreadyStored)
@@ -373,8 +457,8 @@ impl InstallStore {
 }
 
 /// The key a built tree is stored under: the content of the resource's
-/// identity paths, whatever `key_command` reported, and the definition that
-/// built it.
+/// identity paths, whatever `key_command` reported, what of the instance's
+/// binding can reach the install, and the definition that built it.
 ///
 /// The definition is in the key because the *command* is an input to the
 /// tree, not just its declared inputs. Edit `npm ci` to `npm ci --omit=dev`
@@ -391,14 +475,49 @@ impl InstallStore {
 /// reclaims it, where a wrongly-reused one hands over a tree that does not
 /// match the command that supposedly built it.
 ///
+/// The binding is in the key because it is an input too, and one a shared
+/// lockfile does not record: the lockfile lists every member, bound or not,
+/// and its install builds the ones it can see, found on disk or named by
+/// `{{bound.paths}}`, where a dropped code tracker's files are not checked
+/// out. Without it, an instance that drops a member would be filled with
+/// the tree built for one that binds it.
+///
+/// `binding` is only the part of the binding that can reach the install
+/// (`BranchManager::install_binding`), not all of it:
+///
+/// - Always, which paths the checkout leaves out: the sparse checkout the
+///   instance's dropped code trackers make. That is how an install reads
+///   the binding without naming it — an unfiltered `npm ci` links a
+///   workspace member only when the member is checked out — so it is in
+///   every resource's key.
+/// - What `{{bound.trackers}}` and `{{bound.paths}}` render to, only when
+///   the install can be told: its own commands, `key_command`, exports or
+///   renders name one, or any resource's export or render does.
+///
+/// A secret tracker puts no paths into the sparse checkout, and neither
+/// does one that owns none, so binding or dropping either leaves the key
+/// alone unless the install is told the names. Before, the whole binding
+/// was in every key, and switching on a branch database (a secret tracker
+/// with `paths = []`) cost a full `npm ci` for an identical tree (#248).
+/// An install that does read a secret tracker's file — an `.npmrc` it
+/// projects, say — names that file in `[identity] paths`, whose content is
+/// hashed like any other input.
+///
 /// Everything is mixed rather than concatenated into the path, so adding a
 /// `key_command` later does not collide with entries built before it — the
 /// whole key moves, and the old entries simply stop being found.
-pub fn identity_key(inputs_rev: &str, key_material: Option<&str>, definition_rev: &str) -> String {
+pub fn identity_key(
+    inputs_rev: &str,
+    key_material: Option<&str>,
+    binding: &str,
+    definition_rev: &str,
+) -> String {
     let mut hasher = Sha256::new();
     hasher.update(inputs_rev.as_bytes());
     hasher.update([0]);
     hasher.update(key_material.unwrap_or_default().as_bytes());
+    hasher.update([0]);
+    hasher.update(binding.as_bytes());
     hasher.update([0]);
     hasher.update(definition_rev.as_bytes());
     let digest = hasher.finalize();
@@ -411,10 +530,17 @@ pub fn identity_key(inputs_rev: &str, key_material: Option<&str>, definition_rev
 /// Copy a tree, preferring the filesystem's copy-on-write clone, and
 /// reporting which one actually happened.
 ///
-/// Shelling out to `cp` rather than walking the tree in process: a
-/// `node_modules` is full of symlinks and executable bits, and `cp` is the
-/// boring thing that already gets them right. It is also the only way to
-/// reach `clonefile`/`--reflink` at all without binding platform syscalls.
+/// On macOS the clone is one `clonefile(2)` on the whole tree, which the
+/// kernel walks itself. `cp -c` clones file by file from userspace, and a
+/// pnpm monorepo is hundreds of thousands of files: on T3 Code (264k files)
+/// that was 37s, slower than the install it stands in for, against 2.7s for
+/// the single call.
+///
+/// Everywhere else, and as the fallback on macOS, this shells out to `cp`
+/// rather than walking the tree in process: a `node_modules` is full of
+/// symlinks and executable bits, and `cp` is the boring thing that already
+/// gets them right. It is also how Linux reaches `--reflink` without binding
+/// platform syscalls.
 ///
 /// One thing it does *not* preserve everywhere: hardlinks. GNU `cp -a`
 /// implies `--preserve=links`, but BSD `cp` on macOS has no equivalent, so a
@@ -430,16 +556,38 @@ pub fn identity_key(inputs_rev: &str, key_material: Option<&str>, definition_rev
 /// fail on the way out of it. Same result either way, and the caller is told
 /// which it got.
 fn copy_tree(source: &Utf8Path, destination: &Utf8Path, method: CopyMethod) -> Result<CopyMethod> {
-    if let CopyMethod::Reflink = method
-        && run_cp(copy_args(CopyMethod::Reflink), source, destination).is_ok()
-    {
-        return Ok(CopyMethod::Reflink);
+    if let CopyMethod::Reflink = method {
+        if clone_tree(source, destination) {
+            return Ok(CopyMethod::Reflink);
+        }
+        remove_tree(destination)?;
+        if run_cp(copy_args(CopyMethod::Reflink), source, destination).is_ok() {
+            return Ok(CopyMethod::Reflink);
+        }
     }
     // A failed clone can leave a partial tree behind, and `cp` over it would
     // merge rather than replace.
     remove_tree(destination)?;
     run_cp(copy_args(CopyMethod::Full), source, destination)?;
     Ok(CopyMethod::Full)
+}
+
+/// Clone a whole tree in one call, where the platform has one. A failure
+/// (another volume, a filesystem without clones) is not an error: the
+/// caller cleans up and falls back to `cp`.
+///
+/// A produced path that is itself a symlink is left to `cp`, which copies
+/// the link. `clonefile` follows a symlink it is handed as the source, and
+/// would put a copy of whatever the link points at in its place.
+#[cfg(target_os = "macos")]
+fn clone_tree(source: &Utf8Path, destination: &Utf8Path) -> bool {
+    let is_link = std::fs::symlink_metadata(source).is_ok_and(|meta| meta.is_symlink());
+    !is_link && reflink_copy::reflink(source, destination).is_ok()
+}
+
+#[cfg(not(target_os = "macos"))]
+fn clone_tree(_source: &Utf8Path, _destination: &Utf8Path) -> bool {
+    false
 }
 
 fn run_cp(args: &[&str], source: &Utf8Path, destination: &Utf8Path) -> Result<()> {
@@ -527,45 +675,153 @@ fn workspace_spellings(workspace: &Utf8Path) -> Vec<String> {
     spellings
 }
 
-/// The first file under `root` whose content — or, for a symlink, whose
-/// target — contains any of `needles`. `None` means the tree never mentions
-/// them.
+/// Rewrite a text file through `change`, reporting whether it changed. A
+/// path that is missing or not a regular file is left alone: a tool that
+/// stops writing the file must not break the store.
+///
+/// The result goes to a sibling and is renamed over the original, so a
+/// file that was a hardlink or a clone is replaced rather than written
+/// through, and a reader never sees half a rewrite.
+fn rewrite_text(path: &Utf8Path, change: impl FnOnce(&str) -> String) -> Result<bool> {
+    let Ok(metadata) = std::fs::symlink_metadata(path) else {
+        return Ok(false);
+    };
+    if !metadata.is_file() {
+        return Ok(false);
+    }
+    let content = std::fs::read_to_string(path).map_err(|source| NewgitError::io(path, source))?;
+    let changed = change(&content);
+    if changed == content {
+        return Ok(false);
+    }
+    let staged = Utf8PathBuf::from(format!("{path}.newgit-rendering"));
+    std::fs::write(&staged, &changed).map_err(|source| NewgitError::io(staged.clone(), source))?;
+    std::fs::set_permissions(&staged, metadata.permissions())
+        .map_err(|source| NewgitError::io(staged.clone(), source))?;
+    std::fs::rename(&staged, path).map_err(|source| NewgitError::io(path, source))?;
+    Ok(true)
+}
+
+/// A file under `root` whose content — or, for a symlink, whose target —
+/// contains any of `needles`. `None` means the tree never mentions them.
 ///
 /// Symlinks are read rather than followed: a `node_modules` is full of them,
 /// following would recurse forever through a package manager's store links,
 /// and a link *target* naming the workspace is exactly the poisoning being
 /// looked for.
-fn find_path_reference(root: &Utf8Path, needles: &[String]) -> Result<Option<Utf8PathBuf>> {
+///
+/// This reads every byte of every produced tree on every install that might
+/// be stored — 3.8 GB in 264k files for T3 Code — so it runs in parallel:
+/// one task per directory and per file, on rayon's pool. Single-threaded it
+/// took ~28s on that tree, longer than the install it was vetting (#235).
+/// The walk stops at the first match, so *which* match is reported is not
+/// deterministic when there are several; any one declines the tree.
+fn find_path_reference(
+    root: &Utf8Path,
+    needles: &[String],
+    exempt: &[Utf8PathBuf],
+) -> Result<Option<Utf8PathBuf>> {
     let metadata =
         std::fs::symlink_metadata(root).map_err(|source| NewgitError::io(root, source))?;
-
-    if metadata.is_symlink() {
-        let target = std::fs::read_link(root).map_err(|source| NewgitError::io(root, source))?;
-        let target = target.to_string_lossy();
-        let names = needles
+    let scan = ReferenceScan {
+        finders: needles
             .iter()
-            .any(|needle| target.contains(needle.as_str()));
-        return Ok(names.then(|| root.to_path_buf()));
+            .filter(|needle| !needle.is_empty())
+            .map(|needle| memchr::memmem::Finder::new(needle.as_bytes()).into_owned())
+            .collect(),
+        exempt,
+        stop: AtomicBool::new(false),
+        outcome: Mutex::new(None),
+    };
+    rayon::scope(|scope| scan.visit(scope, root.to_path_buf(), metadata.file_type()));
+    match scan.outcome.into_inner() {
+        Ok(outcome) => outcome.transpose(),
+        Err(poisoned) => poisoned.into_inner().transpose(),
     }
+}
 
-    if metadata.is_file() {
-        return Ok(file_contains_any(root, needles)?.then(|| root.to_path_buf()));
-    }
+/// The shared state of one [`find_path_reference`] walk.
+struct ReferenceScan<'a> {
+    finders: Vec<memchr::memmem::Finder<'static>>,
+    exempt: &'a [Utf8PathBuf],
+    /// Set by the first match or error: every task still queued returns
+    /// without touching the disk.
+    stop: AtomicBool,
+    /// The first match or error, whichever came first.
+    outcome: Mutex<Option<Result<Utf8PathBuf>>>,
+}
 
-    if !metadata.is_dir() {
-        return Ok(None);
-    }
-    for entry in std::fs::read_dir(root).map_err(|source| NewgitError::io(root, source))? {
-        let entry = entry.map_err(|source| NewgitError::io(root, source))?;
-        let name = entry.file_name();
-        let Some(name) = name.to_str() else {
-            return Err(NewgitError::NonUtf8Path(entry.path().display().to_string()));
-        };
-        if let Some(found) = find_path_reference(&root.join(name), needles)? {
-            return Ok(Some(found));
+impl<'a> ReferenceScan<'a> {
+    fn visit<'s>(&'s self, scope: &rayon::Scope<'s>, path: Utf8PathBuf, kind: std::fs::FileType)
+    where
+        'a: 's,
+    {
+        if self.stop.load(Ordering::Relaxed) {
+            return;
+        }
+        match self.check(scope, &path, kind) {
+            Ok(false) => {}
+            Ok(true) => self.finish(Ok(path)),
+            Err(error) => self.finish(Err(error)),
         }
     }
-    Ok(None)
+
+    /// Whether `path` itself names a needle. A directory never does: its
+    /// entries are queued as tasks of their own.
+    fn check<'s>(
+        &'s self,
+        scope: &rayon::Scope<'s>,
+        path: &Utf8Path,
+        kind: std::fs::FileType,
+    ) -> Result<bool>
+    where
+        'a: 's,
+    {
+        if kind.is_symlink() {
+            let target =
+                std::fs::read_link(path).map_err(|source| NewgitError::io(path, source))?;
+            let target = target.as_os_str().as_encoded_bytes();
+            return Ok(self
+                .finders
+                .iter()
+                .any(|finder| finder.find(target).is_some()));
+        }
+        if kind.is_file() {
+            if self.exempt.iter().any(|exempt| exempt == path) {
+                return Ok(false);
+            }
+            return file_contains_any(path, &self.finders);
+        }
+        if !kind.is_dir() {
+            return Ok(false);
+        }
+        for entry in std::fs::read_dir(path).map_err(|source| NewgitError::io(path, source))? {
+            let entry = entry.map_err(|source| NewgitError::io(path, source))?;
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else {
+                return Err(NewgitError::NonUtf8Path(entry.path().display().to_string()));
+            };
+            let child = path.join(name);
+            // `DirEntry::file_type` comes from the directory listing itself
+            // on macOS and Linux, so the walk costs no `lstat` per entry.
+            let kind = entry
+                .file_type()
+                .map_err(|source| NewgitError::io(child.clone(), source))?;
+            scope.spawn(move |scope| self.visit(scope, child, kind));
+        }
+        Ok(false)
+    }
+
+    fn finish(&self, outcome: Result<Utf8PathBuf>) {
+        self.stop.store(true, Ordering::Relaxed);
+        let mut slot = self
+            .outcome
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if slot.is_none() {
+            *slot = Some(outcome);
+        }
+    }
 }
 
 /// Whether a file contains any needle, read in fixed-size chunks.
@@ -575,55 +831,50 @@ fn find_path_reference(root: &Utf8Path, needles: &[String]) -> Result<Option<Utf
 /// several gigabytes for a real monorepo, including individual native
 /// artifacts large enough that reading one into a single allocation is its
 /// own problem. Consecutive chunks overlap by `len - 1` bytes so a match
-/// straddling a boundary is still found.
-fn file_contains_any(path: &Utf8Path, needles: &[String]) -> Result<bool> {
-    let longest = needles.iter().map(String::len).max().unwrap_or(0);
+/// straddling a boundary is still found. The buffer is per thread, so the
+/// walk does not allocate one per file.
+fn file_contains_any(path: &Utf8Path, finders: &[memchr::memmem::Finder<'_>]) -> Result<bool> {
+    let longest = finders
+        .iter()
+        .map(|finder| finder.needle().len())
+        .max()
+        .unwrap_or(0);
     if longest == 0 {
         return Ok(false);
     }
     const CHUNK: usize = 64 * 1024;
+    thread_local! {
+        static BUFFER: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
 
-    let file = std::fs::File::open(path).map_err(|source| NewgitError::io(path, source))?;
-    let mut reader = std::io::BufReader::new(file);
+    let mut file = std::fs::File::open(path).map_err(|source| NewgitError::io(path, source))?;
     let overlap = longest - 1;
-    let mut buffer = vec![0u8; overlap + CHUNK];
-    let mut filled = 0;
+    let matches = |window: &[u8]| finders.iter().any(|finder| finder.find(window).is_some());
 
-    loop {
-        let read = std::io::Read::read(&mut reader, &mut buffer[filled..])
-            .map_err(|source| NewgitError::io(path, source))?;
-        if read == 0 {
-            break;
+    BUFFER.with_borrow_mut(|buffer| {
+        buffer.resize(overlap + CHUNK, 0);
+        let mut filled = 0;
+        loop {
+            let read = std::io::Read::read(&mut file, &mut buffer[filled..])
+                .map_err(|source| NewgitError::io(path, source))?;
+            if read == 0 {
+                break;
+            }
+            filled += read;
+            if filled < buffer.len() {
+                // Short read: go around rather than scanning a half-filled
+                // window, so a boundary match is never split by an artifact
+                // of how the bytes arrived.
+                continue;
+            }
+            if matches(&buffer[..filled]) {
+                return Ok(true);
+            }
+            buffer.copy_within(filled - overlap..filled, 0);
+            filled = overlap;
         }
-        filled += read;
-        if filled < buffer.len() {
-            // Short read: go around rather than scanning a half-filled
-            // window, so a boundary match is never split by an artifact of
-            // how the bytes arrived.
-            continue;
-        }
-        if needles
-            .iter()
-            .any(|needle| contains_bytes(&buffer[..filled], needle.as_bytes()))
-        {
-            return Ok(true);
-        }
-        buffer.copy_within(filled - overlap..filled, 0);
-        filled = overlap;
-    }
-
-    Ok(needles
-        .iter()
-        .any(|needle| contains_bytes(&buffer[..filled], needle.as_bytes())))
-}
-
-fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
-    if needle.is_empty() || haystack.len() < needle.len() {
-        return false;
-    }
-    haystack
-        .windows(needle.len())
-        .any(|window| window == needle)
+        Ok(matches(&buffer[..filled]))
+    })
 }
 
 /// Remove whatever is at `path` — a directory, a file, or a symlink.
@@ -689,9 +940,12 @@ mod tests {
 
         let produces = vec![Utf8PathBuf::from("node_modules")];
         let admission = store
-            .admit("deps", "abc123", &built, &produces)
+            .admit("deps", "abc123", &built, &produces, &[])
             .expect("admit");
-        assert!(matches!(admission, Admission::Stored(_)), "{admission:?}");
+        assert!(
+            matches!(admission, Admission::Stored { .. }),
+            "{admission:?}"
+        );
         assert_eq!(
             store.entries().expect("entries"),
             vec![("deps".to_owned(), "abc123".to_owned())]
@@ -701,7 +955,7 @@ mod tests {
         std::fs::create_dir_all(&fresh).expect("mkdir");
         let entry = store.lookup("deps", "abc123").expect("entry");
         let method = store
-            .fill(&entry, &fresh, &produces)
+            .fill(&entry, &fresh, &produces, &[])
             .expect("fill")
             .expect("a fresh workspace should be filled");
         assert!(matches!(method, CopyMethod::Reflink | CopyMethod::Full));
@@ -713,7 +967,7 @@ mod tests {
         // Re-admitting the same key is not an overwrite.
         assert_eq!(
             store
-                .admit("deps", "abc123", &built, &produces)
+                .admit("deps", "abc123", &built, &produces, &[])
                 .expect("re-admit"),
             Admission::AlreadyStored
         );
@@ -729,14 +983,16 @@ mod tests {
         std::fs::create_dir_all(built.join("node_modules")).expect("mkdir");
         std::fs::write(built.join("node_modules/build.json"), "{}\n").expect("write");
         let produces = vec![Utf8PathBuf::from("node_modules")];
-        store.admit("deps", "k", &built, &produces).expect("admit");
+        store
+            .admit("deps", "k", &built, &produces, &[])
+            .expect("admit");
         let entry = store.lookup("deps", "k").expect("entry");
 
         let one = root.join("one");
         let two = root.join("two");
         for workspace in [&one, &two] {
             std::fs::create_dir_all(workspace).expect("mkdir");
-            store.fill(&entry, workspace, &produces).expect("fill");
+            store.fill(&entry, workspace, &produces, &[]).expect("fill");
         }
 
         std::fs::write(one.join("node_modules/build.json"), "{\"native\": true}\n")
@@ -751,6 +1007,119 @@ mod tests {
             std::fs::read_to_string(entry.join("node_modules/build.json")).expect("read"),
             "{}\n",
             "nor the store entry every later instance is cloned from"
+        );
+    }
+
+    /// `cp -R` copies a symlink operand as a link; a clone of the tree
+    /// must too, rather than copying what the link points at.
+    #[test]
+    fn a_produced_symlink_is_filled_as_a_symlink() {
+        let (_guard, root) = temp();
+        let store = InstallStore::at(root.join("installs"));
+        let built = root.join("built");
+        std::fs::create_dir_all(built.join("vendor/pkg")).expect("mkdir");
+        std::fs::write(built.join("vendor/pkg/index.js"), "module.exports = 1\n").expect("write");
+        std::os::unix::fs::symlink("vendor", built.join("node_modules")).expect("symlink");
+
+        let produces = vec![Utf8PathBuf::from("node_modules")];
+        store
+            .admit("deps", "k", &built, &produces, &[])
+            .expect("admit");
+        let entry = store.lookup("deps", "k").expect("entry");
+        let fresh = root.join("fresh");
+        std::fs::create_dir_all(&fresh).expect("mkdir");
+        store.fill(&entry, &fresh, &produces, &[]).expect("fill");
+
+        let filled = fresh.join("node_modules");
+        assert!(
+            std::fs::symlink_metadata(&filled)
+                .expect("filled")
+                .is_symlink(),
+            "the produced symlink must be filled as a symlink, not a copy of its target"
+        );
+        assert_eq!(
+            std::fs::read_link(&filled).expect("readlink"),
+            std::path::Path::new("vendor")
+        );
+    }
+
+    fn workspace_render(find: &str, value: &str) -> TreeRender {
+        TreeRender {
+            path: Utf8PathBuf::from("node_modules/state.json"),
+            applied: vec![AppliedReplacement {
+                find: find.to_owned(),
+                value: value.to_owned(),
+                count: 1,
+            }],
+        }
+    }
+
+    /// The render covers one spelling. A copy of the path it did not cover
+    /// is still poison, and the stored copy is scanned to find it.
+    #[test]
+    fn a_rendered_file_still_naming_its_workspace_is_declined() {
+        let (_guard, root) = temp();
+        let store = InstallStore::at(root.join("installs"));
+        let built = root.join("built");
+        std::fs::create_dir_all(built.join("node_modules")).expect("mkdir");
+        std::fs::write(
+            built.join("node_modules/state.json"),
+            format!("{built} and again {built}"),
+        )
+        .expect("write");
+        let produces = vec![Utf8PathBuf::from("node_modules")];
+
+        let covered = store
+            .admit(
+                "deps",
+                "covered",
+                &built,
+                &produces,
+                &[workspace_render("/__ws__", built.as_str())],
+            )
+            .expect("admit");
+        assert!(matches!(covered, Admission::Stored { .. }), "{covered:?}");
+
+        let missed = store
+            .admit(
+                "deps",
+                "missed",
+                &built,
+                &produces,
+                &[workspace_render("/__ws__", "/somewhere/else")],
+            )
+            .expect("admit");
+        assert!(matches!(missed, Admission::Declined { .. }), "{missed:?}");
+        assert!(
+            store.lookup("deps", "missed").is_none(),
+            "a declined tree leaves no entry behind"
+        );
+    }
+
+    /// A render whose value the tool no longer writes is reported, not
+    /// fatal: the tree has nothing to rewrite, so it is safe to store.
+    #[test]
+    fn a_render_that_reverses_nothing_is_reported() {
+        let (_guard, root) = temp();
+        let store = InstallStore::at(root.join("installs"));
+        let built = root.join("built");
+        std::fs::create_dir_all(built.join("node_modules")).expect("mkdir");
+        std::fs::write(built.join("node_modules/state.json"), "{}").expect("write");
+        let admission = store
+            .admit(
+                "deps",
+                "k",
+                &built,
+                &[Utf8PathBuf::from("node_modules")],
+                &[workspace_render("/__ws__", built.as_str())],
+            )
+            .expect("admit");
+        assert_eq!(
+            admission,
+            Admission::Stored {
+                method: store.copy_method(),
+                unrendered: vec![Utf8PathBuf::from("node_modules/state.json")],
+            }
         );
     }
 
@@ -772,6 +1141,7 @@ mod tests {
                 "poisoned",
                 &built,
                 &[Utf8PathBuf::from("node_modules")],
+                &[],
             )
             .expect("admit");
         match admission {
@@ -798,7 +1168,13 @@ mod tests {
         std::os::unix::fs::symlink(&built, built.join("node_modules/self")).expect("symlink");
 
         let admission = store
-            .admit("deps", "loop", &built, &[Utf8PathBuf::from("node_modules")])
+            .admit(
+                "deps",
+                "loop",
+                &built,
+                &[Utf8PathBuf::from("node_modules")],
+                &[],
+            )
             .expect("a cyclic symlink must not hang the scan");
         assert!(
             matches!(admission, Admission::Declined { .. }),
@@ -815,7 +1191,13 @@ mod tests {
 
         assert_eq!(
             store
-                .admit("deps", "k", &built, &[Utf8PathBuf::from("node_modules")])
+                .admit(
+                    "deps",
+                    "k",
+                    &built,
+                    &[Utf8PathBuf::from("node_modules")],
+                    &[]
+                )
                 .expect("admit"),
             Admission::Incomplete {
                 path: Utf8PathBuf::from("node_modules")
@@ -833,13 +1215,15 @@ mod tests {
         std::fs::create_dir_all(built.join("node_modules")).expect("mkdir");
         std::fs::write(built.join("node_modules/a.js"), "a\n").expect("write");
         let produces = vec![Utf8PathBuf::from("node_modules")];
-        store.admit("deps", "k", &built, &produces).expect("admit");
+        store
+            .admit("deps", "k", &built, &produces, &[])
+            .expect("admit");
         let entry = store.lookup("deps", "k").expect("entry");
 
         let occupied = root.join("occupied");
         std::fs::create_dir_all(occupied.join("node_modules")).expect("mkdir");
         assert_eq!(
-            store.fill(&entry, &occupied, &produces).expect("fill"),
+            store.fill(&entry, &occupied, &produces, &[]).expect("fill"),
             None,
             "a workspace that already has the tree is left alone"
         );
@@ -855,7 +1239,9 @@ mod tests {
         std::fs::create_dir_all(built.join("node_modules")).expect("mkdir");
         std::fs::write(built.join("node_modules/version"), "v1\n").expect("write");
         let produces = vec![Utf8PathBuf::from("node_modules")];
-        store.admit("deps", "v1", &built, &produces).expect("admit");
+        store
+            .admit("deps", "v1", &built, &produces, &[])
+            .expect("admit");
         let entry = store.lookup("deps", "v1").expect("entry");
 
         // The instance has moved on to a newer tree, with a stray file the
@@ -866,7 +1252,7 @@ mod tests {
         std::fs::write(workspace.join("node_modules/only-in-v2"), "x\n").expect("write");
 
         store
-            .replace(&entry, &workspace, &produces)
+            .replace(&entry, &workspace, &produces, &[])
             .expect("replace");
 
         assert_eq!(
@@ -897,7 +1283,7 @@ mod tests {
         // shape as a store entry someone deleted out from under us.
         let missing = root.join("installs/deps/gone");
         let produces = vec![Utf8PathBuf::from("node_modules")];
-        let error = store.replace(&missing, &workspace, &produces);
+        let error = store.replace(&missing, &workspace, &produces, &[]);
         assert!(error.is_err(), "a failed clone must not report success");
 
         assert_eq!(
@@ -906,6 +1292,48 @@ mod tests {
             "the instance keeps the tree it had"
         );
         assert!(!workspace.join("node_modules.newgit-replacing").exists());
+    }
+
+    /// The scan fans out over a wide, deep tree. One poisoned file among
+    /// hundreds of clean ones is still found, and a clean tree of the same
+    /// shape is stored.
+    #[test]
+    fn the_parallel_scan_finds_one_poisoned_file_in_a_wide_tree() {
+        let (_guard, root) = temp();
+        let store = InstallStore::at(root.join("installs"));
+        for (key, poisoned) in [("clean", false), ("poisoned", true)] {
+            let built = root.join(key);
+            for package in 0..40 {
+                let dir = built.join(format!("node_modules/.pnpm/pkg{package}/lib/deep"));
+                std::fs::create_dir_all(&dir).expect("mkdir");
+                for file in 0..10 {
+                    std::fs::write(dir.join(format!("f{file}.js")), "module.exports = 1;\n")
+                        .expect("write");
+                }
+            }
+            let target = built.join("node_modules/.pnpm/pkg23/lib/deep/f7.js");
+            if poisoned {
+                std::fs::write(&target, format!("require(\"{built}/x\");\n")).expect("write");
+            }
+
+            let admission = store
+                .admit(
+                    "deps",
+                    key,
+                    &built,
+                    &[Utf8PathBuf::from("node_modules")],
+                    &[],
+                )
+                .expect("admit");
+            if poisoned {
+                assert_eq!(admission, Admission::Declined { path: target });
+            } else {
+                assert!(
+                    matches!(admission, Admission::Stored { .. }),
+                    "{admission:?}"
+                );
+            }
+        }
     }
 
     /// The scan runs over whole trees, so it reads in chunks — a match must
@@ -926,7 +1354,13 @@ mod tests {
         std::fs::write(built.join("node_modules/native.node"), &blob).expect("write");
 
         let admission = store
-            .admit("deps", "k", &built, &[Utf8PathBuf::from("node_modules")])
+            .admit(
+                "deps",
+                "k",
+                &built,
+                &[Utf8PathBuf::from("node_modules")],
+                &[],
+            )
             .expect("admit");
         assert!(
             matches!(admission, Admission::Declined { .. }),
@@ -946,14 +1380,16 @@ mod tests {
 
         let produces = vec![Utf8PathBuf::from("build/app.bin")];
         assert!(matches!(
-            store.admit("app", "k", &built, &produces).expect("admit"),
-            Admission::Stored(_)
+            store
+                .admit("app", "k", &built, &produces, &[])
+                .expect("admit"),
+            Admission::Stored { .. }
         ));
 
         let fresh = root.join("fresh");
         std::fs::create_dir_all(&fresh).expect("mkdir");
         let entry = store.lookup("app", "k").expect("entry");
-        store.fill(&entry, &fresh, &produces).expect("fill");
+        store.fill(&entry, &fresh, &produces, &[]).expect("fill");
         assert_eq!(
             std::fs::read(fresh.join("build/app.bin")).expect("read"),
             b"\x7fELF binary\n"
@@ -961,7 +1397,9 @@ mod tests {
 
         // And replacing one works the same way `remove_dir_all` would not.
         std::fs::write(fresh.join("build/app.bin"), b"stale\n").expect("write");
-        store.replace(&entry, &fresh, &produces).expect("replace");
+        store
+            .replace(&entry, &fresh, &produces, &[])
+            .expect("replace");
         assert_eq!(
             std::fs::read(fresh.join("build/app.bin")).expect("read"),
             b"\x7fELF binary\n"
@@ -993,24 +1431,37 @@ mod tests {
     #[test]
     fn the_key_moves_when_any_part_of_it_does() {
         let rev = "sha256:000000000000";
-        let base = identity_key("aaaa", None, rev);
-        assert_eq!(base, identity_key("aaaa", None, rev), "and is stable");
-        assert_ne!(base, identity_key("bbbb", None, rev), "inputs move the key");
+        let both = "";
+        let base = identity_key("aaaa", None, both, rev);
+        assert_eq!(base, identity_key("aaaa", None, both, rev), "and is stable");
         assert_ne!(
             base,
-            identity_key("aaaa", Some("v24.3.0 Darwin arm64"), rev),
+            identity_key("bbbb", None, both, rev),
+            "inputs move the key"
+        );
+        assert_ne!(
+            base,
+            identity_key("aaaa", Some("v24.3.0 Darwin arm64"), both, rev),
             "adding key material moves it too, so old entries stop matching"
         );
         assert_ne!(
-            identity_key("aaaa", Some("v24.3.0 Darwin arm64"), rev),
-            identity_key("aaaa", Some("v22.1.0 Darwin arm64"), rev),
+            identity_key("aaaa", Some("v24.3.0 Darwin arm64"), both, rev),
+            identity_key("aaaa", Some("v22.1.0 Darwin arm64"), both, rev),
             "a toolchain bump is a different tree"
+        );
+        // A shared lockfile lists every member, bound or not: the same
+        // inputs build less for an instance that checks out less.
+        let without_b = "/*\n!/apps/b/\n!/apps/b";
+        assert_ne!(
+            base,
+            identity_key("aaaa", None, without_b, rev),
+            "checking out fewer members is a different tree"
         );
         // The command that builds the tree is as much an input as the
         // lockfile it reads: same inputs, edited `prepare`, different tree.
         assert_ne!(
             base,
-            identity_key("aaaa", None, "sha256:111111111111"),
+            identity_key("aaaa", None, both, "sha256:111111111111"),
             "an edited definition must not reuse the tree the old one built"
         );
     }

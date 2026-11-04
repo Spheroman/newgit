@@ -1,6 +1,6 @@
 //! The newgit remote: a Worker that keeps binding records and checkpoints
 //! and mints Git credentials for a project's Artifacts repos (see
-//! `newgit-cloudflare.md`).
+//! `docs/design/remote.md`).
 //!
 //! The rest of newgit talks to it through [`Remote`], so tests can stand in a
 //! fake whose "repos" are local bare repositories. [`HttpRemote`] is the real

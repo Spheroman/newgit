@@ -1671,6 +1671,93 @@ command = "mkdir -p node_modules && echo built > node_modules/marker"
     assert_ne!(install_key(&second.resources), first_key);
 }
 
+/// A tree that names its own workspace is shared once a `[[render]]` says
+/// which file names it: the store keeps the render's `find` there and each
+/// filled instance gets its own path back.
+#[test]
+fn a_render_into_the_built_tree_lets_the_store_share_it() {
+    let (_guard, temp) = tempdir();
+    let store = setup(&temp);
+    let repo = store.paths().project_root.clone();
+    std::fs::write(repo.join("lock.txt"), "v1\n").expect("write lock");
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-q", "-m", "lockfile"]);
+
+    write_resource(
+        &store,
+        "deps",
+        r#"ownership = "workspace"
+
+[identity]
+paths = ["lock.txt"]
+produces = ["node_modules"]
+
+[actions.prepare]
+command = "mkdir -p node_modules && printf '{\"root\":\"%s\",\"a\":\"%s/a\"}' '{{workspace}}' '{{workspace}}' > node_modules/state.json"
+
+[[render]]
+path = "node_modules/state.json"
+replace = [{ find = "/__ws__", with = "{{workspace}}" }]
+"#,
+    );
+    let manager = BranchManager::open(MetadataStore::at(&repo)).expect("manager");
+
+    let first = manager.spawn("one", None).expect("spawn one");
+    let report = first
+        .resources
+        .iter()
+        .find(|resource| resource.name == "deps")
+        .expect("deps reported");
+    let key = match report.install.as_ref().expect("an install report") {
+        InstallReport::Stored {
+            key, unrendered, ..
+        } => {
+            assert!(unrendered.is_empty(), "the render matched: {unrendered:?}");
+            key.clone()
+        }
+        other => panic!("a rendered tree should be stored, not declined: {other:?}"),
+    };
+    let stored = std::fs::read_to_string(
+        store
+            .paths()
+            .project_root
+            .join(".newgit/installs/deps")
+            .join(&key)
+            .join("node_modules/state.json"),
+    )
+    .expect("stored copy");
+    assert_eq!(
+        stored, r#"{"root":"/__ws__","a":"/__ws__/a"}"#,
+        "the store holds the render's `find`, not the instance that built it"
+    );
+    assert!(
+        std::fs::read_to_string(first.branch.workspace_path.join("node_modules/state.json"))
+            .expect("built copy")
+            .contains(first.branch.workspace_path.as_str()),
+        "and the building instance keeps its own file as the tool wrote it"
+    );
+
+    let second = manager.spawn("two", None).expect("spawn two");
+    let report = second
+        .resources
+        .iter()
+        .find(|resource| resource.name == "deps")
+        .expect("deps reported");
+    assert!(report.prepare.is_none(), "the second instance is filled");
+    assert!(
+        matches!(report.install, Some(InstallReport::Filled { .. })),
+        "{:?}",
+        report.install
+    );
+    let ws = second.branch.workspace_path.as_str();
+    assert_eq!(
+        std::fs::read_to_string(second.branch.workspace_path.join("node_modules/state.json"))
+            .expect("filled copy"),
+        format!(r#"{{"root":"{ws}","a":"{ws}/a"}}"#),
+        "every occurrence names the instance it was filled into"
+    );
+}
+
 fn install_key(resources: &[newgit_core::manager::ResourceBindOutcome]) -> String {
     match resources
         .iter()

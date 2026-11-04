@@ -12,41 +12,13 @@ use newgit_core::SourceSubstrate;
 use newgit_core::manager::BranchManager;
 use newgit_core::store::MetadataStore;
 
-/// The port lines `supabase init` writes, in the shape it writes them.
-const CONFIG_TOML: &str = r#"project_id = "EDIT_ME_PROJECT"
+mod common;
+use common::add_supabase_without_starting_it;
 
-[api]
-enabled = true
-port = 54321
-schemas = ["public", "graphql_public"]
-
-[db]
-port = 54322
-shadow_port = 54320
-major_version = 15
-
-[db.pooler]
-enabled = false
-port = 54329
-
-[studio]
-enabled = true
-port = 54323
-api_url = "http://127.0.0.1"
-
-[inbucket]
-enabled = true
-port = 54324
-
-[analytics]
-enabled = true
-port = 54327
-backend = "postgres"
-
-[auth]
-site_url = "http://127.0.0.1:3000"
-additional_redirect_urls = ["exp://127.0.0.1:8081"]
-"#;
+/// `supabase init` output from CLI 2.111.0, verbatim apart from `project_id`,
+/// which the CLI sets to the directory name and the template's `find` expects
+/// as `EDIT_ME_PROJECT`.
+const CONFIG_TOML: &str = include_str!("fixtures/supabase-init-config.toml");
 
 fn git(dir: &Utf8Path, args: &[&str]) {
     let output = Command::new("git")
@@ -122,10 +94,7 @@ fn the_supabase_template_renders_against_the_clis_committed_defaults() {
     let store = setup(&temp);
     let repo = store.paths().project_root.clone();
 
-    BranchManager::open(MetadataStore::at(repo.clone()))
-        .expect("manager")
-        .add_resource("supabase", "supabase")
-        .expect("add supabase");
+    add_supabase_without_starting_it(&repo);
 
     let manager = BranchManager::open(MetadataStore::at(repo)).expect("reopen");
     let spawned = manager.spawn("feature-a", None).expect("spawn");
@@ -156,7 +125,7 @@ fn the_supabase_template_renders_against_the_clis_committed_defaults() {
         "project_id must carry the instance slug, got:\n{rendered}"
     );
 
-    // All six ports moved to their allocated values. The allocated numbers
+    // Every port moved to its allocated value. The allocated numbers
     // depend on what is listening on the machine, so assert against the
     // binding record rather than against literals — a suite running in
     // parallel legitimately pushes these around.
@@ -166,8 +135,9 @@ fn the_supabase_template_renders_against_the_clis_committed_defaults() {
         ("db", "port", "db"),
         ("db", "shadow_port", "shadow"),
         ("studio", "port", "studio"),
-        ("inbucket", "port", "inbucket"),
+        ("local_smtp", "port", "inbucket"),
         ("analytics", "port", "analytics"),
+        ("db.pooler", "port", "pooler"),
     ] {
         assert_eq!(
             rendered_ports
@@ -178,17 +148,22 @@ fn the_supabase_template_renders_against_the_clis_committed_defaults() {
         );
     }
 
+    // `supabase init` leaves these two commented out; they move anyway, so
+    // uncommenting one does not reintroduce the default.
+    for (key, port_name) in [("smtp_port", "smtp"), ("pop3_port", "pop3")] {
+        let line = format!("# {key} = {}", binding.resolved_ports[port_name]);
+        assert!(
+            rendered.contains(&line),
+            "`{line}` missing from the render:\n{rendered}"
+        );
+    }
+
     // `shadow_port = 54320` must not have been eaten by the `port = 54320`
-    // that is its own substring, and the pooler is not one of the six.
+    // that is its own substring.
     assert_ne!(
         rendered_ports[&("db".to_owned(), "shadow_port".to_owned())],
         rendered_ports[&("db".to_owned(), "port".to_owned())],
         "shadow_port and port collided"
-    );
-    assert_eq!(
-        rendered_ports[&("db.pooler".to_owned(), "port".to_owned())],
-        54329,
-        "the pooler port is not newgit's to rewrite"
     );
 
     // The exports the restore hook depends on resolved to real values.
@@ -229,10 +204,7 @@ fn two_instances_get_different_ports_and_different_project_ids() {
     let store = setup(&temp);
     let repo = store.paths().project_root.clone();
 
-    BranchManager::open(MetadataStore::at(repo.clone()))
-        .expect("manager")
-        .add_resource("supabase", "supabase")
-        .expect("add supabase");
+    add_supabase_without_starting_it(&repo);
 
     let manager = BranchManager::open(MetadataStore::at(repo)).expect("reopen");
     let first = manager.spawn("feature-a", None).expect("spawn a");
@@ -245,7 +217,17 @@ fn two_instances_get_different_ports_and_different_project_ids() {
         a.resolved_exports["SUPABASE_PROJECT"],
         b.resolved_exports["SUPABASE_PROJECT"]
     );
-    for port_name in ["api", "db", "shadow", "studio", "inbucket", "analytics"] {
+    for port_name in [
+        "api",
+        "db",
+        "shadow",
+        "studio",
+        "inbucket",
+        "smtp",
+        "pop3",
+        "analytics",
+        "pooler",
+    ] {
         assert_ne!(
             a.resolved_ports[port_name], b.resolved_ports[port_name],
             "`{port_name}` was handed to both instances"

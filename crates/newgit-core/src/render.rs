@@ -8,7 +8,9 @@
 //! There is no template file. `port = 54321` is not a placeholder, it is the
 //! project's working default — a clone without newgit still starts on it.
 //! newgit substitutes into the committed content and writes the result into
-//! one workspace. See *Render* in newgit-v1-mvp.md.
+//! one workspace. See *Render* in docs/design/spec.md.
+
+use std::collections::BTreeMap;
 
 use camino::{Utf8Path, Utf8PathBuf};
 use serde::{Deserialize, Serialize};
@@ -34,16 +36,22 @@ pub struct RenderSpec {
 pub struct Replacement {
     pub find: String,
     pub with: String,
-    /// How many times `find` is expected to occur. Exactly one by default.
+    /// How many times `find` is expected to occur. Exactly one when not
+    /// declared — see [`Replacement::expected_count`].
     ///
     /// Not an `all` flag: a declared number keeps failing when a file changes
     /// from two occurrences to three, which is the property worth protecting.
-    #[serde(default = "one")]
-    pub count: usize,
+    /// Kept optional only so a render into a built tree can refuse it: there
+    /// the occurrences are ones the store wrote, not a committed default
+    /// that can drift.
+    #[serde(default)]
+    pub count: Option<usize>,
 }
 
-fn one() -> usize {
-    1
+impl Replacement {
+    pub fn expected_count(&self) -> usize {
+        self.count.unwrap_or(1)
+    }
 }
 
 /// What a render actually did, recorded on the binding record so capture can
@@ -80,6 +88,12 @@ struct Located {
 fn locate(content: &str, finds: &[&str]) -> Vec<Located> {
     let mut found = Vec::new();
     for (rule, find) in finds.iter().enumerate() {
+        // An empty pattern matches everywhere and never advances. A `find`
+        // cannot be empty, but [`reverse`] searches for values, and a `with`
+        // can render to nothing.
+        if find.is_empty() {
+            continue;
+        }
         let mut from = 0;
         while let Some(offset) = content[from..].find(find) {
             let start = from + offset;
@@ -97,8 +111,38 @@ fn locate(content: &str, finds: &[&str]) -> Vec<Located> {
     found
 }
 
-/// Substitute into `committed`, the file's committed content — never what is
-/// currently on disk.
+/// One resource's share of a rendered path: its replacements, already
+/// resolved. Several resources may render one file — an app's `.env.local`
+/// wants its own port and the database's URL — so everything that writes,
+/// recomputes, or reverses a path works on every claim on it at once.
+#[derive(Debug, Clone, Copy)]
+pub struct Claim<'a> {
+    pub resource: &'a str,
+    pub applied: &'a [AppliedReplacement],
+}
+
+/// Render one resource's spec alone: [`resolve`], then [`compose`] with no
+/// other claim on the path.
+pub fn apply(
+    resource: &str,
+    spec: &RenderSpec,
+    committed: &str,
+    context: &RenderContext,
+) -> Result<(String, Vec<AppliedReplacement>)> {
+    let applied = resolve(resource, spec, context)?;
+    let content = compose(
+        &spec.path,
+        committed,
+        &[Claim {
+            resource,
+            applied: &applied,
+        }],
+    )?;
+    Ok((content, applied))
+}
+
+/// Substitute every claim on a path into `committed`, the file's committed
+/// content — never what is currently on disk.
 ///
 /// That is what makes a render idempotent: reading the working file would
 /// mean the second render looks for `port = 54321`, finds `port = 54400`, and
@@ -106,20 +150,49 @@ fn locate(content: &str, finds: &[&str]) -> Vec<Located> {
 /// record with no extra machinery, a `pull` that moves a lane head re-renders
 /// from the new content, and values can never compound.
 ///
-/// **Every `find` is located in the committed content, and all replacements
-/// apply as one batch. A replacement's output is never a match target.**
-/// Rewriting in declaration order, re-matching each rule against the
-/// partially-rewritten text, would make a rule mean different things
-/// depending on what ran before it: a `find` that happens to equal an earlier
-/// rule's output would either report a spurious second match or silently
-/// rewrite that output. Declaration order then stops being cosmetic, which is
-/// not a property a config file should have.
-pub fn apply(
+/// **Every `find` — across every resource rendering this path — is located
+/// in the committed content, and all replacements apply as one batch. A
+/// replacement's output is never a match target.** Rewriting in declaration
+/// order, re-matching each rule against the partially-rewritten text, would
+/// make a rule mean different things depending on what ran before it: a
+/// `find` that happens to equal an earlier rule's output would either report
+/// a spurious second match or silently rewrite that output. Declaration
+/// order then stops being cosmetic, which is not a property a config file
+/// should have. The same holds between resources: the file does not depend
+/// on which of them bound first, so there is no order to get wrong.
+pub fn compose(path: &Utf8Path, committed: &str, claims: &[Claim]) -> Result<String> {
+    let content = substitute(path, committed, claims)?;
+
+    // The inverse has to be as unambiguous as the forward pass, or
+    // `newgit capture` on a tracker-owned file would rewrite the wrong
+    // occurrence. Checked against the finished file — every claim's output
+    // in it, not just one resource's — and here rather than at capture, so
+    // the failure lands where the definition is in front of you.
+    for claim in claims {
+        for replacement in claim.applied {
+            let back = content.matches(replacement.value.as_str()).count();
+            if back != replacement.count {
+                return Err(NewgitError::RenderNotInvertible {
+                    resource: claim.resource.to_owned(),
+                    path: path.to_path_buf(),
+                    value: replacement.value.clone(),
+                    expected: replacement.count,
+                    found: back,
+                });
+            }
+        }
+    }
+
+    Ok(content)
+}
+
+/// Resolve every `with` against an instance, refusing one that leaves a
+/// placeholder behind — a file must not gain text nobody wrote.
+pub fn resolve(
     resource: &str,
     spec: &RenderSpec,
-    committed: &str,
     context: &RenderContext,
-) -> Result<(String, Vec<AppliedReplacement>)> {
+) -> Result<Vec<AppliedReplacement>> {
     let mut applied = Vec::with_capacity(spec.replace.len());
     for replacement in &spec.replace {
         let value = render_template(&replacement.with, context);
@@ -133,56 +206,52 @@ pub fn apply(
         applied.push(AppliedReplacement {
             find: replacement.find.clone(),
             value,
-            count: replacement.count,
+            count: replacement.expected_count(),
         });
     }
-
-    let content = substitute(resource, &spec.path, committed, &applied)?;
-
-    // The inverse has to be as unambiguous as the forward pass, or
-    // `newgit capture` on a tracker-owned file would rewrite the wrong
-    // occurrence. Checked against the finished render, and here rather than
-    // at capture, so the failure lands where the definition is in front of
-    // you.
-    for replacement in &applied {
-        let back = content.matches(replacement.value.as_str()).count();
-        if back != replacement.count {
-            return Err(NewgitError::RenderNotInvertible {
-                resource: resource.to_owned(),
-                path: spec.path.clone(),
-                value: replacement.value.clone(),
-                expected: replacement.count,
-                found: back,
-            });
-        }
-    }
-
-    Ok((content, applied))
+    Ok(applied)
 }
 
-/// Apply already-resolved replacements as one simultaneous batch, enforcing
-/// each rule's declared match count against the input.
+/// Apply already-resolved claims as one simultaneous batch, enforcing each
+/// rule's declared match count against the input.
 ///
 /// Also the recomputation behind drift detection: the expected on-disk
 /// content of a rendered file is exactly this, run over the same committed
-/// content with the replacements the binding record remembers.
-pub fn substitute(
-    resource: &str,
+/// content with the replacements the binding records remember.
+pub fn substitute(path: &Utf8Path, committed: &str, claims: &[Claim]) -> Result<String> {
+    substitute_spans(path, committed, claims).map(|(output, _)| output)
+}
+
+/// Where one rule's value landed in a render's output.
+struct Span {
+    rule: usize,
+    start: usize,
+    end: usize,
+}
+
+fn rules<'a>(claims: &[Claim<'a>]) -> Vec<(&'a str, &'a AppliedReplacement)> {
+    claims
+        .iter()
+        .flat_map(|claim| claim.applied.iter().map(move |rule| (claim.resource, rule)))
+        .collect()
+}
+
+/// [`substitute`], also returning where each value was written — what
+/// [`reverse_rendered`] needs to take back exactly those spans.
+fn substitute_spans(
     path: &Utf8Path,
     committed: &str,
-    applied: &[AppliedReplacement],
-) -> Result<String> {
-    let finds: Vec<&str> = applied
-        .iter()
-        .map(|replacement| replacement.find.as_str())
-        .collect();
+    claims: &[Claim],
+) -> Result<(String, Vec<Span>)> {
+    let rules = rules(claims);
+    let finds: Vec<&str> = rules.iter().map(|(_, rule)| rule.find.as_str()).collect();
     let located = locate(committed, &finds);
 
-    for (rule, replacement) in applied.iter().enumerate() {
-        let found = located.iter().filter(|hit| hit.rule == rule).count();
+    for (index, (resource, replacement)) in rules.iter().enumerate() {
+        let found = located.iter().filter(|hit| hit.rule == index).count();
         if found != replacement.count {
             return Err(NewgitError::RenderMatchCount {
-                resource: resource.to_owned(),
+                resource: (*resource).to_owned(),
                 path: path.to_path_buf(),
                 find: replacement.find.clone(),
                 expected: replacement.count,
@@ -193,28 +262,46 @@ pub fn substitute(
 
     // Two rules claiming overlapping text have no batch answer — whichever
     // won would be an accident of declaration order, the thing simultaneous
-    // application exists to remove.
+    // application exists to remove. Between two resources it is an
+    // ownership question, and the error says so.
     let mut output = String::with_capacity(committed.len());
+    let mut spans = Vec::with_capacity(located.len());
     let mut cursor = 0;
+    let mut previous = 0;
     for hit in &located {
         if hit.start < cursor {
-            return Err(NewgitError::RenderOverlappingFinds {
-                resource: resource.to_owned(),
-                path: path.to_path_buf(),
-                left: applied[hit.rule].find.clone(),
-                right: located
-                    .iter()
-                    .find(|other| other.end > hit.start && other.rule != hit.rule)
-                    .map(|other| applied[other.rule].find.clone())
-                    .unwrap_or_else(|| applied[hit.rule].find.clone()),
+            let (left_resource, left) = rules[previous];
+            let (right_resource, right) = rules[hit.rule];
+            return Err(if left_resource == right_resource {
+                NewgitError::RenderOverlappingFinds {
+                    resource: left_resource.to_owned(),
+                    path: path.to_path_buf(),
+                    left: left.find.clone(),
+                    right: right.find.clone(),
+                }
+            } else {
+                NewgitError::RenderPathConflict {
+                    left: left_resource.to_owned(),
+                    left_find: left.find.clone(),
+                    right: right_resource.to_owned(),
+                    right_find: right.find.clone(),
+                    path: path.to_path_buf(),
+                }
             });
         }
         output.push_str(&committed[cursor..hit.start]);
-        output.push_str(&applied[hit.rule].value);
+        let start = output.len();
+        output.push_str(&rules[hit.rule].1.value);
+        spans.push(Span {
+            rule: hit.rule,
+            start,
+            end: output.len(),
+        });
         cursor = hit.end;
+        previous = hit.rule;
     }
     output.push_str(&committed[cursor..]);
-    Ok(output)
+    Ok((output, spans))
 }
 
 /// Undo a render: rewrite this instance's values back to the committed ones.
@@ -225,8 +312,13 @@ pub fn substitute(
 /// instance's port does not. Only literal substitution can be run backwards;
 /// a whole-file template could not.
 ///
-/// Simultaneous for the same reason [`apply`] is, and lenient where `apply`
-/// is strict: this runs against a file someone may have edited, so a value
+/// For a path several resources render, pass every claim's replacements to
+/// reverse the whole render, or one resource's to take back just its values
+/// (its binding is going away). [`compose`] checked that each value is
+/// unique in the finished file, so either is exact.
+///
+/// Simultaneous for the same reason [`compose`] is, and lenient where it is
+/// strict: this runs against a file someone may have edited, so a value
 /// that no longer appears the declared number of times is not an error here.
 /// Whether those edits survive is [`crate::manager`]'s question, not this
 /// function's.
@@ -235,22 +327,217 @@ pub fn reverse(rendered: &str, applied: &[AppliedReplacement]) -> String {
         .iter()
         .map(|replacement| replacement.value.as_str())
         .collect();
-    let located = locate(rendered, &values);
+    let finds: Vec<&str> = applied
+        .iter()
+        .map(|replacement| replacement.find.as_str())
+        .collect();
+    swap_every(rendered, &values, &finds)
+}
 
-    let mut output = String::with_capacity(rendered.len());
+/// [`reverse`] run forwards: every `find` becomes this instance's value,
+/// however many times it occurs.
+///
+/// For a render into a built tree, where the input is a stored copy the
+/// install store reversed itself. Its occurrences are the ones the build
+/// wrote, so there is no declared count to hold them to.
+pub fn restore(stored: &str, applied: &[AppliedReplacement]) -> String {
+    let finds: Vec<&str> = applied
+        .iter()
+        .map(|replacement| replacement.find.as_str())
+        .collect();
+    let values: Vec<&str> = applied
+        .iter()
+        .map(|replacement| replacement.value.as_str())
+        .collect();
+    swap_every(stored, &finds, &values)
+}
+
+fn swap_every(content: &str, from: &[&str], to: &[&str]) -> String {
+    let located = locate(content, from);
+    let mut output = String::with_capacity(content.len());
     let mut cursor = 0;
     for hit in &located {
-        // Leftmost wins where two values overlap; nothing to decide between
+        // Leftmost wins where two matches overlap; nothing to decide between
         // them, and the alternative is dropping text.
         if hit.start < cursor {
             continue;
         }
-        output.push_str(&rendered[cursor..hit.start]);
-        output.push_str(&applied[hit.rule].find);
+        output.push_str(&content[cursor..hit.start]);
+        output.push_str(to[hit.rule]);
         cursor = hit.end;
     }
-    output.push_str(&rendered[cursor..]);
+    output.push_str(&content[cursor..]);
     output
+}
+
+/// What [`reverse_rendered`] did to a file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Reversed {
+    pub content: String,
+    /// Rendered values left in place, one line each: where the render wrote
+    /// a value could not be told apart from the same text written beside
+    /// it, so nothing was guessed.
+    pub unplaced: Vec<String>,
+}
+
+/// Undo a render on a file someone may have edited, taking back only the
+/// spans the render wrote (#260).
+///
+/// Reversing by value alone rewrites every occurrence of `127.0.0.1:18002`,
+/// including the one a user typed into a `MIRROR=` line, and the lane then
+/// holds two copies of the `find` and renders for nobody. The render is a
+/// pure function of committed content, so where it wrote each value is
+/// recomputable: an occurrence in the current file is reversed when it sits
+/// on a line the render wrote, at the same place in that line. That
+/// survives edits anywhere else in the file, which is the edit a lane is
+/// for.
+///
+/// Where a rendered line was itself edited, the value is still reversed when
+/// it occurs exactly as often as the render wrote it — the same uniqueness
+/// [`compose`] checks at bind, so there is only one thing it can be.
+/// Anything else is left in place and listed in [`Reversed::unplaced`].
+///
+/// If `committed` no longer takes these claims (the lane moved under a
+/// failed re-render), there is nothing to recompute from, and this falls
+/// back to [`reverse`].
+pub fn reverse_rendered(
+    current: &str,
+    path: &Utf8Path,
+    committed: &str,
+    claims: &[Claim],
+) -> Reversed {
+    let rules = rules(claims);
+    let Ok((expected, spans)) = substitute_spans(path, committed, claims) else {
+        let applied: Vec<AppliedReplacement> =
+            rules.iter().map(|(_, rule)| (*rule).clone()).collect();
+        return Reversed {
+            content: reverse(current, &applied),
+            unplaced: Vec::new(),
+        };
+    };
+
+    // A value's place: its rule, the whole line(s) it sits on, and its
+    // column there.
+    fn place(content: &str, rule: usize, start: usize, end: usize) -> (usize, String, usize) {
+        let line_start = content[..start].rfind('\n').map_or(0, |at| at + 1);
+        let line_end = content[end..]
+            .find('\n')
+            .map_or(content.len(), |at| end + at);
+        (
+            rule,
+            content[line_start..line_end].to_owned(),
+            start - line_start,
+        )
+    }
+
+    let mut written: BTreeMap<(usize, String, usize), usize> = BTreeMap::new();
+    for span in &spans {
+        *written
+            .entry(place(&expected, span.rule, span.start, span.end))
+            .or_default() += 1;
+    }
+    let values: Vec<&str> = rules.iter().map(|(_, rule)| rule.value.as_str()).collect();
+    let found = locate(current, &values);
+    let mut at: BTreeMap<(usize, String, usize), Vec<usize>> = BTreeMap::new();
+    for (index, hit) in found.iter().enumerate() {
+        at.entry(place(current, hit.rule, hit.start, hit.end))
+            .or_default()
+            .push(index);
+    }
+
+    let mut chosen = vec![false; found.len()];
+    let mut missing = vec![0usize; rules.len()];
+    for (key, &count) in &written {
+        match at.get(key) {
+            Some(hits) if hits.len() == count => {
+                for &index in hits {
+                    chosen[index] = true;
+                }
+            }
+            _ => missing[key.0] += count,
+        }
+    }
+
+    let mut unplaced = Vec::new();
+    for (rule, &count) in missing.iter().enumerate() {
+        if count == 0 {
+            continue;
+        }
+        let hits: Vec<usize> = (0..found.len())
+            .filter(|&index| found[index].rule == rule)
+            .collect();
+        if hits.len() == rules[rule].1.count {
+            for index in hits {
+                chosen[index] = true;
+            }
+            continue;
+        }
+        let lines: Vec<String> = hits
+            .iter()
+            .filter(|&&index| !chosen[index])
+            .map(|&index| line_of(current, found[index].start).to_string())
+            .collect();
+        // A value that is gone altogether was not misplaced: the file no
+        // longer renders, and the caller's render check says that in its
+        // own words.
+        if lines.is_empty() {
+            continue;
+        }
+        unplaced.push(format!(
+            "resource `{}`'s value `{}` on line(s) {}",
+            rules[rule].0,
+            rules[rule].1.value,
+            lines.join(", ")
+        ));
+    }
+
+    let mut content = String::with_capacity(current.len());
+    let mut cursor = 0;
+    for (index, hit) in found.iter().enumerate() {
+        if !chosen[index] || hit.start < cursor {
+            continue;
+        }
+        content.push_str(&current[cursor..hit.start]);
+        content.push_str(&rules[hit.rule].1.find);
+        cursor = hit.end;
+    }
+    content.push_str(&current[cursor..]);
+    Reversed { content, unplaced }
+}
+
+/// Why `content`, captured into a lane, would no longer render these
+/// claims — the check `render --check` makes, with the lines named. `None`
+/// when it would.
+pub fn unrenderable(path: &Utf8Path, content: &str, claims: &[Claim]) -> Option<String> {
+    match substitute(path, content, claims) {
+        Ok(_) => None,
+        Err(NewgitError::RenderMatchCount {
+            resource,
+            find,
+            expected,
+            found,
+            ..
+        }) => {
+            let lines: Vec<String> = content
+                .match_indices(find.as_str())
+                .map(|(at, _)| line_of(content, at).to_string())
+                .collect();
+            Some(format!(
+                "resource `{resource}`'s `{find}` would occur {found} time(s), not {expected}{}",
+                if lines.is_empty() {
+                    String::new()
+                } else {
+                    format!(" (line(s) {})", lines.join(", "))
+                }
+            ))
+        }
+        Err(other) => Some(other.to_string()),
+    }
+}
+
+/// 1-based line number of a byte offset.
+fn line_of(content: &str, offset: usize) -> usize {
+    content[..offset].matches('\n').count() + 1
 }
 
 /// One `find`'s result against a file's current content, independent of any
@@ -294,24 +581,40 @@ pub fn check(spec: &RenderSpec, content: &str) -> Vec<FindCheck> {
         .enumerate()
         .map(|(rule, replacement)| FindCheck {
             find: replacement.find.clone(),
-            expected: replacement.count,
+            expected: replacement.expected_count(),
             found: located.iter().filter(|hit| hit.rule == rule).count(),
         })
         .collect()
 }
 
-/// Two resources rendering the same path is a config error, not a merge:
-/// they would race, and the second would render over the first's output and
-/// fail its own match check for reasons nothing in the definition explains.
+/// Refuse, at load, two resources whose `find`s on one path are bound to
+/// claim the same text: identical, or one inside the other.
+///
+/// Several resources may render one file — it belongs to whoever needs a
+/// value in it, not to whichever resource got there first — but each piece
+/// of text has one owner. An overlap that depends on the file's content (one
+/// `find`'s tail is another's head) can only be seen against it, so
+/// [`substitute`] refuses that at render time with the same error.
 pub fn validate_disjoint(specs: &[(&str, &RenderSpec)]) -> Result<()> {
     for (index, (left, left_spec)) in specs.iter().enumerate() {
         for (right, right_spec) in &specs[index + 1..] {
-            if left_spec.path == right_spec.path {
-                return Err(NewgitError::RenderPathConflict {
-                    left: (*left).to_owned(),
-                    right: (*right).to_owned(),
-                    path: left_spec.path.clone(),
-                });
+            if left == right || left_spec.path != right_spec.path {
+                continue;
+            }
+            for left_rule in &left_spec.replace {
+                for right_rule in &right_spec.replace {
+                    if left_rule.find.contains(&right_rule.find)
+                        || right_rule.find.contains(&left_rule.find)
+                    {
+                        return Err(NewgitError::RenderPathConflict {
+                            left: (*left).to_owned(),
+                            left_find: left_rule.find.clone(),
+                            right: (*right).to_owned(),
+                            right_find: right_rule.find.clone(),
+                            path: left_spec.path.clone(),
+                        });
+                    }
+                }
             }
         }
     }
@@ -341,7 +644,7 @@ mod tests {
         Replacement {
             find: find.to_owned(),
             with: with.to_owned(),
-            count: 1,
+            count: None,
         }
     }
 
@@ -428,7 +731,7 @@ mod tests {
         let spec = spec(vec![Replacement {
             find: "\"3000:3000\"".to_owned(),
             with: "\"{{ports.api}}:3000\"".to_owned(),
-            count: 2,
+            count: Some(2),
         }]);
 
         let (rendered, _) = apply("app", &spec, committed, &context).expect("renders");
@@ -446,7 +749,7 @@ mod tests {
         let spec = spec(vec![Replacement {
             find: "x".to_owned(),
             with: "{{ports.api}}".to_owned(),
-            count: 2,
+            count: Some(2),
         }]);
 
         assert!(matches!(
@@ -641,7 +944,7 @@ mod tests {
         let spec = spec(vec![Replacement {
             find: "x".to_owned(),
             with: "{{ports.api}}".to_owned(),
-            count: 2,
+            count: Some(2),
         }]);
         let results = check(&spec, "x\nx\nx\n");
         assert!(!results[0].ok());
@@ -660,9 +963,9 @@ mod tests {
     }
 
     #[test]
-    fn two_resources_rendering_one_path_is_refused() {
-        let left = spec(vec![]);
-        let right = spec(vec![]);
+    fn two_resources_claiming_one_find_on_one_path_is_refused() {
+        let left = spec(vec![replacement("port = 54321", "port = {{ports.api}}")]);
+        let right = spec(vec![replacement("54321", "{{ports.api}}")]);
         assert!(matches!(
             validate_disjoint(&[("supabase", &left), ("app", &right)]),
             Err(NewgitError::RenderPathConflict { .. })

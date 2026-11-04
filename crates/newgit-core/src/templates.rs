@@ -45,6 +45,13 @@ depends_on = []
 # workspace root; uncomment and every command runs from there instead.
 # workdir = "packages/app"
 
+# THE PORT IS OPTIONAL. This template assumes a dev server with a port of its
+# own. If yours listens on none (a worker, a queue consumer, a file watcher
+# like `tsc --watch`, or `supabase functions serve`, which is served through
+# the `supabase` resource's `api` port), delete `[ports]`, `[exports]` and
+# `[[render]]` below and keep only the actions. Name what it needs in
+# `depends_on` above (`supabase functions serve` wants ["supabase"]).
+
 [ports]
 # `env` is the variable your dev server reads its port from. Every resource's
 # environment lands in one process environment, so the name has to be unique
@@ -56,6 +63,9 @@ app = { start = 3100, env = "RESOURCE_PORT" }
 # Edit to your dev command, e.g. "pnpm dev" or "bin/rails server".
 command = "npm run dev"
 long_running = true
+# Started at spawn, once every `prepare` has run. Remove it to start the dev
+# server only when you ask, with `newgit action <resource>.start`.
+autostart = true
 
 [actions.stop]
 signal = "term"
@@ -120,6 +130,14 @@ key_command = "node -v && uname -sm"
 
 [actions.prepare]
 command = "pnpm install --frozen-lockfile"
+
+# pnpm writes this workspace's absolute path into its install state, and a
+# tree that names its own workspace is never shared. The store reverses the
+# path to `find` when it stores the tree and renders it back for each
+# instance it fills. `find` is any string that does not otherwise occur.
+[[render]]
+path = "node_modules/.pnpm-workspace-state-v1.json"
+replace = [{ find = "/__newgit_workspace__", with = "{{workspace}}" }]
 
 # Hashes `[identity] paths` above: what the install is derived from is
 # declared once, and a `recompute` restore skips when it has not moved.
@@ -328,7 +346,7 @@ RESOURCE_URL = "postgres://localhost/{{branch.slug}}"
     },
     ResourceTemplate {
         name: "supabase",
-        description: "a per-instance Supabase stack: own project_id, own six ports, dump/reset/load",
+        description: "a per-instance Supabase stack: own project_id, own nine ports, dump/reset/load",
         companions: &[],
         // Same lane as the other two database templates: a lane is per
         // database, not per template.
@@ -354,16 +372,43 @@ RESOURCE_URL = "postgres://localhost/{{branch.slug}}"
 # instead of starting its own. A mismatched `find` refuses at spawn naming
 # the file and the string, which is the failure you want; a *missing* render
 # would silently share a database between branches.
+#
+# The same goes for every port below. The CLI uses a built-in default for a
+# service whose section is missing from config.toml, and every instance
+# shares that default. A fresh `supabase init` file has all six sections; an
+# older or trimmed one may lack `[inbucket]` or `[analytics]`. Newgit cannot
+# rewrite a line that is not there, so that bind fails naming the string it
+# did not find. Add the section to config.toml (`[inbucket]` with `port =
+# 54324`, `[analytics]` with `port = 54327`). Do not delete the rule to make
+# the bind pass: the port would then collide between instances.
+
+# In a monorepo, `supabase` usually lives in a package, not the workspace
+# root. Uncomment and every action below runs from there. Change `path` in
+# the [[render]] along with it ("apps/db/supabase/config.toml"), or the
+# render rewrites a file the CLI never reads.
+# workdir = "apps/db"
 
 [ports]
 # Supabase's committed defaults, one lane each. `start` is where scanning
 # begins, so instance two lands just above instance one.
+#
+# Every 543xx port `supabase init` writes has a lane here, including the
+# disabled pooler's and the commented-out `smtp_port` and `pop3_port`. The
+# lanes scan up through that block, so a number the file names but no lane
+# owns is one some instance will land on, and its render would then write a
+# value the file already has, which `newgit capture` could not reverse
+# (#205). If your config.toml names another port in that range, give it a
+# lane and a `[[render]]` line the same way. `inspector_port = 8083` is
+# outside it and stays shared.
 api       = { start = 54321, env = "RESOURCE_API_PORT" }
 db        = { start = 54322, env = "RESOURCE_DB_PORT" }
 shadow    = { start = 54320 }
 studio    = { start = 54323 }
 inbucket  = { start = 54324 }
 analytics = { start = 54327 }
+smtp      = { start = 54325 }
+pop3      = { start = 54326 }
+pooler    = { start = 54329 }
 
 [exports]
 # EDIT ME: the left half must match your committed `project_id`.
@@ -382,7 +427,9 @@ RESOURCE_DB_URL = "postgresql://postgres:postgres@127.0.0.1:{{ports.db}}/postgre
 #
 # Careful with `shadow_port`: the literal `port = 54320` is a substring of
 # `shadow_port = 54320`, so it is spelled out in full here rather than left
-# to match the wrong line.
+# to match the wrong line. `smtp_port` and `pop3_port` are spelled out for
+# the same reason, and without their `# ` so the rule still matches once you
+# uncomment them.
 [[render]]
 path = "supabase/config.toml"
 replace = [
@@ -392,7 +439,10 @@ replace = [
   { find = "shadow_port = 54320", with = "shadow_port = {{ports.shadow}}" },
   { find = "port = 54323",        with = "port = {{ports.studio}}" },
   { find = "port = 54324",        with = "port = {{ports.inbucket}}" },
+  { find = "smtp_port = 54325",   with = "smtp_port = {{ports.smtp}}" },
+  { find = "pop3_port = 54326",   with = "pop3_port = {{ports.pop3}}" },
   { find = "port = 54327",        with = "port = {{ports.analytics}}" },
+  { find = "port = 54329",        with = "port = {{ports.pooler}}" },
 ]
 
 # If a dev server in this project publishes a URL the auth config has to
@@ -412,11 +462,28 @@ replace = [
 [actions.prepare]
 # Reads the rendered config.toml, so it starts this instance's own stack.
 # Ports and exports are bound before a resource's own `prepare` runs.
-command = "supabase start"
+#
+# The `stop` comes first because `supabase start` against a stack that is
+# still running from an earlier binding (same `project_id`) prints its status
+# and exits 0 without re-reading the rendered ports, so the instance would
+# report ready on ports nothing listens on. `stop` keeps the database volume
+# (only `--no-backup`, used in `cleanup`, deletes it), so the branch's data
+# comes back on the new ports. Its output and exit code are ignored: there is
+# nothing to stop on a first start.
+command = "supabase stop >/dev/null 2>&1; supabase start"
 
 # A convenience command, not a lifecycle hook: nothing runs this for you.
 [actions.reset]
 command = "supabase db reset"
+
+# `newgit stop` and `newgit start`: the stack is not a process newgit
+# supervises, so these are how it comes down and back up. `supabase stop`
+# keeps the database volumes, so `resume` finds the data where it was.
+[actions.suspend]
+command = "supabase stop"
+
+[actions.resume]
+command = "supabase start"
 
 [checkpoint]
 mode = "command"

@@ -1,4 +1,4 @@
-//! The Git endpoint's work inside its container (newgit-trackers.md, *The Git
+//! The Git endpoint's work inside its container (docs/design/trackers.md, *The Git
 //! endpoint*). The Worker decides who may read what and hands the container a
 //! plan: each branch's list, cut down to the trackers this reader may read,
 //! and where to fetch every tracker. This composes those lists into a bare

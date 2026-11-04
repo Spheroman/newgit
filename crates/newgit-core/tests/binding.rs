@@ -1,4 +1,4 @@
-//! Binding (newgit-trackers.md, step 4): `newgit tracker use` and `drop`. An
+//! Binding (docs/design/trackers.md, step 4): `newgit tracker use` and `drop`. An
 //! instance's history holds every code tracker its user may read; dropping one
 //! takes it out of the working tree (sparse checkout) and out of the instance's
 //! scope, never out of its history.

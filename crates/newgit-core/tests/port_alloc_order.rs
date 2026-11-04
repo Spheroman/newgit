@@ -65,9 +65,9 @@ fn write_resource(store: &MetadataStore, name: &str, contents: &str) {
 
 /// `zeta` is declared first and reaches into the range `alpha` would
 /// otherwise take, and both start on the same port. If allocation followed
-/// declaration order, `zeta` would claim the shared start port and push
-/// `alpha` one past it. Name order (what `BTreeMap` iteration gives) means
-/// `alpha` is allocated first instead, so `alpha` keeps the shared start and
+/// declaration order, `zeta` would claim the first free port from that start
+/// and push `alpha` past it. Name order (what `BTreeMap` iteration gives)
+/// means `alpha` is allocated first instead, so `alpha` takes that port and
 /// `zeta` is the one pushed up.
 const OVERLAPPING_RESOURCE: &str = r#"ownership = "branch"
 
@@ -88,13 +88,20 @@ fn ports_within_one_resource_are_allocated_in_name_order() {
     let ports = &spawned.branch.resources["app"].resolved_ports;
 
     // Name-sorted allocation: `alpha` is considered before `zeta`, so
-    // `alpha` gets the shared start port and `zeta` is scanned past it.
-    assert_eq!(
-        ports["alpha"], 48200,
-        "alpha is allocated first (name order), so it keeps the shared start"
-    );
-    assert_eq!(
-        ports["zeta"], 48201,
-        "zeta is allocated second and is scanned past alpha's port"
+    // `alpha` gets the first free port from the shared start and `zeta` is
+    // scanned past it.
+    //
+    // This compares the two ports instead of expecting 48200 and 48201.
+    // `allocate` skips any port it cannot bind with `SO_REUSEADDR` off
+    // (#93), so a port held by anything else, even a client socket an
+    // earlier test left in `TIME_WAIT`, pushes the allocation past it. 48200
+    // is inside Linux's ephemeral range (32768-60999), where the kernel picks
+    // client ports, and on ubuntu-latest CI `alpha` once got 48201. Moving
+    // the start below that range would still need two particular ports
+    // free. Both scans start on the same port and go up, so whichever is
+    // allocated first gets the lower port, wherever the free ones are.
+    assert!(
+        ports["alpha"] < ports["zeta"],
+        "alpha is allocated first (name order), so zeta is scanned past it: {ports:?}"
     );
 }

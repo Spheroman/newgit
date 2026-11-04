@@ -25,9 +25,12 @@ jobs:
             os: macos-latest
           - target: x86_64-apple-darwin
             os: macos-latest
-          - target: x86_64-unknown-linux-gnu
+          # Static musl, not glibc: a glibc build only runs on distros at
+          # least as new as the runner (2.39 on ubuntu-24.04), which left out
+          # Debian 12, Ubuntu 22.04, RHEL 9, and Alpine entirely.
+          - target: x86_64-unknown-linux-musl
             os: ubuntu-latest
-          - target: aarch64-unknown-linux-gnu
+          - target: aarch64-unknown-linux-musl
             os: ubuntu-24.04-arm
     runs-on: ${{ matrix.os }}
     steps:
@@ -36,6 +39,11 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
+
+      - name: Install musl-gcc
+        # ring compiles C, and the cc crate finds musl-gcc for musl targets.
+        if: endsWith(matrix.target, '-musl')
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
 
       - uses: Swatinem/rust-cache@v2
         with:
@@ -69,9 +77,23 @@ jobs:
           echo "archive=$name.tar.gz" >> "$GITHUB_OUTPUT"
 
       - name: Verify the packaged binary runs
-        # Skipped when cross-architecture: this runner cannot execute it.
-        if: matrix.target != 'aarch64-unknown-linux-gnu' || runner.arch == 'ARM64'
         run: ./target/${{ matrix.target }}/release/newgit --version
+
+      - name: Verify the Linux binary is static
+        # A dynamic link to any libc brings back "runs on some distros".
+        if: endsWith(matrix.target, '-musl')
+        # Not `file`'s wording, which differs by arch ("statically linked" on
+        # aarch64, "static-pie linked" on x86_64): no interpreter and no
+        # shared libraries is what static means.
+        run: |
+          set -euo pipefail
+          bin="target/${{ matrix.target }}/release/newgit"
+          file "$bin"
+          if readelf -l "$bin" | grep -q INTERP || readelf -d "$bin" | grep -q NEEDED; then
+            readelf -l -d "$bin" | grep -E "INTERP|interpreter|NEEDED" >&2
+            echo "$bin is dynamically linked" >&2
+            exit 1
+          fi
 
       - uses: actions/upload-artifact@v7
         with:
@@ -149,6 +171,52 @@ jobs:
             --notes-file release-notes.md \
             --verify-tag \
             artifacts/*
+
+  homebrew:
+    name: update the Homebrew tap
+    # After publish: the formula points at the release's archives, so they
+    # must exist before `brew install` can find them.
+    needs: [build, publish]
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/download-artifact@v8
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Check the deploy key
+        env:
+          HOMEBREW_TAP_DEPLOY_KEY: ${{ secrets.HOMEBREW_TAP_DEPLOY_KEY }}
+        run: |
+          if [ -z "${HOMEBREW_TAP_DEPLOY_KEY:-}" ]; then
+            echo "HOMEBREW_TAP_DEPLOY_KEY is not set: a write deploy key on Spheroman/homebrew-newgit." >&2
+            echo "Repair by hand: scripts/homebrew-formula.sh <version> <dir of .sha256 files>" >&2
+            exit 1
+          fi
+
+      - uses: actions/checkout@v7
+        with:
+          repository: Spheroman/homebrew-newgit
+          ssh-key: ${{ secrets.HOMEBREW_TAP_DEPLOY_KEY }}
+          path: tap
+
+      - name: Commit the formula
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          scripts/homebrew-formula.sh "$version" artifacts > tap/Formula/newgit.rb
+          cd tap
+          if git diff --quiet; then
+            echo "Formula/newgit.rb is already at $version"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -am "newgit $version"
+          git push
 
   crates-io:
     name: publish to crates.io

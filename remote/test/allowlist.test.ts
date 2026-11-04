@@ -1,7 +1,7 @@
 import { env } from "cloudflare:workers";
 import { describe, expect, it } from "vitest";
 
-import { LOGIN_TTL_SECONDS, invited } from "../src/auth";
+import { LOGIN_TTL_SECONDS, listed } from "../src/auth";
 import { handle, issue } from "../src/index";
 import { FakeRepos, noEndpoint } from "./fake-repos";
 
@@ -35,11 +35,11 @@ const tokenFor = async (login: string) =>
 
 describe("the allowlist", () => {
 	it("reads logins separated by commas or whitespace, ignoring case", () => {
-		expect(invited("jack, ana\nbo", "Ana")).toBe(true);
-		expect(invited("jack ana", "bo")).toBe(false);
-		expect(invited("*", "anyone")).toBe(true);
-		expect(invited(undefined, "jack")).toBe(false);
-		expect(invited("", "jack")).toBe(false);
+		expect(listed("jack, ana\nbo", "Ana")).toBe(true);
+		expect(listed("jack ana", "bo")).toBe(false);
+		expect(listed("*", "anyone")).toBe(true);
+		expect(listed(undefined, "jack")).toBe(false);
+		expect(listed("", "jack")).toBe(false);
 	});
 
 	it("refuses to log in someone not invited", async () => {

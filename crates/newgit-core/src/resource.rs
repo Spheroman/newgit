@@ -31,6 +31,13 @@ pub struct ResourceDefinition {
     /// Files this resource substitutes per-instance values into, before
     /// `prepare`. See [`crate::render`].
     pub render: Vec<RenderSpec>,
+    /// Files and directories this resource's running process reads, when
+    /// declared: a `tracker use` or `drop` that rewrites a rendered file
+    /// under one restarts the process, and one that declares this and reads
+    /// nothing that changed is left alone in silence. `None` means newgit
+    /// cannot tell, so a change that rewrote a rendered file names the
+    /// process as possibly stale. Workspace-relative, like `[[render]].path`.
+    pub reads: Option<Vec<Utf8PathBuf>>,
     pub actions: BTreeMap<String, ActionSpec>,
     pub checkpoint: Option<CheckpointSpec>,
     pub restore: Option<RestoreSpec>,
@@ -116,6 +123,11 @@ pub struct ActionSpec {
     pub workdir: Option<Utf8PathBuf>,
     #[serde(default)]
     pub long_running: bool,
+    /// Start this long-running action when an instance is spawned, once
+    /// every `prepare` has run. At most one per resource: a resource
+    /// supervises one process.
+    #[serde(default)]
+    pub autostart: bool,
     /// Signal sent by `stop` for a long-running sibling `start`.
     #[serde(default)]
     pub signal: Option<String>,
@@ -208,6 +220,8 @@ struct ResourceDefinitionFile {
     #[serde(default)]
     render: Vec<RenderSpec>,
     #[serde(default)]
+    reads: Option<Vec<Utf8PathBuf>>,
+    #[serde(default)]
     actions: BTreeMap<String, ActionSpec>,
     #[serde(default)]
     checkpoint: Option<CheckpointSpec>,
@@ -242,6 +256,7 @@ impl ResourceDefinition {
             ports: file.ports,
             exports: file.exports,
             render: file.render,
+            reads: file.reads,
             actions: file.actions,
             checkpoint: file.checkpoint,
             restore: file.restore,
@@ -264,6 +279,25 @@ impl ResourceDefinition {
         self.actions.values().any(|action| action.long_running)
     }
 
+    /// The long-running action spawn starts for this resource, if one is
+    /// marked `autostart`.
+    pub fn autostart_action(&self) -> Option<(&str, &ActionSpec)> {
+        self.actions
+            .iter()
+            .find(|(_, action)| action.autostart)
+            .map(|(name, action)| (name.as_str(), action))
+    }
+
+    /// The `prepare` spawn would run for this resource, if there is one: a
+    /// `prepare` with a command that finishes. A `prepare` with no command
+    /// or one marked `long_running` is not something spawn runs, so a
+    /// failed dependency has nothing to withhold from it.
+    pub fn runnable_prepare(&self) -> Option<&ActionSpec> {
+        self.actions
+            .get("prepare")
+            .filter(|action| action.command.is_some() && !action.long_running)
+    }
+
     /// The `workdir` in effect for one command: an action's own `workdir`
     /// replaces the resource-level one entirely rather than nesting under
     /// it. `action` is `None` for hooks that are not actions (`checkpoint`,
@@ -284,6 +318,30 @@ impl ResourceDefinition {
             .unwrap_or(&[])
     }
 
+    /// Whether a `[[render]]` targets a file inside the tree this resource
+    /// builds. Such a render is the install store's to apply: its input is
+    /// the stored tree rather than committed content, and it runs when the
+    /// store fills an instance, not when the resource binds.
+    pub fn renders_into_produced(&self, spec: &crate::render::RenderSpec) -> bool {
+        self.identity_produces()
+            .iter()
+            .any(|produced| contains_path(produced, &spec.path))
+    }
+
+    /// Whether `reads` covers `path`: names it, or names a directory it is
+    /// in. `None` when the definition does not declare `reads`, since then
+    /// nobody has said.
+    pub fn reads_path(&self, path: &Utf8Path) -> Option<bool> {
+        let reads = self.reads.as_ref()?;
+        Some(reads.iter().any(|read| {
+            let read: Utf8PathBuf = read
+                .components()
+                .filter(|part| !matches!(part, camino::Utf8Component::CurDir))
+                .collect();
+            contains_path(&read, path)
+        }))
+    }
+
     /// The tree `[identity] produces`, if this resource declares one. A
     /// non-empty list is what makes the resource eligible for the install
     /// store; everything else about it is inferred from `[identity]`.
@@ -300,6 +358,40 @@ impl ResourceDefinition {
             .and_then(|spec| spec.key_command.as_deref())
     }
 
+    /// Whether anything this resource renders names `{{bound.trackers}}`
+    /// or `{{bound.paths}}`: an action, `key_command`, a `workdir`, an
+    /// export, or a `[[render]]`. Its install can then be told which
+    /// trackers are bound, so the install store keys it on them (see
+    /// [`crate::installs::identity_key`]).
+    pub fn mentions_bound(&self) -> bool {
+        self.spreads_bound()
+            || self.identity_key_command().is_some_and(names_bound)
+            || self
+                .workdir
+                .as_ref()
+                .is_some_and(|workdir| names_bound(workdir.as_str()))
+            || self.actions.values().any(|action| {
+                action.command.as_deref().is_some_and(names_bound)
+                    || action
+                        .workdir
+                        .as_ref()
+                        .is_some_and(|workdir| names_bound(workdir.as_str()))
+            })
+    }
+
+    /// Whether this resource hands `{{bound…}}` to *other* resources'
+    /// commands: through an export, which every command's environment
+    /// carries, or a `[[render]]`, which writes it into a file any install
+    /// can read.
+    pub fn spreads_bound(&self) -> bool {
+        self.exports.values().any(|value| names_bound(value))
+            || self
+                .render
+                .iter()
+                .flat_map(|spec| &spec.replace)
+                .any(|replacement| names_bound(&replacement.with))
+    }
+
     /// The action that builds `[identity] produces`. A store entry is filled
     /// from whatever a `recompute` restore would re-run to rebuild the same
     /// tree — those are the same job, and letting them name different actions
@@ -311,6 +403,21 @@ impl ResourceDefinition {
             .as_ref()
             .filter(|restore| restore.mode == RestoreMode::Recompute)
             .map_or("prepare", |restore| restore.recompute_action())
+    }
+
+    /// Whether `[restore]` reads back what `[checkpoint]` records: a
+    /// `command` restore, after a `command` checkpoint's dump or ref or an
+    /// `external` handle. A `recompute` rebuilds from the restored inputs
+    /// and ignores the ref, `none` and `external` restores run nothing, and
+    /// a `none` or `hash` checkpoint records nothing a command is handed.
+    pub fn restore_reads_checkpoint(&self) -> bool {
+        matches!(
+            self.checkpoint_mode(),
+            CheckpointMode::Command | CheckpointMode::External
+        ) && self
+            .restore
+            .as_ref()
+            .is_some_and(|restore| restore.mode == RestoreMode::Command)
     }
 
     fn validate(&self) -> Result<()> {
@@ -389,8 +496,45 @@ impl ResourceDefinition {
                     "action `{action_name}` is long_running but has no command"
                 )));
             }
+            if action.autostart && !action.long_running {
+                return Err(self.invalid(format!(
+                    "action `{action_name}` has autostart but is not long_running: only a \
+                     process newgit supervises is started at spawn, and a command that \
+                     finishes belongs in `prepare`"
+                )));
+            }
             if let Some(workdir) = &action.workdir {
                 self.check_workdir_is_workspace_relative(workdir)?;
+            }
+        }
+        self.check_suspend_resume_pairing()?;
+        let autostarts: Vec<&str> = self
+            .actions
+            .iter()
+            .filter(|(_, action)| action.autostart)
+            .map(|(name, _)| name.as_str())
+            .collect();
+        if autostarts.len() > 1 {
+            return Err(self.invalid(format!(
+                "actions {} all have autostart, but a resource supervises one process: \
+                 give it to one of them",
+                autostarts
+                    .iter()
+                    .map(|name| format!("`{name}`"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )));
+        }
+        for path in self.reads.iter().flatten() {
+            if path.is_absolute()
+                || path
+                    .components()
+                    .any(|part| matches!(part, camino::Utf8Component::ParentDir))
+            {
+                return Err(self.invalid(format!(
+                    "`reads` entry `{path}` must be workspace-relative: it names a file a \
+                     render writes, and renders only write inside the workspace"
+                )));
             }
         }
         for spec in &self.render {
@@ -420,7 +564,20 @@ impl ResourceDefinition {
                         self.invalid(format!("render into `{}` has an empty `find`", spec.path))
                     );
                 }
-                if replacement.count == 0 {
+                // In a built tree the occurrences are the ones the build
+                // wrote and the store reversed, not a committed default that
+                // can drift: the store's scan is what notices a build that
+                // starts naming its workspace somewhere else.
+                if replacement.count.is_some() && self.renders_into_produced(spec) {
+                    return Err(self.invalid(format!(
+                        "render into `{}` declares `count` for `{}`, but `{}` is inside \
+                         `[identity] produces`: a render into a built tree replaces every \
+                         occurrence the build wrote, and the install store's scan catches one \
+                         it missed",
+                        spec.path, replacement.find, spec.path
+                    )));
+                }
+                if replacement.count == Some(0) {
                     return Err(self.invalid(format!(
                         "render into `{}` declares `count = 0` for `{}`; a replacement that \
                          matches nothing is a definition that does nothing",
@@ -624,6 +781,38 @@ impl ResourceDefinition {
         self.check_state_ref_is_recordable()
     }
 
+    /// `newgit stop` runs `suspend` and `newgit start` runs `resume`, so each
+    /// is a command that finishes, and neither makes sense alone: a suspend
+    /// with no resume takes a resource down that `start` can never bring
+    /// back, and a resume with no suspend is never run.
+    fn check_suspend_resume_pairing(&self) -> Result<()> {
+        let suspend = self.actions.get("suspend");
+        let resume = self.actions.get("resume");
+        for (name, action) in [("suspend", suspend), ("resume", resume)] {
+            let Some(action) = action else { continue };
+            if action.command.is_none() || action.long_running {
+                return Err(self.invalid(format!(
+                    "action `{name}` is run by `newgit {}` and waited on, so it needs a command \
+                     and cannot be long_running",
+                    if name == "suspend" { "stop" } else { "start" }
+                )));
+            }
+        }
+        match (suspend, resume) {
+            (Some(_), None) => Err(self.invalid(
+                "action `suspend` has no `resume`: `newgit stop` would take this resource down \
+                 and `newgit start` could not bring it back"
+                    .to_owned(),
+            )),
+            (None, Some(_)) => Err(self.invalid(
+                "action `resume` has no `suspend`: `newgit start` only resumes what `newgit \
+                 stop` suspended, so it would never run"
+                    .to_owned(),
+            )),
+            _ => Ok(()),
+        }
+    }
+
     /// An absent `[checkpoint]` records exactly what `mode = "none"` does.
     fn checkpoint_mode(&self) -> CheckpointMode {
         self.checkpoint
@@ -641,10 +830,11 @@ impl ResourceDefinition {
     /// a no-op, it is a wrong argument.
     ///
     /// Both are decidable from the definition alone, so both are refused
-    /// where the mistake was made. The guard that refuses a cleanup hook with
-    /// an unresolved placeholder still stands behind this: it catches the
-    /// same mistake in a record written under an older definition, which no
-    /// amount of reading the current one can predict.
+    /// where the mistake was made. The guards that refuse a cleanup hook with
+    /// an unresolved placeholder, and a restore command whose `{{state_ref}}`
+    /// has no value, still stand behind this: they catch the same mistake in
+    /// a record written under an older definition, which no amount of
+    /// reading the current one can predict.
     fn check_state_ref_is_recordable(&self) -> Result<()> {
         let hint = match self.checkpoint_mode() {
             CheckpointMode::None if self.checkpoint.is_some() => {
@@ -704,6 +894,11 @@ impl ResourceDefinition {
 /// The one action a spawn runs, and so the only one an install-store entry
 /// can stand in for.
 pub const PRODUCING_ACTION: &str = "prepare";
+
+/// Whether a template names either `{{bound…}}` placeholder.
+fn names_bound(template: &str) -> bool {
+    template.contains("{{bound.trackers}}") || template.contains("{{bound.paths}}")
+}
 
 /// Whether `outer` is `inner` or a directory containing it, compared by
 /// path component so `node_modules` does not appear to contain
@@ -1089,7 +1284,7 @@ fn resolve_order(
 
 /// Names newgit sets on every command it runs, after every resource's. A
 /// declaration claiming one of these is dead on arrival.
-const RESERVED_ENV_NAMES: [&str; 2] = ["NEWGIT_BRANCH", "NEWGIT_WORKSPACE"];
+const RESERVED_ENV_NAMES: [&str; 3] = ["NEWGIT_BRANCH", "NEWGIT_WORKSPACE", "NEWGIT_LOCKED"];
 
 /// Check that no environment variable name is claimed by two declarations.
 ///
@@ -1187,6 +1382,7 @@ mod tests {
             ports: BTreeMap::new(),
             exports: BTreeMap::new(),
             render: Vec::new(),
+            reads: None,
             actions: BTreeMap::new(),
             checkpoint: None,
             restore: None,
@@ -1298,6 +1494,7 @@ mod tests {
                 command: Some("true".to_owned()),
                 workdir: None,
                 long_running: false,
+                autostart: false,
                 signal: None,
                 captures: captures.iter().map(ToString::to_string).collect(),
             },
@@ -1425,7 +1622,7 @@ mod tests {
             replace: vec![crate::render::Replacement {
                 find: "placeholder".to_owned(),
                 with: with.to_owned(),
-                count: 1,
+                count: None,
             }],
         }];
         definition
@@ -1854,6 +2051,35 @@ command = "npm ci"
         .expect("identity without produces should load");
         assert!(inputs_only.identity_produces().is_empty());
         assert!(inputs_only.identity_key_command().is_none());
+    }
+
+    /// A render into the built tree replaces what the build wrote, however
+    /// often; `count` guards a committed default, which is not what this is.
+    #[test]
+    fn a_render_into_the_built_tree_may_not_declare_count() {
+        let base = r#"ownership = "workspace"
+
+[identity]
+paths = ["pnpm-lock.yaml"]
+produces = ["node_modules"]
+
+[actions.prepare]
+command = "pnpm install"
+"#;
+        let without = format!(
+            "{base}\n[[render]]\npath = \"node_modules/state.json\"\nreplace = [{{ find = \"/__ws__\", with = \"{{{{workspace}}}}\" }}]\n"
+        );
+        let definition = write_and_load(&without).expect("a render into the built tree loads");
+        assert!(definition.renders_into_produced(&definition.render[0]));
+
+        let with_count = format!(
+            "{base}\n[[render]]\npath = \"node_modules/state.json\"\nreplace = [{{ find = \"/__ws__\", with = \"{{{{workspace}}}}\", count = 2 }}]\n"
+        );
+        let error = write_and_load(&with_count).expect_err("count is refused there");
+        assert!(
+            error.to_string().contains("inside `[identity] produces`"),
+            "{error}"
+        );
     }
 
     /// A spawn runs `prepare` and nothing else, so `prepare` is the only

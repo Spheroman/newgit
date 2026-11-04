@@ -1,5 +1,5 @@
 //! A path belongs to its most specific claimant: trackers nest, and the root
-//! tracker owns whatever nobody else claims (newgit-trackers.md, step 2).
+//! tracker owns whatever nobody else claims (docs/design/trackers.md, step 2).
 
 use std::process::Command;
 

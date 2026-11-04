@@ -157,7 +157,7 @@ function mayRead(audience: Audience, who: Requester, project: string): Decision 
 }
 
 /**
- * May `who` hold a `scope` token for `ref`? The table in newgit-trackers.md
+ * May `who` hold a `scope` token for `ref`? The table in docs/design/trackers.md
  * (*On the remote*), as code.
  */
 export function decide(ref: RepoRef, scope: Scope, who: Requester, facts: Facts): Decision {

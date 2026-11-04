@@ -1,4 +1,4 @@
-use camino::{Utf8Path, Utf8PathBuf};
+use camino::{Utf8Component, Utf8Path, Utf8PathBuf};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -13,11 +13,11 @@ pub struct TrackerDefinition {
     pub storage: Storage,
     /// Whether a source merge should carry this tracker binding with it.
     pub merge_with_source: bool,
-    /// Workspace-relative paths this tracker owns. May be empty for lanes
-    /// that only receive deposits (e.g. `db-snapshots`). `.` means everything
-    /// no more specific tracker owns — the `root` tracker. A mounted
-    /// tracker's file states them relative to its mount; here they are
-    /// always joined to it.
+    /// Workspace-relative paths this tracker owns, as [`normalize_path`]
+    /// spells them. May be empty for lanes that only receive deposits (e.g.
+    /// `db-snapshots`). `.` means everything no more specific tracker owns —
+    /// the `root` tracker. A mounted tracker's file states them relative to
+    /// its mount; here they are always joined to it.
     pub paths: Vec<Utf8PathBuf>,
     /// Where the tracker's own root sits in the workspace, for a code tracker
     /// stored relative to its own root (one imported from outside, which
@@ -125,9 +125,35 @@ impl TrackerDefinition {
             audience,
             storage,
             merge_with_source,
-            paths,
+            paths: paths.iter().map(|path| normalize_path(path)).collect(),
             mount: None,
             secret: true,
+            maintainers: None,
+            role: None,
+            priority: 0,
+            requires: Vec::new(),
+            resources: Vec::new(),
+            excluded: Vec::new(),
+            definition_rev: String::new(),
+        };
+        definition.validate()?;
+        definition.definition_rev = definition.compute_definition_rev()?;
+        Ok(definition)
+    }
+
+    /// A code tracker as `newgit tracker create --code` writes it: committed,
+    /// merged with the work that changes it. Checked as one from the start,
+    /// since a code tracker may own what a secret one may not: another
+    /// tracker's definition.
+    pub fn code(name: &str, audience: String, paths: &[Utf8PathBuf]) -> Result<Self> {
+        let mut definition = Self {
+            name: name.to_owned(),
+            audience,
+            storage: Storage::Local,
+            merge_with_source: true,
+            paths: paths.iter().map(|path| normalize_path(path)).collect(),
+            mount: None,
+            secret: false,
             maintainers: None,
             role: None,
             priority: 0,
@@ -167,9 +193,9 @@ impl TrackerDefinition {
                     .iter()
                     .map(|path| mounted_path(mount, path))
                     .collect(),
-                None => file.paths,
+                None => file.paths.iter().map(|path| normalize_path(path)).collect(),
             },
-            mount: file.mount,
+            mount: file.mount.as_deref().map(normalize_path),
             secret: file.secret,
             maintainers: file.maintainers,
             role: file.role,
@@ -212,7 +238,11 @@ impl TrackerDefinition {
             if mount.is_absolute()
                 || matches!(mount.as_str(), "" | ".")
                 || mount.components().any(|c| matches!(c.as_str(), ".." | "."))
-                || matches!(first.as_deref(), Some(".git" | ".newgit"))
+                || first.as_deref().is_some_and(|first| {
+                    [".git", ".newgit"]
+                        .iter()
+                        .any(|reserved| first.eq_ignore_ascii_case(reserved))
+                })
             {
                 return Err(self.invalid(format!(
                     "mount `{mount}` must be a workspace-relative directory outside `.git` and `.newgit`"
@@ -227,14 +257,16 @@ impl TrackerDefinition {
                 "`.` owns everything not claimed elsewhere, so it must be the only path".to_owned(),
             ));
         }
-        // `.newgit` holds the project's own definitions, which only the
-        // project tracker carries; anyone else claiming it would split the
-        // definitions across trackers.
+        // `.newgit` holds the project's own definitions: `project` carries
+        // them, and `access` the tracker definitions among them. Anyone else
+        // claiming part of it would split the definitions across trackers.
         let is_project = (self.name == PROJECT_TRACKER
             && self.paths == [Utf8PathBuf::from(".newgit")])
             || (self.name == ACCESS_TRACKER
                 && self.paths == [Utf8PathBuf::from(".newgit/trackers")]);
 
+        // Every path here is already normalized, so `./.git` meets the
+        // checks as `.git`.
         for path in &self.paths {
             if path.as_str() == "." || is_project {
                 continue;
@@ -245,12 +277,31 @@ impl TrackerDefinition {
             {
                 return Err(self.invalid(format!("path `{path}` must be workspace-relative")));
             }
-            let first = path.components().next().map(|c| c.as_str().to_owned());
-            if matches!(first.as_deref(), Some(".git" | ".newgit")) {
+            // Except a tracker's definition: whoever may change the tracker
+            // owning `web.toml` decides who may read `web`, so governance
+            // layers by owning definitions (docs/design/trackers.md, "Who may
+            // change what"). Only a code tracker may: a secret one would
+            // keep the definition out of Git.
+            if is_definition_file(path) {
+                if self.is_code() {
+                    continue;
+                }
                 return Err(self.invalid(format!(
-                    "path `{path}` may not reach into `{}`",
-                    first.unwrap_or_default()
+                    "path `{path}` is a tracker definition, which only a code tracker may own"
                 )));
+            }
+            // Regardless of case: a case-insensitive file system opens `.GIT`
+            // as `.git`, and Git refuses it everywhere.
+            let first = path
+                .components()
+                .next()
+                .map(|c| c.as_str().to_owned())
+                .unwrap_or_default();
+            if [".git", ".newgit"]
+                .iter()
+                .any(|reserved| first.eq_ignore_ascii_case(reserved))
+            {
+                return Err(self.invalid(format!("path `{path}` may not reach into `{first}`")));
             }
         }
         Ok(())
@@ -259,8 +310,9 @@ impl TrackerDefinition {
     pub fn with_added_paths(&self, paths: &[Utf8PathBuf]) -> Result<Self> {
         let mut updated = self.clone();
         for path in paths {
-            if !updated.paths.iter().any(|existing| existing == path) {
-                updated.paths.push(path.clone());
+            let path = normalize_path(path);
+            if !updated.paths.contains(&path) {
+                updated.paths.push(path);
             }
         }
         updated.paths.sort();
@@ -439,14 +491,48 @@ impl TrackerDefinition {
     }
 }
 
-/// `path` from a mounted definition file, joined to its `mount`: `.` is the
-/// mount itself.
+/// `path` from a mounted definition file, joined to its `mount` and
+/// normalized: `.` is the mount itself.
 fn mounted_path(mount: &Utf8Path, path: &Utf8Path) -> Utf8PathBuf {
+    let path = normalize_path(path);
     if path.as_str() == "." {
-        mount.to_path_buf()
+        normalize_path(mount)
     } else {
-        mount.join(path)
+        normalize_path(&mount.join(path))
     }
+}
+
+/// A tracker path by its components alone, so `./.git`, `.git/` and `.git`
+/// are one path: checked, compared, and written to `.gitignore` as one. `./`
+/// is `.`. A path that is not workspace-relative (absolute, or with `..`) is
+/// returned as written, for validation to refuse.
+pub fn normalize_path(path: &Utf8Path) -> Utf8PathBuf {
+    let mut normal = Utf8PathBuf::new();
+    for component in path.components() {
+        match component {
+            Utf8Component::CurDir => {}
+            Utf8Component::Normal(part) => normal.push(part),
+            Utf8Component::ParentDir | Utf8Component::RootDir | Utf8Component::Prefix(_) => {
+                return path.to_path_buf();
+            }
+        }
+    }
+    if normal.as_str().is_empty() && !path.as_str().is_empty() {
+        return Utf8PathBuf::from(".");
+    }
+    normal
+}
+
+/// Whether `path` is a tracker's definition: a `.toml` file directly in
+/// `.newgit/trackers/`, the files newgit reads definitions from.
+fn is_definition_file(path: &Utf8Path) -> bool {
+    let mut components = path.components().map(|component| component.as_str());
+    components.next() == Some(".newgit")
+        && components.next() == Some("trackers")
+        && components
+            .next()
+            .is_some_and(|file| Utf8Path::new(file).extension() == Some("toml"))
+        && components.next().is_none()
 }
 
 /// Settle who owns what across every tracker. A path's owner is its most
@@ -512,8 +598,91 @@ pub fn resolve_ownership(definitions: &mut [TrackerDefinition]) -> Result<()> {
     Ok(())
 }
 
+/// Whether a symlink at `link` (relative to `root`) whose target is written
+/// `target` stays inside `root`, judged from the text alone: the target is
+/// relative and its `..`s never climb above `root`. This is what a stored
+/// link means on any machine, which is why checkout judges a lane's links
+/// by it; capture additionally resolves the link on disk
+/// ([`link_resolves_inside`]).
+pub fn link_target_inside(link: &Utf8Path, target: &Utf8Path) -> bool {
+    if target.as_str().is_empty() {
+        return false;
+    }
+    let mut depth: Vec<&str> = link
+        .parent()
+        .into_iter()
+        .flat_map(|parent| parent.components())
+        .filter_map(|component| match component {
+            Utf8Component::Normal(part) => Some(part),
+            _ => None,
+        })
+        .collect();
+    for component in target.components() {
+        match component {
+            Utf8Component::CurDir => {}
+            Utf8Component::Normal(part) => depth.push(part),
+            Utf8Component::ParentDir => {
+                if depth.pop().is_none() {
+                    return false;
+                }
+            }
+            Utf8Component::RootDir | Utf8Component::Prefix(_) => return false,
+        }
+    }
+    true
+}
+
+/// Whether the symlink at `root/link` resolves inside `root` on disk, as
+/// well as by its text: a relative target can still leave through another
+/// link along the way. A dangling link is judged by its text alone.
+pub fn link_resolves_inside(root: &Utf8Path, link: &Utf8Path, target: &Utf8Path) -> bool {
+    if !link_target_inside(link, target) {
+        return false;
+    }
+    match (
+        std::fs::canonicalize(root.join(link)),
+        std::fs::canonicalize(root),
+    ) {
+        (Ok(resolved), Ok(root)) => resolved.starts_with(root),
+        _ => true,
+    }
+}
+
+/// The first directory along `relative` (excluding `relative` itself) that
+/// is a symlink, with its target. Anything found "under" such a directory is
+/// really wherever the link leads, so a walk must not go through it.
+pub fn symlinked_parent(
+    root: &Utf8Path,
+    relative: &Utf8Path,
+) -> Option<(Utf8PathBuf, Utf8PathBuf)> {
+    let mut prefix = Utf8PathBuf::new();
+    let parent = relative.parent()?;
+    for component in parent.components() {
+        prefix.push(component);
+        let absolute = root.join(&prefix);
+        let metadata = std::fs::symlink_metadata(&absolute).ok()?;
+        if metadata.is_symlink() {
+            let target = std::fs::read_link(&absolute)
+                .ok()
+                .and_then(|target| Utf8PathBuf::from_path_buf(target).ok())
+                .unwrap_or_else(|| Utf8PathBuf::from("?"));
+            return Some((prefix, target));
+        }
+        if !metadata.is_dir() {
+            return None;
+        }
+    }
+    None
+}
+
 /// Files a tracker owns inside a workspace, as (relative, absolute) pairs,
 /// sorted by relative path. Missing paths are simply absent.
+///
+/// A symlink is listed as itself — the absolute path is the link, never what
+/// it points at — and a symlink to a directory is not descended into, as
+/// Git does. Callers that read content check [`std::fs::symlink_metadata`]
+/// and must not follow it. A tracked path under a symlinked directory is
+/// refused ([`NewgitError::SymlinkedParent`]).
 pub fn collect_owned_files(
     workspace: &Utf8Path,
     definition: &TrackerDefinition,
@@ -536,6 +705,13 @@ pub fn collect_files(
 ) -> Result<Vec<(Utf8PathBuf, Utf8PathBuf)>> {
     let mut files = Vec::new();
     for relative in paths {
+        if let Some((link, target)) = symlinked_parent(root, relative) {
+            return Err(NewgitError::SymlinkedParent {
+                path: relative.clone(),
+                link,
+                target,
+            });
+        }
         walk(root, relative, &mut files)?;
     }
     files.sort();
@@ -563,11 +739,16 @@ fn walk(
     files: &mut Vec<(Utf8PathBuf, Utf8PathBuf)>,
 ) -> Result<()> {
     let absolute = workspace.join(relative);
-    if absolute.is_file() {
+    // `symlink_metadata`, never `metadata`: a link is listed as itself and
+    // never descended into, so nothing outside the root is ever walked.
+    let Ok(metadata) = std::fs::symlink_metadata(&absolute) else {
+        return Ok(());
+    };
+    if metadata.is_file() || metadata.is_symlink() {
         files.push((relative.to_path_buf(), absolute));
         return Ok(());
     }
-    if !absolute.is_dir() {
+    if !metadata.is_dir() {
         return Ok(());
     }
     for entry in
@@ -588,7 +769,18 @@ fn walk(
 pub fn content_rev(files: &[(Utf8PathBuf, Utf8PathBuf)]) -> Result<String> {
     let mut hasher = Sha256::new();
     for (relative, absolute) in files {
-        let bytes = std::fs::read(absolute).map_err(|source| NewgitError::io(absolute, source))?;
+        // A link is its target's text, as Git stores it: hashing what it
+        // points at would read outside the workspace.
+        let is_link = std::fs::symlink_metadata(absolute).is_ok_and(|meta| meta.is_symlink());
+        let bytes = if is_link {
+            let target =
+                std::fs::read_link(absolute).map_err(|source| NewgitError::io(absolute, source))?;
+            let mut bytes = b"\0symlink\0".to_vec();
+            bytes.extend_from_slice(target.as_os_str().as_encoded_bytes());
+            bytes
+        } else {
+            std::fs::read(absolute).map_err(|source| NewgitError::io(absolute, source))?
+        };
         hasher.update(relative.as_str().as_bytes());
         hasher.update([0]);
         hasher.update((bytes.len() as u64).to_le_bytes());

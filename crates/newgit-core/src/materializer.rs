@@ -16,19 +16,61 @@ pub trait Materializer {
     fn remove(&self, branch: &BranchInstance) -> Result<()>;
 }
 
-#[derive(Debug, Clone, Copy, Default)]
-pub struct RealDirMaterializer;
+/// The checkout workspaces are cloned from on macOS, under the workspace
+/// root. A slug never starts with a dot, so it cannot name an instance.
+pub const SOURCE_TEMPLATE_DIR: &str = ".source-template";
 
-impl Materializer for RealDirMaterializer {
-    fn materialize(&self, source: &GitSource, branch: &BranchInstance) -> Result<()> {
+#[derive(Debug, Clone, Default)]
+pub struct RealDirMaterializer {
+    /// The checkout to clone workspaces from (see
+    /// [`GitSource::clone_via_template`]). `None` clones from the store.
+    pub source_template: Option<Utf8PathBuf>,
+}
+
+impl RealDirMaterializer {
+    /// [`Materializer::materialize`], saying why the template was not used
+    /// when there is one and the workspace was `git clone`d instead. The
+    /// fallback gives the same workspace, only slower, so it is a warning
+    /// rather than an error; but a template that fails on every spawn costs
+    /// its own rebuild on top of the clone, and should not do that silently.
+    pub fn materialize_reporting(
+        &self,
+        source: &GitSource,
+        branch: &BranchInstance,
+    ) -> Result<Option<String>> {
         if branch.workspace_path.exists() {
             return Err(NewgitError::WorkspaceExists(branch.workspace_path.clone()));
         }
         if let Some(parent) = branch.workspace_path.parent() {
             create_dir_all(parent)?;
         }
-        source.clone_to(&branch.source_ref, &branch.workspace_path)?;
-        write_workspace_marker(source.root(), branch)
+        let Some(template) = &self.source_template else {
+            source.clone_to(&branch.source_ref, &branch.workspace_path)?;
+            write_workspace_marker(source.root(), branch)?;
+            return Ok(None);
+        };
+        // The template is only a faster way to the same clone: whatever
+        // keeps it from working, `clone_to` still does.
+        let fallback = source
+            .clone_via_template(
+                template,
+                &branch.source_ref,
+                &branch.source_rev,
+                &branch.workspace_path,
+            )
+            .err()
+            .map(|error| error.to_string());
+        if fallback.is_some() {
+            source.clone_to(&branch.source_ref, &branch.workspace_path)?;
+        }
+        write_workspace_marker(source.root(), branch)?;
+        Ok(fallback)
+    }
+}
+
+impl Materializer for RealDirMaterializer {
+    fn materialize(&self, source: &GitSource, branch: &BranchInstance) -> Result<()> {
+        self.materialize_reporting(source, branch).map(|_| ())
     }
 
     fn remove(&self, branch: &BranchInstance) -> Result<()> {
@@ -112,12 +154,27 @@ fn exclude_paths(workspace: &Utf8Path, note: &str, paths: &[Utf8PathBuf]) -> Res
     if wanted.is_empty() {
         return Ok(());
     }
-    if !contents.is_empty() && !contents.ends_with('\n') {
+    // New paths join the block under this note when there is one, at its
+    // end; a second header for the same note only says the file was
+    // written twice.
+    let header = format!("# newgit: {note}");
+    let mut lines: Vec<String> = contents.lines().map(ToOwned::to_owned).collect();
+    if let Some(start) = lines.iter().position(|line| line.trim() == header) {
+        let end = lines[start + 1..]
+            .iter()
+            .position(|line| line.trim().is_empty() || line.trim_start().starts_with('#'))
+            .map_or(lines.len(), |offset| start + 1 + offset);
+        lines.splice(end..end, wanted);
+        contents = lines.join("\n");
         contents.push('\n');
-    }
-    contents.push_str(&format!("\n# newgit: {note}\n"));
-    for pattern in wanted {
-        contents.push_str(&format!("{pattern}\n"));
+    } else {
+        if !contents.is_empty() && !contents.ends_with('\n') {
+            contents.push('\n');
+        }
+        contents.push_str(&format!("\n{header}\n"));
+        for pattern in wanted {
+            contents.push_str(&format!("{pattern}\n"));
+        }
     }
     std::fs::write(&exclude, contents).map_err(|source| NewgitError::io(exclude, source))
 }

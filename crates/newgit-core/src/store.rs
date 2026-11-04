@@ -1,3 +1,6 @@
+use std::io::Write;
+use std::os::unix::fs::PermissionsExt;
+
 use camino::{Utf8Path, Utf8PathBuf};
 use chrono::Utc;
 use serde::Serialize;
@@ -8,6 +11,7 @@ use crate::config::{ProjectConfig, SourceSubstrate};
 use crate::error::{NewgitError, Result};
 use crate::export_target::ExportTarget;
 use crate::installs::InstallStore;
+use crate::lock::InstanceLock;
 use crate::materializer::{WorkspaceMarker, create_dir_all};
 use crate::resource::ResourceDefinition;
 use crate::tracker::{TrackerDefinition, resolve_ownership};
@@ -78,6 +82,11 @@ pub struct NewgitPaths {
     pub tracker_store: Utf8PathBuf,
     /// Tracker revs materialized for commands that take a path. A cache.
     pub tracker_checkouts: Utf8PathBuf,
+    /// The file [`MetadataStore::lock_ports`] locks. Always empty: only the
+    /// lock on it means anything.
+    pub ports_lock: Utf8PathBuf,
+    /// The file [`MetadataStore::lock_fresh_base`] locks, the same way.
+    pub fresh_base_lock: Utf8PathBuf,
     pub logs: Utf8PathBuf,
     pub state: Utf8PathBuf,
     pub checkpoints: Utf8PathBuf,
@@ -308,12 +317,69 @@ impl MetadataStore {
         Ok(path)
     }
 
+    /// Take `slug`'s lock (see [`crate::lock`]), waiting for any other
+    /// process that holds it. Commands go through
+    /// `BranchManager::lock_instance`, which also hands a nested call the
+    /// lock the manager already holds.
+    pub fn lock_instance(&self, slug: &str, name: &str) -> Result<InstanceLock> {
+        InstanceLock::acquire(&self.locks_dir(), slug, name)
+    }
+
+    /// Where instance lock files live: `.newgit/local/locks/<slug>.lock`.
+    pub fn locks_dir(&self) -> Utf8PathBuf {
+        self.paths.local.join("locks")
+    }
+
     /// Overwrite an existing binding record (e.g. after a tracker capture).
     pub fn save_branch_record(&self, branch: &BranchInstance) -> Result<Utf8PathBuf> {
         create_dir_all(&self.paths.branches)?;
         let path = self.branch_record_path(&branch.slug);
         self.write_toml(&path, &format!("branch `{}`", branch.name), branch)?;
         Ok(path)
+    }
+
+    /// Take the store's port lock, held until the returned file is dropped.
+    ///
+    /// It covers one thing: choosing a resource's ports and writing them into
+    /// the instance's binding record (`BranchManager::claim_ports`, the only
+    /// caller). The records are the only claim on a port, so two processes
+    /// that each read them before the other had written would both be handed
+    /// the same one, and those may be spawning different instances: this is
+    /// one lock for the whole store, not one per instance.
+    ///
+    /// On Linux and macOS `File::lock` is `flock(2)`, which locks the open
+    /// file rather than the process: two managers in one process exclude
+    /// each other the way two processes do, and the kernel drops the lock
+    /// with the last descriptor. A newgit that crashes or is killed while
+    /// holding it lets go as it dies, and the file it leaves behind locks
+    /// nothing.
+    pub fn lock_ports(&self) -> Result<std::fs::File> {
+        self.lock_store_file(&self.paths.ports_lock)
+    }
+
+    /// Take the store's fresh-base lock, held until the returned file is
+    /// dropped: the same kind of lock as [`MetadataStore::lock_ports`].
+    ///
+    /// It covers choosing the base a Claude Code worktree starts from
+    /// ([`crate::fresh_base`]), which may fetch the project branch's
+    /// upstream. Subagents launched together run their hooks at once; under
+    /// this lock the first fetches and the rest find that fetch fresh and
+    /// read the ref it left, so they all start from the same commit.
+    pub fn lock_fresh_base(&self) -> Result<std::fs::File> {
+        self.lock_store_file(&self.paths.fresh_base_lock)
+    }
+
+    fn lock_store_file(&self, path: &Utf8Path) -> Result<std::fs::File> {
+        create_dir_all(&self.paths.local)?;
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(path)
+            .map_err(|source| NewgitError::io(path, source))?;
+        file.lock()
+            .map_err(|source| NewgitError::io(path, source))?;
+        Ok(file)
     }
 
     /// Tracker definitions, one per file in `.newgit/trackers/`; the name
@@ -675,6 +741,8 @@ impl NewgitPaths {
             local: metadata_root.join("local"),
             tracker_store: metadata_root.join("local/trackers.git"),
             tracker_checkouts: metadata_root.join("local/tracker-checkouts"),
+            ports_lock: metadata_root.join("local/ports.lock"),
+            fresh_base_lock: metadata_root.join("local/fresh-base.lock"),
             logs: metadata_root.join("logs"),
             state: metadata_root.join("state"),
             checkpoints: metadata_root.join("checkpoints"),
@@ -713,7 +781,52 @@ where
         label: label.to_owned(),
         source,
     })?;
-    std::fs::write(path, contents).map_err(|source| NewgitError::io(path, source))
+    // Written whole to a temporary file beside it, flushed to disk, then
+    // renamed over it: a reader sees the old record or the new one, never
+    // the truncated middle `std::fs::write` goes through, and a process or
+    // machine that dies mid-write leaves the record it found (#212).
+    //
+    // The temporary has no `.toml` extension, so a directory listing never
+    // mistakes one for a record. One is left behind only if the process is
+    // killed between creating and renaming it; nothing reads it, and it is
+    // safe to delete.
+    //
+    // A new file gets the mode `std::fs::write` would give it (0666 less the
+    // umask) rather than the temporary's 0600, and an existing one keeps its
+    // own.
+    let dir = path.parent().unwrap_or_else(|| Utf8Path::new("."));
+    let mode = match std::fs::metadata(path) {
+        Ok(metadata) => Some(metadata.permissions()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(source) => return Err(NewgitError::io(path, source)),
+    };
+    let mut temp = tempfile::Builder::new()
+        .prefix(".")
+        .suffix(".tmp")
+        .permissions(std::fs::Permissions::from_mode(0o666))
+        .tempfile_in(dir)
+        .map_err(|source| NewgitError::io(dir, source))?;
+    if let Some(mode) = mode {
+        temp.as_file()
+            .set_permissions(mode)
+            .map_err(|source| NewgitError::io(path, source))?;
+    }
+    temp.write_all(contents.as_bytes())
+        .map_err(|source| NewgitError::io(path, source))?;
+    // Plain fsync, not the F_FULLFSYNC `File::sync_all` uses on macOS: that
+    // is a cache flush of the whole drive per record, and the data reaching
+    // the drive is the guarantee this is after.
+    nix::unistd::fsync(temp.as_file())
+        .map_err(|errno| NewgitError::io(path, std::io::Error::from(errno)))?;
+    temp.persist(path)
+        .map_err(|error| NewgitError::io(path, error.error))?;
+    // The rename itself is durable once the directory is. Best-effort: some
+    // filesystems refuse to fsync a directory, and the record is already in
+    // place either way.
+    if let Ok(dir) = std::fs::File::open(dir) {
+        let _ = nix::unistd::fsync(&dir);
+    }
+    Ok(())
 }
 
 /// Immediate subdirectories, sorted. The dir-shaped counterpart to
@@ -756,6 +869,8 @@ pub(crate) fn read_dir_sorted(path: &Utf8Path) -> Result<Vec<Utf8PathBuf>> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use super::*;
 
     fn store() -> (tempfile::TempDir, MetadataStore) {
@@ -763,6 +878,28 @@ mod tests {
         let root = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).expect("utf8");
         let store = MetadataStore::init(&root, "proj", SourceSubstrate::Git).expect("init");
         (temp, store)
+    }
+
+    /// A record renamed into place keeps the mode the file had, and a new
+    /// one gets what `std::fs::write` would give it — not the 0600 of the
+    /// temporary it was written to.
+    #[test]
+    fn a_record_written_atomically_keeps_the_usual_mode() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let dir = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).expect("utf8");
+        let mode =
+            |path: &Utf8Path| std::fs::metadata(path).expect("stat").permissions().mode() & 0o777;
+        let plain = dir.join("plain");
+        std::fs::write(&plain, "").expect("write");
+
+        let record = dir.join("record.toml");
+        write_toml_at(&record, "record", &BTreeMap::from([("a", 1)])).expect("new");
+        assert_eq!(mode(&record), mode(&plain));
+
+        std::fs::set_permissions(&record, std::fs::Permissions::from_mode(0o640)).expect("chmod");
+        write_toml_at(&record, "record", &BTreeMap::from([("a", 2)])).expect("rewrite");
+        assert_eq!(mode(&record), 0o640);
+        assert_eq!(std::fs::read_to_string(&record).expect("read"), "a = 2\n");
     }
 
     #[test]

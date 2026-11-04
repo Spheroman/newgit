@@ -202,7 +202,7 @@ fn restore_keeps_a_case_only_rename_on_a_case_insensitive_file_system() {
         ],
     );
 
-    GitSource::workspace_restore_to(&ws, &head, Some(&dirty)).expect("restore");
+    GitSource::workspace_restore_to(&ws, &head, Some(&dirty), &[], &[]).expect("restore");
 
     let mut on_disk: Vec<_> = std::fs::read_dir(&ws)
         .expect("read_dir")

@@ -1,4 +1,4 @@
-//! Code trackers (newgit-trackers.md, step 3b): committed content with its
+//! Code trackers (docs/design/trackers.md, step 3b): committed content with its
 //! own history, carved out of whichever tracker owned its paths, so composing
 //! still reproduces the project's history exactly.
 

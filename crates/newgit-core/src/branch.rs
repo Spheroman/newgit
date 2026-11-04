@@ -49,6 +49,15 @@ pub struct BranchInstance {
     /// secret tracker keeps its binding's content for when it is used again.
     #[serde(default, skip_serializing_if = "std::collections::BTreeSet::is_empty")]
     pub dropped: std::collections::BTreeSet<String>,
+    /// Resources a dropped tracker brought, set aside rather than released
+    /// (#254, #255): taken down when the tracker was dropped, their ports
+    /// still claimed, and handed back by `newgit tracker use`. Ports are for
+    /// the instance's lifetime, so the files a resource renders and whatever
+    /// it left running or on disk agree with its binding when it comes back.
+    /// `remove` tears these down too. Never in `resources`: everything that
+    /// reads that map reads what the instance binds now.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub parked: BTreeMap<String, ParkedBinding>,
     /// Where this instance lives on the project's remote, once registered.
     /// `None` for a project without a remote, or when registration has not
     /// succeeded yet (it is retried at the next checkpoint).
@@ -101,6 +110,52 @@ pub struct ResourceBinding {
     /// — neither runs a command that can fail.
     #[serde(default)]
     pub restore_proven: bool,
+    /// Why rendering this resource's `[[render]]` files failed at bind, when
+    /// it did. Kept in the record, not only in the bind's report, so
+    /// `status` can say why the resource is `failed` and point at the fix:
+    /// the file or the definition, then `newgit resource rebind` (#262).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub render_error: Option<String>,
+    /// Why an export refused to resolve at bind, when one did; as
+    /// `render_error`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub export_error: Option<String>,
+}
+
+/// A binding a tracker drop set aside: the binding as it was, and how far
+/// the drop took the resource down.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ParkedBinding {
+    pub binding: ResourceBinding,
+    pub state: ParkedState,
+}
+
+/// What a parked resource's drop left behind, which decides what bringing
+/// it back and removing the instance each run.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum ParkedState {
+    /// Its `suspend` ran: `use` runs `resume`, `remove` runs `[cleanup]`.
+    Suspended,
+    /// Its `[cleanup]` ran: `use` runs `prepare`, and `remove` has nothing
+    /// left to tear down.
+    CleanedUp,
+    /// Nothing took it down beyond stopping its supervised process: it has
+    /// no hook to, its hook failed, or it is shared with other instances.
+    /// `use` runs `prepare`, on the same ports; `remove` runs `[cleanup]`.
+    Untouched,
+}
+
+impl BranchInstance {
+    /// Every binding holding ports: what the instance binds, and what it
+    /// parked. The port ledger is this, across every record.
+    pub fn port_claims(&self) -> impl Iterator<Item = (&String, &ResourceBinding)> {
+        self.resources.iter().chain(
+            self.parked
+                .iter()
+                .map(|(name, parked)| (name, &parked.binding)),
+        )
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -155,6 +210,7 @@ impl BranchInstance {
             trackers: BTreeMap::new(),
             resources: BTreeMap::new(),
             dropped: Default::default(),
+            parked: BTreeMap::new(),
             private: false,
             created_at: now,
             remote: None,
@@ -194,8 +250,23 @@ pub fn branch_slug(name: &str) -> String {
     slug.trim_matches('-').to_owned()
 }
 
+/// The longest instance name. The slug is spliced into other systems' names
+/// (`faretable-{{branch.slug}}` as a Supabase `project_id`, which Supabase
+/// prefixes again for its containers, e.g. `supabase_realtime_`; a Docker
+/// Compose project; a preview or remote hostname, where a DNS label is 63).
+/// 40 leaves 23 characters of prefix before the 63 runs out, and is still
+/// room for `fix/1234-some-descriptive-title`. The filesystem's own limit
+/// (255, hit at the lock file) was never the real one.
+pub const MAX_NAME_LEN: usize = 40;
+
 /// Names double as Git branch names, so stay well inside ref-name rules.
 pub fn validate_name(name: &str) -> Result<()> {
+    if name.len() > MAX_NAME_LEN {
+        return Err(NewgitError::NameTooLong {
+            len: name.len(),
+            max: MAX_NAME_LEN,
+        });
+    }
     let starts_ok = name
         .chars()
         .next()

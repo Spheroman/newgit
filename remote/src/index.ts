@@ -5,12 +5,15 @@
 
 import { parse as parseToml } from "smol-toml";
 
+// The one-line installer, bundled as text (the `rules` in wrangler.jsonc).
+import installScript from "../../scripts/install.sh";
+
 import { type Repos, ArtifactsRepos } from "./artifacts";
 import {
 	AGENT_TTL_MAX_SECONDS,
 	AGENT_TTL_SECONDS,
 	LOGIN_TTL_SECONDS,
-	invited,
+	listed,
 	type NewToken,
 	pollDeviceFlow,
 	signToken,
@@ -33,10 +36,12 @@ import {
 	projectKey,
 	repoName,
 } from "./names";
+import { checkBudget, pausedBy } from "./budget";
 import { type EndpointKind, type EndpointPlan, PLAN_HEADER } from "./endpoint";
 import type { Instance, ProjectDO } from "./project";
 import type { UserDO } from "./users";
 
+export { BudgetDO } from "./budget";
 export { GitEndpoint } from "./endpoint";
 export { ProjectDO } from "./project";
 export { UserDO } from "./users";
@@ -82,7 +87,14 @@ const json = (body: unknown, status = 200) => Response.json(body, { status });
 
 export default {
 	async fetch(request, env, ctx): Promise<Response> {
-		return handle(request, env, {
+		// The landing page is read from a tracker on every miss, so the edge
+		// keeps it for as long as it says it may (`landingPage`).
+		const landing = request.method === "GET" && new URL(request.url).pathname === "/";
+		if (landing) {
+			const cached = await caches.default.match(request);
+			if (cached) return cached;
+		}
+		const response = await handle(request, env, {
 			repos: new ArtifactsRepos(env.ARTIFACTS, env.ARTIFACTS_GIT_BASE),
 			fetcher: fetch,
 			waitUntil: (promise) => ctx.waitUntil(promise),
@@ -97,6 +109,12 @@ export default {
 				);
 			},
 		});
+		if (landing && response.status === 200) ctx.waitUntil(caches.default.put(request, response.clone()));
+		return response;
+	},
+
+	async scheduled(_controller, env, ctx) {
+		ctx.waitUntil(checkBudget(env, fetch));
 	},
 } satisfies ExportedHandler<Env>;
 
@@ -114,7 +132,10 @@ export async function handle(request: Request, env: Env, deps: Deps): Promise<Re
 					error.status === 401 ? { "www-authenticate": 'Basic realm="newgit"' } : { "content-type": "text/plain" },
 			});
 		if (error instanceof HttpError) return json({ error: error.message }, error.status);
-		console.error(error);
+		// A bare error logs only its message; an ArtifactsError's code and the
+		// stack are what say which call failed and why.
+		const { name, code, message, stack } = error as { name?: string; code?: string; message?: string; stack?: string };
+		console.error(JSON.stringify({ path: new URL(request.url).pathname, name, code, message, stack }));
 		return json({ error: "internal error" }, 500);
 	}
 }
@@ -123,6 +144,15 @@ async function route(request: Request, env: Env, deps: Deps): Promise<Response> 
 	const url = new URL(request.url);
 	const path = url.pathname.replace(/\/+$/, "");
 	const method = request.method;
+
+	// ── Install (`curl -fsSL https://newgit.dev/install.sh | sh`) ──────────
+	if ((method === "GET" || method === "HEAD") && (path === "/install.sh" || path === "/install"))
+		return new Response(method === "HEAD" ? null : installScript, {
+			headers: { "content-type": "text/x-shellscript; charset=utf-8", "cache-control": "public, max-age=300" },
+		});
+
+	// ── The landing page ───────────────────────────────────────────────────
+	if ((method === "GET" || method === "HEAD") && path === "") return landingPage(method, env, deps.repos);
 
 	// ── Login (no token yet) ───────────────────────────────────────────────
 	if (method === "POST" && path === "/v1/login/device") {
@@ -134,7 +164,7 @@ async function route(request: Request, env: Env, deps: Deps): Promise<Response> 
 		if (!device_code) throw new HttpError(400, "device_code is required");
 		const result = await pollDeviceFlow(env.GITHUB_CLIENT_ID, device_code, deps.fetcher);
 		if (result.status !== "done") return json(result, result.status === "pending" ? 202 : 401);
-		requireInvited(env, result.login);
+		await requireInvited(env, result.login);
 		const issued = await issue(env, { kind: "login", login: result.login, ttlSeconds: LOGIN_TTL_SECONDS });
 		return json({ status: "done", login: result.login, token: issued.token, token_id: issued.id });
 	}
@@ -206,15 +236,24 @@ async function route(request: Request, env: Env, deps: Deps): Promise<Response> 
 			throw new HttpError(400, "trackers is required: the code trackers whose repos to create (root, project, …)");
 		for (const tracker of trackers) requirePart("tracker name", tracker);
 		const id: ProjectId = { owner: login, name };
+		const key = projectKey(id);
 		const project = projectStub(env, id);
-		if (!(await project.init(name, login)))
-			throw new HttpError(409, `project \`${projectKey(id)}\` already exists`);
+		const owner = userStub(env, login);
+		if (!listed(env.ADMIN_LOGINS, login)) {
+			const cap = projectCap(env);
+			if (!(await owner.claimProject(key, cap)))
+				throw new HttpError(
+					403,
+					`${login} already owns ${cap} projects, the most one login may on this remote: delete one with \`newgit remote delete\``,
+				);
+		}
+		if (!(await project.init(name, login))) throw new HttpError(409, `project \`${key}\` already exists`);
 		// The one write to a code tracker's repo outside a merge: the creator's
 		// initial push of its history. Only here, only once, only briefly.
 		const seeds = [];
 		for (const tracker of trackers) seeds.push(await seed(env, deps, caller, { kind: "tracker", project: id, tracker }));
 		return json(
-			{ owner: login, name, key: projectKey(id), endpoint: endpointUrl(url, id), seeds },
+			{ owner: login, name, key, endpoint: endpointUrl(url, id), seeds },
 			201,
 		);
 	}
@@ -246,6 +285,27 @@ async function route(request: Request, env: Env, deps: Deps): Promise<Response> 
 		return json(await credential(env, deps, project, info.defaultBranch, ref, scope, caller, member));
 	}
 
+	// Deleting a project takes everything with it. Its record goes first, so
+	// every request after this one finds no project; then the tokens pinned
+	// to it; then its repos, and with each repo every password minted for it.
+	if (method === "DELETE" && rest === "") {
+		requireHuman(caller, "delete projects");
+		// An admin may too, member or not, so the operator can take down what
+		// should not be here.
+		if (!listed(env.ADMIN_LOGINS, login)) requireOwner(info.owner, login, `delete ${key}`);
+		const holders = new Set([
+			...(await project.members()).map((m) => m.login),
+			...(await project.instances()).map((i) => i.owner),
+		]);
+		await project.destroy();
+		await userStub(env, info.owner).releaseProject(key);
+		for (const holder of holders) await revokeRepoTokens(deps, await userStub(env, holder).revokeProject(key));
+		// Parts never contain dots, so this prefix is this project's and no other's.
+		const names = await deps.repos.names(`${id.owner}.${id.name}.`);
+		for (const name of names) await deps.repos.delete(name);
+		return json({ key, deleted: true, repos_deleted: names.length });
+	}
+
 	if (!member) throw new HttpError(403, `${login} is not a member of ${key}`);
 
 	if (method === "GET" && rest === "") {
@@ -256,24 +316,6 @@ async function route(request: Request, env: Env, deps: Deps): Promise<Response> 
 			members: await project.members(),
 			branches: await project.branches(),
 		});
-	}
-
-	// Deleting a project takes everything with it. Its record goes first, so
-	// every request after this one finds no project; then the tokens pinned
-	// to it; then its repos, and with each repo every password minted for it.
-	if (method === "DELETE" && rest === "") {
-		requireHuman(caller, "delete projects");
-		requireOwner(info.owner, login, `delete ${key}`);
-		const holders = new Set([
-			...(await project.members()).map((m) => m.login),
-			...(await project.instances()).map((i) => i.owner),
-		]);
-		await project.destroy();
-		for (const holder of holders) await revokeRepoTokens(deps, await userStub(env, holder).revokeProject(key));
-		// Parts never contain dots, so this prefix is this project's and no other's.
-		const names = await deps.repos.names(`${id.owner}.${id.name}.`);
-		for (const name of names) await deps.repos.delete(name);
-		return json({ key, deleted: true, repos_deleted: names.length });
 	}
 
 	// ── Members ────────────────────────────────────────────────────────────
@@ -663,6 +705,29 @@ async function gitEndpoint(request: Request, env: Env, deps: Deps, match: RegExp
 	return deps.endpoint(key, service === match[3] ? "upload-pack" : "advertise", plan, request);
 }
 
+/** Where `/` sends a visitor when this remote publishes no landing page. */
+const REPOSITORY = "https://github.com/Spheroman/newgit";
+
+/**
+ * The landing page: one file of one tracker, at that tracker's `main`, named
+ * by `LANDING_PAGE` in wrangler.jsonc. newgit.dev's is in `site`, a secret
+ * tracker, so this route is the one place its content is published, and
+ * only the file the config names. Publishing a change is `newgit tracker
+ * merge site`, which moves the repo's branch `main` (its default branch, so
+ * what `HEAD` reads); no deploy. Only a merge creates that branch, so a
+ * tracker never merged serves nothing.
+ */
+async function landingPage(method: string, env: Env, repos: Repos): Promise<Response> {
+	const page = env.LANDING_PAGE;
+	const project = page ? parseProjectKey(page.project) : null;
+	const html =
+		page && project ? await repos.readFile(repoName({ kind: "tracker", project, tracker: page.tracker }), "HEAD", page.path) : null;
+	if (html === null) return Response.redirect(REPOSITORY, 302);
+	return new Response(method === "HEAD" ? null : html, {
+		headers: { "content-type": "text/html; charset=utf-8", "cache-control": "public, max-age=60" },
+	});
+}
+
 /** Where a project's Git endpoint is: `https://<host>/<owner>/<name>.git`. */
 function endpointUrl(url: URL, id: ProjectId): string {
 	return `${url.origin}/${id.owner}/${id.name}.git`;
@@ -703,6 +768,11 @@ async function credential(
 		facts.instancePrivate = instance?.private;
 	}
 	facts.tracker = await definitionFacts(deps.repos, ref.project, defaultBranch, ref.tracker, await listedTrackers(project));
+	// Not a refusal but an absence, as on the fork route: a client may wait
+	// for the definition to land (a checkpoint leaves the tracker for later),
+	// while a 403 is a "no" it must not wait out.
+	if (facts.tracker === undefined)
+		throw new HttpError(404, `tracker \`${ref.tracker}\` is not defined on ${projectKey(ref.project)}'s default branch`);
 
 	const decision = decide(ref, scope, who, facts);
 	if (!decision.ok) throw new HttpError(403, decision.reason);
@@ -889,7 +959,7 @@ async function callerFor(token: string, env: Env): Promise<Caller> {
 	if (claims === null) throw new HttpError(401, "not logged in: run `newgit login`");
 	// On every request, not only at login: taking someone off the list shuts
 	// out the tokens they already hold, agents' included.
-	requireInvited(env, claims.sub);
+	await requireInvited(env, claims.sub);
 	if (!(await userStub(env, claims.sub).check(claims.jti)))
 		throw new HttpError(401, "this token was revoked: run `newgit login`, or ask its owner for a new agent token");
 	return {
@@ -902,11 +972,26 @@ async function callerFor(token: string, env: Env): Promise<Caller> {
 	};
 }
 
-function requireInvited(env: Env, login: string) {
+async function requireInvited(env: Env, login: string) {
 	if (!env.ALLOWED_LOGINS)
 		throw new HttpError(503, "this remote admits no one yet: its operator has not set ALLOWED_LOGINS (`*` for anyone)");
-	if (!invited(env.ALLOWED_LOGINS, login))
+	if (!listed(env.ALLOWED_LOGINS, login))
 		throw new HttpError(403, `this remote is invite-only, and GitHub user \`${login}\` is not invited`);
+	if (listed(env.BLOCKED_LOGINS, login))
+		throw new HttpError(403, `GitHub user \`${login}\` is blocked from this remote`);
+	if (listed(env.ADMIN_LOGINS, login)) return;
+	const paused = await pausedBy(env);
+	if (paused)
+		throw new HttpError(
+			503,
+			`this remote is paused: it was billed $${paused.spent.toFixed(2)} in the last 7 days, over its $${paused.limit} weekly budget (as of ${paused.checkedAt}). It reopens on its own once that falls under the budget.`,
+		);
+}
+
+/** How many projects one login may own: `PROJECTS_PER_LOGIN`, 5 when unset. */
+function projectCap(env: Env): number {
+	const cap = Number.parseInt(env.PROJECTS_PER_LOGIN ?? "", 10);
+	return Number.isFinite(cap) && cap >= 0 ? cap : 5;
 }
 
 /** Sign a token and record it with its user, so it can later be revoked. */

@@ -10,22 +10,27 @@ newgit run --on devbox -- claude ...
 
 A **host** is where an instance runs: this machine, a machine reachable over
 SSH (or a tailnet), or a Cloudflare sandbox. Three backends for one concept.
+A review can also place one tracker's resources on another machine while
+the rest run here (#229; *Reviewing a change* in [remote.md](remote.md));
+a host is the natural target for that placement, as the preview sandbox is.
 The motivating case: steer eight agents from a laptop while they run on a
 desktop, and open their dev servers in the laptop's browser.
 
 ## The shape
 
 This is `spawn --from-checkpoint` pointed at a machine you control instead of
-at newgit.dev. Nothing new travels; it is all Git.
+at newgit.dev (see [remote.md](remote.md)), with the tracker store described
+in [trackers.md](trackers.md). Nothing new travels; it is all Git.
 
 1. **Ship bytes with Git.** `git push` the source rev and the bound tracker
    refs into the host's store over SSH. Push, not fetch, so the laptop need
    not be reachable.
-2. **Spawn there.** `ssh devbox newgit spawn <name> --rev <sha> ...`. The
+2. **Spawn there.** `ssh devbox newgit spawn <name> --from <sha> ...`. The
    host's own `prepare`/`restore` builds installs, ports, and processes.
 3. **The binding record lives on the host**, since pids, ports, and installs
    are host-local. The laptop keeps a pointer (`auth-refactor → devbox`);
-   `status`, `run`, `checkpoint`, `undo`, and `remove` pass through over SSH.
+   `status`, `run`, `stop`, `start`, `action`, `checkpoint`, `undo`, and
+   `remove` pass through over SSH.
 4. **Come back the same way:** `spawn --from-checkpoint devbox:<inst>/<ckpt>`.
 
 The agent runs on the host. Editing remote files from a local agent
@@ -54,5 +59,6 @@ are declared, and trust is explicit:
 - Version skew: require a matching newgit on the host at first; auto-push
   the binary later (as VS Code Server does).
 - Does the host's store sync with newgit.dev directly, or only through the
-  laptop?
+  laptop? Today a per-user tracker's `main` reaches the remote only through
+  some instance's checkpoint (#224), which a host would inherit.
 - Should `newgit status` list instances on every known host by default?

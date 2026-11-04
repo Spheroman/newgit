@@ -15,12 +15,13 @@ use crate::error::{NewgitError, Result};
 use crate::resource::ResourceDefinition;
 
 /// Ports already promised to instances. Binding records are the single
-/// source of truth: removing an instance frees its ports with no ledger.
+/// source of truth: removing an instance frees its ports with no ledger. A
+/// parked binding still claims its ports: `tracker use` hands them back.
 pub fn used_ports(branches: &[BranchInstance]) -> BTreeSet<u16> {
     branches
         .iter()
-        .flat_map(|branch| branch.resources.values())
-        .flat_map(|binding| binding.resolved_ports.values().copied())
+        .flat_map(BranchInstance::port_claims)
+        .flat_map(|(_, binding)| binding.resolved_ports.values().copied())
         .collect()
 }
 
@@ -286,10 +287,9 @@ pub fn check_ports(
         .filter(|listener| ranges.iter().any(|range| range.contains(&listener.port)))
         .map(|listener| {
             let claimed_by = branches.iter().find(|branch| {
-                branch
-                    .resources
-                    .values()
-                    .any(|binding| binding.resolved_ports.values().any(|p| *p == listener.port))
+                branch.port_claims().any(|(_, binding)| {
+                    binding.resolved_ports.values().any(|p| *p == listener.port)
+                })
             });
             let attributed_to = if listener.command.is_empty() {
                 None
