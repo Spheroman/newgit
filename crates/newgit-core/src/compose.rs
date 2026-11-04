@@ -142,6 +142,9 @@ pub struct View {
 /// Tracker commits by tracker name.
 pub type State = BTreeMap<String, String>;
 
+/// Whether a commit may be expanded as a tracker's: `(tracker, commit)`.
+pub type Admit<'a> = dyn Fn(&str, &str) -> bool + 'a;
+
 /// Who is composing: which trackers they may read, and how much to trust a
 /// pin.
 pub struct ComposeOptions<'a> {
@@ -152,7 +155,7 @@ pub struct ComposeOptions<'a> {
     /// checks every pin is in that tracker's own history, so a parent cannot
     /// pin another tracker's commit under a name its reader may read. `None`
     /// trusts every pin (a local store holds only your own trackers).
-    pub admit: Option<&'a dyn Fn(&str, &str) -> bool>,
+    pub admit: Option<&'a Admit<'a>>,
 }
 
 /// The pins in `tree`: child name → commit.
@@ -293,14 +296,21 @@ struct Composed {
     tree: String,
 }
 
+/// Where a child view commit was taken: `(walk position, tracker commit,
+/// view commit)`.
+type TakenAt = (usize, String, String);
+
+/// A tracker commit with its pins and where each readable one is mounted.
+type Shape = (Commit, BTreeMap<String, String>, BTreeMap<String, String>);
+
 /// Per tracker: which child view commits its view has taken, and where.
 #[derive(Default)]
 struct Taken {
     /// `(mount, child view commit)` → every `(position, tracker commit, view
     /// commit)` that took it inline.
-    inline: HashMap<(String, String), Vec<(usize, String, String)>>,
+    inline: HashMap<(String, String), Vec<TakenAt>>,
     /// The same for replays: where a brought-in child commit was replayed.
-    replayed: HashMap<(String, String), Vec<(usize, String, String)>>,
+    replayed: HashMap<(String, String), Vec<TakenAt>>,
 }
 
 struct Composer<'a> {
@@ -428,8 +438,7 @@ impl Composer<'_> {
 
         // First every child this history pins, so a parent always mounts a
         // view that is already composed.
-        let mut shapes: Vec<(Commit, BTreeMap<String, String>, BTreeMap<String, String>)> =
-            Vec::with_capacity(walk.len());
+        let mut shapes: Vec<Shape> = Vec::with_capacity(walk.len());
         let mut child_tips: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
         for id in &walk {
             let commit = self.objects.commit(id)?;
@@ -1203,7 +1212,7 @@ impl Splitter<'_> {
             .root_history
             .as_ref()
             .is_some_and(|history| history.contains(view))
-            || self.from_before_mounts(view)?)
+            || self.made_before_mounts(view)?)
             && !defines_mounts_in(&mut self.objects, view)?
         {
             self.mapped.insert(view.to_owned(), view.to_owned());
@@ -1217,7 +1226,7 @@ impl Splitter<'_> {
     /// own root commit: the migration's "root's history is the view's
     /// history, commit for commit", for commits it did not see (work still
     /// in a workspace).
-    fn from_before_mounts(&mut self, view: &str) -> Result<bool> {
+    fn made_before_mounts(&mut self, view: &str) -> Result<bool> {
         let commit = self.objects.commit(view)?;
         let project = format!("{DEFINITIONS_DIR}/{}.toml", crate::tracker::PROJECT_TRACKER);
         if self.objects.entry_at(&commit.tree, &project)?.is_some() {
@@ -1728,13 +1737,22 @@ impl Splitter<'_> {
         if ancestor == descendant {
             return Ok(true);
         }
-        let status = Command::new("git")
+        // Git answers for what it has: commits made in this split first.
+        self.objects.flush()?;
+        let output = Command::new("git")
             .arg("-C")
             .arg(self.objects.repo().as_str())
             .args(["merge-base", "--is-ancestor", ancestor, descendant])
-            .status()
+            .output()
             .map_err(|source| NewgitError::io(self.objects.repo(), source))?;
-        Ok(status.success())
+        match output.status.code() {
+            Some(0) => Ok(true),
+            Some(1) => Ok(false),
+            _ => Err(NewgitError::SourceCommand {
+                command: format!("git merge-base --is-ancestor {ancestor} {descendant}"),
+                stderr: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+            }),
+        }
     }
 
     /// The one of `commits` every other is an ancestor of.

@@ -2046,6 +2046,7 @@ impl BranchManager {
         autostart: bool,
     ) -> Result<SpawnOutcome> {
         self.require_resolvable_graph()?;
+        self.require_migrated()?;
         if choice.private && self.remote.is_none() {
             return Err(NewgitError::Unsupported(
                 "a private instance is private on the project's newgit remote, and this project \

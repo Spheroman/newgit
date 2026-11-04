@@ -501,16 +501,11 @@ fn signed_and_non_utf8_commits_come_back_as_themselves_from_tracker_commits_alon
     let raw = format!(
         "tree {tree}\nparent {head}\nauthor B\u{e9}a <bea@example.com> 5000 +0000\ncommitter GitHub <noreply@github.com> 5000 +0000\nencoding ISO-8859-1\ngpgsig -----BEGIN PGP SIGNATURE-----\n \n wsFcBAABCAAQ\r\n -----END PGP SIGNATURE-----\n\ncaf\u{e9} au lait"
     );
-    let mut bytes = raw.into_bytes();
     // Latin-1: é is one byte, 0xe9.
-    let latin = |bytes: Vec<u8>| -> Vec<u8> {
-        String::from_utf8(bytes)
-            .expect("utf8")
-            .chars()
-            .map(|character| character as u32 as u8)
-            .collect()
-    };
-    bytes = latin(bytes);
+    let bytes: Vec<u8> = raw
+        .chars()
+        .map(|character| character as u32 as u8)
+        .collect();
     let path = temp.join("raw-commit");
     std::fs::write(&path, &bytes).expect("write");
     let signed = git(
@@ -835,5 +830,82 @@ fn an_upstream_sync_dated_before_everything_goes_on_top() {
         git(&repo.dir, &["rev-parse", &format!("{view}^2^")]),
         work,
         "it replays onto the view commit that took our t3code work inline"
+    );
+}
+
+#[test]
+fn a_diamond_of_merges_through_two_trackers_round_trips() {
+    let (_guard, temp) = tempdir();
+    let (repo, _) = carved_project(&temp);
+    let top = git(&repo.dir, &["rev-parse", "HEAD"]);
+    git(&repo.dir, &["checkout", "-q", "-b", "left"]);
+    repo.commit(&[("apps/app/left.js", Some("left\n"))], "left");
+    git(&repo.dir, &["checkout", "-q", "-b", "right", &top]);
+    repo.commit(&[("right.txt", Some("right\n"))], "right");
+    git(&repo.dir, &["checkout", "-q", "left"]);
+    let bottom = repo.merge("right", "join the diamond");
+    let outcome = repo.split(&bottom);
+    let (_fresh_guard, fresh, composed) = compose_fresh(
+        &repo.dir,
+        &tracker_refs(&outcome.index),
+        &outcome.root,
+        &["*"],
+    );
+    assert_eq!(composed.as_deref(), Some(bottom.as_str()));
+    assert_eq!(
+        git(
+            &fresh,
+            &["merge-base", "refs/heads/view^1", "refs/heads/view^2"]
+        ),
+        top,
+        "the diamond's top is one commit"
+    );
+}
+
+#[test]
+fn an_edit_to_one_copy_of_a_tracker_mounted_twice_splits_into_that_copy() {
+    let (_guard, temp) = tempdir();
+    let (repo, _) = carved_project(&temp);
+    let first = repo.commit(
+        &[
+            (".newgit/trackers/ui.toml", Some(&mounted("ui"))),
+            ("ui/button.js", Some("v2\n")),
+        ],
+        "root mounts ui",
+    );
+    repo.split(&first);
+    let second = repo.commit(
+        &[
+            (
+                "apps/app/.newgit/trackers/ui.toml",
+                Some(&mounted("vendor/ui")),
+            ),
+            ("apps/app/vendor/ui/button.js", Some("v1\n")),
+        ],
+        "the app mounts its own copy",
+    );
+    let outcome = repo.split(&second);
+    let edit = repo.commit(
+        &[("apps/app/vendor/ui/button.js", Some("v1.1\n"))],
+        "edit one copy",
+    );
+    let outcome = {
+        let _ = outcome;
+        repo.split(&edit)
+    };
+    // Composed here: an index lists one copy of a tracker per name, so a
+    // fresh repository fed from the index alone lacks the other's commits.
+    let composed = compose_in(&repo.dir, &outcome.root, &["*"]);
+    assert_eq!(composed.as_deref(), Some(edit.as_str()));
+    assert_eq!(
+        git(&repo.dir, &["show", &format!("{edit}:ui/button.js")]),
+        "v2"
+    );
+    assert_eq!(
+        git(
+            &repo.dir,
+            &["show", &format!("{edit}:apps/app/vendor/ui/button.js")]
+        ),
+        "v1.1"
     );
 }

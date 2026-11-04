@@ -92,7 +92,7 @@ impl BranchManager {
             GitSource::fetch_refs(
                 &["-C", project.as_str()],
                 store.as_str(),
-                &[format!("+refs/trackers/*:refs/newgit/trackers/*")],
+                &["+refs/trackers/*:refs/newgit/trackers/*".to_owned()],
                 None,
             )?;
             let view = self
@@ -518,7 +518,7 @@ impl BranchManager {
         GitSource::fetch_refs(
             &["-C", project.as_str()],
             store.as_str(),
-            &[format!("+refs/trackers/*:refs/newgit/trackers/*")],
+            &["+refs/trackers/*:refs/newgit/trackers/*".to_owned()],
             None,
         )?;
         outcome.lines.push(format!(

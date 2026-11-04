@@ -12,7 +12,7 @@ use newgit_core::compose;
 use newgit_core::config::WorkspaceSection;
 use newgit_core::manager::BranchManager;
 use newgit_core::store::MetadataStore;
-use newgit_core::tracker::{Storage, TrackerDefinition};
+use newgit_core::tracker::Storage;
 
 fn git_env(dir: &Utf8Path, args: &[&str], env: &[(&str, String)]) -> String {
     let output = Command::new("git")
