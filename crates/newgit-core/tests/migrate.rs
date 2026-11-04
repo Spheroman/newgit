@@ -175,7 +175,11 @@ fn a_dry_run_runs_the_gate_and_moves_nothing() {
     let text = outcome.lines.join("\n");
     assert!(text.contains("Gate: recomposed"), "{text}");
     assert!(text.contains("Dry run: nothing moved"), "{text}");
-    assert_eq!(outcome.checked, 2, "main and the instance: {text}");
+    assert_eq!(
+        outcome.checked, 3,
+        "main, the instance, and a test commit on top of the carve: {text}"
+    );
+    assert!(text.contains("Rebuilt from their splits: 2"), "{text}");
     assert_eq!(root_main(&store), main, "the store did not move");
     assert_eq!(
         git(&repo, &["rev-parse", "HEAD"]),

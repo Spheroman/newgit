@@ -423,20 +423,55 @@ impl BranchManager {
         )?;
         delete_refs(&project, "refs/newgit/migrate/")?;
 
-        // The gate.
-        let checked = self.gate(&store, &expected)?;
+        // The gate. Everything from before the carve pins nothing and is
+        // its own root commit, so it reproduces by construction; what proves
+        // the engine is what has to be rebuilt from a split: the carve, and
+        // a test commit on top of it that changes a file of root's and one
+        // of access's, made the way you make commits (signed, if you sign).
+        let (probe, probe_split) = self.gate_probe(&carve)?;
+        let mut extra: Vec<(String, String)> = Vec::new();
+        for (tracker, commit) in &probe_split.index {
+            extra.push((format!("{tracker}/gate"), commit.clone()));
+        }
+        expected.push(Expected {
+            label: "a test commit on top of the carve".to_owned(),
+            root: probe_split.root.clone(),
+            view: probe.clone(),
+        });
+        let checked = self.gate(&store, &expected, &extra)?;
         outcome.checked = checked;
-        let signed = project_git(&["log", "--format=%G?", &carve])?
+        let rebuilt = expected
+            .iter()
+            .filter(|want| want.root != want.view)
+            .count();
+        let signed_before = project_git(&["log", "--format=%G?", main_view])?
             .lines()
             .filter(|line| *line != "N")
             .count();
+        let signed_rebuilt = expected
+            .iter()
+            .filter(|want| want.root != want.view)
+            .filter(|want| {
+                project_git(&["cat-file", "commit", &want.view])
+                    .is_ok_and(|raw| raw.contains("\ngpgsig "))
+            })
+            .count();
         outcome.lines.push(format!(
-            "Gate: recomposed {checked} views ({} branch{}, {} checkpoint sides) in a fresh \
-             repository holding only the new tracker commits: every id identical, the {signed} \
-             signed commits on `main` included",
-            1 + instance_views.len(),
-            if instance_views.is_empty() { "" } else { "es" },
-            expected.len() - 1 - instance_views.len()
+            "Gate: recomposed {checked} views in a fresh repository holding only the new \
+             tracker commits, every id identical. Rebuilt from their splits: {rebuilt} (the \
+             carve, and a test commit on top changing root and access{}), over `main`'s \
+             history before the carve, whose commits pin nothing and come back as themselves \
+             ({signed_before} of them signed). Reused as their own root commits, for the same \
+             reason: {} ({} instance branch{}, {} checkpoint sides)",
+            if signed_rebuilt > 0 {
+                format!(", {signed_rebuilt} of them signed and given back with the signature")
+            } else {
+                String::new()
+            },
+            checked - rebuilt,
+            instance_views.len(),
+            if instance_views.len() == 1 { "" } else { "es" },
+            expected.len() - 2 - instance_views.len()
         ));
         if dry_run {
             outcome.lines.push(
@@ -615,9 +650,53 @@ impl BranchManager {
         Ok((carve, mounted))
     }
 
+    /// A view commit on top of the carve changing a file of root's and one of
+    /// `access`'s, made the way this machine makes commits, and its split.
+    /// Never on any branch: it exists so the gate rebuilds a split commit.
+    fn gate_probe(&self, carve: &str) -> Result<(String, crate::compose::SplitOutcome)> {
+        let project = self.store.paths().project_root.clone();
+        let mut objects = crate::objects::Objects::open(&project)?;
+        let base = objects.commit(carve)?;
+        let root_file = write_blob(&project, "the migration's gate\n")?;
+        let access_file = write_blob(&project, "the migration's gate, in access\n")?;
+        let mut tree = objects.set_path(
+            &base.tree,
+            ".newgit/migrate-gate",
+            Some((b"100644".to_vec(), root_file)),
+        )?;
+        tree = objects.set_path(
+            &tree,
+            &format!("{DEFINITIONS_DIR}/migrate-gate"),
+            Some((b"100644".to_vec(), access_file)),
+        )?;
+        objects.flush()?;
+        let probe = run_git_env(
+            &[
+                "-C",
+                project.as_str(),
+                "commit-tree",
+                &tree,
+                "-p",
+                carve,
+                "-m",
+                "The migration's gate: a commit splitting into root and access",
+            ],
+            &[],
+        )?
+        .trim()
+        .to_owned();
+        let split = self.split_view_made(&probe, &BTreeSet::new(), Some(&probe))?;
+        Ok((probe, split))
+    }
+
     /// Recompose every expected view in a fresh repository holding only
     /// the staged tracker commits, and require each comes out with its id.
-    fn gate(&self, store: &Utf8Path, expected: &[Expected]) -> Result<usize> {
+    fn gate(
+        &self,
+        store: &Utf8Path,
+        expected: &[Expected],
+        extra: &[(String, String)],
+    ) -> Result<usize> {
         let fresh = tempfile::Builder::new()
             .prefix("newgit-migrate-gate-")
             .tempdir()
@@ -631,6 +710,31 @@ impl BranchManager {
             &[format!("+{STAGING}/*:refs/trackers/*")],
             None,
         )?;
+        if !extra.is_empty() {
+            let project = self.store.paths().project_root.clone();
+            let mut stdin = String::new();
+            for (name, commit) in extra {
+                stdin.push_str(&format!(
+                    "update refs/newgit/migrate-gate/{name} {commit}\n"
+                ));
+            }
+            crate::objects::run(
+                std::process::Command::new("git")
+                    .arg("-C")
+                    .arg(project.as_str())
+                    .args(["update-ref", "--stdin"]),
+                "git update-ref --stdin",
+                Some(stdin.as_bytes()),
+            )?;
+            let fetched = GitSource::fetch_refs(
+                &[&format!("--git-dir={fresh}")],
+                project.as_str(),
+                &["+refs/newgit/migrate-gate/*:refs/trackers/*".to_owned()],
+                None,
+            );
+            delete_refs(&project, "refs/newgit/migrate-gate/")?;
+            fetched?;
+        }
         let everything = |_: &str| true;
         let tips: Vec<(String, String)> = expected
             .iter()
@@ -684,25 +788,23 @@ impl BranchManager {
             return Ok(());
         };
         let list = split.index.clone();
-        // Every tracker in the new index has its repo; one that never did
-        // (a tracker carved since the remote was made) is seeded.
-        let moving: Vec<String> = list
-            .keys()
-            .chain(base.keys())
-            .cloned()
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .filter(|tracker| base.get(tracker) != list.get(tracker))
-            .collect();
         let pushed: Vec<&str> = list.values().map(String::as_str).collect();
         self.refuse_unpublished(&pushed)?;
-        let off_main: Vec<String> = moving
+        // Every tracker in the new index has its repo; one that never did
+        // (a tracker carved since the remote was made) is seeded first.
+        for (tracker, commit) in list
             .iter()
-            .filter(|tracker| list.contains_key(*tracker) && **tracker != self.root.name)
-            .cloned()
-            .collect();
-        let credentials =
-            client.begin_merge(&key, &view.default_branch, &base, &moving, &off_main)?;
+            .filter(|(tracker, _)| !base.contains_key(*tracker))
+        {
+            let seed = client.create_tracker_repo(&key, tracker)?;
+            GitSource::push_refs(
+                &["-C", project.as_str()],
+                seed.credential.remote.as_deref().unwrap_or_default(),
+                &[format!("+{commit}:refs/heads/main")],
+                Some(&basic_auth_header(&seed.credential)),
+            )?;
+        }
+        let credentials = client.begin_merge(&key, &view.default_branch, &base, &list)?;
         for credential in &credentials {
             let Some(commit) = list.get(&credential.tracker) else {
                 continue;
