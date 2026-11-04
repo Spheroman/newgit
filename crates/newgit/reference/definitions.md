@@ -23,12 +23,13 @@ a line quietly skipped. A misspelled `ownership` would otherwise decide what
 whether a lane travels with a merge — both by defaulting, silently.
 
 ```
-.newgit/
+.newgit/                 root's, except trackers/
   config.toml            project settings          committed
-  trackers/<name>.toml   tracker definitions       committed
+  trackers/<name>.toml   tracker definitions       committed; the `access` tracker
   resources/<name>.toml  resource definitions      committed
   exports/<name>.toml    export targets            committed
   scripts/<name>         scripts hooks call        committed
+  pins/<name>            a mounted tracker's commit; in root's history only, never in a workspace
   branches/ checkpoints/ logs/ state/ local/   local, gitignored
   local/trackers.git     every tracker's history   local, gitignored
   installs/              built trees, shared       local, gitignored
@@ -282,25 +283,35 @@ the commands they will use every day: `spawn`, `status`, `checkpoint`,
 A named, versioned history of file content. Create with `newgit tracker
 create`; hand-edit afterwards.
 
-Three trackers always exist: `root` owns `.` — every path no more specific
-tracker claims — and its history starts as the project's Git history;
-`project` owns `.newgit` (resources, scripts, config); and `access` owns
-`.newgit/trackers/`, every tracker's definition, with `maintainers =
-"owner"`. Ownership nests: the most specific claim wins, so
-`root` owning `.` and `runtime-env` owning `.env.local` do not conflict. Two
-trackers claiming the identical path is an error.
+Two trackers always exist: `root` owns `.` — every path no more specific
+tracker claims, `.newgit/` (resources, scripts, config) included — and its
+history starts as the project's Git history; `access` is mounted at
+`.newgit/trackers` with `paths = ["."]`, so it holds every tracker's
+definition, with `maintainers = "owner"`. A tracker is *mounted* at a path
+inside its parent and claims paths relative to its mount. Ownership nests:
+the deepest mount wins, then the longest claim, so `root` owning `.` and
+`runtime-env` owning `.env.local` do not conflict. Two trackers claiming the
+identical path at the same mount is an error. A claim starting with `!`
+excludes: a path every claim excludes is owned by nothing, and a commit
+changing it is refused when it leaves the machine.
 
 Every tracker has a history, and `git` says where it lives. By default
 (`git = false`) a tracker is outside Git: its files are never committed, and
 newgit captures them into the tracker's own history. That is where a `.env`
 belongs, and also where content that is not sensitive but is not source
 either (agent notes, db snapshots) goes. A tracker with `git = true` is
-committed with Git, as ordinary source with its own history — `root`,
-`project`, `access`, and anything made with `newgit tracker create <name> --git
---path <path>`, which carves those paths, history included, out of whichever
-tracker owned them. You commit to a tracker in Git with Git; `newgit tracker
-capture` and `track` refuse it. How sensitive a tracker's content is has
-nothing to do with this; that is its `audience`.
+committed with Git, as ordinary source with its own history, stored relative
+to its own root — `root`, `access`, and anything made with `newgit tracker
+create <name> --git --path <path>`, which mounts a new tracker at that path
+in one commit: the files move into it and root *pins* its first commit
+(`.newgit/pins/<name>`, a gitlink in root's history). History before the
+carve stays in root, so no commit id changes. You commit to a tracker in Git
+with Git; `newgit tracker capture` and `track` refuse it. `newgit pull
+<tracker>` moves its pin to its `follow` ref in one commit; nothing else
+moves a pin on your behalf. How sensitive a tracker's content is has nothing
+to do with this; that is its `audience`. A project laid out before mounts
+(a `project` tracker owning `.newgit`) is moved onto them by `newgit tracker
+migrate`.
 
 ```toml
 # .newgit/trackers/runtime-env.toml — outside Git: each user's own .env.local
@@ -322,13 +333,15 @@ resources = ["staging-tunnel"]
 | `audience` | string | yes | — | who may read it. `public`, `project-devs`, `user` (each user gets their own copy), or `user:<login>`. Only `public` ships in an `export --to` without an explicit `--include`, or to an export target that does not name it. |
 | `storage` | string | yes | — | `local` or `remote` — where synced state lives. `remote` needs a `[remote]` in `config.toml`; checkpoint sync then pushes the tracker there. |
 | `merge_with_source` | bool | no | `false` | meant to say whether a source merge carries this tracker's state with it. Accepted and stored, but nothing reads it yet: `newgit merge` merges every tracker the instance changed. |
-| `paths` | array of strings | no | `[]` | workspace-relative paths the lane owns, normalized first (`./.env.local` is `.env.local`). Must not be absolute, contain `..`, or reach into `.git` or `.newgit` in any case (`.GIT` too), except that a tracker in Git may own other trackers' definitions, `.newgit/trackers/<name>.toml` (see `maintainers`); the rest of `.newgit` is `project`'s and `access`'s. `.` must be a tracker's only path. May be empty for a tracker that only receives resource deposits (`into_tracker`) or only brings `resources`: such a tracker has nothing in the workspace, so `tracker drop` (and `tracker use` swapping it out of its role) skips the capture, and `tracker list` shows it after the ownership tree with what deposits into it and what it brings. |
+| `mount` | string | no | `.` | where the tracker's own root sits inside the parent that defines it (`apps/electron`). `.` is an overlay beside the parent's files. A tracker in Git may be mounted at `.newgit/trackers`, beside `access`, to govern the definitions it claims (see `maintainers`); no other mount may reach into `.git` or `.newgit`. A tracker outside Git may have a mount too; it is never pinned. |
+| `follow` | string | no | `main` | the ref of the tracker's own history that `newgit pull <tracker>` brings in. Trackers outside Git ignore it. |
+| `paths` | array of strings | no | `[]` | its claims, relative to the mount, normalized first (`./.env.local` is `.env.local`). `!` excludes (`[".", "!dist/"]`): an excluded path is owned by a tracker that claims it at the same mount, or by nothing. Must not be absolute, contain `..`, or reach into `.git` or `.newgit` in any case (`.GIT` too). `.` must be a tracker's only claim. May be empty for a tracker that only receives resource deposits (`into_tracker`) or only brings `resources`: such a tracker has nothing in the workspace, so `tracker drop` (and `tracker use` swapping it out of its role) skips the capture, and `tracker list` shows it after the ownership tree with what deposits into it and what it brings. |
 | `git` | bool | no | `false` | `true` makes a tracker in Git: committed with Git rather than captured by newgit. The default keeps its files out of Git, so a new tracker fails closed. Written only when `true`. |
 | `role` | string | no | — | the slot it fills: trackers sharing a role are alternatives (`dev-db`, `staging-db`) and may claim the same paths; an instance binds one of them. |
 | `priority` | integer | no | `0` | which tracker of a role an instance binds by default (the highest), unless your own default says otherwise (`[projects.<project>.roles]` in `~/.newgit/config.toml`). Negative means only when asked for (`--use`), for a role-less tracker too. |
 | `requires` | array of strings | no | `[]` | trackers or roles it cannot do without: binding it binds them, and they cannot be dropped while it is bound. |
 | `resources` | array of strings | no | `[]` | resources it brings: they bind only while it is bound. `newgit tracker use` binds and prepares them and starts their `autostart` action; `drop` stops them and releases their binding. |
-| `maintainers` | string | no | its `audience` | who may merge changes to it on a remote: `owner` (the project's owner), `project-devs`, or `user:<login>`. Changing a tracker's definition is changing the tracker that owns its file in `.newgit/trackers/` — `access` unless a more specific tracker in Git claims it — so governance layers: an `admin` tracker claiming `.newgit/trackers/web.toml` decides who changes `web`'s paths, audience, and maintainers. |
+| `maintainers` | string | no | its `audience` | who may merge changes to it on a remote: `owner` (the project's owner), `project-devs`, or `user:<login>`. Changing a tracker's definition is changing the tracker that owns its file in `.newgit/trackers/` — `access` unless a tracker in Git mounted beside it at `.newgit/trackers` claims the file — so governance layers: an `admin` tracker with `mount = ".newgit/trackers"` and `paths = ["web.toml"]` decides who changes `web`'s paths, audience, and maintainers. |
 
 The paths of a tracker outside Git stay out of Git: `newgit tracker track` adds them to
 the store's `.gitignore`, and each workspace's Git is told to ignore them too,
@@ -1397,7 +1410,7 @@ environment variable handed to every later process.
 | `{{exports.<name>}}` | a rendered export from this resource's binding |
 | `{{snapshot.path}}` | directory to write checkpoint output into |
 | `{{state_ref}}` | the handle the last checkpoint recorded, or the path of the snapshot it deposited. A `hash` checkpoint records neither, so it has no value |
-| `{{bound.trackers}}` | the trackers the instance binds, space-separated — every selectable tracker it has not dropped (`root`, `project`, and `access` are always bound and not listed) |
+| `{{bound.trackers}}` | the trackers the instance binds, space-separated — every selectable tracker it has not dropped (`root` and `access` are always bound and not listed) |
 | `{{bound.paths}}` | the paths those trackers own, trackers in Git only, space-separated — what a shared install should build |
 
 Scope — which of them have a value where:
@@ -1599,10 +1612,11 @@ trackers = ["root"]
 | `branches` | bool | no | `false` | also export each instance's branch, every time its workspace pushes, so a pull request can be opened against the target (see below). |
 
 What ships fails closed. Only trackers in Git whose audience is `public` ship
-unless `trackers` names them, and `root`, `project`, and `access` are
-`project-devs`. So `trackers = ["root"]` mirrors the project's code without
-`.newgit/`, and adding `"project", "access"` mirrors that too. A path owned
-by a tracker that does not ship stays out of every exported commit. A
+unless `trackers` names them, and `root` and `access` are `project-devs`.
+So `trackers = ["root"]` mirrors the project's code and its `.newgit/`
+(config, resources, scripts, export targets) without `.newgit/trackers/`,
+and adding `"access"` mirrors the definitions too. A path owned by a tracker
+that does not ship stays out of every exported commit. A
 history that ever adds a path a tracker outside Git owns, such as a `.env`
 committed before it was tracked, refuses the whole export before anything
 is pushed.

@@ -105,7 +105,10 @@ this repository is `spheroman/newgit` on newgit.dev, and GitHub's
 - Forge features: pull requests, reviews, issues, checks, releases.
 - CLI commands for things the API already does: by-hand agent tokens
   (create, list, revoke), and creating branches or changing the default one.
-- Merge stacking (`merge --only`), and resources that depend on a role.
+- Resources that depend on a role. (Merge stacking by tracker, `merge
+  --only`, was dropped on 2026-11-04: with root's history as the view's
+  shape, a partial merge would be a cherry-pick with new ids. See
+  [trackers.md](trackers.md), *`--only` is dropped*.)
 
 ---
 
@@ -161,7 +164,7 @@ Facts from the docs (2026-10), because the design leans on each one.
  newgit CLI ── HTTPS + newgit token ─────────► Worker  (API; later the web UI and previews)
    remote add / spawn / checkpoint /             │
    merge / clone / spawn --from-checkpoint       ├─► ProjectDO (Durable Object, SQLite)
-                                                 │     members, branches (as lists),
+                                                 │     members, branches (root's ref + index),
  workspace                                       │     instances, forks, checkpoints
    git push ─► outbox ─► checkpoint ─┐           │
    git credential helper ── tokens ──┼──────────►├─► UserDO: each user's recorded tokens
@@ -497,17 +500,23 @@ run`. Trackers never export env.
 ## Merge
 
 `newgit merge [instance] [--into main]` (the instance is inferred inside a
-workspace) runs on the merger's machine, tracker by tracker: fast-forward
-where the branch has not moved, `git merge-tree` where both sides changed a
-tracker, nothing at all on a conflict ([trackers.md](trackers.md),
-*Checkpoints, merges, and coherence*). `newgit merge main` merges the
-project root instead, which is how trackers made after `remote add` reach
-the remote. On the remote it begins under a short
-lock with the list it was based on, pushes each moved tracker's commit with
-passwords minted for that merge, and finishes with a compare-and-swap of the
-branch's list in the project's Durable Object — every tracker moves
-together, or none does. (The Worker's Artifacts binding cannot write refs,
-so the merge's Git work is the merger's; the list is the truth.)
+workspace) runs on the merger's machine. The merge commit is made in the
+merger's view, each tracker's files merged by `git merge-tree` (a conflict
+moves nothing and names each file's tracker), and split like any other
+commit, so a merger's signed merge comes back as itself
+([trackers.md](trackers.md), *Checkpoints, merges, and pull*). `newgit merge
+main` merges the project root instead, which is how trackers made after
+`remote add` reach the remote. On the remote it begins under a short lock
+with the list it was based on, telling the Worker which trackers' pins move
+to a commit not on their own `main` (`off_main`: those need their
+maintainers, and root always needs its own; the Worker cannot run Git, so it
+takes that list from the client, and the Git endpoint serves only pins found
+in each tracker's own repo). It pushes each moved tracker's commit with
+passwords minted for that merge, moves root's ref by one compare-and-swap,
+catches each child's `main` up with what root now pins, and finishes by
+writing the branch's list in the project's Durable Object as an index. (The
+Worker's Artifacts binding cannot write refs, so the merge's Git work is the
+merger's; root's ref is the truth and the list says which repos to fetch.)
 
 Who may move a tracker is its definition's `maintainers` (`owner`,
 `project-devs`, or `user:<login>`; it defaults to the audience). A
@@ -579,12 +588,11 @@ preview sandbox)? This settles [#229] ("preview = role replaced by container
 remote?"): what a preview replaces is not a role but where a tracker's
 resources run.
 
-- **The list is a trial merge.** The review's branch is your `main` with the
-  change merged in, tracker by tracker, as `newgit merge` does it: trackers
-  the change did not touch stay at `main`. The same `requires` check as
-  `merge --only` applies — `electron` cannot be tried without the
-  `supabase` it requires when the change touched both
-  ([trackers.md](trackers.md), *Merges stack by tracker*).
+- **The branch is a trial merge.** The review's branch is your `main` with
+  the change merged in, as `newgit merge` does it: one merge commit, so
+  trackers the change did not touch stay at `main`'s pins. Since `--only`
+  was dropped, a trial merge takes every tracker the change touched; a
+  change that should be tried apart goes in its own instance.
 - **Clients run here.** A tracker whose resources are local processes the
   reviewer drives (an Electron app, a CLI, a mobile build) can only be tried
   on the reviewer's machine: an Electron-only change is a local trial merge
@@ -613,9 +621,8 @@ Worker, so the rendered `DATABASE_URL` is a `127.0.0.1` port newgit carries,
 like `cloudflared access tcp`.
 
 **Missing before any of this works:** `merge --into` a throwaway branch and
-`spawn --from` a newgit branch rather than a Git revision; `merge --only`
-and its `requires` check; resource placement and the TCP forwarder; and
-previews themselves.
+`spawn --from` a newgit branch rather than a Git revision; resource
+placement and the TCP forwarder; and previews themselves.
 
 ### One sandbox per distinct environment
 

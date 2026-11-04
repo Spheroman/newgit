@@ -47,7 +47,7 @@ newgit login                      # GitHub device flow
 newgit remote add                 # create <you>/<project>: a repo per tracker in Git
 newgit members add octocat
 newgit spawn --from-checkpoint auth-refactor/ckpt_003
-newgit merge auth-refactor        # into main, tracker by tracker, all at once
+newgit merge auth-refactor        # into main: one merge commit, every tracker at once
 
 # a teammate
 newgit clone jack/widget          # or plain: git clone https://newgit.dev/jack/widget.git
@@ -58,12 +58,13 @@ Git you may read, so two people can read different parts of one
 project.
 
 Every tracker is its own history. `root` owns `.` — whatever no more specific
-tracker claims — and starts as your project's Git history; `project` owns
-`.newgit` (resources, scripts, config), and `access` owns `.newgit/trackers/`,
-who may read what, which only the project's owner changes by default
-(`maintainers = "owner"`). Carve out a tracker in Git, history included, with
-`newgit tracker create electron --git --path apps/electron`. Without `--git`
-a tracker stays outside Git: captured, never committed.
+tracker claims, `.newgit/` included — and starts as your project's Git
+history; `access`, mounted at `.newgit/trackers/`, holds who may read what,
+which only the project's owner changes by default (`maintainers = "owner"`).
+Carve out a tracker in Git with `newgit tracker create electron --git --path
+apps/electron`: one commit that mounts it there, with its history starting
+at the carve. Without `--git` a tracker stays outside Git: captured, never
+committed.
 
 An instance works on what it binds:
 
@@ -303,8 +304,8 @@ Definition management (noun subcommands):
 
 - `newgit tracker create <name> [--audience <a>] [--storage <s>]
   [--merge-with-source]`
-- `newgit tracker create <name> --git --path <path>...` — a tracker in Git,
-  committed and carved with its history out of whichever tracker owns the paths
+- `newgit tracker create <name> --git --path <path>` — a tracker in Git,
+  mounted at that path by one commit; history before it stays in root
 - `newgit tracker track <tracker> <path>...` — trackers outside Git only
 - `newgit tracker remove <name>`
 - `newgit tracker capture|merge|pull|checkout <tracker> [instance]`
@@ -322,11 +323,11 @@ Definition management (noun subcommands):
   [instance] [--stash | --discard]` — a drop parks the resources the tracker
   brought: taken down by `suspend` (else `[cleanup]`), ports kept, and
   brought back on them by the next `use`; `remove` tears parked ones down
-- `newgit tracker repair [--dry-run]` — rewrite the commits of trackers in Git split
-  before newgit kept each original's message ending and signature, so a
-  clone from the remote gets the project's own commit ids. Moves every branch of
-  a tracker in Git, and on the remote each branch's list: a force push of
-  tracker history, so run it once, after upgrading
+- `newgit tracker migrate [--dry-run]` — move a project laid out before
+  mounts (a `project` tracker owning `.newgit`) onto roots and mounts.
+  Recomposes every branch and checkpoint first and moves nothing unless the
+  ids come out the same. A force push of tracker history, so run it once,
+  after upgrading
 - `newgit log <tracker> [instance] [-- <git log args>]` — one tracker's
   history: an instance's branch as of its last checkpoint, or the project
   root's
@@ -345,8 +346,11 @@ Remote:
 - `newgit remote delete <owner>/<name>` — the owner deletes the project
   from the remote: every repo, record, and token pinned to it. Not undoable
 - `newgit clone <owner>/<name> [dir] [--url <url>]`
-- `newgit merge [instance] [--into <branch>]` — `newgit merge main` merges
-  the project root
+- `newgit merge [instance] [--into <branch>]` — the merge commit is made in
+  your view and committed at root's ref; `newgit merge main` merges the
+  project root
+- `newgit pull <tracker> [instance]` — one commit moving a mounted tracker's
+  pin to its `follow` ref; spawn says when a tracker is behind
 - `newgit members add|remove <github-login>` / `members list [--json]`
 - `newgit spawn <name> --from-checkpoint <instance>/<checkpoint>`
 

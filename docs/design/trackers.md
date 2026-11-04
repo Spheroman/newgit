@@ -1,22 +1,39 @@
 # Trackers all the way down
 
 *Design for newgit's core model: no privileged Git source. Every tracker is
-its own repository; a workspace is composed from the trackers it binds; Git
-and GitHub see a projection. Supersedes the v1 split between "source" and
-"other trackers". Decisions marked **(decided)** are made; what is still
-open or unbuilt is listed at the end, under *Open questions and known gaps*.
-Every definition key is specified in
+its own history, stored relative to its own root; a parent records the
+commit of each tracker it mounts; the root tracker's history is the view's
+shape; Git and GitHub see a projection. Supersedes the v1 split between
+"source" and "other trackers", and folds in the roots-and-mounts design
+decided with Jack on 2026-11-04 (built as #201). Decisions marked
+**(decided)** are made; what is still open or unbuilt is listed at the end,
+under *Open questions and known gaps*. Every definition key is specified in
 [definitions.md](../../crates/newgit/reference/definitions.md), which wins
 where this document differs; [spec.md](spec.md) is the main design doc, and
 [remote.md](remote.md) the newgit.dev remote.*
+
+*Terms: a tracker **in Git** (`git = true`) is committed with Git and split
+into its history; one **outside Git** (`git = false`, the default) is
+captured by newgit and never committed.*
 
 ---
 
 ## The model in one page
 
-- **A tracker** is a definition in `.newgit/trackers/<name>.toml`: the paths
-  it owns, who may read it, which resources it brings, and which role (if
-  any) it fills.
+- **A tracker** is a history of files stored relative to its own root, and a
+  definition in `.newgit/trackers/<name>.toml`: where it is mounted, what it
+  claims, who may read and maintain it, the resources it brings, which role
+  (if any) it fills, and whether it is in Git.
+- **A mount** places a tracker at a path inside another tracker.
+- **A pin** is the commit of a mounted tracker in Git that a parent commit
+  holds, stored in the parent's tree as a Git *gitlink* (the object Git uses
+  for a submodule's commit) at `.newgit/pins/<name>`.
+- **A root** is the tracker an instance is rooted at: today, always `root`.
+  The instance's `.git` is the *view*: the root's history with every pin
+  expanded into files under its mount, recursively.
+- **A view commit is one root commit.** Each commit of the root's history
+  composes to exactly one view commit, and splitting a view commit makes
+  exactly one root commit. The root's history is the view's shape.
 - **A tracker's repo** is its history: a `main` branch (what new instances
   get) and one branch per instance that has changed it. Locally every
   tracker shares one store, `.newgit/local/trackers.git`, under
@@ -24,24 +41,28 @@ where this document differs; [spec.md](spec.md) is the main design doc, and
   `pins/<rev>`, which keep commits a binding or checkpoint names alive);
   only on the remote is each tracker its own repository, an Artifacts repo.
   *("Lane" is retired as a term: it is just the tracker's history.)*
-- **A workspace** is composed from the trackers an instance binds: each
-  tracker's files at the instance's commit, laid out by path. To agents and
-  tools it is one ordinary Git repository.
+- **A workspace** is a clone of the view with the trackers the instance does
+  not bind hidden by sparse checkout. To agents and tools it is one ordinary
+  Git repository.
 - **A resource** is brought by a tracker and runs what that tracker's content
   needs (a database, a dev server, an install).
-- **The project** is `.newgit/` itself — definitions only — held by the one
-  tracker every instance binds, `project`.
+- **`.newgit/` is ordinary content of the root tracker.** `access`, mounted
+  at `.newgit/trackers`, holds the definitions: who may read what.
 
 ```
-            trackers (each its own repo: main + instance branches)
-   project ─┐   root ─┐   web ─┐   electron ─┐   local-db ─┐   jack-env ─┐
-            ▼         ▼        ▼             ▼             ▼             ▼
-         ┌───────────────────────────────────────────────────────────────┐
- bind →  │ workspace: files composed by path · .git = projection          │
-         │ resources: those the bound trackers bring                      │
-         └───────────────────────────────────────────────────────────────┘
-            ▲ capture splits commits back into each tracker's repo by path
+   root                                   electron
+   ────                                   ────────
+   R3  split from V3, pins electron at E2  ◄──  E2   (V3's electron half)
+   R2  newgit pull electron: pins X1       ◄──  X1   (merged on electron's main)
+   R1  carves electron, pins E0           ◄──  E0   (the files at its own root)
+
+   view rooted at root:
+     V3 ── V2 ──────── V1 ──────── root's history before the carve …
+           └ X1'  (X1 replayed under apps/electron)
 ```
+
+A submodule in storage, a monorepo in every view. Agents never see a
+gitlink, `.gitmodules`, or a nested `.git`.
 
 ---
 
@@ -52,7 +73,9 @@ where this document differs; [spec.md](spec.md) is the main design doc, and
 audience = "project-devs"        # public | project-devs | user | user:<login>
 storage = "remote"               # local | remote
 git = true
-paths = ["apps/electron"]
+mount = "apps/electron"          # where its root sits in the parent; default "."
+follow = "main"                  # the ref `newgit pull electron` brings in; default "main"
+paths = ["."]                    # claims, relative to the mount
 priority = -1                    # negative: bound only when asked
 resources = ["electron-dev"]
 
@@ -79,11 +102,13 @@ authoritative list; in short:
 |---|---|
 | `audience` | Required. Who may read its repo. Enforced by the remote (token minting). |
 | `storage` | Required. `local` or `remote`: where its synced state lives. |
-| `paths` | What it owns. The most specific owner of a path wins, so `root` can own `.` while `electron` owns `apps/electron`. |
+| `mount` | Where its root sits inside the parent that defines it. Default `.`: an overlay beside the parent's files. |
+| `follow` | The ref `newgit pull <tracker>` brings in. Default `main`. |
+| `paths` | Its claims, relative to the mount. `!` excludes: `[".", "!dist/"]`. The most specific owner of a path wins (see *Ownership*). |
 | `role` | Trackers with the same role are mutually exclusive alternatives: an instance binds exactly one per role. A tracker without a role is its own slot. |
 | `priority` | Which alternative is picked by default: highest readable wins. **Negative: never picked automatically** — only by `--use` or a personal setting. |
 | `resources` | Resources this tracker brings. A resource is bound iff a bound tracker brings it. |
-| `requires` | Trackers or roles this one needs: bound with it, and (planned) merged before or with it. |
+| `requires` | Trackers or roles this one needs: bound with it, and not droppable while it is bound. |
 | `git` | Whether its content is committed with Git. `false` (the default): never in the workspace's Git, excluded, never committed, captured by newgit from the files at checkpoint. `true`: a tracker in Git, committed with Git and split into its own history. Written only when `true`. |
 | `maintainers` | Who may merge changes to it: `owner`, `project-devs`, or `user:<login>`; by default its audience. See *Who may change what*. |
 | `merge_with_source` | Whether a source merge carries this tracker's bound state with it. Default `false`. |
@@ -97,16 +122,67 @@ tracker outside Git, and so are agent notes, a db snapshot, and the public
 `site` page. Fail-closed is why outside Git is the default: a new tracker
 never lands in a commit by accident.
 
-**Ownership (decided).** Every path has exactly one owner: the most specific
-claim among the project's trackers. Two trackers may not claim the same path
-unless one's claim is strictly more specific — except trackers in the same
-role, which may claim identical paths, since they are never bound together.
+**Where a definition lives (decided).** A tracker's children are defined in
+its own `.newgit/trackers/`. Root's live in `access`, which is mounted there;
+before `access` is carved (the commits before the first merge of a fresh
+project) they are in root's own tree. A mount is relative to the parent's
+root, so nested mounts work through this: a tracker mounted at
+`apps/electron` defines its own children in `apps/electron/.newgit/trackers/`,
+mounted relative to `apps/electron`.
 
 **The root tracker (decided).** `newgit init` creates `root`, owning `.`. It
-holds whatever no other tracker claims — in a fresh project, everything — so
-a project never has unowned files. Carving out a tracker (`newgit tracker
-create electron --git --path apps/electron`) moves those paths' history out of
-`root` into the new repo (a path-filtered split, done once).
+holds whatever no other tracker claims — in a fresh project, everything,
+`.newgit/` included — so a project never has unowned files. Carving out a
+tracker in Git (`newgit tracker create electron --git --path apps/electron`)
+is one commit; see *Carving is a commit*.
+
+## Ownership
+
+Every path in a view has at most one owner. Ownership comes from claims,
+never from which tracker currently has the file, and it is the same whichever
+tracker you root at. Split assigns paths by this rule **(decided)**:
+
+1. **The deepest mount wins.** A path under `apps/electron/` is decided among
+   the trackers mounted at `apps/electron` or deeper. A parent's claim of `.`
+   does not reach into a mount.
+2. **Among trackers mounted at the same path, the longest claim wins.**
+   `local-db` mounted at `.` claiming `.env.db` beats root's `.`. Trackers
+   sharing a mount split by their claims: a tracker mounted beside `access`
+   at `.newgit/trackers` and claiming `web.toml` owns that file; `access`
+   keeps the rest.
+3. **Identical claims at the same mount are an error, except within a role.**
+4. **Claims can exclude**, `.gitignore`-style: `paths = [".", "!.env",
+   "!node_modules/"]`. An excluded path is owned only by a tracker that
+   explicitly claims it at that mount, or filled by a resource. Otherwise it
+   is unowned, which is all "ignored" ever meant, and split refuses a commit
+   that changes it.
+
+A tracker carved inside another tracker's mount (`apps/electron/native`
+while `electron` is mounted at `apps/electron`) is a deeper mount of root's,
+not a child of `electron`: root defines it and pins it.
+
+**The definition is the `.gitignore`.** Generating the view's `.gitignore`
+from claims, and turning an agent's edit of it into a definition change, is
+planned (step 6). Compose doesn't depend on it.
+
+## Shape and policy
+
+Compose needs the **shape** of each commit: which trackers it pins, at which
+commits, mounted where. Everything that decides who may read or change
+something is **policy**. They come from different places, on purpose
+**(decided)**:
+
+- **Shape comes from the commit itself.** Its pins, and each pinned tracker's
+  `mount` as that commit's own tree states it (in `access`'s content at that
+  commit). A commit that moves a mount composes by the new one.
+- **Policy comes from `access`'s own `main`,** never through a pin: who may
+  read and maintain each tracker. The Worker already reads definitions this
+  way. So `access`'s pin in the root exists only so that views reproduce. No
+  one can roll policy back by moving a pin, or by editing an old commit.
+- **Claims are read only by split.** Compose never reads them: each tracker's
+  stored tree contains exactly what it owned when the commit was made, so
+  overlaying the stored trees is enough. Changing a claim (adding `!dist/`)
+  changes where new work goes, never what old commits look like.
 
 ---
 
@@ -161,14 +237,14 @@ binding has changed by then. A process already running when a use or drop
 rewrites a rendered file is restarted if its resource declares `reads`
 covering that file, and otherwise named as possibly stale, with the command
 that restarts it (#249; see *Render* in [spec.md](spec.md)). The content of a
-tracker outside Git is captured into its lane before its files leave the
+tracker outside Git is captured into its history before its files leave the
 workspace; a tracker with no `paths` (one that only receives `into_tracker`
 deposits, or only brings resources) has nothing in the workspace, so there is
 no capture step and `--stash`/`--discard` have nothing to act on — its
-deposits are already in its lane, and a checkpoint covers them. (An explicit
+deposits are already in its history, and a checkpoint covers them. (An explicit
 `newgit tracker capture` of such a tracker is still an error: asked for
-directly, it should say there is nothing to capture.) `root`, `project`, and
-`access` cannot be dropped. A checkpoint records the binding, and undo
+directly, it should say there is nothing to capture.) `root` and `access`
+cannot be dropped. A checkpoint records the binding, and undo
 restores it; `newgit status` lists the trackers the binding binds, not every
 tracker in a role.
 
@@ -191,92 +267,197 @@ whose commits newgit composes.
 
 **Tracker repos are the truth; a workspace's Git is a view (decided).** The
 remote holds one repo per tracker, with its own permissions. A machine
-composes the trackers in Git its instance binds (and its user may read) into
-one ordinary Git history — the view — in the project repo, and workspaces
-clone that as they always have. Work leaving the machine is split back into
-per-tracker commits. Two people's views can differ: each composes only what
-its user may read. Tracker repos store files at their workspace paths
-(`apps/electron/…`), so composing is overlaying trees; ownership guarantees
-they never collide.
+composes the trackers in Git its user may read into one ordinary Git history
+— the view — in the project repo, and workspaces clone that as they always
+have. Work leaving the machine is split back into per-tracker commits. Two
+people's views can differ: each composes only what its user may read.
 
-**Composing is full replay (decided).** The history of every bound tracker in Git
-is read in one `git log --raw` pass (first parent, diff against it), all
-trackers' commits are interleaved by committer date (ties: tracker name,
-then commit id), and the whole view is written in one `git fast-import`
-stream, applying each commit's changes to the running tree. View commits
-carry the original author, date, and message — nothing added — so `git log`
-and `git blame` are real everywhere. Which tracker commits a view commit
-came from is kept in a note (`refs/notes/newgit-composed`). Composing again
-after trackers move appends to the view; it rewrites the view only past
-the earliest commit whose position changed.
+### Storage
 
-**Merges keep every parent (decided).** Replay covers each tracker's whole
-history, not just its first-parent line: the commits a merge brings in are
-replayed as real view commits, and a rebuilt merge points at them, so `git
-log` shows merged branches and `git blame` reaches into them. On a side
-branch, a tracker's commit carries the other trackers' content as it stood
-where the branch forked, plus any of its own changes to paths another bound
-tracker owns (pre-carve history, the true state on that branch).
+**Every tracker stores files relative to its own root (decided).**
+`apps/electron/x.ts` in the view is `x.ts` in electron's repository. That is
+what lets one tracker be mounted by two parents, or be a root itself, and it
+is the shape an imported repository already has, so importing rewrites
+nothing.
 
-**Originals are reused (decided).** A view commit is emitted as the existing
-original — same object, id, merge parents, signature — whenever it lands
-exactly where the original sits (same parents, each reused itself) with
-exactly its changes. A history that never diverged across trackers is reused
-whole, and nothing is written; recreating starts only where tracker
-histories really differ.
+**Pins.** Each commit of a parent holds a gitlink at `.newgit/pins/<name>`
+for every tracker in Git that it mounts. Pins are left out of every view, so
+no workspace ever holds one. They sit under `.newgit/pins/` rather than at
+the mount because a tracker can be mounted at `.` (an overlay beside its
+parent's files), and a gitlink cannot be the root of a tree. A gitlink
+rather than a text file because it is Git's own object for "this tree holds
+that commit". newgit resolves pins itself in every merge, so it never relies
+on Git's handling of gitlinks. Gitlinks don't make Git keep the commit; the
+tracker store's refs do.
 
-**Splitting (decided).** A view commit is split by ownership into one commit
-per tracker in Git it touched, on that tracker's instance branch: same author,
-date, and message, plus trailers: `Newgit-Split: <view commit>`;
-`Newgit-Split-Parent: <commit>` naming the commit it followed in the view, so
-trackers' commits interleave back in the order they were made rather than
-merely by date; and a `Newgit-Split-Header:` for each line of the headers
-Git stored after the committer line (a signature, a merged tag, an
-encoding), verbatim. One trailer per line, continuation lines included: a
-PGP signature holds a line that is only a space, which Git's trailer parser
-reads as blank. The split commit's message ends the way the original's did,
-final newline or none (GitHub writes merges without one).
-On replay, tracker commits sharing a split source fold back into one view
-commit with the trailers stripped — so a commit split and recomposed is
-*the same commit*: same tree, parent, author, date, message, and headers,
-same id. Commit ids do not change under an agent, on any machine,
-with two exceptions today: split follows the first parent, so a merge
-*inside* the work being split is flattened and its commit recomposes
-differently; and a history imported from outside the project is
-interleaved by date rather than folded back (#139).
+**Trackers outside Git may have a `mount`** but are never pinned. Their state
+stays in the instance's binding record and in checkpoints.
 
-**One commit, one audience (decided).** Because every part of a split keeps
-the commit's message, a commit that changes trackers in Git with different
-audiences would put a message about work only some may read into a tracker
-everyone else reads ("Fix the refund bypass" landing in `root`). The split
-refuses it, naming the commit and each tracker's audience: make one commit
-per audience. A refusal, not a warning, because the split is where work
-leaves the machine, so a warning would arrive after the message had gone.
-Merge commits are exempt (their message is Git's own, and their first-parent
-diff spans whatever the merged branch changed); history already split is not
-checked again, so a teammate's published work never blocks your sync.
+### Compose
+
+Compose is defined over views, recursively: a child's view (rooted at the
+child) is composed first, and what a parent mounts is that view. A
+grandchild's history therefore reaches the root exactly as it reaches the
+child.
+
+For a view rooted at tracker `T`, for a reader who may read some set of
+trackers **(decided)**:
+
+1. **Walk `T`'s history** in `git rev-list --topo-order --reverse --parents`
+   order, every parent of every commit. The order is part of the spec, since
+   byte-identical output depends on it.
+2. **For each commit `R`, the view commit `V(R)` has:**
+   - **parents:** `V(p)` for each parent `p` of `R`, in order, plus one more
+     for each child that `R` brings history in from (step 3);
+   - **tree:** `R`'s tree without `.newgit/pins/`, with each readable pinned
+     child's view tree at its pin set under its mount, with no diffing;
+   - **metadata:** `R`'s author, committer, dates, and message, newgit's
+     trailers stripped and the recorded headers put back. When `R` holds
+     none of `T`'s own changes, and a child commit holds the work (see
+     *Split*), the metadata comes from that child commit.
+3. **Inline, or brought in.** For each pinned child, the child view commits
+   *new* at `R` are those reachable from the child's view at `R`'s pin and
+   not from its view at any of `R`'s parents' pins.
+   - **Inline** when `R` was split from a view commit (it carries
+     `Newgit-Split`): its new child commits are the other halves of the same
+     work. Also inline when the only new child commit's parents are exactly
+     `R`'s parents' pins and either `R` is a merge or the child commit has
+     the same committer line as `R`: the child half of the same work, made
+     by the same split. Child commits carry no trailers, so this is how a
+     nested child's pin-only commits are recognised. Their changes are part
+     of `V(R)`, and nothing is added.
+   - **Brought in** otherwise: a mount added, a `newgit pull`, an upstream
+     sync, a pin moved by hand. `V(R)` is a merge whose extra parent is the
+     new child commits, *replayed*. Each replayed commit is the child's view
+     commit with its tree under the mount and, beside the mount, the rest of
+     the tree as its first parent holds it (the first parent being the
+     replay of the child commit before it, or the view commit that first
+     took that child commit inline, in this view's walk order). History from
+     before the mount existed has nothing beside the mount. This is
+     `git subtree add` and `git subtree pull`'s shape: `git log --
+     apps/electron`, `git blame`, and `git bisect` stay real through the
+     merge, and because inline commits are represented by their own view
+     commits, nothing appears twice.
+
+   A replay is a pure function of the child's commits and the view commits
+   it starts from, so two branches that bring in the same upstream push
+   replay it identically, and merging them shows it once. Replays are
+   recomputed on every compose; nothing is cached. A mount removed and added
+   again replays the child's whole history again, as `git subtree add`
+   would.
+4. **Readers.** A child the reader may not read is left out of the tree, and
+   so is everything mounted inside it. A single-parent view commit whose only
+   change was to such a child is dropped, and the commit after it moves onto
+   its parent. A merge is never dropped. Someone who cannot read a tracker
+   sees different ids from the first commit that touched it (see *One name
+   for a commit*).
+5. **Originals are reused.** Commits are written byte for byte, so when
+   `V(R)`'s parents, tree, and metadata come out as the view commit `R` was
+   split from (its `Newgit-Split`), compose emits that object, signature and
+   id intact. A composer without it rebuilds it and puts the recorded
+   headers back (#291's mechanism).
+
+**Commits from before mounts.** A root commit whose definitions put
+`.newgit/` in a `project` tracker, or leave `access` unmounted, or mount no
+tracker in Git at all, pins nothing and is its own view commit. A commit
+whose definitions mount a tracker in Git it does not pin is a view commit
+that only a split can make a root commit of. This is what lets `newgit init`
+adopt a repository's history as root's, and what the migration rests on.
+
+### Split
+
+Splitting view commit `V` (work leaving the machine: push, sync, merge),
+rooted at `T` **(decided)**:
+
+1. **Walk every parent,** not only the first. A parent already split is
+   found through the note on it (`refs/notes/newgit-composed`: `<tracker>
+   <commit>`) or the root commit naming it, so a merge of an already-pushed
+   `origin/main` maps to the root commit it was split into. The refusals
+   below apply to every commit sent, side branches included.
+2. **Assign each changed path** to its owner, by the claims as `V`'s own tree
+   states them.
+3. **For each child, deepest first:** if `V`'s subtree for it equals the
+   child's view at one parent's pin, and that pin descends from every other
+   parent's pin, reuse that pin and make no commit. (Merging `main` into an
+   instance that never touched electron makes nothing in electron.)
+   Otherwise commit the child's part on the child's instance branch, on top
+   of the child's pins in `V`'s parents (a merge where they differ), at the
+   child's own root.
+4. **Commit `R` to `T`** with `T`'s own changes, every pin moved to what step
+   3 decided, and parents mapped one-to-one from `V`'s parents. A merge in
+   the view is a merge in the root, so merges inside the work are kept, and
+   an instance commit touching two trackers stays one commit wherever it is
+   merged.
+
+**Split refuses, naming what to do instead:**
+
+- a path whose owner this instance has not bound (`newgit tracker use`);
+- a path owned by a tracker outside Git (see *What a tracker outside Git
+  owns never leaves through Git*);
+- a path nothing owns, because every claim excludes it;
+- a path under `.newgit/pins/`, which only newgit writes;
+- a commit whose message would be carried by trackers of different
+  audiences (next section);
+- a commit that edits both copies of a tracker mounted twice (see *Rooting
+  at any tracker*).
+
+**Which commit carries the message.** `V`'s author, dates, and message go on
+the commit that holds the work:
+
+- **`R` holds `T`'s own changes, or no child commit was made** (an empty
+  commit, a merge where every child's pin was reused): `R` carries `V`'s
+  metadata, with `Newgit-Split: <V>` and a `Newgit-Split-Header:` per
+  recorded header (one trailer per line, continuation lines included: a PGP
+  signature holds a line that is only a space, which Git's trailer parser
+  reads as blank; the message ends the way the original's did, final newline
+  or none). Any child commits carry the same author, dates, and message,
+  without trailers.
+- **`R` holds only child changes** (one child or several): every child commit
+  carries `V`'s metadata without trailers, and `R` gets a fixed message
+  (`Update electron`), the child commits' dates, and the trailers. Compose
+  takes `V`'s metadata from the child commits, which are identical. The
+  fixed message never reaches a view.
+
+This keeps every tracker's own history clean: a tracker that mounts nothing
+in Git has its commits shown as themselves, and a repository that receives
+its history gets ordinary commits, not ones ending in `Newgit-Split:` lines.
+It also lets a narrow child be edited from a wider root: the message stays
+with the child.
+
+**One commit, one audience (decided).** When more than one commit carries
+`V`'s message, all of their trackers must share one audience. Otherwise a
+message about work only some may read would land in a tracker everyone else
+reads ("Fix the refund bypass" landing in `root`). The split refuses it,
+naming the commit and each tracker's audience: make one commit per audience.
+A refusal, not a warning, because the split is where work leaves the
+machine. Exempt: merge commits (their message is Git's or newgit's own), and
+the carve commit newgit makes (`Create tracker `x` at <path>`, which says
+nothing the definition it adds does not; without this, carving a
+narrow-audience tracker out of root would always be refused). History
+already split is not checked again, so a teammate's published work never
+blocks your sync.
 
 **Signed commits (decided).** A signature covers a commit's exact content,
 so it can only ever sit on the commit it was made for. Three rules:
 
-1. **Locally, the original is reused.** When a group would recompose into
-   content identical to the view commit it was split from (same parent,
-   same changes), compose emits that original object — signature and id
-   intact. An agent's own workspace never sees its commits change.
+1. **Locally, the original is reused.** When a root commit and its children
+   recompose into content identical to the view commit they were split from,
+   compose emits that original object — signature and id intact. An agent's
+   own workspace never sees its commits change.
 2. **Elsewhere, the original is rebuilt, signature included.** A composer
    with only the tracker commits — the remote, a teammate, `spawn
-   --from-checkpoint` — rebuilds each view commit (Git's `fast-import`
-   writes no signature), then puts back the headers the trailers recorded
-   and keeps the result only if it hashes to the `Newgit-Split` id. The id
-   is the proof: a matching commit is byte for byte the one its author
-   made, so its signature verifies with `git verify-commit` like any other,
-   and the commits after it move onto it. Whoever can read every tracker a
-   commit touched gets the same ids as the project's own history, GitHub
-   included. Someone who cannot gets a different tree, so the id cannot
-   match, and their commit stays rebuilt and unsigned: a signature is never
-   put on content it does not cover. The same holds for commits the forge
-   makes when it merges: unsigned ones rebuild exactly, and ones it signs
-   carry their signature in the trailer like anyone's.
+   --from-checkpoint` — rebuilds each view commit, then puts back the
+   headers the trailers recorded and keeps the result only if it hashes to
+   the `Newgit-Split` id. The id is the proof: a matching commit is byte for
+   byte the one its author made, so its signature verifies with `git
+   verify-commit` like any other, and the commits after it move onto it.
+   Whoever can read every tracker a commit touched gets the same ids as the
+   project's own history, GitHub included. Someone who cannot gets a
+   different tree, so the id cannot match, and their commit stays rebuilt
+   and unsigned: a signature is never put on content it does not cover. The
+   same holds for commits the forge makes when it merges: unsigned ones
+   rebuild exactly, and ones it signs carry their signature in the trailer
+   like anyone's.
 3. **Split commits are signed as their author** when the author configured
    signing (`commit.gpgSign`): newgit signs the per-tracker commits on that
    person's machine, with their key.
@@ -289,8 +470,9 @@ project root's commits not yet split reach each tracker's `instances/main`.
 Its own branch — the one checked out at `newgit init` — is the truth for
 that instance: a `git reset` of it moves those branches back, while a
 feature branch or tag checked out in the project root is not its history.
-No spawned instance may be named `main`. A refusal there is a warning, not an error — nothing has
-left the machine — and the split runs again before anything does.
+No spawned instance may be named `main`. A refusal there is a warning, not
+an error — nothing has left the machine — and the split runs again before
+anything does.
 
 **Composing decides ownership among trackers in Git (decided).** A tracker
 outside Git is never in a view, so a path it owns now that history once
@@ -299,22 +481,26 @@ in Git that held it then. Dropping it would rewrite every commit after
 it; removing it is a history rewrite (`git filter-repo`), which is not
 newgit's to do silently.
 
-**Carving out a tracker** (`newgit tracker create electron --git
---path apps/electron`) splits its paths' history out of root the same way,
-each commit marked with its source, so the view reproduces the original
-history exactly — mixed commits included. Every branch of the source is
-carved — `main` and every instance's — and every view is recomposed, so
-no instance is left with notes that predate the new tracker. Split refuses
-rather than guess if one ever is.
+### Carving is a commit
+
+`newgit tracker create electron --git --path apps/electron` commits the
+definition in the project root, and splitting that commit makes one root
+commit, `Create tracker `electron` at apps/electron`, that removes the files
+from the root's tree and adds the mount and a pin to the child's first
+commit, which holds those files at its own root. History before the carve
+stays in the root, where the view already shows it, so nothing is rewritten
+and no id changes. The cost: rooted at `electron` alone, its history starts
+at the carve. Carving with history can come later as an explicit rewrite if
+a case needs it **(decided)**.
 
 **Objects: every repository references what it needs (decided).** No
 borrowing between repositories (Git alternates): Git's own cleanup in a
 repository deletes whatever *that* repository does not reference, so
 borrowed history can vanish weeks later. Root's history is copied into the
 tracker store at `newgit init`; split commits are fetched into the store's
-refs once made; composing fetches the commits of trackers in Git into the project
-repo under its own refs. Trackers outside Git never enter the view: their files
-are projected into workspaces as today.
+refs once made; composing fetches the commits of trackers in Git into the
+project repo under its own refs. Trackers outside Git never enter the view:
+their files are projected into workspaces as today.
 
 **Unbound trackers are out of the working tree, not the history (decided).**
 A tracker the instance does not bind is hidden by Git's sparse checkout:
@@ -323,23 +509,24 @@ A tracker the instance does not bind is hidden by Git's sparse checkout:
 altogether.
 
 **What a tracker outside Git owns never leaves through Git (decided).** This
-is the guarantee for secrets: a `.env` belongs to a tracker outside Git. A commit
-adding or changing a file such a tracker owns (`git add -f .env.local`) is
-refused when it would leave the machine, naming the commit and the file, even by force. There is
-one gate, run over exactly what is sent — every commit, every parent of a
-merge, so a file added and deleted on a merged side branch is still
-caught: a push checks every ref it sends (any branch, any tag) against
-what the remote already has; a checkpoint sync checks everything it
-uploads, its uncommitted-work commit included. Deleting such a file is
-how it comes out, so it is never refused. Splitting itself only assigns
-paths to trackers. The limit, stated plainly: an agent can read anything in
-its workspace, so this prevents accidental leaks, not a malicious agent.
+is the guarantee for secrets: a `.env` belongs to a tracker outside Git. A
+commit adding or changing a file such a tracker owns (`git add -f
+.env.local`) is refused when it would leave the machine, naming the commit
+and the file, even by force. There is one gate, run over exactly what is
+sent — every commit, every parent of a merge, so a file added and deleted on
+a merged side branch is still caught: a push checks every ref it sends (any
+branch, any tag) against what the remote already has; a checkpoint sync
+checks everything it uploads, its uncommitted-work commit included.
+Deleting such a file is how it comes out, so it is never refused. Splitting
+itself only assigns paths to trackers. The limit, stated plainly: an agent
+can read anything in its workspace, so this prevents accidental leaks, not a
+malicious agent.
 
 **New work only (decided):** root's `main` — the history newgit adopted —
 is exempt, so an old committed `.env` never blocks a first push to a fresh
-remote. A file of a tracker outside Git committed *after* `newgit init` is refused by newgit's
-remote even when plain Git already pushed it elsewhere: it has to come out
-of the history (`git filter-repo`).
+remote. A file of a tracker outside Git committed *after* `newgit init` is
+refused by newgit's remote even when plain Git already pushed it elsewhere:
+it has to come out of the history (`git filter-repo`).
 
 **Writes outside the binding (decided).** A change to a path whose owner is
 not bound (an agent creates `apps/electron/x` in an instance without
@@ -372,7 +559,7 @@ resolves versions — that would be emulating npm or pip.
   template variable naming the bound trackers' paths. What of the binding
   can reach the install is part of its identity, so copy-on-write installs
   are keyed correctly: which paths the checkout leaves out, and the bound
-  set itself when a `{{bound…}}` tells the install it. (Step 4.)
+  set itself when a `{{bound…}}` tells the install it.
 - **Python environments are flat**, so code sharing one venv needs one
   resolution — the shared lockfile, where conflicts surface when locking,
   not at spawn.
@@ -381,61 +568,82 @@ resolves versions — that would be emulating npm or pip.
   bound trackers that conflicts: swapping one out returns to an environment
   already built.
 
-## Checkpoints, merges, and coherence
+## Checkpoints, merges, and pull
 
 **A checkpoint** names one commit per bound tracker (plus resource state). It
 is the atomic unit across trackers: spawning or undoing a checkpoint restores
 every tracker to the commit it names.
 
-**What is built.** `newgit merge [instance] [--into <branch>]` merges an
-instance's committed work into a branch (`main` by default), tracker by
-tracker: per tracker, the instance's commit when the branch has not moved, a
-real Git merge when both sides changed it, and every tracker moves together
-or none does — on the remote, a compare-and-swap in the ProjectDO.
-`newgit merge main` merges the project root. Choosing a subset of trackers,
-and checking `requires` when you do, is the design below, not built yet.
+**A merge is a view commit, split like any other (decided).** `newgit merge
+<instance> [--into <branch>]` makes the merge commit in the merger's view
+(parents: the branch's view tip and the instance's), with each tracker's
+files merged by `git merge-tree` (a conflict moves nothing, and names each
+file's tracker), and splits it the ordinary way. The root merge carries
+`Newgit-Split`, so a merger's signed merge commit comes back as itself. What
+is committed in the workspace now is what merges: a checkpoint is taken
+first. `newgit merge main` merges the project root, which is how trackers
+made after `remote add` reach the remote.
 
-**Merges stack by tracker (decided, planned).** Trackers declare what they
-require:
+**The commit point is the root's ref (decided).** A branch is a ref on the
+root tracker's repository. Its view follows from that one commit, and on the
+remote, ProjectDO's list for the branch is an index written after the ref
+moves (see *On the remote*).
 
-```toml
-# .newgit/trackers/electron.toml
-paths = ["apps/electron"]
-requires = ["supabase"]      # trackers or roles; a client assumes its backend
+1. Before anything is pushed, the Worker is told every tracker whose pin
+   moves to a commit not on that tracker's `main` (`off_main`), and refuses
+   a merger who doesn't maintain it, or root. A pin moving to a commit
+   already on the child's `main` changes only root, so it needs only root's
+   maintainers.
+2. The root's ref moves by one compare-and-swap. If it loses the race,
+   nothing has changed and the merge reruns on the new tip.
+3. Each child's `main` then moves to include what the root now pins, also by
+   compare-and-swap. If a child's `main` moved meanwhile (a merge on the
+   child's own upstream), newgit merges the two and moves the child's `main`
+   to the result. The root picks that merge up at its next `newgit pull`.
+   The views are coherent throughout: the root pins exactly what was merged,
+   and a view rooted at the child lags until its `main` catches up.
+
+**What the Worker trusts.** The Worker cannot run Git, so `off_main` is the
+client's word. The backstop is the Git endpoint's container, which expands
+only pins found in the tracker's own repo: a pin a merger could not have
+pushed is never served. The check is enforced in the Worker and not in the
+client, because it is the only place pin moves are checked.
+
+**`--only` is dropped (decided).** Merge stacking by tracker (`newgit merge
+<instance> --only supabase`, once planned) is not coming. With the root as
+spine, moving the root's `main` to an instance's commits moves every child
+those commits touched. You can't merge `supabase`'s half of a commit and
+leave `electron`'s, any more than in a Git monorepo: a partial merge would
+be a cherry-pick, with new ids. Work that should merge separately goes in
+separate instances. `requires` stays for binding (below); checking it
+between instances (`spawn --from <instance>`) is planned.
+
+**Pulling a child is explicit (decided).** A child's `main` moves when an
+instance rooted at it merges, when `newgit pull --remote` brings in a PR
+merged on GitHub (planned, #142), or when an upstream is synced. The parent
+sees it when someone runs:
+
+```sh
+newgit pull electron
 ```
 
-From an instance's changes, you would choose which trackers' changes to merge
-(`newgit merge <instance> --only supabase`, planned); the rest are left on the
-instance's branches, not lost. A choice is valid when, for every tracker it
-merges, every tracker it requires *that also changed in this instance* is
-merged too:
+That makes one view commit, `Pull electron: 14 commits from main`, which
+moves the pin and composes as a merge (*brought in*, above). It is authored
+by whoever ran it, needs the root's maintainers like any change, and merges
+into `main` like any instance commit; the workspace fast-forwards to it.
+`follow` names the ref it pulls. Spawn never writes a commit, but it says
+when a mounted tracker is behind its `follow` ref.
 
-- `supabase` alone — fine; the electron changes stay unmerged.
-- `supabase` and `electron` — fine; `main`s move in requirement order, all or
-  nothing.
-- `electron` alone while `supabase` also changed — refused, naming the
-  requirement. If `supabase` did not change here, `electron` merges alone:
-  its requirement is already met by `main`.
+Parallel instances merge the way a monorepo does: two instances that each
+made a commit produce a merge commit in `main`'s view, even if they touched
+different trackers. That is what Git would show.
 
-Commits are split per tracker, so a commit that touched both does not pin
-them together: the requirement graph, not commit boundaries, decides what may
-be separated. An instance spawned from another would stack the same way —
-its changes merge after, or with, the ones it was built on. *(Planned:
-today `spawn --from` takes a Git revision, not an instance, so nothing
-records that one instance was built on another.)* Every merge moves the
-affected `main`s only after all of them succeeded: the remote's ProjectDO
-serializes merges and flips them together.
-
-The same check governs trying a change before merging it: a review is a
-trial merge of the change onto `main`, and it may leave out a tracker only
-where a merge could (see *Reviewing a change* in [remote.md](remote.md)).
-
-**`requires` governs binding too (built).** An instance cannot bind
-`electron` without `supabase` (or, for a role, some tracker filling it):
-`newgit tracker use electron` brings in what it requires, and dropping a
-tracker others require is refused, naming them. Trackers have `requires`
-(trackers or roles); resources have `depends_on` (resources or trackers;
-roles planned) — one model.
+**`requires` governs binding (built).** An instance cannot bind `electron`
+without `supabase` (or, for a role, some tracker filling it): `newgit
+tracker use electron` brings in what it requires, and dropping a tracker
+others require is refused, naming them. Trackers have `requires` (trackers
+or roles); resources have `depends_on` (resources or trackers; roles
+planned) — one model.
 
 Env-file trackers move by `newgit tracker merge <tracker>`, which promotes
 an instance's revision to the tracker's `main`. Today `merge_with_source`
@@ -445,24 +653,85 @@ key would replace it, and `explicit` trackers would never be carried by
 
 ---
 
+## Rooting at any tracker
+
+**Spawning at a tracker** (`newgit spawn --root electron`, planned, step 6)
+composes the view rooted there. Resources come from the trackers in that
+view. A tracker that mounts nothing in Git composes to its own history
+unchanged. One that does composes like any root (its pin-only commits
+rebuilt with their children's metadata), so its view is no longer its raw
+history. While that is so, it can't be exported as its own root (#141
+refuses, naming the child).
+
+**A root that `requires` its parent** (rooting at `electron`, which needs the
+workspace `package.json`) is an error naming the parent to root at instead
+**(decided)**. Rooting at the parent automatically would quietly give you a
+repository you didn't ask for.
+
+**The same tracker mounted twice in one view (decided, built)** (newgit
+mounts `ui-kit@v2`, and `design-system` mounts `ui-kit@v1`) is allowed. Each
+parent pins its own copy, so the two copies sit at their own commits, which
+is what #202 needs for packages (one version per dependent, as
+`node_modules` nests). An edit at either path splits into `ui-kit` on top of
+that copy's pin. A commit that edits both copies is refused: `ui-kit is
+mounted twice; edit one`. A branch's index lists one commit per tracker
+name, so only the first copy is listed; the second copy's commits are in the
+store but not on a branch list yet.
+
+**Layering** (a lower tracker supplies defaults, the upper takes the writes)
+is not built **(decided)**. Separate file names (`.env` and `.env.local`)
+cover every case found so far, and layering needs whiteouts.
+
+## Users, remotes, and trust
+
+None of this is needed for the engine. These are positions, so it doesn't
+paint them into a corner:
+
+- **A profile is a root that mounts your projects,** plus an *overlay*
+  tracker, bound into instances, that only fills paths other trackers
+  exclude. Keeping them as two trackers avoids the newgit ⊃ jack ⊃ newgit
+  cycle without a special binding rule.
+- **Cost of composing a profile:** each tracker's view is composed once per
+  compose, so a profile costs the sum of its projects once, plus the
+  profile's own commits. To be measured with t3code as part of #144.
+- **Code enforces, trackers hold policy.** Reading policy from `access`'s
+  `main` is the first instance. Per-remote trackers, home trackers for
+  branch heads, and per-audience registries stay as the #201 comments
+  propose. They are a remote redesign, later. The root's ref as the commit
+  point already answers #201 item 3 for one root.
+- **Remote naming** flattens to `<owner>/<tracker>` with that redesign. Today
+  it is `<owner>/<project>`.
+- **A fork keeps its upstream's audience as a ceiling** (#227), unchanged.
+
+**#202.** The four decisions this design leaves room for: mounts accept a
+ref (pins hold exact commits and `follow` names the ref, so `ui-kit@v2` is a
+`follow` value; "pin by forking" is no longer needed, since every parent
+commit is already a lockfile); resources fill excluded paths (ownership rule
+4); content-keyed resource outputs and resources declaring permissions are
+independent of compose.
+
+---
+
 ## On the remote
 
-**A branch is a list (decided).** A newgit branch names one commit per
-tracker in Git; `main` is the default branch, as on GitHub. A checkpoint is a frozen
-list and an instance is a list being worked on, so spawning starts an
-instance from a branch's list. Lists live in the project's Durable Object,
-and moving a branch is one write: every tracker moves together or none does.
-`newgit remote add` creates `main` from the project root's current list, its
-first publication; after that `main` moves only by `newgit merge` (step 5).
-The remote already lists branches, creates one from a list, and sets the
-default (`/branches` routes in `remote/src/index.ts`); the CLI to match,
+**A branch is root's ref, with an index (decided).** A newgit branch is a
+ref on the root tracker's repository; `main` is the default branch, as on
+GitHub. ProjectDO's list for the branch — one commit per tracker in Git, the
+root's and every pin's, recursively — is an index written after the ref
+moves, so that spawning, `clone`, and the Git endpoint know which repos to
+fetch without expanding pins first. A checkpoint is a frozen list and an
+instance is a list being worked on, so spawning starts an instance from a
+branch's list. `newgit remote add` creates `main` from the project root's
+current state, its first publication; after that `main` moves only by
+`newgit merge`. The remote lists branches, creates one from a list, and sets
+the default (`/branches` routes in `remote/src/index.ts`); the CLI to match,
 `newgit branch create <name> [--from <instance>]` and `newgit branch default
 <name>`, is planned. (A newgit branch is not the Git branches an agent makes
 inside one workspace.)
 
 | Repo (Artifacts) | Holds | Read | Write |
 |---|---|---|---|
-| `<owner>.<project>.t.<tracker>` | the history of a tracker in Git | its audience | seeding, then merges |
+| `<owner>.<project>.t.<tracker>` | the history of a tracker in Git, at its own root | its audience | seeding, then merges |
 | `<owner>.<project>.i.<instance>.<tracker>` | an instance's branch of one tracker in Git, forked the first time the instance changes it | the tracker's audience; only the instance's owner when it is private | the instance |
 | `<owner>.<project>.t.<tracker>[.<login>]` | a tracker outside Git, as before | its audience | its audience |
 
@@ -484,17 +753,18 @@ an ordinary Git remote: `git clone` and `git pull` work with plain Git, no
 newgit installed. It advertises each newgit branch as `refs/heads/<branch>`.
 The Worker authenticates the caller and hands the request to the project's
 sandbox, which runs real `git` and the `newgit` binary: it fetches the
-tracker repos, composes the branch's list from the trackers *this caller*
-may read, and answers with `git upload-pack`. A workspace's `origin` fetches
-from it, so `git pull` shows `main`. Each person's view holds only what they
-may read, enforced by the server; nothing is pre-built, so nothing is
-rebuilt on merge. When the sandbox goes idle, an alarm snapshots its tracker
-repos and composed views (if anything was composed since the last snapshot)
-and then stops it, so a cold start restores rather than re-clones. A
-snapshot is the whole container, the `newgit` binary included, so one taken
-on an earlier image is dropped and the next start is from the image: a
-deploy reaches every project, at the cost of one re-clone each. Read-only
-in step 3d: pushes go through a newgit workspace, which splits locally.
+tracker repos, composes the branch from root's ref, expanding only the pins
+*this caller* may read and that are found in each tracker's own repo, and
+answers with `git upload-pack`. A workspace's `origin` fetches from it, so
+`git pull` shows `main`. Each person's view holds only what they may read,
+enforced by the server; nothing is pre-built, so nothing is rebuilt on
+merge. When the sandbox goes idle, an alarm snapshots its tracker repos and
+composed views (if anything was composed since the last snapshot) and then
+stops it, so a cold start restores rather than re-clones. A snapshot is the
+whole container, the `newgit` binary included, so one taken on an earlier
+image is dropped and the next start is from the image: a deploy reaches
+every project, at the cost of one re-clone each. Read-only: pushes go
+through a newgit workspace, which splits locally.
 
 Why a sandbox and not the Worker: a Worker cannot run Git, and composing in
 JavaScript would mean writing Git's object model ourselves.
@@ -503,21 +773,24 @@ JavaScript would mean writing Git's object model ourselves.
 changes to it; by default they are its audience — anyone who may read a
 tracker may change it. Who may change a tracker's *security* (its paths,
 audience, maintainers) is then just who may change the tracker that owns its
-definition file, `.newgit/trackers/<name>.toml`. That is `access` — which
-`newgit init` creates with `maintainers = "owner"` — unless a more specific
-tracker in Git claims the file. So governance layers with no special case:
-project trackers; an admin tracker owning their definitions (readable by
-everyone who uses them, since newgit needs their paths, but maintained by
-admins); and a tracker of yours owning the admin tracker's. Everything else
-in `.newgit/` — resources, scripts, config — is the `project` tracker, which
-anyone who merges may change. The remote reads each definition from the
-tracker that owns its file, at the default branch, to a fixed point.
-*(Not enforced for trackers outside Git yet, and open: the remote gives a write
-credential for the repo of a tracker outside Git to anyone in its audience, and that
-credential can push the repo's `main` directly. For `site`, that is the page
-newgit.dev serves. Credentials are scoped to a repo, not a ref, so enforcing
-`maintainers` there means the merge of a tracker outside Git has to go through the
-Worker, as `newgit merge` does for a tracker in Git.)*
+definition file. That is `access` — which `newgit init` creates with
+`maintainers = "owner"`, mounted at `.newgit/trackers` claiming `.` — unless
+a tracker in Git mounted beside it at `.newgit/trackers` claims the file
+(ownership rule 2). So governance layers with no special case: project
+trackers; an admin tracker mounted at `.newgit/trackers` claiming the
+definitions it governs (readable by everyone who uses them, since newgit
+needs their paths, but maintained by admins); and a tracker of yours
+claiming the admin tracker's. Everything else in `.newgit/` — resources,
+scripts, config, exports — is root's, which anyone who merges may change.
+The remote reads each definition from the tracker that owns its file, at
+the default branch, to a fixed point.
+*(Not enforced for trackers outside Git yet, and open: the remote gives a
+write credential for the repo of a tracker outside Git to anyone in its
+audience, and that credential can push the repo's `main` directly. For
+`site`, that is the page newgit.dev serves. Credentials are scoped to a
+repo, not a ref, so enforcing `maintainers` there means the merge of a
+tracker outside Git has to go through the Worker, as `newgit merge` does for
+a tracker in Git.)*
 
 **One name for a commit, whoever reads it (decided).** A Git commit id is the
 hash of the commit's contents and its parent's id, so someone whose view
@@ -533,127 +806,126 @@ it onward. Two layers keep that from mattering:
   without a warning. What is built is the split's refusal of one commit
   spanning audiences, under* One commit, one audience*.)*
 - **When it does, every commit has a canonical id:** the commit as its author
-  made it, which every tracker commit split from it already carries as
-  `Newgit-Split: <id>`. A commit given back as its original (*Signed
-  commits*, rule 2) is its canonical id. The endpoint notes it on each
-  commit that stays rebuilt, in
-  `refs/notes/newgit-canonical`, served to Git clients as
+  made it, which the root commit split from it carries as `Newgit-Split:
+  <id>`. A commit given back as its original (*Signed commits*, rule 2) is
+  its canonical id. The endpoint notes it on each commit that stays rebuilt,
+  in `refs/notes/newgit-canonical`, served to Git clients as
   `refs/notes/commits` so `git log` shows it; newgit commands accept either
-  id, and newgit's own
-  surfaces — checkpoints, branch lists, the web UI — always show canonical
-  ids. A branch's state as a whole is named by its list.
+  id, and newgit's own surfaces — checkpoints, branch lists, the web UI —
+  always show canonical ids.
 
 ## Git and GitHub
 
 **GitHub is an export (decided).** `newgit export --remote <name>` pushes a
 composed projection of the `public` (or chosen) trackers' `main`s, with
 composed history, to the target defined in `.newgit/exports/<name>.toml` —
-an ordinary GitHub repository, say (step 6). GitHub never holds a
-tracker the export did not include, so `.env` files can live in the project
-and never reach a public mirror.
+an ordinary GitHub repository, say. GitHub never holds a tracker the export
+did not include, so `.env` files can live in the project and never reach a
+public mirror. Since `.newgit/` is root's, exporting root ships the config,
+resources, scripts, and export targets; only `.newgit/trackers/` follows
+`access`'s audience.
 
 **Adopting an existing repository (decided).** `newgit init` in a Git
-repository imports its full history as `root`'s history. Trackers carved out
-later take their paths' history with them.
+repository imports its history as `root`'s history, up to the first commit
+that mounts a tracker in Git (a repository that already carries newgit's
+definitions); commits past that are view commits, and split makes root
+commits of them. A fresh project has no such commit, so all of it is
+adopted, and every view id is unchanged by construction.
+
+---
+
+## Migration
+
+Before roots, a project's trackers in Git were `root`, `project` (owning
+`.newgit/`), and `access` (owning `.newgit/trackers/`, unmounted), and any
+others were carved out of root's history by path and composed back by date.
+`newgit tracker migrate` moves such a project onto pins. Since carving is a
+commit, no view history is rewritten **(decided)**:
+
+1. `project`, `access`, and every other tracker in Git fold back into root.
+   Root's history becomes the view's history, commit for commit: a commit
+   from before mounts pins nothing, so it composes to itself, and every view
+   id is unchanged by construction.
+2. One commit at the tip of `main` mounts them again: `access` at
+   `.newgit/trackers` with `follow = "main"`, each other tracker in Git at
+   the path it owned, and `project` is gone. Splitting it gives root its
+   first pins.
+3. **Gate:** every branch and checkpoint is recomposed in a fresh repository
+   holding only the new tracker commits (the remote's situation), and
+   nothing moves unless each comes out with the id it has here, signatures
+   included, since most of `main` is signed by GitHub. A check run against
+   the local repo would pass trivially, because local compose reuses
+   originals.
+
+Nothing old is deleted: the store's old tracker refs move under
+`refs/newgit-premigration/`, and the project repo's old notes with them. On
+the remote it force-pushes every tracker repository and rewrites each
+branch's list as the new index. Jack is the only user, so no compatibility
+path is kept; `--dry-run` says what would move.
+
+## The t3code milestone on this design
+
+- **#139 (compose an imported tracker):** replaced by this design. #151 is
+  closed unmerged; its tests carry over as acceptance cases (the join keeps
+  ids, old branches don't get t3code until they merge `main`, upstream syncs
+  go on top whatever their dates, log and blame through the join, non-UTF-8
+  headers), plus the cases its last review found: a pre-import branch merged
+  into `main`, and a repair over a join.
+- **#140 (import):** fetch the branch unchanged as the tracker's history,
+  then one view commit adding the definition, the mount, and the pin (a
+  *brought in* merge). #156's fetch and refusals carry over; its join wiring
+  does not.
+- **#141 (export a tracker as its own root):** push the view rooted at
+  `t3code`. While t3code mounts nothing in Git, that is its own history, so
+  the first export is a no-op fast-forward of Spheroman/t3code, ids and
+  signatures intact. Refused while it mounts a tracker in Git.
+- **#142 (pull from a target):** for Spheroman/t3code, fetch, merge into
+  t3code's `main`, then `newgit pull t3code`. For Spheroman/newgit, its
+  commits are view commits: ours are recognised by the canonical notes, and
+  the rest are split as ordinary work.
+- **#143 (`gh` per target):** unchanged.
+- **#144 (bring t3code in):** Spheroman/newgit's export *includes* t3code
+  (decided), so it stays a true mirror with the project's own ids, and
+  `git pull` from GitHub in the project root keeps working. FORK.md:
+  upstream comes in by merging pingdotgg/t3code into the fork's `newgit`
+  branch, then `newgit pull --remote t3code` and `newgit pull t3code`. The
+  cold-start measurement doubles as the profile cost check.
 
 ---
 
 ## Build order
 
-Each step lands alone and keeps the suite green. Status as of 2026-10-28.
+Status as of 2026-11-04. Each step lands alone and keeps the suite green.
 
-1. **Tracker repos with history.** *Done.* Lanes became real branches
-   (`main`, `instances/<instance>`) with parents, messages, authors, in the
-   shared store described under *The model in one page*. Capture commits;
-   merge merges.
-2. **`root` tracker; ownership by specificity; `git`.** *Done.*
-   `newgit init` writes `trackers/root.toml` (owns `.`, committed) and
-   copies the project's history into root's `main` with a real fetch (no
-   alternates; see *Objects*). Trackers nest; the most specific owner wins.
-   `git` defaults to false.
-3. **The projection, and the `project` tracker.**
-   - *3a — compose/split engine. Done.* Full replay, merges keep every
-     parent, originals reused, split refusals for paths owned by trackers outside Git and unbound paths.
-   - *3b — trackers in Git and the `project` tracker. Done.* `newgit
-     tracker create <name> --git --path <p>` carves paths out of their
-     owner, history included; `project` owns `.newgit`. The paths of a tracker in Git
-     are set at creation — adding one later would splice a second
-     history into it.
-   - *3c — wiring. Done.* The project root's commits split into
-     `instances/main` at spawn; push and checkpoint sync split an
-     instance's work into `instances/<instance>` and refuse what a tracker outside Git owns on
-     every ref sent; trackers in Git without history are carved the first
-     time they are needed; split commits are signed as their author when
-     `commit.gpgSign` is set; `newgit log <tracker> [instance]`. A local
-     spawn never composes: an instance's history holds every tracker in Git,
-     so the workspace is the project's own history and binding is a sparse
-     checkout (step 4). Composing happens where a history has to be built
-     from tracker repos: `spawn --from-checkpoint`, `newgit clone`, `newgit
-     export`, the Git endpoint, recomposing every view after a carve, and
-     bringing the project root along after a merge into `main`.
-     Split follows the first parent, so a merge *inside* the work being
-     split is still flattened (step 5).
-   - *3d — remote. Done.* Projects as `<owner>/<name>`, branches as
-     lists, one Artifacts repo per tracker in Git, per-tracker forks made
-     when an instance changes a tracker, checkpoints synced as lists and
-     composed by `spawn --from-checkpoint`, `newgit clone`, and the Git
-     endpoint at `newgit.dev/<owner>/<name>.git` (a per-project container
-     composing each reader's view). A rebuilt commit is given back as its
-     original, signature included, when its id comes out as the
-     original's; one that cannot be carries a note naming its canonical
-     id. Tracker commits split before the trailers kept message endings
-     and headers never come back as the original (step 3e).
-   - *3e — repairing older splits. Done.* Tracker commits split before
-     the trailers recorded headers and message endings lost both, so on
-     the remote they rebuild with new ids, and so does every commit after
-     them. `newgit tracker repair` rewrites each such commit's trailers
-     from the original view commit, where this machine has it (trees,
-     authors, and committers unchanged; a commit whose original is not
-     here keeps its message and only moves; a carved commit's trailers
-     follow the tracker commit it was carved from when that moves too).
-     Rewritten tracker commits are unsigned, so the same repair always
-     makes the same ids and a retry after a partial failure lands on what
-     the first attempt pushed; the commits they compose into keep their
-     signatures (*Signed commits*). It then moves every tracker in Git
-     branch, the composed-state notes, and on the remote each branch's
-     list, the way a merge moves it: its tracker repos force-pushed with a
-     lease. Instance forks and checkpoints on the remote keep the commits
-     they were made with, so an old checkpoint composes as it always did.
-     A force push of tracker history, so it runs once, by hand
-     (`--dry-run` says what would move).
-4. **Roles, priority, resources, use/drop.** *Done, except a resource's
-   `depends_on` naming a role.* `role`, `priority` (negative: only when
-   asked), `requires`, and `resources` decide what a spawn binds (`--use`,
-   `--drop`; personal defaults in `~/.newgit/config.toml` override
-   priority); `newgit tracker use` and `drop` change it afterwards (see
-   *Binding*). `{{bound.trackers}}` and `{{bound.paths}}`; `tracker list` as
-   a tree.
-5. **Coherent merges** locally and on the remote. *Partial.* Built:
-   `newgit merge [instance] [--into <branch>]` writes a branch's new list
-   in one step — per tracker, the instance's commit when the branch has not
-   moved, a real Git merge when both sides changed it — moved by
-   compare-and-swap on the remote; `newgit merge main` merges the project
-   root, which is how trackers made after `remote add` reach the remote.
-   Missing: `--only` and checking it against `requires`; spawning one
-   instance on another and stacking their merges; merges inside the work
-   being split kept rather than flattened; the `newgit branch` CLI.
-6. **GitHub export.** *Done.* `newgit export --remote <name>` pushes
-   the composed `main`s to the target in `.newgit/exports/<name>.toml`:
-   `public` trackers in Git plus the ones it names, so each target has its
-   own view. A history adding the path of a tracker outside Git is refused. Before
-   pushing, it brings in what was merged on the target (a pull request
-   merged on GitHub): the project root fast-forwards to it and it merges
-   into `main`. When the target's commits are not the project's own, it
-   refuses and says how to bring them in; `--force` replaces the branch
-   instead, and `--dry-run` composes and checks without pushing. Targets
-   live under `project`, so whoever may change resources may change what a
-   mirror shows; moving them under `access` waits until that matters.
-   With `branches = true`, each workspace push exports the instance's
-   branch too, and on a newgit remote the target is the workspace remote
-   `gh` resolves: interpose, don't emulate ([vision.md](vision.md)) — the
-   tracking ref is the commit the target holds, and when that is not the
-   agent's `HEAD` (a filtered target), the push says `gh pr create
-   --head`.
+**Before roots (done, 2026-10):** tracker repos with real history (`main`,
+`instances/<instance>`) in the shared store; the `root` tracker, ownership by
+specificity, and the `git` flag; the projection (compose/split engine,
+trackers in Git, wiring into spawn, push, and checkpoint sync, the remote
+with one Artifacts repo per tracker and the Git endpoint); roles, priority,
+`requires`, resources, `use`/`drop`; `newgit merge [instance] [--into
+<branch>]` moving every tracker together; the GitHub export
+(`.newgit/exports/<name>.toml`, `branches = true`). The engine of that
+period — interleaving by committer date, `Newgit-Split-Parent`, carving with
+history, the `project` tracker, `tracker repair` for commits split before
+headers were recorded — is replaced by the steps below and deleted.
+
+1. **`secret` → `git`, alone.** *Done* (#320). It touched every definition
+   and fixture, so it went first (AGENTS.md: a shared rename goes first).
+2. **Compose and split on pins.** *Done* (#201). The compose and split
+   above, `newgit merge` at root's ref, `newgit pull <tracker>`, `mount`,
+   `follow`, and `!` claims, carving as a commit, the same tracker mounted
+   twice, `project` folded into root for `newgit init`, and the migration's
+   gate as the test everything else waited on.
+3. **Migration.** *Done:* `newgit tracker migrate`, run locally, then on
+   newgit.dev.
+4. **Delete the old engine.** *Done:* date interleave, group scheduler,
+   `Newgit-Split-Parent`, carving with history, `tracker repair`,
+   workspace-path storage, `project`.
+5. **The t3code milestone** on the new engine: #140, #141, #142, #143, #144.
+6. **Later:** spawning at a tracker (`spawn --root`), `.gitignore` as
+   definition, moving `role`/`priority`/`requires` to the mounting parent,
+   `spawn --from <instance>` with `requires` checked between instances,
+   profiles, the per-remote redesign, the `newgit branch` CLI.
 
 Then the preview work in [remote.md](remote.md) continues on top: a
 preview's environment identity is simply the set of tracker commits it
@@ -663,9 +935,12 @@ composes.
 
 ## Decided with Jack (2026-10-04)
 
-The rest of that day's decisions — trackers outside Git out of the workspace's
-Git, merges stacking by tracker, full replay, splitting when work leaves the
-machine — are recorded where they apply above. Two add something:
+The rest of that day's decisions — trackers outside Git out of the
+workspace's Git, splitting when work leaves the machine — are recorded where
+they apply above. Two of them were revisited on 2026-11-04: *full replay*
+(interleaving every tracker's history by date) became *the root as spine*,
+and *merges stacking by tracker* (`--only`) was dropped; see below. Two add
+something:
 
 1. **The project root is a workspace:** the instance `main`, bound to every
    tracker's `main`. You work there as today; its commits reach a shared
@@ -674,24 +949,114 @@ machine — are recorded where they apply above. Two add something:
    on your machine or as a preview, with its whole environment and your
    keys — with trackers shown as how it works.
 
+## Decided with Jack (2026-11-04)
+
+1. **The parent records the child's commit** (gitlink pins under
+   `.newgit/pins/`), and the root's history is the view's shape: one root
+   commit per view commit. This revisits 2026-10-04's "full replay". The
+   consequence: parallel instances produce merge commits in `main`, as in a
+   monorepo.
+2. **One kind of tracker.** `secret` becomes `git`, which says only whether
+   the tracker's content is committed with Git. Sensitivity is `audience`
+   alone. The default stays `git = false`, so a forgotten flag can't leak.
+3. **Shape from the commit, policy from `access`'s `main`, claims only in
+   split.** Mounts can move (a commit moves them); editing a claim never
+   rewrites history; nobody rolls policy back with a pin.
+4. **The message stays with the work:** on the root when it changed the
+   root's files or nothing else holds the work, on the child commits
+   otherwise. Any mixed audience among commits that carry the message is
+   refused.
+5. **Carving is a commit,** and so the migration rewrites no view.
+6. **Pulling a child is explicit** (`newgit pull <tracker>`); nothing writes
+   commits on anyone's behalf. `--only` is dropped.
+7. **A merge commits at the root's ref,** with pin moves checked by the
+   Worker before the push.
+8. **`project` folds into the root tracker.**
+9. **The same tracker may be mounted twice;** a commit editing both copies is
+   refused. Layering is not built. Rooting at a child that requires its
+   parent is refused.
+10. **Spheroman/newgit mirrors t3code too.**
+
+### Settled while building (2026-11-04)
+
+Where the code ended up differing from the design as written that morning,
+resolved while building steps 2–4. Each is recorded above where it applies;
+this is the list.
+
+- **A tracker's children are defined in its own `.newgit/trackers/`.**
+  Root's live in `access`, mounted there; before `access` is carved, in
+  root's own tree. A mount is relative to the parent's root, and nested
+  mounts work through this. The design said only "`access` owns the
+  definitions".
+- **Inline has a second rule.** Besides a root commit carrying
+  `Newgit-Split`, a child commit is inline when it is the only new one, its
+  parents are exactly the parent commit's parents' pins, and either the
+  parent commit is a merge or the two share a committer line. Child commits
+  carry no trailers, and a nested child's pin-only commits have nothing else
+  to say they belong to the same split.
+- **Two exemptions from one-audience.** Merge commits stay exempt (their
+  message is Git's or newgit's own). So is the carve commit newgit makes,
+  `Create tracker `x` at <path>`: without that, carving a narrow-audience
+  tracker out of root would always be refused.
+- **No replay cache.** The design noted a cache keyed by the child's commits
+  and the view commits they start from. Not built: replays are recomputed on
+  each compose. They are pure functions, so the results are identical, and
+  it can be added if compose gets slow.
+- **An index lists one commit per tracker name.** With a tracker mounted
+  twice, only the first copy is listed. The second copy's commits are in the
+  store locally but on no branch list yet.
+- **Commits from before mounts are their own root commits.** A view commit
+  with a legacy layout (`project` holding `.newgit/`, `access` unmounted, or
+  no mounted tracker in Git defined) pins nothing and is its own root
+  commit. A commit whose definitions mount a tracker in Git it does not pin
+  is a view commit that only a split can make a root commit of. `newgit
+  init` therefore adopts root's history up to the first commit that mounts a
+  tracker in Git.
+- **Trackers sharing a mount split by their claims** (longest wins). So
+  governance layers by mounting a tracker beside `access` at
+  `.newgit/trackers`, claiming the definition files it governs; `tracker
+  create --git --path .newgit/trackers/x.toml` is no longer the way. Carving
+  inside another tracker's mount makes a deeper mount of root's, not a child
+  of that tracker.
+- **Trackers outside Git may have a `mount`.** They are never pinned.
+- **Split refuses more than the design listed:** unowned paths (every claim
+  excludes them) and paths owned by a tracker outside Git, besides unbound
+  trackers, `.newgit/pins/`, mixed audience, and edits to both copies of a
+  tracker mounted twice.
+- **Exporting root ships `.newgit/`** (config, resources, scripts, exports),
+  because `project` folded into root. Only `.newgit/trackers/` follows
+  `access`'s audience.
+- **What the Worker trusts.** `begin_merge` takes `off_main`, the trackers
+  whose pin moves to a commit not on their own `main`, and requires their
+  maintainers and root's. The Worker cannot run Git, so it takes that list
+  from the client. The backstop is the endpoint container, which expands
+  only pins found in each tracker's own repo. The hole that leaves: a maintainer
+  of root who does not maintain `t3code` can leave it out of `off_main` and
+  pin any commit already in `t3code`'s repo — an older commit on its `main`
+  among them, rolling it back under the parent. They cannot put content in
+  `t3code` that is not already there, or move its `main`. Closing it means
+  deciding whether moving a pin backwards needs the child's maintainers
+  (and then checking it in the container, which can run Git).
+- **The migration folds every tracker in Git,** not only `project` and
+  `access`, and mounts each of the others again at the path it owned.
+
 ---
 
 ## Open questions and known gaps
 
 Unbuilt parts of the design above are marked *planned* where they appear:
-the `merge` and `production` keys, `merge --only` and its `requires` check,
-spawning an instance on another, the `newgit branch` CLI, the narrow-audience
-warning, and `depends_on` naming a role. Open issues on Spheroman/newgit:
+the `merge` and `production` keys, spawning an instance on another with
+`requires` checked between them, spawning at a tracker, the `newgit branch`
+CLI, the narrow-audience warning, `.gitignore` as definition, and
+`depends_on` naming a role. Open issues on Spheroman/newgit:
 
-- **Imported histories.** Compose interleaves trackers by committer date,
-  which is right for carved trackers but wrong for a history from outside
-  the project; mount it through one merge commit instead (#139). Importing
-  an outside repository unchanged as a tracker in Git, `tracker create --git
-  --from` (#140). Exporting a tracker as its own root, for a fork that keeps
-  its files at the top (#141). Pulling a target's new commits back into its
-  trackers, `newgit pull --remote` (#142). Resolving `gh` to the export
-  target an instance's work belongs to, not the first `branches = true` one
-  (#143).
+- **Imported histories.** Importing an outside repository unchanged as a
+  tracker in Git, `tracker create --git --from` (#140). Exporting a tracker
+  as its own root, for a fork that keeps its files at the top (#141).
+  Pulling a target's new commits back into its trackers, `newgit pull
+  --remote` (#142). Resolving `gh` to the export target an instance's work
+  belongs to, not the first `branches = true` one (#143). The engine for
+  them is built (step 2); #139 is closed by it.
 - **Per-user trackers.** A per-user tracker's `main` reaches the remote only
   as a side effect of some instance's checkpoint (#224).
 - **Sparse checkouts.** Restoring a dirty checkpoint writes files into a
@@ -703,9 +1068,6 @@ warning, and `depends_on` naming a role. Open issues on Spheroman/newgit:
   needing supabase running) cannot be expressed (#54). Reviewing a change
   places each tracker it touched locally or in the preview; settled in
   [remote.md](remote.md), *Reviewing a change* (#229).
-- **The model itself.** Dropping projects as a structure: every tracker the
-  same kind of thing, rooted at the user (#201). Designed in
-  [roots.md](roots.md) (decided 2026-11-04, not built yet): parents pin their
-  children's commits, and the root's history is the view's shape. It
-  replaces composing by date, `Newgit-Split-Parent`, and carving with
-  history, and covers the imported-history issues above (#139–#142).
+- **The model itself.** The rest of #201: every tracker the same kind of
+  thing, rooted at the user. The engine is built; what remains is step 6
+  above, and the per-remote redesign under *Users, remotes, and trust*.

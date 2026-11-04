@@ -13,8 +13,8 @@ design, not the commands. For those, and for the rest of the documentation:
   sees. Run `newgit resource templates --show <name>` to read a starter
   template in full.
 - [`trackers.md`](trackers.md) covers the tracker model in depth: root,
-  project, access, and trackers in Git, how a workspace history is composed
-  from them and split back, roles, binding, and merge.
+  access, mounts and pins, how a workspace history is composed from the
+  trackers in Git and split back, roles, binding, merge, and pull.
 - [`remote.md`](remote.md) covers the newgit.dev remote.
 - [`vision.md`](vision.md) is the original long-range architecture. Most of
   it is not built.
@@ -242,21 +242,28 @@ remote, it is that tracker's own repository.
 
 The full model is in [`trackers.md`](trackers.md). The short version:
 
-- **Every path has exactly one owner**, the most specific claim. `root`
-  owns `.`, everything nothing else claims. `project` owns `.newgit`.
-  `access` owns `.newgit/trackers/`, which decides who may read what, and by
-  default only the project's owner may change it (`maintainers = "owner"`).
-  `newgit init` creates all three and copies the project's Git history into
-  `root`.
+- **Every path has at most one owner.** A tracker is *mounted* at a path
+  inside its parent, and claims paths relative to its mount (`!` excludes).
+  The deepest mount wins, then the longest claim. `root` owns `.`,
+  everything nothing else claims, `.newgit/` included. `access` is mounted
+  at `.newgit/trackers/` and holds every tracker's definition, which decides
+  who may read what; by default only the project's owner may change it
+  (`maintainers = "owner"`). `newgit init` creates both and adopts the
+  project's Git history as `root`'s.
 - **There is one kind of tracker.** Its `git` key says whether its files are
   committed with Git. It says nothing about sensitivity; that is the
   `audience`.
 - **A tracker in Git** (`git = true`) is committed content with its own
-  history. `newgit tracker create electron --git --path apps/electron`
-  carves those paths, history included, out of whichever tracker owned
-  them. You commit to them with Git. When work leaves the machine, newgit
-  splits each commit into per-tracker commits, and composing them back
-  gives the same commit, with the same id.
+  history, stored relative to its own root. Each root commit *pins* the
+  commit of every tracker in Git it mounts, and the root's history is the
+  workspace's shape: one root commit per view commit. `newgit tracker
+  create electron --git --path apps/electron` is one commit that moves the
+  files into the new tracker and pins it; history before it stays in root,
+  so no id changes. You commit to a tracker in Git with Git. When work
+  leaves the machine, newgit splits each commit into one root commit and a
+  commit in each tracker it changed, and composing them back gives the same
+  commit, with the same id. `newgit pull <tracker>` moves a pin to the
+  tracker's `follow` ref; nothing else moves one on your behalf.
 - **A tracker outside Git** (`git = false`, the default) owns files that
   never belong in Git: an `.env.local`, an agent's notes, a SQLite file, a
   public page. They are captured by newgit, never committed.
@@ -1328,8 +1335,9 @@ Git repository per tracker. It gives you:
   branch from the trackers in Git you may read.
 - Checkpoints that sync, and `spawn --from-checkpoint` to bring one up
   anywhere, with your own copy of per-user trackers.
-- `newgit merge [instance] [--into <branch>]`, which merges tracker by
-  tracker and moves all of them or none.
+- `newgit merge [instance] [--into <branch>]`, which makes the merge
+  commit in your view and commits it at root's ref by compare-and-swap, so
+  every tracker moves together or none does.
 - `spawn --private`, an embargo: only you see the instance until `merge`
   publishes it.
 
