@@ -37,14 +37,30 @@ async function call(token: string, method: string, route: string, body?: unknown
 			body: body === undefined ? undefined : JSON.stringify(body),
 		}),
 		env,
-		{ repos, fetcher: fetch, waitUntil: () => {}, endpoint: noEndpoint },
+		{ repos, fetcher: fetch, waitUntil: () => {}, endpoint: noEndpoint, ancestry: fakeAncestry },
 	);
 	return { status: response.status, body: (await response.json()) as any };
 }
 
-/** Merge moving root and `trackers`, each off its own `main` (so its maintainers' to move). */
-const begin = (token: string, trackers: string[], off_main = trackers) =>
-	call(token, "POST", path("/branches/main/merge"), { base: main, trackers: ["root", ...trackers], off_main });
+/** The pins the fake container says move forward along their tracker's `main`. */
+let along = new Set<string>();
+const fakeAncestry = async (_project: string, plan: { checks: { tracker: string }[] }) =>
+	plan.checks.map((check) => ({ tracker: check.tracker, forward: along.has(check.tracker), onMain: along.has(check.tracker) }));
+
+/** The index a merge moving root and `trackers` makes. */
+const target = (trackers: string[]) =>
+	Object.fromEntries(
+		Object.entries(main).map(([tracker, commit]) => [tracker, tracker === "root" || trackers.includes(tracker) ? sha("9") : commit]),
+	);
+
+/**
+ * Merge moving root and `trackers`, each off its own `main` (so its
+ * maintainers' to move) unless named in `forward`.
+ */
+const begin = (token: string, trackers: string[], forward: string[] = []) => {
+	along = new Set(forward);
+	return call(token, "POST", path("/branches/main/merge"), { base: main, list: target(trackers) });
+};
 
 describe("maintainers", () => {
 	it("decide who merges a tracker — the owner too", async () => {
@@ -60,32 +76,46 @@ describe("maintainers", () => {
 		// jack maintains root (project-devs) but not web: moving web's pin
 		// along its own `main` changes only root.
 		const before = repos.minted.length;
-		const along = await begin(jack, ["web"], []);
-		expect(along.status).toBe(200);
+		const forward = await begin(jack, ["web"], ["web"]);
+		expect(forward.status).toBe(200);
 		// Write credentials for root alone: web's `main` is not this merge's to push.
-		expect(along.body.credentials.map((c: { tracker: string }) => c.tracker)).toEqual(["root"]);
+		expect(forward.body.credentials.map((c: { tracker: string }) => c.tracker)).toEqual(["root"]);
 		expect(repos.minted.slice(before).filter((m) => m.scope === "write").map((m) => m.name)).toEqual([`jack.${name}.t.root`]);
 	});
 
 	it("are handed write credentials for root and the trackers off their main, nothing else", async () => {
 		define("access", "web", 'audience = "project-devs"\ngit = true\n');
 		define("access", "admin", 'audience = "project-devs"\ngit = true\n');
-		const started = await begin(ana, ["web", "admin"], ["admin"]);
+		const started = await begin(ana, ["web", "admin"], ["web"]);
 		expect(started.status).toBe(200);
 		expect(started.body.credentials.map((c: { tracker: string }) => c.tracker)).toEqual(["root", "admin"]);
 	});
 
-	it("refuse a merge that does not move root, or names off_main outside trackers", async () => {
+	it("refuse a merge that does not move root, or names a commit that is not an id", async () => {
 		define("access", "web", 'audience = "project-devs"\ngit = true\n');
-		const noRoot = await call(ana, "POST", path("/branches/main/merge"), { base: main, trackers: ["web"] });
+		const noRoot = await call(ana, "POST", path("/branches/main/merge"), { base: main, list: { ...main, web: sha("9") } });
 		expect(noRoot.status).toBe(400);
 		expect(noRoot.body.error).toContain("`root`");
-		const stray = await call(ana, "POST", path("/branches/main/merge"), {
-			base: main,
-			trackers: ["root"],
-			off_main: ["web"],
-		});
-		expect(stray.status).toBe(400);
+		const bad = await call(ana, "POST", path("/branches/main/merge"), { base: main, list: { ...main, root: "HEAD" } });
+		expect(bad.status).toBe(400);
+	});
+
+	it("are needed to move a pin back along a tracker's history, even onto its main", async () => {
+		define("access", "web", 'audience = "project-devs"\ngit = true\nmaintainers = "user:ana"\n');
+		// On `main`, but not forward from the old pin: a rollback.
+		const back = async (_project: string, plan: { checks: { tracker: string }[] }) =>
+			plan.checks.map((check) => ({ tracker: check.tracker, forward: false, onMain: true }));
+		const response = await handle(
+			new Request(`https://newgit.dev${path("/branches/main/merge")}`, {
+				method: "POST",
+				headers: { "content-type": "application/json", authorization: `Bearer ${jack}` },
+				body: JSON.stringify({ base: main, list: target(["web"]) }),
+			}),
+			env,
+			{ repos, fetcher: fetch, waitUntil: () => {}, endpoint: noEndpoint, ancestry: back },
+		);
+		expect(response.status).toBe(403);
+		expect(((await response.json()) as any).error).toContain("back or sideways");
 	});
 
 	it("default to the audience: anyone who may read a tracker may change it", async () => {
@@ -115,7 +145,7 @@ describe("maintainers", () => {
 
 		// web's definition is read from admin: ana, a member, may read and merge it.
 		expect((await begin(ana, ["web"])).status).toBe(200);
-		await call(ana, "PUT", path("/branches/main"), { base: main, list: main });
+		await call(ana, "PUT", path("/branches/main"), { base: main, list: target(["web"]) });
 
 		// Changing admin itself is ana's; the owner is not admin's maintainer.
 		expect((await begin(jack, ["admin"])).status).toBe(403);

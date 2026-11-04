@@ -59,6 +59,31 @@ struct State {
     undefined_trackers: std::collections::BTreeSet<String>,
     /// Trackers the caller may not write: the real remote's 403.
     denied_trackers: std::collections::BTreeSet<String>,
+    /// Branch → the index the merge in flight began with.
+    merge_targets: BTreeMap<String, Value>,
+}
+
+/// A tracker's definition as the remote reads it, from `access`'s `main`:
+/// `<name>.toml` at its root, or where the layout before mounts kept it.
+fn definition_text(repos: &Utf8Path, project: &str, tracker: &str) -> Option<String> {
+    let access = repos.join(format!("{}.t.access.git", project.replace('/', ".")));
+    [format!("main:{tracker}.toml"), format!("main:.newgit/trackers/{tracker}.toml")]
+        .iter()
+        .find_map(|spec| {
+            let output = git_output(&access, &["show", spec]);
+            output
+                .status
+                .success()
+                .then(|| String::from_utf8_lossy(&output.stdout).into_owned())
+        })
+}
+
+/// Whether `commit` is on tracker `tracker`'s own `main` in its repo.
+fn on_main(repos: &Utf8Path, project: &str, tracker: &str, commit: &str) -> bool {
+    let repo = repos.join(format!("{}.t.{tracker}.git", project.replace('/', ".")));
+    git_output(&repo, &["merge-base", "--is-ancestor", commit, "main"])
+        .status
+        .success()
 }
 
 /// Ana's login token; every other login token is jack's.
@@ -270,27 +295,60 @@ fn route(
                     json!({ "error": "the branch moved since you looked: merge again" }),
                 );
             }
-            let credentials: Vec<Value> = body["trackers"]
-                .as_array()
-                .cloned()
-                .unwrap_or_default()
-                .iter()
-                .map(|tracker| {
-                    let tracker = tracker.as_str().unwrap_or_default();
+            // Like the Worker: every tracker whose pin changes is defined and in
+            // Git, unless it only leaves the index; root and each tracker
+            // whose new pin is not on its own `main` get a write password.
+            let base = body["base"].as_object().cloned().unwrap_or_default();
+            let list = body["list"].as_object().cloned().unwrap_or_default();
+            if list.get("root").is_none() || list.get("root") == base.get("root") {
+                return (400, json!({ "error": "a merge moves `root`" }));
+            }
+            let mut names: Vec<&String> = base.keys().chain(list.keys()).collect();
+            names.sort();
+            names.dedup();
+            let mut credentials = Vec::new();
+            for tracker in names {
+                if base.get(tracker) == list.get(tracker) {
+                    continue;
+                }
+                let defined = definition_text(repos, &key, tracker)
+                    .filter(|text| text.contains("git = true") || tracker == "root");
+                let Some(new) = list.get(tracker).and_then(Value::as_str) else {
+                    continue;
+                };
+                if defined.is_none() && base.contains_key(tracker) {
+                    return (
+                        400,
+                        json!({ "error": format!("`{tracker}` is not defined on `main`") }),
+                    );
+                }
+                if !base.contains_key(tracker) {
+                    continue;
+                }
+                if tracker == "root" || !on_main(repos, &key, tracker, new) {
                     let mut seed = credential(&format!("{owner}.{name}.t.{tracker}"));
                     seed["tracker"] = json!(tracker);
-                    seed
-                })
-                .collect();
+                    credentials.push(seed);
+                }
+            }
+            state
+                .merge_targets
+                .insert(format!("{key}/{branch}"), body["list"].clone());
             (
                 200,
                 json!({ "branch": branch, "until": "later", "credentials": credentials }),
             )
         }
         ("PUT", ["v1", "projects", owner, name, "branches", branch]) => {
-            let key = format!("{owner}/{name}");
-            let branches = state.branches.entry(key).or_default();
             if !body["base"].is_null() {
+                let target = format!("{owner}/{name}/{branch}");
+                if state.merge_targets.get(&target) != Some(&body["list"]) {
+                    return (
+                        400,
+                        json!({ "error": "this is not the index the merge began with" }),
+                    );
+                }
+                let branches = state.branches.entry(format!("{owner}/{name}")).or_default();
                 if branches.get(*branch) != Some(&body["base"]) {
                     return (
                         409,
@@ -300,6 +358,7 @@ fn route(
                 branches.insert((*branch).to_owned(), body["list"].clone());
                 return (200, json!({ "name": branch, "list": body["list"] }));
             }
+            let branches = state.branches.entry(format!("{owner}/{name}")).or_default();
             if branches.contains_key(*branch) {
                 return (
                     409,
@@ -417,6 +476,20 @@ fn route(
                 201,
                 json!({ "instance": instance, "id": id, "createdBy": caller, "createdAt": "now", "record": body["record"] }),
             )
+        }
+        ("GET", ["v1", "projects", _, _, "checkpoints"]) => {
+            let listed: Vec<Value> = state
+                .checkpoints
+                .iter()
+                .map(|((instance, id), record)| {
+                    json!({
+                        "instance": instance, "id": id,
+                        "createdBy": state.checkpoint_authors.get(&(instance.clone(), id.clone())).cloned().unwrap_or_else(|| "jack".to_owned()),
+                        "agent": null, "createdAt": "now", "record": record,
+                    })
+                })
+                .collect();
+            (200, json!({ "checkpoints": listed }))
         }
         ("GET", ["v1", "projects", _, _, "checkpoints", instance, id]) => {
             let key = ((*instance).to_owned(), (*id).to_owned());

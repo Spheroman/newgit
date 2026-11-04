@@ -37,7 +37,7 @@ import {
 	repoName,
 } from "./names";
 import { checkBudget, pausedBy } from "./budget";
-import { type EndpointKind, type EndpointPlan, PLAN_HEADER } from "./endpoint";
+import { type AncestryAnswer, type AncestryPlan, type EndpointKind, type EndpointPlan, type IndexAnswer, type IndexPlan, PLAN_HEADER } from "./endpoint";
 import type { Instance, ProjectDO } from "./project";
 import type { UserDO } from "./users";
 
@@ -72,6 +72,18 @@ export interface Deps {
 	waitUntil(promise: Promise<unknown>): void;
 	/** Serve one Git request from a project's endpoint container. */
 	endpoint(project: string, kind: EndpointKind, plan: EndpointPlan, request: Request): Promise<Response>;
+	/**
+	 * Ask the project's endpoint container, which runs Git, how each pin
+	 * moves along its tracker's history. Absent (tests that do not fake it),
+	 * every move counts as not forward.
+	 */
+	ancestry?(project: string, plan: AncestryPlan): Promise<AncestryAnswer[]>;
+	/**
+	 * Ask the container whether an index is what its root commit pins. The
+	 * production Deps always has it; a test that does not fake it skips the
+	 * check.
+	 */
+	index?(project: string, plan: IndexPlan): Promise<IndexAnswer>;
 }
 
 class HttpError extends Error {
@@ -98,6 +110,26 @@ export default {
 			repos: new ArtifactsRepos(env.ARTIFACTS, env.ARTIFACTS_GIT_BASE),
 			fetcher: fetch,
 			waitUntil: (promise) => ctx.waitUntil(promise),
+			ancestry: async (project, plan) => {
+				const response = await env.ENDPOINTS.getByName(project).fetch(
+					new Request("https://endpoint/ancestry", {
+						method: "POST",
+						headers: { [PLAN_HEADER]: btoa(JSON.stringify(plan)) },
+					}),
+				);
+				if (!response.ok) throw new HttpError(502, "the remote could not check where the merge's pins move; try again");
+				return (await response.json()) as AncestryAnswer[];
+			},
+			index: async (project, plan) => {
+				const response = await env.ENDPOINTS.getByName(project).fetch(
+					new Request("https://endpoint/index", {
+						method: "POST",
+						headers: { [PLAN_HEADER]: btoa(JSON.stringify(plan)) },
+					}),
+				);
+				if (!response.ok) throw new HttpError(502, "the remote could not check the merge's index; try again");
+				return (await response.json()) as IndexAnswer;
+			},
 			endpoint: (project, kind, plan, original) => {
 				const headers = new Headers({ [PLAN_HEADER]: btoa(JSON.stringify(plan)) });
 				for (const name of ["git-protocol", "content-encoding", "content-type"]) {
@@ -379,46 +411,92 @@ async function route(request: Request, env: Env, deps: Deps): Promise<Response> 
 		// Merging is a person's decision: an agent proposes, a member merges.
 		requireHuman(caller, "merge");
 		const branch = decodeURIComponent(mergeMatch[1]);
-		const { base, trackers, off_main = [] } = await body<{
+		const { base, list } = await body<{
 			base?: Record<string, string>;
-			trackers?: string[];
-			off_main?: string[];
+			list?: Record<string, string>;
 		}>(request);
-		if (!base || !Array.isArray(trackers) || trackers.length === 0)
-			throw new HttpError(400, "base (the list you merged onto) and trackers (the ones that move) are required");
-		if (!trackers.includes("root"))
-			throw new HttpError(400, "a merge moves `root`: the branch is root's ref, so `root` must be among trackers");
-		if (!Array.isArray(off_main) || off_main.some((tracker) => typeof tracker !== "string" || !trackers.includes(tracker)))
-			throw new HttpError(400, "off_main names trackers in trackers: those whose pin moves off their own `main`");
-		// Who must maintain what: root, whose ref is the commit point, and
-		// every tracker whose own `main` this merge pushes. A pin moving to a
-		// commit already on that tracker's `main` changes only root, so only
-		// needs root's maintainers. The Worker cannot run Git: `off_main` is
-		// the client's word, and the Git endpoint is the backstop (it expands
-		// only pins found in the tracker's own repo).
-		const writes = trackers.filter((tracker) => tracker === "root" || off_main.includes(tracker));
+		if (!base || typeof base !== "object" || !list || typeof list !== "object")
+			throw new HttpError(400, "base (the index you merged onto) and list (the index the merge makes) are required");
+		if (typeof list.root !== "string" || list.root === base.root)
+			throw new HttpError(400, "a merge moves `root`: the branch is root's ref, so the new index names a new root commit");
+		for (const [tracker, commit] of Object.entries(list)) {
+			requirePart("tracker name", tracker);
+			if (typeof commit !== "string" || !/^[0-9a-f]{40}$/.test(commit))
+				throw new HttpError(400, `\`${tracker}\` must name a full commit id`);
+		}
+		const trackers = [...new Set([...Object.keys(base), ...Object.keys(list)])].filter(
+			(tracker) => base[tracker] !== list[tracker],
+		);
+		// Every pin that moves is checked here, by Git, in the endpoint's
+		// container: a move forward along that tracker's own `main` changes
+		// only root, so root's maintainers may make it; anything else — back,
+		// sideways, or to a commit `main` does not have — is that tracker's
+		// maintainers' to make, and a commit off `main` means its `main` moves
+		// too, so they get a write password for it. Without the container
+		// (a test, or one that cannot start), every move counts as not
+		// forward: the safe answer.
+		const children = trackers.filter((tracker) => tracker !== "root" && tracker in base && tracker in list);
+		const moves = new Map<string, AncestryAnswer>();
+		if (children.length > 0 && deps.ancestry) {
+			const plan: AncestryPlan = { dir: "/work", repos: {}, checks: [] };
+			for (const tracker of children) {
+				const name = repoName({ kind: "tracker", project: id, tracker });
+				const minted = await deps.repos.mint(name, "read", CREDENTIAL_TTL_SECONDS);
+				await userStub(env, login).recordRepoToken(caller.tokenId, name, minted.id, minted.expiresAt);
+				plan.repos[tracker] = { url: deps.repos.url(name), auth: `Authorization: Basic ${btoa(`x:${minted.password}`)}` };
+				plan.checks.push({ tracker, old: base[tracker], new: list[tracker] });
+			}
+			for (const answer of await deps.ancestry(key, plan)) moves.set(answer.tracker, answer);
+		}
 		// Everything is checked before the lock is taken: a refused merge
 		// holds nothing.
 		const who = { login, member };
+		const writes: string[] = [];
 		for (const tracker of trackers) {
-			requirePart("tracker name", tracker);
 			const facts = await definitionFacts(deps.repos, id, info.defaultBranch, tracker, await listedTrackers(project));
-			if (facts === undefined)
+			const dropped = !(tracker in list);
+			if (!(tracker in base)) {
+				// New to the branch: its definition lands with this very merge
+				// (it is not on the default branch yet), and its history came in
+				// through the repo seeded for it. Only whoever governs that
+				// definition adds it.
+				if (facts !== undefined && !facts.git)
+					throw new HttpError(400, `\`${tracker}\` is not in Git; \`newgit merge\` never carries it`);
+				if ((await deps.repos.remote(repoName({ kind: "tracker", project: id, tracker }))) === null)
+					throw new HttpError(400, `\`${tracker}\` has no repo: a new tracker in Git joins by its own seeded repo`);
+				if (!(await governs_(deps, id, info, who, tracker, await listedTrackers(project))))
+					throw new HttpError(403, `only the maintainers of the tracker holding \`${tracker}\`'s definition may add it`);
+				continue;
+			}
+			if (facts === undefined) {
+				// A tracker the definitions no longer name (the migration
+				// folding `project` into root) may only leave the index.
+				if (dropped) continue;
 				throw new HttpError(
 					400,
 					`\`${tracker}\` is not defined on \`${info.defaultBranch}\`: a new tracker in Git joins by its own seeded repo`,
 				);
+			}
 			if (!facts.git) throw new HttpError(400, `\`${tracker}\` is not in Git; \`newgit merge\` never carries it`);
 			const read = decide({ kind: "tracker", project: id, tracker }, "read", who, { tracker: facts });
 			if (!read.ok) throw new HttpError(403, read.reason);
+			const answer = moves.get(tracker);
+			const forwardOnMain = !dropped && answer?.forward === true && answer.onMain === true;
+			if (tracker !== "root" && forwardOnMain) continue;
 			// Merging a tracker is its maintainers' (by default, its readers'):
 			// `access`, which holds every definition, is the owner's unless the
 			// definitions say otherwise.
-			if (!writes.includes(tracker)) continue;
 			const may = mayMaintain(facts.maintainers, who, info.owner, tracker);
-			if (!may.ok) throw new HttpError(403, may.reason);
+			if (!may.ok) {
+				const why =
+					tracker === "root" || dropped
+						? may.reason
+						: `${may.reason} (its pin moves ${answer?.forward ? "to a commit not on its `main`" : "back or sideways along its history"})`;
+				throw new HttpError(403, why);
+			}
+			if (tracker === "root" || (!dropped && answer?.onMain !== true)) writes.push(tracker);
 		}
-		const started = await project.beginMerge(branch, base, login, MERGE_LOCK_SECONDS, trackers);
+		const started = await project.beginMerge(branch, base, login, MERGE_LOCK_SECONDS, trackers, list);
 		if (!started.ok) {
 			if (started.reason === "missing") throw new HttpError(404, `no branch \`${branch}\` in ${key}`);
 			if (started.reason === "moved")
@@ -475,25 +553,28 @@ async function route(request: Request, env: Env, deps: Deps): Promise<Response> 
 			if (base !== undefined) {
 				// The end of a merge: the list moves from `base`, all at once.
 				requireHuman(caller, "merge");
-				// Only what the merge declared may move: every other tracker
-				// keeps its commit, and a new one joins only from the repo the
-				// owner seeded for it.
-				for (const [tracker, commit] of Object.entries(list)) {
-					if (base[tracker] === commit) continue;
-					if (await project.mergeDeclares(branch, tracker)) continue;
-					if (!(tracker in base)) {
-						const defined = await definitionFacts(deps.repos, id, info.defaultBranch, tracker, await listedTrackers(project));
-						const governs = await governs_(deps, id, info, { login, member }, tracker, await listedTrackers(project));
-						if (governs && (defined === undefined || defined.git)) continue;
+				// The index the merge began with, exactly: every pin in it was
+				// checked then, so nothing else may land.
+				if (!(await project.mergeTargets(branch, list)))
+					throw new HttpError(400, "this is not the index the merge began with: start the merge again");
+				// And what root's pushed commit really pins: the Git endpoint
+				// composes from the gitlinks, so an index that says otherwise
+				// would have had its pins checked for nothing.
+				if (deps.index) {
+					const plan: IndexPlan = { dir: "/work", repos: {}, list };
+					for (const tracker of Object.keys(list)) {
+						const name = repoName({ kind: "tracker", project: id, tracker });
+						const minted = await deps.repos.mint(name, "read", CREDENTIAL_TTL_SECONDS);
+						await userStub(env, login).recordRepoToken(caller.tokenId, name, minted.id, minted.expiresAt);
+						plan.repos[tracker] = { url: deps.repos.url(name), auth: `Authorization: Basic ${btoa(`x:${minted.password}`)}` };
 					}
-					throw new HttpError(400, `this merge did not declare \`${tracker}\`, so it cannot move it`);
+					const checked = await deps.index(key, plan);
+					if (!checked.matches)
+						throw new HttpError(
+							400,
+							"root's commit on the branch does not pin what this index says: push the root commit the merge made, then finish",
+						);
 				}
-				// A tracker may leave the index (a merge that unmounts it, or the
-				// migration folding `project` into root), but only one the merge
-				// declared.
-				for (const tracker of Object.keys(base))
-					if (!(tracker in list) && !(await project.mergeDeclares(branch, tracker)))
-						throw new HttpError(400, `this merge did not declare \`${tracker}\`, so it cannot drop it`);
 				const finished = await project.finishMerge(branch, base, list, login);
 				if (!finished.ok) {
 					if (finished.reason === "missing") throw new HttpError(404, `no branch \`${branch}\` in ${key}`);
@@ -915,7 +996,7 @@ function claimOn(facts: TrackerFacts, path: string): number | undefined {
 
 /**
  * The tracker in Git owning workspace `path`, by the ownership rules
- * (docs/design/roots.md, *Ownership*), as the client's `owner_of` decides it:
+ * (docs/design/trackers.md, *Ownership*), as the client's `owner_of` decides it:
  * the deepest mount holding the path decides, a parent's claim not reaching
  * into it; among the trackers mounted there the longest claim wins, ties to
  * the lesser name; a path every claim there excludes is owned by nothing.
@@ -962,8 +1043,14 @@ async function loadDefinitions(
 		for (const name of all) {
 			const from = source.get(name)!;
 			const path = relativeTo(from.mount, file(name));
-			const text =
+			let text =
 				path === "." ? null : await repos.readFile(repoName({ kind: "tracker", project, tracker: from.tracker }), branch, path);
+			// The layout before mounts kept `access`'s files at their
+			// workspace paths. Read it too, so a remote deployed before a
+			// project migrates (`newgit tracker migrate`) still reads its
+			// definitions. Delete once every project on the remote migrated.
+			if (text === null && from.tracker === "access")
+				text = await repos.readFile(repoName({ kind: "tracker", project, tracker: "access" }), branch, file(name));
 			const read = text === null ? implicitFacts(name) : parseFacts(text, from.tracker);
 			if (read !== undefined) facts.set(name, { ...read, source: from.tracker });
 		}

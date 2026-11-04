@@ -8057,9 +8057,11 @@ impl BranchManager {
                 .rev_parse(&format!("refs/newgit/remote/{tracker}/main"))
                 .ok()
         };
+        // Only a merge into `main` moves them: another branch pins what it
+        // pins, and a child's own `main` is the one `main` follows.
         let mut mains: Vec<(String, Option<String>, String)> = Vec::new();
         for merge in &moved {
-            if merge.tracker == self.root.name {
+            if merge.tracker == self.root.name || into != "main" {
                 continue;
             }
             let current = if client.is_some() {
@@ -8123,35 +8125,67 @@ impl BranchManager {
                 let seed = client.create_tracker_repo(project_key, &merge.tracker)?;
                 push(&seed.credential, &merge.commit, "refs/heads/main", None)?;
             }
-            // The Worker cannot run Git, so it is told which pins move to a
-            // commit that is not on that tracker's `main` — the ones whose
-            // `main` this merge moves — and refuses a merger who does not
-            // maintain them. Root always moves.
-            let moving: Vec<String> = moved
-                .iter()
-                .filter(|merge| merge.action != TrackerMergeAction::New)
-                .map(|merge| merge.tracker.clone())
-                .collect();
-            let off_main: Vec<String> = mains
-                .iter()
-                .map(|(tracker, _, _)| tracker.clone())
-                .filter(|tracker| moving.contains(tracker))
-                .collect();
-            let credentials = client.begin_merge(project_key, into, &base, &moving, &off_main)?;
+            // The remote asks Git how each pin moves, and hands a write
+            // password for root and for each tracker whose `main` must catch
+            // up; whether this merge may make each move is its call, not ours.
+            let credentials = client.begin_merge(project_key, into, &base, &list)?;
             let credential_for = |tracker: &str| {
                 credentials
                     .iter()
                     .find(|credential| credential.tracker == tracker)
                     .map(|credential| &credential.credential)
             };
-            // The commit point: root's ref, by compare-and-swap.
+            // The commit point: root's ref, by compare-and-swap on what root's
+            // repo holds there now — none yet for a branch made as a list —
+            // which must be what the index says.
+            let held = self
+                .source
+                .rev_parse(&format!("refs/newgit/remote/{}/{into}", self.root.name))
+                .ok();
+            if held.is_some() && held != base_root {
+                return Err(NewgitError::Unsupported(format!(
+                    "root's `{into}` on {project_key} is not the commit `{into}`'s index names, so \
+                     another merge is landing: run `newgit merge` again"
+                )));
+            }
             if let Some(auth) = credential_for(&self.root.name) {
-                push(auth, &merged_root, &branch_ref, base_root.as_deref())?;
+                push(auth, &merged_root, &branch_ref, held.as_deref()).map_err(|_| {
+                    NewgitError::Unsupported(format!(
+                        "`{into}` moved while this merge ran: run `newgit merge` again"
+                    ))
+                })?;
+            }
+            // On a branch other than `main`, a child's commit is kept on the
+            // child's branch of the same name: its `main` is `main`'s to move.
+            if into != "main" {
+                for merge in moved.iter().filter(|merge| {
+                    merge.tracker != self.root.name && merge.action != TrackerMergeAction::New
+                }) {
+                    let Some(auth) = credential_for(&merge.tracker) else {
+                        continue;
+                    };
+                    let held = self
+                        .source
+                        .rev_parse(&format!("refs/newgit/remote/{}/{into}", merge.tracker))
+                        .ok();
+                    push(auth, &merge.commit, &branch_ref, held.as_deref()).map_err(|_| {
+                        NewgitError::Unsupported(format!(
+                            "`{}`'s `{into}` moved while this merge ran: run `newgit merge` again",
+                            merge.tracker
+                        ))
+                    })?;
+                }
             }
             for (tracker, before, caught_up) in &mains {
-                if let Some(auth) = credential_for(tracker) {
-                    push(auth, caught_up, "refs/heads/main", before.as_deref())?;
-                }
+                let Some(auth) = credential_for(tracker) else {
+                    continue;
+                };
+                push(auth, caught_up, "refs/heads/main", before.as_deref()).map_err(|_| {
+                    NewgitError::Unsupported(format!(
+                        "`{tracker}`'s `main` moved while this merge ran: run `newgit merge` \
+                         again (`{into}` has the merge; `{tracker}`'s `main` catches up then)"
+                    ))
+                })?;
             }
             client.finish_merge(project_key, into, &base, &list)?;
         }

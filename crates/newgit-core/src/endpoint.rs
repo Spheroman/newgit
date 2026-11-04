@@ -88,16 +88,24 @@ pub fn compose_view(plan: &Plan) -> Result<Utf8PathBuf> {
     // A branch naming a commit its tracker does not have is left out —
     // logged, not served, and not allowed to take the others down with it.
     let mut plan = plan.clone();
+    // A child naming a commit its tracker does not have is left out of
+    // that branch, as for a reader who may not read it; a root commit that is
+    // not root's leaves the branch unserved. Logged either way.
     plan.branches.retain(|branch, list| {
-        let bad: Vec<&String> = list
+        let bad: Vec<String> = list
             .iter()
             .filter(|(tracker, commit)| !in_tracker(&store, tracker, commit))
-            .map(|(tracker, _)| tracker)
+            .map(|(tracker, _)| tracker.clone())
             .collect();
         if !bad.is_empty() {
             eprintln!("newgit: branch `{branch}` names commits its trackers do not have: {bad:?}");
         }
-        bad.is_empty() && list.contains_key(ROOT_TRACKER)
+        for tracker in &bad {
+            if tracker != ROOT_TRACKER {
+                list.remove(tracker);
+            }
+        }
+        !bad.iter().any(|tracker| tracker == ROOT_TRACKER) && list.contains_key(ROOT_TRACKER)
     });
     if !plan.branches.contains_key(&plan.default_branch) {
         return Err(NewgitError::Unsupported(format!(
@@ -317,4 +325,126 @@ fn plan_key(plan: &Plan) -> String {
         .take(16)
         .map(|byte| format!("{byte:02x}"))
         .collect()
+}
+
+/// What the Worker asks before a merge: for each pin the merge moves, does
+/// the new commit descend from the old one, and is it on that tracker's own
+/// `main`? The Worker cannot run Git; this container can.
+#[derive(Debug, Clone, Deserialize)]
+pub struct AncestryPlan {
+    pub dir: Utf8PathBuf,
+    pub repos: BTreeMap<String, Source>,
+    pub checks: Vec<AncestryCheck>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct AncestryCheck {
+    pub tracker: String,
+    pub old: String,
+    pub new: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct AncestryAnswer {
+    pub tracker: String,
+    pub forward: bool,
+    #[serde(rename = "onMain")]
+    pub on_main: bool,
+}
+
+/// Answer `plan` from each tracker's own repo, fetched fresh into the
+/// container's store. A commit the repo does not have is neither forward nor
+/// on `main`.
+pub fn check_ancestry(plan: &AncestryPlan) -> Result<Vec<AncestryAnswer>> {
+    let store = plan.dir.join("trackers.git");
+    std::fs::create_dir_all(&plan.dir).map_err(|source| NewgitError::io(&plan.dir, source))?;
+    if !store.join("HEAD").exists() {
+        run_git_env(&["init", "-q", "--bare", store.as_str()], &[])?;
+    }
+    let git_dir = format!("--git-dir={store}");
+    let mut answers = Vec::new();
+    for check in &plan.checks {
+        let source = plan.repos.get(&check.tracker).ok_or_else(|| {
+            NewgitError::Unsupported(format!(
+                "the plan checks `{}` but not where it is",
+                check.tracker
+            ))
+        })?;
+        // Fresh and pruned: a head deleted since the last fetch is not `main`.
+        GitSource::fetch_refs(
+            &[&git_dir, "-c", "fetch.prune=true"],
+            &source.url,
+            &[format!(
+                "+refs/heads/*:refs/trackers/{}/heads/*",
+                check.tracker
+            )],
+            Some(&source.auth),
+        )?;
+        let in_repo = |commit: &str| in_tracker(&store, &check.tracker, commit);
+        let ancestor = |old: &str, new: &str| {
+            std::process::Command::new("git")
+                .args([&git_dir, "merge-base", "--is-ancestor", old, new])
+                .output()
+                .is_ok_and(|output| output.status.success())
+        };
+        let main = format!("refs/trackers/{}/heads/main", check.tracker);
+        let known = in_repo(&check.new);
+        answers.push(AncestryAnswer {
+            tracker: check.tracker.clone(),
+            forward: known && in_repo(&check.old) && ancestor(&check.old, &check.new),
+            on_main: known && ancestor(&check.new, &main),
+        });
+    }
+    Ok(answers)
+}
+
+/// What the Worker asks before it writes a branch's index: is `list` exactly
+/// the index of root commit `list["root"]` as root's repo holds it — every
+/// pin, recursively, as the gitlinks in those commits say?
+#[derive(Debug, Clone, Deserialize)]
+pub struct IndexPlan {
+    pub dir: Utf8PathBuf,
+    pub repos: BTreeMap<String, Source>,
+    pub list: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct IndexAnswer {
+    pub matches: bool,
+    /// The index the commits give, as far as the repos here hold them.
+    pub actual: BTreeMap<String, String>,
+}
+
+pub fn check_index(plan: &IndexPlan) -> Result<IndexAnswer> {
+    let store = plan.dir.join("trackers.git");
+    std::fs::create_dir_all(&plan.dir).map_err(|source| NewgitError::io(&plan.dir, source))?;
+    if !store.join("HEAD").exists() {
+        run_git_env(&["init", "-q", "--bare", store.as_str()], &[])?;
+    }
+    let git_dir = format!("--git-dir={store}");
+    for (tracker, source) in &plan.repos {
+        GitSource::fetch_refs(
+            &[&git_dir, "-c", "fetch.prune=true"],
+            &source.url,
+            &[format!("+refs/heads/*:refs/trackers/{tracker}/heads/*")],
+            Some(&source.auth),
+        )?;
+    }
+    let Some(root) = plan.list.get(ROOT_TRACKER) else {
+        return Ok(IndexAnswer {
+            matches: false,
+            actual: BTreeMap::new(),
+        });
+    };
+    if !in_tracker(&store, ROOT_TRACKER, root) {
+        return Ok(IndexAnswer {
+            matches: false,
+            actual: BTreeMap::new(),
+        });
+    }
+    let actual = compose::index(&store, ROOT_TRACKER, root)?;
+    Ok(IndexAnswer {
+        matches: actual == plan.list,
+        actual,
+    })
 }

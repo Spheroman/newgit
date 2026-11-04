@@ -201,18 +201,18 @@ pub trait Remote {
     /// Create the repo of a tracker in Git carved after the project was, and
     /// the one write that seeds it.
     fn create_tracker_repo(&self, project: &str, tracker: &str) -> Result<SeedCredential>;
-    /// Start merging into `branch`, whose index must still be `base`:
-    /// `trackers` are the ones whose pin moves (root always), and `off_main`
-    /// those among them whose pin moves to a commit not on that tracker's
-    /// `main` — the remote refuses a merger who does not maintain one, and
-    /// hands write passwords for root and for each of them.
+    /// Start merging into `branch`, whose index must still be `base`, to
+    /// make index `list`. The remote asks Git how each pin moves: a move
+    /// forward along that tracker's own `main` needs only root's
+    /// maintainers; any other needs that tracker's, and one off its `main`
+    /// gets a write password for it. Root always gets one. Finishing must
+    /// land exactly `list`.
     fn begin_merge(
         &self,
         project: &str,
         branch: &str,
         base: &std::collections::BTreeMap<String, String>,
-        trackers: &[String],
-        off_main: &[String],
+        list: &std::collections::BTreeMap<String, String>,
     ) -> Result<Vec<SeedCredential>>;
     /// Finish it: `branch`'s list moves from `base` to `list` in one write.
     fn finish_merge(
@@ -473,8 +473,7 @@ impl Remote for HttpRemote {
         project: &str,
         branch: &str,
         base: &std::collections::BTreeMap<String, String>,
-        trackers: &[String],
-        off_main: &[String],
+        list: &std::collections::BTreeMap<String, String>,
     ) -> Result<Vec<SeedCredential>> {
         #[derive(Deserialize)]
         struct Started {
@@ -487,7 +486,7 @@ impl Remote for HttpRemote {
                 project_path(project),
                 segment(branch)
             ),
-            Some(serde_json::json!({ "base": base, "trackers": trackers, "off_main": off_main })),
+            Some(serde_json::json!({ "base": base, "list": list })),
         )?;
         Ok(started.credentials)
     }

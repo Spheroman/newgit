@@ -292,6 +292,14 @@ enum Command {
     /// (JSON) on stdin, prints the bare repository it composed
     #[command(hide = true)]
     EndpointCompose,
+    /// The Git endpoint's check before a merge, run inside its container:
+    /// reads a plan (JSON) on stdin, prints how each pin moves
+    #[command(hide = true)]
+    EndpointAncestry,
+    /// The Git endpoint's check before a branch's index is written, run
+    /// inside its container: is the index what root's commit pins?
+    #[command(hide = true)]
+    EndpointIndex,
     /// Link this project to a newgit remote
     Remote {
         #[command(subcommand)]
@@ -640,6 +648,23 @@ fn main() -> Result<()> {
             let plan: newgit_core::endpoint::Plan = serde_json::from_reader(std::io::stdin())
                 .context("the plan on stdin is not JSON newgit can read")?;
             println!("{}", newgit_core::endpoint::compose_view(&plan)?);
+            Ok(())
+        }
+        Command::EndpointAncestry => {
+            let plan: newgit_core::endpoint::AncestryPlan =
+                serde_json::from_reader(std::io::stdin())
+                    .context("the plan on stdin is not JSON newgit can read")?;
+            let answers = newgit_core::endpoint::check_ancestry(&plan)?;
+            println!("{}", serde_json::to_string(&answers)?);
+            Ok(())
+        }
+        Command::EndpointIndex => {
+            let plan: newgit_core::endpoint::IndexPlan = serde_json::from_reader(std::io::stdin())
+                .context("the plan on stdin is not JSON newgit can read")?;
+            println!(
+                "{}",
+                serde_json::to_string(&newgit_core::endpoint::check_index(&plan)?)?
+            );
             Ok(())
         }
         Command::Members { command } => remote_cmd::members(command),

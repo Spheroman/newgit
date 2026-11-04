@@ -30,6 +30,36 @@ export interface EndpointPlan {
 
 export type EndpointKind = "advertise" | "upload-pack";
 
+/** `newgit endpoint-ancestry`'s input: how each pin a merge moves goes. */
+export interface AncestryPlan {
+	dir: string;
+	repos: Record<string, { url: string; auth: string }>;
+	checks: { tracker: string; old: string; new: string }[];
+}
+
+/** `newgit endpoint-index`'s input: is `list` the index of `list.root`? */
+export interface IndexPlan {
+	dir: string;
+	repos: Record<string, { url: string; auth: string }>;
+	list: Record<string, string>;
+}
+
+export interface IndexAnswer {
+	matches: boolean;
+	actual: Record<string, string>;
+}
+
+/**
+ * Per tracker: whether its new pin descends from its old one, and whether
+ * the new one is on that tracker's own `main`. Git's answer, from the
+ * tracker's own repo.
+ */
+export interface AncestryAnswer {
+	tracker: string;
+	forward: boolean;
+	onMain: boolean;
+}
+
 /** Snapshot at most this often, after a compose changed what is on disk. */
 const SNAPSHOT_EVERY_MS = 10 * 60_000;
 
@@ -267,11 +297,25 @@ export class GitEndpoint extends DurableObject<Env> {
 	}
 
 	private async serve(request: Request): Promise<Response> {
-		const kind = new URL(request.url).pathname.slice(1) as EndpointKind;
+		const kind = new URL(request.url).pathname.slice(1) as EndpointKind | "ancestry" | "index";
 		const encoded = request.headers.get(PLAN_HEADER);
 		if (!encoded) return new Response("no plan\n", { status: 400 });
 		const plan = atob(encoded);
 		const container = await this.ensureRunning();
+
+		if (kind === "ancestry" || kind === "index") {
+			const check = await container.exec(["newgit", `endpoint-${kind}`], {
+				stdin: new Response(plan).body!,
+				stdout: "pipe",
+				stderr: "pipe",
+			});
+			const checked = await check.output();
+			if (checked.exitCode !== 0) {
+				console.error(`endpoint-${kind} failed`, new TextDecoder().decode(checked.stderr).trim());
+				return new Response("newgit could not check the merge's pins; the remote logged why\n", { status: 502 });
+			}
+			return new Response(checked.stdout, { headers: { "content-type": "application/json" } });
+		}
 
 		const compose = await container.exec(["newgit", "endpoint-compose"], {
 			stdin: new Response(plan).body!,
