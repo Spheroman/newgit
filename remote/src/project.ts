@@ -322,9 +322,11 @@ export class ProjectDO extends DurableObject<Env> {
 		return tokens;
 	}
 
-	/** A look found something to land. */
-	markPeeked(pull: MirrorPull): void {
-		this.writePulls(this.pulls().map((known) => (samePull(known, pull) ? { ...known, peeked: true } : known)));
+	/** A look found something to land, and this is whose work it may hold. */
+	markPeeked(pull: MirrorPull, instances: MirrorInstance[]): void {
+		this.writePulls(
+			this.pulls().map((known) => (samePull(known, pull) ? { ...known, peeked: true, instances } : known)),
+		);
 	}
 
 	notePullTokens(pull: MirrorPull, tokens: { repo: string; artifactsId: string }[]): void {

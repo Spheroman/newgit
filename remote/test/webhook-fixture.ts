@@ -32,6 +32,19 @@ export const setAnswers = (next: Answer[]) => {
 export const setLooks = (next: Answer[]) => {
 	looks = next;
 };
+/** What GitHub answers `/commits/{sha}/pulls` with, by commit; unset is no pull request. */
+let github: (commit: string) => Response;
+export const setGitHub = (next: (commit: string) => Response) => {
+	github = next;
+};
+/** The commits GitHub was asked about. */
+export let asked: string[];
+const githubFetch = (async (input: RequestInfo | URL) => {
+	const commit = String(input).match(/\/commits\/([0-9a-f]+)\/pulls$/)?.[1] ?? "";
+	asked.push(commit);
+	return github(commit);
+}) as typeof fetch;
+
 /** The plans the container was asked to land, and to look at. */
 export let plans: PullPlan[];
 export let peeks: PullPlan[];
@@ -55,7 +68,7 @@ const pull: Deps["pull"] = async (_project, plan, credentials) => {
 
 export const deps = (): Deps => ({
 	repos,
-	fetcher: fetch,
+	fetcher: githubFetch,
 	waitUntil: () => {},
 	endpoint: noEndpoint,
 	pull,
@@ -94,6 +107,8 @@ export const push = (overrides: Record<string, unknown> = {}) => ({
 	after: THEIRS,
 	repository: { full_name: "Spheroman/newgit", private: false },
 	pusher: { name: "jack" },
+	commits: [{ id: THEIRS }],
+	head_commit: { message: "A change (#7)" },
 	...overrides,
 });
 
@@ -131,6 +146,8 @@ beforeEach(async () => {
 	repos = new FakeRepos();
 	answers = [];
 	looks = [];
+	github = () => Response.json([]);
+	asked = [];
 	plans = [];
 	peeks = [];
 	started = [];

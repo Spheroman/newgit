@@ -1,10 +1,12 @@
 import { runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
 import { describe, expect, it, vi } from "vitest";
 
-import { CHECKING, type MirrorInstance } from "../src/endpoint";
-import { PULL_ATTEMPTS, implicated } from "../src/webhook";
+import { CHECKING } from "../src/endpoint";
+import { PULLS_ASKED, PULL_ATTEMPTS } from "../src/webhook";
 import {
+	THEIRS,
 	advance,
+	asked,
 	call,
 	deliver,
 	index,
@@ -16,6 +18,7 @@ import {
 	push,
 	repos,
 	setAnswers,
+	setGitHub,
 	setLooks,
 	sha,
 	stub,
@@ -113,54 +116,156 @@ describe("`main` not being what the pull began from", () => {
 	});
 });
 
-describe("work only an instance holds", () => {
-	const instance = (name: string): MirrorInstance => ({ name, pins: { t3code: sha("7") } });
+/** A pull request from this repo's branch `ref`. */
+const pullRequest = (ref: string, repo = "Spheroman/newgit") => ({ head: { ref, repo: { full_name: repo } } });
 
-	it("names the instance a merge commit says it came from", () => {
-		const all = [instance("feature-x"), instance("other")];
-		expect(implicated("Merge pull request #7 from Spheroman/feature/x\n\nbody", all)).toEqual([all[0]]);
-		expect(implicated("Merge pull request #7 from Spheroman/unknown", all)).toEqual([]);
+/** An instance with a fork of `tracker`, and a checkpoint saying what it holds. */
+async function instanceWith(instance: string, tracker = "t3code") {
+	await call(jack, "POST", path("/instances"), { name: instance, base_rev: "x" });
+	await stub().startFork(instance, tracker);
+	await stub().completeFork(instance, tracker);
+	await call(jack, "PUT", path(`/checkpoints/${instance}/one`), { record: { code: { head: { [tracker]: sha("7") } } } });
+}
+
+const holding = (instance: string) => ({ name: instance, pins: { t3code: sha("7") } });
+const landed = { outcome: "landed", list: merged, commits: 1 } as const;
+
+describe("whose withheld work a commit may hold", () => {
+	it("lands an unrelated squash while another instance holds withheld work", async () => {
+		await instanceWith("feature");
+		setGitHub(() => Response.json([pullRequest("other")]));
+		setAnswers([landed]);
+		await deliver();
+		expect(asked).toEqual([THEIRS]);
+		expect(plans[0].instances).toEqual([]);
+		expect((await index()).root).toBe(sha("f"));
 	});
 
-	it("counts every instance when the commit does not say: a squash", () => {
-		const all = [instance("feature-x"), instance("other")];
-		expect(implicated("A change (#7)", all)).toEqual(all);
-		expect(implicated(undefined, all)).toEqual(all);
-	});
-
-	it("hands the container the instance's withheld pins from its last checkpoint", async () => {
-		await call(jack, "POST", path("/instances"), { name: "feature", base_rev: "x" });
-		await stub().startFork("feature", "t3code");
-		await stub().completeFork("feature", "t3code");
-		await call(jack, "PUT", path("/checkpoints/feature/one"), { record: { code: { head: { t3code: sha("7") } } } });
-		setLooks([{ outcome: "refused", why: "run `newgit merge feature`, then redeliver this event" }]);
+	it("checks the instance whose squash this is", async () => {
+		await instanceWith("feature");
+		await instanceWith("other");
+		setGitHub(() => Response.json([pullRequest("feature")]));
+		setAnswers([{ outcome: "refused", why: "run `newgit merge feature`, then redeliver this event" }]);
 		const logged = vi.spyOn(console, "error").mockImplementation(() => {});
-		await deliver({
-			payload: push({ head_commit: { message: "Merge pull request #7 from Spheroman/feature" } }),
-		});
-		expect(peeks[0].instances).toEqual([{ name: "feature", pins: { t3code: sha("7") } }]);
+		await deliver();
+		expect(plans[0].instances, "only that instance").toEqual([holding("feature")]);
 		expect(logged.mock.calls.flat().join("\n")).toContain("newgit merge feature");
 		logged.mockRestore();
 		expect(await index()).toEqual(main);
 		expect((await startMerge()).status, "nothing locked").toBe(200);
 	});
 
+	it("matches a branch to its instance's slug", async () => {
+		await instanceWith("feature-x");
+		setGitHub(() => Response.json([pullRequest("Feature/X")]));
+		await deliver();
+		expect(plans[0].instances).toEqual([holding("feature-x")]);
+	});
+
+	it("lands a direct push: no pull request, no instance", async () => {
+		await instanceWith("feature");
+		setAnswers([landed]);
+		await deliver();
+		expect(asked).toEqual([THEIRS]);
+		expect(plans[0].instances).toEqual([]);
+		expect((await index()).root).toBe(sha("f"));
+	});
+
+	it("does not take a fork's branch for an instance of the same name", async () => {
+		await instanceWith("feature");
+		setGitHub(() => Response.json([pullRequest("feature", "Someone/newgit")]));
+		await deliver();
+		expect(plans[0].instances).toEqual([]);
+	});
+
+	it("counts a pull request not marked merged yet: the event can beat the mark", async () => {
+		await instanceWith("feature");
+		setGitHub(() => Response.json([{ ...pullRequest("feature"), merged_at: null }]));
+		await deliver();
+		expect(plans[0].instances).toEqual([holding("feature")]);
+	});
+
+	it("asks about every commit the event landed", async () => {
+		await instanceWith("feature");
+		setGitHub((commit) => Response.json(commit === sha("c") ? [pullRequest("feature")] : []));
+		await deliver({ payload: push({ commits: [{ id: sha("c") }, { id: THEIRS }] }) });
+		expect([...asked].sort()).toEqual([THEIRS, sha("c")].sort());
+		expect(plans[0].instances).toEqual([holding("feature")]);
+	});
+
+	it("takes a merge commit's subject at its word, and spends no call", async () => {
+		await instanceWith("feature");
+		await instanceWith("other");
+		await deliver({ payload: push({ head_commit: { message: "Merge pull request #7 from Spheroman/feature\n\nbody" } }) });
+		expect(asked).toEqual([]);
+		expect(plans[0].instances).toEqual([holding("feature")]);
+	});
+
+	it("spends no call when no instance holds withheld work", async () => {
+		await instanceWith("shipped", "root");
+		await deliver();
+		expect(asked).toEqual([]);
+		expect(plans[0].instances).toEqual([]);
+	});
+
+	it("spends no call on an event for our own export", async () => {
+		await instanceWith("feature");
+		setLooks([{ outcome: "nothing" }]);
+		await deliver();
+		expect(asked).toEqual([]);
+		expect(plans).toEqual([]);
+	});
+
 	it("reads a fork with no checkpoint as work", async () => {
 		await call(jack, "POST", path("/instances"), { name: "feature", base_rev: "x" });
 		await stub().startFork("feature", "t3code");
 		await stub().completeFork("feature", "t3code");
-		setLooks([{ outcome: "nothing" }]);
+		setGitHub(() => Response.json([pullRequest("feature")]));
 		await deliver();
-		expect(peeks[0].instances).toEqual([{ name: "feature", pins: { t3code: "" } }]);
-	});
-
-	it("ignores an instance that forked only what the mirror ships", async () => {
-		await call(jack, "POST", path("/instances"), { name: "feature", base_rev: "x" });
-		await stub().startFork("feature", "root");
-		await stub().completeFork("feature", "root");
-		setLooks([{ outcome: "nothing" }]);
-		await deliver();
-		expect(peeks[0].instances).toEqual([]);
+		expect(plans[0].instances).toEqual([{ name: "feature", pins: { t3code: "" } }]);
 	});
 });
 
+describe("when GitHub cannot say", () => {
+	const failing: [string, () => Response][] = [
+		["a rate limit", () => new Response("rate limited", { status: 403 })],
+		["a 5xx", () => new Response("down", { status: 503 })],
+		["a private repo", () => new Response("not found", { status: 404 })],
+		[
+			"no connection",
+			() => {
+				throw new Error("the network went away");
+			},
+		],
+	];
+
+	it.each(failing)("counts every instance on %s, says why, and a redelivery can land it", async (_case, answer) => {
+		await instanceWith("feature");
+		await instanceWith("other");
+		setGitHub(answer);
+		setAnswers([{ outcome: "refused", why: "may hold `feature`'s work: redeliver this event" }]);
+		const logged = vi.spyOn(console, "error").mockImplementation(() => {});
+		await deliver();
+		expect(plans[0].instances).toEqual([holding("feature"), holding("other")]);
+		expect(logged.mock.calls.flat().join("\n")).toContain("GitHub could not say");
+		logged.mockRestore();
+		expect(await index()).toEqual(main);
+		expect(await stub().pulls(), "finished, so a redelivery starts over").toEqual([]);
+
+		setGitHub(() => Response.json([pullRequest("nobody")]));
+		setAnswers([landed]);
+		await deliver();
+		expect(plans[1].instances).toEqual([]);
+		expect((await index()).root).toBe(sha("f"));
+	});
+
+	it("does not ask about more commits than it may", async () => {
+		await instanceWith("feature");
+		const logged = vi.spyOn(console, "error").mockImplementation(() => {});
+		const commits = Array.from({ length: PULLS_ASKED + 1 }, (_, n) => ({ id: n.toString(16).padStart(40, "0") }));
+		await deliver({ payload: push({ commits }) });
+		logged.mockRestore();
+		expect(asked).toEqual([]);
+		expect(plans[0].instances).toEqual([holding("feature")]);
+	});
+});

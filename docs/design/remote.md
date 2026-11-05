@@ -683,9 +683,19 @@ on its fork and not on the mirror. Landing the merged pull request would keep
 the rest of that commit and lose the edit without a word, so it is refused,
 saying to run `newgit merge <instance>` and redeliver the event. A mirror's
 branch is named for its instance, but a push to `main` does not say which
-branch it merged: the name comes from the subject of GitHub's merge commit.
-A squash, a rebase, or an edited subject has no name, and then every instance
-with such work counts, so an unrelated squash is refused while one exists.
+branch it merged. Once a look has found work to land, and only if some
+instance holds withheld work at all, the subject of GitHub's merge commit
+says; a squash, which is how most pull requests merge, has no such subject,
+so `GET /repos/{owner}/{repo}/commits/{sha}/pulls` does, for each commit the
+event landed, and each pull request's `head.ref` names an instance. Only
+those instances are checked, so an unrelated squash lands while another
+instance holds such work. A pull request listed there counts whether or not
+it is marked merged yet, because the event can beat the mark. One from a fork
+does not. No pull request means a direct push, which has no instance, and
+lands. If GitHub cannot answer (a rate limit, a 5xx, more than 20 commits),
+that is logged and every instance with such work counts, which is the one
+case that does; the refusal can be redelivered. Those calls are
+unauthenticated, 60 an hour across whatever shares the Worker's address.
 The instance's pins come from its last checkpoint, and only the forks it made
 of withheld trackers are looked at; the container asks whether each pin is on
 that tracker's `main`, so an instance merely behind `main`, or already merged,

@@ -54,8 +54,13 @@ export interface MirrorPull {
 	pusher: string;
 	/** The trackers this pull may change: what the pusher maintains. */
 	writable: string[];
-	/** Instances whose withheld work may be behind this commit (`implicated`). */
-	instances: MirrorInstance[];
+	/** What the event says landed, and the subject of its last commit: which instance it was. */
+	commits: string[];
+	subject?: string;
+	/** The trackers the mirror withholds. */
+	withheld: string[];
+	/** Instances whose withheld work this may hold, known once a look found work. */
+	instances?: MirrorInstance[];
 	queuedAt: number;
 	attempts: number;
 	/** A look found something to land. */
@@ -97,19 +102,70 @@ function instanceSlug(branch: string): string {
 		.replace(/^-+|-+$/g, "");
 }
 
+/** The most commits one event asks GitHub about; past it, nobody can say. */
+export const PULLS_ASKED = 20;
+
+/** How long GitHub gets to say which pull request a commit came from. */
+const GITHUB_TIMEOUT_MS = 10_000;
+
+/** The branch GitHub's merge commit subject names, if it is one. */
+function mergedBranch(subject: string | undefined): string | undefined {
+	return subject?.match(/^Merge pull request #\d+ from [^/\s]+\/(\S+)/)?.[1];
+}
+
 /**
- * The instances whose withheld work may be behind a commit on the mirror. A
- * mirror's branch is named for its instance, and a push to `main` does not
- * say which branch it merged, so that name comes from GitHub's merge commit
- * subject. A squash, a rebase, or an edited subject has no name, and then
- * every instance with such work counts: a refusal that says so beats work
- * that silently goes missing.
+ * The branches of the pull requests `commits` came from, as GitHub says. Any
+ * pull request listed counts, marked merged or not: the push event can beat
+ * that mark, and missing the pull request would land work without what it
+ * holds. One from a fork does not: its branch names no instance here. Throws
+ * when GitHub cannot answer.
  */
-export function implicated(message: string | undefined, instances: MirrorInstance[]): MirrorInstance[] {
-	const branch = message?.match(/^Merge pull request #\d+ from [^/\s]+\/(\S+)/)?.[1];
-	if (branch === undefined) return instances;
-	const slug = instanceSlug(branch);
-	return instances.filter((instance) => instance.name === slug);
+async function pullRequestBranches(fetcher: typeof fetch, repo: string, commits: string[]): Promise<string[]> {
+	if (commits.length > PULLS_ASKED) throw new Error(`${commits.length} commits is too many to ask about`);
+	const asked = await Promise.all(
+		commits.map(async (commit) => {
+			const response = await fetcher(`https://api.github.com/repos/${repo}/commits/${commit}/pulls`, {
+				headers: { accept: "application/vnd.github+json", "user-agent": "newgit-remote" },
+				signal: AbortSignal.timeout(GITHUB_TIMEOUT_MS),
+			});
+			if (!response.ok) throw new Error(`GitHub answered ${response.status} for ${commit}`);
+			return (await response.json()) as { head?: { ref?: string; repo?: { full_name?: string } | null } }[];
+		}),
+	);
+	return asked
+		.flat()
+		.filter((pull) => pull.head?.repo?.full_name?.toLowerCase() === repo.toLowerCase())
+		.flatMap((pull) => pull.head?.ref ?? []);
+}
+
+/**
+ * The instances among `work` whose withheld work this pull's commits may
+ * hold. A mirror's branch is named for its instance, and a push to `main`
+ * does not say which branch it merged, so GitHub's merge subject says, or
+ * else GitHub. No pull request means a direct push: no instance. Only when
+ * GitHub cannot answer does every instance count, and the refusal that
+ * follows can be redelivered.
+ */
+export async function implicated(
+	deps: Deps,
+	pull: Pick<MirrorPull, "repo" | "commit" | "commits" | "subject">,
+	work: MirrorInstance[],
+): Promise<MirrorInstance[]> {
+	if (work.length === 0) return [];
+	let branches: string[];
+	const named = mergedBranch(pull.subject);
+	if (named !== undefined) branches = [named];
+	else {
+		try {
+			branches = await pullRequestBranches(deps.fetcher, pull.repo, [...new Set([...pull.commits, pull.commit])]);
+		} catch (error) {
+			const why = error instanceof Error ? error.message : String(error);
+			console.error(JSON.stringify({ webhook: "GitHub could not say which pull request this is", repo: pull.repo, commit: pull.commit, why }));
+			return work;
+		}
+	}
+	const slugs = new Set(branches.map(instanceSlug));
+	return work.filter((instance) => slugs.has(instance.name));
 }
 
 interface Target {
@@ -164,6 +220,7 @@ export async function githubWebhook(request: Request, env: Env, deps: Deps): Pro
 		repository?: { full_name?: string; private?: boolean };
 		pusher?: { name?: string };
 		head_commit?: { message?: string };
+		commits?: { id?: string }[];
 	};
 	try {
 		payload = JSON.parse(new TextDecoder().decode(raw));
@@ -235,7 +292,9 @@ export async function githubWebhook(request: Request, env: Env, deps: Deps): Pro
 		commit,
 		pusher,
 		writable,
-		instances: implicated(payload.head_commit?.message, await project.withheldWork(withheld)),
+		commits: (payload.commits ?? []).flatMap((pushed) => pushed.id ?? []),
+		...(payload.head_commit?.message === undefined ? {} : { subject: payload.head_commit.message }),
+		withheld,
 		queuedAt: Date.now(),
 		attempts: 0,
 	});
@@ -291,6 +350,7 @@ async function advance(env: Env, deps: Deps, id: ProjectId, pull: MirrorPull): P
 	const key = projectKey(id);
 	const project = projectStub(env, id);
 	const log = { project: key, target: pull.target, commit: pull.commit, pusher: pull.pusher };
+	let instances = pull.instances ?? [];
 	const plan = (list: Record<string, string>): PullPlan => ({
 		dir: "/work",
 		repos: Object.fromEntries(
@@ -303,7 +363,7 @@ async function advance(env: Env, deps: Deps, id: ProjectId, pull: MirrorPull): P
 		writable: pull.writable,
 		target: pull.target,
 		mirror: { url: `https://github.com/${pull.repo}.git`, branch: pull.branch, commit: pull.commit },
-		instances: pull.instances,
+		instances,
 	});
 	const mint = async (list: Record<string, string>, scope: (tracker: string) => "read" | "write") => {
 		const handed = [];
@@ -335,7 +395,9 @@ async function advance(env: Env, deps: Deps, id: ProjectId, pull: MirrorPull): P
 		});
 		if (isChecking(seen)) return false;
 		if (seen.outcome === "nothing" || seen.outcome === "refused") return ended(seen);
-		await project.markPeeked(pull);
+		// Asked only now: our own exports end above, and cost GitHub no call.
+		instances = await implicated(deps, pull, await project.withheldWork(pull.withheld));
+		await project.markPeeked(pull, instances);
 	}
 
 	const begun = await project.beginPull(pull, PULL_LOCK_SECONDS);
