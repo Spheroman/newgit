@@ -23,8 +23,6 @@ interface MergeLock {
 	until: string;
 	/** The index the merge began with: every pin in it was checked then. */
 	target?: TrackerList;
-	/** The trackers the merge declared when it began: all it may move. */
-	trackers?: string[];
 	/** Write passwords handed out for it. */
 	tokens?: { repo: string; artifactsId: string }[];
 }
@@ -188,8 +186,7 @@ export class ProjectDO extends DurableObject<Env> {
 		base: TrackerList,
 		by: string,
 		seconds: number,
-		trackers: string[],
-		target?: TrackerList,
+		target: TrackerList,
 	): MergeStart {
 		const branch = this.branch(name);
 		if (branch === null) return { ok: false, reason: "missing" };
@@ -204,7 +201,7 @@ export class ProjectDO extends DurableObject<Env> {
 		this.sql.exec(
 			"INSERT OR REPLACE INTO meta VALUES (?, ?)",
 			`merge:${name}`,
-			JSON.stringify({ by, until, trackers, target, tokens: [] }),
+			JSON.stringify({ by, until, target, tokens: [] }),
 		);
 		return { ok: true, until, stale };
 	}
@@ -239,15 +236,10 @@ export class ProjectDO extends DurableObject<Env> {
 		return { ok: true, branch: this.branch(name)!, tokens: lock.tokens ?? [] };
 	}
 
-	/** Whether the merge in flight into `name` declared `tracker` when it began. */
 	/** Whether `list` is exactly the index the merge in flight into `name` began with. */
 	mergeTargets(name: string, list: TrackerList): boolean {
 		const target = this.mergeLock(name)?.target;
 		return target !== undefined && sameList(target, list);
-	}
-
-	mergeDeclares(name: string, tracker: string): boolean {
-		return this.mergeLock(name)?.trackers?.includes(tracker) ?? false;
 	}
 
 	private mergeLock(name: string): MergeLock | null {

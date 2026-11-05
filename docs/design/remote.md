@@ -408,7 +408,7 @@ branches.
 A tracker outside Git the remote has no definition for yet is left out of the
 sync instead of failing it, with a warning that names it and quotes why.
 That is a new tracker: the remote reads its audience from its definition on
-the default branch, and the push that carries the definition is the one
+`access`'s `main`, and the push that carries the definition is the one
 being checkpointed. The remote answers 404 for it, not 403, because it is
 an absence a later checkpoint can fill; a 403 (not a member, not in the
 audience) still fails the sync. The record that goes up leaves the tracker
@@ -511,11 +511,15 @@ with the index it was based on and the index it will make. The Worker has
 the Git endpoint's container (which runs Git) say how each child's pin moves
 along that child's history: forward along its `main` needs only root's
 maintainers; back, sideways, or off `main` needs the child's, who get a
-write password for its `main`. Root always needs its own. Before the new
+write password for it. A merge into `main` moves that child's `main` to
+catch up; a merge into another branch keeps the child's commit on the
+child's branch of that name and moves no child's `main`. Root always needs
+its own. Before the new
 index is written, the container checks root's pushed commit pins exactly
 that, and the merge may finish only with the index it began with. It pushes each moved tracker's commit with
 passwords minted for that merge, moves root's ref by one compare-and-swap,
-catches each child's `main` up with what root now pins, and finishes by
+catches each child's `main` up with what root now pins (on a merge into
+`main`), and finishes by
 writing the branch's list in the project's Durable Object as an index. (The
 Worker's Artifacts binding cannot write refs, so the merge's Git work is the
 merger's; root's ref is the truth and the list says which repos to fetch.)

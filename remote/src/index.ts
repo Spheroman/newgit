@@ -314,7 +314,7 @@ async function route(request: Request, env: Env, deps: Deps): Promise<Response> 
 			throw new HttpError(400, `\`${repo}\` is not one of ${key}'s repos`);
 		if (caller.instance !== undefined && scope === "write" && ref.kind === "fork")
 			requireThisInstance(caller, ref.instance);
-		return json(await credential(env, deps, project, info.defaultBranch, ref, scope, caller, member));
+		return json(await credential(env, deps, project, ref, scope, caller, member));
 	}
 
 	// Deleting a project takes everything with it. Its record goes first, so
@@ -380,7 +380,7 @@ async function route(request: Request, env: Env, deps: Deps): Promise<Response> 
 		if (!tracker) throw new HttpError(400, "name is required");
 		requirePart("tracker name", tracker);
 		await requireGovernor(deps, id, info, { login, member }, tracker, await listedTrackers(project));
-		const defined = await definitionFacts(deps.repos, id, info.defaultBranch, tracker, await listedTrackers(project));
+		const defined = await definitionFacts(deps.repos, id, tracker, await listedTrackers(project));
 		if (defined !== undefined && !defined.git)
 			throw new HttpError(400, `\`${tracker}\` is not in Git; its repo is made by its first sync`);
 		const ref: RepoRef = { kind: "tracker", project: id, tracker };
@@ -431,8 +431,9 @@ async function route(request: Request, env: Env, deps: Deps): Promise<Response> 
 		// container: a move forward along that tracker's own `main` changes
 		// only root, so root's maintainers may make it; anything else — back,
 		// sideways, or to a commit `main` does not have — is that tracker's
-		// maintainers' to make, and a commit off `main` means its `main` moves
-		// too, so they get a write password for it. Without the container
+		// maintainers' to make, and a commit off `main` gets them a write
+		// password for that tracker: a merge into `main` moves its `main` to
+		// catch up, one into another branch its branch of that name. Without the container
 		// (a test, or one that cannot start), every move counts as not
 		// forward: the safe answer.
 		const children = trackers.filter((tracker) => tracker !== "root" && tracker in base && tracker in list);
@@ -453,7 +454,7 @@ async function route(request: Request, env: Env, deps: Deps): Promise<Response> 
 		const who = { login, member };
 		const writes: string[] = [];
 		for (const tracker of trackers) {
-			const facts = await definitionFacts(deps.repos, id, info.defaultBranch, tracker, await listedTrackers(project));
+			const facts = await definitionFacts(deps.repos, id, tracker, await listedTrackers(project));
 			const dropped = !(tracker in list);
 			if (!(tracker in base)) {
 				// New to the branch: its definition lands with this very merge
@@ -474,7 +475,7 @@ async function route(request: Request, env: Env, deps: Deps): Promise<Response> 
 				if (dropped) continue;
 				throw new HttpError(
 					400,
-					`\`${tracker}\` is not defined on \`${info.defaultBranch}\`: a new tracker in Git joins by its own seeded repo`,
+					`\`${tracker}\` is not defined on \`access\`'s \`main\`: a new tracker in Git joins by its own seeded repo`,
 				);
 			}
 			if (!facts.git) throw new HttpError(400, `\`${tracker}\` is not in Git; \`newgit merge\` never carries it`);
@@ -496,7 +497,7 @@ async function route(request: Request, env: Env, deps: Deps): Promise<Response> 
 			}
 			if (tracker === "root" || (!dropped && answer?.onMain !== true)) writes.push(tracker);
 		}
-		const started = await project.beginMerge(branch, base, login, MERGE_LOCK_SECONDS, trackers, list);
+		const started = await project.beginMerge(branch, base, login, MERGE_LOCK_SECONDS, list);
 		if (!started.ok) {
 			if (started.reason === "missing") throw new HttpError(404, `no branch \`${branch}\` in ${key}`);
 			if (started.reason === "moved")
@@ -569,7 +570,7 @@ async function route(request: Request, env: Env, deps: Deps): Promise<Response> 
 						plan.repos[tracker] = { url: deps.repos.url(name), auth: `Authorization: Basic ${btoa(`x:${minted.password}`)}` };
 					}
 					const checked = await deps.index(key, plan);
-					if (!checked.matches)
+					if (checked.matches !== true)
 						throw new HttpError(
 							400,
 							"root's commit on the branch does not pin what this index says: push the root commit the merge made, then finish",
@@ -634,8 +635,8 @@ async function route(request: Request, env: Env, deps: Deps): Promise<Response> 
 		if (instance === null || !visibleTo(instance, login)) throw new HttpError(404, `no instance \`${name}\` in ${key}`);
 		requireOwner(instance.owner, login, `fork for \`${name}\``);
 		requireThisInstance(caller, name);
-		const facts = await definitionFacts(deps.repos, id, info.defaultBranch, tracker, await listedTrackers(project));
-		if (facts === undefined) throw new HttpError(404, `tracker \`${tracker}\` is not defined on ${key}'s default branch`);
+		const facts = await definitionFacts(deps.repos, id, tracker, await listedTrackers(project));
+		if (facts === undefined) throw new HttpError(404, `tracker \`${tracker}\` is not defined on ${key}'s \`access\` \`main\``);
 		if (!facts.git) throw new HttpError(400, `\`${tracker}\` is not in Git; instances do not fork it`);
 		const fork = repoName({ kind: "fork", project: id, instance: name, tracker });
 		let remote = await deps.repos.remote(fork);
@@ -761,12 +762,11 @@ async function gitEndpoint(request: Request, env: Env, deps: Deps, match: RegExp
 	if (!main?.root) throw new HttpError(404, `${key} has no \`${info.defaultBranch}\` branch yet`);
 
 	// Policy, read as the remote reads it: each definition from the tracker
-	// that owns its file, at the default branch. Shape (pins, mounts) is the
+	// that owns its file, at that tracker's `main`. Shape (pins, mounts) is the
 	// container's to read from the commits themselves.
 	const facts = await loadDefinitions(
 		deps.repos,
 		id,
-		info.defaultBranch,
 		branches.flatMap((branch) => Object.keys(branch.list)),
 	);
 	const readable = (tracker: string) => {
@@ -854,7 +854,6 @@ async function credential(
 	env: Env,
 	deps: Deps,
 	project: DurableObjectStub<ProjectDO>,
-	defaultBranch: string,
 	ref: RepoRef,
 	scope: "read" | "write",
 	caller: Caller,
@@ -867,12 +866,12 @@ async function credential(
 		facts.instanceOwner = instance?.owner;
 		facts.instancePrivate = instance?.private;
 	}
-	facts.tracker = await definitionFacts(deps.repos, ref.project, defaultBranch, ref.tracker, await listedTrackers(project));
+	facts.tracker = await definitionFacts(deps.repos, ref.project, ref.tracker, await listedTrackers(project));
 	// Not a refusal but an absence, as on the fork route: a client may wait
 	// for the definition to land (a checkpoint leaves the tracker for later),
 	// while a 403 is a "no" it must not wait out.
 	if (facts.tracker === undefined)
-		throw new HttpError(404, `tracker \`${ref.tracker}\` is not defined on ${projectKey(ref.project)}'s default branch`);
+		throw new HttpError(404, `tracker \`${ref.tracker}\` is not defined on ${projectKey(ref.project)}'s \`access\` \`main\``);
 
 	const decision = decide(ref, scope, who, facts);
 	if (!decision.ok) throw new HttpError(403, decision.reason);
@@ -1029,9 +1028,11 @@ function ownerOf(facts: Map<string, TrackerFacts>, path: string): string | undef
 async function loadDefinitions(
 	repos: Repos,
 	project: ProjectId,
-	branch: string,
 	names: Iterable<string>,
 ): Promise<Map<string, TrackerFacts>> {
+	// Policy is each definition holder's own `main` (`access`'s, or the
+	// governing tracker's), whatever the project's default branch is called.
+	const branch = "main";
 	const all = new Set<string>(["root", "access", ...names]);
 	const file = (name: string) => `${ACCESS_MOUNT}/${name}.toml`;
 	const source = new Map<string, { tracker: string; mount: string }>(
@@ -1081,7 +1082,7 @@ async function governs_(
 	tracker: string,
 	listed: Iterable<string>,
 ): Promise<boolean> {
-	const definitions = await loadDefinitions(deps.repos, id, info.defaultBranch, [tracker, ...listed]);
+	const definitions = await loadDefinitions(deps.repos, id, [tracker, ...listed]);
 	const governor = definitions.get(tracker)?.source ?? "access";
 	const facts = definitions.get(governor) ?? implicitFacts("access")!;
 	return mayMaintain(facts.maintainers, who, info.owner, governor).ok;
@@ -1111,11 +1112,10 @@ async function listedTrackers(project: DurableObjectStub<ProjectDO>): Promise<st
 async function definitionFacts(
 	repos: Repos,
 	project: ProjectId,
-	branch: string,
 	tracker: string,
 	listed: Iterable<string> = [],
 ): Promise<TrackerFacts | undefined> {
-	return (await loadDefinitions(repos, project, branch, [tracker, ...listed])).get(tracker);
+	return (await loadDefinitions(repos, project, [tracker, ...listed])).get(tracker);
 }
 
 /** Accept a bare repo name or anything ending in `/<repo>.git` (what a credential helper sees). */

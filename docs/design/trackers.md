@@ -597,7 +597,9 @@ moves (see *On the remote*).
    along the child's `main` changes only root, so root's maintainers may
    make it. Any other move — back, sideways, or to a commit `main` does not
    have — is the child's maintainers' to make, and a commit off `main` gets
-   them a write password for the child's `main`, which catches up (step 3).
+   them a write password for the child: on a merge into `main` its `main`
+   catches up (step 3); on a merge into another branch the child's commit
+   goes to the child's branch of that name, and no child's `main` moves.
    Root always needs its own maintainers. A tracker leaving the index needs
    its maintainers, unless nothing defines it any more (the migration
    dropping `project`); one joining needs whoever governs its definition.
@@ -795,7 +797,8 @@ needs their paths, but maintained by admins); and a tracker of yours
 claiming the admin tracker's. Everything else in `.newgit/` — resources,
 scripts, config, exports — is root's, which anyone who merges may change.
 The remote reads each definition from the tracker that owns its file, at
-the default branch, to a fixed point.
+that tracker's own `main` (whatever the project's default branch is called),
+to a fixed point.
 *(Not enforced for trackers outside Git yet, and open: the remote gives a
 write credential for the repo of a tracker outside Git to anyone in its
 audience, and that credential can push the repo's `main` directly. For
@@ -875,9 +878,21 @@ commit, no view history is rewritten **(decided)**:
 
 Nothing old is deleted: the store's old tracker refs move under
 `refs/newgit-premigration/`, and the project repo's old notes with them. On
-the remote it force-pushes every tracker repository and rewrites each
-branch's list as the new index. Jack is the only user, so no compatibility
-path is kept; `--dry-run` says what would move.
+the remote it moves every branch: `main` to the carve's index, each other
+branch to the root commit its old list was (a branch whose old list names no
+view this machine split is refused, by name, before anything is pushed),
+pushing each tracker repository on what it holds now. Jack is the only user,
+so no compatibility path is kept; `--dry-run` says what would move.
+
+It resumes. The carve and its split are made once and kept under
+`refs/newgit-migrating/` until the end, so a run stopped part way (the
+remote failing as the merge finishes, a checkpoint write dropping, the local
+ref transaction failing after the remote moved) is finished by running it
+again, with the same commits: a list already at its new index is left alone,
+a ref already at its target is not pushed, a checkpoint already naming root
+commits is not rewritten, and the local steps after the store moves repeat
+safely. A checkpoint this login may not rewrite (someone else's instance) is
+named and skipped.
 
 ## The t3code milestone on this design
 
