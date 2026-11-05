@@ -1212,8 +1212,63 @@ impl GitSource {
         };
         match attempt(expected.unwrap_or("")) {
             Ok(()) => Ok(()),
-            Err(error) => attempt(commit).map_err(|_| error),
+            Err(error) => {
+                let Some((size, limit)) = too_large(&error) else {
+                    return attempt(commit).map_err(|_| error);
+                };
+                // Too big for one push (Artifacts takes 64 MiB at a time): send
+                // the history in steps first, then the same leased push, which
+                // now has nothing left to send but the last step.
+                let staged =
+                    Self::push_in_steps(location, url, commit, expected, auth, size, limit);
+                let result = staged.and_then(|()| {
+                    attempt(expected.unwrap_or(""))
+                        .or_else(|error| attempt(commit).map_err(|_| error))
+                });
+                let _ = Self::push_refs(location, url, &[format!(":{STAGING_REF}")], auth);
+                result
+            }
         }
+    }
+
+    /// Send `commit`'s history to `url` in steps along its first-parent line,
+    /// each on [`STAGING_REF`], so that no one push is over the remote's
+    /// limit. The steps start from the reported `size` against `limit` and
+    /// halve whenever the remote still refuses one. Stops one short of
+    /// `commit`: the caller's own push sends that, leased as it always is.
+    fn push_in_steps(
+        location: &[&str],
+        url: &str,
+        commit: &str,
+        base: Option<&str>,
+        auth: Option<&str>,
+        size: f64,
+        limit: f64,
+    ) -> Result<()> {
+        let mut args: Vec<&str> = location.to_vec();
+        args.extend(["rev-list", "--first-parent", "--reverse", commit]);
+        if let Some(base) = base.filter(|base| !base.is_empty()) {
+            args.extend(["--not", base]);
+        }
+        let chain: Vec<String> = run_git_env(&args, &[])?
+            .lines()
+            .map(ToOwned::to_owned)
+            .collect();
+        // Aim well under the limit: the steps are by commit count, and
+        // commits are not all the same size.
+        let pieces = ((size / (limit * 0.5)).ceil() as usize).max(2);
+        let mut step = (chain.len() / pieces).max(1);
+        let mut pushed = 0;
+        while pushed + 1 < chain.len() {
+            let upto = (pushed + step).min(chain.len() - 1);
+            let refspec = format!("+{}:{STAGING_REF}", chain[upto - 1]);
+            match Self::push_refs(location, url, &[refspec], auth) {
+                Ok(()) => pushed = upto,
+                Err(error) if too_large(&error).is_some() && step > 1 => step /= 2,
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(())
     }
 
     /// The commit `reference` names in the repository at `url`, or `None`
@@ -1300,6 +1355,33 @@ fn export_identity(destination: &Utf8Path) -> Vec<(String, String)> {
             ]
         })
         .collect()
+}
+
+/// Where a push too big for the remote is staged step by step, deleted
+/// once the real push lands.
+const STAGING_REF: &str = "refs/heads/newgit-staging";
+
+/// When the remote refused a push for its size, the size and the limit in
+/// MiB, as Artifacts reports them (`push is 364.7 MiB, limit is 64.0 MiB`).
+/// Either unknown is taken as twice the limit, and 64 MiB.
+fn too_large(error: &NewgitError) -> Option<(f64, f64)> {
+    let NewgitError::SourceCommand { stderr, .. } = error else {
+        return None;
+    };
+    let at = stderr.find("request_too_large")?;
+    let rest = &stderr[at..];
+    let number = |after: &str| -> Option<f64> {
+        rest.split(after)
+            .nth(1)?
+            .split(" MiB")
+            .next()?
+            .trim()
+            .parse()
+            .ok()
+    };
+    let limit = number("limit is ").unwrap_or(64.0);
+    let size = number("push is ").unwrap_or(limit * 2.0);
+    Some((size, limit))
 }
 
 pub fn run_git_env(args: &[&str], env: &[(String, String)]) -> Result<String> {
