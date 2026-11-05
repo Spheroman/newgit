@@ -1,8 +1,8 @@
 import { runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { CHECKING } from "../src/endpoint";
-import { PULLS_ASKED, PULL_ATTEMPTS } from "../src/webhook";
+import { PULLS_ASKED, PULL_ATTEMPTS, PULL_INDEX_ASK_MS, PULL_INDEX_WAIT_MS, PULL_POLL_MS } from "../src/webhook";
 import {
 	THEIRS,
 	advance,
@@ -162,15 +162,6 @@ describe("whose withheld work a commit may hold", () => {
 		expect(plans[0].instances).toEqual([holding("feature-x")]);
 	});
 
-	it("lands a direct push: no pull request, no instance", async () => {
-		await instanceWith("feature");
-		setAnswers([landed]);
-		await deliver();
-		expect(asked).toEqual([THEIRS]);
-		expect(plans[0].instances).toEqual([]);
-		expect((await index()).root).toBe(sha("f"));
-	});
-
 	it("does not take a fork's branch for an instance of the same name", async () => {
 		await instanceWith("feature");
 		setGitHub(() => Response.json([pullRequest("feature", "Someone/newgit")]));
@@ -187,7 +178,7 @@ describe("whose withheld work a commit may hold", () => {
 
 	it("asks about every commit the event landed", async () => {
 		await instanceWith("feature");
-		setGitHub((commit) => Response.json(commit === sha("c") ? [pullRequest("feature")] : []));
+		setGitHub((commit) => Response.json([pullRequest(commit === sha("c") ? "feature" : "other")]));
 		await deliver({ payload: push({ commits: [{ id: sha("c") }, { id: THEIRS }] }) });
 		expect([...asked].sort()).toEqual([THEIRS, sha("c")].sort());
 		expect(plans[0].instances).toEqual([holding("feature")]);
@@ -223,6 +214,87 @@ describe("whose withheld work a commit may hold", () => {
 		setGitHub(() => Response.json([pullRequest("feature")]));
 		await deliver();
 		expect(plans[0].instances).toEqual([{ name: "feature", pins: { t3code: "" } }]);
+	});
+});
+
+describe("GitHub listing no pull request", () => {
+	/** Let `ms` pass, and run a step of the queue, as a poll would. */
+	const later = async (ms: number) => {
+		vi.setSystemTime(Date.now() + ms);
+		return advance();
+	};
+
+	beforeEach(() => {
+		vi.useFakeTimers({ toFake: ["Date"] });
+	});
+	afterEach(() => {
+		vi.useRealTimers();
+	});
+
+	it("is not believed: a commit GitHub catches up on is still refused", async () => {
+		await instanceWith("feature");
+		let lookups = 0;
+		setGitHub(() => Response.json(++lookups > 2 ? [pullRequest("feature")] : []));
+		setAnswers([{ outcome: "refused", why: "run `newgit merge feature`, then redeliver this event" }]);
+		const logged = vi.spyOn(console, "error").mockImplementation(() => {});
+		await deliver();
+		expect(plans, "nothing lands on the first no").toEqual([]);
+		expect(await later(PULL_INDEX_ASK_MS)).toBe(true);
+		expect(plans, "nor on the second").toEqual([]);
+		expect(await later(PULL_INDEX_ASK_MS)).toBe(false);
+		expect(asked).toHaveLength(3);
+		expect(plans[0].instances).toEqual([holding("feature")]);
+		expect(logged.mock.calls.flat().join("\n")).toContain("newgit merge feature");
+		logged.mockRestore();
+		expect(await index(), "the landing was refused, not made").toEqual(main);
+	});
+
+	it("lands a real direct push once the wait is over", async () => {
+		await instanceWith("feature");
+		setAnswers([landed]);
+		await deliver();
+		let steps = 0;
+		while (plans.length === 0) {
+			expect(await later(PULL_POLL_MS)).toBeTypeOf("boolean");
+			expect(++steps, "it ends").toBeLessThan(20);
+		}
+		expect(steps * PULL_POLL_MS).toBeGreaterThanOrEqual(PULL_INDEX_WAIT_MS);
+		expect(plans[0].instances).toEqual([]);
+		expect((await index()).root).toBe(sha("f"));
+		expect(asked.length, "polled every 15s, asked about every 30s").toBeLessThanOrEqual(6);
+	});
+
+	it("holds no lock while it waits, and runs the look only once", async () => {
+		await instanceWith("feature");
+		await deliver();
+		await later(PULL_POLL_MS);
+		await later(PULL_INDEX_ASK_MS);
+		expect(peeks).toHaveLength(1);
+		expect(plans).toEqual([]);
+		expect((await startMerge()).status).toBe(200);
+	});
+
+	it("does not wait when no instance holds withheld work", async () => {
+		await deliver();
+		expect(asked).toEqual([]);
+		expect(plans[0].instances).toEqual([]);
+	});
+
+	it("does not wait for a commit GitHub did list", async () => {
+		await instanceWith("feature");
+		setGitHub(() => Response.json([pullRequest("other")]));
+		await deliver();
+		expect(plans[0].instances).toEqual([]);
+		expect(asked).toHaveLength(1);
+	});
+
+	it("waits while any commit of the event is unlisted, and keeps what the others named", async () => {
+		await instanceWith("feature");
+		setGitHub((commit) => Response.json(commit === sha("c") ? [pullRequest("feature")] : []));
+		await deliver({ payload: push({ commits: [{ id: sha("c") }, { id: THEIRS }] }) });
+		expect(plans).toEqual([]);
+		for (let step = 0; step < 10 && plans.length === 0; step++) await later(PULL_INDEX_ASK_MS);
+		expect(plans[0].instances).toEqual([holding("feature")]);
 	});
 });
 

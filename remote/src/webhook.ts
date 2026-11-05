@@ -59,8 +59,10 @@ export interface MirrorPull {
 	subject?: string;
 	/** The trackers the mirror withholds. */
 	withheld: string[];
-	/** Instances whose withheld work this may hold, known once a look found work. */
+	/** Instances whose withheld work this may hold, known once GitHub has said. */
 	instances?: MirrorInstance[];
+	/** When GitHub first listed no pull request for this, and was last asked. */
+	lookup?: { since: number; last: number };
 	queuedAt: number;
 	attempts: number;
 	/** A look found something to land. */
@@ -105,6 +107,16 @@ function instanceSlug(branch: string): string {
 /** The most commits one event asks GitHub about; past it, nobody can say. */
 export const PULLS_ASKED = 20;
 
+/**
+ * How long "no pull request" is not believed. GitHub's list can lag the push
+ * that told us, and believing it too soon lands a squash without the withheld
+ * work of the instance it came from. Past this, it is a direct push.
+ */
+export const PULL_INDEX_WAIT_MS = 2 * 60_000;
+
+/** How often GitHub is asked again during that wait: not every poll. */
+export const PULL_INDEX_ASK_MS = 30_000;
+
 /** How long GitHub gets to say which pull request a commit came from. */
 const GITHUB_TIMEOUT_MS = 10_000;
 
@@ -120,7 +132,11 @@ function mergedBranch(subject: string | undefined): string | undefined {
  * holds. One from a fork does not: its branch names no instance here. Throws
  * when GitHub cannot answer.
  */
-async function pullRequestBranches(fetcher: typeof fetch, repo: string, commits: string[]): Promise<string[]> {
+async function pullRequestBranches(
+	fetcher: typeof fetch,
+	repo: string,
+	commits: string[],
+): Promise<{ branches: string[]; unlisted: boolean }> {
 	if (commits.length > PULLS_ASKED) throw new Error(`${commits.length} commits is too many to ask about`);
 	const asked = await Promise.all(
 		commits.map(async (commit) => {
@@ -132,40 +148,47 @@ async function pullRequestBranches(fetcher: typeof fetch, repo: string, commits:
 			return (await response.json()) as { head?: { ref?: string; repo?: { full_name?: string } | null } }[];
 		}),
 	);
-	return asked
-		.flat()
-		.filter((pull) => pull.head?.repo?.full_name?.toLowerCase() === repo.toLowerCase())
-		.flatMap((pull) => pull.head?.ref ?? []);
+	return {
+		branches: asked
+			.flat()
+			.filter((pull) => pull.head?.repo?.full_name?.toLowerCase() === repo.toLowerCase())
+			.flatMap((pull) => pull.head?.ref ?? []),
+		unlisted: asked.some((pulls) => pulls.length === 0),
+	};
 }
 
 /**
  * The instances among `work` whose withheld work this pull's commits may
  * hold. A mirror's branch is named for its instance, and a push to `main`
  * does not say which branch it merged, so GitHub's merge subject says, or
- * else GitHub. No pull request means a direct push: no instance. Only when
- * GitHub cannot answer does every instance count, and the refusal that
- * follows can be redelivered.
+ * else GitHub. `unlisted` says GitHub listed nothing for some commit, which
+ * may be a direct push, or may be GitHub not having caught up: the caller
+ * decides how long to wait. Only when GitHub cannot answer does every instance
+ * count, and the refusal that follows can be redelivered.
  */
 export async function implicated(
 	deps: Deps,
 	pull: Pick<MirrorPull, "repo" | "commit" | "commits" | "subject">,
 	work: MirrorInstance[],
-): Promise<MirrorInstance[]> {
-	if (work.length === 0) return [];
+): Promise<{ instances: MirrorInstance[]; unlisted: boolean }> {
+	if (work.length === 0) return { instances: [], unlisted: false };
 	let branches: string[];
+	let unlisted = false;
 	const named = mergedBranch(pull.subject);
 	if (named !== undefined) branches = [named];
 	else {
 		try {
-			branches = await pullRequestBranches(deps.fetcher, pull.repo, [...new Set([...pull.commits, pull.commit])]);
+			({ branches, unlisted } = await pullRequestBranches(deps.fetcher, pull.repo, [
+				...new Set([...pull.commits, pull.commit]),
+			]));
 		} catch (error) {
 			const why = error instanceof Error ? error.message : String(error);
 			console.error(JSON.stringify({ webhook: "GitHub could not say which pull request this is", repo: pull.repo, commit: pull.commit, why }));
-			return work;
+			return { instances: work, unlisted: false };
 		}
 	}
 	const slugs = new Set(branches.map(instanceSlug));
-	return work.filter((instance) => slugs.has(instance.name));
+	return { instances: work.filter((instance) => slugs.has(instance.name)), unlisted };
 }
 
 interface Target {
@@ -350,7 +373,7 @@ async function advance(env: Env, deps: Deps, id: ProjectId, pull: MirrorPull): P
 	const key = projectKey(id);
 	const project = projectStub(env, id);
 	const log = { project: key, target: pull.target, commit: pull.commit, pusher: pull.pusher };
-	let instances = pull.instances ?? [];
+	let instances = pull.instances;
 	const plan = (list: Record<string, string>): PullPlan => ({
 		dir: "/work",
 		repos: Object.fromEntries(
@@ -363,7 +386,7 @@ async function advance(env: Env, deps: Deps, id: ProjectId, pull: MirrorPull): P
 		writable: pull.writable,
 		target: pull.target,
 		mirror: { url: `https://github.com/${pull.repo}.git`, branch: pull.branch, commit: pull.commit },
-		instances,
+		instances: instances ?? [],
 	});
 	const mint = async (list: Record<string, string>, scope: (tracker: string) => "read" | "write") => {
 		const handed = [];
@@ -395,9 +418,22 @@ async function advance(env: Env, deps: Deps, id: ProjectId, pull: MirrorPull): P
 		});
 		if (isChecking(seen)) return false;
 		if (seen.outcome === "nothing" || seen.outcome === "refused") return ended(seen);
-		// Asked only now: our own exports end above, and cost GitHub no call.
-		instances = await implicated(deps, pull, await project.withheldWork(pull.withheld));
-		await project.markPeeked(pull, instances);
+		await project.markPeeked(pull);
+	}
+
+	// Asked only now: our own exports end above, and cost GitHub no call. No
+	// lock is held while "no pull request" waits to be believed.
+	if (instances === undefined) {
+		const now = Date.now();
+		if (pull.lookup !== undefined && now - pull.lookup.last < PULL_INDEX_ASK_MS) return false;
+		const found = await implicated(deps, pull, await project.withheldWork(pull.withheld));
+		const since = pull.lookup?.since ?? now;
+		if (found.unlisted && now - since < PULL_INDEX_WAIT_MS) {
+			await project.noteLookup(pull, { since, last: now });
+			return false;
+		}
+		instances = found.instances;
+		await project.setPullInstances(pull, instances);
 	}
 
 	const begun = await project.beginPull(pull, PULL_LOCK_SECONDS);

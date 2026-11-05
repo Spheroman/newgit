@@ -691,8 +691,12 @@ event landed, and each pull request's `head.ref` names an instance. Only
 those instances are checked, so an unrelated squash lands while another
 instance holds such work. A pull request listed there counts whether or not
 it is marked merged yet, because the event can beat the mark. One from a fork
-does not. No pull request means a direct push, which has no instance, and
-lands. If GitHub cannot answer (a rate limit, a 5xx, more than 20 commits),
+does not. GitHub's list can lag the push that told us, and believing an empty
+one too soon would land a squash without the withheld work of the instance it
+came from. So while some instance holds such work, a commit with no pull
+request listed waits: the pull stays queued, holding no lock, and GitHub is
+asked again every 30 seconds for two minutes. Only then does it count as a
+direct push, which has no instance, and land. If GitHub cannot answer (a rate limit, a 5xx, more than 20 commits),
 that is logged and every instance with such work counts, which is the one
 case that does; the refusal can be redelivered. Those calls are
 unauthenticated, 60 an hour across whatever shares the Worker's address.
