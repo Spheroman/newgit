@@ -713,7 +713,21 @@ async function route(request: Request, env: Env, deps: Deps): Promise<Response> 
 		if (remote === null) {
 			// Seconds on a real repo; the request waits, since the push that
 			// asked for it cannot go anywhere until it exists.
-			remote = (await deps.repos.fork(repoName({ kind: "tracker", project: id, tracker }), fork)).remote;
+			try {
+				remote = (await deps.repos.fork(repoName({ kind: "tracker", project: id, tracker }), fork)).remote;
+			} catch (error) {
+				// A fork of a large repository (t3code, 365 MiB) can outlast the
+				// request that asked for it and finish anyway; take it if so.
+				remote = await deps.repos.remote(fork);
+				if (remote === null) {
+					const { code, message } = error as { code?: string; message?: string };
+					console.error(JSON.stringify({ fork, code, message }));
+					throw new HttpError(
+						502,
+						`Artifacts could not fork \`${tracker}\` for \`${name}\`: ${code ?? "error"}: ${message ?? "no message"}`,
+					);
+				}
+			}
 		}
 		await project.addFork(name, tracker);
 		return json({ instance: name, tracker, repo: fork, remote });
