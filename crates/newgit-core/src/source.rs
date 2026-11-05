@@ -1400,10 +1400,51 @@ impl GitSource {
         refspecs: &[String],
         auth: Option<&str>,
     ) -> Result<()> {
-        let mut args: Vec<&str> = location.to_vec();
-        args.extend(["fetch", "--quiet", "--no-write-fetch-head", "--", url]);
-        args.extend(refspecs.iter().map(String::as_str));
-        run_git_env(&args, &auth_env(auth)).map(|_| ())
+        let fetch = |extra: Option<&str>| {
+            let mut args: Vec<&str> = location.to_vec();
+            args.extend(["fetch", "--quiet", "--no-write-fetch-head"]);
+            args.extend(extra);
+            args.extend(["--", url]);
+            args.extend(refspecs.iter().map(String::as_str));
+            run_git_env(&args, &auth_env(auth)).map(|_| ())
+        };
+        let shallow_store = |location: &[&str]| -> Result<bool> {
+            let mut args: Vec<&str> = location.to_vec();
+            args.extend(["rev-parse", "--is-shallow-repository"]);
+            Ok(run_git_env(&args, &[])? == "true")
+        };
+        // A store left shallow by a stepped fetch that stopped part way
+        // carries on deepening, even when this fetch went through whole.
+        let mut started = match fetch(None) {
+            Ok(()) if !shallow_store(location)? => return Ok(()),
+            Ok(()) => true,
+            Err(error) if dropped(&error) => false,
+            Err(error) => return Err(error),
+        };
+        // The remote dropped it: a history too big for it to send at once
+        // (Artifacts fails a 365 MiB fetch with an HTTP 500). Fetch the tips
+        // first, then deepen band by band until nothing is shallow: each
+        // fetch brings only the next band. A band the remote still drops is
+        // halved; one that comes grows the next.
+        let mut depth: u32 = 256;
+        loop {
+            let flag = if started {
+                format!("--deepen={depth}")
+            } else {
+                format!("--depth={depth}")
+            };
+            match fetch(Some(&flag)) {
+                Ok(()) => {
+                    started = true;
+                    if !shallow_store(location)? {
+                        return Ok(());
+                    }
+                    depth = (depth * 2).min(4096);
+                }
+                Err(error) if dropped(&error) && depth > 1 => depth /= 2,
+                Err(error) => return Err(error),
+            }
+        }
     }
 }
 
@@ -1478,8 +1519,9 @@ const FILES_REF: &str = "refs/heads/newgit-staging-files";
 /// A file this big is sent on its own when a commit carrying it is refused.
 const LARGE_FILE: u64 = 4 * 1024 * 1024;
 
-/// Whether the remote dropped a push partway (an HTTP 500, a hung-up
-/// connection), as Artifacts' front end does with a push it will not take.
+/// Whether the remote dropped a push or a fetch partway (an HTTP 500, a
+/// hung-up connection, a pack it never finished), as Artifacts does with a
+/// push it will not take or a history too big to send at once.
 fn dropped(error: &NewgitError) -> bool {
     let NewgitError::SourceCommand { stderr, .. } = error else {
         return false;
@@ -1489,6 +1531,9 @@ fn dropped(error: &NewgitError) -> bool {
         "unexpected disconnect",
         "remote end hung up",
         "receive_pack_failed",
+        "expected 'packfile'",
+        "early EOF",
+        "bad pack header",
     ]
     .iter()
     .any(|sign| stderr.contains(sign))
