@@ -65,6 +65,9 @@ struct State {
     fail_finish_once: bool,
     /// Failure injection: answer this many checkpoint writes with a 500.
     fail_checkpoint_writes: usize,
+    /// Failure injection: answer every credential request with a 503, as a
+    /// remote that is down would.
+    fail_credentials: bool,
     /// Instances whose fork this login may not make: the real remote's 403
     /// for someone else's instance.
     foreign_instances: std::collections::BTreeSet<String>,
@@ -443,6 +446,9 @@ fn route(
                 )));
             }
             (200, json!({ "name": name, "removed": true }))
+        }
+        ("POST", ["v1", "projects", _, _, "credentials"]) if state.fail_credentials => {
+            (503, json!({ "error": "the remote is down" }))
         }
         ("POST", ["v1", "projects", _, _, "credentials"]) => {
             let repo = body["repo"].as_str().unwrap_or_default();

@@ -1088,10 +1088,12 @@ this is the list.
 - **The migration folds every tracker in Git,** not only `project` and
   `access`, and mounts each of the others again at the path it owned.
 - **A rooted export ships the tracker's own `main`,** not the commit root's
-  `main` pins: a branch is a ref of the root a view is rooted at. So a pull
-  request merged upstream and pulled back exports as itself before
-  `newgit merge main` moves root's pin, and `branches = true` pushes each
-  instance's own branch of the tracker.
+  `main` pins: a branch is a ref of the root a view is rooted at, and
+  `branches = true` pushes each instance's own branch of the tracker. On a
+  linked project that `main` is the remote's, so a pull request pulled back
+  goes out again only once `newgit merge main` has published it; until then
+  the export says so, and a repeat `newgit pull --remote` finds nothing new.
+  Unlinked, the store's `main` already has it.
 - **An export finding a rooted target ahead refuses** and names `newgit pull
   --remote`, instead of pulling by itself as an export of the project does:
   bringing those commits in moves a pin, which is a commit nobody asked for.
@@ -1100,8 +1102,16 @@ this is the list.
   `newgit pull <tracker>`. For a target without `root`, the files of each
   tracker it withholds are put back from the parent commit, and a commit
   touching a withheld tracker's mount is refused rather than guessed at.
-- **The import's commit and a pull's are unsigned,** like the merge commits
-  `newgit merge` makes; signing what newgit itself commits is open.
+- **The import's commit is unsigned,** since newgit writes it and its
+  `access` half byte for byte so they compose inline. A pull's commit, and
+  the merge `pull --remote` makes, go through `git commit-tree`, which
+  honours `commit.gpgSign`: they are signed when you sign.
+- **A tracker's branch on the remote falls back to the store only when the
+  remote says it has none** (a 404 for the repo, or no such branch). Any
+  other failure fails the command, so nothing is decided on stale refs.
+- **Commits record where history came from without secrets or paths:** a
+  URL loses its userinfo and query, and a local path is written as its
+  `origin` URL, or only its directory's name.
 
 ---
 

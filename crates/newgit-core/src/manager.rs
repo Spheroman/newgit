@@ -1779,7 +1779,10 @@ impl BranchManager {
             .trim()
             .is_empty();
 
-            let message = format!("Import `{name}` at {mount} from {from}\n");
+            let message = format!(
+                "Import `{name}` at {mount} from {}\n",
+                recorded_source(from)
+            );
             let text = toml::to_string_pretty(&definition.to_file()).map_err(|source| {
                 NewgitError::TomlWrite {
                     label: format!("tracker `{name}`"),
@@ -7449,6 +7452,14 @@ impl BranchManager {
         // moves that tracker's `main` and then its pin, which is a commit of
         // its own, asked for by name.
         if let Some(tracker) = &target.root {
+            if self.local_main_has(tracker, &theirs)? {
+                return Err(NewgitError::Unsupported(format!(
+                    "`{}` on `{}` has {commits} commit(s) `{tracker}`'s published `main` does \
+                     not, but `main` here already has them (pulled back, not published yet): \
+                     `newgit merge main`, then export again",
+                    target.branch, target.name
+                )));
+            }
             return Err(NewgitError::Unsupported(format!(
                 "`{}` on `{}` has {commits} commit(s) `{tracker}`'s `main` does not (merged \
                  there?): `newgit pull --remote {}` brings them in, then export again. \
@@ -7601,7 +7612,22 @@ impl BranchManager {
             .ok_or_else(|| {
                 NewgitError::Unsupported(format!("`{tracker}` is not a tracker in Git here"))
             })?;
-        let ours = self.tracker_branch_commit(tracker, "main")?;
+        // `main` as published, or as it is here when that is ahead of it
+        // (pulled back before, not merged yet): a pull again finds nothing.
+        let published = self.tracker_branch_commit(tracker, "main")?;
+        let here = self
+            .source
+            .rev_parse(&local_tracker_ref(tracker, "main"))
+            .ok();
+        let ours = match (&published, &here) {
+            (Some(published), Some(here))
+                if published != here && self.source.is_ancestor(published, here)? =>
+            {
+                Some(here.clone())
+            }
+            (None, Some(here)) => Some(here.clone()),
+            _ => published,
+        };
         let mut new_args = vec![theirs];
         if let Some(ours) = &ours {
             new_args.extend(["--not", ours.as_str()]);
@@ -7628,7 +7654,7 @@ impl BranchManager {
             .trim()
             .parse()
             .unwrap_or(0);
-        let from = format!("{} {}", target.url, target.branch);
+        let from = format!("{} {}", recorded_source(&target.url), target.branch);
         let (main, merged) = match &ours {
             None => (theirs.to_owned(), false),
             Some(ours) if ours == theirs || self.source.is_ancestor(theirs, ours)? => {
@@ -7649,12 +7675,13 @@ impl BranchManager {
                 }
             },
         };
-        if ours.as_deref() != Some(main.as_str()) {
-            self.source
-                .update_ref(&local_tracker_ref(tracker, "main"), &main)?;
-            self.publish_carved_refs(tracker, &["main"])?;
-        }
-        let pulled = self.move_pin(None, &definition, &main, &from)?;
+        // `main` moves with the pin, after the project root has taken it.
+        let mains: Vec<(String, String)> = if ours.as_deref() != Some(main.as_str()) {
+            vec![(tracker.to_owned(), main.clone())]
+        } else {
+            Vec::new()
+        };
+        let pulled = self.move_pin(None, &definition, &main, &from, &mains)?;
         Ok(PullRemoteOutcome {
             target: target.name.clone(),
             url: target.push_url(),
@@ -7826,7 +7853,7 @@ impl BranchManager {
             match self.merge_commits(
                 &head,
                 &tip,
-                &format!("Merge {} {}", target.url, target.branch),
+                &format!("Merge {} {}", recorded_source(&target.url), target.branch),
             )? {
                 Ok(merged) => (merged, true),
                 Err(files) => {
@@ -7871,6 +7898,14 @@ impl BranchManager {
             self.source.update_ref(&branch_ref, &new_head)?;
         }
         Ok(outcome(commits, merged, Some(new_head)))
+    }
+
+    /// Whether tracker `tracker`'s `main` here already holds `commit`.
+    fn local_main_has(&self, tracker: &str, commit: &str) -> Result<bool> {
+        match self.source.rev_parse(&local_tracker_ref(tracker, "main")) {
+            Ok(here) => Ok(here == commit || self.source.is_ancestor(commit, &here)?),
+            Err(_) => Ok(false),
+        }
     }
 
     /// Every export target, each checked against this project's trackers:
@@ -9551,7 +9586,7 @@ impl BranchManager {
                 definition.follow
             ))
         })?;
-        self.move_pin(instance, &definition, &new, &definition.follow)
+        self.move_pin(instance, &definition, &new, &definition.follow, &[])
     }
 
     /// Move `definition`'s pin in `instance` (the project root when `None`)
@@ -9565,6 +9600,7 @@ impl BranchManager {
         definition: &TrackerDefinition,
         new: &str,
         from: &str,
+        mains: &[(String, String)],
     ) -> Result<PullOutcome> {
         let tracker = definition.name.as_str();
         let project = self.store.paths().project_root.clone();
@@ -9623,6 +9659,11 @@ impl BranchManager {
         };
         let new = new.to_owned();
         if new == old || self.source.is_ancestor(&new, &old)? {
+            for (tracker, main) in mains {
+                self.source
+                    .update_ref(&local_tracker_ref(tracker, "main"), main)?;
+                self.publish_carved_refs(tracker, &["main"])?;
+            }
             return Ok(PullOutcome {
                 tracker: tracker.to_owned(),
                 follow: from.to_owned(),
@@ -9675,12 +9716,41 @@ impl BranchManager {
         )?
         .trim()
         .to_owned();
-        let view_ref = format!("refs/newgit/views/instances/{slug}");
+        // Composed to a ref of its own, and taken by the workspace, before
+        // any branch moves: a working tree that cannot take it leaves every
+        // ref as it was, so the pull can simply run again.
+        let view_ref = format!("refs/newgit/pull/view-{slug}");
         let view = self
             .compose_here(&view_ref, &pulled)?
             .ok_or_else(|| NewgitError::Unsupported("the pull composes to nothing".to_owned()))?;
+        let taken = self.take_pull(workspace.as_deref(), definition, &view_ref, &view);
+        let _ = self.source.delete_ref(&view_ref);
+        taken?;
+        for (tracker, main) in mains {
+            self.source
+                .update_ref(&local_tracker_ref(tracker, "main"), main)?;
+            self.publish_carved_refs(tracker, &["main"])?;
+        }
         self.land_root_commit(&slug, &pulled, &[(tracker.to_owned(), new.clone())], &view)?;
-        match &workspace {
+        Ok(PullOutcome {
+            tracker: tracker.to_owned(),
+            follow: from.to_owned(),
+            commits,
+            view: Some(view),
+        })
+    }
+
+    /// Fast-forward `workspace` (the project root when `None`) to the pull's
+    /// view commit `view`, composed at `view_ref`.
+    fn take_pull(
+        &self,
+        workspace: Option<&Utf8Path>,
+        definition: &TrackerDefinition,
+        view_ref: &str,
+        view: &str,
+    ) -> Result<()> {
+        let project = self.store.paths().project_root.clone();
+        match workspace {
             Some(workspace) => {
                 GitSource::fetch_refs(
                     &["-C", workspace.as_str()],
@@ -9701,11 +9771,9 @@ impl BranchManager {
                 )
                 .map_err(|error| {
                     NewgitError::Unsupported(format!(
-                        "the pull is {}, but the workspace could not fast-forward to it \
-                         (uncommitted changes under `{}`?): `git merge --ff-only {}` there: {error}",
-                        &view[..12],
-                        definition.mount,
-                        &view[..12]
+                        "the workspace could not take the pull (uncommitted changes under \
+                         `{}`?), so nothing moved: commit or stash them and pull again: {error}",
+                        definition.mount
                     ))
                 })?;
             }
@@ -9718,21 +9786,23 @@ impl BranchManager {
                 .is_ok_and(|head| head.trim() == format!("refs/heads/{branch}"));
                 if checked_out {
                     crate::source::run_git_env(
-                        &["-C", project.as_str(), "merge", "--ff-only", "-q", &view],
+                        &["-C", project.as_str(), "merge", "--ff-only", "-q", view],
                         &[],
-                    )?;
+                    )
+                    .map_err(|error| {
+                        NewgitError::Unsupported(format!(
+                            "the project root could not take the pull (uncommitted changes in \
+                             the way?), so nothing moved: commit or stash them and pull again: \
+                             {error}"
+                        ))
+                    })?;
                 } else {
                     self.source
-                        .update_ref(&format!("refs/heads/{branch}"), &view)?;
+                        .update_ref(&format!("refs/heads/{branch}"), view)?;
                 }
             }
         }
-        Ok(PullOutcome {
-            tracker: tracker.to_owned(),
-            follow: from.to_owned(),
-            commits,
-            view: Some(view),
-        })
+        Ok(())
     }
 
     /// The commit `definition`'s `follow` ref names: on the remote, that
@@ -9742,25 +9812,32 @@ impl BranchManager {
     }
 
     /// The commit branch `branch` of tracker `tracker` is at: on the remote,
-    /// that branch of its repo; here, its branch in the tracker store.
+    /// that branch of its repo; here, its branch in the tracker store. The
+    /// store answers only when the remote says it has no such repo (404) or
+    /// no such branch: any other failure is the remote's, and returned, so
+    /// nothing is ever decided on refs that may be stale.
     fn tracker_branch_commit(&self, tracker: &str, branch: &str) -> Result<Option<String>> {
         let project = self.store.paths().project_root.clone();
         if let Some(link) = &self.remote {
             let client = link.connect(Acting::Login)?;
             let repo = format!("{}.t.{tracker}", link.project.replace('/', "."));
-            if let Ok(credential) = client.credential(&link.project, &repo, Scope::Read) {
-                let target = format!("refs/newgit/remote/{tracker}/{branch}");
-                let fetched = GitSource::fetch_refs(
-                    &["-C", project.as_str()],
-                    credential.remote.as_deref().unwrap_or_default(),
-                    &[format!("+refs/heads/{branch}:{target}")],
-                    Some(&basic_auth_header(&credential)),
-                );
-                if fetched.is_ok()
-                    && let Ok(commit) = self.source.rev_parse(&target)
-                {
-                    return Ok(Some(commit));
+            match client.credential(&link.project, &repo, Scope::Read) {
+                Ok(credential) => {
+                    let target = format!("refs/newgit/remote/{tracker}/{branch}");
+                    match GitSource::fetch_refs(
+                        &["-C", project.as_str()],
+                        credential.remote.as_deref().unwrap_or_default(),
+                        &[format!("+refs/heads/{branch}:{target}")],
+                        Some(&basic_auth_header(&credential)),
+                    ) {
+                        Ok(()) => return Ok(Some(self.source.rev_parse(&target)?)),
+                        Err(NewgitError::SourceCommand { stderr, .. })
+                            if stderr.contains("couldn't find remote ref") => {}
+                        Err(error) => return Err(error),
+                    }
                 }
+                Err(NewgitError::Remote { status: 404, .. }) => {}
+                Err(error) => return Err(error),
             }
         }
         self.fetch_carved_trackers()?;
@@ -12022,6 +12099,54 @@ fn route_to_targets<'a>(
         exporting,
         resolved,
     }
+}
+
+/// How a repository a commit names is written into that commit, which may
+/// be published: a URL without its userinfo (a token, a password) or query;
+/// a local path as the URL its `origin` has, written the same way, or failing
+/// that only the directory's name. Never a path on this machine.
+pub fn recorded_source(source: &str) -> String {
+    if let Some(path) = source.strip_prefix("file://") {
+        return recorded_source(path);
+    }
+    if let Some((scheme, rest)) = source.split_once("://") {
+        let (authority, path) = match rest.find('/') {
+            Some(at) => rest.split_at(at),
+            None => (rest, ""),
+        };
+        let host = authority
+            .rsplit_once('@')
+            .map_or(authority, |(_, host)| host);
+        let path = path.split(['?', '#']).next().unwrap_or_default();
+        return format!("{scheme}://{host}{path}");
+    }
+    let local = Utf8Path::new(source);
+    let path_like = source.starts_with('/') || source.starts_with('.') || local.exists();
+    if !path_like {
+        // `owner/repo` or `git@host:owner/repo`: nothing secret in it.
+        return source.to_owned();
+    }
+    let origin =
+        crate::source::run_git_env(&["-C", source, "config", "--get", "remote.origin.url"], &[])
+            .ok()
+            .map(|url| url.trim().to_owned())
+            .filter(|url| !url.is_empty());
+    if let Some(origin) = origin {
+        let path_too =
+            origin.starts_with('/') || origin.starts_with('.') || origin.starts_with("file:");
+        if !path_too {
+            return recorded_source(&origin);
+        }
+    }
+    local
+        .canonicalize_utf8()
+        .ok()
+        .as_deref()
+        .unwrap_or(local)
+        .file_name()
+        .map(|name| name.trim_end_matches(".git").to_owned())
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| "a local repository".to_owned())
 }
 
 /// Where an export target's view of `branch` is composed in the project repo.

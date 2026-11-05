@@ -46,7 +46,8 @@ fn an_import_keeps_every_id_and_comes_in_through_one_merge() {
     assert_eq!(git(&repo, &["rev-parse", "HEAD^1"]), before);
     assert_eq!(
         git(&repo, &["log", "-1", "--format=%s"]),
-        format!("Import `t3code` at apps/t3code from {upstream}")
+        "Import `t3code` at apps/t3code from upstream",
+        "a local path is recorded as its directory's name, never the path"
     );
     assert_eq!(
         git(&repo, &["log", "--format=%s", "HEAD^1..HEAD^2"]),

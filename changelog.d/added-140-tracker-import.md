@@ -10,4 +10,5 @@
   it. It refuses, leaving nothing behind, when the mount already has files
   or the history adds a file a tracker outside Git owns there, and says when
   the import has a `.gitmodules`, which Git does not read under a mount.
-  `newgit merge main` publishes it, as for any new tracker.
+  `newgit merge main` publishes it, as for any new tracker. The commit says
+  where the history came from without a URL's credentials or a local path.
