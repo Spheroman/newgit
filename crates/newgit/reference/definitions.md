@@ -306,9 +306,14 @@ create <name> --git --path <path>`, which mounts a new tracker at that path
 in one commit: the files move into it and root *pins* its first commit
 (`.newgit/pins/<name>`, a gitlink in root's history). History before the
 carve stays in root, so no commit id changes. You commit to a tracker in Git
-with Git; `newgit tracker capture` and `track` refuse it. `newgit pull
-<tracker>` moves its pin to its `follow` ref in one commit; nothing else
-moves a pin on your behalf. How sensitive a tracker's content is has nothing
+with Git; `newgit tracker capture` and `track` refuse it.
+`newgit tracker create <name> --git --mount <dir> --from <repo>
+[--from-branch <branch>]` brings in another repository's history instead:
+the branch (its `HEAD` by default) becomes the tracker's `main` unchanged,
+ids and signatures intact, and one commit mounts it at `<dir>`, an empty
+directory, composing as a merge that brings that history in. A `--from` path
+is relative to where you run it. `newgit pull <tracker>` moves its pin to
+its `follow` ref in one commit; nothing else moves a pin on your behalf. How sensitive a tracker's content is has nothing
 to do with this; that is its `audience`. A project laid out before mounts
 (a `project` tracker owning `.newgit`) is moved onto them by `newgit tracker
 migrate`.

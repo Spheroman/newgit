@@ -1956,6 +1956,19 @@ pub fn find_outside_git(
     env: &[(String, String)],
     all: &[TrackerDefinition],
 ) -> Result<Option<(String, String, String)>> {
+    find_outside_git_under(repo, rev_list, env, all, None)
+}
+
+/// [`find_outside_git`] over a tracker's own history, whose files sit at
+/// `mount` in the view: each path is judged, and reported, where the view
+/// has it. What an import, a rooted export, and a pull from one check.
+pub fn find_outside_git_under(
+    repo: &Utf8Path,
+    rev_list: &[&str],
+    env: &[(String, String)],
+    all: &[TrackerDefinition],
+    mount: Option<&Utf8Path>,
+) -> Result<Option<(String, String, String)>> {
     // Each commit starts with \x01 — no path holds that byte, so a file
     // named like a commit id cannot be mistaken for one.
     let mut args = vec![
@@ -1988,8 +2001,12 @@ pub fn find_outside_git(
         if field.is_empty() {
             continue;
         }
-        if let Some(owner) = owner_of(all, Utf8Path::new(field)).filter(|owner| !owner.git) {
-            return Ok(Some((commit, field.to_owned(), owner.name.clone())));
+        let field = match mount {
+            Some(mount) if mount.as_str() != "." => format!("{mount}/{field}"),
+            _ => field.to_owned(),
+        };
+        if let Some(owner) = owner_of(all, Utf8Path::new(&field)).filter(|owner| !owner.git) {
+            return Ok(Some((commit, field, owner.name.clone())));
         }
     }
     Ok(None)

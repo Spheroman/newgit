@@ -348,12 +348,24 @@ enum TrackerCommand {
         #[arg(long, default_value = "local")]
         storage: String,
         /// A tracker in Git: committed content with its own history, carved out
-        /// of whichever tracker owns its paths now (usually root)
-        #[arg(long, requires = "path")]
+        /// of whichever tracker owns its paths now (usually root), or with
+        /// --from, brought in from another repository
+        #[arg(long, requires = "place")]
         git: bool,
         /// A path a tracker in Git owns (repeatable; set at creation)
-        #[arg(long = "path", value_name = "PATH")]
+        #[arg(long = "path", value_name = "PATH", group = "place")]
         path: Vec<Utf8PathBuf>,
+        /// Where an imported tracker is mounted (with --from): an empty
+        /// directory its files appear under
+        #[arg(long, value_name = "DIR", requires = "from", group = "place")]
+        mount: Option<Utf8PathBuf>,
+        /// Import another repository's history, unchanged, as this tracker's
+        /// `main`: a URL, or a path (relative to here)
+        #[arg(long, value_name = "REPOSITORY", requires = "git")]
+        from: Option<String>,
+        /// The branch of --from to import (default: its HEAD)
+        #[arg(long, value_name = "BRANCH", requires = "from")]
+        from_branch: Option<String>,
     },
     /// Add workspace paths to a tracker outside Git
     Track {
@@ -1968,6 +1980,60 @@ fn shell_quote(value: &str) -> String {
 
 fn tracker(command: TrackerCommand) -> Result<()> {
     match command {
+        TrackerCommand::Create {
+            name,
+            audience,
+            git: true,
+            path,
+            mount,
+            from: Some(from),
+            from_branch,
+            ..
+        } => {
+            let Some(mount) = mount.filter(|_| path.is_empty()) else {
+                bail!(
+                    "an imported tracker is placed with --mount, not --path (its files keep their \
+                     own root): `newgit tracker create {name} --git --mount <dir> --from {from}`"
+                );
+            };
+            // A local repository named relative to here, not to the project
+            // root the fetch runs in.
+            let from = match std::fs::canonicalize(&from) {
+                Ok(local) => local.to_string_lossy().into_owned(),
+                Err(_) => from,
+            };
+            let manager = manager_here()?;
+            let outcome = manager.import_git_tracker(
+                &name,
+                &audience,
+                &mount,
+                &from,
+                from_branch.as_deref(),
+            )?;
+            let root = manager.store().paths().project_root.clone();
+            println!(
+                "Imported `{name}`, a tracker in Git, at {}",
+                display_path(&root, &outcome.path)
+            );
+            println!(
+                "  history:   {} from {from}, unchanged (its `main` is {})",
+                plural(outcome.commits, "commit"),
+                short_rev(&outcome.main)
+            );
+            println!(
+                "  mounted:   {}, brought in by one merge ({}) on the project root",
+                outcome.mount,
+                short_rev(&outcome.view)
+            );
+            if outcome.submodules {
+                println!(
+                    "  note:      it has a .gitmodules, which Git does not read under a mount, so \
+                     its submodules are not checked out"
+                );
+            }
+            println!("  publish it with: newgit merge main");
+            Ok(())
+        }
         TrackerCommand::Create {
             name,
             audience,
