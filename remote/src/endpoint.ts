@@ -23,6 +23,9 @@
 // branch of the tracker's repo into it, in the background. Artifacts' own
 // fork never finished on t3code; a stepped fetch and a stepped push do.
 //
+// A GitHub webhook's pull (`newgit endpoint-pull`, src/webhook.ts) runs the
+// same way, with `ProjectDO`'s alarm doing the asking again.
+//
 // A snapshot is the whole container, the `newgit` binary included, and the
 // views it composed. So a snapshot, or a running container, from an image
 // other than the one deployed now is dropped: otherwise a deploy would never
@@ -71,7 +74,27 @@ export interface CopyAnswer {
 	branches: Record<string, string>;
 }
 
-export type BackgroundKind = "ancestry" | "index" | "copy";
+export type BackgroundKind = "ancestry" | "index" | "copy" | "pull";
+
+/**
+ * `newgit endpoint-pull`'s input: bring `mirror.commit` into `main`, whose
+ * index is `list`. `repos` carry a write password for `writable`, a read
+ * password for the rest.
+ */
+export interface PullPlan {
+	dir: string;
+	repos: Record<string, { url: string; auth: string }>;
+	list: Record<string, string>;
+	writable: string[];
+	target: string;
+	mirror: { url: string; branch: string; commit: string };
+}
+
+/** How a pull ended. A refusal is an answer: running it again refuses again. */
+export type PullAnswer =
+	| { outcome: "nothing" }
+	| { outcome: "landed"; list: Record<string, string>; commits: number }
+	| { outcome: "refused"; why: string };
 
 export interface IndexAnswer {
 	matches: boolean;
@@ -208,6 +231,11 @@ export async function checkKey(
  */
 export function copyKey(plan: { to: { url: string } }): string {
 	return `copy ${plan.to.url}`;
+}
+
+/** The key of a pull: what it brings in, on top of what. */
+export function pullKey(plan: Pick<PullPlan, "list" | "mirror">): string {
+	return `pull ${plan.mirror.url} ${plan.mirror.commit} ${plan.list.root}`;
 }
 
 /** Snapshot at most this often, after a compose changed what is on disk. */
@@ -468,7 +496,8 @@ export class GitEndpoint extends DurableObject<Env> {
 	 */
 	private async check(kind: BackgroundKind, plan: string, peek: boolean): Promise<Response> {
 		const parsed = JSON.parse(plan);
-		const key = kind === "copy" ? copyKey(parsed) : await checkKey(kind, parsed);
+		const key =
+			kind === "copy" ? copyKey(parsed) : kind === "pull" ? pullKey(parsed) : await checkKey(kind, parsed);
 		const known = this.checks.collect(key);
 		if (known === "running") return Response.json(CHECKING, { status: 202 });
 		if (known?.ok)
@@ -516,7 +545,7 @@ export class GitEndpoint extends DurableObject<Env> {
 		const encoded = request.headers.get(PLAN_HEADER);
 		if (!encoded) return new Response("no plan\n", { status: 400 });
 		const plan = atob(encoded);
-		if (kind === "ancestry" || kind === "index" || kind === "copy")
+		if (kind === "ancestry" || kind === "index" || kind === "copy" || kind === "pull")
 			return this.check(kind, plan, url.searchParams.has("peek"));
 		const container = await this.ensureRunning();
 

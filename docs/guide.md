@@ -293,7 +293,8 @@ inside a workspace):
 - `newgit export [instance] --to <dir> [--include <path>] [--exclude <path>]`
 - `newgit export --remote <name> [--dry-run] [--force]` — push the trackers'
   `main`s, history and all, to the target in `.newgit/exports/<name>.toml`
-  (a GitHub mirror, say); `public` trackers plus the ones it names
+  (a GitHub mirror, say); exactly the trackers it names, or the `public`
+  ones if it names none
 - `newgit cleanup [--dry-run] [--purge-archived]`
 - `newgit ports [--check]` — claimed ports, or detect a listening one nothing
   claims
@@ -372,7 +373,8 @@ including withheld ones. This is a path-level filter, not concealment.
 **GitHub stays where it is.** `newgit export --remote github` pushes a
 composed history to an ordinary repository defined in
 `.newgit/exports/github.toml` (`url = "acme/widget"`, `trackers =
-["root"]`). Only `public` trackers and the ones a target names ship, so a
+["root"]`). A target ships exactly the trackers it names, or the `public`
+ones if it names none, so a
 public mirror and a private one can show different views, and a history that
 ever committed the file of a tracker outside Git is refused. Exporting again
 fast-forwards, after bringing in whatever was merged on the target since,

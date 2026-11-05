@@ -1,7 +1,7 @@
 //! `newgit pull --remote <target>` (#142): a target's new commits come back
 //! into its trackers. Rooted at a tracker, they are its own history: its
-//! `main` takes them and its pin moves, composing as a merge that brings
-//! them in on top, whatever their dates. Otherwise they are view commits:
+//! `main` takes them and its pin moves, one commit on top, whatever their
+//! dates. Otherwise they are view commits:
 //! ours are recognised, and the rest come in as work.
 
 mod imports;

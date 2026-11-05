@@ -57,4 +57,5 @@
   // PROJECTS_PER_LOGIN (unset is 5). See docs/design/remote.md, *Identity And Tokens*.
   // BILLING_TOKEN (an API token with Billing: Read; unset turns the spend
   // kill switch off), SPEND_LIMIT_WEEKLY_USD (unset is 10).
+  // GITHUB_WEBHOOK_SECRET (signs GitHub's webhook events; unset answers 503).
 }

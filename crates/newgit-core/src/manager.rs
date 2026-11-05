@@ -1629,9 +1629,8 @@ impl BranchManager {
     /// tracker's `main` unchanged — every id, signature, and merge as
     /// upstream has them, since a tracker is stored relative to its own root.
     /// Then one commit in the project root adds the definition (in `access`),
-    /// the mount, and the pin; it composes as a *brought in* merge, so the
-    /// history appears under the mount through one merge, and `git log` and
-    /// `git blame` reach through it. The project root fast-forwards to it;
+    /// the mount, and the pin: one ordinary view commit holding the files.
+    /// The history stays in the tracker. The project root fast-forwards to it;
     /// `newgit merge main` publishes it, as for any new tracker.
     ///
     /// Refuses, leaving nothing behind, when anything is at `mount` already
@@ -2401,14 +2400,18 @@ impl BranchManager {
         let owned: Vec<ExportTarget> = targets.into_iter().cloned().collect();
         self.route_export_remotes(&root, PROJECT_ROOT_INSTANCE, &owned, &outbox)?;
         let definitions = self.carved_definitions();
-        let resolved = route_to_targets(&owned, &[self.root.name.clone()], |target, tracker| {
-            definitions
-                .iter()
-                .find(|definition| definition.name == tracker)
-                .is_some_and(|definition| {
-                    export_reason(target, definition) != ExportReason::Withheld
-                })
-        })
+        let resolved = route_to_targets(
+            &owned,
+            std::slice::from_ref(&self.root.name),
+            |target, tracker| {
+                definitions
+                    .iter()
+                    .find(|definition| definition.name == tracker)
+                    .is_some_and(|definition| {
+                        export_reason(target, definition) != ExportReason::Withheld
+                    })
+            },
+        )
         .resolved;
         if let Some(target) = resolved {
             config(&format!("remote.{target}.gh-resolved"), "base")?;
@@ -7744,8 +7747,7 @@ impl BranchManager {
     /// - **Rooted at a tracker** (`root`), they are that tracker's own
     ///   history: its `main` fast-forwards to them, or really merges them as
     ///   `newgit merge` would, and then its pin in the project root moves to
-    ///   that `main` as `newgit pull <tracker>` moves it — one commit,
-    ///   composing as a merge that brings them in on top.
+    ///   that `main` as `newgit pull <tracker>` moves it, in one commit.
     /// - **Otherwise** they are view commits. The ones that came from here
     ///   are recognised — by id, by the note naming the root commit an
     ///   exported commit stands for, or by a canonical id — and the rest
@@ -9641,7 +9643,7 @@ impl BranchManager {
     /// `newgit pull <tracker>`: one view commit in `instance` (the project
     /// root when `None`) that moves `tracker`'s pin to its `follow` ref —
     /// `Pull t3code: 14 commits from main` — authored by whoever runs it.
-    /// It composes as a merge bringing those commits in, and merges into
+    /// It holds the tracker's files at the new pin, and merges into
     /// `main` like any instance commit. The workspace fast-forwards to it.
     pub fn pull(&self, instance: Option<&str>, tracker: &str) -> Result<PullOutcome> {
         self.require_migrated()?;
@@ -9668,7 +9670,7 @@ impl BranchManager {
     /// Move `definition`'s pin in `instance` (the project root when `None`)
     /// to `new`, which came from `from` (a ref, or a target): one view
     /// commit, `Pull <tracker>: N commits from <from>`, authored by whoever
-    /// runs it, composing as a merge that brings the commits in. Nothing
+    /// runs it, holding the tracker's files at `new`. Nothing
     /// when the pin already has `new`.
     fn move_pin(
         &self,

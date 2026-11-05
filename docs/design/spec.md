@@ -1314,8 +1314,8 @@ leaves the machine.
 
 `newgit export --remote <name>` pushes the project's trackers, history and
 all, to an ordinary repository defined in `.newgit/exports/<name>.toml`,
-typically a GitHub mirror. Only `public` trackers and the ones the target
-names ship, so a public mirror and a private one can show different views,
+typically a GitHub mirror. It ships exactly the trackers the target names,
+or the `public` ones if it names none, so a public mirror and a private one can show different views,
 and a history that ever committed a file a tracker outside Git owns is refused. It
 pushes with your own Git credentials, so GitHub Actions and `gh` keep
 working. When the target's branch has moved ahead (a pull request merged on

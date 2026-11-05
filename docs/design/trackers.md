@@ -57,8 +57,8 @@ captured by newgit and never committed.*
    R1  carves electron, pins E0           ◄──  E0   (the files at its own root)
 
    view rooted at root:
-     V3 ── V2 ──────── V1 ──────── root's history before the carve …
-           └ X1'  (X1 replayed under apps/electron)
+     V3 ── V2 ── V1 ── root's history before the carve …
+     (V2 holds electron's files at X1, and nothing of X1's history)
 ```
 
 A submodule in storage, a monorepo in every view. Agents never see a
@@ -307,50 +307,37 @@ trackers **(decided)**:
    order, every parent of every commit. The order is part of the spec, since
    byte-identical output depends on it.
 2. **For each commit `R`, the view commit `V(R)` has:**
-   - **parents:** `V(p)` for each parent `p` of `R`, in order, plus one more
-     for each child that `R` brings history in from (step 3);
+   - **parents:** `V(p)` for each parent `p` of `R`, in order, and no others;
    - **tree:** `R`'s tree without `.newgit/pins/`, with each readable pinned
      child's view tree at its pin set under its mount, with no diffing;
    - **metadata:** `R`'s author, committer, dates, and message, newgit's
      trailers stripped and the recorded headers put back. When `R` holds
      none of `T`'s own changes, and a child commit holds the work (see
-     *Split*), the metadata comes from that child commit.
-3. **Inline, or brought in.** For each pinned child, the child view commits
-   *new* at `R` are those reachable from the child's view at `R`'s pin and
-   not from its view at any of `R`'s parents' pins.
-   - **Inline** when `R` was split from a view commit (it carries
-     `Newgit-Split`): its new child commits are the other halves of the same
-     work. Also inline when the only new child commit's parents are exactly
-     `R`'s parents' pins and either `R` is a merge or the child commit has
-     the same committer line as `R`: the child half of the same work, made
-     by the same split. Child commits carry no trailers, so this is how a
-     nested child's pin-only commits are recognised. Their changes are part
-     of `V(R)`, and nothing is added.
-   - **Brought in** otherwise: a mount added, a `newgit pull`, an upstream
-     sync, a pin moved by hand. `V(R)` is a merge whose extra parent is the
-     new child commits, *replayed*. Each replayed commit is the child's view
-     commit with its tree under the mount and, beside the mount, the rest of
-     the tree as its first parent holds it (the first parent being the
-     replay of the child commit before it, or the view commit that first
-     took that child commit inline, in this view's walk order). History from
-     before the mount existed has nothing beside the mount. This is
-     `git subtree add` and `git subtree pull`'s shape: `git log --
-     apps/electron`, `git blame`, and `git bisect` stay real through the
-     merge, and because inline commits are represented by their own view
-     commits, nothing appears twice.
+     *Split*), the metadata comes from that child commit: the child whose
+     pin moved at a commit split from a view commit.
+3. **A child is its tree at the pin, never its history (decided
+   2026-11-05).** A tracker's history stays in its own repo, and no view
+   reaches it. Two things can happen at `R`, and both are one view commit:
+   - **Work made here.** `R` was split from a view commit, so its child
+     commits are the other halves of that work. `V(R)` is that view commit.
+   - **History from elsewhere.** `R` adds a mount or moves a pin: an import,
+     a `newgit pull`, an upstream sync, a pin moved by hand. `V(R)` is one
+     ordinary commit on `V(p)`, its tree holding the child's files at the
+     pin. `git log -- apps/electron` starts at the import and shows each
+     pull as one commit; the child's own log is in the child
+     (`newgit tracker log`, or its repository).
 
-   A replay is a pure function of the child's commits and the view commits
-   it starts from, so two branches that bring in the same upstream push
-   replay it identically, and merging them shows it once. Replays are
-   recomputed on every compose; nothing is cached. A mount removed and added
-   again replays the child's whole history again, as `git subtree add`
-   would.
+   Nothing depends on the child's commits, so nothing has to be recomputed,
+   no two branches can disagree about them, and a mount removed and added
+   again costs one commit.
 4. **Readers.** A child the reader may not read is left out of the tree, and
    so is everything mounted inside it. A single-parent view commit whose only
    change was to such a child is dropped, and the commit after it moves onto
-   its parent. A merge is never dropped. Someone who cannot read a tracker
-   sees different ids from the first commit that touched it (see *One name
-   for a commit*).
+   its parent. A merge goes the same way only when its sides differ in such
+   a child and what is left adds nothing to one parent: the side that moved
+   the pin was dropped, so there is nothing to join. Any other merge stays.
+   Someone who cannot read a tracker sees different ids from the first commit
+   that touched it (see *One name for a commit*).
 5. **Originals are reused.** Commits are written byte for byte, so when
    `V(R)`'s parents, tree, and metadata come out as the view commit `R` was
    split from (its `Newgit-Split`), compose emits that object, signature and
@@ -642,7 +629,7 @@ newgit pull electron
 ```
 
 That makes one view commit, `Pull electron: 14 commits from main`, which
-moves the pin and composes as a merge (*brought in*, above). It is authored
+moves the pin and holds the child's files there, on one parent. It is authored
 by whoever ran it, needs the root's maintainers like any change, and merges
 into `main` like any instance commit; the workspace fast-forwards to it.
 `follow` names the ref it pulls. Spawn never writes a commit, but it says
@@ -831,15 +818,35 @@ it onward. Two layers keep that from mattering:
 
 ## Git and GitHub
 
+**A GitHub repo holds only its own trackers (decided 2026-11-05).**
+Spheroman/newgit holds newgit's, Spheroman/t3code holds t3code's.
+
 **GitHub is an export (decided).** `newgit export --remote <name>` pushes a
-composed projection of the `public` (or chosen) trackers' `main`s, with
-composed history, to the target defined in `.newgit/exports/<name>.toml` —
-an ordinary GitHub repository, say. With `root = "<tracker>"` the target
+composed projection of the trackers' `main`s, with composed history, to the
+target defined in `.newgit/exports/<name>.toml` — an ordinary GitHub
+repository, say. A target with `trackers` ships exactly those, of any
+audience; one without ships the `public` ones. A tracker left out leaves no
+path, no pin, and no history there, and a commit that only moved its pin is
+not shown, so the target's ids differ from the view's from the first commit
+that touched it. With `root = "<tracker>"` the target
 gets the view rooted at that tracker instead: the tracker's own `main`, its
 files at the top, which for a tracker that mounts nothing in Git is its
 history unchanged (#141). GitHub never holds a tracker the export
 did not include, so `.env` files can live in the project and never reach a
-public mirror. Since `.newgit/` is root's, exporting root ships the config,
+public mirror.
+
+**Coming back (decided 2026-11-05).** Ids differ on a mirror, so what is
+merged there comes back through newgit, never by fetching GitHub. A linked
+project root's `origin` is the Git endpoint, as a workspace's is, so `git
+pull` serves the project's own commits, and a commit on the mirror becomes a
+root commit with the withheld trackers' pins carried over: by hand with
+`newgit pull --remote <target>`, or by a webhook
+([remote.md](remote.md), *The GitHub webhook*). Such a root commit records
+the mirror's commit in its trailers, headers included, so composing for that
+target gives that very commit back, GitHub's signature and all, and the next
+export is a no-op. For a reader of everything it is a rebuilt commit with a
+canonical note, like any other (*One name for a commit*).
+ Since `.newgit/` is root's, exporting root ships the config,
 resources, scripts, and export targets; only `.newgit/trackers/` follows
 `access`'s audience.
 
@@ -909,7 +916,7 @@ named and skipped.
   apps/t3code --from <url> [--from-branch newgit]` fetches the branch
   unchanged as the tracker's `main`, then makes one commit in the project
   root adding the definition (in `access`), the mount, and the pin (a
-  *brought in* merge). Refused, leaving nothing behind, when the mount has
+  commit on one parent). Refused, leaving nothing behind, when the mount has
   files or the history adds a file a tracker outside Git owns there.
 - **#141 (export a tracker as its own root):** *done.* `root = "t3code"` on
   an export target pushes t3code's own `main`, composed rooted at it. While
@@ -924,18 +931,19 @@ named and skipped.
   project root as ordinary work, split when `newgit merge main` publishes.
 - **#143 (`gh` per target):** done: a push resolves `gh` to the target that
   ships a tracker the work touched.
-- **#144 (bring t3code in):** Spheroman/newgit's export *includes* t3code
-  (decided), so it stays a true mirror with the project's own ids, and
-  `git pull` from GitHub in the project root keeps working. FORK.md:
-  upstream comes in by merging pingdotgg/t3code into the fork's `newgit`
-  branch, then `newgit pull --remote t3code` and `newgit pull t3code`. The
+- **#144 (bring t3code in):** Spheroman/newgit's export *leaves t3code out*
+  (decided 2026-11-05, replacing 2026-11-04's): Spheroman/t3code is t3code's
+  mirror, rooted at it, and importing t3code once put 8,164 of its commits
+  into newgit's view and onto the public mirror. FORK.md: upstream comes in
+  by merging pingdotgg/t3code into the fork's `newgit` branch, then `newgit
+  pull --remote t3code` and `newgit pull t3code`, one commit here. The
   cold-start measurement doubles as the profile cost check.
 
 ---
 
 ## Build order
 
-Status as of 2026-11-04. Each step lands alone and keeps the suite green.
+Status as of 2026-11-05. Each step lands alone and keeps the suite green.
 
 **Before roots (done, 2026-10):** tracker repos with real history (`main`,
 `instances/<instance>`) in the shared store; the `root` tracker, ownership by
@@ -962,7 +970,9 @@ headers were recorded — is replaced by the steps below and deleted.
    `Newgit-Split-Parent`, carving with history, `tracker repair`,
    workspace-path storage, `project`.
 5. **The t3code milestone** on the new engine: #140, #141, #142, and #143
-   are done; #144 (bringing the real t3code in) is next.
+   are done. For #144, a mounted tracker joins as one commit, a mirror holds
+   only what it ships, the project root fetches from the endpoint, and a
+   webhook brings GitHub's merges in; bringing the real t3code in is next.
 6. **Later:** spawning at a tracker (`spawn --root`), `.gitignore` as
    definition, moving `role`/`priority`/`requires` to the mounting parent,
    `spawn --from <instance>` with `requires` checked between instances,
@@ -990,6 +1000,38 @@ something:
    on your machine or as a preview, with its whole environment and your
    keys — with trackers shown as how it works.
 
+## Decided with Jack (2026-11-05)
+
+1. **A GitHub repo holds only its own trackers,** and a mounted tracker's
+   history stays in its own repo and never enters the mounting project's Git
+   history. This replaces 2026-11-04's *Spheroman/newgit mirrors t3code too*
+   and the replay rule: a mount or a pin move is one ordinary view commit.
+   The cost, accepted: `git log`, `git blame`, and `git bisect` under a mount
+   stop at the import and at each pull. The child's own history answers
+   those.
+2. **A project's `origin` is its remote's endpoint.** A mirror's ids are not
+   the project's once it withholds a tracker, so the project root fetches
+   from newgit.
+3. **A mirror's merged commits come back by webhook,** as root commits, on
+   the same terms as `newgit pull --remote`.
+
+### Settled while building (2026-11-05)
+
+- **`trackers` on a target is exact.** It used to add to the `public`
+  trackers, so a public tracker (t3code) could not be left out.
+- **A root commit brought in from a mirror names the mirror's commit,** not
+  the view commit rebuilt from it, so its id survives the round trip.
+- **The project root learns what `git pull` brought.** The view commit of
+  such a root commit is not what its trailers name, so the first sync after a
+  pull composes the remote's `main` here, which notes it. A workspace that
+  `git pull`s `origin` instead of `newgit pull` does not, and its split makes
+  a commit of its own, which merges.
+- **A mirror's event lands as a merge by whoever pushed it:** they must be a
+  member and maintain what it changes (*The GitHub webhook*).
+- **`git push` in a linked project root is refused** by the endpoint, which
+  is read-only; `newgit merge main` publishes from there. Pushing straight to
+  a `branches = true` target is refused too, as in a workspace.
+
 ## Decided with Jack (2026-11-04)
 
 1. **The parent records the child's commit** (gitlink pins under
@@ -1016,7 +1058,8 @@ something:
 9. **The same tracker may be mounted twice;** a commit editing both copies is
    refused. Layering is not built. Rooting at a child that requires its
    parent is refused.
-10. **Spheroman/newgit mirrors t3code too.**
+10. **Spheroman/newgit mirrors t3code too.** Replaced on 2026-11-05: it does
+    not.
 
 ### Settled while building (2026-11-04)
 
@@ -1029,21 +1072,11 @@ this is the list.
   root's own tree. A mount is relative to the parent's root, and nested
   mounts work through this. The design said only "`access` owns the
   definitions".
-- **Inline has a second rule.** Besides a root commit carrying
-  `Newgit-Split`, a child commit is inline when it is the only new one, its
-  parents are exactly the parent commit's parents' pins, and either the
-  parent commit is a merge or the two share a committer line. Child commits
-  carry no trailers, and a nested child's pin-only commits have nothing else
-  to say they belong to the same split.
 - **Two exemptions from one-audience.** A merge is exempt only when its
   message is one nobody wrote: Git's own one-line form or newgit's. So is
   the carve commit newgit makes,
   `Create tracker `x` at <path>`: without that, carving a narrow-audience
   tracker out of root would always be refused.
-- **No replay cache.** The design noted a cache keyed by the child's commits
-  and the view commits they start from. Not built: replays are recomputed on
-  each compose. They are pure functions, so the results are identical, and
-  it can be added if compose gets slow.
 - **An index lists one commit per tracker name.** With a tracker mounted
   twice, only the first copy is listed. The second copy's commits are in the
   store locally but on no branch list yet.
@@ -1079,8 +1112,6 @@ this is the list.
   `main`.
 - **A pin its tracker's repo does not have** leaves that tracker out at that
   commit, as for a reader who may not read it, rather than failing the view.
-- **Replays of a tracker mounted at `.`** take the previous commit's files
-  out before laying the next one over, so a deletion shows.
 - **During the move to mounts the Worker reads both layouts** of `access`
   (`<name>.toml`, and `.newgit/trackers/<name>.toml` from before), so a
   remote deployed before a project migrates still reads its definitions.

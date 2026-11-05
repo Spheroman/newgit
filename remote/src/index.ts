@@ -49,7 +49,10 @@ import {
 	type IndexAnswer,
 	type IndexPlan,
 	PLAN_HEADER,
+	type PullAnswer,
+	type PullPlan,
 } from "./endpoint";
+import { githubWebhook } from "./webhook";
 
 type Checking = typeof CHECKING;
 import type { Instance, ProjectDO } from "./project";
@@ -161,6 +164,15 @@ export interface Deps {
 		plan: CopyPlan,
 		credentials: () => Promise<Pick<CopyPlan, "from" | "to">>,
 	): Promise<CopyAnswer | Checking>;
+	/**
+	 * Have the container bring a mirror's commit into `main` and land it, in
+	 * the background, as the checks run. Absent, a webhook's pull fails.
+	 */
+	pull?(
+		project: string,
+		plan: PullPlan,
+		credentials: () => Promise<PullPlan["repos"]>,
+	): Promise<PullAnswer | Checking>;
 }
 
 /**
@@ -197,7 +209,7 @@ async function askCheck<P>(
 	return response.json();
 }
 
-class HttpError extends Error {
+export class HttpError extends Error {
 	constructor(
 		readonly status: number,
 		message: string,
@@ -208,6 +220,54 @@ class HttpError extends Error {
 
 const json = (body: unknown, status = 200) => Response.json(body, { status });
 
+/** The real thing: what the Worker runs on, and `ProjectDO`'s alarm. */
+export function liveDeps(env: Env, waitUntil: Deps["waitUntil"]): Deps {
+	return {
+		repos: new ArtifactsRepos(env.ARTIFACTS, env.ARTIFACTS_GIT_BASE),
+		fetcher: fetch,
+		waitUntil,
+		ancestry: async (project, plan, credentials) =>
+			(await askCheck(
+				env,
+				project,
+				"ancestry",
+				plan,
+				async () => ({ repos: await credentials() }),
+				"the remote could not check where the merge's pins move",
+			)) as AncestryAnswer[] | Checking,
+		index: async (project, plan, credentials) =>
+			(await askCheck(
+				env,
+				project,
+				"index",
+				plan,
+				async () => ({ repos: await credentials() }),
+				"the remote could not check the merge's index",
+			)) as IndexAnswer | Checking,
+		copy: async (project, plan, credentials) =>
+			(await askCheck(env, project, "copy", plan, credentials, "its Git endpoint said")) as CopyAnswer | Checking,
+		pull: async (project, plan, credentials) =>
+			(await askCheck(
+				env,
+				project,
+				"pull",
+				plan,
+				async () => ({ repos: await credentials() }),
+				"the Git endpoint could not pull",
+			)) as PullAnswer | Checking,
+		endpoint: (project, kind, plan, original) => {
+			const headers = new Headers({ [PLAN_HEADER]: btoa(JSON.stringify(plan)) });
+			for (const name of ["git-protocol", "content-encoding", "content-type"]) {
+				const value = original.headers.get(name);
+				if (value) headers.set(name, value);
+			}
+			return env.ENDPOINTS.getByName(project).fetch(
+				new Request(`https://endpoint/${kind}`, { method: "POST", headers, body: original.body }),
+			);
+		},
+	};
+}
+
 export default {
 	async fetch(request, env, ctx): Promise<Response> {
 		// The landing page is read from a tracker on every miss, so the edge
@@ -217,50 +277,7 @@ export default {
 			const cached = await caches.default.match(request);
 			if (cached) return cached;
 		}
-		const response = await handle(request, env, {
-			repos: new ArtifactsRepos(env.ARTIFACTS, env.ARTIFACTS_GIT_BASE),
-			fetcher: fetch,
-			waitUntil: (promise) => ctx.waitUntil(promise),
-			ancestry: async (project, plan, credentials) =>
-				(await askCheck(
-					env,
-					project,
-					"ancestry",
-					plan,
-					async () => ({ repos: await credentials() }),
-					"the remote could not check where the merge's pins move",
-				)) as
-					| AncestryAnswer[]
-					| Checking,
-			index: async (project, plan, credentials) =>
-				(await askCheck(
-					env,
-					project,
-					"index",
-					plan,
-					async () => ({ repos: await credentials() }),
-					"the remote could not check the merge's index",
-				)) as IndexAnswer | Checking,
-			copy: async (project, plan, credentials) =>
-				(await askCheck(
-					env,
-					project,
-					"copy",
-					plan,
-					credentials,
-					"its Git endpoint said",
-				)) as CopyAnswer | Checking,
-			endpoint: (project, kind, plan, original) => {
-				const headers = new Headers({ [PLAN_HEADER]: btoa(JSON.stringify(plan)) });
-				for (const name of ["git-protocol", "content-encoding", "content-type"]) {
-					const value = original.headers.get(name);
-					if (value) headers.set(name, value);
-				}
-				return env.ENDPOINTS.getByName(project).fetch(
-					new Request(`https://endpoint/${kind}`, { method: "POST", headers, body: original.body }),
-				);
-			},
-		});
+		const response = await handle(request, env, liveDeps(env, (promise) => ctx.waitUntil(promise)));
 		if (landing && response.status === 200) ctx.waitUntil(caches.default.put(request, response.clone()));
 		return response;
 	},
@@ -305,6 +322,9 @@ async function route(request: Request, env: Env, deps: Deps): Promise<Response> 
 
 	// ── The landing page ───────────────────────────────────────────────────
 	if ((method === "GET" || method === "HEAD") && path === "") return landingPage(method, env, deps.repos);
+
+	// ── GitHub's webhook: signed, not logged in ────────────────────────────
+	if (method === "POST" && path === "/v1/webhooks/github") return githubWebhook(request, env, deps);
 
 	// ── Login (no token yet) ───────────────────────────────────────────────
 	if (method === "POST" && path === "/v1/login/device") {
@@ -1196,7 +1216,7 @@ function ownerOf(facts: Map<string, TrackerFacts>, path: string): string | undef
  * maintainers merge it. The file is read from its owner's repo, relative to
  * the owner's mount. Resolved to a fixed point, a few reads per round.
  */
-async function loadDefinitions(
+export async function loadDefinitions(
 	repos: Repos,
 	project: ProjectId,
 	names: Iterable<string>,
@@ -1434,7 +1454,7 @@ async function copyCredentials(
  * Revoke repo passwords at Artifacts. Best effort per password: one already
  * gone (expired, or its repo deleted) must not stop the rest.
  */
-async function revokeRepoTokens(deps: Deps, tokens: { repo: string; artifactsId: string }[]) {
+export async function revokeRepoTokens(deps: Deps, tokens: { repo: string; artifactsId: string }[]) {
 	await Promise.allSettled(tokens.map((token) => deps.repos.revokeToken(token.repo, token.artifactsId)));
 }
 
@@ -1459,7 +1479,7 @@ function requireHuman(caller: Caller, action: string) {
 		throw new HttpError(403, `agent tokens cannot ${action}; ${caller.login} can, from their own login`);
 }
 
-function projectStub(env: Env, id: ProjectId): DurableObjectStub<ProjectDO> {
+export function projectStub(env: Env, id: ProjectId): DurableObjectStub<ProjectDO> {
 	return env.PROJECTS.getByName(projectKey(id));
 }
 

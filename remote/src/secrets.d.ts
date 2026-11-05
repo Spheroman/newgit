@@ -29,6 +29,11 @@ interface SecretEnv {
 	BILLING_TOKEN?: string;
 	/** Past this many dollars billed in 7 days, the remote pauses. Unset is 10. */
 	SPEND_LIMIT_WEEKLY_USD?: string;
+	/**
+	 * Signs GitHub's webhook events (`POST /v1/webhooks/github`): the value
+	 * set as the webhook's secret. Unset, the route answers 503.
+	 */
+	GITHUB_WEBHOOK_SECRET?: string;
 }
 interface Env extends SecretEnv {}
 declare namespace Cloudflare {

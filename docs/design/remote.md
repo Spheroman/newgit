@@ -48,6 +48,8 @@ this repository is `spheroman/newgit` on newgit.dev, and GitHub's
 
 **Built, and run live:**
 
+- A GitHub webhook that lands what is merged on a mirror on `main`
+  (*The GitHub webhook*).
 - GitHub login (device flow), project members, and a recorded,
   individually revocable token for every login, agent, and instance.
 - Open to any GitHub account (`ALLOWED_LOGINS = "*"`, since 2026-11-02),
@@ -627,6 +629,79 @@ Undo stays as it is in v1, local only.
 
 ---
 
+## The GitHub webhook
+
+A pull request merged on a mirror lands in `main` on newgit.dev by itself.
+GitHub pushes an event to `POST
+/v1/webhooks/github?project=<owner>/<name>&target=<target>`, and the rest is
+`newgit pull --remote <target>` for a target without `root`, run on the
+remote ([trackers.md](trackers.md), *Git and GitHub*).
+
+**What is checked, in order.** `X-Hub-Signature-256` is HMAC-SHA256 of the
+raw body under `GITHUB_WEBHOOK_SECRET`, compared in constant time; unsigned
+or mis-signed is 401, and with no secret configured everything is 503.
+`ping` is 200, and any event but `push` is 200 and ignored. The URL names
+the project and the target; root's `main` must have that
+`.newgit/exports/<target>.toml`, and its `url` must be the repo the event
+came from, or it is 403, so one repo's event cannot move a project that does
+not say it mirrors there. A rooted target, another branch, and a deleted
+branch are 200 and ignored. Whoever pushed (GitHub's `pusher.name`, which is
+their newgit login) must be a member who may merge root; what they do not
+maintain, and what the target withholds, gets no write password and may not
+change. A private mirror is 422: the endpoint fetches mirrors without
+credentials.
+
+**What happens.** The event is queued on the project and answered 202.
+`ProjectDO`'s alarm then moves it on every 15 seconds, which is also what
+keeps the endpoint awake: unlike a merge check, nobody else is asking. A pull
+takes `main`'s merge lock as `the GitHub webhook`, waiting while anyone else
+holds it, and extends the lock as it runs. `newgit endpoint-pull` in the
+container fetches the mirror's branch, confirms the event's commit is on it,
+composes `main` as the target sees it, and walks what the mirror has beyond
+that. If that is nothing, the event was our own export or a redelivery, and
+nothing changes. The rest come in with the withheld trackers' files put back
+and split, so their pins carry over; if `main` moved meanwhile, a merge made
+in the view, dated by the mirror's commit so a retry makes the same one.
+Root's ref moves by compare-and-swap, each child's `main` catches up, and
+the Worker moves the index, ending the lock and cancelling its passwords.
+Every commit comes out the same on a second run, so a run that stopped after
+root moved finishes with what it pushed.
+
+**The same refusals as a pull.** A file a tracker outside Git owns, a commit
+touching a withheld tracker's mount, a conflict with `main`, a tracker the
+pusher does not maintain: refused, logged, nothing moved, lock released.
+
+**When it fails.** A failure (GitHub or Artifacts down, the container gone)
+is logged and tried again, five times; a wait on someone else's merge gives
+up after two hours. After that it is dropped, loudly, and redelivering the
+event from GitHub's *Recent Deliveries* starts it again. Everything is in
+the Worker's logs under `webhook`. GitHub's own page shows only the 202.
+
+**What it trusts.** GitHub, to say who pushed what: the signature proves an
+event came from someone holding the secret, and the payload is taken at its
+word. There is one secret per remote, so setting up a webhook is an
+operator's act; a repo's owner cannot do it alone. Landing on `main` skips
+`newgit merge`'s own checks of pin moves, because no pin moves but by the
+split itself, and it skips no maintainers' check. It does not re-verify
+GitHub's signatures on commits, and a branch's protection rules are GitHub's
+to enforce: anyone GitHub lets onto that branch, who is also a member here,
+can land work on `main`. What lands is exactly what is on the mirror's
+branch at the event's commit.
+
+**A pull request's commits** come in as new root commits, not as the
+instance's own: those are in the instance's forks, which the pull does not
+read. The instance's work is already on `main` then, so merging it finds
+nothing to do but a merge commit.
+
+**Setting one up**, in the repo's *Settings → Webhooks*:
+
+- Payload URL:
+  `https://newgit.dev/v1/webhooks/github?project=<owner>/<name>&target=<target>`
+- Content type: `application/json`
+- Secret: the value of `GITHUB_WEBHOOK_SECRET`, set with `wrangler secret put
+  GITHUB_WEBHOOK_SECRET`
+- Events: *Just the push event*
+
 ## Local Tracker Repos
 
 Each tracker's history lives in a bare repo at `.newgit/local/trackers.git`,
@@ -895,7 +970,8 @@ Resolved loudly; each is reversible.
 9. **ProjectDO is the source of truth** for members, branches, instances,
    and checkpoints when a remote is configured. Binding records stay local.
 10. **Artifacts is the project remote** in remote mode; GitHub is an export
-    (`newgit export --remote`).
+    (`newgit export --remote`), and what is merged there comes back through
+    newgit (*The GitHub webhook*), never by fetching GitHub.
 11. **Identity is GitHub login**, via device flow. **Agents act as their
     owner.**
 12. **Tracker history is Git** (`refs/trackers/<tracker>/*`), in a tracker repo

@@ -311,7 +311,9 @@ with Git; `newgit tracker capture` and `track` refuse it.
 [--from-branch <branch>]` brings in another repository's history instead:
 the branch (its `HEAD` by default) becomes the tracker's `main` unchanged,
 ids and signatures intact, and one commit mounts it at `<dir>`, an empty
-directory, composing as a merge that brings that history in. A `--from` path
+directory: one ordinary commit holding its files. Its history stays in its
+own repository and never enters this project's, so `git log` under the mount
+starts there. A `--from` path
 is relative to where you run it. `newgit pull <tracker>` moves its pin to
 its `follow` ref in one commit; nothing else moves a pin on your behalf. How sensitive a tracker's content is has nothing
 to do with this; that is its `audience`. A project laid out before mounts
@@ -1613,16 +1615,18 @@ trackers = ["root"]
 | --- | --- | --- | --- | --- |
 | `url` | string | yes | — | where to push. `owner/repo` means `https://github.com/owner/repo.git`; anything else (an `https://` or `git@` URL, a path) is used as written. Pushed with plain `git push`, so your own Git credentials apply (`gh auth setup-git` sets them up for GitHub). |
 | `branch` | string | no | `main` | the branch the export is pushed to. |
-| `trackers` | array of strings | no | `[]` | trackers in Git to ship besides the `public` ones. A tracker outside Git here is an error: what it owns (a `.env`, say) never leaves through Git. |
+| `trackers` | array of strings | no | `[]` | exactly the trackers in Git to ship, of any audience; left out, the `public` ones ship. A tracker outside Git here is an error: what it owns (a `.env`, say) never leaves through Git. |
 | `branches` | bool | no | `false` | also export each instance's branch, every time its workspace pushes, so a pull request can be opened against the target (see below). |
 | `root` | string | no | — | export the view rooted at this tracker in Git instead of the project's: its own files at the top, and its own history, ids and signatures intact. For a fork that keeps its files at the repository root (see *Rooted at a tracker*). Cannot be set with `trackers`. |
 
-What ships fails closed. Only trackers in Git whose audience is `public` ship
-unless `trackers` names them, and `root` and `access` are `project-devs`.
+What ships fails closed. A target naming no `trackers` ships only those whose
+audience is `public`, and `root` and `access` are `project-devs`. A target
+naming them ships exactly those: a `public` tracker it leaves out stays out.
 So `trackers = ["root"]` mirrors the project's code and its `.newgit/`
 (config, resources, scripts, export targets) without `.newgit/trackers/`,
 and adding `"access"` mirrors the definitions too. A path owned by a tracker
-that does not ship stays out of every exported commit. A
+that does not ship stays out of every exported commit, with its pin and its
+history, and a commit that only moved its pin is not exported at all. A
 history that ever adds a path a tracker outside Git owns, such as a `.env`
 committed before it was tracked, refuses the whole export before anything
 is pushed.
@@ -1655,6 +1659,13 @@ target withholds put back as their parent had them. A commit that touches a
 withheld tracker's mount, or adds a file a tracker outside Git owns, is
 refused. `newgit merge main` publishes what came in.
 
+On a linked project the same thing happens on the remote when the target's
+repository has the webhook (`docs/design/remote.md`, *The GitHub webhook*),
+and the project root takes it with `git pull`: its `origin` is the remote's
+Git endpoint, set by `newgit remote add` and, for a project linked earlier,
+the next time newgit syncs the project root. Git does not push there: `newgit
+merge main` publishes from the project root.
+
 ### Rooted at a tracker: `root`
 
 ```toml
@@ -1677,9 +1688,8 @@ when the instance's work touched that tracker.
 
 A pull request merged there comes back with `newgit pull --remote <target>`:
 the tracker's `main` fast-forwards to it (or really merges it, when `main`
-moved here too), then its pin in the project root moves, one commit that
-composes as a merge bringing the new commits in on top, whatever their
-dates. Instances pick it up with `newgit pull <tracker>` once `newgit merge
+moved here too), then its pin in the project root moves, in one commit on
+top, whatever the new commits' dates. Instances pick it up with `newgit pull <tracker>` once `newgit merge
 main` has published it. An export finding the target ahead says to run
 that rather than pulling by itself.
 
