@@ -25,10 +25,16 @@ jobs:
     # ports, so its tests are integration tests by nature. They have to run
     # on both platforms it claims to support — a unit-test-only CI would
     # prove almost nothing about this codebase.
+    #
+    # macOS runs on main, not on pull requests. The suite is thousands of git
+    # spawns, and GitHub's 3-vCPU macOS runners take ~12 minutes on it, CPU
+    # bound, against ~3 on Ubuntu. A macOS-only break is rare and shows up on
+    # the next main run; to check a branch on macOS before merging, run this
+    # workflow by hand on it (workflow_dispatch runs both).
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: ${{ github.event_name == 'pull_request' && fromJSON('["ubuntu-latest"]') || fromJSON('["ubuntu-latest", "macos-latest"]') }}
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
