@@ -342,6 +342,19 @@ impl GitSource {
         .filter(|rev| !rev.is_empty())
     }
 
+    /// The best common ancestor of `a` and `b`.
+    pub fn merge_base(&self, a: &str, b: &str) -> Result<String> {
+        self.git(&["merge-base", a, b])
+    }
+
+    /// Whether `tip` changes anything `base` does not hold, leaving out the
+    /// paths under `exclude`: what a tracker's own files did, its pins aside.
+    pub fn changes_outside(&self, base: &str, tip: &str, exclude: &str) -> Result<bool> {
+        let exclude = format!(":(exclude){exclude}");
+        let names = self.git(&["diff", "--name-only", base, tip, "--", ".", &exclude])?;
+        Ok(!names.trim().is_empty())
+    }
+
     pub fn is_ancestor(&self, ancestor: &str, descendant: &str) -> Result<bool> {
         let args = [
             "-C",

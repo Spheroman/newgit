@@ -2977,7 +2977,9 @@ impl BranchManager {
     }
 
     /// The trackers in Git the instance's work touched: those whose
-    /// `instances/<slug>` has commits their `main` does not.
+    /// `instances/<slug>` has commits their `main` does not. The root makes a
+    /// commit for every view commit, moving its pins when the work was in a
+    /// child, so it counts only when its own files changed.
     fn touched_trackers(&self, branch: &BranchInstance) -> Vec<String> {
         let instance = format!("instances/{}", branch.slug);
         self.carved_definitions()
@@ -2989,13 +2991,24 @@ impl BranchManager {
                 else {
                     return false;
                 };
-                match self
+                let Ok(main) = self
                     .source
                     .rev_parse(&local_tracker_ref(&definition.name, "main"))
-                {
-                    Ok(main) => !self.source.is_ancestor(&tip, &main).unwrap_or(true),
-                    Err(_) => true,
+                else {
+                    return true;
+                };
+                if self.source.is_ancestor(&tip, &main).unwrap_or(true) {
+                    return false;
                 }
+                if !definition.owns_everything() {
+                    return true;
+                }
+                let Ok(base) = self.source.merge_base(&main, &tip) else {
+                    return true;
+                };
+                self.source
+                    .changes_outside(&base, &tip, crate::compose::PINS_DIR)
+                    .unwrap_or(true)
             })
             .map(|definition| definition.name)
             .collect()
