@@ -3232,9 +3232,21 @@ fn export_to_remote(name: &str, options: RemoteExportOptions) -> Result<()> {
     } else {
         "Would export (dry run)"
     };
-    println!("{verb} `main` → {} (branch {})", outcome.url, target.branch);
+    match &target.root {
+        Some(root) => println!(
+            "{verb} `{root}`'s `main`, as its own root → {} (branch {})",
+            outcome.url, target.branch
+        ),
+        None => println!("{verb} `main` → {} (branch {})", outcome.url, target.branch),
+    }
     let width = column_width(outcome.trackers.iter().map(|t| t.name.len()), "");
-    for tracker in &outcome.trackers {
+    // Rooted at a tracker, the others are not withheld so much as not in
+    // that view at all.
+    let shown = outcome
+        .trackers
+        .iter()
+        .filter(|t| target.root.is_none() || t.reason != ExportReason::Withheld);
+    for tracker in shown {
         let at = tracker
             .commit
             .as_deref()
@@ -3247,6 +3259,10 @@ fn export_to_remote(name: &str, options: RemoteExportOptions) -> Result<()> {
             ExportReason::Listed => println!(
                 "  tracker:  {:<width$}  included (named by .newgit/exports/{}.toml, audience {}) @ {at}",
                 tracker.name, target.name, tracker.audience
+            ),
+            ExportReason::Root => println!(
+                "  tracker:  {:<width$}  the root (named by .newgit/exports/{}.toml), its own files at the top @ {at}",
+                tracker.name, target.name
             ),
             ExportReason::Withheld => println!(
                 "  withheld: {:<width$}  (audience {})",
@@ -3280,10 +3296,11 @@ fn export_to_remote(name: &str, options: RemoteExportOptions) -> Result<()> {
     if let Some(error) = &outcome.project_root_error {
         println!("\n  Could not compare the project root's own work with `main`: {error}");
     }
-    if outcome
-        .trackers
-        .iter()
-        .any(|t| t.reason == ExportReason::Withheld)
+    if target.root.is_none()
+        && outcome
+            .trackers
+            .iter()
+            .any(|t| t.reason == ExportReason::Withheld)
     {
         println!(
             "  Ship a withheld tracker by naming it in .newgit/exports/{}.toml: trackers = [\"<name>\"]",

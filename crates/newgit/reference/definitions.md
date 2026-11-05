@@ -1615,6 +1615,7 @@ trackers = ["root"]
 | `branch` | string | no | `main` | the branch the export is pushed to. |
 | `trackers` | array of strings | no | `[]` | trackers in Git to ship besides the `public` ones. A tracker outside Git here is an error: what it owns (a `.env`, say) never leaves through Git. |
 | `branches` | bool | no | `false` | also export each instance's branch, every time its workspace pushes, so a pull request can be opened against the target (see below). |
+| `root` | string | no | — | export the view rooted at this tracker in Git instead of the project's: its own files at the top, and its own history, ids and signatures intact. For a fork that keeps its files at the repository root (see *Rooted at a tracker*). Cannot be set with `trackers`. |
 
 What ships fails closed. Only trackers in Git whose audience is `public` ship
 unless `trackers` names them, and `root` and `access` are `project-devs`.
@@ -1645,6 +1646,26 @@ project's: the project root has no commits of its own, and the target ships
 every tracker those commits touch. Otherwise the export refuses and says how
 to bring them in by hand. `--dry-run` says how many commits would come in;
 `--force` replaces the branch instead.
+
+### Rooted at a tracker: `root`
+
+```toml
+# .newgit/exports/t3code.toml
+url = "Spheroman/t3code"
+branch = "newgit"
+root = "t3code"
+branches = true
+```
+
+The export is the tracker's own `main`, composed rooted at it, so its files
+sit at the top. While it mounts no tracker in Git, that is its history as it
+is: a tracker imported with `newgit tracker create t3code --git --mount
+apps/t3code --from <url>` exports as a no-op fast-forward of where it came
+from, and commits made here go out as the tracker commits they were split
+into. Once it mounts a tracker in Git its view is no longer its own history,
+and the export is refused, naming the child. With `branches = true` each
+instance's branch of the tracker is pushed, and `gh` resolves to the target
+when the instance's work touched that tracker.
 
 ### Pull requests from a workspace: `branches = true`
 

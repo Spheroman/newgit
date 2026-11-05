@@ -850,6 +850,8 @@ pub enum ExportReason {
     Public,
     /// The target's `trackers` names it.
     Listed,
+    /// The target is rooted at it (`root`).
+    Root,
     /// Neither: its history stays out.
     Withheld,
 }
@@ -7201,26 +7203,7 @@ impl BranchManager {
         name: &str,
         options: RemoteExportOptions,
     ) -> Result<RemoteExportOutcome> {
-        let targets = self.export_targets()?;
-        let target = targets
-            .iter()
-            .find(|target| target.name == name)
-            .cloned()
-            .ok_or_else(|| {
-                let known: Vec<&str> = targets.iter().map(|target| target.name.as_str()).collect();
-                NewgitError::Unsupported(if known.is_empty() {
-                    format!(
-                        "no export target `{name}`: define one in .newgit/exports/{name}.toml \
-                         (`newgit reference export`)"
-                    )
-                } else {
-                    format!(
-                        "no export target `{name}` (defined: {}); targets live in \
-                         .newgit/exports/<name>.toml",
-                        known.join(", ")
-                    )
-                })
-            })?;
+        let target = self.export_target(name)?;
 
         self.prepare_projection()?;
         // Only to say what the export leaves behind, so its failing is said,
@@ -7233,12 +7216,20 @@ impl BranchManager {
             Some(link) => Some((link.connect(Acting::Login)?, link.project.clone())),
             None => None,
         };
-        let list = self.branch_list(
-            client
-                .as_ref()
-                .map(|(client, project)| (client.as_ref(), project.as_str())),
-            PROJECT_ROOT_INSTANCE,
-        )?;
+        // Rooted at a tracker, `main` is that tracker's own `main`: a branch
+        // is a ref of the root a view is rooted at.
+        let list = match &target.root {
+            Some(tracker) => self
+                .tracker_branch_commit(tracker, PROJECT_ROOT_INSTANCE)?
+                .map(|commit| BTreeMap::from([(tracker.clone(), commit)]))
+                .unwrap_or_default(),
+            None => self.branch_list(
+                client
+                    .as_ref()
+                    .map(|(client, project)| (client.as_ref(), project.as_str())),
+                PROJECT_ROOT_INSTANCE,
+            )?,
+        };
 
         let (mut trackers, mut view) =
             self.compose_export(&target, &list, PROJECT_ROOT_INSTANCE)?;
@@ -7331,30 +7322,10 @@ impl BranchManager {
     /// target that diverged from the export is left to the push to refuse.
     fn pull_export_target(&self, target: &ExportTarget, tip: &str, dry_run: bool) -> Result<u32> {
         let root = self.store.paths().project_root.clone();
-        let upstream = export_ref(&target.name, "upstream");
-        let fetched = crate::source::run_git_env(
-            &[
-                "-C",
-                root.as_str(),
-                "fetch",
-                "--quiet",
-                "--no-tags",
-                &target.push_url(),
-                &format!("+refs/heads/{}:{upstream}", target.branch),
-            ],
-            &[],
-        );
-        match fetched {
-            Ok(_) => {}
-            // Not exported yet: nothing there to bring in.
-            Err(NewgitError::SourceCommand { stderr, .. })
-                if stderr.contains("couldn't find remote ref") =>
-            {
-                return Ok(0);
-            }
-            Err(error) => return Err(error),
-        }
-        let theirs = self.source.rev_parse(&upstream)?;
+        // Not exported yet: nothing there to bring in.
+        let Some(theirs) = self.fetch_target(target)? else {
+            return Ok(0);
+        };
         if theirs == tip
             || self.source.is_ancestor(&theirs, tip)?
             || !self.source.is_ancestor(tip, &theirs)?
@@ -7362,6 +7333,16 @@ impl BranchManager {
             return Ok(0);
         }
         let commits = self.source.commit_count(&format!("{tip}..{theirs}"))?;
+        // A rooted target's commits are its tracker's own: bringing them in
+        // moves that tracker's `main` and then its pin, which is a commit of
+        // its own, asked for by name.
+        if let Some(tracker) = &target.root {
+            return Err(NewgitError::Unsupported(format!(
+                "`{}` on `{}` has {commits} commit(s) `{tracker}`'s `main` does not (merged \
+                 there?), so nothing was pushed; `--force` replaces the branch",
+                target.branch, target.name
+            )));
+        }
 
         let branch = std::fs::read_to_string(self.store.paths().project_branch_file())
             .map(|branch| branch.trim().to_owned())
@@ -7408,12 +7389,82 @@ impl BranchManager {
         Ok(commits)
     }
 
+    /// Fetch `target`'s branch into `refs/newgit/exports/<target>/upstream`:
+    /// the commit it is at, or `None` when the target has no such branch.
+    fn fetch_target(&self, target: &ExportTarget) -> Result<Option<String>> {
+        let root = self.store.paths().project_root.clone();
+        let upstream = export_ref(&target.name, "upstream");
+        let fetched = crate::source::run_git_env(
+            &[
+                "-C",
+                root.as_str(),
+                "fetch",
+                "--quiet",
+                "--no-tags",
+                &target.push_url(),
+                &format!("+refs/heads/{}:{upstream}", target.branch),
+            ],
+            &[],
+        );
+        match fetched {
+            Ok(_) => Ok(Some(self.source.rev_parse(&upstream)?)),
+            Err(NewgitError::SourceCommand { stderr, .. })
+                if stderr.contains("couldn't find remote ref") =>
+            {
+                Ok(None)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Export target `name`, or an error listing the ones there are.
+    fn export_target(&self, name: &str) -> Result<ExportTarget> {
+        let targets = self.export_targets()?;
+        targets
+            .iter()
+            .find(|target| target.name == name)
+            .cloned()
+            .ok_or_else(|| {
+                let known: Vec<&str> = targets.iter().map(|target| target.name.as_str()).collect();
+                NewgitError::Unsupported(if known.is_empty() {
+                    format!(
+                        "no export target `{name}`: define one in .newgit/exports/{name}.toml \
+                         (`newgit reference export`)"
+                    )
+                } else {
+                    format!(
+                        "no export target `{name}` (defined: {}); targets live in \
+                         .newgit/exports/<name>.toml",
+                        known.join(", ")
+                    )
+                })
+            })
+    }
+
     /// Every export target, each checked against this project's trackers:
     /// a target naming a tracker outside Git, or none at all, is an error.
     fn export_targets(&self) -> Result<Vec<ExportTarget>> {
         let targets = self.store.load_export_targets()?;
         let code = self.carved_definitions();
         for target in &targets {
+            if let Some(root) = &target.root
+                && !code.iter().any(|definition| &definition.name == root)
+            {
+                let reason = if self
+                    .trackers
+                    .iter()
+                    .any(|definition| &definition.name == root)
+                {
+                    "is not in Git, and a tracker outside Git never leaves this machine through Git"
+                } else {
+                    "is not a tracker in this project"
+                };
+                return Err(NewgitError::InvalidDefinition {
+                    kind: "export",
+                    name: target.name.clone(),
+                    reason: format!("`root` names `{root}`, which {reason}"),
+                });
+            }
             for listed in &target.trackers {
                 if code.iter().any(|definition| &definition.name == listed) {
                     continue;
@@ -7435,6 +7486,53 @@ impl BranchManager {
             }
         }
         Ok(targets)
+    }
+
+    /// A target rooted at `tracker` ships its own history only while that is
+    /// its view: refuse once any commit of it at `commit` pins a tracker in
+    /// Git, naming the child.
+    fn refuse_rooted_mounts(
+        &self,
+        target: &ExportTarget,
+        tracker: &str,
+        commit: &str,
+    ) -> Result<()> {
+        let root = self.store.paths().project_root.clone();
+        let pinning = crate::source::run_git_env(
+            &[
+                "-C",
+                root.as_str(),
+                "rev-list",
+                "-1",
+                commit,
+                "--",
+                crate::compose::PINS_DIR,
+            ],
+            &[],
+        )?;
+        let pinning = pinning.trim();
+        if pinning.is_empty() {
+            return Ok(());
+        }
+        let mut objects = crate::objects::Objects::open(&root)?;
+        let found = objects.commit(pinning)?;
+        let mut children: BTreeSet<String> = crate::compose::pins_in(&mut objects, &found.tree)?
+            .into_keys()
+            .collect();
+        if let Some(parent) = found.parents.first() {
+            let parent = objects.commit(parent)?;
+            children.extend(crate::compose::pins_in(&mut objects, &parent.tree)?.into_keys());
+        }
+        let named: Vec<String> = children.iter().map(|child| format!("`{child}`")).collect();
+        Err(NewgitError::Unsupported(format!(
+            "`{}` is rooted at `{tracker}`, which mounts {}, a tracker in Git (commit {}), so \
+             its view is not its own history and it cannot be exported as its own root yet. \
+             Export the project instead: drop `root` from .newgit/exports/{}.toml",
+            target.name,
+            named.join(", "),
+            short(pinning),
+            target.name
+        )))
     }
 
     /// Compose `list` (tracker → commit) as `target` sees it — its trackers
@@ -7463,9 +7561,22 @@ impl BranchManager {
             .filter(|tracker| tracker.reason != ExportReason::Withheld)
             .map(|tracker| tracker.name.clone())
             .collect();
+        let root_name = target
+            .root
+            .clone()
+            .unwrap_or_else(|| self.root.name.clone());
         let root_commit = list
-            .get(&self.root.name)
-            .filter(|_| shipped.contains(&self.root.name));
+            .get(&root_name)
+            .filter(|_| shipped.contains(&root_name));
+        if target.root.is_some() {
+            let Some(root_commit) = root_commit else {
+                return Err(NewgitError::Unsupported(format!(
+                    "nothing to export to `{}`: `{root_name}` has no history on `{branch}` yet",
+                    target.name
+                )));
+            };
+            self.refuse_rooted_mounts(target, &root_name, root_commit)?;
+        }
         let Some(root_commit) = root_commit else {
             return Err(NewgitError::Unsupported(format!(
                 "nothing to export to `{}`: `{}` holds the project's history on `{branch}`, and it                  is not public and the target does not name it. Name the trackers to ship in                  .newgit/exports/{}.toml — `trackers = [\"root\"]` mirrors the project's own                  code",
@@ -7478,7 +7589,7 @@ impl BranchManager {
         let may_ship = |tracker: &str| shipped.contains(tracker);
         let view = crate::compose::compose(
             &root,
-            &self.root.name,
+            &root_name,
             &[(export_ref(&target.name, branch), root_commit.clone())],
             &crate::compose::ComposeOptions {
                 readable: &may_ship,
@@ -7497,8 +7608,15 @@ impl BranchManager {
                 target.name
             ))
         })?;
+        // A rooted view holds the tracker's files at its own root: each is
+        // judged where the project's view has it, under the mount.
+        let mount = target
+            .root
+            .as_ref()
+            .and_then(|_| code.iter().find(|definition| definition.name == root_name))
+            .map(|definition| definition.mount.clone());
         if let Some((commit, path, tracker)) =
-            crate::compose::find_outside_git(&root, &[&tip], &[], &all)?
+            crate::compose::find_outside_git_under(&root, &[&tip], &[], &all, mount.as_deref())?
         {
             return Err(NewgitError::SplitRefused(format!(
                 "the export to `{}` would carry commit {}, which adds `{path}`, and `{path}` \
@@ -9188,22 +9306,27 @@ impl BranchManager {
     /// The commit `definition`'s `follow` ref names: on the remote, that
     /// branch of its repo; here, its branch in the tracker store.
     fn follow_commit(&self, definition: &TrackerDefinition) -> Result<Option<String>> {
+        self.tracker_branch_commit(&definition.name, &definition.follow)
+    }
+
+    /// The commit branch `branch` of tracker `tracker` is at: on the remote,
+    /// that branch of its repo; here, its branch in the tracker store.
+    fn tracker_branch_commit(&self, tracker: &str, branch: &str) -> Result<Option<String>> {
         let project = self.store.paths().project_root.clone();
         if let Some(link) = &self.remote {
             let client = link.connect(Acting::Login)?;
-            let repo = format!("{}.t.{}", link.project.replace('/', "."), definition.name);
+            let repo = format!("{}.t.{tracker}", link.project.replace('/', "."));
             if let Ok(credential) = client.credential(&link.project, &repo, Scope::Read) {
-                let target = format!(
-                    "refs/newgit/remote/{}/{}",
-                    definition.name, definition.follow
-                );
-                GitSource::fetch_refs(
+                let target = format!("refs/newgit/remote/{tracker}/{branch}");
+                let fetched = GitSource::fetch_refs(
                     &["-C", project.as_str()],
                     credential.remote.as_deref().unwrap_or_default(),
-                    &[format!("+refs/heads/{}:{target}", definition.follow)],
+                    &[format!("+refs/heads/{branch}:{target}")],
                     Some(&basic_auth_header(&credential)),
-                )?;
-                if let Ok(commit) = self.source.rev_parse(&target) {
+                );
+                if fetched.is_ok()
+                    && let Ok(commit) = self.source.rev_parse(&target)
+                {
                     return Ok(Some(commit));
                 }
             }
@@ -9211,7 +9334,7 @@ impl BranchManager {
         self.fetch_carved_trackers()?;
         Ok(self
             .source
-            .rev_parse(&local_tracker_ref(&definition.name, &definition.follow))
+            .rev_parse(&local_tracker_ref(tracker, branch))
             .ok())
     }
 
@@ -11410,9 +11533,17 @@ struct ImportedCode {
 }
 
 /// Whether `target` ships a tracker in Git, and why: the one place that is
-/// decided, for composing an export and for routing `gh` alike. A target that
-/// ships a tracker as its own root (docs/design/roots.md) plugs in here.
+/// decided, for composing an export and for routing `gh` alike. A target
+/// rooted at a tracker ships that tracker alone (one that mounts another in
+/// Git is refused when composed).
 fn export_reason(target: &ExportTarget, definition: &TrackerDefinition) -> ExportReason {
+    if let Some(root) = &target.root {
+        return if root == &definition.name {
+            ExportReason::Root
+        } else {
+            ExportReason::Withheld
+        };
+    }
     if definition.audience == "public" {
         ExportReason::Public
     } else if target.trackers.contains(&definition.name) {

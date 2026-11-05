@@ -5,8 +5,8 @@
 //! <branch>` to run for each. A direct push to a target stays refused.
 //!
 //! The project has two trackers in Git: `root` (the project's code, shipped by
-//! `code`) and `b` (`apps/b`, shipped by `apps-b`). A bare repository stands
-//! in for each GitHub repo.
+//! `code`) and `b` (`apps/b`, which `apps-b` exports as its own root, #141:
+//! `b`'s files at the top). A bare repository stands in for each GitHub repo.
 //!
 //! New tests live in their own file per AGENTS.md's "Working in parallel".
 
@@ -24,17 +24,30 @@ fn bare(fixture: &Fixture, name: &str) -> Utf8PathBuf {
 }
 
 fn define(fixture: &Fixture, name: &str, repo: &Utf8Path, trackers: &[&str]) {
-    let dir = fixture.store.join(".newgit/exports");
-    std::fs::create_dir_all(&dir).expect("mkdir");
     let trackers: Vec<String> = trackers.iter().map(|t| format!("\"{t}\"")).collect();
-    std::fs::write(
-        dir.join(format!("{name}.toml")),
-        format!(
+    write_target(
+        fixture,
+        name,
+        &format!(
             "url = \"{repo}\"\nbranches = true\ntrackers = [{}]\n",
             trackers.join(", ")
         ),
-    )
-    .expect("write");
+    );
+}
+
+/// A target that exports tracker `root` as its own root.
+fn define_rooted(fixture: &Fixture, name: &str, repo: &Utf8Path, root: &str) {
+    write_target(
+        fixture,
+        name,
+        &format!("url = \"{repo}\"\nbranches = true\nroot = \"{root}\"\n"),
+    );
+}
+
+fn write_target(fixture: &Fixture, name: &str, text: &str) {
+    let dir = fixture.store.join(".newgit/exports");
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    std::fs::write(dir.join(format!("{name}.toml")), text).expect("write");
 }
 
 /// A tracker in Git `b` owning `apps/b`: carving it is a commit of its own.
@@ -55,7 +68,7 @@ fn two_targets(fixture: &Fixture) -> (Utf8PathBuf, Utf8PathBuf, Utf8PathBuf) {
     let code = bare(fixture, "code");
     let apps = bare(fixture, "apps-b");
     define(fixture, "code", &code, &["root", "access"]);
-    define(fixture, "apps-b", &apps, &["b"]);
+    define_rooted(fixture, "apps-b", &apps, "b");
     git(&fixture.store, &["add", "-A"]);
     git(&fixture.store, &["commit", "-q", "-m", "export targets"]);
     fixture.ok(&fixture.store, &["merge", "main"]);
@@ -130,11 +143,11 @@ fn work_in_one_targets_tracker_resolves_gh_to_that_target() {
     let stderr = pushed(&workspace);
     assert_eq!(resolved(&workspace, "apps-b").as_deref(), Some("base"));
     assert_eq!(resolved(&workspace, "code"), None);
-    // The branch goes to `apps-b` alone. A target that ships `b` without
-    // `root` exports it as its own root, which is #141: until then the
-    // export itself says why it could not, so only the routing is checked.
+    // The branch goes to `apps-b` alone, rooted at `b`: its files at the top.
     assert!(stderr.contains("`apps-b`"), "{stderr}");
-    let _ = &apps;
+    let files = files_at(&apps, "feature-a");
+    assert!(files.contains("feature.js"), "{files}");
+    assert!(!files.contains("apps/b/"), "{files}");
     assert_eq!(
         git(&code, &["for-each-ref"]),
         "",
@@ -172,10 +185,9 @@ fn work_in_both_goes_to_both_and_gh_resolves_neither() {
     assert!(files_at(&code, "feature-a").contains("change.txt"));
     let command = format!("gh pr create -R {code} --head feature-a");
     assert!(stderr.contains(&command), "no `{command}` in:\n{stderr}");
-    // `apps-b` ships `b` without `root`, which exports as its own root
-    // (#141); until then it is only routed to, and says why it could not.
-    let _ = &apps;
-    assert!(stderr.contains("`apps-b`"), "{stderr}");
+    let command = format!("gh pr create -R {apps} --head feature-a");
+    assert!(stderr.contains(&command), "no `{command}` in:\n{stderr}");
+    assert!(files_at(&apps, "feature-a").contains("feature.js"));
 }
 
 #[test]

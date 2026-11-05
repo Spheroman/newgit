@@ -25,6 +25,11 @@ pub struct ExportTarget {
     /// Instances' branches go here too, each time a workspace pushes one —
     /// so a pull request can be opened against the target.
     pub branches: bool,
+    /// Export the view rooted at this tracker instead of the project's: its
+    /// own files at the top, and while it mounts no tracker in Git, its own
+    /// history, ids and signatures intact (a fork that keeps its files at
+    /// the root).
+    pub root: Option<String>,
 }
 
 /// On-disk shape (everything but the filename-derived name).
@@ -38,6 +43,8 @@ struct ExportTargetFile {
     trackers: Vec<String>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     branches: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    root: Option<String>,
 }
 
 impl ExportTarget {
@@ -55,6 +62,7 @@ impl ExportTarget {
             branch: file.branch.unwrap_or_else(|| "main".to_owned()),
             trackers: file.trackers,
             branches: file.branches,
+            root: file.root,
         };
         target.validate()?;
         Ok(target)
@@ -95,6 +103,14 @@ impl ExportTarget {
                 .any(|c| c.is_whitespace() || c.is_control() || "~^:?*[\\".contains(c))
         {
             return Err(self.invalid(format!("`branch = \"{branch}\"` is not a branch name")));
+        }
+        if let Some(root) = &self.root
+            && !self.trackers.is_empty()
+        {
+            return Err(self.invalid(format!(
+                "`root = \"{root}\"` ships `{root}` and what it mounts, so `trackers` cannot \
+                 also be set: drop one"
+            )));
         }
         for (index, tracker) in self.trackers.iter().enumerate() {
             if self.trackers[..index].contains(tracker) {
@@ -140,6 +156,7 @@ mod tests {
             branch: branch.to_owned(),
             trackers: Vec::new(),
             branches: false,
+            root: None,
         }
     }
 
@@ -170,6 +187,15 @@ mod tests {
                 "`{branch}` should be refused"
             );
         }
+    }
+
+    #[test]
+    fn root_and_trackers_cannot_both_be_set() {
+        let mut both = target("acme/widget", "main");
+        both.root = Some("t3code".to_owned());
+        assert!(both.validate().is_ok());
+        both.trackers = vec!["root".to_owned()];
+        assert!(both.validate().is_err());
     }
 
     #[test]
