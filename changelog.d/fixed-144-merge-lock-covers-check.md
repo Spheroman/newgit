@@ -7,3 +7,7 @@
   while the check ran, and the finish was refused with "you hold no merge".
   The finish now extends the caller's lock for twenty minutes before the
   check, longer than the client waits.
+
+  The endpoint also now keeps what a merge's check fetched. It snapshotted
+  its store before sleeping only after composing a view, so a check's fetch
+  of t3code was lost and every later merge fetched all of it again.

@@ -317,6 +317,12 @@ export class GitEndpoint extends DurableObject<Env> {
 				// plan passes them as a header): say why, so a failure is fixable.
 				return new Response(`newgit endpoint-${kind} failed: ${why.slice(-800)}\n`, { status: 502 });
 			}
+			// A check fetches every tracker it looks at into the store, which
+			// for a large history (t3code, 365 MiB) takes minutes. Keep it like
+			// a composed view, so the container does not sleep without saving
+			// it and fetch the whole history again next time.
+			await this.ctx.storage.put("composed_at", Date.now());
+			await this.snapshotSoon();
 			return new Response(checked.stdout, { headers: { "content-type": "application/json" } });
 		}
 
