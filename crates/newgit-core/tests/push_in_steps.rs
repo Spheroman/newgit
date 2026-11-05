@@ -265,3 +265,28 @@ fn a_commit_the_remote_will_not_take_has_its_large_files_sent_ahead() {
         git(&repo, &["rev-list", "--count", "main"]),
     );
 }
+
+/// What `newgit remote add` seeds a tracker with, and a checkpoint sync
+/// sends: a plain push of a commit to a ref. Too big for the remote, it goes
+/// in steps too.
+#[test]
+fn a_plain_push_too_big_for_the_remote_goes_in_steps() {
+    let (_guard, temp) = tempdir();
+    let remote = limited_remote(&temp);
+    let (repo, tip) = history(&temp);
+
+    GitSource::push_refs(
+        &["-C", repo.as_str()],
+        remote.as_str(),
+        &[format!("+{tip}:refs/heads/main")],
+        None,
+    )
+    .expect("pushed in steps");
+
+    assert_eq!(git(&remote, &["rev-parse", "refs/heads/main"]), tip);
+    assert_eq!(
+        git(&remote, &["for-each-ref", "--format=%(refname)"]),
+        "refs/heads/main",
+        "the staging refs are gone"
+    );
+}

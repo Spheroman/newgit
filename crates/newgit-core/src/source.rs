@@ -1173,7 +1173,46 @@ impl RefUpdate {
 impl GitSource {
     /// `git <location> push <url> <refspecs>`, authenticated with `auth` (an
     /// `Authorization` header). `location` is `-C <repo>` or `--git-dir=…`.
+    ///
+    /// A push the remote refuses for its size, or drops, goes in steps: each
+    /// refspec's commit is staged as [`Self::push_leased`] stages one, then
+    /// the same push again.
     pub fn push_refs(
+        location: &[&str],
+        url: &str,
+        refspecs: &[String],
+        auth: Option<&str>,
+    ) -> Result<()> {
+        let error = match Self::push_once(location, url, refspecs, auth) {
+            Ok(()) => return Ok(()),
+            Err(error) => error,
+        };
+        let Some((size, limit)) =
+            too_large(&error).or_else(|| dropped(&error).then_some((128.0, 64.0)))
+        else {
+            return Err(error);
+        };
+        let staged = refspecs
+            .iter()
+            .filter_map(|refspec| {
+                let source = refspec.trim_start_matches('+').split(':').next()?;
+                (!source.is_empty()).then_some(source)
+            })
+            .try_for_each(|source| {
+                Self::push_in_steps(location, url, source, None, auth, size, limit)
+            });
+        let result = staged.and_then(|()| Self::push_once(location, url, refspecs, auth));
+        let _ = Self::push_once(
+            location,
+            url,
+            &[format!(":{STAGING_REF}"), format!(":{FILES_REF}")],
+            auth,
+        );
+        result
+    }
+
+    /// One `git push`, as it is: what the stepping is made of.
+    fn push_once(
         location: &[&str],
         url: &str,
         refspecs: &[String],
@@ -1230,7 +1269,7 @@ impl GitSource {
                     attempt(expected.unwrap_or(""))
                         .or_else(|error| attempt(commit).map_err(|_| error))
                 });
-                let _ = Self::push_refs(
+                let _ = Self::push_once(
                     location,
                     url,
                     &[format!(":{STAGING_REF}"), format!(":{FILES_REF}")],
@@ -1313,7 +1352,7 @@ impl GitSource {
                 args.extend(["-p", parent]);
             }
             let carrier = run_git_env(&args, &env)?;
-            Self::push_refs(location, url, &[format!("+{carrier}:{FILES_REF}")], auth)?;
+            Self::push_once(location, url, &[format!("+{carrier}:{FILES_REF}")], auth)?;
             parent = Some(carrier);
         }
         Ok(())
@@ -1352,7 +1391,7 @@ impl GitSource {
         while pushed + 1 < chain.len() {
             let upto = (pushed + step).min(chain.len() - 1);
             let refspec = format!("+{}:{STAGING_REF}", chain[upto - 1]);
-            match Self::push_refs(location, url, &[refspec], auth) {
+            match Self::push_once(location, url, &[refspec], auth) {
                 // Grow back after a step got through: one hard commit should
                 // not leave every commit after it a push of its own.
                 Ok(()) => {
