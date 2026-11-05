@@ -89,7 +89,10 @@ fn a_project_linked_before_this_is_moved_when_newgit_next_touches_it() {
     );
     assert_eq!(
         git(&fixture.store, &["remote", "get-url", "--push", "origin"]),
-        endpoint(&fixture),
+        fixture
+            .store
+            .join(".newgit/local/publish/outbox.git")
+            .as_str(),
         "a push no longer goes straight to the mirror"
     );
 }
@@ -141,7 +144,7 @@ fn a_branches_target_is_a_remote_for_gh_and_refuses_a_straight_push() {
     let pushed = git_as_user(&fixture, &fixture.store, &["push", "github", "main"]);
     assert!(!pushed.status.success());
     let stderr = String::from_utf8_lossy(&pushed.stderr);
-    assert!(stderr.contains("`newgit merge main`"), "{stderr}");
+    assert!(stderr.contains("`git push origin main`"), "{stderr}");
     assert!(
         !git_output(&mirror, &["rev-parse", "--verify", "main"])
             .status

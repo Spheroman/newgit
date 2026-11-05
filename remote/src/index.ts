@@ -909,7 +909,7 @@ async function gitEndpoint(request: Request, env: Env, deps: Deps, match: RegExp
 	if (service === "git-receive-pack")
 		throw new HttpError(
 			403,
-			"this endpoint is read-only: push from a newgit workspace, which splits your work into its trackers; in the project root, `newgit merge main` publishes",
+			"this endpoint is read-only: push from a newgit workspace, which splits your work into its trackers",
 		);
 	if (service !== "git-upload-pack") throw new HttpError(400, "only Git's smart HTTP protocol is served here");
 

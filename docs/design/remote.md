@@ -48,6 +48,9 @@ this repository is `spheroman/newgit` on newgit.dev, and GitHub's
 
 **Built, and run live:**
 
+- `git push` in a linked project root: `newgit merge main`, then an export
+  to each target whose trackers changed ([trackers.md](trackers.md),
+  *Settled while building (2026-11-05)*).
 - A GitHub webhook that lands what is merged on a mirror on `main`
   (*The GitHub webhook*).
 - GitHub login (device flow), project members, and a recorded,

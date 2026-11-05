@@ -1663,8 +1663,18 @@ On a linked project the same thing happens on the remote when the target's
 repository has the webhook (`docs/design/remote.md`, *The GitHub webhook*),
 and the project root takes it with `git pull`: its `origin` is the remote's
 Git endpoint, set by `newgit remote add` and, for a project linked earlier,
-the next time newgit syncs the project root. Git does not push there: `newgit
-merge main` publishes from the project root.
+the next time newgit syncs the project root.
+
+`git push` works there too, from any directory of the project root: pushing
+its branch does what `newgit merge main` and then `newgit export --remote
+<target>` do by hand, for each target whose view of `main` moved since the
+last export, each getting only its own trackers. So one push with changes in
+root and under a mount updates a mirror and a `root` target together. A
+refused merge fails the push, with its own message, and nothing is exported.
+A merge that landed stays: if an export then fails, the push fails, saying
+which `newgit export --remote <target>` to rerun, and `git push` again retries
+it. A push does not pull, so a target that is ahead fails with the `newgit
+pull --remote` to run. Any other branch is refused: spawn an instance.
 
 ### Rooted at a tracker: `root`
 

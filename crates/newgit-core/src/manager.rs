@@ -218,6 +218,20 @@ impl Recognise {
     }
 }
 
+/// What a `git push` from the project root did.
+#[derive(Debug)]
+pub struct ProjectPushOutcome {
+    pub merge: MergeOutcome,
+    /// Each target that had something new, or failed.
+    pub exports: Vec<ProjectPushExport>,
+}
+
+#[derive(Debug)]
+pub struct ProjectPushExport {
+    pub target: String,
+    pub result: std::result::Result<RemoteExportOutcome, String>,
+}
+
 /// What `tracker create --git --mount --from` did.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ImportGitTrackerOutcome {
@@ -1016,6 +1030,9 @@ pub struct RemoteExportOptions {
     pub force: bool,
     /// Compose and check, but push nothing.
     pub dry_run: bool,
+    /// A `git push` from the project root: only if the target's view moved
+    /// since the last export, and never pulling from an ahead target.
+    pub from_push: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2319,9 +2336,10 @@ impl BranchManager {
     /// Git endpoint, as a workspace's is. A mirror withholding a tracker has
     /// ids of its own, so `git pull` from it would bring in commits that are
     /// not the project's; the endpoint serves the project's own. `git push`
-    /// there is the endpoint's refusal: the project root publishes with
-    /// `newgit merge main`. Each `branches = true` target is a remote too,
-    /// for `gh`, and pushing to it straight is refused, as in a workspace.
+    /// goes to the outbox, as a workspace's does, and
+    /// [`Self::receive_project_push`] merges and exports what it brings. Each
+    /// `branches = true` target is a remote too, for `gh`, and pushing to it
+    /// straight is refused, as in a workspace.
     ///
     /// Run by `newgit remote add` and whenever the project root is synced,
     /// which moves a project linked before this; a repeat costs one read of
@@ -2345,8 +2363,11 @@ impl BranchManager {
                     .is_some_and(|(found, text)| found == key && text == value)
             })
         };
+        let outbox = self.outbox();
+        let receive_pack = self.receive_pack_command(PROJECT_ROOT_INSTANCE);
         if has("remote.origin.url", &endpoint)
-            && !set.contains("remote.origin.pushurl")
+            && has("remote.origin.pushurl", outbox.as_str())
+            && has("remote.origin.receivepack", &receive_pack)
             && targets
                 .iter()
                 .all(|target| has(&format!("remote.{}.url", target.name), &target.push_url()))
@@ -2356,16 +2377,10 @@ impl BranchManager {
         let config = |key: &str, value: &str| {
             crate::source::run_git_env(&["-C", root.as_str(), "config", key, value], &[]).map(drop)
         };
-        config("remote.origin.url", &endpoint)?;
+        self.ensure_push_route(&outbox)?;
+        GitSource::workspace_route_origin(&root, Some(&endpoint), &outbox, &receive_pack)?;
         if !set.contains("remote.origin.fetch") {
             config("remote.origin.fetch", "+refs/heads/*:refs/remotes/origin/*")?;
-        }
-        for key in ["remote.origin.pushurl", "remote.origin.receivepack"] {
-            // Exit 5 is "was not set", which is the state wanted.
-            let _ = crate::source::run_git_env(
-                &["-C", root.as_str(), "config", "--unset-all", key],
-                &[],
-            );
         }
         GitSource::workspace_use_credential_helper(
             &root,
@@ -2395,8 +2410,6 @@ impl BranchManager {
         if targets.is_empty() {
             return Ok(());
         }
-        let outbox = self.outbox();
-        self.source.ensure_outbox(&outbox)?;
         let owned: Vec<ExportTarget> = targets.into_iter().cloned().collect();
         self.route_export_remotes(&root, PROJECT_ROOT_INSTANCE, &owned, &outbox)?;
         let definitions = self.carved_definitions();
@@ -3517,23 +3530,8 @@ impl BranchManager {
     /// store if its `origin` changes.
     fn ensure_workspace_push(&self, branch: &BranchInstance) -> Result<()> {
         let outbox = self.outbox();
-        self.source.ensure_outbox(&outbox)?;
-        let hook = outbox.join("hooks/pre-receive");
-        let script = pre_receive_script(&self.store.paths().project_root, &newgit_program());
-        if std::fs::read_to_string(&hook).ok().as_deref() != Some(script.as_str()) {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::write(&hook, &script).map_err(|error| NewgitError::io(&hook, error))?;
-            std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755))
-                .map_err(|error| NewgitError::io(&hook, error))?;
-        }
-
-        // Git runs this with the outbox's path appended.
-        let receive_pack = format!(
-            "{} push-receive-pack --store {} -- {}",
-            sh_quote(&newgit_program()),
-            sh_quote(self.store.paths().project_root.as_str()),
-            sh_quote(&branch.name),
-        );
+        self.ensure_push_route(&outbox)?;
+        let receive_pack = self.receive_pack_command(&branch.name);
         // On a remote, `origin` is the project's Git endpoint; otherwise the
         // store's own origin.
         let fetch_url = match &branch.remote {
@@ -3552,6 +3550,31 @@ impl BranchManager {
             self.resolve_gh(branch, &targets)?;
         }
         Ok(())
+    }
+
+    /// The outbox, with the hook a push arrives through.
+    fn ensure_push_route(&self, outbox: &Utf8Path) -> Result<()> {
+        self.source.ensure_outbox(outbox)?;
+        let hook = outbox.join("hooks/pre-receive");
+        let script = pre_receive_script(&self.store.paths().project_root, &newgit_program());
+        if std::fs::read_to_string(&hook).ok().as_deref() != Some(script.as_str()) {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::write(&hook, &script).map_err(|error| NewgitError::io(&hook, error))?;
+            std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755))
+                .map_err(|error| NewgitError::io(&hook, error))?;
+        }
+        Ok(())
+    }
+
+    /// What Git runs to receive a push from `instance`, the outbox's path
+    /// appended.
+    fn receive_pack_command(&self, instance: &str) -> String {
+        format!(
+            "{} push-receive-pack --store {} -- {}",
+            sh_quote(&newgit_program()),
+            sh_quote(self.store.paths().project_root.as_str()),
+            sh_quote(instance),
+        )
     }
 
     /// On a newgit remote, `origin` is the project's Git endpoint, which
@@ -7527,7 +7550,25 @@ impl BranchManager {
 
         let (mut trackers, mut view) =
             self.compose_export(&target, &list, PROJECT_ROOT_INSTANCE)?;
-        let pulled = if options.force {
+        let pushed_ref = export_ref(&target.name, "pushed");
+        if options.from_push {
+            // Nothing new for this target: not even a fetch, so a pull
+            // request waiting there does not fail a push it has no part in.
+            if self.source.rev_parse(&pushed_ref).ok().as_deref() == Some(view.tip.as_str()) {
+                return Ok(RemoteExportOutcome {
+                    target: target.clone(),
+                    url: target.push_url(),
+                    trackers,
+                    tip: view.tip,
+                    commits: view.commits,
+                    pushed: false,
+                    project_root_error,
+                    pulled: 0,
+                });
+            }
+            self.refuse_target_ahead(&target, &view.tip)?;
+        }
+        let pulled = if options.force || options.from_push {
             0
         } else {
             self.pull_export_target(&target, &view.tip, options.dry_run)?
@@ -7588,6 +7629,7 @@ impl BranchManager {
                     }
                     other => other,
                 })?;
+            self.source.update_ref(&pushed_ref, &view.tip)?;
         }
 
         Ok(RemoteExportOutcome {
@@ -7600,6 +7642,22 @@ impl BranchManager {
             project_root_error,
             pulled,
         })
+    }
+
+    /// Refuse when `target`'s branch has commits `tip` does not: a push does
+    /// not pull, so it names the command that does.
+    fn refuse_target_ahead(&self, target: &ExportTarget, tip: &str) -> Result<()> {
+        let Some(theirs) = self.fetch_target(target)? else {
+            return Ok(());
+        };
+        if theirs == tip || self.source.is_ancestor(&theirs, tip)? {
+            return Ok(());
+        }
+        Err(NewgitError::Unsupported(format!(
+            "`{}` on `{}` has commits `main` does not (merged there?), and a push does not pull \
+             them in: `newgit pull --remote {}`, then `newgit export --remote {}`",
+            target.branch, target.name, target.name, target.name
+        )))
     }
 
     /// When `target`'s branch is ahead of `tip`, the export about to be
@@ -8360,6 +8418,9 @@ impl BranchManager {
     /// On a newgit remote there is nothing to mirror: a push publishes the
     /// instance's work into its trackers' forks, not one history somewhere.
     pub fn serve_push(&self, instance: &str) -> Result<Utf8PathBuf> {
+        if instance == PROJECT_ROOT_INSTANCE {
+            return self.serve_project_push();
+        }
         let branch = self.store.find_branch(instance)?;
         let outbox = self.outbox();
         self.source.ensure_outbox(&outbox)?;
@@ -8367,6 +8428,85 @@ impl BranchManager {
             GitSource::sync_outbox(&outbox, &self.require_publish_url()?, None)?;
         }
         Ok(outbox)
+    }
+
+    /// A push from the project root. The outbox holds no `main`, so Git
+    /// always hands the push over: `Everything up-to-date` would end a retry
+    /// after a failed export before it reached newgit.
+    fn serve_project_push(&self) -> Result<Utf8PathBuf> {
+        let outbox = self.outbox();
+        self.ensure_push_route(&outbox)?;
+        if let Some(branch) = self.project_branch() {
+            let _ = crate::source::run_git_env(
+                &[
+                    "-C",
+                    outbox.as_str(),
+                    "update-ref",
+                    "-d",
+                    &format!("refs/heads/{branch}"),
+                ],
+                &[],
+            );
+        }
+        Ok(outbox)
+    }
+
+    /// A `git push` of the project root's branch: what `newgit merge main`
+    /// and then `newgit export --remote <target>` do by hand, for each
+    /// target whose view of `main` is not what was last pushed there, each
+    /// getting only its own trackers.
+    ///
+    /// A refused merge fails the push and nothing is exported. Once the
+    /// merge has landed it stays: an export that fails is reported in the
+    /// outcome, and the others still run. Nothing here pulls: a target that
+    /// is ahead is a failed export, naming `newgit pull --remote`.
+    pub fn receive_project_push(&self, updates: &[RefUpdate]) -> Result<ProjectPushOutcome> {
+        let branch = self
+            .project_branch()
+            .unwrap_or_else(|| PROJECT_ROOT_INSTANCE.to_owned());
+        let own_ref = format!("refs/heads/{branch}");
+        let spawn = "`newgit spawn <name>` makes an instance, whose branch can be pushed";
+        for update in updates {
+            if update.name != own_ref {
+                return Err(NewgitError::Unsupported(format!(
+                    "the project root pushes only `{branch}`, so `{}` was refused: {spawn}",
+                    update.name
+                )));
+            }
+            let Some(new) = &update.new else {
+                return Err(NewgitError::Unsupported(format!(
+                    "refusing to delete `{branch}`: it is the project's own branch"
+                )));
+            };
+            if *new != self.source.rev_parse(&own_ref)? {
+                return Err(NewgitError::Unsupported(format!(
+                    "this pushes {} to `{branch}`, which is not the project root's `{branch}`: \
+                     {spawn}",
+                    short(new)
+                )));
+            }
+        }
+        // Before the merge, so a target that cannot be read stops the push
+        // with nothing landed.
+        let targets = self.export_targets()?;
+        let merge = self.merge(PROJECT_ROOT_INSTANCE, PROJECT_ROOT_INSTANCE)?;
+        let exports = targets
+            .iter()
+            .map(|target| ProjectPushExport {
+                target: target.name.clone(),
+                result: self
+                    .export_to_remote(
+                        &target.name,
+                        RemoteExportOptions {
+                            from_push: true,
+                            ..RemoteExportOptions::default()
+                        },
+                    )
+                    .map_err(|error| error.to_string()),
+            })
+            .filter(|export| !matches!(&export.result, Ok(outcome) if !outcome.pushed))
+            .collect();
+        Ok(ProjectPushOutcome { merge, exports })
     }
 
     /// The second half, run from the outbox's `pre-receive` hook while the

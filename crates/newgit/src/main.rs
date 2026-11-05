@@ -2757,7 +2757,7 @@ fn refuse_export_push(store: &Utf8Path, instance: &str, target: &str) -> Result<
             "newgit: `{target}` is an export target: newgit pushes there itself, composed from \
              the trackers `{target}` ships. A push straight to it could carry trackers it \
              withholds.\n\
-             newgit: publish with `newgit merge main`, then `newgit export --remote {target}`."
+             newgit: `git push origin main` merges and exports."
         );
     }
     let branch = manager.store().find_branch(instance)?.source_ref;
@@ -2767,6 +2767,60 @@ fn refuse_export_push(store: &Utf8Path, instance: &str, target: &str) -> Result<
          checkpoint and could carry trackers it withholds.\n\
          newgit: push with `git push origin {branch}`, then open a pull request with `gh pr \
          create`."
+    )
+}
+
+/// A push from the project root: a refused merge fails it with its own
+/// message. Once the merge has landed, an export that failed still fails the
+/// push, because it did not do all it was asked to, and says what to rerun.
+fn push_project_root(manager: &BranchManager, updates: &[RefUpdate]) -> Result<()> {
+    use newgit_core::manager::TrackerMergeAction;
+    let outcome = manager.receive_project_push(updates)?;
+    print_warnings(&outcome.merge.warnings);
+    let moved: Vec<&str> = outcome
+        .merge
+        .trackers
+        .iter()
+        .filter(|merge| merge.action != TrackerMergeAction::Unchanged)
+        .map(|merge| merge.tracker.as_str())
+        .collect();
+    if moved.is_empty() {
+        println!("newgit: `main` already has this");
+    } else {
+        println!("newgit: merged into `main` ({})", moved.join(", "));
+    }
+    if let Some(note) = &outcome.merge.project_root {
+        println!("newgit: {note}");
+    }
+    let mut failed = Vec::new();
+    for export in &outcome.exports {
+        match &export.result {
+            Ok(exported) => println!(
+                "newgit: exported to `{}` ({}, branch {})",
+                export.target, exported.url, exported.target.branch
+            ),
+            Err(error) => {
+                eprintln!("newgit: the export to `{}` failed: {error}", export.target);
+                failed.push(export.target.as_str());
+            }
+        }
+    }
+    if failed.is_empty() {
+        return Ok(());
+    }
+    let rerun: Vec<String> = failed
+        .iter()
+        .map(|target| format!("`newgit export --remote {target}`"))
+        .collect();
+    bail!(
+        "newgit: the push is not finished: `main` has the merge, and it stays, but {} did not \
+         get it. Rerun {}, or `git push` again.",
+        failed
+            .iter()
+            .map(|target| format!("`{target}`"))
+            .collect::<Vec<_>>()
+            .join(", "),
+        rerun.join(" and ")
     )
 }
 
@@ -2784,6 +2838,9 @@ fn push_pre_receive(instance: &str) -> Result<()> {
         .map(Utf8PathBuf::from);
 
     let manager = manager_here()?;
+    if instance == newgit_core::manager::PROJECT_ROOT_INSTANCE {
+        return push_project_root(&manager, &updates);
+    }
     println!("newgit: checkpointing `{instance}` before publishing this push");
     let outcome = manager.receive_push(instance, &updates, admitting.as_deref())?;
     print_warnings(&outcome.checkpoint.warnings);
@@ -3154,6 +3211,7 @@ fn export(args: ExportArgs) -> Result<()> {
         return export_to_remote(
             name,
             RemoteExportOptions {
+                from_push: false,
                 force: args.force,
                 dry_run: args.dry_run,
             },

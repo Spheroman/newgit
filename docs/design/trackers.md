@@ -1034,9 +1034,17 @@ something:
   <instance>` instead, and a mirror's merge then takes each withheld tracker's
   files from whichever parent is ahead, not its first
   ([remote.md](remote.md), *The GitHub webhook*).
-- **`git push` in a linked project root is refused** by the endpoint, which
-  is read-only; `newgit merge main` publishes from there. Pushing straight to
-  a `branches = true` target is refused too, as in a workspace.
+- **`git push` in a linked project root publishes.** Fetch stays on the
+  endpoint; a push goes through the outbox and `push-receive-pack`, as a
+  workspace's does. Pushing the project root's branch is `newgit merge main`,
+  then an export to each target whose view of `main` is not what was last
+  pushed there, so one push of root and mount work updates both mirrors, each
+  with only its own trackers. A refused merge fails the push and nothing is
+  exported. A merge stays once it has landed: a failed export fails the push
+  and names the `newgit export --remote <target>` to rerun. A push does not
+  pull, so a target that is ahead is such a failure. Any other branch is
+  refused, saying to spawn an instance. Pushing straight to a `branches =
+  true` target is refused, as in a workspace.
 
 ## Decided with Jack (2026-11-04)
 
