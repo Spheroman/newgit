@@ -270,12 +270,22 @@ enum Command {
     /// Move a mounted tracker's pin to its `follow` ref (default `main`): one
     /// commit, `Pull <tracker>: N commits from <ref>`, that brings its new
     /// history in as a merge. Nothing else moves a pin on anyone's behalf
+    ///
+    /// With --remote <target>, bring the commits on an export target's branch
+    /// (a pull request merged there) back instead: into the tracker a rooted
+    /// target is rooted at, then its pin in the project root; otherwise into
+    /// the project root as work. `newgit merge main` publishes either
+    #[command(group(clap::ArgGroup::new("what").args(["tracker", "remote"]).required(true)))]
     Pull {
         /// The mounted tracker in Git to bring up to date
-        tracker: String,
+        tracker: Option<String>,
         /// Instance (inferred when run inside a workspace; the project root
         /// otherwise)
+        #[arg(conflicts_with = "remote")]
         instance: Option<String>,
+        /// The export target (`.newgit/exports/<name>.toml`) to pull from
+        #[arg(long, value_name = "TARGET", conflicts_with = "tracker")]
+        remote: Option<String>,
     },
     /// Clone a project from a newgit remote: its default branch composed from
     /// the trackers in Git you may read, set up for newgit
@@ -655,7 +665,13 @@ fn main() -> Result<()> {
         Command::Remote { command } => remote_cmd::remote_command(command),
         Command::Clone { project, dir, url } => remote_cmd::clone(&project, dir, url),
         Command::Merge { instance, into } => merge(instance, &into),
-        Command::Pull { tracker, instance } => pull(instance, &tracker),
+        Command::Pull {
+            remote: Some(target),
+            ..
+        } => pull_remote(&target),
+        Command::Pull {
+            tracker, instance, ..
+        } => pull(instance, &tracker.unwrap_or_default()),
         Command::EndpointCompose => {
             let plan: newgit_core::endpoint::Plan = serde_json::from_reader(std::io::stdin())
                 .context("the plan on stdin is not JSON newgit can read")?;
@@ -4156,6 +4172,47 @@ fn pull(instance: Option<String>, tracker: &str) -> Result<()> {
             &view[..view.len().min(12)]
         ),
     }
+    Ok(())
+}
+
+fn pull_remote(target: &str) -> Result<()> {
+    let manager = BranchManager::open(context_here()?.store)?;
+    let outcome = manager.pull_remote(target)?;
+    let from = format!("{} (branch {})", outcome.url, outcome.branch);
+    let Some(view) = &outcome.view else {
+        match &outcome.root {
+            Some(tracker) if outcome.commits > 0 => println!(
+                "`{tracker}`'s `main` took {} from {from}; its pin here already has them",
+                plural(outcome.commits, "commit")
+            ),
+            _ => println!("Nothing new on {from}"),
+        }
+        return Ok(());
+    };
+    let how = if outcome.merged {
+        "merged"
+    } else {
+        "fast-forwarded"
+    };
+    match &outcome.root {
+        Some(tracker) => {
+            println!(
+                "Pulled {} from {from} into `{tracker}`'s `main` ({how})",
+                plural(outcome.commits, "commit")
+            );
+            println!(
+                "  pinned:   the project root now pins it, one commit bringing {} in ({})",
+                plural(outcome.pinned, "commit"),
+                short_rev(view)
+            );
+        }
+        None => println!(
+            "Pulled {} from {from} into the project root ({how}, {})",
+            plural(outcome.commits, "commit"),
+            short_rev(view)
+        ),
+    }
+    println!("  publish it with: newgit merge main");
     Ok(())
 }
 

@@ -634,7 +634,7 @@ between instances (`spawn --from <instance>`) is planned.
 
 **Pulling a child is explicit (decided).** A child's `main` moves when an
 instance rooted at it merges, when `newgit pull --remote` brings in a PR
-merged on GitHub (planned, #142), or when an upstream is synced. The parent
+merged on GitHub (#142), or when an upstream is synced. The parent
 sees it when someone runs:
 
 ```sh
@@ -674,8 +674,8 @@ composes the view rooted there. Resources come from the trackers in that
 view. A tracker that mounts nothing in Git composes to its own history
 unchanged. One that does composes like any root (its pin-only commits
 rebuilt with their children's metadata), so its view is no longer its raw
-history. While that is so, it can't be exported as its own root (#141
-refuses, naming the child).
+history. While that is so, it can't be exported as its own root (an export
+target's `root` refuses, naming the child).
 
 **A root that `requires` its parent** (rooting at `electron`, which needs the
 workspace `package.json`) is an error naming the parent to root at instead
@@ -834,7 +834,10 @@ it onward. Two layers keep that from mattering:
 **GitHub is an export (decided).** `newgit export --remote <name>` pushes a
 composed projection of the `public` (or chosen) trackers' `main`s, with
 composed history, to the target defined in `.newgit/exports/<name>.toml` —
-an ordinary GitHub repository, say. GitHub never holds a tracker the export
+an ordinary GitHub repository, say. With `root = "<tracker>"` the target
+gets the view rooted at that tracker instead: the tracker's own `main`, its
+files at the top, which for a tracker that mounts nothing in Git is its
+history unchanged (#141). GitHub never holds a tracker the export
 did not include, so `.env` files can live in the project and never reach a
 public mirror. Since `.newgit/` is root's, exporting root ships the config,
 resources, scripts, and export targets; only `.newgit/trackers/` follows
@@ -902,18 +905,23 @@ named and skipped.
   go on top whatever their dates, log and blame through the join, non-UTF-8
   headers), plus the cases its last review found: a pre-import branch merged
   into `main`, and a repair over a join.
-- **#140 (import):** fetch the branch unchanged as the tracker's history,
-  then one view commit adding the definition, the mount, and the pin (a
-  *brought in* merge). #156's fetch and refusals carry over; its join wiring
-  does not.
-- **#141 (export a tracker as its own root):** push the view rooted at
-  `t3code`. While t3code mounts nothing in Git, that is its own history, so
-  the first export is a no-op fast-forward of Spheroman/t3code, ids and
-  signatures intact. Refused while it mounts a tracker in Git.
-- **#142 (pull from a target):** for Spheroman/t3code, fetch, merge into
-  t3code's `main`, then `newgit pull t3code`. For Spheroman/newgit, its
-  commits are view commits: ours are recognised by the canonical notes, and
-  the rest are split as ordinary work.
+- **#140 (import):** *done.* `newgit tracker create t3code --git --mount
+  apps/t3code --from <url> [--from-branch newgit]` fetches the branch
+  unchanged as the tracker's `main`, then makes one commit in the project
+  root adding the definition (in `access`), the mount, and the pin (a
+  *brought in* merge). Refused, leaving nothing behind, when the mount has
+  files or the history adds a file a tracker outside Git owns there.
+- **#141 (export a tracker as its own root):** *done.* `root = "t3code"` on
+  an export target pushes t3code's own `main`, composed rooted at it. While
+  t3code mounts nothing in Git, that is its own history, so the first export
+  is a no-op fast-forward of Spheroman/t3code, ids and signatures intact.
+  Refused while it mounts a tracker in Git.
+- **#142 (pull from a target):** *done.* `newgit pull --remote t3code`
+  fetches, fast-forwards or merges t3code's `main`, then moves its pin in
+  the project root as `newgit pull t3code` would. For Spheroman/newgit, its
+  commits are view commits: ours are recognised by id, by the note on each
+  exported commit, or by the canonical notes, and the rest come into the
+  project root as ordinary work, split when `newgit merge main` publishes.
 - **#143 (`gh` per target):** done: a push resolves `gh` to the target that
   ships a tracker the work touched.
 - **#144 (bring t3code in):** Spheroman/newgit's export *includes* t3code
@@ -953,7 +961,8 @@ headers were recorded — is replaced by the steps below and deleted.
 4. **Delete the old engine.** *Done:* date interleave, group scheduler,
    `Newgit-Split-Parent`, carving with history, `tracker repair`,
    workspace-path storage, `project`.
-5. **The t3code milestone** on the new engine: #140, #141, #142, #144 (#143 is done).
+5. **The t3code milestone** on the new engine: #140, #141, #142, and #143
+   are done; #144 (bringing the real t3code in) is next.
 6. **Later:** spawning at a tracker (`spawn --root`), `.gitignore` as
    definition, moving `role`/`priority`/`requires` to the mounting parent,
    `spawn --from <instance>` with `requires` checked between instances,
@@ -1078,6 +1087,21 @@ this is the list.
   The old read goes once every project on the remote has migrated.
 - **The migration folds every tracker in Git,** not only `project` and
   `access`, and mounts each of the others again at the path it owned.
+- **A rooted export ships the tracker's own `main`,** not the commit root's
+  `main` pins: a branch is a ref of the root a view is rooted at. So a pull
+  request merged upstream and pulled back exports as itself before
+  `newgit merge main` moves root's pin, and `branches = true` pushes each
+  instance's own branch of the tracker.
+- **An export finding a rooted target ahead refuses** and names `newgit pull
+  --remote`, instead of pulling by itself as an export of the project does:
+  bringing those commits in moves a pin, which is a commit nobody asked for.
+- **`newgit pull --remote` lands in the project root only,** and publishes
+  nothing; `newgit merge main` does. Instances pick a moved pin up with
+  `newgit pull <tracker>`. For a target without `root`, the files of each
+  tracker it withholds are put back from the parent commit, and a commit
+  touching a withheld tracker's mount is refused rather than guessed at.
+- **The import's commit and a pull's are unsigned,** like the merge commits
+  `newgit merge` makes; signing what newgit itself commits is open.
 
 ---
 
@@ -1089,12 +1113,9 @@ the `merge` and `production` keys, spawning an instance on another with
 CLI, the narrow-audience warning, `.gitignore` as definition, and
 `depends_on` naming a role. Open issues on Spheroman/newgit:
 
-- **Imported histories.** Importing an outside repository unchanged as a
-  tracker in Git, `tracker create --git --from` (#140). Exporting a tracker
-  as its own root, for a fork that keeps its files at the top (#141).
-  Pulling a target's new commits back into its trackers, `newgit pull
-  --remote` (#142). The engine for them is built (step 2); #139 is closed
-  by it.
+- **Imported histories.** Import (#140), export as a root (#141), and pull
+  back (#142) are built; bringing the real t3code in, and measuring its
+  cold start, is #144.
 - **Per-user trackers.** A per-user tracker's `main` reaches the remote only
   as a side effect of some instance's checkpoint (#224).
 - **Sparse checkouts.** Restoring a dirty checkpoint writes files into a

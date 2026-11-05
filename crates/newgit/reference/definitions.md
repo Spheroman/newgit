@@ -1647,6 +1647,14 @@ every tracker those commits touch. Otherwise the export refuses and says how
 to bring them in by hand. `--dry-run` says how many commits would come in;
 `--force` replaces the branch instead.
 
+`newgit pull --remote <target>` brings them in explicitly, and also when the
+export could not: commits that came from here are recognised (by id, by the
+note on each exported commit, or by a canonical id), and the rest come into
+the project root as ordinary work, with the files of every tracker the
+target withholds put back as their parent had them. A commit that touches a
+withheld tracker's mount, or adds a file a tracker outside Git owns, is
+refused. `newgit merge main` publishes what came in.
+
 ### Rooted at a tracker: `root`
 
 ```toml
@@ -1666,6 +1674,14 @@ into. Once it mounts a tracker in Git its view is no longer its own history,
 and the export is refused, naming the child. With `branches = true` each
 instance's branch of the tracker is pushed, and `gh` resolves to the target
 when the instance's work touched that tracker.
+
+A pull request merged there comes back with `newgit pull --remote <target>`:
+the tracker's `main` fast-forwards to it (or really merges it, when `main`
+moved here too), then its pin in the project root moves, one commit that
+composes as a merge bringing the new commits in on top, whatever their
+dates. Instances pick it up with `newgit pull <tracker>` once `newgit merge
+main` has published it. An export finding the target ahead says to run
+that rather than pulling by itself.
 
 ### Pull requests from a workspace: `branches = true`
 
