@@ -117,7 +117,8 @@ export default {
 						headers: { [PLAN_HEADER]: btoa(JSON.stringify(plan)) },
 					}),
 				);
-				if (!response.ok) throw new HttpError(502, "the remote could not check where the merge's pins move; try again");
+				if (!response.ok)
+					throw new HttpError(502, `the remote could not check where the merge's pins move: ${(await response.text()).trim()}`);
 				return (await response.json()) as AncestryAnswer[];
 			},
 			index: async (project, plan) => {
@@ -127,7 +128,8 @@ export default {
 						headers: { [PLAN_HEADER]: btoa(JSON.stringify(plan)) },
 					}),
 				);
-				if (!response.ok) throw new HttpError(502, "the remote could not check the merge's index; try again");
+				if (!response.ok)
+					throw new HttpError(502, `the remote could not check the merge's index: ${(await response.text()).trim()}`);
 				return (await response.json()) as IndexAnswer;
 			},
 			endpoint: (project, kind, plan, original) => {

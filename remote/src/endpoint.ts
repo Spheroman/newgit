@@ -311,8 +311,11 @@ export class GitEndpoint extends DurableObject<Env> {
 			});
 			const checked = await check.output();
 			if (checked.exitCode !== 0) {
-				console.error(`endpoint-${kind} failed`, new TextDecoder().decode(checked.stderr).trim());
-				return new Response("newgit could not check the merge's pins; the remote logged why\n", { status: 502 });
+				const why = new TextDecoder().decode(checked.stderr).trim();
+				console.error(`endpoint-${kind} failed`, why);
+				// Only the merger asked, and Git's errors carry no credential (the
+				// plan passes them as a header): say why, so a failure is fixable.
+				return new Response(`newgit endpoint-${kind} failed: ${why.slice(-800)}\n`, { status: 502 });
 			}
 			return new Response(checked.stdout, { headers: { "content-type": "application/json" } });
 		}

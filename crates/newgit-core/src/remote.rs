@@ -258,6 +258,8 @@ pub struct HttpRemote {
     url: String,
     token: Option<String>,
     agent: ureq::Agent,
+    /// For calls that wait on the remote running Git: minutes, not seconds.
+    slow: ureq::Agent,
 }
 
 impl HttpRemote {
@@ -268,10 +270,18 @@ impl HttpRemote {
             .http_status_as_error(false)
             .timeout_global(Some(Duration::from_secs(60)))
             .build();
+        // A merge's begin and finish wait on the remote running Git over
+        // every tracker repo the merge moves; the first time a large history
+        // is there (t3code's 365 MiB), fetching it takes minutes.
+        let slow = ureq::Agent::config_builder()
+            .http_status_as_error(false)
+            .timeout_global(Some(Duration::from_secs(15 * 60)))
+            .build();
         Self {
             url: url.trim_end_matches('/').to_owned(),
             token,
             agent: config.into(),
+            slow: slow.into(),
         }
     }
 
@@ -322,7 +332,28 @@ impl HttpRemote {
         path: &str,
         body: Option<serde_json::Value>,
     ) -> Result<T> {
-        let (status, text) = self.request(method, path, body)?;
+        self.send_with(&self.agent, method, path, body)
+    }
+
+    /// [`Self::send`] with the agent that waits minutes, for the calls where
+    /// the remote runs Git before it answers.
+    fn send_slow<T: DeserializeOwned>(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<serde_json::Value>,
+    ) -> Result<T> {
+        self.send_with(&self.slow, method, path, body)
+    }
+
+    fn send_with<T: DeserializeOwned>(
+        &self,
+        agent: &ureq::Agent,
+        method: &str,
+        path: &str,
+        body: Option<serde_json::Value>,
+    ) -> Result<T> {
+        let (status, text) = self.request_with(agent, method, path, body)?;
         if !(200..300).contains(&status) {
             return Err(remote_error(status, &text));
         }
@@ -331,6 +362,16 @@ impl HttpRemote {
 
     fn request(
         &self,
+        method: &str,
+        path: &str,
+        body: Option<serde_json::Value>,
+    ) -> Result<(u16, String)> {
+        self.request_with(&self.agent, method, path, body)
+    }
+
+    fn request_with(
+        &self,
+        agent: &ureq::Agent,
         method: &str,
         path: &str,
         body: Option<serde_json::Value>,
@@ -344,9 +385,9 @@ impl HttpRemote {
         let mut response = match method {
             "GET" | "DELETE" => {
                 let mut request = if method == "GET" {
-                    self.agent.get(&url)
+                    agent.get(&url)
                 } else {
-                    self.agent.delete(&url)
+                    agent.delete(&url)
                 };
                 if let Some(auth) = &auth {
                     request = request.header("authorization", auth);
@@ -355,9 +396,9 @@ impl HttpRemote {
             }
             _ => {
                 let mut request = if method == "PUT" {
-                    self.agent.put(&url)
+                    agent.put(&url)
                 } else {
-                    self.agent.post(&url)
+                    agent.post(&url)
                 };
                 if let Some(auth) = &auth {
                     request = request.header("authorization", auth);
@@ -479,7 +520,7 @@ impl Remote for HttpRemote {
         struct Started {
             credentials: Vec<SeedCredential>,
         }
-        let started: Started = self.send(
+        let started: Started = self.send_slow(
             "POST",
             &format!(
                 "/v1/projects/{}/branches/{}/merge",
@@ -498,7 +539,7 @@ impl Remote for HttpRemote {
         base: &std::collections::BTreeMap<String, String>,
         list: &std::collections::BTreeMap<String, String>,
     ) -> Result<()> {
-        let _: serde_json::Value = self.send(
+        let _: serde_json::Value = self.send_slow(
             "PUT",
             &format!(
                 "/v1/projects/{}/branches/{}",
