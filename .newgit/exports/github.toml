@@ -1,5 +1,5 @@
 # The GitHub mirror: every tracker in Git ships, so commit ids match newgit's,
 # and each workspace push lands its branch here for `gh pr create`.
 url = "Spheroman/newgit"
-trackers = ["root", "access"]
+trackers = ["root", "access", "t3code"]
 branches = true

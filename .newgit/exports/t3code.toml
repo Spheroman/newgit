@@ -1,0 +1,7 @@
+# Spheroman/t3code: the t3code tracker as its own root, so its history goes
+# out as itself (same ids, signatures intact), and each workspace push lands
+# its branch of t3code there for `gh pr create`.
+url = "Spheroman/t3code"
+branch = "newgit"
+root = "t3code"
+branches = true
