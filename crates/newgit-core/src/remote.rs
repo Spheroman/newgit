@@ -362,6 +362,25 @@ impl HttpRemote {
         path: &str,
         body: serde_json::Value,
     ) -> Result<T> {
+        self.send_waiting(
+            method,
+            path,
+            body,
+            "checking the merge",
+            "a first look at a large tracker takes several minutes",
+        )
+    }
+
+    /// [`Self::send_checked`] for anything the remote answers `202` while it
+    /// works: asked again until it is done, saying `doing` once a minute.
+    fn send_waiting<T: DeserializeOwned>(
+        &self,
+        method: &str,
+        path: &str,
+        body: serde_json::Value,
+        doing: &str,
+        why: &str,
+    ) -> Result<T> {
         let started = std::time::Instant::now();
         let mut checking = false;
         let mut said_minutes = 0;
@@ -394,7 +413,7 @@ impl HttpRemote {
                 return Err(NewgitError::Remote {
                     status: reply.status,
                     message: format!(
-                        "{} was still checking the merge after {} minutes; the check carries on there, so running the merge again picks it up",
+                        "{} was still {doing} after {} minutes; it carries on there, so running this again picks it up",
                         self.host(),
                         CHECK_LIMIT.as_secs() / 60
                     ),
@@ -403,10 +422,7 @@ impl HttpRemote {
             let minutes = elapsed.as_secs() / 60;
             if minutes > said_minutes {
                 said_minutes = minutes;
-                eprintln!(
-                    "{} is still checking the merge ({minutes} min); a first look at a large tracker takes several minutes",
-                    self.host()
-                );
+                eprintln!("{} is still {doing} ({minutes} min); {why}", self.host());
             }
             let wait = reply
                 .retry_after
@@ -636,7 +652,9 @@ impl Remote for HttpRemote {
     }
 
     fn fork(&self, project: &str, instance: &str, tracker: &str) -> Result<RepoLocation> {
-        self.send(
+        // Artifacts forks a large repository in the background (t3code's
+        // 365 MiB takes a long while); the remote answers 202 until it is done.
+        self.send_waiting(
             "POST",
             &format!(
                 "/v1/projects/{}/instances/{}/trackers/{}/fork",
@@ -644,7 +662,9 @@ impl Remote for HttpRemote {
                 segment(instance),
                 segment(tracker)
             ),
-            None,
+            serde_json::json!({}),
+            &format!("forking `{tracker}` for `{instance}`"),
+            "Artifacts copies a large tracker's repository the first time an instance changes it",
         )
     }
 

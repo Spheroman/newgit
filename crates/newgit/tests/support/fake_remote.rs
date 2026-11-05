@@ -74,6 +74,9 @@ struct State {
     /// Instances whose fork this login may not make: the real remote's 403
     /// for someone else's instance.
     foreign_instances: std::collections::BTreeSet<String>,
+    /// Answer this many fork requests `202 {"forking": true}`, as the real
+    /// remote does while Artifacts copies a large repository.
+    forking: usize,
 }
 
 /// A tracker's definition as the remote reads it, from `access`'s `main`:
@@ -425,6 +428,10 @@ fn route(
                     403,
                     json!({ "error": format!("`{name}` is someone else's instance") }),
                 );
+            }
+            if state.forking > 0 {
+                state.forking -= 1;
+                return (202, json!({ "forking": true }));
             }
             let fork = format!("{owner}.{project}.i.{name}.{tracker}");
             if !exists(&fork) {

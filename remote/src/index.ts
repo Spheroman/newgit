@@ -80,6 +80,12 @@ export const CREDENTIAL_TTL_SECONDS = 15 * 60;
  */
 const CHECK_CREDENTIAL_SECONDS = 50 * 60;
 
+/** Artifacts is still forking a repository: asked again shortly. */
+class ForkInProgress extends Error {}
+
+/** How soon a client should ask again while Artifacts forks a repository. */
+const FORK_RETRY_SECONDS = 15;
+
 /** How soon a client should ask again while the remote checks its merge. */
 const CHECK_RETRY_SECONDS = 10;
 
@@ -699,6 +705,18 @@ async function route(request: Request, env: Env, deps: Deps): Promise<Response> 
 
 	const forkMatch = rest.match(/^\/instances\/([^/]+)\/trackers\/([^/]+)\/fork$/);
 	if (method === "POST" && forkMatch) {
+		try {
+			return await forkRoute(forkMatch, id);
+		} catch (error) {
+			if (error instanceof ForkInProgress)
+				return Response.json(
+					{ forking: true },
+					{ status: 202, headers: { "retry-after": String(FORK_RETRY_SECONDS) } },
+				);
+			throw error;
+		}
+	}
+	async function forkRoute(forkMatch: RegExpMatchArray, id: ProjectId): Promise<Response> {
 		const name = decodeURIComponent(forkMatch[1]);
 		const tracker = decodeURIComponent(forkMatch[2]);
 		const instance = await project.instance(name);
@@ -714,6 +732,9 @@ async function route(request: Request, env: Env, deps: Deps): Promise<Response> 
 		const artifacts = (step: string) => (error: unknown) => {
 			if (error instanceof HttpError) throw error;
 			const { code, message } = error as { code?: string; message?: string };
+			// Artifacts forks a large repository in the background: not done yet,
+			// not failed. The client asks again until it is.
+			if (code === "FORK_IN_PROGRESS") throw new ForkInProgress();
 			console.error(JSON.stringify({ fork, step, code, message }));
 			throw new HttpError(
 				502,

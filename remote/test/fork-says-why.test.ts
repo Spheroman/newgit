@@ -12,13 +12,23 @@ import { FakeRepos, noEndpoint } from "./fake-repos";
 
 /** Repos whose fork fails, either outright or after making the fork anyway. */
 class FailingForks extends FakeRepos {
-	mode: "fails" | "made-anyway" | "lookup-fails" = "fails";
+	mode: "fails" | "made-anyway" | "lookup-fails" | "in-progress" = "fails";
+	/** In "in-progress": how many more look-ups say the fork is still running. */
+	busy = 0;
 	override async remote(name: string): Promise<string | null> {
 		if (this.mode === "lookup-fails" && name.includes(".i."))
 			throw Object.assign(new Error("the repository is not ready"), { code: "REPO_NOT_READY" });
+		if (this.mode === "in-progress" && name.includes(".i.") && this.busy > 0) {
+			this.busy -= 1;
+			throw Object.assign(new Error("the fork is still in progress"), { code: "FORK_IN_PROGRESS" });
+		}
 		return super.remote(name);
 	}
 	override async fork(from: string, to: string): Promise<{ remote: string }> {
+		if (this.mode === "in-progress") {
+			await super.fork(from, to);
+			throw Object.assign(new Error("the fork is still in progress"), { code: "FORK_IN_PROGRESS" });
+		}
 		if (this.mode === "made-anyway") await super.fork(from, to);
 		throw Object.assign(new Error("the fork did not finish"), { code: "INTERNAL_ERROR" });
 	}
@@ -72,6 +82,21 @@ describe("an instance's fork that Artifacts fails", () => {
 		const forked = await forkT3code();
 		expect(forked.status).toBe(502);
 		expect(forked.body.error).toContain("REPO_NOT_READY");
+	});
+
+	it("answers 202 while Artifacts is still forking, then the fork", async () => {
+		repos.mode = "in-progress";
+		repos.busy = 2;
+		const created = await call(jack, "POST", `/v1/projects/${project}/instances`, { name: "fix", base_rev: "abc" });
+		const ask = () => call(created.body.token, "POST", `/v1/projects/${project}/instances/fix/trackers/t3code/fork`);
+		// Artifacts says the fork is in progress, twice: still forking.
+		expect((await ask()).status).toBe(202);
+		expect((await ask()).status).toBe(202);
+		// Then the fork, which Artifacts makes and says is in progress, and a
+		// look-up after that finds it there.
+		const done = await ask();
+		expect(done.status).toBe(200);
+		expect(done.body.repo).toContain("t3code");
 	});
 
 	it("takes a fork that was made anyway", async () => {
