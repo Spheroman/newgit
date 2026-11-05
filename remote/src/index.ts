@@ -64,6 +64,11 @@ export const CREDENTIAL_TTL_SECONDS = 15 * 60;
 
 /** A merge holds its branch this long at most: pushing the trackers' commits. */
 const MERGE_LOCK_SECONDS = 10 * 60;
+/**
+ * How long a merge's finish holds its lock while the remote checks the index:
+ * longer than the client waits (15 minutes), so the lock never ends first.
+ */
+const INDEX_CHECK_SECONDS = 20 * 60;
 
 export interface Deps {
 	repos: Repos;
@@ -564,6 +569,10 @@ async function route(request: Request, env: Env, deps: Deps): Promise<Response> 
 				// composes from the gitlinks, so an index that says otherwise
 				// would have had its pins checked for nothing.
 				if (deps.index) {
+					// The check can take minutes the first time a large history is
+					// here; the merge stays this caller's for as long as it runs.
+					if (!(await project.extendMerge(branch, login, INDEX_CHECK_SECONDS)))
+						throw new HttpError(409, `you hold no merge into \`${branch}\`: start one with \`newgit merge\``);
 					const plan: IndexPlan = { dir: "/work", repos: {}, list };
 					for (const tracker of Object.keys(list)) {
 						const name = repoName({ kind: "tracker", project: id, tracker });
