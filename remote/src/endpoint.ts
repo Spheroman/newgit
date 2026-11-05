@@ -11,6 +11,13 @@
 // (docs/design/remote.md, *Measurements*). The runtime's inactivity timeout
 // is the backstop, in case the alarm never runs.
 //
+// A merge's checks (`newgit endpoint-ancestry`, `newgit endpoint-index`) run
+// in the background: the first time a large history is here (t3code, 365
+// MiB) fetching it takes many minutes, longer than any one request should
+// wait. The first request starts the check and is answered 202; the merge's
+// client asks again every few seconds, each request also keeping this object
+// alive, and the one after the check ends gets its answer (`BackgroundChecks`).
+//
 // A snapshot is the whole container, the `newgit` binary included, and the
 // views it composed. So a snapshot, or a running container, from an image
 // other than the one deployed now is dropped: otherwise a deploy would never
@@ -58,6 +65,111 @@ export interface AncestryAnswer {
 	tracker: string;
 	forward: boolean;
 	onMain: boolean;
+}
+
+/** A check's answer is kept this long for the merge that asked to collect it. */
+export const CHECK_RESULT_MS = 5 * 60_000;
+
+/**
+ * A check running longer than this counts as failed. The whole of t3code
+ * comes in one fetch in about five minutes, and in 2048-commit bands in
+ * about ten; this is well past both.
+ */
+export const CHECK_LIMIT_MS = 45 * 60_000;
+
+/** The body of every answer to a check that is still running. */
+export const CHECKING = { checking: true } as const;
+
+/** A finished check: Git's answer as JSON, or why it failed. */
+export type CheckOutcome = { ok: true; json: string } | { ok: false; why: string };
+
+interface CheckEntry {
+	startedAt: number;
+	outcome?: CheckOutcome;
+	finishedAt?: number;
+	run?: Promise<void>;
+}
+
+/**
+ * The checks this object is running or has finished, by key. In memory only:
+ * an object evicted mid-check loses it, and the next request starts the
+ * check again, which fetches only what the first did not get into the store.
+ * Pure of the container, so the tests can drive it.
+ */
+export class BackgroundChecks {
+	private readonly entries = new Map<string, CheckEntry>();
+
+	constructor(private readonly now: () => number = Date.now) {}
+
+	/**
+	 * What is known of check `key`: still running, its outcome (forgotten once
+	 * collected), or nothing — never started, collected already, or expired.
+	 */
+	collect(key: string): "running" | CheckOutcome | undefined {
+		this.prune();
+		const entry = this.entries.get(key);
+		if (!entry) return undefined;
+		if (!entry.outcome) return "running";
+		this.entries.delete(key);
+		return entry.outcome;
+	}
+
+	/** Start check `key`, unless it already is; resolves when it ends. */
+	start(key: string, run: () => Promise<CheckOutcome>): Promise<void> {
+		const known = this.entries.get(key);
+		if (known?.run) return known.run;
+		const entry: CheckEntry = { startedAt: this.now() };
+		this.entries.set(key, entry);
+		entry.run = run()
+			.catch((error: unknown): CheckOutcome => ({
+				ok: false,
+				why: String(error),
+			}))
+			.then((outcome) => {
+				// A check given up on for running too long, or one replaced since,
+				// does not answer for the one in its place.
+				if (this.entries.get(key) !== entry || entry.outcome) return;
+				entry.outcome = outcome;
+				entry.finishedAt = this.now();
+			});
+		return entry.run;
+	}
+
+	/** How many checks are running: the idle alarm must not stop the container under them. */
+	running(): number {
+		this.prune();
+		return [...this.entries.values()].filter((entry) => !entry.outcome).length;
+	}
+
+	private prune(): void {
+		const now = this.now();
+		for (const [key, entry] of this.entries) {
+			if (entry.outcome) {
+				if (now - (entry.finishedAt ?? now) > CHECK_RESULT_MS) this.entries.delete(key);
+			} else if (now - entry.startedAt > CHECK_LIMIT_MS) {
+				entry.outcome = {
+					ok: false,
+					why: `the check ran longer than ${CHECK_LIMIT_MS / 60_000} minutes; merge again to start it over`,
+				};
+				entry.finishedAt = now;
+			}
+		}
+	}
+}
+
+/**
+ * The key of a check: its kind and its plan without credentials, which are
+ * minted afresh for each request and would otherwise make every poll a new
+ * check.
+ */
+export async function checkKey(
+	kind: "ancestry" | "index",
+	plan: { repos: Record<string, { url: string }> },
+): Promise<string> {
+	const repos = Object.fromEntries(Object.entries(plan.repos).map(([tracker, repo]) => [tracker, repo.url]));
+	const text = JSON.stringify({ kind, plan: { ...plan, repos } });
+	const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(text));
+	return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
 }
 
 /** Snapshot at most this often, after a compose changed what is on disk. */
@@ -127,13 +239,16 @@ export class GitEndpoint extends DurableObject<Env> {
 	private backstopSet = false;
 	/** The start under way, which concurrent requests share. */
 	private starting?: Promise<Container>;
+	/** The merge checks running here, and the answers waiting to be collected. */
+	private readonly checks = new BackgroundChecks();
 
 	private async sleepDecision(): Promise<SleepDecision> {
 		const storage = this.ctx.storage;
 		return decideSleep({
 			now: Date.now(),
 			running: this.container().running,
-			inFlight: this.inFlight,
+			// A check runs past the request that started it.
+			inFlight: this.inFlight + this.checks.running(),
 			lastRequestAt: (await storage.get<number>("request_at")) ?? 0,
 			composedAt: (await storage.get<number>("composed_at")) ?? 0,
 			snapshotAt: (await storage.get<number>("snapshot_at")) ?? 0,
@@ -159,7 +274,7 @@ export class GitEndpoint extends DurableObject<Env> {
 		if (decision !== "stop") return;
 		// Checked again with nothing awaited before the stop, so a fetch that
 		// started during the decision is never cut off.
-		if (this.inFlight > 0) {
+		if (this.inFlight + this.checks.running() > 0) {
 			await this.ctx.storage.setAlarm(Date.now() + BUSY_RETRY_MS);
 			return;
 		}
@@ -203,7 +318,8 @@ export class GitEndpoint extends DurableObject<Env> {
 			image,
 			running: container.running,
 			runningImage: await storage.get<string>("running_image"),
-			inFlight: this.inFlight,
+			// A check running on the old image is not cut off under it either.
+			inFlight: this.inFlight + this.checks.running(),
 			snapshot: await storage.get<string>("snapshot"),
 			snapshotImage: await storage.get<string>("snapshot_image"),
 		});
@@ -217,7 +333,10 @@ export class GitEndpoint extends DurableObject<Env> {
 		await storage.put("running_image", image);
 		if (decision === "from-snapshot" && snapshot) {
 			try {
-				container.start({ containerSnapshot: { id: snapshot }, enableInternet: true });
+				container.start({
+					containerSnapshot: { id: snapshot },
+					enableInternet: true,
+				});
 			} catch {
 				await storage.delete(["snapshot", "snapshot_image"]);
 				container.start({ image, enableInternet: true });
@@ -249,8 +368,14 @@ export class GitEndpoint extends DurableObject<Env> {
 	private async takeSnapshot(): Promise<void> {
 		const startedAt = Date.now();
 		const image = await this.ctx.storage.get<string>("running_image");
-		const snapshot = await this.container().snapshotContainer({ name: "endpoint" });
-		await this.ctx.storage.put({ snapshot: snapshot.id, snapshot_image: image, snapshot_at: startedAt });
+		const snapshot = await this.container().snapshotContainer({
+			name: "endpoint",
+		});
+		await this.ctx.storage.put({
+			snapshot: snapshot.id,
+			snapshot_image: image,
+			snapshot_at: startedAt,
+		});
 	}
 
 	private async snapshotSoon(): Promise<void> {
@@ -296,26 +421,62 @@ export class GitEndpoint extends DurableObject<Env> {
 		return new Response(body, response);
 	}
 
+	/**
+	 * A merge check, in the background: started by the first request with
+	 * its plan, answered 202 while it runs, and its answer handed to the
+	 * first request after it ends. A `peek` carries no credentials: it only
+	 * asks after a check already known, and is answered 404 when there is
+	 * none, so the Worker mints read passwords only for a check it starts.
+	 */
+	private async check(kind: "ancestry" | "index", plan: string, peek: boolean): Promise<Response> {
+		const key = await checkKey(kind, JSON.parse(plan));
+		const known = this.checks.collect(key);
+		if (known === "running") return Response.json(CHECKING, { status: 202 });
+		if (known?.ok)
+			return new Response(known.json, {
+				headers: { "content-type": "application/json" },
+			});
+		// Only the merger asked, and Git's errors carry no credential (the
+		// plan passes them as a header): say why, so a failure is fixable.
+		if (known) return new Response(`newgit endpoint-${kind} failed: ${known.why.slice(-800)}\n`, { status: 502 });
+		if (peek) return new Response("no such check\n", { status: 404 });
+		// Held by `checks` and by `waitUntil`: the object stays up while the
+		// merger's polls keep arriving, and the promise is what they collect.
+		this.ctx.waitUntil(this.checks.start(key, () => this.runCheck(kind, plan)));
+		return Response.json(CHECKING, { status: 202 });
+	}
+
+	private async runCheck(kind: "ancestry" | "index", plan: string): Promise<CheckOutcome> {
+		const container = await this.ensureRunning();
+		const check = await container.exec(["newgit", `endpoint-${kind}`], {
+			stdin: new Response(plan).body!,
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		const checked = await check.output();
+		// A check fetches every tracker it looks at into the store, which
+		// for a large history (t3code, 365 MiB) takes minutes. Keep it like
+		// a composed view, so the container does not sleep without saving
+		// it and fetch the whole history again next time — a failed one too,
+		// since a stepped fetch that stopped part way carries on from there.
+		await this.ctx.storage.put("composed_at", Date.now());
+		await this.snapshotSoon();
+		if (checked.exitCode !== 0) {
+			const why = new TextDecoder().decode(checked.stderr).trim();
+			console.error(`endpoint-${kind} failed`, why);
+			return { ok: false, why };
+		}
+		return { ok: true, json: new TextDecoder().decode(checked.stdout) };
+	}
+
 	private async serve(request: Request): Promise<Response> {
-		const kind = new URL(request.url).pathname.slice(1) as EndpointKind | "ancestry" | "index";
+		const url = new URL(request.url);
+		const kind = url.pathname.slice(1) as EndpointKind | "ancestry" | "index";
 		const encoded = request.headers.get(PLAN_HEADER);
 		if (!encoded) return new Response("no plan\n", { status: 400 });
 		const plan = atob(encoded);
+		if (kind === "ancestry" || kind === "index") return this.check(kind, plan, url.searchParams.has("peek"));
 		const container = await this.ensureRunning();
-
-		if (kind === "ancestry" || kind === "index") {
-			const check = await container.exec(["newgit", `endpoint-${kind}`], {
-				stdin: new Response(plan).body!,
-				stdout: "pipe",
-				stderr: "pipe",
-			});
-			const checked = await check.output();
-			if (checked.exitCode !== 0) {
-				console.error(`endpoint-${kind} failed`, new TextDecoder().decode(checked.stderr).trim());
-				return new Response("newgit could not check the merge's pins; the remote logged why\n", { status: 502 });
-			}
-			return new Response(checked.stdout, { headers: { "content-type": "application/json" } });
-		}
 
 		const compose = await container.exec(["newgit", "endpoint-compose"], {
 			stdin: new Response(plan).body!,
@@ -348,7 +509,10 @@ export class GitEndpoint extends DurableObject<Env> {
 					? new Uint8Array(stdout)
 					: concat(pkt("# service=git-upload-pack\n"), new TextEncoder().encode("0000"), new Uint8Array(stdout));
 			return new Response(body, {
-				headers: { "content-type": "application/x-git-upload-pack-advertisement", "cache-control": "no-cache" },
+				headers: {
+					"content-type": "application/x-git-upload-pack-advertisement",
+					"cache-control": "no-cache",
+				},
 			});
 		}
 
@@ -361,7 +525,10 @@ export class GitEndpoint extends DurableObject<Env> {
 			stderr: "ignore",
 		});
 		return new Response(process.stdout, {
-			headers: { "content-type": "application/x-git-upload-pack-result", "cache-control": "no-cache" },
+			headers: {
+				"content-type": "application/x-git-upload-pack-result",
+				"cache-control": "no-cache",
+			},
 		});
 	}
 }

@@ -1173,7 +1173,46 @@ impl RefUpdate {
 impl GitSource {
     /// `git <location> push <url> <refspecs>`, authenticated with `auth` (an
     /// `Authorization` header). `location` is `-C <repo>` or `--git-dir=…`.
+    ///
+    /// A push the remote refuses for its size, or drops, goes in steps: each
+    /// refspec's commit is staged as [`Self::push_leased`] stages one, then
+    /// the same push again.
     pub fn push_refs(
+        location: &[&str],
+        url: &str,
+        refspecs: &[String],
+        auth: Option<&str>,
+    ) -> Result<()> {
+        let error = match Self::push_once(location, url, refspecs, auth) {
+            Ok(()) => return Ok(()),
+            Err(error) => error,
+        };
+        let Some((size, limit)) =
+            too_large(&error).or_else(|| dropped(&error).then_some((128.0, 64.0)))
+        else {
+            return Err(error);
+        };
+        let staged = refspecs
+            .iter()
+            .filter_map(|refspec| {
+                let source = refspec.trim_start_matches('+').split(':').next()?;
+                (!source.is_empty()).then_some(source)
+            })
+            .try_for_each(|source| {
+                Self::push_in_steps(location, url, source, None, auth, size, limit)
+            });
+        let result = staged.and_then(|()| Self::push_once(location, url, refspecs, auth));
+        let _ = Self::push_once(
+            location,
+            url,
+            &[format!(":{STAGING_REF}"), format!(":{FILES_REF}")],
+            auth,
+        );
+        result
+    }
+
+    /// One `git push`, as it is: what the stepping is made of.
+    fn push_once(
         location: &[&str],
         url: &str,
         refspecs: &[String],
@@ -1212,8 +1251,174 @@ impl GitSource {
         };
         match attempt(expected.unwrap_or("")) {
             Ok(()) => Ok(()),
-            Err(error) => attempt(commit).map_err(|_| error),
+            Err(error) => {
+                // Refused for its size, or dropped by the remote partway:
+                // either way, smaller pushes. A drop says no size, so start
+                // as if it were twice Artifacts' limit.
+                let Some((size, limit)) =
+                    too_large(&error).or_else(|| dropped(&error).then_some((128.0, 64.0)))
+                else {
+                    return attempt(commit).map_err(|_| error);
+                };
+                // Too big for one push (Artifacts takes 64 MiB at a time): send
+                // the history in steps first, then the same leased push, which
+                // now has nothing left to send but the last step.
+                let staged =
+                    Self::push_in_steps(location, url, commit, expected, auth, size, limit);
+                let result = staged.and_then(|()| {
+                    attempt(expected.unwrap_or(""))
+                        .or_else(|error| attempt(commit).map_err(|_| error))
+                });
+                let _ = Self::push_once(
+                    location,
+                    url,
+                    &[format!(":{STAGING_REF}"), format!(":{FILES_REF}")],
+                    auth,
+                );
+                result
+            }
         }
+    }
+
+    /// Send each file over [`LARGE_FILE`] that `commit` brings beyond `since`
+    /// to `url` in a push of its own, on [`FILES_REF`]: a commit made only to
+    /// carry it, so the remote holds the file before `commit` is pushed.
+    /// Artifacts takes a large file alone that it will not take among a
+    /// commit's other changes. Git sends the file again with `commit`, since
+    /// only that unrelated history reaches it on the remote, but a file the
+    /// remote already holds costs it nothing to take.
+    fn push_large_files(
+        location: &[&str],
+        url: &str,
+        commit: &str,
+        since: Option<&str>,
+        auth: Option<&str>,
+    ) -> Result<()> {
+        let git = |args: &[&str], input: Option<&str>| -> Result<String> {
+            let mut full: Vec<&str> = location.to_vec();
+            full.extend_from_slice(args);
+            match input {
+                None => run_git_env(&full, &[]),
+                Some(input) => run_git_input(&full, input),
+            }
+        };
+        let mut args = vec!["rev-list", "--objects", commit];
+        if let Some(since) = since {
+            args.extend(["--not", since]);
+        }
+        let objects = git(&args, None)?;
+        let ids: String = objects
+            .lines()
+            .filter_map(|line| line.split(' ').next())
+            .map(|id| format!("{id}\n"))
+            .collect();
+        let sizes = git(
+            &[
+                "cat-file",
+                "--batch-check=%(objecttype) %(objectsize) %(objectname)",
+            ],
+            Some(&ids),
+        )?;
+        let large: Vec<&str> = sizes
+            .lines()
+            .filter_map(|line| {
+                let mut parts = line.split(' ');
+                let (kind, size, id) = (parts.next()?, parts.next()?, parts.next()?);
+                (kind == "blob" && size.parse::<u64>().ok()? > LARGE_FILE).then_some(id)
+            })
+            .collect();
+        let env = [
+            ("GIT_AUTHOR_NAME", "newgit"),
+            ("GIT_AUTHOR_EMAIL", "newgit@localhost"),
+            ("GIT_AUTHOR_DATE", "@0 +0000"),
+            ("GIT_COMMITTER_NAME", "newgit"),
+            ("GIT_COMMITTER_EMAIL", "newgit@localhost"),
+            ("GIT_COMMITTER_DATE", "@0 +0000"),
+        ]
+        .map(|(key, value)| (key.to_owned(), value.to_owned()));
+        let mut parent: Option<String> = None;
+        for blob in large {
+            let tree = git(&["mktree"], Some(&format!("100644 blob {blob}\tfile\n")))?;
+            let mut args: Vec<&str> = location.to_vec();
+            args.extend([
+                "-c",
+                "commit.gpgSign=false",
+                "commit-tree",
+                &tree,
+                "-m",
+                "newgit: a large file, sent ahead",
+            ]);
+            if let Some(parent) = &parent {
+                args.extend(["-p", parent]);
+            }
+            let carrier = run_git_env(&args, &env)?;
+            Self::push_once(location, url, &[format!("+{carrier}:{FILES_REF}")], auth)?;
+            parent = Some(carrier);
+        }
+        Ok(())
+    }
+
+    /// Send `commit`'s history to `url` in steps along its first-parent line,
+    /// each on [`STAGING_REF`], so that no one push is over the remote's
+    /// limit. The steps start from the reported `size` against `limit` and
+    /// halve whenever the remote still refuses one. Stops one short of
+    /// `commit`: the caller's own push sends that, leased as it always is.
+    fn push_in_steps(
+        location: &[&str],
+        url: &str,
+        commit: &str,
+        base: Option<&str>,
+        auth: Option<&str>,
+        size: f64,
+        limit: f64,
+    ) -> Result<()> {
+        let mut args: Vec<&str> = location.to_vec();
+        args.extend(["rev-list", "--first-parent", "--reverse", commit]);
+        if let Some(base) = base.filter(|base| !base.is_empty()) {
+            args.extend(["--not", base]);
+        }
+        let chain: Vec<String> = run_git_env(&args, &[])?
+            .lines()
+            .map(ToOwned::to_owned)
+            .collect();
+        // Aim well under the limit: the steps are by commit count, and
+        // commits are not all the same size.
+        let pieces = ((size / (limit / 3.0)).ceil() as usize).max(2);
+        let start = (chain.len() / pieces).max(1);
+        let mut step = start;
+        let mut pushed = 0;
+        let mut split_files = false;
+        while pushed + 1 < chain.len() {
+            let upto = (pushed + step).min(chain.len() - 1);
+            let refspec = format!("+{}:{STAGING_REF}", chain[upto - 1]);
+            match Self::push_once(location, url, &[refspec], auth) {
+                // Grow back after a step got through: one hard commit should
+                // not leave every commit after it a push of its own.
+                Ok(()) => {
+                    pushed = upto;
+                    split_files = false;
+                    step = (step * 2).min(start);
+                }
+                // One commit the remote still will not take: send its large
+                // files first, one push each, then the commit again.
+                Err(error) if step == 1 && !split_files && dropped(&error) => {
+                    let since = pushed
+                        .checked_sub(1)
+                        .map(|index| chain[index].as_str())
+                        .or(base);
+                    Self::push_large_files(location, url, &chain[upto - 1], since, auth)?;
+                    split_files = true;
+                }
+                // A step can also be too much for the remote's front end,
+                // which drops it (an HTTP 500, a hung-up connection) before
+                // Git's own limit answers: smaller steps get through.
+                Err(error) if (too_large(&error).is_some() || dropped(&error)) && step > 1 => {
+                    step /= 2;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(())
     }
 
     /// The commit `reference` names in the repository at `url`, or `None`
@@ -1234,10 +1439,64 @@ impl GitSource {
         refspecs: &[String],
         auth: Option<&str>,
     ) -> Result<()> {
-        let mut args: Vec<&str> = location.to_vec();
-        args.extend(["fetch", "--quiet", "--no-write-fetch-head", "--", url]);
-        args.extend(refspecs.iter().map(String::as_str));
-        run_git_env(&args, &auth_env(auth)).map(|_| ())
+        let fetch = |extra: Option<&str>| {
+            let mut args: Vec<&str> = location.to_vec();
+            args.extend(["fetch", "--quiet", "--no-write-fetch-head"]);
+            args.extend(extra);
+            args.extend(["--", url]);
+            args.extend(refspecs.iter().map(String::as_str));
+            run_git_env(&args, &auth_env(auth)).map(|_| ())
+        };
+        let shallow_store = |location: &[&str]| -> Result<bool> {
+            let mut args: Vec<&str> = location.to_vec();
+            args.extend(["rev-parse", "--is-shallow-repository"]);
+            Ok(run_git_env(&args, &[])? == "true")
+        };
+        // A whole fetch is by far the fastest way to get a large history
+        // (t3code's 365 MiB: five minutes whole, against half an hour in
+        // bands), and a dropped one often comes through on a second try. So
+        // a dropped fetch is tried whole again, twice, before stepping.
+        //
+        // A store left shallow by a stepped fetch that stopped part way
+        // carries on deepening, even when this fetch went through whole.
+        let mut tries = WHOLE_FETCH_BACKOFF.iter();
+        let mut started = loop {
+            match fetch(None) {
+                Ok(()) if !shallow_store(location)? => return Ok(()),
+                Ok(()) => break true,
+                Err(error) if dropped(&error) => match tries.next() {
+                    Some(wait) => std::thread::sleep(*wait),
+                    None => break false,
+                },
+                Err(error) => return Err(error),
+            }
+        };
+        // The remote still dropped it: a history too big for it to send at
+        // once (Artifacts fails a 365 MiB fetch with an HTTP 500). Fetch the
+        // tips first, then deepen band by band until nothing is shallow:
+        // each fetch brings only the next band. A band the remote still
+        // drops is halved; one that comes grows the next. The bands start
+        // wide, because each costs the remote about a minute to compute
+        // whatever its size.
+        let mut depth: u32 = FIRST_BAND;
+        loop {
+            let flag = if started {
+                format!("--deepen={depth}")
+            } else {
+                format!("--depth={depth}")
+            };
+            match fetch(Some(&flag)) {
+                Ok(()) => {
+                    started = true;
+                    if !shallow_store(location)? {
+                        return Ok(());
+                    }
+                    depth = (depth * 2).min(4 * FIRST_BAND);
+                }
+                Err(error) if dropped(&error) && depth > 1 => depth /= 2,
+                Err(error) => return Err(error),
+            }
+        }
     }
 }
 
@@ -1300,6 +1559,95 @@ fn export_identity(destination: &Utf8Path) -> Vec<(String, String)> {
             ]
         })
         .collect()
+}
+
+/// How long a dropped whole fetch waits before each of its retries.
+const WHOLE_FETCH_BACKOFF: [std::time::Duration; 2] = [
+    std::time::Duration::from_secs(1),
+    std::time::Duration::from_secs(3),
+];
+
+/// The commits a stepped fetch asks for first, and deepens by.
+const FIRST_BAND: u32 = 2048;
+
+/// Where a push too big for the remote is staged step by step, deleted
+/// once the real push lands.
+const STAGING_REF: &str = "refs/heads/newgit-staging";
+
+/// Where large files are sent ahead of the commit that brings them.
+const FILES_REF: &str = "refs/heads/newgit-staging-files";
+
+/// A file this big is sent on its own when a commit carrying it is refused.
+const LARGE_FILE: u64 = 4 * 1024 * 1024;
+
+/// Whether the remote dropped a push or a fetch partway (an HTTP 500, a
+/// hung-up connection, a pack it never finished), as Artifacts does with a
+/// push it will not take or a history too big to send at once.
+fn dropped(error: &NewgitError) -> bool {
+    let NewgitError::SourceCommand { stderr, .. } = error else {
+        return false;
+    };
+    [
+        "HTTP 500",
+        "unexpected disconnect",
+        "remote end hung up",
+        "receive_pack_failed",
+        "expected 'packfile'",
+        "early EOF",
+        "bad pack header",
+    ]
+    .iter()
+    .any(|sign| stderr.contains(sign))
+}
+
+/// When the remote refused a push for its size, the size and the limit in
+/// MiB, as Artifacts reports them (`push is 364.7 MiB, limit is 64.0 MiB`).
+/// Either unknown is taken as twice the limit, and 64 MiB.
+fn too_large(error: &NewgitError) -> Option<(f64, f64)> {
+    let NewgitError::SourceCommand { stderr, .. } = error else {
+        return None;
+    };
+    let at = stderr.find("request_too_large")?;
+    let rest = &stderr[at..];
+    let number = |after: &str| -> Option<f64> {
+        rest.split(after)
+            .nth(1)?
+            .split(" MiB")
+            .next()?
+            .trim()
+            .parse()
+            .ok()
+    };
+    let limit = number("limit is ").unwrap_or(64.0);
+    let size = number("push is ").unwrap_or(limit * 2.0);
+    Some((size, limit))
+}
+
+/// `git <args>` with `input` on its stdin; its stdout, trimmed.
+fn run_git_input(args: &[&str], input: &str) -> Result<String> {
+    use std::io::Write as _;
+    let mut child = Command::new("git")
+        .args(args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|source| spawn_error(args, &source))?;
+    let mut stdin = child.stdin.take().expect("stdin is piped");
+    let writing = std::thread::scope(|scope| {
+        let writer = scope.spawn(move || stdin.write_all(input.as_bytes()));
+        let output = child.wait_with_output();
+        (writer.join(), output)
+    });
+    let output = writing.1.map_err(|source| spawn_error(args, &source))?;
+    if output.status.success() {
+        Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+    } else {
+        Err(NewgitError::SourceCommand {
+            command: format!("git {}", args.join(" ")),
+            stderr: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+        })
+    }
 }
 
 pub fn run_git_env(args: &[&str], env: &[(String, String)]) -> Result<String> {

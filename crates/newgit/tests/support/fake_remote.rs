@@ -63,6 +63,9 @@ struct State {
     merge_targets: BTreeMap<String, Value>,
     /// Failure injection: answer the next merge finish with a 502.
     fail_finish_once: bool,
+    /// Answer this many merge finishes `202 {"checking": true}`, as the real
+    /// remote does while its check of a large tracker runs.
+    checking_finishes: usize,
     /// Failure injection: answer this many checkpoint writes with a 500.
     fail_checkpoint_writes: usize,
     /// Failure injection: answer every credential request with a 503, as a
@@ -167,9 +170,11 @@ impl FakeRemote {
                 let (status, reply) =
                     route(&thread_state, &thread_repos, &method, &path, &token, &body);
                 let text = reply.to_string();
+                // A check still running: ask again at once, so tests do not wait.
+                let retry = if status == 202 { "retry-after: 0\r\n" } else { "" };
                 let _ = write!(
                     stream,
-                    "HTTP/1.1 {status} X\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{text}",
+                    "HTTP/1.1 {status} X\r\ncontent-type: application/json\r\n{retry}content-length: {}\r\nconnection: close\r\n\r\n{text}",
                     text.len()
                 );
             }
@@ -350,6 +355,10 @@ fn route(
             )
         }
         ("PUT", ["v1", "projects", owner, name, "branches", branch]) => {
+            if !body["base"].is_null() && state.checking_finishes > 0 {
+                state.checking_finishes -= 1;
+                return (202, json!({ "checking": true }));
+            }
             if !body["base"].is_null() && state.fail_finish_once {
                 state.fail_finish_once = false;
                 return (502, json!({ "error": "the remote could not check the merge's index; try again" }));

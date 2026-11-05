@@ -9203,13 +9203,16 @@ impl BranchManager {
                 .source
                 .rev_parse(&format!("refs/newgit/remote/{}/{into}", self.root.name))
                 .ok();
-            if held.is_some() && held != base_root {
+            // Already this merge's own commit: a run before this one pushed it
+            // and stopped before the finish (a timeout, a 502). Finish it.
+            let resumed = held.as_deref() == Some(merged_root.as_str());
+            if held.is_some() && held != base_root && !resumed {
                 return Err(NewgitError::Unsupported(format!(
                     "root's `{into}` on {project_key} is not the commit `{into}`'s index names, so \
                      another merge is landing: run `newgit merge` again"
                 )));
             }
-            if let Some(auth) = credential_for(&self.root.name) {
+            if !resumed && let Some(auth) = credential_for(&self.root.name) {
                 push(auth, &merged_root, &branch_ref, held.as_deref()).map_err(|_| {
                     NewgitError::Unsupported(format!(
                         "`{into}` moved while this merge ran: run `newgit merge` again"

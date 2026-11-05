@@ -206,6 +206,21 @@ export class ProjectDO extends DurableObject<Env> {
 		return { ok: true, until, stale };
 	}
 
+	/**
+	 * Hold the merge into `name` that `by` holds for `seconds` more, from
+	 * now: what the finish does before the remote runs Git over every tracker
+	 * the merge moves, which the first time a large history is there takes
+	 * longer than the lock began with. Refused, changing nothing, unless `by`
+	 * holds it now.
+	 */
+	extendMerge(name: string, by: string, seconds: number): boolean {
+		const lock = this.mergeLock(name);
+		if (lock === null || lock.by !== by || Date.parse(lock.until) <= Date.now()) return false;
+		lock.until = new Date(Date.now() + seconds * 1000).toISOString();
+		this.sql.exec("INSERT OR REPLACE INTO meta VALUES (?, ?)", `merge:${name}`, JSON.stringify(lock));
+		return true;
+	}
+
 	/** The write passwords handed out for the merge in flight, to cancel when it ends. */
 	recordMergeTokens(name: string, tokens: { repo: string; artifactsId: string }[]): void {
 		const lock = this.mergeLock(name);

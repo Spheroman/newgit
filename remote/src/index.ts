@@ -37,7 +37,18 @@ import {
 	repoName,
 } from "./names";
 import { checkBudget, pausedBy } from "./budget";
-import { type AncestryAnswer, type AncestryPlan, type EndpointKind, type EndpointPlan, type IndexAnswer, type IndexPlan, PLAN_HEADER } from "./endpoint";
+import {
+	type AncestryAnswer,
+	type AncestryPlan,
+	CHECKING,
+	type EndpointKind,
+	type EndpointPlan,
+	type IndexAnswer,
+	type IndexPlan,
+	PLAN_HEADER,
+} from "./endpoint";
+
+type Checking = typeof CHECKING;
 import type { Instance, ProjectDO } from "./project";
 import type { UserDO } from "./users";
 
@@ -62,8 +73,34 @@ export interface Caller {
 /** Git credentials last this long: long enough for a big push, short enough that losing membership bites fast. */
 export const CREDENTIAL_TTL_SECONDS = 15 * 60;
 
+/**
+ * The read passwords a merge check fetches with: as long as the check may
+ * run (`CHECK_LIMIT_MS`, 45 minutes) and a little more, since a fetch of a
+ * large history starts minutes in and must not lose its password part way.
+ */
+const CHECK_CREDENTIAL_SECONDS = 50 * 60;
+
+/** How soon a client should ask again while the remote checks its merge. */
+const CHECK_RETRY_SECONDS = 10;
+
+/** The answer while the endpoint is still checking a merge. */
+const stillChecking = () =>
+	Response.json(CHECKING, { status: 202, headers: { "retry-after": String(CHECK_RETRY_SECONDS) } });
+
+/** Whether a check's answer is that it is still running. */
+export function isChecking(answer: unknown): answer is Checking {
+	return typeof answer === "object" && answer !== null && (answer as { checking?: unknown }).checking === true;
+}
+
 /** A merge holds its branch this long at most: pushing the trackers' commits. */
 const MERGE_LOCK_SECONDS = 10 * 60;
+/**
+ * How long each request of a merge's finish holds its lock while the remote
+ * checks the index. The client asks again every few seconds while the check
+ * runs, and each request extends the lock again, so it holds for as long as
+ * the client keeps asking.
+ */
+const INDEX_CHECK_SECONDS = 20 * 60;
 
 export interface Deps {
 	repos: Repos;
@@ -76,14 +113,61 @@ export interface Deps {
 	 * Ask the project's endpoint container, which runs Git, how each pin
 	 * moves along its tracker's history. Absent (tests that do not fake it),
 	 * every move counts as not forward.
+	 *
+	 * Both checks run in the background (src/endpoint.ts): the answer is
+	 * `CHECKING` until the check ends, and asking again with the same plan
+	 * collects it. `plan`'s repos carry no credentials; `credentials` mints
+	 * them, and is called only when the check has to start.
 	 */
-	ancestry?(project: string, plan: AncestryPlan): Promise<AncestryAnswer[]>;
+	ancestry?(
+		project: string,
+		plan: AncestryPlan,
+		credentials: () => Promise<AncestryPlan["repos"]>,
+	): Promise<AncestryAnswer[] | Checking>;
 	/**
 	 * Ask the container whether an index is what its root commit pins. The
 	 * production Deps always has it; a test that does not fake it skips the
 	 * check.
 	 */
-	index?(project: string, plan: IndexPlan): Promise<IndexAnswer>;
+	index?(
+		project: string,
+		plan: IndexPlan,
+		credentials: () => Promise<IndexPlan["repos"]>,
+	): Promise<IndexAnswer | Checking>;
+}
+
+/**
+ * Ask the endpoint after a merge check: a peek, without credentials, at one
+ * already started; and only when there is none, the plan with credentials,
+ * which starts it.
+ */
+async function askCheck<P extends { repos: Record<string, { url: string; auth: string }> }>(
+	env: Env,
+	project: string,
+	kind: "ancestry" | "index",
+	plan: P,
+	credentials: () => Promise<P["repos"]>,
+	what: string,
+): Promise<unknown> {
+	const endpoint = env.ENDPOINTS.getByName(project);
+	const ask = (sent: P, peek: boolean) =>
+		endpoint.fetch(
+			new Request(`https://endpoint/${kind}${peek ? "?peek" : ""}`, {
+				method: "POST",
+				headers: { [PLAN_HEADER]: btoa(JSON.stringify(sent)) },
+			}),
+		);
+	let response = await ask(plan, true);
+	if (response.status === 404) {
+		await response.body?.cancel();
+		response = await ask({ ...plan, repos: await credentials() }, false);
+	}
+	if (response.status === 202) {
+		await response.body?.cancel();
+		return CHECKING;
+	}
+	if (!response.ok) throw new HttpError(502, `the remote could not check ${what}: ${(await response.text()).trim()}`);
+	return response.json();
 }
 
 class HttpError extends Error {
@@ -110,26 +194,12 @@ export default {
 			repos: new ArtifactsRepos(env.ARTIFACTS, env.ARTIFACTS_GIT_BASE),
 			fetcher: fetch,
 			waitUntil: (promise) => ctx.waitUntil(promise),
-			ancestry: async (project, plan) => {
-				const response = await env.ENDPOINTS.getByName(project).fetch(
-					new Request("https://endpoint/ancestry", {
-						method: "POST",
-						headers: { [PLAN_HEADER]: btoa(JSON.stringify(plan)) },
-					}),
-				);
-				if (!response.ok) throw new HttpError(502, "the remote could not check where the merge's pins move; try again");
-				return (await response.json()) as AncestryAnswer[];
-			},
-			index: async (project, plan) => {
-				const response = await env.ENDPOINTS.getByName(project).fetch(
-					new Request("https://endpoint/index", {
-						method: "POST",
-						headers: { [PLAN_HEADER]: btoa(JSON.stringify(plan)) },
-					}),
-				);
-				if (!response.ok) throw new HttpError(502, "the remote could not check the merge's index; try again");
-				return (await response.json()) as IndexAnswer;
-			},
+			ancestry: async (project, plan, credentials) =>
+				(await askCheck(env, project, "ancestry", plan, credentials, "where the merge's pins move")) as
+					| AncestryAnswer[]
+					| Checking,
+			index: async (project, plan, credentials) =>
+				(await askCheck(env, project, "index", plan, credentials, "the merge's index")) as IndexAnswer | Checking,
 			endpoint: (project, kind, plan, original) => {
 				const headers = new Headers({ [PLAN_HEADER]: btoa(JSON.stringify(plan)) });
 				for (const name of ["git-protocol", "content-encoding", "content-type"]) {
@@ -439,15 +509,13 @@ async function route(request: Request, env: Env, deps: Deps): Promise<Response> 
 		const children = trackers.filter((tracker) => tracker !== "root" && tracker in base && tracker in list);
 		const moves = new Map<string, AncestryAnswer>();
 		if (children.length > 0 && deps.ancestry) {
-			const plan: AncestryPlan = { dir: "/work", repos: {}, checks: [] };
-			for (const tracker of children) {
-				const name = repoName({ kind: "tracker", project: id, tracker });
-				const minted = await deps.repos.mint(name, "read", CREDENTIAL_TTL_SECONDS);
-				await userStub(env, login).recordRepoToken(caller.tokenId, name, minted.id, minted.expiresAt);
-				plan.repos[tracker] = { url: deps.repos.url(name), auth: `Authorization: Basic ${btoa(`x:${minted.password}`)}` };
-				plan.checks.push({ tracker, old: base[tracker], new: list[tracker] });
-			}
-			for (const answer of await deps.ancestry(key, plan)) moves.set(answer.tracker, answer);
+			const plan: AncestryPlan = { dir: "/work", repos: checkRepos(deps, id, children), checks: [] };
+			for (const tracker of children) plan.checks.push({ tracker, old: base[tracker], new: list[tracker] });
+			// The first time a large history is here the check takes minutes:
+			// the client asks again until it has the answer.
+			const answers = await deps.ancestry(key, plan, () => checkCredentials(env, deps, caller, id, children));
+			if (isChecking(answers)) return stillChecking();
+			for (const answer of answers) moves.set(answer.tracker, answer);
 		}
 		// Everything is checked before the lock is taken: a refused merge
 		// holds nothing.
@@ -562,14 +630,16 @@ async function route(request: Request, env: Env, deps: Deps): Promise<Response> 
 				// composes from the gitlinks, so an index that says otherwise
 				// would have had its pins checked for nothing.
 				if (deps.index) {
-					const plan: IndexPlan = { dir: "/work", repos: {}, list };
-					for (const tracker of Object.keys(list)) {
-						const name = repoName({ kind: "tracker", project: id, tracker });
-						const minted = await deps.repos.mint(name, "read", CREDENTIAL_TTL_SECONDS);
-						await userStub(env, login).recordRepoToken(caller.tokenId, name, minted.id, minted.expiresAt);
-						plan.repos[tracker] = { url: deps.repos.url(name), auth: `Authorization: Basic ${btoa(`x:${minted.password}`)}` };
-					}
-					const checked = await deps.index(key, plan);
+					// The check can take minutes the first time a large history is
+					// here; the merge stays this caller's for as long as it runs.
+					if (!(await project.extendMerge(branch, login, INDEX_CHECK_SECONDS)))
+						throw new HttpError(409, `you hold no merge into \`${branch}\`: start one with \`newgit merge\``);
+					const trackers = Object.keys(list);
+					const plan: IndexPlan = { dir: "/work", repos: checkRepos(deps, id, trackers), list };
+					const checked = await deps.index(key, plan, () => checkCredentials(env, deps, caller, id, trackers));
+					// Still running: the client asks again, and this request's
+					// extension above holds the lock until it does.
+					if (isChecking(checked)) return stillChecking();
 					if (checked.matches !== true)
 						throw new HttpError(
 							400,
@@ -1180,6 +1250,38 @@ export async function issue(env: Env, spec: NewToken) {
 
 function userStub(env: Env, login: string): DurableObjectStub<UserDO> {
 	return env.USERS.getByName(login.toLowerCase());
+}
+
+/** A merge check's repos, without credentials: enough to ask after one already started. */
+function checkRepos(deps: Deps, project: ProjectId, trackers: string[]): Record<string, { url: string; auth: string }> {
+	return Object.fromEntries(
+		trackers.map((tracker) => [
+			tracker,
+			{ url: deps.repos.url(repoName({ kind: "tracker", project, tracker })), auth: "" },
+		]),
+	);
+}
+
+/**
+ * Read passwords for a merge check that is starting, recorded against the
+ * caller's token so revoking it revokes them. They last as long as the
+ * check may run, not the default fifteen minutes.
+ */
+async function checkCredentials(
+	env: Env,
+	deps: Deps,
+	caller: Caller,
+	project: ProjectId,
+	trackers: string[],
+): Promise<Record<string, { url: string; auth: string }>> {
+	const repos: Record<string, { url: string; auth: string }> = {};
+	for (const tracker of trackers) {
+		const name = repoName({ kind: "tracker", project, tracker });
+		const minted = await deps.repos.mint(name, "read", CHECK_CREDENTIAL_SECONDS);
+		await userStub(env, caller.login).recordRepoToken(caller.tokenId, name, minted.id, minted.expiresAt);
+		repos[tracker] = { url: deps.repos.url(name), auth: `Authorization: Basic ${btoa(`x:${minted.password}`)}` };
+	}
+	return repos;
 }
 
 /**

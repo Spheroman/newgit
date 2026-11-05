@@ -260,6 +260,27 @@ pub struct HttpRemote {
     agent: ureq::Agent,
 }
 
+/// How often a merge's begin or finish asks again while the remote checks
+/// it, unless the remote's `Retry-After` says otherwise.
+const CHECK_POLL: Duration = Duration::from_secs(10);
+
+/// How long a merge waits on the remote's check before giving up. The
+/// remote counts a check running longer than 45 minutes as failed, so this
+/// only ends a wait on a remote that never answers.
+const CHECK_LIMIT: Duration = Duration::from_secs(60 * 60);
+
+/// Requests that fail to arrive in a row while polling a check before the
+/// wait gives up: one dropped connection should not cost a 40-minute check.
+const CHECK_UNREACHABLE_TRIES: u32 = 3;
+
+/// One answer from the remote.
+struct Reply {
+    status: u16,
+    text: String,
+    /// `Retry-After`, in seconds, when it sent one.
+    retry_after: Option<u64>,
+}
+
 impl HttpRemote {
     pub fn new(url: &str, token: Option<String>) -> Self {
         let config = ureq::Agent::config_builder()
@@ -322,11 +343,83 @@ impl HttpRemote {
         path: &str,
         body: Option<serde_json::Value>,
     ) -> Result<T> {
-        let (status, text) = self.request(method, path, body)?;
-        if !(200..300).contains(&status) {
-            return Err(remote_error(status, &text));
+        let reply = self.request_with(method, path, body)?;
+        if !(200..300).contains(&reply.status) {
+            return Err(remote_error(reply.status, &reply.text));
         }
-        parse(&text, status)
+        parse(&reply.text, reply.status)
+    }
+
+    /// A call the remote may answer only after it has run Git over every
+    /// tracker repo a merge moves: a merge's begin and finish. The first time
+    /// a large history is there (t3code's 365 MiB), fetching it takes many
+    /// minutes, so the remote runs the check in the background and answers
+    /// `202 {"checking": true}` until it is done. This asks again, the same
+    /// request, until it gets the real answer.
+    fn send_checked<T: DeserializeOwned>(
+        &self,
+        method: &str,
+        path: &str,
+        body: serde_json::Value,
+    ) -> Result<T> {
+        let started = std::time::Instant::now();
+        let mut checking = false;
+        let mut said_minutes = 0;
+        let mut unreachable = 0;
+        loop {
+            let reply = match self.request_with(method, path, Some(body.clone())) {
+                Ok(reply) => reply,
+                // Once the check is under way, a request that did not arrive
+                // is asked again: the check carries on without it.
+                Err(error @ NewgitError::RemoteUnreachable { .. }) if checking => {
+                    unreachable += 1;
+                    if unreachable >= CHECK_UNREACHABLE_TRIES {
+                        return Err(error);
+                    }
+                    std::thread::sleep(CHECK_POLL);
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            unreachable = 0;
+            if reply.status != 202 {
+                if !(200..300).contains(&reply.status) {
+                    return Err(remote_error(reply.status, &reply.text));
+                }
+                return parse(&reply.text, reply.status);
+            }
+            checking = true;
+            let elapsed = started.elapsed();
+            if elapsed >= CHECK_LIMIT {
+                return Err(NewgitError::Remote {
+                    status: reply.status,
+                    message: format!(
+                        "{} was still checking the merge after {} minutes; the check carries on there, so running the merge again picks it up",
+                        self.host(),
+                        CHECK_LIMIT.as_secs() / 60
+                    ),
+                });
+            }
+            let minutes = elapsed.as_secs() / 60;
+            if minutes > said_minutes {
+                said_minutes = minutes;
+                eprintln!(
+                    "{} is still checking the merge ({minutes} min); a first look at a large tracker takes several minutes",
+                    self.host()
+                );
+            }
+            let wait = reply
+                .retry_after
+                .map_or(CHECK_POLL, |seconds| Duration::from_secs(seconds.min(60)));
+            std::thread::sleep(wait);
+        }
+    }
+
+    /// The remote's host, as people know it: `newgit.dev`.
+    fn host(&self) -> &str {
+        self.url
+            .split_once("://")
+            .map_or(self.url.as_str(), |(_, rest)| rest)
     }
 
     fn request(
@@ -335,6 +428,17 @@ impl HttpRemote {
         path: &str,
         body: Option<serde_json::Value>,
     ) -> Result<(u16, String)> {
+        let reply = self.request_with(method, path, body)?;
+        Ok((reply.status, reply.text))
+    }
+
+    fn request_with(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<serde_json::Value>,
+    ) -> Result<Reply> {
+        let agent = &self.agent;
         let url = format!("{}{path}", self.url);
         let unreachable = |error: ureq::Error| NewgitError::RemoteUnreachable {
             url: self.url.clone(),
@@ -344,9 +448,9 @@ impl HttpRemote {
         let mut response = match method {
             "GET" | "DELETE" => {
                 let mut request = if method == "GET" {
-                    self.agent.get(&url)
+                    agent.get(&url)
                 } else {
-                    self.agent.delete(&url)
+                    agent.delete(&url)
                 };
                 if let Some(auth) = &auth {
                     request = request.header("authorization", auth);
@@ -355,9 +459,9 @@ impl HttpRemote {
             }
             _ => {
                 let mut request = if method == "PUT" {
-                    self.agent.put(&url)
+                    agent.put(&url)
                 } else {
-                    self.agent.post(&url)
+                    agent.post(&url)
                 };
                 if let Some(auth) = &auth {
                     request = request.header("authorization", auth);
@@ -368,8 +472,17 @@ impl HttpRemote {
             }
         };
         let status = response.status().as_u16();
+        let retry_after = response
+            .headers()
+            .get("retry-after")
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.trim().parse().ok());
         let text = response.body_mut().read_to_string().map_err(unreachable)?;
-        Ok((status, text))
+        Ok(Reply {
+            status,
+            text,
+            retry_after,
+        })
     }
 }
 
@@ -479,14 +592,14 @@ impl Remote for HttpRemote {
         struct Started {
             credentials: Vec<SeedCredential>,
         }
-        let started: Started = self.send(
+        let started: Started = self.send_checked(
             "POST",
             &format!(
                 "/v1/projects/{}/branches/{}/merge",
                 project_path(project),
                 segment(branch)
             ),
-            Some(serde_json::json!({ "base": base, "list": list })),
+            serde_json::json!({ "base": base, "list": list }),
         )?;
         Ok(started.credentials)
     }
@@ -498,14 +611,14 @@ impl Remote for HttpRemote {
         base: &std::collections::BTreeMap<String, String>,
         list: &std::collections::BTreeMap<String, String>,
     ) -> Result<()> {
-        let _: serde_json::Value = self.send(
+        let _: serde_json::Value = self.send_checked(
             "PUT",
             &format!(
                 "/v1/projects/{}/branches/{}",
                 project_path(project),
                 segment(branch)
             ),
-            Some(serde_json::json!({ "base": base, "list": list })),
+            serde_json::json!({ "base": base, "list": list }),
         )?;
         Ok(())
     }
