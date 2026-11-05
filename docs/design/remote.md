@@ -525,6 +525,36 @@ writing the branch's list in the project's Durable Object as an index. (The
 Worker's Artifacts binding cannot write refs, so the merge's Git work is the
 merger's; root's ref is the truth and the list says which repos to fetch.)
 
+Both of the container's checks — the begin's ancestry check (`newgit
+endpoint-ancestry`) and the finish's index check (`newgit endpoint-index`) —
+fetch every tracker they look at into the container's store, and the first
+time a large history is there that takes many minutes (Spheroman/t3code,
+365 MiB: about five minutes in one fetch). So they run in the background.
+The endpoint's Durable Object keys each check by its kind and its plan
+without credentials. The first request starts it and every request until it
+ends is answered `202 {"checking": true}` with `Retry-After: 10`; the first
+one after gets Git's answer, or the 502 with Git's error, and the answer is
+forgotten. An answer nobody collects is dropped after five minutes, and a
+check running past 45 minutes counts as failed. The Worker asks with a
+credential-free peek first and mints read passwords (for the check's
+length, not the usual fifteen minutes) only for a check it starts, so
+polling mints nothing. Those passwords go only to the container, never to
+the merger, and are recorded against the merger's token like any other, so
+revoking it revokes them. The client asks again every ten seconds while it gets
+202, says so once a minute, and gives up after an hour; every request is
+short. The finish extends the merge's lock on every request, so the lock
+holds while the client keeps asking. The checks are held in the object's
+memory and in `waitUntil`; the polls are what keep the object alive. An
+object evicted mid-check forgets it, and the next request starts it again,
+against a store that keeps what the first fetched.
+
+A fetch the remote drops (Artifacts fails some whole fetches with an HTTP
+500, `expected 'packfile'`) is tried whole twice more, a few seconds apart,
+before newgit fetches in bands: the tips at `--depth=2048`, then
+`--deepen=2048` (growing to 8192) until nothing is shallow, halving a band
+the remote still drops. Each band costs the remote about a minute however
+small it is, so the bands are wide.
+
 Who may move a tracker is its definition's `maintainers` (`owner`,
 `project-devs`, or `user:<login>`; it defaults to the audience). A
 definition is itself a file, `.newgit/trackers/<name>.toml`, owned by

@@ -1452,20 +1452,33 @@ impl GitSource {
             args.extend(["rev-parse", "--is-shallow-repository"]);
             Ok(run_git_env(&args, &[])? == "true")
         };
+        // A whole fetch is by far the fastest way to get a large history
+        // (t3code's 365 MiB: five minutes whole, against half an hour in
+        // bands), and a dropped one often comes through on a second try. So
+        // a dropped fetch is tried whole again, twice, before stepping.
+        //
         // A store left shallow by a stepped fetch that stopped part way
         // carries on deepening, even when this fetch went through whole.
-        let mut started = match fetch(None) {
-            Ok(()) if !shallow_store(location)? => return Ok(()),
-            Ok(()) => true,
-            Err(error) if dropped(&error) => false,
-            Err(error) => return Err(error),
+        let mut tries = WHOLE_FETCH_BACKOFF.iter();
+        let mut started = loop {
+            match fetch(None) {
+                Ok(()) if !shallow_store(location)? => return Ok(()),
+                Ok(()) => break true,
+                Err(error) if dropped(&error) => match tries.next() {
+                    Some(wait) => std::thread::sleep(*wait),
+                    None => break false,
+                },
+                Err(error) => return Err(error),
+            }
         };
-        // The remote dropped it: a history too big for it to send at once
-        // (Artifacts fails a 365 MiB fetch with an HTTP 500). Fetch the tips
-        // first, then deepen band by band until nothing is shallow: each
-        // fetch brings only the next band. A band the remote still drops is
-        // halved; one that comes grows the next.
-        let mut depth: u32 = 256;
+        // The remote still dropped it: a history too big for it to send at
+        // once (Artifacts fails a 365 MiB fetch with an HTTP 500). Fetch the
+        // tips first, then deepen band by band until nothing is shallow:
+        // each fetch brings only the next band. A band the remote still
+        // drops is halved; one that comes grows the next. The bands start
+        // wide, because each costs the remote about a minute to compute
+        // whatever its size.
+        let mut depth: u32 = FIRST_BAND;
         loop {
             let flag = if started {
                 format!("--deepen={depth}")
@@ -1478,7 +1491,7 @@ impl GitSource {
                     if !shallow_store(location)? {
                         return Ok(());
                     }
-                    depth = (depth * 2).min(4096);
+                    depth = (depth * 2).min(4 * FIRST_BAND);
                 }
                 Err(error) if dropped(&error) && depth > 1 => depth /= 2,
                 Err(error) => return Err(error),
@@ -1547,6 +1560,15 @@ fn export_identity(destination: &Utf8Path) -> Vec<(String, String)> {
         })
         .collect()
 }
+
+/// How long a dropped whole fetch waits before each of its retries.
+const WHOLE_FETCH_BACKOFF: [std::time::Duration; 2] = [
+    std::time::Duration::from_secs(1),
+    std::time::Duration::from_secs(3),
+];
+
+/// The commits a stepped fetch asks for first, and deepens by.
+const FIRST_BAND: u32 = 2048;
 
 /// Where a push too big for the remote is staged step by step, deleted
 /// once the real push lands.
