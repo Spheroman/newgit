@@ -18,6 +18,11 @@
 // client asks again every few seconds, each request also keeping this object
 // alive, and the one after the check ends gets its answer (`BackgroundChecks`).
 //
+// An instance's fork of a tracker in Git is made the same way (`newgit
+// endpoint-copy`): the Worker creates an empty repo, and this copies every
+// branch of the tracker's repo into it, in the background. Artifacts' own
+// fork never finished on t3code; a stepped fetch and a stepped push do.
+//
 // A snapshot is the whole container, the `newgit` binary included, and the
 // views it composed. So a snapshot, or a running container, from an image
 // other than the one deployed now is dropped: otherwise a deploy would never
@@ -51,6 +56,23 @@ export interface IndexPlan {
 	list: Record<string, string>;
 }
 
+/**
+ * `newgit endpoint-copy`'s input: copy every branch of `from` (a tracker's
+ * repo, read) into `to` (an instance's fork, write).
+ */
+export interface CopyPlan {
+	dir: string;
+	from: { url: string; auth: string };
+	to: { url: string; auth: string };
+}
+
+/** Every branch the copy made, at its commit. */
+export interface CopyAnswer {
+	branches: Record<string, string>;
+}
+
+export type BackgroundKind = "ancestry" | "index" | "copy";
+
 export interface IndexAnswer {
 	matches: boolean;
 	actual: Record<string, string>;
@@ -77,6 +99,13 @@ export const CHECK_RESULT_MS = 5 * 60_000;
  */
 export const CHECK_LIMIT_MS = 45 * 60_000;
 
+/**
+ * A copy running longer than this counts as failed. A copy is a check's
+ * fetch and then a push of the same history in 64 MiB steps, so it may run
+ * well past one; asked again, it carries on from what got there.
+ */
+export const COPY_LIMIT_MS = 2 * 60 * 60_000;
+
 /** The body of every answer to a check that is still running. */
 export const CHECKING = { checking: true } as const;
 
@@ -85,6 +114,7 @@ export type CheckOutcome = { ok: true; json: string } | { ok: false; why: string
 
 interface CheckEntry {
 	startedAt: number;
+	limitMs: number;
 	outcome?: CheckOutcome;
 	finishedAt?: number;
 	run?: Promise<void>;
@@ -115,10 +145,10 @@ export class BackgroundChecks {
 	}
 
 	/** Start check `key`, unless it already is; resolves when it ends. */
-	start(key: string, run: () => Promise<CheckOutcome>): Promise<void> {
+	start(key: string, run: () => Promise<CheckOutcome>, limitMs = CHECK_LIMIT_MS): Promise<void> {
 		const known = this.entries.get(key);
 		if (known?.run) return known.run;
-		const entry: CheckEntry = { startedAt: this.now() };
+		const entry: CheckEntry = { startedAt: this.now(), limitMs };
 		this.entries.set(key, entry);
 		entry.run = run()
 			.catch((error: unknown): CheckOutcome => ({
@@ -146,10 +176,10 @@ export class BackgroundChecks {
 		for (const [key, entry] of this.entries) {
 			if (entry.outcome) {
 				if (now - (entry.finishedAt ?? now) > CHECK_RESULT_MS) this.entries.delete(key);
-			} else if (now - entry.startedAt > CHECK_LIMIT_MS) {
+			} else if (now - entry.startedAt > entry.limitMs) {
 				entry.outcome = {
 					ok: false,
-					why: `the check ran longer than ${CHECK_LIMIT_MS / 60_000} minutes; merge again to start it over`,
+					why: `it ran longer than ${entry.limitMs / 60_000} minutes; ask again to start it over`,
 				};
 				entry.finishedAt = now;
 			}
@@ -170,6 +200,14 @@ export async function checkKey(
 	const text = JSON.stringify({ kind, plan: { ...plan, repos } });
 	const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(text));
 	return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+/**
+ * The key of a copy: the fork it fills. One copy into a fork at a time,
+ * whatever credentials each request carries.
+ */
+export function copyKey(plan: { to: { url: string } }): string {
+	return `copy ${plan.to.url}`;
 }
 
 /** Snapshot at most this often, after a compose changed what is on disk. */
@@ -422,14 +460,15 @@ export class GitEndpoint extends DurableObject<Env> {
 	}
 
 	/**
-	 * A merge check, in the background: started by the first request with
+	 * A merge check or a fork's copy, in the background: started by the first request with
 	 * its plan, answered 202 while it runs, and its answer handed to the
 	 * first request after it ends. A `peek` carries no credentials: it only
 	 * asks after a check already known, and is answered 404 when there is
-	 * none, so the Worker mints read passwords only for a check it starts.
+	 * none, so the Worker mints passwords only for a check it starts.
 	 */
-	private async check(kind: "ancestry" | "index", plan: string, peek: boolean): Promise<Response> {
-		const key = await checkKey(kind, JSON.parse(plan));
+	private async check(kind: BackgroundKind, plan: string, peek: boolean): Promise<Response> {
+		const parsed = JSON.parse(plan);
+		const key = kind === "copy" ? copyKey(parsed) : await checkKey(kind, parsed);
 		const known = this.checks.collect(key);
 		if (known === "running") return Response.json(CHECKING, { status: 202 });
 		if (known?.ok)
@@ -442,11 +481,13 @@ export class GitEndpoint extends DurableObject<Env> {
 		if (peek) return new Response("no such check\n", { status: 404 });
 		// Held by `checks` and by `waitUntil`: the object stays up while the
 		// merger's polls keep arriving, and the promise is what they collect.
-		this.ctx.waitUntil(this.checks.start(key, () => this.runCheck(kind, plan)));
+		this.ctx.waitUntil(
+			this.checks.start(key, () => this.runCheck(kind, plan), kind === "copy" ? COPY_LIMIT_MS : CHECK_LIMIT_MS),
+		);
 		return Response.json(CHECKING, { status: 202 });
 	}
 
-	private async runCheck(kind: "ancestry" | "index", plan: string): Promise<CheckOutcome> {
+	private async runCheck(kind: BackgroundKind, plan: string): Promise<CheckOutcome> {
 		const container = await this.ensureRunning();
 		const check = await container.exec(["newgit", `endpoint-${kind}`], {
 			stdin: new Response(plan).body!,
@@ -471,11 +512,12 @@ export class GitEndpoint extends DurableObject<Env> {
 
 	private async serve(request: Request): Promise<Response> {
 		const url = new URL(request.url);
-		const kind = url.pathname.slice(1) as EndpointKind | "ancestry" | "index";
+		const kind = url.pathname.slice(1) as EndpointKind | BackgroundKind;
 		const encoded = request.headers.get(PLAN_HEADER);
 		if (!encoded) return new Response("no plan\n", { status: 400 });
 		const plan = atob(encoded);
-		if (kind === "ancestry" || kind === "index") return this.check(kind, plan, url.searchParams.has("peek"));
+		if (kind === "ancestry" || kind === "index" || kind === "copy")
+			return this.check(kind, plan, url.searchParams.has("peek"));
 		const container = await this.ensureRunning();
 
 		const compose = await container.exec(["newgit", "endpoint-compose"], {

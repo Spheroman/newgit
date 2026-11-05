@@ -310,6 +310,10 @@ enum Command {
     /// inside its container: is the index what root's commit pins?
     #[command(hide = true)]
     EndpointIndex,
+    /// The Git endpoint's copy of a tracker into an instance's fork, run
+    /// inside its container: fetches every branch, pushes them in steps
+    #[command(hide = true)]
+    EndpointCopy,
     /// Link this project to a newgit remote
     Remote {
         #[command(subcommand)]
@@ -692,6 +696,16 @@ fn main() -> Result<()> {
             println!(
                 "{}",
                 serde_json::to_string(&newgit_core::endpoint::check_index(&plan)?)?
+            );
+            Ok(())
+        }
+        Command::EndpointCopy => {
+            let plan: newgit_core::endpoint::CopyPlan =
+                serde_json::from_reader(std::io::stdin())
+                    .context("the plan on stdin is not JSON newgit can read")?;
+            println!(
+                "{}",
+                serde_json::to_string(&newgit_core::endpoint::copy_repo(&plan)?)?
             );
             Ok(())
         }

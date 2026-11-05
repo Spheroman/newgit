@@ -213,7 +213,7 @@ Facts from the docs (2026-10), because the design leans on each one.
   Also the content of a shared tracker outside Git.
 - `<owner>.<name>.t.<tracker>.<login>` — one user's per-user tracker outside Git.
 - `<owner>.<name>.i.<instance>.<tracker>` — an instance's fork of one tracker
-  in Git, made the first time the instance changes it; its branch is
+  in Git, made the first time the instance changes it (*Forks*); its branch is
   `refs/heads/<instance>` and each checkpoint's commit
   `refs/newgit/checkpoints/<id>`. Written only by that instance. Deleted by
   `newgit remove`. A private instance's forks (`newgit spawn --private`) are
@@ -404,6 +404,51 @@ commit pushed to the instance's fork of it — forked then, the first time.
 The push succeeds exactly when that reached the remote. Nothing is forwarded
 as one history; the endpoint composes views, and `newgit merge` moves
 branches.
+
+### Forks
+
+> **Decision (loud): the remote copies a fork itself; Artifacts' `fork` is
+> not used.** Artifacts' fork of Spheroman/t3code (365 MiB, 8,164 commits)
+> never finished: it said `FORK_IN_PROGRESS` for over two and a half hours
+> ([#144]). Git does finish, with the fetch that steps and retries and the
+> push that steps past Artifacts' 64 MiB per-push limit, and the Git
+> endpoint's container already runs Git.
+
+`POST /v1/projects/:o/:n/instances/:instance/trackers/:tracker/fork`:
+
+1. A **complete** fork is returned as it is (`200 {instance, tracker, repo,
+   remote}`): the instance's work may be on it.
+2. Otherwise the route creates the fork as an empty repo, mints a read
+   password for the tracker's repo and a write password for the fork (130
+   minutes: as long as a copy may run, and a little more), and asks the
+   endpoint to copy. The container runs `newgit endpoint-copy`: fetch every
+   branch of the tracker into its store, push each into the fork. The copy
+   runs in the background, keyed by the fork, like a merge's checks; the
+   route answers `202 {"forking": true}` with `Retry-After: 5` until it is
+   done, and the client asks again. Then `200`, as in 1.
+3. **Whether a fork is complete is recorded in the project's Durable
+   Object** (the `forks` table's `complete` column), not in the fork. The
+   object already lists each instance's forks, a row there is what the fork
+   route, the credentials route, and `newgit remove` read, and the Worker can
+   write it in the same step it answers 200; a marker ref would need Git to
+   read and a push to write. A fork recorded before the copy finished is
+   not handed out: the credentials route says it does not exist yet, and the
+   next ask copies again into the same repo. The copy is idempotent — the
+   fetch takes only what the store lacks, the push only what the fork lacks
+   — so a copy that died part way is finished, not started over.
+4. A failed copy answers `502` with Git's error as the container gave it;
+   Artifacts refusing a step answers `502` with its code and message.
+5. **A fork left stuck by Artifacts' fork**, which this route used before
+   and which says `FORK_IN_PROGRESS` forever, is deleted and made empty
+   again. A refused delete is answered `502` with Artifacts' error, not
+   retried.
+
+Every fork takes this one path, small trackers included. So a small fork
+now costs a container wake (about a second from the endpoint's snapshot,
+*Measurements*), a fetch and a push of the tracker, and at least one
+5-second poll — against 5–22 s for Artifacts' fork of hono (41 MB). The
+copy also keeps the tracker's history in the endpoint's store, so a merge's
+checks on it afterwards fetch nothing new.
 
 A tracker outside Git the remote has no definition for yet is left out of the
 sync instead of failing it, with a warning that names it and quotes why.
@@ -881,7 +926,7 @@ Resolved loudly; each is reversible.
   never writes kernel sysctls.
 - **Snapshot pricing** is unlisted while snapshots are in beta.
 - **Fork latency:** the first checkpoint that changes a large tracker waits
-  on its fork (*Measurements*).
+  on its copy (*Forks*): minutes for t3code.
 - **The 1 GB repo cap** for large `db-snapshots` trackers.
 - **Merges inside an instance's work are flattened** when it is split into
   trackers ([trackers.md](trackers.md), *Build order* step 5).
@@ -903,7 +948,7 @@ leans on:
 
 | What | Measured | So |
 |---|---|---|
-| Artifacts fork (hono, 41 MB) | 5–22 s | fork only the trackers an instance changes |
+| Artifacts fork (hono, 41 MB) | 5–22 s; never finished on t3code (365 MiB) | fork only the trackers an instance changes, and copy them with Git (*Forks*) |
 | Artifacts full clone (hono) | 9–38 s, against 1.8 s from GitHub | clone from the local store |
 | Merge in a Worker (isomorphic-git) | fails on full history (memory) | merges run on the merger's machine |
 | Sandbox boot, fresh / from a snapshot | 0.2–0.3 s / ~0.6 s (one 13.6 s outlier) | starting is cheap; building the environment is not |
@@ -921,6 +966,7 @@ leans on:
 [#140]: https://github.com/Spheroman/newgit/issues/140
 [#141]: https://github.com/Spheroman/newgit/issues/141
 [#142]: https://github.com/Spheroman/newgit/issues/142
+[#144]: https://github.com/Spheroman/newgit/issues/144
 [#148]: https://github.com/Spheroman/newgit/issues/148
 [#160]: https://github.com/Spheroman/newgit/issues/160
 [#165]: https://github.com/Spheroman/newgit/issues/165

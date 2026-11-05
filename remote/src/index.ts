@@ -40,7 +40,10 @@ import { checkBudget, pausedBy } from "./budget";
 import {
 	type AncestryAnswer,
 	type AncestryPlan,
+	type BackgroundKind,
 	CHECKING,
+	type CopyAnswer,
+	type CopyPlan,
 	type EndpointKind,
 	type EndpointPlan,
 	type IndexAnswer,
@@ -80,11 +83,19 @@ export const CREDENTIAL_TTL_SECONDS = 15 * 60;
  */
 const CHECK_CREDENTIAL_SECONDS = 50 * 60;
 
-/** Artifacts is still forking a repository: asked again shortly. */
-class ForkInProgress extends Error {}
+/**
+ * The passwords a fork's copy fetches and pushes with: as long as the copy
+ * may run (`COPY_LIMIT_MS`, two hours) and a little more, so a push of a
+ * large history late in the copy does not lose its password.
+ */
+const COPY_CREDENTIAL_SECONDS = 130 * 60;
 
-/** How soon a client should ask again while Artifacts forks a repository. */
-const FORK_RETRY_SECONDS = 15;
+/**
+ * How soon a client should ask again while the remote copies a fork. Short:
+ * a small tracker's copy is done in seconds, and every fork now waits at
+ * least one of these.
+ */
+const FORK_RETRY_SECONDS = 5;
 
 /** How soon a client should ask again while the remote checks its merge. */
 const CHECK_RETRY_SECONDS = 10;
@@ -111,7 +122,7 @@ const INDEX_CHECK_SECONDS = 20 * 60;
 export interface Deps {
 	repos: Repos;
 	fetcher: typeof fetch;
-	/** Work that may outlive the response (a fork takes seconds). */
+	/** Work that may outlive the response. */
 	waitUntil(promise: Promise<unknown>): void;
 	/** Serve one Git request from a project's endpoint container. */
 	endpoint(project: string, kind: EndpointKind, plan: EndpointPlan, request: Request): Promise<Response>;
@@ -140,6 +151,16 @@ export interface Deps {
 		plan: IndexPlan,
 		credentials: () => Promise<IndexPlan["repos"]>,
 	): Promise<IndexAnswer | Checking>;
+	/**
+	 * Have the container copy every branch of a tracker's repo into an
+	 * instance's empty fork, in the background, as the checks run. Absent
+	 * (tests that do not fake it), the fork route answers 501.
+	 */
+	copy?(
+		project: string,
+		plan: CopyPlan,
+		credentials: () => Promise<Pick<CopyPlan, "from" | "to">>,
+	): Promise<CopyAnswer | Checking>;
 }
 
 /**
@@ -147,13 +168,13 @@ export interface Deps {
  * already started; and only when there is none, the plan with credentials,
  * which starts it.
  */
-async function askCheck<P extends { repos: Record<string, { url: string; auth: string }> }>(
+async function askCheck<P>(
 	env: Env,
 	project: string,
-	kind: "ancestry" | "index",
+	kind: BackgroundKind,
 	plan: P,
-	credentials: () => Promise<P["repos"]>,
-	what: string,
+	credentials: () => Promise<Partial<P>>,
+	failure: string,
 ): Promise<unknown> {
 	const endpoint = env.ENDPOINTS.getByName(project);
 	const ask = (sent: P, peek: boolean) =>
@@ -166,13 +187,13 @@ async function askCheck<P extends { repos: Record<string, { url: string; auth: s
 	let response = await ask(plan, true);
 	if (response.status === 404) {
 		await response.body?.cancel();
-		response = await ask({ ...plan, repos: await credentials() }, false);
+		response = await ask({ ...plan, ...(await credentials()) }, false);
 	}
 	if (response.status === 202) {
 		await response.body?.cancel();
 		return CHECKING;
 	}
-	if (!response.ok) throw new HttpError(502, `the remote could not check ${what}: ${(await response.text()).trim()}`);
+	if (!response.ok) throw new HttpError(502, `${failure}: ${(await response.text()).trim()}`);
 	return response.json();
 }
 
@@ -201,11 +222,34 @@ export default {
 			fetcher: fetch,
 			waitUntil: (promise) => ctx.waitUntil(promise),
 			ancestry: async (project, plan, credentials) =>
-				(await askCheck(env, project, "ancestry", plan, credentials, "where the merge's pins move")) as
+				(await askCheck(
+					env,
+					project,
+					"ancestry",
+					plan,
+					async () => ({ repos: await credentials() }),
+					"the remote could not check where the merge's pins move",
+				)) as
 					| AncestryAnswer[]
 					| Checking,
 			index: async (project, plan, credentials) =>
-				(await askCheck(env, project, "index", plan, credentials, "the merge's index")) as IndexAnswer | Checking,
+				(await askCheck(
+					env,
+					project,
+					"index",
+					plan,
+					async () => ({ repos: await credentials() }),
+					"the remote could not check the merge's index",
+				)) as IndexAnswer | Checking,
+			copy: async (project, plan, credentials) =>
+				(await askCheck(
+					env,
+					project,
+					"copy",
+					plan,
+					credentials,
+					"its Git endpoint said",
+				)) as CopyAnswer | Checking,
 			endpoint: (project, kind, plan, original) => {
 				const headers = new Headers({ [PLAN_HEADER]: btoa(JSON.stringify(plan)) });
 				for (const name of ["git-protocol", "content-encoding", "content-type"]) {
@@ -705,18 +749,6 @@ async function route(request: Request, env: Env, deps: Deps): Promise<Response> 
 
 	const forkMatch = rest.match(/^\/instances\/([^/]+)\/trackers\/([^/]+)\/fork$/);
 	if (method === "POST" && forkMatch) {
-		try {
-			return await forkRoute(forkMatch, id);
-		} catch (error) {
-			if (error instanceof ForkInProgress)
-				return Response.json(
-					{ forking: true },
-					{ status: 202, headers: { "retry-after": String(FORK_RETRY_SECONDS) } },
-				);
-			throw error;
-		}
-	}
-	async function forkRoute(forkMatch: RegExpMatchArray, id: ProjectId): Promise<Response> {
 		const name = decodeURIComponent(forkMatch[1]);
 		const tracker = decodeURIComponent(forkMatch[2]);
 		const instance = await project.instance(name);
@@ -727,35 +759,61 @@ async function route(request: Request, env: Env, deps: Deps): Promise<Response> 
 		if (facts === undefined) throw new HttpError(404, `tracker \`${tracker}\` is not defined on ${key}'s \`access\` \`main\``);
 		if (!facts.git) throw new HttpError(400, `\`${tracker}\` is not in Git; instances do not fork it`);
 		const fork = repoName({ kind: "fork", project: id, instance: name, tracker });
-		// Whatever Artifacts says, in the answer: a fork of a large repository
-		// fails in ways only its code and message explain.
+		const source = repoName({ kind: "tracker", project: id, tracker });
+		const done = () => json({ instance: name, tracker, repo: fork, remote: deps.repos.url(fork) });
+		// Whatever Artifacts says, in the answer: only its code and message
+		// explain a failure on a large repository.
 		const artifacts = (step: string) => (error: unknown) => {
 			if (error instanceof HttpError) throw error;
 			const { code, message } = error as { code?: string; message?: string };
-			// Artifacts forks a large repository in the background: not done yet,
-			// not failed. The client asks again until it is.
-			if (code === "FORK_IN_PROGRESS") throw new ForkInProgress();
 			console.error(JSON.stringify({ fork, step, code, message }));
 			throw new HttpError(
 				502,
 				`Artifacts could not ${step} \`${tracker}\`'s fork for \`${name}\`: ${code ?? "error"}: ${message ?? "no message"}`,
 			);
 		};
-		let remote = await deps.repos.remote(fork).catch(artifacts("look up"));
-		if (remote === null) {
-			// Seconds on a real repo; the request waits, since the push that
-			// asked for it cannot go anywhere until it exists.
-			try {
-				remote = (await deps.repos.fork(repoName({ kind: "tracker", project: id, tracker }), fork)).remote;
-			} catch (error) {
-				// A fork of a large repository (t3code, 365 MiB) can outlast the
-				// request that asked for it and finish anyway; take it if so.
-				remote = await deps.repos.remote(fork).catch(artifacts("look up"));
-				if (remote === null) artifacts("make")(error);
-			}
+
+		// Complete forks are handed out as they are: the instance's work may be on them.
+		if (await project.forkComplete(name, tracker)) {
+			if ((await deps.repos.remote(fork).catch(artifacts("look up"))) !== null) return done();
+			// Its repo is gone; it is made and copied again below.
 		}
-		await project.addFork(name, tracker);
-		return json({ instance: name, tracker, repo: fork, remote });
+		if (!deps.copy) throw new HttpError(501, "this remote has no Git endpoint to copy forks with");
+		// The container copies the tracker's branches into an empty repo, in
+		// the background: t3code's 365 MiB takes many minutes. The client asks
+		// again on a 202 until the copy is done.
+		const plan: CopyPlan = {
+			dir: "/work",
+			from: { url: deps.repos.url(source), auth: "" },
+			to: { url: deps.repos.url(fork), auth: "" },
+		};
+		// Starting the copy makes the repo and its passwords; Artifacts'
+		// refusals there are answered as they are, and anything else the copy
+		// itself failed at, with Git's error as the container gave it.
+		let refused: unknown;
+		const answer = await deps
+			.copy(key, plan, async () => {
+				try {
+					// Recorded before the repo exists, so removing the instance
+					// deletes a fork whose copy never finished too.
+					await project.startFork(name, tracker);
+					await emptyFork(deps, fork, artifacts);
+					return await copyCredentials(env, deps, caller, source, fork);
+				} catch (error) {
+					refused = error;
+					throw error;
+				}
+			})
+			.catch((error: unknown) => {
+				if (refused !== undefined) throw refused;
+				const why = error instanceof Error ? error.message : String(error);
+				console.error(JSON.stringify({ fork, step: "copy", why }));
+				throw new HttpError(502, `the remote could not copy \`${tracker}\` into \`${name}\`'s fork: ${why}`);
+			});
+		if (isChecking(answer))
+			return Response.json({ forking: true }, { status: 202, headers: { "retry-after": String(FORK_RETRY_SECONDS) } });
+		await project.completeFork(name, tracker);
+		return done();
 	}
 
 	const instanceMatch = rest.match(/^\/instances\/([^/]+)(\/head)?$/);
@@ -774,7 +832,7 @@ async function route(request: Request, env: Env, deps: Deps): Promise<Response> 
 		if (method === "DELETE" && !instanceMatch[2]) {
 			requireOwner(instance.owner, login, `remove \`${name}\``);
 			requireNotInstance(caller, "remove instances");
-			for (const tracker of instance.forks)
+			for (const tracker of await project.forkRepos(name))
 				await deps.repos.delete(repoName({ kind: "fork", project: id, instance: name, tracker })).catch(() => false);
 			await project.deleteInstance(name);
 			await revokeRepoTokens(deps, await userStub(env, instance.owner).revokeInstance(key, name));
@@ -986,6 +1044,10 @@ async function credential(
 	if (!decision.ok) throw new HttpError(403, decision.reason);
 
 	const name = repoName(ref);
+	// A fork whose copy is not done yet holds only part of its tracker: it
+	// is not there to write, or read, until the fork route says it is.
+	if (ref.kind === "fork" && !(await project.forkComplete(ref.instance, ref.tracker)))
+		throw new HttpError(404, `${name} does not exist yet`);
 	let remote = await deps.repos.remote(name);
 	if (remote === null) {
 		// The repo of a tracker outside Git is created on its first write. The repos of
@@ -1321,6 +1383,51 @@ async function checkCredentials(
 		repos[tracker] = { url: deps.repos.url(name), auth: `Authorization: Basic ${btoa(`x:${minted.password}`)}` };
 	}
 	return repos;
+}
+
+/**
+ * Make `fork` an empty repo for a copy to fill. One already there (a copy
+ * that died part way) is kept: the copy carries on into it. One left stuck
+ * by Artifacts' own fork, which this route used before, says
+ * `FORK_IN_PROGRESS` forever (hours, on t3code): it is deleted and made
+ * again. A refused delete is answered, not retried.
+ */
+async function emptyFork(deps: Deps, fork: string, artifacts: (step: string) => (error: unknown) => never) {
+	let exists: boolean;
+	try {
+		exists = (await deps.repos.remote(fork)) !== null;
+	} catch (error) {
+		if ((error as { code?: string }).code !== "FORK_IN_PROGRESS") artifacts("look up")(error);
+		console.log(JSON.stringify({ fork, step: "delete a fork stuck in FORK_IN_PROGRESS" }));
+		const deleted = await deps.repos.delete(fork).catch(artifacts("delete the stuck Artifacts fork of"));
+		if (!deleted)
+			artifacts("delete the stuck Artifacts fork of")({ code: "NOT_DELETED", message: "the delete returned false" });
+		exists = false;
+	}
+	if (exists) return;
+	await deps.repos.create(fork).catch((error: unknown) => {
+		// Made by a request racing this one: as good.
+		if ((error as { code?: string }).code !== "ALREADY_EXISTS") artifacts("make")(error);
+	});
+}
+
+/**
+ * The copy's passwords: read on the tracker's repo, write on the fork,
+ * recorded against the caller's token so revoking it revokes them.
+ */
+async function copyCredentials(
+	env: Env,
+	deps: Deps,
+	caller: Caller,
+	source: string,
+	fork: string,
+): Promise<Pick<CopyPlan, "from" | "to">> {
+	const mint = async (name: string, scope: "read" | "write") => {
+		const minted = await deps.repos.mint(name, scope, COPY_CREDENTIAL_SECONDS);
+		await userStub(env, caller.login).recordRepoToken(caller.tokenId, name, minted.id, minted.expiresAt);
+		return { url: deps.repos.url(name), auth: `Authorization: Basic ${btoa(`x:${minted.password}`)}` };
+	};
+	return { from: await mint(source, "read"), to: await mint(fork, "write") };
 }
 
 /**

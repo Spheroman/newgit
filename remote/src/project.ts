@@ -99,7 +99,8 @@ export class ProjectDO extends DurableObject<Env> {
 				name TEXT PRIMARY KEY, owner TEXT NOT NULL, agent TEXT, base_rev TEXT NOT NULL, head_rev TEXT,
 				created_at TEXT NOT NULL, updated_at TEXT NOT NULL, private INTEGER NOT NULL DEFAULT 0);
 			CREATE TABLE IF NOT EXISTS forks (
-				instance TEXT NOT NULL, tracker TEXT NOT NULL, PRIMARY KEY (instance, tracker));
+				instance TEXT NOT NULL, tracker TEXT NOT NULL, complete INTEGER NOT NULL DEFAULT 1,
+				PRIMARY KEY (instance, tracker));
 			CREATE TABLE IF NOT EXISTS checkpoints (
 				instance TEXT NOT NULL, id TEXT NOT NULL, created_by TEXT NOT NULL, agent TEXT,
 				created_at TEXT NOT NULL, record TEXT NOT NULL, PRIMARY KEY (instance, id));
@@ -107,6 +108,11 @@ export class ProjectDO extends DurableObject<Env> {
 		// Projects made before private instances: add the column (a no-op error otherwise).
 		try {
 			this.sql.exec("ALTER TABLE instances ADD COLUMN private INTEGER NOT NULL DEFAULT 0");
+		} catch {}
+		// Forks recorded before the remote copied them itself were recorded
+		// only once Artifacts had made them: complete.
+		try {
+			this.sql.exec("ALTER TABLE forks ADD COLUMN complete INTEGER NOT NULL DEFAULT 1");
 		} catch {}
 	}
 
@@ -322,14 +328,43 @@ export class ProjectDO extends DurableObject<Env> {
 			.map((row) => this.toInstance(row));
 	}
 
-	/** Record that `instance` forked `tracker`. */
-	addFork(instance: string, tracker: string): void {
-		this.sql.exec("INSERT OR IGNORE INTO forks VALUES (?, ?)", instance, tracker);
+	/**
+	 * Record that `instance`'s fork of `tracker` is being copied: its repo
+	 * exists, but is not handed out until `completeFork`. A copy that died
+	 * part way leaves it here, and the next ask copies again.
+	 */
+	startFork(instance: string, tracker: string): void {
+		this.sql.exec("INSERT OR REPLACE INTO forks (instance, tracker, complete) VALUES (?, ?, 0)", instance, tracker);
+	}
+
+	/** Record that `instance`'s fork of `tracker` holds every branch of the tracker. */
+	completeFork(instance: string, tracker: string): void {
+		this.sql.exec("INSERT OR REPLACE INTO forks (instance, tracker, complete) VALUES (?, ?, 1)", instance, tracker);
+	}
+
+	/** Whether `instance`'s fork of `tracker` is complete. */
+	forkComplete(instance: string, tracker: string): boolean {
+		return (
+			this.sql
+				.exec("SELECT 1 FROM forks WHERE instance = ? AND tracker = ? AND complete = 1", instance, tracker)
+				.toArray().length > 0
+		);
+	}
+
+	/** Every tracker `instance` has a fork repo of, complete or not: what removing it deletes. */
+	forkRepos(instance: string): string[] {
+		return this.sql
+			.exec<{ tracker: string }>("SELECT tracker FROM forks WHERE instance = ? ORDER BY tracker", instance)
+			.toArray()
+			.map((fork) => fork.tracker);
 	}
 
 	private toInstance(row: InstanceRow): Instance {
 		const forks = this.sql
-			.exec<{ tracker: string }>("SELECT tracker FROM forks WHERE instance = ? ORDER BY tracker", row.name)
+			.exec<{ tracker: string }>(
+				"SELECT tracker FROM forks WHERE instance = ? AND complete = 1 ORDER BY tracker",
+				row.name,
+			)
 			.toArray()
 			.map((fork) => fork.tracker);
 		return {

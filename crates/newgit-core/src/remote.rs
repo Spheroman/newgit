@@ -652,8 +652,9 @@ impl Remote for HttpRemote {
     }
 
     fn fork(&self, project: &str, instance: &str, tracker: &str) -> Result<RepoLocation> {
-        // Artifacts forks a large repository in the background (t3code's
-        // 365 MiB takes a long while); the remote answers 202 until it is done.
+        // The remote copies the tracker's repository into the fork in the
+        // background (t3code's 365 MiB takes many minutes); it answers 202
+        // until the copy is done.
         self.send_waiting(
             "POST",
             &format!(
@@ -664,7 +665,7 @@ impl Remote for HttpRemote {
             ),
             serde_json::json!({}),
             &format!("forking `{tracker}` for `{instance}`"),
-            "Artifacts copies a large tracker's repository the first time an instance changes it",
+            "the remote copies a tracker's repository the first time an instance changes it",
         )
     }
 

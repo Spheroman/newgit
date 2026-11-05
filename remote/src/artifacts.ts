@@ -11,8 +11,6 @@ export interface MintedToken {
 
 export interface Repos {
 	create(name: string): Promise<{ remote: string }>;
-	/** Fork `from` into `to`. Slow on real repos (5–22 s measured), so callers run it in the background. */
-	fork(from: string, to: string): Promise<{ remote: string }>;
 	/** The repo's Git remote, or null when it does not exist. */
 	remote(name: string): Promise<string | null>;
 	/** Where the repo is (or will be) served, without checking it exists. */
@@ -46,12 +44,6 @@ export class ArtifactsRepos implements Repos {
 	async create(name: string) {
 		const created = await this.artifacts.create(name, { setDefaultBranch: "main" });
 		return { remote: created.remote };
-	}
-
-	async fork(from: string, to: string) {
-		using source = await this.artifacts.get(from);
-		const forked = await source.fork(to, { defaultBranchOnly: false });
-		return { remote: forked.remote };
 	}
 
 	async remote(name: string) {

@@ -1,4 +1,5 @@
 import type { MintedToken, Repos } from "../src/artifacts";
+import type { CopyAnswer, CopyPlan } from "../src/endpoint";
 
 /** The password the fake mints for a repo and scope: recognisable, not random. */
 export const fakePassword = (name: string, scope: string) => ["pw", name, scope].join("-");
@@ -13,12 +14,6 @@ export class FakeRepos implements Repos {
 		if (this.repos.has(name)) throw Object.assign(new Error("exists"), { code: "ALREADY_EXISTS" });
 		this.repos.set(name, new Map());
 		return { remote: this.url(name) };
-	}
-	async fork(from: string, to: string) {
-		const source = this.repos.get(from);
-		if (!source) throw Object.assign(new Error("missing"), { code: "NOT_FOUND" });
-		this.repos.set(to, new Map(source));
-		return { remote: this.url(to) };
 	}
 	async remote(name: string) {
 		return this.repos.has(name) ? this.url(name) : null;
@@ -50,6 +45,27 @@ export class FakeRepos implements Repos {
 	url(name: string) {
 		return `https://acct.artifacts.example/git/newgit/${name}.git`;
 	}
+
+	/** The repo a URL from `url` names. */
+	nameOf(url: string) {
+		return url.replace("https://acct.artifacts.example/git/newgit/", "").replace(/\.git$/, "");
+	}
+}
+
+/**
+ * The endpoint's copy into a fork, done at once: what the container does in
+ * the background, for tests that fork but are not about the copy. It starts
+ * the copy (mints its passwords) and copies the source's files over.
+ */
+export function fakeCopy(repos: FakeRepos) {
+	return async (_project: string, plan: CopyPlan, credentials: () => Promise<Pick<CopyPlan, "from" | "to">>) => {
+		await credentials();
+		const from = repos.repos.get(repos.nameOf(plan.from.url));
+		const to = repos.repos.get(repos.nameOf(plan.to.url));
+		if (!from || !to) throw new Error(`fake copy: ${plan.from.url} or ${plan.to.url} is missing`);
+		for (const [path, text] of from) to.set(path, text);
+		return { branches: { main: "0".repeat(40) } } satisfies CopyAnswer;
+	};
 }
 
 /** For tests that never reach the Git endpoint. */

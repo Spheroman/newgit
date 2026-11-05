@@ -448,3 +448,78 @@ pub fn check_index(plan: &IndexPlan) -> Result<IndexAnswer> {
         actual,
     })
 }
+
+/// What the Worker asks when an instance first changes a tracker in Git:
+/// copy every branch of the tracker's repo (`from`) into the instance's
+/// fork (`to`), an empty repo the Worker made. Artifacts' own fork never
+/// finished on a large history (Spheroman/t3code, 365 MiB), so the copy is
+/// Git's: a fetch that steps and retries, and a push that steps past
+/// Artifacts' per-push limit.
+#[derive(Debug, Clone, Deserialize)]
+pub struct CopyPlan {
+    pub dir: Utf8PathBuf,
+    pub from: Source,
+    pub to: Source,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct CopyAnswer {
+    /// Every branch copied, and the commit it is at.
+    pub branches: BTreeMap<String, String>,
+}
+
+/// Copy `plan.from`'s branches into `plan.to`. Idempotent: run again after a
+/// copy that stopped part way, the fetch takes only what the store lacks and
+/// the push only what the fork lacks, so it finishes the job.
+pub fn copy_repo(plan: &CopyPlan) -> Result<CopyAnswer> {
+    let store = plan.dir.join("trackers.git");
+    std::fs::create_dir_all(&plan.dir).map_err(|source| NewgitError::io(&plan.dir, source))?;
+    if !store.join("HEAD").exists() {
+        run_git_env(&["init", "-q", "--bare", store.as_str()], &[])?;
+    }
+    let git_dir = format!("--git-dir={store}");
+    // Each source under its own refs, so a copy never moves the refs a
+    // merge check reads (`refs/trackers/…`); the objects are shared anyway.
+    let mut hasher = Sha256::new();
+    hasher.update(plan.from.url.as_bytes());
+    let key: String = hasher
+        .finalize()
+        .iter()
+        .take(8)
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    let prefix = format!("refs/copies/{key}/heads/");
+    GitSource::fetch_refs(
+        &[&git_dir, "-c", "fetch.prune=true"],
+        &plan.from.url,
+        &[format!("+refs/heads/*:{prefix}*")],
+        Some(&plan.from.auth),
+    )?;
+    let listing = run_git_env(
+        &[
+            &git_dir,
+            "for-each-ref",
+            "--format=%(refname) %(objectname)",
+            &prefix,
+        ],
+        &[],
+    )?;
+    let branches: BTreeMap<String, String> = listing
+        .lines()
+        .filter_map(|line| {
+            let (name, commit) = line.split_once(' ')?;
+            Some((name.strip_prefix(&prefix)?.to_owned(), commit.to_owned()))
+        })
+        .collect();
+    if branches.is_empty() {
+        return Ok(CopyAnswer { branches });
+    }
+    // Forced: the fork is the Worker's own until the copy is done, so a
+    // branch left behind by an earlier copy is only ever moved to the source's.
+    let refspecs: Vec<String> = branches
+        .keys()
+        .map(|branch| format!("+{prefix}{branch}:refs/heads/{branch}"))
+        .collect();
+    GitSource::push_refs(&[&git_dir], &plan.to.url, &refspecs, Some(&plan.to.auth))?;
+    Ok(CopyAnswer { branches })
+}
