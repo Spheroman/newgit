@@ -205,8 +205,7 @@ describe("the endpoint's background checks", () => {
 		});
 		expect(await checkKey("index", plan("Authorization: Basic one"))).toBe(await checkKey("index", plan("")));
 		expect(await checkKey("index", plan(""))).not.toBe(await checkKey("ancestry", plan("")));
-		expect(await checkKey("index", plan(""))).not.toBe(
-			await checkKey("index", { ...plan(""), list: { root: sha("b") } }),
-		);
+		const another = { ...plan(""), list: { root: sha("b") } };
+		expect(await checkKey("index", plan(""))).not.toBe(await checkKey("index", another));
 	});
 });
