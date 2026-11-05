@@ -1203,6 +1203,17 @@ impl GitSource {
         }
     }
 
+    /// The commit `reference` names in the repository at `url`, or `None`
+    /// when it has no such ref: what a lease should be on.
+    pub fn remote_ref(url: &str, reference: &str, auth: Option<&str>) -> Result<Option<String>> {
+        let out = run_git_env(&["ls-remote", "--", url, reference], &auth_env(auth))?;
+        Ok(out
+            .lines()
+            .filter_map(|line| line.split_once('\t'))
+            .find(|(_, name)| *name == reference)
+            .map(|(commit, _)| commit.to_owned()))
+    }
+
     /// `git <location> fetch <url> <refspecs>`, authenticated like [`Self::push_refs`].
     pub fn fetch_refs(
         location: &[&str],

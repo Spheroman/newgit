@@ -35,6 +35,10 @@ use crate::tracker::{ACCESS_TRACKER, DEFINITIONS_DIR, PROJECT_TRACKER, TrackerDe
 const STAGING: &str = "refs/newgit-migrate/trackers";
 /// Where the old tracker refs, and the old notes, are kept.
 const BACKUP: &str = "refs/newgit-premigration";
+/// Where a run keeps the carve it made and its split, in the project repo,
+/// until the migration finishes: a run that stopped part way resumes with
+/// the very same commits.
+const SAVED: &str = "refs/newgit-migrating";
 
 /// What the migration did, or would do: lines to print.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -46,6 +50,20 @@ pub struct MigrateOutcome {
     /// What the gate compared, and how many came out the same.
     pub checked: usize,
 }
+
+/// What the migration found before it moved anything.
+#[derive(Clone, Copy)]
+struct Found<'a> {
+    main_view: &'a str,
+    instance_views: &'a BTreeMap<String, String>,
+    checkpoints: &'a [(String, CheckpointRecord)],
+    project_tip: &'a str,
+    /// The view commit an old list of tracker commits was, by the old notes.
+    find_view: &'a dyn Fn(&BTreeMap<String, String>) -> Option<String>,
+}
+
+/// A remote branch to move: its name, its list now, and its new index.
+type BranchPlan = (String, BTreeMap<String, String>, BTreeMap<String, String>);
 
 /// One view the gate recomposes: a root commit, and the view commit it must
 /// come out as.
@@ -82,28 +100,55 @@ impl BranchManager {
             run_git_env(&full, &[]).map(|out| out.trim().to_owned())
         };
 
-        // A store moved over by an earlier run that stopped before the
-        // project root followed: only that step is left.
+        // Every checkpoint here: its committed work and its tip are view
+        // commits, so each is its own root commit.
+        let mut checkpoints: Vec<(String, CheckpointRecord)> = Vec::new();
+        if let Ok(entries) = std::fs::read_dir(&self.store.paths().checkpoints) {
+            for entry in entries.flatten() {
+                let Some(slug) = entry.file_name().to_str().map(ToOwned::to_owned) else {
+                    continue;
+                };
+                let log = CheckpointLog::new(self.store.checkpoint_dir(&slug), &slug);
+                for record in log.list().unwrap_or_default() {
+                    checkpoints.push((slug.clone(), record));
+                }
+            }
+        }
+
+        // A store moved over by an earlier run that stopped after it: only
+        // the local steps after that are left, and each is safe to repeat.
         if !store_git(&["for-each-ref", "--count=1", &format!("{BACKUP}/trackers/")])?.is_empty() {
-            let main = store_git(&[
-                "rev-parse",
-                &format!("refs/trackers/{}/main", self.root.name),
-            ])?;
             GitSource::fetch_refs(
                 &["-C", project.as_str()],
                 store.as_str(),
                 &["+refs/trackers/*:refs/newgit/trackers/*".to_owned()],
                 None,
             )?;
-            let view = self
-                .compose_here("refs/newgit/views/branches/main", &main)?
-                .ok_or_else(|| NewgitError::Unsupported("`main` composes to nothing".to_owned()))?;
+            let main = store_git(&[
+                "rev-parse",
+                &format!("refs/trackers/{}/main", self.root.name),
+            ])?;
+            let carve =
+                match project_git(&["rev-parse", "-q", "--verify", &format!("{SAVED}/carve")]) {
+                    Ok(carve) => carve,
+                    Err(_) => self
+                        .compose_here("refs/newgit/views/branches/main", &main)?
+                        .ok_or_else(|| {
+                            NewgitError::Unsupported("`main` composes to nothing".to_owned())
+                        })?,
+                };
+            let index = crate::compose::index(&project, &self.root.name, &main)?;
             outcome.lines.push(format!(
-                "The tracker store was moved over already; `main` is {}",
-                short(&view)
+                "Resuming: the tracker store was moved over already; `main` is {}",
+                short(&carve)
             ));
             if !dry_run {
-                self.follow_in_project_root(&view, &mut outcome)?;
+                let split = crate::compose::SplitOutcome {
+                    root: main,
+                    index,
+                    made: Vec::new(),
+                };
+                self.finish_locally(&carve, &split, &checkpoints, &mut outcome)?;
             }
             return Ok(outcome);
         }
@@ -240,21 +285,6 @@ impl BranchManager {
             }
         ));
 
-        // Every checkpoint here: its committed work and its tip are view
-        // commits, so each is its own root commit.
-        let mut checkpoints: Vec<(String, CheckpointRecord)> = Vec::new();
-        if let Ok(entries) = std::fs::read_dir(&self.store.paths().checkpoints) {
-            for entry in entries.flatten() {
-                let Some(slug) = entry.file_name().to_str().map(ToOwned::to_owned) else {
-                    continue;
-                };
-                let log = CheckpointLog::new(self.store.checkpoint_dir(&slug), &slug);
-                for record in log.list().unwrap_or_default() {
-                    checkpoints.push((slug.clone(), record));
-                }
-            }
-        }
-
         // Clear the project repo's copies of the old histories: the old
         // notes would say a view commit stands for tracker commits that no
         // longer exist, and old root commits carry trailers naming view
@@ -275,14 +305,21 @@ impl BranchManager {
             delete_refs(&project, "refs/newgit/trackers/")?;
             self.migrate_with(
                 dry_run,
-                &main_view,
-                &instance_views,
-                &checkpoints,
-                &project_tip,
+                &Found {
+                    main_view: &main_view,
+                    instance_views: &instance_views,
+                    checkpoints: &checkpoints,
+                    project_tip: &project_tip,
+                    find_view: &find_view,
+                },
                 &mut outcome,
             )
         })();
-        if dry_run || result.is_err() {
+        // Once the store moved over, the old notes and refs are history: a
+        // failure after that is resumed by running again, not undone.
+        let store_moved =
+            !store_git(&["for-each-ref", "--count=1", &format!("{BACKUP}/trackers/")])?.is_empty();
+        if dry_run || (result.is_err() && !store_moved) {
             restore_notes(&old_notes_tip)?;
             let _ = project_git(&["update-ref", "-d", &backup_notes]);
             let _ = delete_refs_in(&store, &format!("{STAGING}/"));
@@ -305,12 +342,16 @@ impl BranchManager {
     fn migrate_with(
         &self,
         dry_run: bool,
-        main_view: &str,
-        instance_views: &BTreeMap<String, String>,
-        checkpoints: &[(String, CheckpointRecord)],
-        project_tip: &str,
+        found: &Found<'_>,
         outcome: &mut MigrateOutcome,
     ) -> Result<()> {
+        let Found {
+            main_view,
+            instance_views,
+            checkpoints,
+            project_tip,
+            find_view,
+        } = *found;
         let project = self.store.paths().project_root.clone();
         let store = self.store.paths().tracker_store.clone();
         let project_git = |args: &[&str]| {
@@ -320,19 +361,33 @@ impl BranchManager {
         };
 
         // The carve: one commit on `main`'s view, mounting every tracker in
-        // Git again and dropping `project`.
-        let (carve, mounted) = self.carve_commit(main_view)?;
-        outcome.lines.push(format!(
-            "One commit on top, {}: mounts {}, and `project` folds into root",
-            short(&carve),
-            mounted
-                .iter()
-                .map(|(name, mount)| format!("`{name}` at {mount}"))
-                .collect::<Vec<_>>()
-                .join(", ")
-        ));
-        let everything = BTreeSet::new();
-        let split = self.split_view(&carve, &everything)?;
+        // Git again and dropping `project`. Made once: a run that stopped
+        // after it left the remote holding it, so a later run takes the same
+        // commit and its split, never a new one.
+        let (carve, split) = match self.saved_carve(main_view)? {
+            Some(saved) => {
+                outcome.lines.push(format!(
+                    "Resuming: the migration commit {} from an earlier run",
+                    short(&saved.0)
+                ));
+                saved
+            }
+            None => {
+                let (carve, mounted) = self.carve_commit(main_view)?;
+                outcome.lines.push(format!(
+                    "One commit on top, {}: mounts {}, and `project` folds into root",
+                    short(&carve),
+                    mounted
+                        .iter()
+                        .map(|(name, mount)| format!("`{name}` at {mount}"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
+                let everything = BTreeSet::new();
+                let split = self.split_view(&carve, &everything)?;
+                (carve, split)
+            }
+        };
         outcome.lines.push(format!(
             "Split, it is root {} pinning {}",
             short(&split.root),
@@ -480,9 +535,13 @@ impl BranchManager {
             return Ok(());
         }
 
+        // Saved before anything leaves this machine, so a run that stops
+        // part way resumes with the very same commits.
+        self.save_carve(&carve, &split)?;
+
         // The remote first: if it refuses, nothing here has moved.
         if let Some(link) = &self.remote {
-            self.migrate_remote(link, &split, outcome)?;
+            self.migrate_remote(link, &split, find_view, outcome)?;
         }
 
         // Here: the old tracker refs kept, the new ones put in place — one
@@ -546,6 +605,27 @@ impl BranchManager {
             "git update-ref --stdin (tracker store)",
             Some(transaction.as_bytes()),
         )?;
+        outcome.lines.push(format!(
+            "Moved the tracker store over; the old tracker refs are kept under {BACKUP}/"
+        ));
+        self.finish_locally(&carve, &split, checkpoints, outcome)
+    }
+
+    /// Everything after the tracker store moved, each step safe to run
+    /// again: the project repo's stale copies gone and the new refs
+    /// fetched, the carve's note written, every checkpoint record here
+    /// naming root commits, the project root brought to the migration
+    /// commit, and the saved carve dropped.
+    fn finish_locally(
+        &self,
+        carve: &str,
+        split: &crate::compose::SplitOutcome,
+        checkpoints: &[(String, CheckpointRecord)],
+        outcome: &mut MigrateOutcome,
+    ) -> Result<()> {
+        let project = self.store.paths().project_root.clone();
+        let store = self.store.paths().tracker_store.clone();
+        let root = self.root.name.clone();
         for stale in ["refs/newgit/views/", "refs/newgit/carve-checked/"] {
             delete_refs(&project, stale)?;
         }
@@ -556,9 +636,12 @@ impl BranchManager {
             &["+refs/trackers/*:refs/newgit/trackers/*".to_owned()],
             None,
         )?;
-        outcome.lines.push(format!(
-            "Moved the tracker store over; the old tracker refs are kept under {BACKUP}/"
-        ));
+        crate::compose::write_notes(
+            &project,
+            crate::compose::NOTES_REF,
+            "migrate",
+            &[(carve.to_owned(), format!("{root} {}\n", split.root))],
+        )?;
 
         // Checkpoints that carried tracker commits name root commits now.
         let mut rewritten = 0;
@@ -567,7 +650,11 @@ impl BranchManager {
                 continue;
             }
             let mut record = record.clone();
-            record.code = checkpoint_code(&root, &record);
+            let code = checkpoint_code(&root, &record);
+            if record.code == code {
+                continue;
+            }
+            record.code = code;
             CheckpointLog::new(self.store.checkpoint_dir(slug), slug).save(&record)?;
             rewritten += 1;
         }
@@ -578,7 +665,67 @@ impl BranchManager {
             ));
         }
 
-        self.follow_in_project_root(&carve, outcome)
+        self.follow_in_project_root(carve, outcome)?;
+        delete_refs(&project, &format!("{SAVED}/"))
+    }
+
+    /// Keep the carve and its split where a later run finds them.
+    fn save_carve(&self, carve: &str, split: &crate::compose::SplitOutcome) -> Result<()> {
+        let project = self.store.paths().project_root.clone();
+        let mut stdin = format!("update {SAVED}/carve {carve}\n");
+        for (tracker, commit) in &split.index {
+            stdin.push_str(&format!("update {SAVED}/index/{tracker} {commit}\n"));
+        }
+        crate::objects::run(
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(project.as_str())
+                .args(["update-ref", "--stdin"]),
+            "git update-ref --stdin",
+            Some(stdin.as_bytes()),
+        )
+        .map(drop)
+    }
+
+    /// The carve an earlier run saved, with its split, when it was made on
+    /// `main_view`.
+    fn saved_carve(
+        &self,
+        main_view: &str,
+    ) -> Result<Option<(String, crate::compose::SplitOutcome)>> {
+        let project = self.store.paths().project_root.clone();
+        let git = |args: &[&str]| {
+            let mut full = vec!["-C", project.as_str()];
+            full.extend_from_slice(args);
+            run_git_env(&full, &[]).map(|out| out.trim().to_owned())
+        };
+        let Ok(carve) = git(&["rev-parse", "-q", "--verify", &format!("{SAVED}/carve")]) else {
+            return Ok(None);
+        };
+        if git(&["rev-parse", &format!("{carve}^")]).ok().as_deref() != Some(main_view) {
+            delete_refs(&project, &format!("{SAVED}/"))?;
+            return Ok(None);
+        }
+        let prefix = format!("{SAVED}/index/");
+        let index: BTreeMap<String, String> =
+            git(&["for-each-ref", "--format=%(refname) %(objectname)", &prefix])?
+                .lines()
+                .filter_map(|line| line.split_once(' '))
+                .filter_map(|(name, commit)| {
+                    Some((name.strip_prefix(&prefix)?.to_owned(), commit.to_owned()))
+                })
+                .collect();
+        let Some(root) = index.get(&self.root.name).cloned() else {
+            return Ok(None);
+        };
+        Ok(Some((
+            carve,
+            crate::compose::SplitOutcome {
+                root,
+                index,
+                made: Vec::new(),
+            },
+        )))
     }
 
     /// The commit that mounts every tracker in Git again, on `main_view`:
@@ -770,75 +917,148 @@ impl BranchManager {
         Ok(expected.len())
     }
 
-    /// On the remote: each tracker repo's `main` force-pushed with a lease on
-    /// what it holds now, `main`'s list rewritten as the new index, and each
-    /// checkpoint record this machine can map named by root commits, those
-    /// commits pushed to the instance's fork of root.
+    /// On the remote: every branch's list moved to its new index (`main`'s
+    /// the carve's, each other branch's the root commit its old list was),
+    /// each tracker repo's ref pushed with a lease on what it holds now, and
+    /// each checkpoint record this machine can map named by root commits,
+    /// those commits pushed to the instance's fork of root.
+    ///
+    /// Resumable from any point: a list already at its new index is left
+    /// alone, a ref already at its target is not pushed, and a checkpoint
+    /// already naming root commits is not rewritten. A checkpoint this login
+    /// may not rewrite (someone else's instance) is said and skipped.
     fn migrate_remote(
         &self,
         link: &crate::remote::RemoteLink,
         split: &crate::compose::SplitOutcome,
+        find_view: &dyn Fn(&BTreeMap<String, String>) -> Option<String>,
         outcome: &mut MigrateOutcome,
     ) -> Result<()> {
         let project = self.store.paths().project_root.clone();
         let client = link.connect(Acting::Login)?;
         let key = link.project.clone();
         let view = client.project(&key)?;
-        let Some(base) = view.default_list().cloned() else {
-            return Ok(());
-        };
-        let list = split.index.clone();
-        let pushed: Vec<&str> = list.values().map(String::as_str).collect();
-        self.refuse_unpublished(&pushed)?;
-        // Every tracker in the new index has its repo; one that never did
-        // (a tracker carved since the remote was made) is seeded first.
-        for (tracker, commit) in list
-            .iter()
-            .filter(|(tracker, _)| !base.contains_key(*tracker))
-        {
-            let seed = client.create_tracker_repo(&key, tracker)?;
-            GitSource::push_refs(
-                &["-C", project.as_str()],
-                seed.credential.remote.as_deref().unwrap_or_default(),
-                &[format!("+{commit}:refs/heads/main")],
-                Some(&basic_auth_header(&seed.credential)),
-            )?;
-        }
-        let credentials = client.begin_merge(&key, &view.default_branch, &base, &list)?;
-        for credential in &credentials {
-            let Some(commit) = list.get(&credential.tracker) else {
+        let root = self.root.name.clone();
+        let legacy = |list: &BTreeMap<String, String>| list.contains_key(PROJECT_TRACKER);
+
+        // Every branch planned before anything is pushed: one whose old list
+        // names no view this machine knows would stop being served, so it
+        // refuses the whole step, naming it.
+        let mut plans: Vec<BranchPlan> = Vec::new();
+        let mut branches = view.branches.clone();
+        branches.sort_by_key(|branch| branch.name != view.default_branch);
+        for branch in &branches {
+            let target = if branch.name == view.default_branch {
+                split.index.clone()
+            } else if !legacy(&branch.list) {
                 continue;
-            };
-            let target = if credential.tracker == self.root.name {
-                format!("refs/heads/{}", view.default_branch)
             } else {
-                "refs/heads/main".to_owned()
+                let Some(found) = find_view(&branch.list) else {
+                    return Err(NewgitError::Unsupported(format!(
+                        "{key}'s branch `{}` names tracker commits no view here was split \
+                         into, so the migration cannot tell what it becomes; nothing was \
+                         pushed. Merge it into `main` with the newgit it was made with, or \
+                         delete it, then migrate again",
+                        branch.name
+                    )));
+                };
+                BTreeMap::from([(root.clone(), found)])
             };
-            GitSource::push_leased(
-                &["-C", project.as_str()],
-                credential.credential.remote.as_deref().unwrap_or_default(),
-                commit,
-                &target,
-                base.get(&credential.tracker).map(String::as_str),
-                Some(&basic_auth_header(&credential.credential)),
-            )?;
+            if branch.list == target {
+                continue;
+            }
+            if !legacy(&branch.list) {
+                outcome.lines.push(format!(
+                    "On {key}: `{}` has moved on since the migration began, so it was left as it is",
+                    branch.name
+                ));
+                continue;
+            }
+            plans.push((branch.name.clone(), branch.list.clone(), target));
         }
-        client.finish_merge(&key, &view.default_branch, &base, &list)?;
-        outcome.lines.push(format!(
-            "On {key}: `{}` is root {}, its list the new index",
-            view.default_branch,
-            short(&split.root)
-        ));
+        let pushed: Vec<&str> = plans
+            .iter()
+            .flat_map(|(_, _, target)| target.values().map(String::as_str))
+            .collect();
+        self.refuse_unpublished(&pushed)?;
+
+        for (branch, base, target) in &plans {
+            // A tracker new to the remote (carved since it was made) is
+            // seeded first; seeding again until it is on a branch is allowed.
+            for (tracker, commit) in target
+                .iter()
+                .filter(|(tracker, _)| !base.contains_key(*tracker))
+            {
+                let seed = client.create_tracker_repo(&key, tracker)?;
+                let url = seed.credential.remote.clone().unwrap_or_default();
+                let auth = basic_auth_header(&seed.credential);
+                let held = GitSource::remote_ref(&url, "refs/heads/main", Some(&auth))?;
+                if held.as_deref() != Some(commit.as_str()) {
+                    GitSource::push_leased(
+                        &["-C", project.as_str()],
+                        &url,
+                        commit,
+                        "refs/heads/main",
+                        held.as_deref(),
+                        Some(&auth),
+                    )?;
+                }
+            }
+            let credentials = client.begin_merge(&key, branch, base, target)?;
+            for credential in &credentials {
+                let Some(commit) = target.get(&credential.tracker) else {
+                    continue;
+                };
+                let reference = if credential.tracker == root {
+                    format!("refs/heads/{branch}")
+                } else {
+                    "refs/heads/main".to_owned()
+                };
+                let url = credential.credential.remote.clone().unwrap_or_default();
+                let auth = basic_auth_header(&credential.credential);
+                // On what the repo holds now: a run that stopped after this
+                // push finds it done.
+                let held = GitSource::remote_ref(&url, &reference, Some(&auth))?;
+                if held.as_deref() == Some(commit.as_str()) {
+                    continue;
+                }
+                GitSource::push_leased(
+                    &["-C", project.as_str()],
+                    &url,
+                    commit,
+                    &reference,
+                    held.as_deref(),
+                    Some(&auth),
+                )?;
+            }
+            client.finish_merge(&key, branch, base, target)?;
+            outcome.lines.push(format!(
+                "On {key}: `{branch}` is root {}, its list the new index",
+                short(&target[&root])
+            ));
+        }
 
         let mut moved = 0;
-        let mut left = 0;
+        let mut done = 0;
+        let mut elsewhere = 0;
+        let mut refused = Vec::new();
         for found in client.checkpoints(&key, None)? {
             let Ok(mut record) = serde_json::from_value::<CheckpointRecord>(found.record.clone())
             else {
-                left += 1;
+                elsewhere += 1;
                 continue;
             };
             if record.code.is_empty() {
+                continue;
+            }
+            if record
+                .code
+                .head
+                .keys()
+                .chain(record.code.tip.keys())
+                .all(|tracker| *tracker == root)
+            {
+                done += 1;
                 continue;
             }
             let here = [
@@ -861,41 +1081,65 @@ impl BranchManager {
                 .is_ok()
             });
             if !here {
-                left += 1;
+                elsewhere += 1;
                 continue;
             }
-            record.code = checkpoint_code(&self.root.name, &record);
-            let fork = client.fork(&key, &found.instance, &self.root.name)?;
-            let credential = client.credential(&key, &fork.repo, Scope::Write)?;
-            let tip = record.code.tip[&self.root.name].clone();
-            GitSource::push_refs(
-                &["-C", project.as_str()],
-                fork.remote.as_deref().unwrap_or_default(),
-                &[
-                    format!("+{}:refs/heads/{}", record.source.head_rev, found.instance),
-                    format!("+{tip}:{}", super::fork_checkpoint_ref(&found.id)),
-                ],
-                Some(&basic_auth_header(&credential)),
-            )?;
-            let value = serde_json::to_value(&record).map_err(|error| NewgitError::Remote {
-                status: 0,
-                message: format!("could not encode checkpoint {}: {error}", found.id),
-            })?;
-            client.put_checkpoint(&key, &found.instance, &found.id, &value)?;
-            moved += 1;
-        }
-        outcome.lines.push(format!(
-            "On {key}: {moved} checkpoint{} name root commits now{}",
-            if moved == 1 { "" } else { "s" },
-            if left == 0 {
-                String::new()
-            } else {
-                format!(
-                    "; {left} made elsewhere keep their old lists (spawn them with the newgit \
-                     they were made with)"
-                )
+            record.code = checkpoint_code(&root, &record);
+            let rewrite = || -> Result<()> {
+                let fork = client.fork(&key, &found.instance, &root)?;
+                let credential = client.credential(&key, &fork.repo, Scope::Write)?;
+                let tip = record.code.tip[&root].clone();
+                GitSource::push_refs(
+                    &["-C", project.as_str()],
+                    fork.remote.as_deref().unwrap_or_default(),
+                    &[
+                        format!("+{}:refs/heads/{}", record.source.head_rev, found.instance),
+                        format!("+{tip}:{}", super::fork_checkpoint_ref(&found.id)),
+                    ],
+                    Some(&basic_auth_header(&credential)),
+                )?;
+                let value = serde_json::to_value(&record).map_err(|error| NewgitError::Remote {
+                    status: 0,
+                    message: format!("could not encode checkpoint {}: {error}", found.id),
+                })?;
+                client.put_checkpoint(&key, &found.instance, &found.id, &value)
+            };
+            match rewrite() {
+                Ok(()) => moved += 1,
+                // Not this login's to rewrite: said, not failed on. Anything
+                // else stops here, and running the migration again resumes.
+                Err(NewgitError::Remote {
+                    status: 403,
+                    message,
+                }) => {
+                    refused.push(format!("{}/{} ({message})", found.instance, found.id));
+                }
+                Err(error) => return Err(error),
             }
-        ));
+        }
+        let mut line = format!(
+            "On {key}: {moved} checkpoint{} name root commits now",
+            if moved == 1 { "" } else { "s" }
+        );
+        if done > 0 {
+            line.push_str(&format!("; {done} did already"));
+        }
+        if elsewhere > 0 {
+            line.push_str(&format!(
+                "; {elsewhere} made elsewhere keep their old lists (spawn them with the newgit \
+                 they were made with)"
+            ));
+        }
+        outcome.lines.push(line);
+        if !refused.is_empty() {
+            outcome.lines.push(format!(
+                "On {key}: {} checkpoint{} this login may not rewrite, left as they are (their \
+                 owners can run `newgit tracker migrate` on a copy that has them): {}",
+                refused.len(),
+                if refused.len() == 1 { "" } else { "s" },
+                refused.join(", ")
+            ));
+        }
         Ok(())
     }
 

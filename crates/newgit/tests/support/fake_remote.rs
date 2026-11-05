@@ -61,6 +61,13 @@ struct State {
     denied_trackers: std::collections::BTreeSet<String>,
     /// Branch → the index the merge in flight began with.
     merge_targets: BTreeMap<String, Value>,
+    /// Failure injection: answer the next merge finish with a 502.
+    fail_finish_once: bool,
+    /// Failure injection: answer this many checkpoint writes with a 500.
+    fail_checkpoint_writes: usize,
+    /// Instances whose fork this login may not make: the real remote's 403
+    /// for someone else's instance.
+    foreign_instances: std::collections::BTreeSet<String>,
 }
 
 /// A tracker's definition as the remote reads it, from `access`'s `main`:
@@ -340,6 +347,10 @@ fn route(
             )
         }
         ("PUT", ["v1", "projects", owner, name, "branches", branch]) => {
+            if !body["base"].is_null() && state.fail_finish_once {
+                state.fail_finish_once = false;
+                return (502, json!({ "error": "the remote could not check the merge's index; try again" }));
+            }
             if !body["base"].is_null() {
                 let target = format!("{owner}/{name}/{branch}");
                 if state.merge_targets.get(&target) != Some(&body["list"]) {
@@ -397,6 +408,12 @@ fn route(
                 "fork",
             ],
         ) => {
+            if state.foreign_instances.contains(*name) {
+                return (
+                    403,
+                    json!({ "error": format!("`{name}` is someone else's instance") }),
+                );
+            }
             let fork = format!("{owner}.{project}.i.{name}.{tracker}");
             if !exists(&fork) {
                 git(
@@ -465,6 +482,10 @@ fn route(
         }
         ("PUT", ["v1", "projects", _, _, "instances", name, "head"]) => {
             (200, json!({ "name": name, "headRev": body["head_rev"] }))
+        }
+        ("PUT", ["v1", "projects", _, _, "checkpoints", _, _]) if state.fail_checkpoint_writes > 0 => {
+            state.fail_checkpoint_writes -= 1;
+            (500, json!({ "error": "the connection dropped" }))
         }
         ("PUT", ["v1", "projects", _, _, "checkpoints", instance, id]) => {
             let key = ((*instance).to_owned(), (*id).to_owned());
