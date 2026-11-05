@@ -709,7 +709,18 @@ async function route(request: Request, env: Env, deps: Deps): Promise<Response> 
 		if (facts === undefined) throw new HttpError(404, `tracker \`${tracker}\` is not defined on ${key}'s \`access\` \`main\``);
 		if (!facts.git) throw new HttpError(400, `\`${tracker}\` is not in Git; instances do not fork it`);
 		const fork = repoName({ kind: "fork", project: id, instance: name, tracker });
-		let remote = await deps.repos.remote(fork);
+		// Whatever Artifacts says, in the answer: a fork of a large repository
+		// fails in ways only its code and message explain.
+		const artifacts = (step: string) => (error: unknown) => {
+			if (error instanceof HttpError) throw error;
+			const { code, message } = error as { code?: string; message?: string };
+			console.error(JSON.stringify({ fork, step, code, message }));
+			throw new HttpError(
+				502,
+				`Artifacts could not ${step} \`${tracker}\`'s fork for \`${name}\`: ${code ?? "error"}: ${message ?? "no message"}`,
+			);
+		};
+		let remote = await deps.repos.remote(fork).catch(artifacts("look up"));
 		if (remote === null) {
 			// Seconds on a real repo; the request waits, since the push that
 			// asked for it cannot go anywhere until it exists.
@@ -718,15 +729,8 @@ async function route(request: Request, env: Env, deps: Deps): Promise<Response> 
 			} catch (error) {
 				// A fork of a large repository (t3code, 365 MiB) can outlast the
 				// request that asked for it and finish anyway; take it if so.
-				remote = await deps.repos.remote(fork);
-				if (remote === null) {
-					const { code, message } = error as { code?: string; message?: string };
-					console.error(JSON.stringify({ fork, code, message }));
-					throw new HttpError(
-						502,
-						`Artifacts could not fork \`${tracker}\` for \`${name}\`: ${code ?? "error"}: ${message ?? "no message"}`,
-					);
-				}
+				remote = await deps.repos.remote(fork).catch(artifacts("look up"));
+				if (remote === null) artifacts("make")(error);
 			}
 		}
 		await project.addFork(name, tracker);

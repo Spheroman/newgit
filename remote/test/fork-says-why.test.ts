@@ -12,7 +12,12 @@ import { FakeRepos, noEndpoint } from "./fake-repos";
 
 /** Repos whose fork fails, either outright or after making the fork anyway. */
 class FailingForks extends FakeRepos {
-	mode: "fails" | "made-anyway" = "fails";
+	mode: "fails" | "made-anyway" | "lookup-fails" = "fails";
+	override async remote(name: string): Promise<string | null> {
+		if (this.mode === "lookup-fails" && name.includes(".i."))
+			throw Object.assign(new Error("the repository is not ready"), { code: "REPO_NOT_READY" });
+		return super.remote(name);
+	}
 	override async fork(from: string, to: string): Promise<{ remote: string }> {
 		if (this.mode === "made-anyway") await super.fork(from, to);
 		throw Object.assign(new Error("the fork did not finish"), { code: "INTERNAL_ERROR" });
@@ -60,6 +65,13 @@ describe("an instance's fork that Artifacts fails", () => {
 		expect(forked.status).toBe(502);
 		expect(forked.body.error).toContain("INTERNAL_ERROR");
 		expect(forked.body.error).toContain("t3code");
+	});
+
+	it("says Artifacts' error when looking the fork up fails", async () => {
+		repos.mode = "lookup-fails";
+		const forked = await forkT3code();
+		expect(forked.status).toBe(502);
+		expect(forked.body.error).toContain("REPO_NOT_READY");
 	});
 
 	it("takes a fork that was made anyway", async () => {
