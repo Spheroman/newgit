@@ -1833,7 +1833,7 @@ impl Splitter<'_> {
 /// y`) or newgit's (`Merge `x` into y`), one line. A merge exempt from the
 /// one-audience rule says nothing its parents do not; one with words of its
 /// own is refused like any commit.
-pub(crate) fn stock_merge_message(message: &[u8]) -> bool {
+pub fn stock_merge_message(message: &[u8]) -> bool {
     let Ok(text) = std::str::from_utf8(message) else {
         return false;
     };
@@ -1841,6 +1841,8 @@ pub(crate) fn stock_merge_message(message: &[u8]) -> bool {
     if text.contains('\n') {
         return false;
     }
+    // The quoted name, and the `into` target, must be names Git would take
+    // for a branch: no room in them for a sentence.
     let quoted = |rest: &str, open: char, close: char| -> bool {
         let Some(rest) = rest.strip_prefix(open) else {
             return false;
@@ -1849,10 +1851,8 @@ pub(crate) fn stock_merge_message(message: &[u8]) -> bool {
             return false;
         };
         let after = &rest[end + close.len_utf8()..];
-        after.is_empty()
-            || after
-                .strip_prefix(" into ")
-                .is_some_and(|branch| !branch.is_empty() && !branch.contains(' '))
+        ref_name(&rest[..end])
+            && (after.is_empty() || after.strip_prefix(" into ").is_some_and(ref_name))
     };
     if let Some(rest) = text.strip_prefix("Merge branch ") {
         return quoted(rest, '\'', '\'');
@@ -1864,6 +1864,30 @@ pub(crate) fn stock_merge_message(message: &[u8]) -> bool {
         return quoted(rest, '`', '`') && rest.contains(" into ");
     }
     false
+}
+
+/// Whether `name` is one `git check-ref-format --branch` accepts: no
+/// whitespace or control characters, none of `~ ^ : ? * [ \`, no `..`,
+/// `@{`, or `//`, no component starting with `.` or ending in `.lock`, and
+/// not starting with `-` or ending with `/` or `.`.
+fn ref_name(name: &str) -> bool {
+    !name.is_empty()
+        && name != "@"
+        && !name.starts_with('-')
+        && !name.starts_with('/')
+        && !name.ends_with('/')
+        && !name.ends_with('.')
+        && !name.contains("..")
+        && !name.contains("@{")
+        && !name.contains("//")
+        && !name.chars().any(|character| {
+            character.is_whitespace()
+                || character.is_control()
+                || matches!(character, '~' | '^' | ':' | '?' | '*' | '[' | '\\')
+        })
+        && name
+            .split('/')
+            .all(|component| !component.starts_with('.') && !component.ends_with(".lock"))
 }
 
 /// A commit made by `git commit-tree -S`, signed with this machine's key.
