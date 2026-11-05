@@ -976,11 +976,15 @@ impl BranchManager {
             }
             plans.push((branch.name.clone(), branch.list.clone(), target));
         }
-        let pushed: Vec<&str> = plans
+        let pushed: Vec<(&str, &str)> = plans
             .iter()
-            .flat_map(|(_, _, target)| target.values().map(String::as_str))
+            .flat_map(|(_, _, target)| {
+                target
+                    .iter()
+                    .map(|(tracker, commit)| (tracker.as_str(), commit.as_str()))
+            })
             .collect();
-        self.refuse_unpublished(&pushed)?;
+        self.refuse_unpublished_trackers(&pushed)?;
 
         for (branch, base, target) in &plans {
             // A tracker new to the remote (carved since it was made) is
