@@ -345,7 +345,7 @@ impl HttpRemote {
     ) -> Result<T> {
         let reply = self.request_with(method, path, body)?;
         if !(200..300).contains(&reply.status) {
-            return Err(remote_error(reply.status, &reply.text));
+            return Err(remote_error_on(method, path, reply.status, &reply.text));
         }
         parse(&reply.text, reply.status)
     }
@@ -384,7 +384,7 @@ impl HttpRemote {
             unreachable = 0;
             if reply.status != 202 {
                 if !(200..300).contains(&reply.status) {
-                    return Err(remote_error(reply.status, &reply.text));
+                    return Err(remote_error_on(method, path, reply.status, &reply.text));
                 }
                 return parse(&reply.text, reply.status);
             }
@@ -494,6 +494,18 @@ fn parse<T: DeserializeOwned>(text: &str, status: u16) -> Result<T> {
             text.chars().take(200).collect::<String>()
         ),
     })
+}
+
+/// [`remote_error`], naming the call when the remote failed on its side: a
+/// 5xx says nothing about which of a command's requests it was.
+fn remote_error_on(method: &str, path: &str, status: u16, text: &str) -> NewgitError {
+    match remote_error(status, text) {
+        NewgitError::Remote { status, message } if status >= 500 => NewgitError::Remote {
+            status,
+            message: format!("{message} (on {method} {path})"),
+        },
+        error => error,
+    }
 }
 
 fn remote_error(status: u16, text: &str) -> NewgitError {
