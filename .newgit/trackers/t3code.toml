@@ -1,0 +1,6 @@
+audience = "project-devs"
+storage = "local"
+merge_with_source = true
+mount = "apps/t3code"
+paths = ["."]
+git = true
