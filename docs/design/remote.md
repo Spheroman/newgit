@@ -652,14 +652,17 @@ change. A private mirror is 422: the endpoint fetches mirrors without
 credentials.
 
 **What happens.** The event is queued on the project and answered 202.
-`ProjectDO`'s alarm then moves it on every 15 seconds, which is also what
-keeps the endpoint awake: unlike a merge check, nobody else is asking. A pull
-takes `main`'s merge lock as `the GitHub webhook`, waiting while anyone else
-holds it, and extends the lock as it runs. `newgit endpoint-pull` in the
-container fetches the mirror's branch, confirms the event's commit is on it,
-composes `main` as the target sees it, and walks what the mirror has beyond
-that. If that is nothing, the event was our own export or a redelivery, and
-nothing changes. The rest come in with the withheld trackers' files put back
+Only `ProjectDO`'s alarm moves the queue on, a second later and then every
+15 seconds, which is also what keeps the endpoint awake: unlike a merge
+check, nobody else is asking. First `newgit endpoint-pull` looks, with read
+passwords and no lock: it fetches the mirror's branch, confirms the event's
+commit is on it, composes `main` as the target sees it, and walks what the
+mirror has beyond that. If that is nothing, the event was our own export or
+a redelivery, and it ends there, so every export coming back costs `newgit
+merge` no wait, however cold the container. Otherwise the pull takes `main`'s
+merge lock as `the GitHub webhook`, waiting while anyone else holds it, and
+extends the lock as it runs, and the container does the same again and
+lands it. The commits come in with the withheld trackers' files put back
 and split, so their pins carry over; if `main` moved meanwhile, a merge made
 in the view, dated by the mirror's commit so a retry makes the same one.
 Root's ref moves by compare-and-swap, each child's `main` catches up, and
@@ -671,9 +674,28 @@ root moved finishes with what it pushed.
 touching a withheld tracker's mount, a conflict with `main`, a tracker the
 pusher does not maintain: refused, logged, nothing moved, lock released.
 
+**Work the mirror never saw.** A branch exported for a pull request leaves
+out what the target withholds, so an instance's edit under `apps/t3code` is
+on its fork and not on the mirror. Landing the merged pull request would keep
+the rest of that commit and lose the edit without a word, so it is refused,
+saying to run `newgit merge <instance>` and redeliver the event. A mirror's
+branch is named for its instance, but a push to `main` does not say which
+branch it merged: the name comes from the subject of GitHub's merge commit.
+A squash, a rebase, or an edited subject has no name, and then every instance
+with such work counts, so an unrelated squash is refused while one exists.
+The instance's pins come from its last checkpoint, and only the forks it made
+of withheld trackers are looked at; the container asks whether each pin is on
+that tracker's `main`, so an instance merely behind `main`, or already merged,
+does not count. A fork no checkpoint describes counts as work. After `newgit
+merge <instance>` the redelivered event recognises the instance's commits and
+brings in only the mirror's merge, which keeps the edit: a merge takes a
+withheld tracker's files from whichever parent is ahead.
+
 **When it fails.** A failure (GitHub or Artifacts down, the container gone)
-is logged and tried again, five times; a wait on someone else's merge gives
-up after two hours. After that it is dropped, loudly, and redelivering the
+is logged and tried again, five times. If root's ref is not what `main`'s
+index names, or the index moved under the pull, it starts over from what
+`main` is now rather than retrying a base that cannot work. A wait, on
+someone else's merge or on that, gives up after two hours. After that it is dropped, loudly, and redelivering the
 event from GitHub's *Recent Deliveries* starts it again. Everything is in
 the Worker's logs under `webhook`. GitHub's own page shows only the 202.
 
@@ -692,6 +714,10 @@ branch at the event's commit.
 instance's own: those are in the instance's forks, which the pull does not
 read. The instance's work is already on `main` then, so merging it finds
 nothing to do but a merge commit.
+
+**Only `main`.** The webhook lands on `main`, not the project's
+`defaultBranch`, because an export composes `main` and the container moves
+that ref: the rest of the path would have to follow first.
 
 **Setting one up**, in the repo's *Settings → Webhooks*:
 

@@ -552,6 +552,23 @@ pub struct PullPlan {
     /// commit says which trackers the mirror ships.
     pub target: String,
     pub mirror: Mirror,
+    /// Instances whose work in a tracker the mirror withholds may be behind
+    /// this commit. The mirror never saw that work, so landing the commit
+    /// would drop it.
+    #[serde(default)]
+    pub instances: Vec<MirrorInstance>,
+    /// Only say whether there is anything to land: no lock is held and
+    /// nothing moves, so an event for our own export costs no merge a wait.
+    #[serde(default)]
+    pub peek: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct MirrorInstance {
+    pub name: String,
+    /// Withheld tracker → the commit the instance holds. Empty when its
+    /// fork exists and no checkpoint says what is on it.
+    pub pins: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -569,6 +586,11 @@ pub struct Mirror {
 pub enum PullAnswer {
     /// The commit is `main`'s already: an export of ours, or a redelivery.
     Nothing,
+    /// A peek found something to land.
+    Work,
+    /// `main`'s index is not what root's ref says: start again from what it
+    /// is now.
+    Moved { why: String },
     /// `main` moved: root's ref and the `main` of each tracker changed. The
     /// Worker writes `list` as the index.
     Landed {
@@ -707,6 +729,29 @@ fn land(plan: &PullPlan, store: &Utf8Path) -> Result<PullAnswer> {
     .collect();
     if walk.is_empty() {
         return Ok(PullAnswer::Nothing);
+    }
+
+    // Work only an instance holds: the branch that was merged on the mirror
+    // left it out, and put back from `main` it would vanish without a word.
+    // Behind `main`, or already on it, there is nothing to lose.
+    for instance in &plan.instances {
+        for (tracker, pin) in &instance.pins {
+            let on_main = plan
+                .list
+                .get(tracker)
+                .is_some_and(|main| !pin.is_empty() && is_ancestor(pin, main));
+            if !on_main {
+                return Err(NewgitError::SplitRefused(format!(
+                    "commit {commit} on `{}` may hold `{}`'s work, and that instance has work in \
+                     `{tracker}`, which that target does not ship, so landing it would lose that \
+                     work. Nothing moved: `newgit merge {}`, then redeliver this event",
+                    target.name, instance.name, instance.name
+                )));
+            }
+        }
+    }
+    if plan.peek {
+        return Ok(PullAnswer::Work);
     }
 
     let main_view = view_of("refs/mirrors/view/main", base, &everything)?;
@@ -856,9 +901,8 @@ fn land(plan: &PullPlan, store: &Utf8Path) -> Result<PullAnswer> {
     .ok();
     if held.as_deref() != Some(root.as_str()) {
         if held.as_deref() != Some(base.as_str()) {
-            return Err(NewgitError::Remote {
-                status: 409,
-                message: format!(
+            return Ok(PullAnswer::Moved {
+                why: format!(
                     "root's `main` is not the commit `main`'s index names ({base}): a merge is \
                      landing"
                 ),

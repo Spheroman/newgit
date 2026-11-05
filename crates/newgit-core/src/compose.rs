@@ -832,9 +832,11 @@ pub fn view_definitions(repo: &Utf8Path, root: &str, tree: &str) -> Result<Vec<T
 /// project's view: `walk`, oldest first, is what the target has that this
 /// project does not, and `known` says which view commit a commit that came
 /// from here stands for. Each comes back as a view commit on those parents,
-/// with the files of every `withheld` tracker put back as its first parent
-/// has them, and a note naming the original, so a split records it and
-/// composing for the target gives that very commit back.
+/// with the files of every `withheld` tracker put back as its parents have
+/// them, and a note naming the original, so a split records it and composing
+/// for the target gives that very commit back. Parents that differ there
+/// give the one ahead: a merge of work already here must not undo it. Two
+/// that diverged cannot be told apart, and are refused.
 ///
 /// A commit touching a withheld tracker's mount, or sharing no history with
 /// the project, is refused: the mirror holds nothing of a withheld tracker,
@@ -872,7 +874,6 @@ pub fn bring_in(
                 parents.push(ours);
             }
         }
-        let first = objects.commit(&parents[0])?;
         let mut tree = commit.tree.clone();
         for definition in withheld {
             let mount = definition.mount.as_str();
@@ -893,10 +894,30 @@ pub fn bring_in(
                     definition.name
                 )));
             }
-            let theirs_there = objects
-                .subtree(&first.tree, mount)?
-                .map(|tree| (TREE_MODE.to_vec(), tree));
-            tree = objects.set_path(&tree, mount, theirs_there)?;
+            let mut ahead = parents[0].clone();
+            let ahead_tree = objects.commit(&ahead)?.tree;
+            let mut there = objects.subtree(&ahead_tree, mount)?;
+            for other in &parents[1..] {
+                let other_tree = objects.commit(other)?.tree;
+                let other_there = objects.subtree(&other_tree, mount)?;
+                if other_there == there {
+                    continue;
+                }
+                objects.flush()?;
+                if is_ancestor(repo, &ahead, other)? {
+                    ahead = other.clone();
+                    there = other_there;
+                } else if !is_ancestor(repo, other, &ahead)? {
+                    return Err(NewgitError::SplitRefused(format!(
+                        "commit {} on `{target}` merges two lines of `{}`, which that target \
+                         does not ship, so nothing was pulled: `newgit merge` the work there",
+                        short(id),
+                        definition.name
+                    )));
+                }
+            }
+            let there = there.map(|tree| (TREE_MODE.to_vec(), tree));
+            tree = objects.set_path(&tree, mount, there)?;
         }
         let made = if tree == commit.tree && parents == commit.parents {
             id.clone()

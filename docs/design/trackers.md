@@ -1028,6 +1028,12 @@ something:
   a commit of its own, which merges.
 - **A mirror's event lands as a merge by whoever pushed it:** they must be a
   member and maintain what it changes (*The GitHub webhook*).
+- **A mirror's commit that may hold withheld work is refused.** A pull
+  request's branch leaves out what the target withholds, so landing it would
+  lose an instance's edit there. The merge goes through `newgit merge
+  <instance>` instead, and a mirror's merge then takes each withheld tracker's
+  files from whichever parent is ahead, not its first
+  ([remote.md](remote.md), *The GitHub webhook*).
 - **`git push` in a linked project root is refused** by the endpoint, which
   is read-only; `newgit merge main` publishes from there. Pushing straight to
   a `branches = true` target is refused too, as in a workspace.

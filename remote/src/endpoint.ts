@@ -88,11 +88,23 @@ export interface PullPlan {
 	writable: string[];
 	target: string;
 	mirror: { url: string; branch: string; commit: string };
+	/** Instances whose work in a withheld tracker may be behind this commit. */
+	instances: MirrorInstance[];
+	/** Only say whether there is anything to land: no lock, and nothing moves. */
+	peek?: boolean;
+}
+
+/** An instance, and what it holds of each withheld tracker it forked. */
+export interface MirrorInstance {
+	name: string;
+	pins: Record<string, string>;
 }
 
 /** How a pull ended. A refusal is an answer: running it again refuses again. */
 export type PullAnswer =
 	| { outcome: "nothing" }
+	| { outcome: "work" }
+	| { outcome: "moved"; why: string }
 	| { outcome: "landed"; list: Record<string, string>; commits: number }
 	| { outcome: "refused"; why: string };
 
@@ -234,8 +246,8 @@ export function copyKey(plan: { to: { url: string } }): string {
 }
 
 /** The key of a pull: what it brings in, on top of what. */
-export function pullKey(plan: Pick<PullPlan, "list" | "mirror">): string {
-	return `pull ${plan.mirror.url} ${plan.mirror.commit} ${plan.list.root}`;
+export function pullKey(plan: Pick<PullPlan, "list" | "mirror" | "peek">): string {
+	return `pull${plan.peek ? " peek" : ""} ${plan.mirror.url} ${plan.mirror.commit} ${plan.list.root}`;
 }
 
 /** Snapshot at most this often, after a compose changed what is on disk. */

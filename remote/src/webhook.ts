@@ -1,21 +1,22 @@
 // GitHub's push webhook, which brings merged pull requests into newgit.dev
 // (docs/design/remote.md, *The GitHub webhook*). GitHub expects a quick
 // answer and the work takes as long as the container does, so the route only
-// verifies the event and queues it on the project; `advancePulls` then moves
-// the queue on, called from the route and from `ProjectDO`'s alarm, which is
-// also what keeps the endpoint awake while its pull runs: nobody else is
-// polling it.
+// verifies the event and queues it on the project; `ProjectDO`'s alarm then
+// moves the queue on with `advancePulls`, which is also what keeps the
+// endpoint awake while its pull runs: nobody else is polling it.
 //
-// A pull lands as a merge does. It takes `main`'s merge lock, the container
-// moves root's ref by compare-and-swap, and the index moves last. If someone
-// else holds the lock it waits and tries again. Every step can run twice: a
-// redelivery, an evicted object, or a retry finds the work done and ends.
+// A pull first looks, without any lock, and ends there when there is nothing
+// to land: every export of ours comes back as an event. Otherwise it lands as
+// a merge does. It takes `main`'s merge lock, the container moves root's ref
+// by compare-and-swap, and the index moves last. If someone else holds the
+// lock it waits and tries again. Every step can run twice: a redelivery, an
+// evicted object, or a retry finds the work done and ends.
 
 import { parse as parseToml } from "smol-toml";
 
 import { type Deps, HttpError, isChecking, loadDefinitions, projectStub, revokeRepoTokens } from "./index";
 import { pausedBy } from "./budget";
-import type { PullPlan } from "./endpoint";
+import type { MirrorInstance, PullPlan } from "./endpoint";
 import { decide, mayMaintain, type ProjectId, projectKey, repoName } from "./names";
 
 /** Who holds `main`'s merge lock during a pull. Not a login: logins have no spaces. */
@@ -26,6 +27,9 @@ export const PULL_BRANCH = "main";
 
 /** How often the alarm looks at a pull: a poll of the container, or of a lock. */
 export const PULL_POLL_MS = 15_000;
+
+/** How soon after an event the alarm first runs: GitHub has had its answer. */
+export const PULL_START_MS = 1_000;
 
 /** A pull holds the lock this long past each poll, so a stalled one lets go. */
 export const PULL_LOCK_SECONDS = 20 * 60;
@@ -50,8 +54,14 @@ export interface MirrorPull {
 	pusher: string;
 	/** The trackers this pull may change: what the pusher maintains. */
 	writable: string[];
+	/** Instances whose withheld work may be behind this commit (`implicated`). */
+	instances: MirrorInstance[];
 	queuedAt: number;
 	attempts: number;
+	/** A look found something to land. */
+	peeked?: boolean;
+	/** Read passwords handed out for looks, to cancel when the pull ends. */
+	tokens?: { repo: string; artifactsId: string }[];
 	/** `main`'s index when this pull took the lock; unset until then. */
 	base?: Record<string, string>;
 }
@@ -77,6 +87,29 @@ export function githubRepo(url: string): string | null {
 		url.match(/^https:\/\/github\.com\/([\w.-]+\/[\w.-]+?)(?:\.git)?\/?$/) ??
 		url.match(/^git@github\.com:([\w.-]+\/[\w.-]+?)(?:\.git)?$/);
 	return found ? found[1].toLowerCase() : null;
+}
+
+/** The slug newgit names an instance by: its branch, as `branch_slug` makes it. */
+function instanceSlug(branch: string): string {
+	return branch
+		.toLowerCase()
+		.replace(/[^a-z0-9]+/g, "-")
+		.replace(/^-+|-+$/g, "");
+}
+
+/**
+ * The instances whose withheld work may be behind a commit on the mirror. A
+ * mirror's branch is named for its instance, and a push to `main` does not
+ * say which branch it merged, so that name comes from GitHub's merge commit
+ * subject. A squash, a rebase, or an edited subject has no name, and then
+ * every instance with such work counts: a refusal that says so beats work
+ * that silently goes missing.
+ */
+export function implicated(message: string | undefined, instances: MirrorInstance[]): MirrorInstance[] {
+	const branch = message?.match(/^Merge pull request #\d+ from [^/\s]+\/(\S+)/)?.[1];
+	if (branch === undefined) return instances;
+	const slug = instanceSlug(branch);
+	return instances.filter((instance) => instance.name === slug);
 }
 
 interface Target {
@@ -130,6 +163,7 @@ export async function githubWebhook(request: Request, env: Env, deps: Deps): Pro
 		deleted?: boolean;
 		repository?: { full_name?: string; private?: boolean };
 		pusher?: { name?: string };
+		head_commit?: { message?: string };
 	};
 	try {
 		payload = JSON.parse(new TextDecoder().decode(raw));
@@ -190,6 +224,7 @@ export async function githubWebhook(request: Request, env: Env, deps: Deps): Pro
 			decide({ kind: "tracker", project: id, tracker }, "read", who, { tracker: found }).ok
 		);
 	});
+	const withheld = Object.keys(list).filter((tracker) => !ships(tracker));
 	if (!writable.includes("root"))
 		return refused(403, `\`${pusher}\` pushed this, and may not merge into ${projectKey(id)}`, context);
 
@@ -200,10 +235,10 @@ export async function githubWebhook(request: Request, env: Env, deps: Deps): Pro
 		commit,
 		pusher,
 		writable,
+		instances: implicated(payload.head_commit?.message, await project.withheldWork(withheld)),
 		queuedAt: Date.now(),
 		attempts: 0,
 	});
-	deps.waitUntil(advancePulls(env, deps, id));
 	return Response.json({ queued: commit }, { status: 202 });
 }
 
@@ -214,33 +249,40 @@ function parseProject(key: string | null) {
 }
 
 /**
- * Move the oldest pull on. True when there is more to do: `ProjectDO`'s alarm
- * calls again. Never throws: a failure is logged and retried, and past
- * `PULL_ATTEMPTS` it is dropped, for a redelivery to start again.
+ * Move the oldest pull on. True when there is more to do. Only `ProjectDO`'s
+ * alarm calls this, so two steps never run at once. Never throws: a failure
+ * is logged and retried, and past `PULL_ATTEMPTS` it is dropped, for a
+ * redelivery to start again.
  */
 export async function advancePulls(env: Env, deps: Deps, id: ProjectId): Promise<boolean> {
 	const project = projectStub(env, id);
 	const [pull] = await project.pulls();
 	if (pull === undefined) return false;
 	const log = { project: projectKey(id), target: pull.target, commit: pull.commit };
-	let done: boolean;
+	let done = false;
 	try {
 		done = await advance(env, deps, id, pull);
 	} catch (error) {
 		const why = error instanceof Error ? error.message : String(error);
-		const attempts = await project.pullFailed(pull);
-		const givingUp = attempts >= PULL_ATTEMPTS;
-		console.error(JSON.stringify({ webhook: "pull failed", ...log, why, attempts, givingUp }));
-		if (!givingUp) return true;
-		done = true;
-		await revokeRepoTokens(deps, await project.releaseMerge(PULL_BRANCH, WEBHOOK_MERGER));
+		if (error instanceof HttpError && error.status === 409) {
+			// `main` is not what this pull began from: the same base would
+			// only fail again, so it starts from what `main` is now.
+			console.log(JSON.stringify({ webhook: "starting again from `main`", ...log, why }));
+			await project.restartPull(pull);
+		} else {
+			const attempts = await project.pullFailed(pull);
+			done = attempts >= PULL_ATTEMPTS;
+			console.error(JSON.stringify({ webhook: "pull failed", ...log, why, attempts, givingUp: done }));
+		}
 	}
 	if (!done && Date.now() - pull.queuedAt > PULL_LIMIT_MS) {
-		console.error(JSON.stringify({ webhook: "pull gave up waiting; redeliver the event", ...log }));
-		await revokeRepoTokens(deps, await project.releaseMerge(PULL_BRANCH, WEBHOOK_MERGER));
+		console.error(JSON.stringify({ webhook: "pull gave up; redeliver the event", ...log }));
 		done = true;
 	}
-	if (done) await project.dropPull(pull);
+	if (done) {
+		await revokeRepoTokens(deps, await project.releaseMerge(PULL_BRANCH, WEBHOOK_MERGER));
+		await revokeRepoTokens(deps, await project.dropPull(pull));
+	}
 	return (await project.pulls()).length > 0;
 }
 
@@ -248,6 +290,54 @@ export async function advancePulls(env: Env, deps: Deps, id: ProjectId): Promise
 async function advance(env: Env, deps: Deps, id: ProjectId, pull: MirrorPull): Promise<boolean> {
 	const key = projectKey(id);
 	const project = projectStub(env, id);
+	const log = { project: key, target: pull.target, commit: pull.commit, pusher: pull.pusher };
+	const plan = (list: Record<string, string>): PullPlan => ({
+		dir: "/work",
+		repos: Object.fromEntries(
+			trackersOf(list).map((tracker) => [
+				tracker,
+				{ url: deps.repos.url(repoName({ kind: "tracker", project: id, tracker })), auth: "" },
+			]),
+		),
+		list,
+		writable: pull.writable,
+		target: pull.target,
+		mirror: { url: `https://github.com/${pull.repo}.git`, branch: pull.branch, commit: pull.commit },
+		instances: pull.instances,
+	});
+	const mint = async (list: Record<string, string>, scope: (tracker: string) => "read" | "write") => {
+		const handed = [];
+		const minted: PullPlan["repos"] = {};
+		for (const tracker of trackersOf(list)) {
+			const name = repoName({ kind: "tracker", project: id, tracker });
+			const token = await deps.repos.mint(name, scope(tracker), PULL_CREDENTIAL_SECONDS);
+			handed.push({ repo: name, artifactsId: token.id });
+			minted[tracker] = { url: deps.repos.url(name), auth: `Authorization: Basic ${btoa(`x:${token.password}`)}` };
+		}
+		return { handed, minted };
+	};
+	const ended = (answer: { outcome: "nothing" } | { outcome: "refused"; why: string }) => {
+		if (answer.outcome === "refused") console.error(JSON.stringify({ webhook: "refused", ...log, why: answer.why }));
+		else console.log(JSON.stringify({ webhook: "nothing to bring in", ...log }));
+		return true;
+	};
+	if (!deps.pull) throw new HttpError(501, "this remote has no Git endpoint to pull with");
+
+	// First a look, without the lock: every export comes back as an event,
+	// and a merge should not have to wait while the container finds that out.
+	if (!pull.peeked) {
+		const list = (await project.branch(PULL_BRANCH))?.list;
+		if (list === undefined) throw new HttpError(404, `no branch \`${PULL_BRANCH}\` in ${key}`);
+		const seen = await deps.pull(key, { ...plan(list), peek: true }, async () => {
+			const { handed, minted } = await mint(list, () => "read");
+			await project.notePullTokens(pull, handed);
+			return minted;
+		});
+		if (isChecking(seen)) return false;
+		if (seen.outcome === "nothing" || seen.outcome === "refused") return ended(seen);
+		await project.markPeeked(pull);
+	}
+
 	const begun = await project.beginPull(pull, PULL_LOCK_SECONDS);
 	if (!begun.ok) {
 		// Someone is merging, which is theirs to finish. Try again later.
@@ -263,38 +353,16 @@ async function advance(env: Env, deps: Deps, id: ProjectId, pull: MirrorPull): P
 		await project.restartPull(pull);
 		return false;
 	}
-	if (!deps.pull) throw new HttpError(501, "this remote has no Git endpoint to pull with");
-	const trackers = [...new Set([...Object.keys(begun.base), "access"])];
-	const repos = Object.fromEntries(
-		trackers.map((tracker) => [
-			tracker,
-			{ url: deps.repos.url(repoName({ kind: "tracker", project: id, tracker })), auth: "" },
-		]),
-	);
-	const plan: PullPlan = {
-		dir: "/work",
-		repos,
-		list: begun.base,
-		writable: pull.writable,
-		target: pull.target,
-		mirror: { url: `https://github.com/${pull.repo}.git`, branch: pull.branch, commit: pull.commit },
-	};
-	const answer = await deps.pull(key, plan, async () => {
-		const handed = [];
-		const minted: PullPlan["repos"] = {};
-		for (const tracker of trackers) {
-			const name = repoName({ kind: "tracker", project: id, tracker });
-			const scope = pull.writable.includes(tracker) ? "write" : "read";
-			const token = await deps.repos.mint(name, scope, PULL_CREDENTIAL_SECONDS);
-			handed.push({ repo: name, artifactsId: token.id });
-			minted[tracker] = { url: deps.repos.url(name), auth: `Authorization: Basic ${btoa(`x:${token.password}`)}` };
-		}
+	const answer = await deps.pull(key, plan(begun.base), async () => {
+		const { handed, minted } = await mint(begun.base, (tracker) =>
+			pull.writable.includes(tracker) ? "write" : "read",
+		);
 		await project.recordMergeTokens(PULL_BRANCH, handed);
 		return minted;
 	});
 	if (isChecking(answer)) return false;
 
-	const log = { project: key, target: pull.target, commit: pull.commit, pusher: pull.pusher };
+	if (answer.outcome === "moved") throw new HttpError(409, answer.why);
 	if (answer.outcome === "landed") {
 		const finished = await project.finishMerge(PULL_BRANCH, begun.base, answer.list, WEBHOOK_MERGER);
 		if (!finished.ok) throw new HttpError(409, `the pull could not finish: ${finished.reason}`);
@@ -303,7 +371,8 @@ async function advance(env: Env, deps: Deps, id: ProjectId, pull: MirrorPull): P
 		return true;
 	}
 	await revokeRepoTokens(deps, await project.releaseMerge(PULL_BRANCH, WEBHOOK_MERGER));
-	if (answer.outcome === "refused") console.error(JSON.stringify({ webhook: "refused", ...log, why: answer.why }));
-	else console.log(JSON.stringify({ webhook: "nothing to bring in", ...log }));
-	return true;
+	if (answer.outcome === "work") throw new HttpError(500, "a landing answered as a peek");
+	return ended(answer);
 }
+
+const trackersOf = (list: Record<string, string>) => [...new Set([...Object.keys(list), "access"])];
