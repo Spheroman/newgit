@@ -2216,6 +2216,39 @@ impl BranchManager {
         self.refuse_outside_git(&root, &args, &[])
     }
 
+    /// [`Self::refuse_unpublished`] over tracker commits, each named with its
+    /// tracker. A mounted tracker's commits hold its files at its own root,
+    /// so they are judged where the view has them, under its mount: t3code's
+    /// `AGENTS.md` is `apps/t3code/AGENTS.md`, not the `AGENTS.md` a tracker
+    /// outside Git owns at the top. Everything else is judged as it is.
+    fn refuse_unpublished_trackers(&self, commits: &[(&str, &str)]) -> Result<()> {
+        let all = self.all_definitions();
+        let root = self.store.paths().project_root.clone();
+        let mut plain = Vec::new();
+        for (tracker, commit) in commits {
+            let mount = all
+                .iter()
+                .find(|definition| definition.name == *tracker)
+                .filter(|definition| definition.mounted())
+                .map(|definition| definition.mount.clone());
+            let Some(mount) = mount else {
+                plain.push(*commit);
+                continue;
+            };
+            if let Some((found, path, owner)) =
+                crate::compose::find_outside_git_under(&root, &[commit], &[], &all, Some(&mount))?
+            {
+                return Err(NewgitError::SplitRefused(format!(
+                    "commit {} of `{tracker}` changes `{path}`, which belongs to `{owner}`, a \
+                     tracker outside Git: its files (secrets among them) never leave this \
+                     machine through Git. Take it out of `{tracker}`'s history and try again",
+                    &found[..found.len().min(12)]
+                )));
+            }
+        }
+        self.refuse_unpublished(&plain)
+    }
+
     /// The project root is the instance `main` (docs/design/trackers.md): bring
     /// its tracker branches up to its own branch — the one `newgit init`
     /// found checked out — not whatever it has checked out now.
@@ -8843,8 +8876,11 @@ impl BranchManager {
                 mains.insert(tracker.clone(), main);
             }
         }
-        let commits: Vec<&str> = mains.values().map(String::as_str).collect();
-        self.refuse_unpublished(&commits)?;
+        let commits: Vec<(&str, &str)> = mains
+            .iter()
+            .map(|(tracker, commit)| (tracker.as_str(), commit.as_str()))
+            .collect();
+        self.refuse_unpublished_trackers(&commits)?;
         let trackers: Vec<String> = list.keys().cloned().collect();
         let (key, endpoint, seeds) = match client.create_project(name, &trackers) {
             Ok(created) => (created.key, created.endpoint, created.seeds),
@@ -9117,9 +9153,16 @@ impl BranchManager {
         if !moved.is_empty()
             && let Some((client, project_key)) = &client
         {
-            let mut pushed: Vec<&str> = moved.iter().map(|merge| merge.commit.as_str()).collect();
-            pushed.extend(mains.iter().map(|(_, _, commit)| commit.as_str()));
-            self.refuse_unpublished(&pushed)?;
+            let mut pushed: Vec<(&str, &str)> = moved
+                .iter()
+                .map(|merge| (merge.tracker.as_str(), merge.commit.as_str()))
+                .collect();
+            pushed.extend(
+                mains
+                    .iter()
+                    .map(|(tracker, _, commit)| (tracker.as_str(), commit.as_str())),
+            );
+            self.refuse_unpublished_trackers(&pushed)?;
             let branch_ref = format!("refs/heads/{into}");
             let push = |auth: &crate::remote::RepoCredential,
                         commit: &str,
