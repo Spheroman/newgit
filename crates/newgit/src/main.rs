@@ -268,8 +268,9 @@ enum Command {
         into: String,
     },
     /// Move a mounted tracker's pin to its `follow` ref (default `main`): one
-    /// commit, `Pull <tracker>: N commits from <ref>`, that brings its new
-    /// history in as a merge. Nothing else moves a pin on anyone's behalf
+    /// commit, `Pull <tracker>: N commits from <ref>`, holding its files at
+    /// the new pin; its history stays in its own repo. Nothing else moves a
+    /// pin on anyone's behalf
     ///
     /// With --remote <target>, bring the commits on an export target's branch
     /// (a pull request merged there) back instead: into the tracker a rooted
@@ -314,6 +315,10 @@ enum Command {
     /// inside its container: fetches every branch, pushes them in steps
     #[command(hide = true)]
     EndpointCopy,
+    /// The Git endpoint's pull from a mirror a GitHub webhook said moved, run
+    /// inside its container: brings the commit in and lands it on `main`
+    #[command(hide = true)]
+    EndpointPull,
     /// Link this project to a newgit remote
     Remote {
         #[command(subcommand)]
@@ -706,6 +711,16 @@ fn main() -> Result<()> {
             println!(
                 "{}",
                 serde_json::to_string(&newgit_core::endpoint::copy_repo(&plan)?)?
+            );
+            Ok(())
+        }
+        Command::EndpointPull => {
+            let plan: newgit_core::endpoint::PullPlan =
+                serde_json::from_reader(std::io::stdin())
+                    .context("the plan on stdin is not JSON newgit can read")?;
+            println!(
+                "{}",
+                serde_json::to_string(&newgit_core::endpoint::pull_mirror(&plan)?)?
             );
             Ok(())
         }
@@ -2051,7 +2066,7 @@ fn tracker(command: TrackerCommand) -> Result<()> {
                 short_rev(&outcome.main)
             );
             println!(
-                "  mounted:   {}, brought in by one merge ({}) on the project root",
+                "  mounted:   {}, joined as one commit ({}) on the project root",
                 outcome.mount,
                 short_rev(&outcome.view)
             );
@@ -2737,6 +2752,14 @@ fn push_receive_pack(store: &Utf8Path, instance: &str, repository: &Utf8Path) ->
 /// branch there itself.
 fn refuse_export_push(store: &Utf8Path, instance: &str, target: &str) -> Result<()> {
     let manager = BranchManager::open(MetadataStore::at(store))?;
+    if instance == newgit_core::manager::PROJECT_ROOT_INSTANCE {
+        bail!(
+            "newgit: `{target}` is an export target: newgit pushes there itself, composed from \
+             the trackers `{target}` ships. A push straight to it could carry trackers it \
+             withholds.\n\
+             newgit: publish with `newgit merge main`, then `newgit export --remote {target}`."
+        );
+    }
     let branch = manager.store().find_branch(instance)?.source_ref;
     bail!(
         "newgit: `{target}` is an export target: newgit pushes this branch there itself, \

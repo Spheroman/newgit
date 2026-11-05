@@ -5,8 +5,9 @@
 //! composed projection of chosen trackers' `main`s, with their history, as an
 //! ordinary Git repository. Which trackers is the definition's to say, so a
 //! public mirror and a private one can show different views of one project.
-//! `public` trackers in Git always ship; `trackers` adds others by name. A
-//! tracker outside Git never ships.
+//! With no `trackers`, the `public` trackers in Git ship; with `trackers`,
+//! exactly those do, so a target can leave out a tracker of any audience (its
+//! history stays in its own repo). A tracker outside Git never ships.
 
 use camino::Utf8Path;
 use serde::{Deserialize, Serialize};
@@ -20,7 +21,8 @@ pub struct ExportTarget {
     pub url: String,
     /// The branch the export is pushed to.
     pub branch: String,
-    /// Trackers in Git shipped besides the `public` ones.
+    /// The trackers in Git shipped: exactly these. Empty ships the `public`
+    /// ones.
     pub trackers: Vec<String>,
     /// Instances' branches go here too, each time a workspace pushes one —
     /// so a pull request can be opened against the target.
@@ -51,8 +53,13 @@ impl ExportTarget {
     pub fn from_file(name: &str, path: &Utf8Path) -> Result<Self> {
         let contents =
             std::fs::read_to_string(path).map_err(|source| NewgitError::io(path, source))?;
+        Self::from_text(name, path, &contents)
+    }
+
+    /// A target from its file's text; `path` names it in errors.
+    pub fn from_text(name: &str, path: &Utf8Path, contents: &str) -> Result<Self> {
         let file: ExportTargetFile =
-            toml::from_str(&contents).map_err(|source| NewgitError::TomlRead {
+            toml::from_str(contents).map_err(|source| NewgitError::TomlRead {
                 path: path.to_path_buf(),
                 source,
             })?;
@@ -66,6 +73,15 @@ impl ExportTarget {
         };
         target.validate()?;
         Ok(target)
+    }
+
+    /// Whether a target without `root` ships tracker `name` of `audience`.
+    pub fn lists(&self, name: &str, audience: &str) -> bool {
+        if self.trackers.is_empty() {
+            audience == "public"
+        } else {
+            self.trackers.iter().any(|tracker| tracker == name)
+        }
     }
 
     /// Where Git pushes: `owner/repo` is GitHub's; anything else is a URL

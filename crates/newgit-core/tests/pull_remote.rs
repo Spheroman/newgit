@@ -59,12 +59,12 @@ fn a_pr_merged_upstream_comes_back_with_pull_remote_and_newgit_pull() {
     );
     let view = pulled.view.expect("a view commit");
     assert_eq!(git(&repo, &["rev-parse", "HEAD"]), view);
-    assert_eq!(git(&repo, &["rev-parse", "HEAD^1"]), before);
-    assert!(git(&repo, &["log", "-1", "--format=%s"]).starts_with("Pull t3code: 2 commits from "));
     assert_eq!(
-        git(&repo, &["log", "--format=%s", "HEAD^1..HEAD^2"]),
-        "Merge pull request #1\nt3: from a PR"
+        git(&repo, &["rev-parse", "HEAD^@"]),
+        before,
+        "one commit on one parent"
     );
+    assert!(git(&repo, &["log", "-1", "--format=%s"]).starts_with("Pull t3code: 2 commits from "));
     assert!(repo.join("apps/t3code/src/pr.ts").is_file());
     // Again: nothing new.
     assert!(
@@ -127,27 +127,15 @@ fn an_upstream_sync_with_old_dates_lands_on_top() {
     let before = git(&repo, &["rev-parse", "HEAD"]);
 
     manager(&store).pull_remote("t3code").expect("pull");
-    let first_parents = git(&repo, &["rev-list", "--first-parent", "-2", "HEAD"]);
     assert_eq!(
-        first_parents.lines().nth(1),
-        Some(before.as_str()),
-        "the pull is on top"
+        git(&repo, &["rev-parse", "HEAD^@"]),
+        before,
+        "the pull is one commit on top"
     );
-    let replayed = git(&repo, &["log", "--format=%H %s", "HEAD^1..HEAD^2"]);
-    assert!(replayed.contains("t3: old upstream work"), "{replayed}");
-    let old_here = replayed
-        .lines()
-        .find(|line| line.ends_with("t3: old upstream work"))
-        .and_then(|line| line.split(' ').next())
-        .expect("replayed");
-    assert!(!git_ok(
-        &repo,
-        &["merge-base", "--is-ancestor", old_here, &before]
-    ));
     assert_eq!(
-        git(&repo, &["log", "-1", "--format=%at", old_here]),
-        "900000",
-        "its date is its own"
+        git(&repo, &["show", "HEAD:apps/t3code/src/old.ts"]),
+        "old",
+        "and holds the old upstream work"
     );
     let _ = (old, main);
 }

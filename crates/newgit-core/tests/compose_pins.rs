@@ -637,49 +637,42 @@ fn root_project(temp: &Utf8Path) -> (Repo, String, String) {
 }
 
 #[test]
-fn an_import_joins_through_one_merge_and_keeps_every_id() {
+fn an_import_joins_as_one_commit_and_keeps_every_id() {
     let (_guard, temp) = tempdir();
     let (repo, a, b) = root_project(&temp);
     let (tip, imported) = upstream(&repo);
     let joined = import(&repo, &b, &tip);
     let view = compose_in(&repo.dir, &joined, &["*"]).expect("a view");
-    // One commit on top of the original history: a merge whose second
-    // parent is the outside history, replayed under the mount.
-    assert_eq!(git(&repo.dir, &["rev-parse", &format!("{view}^1")]), b);
-    assert_eq!(git(&repo.dir, &["rev-parse", &format!("{b}^")]), a);
-    let second = git(&repo.dir, &["rev-parse", &format!("{view}^2")]);
+    // One ordinary commit on top of the original history.
     assert_eq!(
-        git(&repo.dir, &["log", "--format=%s", &second]),
-        "t3code: merge side\nt3code: two\nt3code: side\nt3code: start"
+        git(&repo.dir, &["rev-parse", &format!("{view}^@")]),
+        b,
+        "one parent: nothing of the child's history"
     );
+    assert_eq!(git(&repo.dir, &["rev-parse", &format!("{b}^")]), a);
     assert_eq!(
-        files(&repo.dir, &second),
-        vec!["apps/t3code/app.js", "apps/t3code/side.js"],
-        "history from before the mount has nothing beside it"
+        files(&repo.dir, &view),
+        vec![
+            ".newgit/trackers/root.toml",
+            ".newgit/trackers/t3code.toml",
+            "README.md",
+            "apps/t3code/app.js",
+            "apps/t3code/side.js",
+        ],
     );
     // The tracker keeps the history as it came.
     assert_eq!(
         git(&repo.dir, &["rev-parse", "refs/trackers/t3code/main"]),
         imported[3]
     );
-    // `git log`, `git blame`, and `git bisect` reach through the merge.
+    // `git log` starts at the import.
     let log = git(
         &repo.dir,
         &["log", "--format=%s", &view, "--", "apps/t3code/app.js"],
     );
-    assert_eq!(log, "t3code: two\nt3code: start");
-    let blame = git(
-        &repo.dir,
-        &["blame", "--porcelain", &view, "--", "apps/t3code/app.js"],
-    );
-    assert!(blame.contains("summary t3code: two") && blame.contains("summary t3code: start"));
-    let bisect = git(&repo.dir, &["rev-list", "--bisect-all", &view, "--not", &a]);
-    assert!(
-        bisect.lines().count() >= 6,
-        "bisect walks the brought-in history: {bisect}"
-    );
+    assert_eq!(log, "Import t3code");
 
-    // Made again from tracker commits alone, it is the same merge.
+    // Made again from tracker commits alone, it is the same commit.
     let refs = BTreeMap::from([
         ("root/main".to_owned(), joined.clone()),
         ("t3code/main".to_owned(), tip.clone()),
@@ -814,23 +807,18 @@ fn an_upstream_sync_dated_before_everything_goes_on_top() {
     );
     let view = compose_in(&repo.dir, &pull, &["*"]).expect("view");
     assert_eq!(
-        git(&repo.dir, &["rev-parse", &format!("{view}^1")]),
+        git(&repo.dir, &["rev-parse", &format!("{view}^@")]),
         work,
-        "on top of the work"
-    );
-    let brought = git(
-        &repo.dir,
-        &["log", "--format=%s", &format!("{view}^1..{view}^2")],
+        "one commit on top of the work, whatever the upstream commit's date"
     );
     assert_eq!(
-        brought, "upstream: dated long ago",
-        "only the new commit, once"
+        git(
+            &repo.dir,
+            &["log", "--format=%s", &format!("{work}..{view}")]
+        ),
+        "Pull t3code: 1 commit from main",
     );
-    assert_eq!(
-        git(&repo.dir, &["rev-parse", &format!("{view}^2^")]),
-        work,
-        "it replays onto the view commit that took our t3code work inline"
-    );
+    assert!(files(&repo.dir, &view).contains(&"apps/t3code/up.js".to_owned()));
 }
 
 #[test]

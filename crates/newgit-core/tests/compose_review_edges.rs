@@ -1,6 +1,6 @@
 //! Edges of compose and split on pins found in review (#323): a merge's own
 //! words keep to one audience, a pin its tracker does not have leaves the
-//! tracker out instead of failing the view, a brought-in commit is not taken
+//! tracker out instead of failing the view, a pull is one commit whoever made
 //! for split work because its committer line matches, and a tracker mounted
 //! at `.` loses files when its replayed history does.
 
@@ -395,7 +395,7 @@ fn a_pin_its_tracker_does_not_have_leaves_the_tracker_out_instead_of_failing() {
 }
 
 #[test]
-fn a_brought_in_commit_sharing_the_pulls_committer_line_is_still_brought_in() {
+fn a_pull_stays_one_commit_when_the_child_commit_shares_its_committer_line() {
     let (_guard, temp) = tempdir();
     let (repo, start) = root_only(&temp);
     let outside = temp.join("lib");
@@ -437,17 +437,17 @@ fn a_brought_in_commit_sharing_the_pulls_committer_line_is_still_brought_in() {
     );
     let view = compose_in(&repo.dir, &pulled, &["*"]).expect("view");
     assert_eq!(
-        git(
-            &repo.dir,
-            &["log", "-1", "--format=%s", &format!("{view}^2")]
+        git(&repo.dir, &["log", "-1", "--format=%s %P", &view]),
+        format!(
+            "Pull lib: 1 commit from main {}",
+            compose_in(&repo.dir, &mounted_at, &["*"]).expect("view")
         ),
-        "lib: two",
-        "the pull is a merge bringing the commit in, not the commit itself"
+        "the pull is its own commit, on one parent"
     );
 }
 
 #[test]
-fn a_tracker_mounted_at_the_root_loses_a_file_its_brought_in_history_deletes() {
+fn a_tracker_mounted_at_the_root_loses_a_file_a_pull_deletes() {
     let (_guard, temp) = tempdir();
     let (repo, start) = root_only(&temp);
     let outside = temp.join("kit");
@@ -484,15 +484,7 @@ fn a_tracker_mounted_at_the_root_loses_a_file_its_brought_in_history_deletes() {
         6_000,
     );
     let view = compose_in(&repo.dir, &pulled, &["*"]).expect("view");
-    for commit in [view.clone(), format!("{view}^2")] {
-        let files = files(&repo.dir, &commit);
-        assert!(
-            !files.contains(&"kit/a.js".to_owned()),
-            "{commit}: {files:?}"
-        );
-        assert!(
-            files.contains(&"kit/b.js".to_owned()),
-            "{commit}: {files:?}"
-        );
-    }
+    let files = files(&repo.dir, &view);
+    assert!(!files.contains(&"kit/a.js".to_owned()), "{files:?}");
+    assert!(files.contains(&"kit/b.js".to_owned()), "{files:?}");
 }

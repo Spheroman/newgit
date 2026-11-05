@@ -41,18 +41,13 @@ fn an_import_keeps_every_id_and_comes_in_through_one_merge() {
     );
     assert_eq!(ours, git(&upstream, &["rev-list", "newgit"]));
 
-    // The project root took one commit: a merge bringing it in.
+    // The project root took one commit, on one parent.
     assert_eq!(git(&repo, &["rev-parse", "HEAD"]), outcome.view);
-    assert_eq!(git(&repo, &["rev-parse", "HEAD^1"]), before);
+    assert_eq!(git(&repo, &["rev-parse", "HEAD^@"]), before);
     assert_eq!(
         git(&repo, &["log", "-1", "--format=%s"]),
         "Import `t3code` at apps/t3code from upstream",
         "a local path is recorded as its directory's name, never the path"
-    );
-    assert_eq!(
-        git(&repo, &["log", "--format=%s", "HEAD^1..HEAD^2"]),
-        "t3: submodules\nMerge side\nt3: second\nt3: side\nt3: first",
-        "upstream's history, merge and all, replayed under the mount"
     );
     assert_eq!(
         git(
@@ -68,12 +63,9 @@ fn an_import_keeps_every_id_and_comes_in_through_one_merge() {
             &repo,
             &["log", "--format=%s", "--", "apps/t3code/src/side.ts"]
         ),
-        "t3: side",
-        "`git log` reaches through the merge"
+        "Import `t3code` at apps/t3code from upstream",
+        "`git log` starts at the import; the history stays in its own repo"
     );
-    let blame = git(&repo, &["blame", "--porcelain", "apps/t3code/src/app.ts"]);
-    assert!(blame.contains("author theo"), "{blame}");
-    assert!(blame.contains("summary t3: second"), "{blame}");
 
     // Root pins it, and the definition is `access`'s.
     let pinned = git(

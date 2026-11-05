@@ -1650,6 +1650,65 @@ fn run_git_input(args: &[&str], input: &str) -> Result<String> {
     }
 }
 
+/// A real merge of two commits in `repo`, by `git merge-tree`: the merge
+/// commit, made with `env` (who, and when, for a merge nobody's Git config
+/// signs for it), or the files that conflict.
+pub fn merge_commits(
+    repo: &Utf8Path,
+    ours: &str,
+    theirs: &str,
+    message: &str,
+    env: &[(String, String)],
+) -> Result<std::result::Result<String, Vec<String>>> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo.as_str())
+        .args([
+            "merge-tree",
+            "--write-tree",
+            "--name-only",
+            "--no-messages",
+            ours,
+            theirs,
+        ])
+        .output()
+        .map_err(|source| NewgitError::io(repo, source))?;
+    let text = String::from_utf8_lossy(&output.stdout).into_owned();
+    let mut lines = text.lines();
+    let tree = lines.next().unwrap_or_default().to_owned();
+    match output.status.code() {
+        Some(0) => {}
+        Some(1) => {
+            return Ok(Err(lines
+                .take_while(|line| !line.is_empty())
+                .map(ToOwned::to_owned)
+                .collect()));
+        }
+        _ => {
+            return Err(NewgitError::SourceCommand {
+                command: format!("git merge-tree --write-tree {ours} {theirs}"),
+                stderr: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+            });
+        }
+    }
+    let commit = run_git_env(
+        &[
+            "-C",
+            repo.as_str(),
+            "commit-tree",
+            &tree,
+            "-p",
+            ours,
+            "-p",
+            theirs,
+            "-m",
+            message,
+        ],
+        env,
+    )?;
+    Ok(Ok(commit.trim().to_owned()))
+}
+
 pub fn run_git_env(args: &[&str], env: &[(String, String)]) -> Result<String> {
     let output = Command::new("git")
         .args(args)

@@ -204,6 +204,7 @@ fn add(url: Option<String>, project: Option<String>, json: bool) -> Result<()> {
         project: Some(key.clone()),
     });
     store.write_config(&config)?;
+    BranchManager::open(store.clone())?.route_project_root()?;
 
     if json {
         println!(
@@ -408,6 +409,7 @@ fn clone_into(
         project: Some(view.key.clone()),
     });
     store.write_config(&config)?;
+    BranchManager::open(store.clone())?.route_project_root()?;
 
     println!("Cloned `{}` into {dir}", view.key);
     println!(

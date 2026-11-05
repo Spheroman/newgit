@@ -135,11 +135,10 @@ fn a_spawn_says_a_mounted_tracker_is_behind_and_the_pull_brings_it_in_as_a_merge
         git(&repo, &["log", "-1", "--format=%s"]),
         "Pull lib: 2 commits from main"
     );
-    assert_eq!(git(&repo, &["rev-parse", "HEAD^1"]), before);
     assert_eq!(
-        git(&repo, &["log", "--format=%s", "HEAD^1..HEAD^2"]),
-        "lib: b\nlib: a",
-        "the new commits, replayed under the mount"
+        git(&repo, &["rev-parse", "HEAD^@"]),
+        before,
+        "one commit on one parent"
     );
     assert_eq!(
         git(&repo, &["ls-tree", "--name-only", "HEAD", "libs/lib/"]),
@@ -150,8 +149,8 @@ fn a_spawn_says_a_mounted_tracker_is_behind_and_the_pull_brings_it_in_as_a_merge
             &repo,
             &["log", "--format=%s", "HEAD", "--", "libs/lib/b.js"]
         ),
-        "lib: b",
-        "`git log` reaches through the merge"
+        "Pull lib: 2 commits from main",
+        "`git log` shows each pull as one commit"
     );
     // Root pins what it pulled, and a second pull has nothing to do.
     let tracker_store = store.paths().tracker_store.clone();

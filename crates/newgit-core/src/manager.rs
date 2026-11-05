@@ -2253,6 +2253,7 @@ impl BranchManager {
     /// its tracker branches up to its own branch — the one `newgit init`
     /// found checked out — not whatever it has checked out now.
     pub fn sync_project_root(&self) -> Result<usize> {
+        self.route_project_root()?;
         let file = self.store.paths().project_branch_file();
         let branch = match std::fs::read_to_string(&file) {
             Ok(branch) => branch.trim().to_owned(),
@@ -2279,7 +2280,140 @@ impl BranchManager {
         let Ok(tip) = self.source.rev_parse(&format!("refs/heads/{branch}")) else {
             return Ok(0);
         };
+        // Failing leaves the split to make commits of its own, which merge.
+        let _ = self.learn_pulled_view(&tip);
         self.split_instance(PROJECT_ROOT_INSTANCE, &tip)
+    }
+
+    /// `git pull` in the project root brings view commits this machine did
+    /// not make. Most split back to the very root commit the remote has, but
+    /// one that landed through a mirror names the mirror's commit, which only
+    /// the remote's root commit records. So when the commit `tip` shares with
+    /// `origin/main` has no note yet, compose the remote's `main` here, which
+    /// notes every view commit of it.
+    fn learn_pulled_view(&self, tip: &str) -> Result<()> {
+        let Some(link) = &self.remote else {
+            return Ok(());
+        };
+        let project = self.store.paths().project_root.clone();
+        let Ok(fetched) = self.source.rev_parse(&format!(
+            "refs/remotes/{PUBLISH_REMOTE}/{PROJECT_ROOT_INSTANCE}"
+        )) else {
+            return Ok(());
+        };
+        let shared = self.source.merge_base(tip, &fetched)?;
+        if crate::compose::read_root(&project, &shared)?.is_some() {
+            return Ok(());
+        }
+        let client = link.connect(Acting::Login)?;
+        let list = self.branch_list(
+            Some((client.as_ref(), link.project.as_str())),
+            PROJECT_ROOT_INSTANCE,
+        )?;
+        if let Some(root) = list.get(&self.root.name) {
+            self.compose_here("refs/newgit/views/branches/main", root)?;
+        }
+        Ok(())
+    }
+
+    /// On a linked project, make the project root's `origin` the remote's
+    /// Git endpoint, as a workspace's is. A mirror withholding a tracker has
+    /// ids of its own, so `git pull` from it would bring in commits that are
+    /// not the project's; the endpoint serves the project's own. `git push`
+    /// there is the endpoint's refusal: the project root publishes with
+    /// `newgit merge main`. Each `branches = true` target is a remote too,
+    /// for `gh`, and pushing to it straight is refused, as in a workspace.
+    ///
+    /// Run by `newgit remote add` and whenever the project root is synced,
+    /// which moves a project linked before this; a repeat costs one read of
+    /// the config.
+    pub fn route_project_root(&self) -> Result<()> {
+        let Some(link) = &self.remote else {
+            return Ok(());
+        };
+        let root = self.store.paths().project_root.clone();
+        let endpoint = format!("{}/{}.git", link.url.trim_end_matches('/'), link.project);
+        let targets = self.export_targets().unwrap_or_default();
+        let targets: Vec<&ExportTarget> = targets.iter().filter(|target| target.branches).collect();
+        let set = crate::source::run_git_env(
+            &["-C", root.as_str(), "config", "--get-regexp", "^remote\\."],
+            &[],
+        )
+        .unwrap_or_default();
+        let has = |key: &str, value: &str| {
+            set.lines().any(|line| {
+                line.split_once(' ')
+                    .is_some_and(|(found, text)| found == key && text == value)
+            })
+        };
+        if has("remote.origin.url", &endpoint)
+            && !set.contains("remote.origin.pushurl")
+            && targets
+                .iter()
+                .all(|target| has(&format!("remote.{}.url", target.name), &target.push_url()))
+        {
+            return Ok(());
+        }
+        let config = |key: &str, value: &str| {
+            crate::source::run_git_env(&["-C", root.as_str(), "config", key, value], &[]).map(drop)
+        };
+        config("remote.origin.url", &endpoint)?;
+        if !set.contains("remote.origin.fetch") {
+            config("remote.origin.fetch", "+refs/heads/*:refs/remotes/origin/*")?;
+        }
+        for key in ["remote.origin.pushurl", "remote.origin.receivepack"] {
+            // Exit 5 is "was not set", which is the state wanted.
+            let _ = crate::source::run_git_env(
+                &["-C", root.as_str(), "config", "--unset-all", key],
+                &[],
+            );
+        }
+        GitSource::workspace_use_credential_helper(
+            &root,
+            &[&endpoint],
+            &format!("!{} credential", sh_quote(&newgit_program())),
+        )?;
+        if let Some(branch) = self.project_branch()
+            && branch == PROJECT_ROOT_INSTANCE
+            && !crate::source::run_git_env(
+                &[
+                    "-C",
+                    root.as_str(),
+                    "config",
+                    "--get",
+                    &format!("branch.{branch}.remote"),
+                ],
+                &[],
+            )
+            .is_ok_and(|remote| !remote.is_empty())
+        {
+            config(&format!("branch.{branch}.remote"), "origin")?;
+            config(
+                &format!("branch.{branch}.merge"),
+                &format!("refs/heads/{branch}"),
+            )?;
+        }
+        if targets.is_empty() {
+            return Ok(());
+        }
+        let outbox = self.outbox();
+        self.source.ensure_outbox(&outbox)?;
+        let owned: Vec<ExportTarget> = targets.into_iter().cloned().collect();
+        self.route_export_remotes(&root, PROJECT_ROOT_INSTANCE, &owned, &outbox)?;
+        let definitions = self.carved_definitions();
+        let resolved = route_to_targets(&owned, &[self.root.name.clone()], |target, tracker| {
+            definitions
+                .iter()
+                .find(|definition| definition.name == tracker)
+                .is_some_and(|definition| {
+                    export_reason(target, definition) != ExportReason::Withheld
+                })
+        })
+        .resolved;
+        if let Some(target) = resolved {
+            config(&format!("remote.{target}.gh-resolved"), "base")?;
+        }
+        Ok(())
     }
 
     /// Where `tracker`'s history is for `instance` (its branch, once its
@@ -3410,7 +3544,9 @@ impl BranchManager {
             &receive_pack,
         )?;
         if branch.remote.is_some() {
-            self.route_export_remotes(branch, &outbox)?;
+            let targets = self.export_targets()?;
+            self.route_export_remotes(&branch.workspace_path, &branch.name, &targets, &outbox)?;
+            self.resolve_gh(branch, &targets)?;
         }
         Ok(())
     }
@@ -3425,12 +3561,17 @@ impl BranchManager {
     ///
     /// Pushing to it directly is refused, naming `origin`: a direct push
     /// would carry trackers the target withholds, and skip the checkpoint.
-    fn route_export_remotes(&self, branch: &BranchInstance, outbox: &Utf8Path) -> Result<()> {
-        let workspace = branch.workspace_path.as_str();
+    fn route_export_remotes(
+        &self,
+        workspace: &Utf8Path,
+        instance: &str,
+        targets: &[ExportTarget],
+        outbox: &Utf8Path,
+    ) -> Result<()> {
+        let workspace = workspace.as_str();
         let config = |key: &str, value: &str| {
             crate::source::run_git_env(&["-C", workspace, "config", key, value], &[]).map(|_| ())
         };
-        let targets = self.export_targets()?;
         for target in targets.iter().filter(|target| target.branches) {
             let remote = &target.name;
             config(&format!("remote.{remote}.url"), &target.push_url())?;
@@ -3446,13 +3587,15 @@ impl BranchManager {
                     sh_quote(&newgit_program()),
                     sh_quote(self.store.paths().project_root.as_str()),
                     sh_quote(remote),
-                    sh_quote(&branch.name),
+                    sh_quote(instance),
                 ),
             )?;
             // What the target's own branch holds, as of the last export from
             // here, so `gh pr create --fill` can list the PR's commits.
             let main = export_ref(&target.name, PROJECT_ROOT_INSTANCE);
-            if self.source.rev_parse(&main).is_ok() {
+            if workspace != self.store.paths().project_root.as_str()
+                && self.source.rev_parse(&main).is_ok()
+            {
                 crate::source::run_git_env(
                     &[
                         "-C",
@@ -3467,7 +3610,7 @@ impl BranchManager {
                 )?;
             }
         }
-        self.resolve_gh(branch, &targets)
+        Ok(())
     }
 
     /// The trackers in Git the instance's work touched: those whose
@@ -7340,8 +7483,8 @@ impl BranchManager {
     /// Push a composed projection of the trackers' `main`s to export target
     /// `name` (`.newgit/exports/<name>.toml`), history and all.
     ///
-    /// Fails closed: only `public` trackers in Git and the ones the target
-    /// names ship, a tracker outside Git cannot be named, and a composed history
+    /// Fails closed: only the trackers in Git the target names ship (the
+    /// `public` ones when it names none), a tracker outside Git cannot be named, and a composed history
     /// that ever adds a path a tracker outside Git owns is refused before anything
     /// is pushed. Composing is deterministic, so exporting again
     /// fast-forwards the target; a different tracker set is a different
@@ -7774,76 +7917,10 @@ impl BranchManager {
             .filter(|definition| export_reason(target, definition) == ExportReason::Withheld)
             .cloned()
             .collect();
-        let mut objects = crate::objects::Objects::open(&project)?;
-        let mut mapped: BTreeMap<String, String> = BTreeMap::new();
-        for id in &walk {
-            if let Some(ours) = recognise.view_of(self, id)? {
-                mapped.insert(id.clone(), ours);
-                continue;
-            }
-            let commit = objects.commit(id)?;
-            if commit.parents.is_empty() {
-                return Err(NewgitError::Unsupported(format!(
-                    "commit {} on `{}` shares no history with the project, so it cannot be \
-                     brought in as work",
-                    short(id),
-                    target.name
-                )));
-            }
-            let mut parents = Vec::new();
-            for parent in &commit.parents {
-                let ours = match mapped.get(parent) {
-                    Some(ours) => ours.clone(),
-                    None => recognise
-                        .view_of(self, parent)?
-                        .unwrap_or_else(|| parent.clone()),
-                };
-                if !parents.contains(&ours) {
-                    parents.push(ours);
-                }
-            }
-            let first = objects.commit(&parents[0])?;
-            let mut tree = commit.tree.clone();
-            for definition in &withheld {
-                let mount = definition.mount.as_str();
-                if mount == "." {
-                    return Err(NewgitError::Unsupported(format!(
-                        "`{}` withholds `{}`, which is mounted at `.`, so its files cannot be \
-                         put back into the commits that come from there",
-                        target.name, definition.name
-                    )));
-                }
-                if objects.subtree(&commit.tree, mount)?.is_some()
-                    || objects.entry_at(&commit.tree, mount)?.is_some()
-                {
-                    return Err(NewgitError::SplitRefused(format!(
-                        "commit {} on `{}` changes `{mount}`, which belongs to `{}`, a tracker \
-                         that target does not ship, so nothing was pulled",
-                        short(id),
-                        target.name,
-                        definition.name
-                    )));
-                }
-                let theirs_there = objects
-                    .subtree(&first.tree, mount)?
-                    .map(|tree| (crate::objects::TREE_MODE.to_vec(), tree));
-                tree = objects.set_path(&tree, mount, theirs_there)?;
-            }
-            let made = if tree == commit.tree && parents == commit.parents {
-                id.clone()
-            } else {
-                objects.make_commit(
-                    &tree,
-                    &parents,
-                    &commit.author,
-                    &commit.committer,
-                    &crate::objects::Commit::unsigned_headers(&commit.headers),
-                    &commit.message,
-                )
-            };
-            mapped.insert(id.clone(), made);
-        }
-        objects.flush()?;
+        let mapped =
+            crate::compose::bring_in(&project, &target.name, &walk, &withheld, &mut |id| {
+                recognise.view_of(self, id)
+            })?;
         let tip = match mapped.get(theirs) {
             Some(tip) => tip.clone(),
             None => recognise
@@ -9373,54 +9450,7 @@ impl BranchManager {
         theirs: &str,
         message: &str,
     ) -> Result<std::result::Result<String, Vec<String>>> {
-        let root = self.store.paths().project_root.clone();
-        let output = std::process::Command::new("git")
-            .arg("-C")
-            .arg(root.as_str())
-            .args([
-                "merge-tree",
-                "--write-tree",
-                "--name-only",
-                "--no-messages",
-                ours,
-                theirs,
-            ])
-            .output()
-            .map_err(|source| NewgitError::io(root.clone(), source))?;
-        let text = String::from_utf8_lossy(&output.stdout).into_owned();
-        let mut lines = text.lines();
-        let tree = lines.next().unwrap_or_default().to_owned();
-        match output.status.code() {
-            Some(0) => {}
-            Some(1) => {
-                return Ok(Err(lines
-                    .take_while(|line| !line.is_empty())
-                    .map(ToOwned::to_owned)
-                    .collect()));
-            }
-            _ => {
-                return Err(NewgitError::SourceCommand {
-                    command: format!("git merge-tree --write-tree {ours} {theirs}"),
-                    stderr: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
-                });
-            }
-        }
-        let commit = crate::source::run_git_env(
-            &[
-                "-C",
-                root.as_str(),
-                "commit-tree",
-                &tree,
-                "-p",
-                ours,
-                "-p",
-                theirs,
-                "-m",
-                message,
-            ],
-            &[],
-        )?;
-        Ok(Ok(commit.trim().to_owned()))
+        crate::source::merge_commits(&self.store.paths().project_root, ours, theirs, message, &[])
     }
 
     /// Publish an instance's work for checkpoint `record`: its committed work
@@ -11877,7 +11907,7 @@ pub const ADOPTED_REF: &str = "refs/newgit/adopted";
 
 /// The project root's name as an instance: its tracker branches are
 /// `instances/main`, so no spawned instance may take the name.
-const PROJECT_ROOT_INSTANCE: &str = "main";
+pub const PROJECT_ROOT_INSTANCE: &str = "main";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TrackerMergeAction {
@@ -12099,12 +12129,12 @@ fn export_reason(target: &ExportTarget, definition: &TrackerDefinition) -> Expor
             ExportReason::Withheld
         };
     }
-    if definition.audience == "public" {
-        ExportReason::Public
-    } else if target.trackers.contains(&definition.name) {
-        ExportReason::Listed
-    } else {
+    if !target.lists(&definition.name, &definition.audience) {
         ExportReason::Withheld
+    } else if definition.audience == "public" {
+        ExportReason::Public
+    } else {
+        ExportReason::Listed
     }
 }
 

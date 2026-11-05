@@ -151,6 +151,9 @@ impl FakeRemote {
                 );
                 let mut length = 0;
                 let mut token = String::new();
+                let mut basic = false;
+                let mut git_protocol = String::new();
+                let mut gzipped = false;
                 loop {
                     let mut line = String::new();
                     reader.read_line(&mut line).expect("header");
@@ -162,13 +165,29 @@ impl FakeRemote {
                     match name.to_ascii_lowercase().as_str() {
                         "content-length" => length = value.trim().parse().unwrap_or(0),
                         "authorization" => {
+                            basic = value.trim().starts_with("Basic ");
                             token = value.trim().trim_start_matches("Bearer ").to_owned()
                         }
+                        "git-protocol" => git_protocol = value.trim().to_owned(),
+                        "content-encoding" => gzipped = value.contains("gzip"),
                         _ => {}
                     }
                 }
                 let mut body = vec![0; length];
                 reader.read_exact(&mut body).expect("body");
+                if path.contains(".git/") {
+                    let reply = git_endpoint(
+                        &thread_state,
+                        &thread_repos,
+                        &path,
+                        basic,
+                        &git_protocol,
+                        gzipped,
+                        &body,
+                    );
+                    let _ = stream.write_all(&reply);
+                    continue;
+                }
                 let body: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
                 let (status, reply) =
                     route(&thread_state, &thread_repos, &method, &path, &token, &body);
@@ -192,6 +211,135 @@ impl FakeRemote {
     fn repo(&self, name: &str) -> Utf8PathBuf {
         self.repos.join(format!("{name}.git"))
     }
+}
+
+/// `git fetch` from the project's endpoint: Git's smart HTTP, as the Worker
+/// and its container answer it. The branch lists compose with the real
+/// `newgit endpoint-compose` and `git upload-pack` serves the result, and a
+/// request without a password is asked for one, which is what makes Git call
+/// the credential helper.
+fn git_endpoint(
+    state: &Mutex<State>,
+    repos: &Utf8Path,
+    path: &str,
+    basic: bool,
+    protocol: &str,
+    gzipped: bool,
+    body: &[u8],
+) -> Vec<u8> {
+    let respond = |status: u16, extra: &str, content: &[u8]| {
+        let mut reply = format!(
+            "HTTP/1.1 {status} X\r\n{extra}content-length: {}\r\nconnection: close\r\n\r\n",
+            content.len()
+        )
+        .into_bytes();
+        reply.extend_from_slice(content);
+        reply
+    };
+    if !basic {
+        return respond(401, "www-authenticate: Basic realm=\"newgit\"\r\n", b"");
+    }
+    let (project, service) = path
+        .trim_start_matches('/')
+        .split_once(".git/")
+        .expect("an endpoint path");
+    let branches = state
+        .lock()
+        .expect("state")
+        .branches
+        .get(project)
+        .cloned()
+        .unwrap_or_default();
+    let prefix = project.replace('/', ".");
+    let mut plan_repos = serde_json::Map::new();
+    for tracker in branches
+        .values()
+        .filter_map(Value::as_object)
+        .flat_map(|list| list.keys())
+    {
+        plan_repos.insert(
+            tracker.clone(),
+            json!({
+                "url": repos.join(format!("{prefix}.t.{tracker}.git")),
+                "auth": "Authorization: Basic eDpw",
+            }),
+        );
+    }
+    let plan = json!({
+        "dir": repos.with_file_name("endpoint"),
+        "branches": branches,
+        "default_branch": "main",
+        "repos": plan_repos,
+    });
+    let mut compose = Command::new(env!("CARGO_BIN_EXE_newgit"))
+        .arg("endpoint-compose")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .expect("newgit runs");
+    compose
+        .stdin
+        .take()
+        .expect("stdin")
+        .write_all(plan.to_string().as_bytes())
+        .expect("write the plan");
+    let composed = compose.wait_with_output().expect("compose");
+    assert!(composed.status.success(), "endpoint-compose failed");
+    let view = String::from_utf8_lossy(&composed.stdout).trim().to_owned();
+
+    let advertise = service.starts_with("info/refs");
+    let mut args = vec!["upload-pack", "--stateless-rpc"];
+    if advertise {
+        args.push("--advertise-refs");
+    }
+    args.push(&view);
+    let mut upload = Command::new("git")
+        .args(&args)
+        .env("GIT_PROTOCOL", protocol)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .expect("git runs");
+    let mut input = body.to_vec();
+    if gzipped {
+        let mut gunzip = Command::new("gzip")
+            .arg("-dc")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("gzip runs");
+        gunzip
+            .stdin
+            .take()
+            .expect("stdin")
+            .write_all(&input)
+            .expect("write");
+        input = gunzip.wait_with_output().expect("gunzip").stdout;
+    }
+    upload
+        .stdin
+        .take()
+        .expect("stdin")
+        .write_all(&input)
+        .expect("write");
+    let served = upload.wait_with_output().expect("upload-pack").stdout;
+    if !advertise {
+        return respond(
+            200,
+            "content-type: application/x-git-upload-pack-result\r\n",
+            &served,
+        );
+    }
+    let mut content = Vec::new();
+    if !protocol.contains("version=2") {
+        content.extend_from_slice(b"001e# service=git-upload-pack\n0000");
+    }
+    content.extend_from_slice(&served);
+    respond(
+        200,
+        "content-type: application/x-git-upload-pack-advertisement\r\n",
+        &content,
+    )
 }
 
 fn route(
