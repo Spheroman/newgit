@@ -950,7 +950,9 @@ restored from the checkpoint, such as a database loaded from its dump. It
 is built from parts that already exist: fetch, spawn at the checkpoint's
 head, then undo to the checkpoint. Its `autostart` actions start after the
 undo, since the restore stops and restarts processes to match the
-checkpoint.
+checkpoint. The new instance's workspace comes up on its own branch, made
+at the checkpoint's commit, even when the author's was on another branch
+or detached (#315).
 
 #### An incomplete spawn must say so
 

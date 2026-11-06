@@ -3223,6 +3223,12 @@ impl BranchManager {
         let log = self.checkpoint_log(&branch);
         record.id = log.next_id()?;
         record.branch = branch.name.clone();
+        // Taken on the new instance's own branch, which `spawn_inner` made at
+        // the checkpoint's head. The branch the author's workspace was on, or
+        // its detached HEAD, is the author's: the undo below would put this
+        // workspace there (#315).
+        record.source.checked_out = Some(branch.source_ref.clone());
+        record.source.detached = false;
         record.message = Some(format!(
             "spawned from {from_slug}/{checkpoint_id} (by {}{})",
             found.created_by,
