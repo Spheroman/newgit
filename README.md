@@ -138,7 +138,7 @@ curl -fsSL https://newgit.dev/install.sh | sh
 ```
 
 The script picks the prebuilt binary for your OS and architecture, verifies
-its checksum, and puts it in `~/.local/bin`. Set `NEWGIT_VERSION=v0.8.1` to
+its checksum, and puts it in `~/.local/bin`. Set `NEWGIT_VERSION=v0.9.0` to
 pin a release or `NEWGIT_INSTALL_DIR` to put it elsewhere.
 
 Or with Homebrew, on macOS or Linux:

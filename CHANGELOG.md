@@ -12,6 +12,515 @@ time by `scripts/release-changelog.sh`, which then deletes the fragments.
 Two changes never touch the same lines, so nothing queues behind whichever
 branch landed first.
 
+## [0.9.0] — 2026-11-06
+
+Outside repositories can now be trackers. `newgit tracker create --mount
+--from` brings a repository in at a path, and its history stays in its own
+repo: the project records which commit it pins, and a fetch expands that into
+one ordinary commit. newgit itself now works this way with Spheroman/t3code,
+mounted at `apps/t3code`. `git push` from the project root goes to the remote
+and to each GitHub repository, every one holding only its own trackers, and a
+GitHub webhook brings what is merged there back to the remote. `newgit clone`
+fetches pinned snapshots rather than every history, and `newgit init` in a
+GitHub clone joins the project.
+
+Underneath, a workspace's history is now composed from pinned trackers, and
+there is one kind of tracker. The `project` tracker is gone: `.newgit/` is
+part of `root`.
+
+**This release needs migrating.** Run `newgit tracker migrate` once after
+upgrading; try `--dry-run` first. On the remote it force-pushes every tracker
+repository. Definitions must also change by hand: rewrite `secret = false` as
+`git = true` in `.newgit/trackers/*.toml`, and delete `secret = true`. A
+definition still saying `secret` is refused. `tracker create --code` is now
+`--git`, and `tracker repair` is removed.
+
+### Added
+
+- `newgit tracker create <name> --git --mount <dir> --from <repo>
+  [--from-branch <branch>]` imports another repository's history unchanged
+  as a tracker in Git ([#140](https://github.com/Spheroman/newgit/issues/140)).
+
+  A tracker is stored relative to its own root, so the fetched branch is
+  used as the tracker's `main` as it is: every id, signature, and merge
+  stays what upstream has. One commit in the project root adds the
+  definition, the mount, and the pin, and composes as a merge that brings
+  the history in under the mount, so `git log` and `git blame` work through
+  it. It refuses, leaving nothing behind, when the mount already has files
+  or the history adds a file a tracker outside Git owns there, and says when
+  the import has a `.gitmodules`, which Git does not read under a mount.
+  `newgit merge main` publishes it, as for any new tracker. The commit says
+  where the history came from without a URL's credentials or a local path.
+
+- Export targets take `root = "<tracker>"`, exporting the view rooted at
+  that tracker: its own files at the top
+  ([#141](https://github.com/Spheroman/newgit/issues/141)).
+
+  A fork such as Spheroman/t3code keeps its files at the repository root,
+  so exporting the project's view would put them under the mount and never
+  match the fork's ids. Rooted at a tracker that mounts no tracker in Git,
+  the export is that tracker's own `main`, so the first export of an
+  imported tracker is a no-op fast-forward of its upstream. A root that
+  mounts a tracker in Git is refused, naming it; `root` and `trackers`
+  cannot both be set. With `branches = true` each instance's branch of the
+  tracker goes there, and `gh` routing follows.
+
+- `newgit pull --remote <target>` brings an export target's new commits (a
+  pull request merged on GitHub, an upstream sync) back into its trackers
+  ([#142](https://github.com/Spheroman/newgit/issues/142)).
+
+  Before, the only way in from GitHub was `git pull` in the project root,
+  which works only while the mirror's ids are the project's. For a target
+  with `root`, the commits are the tracker's own: its `main` fast-forwards
+  or really merges, and its pin in the project root moves as `newgit pull
+  <tracker>` would, so old-dated upstream history comes in on top through
+  one merge. For a target without `root`, commits that came from here are
+  recognised by id, by the note on an exported commit, or by a canonical
+  id, and the rest come into the project root as work, with the files of
+  trackers the target withholds put back. Either way a file a tracker
+  outside Git owns is refused, and `newgit merge main` publishes.
+
+- A GitHub webhook brings what is merged on a mirror into `main` on the
+  remote: `POST /v1/webhooks/github`, verified against
+  `GITHUB_WEBHOOK_SECRET`
+  ([#144](https://github.com/Spheroman/newgit/issues/144)).
+
+  Merging a pull request on GitHub used to wait for someone to run `newgit
+  pull --remote`. Now the endpoint's container does what that does, under
+  `main`'s merge lock, with the same refusals, and lands it as a merge by
+  whoever pushed. A mirror's commit keeps its id through the round trip,
+  signature included, so the next export is a no-op, and an event for our
+  own export takes no lock. A commit that may hold an instance's work in a
+  withheld tracker is refused rather than landed without it: `newgit merge
+  <instance>`, then redeliver. Set-up is in
+  `docs/design/remote.md`, *The GitHub webhook*.
+
+- A tracker definition gains `mount` (where its root sits in its parent,
+  default `.`) and `follow` (the ref `newgit pull` brings in, default
+  `main`); `paths` are claims relative to the mount and may exclude with
+  `!` ([#201](https://github.com/Spheroman/newgit/issues/201)).
+
+  Ownership follows the mounts: the deepest mount holding a path decides,
+  then the longest claim among the trackers mounted there. A path every
+  claim excludes is owned by nothing, and a commit changing it is refused
+  when it leaves the machine, which is all "ignored" ever meant. Trackers
+  sharing a mount split by their claims, so a tracker in Git mounted at
+  `.newgit/trackers` beside `access` governs the definition files it claims;
+  that replaces claiming `.newgit/trackers/<name>.toml` from `.`. Trackers
+  outside Git may have a mount too; they are never pinned.
+
+- `newgit pull <tracker> [instance]` moves a mounted tracker's pin to its
+  `follow` ref (`main` by default) in one commit, `Pull <tracker>: N commits
+  from <ref>`, and `spawn` says when a mounted tracker is behind that ref
+  ([#201](https://github.com/Spheroman/newgit/issues/201)).
+
+  A child's `main` moves when an instance rooted at it merges or an upstream
+  is synced, and the parent should not pick that up by surprise: nothing
+  writes a commit on anyone's behalf. The pull is authored by whoever ran
+  it, composes as a merge bringing the new commits in, and merges into
+  `main` like any instance commit.
+
+- `newgit tracker migrate [--dry-run]` moves a project laid out before
+  mounts onto roots and mounts; `newgit tracker repair` is removed
+  ([#201](https://github.com/Spheroman/newgit/issues/201)).
+
+  `project`, `access`, and every other tracker in Git fold back into root,
+  whose history becomes the view's history commit for commit, and one
+  commit at the tip of `main` mounts them again (`access` at
+  `.newgit/trackers`, the rest at the paths they owned). Every branch and
+  checkpoint is recomposed in a fresh repository first, and nothing moves
+  unless each comes out with the same id, signatures included. Old tracker
+  refs are kept under `refs/newgit-premigration/`. On the remote it
+  force-pushes every tracker repository, so run it once, after upgrading.
+  `tracker repair` rewrote the trailers of commits split by an older
+  engine; that engine is gone, and the migration covers what it fixed.
+
+
+### Changed
+
+- `gh` in a workspace resolves to the export target the instance's work
+  belongs to, not the first `branches = true` one
+  ([#143](https://github.com/Spheroman/newgit/issues/143)).
+
+  With two targets that export branches, `gh pr create` used to open a pull
+  request against whichever sorted first, even when the instance only changed
+  trackers the other ships. Now a push resolves `gh` to the target that ships
+  a tracker the work touched, and exports the branch only to such targets.
+  When the work spans trackers shipped by more than one, the branch goes to
+  each, `gh` resolves none, and the push names `gh pr create -R <repo>
+  --head <branch>` for each. Pushing straight to a target is still refused.
+
+- `newgit clone` fetches root's whole history and only the commits it pins
+  of each mounted tracker, with that tracker's history fetched the first
+  time something needs it
+  ([#144](https://github.com/Spheroman/newgit/issues/144)).
+
+  Cloning a project with a large mount took 6.5 minutes, nearly all of it
+  fetching a child's history nothing was going to read. The result is an
+  ordinary project with the same commit ids as a full clone, and a commit
+  under a mount splits, pushes, and merges with its pin as a parent. A real
+  merge in a child, a rooted export, `newgit log <tracker>`, and a pull
+  that does not fast-forward fetch the history, saying so once.
+  `newgit clone --full` fetches every history up front. Projects cloned
+  before this are unchanged.
+
+- An export target's `trackers` is exactly what ships, of any audience,
+  instead of adding to the `public` trackers
+  ([#144](https://github.com/Spheroman/newgit/issues/144)).
+
+  A public tracker could not be left out of a target, so a mirror of newgit
+  would have carried t3code. A target naming no `trackers` still ships the
+  `public` ones. A target that relied on a public tracker shipping beside the
+  ones it names has to name it now.
+
+- A mounted tracker's history stays in its own repo: a mount joins the view
+  as one ordinary commit, and each `newgit pull` as one more
+  ([#144](https://github.com/Spheroman/newgit/issues/144)).
+
+  Importing t3code put 8,164 of its commits into newgit's history and onto
+  the public mirror, through a `git subtree`-shaped merge with the child's
+  commits replayed under the mount. No view reaches a child's commits now,
+  so `git log`, `git blame`, and `git bisect` under a mount stop at the
+  import and at each pull; the child's own repository has the rest.
+
+- A linked project root's `origin` is the remote's Git endpoint, as a
+  workspace's is
+  ([#144](https://github.com/Spheroman/newgit/issues/144)).
+
+  A mirror that withholds a tracker has ids of its own, so `git pull` from
+  GitHub would bring in commits that are not the project's. `newgit remote
+  add` sets this, and a project linked earlier moves the next time newgit
+  syncs its root. Each `branches = true` target becomes a remote for `gh`.
+
+  `git push` there publishes: pushing the project root's branch merges it
+  into `main` and exports to each target whose trackers changed, each
+  getting only its own. It used to go straight to GitHub, which would have
+  carried every tracker. Any other branch is refused.
+
+- `newgit tracker create <name> --git --path <path>` is one commit,
+  `Create tracker `<name>` at <path>`, that moves the files into the new
+  tracker and pins its first commit; history before it stays in root
+  ([#201](https://github.com/Spheroman/newgit/issues/201)).
+
+  Carving used to split the paths' history out of root, commit by commit,
+  and recompose every view. That rewrote tracker history each time and
+  needed every branch of root carved too. A carve commit rewrites nothing
+  and changes no id. The cost: rooted at the new tracker alone, its history
+  starts at the carve. Carving with history can come back as an explicit
+  rewrite if a case needs it.
+
+- A workspace's history is composed from pinned trackers: each root commit
+  records the commit of every tracker in Git it mounts (a gitlink at
+  `.newgit/pins/<name>`), and root's history is the view's shape, one root
+  commit per view commit ([#201](https://github.com/Spheroman/newgit/issues/201)).
+
+  Compose used to interleave every tracker's commits by committer date and
+  recover their order from `Newgit-Split-Parent` trailers. That worked for
+  trackers carved out of one project and broke for any history from
+  elsewhere: an imported repository landed under newgit's own commits and
+  every id after it changed. Now the parent says which commit of the child
+  it holds, and nothing is inferred. Trackers store their files relative to
+  their own root, so one tracker can be mounted by two parents, and an
+  imported repository is stored as it is. A child's changes split from the
+  same commit come back inline; history from anywhere else comes in as a
+  `git subtree`-shaped merge, so `git log -- <path>`, `blame`, and `bisect`
+  stay real through it. Split walks every parent, so a merge inside the
+  work being split is kept rather than flattened, and a commit touching two
+  trackers stays one commit wherever it is merged. The date interleave and
+  `Newgit-Split-Parent` are gone.
+
+- `newgit merge` makes the merge commit in your view and commits it at
+  root's ref ([#201](https://github.com/Spheroman/newgit/issues/201)).
+
+  A merge used to be made tracker by tracker and recorded as a list in the
+  remote's Durable Object. Now a merge is a view commit split like any
+  other: each tracker's files are merged by `git merge-tree` (a conflict
+  moves nothing and names each file's tracker), the root commit moves by
+  one compare-and-swap, and each child's `main` catches up with what root
+  pins. A signed merge commit of yours comes back as itself. Before the
+  push, the remote asks Git, in its endpoint's container, how each child's
+  pin moves: forward along that child's `main` needs root's maintainers,
+  anything else needs the child's; and before it writes the new index, it
+  checks root's pushed commit pins exactly that. A merge into a branch
+  other than `main` keeps a child's commit on the child's branch of that
+  name and moves no child's `main`. On the
+  remote a branch is root's ref, and the list is an index written after it
+  moves. Merge stacking by tracker (`--only`) is not coming: with the root
+  as spine, a partial merge would be a cherry-pick with new ids.
+
+- A tracker definition says whether it is in Git with `git`, not whether it
+  is secret with `secret`; `newgit tracker create --code` is now `--git`.
+
+  There is one kind of tracker. `secret` mixed two things: whether the
+  content is committed with Git, and how sensitive it is. Sensitivity is the
+  `audience`; what is left is where the content lives, and plenty of content
+  that is not sensitive belongs outside Git too (agent notes, a public page,
+  db snapshots). `git = true` is what `secret = false` was; the default,
+  `git = false`, keeps today's fail-closed behaviour, and the key is written
+  only when `true`. Behaviour does not change, but a definition still saying
+  `secret` is refused like any unknown key, so rewrite `secret = false` as
+  `git = true` in `.newgit/trackers/*.toml` (and delete `secret = true`).
+  `newgit tracker list` shows a `GIT` column in place of `KIND`.
+
+
+### Removed
+
+- Replaying a child's commits under its mount, and the merge that carried
+  them into a view
+  ([#144](https://github.com/Spheroman/newgit/issues/144)).
+
+  A view is now one commit per root commit, with nothing beside it.
+
+- The `project` tracker is gone: `.newgit/` is ordinary content of `root`,
+  and `access` is mounted at `.newgit/trackers`
+  ([#201](https://github.com/Spheroman/newgit/issues/201)).
+
+  `project` existed only to hold `.newgit/` apart from the code, and with
+  mounts there is no reason to: whoever may merge root may change its
+  resources and scripts, as before. Exporting `root` therefore ships
+  `.newgit/` (config, resources, scripts, export targets); only
+  `.newgit/trackers/` follows `access`'s audience, so an export target that
+  mirrored `"project"` should drop it. `{{bound.trackers}}` no longer hides
+  `project`. `newgit init` writes `root` and `access`; an existing project
+  runs `newgit tracker migrate`.
+
+
+### Fixed
+
+- An instance's first push no longer copies a tracker it never touched
+  ([#144](https://github.com/Spheroman/newgit/issues/144)).
+
+  A tracker counted as changed whenever its commit was not `main`'s, so an
+  instance behind `main` forked whatever `main` had moved since it spawned,
+  which took nine minutes for Spheroman/t3code. Now a tracker still at the
+  commit the instance last shared with `main` has nothing to send.
+- A merge whose check takes many minutes on the remote finishes
+  ([#144](https://github.com/Spheroman/newgit/issues/144)).
+
+  The remote checks a merge by running Git over every tracker it moves, and
+  the first time a large history is there (Spheroman/t3code, 365 MiB) that
+  took longer than the fifteen minutes `newgit merge` waited for an answer,
+  so every finish timed out. The remote now runs its checks in the
+  background and answers `202 {"checking": true}` until they end; `newgit
+  merge` asks again every ten seconds, says once a minute that it is still
+  waiting, and gives up after an hour. The merge's lock holds while it asks,
+  and the check's read passwords last as long as the check may run.
+
+  A fetch the remote drops is now tried whole twice more before newgit
+  fetches it in steps, and the steps start at 2048 commits rather than 256:
+  for t3code, five minutes whole against over half an hour in small steps.
+
+- An instance's first push of a large tracker no longer fails partway through
+  the remote's copy ([#144](https://github.com/Spheroman/newgit/issues/144)).
+
+  When Artifacts dropped the fetch, the copy stepped through bands in
+  `trackers.git`, and another fetch there collided with it: `shallow file has
+  changed since we read it`. A copy now has its own store, so a merge's check
+  never sees a shallow history, and only one stepped fetch runs in a store at
+  a time.
+
+- A first fetch after a deploy no longer fails on a project with a large
+  tracker ([#144](https://github.com/Spheroman/newgit/issues/144)).
+
+  The first fetch composes the view inside `info/refs`, which took longer
+  than the five minutes a request gets with no response started, so it died
+  with `Network connection lost` and an HTTP 500. `info/refs` now starts its
+  response at once and sends the body when the view is ready. The Git
+  endpoint's container also runs as `standard-1` now: 4 GiB of memory, half a
+  vCPU, and 8 GB of disk.
+
+- `git fetch` from the Git endpoint no longer waits for every tracker's
+  whole history ([#144](https://github.com/Spheroman/newgit/issues/144)).
+
+  A view needs a child's files at each pinned commit, not its history, so
+  the container now fetches root's history and each pinned commit, one
+  commit deep. Spheroman/t3code (365 MiB) made the first fetch after every
+  deploy wait five minutes when it worked and over forty when Artifacts
+  dropped it. Compose reads no child's parents anywhere, on the client too,
+  so a reader of a child who may not read something that child mounts can
+  see a commit's real message where they used to see `Update <tracker>`. A
+  merge's checks, a fork's copy, and a mirror's pull still fetch whole
+  histories, into a store of their own, in the background.
+
+- An error on the remote's side names the request it answered, and a
+  fork's Artifacts error says what it was
+  ([#144](https://github.com/Spheroman/newgit/issues/144)).
+
+  A push that failed with "the newgit remote refused (500): internal error"
+  gave no way to tell which of its requests failed. A 5xx now names the
+  call (`on POST /v1/…/fork`), and every Artifacts call an instance's fork
+  makes, the look-ups included, answers with Artifacts' code and message.
+
+- Fetching a tracker history too big for the remote to send at once works
+  ([#144](https://github.com/Spheroman/newgit/issues/144)).
+
+  Cloudflare Artifacts fails a fetch of all of Spheroman/t3code (365 MiB)
+  with an HTTP 500 (`expected 'packfile'`), so the remote could not check a
+  merge that brought t3code in, and could not have served a clone of it.
+  When the remote drops a fetch, newgit now fetches the tips and deepens
+  band by band until nothing is shallow, halving a band the remote still
+  drops; a store left shallow by an interrupted fetch carries on deepening
+  on the next.
+
+- `newgit init` in a clone of a project's GitHub mirror joins the project
+  instead of quietly becoming a separate one
+  ([#144](https://github.com/Spheroman/newgit/issues/144)).
+
+  A mirror carries `.newgit/config.toml` with `[remote]` in it, so `init`
+  made a local project with its own root history and no mounted trackers
+  while `newgit remote show` still read as linked. A member now ends where
+  `newgit clone` ends, in place, and uncommitted changes or commits `main`
+  does not contain stop it before anything moves. Not logged in, it says to
+  log in. Anyone else gets a local copy that says it is not linked, in
+  `init` and in `remote show`, and acts as a project with no remote, except
+  that it will not export to the project's mirror. Projects with no
+  `[remote]` are unchanged.
+
+- A merge's lock lasts as long as the remote takes to check it
+  ([#144](https://github.com/Spheroman/newgit/issues/144)).
+
+  The remote checks a merge's index by running Git over every tracker it
+  moves, and the first time a large history is there (Spheroman/t3code,
+  365 MiB) that takes longer than the ten-minute merge lock. The lock ended
+  while the check ran, and the finish was refused with "you hold no merge".
+  The finish now extends the caller's lock for twenty minutes before the
+  check, longer than the client waits.
+
+  The endpoint also now keeps what a merge's check fetched. It snapshotted
+  its store before sleeping only after composing a view, so a check's fetch
+  of t3code was lost and every later merge fetched all of it again.
+
+- A merge whose finish failed after root's ref moved finishes on the next
+  `newgit merge`
+  ([#144](https://github.com/Spheroman/newgit/issues/144)).
+
+  A timeout or a 502 between pushing root's commit and the remote recording
+  the merge left root's ref ahead of the index, and every later merge was
+  refused as "another merge is landing". When root's ref already holds this
+  merge's own commit, the merge now finishes it. The calls where the remote
+  runs Git over the merge's trackers wait up to 15 minutes instead of 60
+  seconds, since the first look at a large history takes minutes, and a
+  check that fails says why.
+
+- Publishing an imported tracker no longer mistakes its files for those of
+  a tracker outside Git
+  ([#144](https://github.com/Spheroman/newgit/issues/144)).
+
+  A tracker stores its files at its own root, so an imported t3code's
+  `AGENTS.md` is `apps/t3code/AGENTS.md` in the view. The push gate judged
+  it as the `AGENTS.md` agent notes own at the top and refused
+  `newgit merge main`. It now judges a mounted tracker's commits under its
+  mount, as the import already did.
+
+- Publishing a tracker history too big for one push to the remote works
+  ([#144](https://github.com/Spheroman/newgit/issues/144)).
+
+  Cloudflare Artifacts refuses any one push over 64 MiB, and drops some
+  pushes that bring several large new files at once. Spheroman/t3code packs
+  to 365 MiB, so publishing it was refused. When the remote refuses or drops
+  a push, newgit now sends the history along its first-parent line in steps
+  on a temporary `newgit-staging` branch. Steps are sized from what the
+  remote reports, halved when one is refused, and grown back after one gets
+  through. A single commit the remote still will not take has its large
+  files sent ahead one per push. Then comes the same leased push, and the
+  staging branches are deleted.
+
+- A clone of a large tracker no longer loses its credential part way
+  ([#144](https://github.com/Spheroman/newgit/issues/144)).
+
+  A stepped fetch of Spheroman/t3code outlasted the fifteen-minute read
+  credential and failed. Read credentials now last an hour; each is still
+  revoked with the login or instance it was minted for.
+
+- Every push to the remote steps when it is too big, not only a merge's
+  ([#144](https://github.com/Spheroman/newgit/issues/144)).
+
+  `newgit remote add` seeds each tracker, a checkpoint sync sends its
+  trackers, and an instance's fork gets its work, all with plain pushes,
+  which did not step. Creating a project with Spheroman/t3code in it was
+  refused at 359 MiB against Artifacts' 64 MiB. A plain push the remote
+  refuses or drops now stages each commit it sends in steps, then pushes
+  again.
+
+- An instance's fork of a large tracker is made by newgit.dev itself, and a
+  sync waits for it
+  ([#144](https://github.com/Spheroman/newgit/issues/144)).
+
+  Artifacts' own fork of Spheroman/t3code (365 MiB, 8,164 commits) never
+  finished: it said `FORK_IN_PROGRESS` for hours, so the first push from an
+  instance that changed it never landed. The remote no longer uses it. It
+  makes the fork as an empty repo and has its Git endpoint's container copy
+  the tracker's branches in, with the fetch and push that already step
+  through large histories (`newgit endpoint-copy`). The fork route answers
+  `202 {"forking": true}` while the copy runs, and the client asks again,
+  saying once a minute that it is still forking. A copy that dies part way
+  is carried on the next time, never handed out half done; one that fails
+  answers 502 with Git's or Artifacts' own error. A fork left stuck by
+  Artifacts' fork is deleted and made again.
+
+  Every fork takes this path, so a small tracker's first fork now waits
+  for the endpoint's container to wake and for at least one 5-second poll,
+  where Artifacts' fork took 5–22 s.
+
+- A rendered file stays out of `git status`, `git add -A` and checkpoints
+  while a tracker in Git is dropped.
+
+  newgit keeps an instance's values out of Git by marking each rendered
+  file `--skip-worktree`. Dropping a tracker in Git that owns paths makes
+  the workspace a sparse checkout, and a sparse checkout decides that bit
+  itself: `sparse-checkout set` and `disable` work every file's bit out
+  again from the patterns, Git commands that update the working tree
+  (`reset --hard`, `stash`, `checkout`) do too, and reading the index
+  cleared the bit of every marked file Git found on disk. So once `tracker
+  drop` or `spawn --drop` had dropped one, and still after the `tracker
+  use` that bound it again, `git status` showed the rendered file as
+  modified, an agent's `git add -A && git commit` committed this
+  instance's port, and a checkpoint held it as uncommitted work: `newgit
+  checkpoint` printed `+ uncommitted changes` with nothing else changed,
+  and an undo to that checkpoint printed `+ uncommitted changes
+  reapplied`. An agent's `git reset --hard` put the committed value back
+  on disk, and `git rebase` refused over unstaged changes. And while one
+  tracker in Git was dropped, `tracker drop` refused another whose paths
+  held a rendered file, as uncommitted work.
+
+  The sparse patterns now leave the rendered files out too, the workspace
+  sets `sparse.expectFilesOutsideOfPatterns` so that Git keeps the bit of
+  such a file, and a checkpoint sets it again for its own `git add -A`. An
+  instance whose tracker in Git an earlier newgit dropped gets the patterns
+  and the setting at its next `tracker drop` or `tracker use` of a code
+  tracker, or the next undo (without `--only`), `tracker checkout` or
+  `tracker pull`, which render again. Until then `git status` there still
+  shows the rendered file, but its checkpoints no longer hold it.
+
+  The setting also keeps the bit on a dropped tracker's file that is
+  written into the working tree again. `git status` no longer shows an
+  edit to it, and `tracker drop` of a tracker whose paths hold it no
+  longer refuses over it. A checkpoint still names it and `undo` still
+  refuses over it, since they look past that bit, and `tracker use`
+  brings it into view as a modification.
+
+
+### Security
+
+- The remote caps how many projects one login may own
+  (`PROJECTS_PER_LOGIN`, 5 by default), shuts out anyone in
+  `BLOCKED_LOGINS` even when `ALLOWED_LOGINS` is `*`, and lets the
+  logins in `ADMIN_LOGINS` delete any project.
+
+  newgit.dev is now open to any GitHub account. Without these, anyone
+  could create unlimited projects (each with its own repos and Git
+  endpoint container) on the operator's bill, and nobody could remove
+  them or keep the person out.
+
+- The remote pauses itself for everyone but its admins while the last 7
+  days' Cloudflare bill is over `SPEND_LIMIT_WEEKLY_USD` ($10 unless set),
+  and reopens on its own once it falls back under.
+
+  Cloudflare offers no hard spending cap, and newgit.dev is open to any
+  GitHub account. An hourly cron reads the Billable Usage API (it needs a
+  `BILLING_TOKEN` with Billing: Read); the numbers lag about a day, so this
+  bounds a runaway rather than stopping at the cent.
+
 ## [0.8.1] — 2026-10-30
 
 Publishing a shared secret tracker is now one merge: `newgit tracker
@@ -3022,7 +3531,8 @@ themselves and neither of which is a reason to re-spawn:
   fresh field it has not. One successful `undo`, or one `newgit checkpoint
   --verify`, clears it for good.
 
-[Unreleased]: https://github.com/Spheroman/newgit/compare/v0.8.1...HEAD
+[Unreleased]: https://github.com/Spheroman/newgit/compare/v0.9.0...HEAD
+[0.9.0]: https://github.com/Spheroman/newgit/compare/v0.8.1...v0.9.0
 [0.8.1]: https://github.com/Spheroman/newgit/compare/v0.8.0...v0.8.1
 [0.8.0]: https://github.com/Spheroman/newgit/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/Spheroman/newgit/compare/v0.6.0...v0.7.0
