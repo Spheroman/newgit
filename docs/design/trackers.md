@@ -158,8 +158,28 @@ tracker you root at. Split assigns paths by this rule **(decided)**:
    that changes it.
 
 A tracker carved inside another tracker's mount (`apps/electron/native`
-while `electron` is mounted at `apps/electron`) is a deeper mount of root's,
-not a child of `electron`: root defines it and pins it.
+while `electron` is mounted at `apps/electron`) is a child of `electron`
+**(decided 2026-11-06, replacing "a deeper mount of root's")**: `electron`
+defines it in its own `.newgit/trackers/`, mounted relative to itself, and
+its commits pin it, so it goes wherever `electron` goes. Rooted at `electron`
+the view still holds those files. Defined by root instead, the only commit
+that could say which pin went with which of `electron`'s commits was root's,
+and `electron`'s repository, exported on its own, lost the files.
+
+Who may change that definition is who may change `electron`: the file is
+`electron`'s, by the same rule as any definition. A name `access` has a file
+for is never taken by a nested definition, even if that file does not parse,
+and names are unique across a project. Only a tracker in Git is defined
+inside another, and it needs a `mount` of its own.
+
+**A child exists only in its parent (decided 2026-11-06).** `native` is bound
+only where `electron` is: dropping `electron` drops it and says so, and asking
+for `native` by name brings `electron`. Where the parent is bound, the child's
+own `priority` decides as usual: `-1` keeps it out until asked for, and
+anything else brings it along, on `tracker use electron` too. So a large
+directory can stay out of workspaces that want its parent, and with both at
+`-1`, `tracker use electron` brings only `electron`. A tracker root defines
+deep inside another is not its child, and stays when what surrounds it goes.
 
 **The definition is the `.gitignore`.** Generating the view's `.gitignore`
 from claims, and turning an agent's edit of it into a definition change, is
@@ -293,12 +313,82 @@ tracker store's refs do.
 **Trackers outside Git may have a `mount`** but are never pinned. Their state
 stays in the instance's binding record and in checkpoints.
 
+### Snapshots
+
+A view needs a child's files at each commit root pins, never the child's
+history, so `newgit clone` fetches root's whole history and each commit it
+pins `--depth=1`, by id. `--full` fetches every history up front instead,
+for someone who knows they will work in a child.
+
+- **The project repo is the shallow store.** It is where composing and
+  splitting run, and it has to be able to push, so it holds a real `shallow`
+  file: Git then treats a pin as a commit with no parents everywhere, `gc`
+  and `fsck` included. `refs/newgit/snapshots/<tracker>/<commit>` keeps each
+  pin alive and says whose it is. This differs from the remote's
+  `compose.git` + `snapshots.git` ([remote.md](remote.md), *Fetching what a
+  view needs*) for a reason: `compose.git` reads through an alternate and
+  never fetches, and the project repo fetches all the time. A store that
+  fetches must not have a shallow alternate.
+- **`trackers.git` is never shallow**, so a tracker held as snapshots has no
+  refs there until its history arrives. A workspace is a clone of view
+  commits, none of which reach a child commit, so it is whole. A project
+  with a `shallow` file is cloned over Git's pack transport rather than by
+  hardlinks, which costs the first spawn a copy of the view.
+- **A tracker is held as snapshots while one of its snapshot refs is in
+  `shallow`.** There is no second record to disagree with Git, and a project
+  that never had snapshots is never shallow, so a full clone and every
+  project cloned before this behave as they always did.
+- **A snapshot does not deepen by accident.** `fetch_refs` carries on
+  deepening a store left shallow by a stepped fetch; it ignores commits
+  under `refs/newgit/snapshots/`, so an ordinary fetch leaves them alone. A
+  fetch into the project stops at a shallow commit, so bringing `main` on top
+  of a pin costs its new commits. Bringing any other branch of a tracker
+  would cost its whole history, so a project holding snapshots fetches only
+  the branches a command asks about.
+- **A commit already here is never fetched `--depth=1`**: root's own history
+  is fetched first, and a commit root shares with a child stays whole. A
+  shallow commit that later lands on root's history would end it, so root's
+  walk checks for one and fetches that tracker's history.
+- **A new pin arrives before it is composed.** Composing leaves out a pin it
+  cannot find, so before composing, `bring_pins` fetches every snapshot root's
+  history lacks.
+
+- **A remote may refuse a push from a shallow repo.** `git push` names every
+  entry in `shallow`. When one that looks refused fails, every tracker held as
+  snapshots gets its history, which empties the file, and the push runs once
+  more, saying so. Pushing from the outbox instead is no way round it: it
+  borrows these objects through alternates without the `shallow` file.
+
+**History arrives in one place, `need_history`.** It fetches the tracker
+whole into `trackers.git`, where a dropped fetch steps and resumes as any
+whole fetch does, and `--unshallow`s the project from there, which deepens
+only what that store knows, so every other tracker stays a snapshot. It says
+`fetching t3code's history from newgit.dev; this happens once`, and it does.
+
+The rule for what calls it: Git's "yes" is right on a snapshot, since a commit
+reachable from another is an ancestor however short the walk. Its "no" means
+nothing. An instance commit under a mount needs only its pin as a parent, so
+split, checkpoint, push, and an ordinary merge fetch no history.
+
+| Asks about history | What happens on a snapshot |
+|---|---|
+| A child's `main` moved past the pin, and the merge has to join them | Asks both ways round; neither → `need_history`, then `git merge-tree` |
+| A split where a view merge joins two lines of a child, with a tree equal to one of them | Asks whether that one descends from the other; "no" → `need_history` |
+| `newgit pull <tracker>` | Fast-forward: no history, `follow` lands on the pin and is counted. Otherwise `need_history`, so a pin is never moved backwards |
+| `newgit pull --remote` from a rooted target, a rooted export, `newgit log <tracker>`, `tracker migrate` | `need_history` first: each walks the history itself |
+| `spawn --from-checkpoint` | A plain fetch from the author's fork stops at the pin, so the checkpoint's commits are whole enough to push on; other pins come from the tracker's repo; no history unless root's walk reaches a snapshot |
+| A tracker's commits judged before a push | Stops at the pin, which is what the remote already holds |
+| Which tracker an instance touched, for where its branch is exported | Asks both ways round; neither → `need_history`. A false "touched" would send the branch to the wrong repo |
+| "Is this tracker behind?" at spawn, an export's "unmerged" | Advisory: a false "no" says less or names a tracker it need not. Decides nothing |
+
 ### Compose
 
-Compose is defined over views, recursively: a child's view (rooted at the
-child) is composed first, and what a parent mounts is that view. A
-grandchild's history therefore reaches the root exactly as it reaches the
-child.
+Compose walks one history, the root's. A child is expanded at each commit
+that history pins, and a grandchild at each commit those pin: a child's tree
+with its own pins expanded is what a parent mounts. No child's parents are
+read, so a store holding root's history and each pinned commit composes the
+same ids as one holding every history. The remote relies on this (*Fetching
+what a view needs* in [remote.md](remote.md#fetching-what-a-view-needs)).
 
 For a view rooted at tracker `T`, for a reader who may read some set of
 trackers **(decided)**:
@@ -314,7 +404,7 @@ trackers **(decided)**:
      trailers stripped and the recorded headers put back. When `R` holds
      none of `T`'s own changes, and a child commit holds the work (see
      *Split*), the metadata comes from that child commit: the child whose
-     pin moved at a commit split from a view commit.
+     pin moved at a commit split from a view commit, read as it stands.
 3. **A child is its tree at the pin, never its history (decided
    2026-11-05).** A tracker's history stays in its own repo, and no view
    reaches it. Two things can happen at `R`, and both are one view commit:
@@ -333,11 +423,19 @@ trackers **(decided)**:
 4. **Readers.** A child the reader may not read is left out of the tree, and
    so is everything mounted inside it. A single-parent view commit whose only
    change was to such a child is dropped, and the commit after it moves onto
-   its parent. A merge goes the same way only when its sides differ in such
+   its parent. Only a pin of `T` itself counts: a commit moving a child they
+   may read, whose move changed only something mounted inside that child,
+   stays, with no change to its tree, because telling would take the child's
+   history. A merge goes the same way only when its sides differ in such
    a child and what is left adds nothing to one parent: the side that moved
    the pin was dropped, so there is nothing to join. Any other merge stays.
    Someone who cannot read a tracker sees different ids from the first commit
    that touched it (see *One name for a commit*).
+
+   A pin counts if its tracker's repo serves that commit, whether or not a
+   branch reaches it **(decided)**: the reader may read that tracker anyway,
+   and a merge's check on a pin is unchanged. So a commit force-pushed away
+   stays reachable through a pin until the remote garbage-collects it.
 5. **Originals are reused.** Commits are written byte for byte, so when
    `V(R)`'s parents, tree, and metadata come out as the view commit `R` was
    split from (its `Newgit-Split`), compose emits that object, signature and
@@ -661,8 +759,8 @@ composes the view rooted there. Resources come from the trackers in that
 view. A tracker that mounts nothing in Git composes to its own history
 unchanged. One that does composes like any root (its pin-only commits
 rebuilt with their children's metadata), so its view is no longer its raw
-history. While that is so, it can't be exported as its own root (an export
-target's `root` refuses, naming the child).
+history. That is the view an export target's `root` ships, children and all
+(*GitHub is an export*).
 
 **A root that `requires` its parent** (rooting at `electron`, which needs the
 workspace `package.json`) is an error naming the parent to root at instead
@@ -700,8 +798,13 @@ paint them into a corner:
   branch heads, and per-audience registries stay as the #201 comments
   propose. They are a remote redesign, later. The root's ref as the commit
   point already answers #201 item 3 for one root.
-- **Remote naming** flattens to `<owner>/<tracker>` with that redesign. Today
-  it is `<owner>/<project>`.
+- **Remote naming** follows a tracker's home with that redesign **(decided
+  2026-11-06, replacing a flat `<owner>/<tracker>`)**: `spheroman/newgit`,
+  `spheroman/newgit/t3code`, `spheroman/newgit/t3code/repos`. A tracker has
+  one home and so one name, and any number of mounts; mounting never changes
+  the name, and moving it to another home is a rename, with a redirect.
+  `Spheroman/t3code` on GitHub is an export target, nested no deeper only
+  because GitHub cannot. Today a name is `<owner>/<project>`.
 - **A fork keeps its upstream's audience as a ceiling** (#227), unchanged.
 
 **#202.** The four decisions this design leaves room for: mounts accept a
@@ -845,7 +948,12 @@ not shown, so the target's ids differ from the view's from the first commit
 that touched it. With `root = "<tracker>"` the target
 gets the view rooted at that tracker instead: the tracker's own `main`, its
 files at the top, which for a tracker that mounts nothing in Git is its
-history unchanged (#141). GitHub never holds a tracker the export
+history unchanged (#141). What it mounts ships with it, since the repository
+holds those files as its own, so carving a directory out of a tracker changes
+nothing in its export but the one definition file. `root` names only the
+tracker, so a child whose audience is narrower than the root's (and is not
+`public`) refuses the export, naming it: leaving it out would lose files, and
+sending it would pass its audience. GitHub never holds a tracker the export
 did not include, so `.env` files can live in the project and never reach a
 public mirror.
 
@@ -936,10 +1044,14 @@ named and skipped.
   an export target pushes t3code's own `main`, composed rooted at it. While
   t3code mounts nothing in Git, that is its own history, so the first export
   is a no-op fast-forward of Spheroman/t3code, ids and signatures intact.
-  Refused while it mounts a tracker in Git.
+  Once it mounts one, commits from then on are the view's, with the child's
+  files in place and ids of their own.
 - **#142 (pull from a target):** *done.* `newgit pull --remote t3code`
   fetches, fast-forwards or merges t3code's `main`, then moves its pin in
-  the project root as `newgit pull t3code` would. For Spheroman/newgit, its
+  the project root as `newgit pull t3code` would. When t3code mounts
+  trackers, what comes back is view commits, so it is split first: each file
+  goes to the tracker that owns it, an upstream's plain commits and a merge
+  of them included. For Spheroman/newgit, its
   commits are view commits: ours are recognised by id, by the note on each
   exported commit, or by the canonical notes, and the rest come into the
   project root as ordinary work, split when `newgit merge main` publishes.
@@ -1119,8 +1231,8 @@ this is the list.
   governance layers by mounting a tracker beside `access` at
   `.newgit/trackers`, claiming the definition files it governs; `tracker
   create --git --path .newgit/trackers/x.toml` is no longer the way. Carving
-  inside another tracker's mount makes a deeper mount of root's, not a child
-  of that tracker.
+  inside another tracker's mount makes a child of that tracker (*Who owns a
+  path*).
 - **Trackers outside Git may have a `mount`.** They are never pinned.
 - **Split refuses more than the design listed:** unowned paths (every claim
   excludes them) and paths owned by a tracker outside Git, besides unbound

@@ -1,5 +1,6 @@
-# The GitHub mirror: every tracker in Git ships, so commit ids match newgit's,
-# and each workspace push lands its branch here for `gh pr create`.
+# The GitHub mirror: only newgit's own trackers ship. t3code goes to its fork,
+# through exports/t3code.toml. Each workspace push lands its branch here for
+# `gh pr create`.
 url = "Spheroman/newgit"
 trackers = ["root", "access"]
 branches = true

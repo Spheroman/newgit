@@ -19,6 +19,7 @@ pub mod ports;
 pub mod remote;
 pub mod render;
 pub mod resource;
+pub mod snapshots;
 pub mod source;
 pub mod store;
 pub mod supervisor;

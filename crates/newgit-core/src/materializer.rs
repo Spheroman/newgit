@@ -2,6 +2,7 @@ use std::collections::BTreeSet;
 
 use camino::{Utf8Path, Utf8PathBuf};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::branch::BranchInstance;
 use crate::error::{NewgitError, Result};
@@ -20,6 +21,28 @@ pub trait Materializer {
 /// root. A slug never starts with a dot, so it cannot name an instance.
 pub const SOURCE_TEMPLATE_DIR: &str = ".source-template";
 
+/// What a sparse template's directory name starts with.
+pub const SPARSE_TEMPLATE_PREFIX: &str = ".source-template-";
+
+/// The template for workspaces with sparse patterns `sparse`, beside the full
+/// one at `template`: `template` itself when they leave nothing out. One per
+/// binding, since cloning a template is one call and leaving 29,000 files out
+/// of a full copy afterwards is one unlink each.
+pub fn template_for(template: &Utf8Path, sparse: &[String]) -> Utf8PathBuf {
+    if sparse.is_empty() {
+        return template.to_path_buf();
+    }
+    let digest = Sha256::digest(sparse.join("\n").as_bytes());
+    let key: String = digest[..6]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    let name = format!("{SPARSE_TEMPLATE_PREFIX}{key}");
+    template
+        .parent()
+        .map_or_else(|| name.clone().into(), |parent| parent.join(&name))
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct RealDirMaterializer {
     /// The checkout to clone workspaces from (see
@@ -33,10 +56,14 @@ impl RealDirMaterializer {
     /// fallback gives the same workspace, only slower, so it is a warning
     /// rather than an error; but a template that fails on every spawn costs
     /// its own rebuild on top of the clone, and should not do that silently.
+    ///
+    /// `sparse` is the binding's sparse-checkout patterns: what they leave
+    /// out is never written.
     pub fn materialize_reporting(
         &self,
         source: &GitSource,
         branch: &BranchInstance,
+        sparse: &[String],
     ) -> Result<Option<String>> {
         if branch.workspace_path.exists() {
             return Err(NewgitError::WorkspaceExists(branch.workspace_path.clone()));
@@ -45,7 +72,7 @@ impl RealDirMaterializer {
             create_dir_all(parent)?;
         }
         let Some(template) = &self.source_template else {
-            source.clone_to(&branch.source_ref, &branch.workspace_path)?;
+            source.clone_to(&branch.source_ref, &branch.workspace_path, sparse)?;
             write_workspace_marker(source.root(), branch)?;
             return Ok(None);
         };
@@ -53,15 +80,16 @@ impl RealDirMaterializer {
         // keeps it from working, `clone_to` still does.
         let fallback = source
             .clone_via_template(
-                template,
+                &template_for(template, sparse),
                 &branch.source_ref,
                 &branch.source_rev,
                 &branch.workspace_path,
+                sparse,
             )
             .err()
             .map(|error| error.to_string());
         if fallback.is_some() {
-            source.clone_to(&branch.source_ref, &branch.workspace_path)?;
+            source.clone_to(&branch.source_ref, &branch.workspace_path, sparse)?;
         }
         write_workspace_marker(source.root(), branch)?;
         Ok(fallback)
@@ -70,7 +98,7 @@ impl RealDirMaterializer {
 
 impl Materializer for RealDirMaterializer {
     fn materialize(&self, source: &GitSource, branch: &BranchInstance) -> Result<()> {
-        self.materialize_reporting(source, branch).map(|_| ())
+        self.materialize_reporting(source, branch, &[]).map(|_| ())
     }
 
     fn remove(&self, branch: &BranchInstance) -> Result<()> {

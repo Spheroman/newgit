@@ -67,6 +67,17 @@ newgit spawn auth-refactor                        # deps installed, dev server u
 When you like the result, run a plain `git push` from the workspace. It
 checkpoints the instance and publishes to your real remote.
 
+Joining a project that is already on newgit? Clone it from GitHub like any
+repo, log in, and run `newgit init`. If you are a member, you end up exactly
+where `newgit clone` puts you, with its mounted trackers in place. (If not,
+you get a local copy that says it isn't linked.)
+
+```sh
+git clone https://github.com/acme/widget && cd widget
+newgit login
+newgit init
+```
+
 Or hand the setup to your coding agent: tell it to set newgit up, and it
 will find `newgit reference agents`, which walks it through finding what your
 project needs, asking you about it, and proving the result with a real spawn.
@@ -127,7 +138,7 @@ curl -fsSL https://newgit.dev/install.sh | sh
 ```
 
 The script picks the prebuilt binary for your OS and architecture, verifies
-its checksum, and puts it in `~/.local/bin`. Set `NEWGIT_VERSION=v0.8.1` to
+its checksum, and puts it in `~/.local/bin`. Set `NEWGIT_VERSION=v0.9.0` to
 pin a release or `NEWGIT_INSTALL_DIR` to put it elsewhere.
 
 Or with Homebrew, on macOS or Linux:

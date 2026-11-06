@@ -405,7 +405,12 @@ its time checking files out (2.3s of 2.5s on T3 Code's 28.6k files).
 newgit keeps one clean checkout of the project repository beside the
 workspaces, `<workspace root>/.source-template`, with no local branches.
 `spawn` fetches it from the project repository, checks out the instance's
-revision, and copies the whole tree with one `clonefile(2)`. Then the copy
+revision, and copies the whole tree with one `clonefile(2)`. An instance that
+leaves trackers out is copied from a template of its own binding,
+`<workspace root>/.source-template-<key>`, sparse from before its first
+checkout: nothing it leaves out is written, so leaving files out makes a spawn
+faster, not slower. The same goes for a plain `git clone`, where there is no
+template. `newgit cleanup` removes a template no live binding uses. Then the copy
 gets its own branch, with the upstream `git clone --branch` would set, and
 `core.checkStat=minimal` plus `core.trustctime=false`. Without those two
 settings Git would re-hash every file on the first `git status`, because
@@ -749,6 +754,34 @@ dependencies are bound, just before `prepare`, and again before a
 would see in its environment, so an Expo `.env` can name the Supabase
 resource's URL.
 
+**A render never writes through a link** (#283). Before writing any of a
+resource's files, it refuses one that is a symlink or lies under a
+symlinked directory, naming the path, the link, and its target. Through a
+symlinked directory the write would land wherever the link leads: any
+directory the user can write, in the workspace or not. Replacing a symlink
+at the path would discard it without a word. This is the write side of
+[capture's rule](#secret-trackers), judged the same way, with `lstat` and
+nothing followed. The bind fails as on any failed render, and a re-render
+after `undo`, `tracker pull`, or `tracker checkout` warns. A link that
+stays inside the workspace is refused too: it leads to a file other than
+the one the committed content describes, which would then carry this
+instance's ports into whatever captures or commits it. Taking a render's
+values back out, before a capture or when a resource is unbound, leaves a
+file reached through a symlink alone. Remove the link, and `newgit
+resource rebind` writes the file.
+
+A hard link cannot be told from a regular file, and a write into it would
+change every name it has, in the workspace or not. So a render, and taking
+its values back out or putting them back after a capture, opens the file
+without following a symlink at the path (`O_NOFOLLOW`) and judges the file
+it opened, not the path: nothing swapped in after the check is written. A
+file with one name is rewritten in place, so a process holding it open, or
+a container that bind-mounts it alone, sees the new content. A file with
+more than one name is replaced instead, by a temporary file beside the
+path renamed over it, as the install store does: its other names keep
+what they held, and the path gets a file of its own with the old one's
+mode.
+
 **A re-render does not reach a process already running.** A dev server
 reads `.env.local` when it starts. When `tracker use` binds a resource whose
 render rewrites that file, or a `drop` removes it with its tracker, the
@@ -945,7 +978,9 @@ restored from the checkpoint, such as a database loaded from its dump. It
 is built from parts that already exist: fetch, spawn at the checkpoint's
 head, then undo to the checkpoint. Its `autostart` actions start after the
 undo, since the restore stops and restarts processes to match the
-checkpoint.
+checkpoint. The new instance's workspace comes up on its own branch, made
+at the checkpoint's commit, even when the author's was on another branch
+or detached (#315).
 
 #### An incomplete spawn must say so
 

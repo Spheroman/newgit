@@ -134,17 +134,48 @@ impl GitSource {
 
     /// Materialize `branch` as a full standalone clone at `destination`.
     /// A local-path clone hardlinks objects; never `--shared`/`--reference`.
-    pub fn clone_to(&self, branch: &str, destination: &Utf8Path) -> Result<()> {
+    ///
+    /// With `sparse`, the patterns are set before anything is checked out,
+    /// so what they leave out is never written.
+    pub fn clone_to(&self, branch: &str, destination: &Utf8Path, sparse: &[String]) -> Result<()> {
+        if sparse.is_empty() {
+            return run_git(&[
+                "clone",
+                "--quiet",
+                "--branch",
+                branch,
+                "--",
+                self.root.as_str(),
+                destination.as_str(),
+            ])
+            .map(|_| ());
+        }
         run_git(&[
             "clone",
             "--quiet",
+            "--no-checkout",
             "--branch",
             branch,
             "--",
             self.root.as_str(),
             destination.as_str(),
-        ])
-        .map(|_| ())
+        ])?;
+        // `--force`: without it a file that cannot be written is an error on
+        // stderr and exit 0, and the workspace would silently lack it.
+        let checked_out = set_sparse(destination, sparse).and_then(|()| {
+            run_git(&[
+                "-C",
+                destination.as_str(),
+                "checkout",
+                "--quiet",
+                "--force",
+                branch,
+            ])
+        });
+        if checked_out.is_err() {
+            let _ = std::fs::remove_dir_all(destination);
+        }
+        checked_out.map(|_| ())
     }
 
     /// Materialize `branch` at `destination` by cloning `template`, a
@@ -177,12 +208,16 @@ impl GitSource {
     /// An error leaves nothing at `destination` and the caller falls back
     /// to `clone_to`. A template a Git command failed on is deleted and
     /// rebuilt by the next spawn.
+    ///
+    /// `sparse` is what `template` is checked out with, which the workspace
+    /// inherits (see [`crate::materializer::template_for`]).
     pub fn clone_via_template(
         &self,
         template: &Utf8Path,
         branch: &str,
         rev: &str,
         destination: &Utf8Path,
+        sparse: &[String],
     ) -> Result<()> {
         if let (Some(from), Some(to)) = (template.parent(), destination.parent())
             && !same_device(from, to)?
@@ -202,7 +237,7 @@ impl GitSource {
         lock.lock()
             .map_err(|source| NewgitError::io(&lock_path, source))?;
 
-        if let Err(error) = self.prepare_template(template, rev) {
+        if let Err(error) = self.prepare_template(template, rev, sparse) {
             let _ = std::fs::remove_dir_all(template);
             return Err(error);
         }
@@ -248,7 +283,7 @@ impl GitSource {
 
     /// Bring the template to `rev`, cloning it from the store first if it
     /// does not exist yet.
-    fn prepare_template(&self, template: &Utf8Path, rev: &str) -> Result<()> {
+    fn prepare_template(&self, template: &Utf8Path, rev: &str, sparse: &[String]) -> Result<()> {
         let git = |args: &[&str]| {
             let mut full = vec!["-C", template.as_str()];
             full.extend_from_slice(args);
@@ -272,6 +307,7 @@ impl GitSource {
                 self.root.as_str(),
                 template.as_str(),
             ])?;
+            set_sparse(template, sparse)?;
         }
         git(&["checkout", "--quiet", "--force", "--detach", rev])?;
         if fresh {
@@ -442,10 +478,16 @@ impl GitSource {
 
     /// Make the outbox's branches and tags exactly what `url` has now.
     pub fn sync_outbox(outbox: &Utf8Path, url: &str, auth: Option<&str>) -> Result<()> {
+        // The outbox borrows the project repo's objects. Git would send that
+        // repo's refs as `have`s, and a snapshot among them is not the
+        // complete history a `have` promises: the remote would leave out
+        // what the outbox lacks.
         run_git_env(
             &[
                 "-C",
                 outbox.as_str(),
+                "-c",
+                "core.alternateRefsCommand=true",
                 "fetch",
                 "--quiet",
                 "--prune",
@@ -734,13 +776,14 @@ impl GitSource {
     /// dangling commit on top of HEAD, without touching HEAD, the real
     /// index, or the worktree. Returns `None` when the worktree is clean.
     ///
-    /// Mechanics: a throwaway `GIT_INDEX_FILE` seeded from HEAD, `git add -A`
-    /// into it, `git write-tree`, and `git commit-tree` — all public
-    /// interface, nothing reaches into `.git` internals.
+    /// Mechanics: a throwaway `GIT_INDEX_FILE` holding HEAD (see
+    /// [`Self::seed_scratch_index`]), `git add -A` into it, `git write-tree`,
+    /// and `git commit-tree` — all public interface, nothing reaches into
+    /// `.git` internals.
     ///
     /// `rendered` paths are marked skip-worktree *in the throwaway index*.
-    /// The real index carries that bit already, but a fresh index seeded from
-    /// HEAD does not, so without this `git add -A` would sweep the instance's
+    /// The real index carries that bit already, but the seeded index has it
+    /// cleared, so without this `git add -A` would sweep the instance's
     /// rendered ports into the checkpoint — the one place skip-worktree does
     /// not protect on its own.
     ///
@@ -769,7 +812,11 @@ impl GitSource {
         let env = [("GIT_INDEX_FILE".to_owned(), index.to_owned())];
 
         let ws = workspace.as_str();
-        run_git_env(&["-C", ws, "read-tree", "HEAD"], &env)?;
+        if Self::seed_scratch_index(workspace, Utf8Path::new(index), &env).is_err() {
+            // Slower, not wrong: every file is hashed again.
+            let _ = std::fs::remove_file(index);
+            run_git_env(&["-C", ws, "read-tree", "HEAD"], &env)?;
+        }
         if !rendered.is_empty() {
             let mut args: Vec<&str> = vec!["-C", ws, "update-index", "--skip-worktree", "--"];
             args.extend(rendered.iter().map(|path| path.as_str()));
@@ -836,6 +883,83 @@ impl GitSource {
             &ident,
         )
         .map(Some)
+    }
+
+    /// Put HEAD in the throwaway index `index`, keeping what the workspace's
+    /// real index knows about the files on disk. `git read-tree HEAD` alone
+    /// makes an index with no stat data, so the `git add -A` after it reads
+    /// and hashes every tracked file, which on a 30,000-file project is
+    /// seconds on every checkpoint. Copying the real index keeps that data:
+    /// only files that actually changed are hashed.
+    ///
+    /// What the snapshot means must not change, so nothing of the real index
+    /// but its stat data survives:
+    /// - `read-tree --reset` puts HEAD's entries in, dropping what is staged,
+    ///   conflict stages and intent-to-add entries included; `-m` refuses
+    ///   those. An entry the same as HEAD's keeps its stat data.
+    /// - `--no-sparse-checkout` keeps the sparse patterns from being applied.
+    /// - skip-worktree and assume-unchanged bits are cleared, or an edit to a
+    ///   file carrying one would not be seen. The rendered paths are marked
+    ///   again by the caller.
+    /// - The copy keeps the original's mtime. Git trusts an entry only if it
+    ///   is older than its index file, which is how it notices a file edited
+    ///   in the second the index was written; a copy dated now would
+    ///   vouch for that file and the snapshot would miss the edit.
+    fn seed_scratch_index(
+        workspace: &Utf8Path,
+        index: &Utf8Path,
+        env: &[(String, String)],
+    ) -> Result<()> {
+        let ws = workspace.as_str();
+        let real = run_git(&[
+            "-C",
+            ws,
+            "rev-parse",
+            "--path-format=absolute",
+            "--git-path",
+            "index",
+        ])?;
+        let io = |source| NewgitError::io(index, source);
+        std::fs::copy(&real, index).map_err(io)?;
+        let modified = std::fs::metadata(&real)
+            .and_then(|real| real.modified())
+            .map_err(io)?;
+        std::fs::File::options()
+            .write(true)
+            .open(index)
+            .and_then(|copy| copy.set_modified(modified))
+            .map_err(io)?;
+        run_git_env(
+            &[
+                "-C",
+                ws,
+                "read-tree",
+                "--reset",
+                "--no-sparse-checkout",
+                "HEAD",
+            ],
+            env,
+        )?;
+        let listed = run_git_env(&["-C", ws, "ls-files", "-z", "-v"], env)?;
+        let marked: String = listed
+            .split('\0')
+            .filter_map(|entry| entry.split_once(' '))
+            .filter(|(tag, _)| *tag != "H")
+            .flat_map(|(_, path)| [path, "\0"])
+            .collect();
+        if marked.is_empty() {
+            return Ok(());
+        }
+        // One flag a run: given both, `update-index` applies the first it
+        // checks to each path and ignores the other.
+        for flag in ["--no-skip-worktree", "--no-assume-unchanged"] {
+            run_git_input_env(
+                &["-C", ws, "update-index", flag, "-z", "--stdin"],
+                &marked,
+                env,
+            )?;
+        }
+        Ok(())
     }
 
     /// What `git status` reports under `paths` and outside `except` in a
@@ -1022,7 +1146,10 @@ impl GitSource {
             if paths.is_empty() {
                 continue;
             }
-            let mut args = vec!["-C", ws, "reset", "--quiet", rev, "--"];
+            // `--no-refresh`: this index has no stat data, so the refresh a
+            // mixed reset ends with would hash every tracked file, for a
+            // tree that never looks at the working tree.
+            let mut args = vec!["-C", ws, "reset", "--quiet", "--no-refresh", rev, "--"];
             args.extend(paths.iter().map(|path| path.as_str()));
             run_git_env(&args, &env)?;
         }
@@ -1447,11 +1574,10 @@ impl GitSource {
             args.extend(refspecs.iter().map(String::as_str));
             run_git_env(&args, &auth_env(auth)).map(|_| ())
         };
-        let shallow_store = |location: &[&str]| -> Result<bool> {
-            let mut args: Vec<&str> = location.to_vec();
-            args.extend(["rev-parse", "--is-shallow-repository"]);
-            Ok(run_git_env(&args, &[])? == "true")
-        };
+        // Snapshots are shallow on purpose (`crate::snapshots`): deepening
+        // them here is how a snapshot clone would end up fetching every
+        // history on its next ordinary fetch.
+        let left_shallow = crate::snapshots::left_shallow;
         // A whole fetch is by far the fastest way to get a large history
         // (t3code's 365 MiB: five minutes whole, against half an hour in
         // bands), and a dropped one often comes through on a second try. So
@@ -1462,7 +1588,7 @@ impl GitSource {
         let mut tries = WHOLE_FETCH_BACKOFF.iter();
         let mut started = loop {
             match fetch(None) {
-                Ok(()) if !shallow_store(location)? => return Ok(()),
+                Ok(()) if !left_shallow(location)? => return Ok(()),
                 Ok(()) => break true,
                 Err(error) if dropped(&error) => match tries.next() {
                     Some(wait) => std::thread::sleep(*wait),
@@ -1478,6 +1604,15 @@ impl GitSource {
         // drops is halved; one that comes grows the next. The bands start
         // wide, because each costs the remote about a minute to compute
         // whatever its size.
+        //
+        // One stepped fetch in a store at a time: two deepening at once fail
+        // with `shallow file has changed since we read it`. Released when
+        // dropped, or when the process dies. Whoever held it may have
+        // finished the job.
+        let _lock = steps_lock(location)?;
+        if started && !left_shallow(location)? {
+            return Ok(());
+        }
         let mut depth: u32 = FIRST_BAND;
         loop {
             let flag = if started {
@@ -1488,7 +1623,7 @@ impl GitSource {
             match fetch(Some(&flag)) {
                 Ok(()) => {
                     started = true;
-                    if !shallow_store(location)? {
+                    if !left_shallow(location)? {
                         return Ok(());
                     }
                     depth = (depth * 2).min(4 * FIRST_BAND);
@@ -1496,6 +1631,94 @@ impl GitSource {
                 Err(error) if dropped(&error) && depth > 1 => depth /= 2,
                 Err(error) => return Err(error),
             }
+        }
+    }
+
+    /// Fetch exactly `commits` from `url`, each one commit deep, each to
+    /// `<prefix><commit>`, and return those the remote refused.
+    ///
+    /// The store this fetches into stays shallow on purpose, so it must
+    /// never see [`Self::fetch_refs`], which takes a shallow store for a
+    /// stepped fetch that stopped part way and deepens it to the end.
+    ///
+    /// `--depth` also makes Git ask the remote even for a commit the store
+    /// holds already, where a plain fetch would see the object and ask
+    /// nothing. So a ref under `prefix` proves `url` has the commit, however
+    /// many other repos' commits share the store.
+    ///
+    /// A refusal does not prove the repo lacks a commit: a remote may hold it
+    /// and only serve what a branch names. Only a whole fetch can tell.
+    ///
+    /// They come in one fetch, so what the commits share comes once. A
+    /// fetch the remote dropped or refused is halved, down to one commit,
+    /// which is what finds the commit it refused. Anything else (a password
+    /// it will not take, a repo that is not there) is the same for every
+    /// commit, so it is returned at once.
+    pub fn fetch_snapshots(
+        location: &[&str],
+        url: &str,
+        prefix: &str,
+        commits: &[String],
+        auth: Option<&str>,
+    ) -> Result<Vec<String>> {
+        let mut absent = Vec::new();
+        for batch in commits.chunks(SNAPSHOT_BATCH) {
+            Self::fetch_snapshot_batch(location, url, prefix, batch, auth, &mut absent)?;
+        }
+        Ok(absent)
+    }
+
+    fn fetch_snapshot_batch(
+        location: &[&str],
+        url: &str,
+        prefix: &str,
+        commits: &[String],
+        auth: Option<&str>,
+        absent: &mut Vec<String>,
+    ) -> Result<()> {
+        let refspecs: Vec<String> = commits
+            .iter()
+            .map(|commit| format!("+{commit}:{prefix}{commit}"))
+            .collect();
+        let fetch = || {
+            let mut args: Vec<&str> = location.to_vec();
+            args.extend([
+                "fetch",
+                "--quiet",
+                "--no-write-fetch-head",
+                "--no-tags",
+                "--depth=1",
+                "--",
+                url,
+            ]);
+            args.extend(refspecs.iter().map(String::as_str));
+            run_git_env(&args, &auth_env(auth)).map(|_| ())
+        };
+        if let [commit] = commits {
+            let mut tries = WHOLE_FETCH_BACKOFF.iter();
+            loop {
+                match fetch() {
+                    Ok(()) => return Ok(()),
+                    Err(error) if not_there(&error) => {
+                        absent.push(commit.clone());
+                        return Ok(());
+                    }
+                    Err(error) if dropped(&error) => match tries.next() {
+                        Some(wait) => std::thread::sleep(*wait),
+                        None => return Err(error),
+                    },
+                    Err(error) => return Err(error),
+                }
+            }
+        }
+        match fetch() {
+            Ok(()) => Ok(()),
+            Err(error) if dropped(&error) || not_there(&error) => {
+                let (left, right) = commits.split_at(commits.len() / 2);
+                Self::fetch_snapshot_batch(location, url, prefix, left, auth, absent)?;
+                Self::fetch_snapshot_batch(location, url, prefix, right, auth, absent)
+            }
+            Err(error) => Err(error),
         }
     }
 }
@@ -1570,6 +1793,9 @@ const WHOLE_FETCH_BACKOFF: [std::time::Duration; 2] = [
 /// The commits a stepped fetch asks for first, and deepens by.
 const FIRST_BAND: u32 = 2048;
 
+/// The most commits one snapshot fetch asks for: what fits a command line.
+const SNAPSHOT_BATCH: usize = 256;
+
 /// Where a push too big for the remote is staged step by step, deleted
 /// once the real push lands.
 const STAGING_REF: &str = "refs/heads/newgit-staging";
@@ -1600,6 +1826,62 @@ fn dropped(error: &NewgitError) -> bool {
     .any(|sign| stderr.contains(sign))
 }
 
+/// The lock on stepped fetches into the repository at `location`.
+fn steps_lock(location: &[&str]) -> Result<std::fs::File> {
+    let mut args = location.to_vec();
+    args.extend([
+        "rev-parse",
+        "--path-format=absolute",
+        "--git-path",
+        "newgit-steps.lock",
+    ]);
+    let path = run_git_env(&args, &[])?;
+    let path = Utf8Path::new(path.trim());
+    let lock = std::fs::File::create(path).map_err(|source| NewgitError::io(path, source))?;
+    lock.lock()
+        .map_err(|source| NewgitError::io(path, source))?;
+    Ok(lock)
+}
+
+/// Whether a push may have failed because it came from a shallow repository:
+/// the remote objecting to its `shallow` lines, in Git's words or as a request
+/// it would not take. A credential or a lease that failed is neither. A 500 is
+/// here because it is what a push that is dropped ends as once smaller pushes
+/// have failed too, and by then there is nothing left to try.
+pub fn refused_shallow(error: &NewgitError) -> bool {
+    let NewgitError::SourceCommand { stderr, .. } = error else {
+        return false;
+    };
+    [
+        "shallow",
+        "protocol error",
+        "bad line length",
+        "HTTP 400",
+        "HTTP 415",
+        "HTTP 422",
+        "HTTP 500",
+        "HTTP 501",
+    ]
+    .iter()
+    .any(|sign| stderr.contains(sign))
+}
+
+/// Whether the remote refused to serve a commit by id: it has none, or will
+/// not say. Anything else is a failure, not an answer: a pin left out of a
+/// view stays out of it for as long as the view is cached.
+fn not_there(error: &NewgitError) -> bool {
+    let NewgitError::SourceCommand { stderr, .. } = error else {
+        return false;
+    };
+    [
+        "not our ref",
+        "couldn't find remote ref",
+        "unadvertised object",
+    ]
+    .iter()
+    .any(|sign| stderr.contains(sign))
+}
+
 /// When the remote refused a push for its size, the size and the limit in
 /// MiB, as Artifacts reports them (`push is 364.7 MiB, limit is 64.0 MiB`).
 /// Either unknown is taken as twice the limit, and 64 MiB.
@@ -1625,9 +1907,15 @@ fn too_large(error: &NewgitError) -> Option<(f64, f64)> {
 
 /// `git <args>` with `input` on its stdin; its stdout, trimmed.
 fn run_git_input(args: &[&str], input: &str) -> Result<String> {
+    run_git_input_env(args, input, &[])
+}
+
+/// [`run_git_input`], with `env` set for it.
+fn run_git_input_env(args: &[&str], input: &str, env: &[(String, String)]) -> Result<String> {
     use std::io::Write as _;
     let mut child = Command::new("git")
         .args(args)
+        .envs(env.iter().map(|(key, value)| (key, value)))
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -1750,6 +2038,16 @@ fn settle_index(repo: &Utf8Path) -> Result<()> {
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
     run_git(&["-C", repo.as_str(), "update-index", "-q", "--refresh"]).map(|_| ())
+}
+
+/// Set `repo`'s sparse-checkout patterns, before anything is checked out.
+fn set_sparse(repo: &Utf8Path, patterns: &[String]) -> Result<()> {
+    if patterns.is_empty() {
+        return Ok(());
+    }
+    let mut args = vec!["-C", repo.as_str(), "sparse-checkout", "set", "--no-cone"];
+    args.extend(patterns.iter().map(String::as_str));
+    run_git(&args).map(|_| ())
 }
 
 /// Whether two existing directories are on the same filesystem.

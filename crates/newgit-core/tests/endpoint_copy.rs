@@ -140,6 +140,10 @@ fn copies_every_branch_into_an_empty_fork() {
         "refs/heads/main\nrefs/heads/side",
         "nothing but the branches"
     );
+    assert!(
+        !temp.join("container/trackers.git").exists(),
+        "a copy, shallow while it steps, stays out of the store merge checks read"
+    );
 }
 
 #[test]

@@ -63,7 +63,11 @@ history; `access`, mounted at `.newgit/trackers/`, holds who may read what,
 which only the project's owner changes by default (`maintainers = "owner"`).
 Carve out a tracker in Git with `newgit tracker create electron --git --path
 apps/electron`: one commit that mounts it there, with its history starting
-at the carve. Without `--git` a tracker stays outside Git: captured, never
+at the carve. Carved inside another mounted tracker, it is that tracker's
+child, defined in that tracker's own `.newgit/trackers/`: bound only where its
+parent is, and brought along with it unless its own `priority` is negative. So
+a large directory can stay out of workspaces while the parent's own repository
+still holds it. Without `--git` a tracker stays outside Git: captured, never
 committed.
 
 An instance works on what it binds:
@@ -306,7 +310,8 @@ Definition management (noun subcommands):
 - `newgit tracker create <name> [--audience <a>] [--storage <s>]
   [--merge-with-source]`
 - `newgit tracker create <name> --git --path <path>` — a tracker in Git,
-  mounted at that path by one commit; history before it stays in root
+  mounted at that path by one commit; history before it stays in whichever
+  tracker held the files
 - `newgit tracker track <tracker> <path>...` — trackers outside Git only
 - `newgit tracker remove <name>`
 - `newgit tracker capture|merge|pull|checkout <tracker> [instance]`
@@ -346,7 +351,9 @@ Remote:
   your account; `owner/name` joins one that exists
 - `newgit remote delete <owner>/<name>` — the owner deletes the project
   from the remote: every repo, record, and token pinned to it. Not undoable
-- `newgit clone <owner>/<name> [dir] [--url <url>]`
+- `newgit clone <owner>/<name> [dir] [--url <url>] [--full]` — root's whole
+  history and the commits it pins; a mounted tracker's history comes the first
+  time something needs it, once. `--full` fetches every history now
 - `newgit merge [instance] [--into <branch>]` — the merge commit is made in
   your view and committed at root's ref; `newgit merge main` merges the
   project root
@@ -405,7 +412,11 @@ show in `git status` and `git add -A` cannot commit them — which also means
 **real edits to a rendered file do not survive the workspace.** newgit says
 so at bind. For a tracker-owned file, `tracker capture` reverses the
 substitution, so edits you make beside the rendered value reach the lane and
-your port does not.
+your port does not. A render writes only a regular file of its own: a
+rendered path that is a symlink, or lies under a symlinked directory, is
+refused by name rather than written through to wherever the link leads,
+and a hard link there is replaced by a new file, so its other names keep
+what they held ([spec](design/spec.md#render)).
 
 Several resources may render one file — `db` its URL and `web` its port into
 the app's `.env.local` — each declaring only the values it owns. They apply

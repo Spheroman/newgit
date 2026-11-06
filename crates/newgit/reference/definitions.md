@@ -315,7 +315,10 @@ directory: one ordinary commit holding its files. Its history stays in its
 own repository and never enters this project's, so `git log` under the mount
 starts there. A `--from` path
 is relative to where you run it. `newgit pull <tracker>` moves its pin to
-its `follow` ref in one commit; nothing else moves a pin on your behalf. How sensitive a tracker's content is has nothing
+its `follow` ref in one commit; nothing else moves a pin on your behalf.
+`newgit clone` fetches only the commits root pins of a mounted tracker, and
+its history the first time something needs it, once; `newgit clone --full`
+fetches every history up front. How sensitive a tracker's content is has nothing
 to do with this; that is its `audience`. A project laid out before mounts
 (a `project` tracker owning `.newgit`) is moved onto them by `newgit tracker
 migrate`.
@@ -671,11 +674,13 @@ every verify fail. Common dump tools do this by default: `pg_dump` since
 17.6 (and the matching back-branch releases) opens and closes every dump with
 `\restrict <token>` / `\unrestrict <token>`, a fresh random token per run.
 Pass `--restrict-key=<fixed>` to make it stable, as the bundled Postgres
-templates do (their comments say what a fixed key gives up). Anything else
-that stamps a run does the same: a timestamp in the output, or `pg_dump
---verbose`'s `-- Started on` / `-- Completed on` comments. `--verify` names
-this case when it happens rather than blaming `[restore]`; it does not paper
-over it.
+templates do (their comments say what a fixed key gives up). `supabase db
+dump` cannot pass it, and writes the pair as SQL comments (`-- \restrict
+<token>`), so the `supabase` template swaps the token for a fixed one after
+dumping. Anything else that stamps a run does the same: a timestamp in the
+output, or `pg_dump --verbose`'s `-- Started on` / `-- Completed on`
+comments. `--verify` names this case when it happens rather than blaming
+`[restore]`; it does not paper over it.
 
 ### `[restore]`
 
@@ -1751,6 +1756,19 @@ Written by `newgit init`.
 | `workspace.materializer` | string | no | real directories | reserved; every workspace is a full clone. |
 | `remote.url` | string | yes, in `[remote]` | — | the newgit remote, e.g. `https://newgit.dev`. Must be `https://`, except `http://localhost` and `http://127.0.0.1` for a local `wrangler dev`. Written by `newgit remote add`. |
 | `remote.project` | string | yes, to link | — | the project on the remote, `<owner>/<name>`. Without it the project is not linked: newgit acts as if there were no `[remote]`. Written by `newgit remote add`. |
+
+A committed `[remote]` travels with the repository, so `newgit init` in a
+clone of a project's mirror asks that remote what to do. Logged in and a
+member, it joins: root's history and pinned snapshots are fetched, the
+composed `main` checked out, and `origin` pointed at the remote, as `newgit
+clone` leaves things. Uncommitted changes, or commits `main` does not contain,
+stop it before anything moves, unless they are on the clone's own `origin`:
+that is the mirror ahead of the project, which it joins anyway and reports.
+Not logged in, it stops and says to run `newgit login`. Anyone else gets a
+local copy marked not linked, which `newgit remote show` says. It acts as a
+project with no remote: `newgit merge` stays local, `git push` goes to
+`origin`, and `newgit export --remote` refuses. `newgit init` joins it once
+they are a member.
 
 Your own settings live in `~/.newgit/config.toml`, which newgit never
 writes. The one it reads is your default tracker per role, which beats the

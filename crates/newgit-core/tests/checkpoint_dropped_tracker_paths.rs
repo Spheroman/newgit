@@ -118,6 +118,21 @@ fn setup(temp: &Utf8Path, trackers: &[(&str, &str)], resources: &[(&str, &str)])
     git(&repo, &["add", "-A"]);
     git(&repo, &["commit", "-q", "-m", "newgit"]);
     for (name, path) in trackers {
+        if *name == "inner" {
+            // Root's, not `b`'s: carved, it would be `b`'s child and go with
+            // it. This is the tracker that stays when what surrounds it goes.
+            std::fs::write(
+                store.paths().trackers.join("inner.toml"),
+                format!(
+                    "audience = \"project-devs\"\nstorage = \"local\"\ngit = true\n\
+                     mount = \"{path}\"\npaths = [\".\"]\n"
+                ),
+            )
+            .expect("define inner");
+            git(&repo, &["add", "-A"]);
+            git(&repo, &["commit", "-q", "-m", "inner"]);
+            continue;
+        }
         BranchManager::open(store.clone())
             .expect("manager")
             .create_git_tracker(name, "project-devs", &[Utf8PathBuf::from(*path)])

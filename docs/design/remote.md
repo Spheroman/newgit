@@ -71,8 +71,9 @@ this repository is `spheroman/newgit` on newgit.dev, and GitHub's
 - The Git endpoint: `git clone https://newgit.dev/<owner>/<name>.git` with
   plain Git, each reader's view composed from the trackers they may read,
   with canonical-id notes on rebuilt commits.
-- `newgit clone`, and `spawn --from-checkpoint` with the spawner's own
-  per-user trackers.
+- `newgit clone`: root's whole history and the commits it pins, with each
+  mounted tracker's history on demand (`--full` fetches them all), and
+  `spawn --from-checkpoint` with the spawner's own per-user trackers.
 - Private instances (`spawn --private`), hidden from everyone until merged.
 - `newgit remote delete <owner>/<name>`: the owner deletes the project —
   every token pinned to it revoked first, then every repo under its prefix,
@@ -575,11 +576,13 @@ writing the branch's list in the project's Durable Object as an index. (The
 Worker's Artifacts binding cannot write refs, so the merge's Git work is the
 merger's; root's ref is the truth and the list says which repos to fetch.)
 
-Both of the container's checks — the begin's ancestry check (`newgit
-endpoint-ancestry`) and the finish's index check (`newgit endpoint-index`) —
-fetch every tracker they look at into the container's store, and the first
-time a large history is there that takes many minutes (Spheroman/t3code,
-365 MiB: about five minutes in one fetch). So they run in the background.
+The begin's ancestry check (`newgit endpoint-ancestry`) fetches every tracker
+it looks at, whole, into the container's store, and the first time a large
+history is there that takes many minutes (Spheroman/t3code, 365 MiB: about
+five minutes in one fetch, over forty when Artifacts drops it and stepping
+takes over). The finish's index check (`newgit endpoint-index`) needs root's
+history and one commit's pins (*Fetching what a view needs*). Both run in the
+background.
 The endpoint's Durable Object keys each check by its kind and its plan
 without credentials. The first request starts it and every request until it
 ends is answered `202 {"checking": true}` with `Retry-After: 10`; the first
@@ -598,12 +601,125 @@ memory and in `waitUntil`; the polls are what keep the object alive. An
 object evicted mid-check forgets it, and the next request starts it again,
 against a store that keeps what the first fetched.
 
+#### Joining from a GitHub clone
+
+Most people meet a project on GitHub, and its mirror carries
+`.newgit/config.toml` with `[remote]` in it. So `newgit init` in a repository
+whose committed config names a remote project asks the remote what to do,
+because adopting it as a project of its own would look linked and be a
+different history.
+
+- **Not logged in:** it stops before changing anything and says to run
+  `newgit login`, then `newgit init` again.
+- **A member:** it joins in place, ending where `newgit clone` ends: root's
+  whole history, pinned snapshots, the composed default branch checked out,
+  `origin` on the endpoint. It runs the clone's own code in a scratch
+  repository inside `.git`, then moves the result in, so a refusal or a failed
+  fetch leaves nothing behind. The repository's other branches are kept.
+- **Work is never lost.** Uncommitted changes (untracked files included), a
+  shallow clone, an adopted copy's instances, or commits the composed default
+  branch does not contain stop it first, naming them. "Contains" is
+  `pull_view`'s recognition, not ancestry, because a mirror withholding a
+  tracker has other ids than the view: each export target is composed so its
+  commits carry notes, and a commit counts when its id, a note, or a
+  `Newgit-Split` trailer ties it to root's history. So does a path the view
+  would write over an ignored or untracked file that differs.
+- **The mirror being ahead is not local work.** A commit reachable from the
+  clone's own `refs/remotes/origin/<branch>` is safe on the mirror: a pull
+  request merged there and not landed yet. It joins anyway and says how many,
+  and that the webhook lands them or a member runs `newgit pull --remote
+  <target>`. `init` does not land them.
+- **Not a member, or no such project (403, 404):** it adopts locally as it
+  always did, says this copy is not linked, and writes
+  `.newgit/local/unlinked`. While that file is there the copy is a project
+  with no remote: `newgit merge` stays on this machine, because there is no
+  remote for it to move, and `git push` goes to `origin`, so someone's own fork
+  works. `newgit remote show` says NOT LINKED, and `remote add` and `members`
+  refuse. `newgit export --remote` refuses too: a local adoption's root is the
+  mirror's own history, so a forced export would rewrite the mirror's ids.
+  Running `newgit init` again joins once that person is a member.
+- **Anything else from the remote** (a 5xx, no network) is not an answer, so
+  it stops with nothing changed rather than adopt.
+- **Already joined,** `newgit init` does nothing and says so. A project is
+  joined when its store holds root and `origin` is the endpoint, which a copy
+  adopted by a build older than this is not, so that copy joins too.
+
+#### Fetching what a view needs
+
+A view needs root's history, which is its shape, and a child's files at each
+commit that history pins, never the child's history. Each deploy starts the
+container from a fresh image, and every merge to `main` deploys, so a view
+waiting for whole histories cost the first request after every deploy
+minutes. So `endpoint-compose` fetches what it needs and no more, and the
+container keeps three repositories under `/work`, and a fourth for a fork's
+copy:
+
+- **`trackers.git`** holds whole histories: root's, and any tracker a check
+  or a pull fetched. Every question about ancestry is asked here.
+- **`snapshots.git`** is shallow on purpose: pinned commits, each fetched
+  `--depth=1` by id into `refs/snapshots/<tracker>/<commit>`. It never goes
+  through `fetch_refs`, which deepens any store it finds shallow. Root is
+  never here: its `shallow` file would end root's history at any commit root
+  shares with a child.
+- **`compose.git`** reads both through alternates and holds what composing
+  writes. It never fetches: Git takes an alternate's refs for complete
+  history, so a store that fetches must not have a shallow alternate. That is
+  why `trackers.git` has none, and why a wrong "not forward" cannot come of
+  this: a merge's check never meets a shallow commit.
+- **`copies.git`** holds what a fork's copy fetches. A copy Artifacts drops
+  comes in bands, shallow until the last one, and in `trackers.git` that
+  would hand a merge's check a shallow history. It costs that tracker's
+  history twice on disk: a copy of t3code in `copies.git`, and t3code again
+  in `trackers.git` if a check needed it.
+
+The ref is the proof a commit is that tracker's. A shallow fetch asks the
+remote even for a commit the store already holds, and the remote refuses an
+id it lacks, so one tracker's commit cannot pass as another's. A refusal does
+not prove the repo lacks a commit, though: a remote may hold it and only serve
+what a branch names. So a pin refused by id is settled by fetching that
+tracker whole into `trackers.git`, and left out only if no branch reaches it
+there either. A pin a repo really lacks therefore costs the first request on
+a fresh container that tracker's whole history, once. Any other failure fails
+the request rather than cache a view missing a child. One tracker's pins come
+in one fetch, halved only when the remote dropped or refused it, so what they
+share comes once. Only a branch whose view is not composed yet walks root's
+history for pins.
+
+What each costs on a fresh container:
+
+| | Waits | Fetches |
+|---|---|---|
+| `git fetch`, first | that request | root's whole history, then one shallow fetch per tracker, and a whole tracker whose pin was refused |
+| `git fetch`, next, branch unchanged | nothing | nothing |
+| index check | background | root's new commits, and the one commit's pins |
+| ancestry check, and a copy | background | that tracker's whole history, as it always did: 5 minutes for t3code, over 40 if stepped |
+
+A cold `git fetch` is bounded by root's size plus its pins. For a project whose
+large history is a mount, that is about 32 seconds and 113 MB for one pin
+(measured from a laptop against the real t3code repo) and, unmeasured, more
+for several. Where root itself is the large history, it is what it was:
+that request waits for all of it. A request with no response started is cut
+off at five minutes (`Network connection lost`, measured twice at 5:07), and a
+cold compose of newgit with t3code took longer than that. So `info/refs` sends
+its headers at once and its body when the view is ready, and a failure is an
+`ERR` line, which Git prints as a `remote error`. The compose carries on if the
+client leaves, and the plan's read passwords last an hour.
+
+`newgit clone` works the same way: root whole and each pin `--depth=1`, with
+a tracker's history fetched the first time something needs it, or all of it
+up front with `--full`. The client's store differs from the three here, and
+[trackers.md](trackers.md), *Snapshots*, says why and lists what asks for
+history.
+
 A fetch the remote drops (Artifacts fails some whole fetches with an HTTP
 500, `expected 'packfile'`) is tried whole twice more, a few seconds apart,
 before newgit fetches in bands: the tips at `--depth=2048`, then
 `--deepen=2048` (growing to 8192) until nothing is shallow, halving a band
 the remote still drops. Each band costs the remote about a minute however
-small it is, so the bands are wide.
+small it is, so the bands are wide. One stepped fetch runs in a store at a
+time, since two deepening at once fail with `shallow file has changed since
+we read it`; the second waits, then carries on only if the store still needs
+it.
 
 Who may move a tracker is its definition's `maintainers` (`owner`,
 `project-devs`, or `user:<login>`; it defaults to the audience). A

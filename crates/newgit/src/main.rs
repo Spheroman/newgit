@@ -298,6 +298,12 @@ enum Command {
         /// The remote (default: https://newgit.dev)
         #[arg(long)]
         url: Option<String>,
+        /// Fetch every tracker's whole history now, for someone who knows
+        /// they will work in a child. By default a mounted tracker comes as
+        /// the commits root pins, and its history the first time something
+        /// needs it
+        #[arg(long)]
+        full: bool,
     },
     /// The Git endpoint's composer, run inside its container: reads a plan
     /// (JSON) on stdin, prints the bare repository it composed
@@ -672,7 +678,12 @@ fn main() -> Result<()> {
         Command::Logout { url } => remote_cmd::logout(url),
         Command::Whoami { url, json } => remote_cmd::whoami(url, json),
         Command::Remote { command } => remote_cmd::remote_command(command),
-        Command::Clone { project, dir, url } => remote_cmd::clone(&project, dir, url),
+        Command::Clone {
+            project,
+            dir,
+            url,
+            full,
+        } => remote_cmd::clone(&project, dir, url, full),
         Command::Merge { instance, into } => merge(instance, &into),
         Command::Pull {
             remote: Some(target),
@@ -936,6 +947,14 @@ fn init(args: InitArgs) -> Result<()> {
         bail!("this is a newgit workspace; run `newgit init` in the project's store");
     }
     if repo_root.join(".newgit/config.toml").is_file() {
+        let named = MetadataStore::at(&repo_root).load_config()?;
+        if let Some(section) = &named.remote
+            && let Some(key) = named
+                .remote_project()
+                .filter(|key| newgit_core::config::is_project_key(key))
+        {
+            return remote_cmd::init_named_project(&repo_root, &section.url, key);
+        }
         let (_, done) = MetadataStore::adopt_in_place(&repo_root)?;
         if done.is_empty() {
             println!("newgit is already set up here: nothing to do");
@@ -2436,7 +2455,7 @@ fn tracker(command: TrackerCommand) -> Result<()> {
             }
             print_parked(&change.parked);
             for other in &change.brought {
-                println!("  bound `{other}` too: `{tracker}` requires it");
+                println!("  bound `{other}` too: it goes with `{tracker}`");
             }
             if !change.started.is_empty() {
                 println!("  bound what it brings: {}", change.started.join(", "));
@@ -2477,6 +2496,9 @@ fn tracker(command: TrackerCommand) -> Result<()> {
                 return Ok(());
             }
             println!("Dropped `{tracker}` from `{instance}`");
+            for child in &change.children {
+                println!("  dropped `{child}` too: it exists only in `{tracker}`");
+            }
             print_parked(&change.parked);
             print_rebuilt(&change.rebuilt);
             if change.stashed {
@@ -3374,6 +3396,10 @@ fn export_to_remote(name: &str, options: RemoteExportOptions) -> Result<()> {
             ExportReason::Root => println!(
                 "  tracker:  {:<width$}  the root (named by .newgit/exports/{}.toml), its own files at the top @ {at}",
                 tracker.name, target.name
+            ),
+            ExportReason::Mounted => println!(
+                "  tracker:  {:<width$}  mounted in the root @ {at}",
+                tracker.name
             ),
             ExportReason::Withheld => println!(
                 "  withheld: {:<width$}  (audience {})",
