@@ -63,7 +63,11 @@ history; `access`, mounted at `.newgit/trackers/`, holds who may read what,
 which only the project's owner changes by default (`maintainers = "owner"`).
 Carve out a tracker in Git with `newgit tracker create electron --git --path
 apps/electron`: one commit that mounts it there, with its history starting
-at the carve. Without `--git` a tracker stays outside Git: captured, never
+at the carve. Carved inside another mounted tracker, it is that tracker's
+child, defined in that tracker's own `.newgit/trackers/`: bound only where its
+parent is, and brought along with it unless its own `priority` is negative. So
+a large directory can stay out of workspaces while the parent's own repository
+still holds it. Without `--git` a tracker stays outside Git: captured, never
 committed.
 
 An instance works on what it binds:
@@ -306,7 +310,8 @@ Definition management (noun subcommands):
 - `newgit tracker create <name> [--audience <a>] [--storage <s>]
   [--merge-with-source]`
 - `newgit tracker create <name> --git --path <path>` — a tracker in Git,
-  mounted at that path by one commit; history before it stays in root
+  mounted at that path by one commit; history before it stays in whichever
+  tracker held the files
 - `newgit tracker track <tracker> <path>...` — trackers outside Git only
 - `newgit tracker remove <name>`
 - `newgit tracker capture|merge|pull|checkout <tracker> [instance]`
