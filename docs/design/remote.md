@@ -651,10 +651,11 @@ commit that history pins, never the child's history. Each deploy starts the
 container from a fresh image, and every merge to `main` deploys, so a view
 waiting for whole histories cost the first request after every deploy
 minutes. So `endpoint-compose` fetches what it needs and no more, and the
-container keeps three repositories under `/work`:
+container keeps three repositories under `/work`, and a fourth for a fork's
+copy:
 
-- **`trackers.git`** holds whole histories: root's, and any tracker a check,
-  a copy, or a pull fetched. Every question about ancestry is asked here.
+- **`trackers.git`** holds whole histories: root's, and any tracker a check
+  or a pull fetched. Every question about ancestry is asked here.
 - **`snapshots.git`** is shallow on purpose: pinned commits, each fetched
   `--depth=1` by id into `refs/snapshots/<tracker>/<commit>`. It never goes
   through `fetch_refs`, which deepens any store it finds shallow. Root is
@@ -665,6 +666,11 @@ container keeps three repositories under `/work`:
   history, so a store that fetches must not have a shallow alternate. That is
   why `trackers.git` has none, and why a wrong "not forward" cannot come of
   this: a merge's check never meets a shallow commit.
+- **`copies.git`** holds what a fork's copy fetches. A copy Artifacts drops
+  comes in bands, shallow until the last one, and in `trackers.git` that
+  would hand a merge's check a shallow history. It costs that tracker's
+  history twice on disk: a copy of t3code in `copies.git`, and t3code again
+  in `trackers.git` if a check needed it.
 
 The ref is the proof a commit is that tracker's. A shallow fetch asks the
 remote even for a commit the store already holds, and the remote refuses an
@@ -710,7 +716,10 @@ A fetch the remote drops (Artifacts fails some whole fetches with an HTTP
 before newgit fetches in bands: the tips at `--depth=2048`, then
 `--deepen=2048` (growing to 8192) until nothing is shallow, halving a band
 the remote still drops. Each band costs the remote about a minute however
-small it is, so the bands are wide.
+small it is, so the bands are wide. One stepped fetch runs in a store at a
+time, since two deepening at once fail with `shallow file has changed since
+we read it`; the second waits, then carries on only if the store still needs
+it.
 
 Who may move a tracker is its definition's `maintainers` (`owner`,
 `project-devs`, or `user:<login>`; it defaults to the audience). A

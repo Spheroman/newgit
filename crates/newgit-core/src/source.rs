@@ -1483,6 +1483,15 @@ impl GitSource {
         // drops is halved; one that comes grows the next. The bands start
         // wide, because each costs the remote about a minute to compute
         // whatever its size.
+        //
+        // One stepped fetch in a store at a time: two deepening at once fail
+        // with `shallow file has changed since we read it`. Released when
+        // dropped, or when the process dies. Whoever held it may have
+        // finished the job.
+        let _lock = steps_lock(location)?;
+        if started && !left_shallow(location)? {
+            return Ok(());
+        }
         let mut depth: u32 = FIRST_BAND;
         loop {
             let flag = if started {
@@ -1694,6 +1703,23 @@ fn dropped(error: &NewgitError) -> bool {
     ]
     .iter()
     .any(|sign| stderr.contains(sign))
+}
+
+/// The lock on stepped fetches into the repository at `location`.
+fn steps_lock(location: &[&str]) -> Result<std::fs::File> {
+    let mut args = location.to_vec();
+    args.extend([
+        "rev-parse",
+        "--path-format=absolute",
+        "--git-path",
+        "newgit-steps.lock",
+    ]);
+    let path = run_git_env(&args, &[])?;
+    let path = Utf8Path::new(path.trim());
+    let lock = std::fs::File::create(path).map_err(|source| NewgitError::io(path, source))?;
+    lock.lock()
+        .map_err(|source| NewgitError::io(path, source))?;
+    Ok(lock)
 }
 
 /// Whether a push may have failed because it came from a shallow repository:

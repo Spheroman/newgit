@@ -52,10 +52,11 @@ pub struct Source {
 }
 
 /// The container's repositories. Three, because a shallow commit must never
-/// meet a question about history:
+/// meet a question about history (a fork's copy has a fourth, `copies.git`,
+/// for the same reason: see [`copy_repo`]):
 ///
-/// - `trackers.git` holds whole histories: root's, and any tracker a check,
-///   a copy, or a pull needed. Every question about ancestry is asked here.
+/// - `trackers.git` holds whole histories: root's, and any tracker a check
+///   or a pull needed. Every question about ancestry is asked here.
 /// - `snapshots.git` is shallow on purpose: pinned commits, one commit deep,
 ///   each under `refs/snapshots/<tracker>/<commit>` as proof that tracker's
 ///   repo has it. It holds nothing else. Its `shallow` file would cut any
@@ -728,15 +729,19 @@ pub struct CopyAnswer {
 /// Copy `plan.from`'s branches into `plan.to`. Idempotent: run again after a
 /// copy that stopped part way, the fetch takes only what the store lacks and
 /// the push only what the fork lacks, so it finishes the job.
+///
+/// It has a store of its own. A copy Artifacts drops comes in bands, shallow
+/// until the last one, for as long as half an hour. In `trackers.git` that
+/// would hand a merge's check a shallow history, and every other fetch there
+/// would take the store for one left part way and deepen it too.
 pub fn copy_repo(plan: &CopyPlan) -> Result<CopyAnswer> {
-    let store = plan.dir.join("trackers.git");
+    let store = plan.dir.join("copies.git");
     std::fs::create_dir_all(&plan.dir).map_err(|source| NewgitError::io(&plan.dir, source))?;
     if !store.join("HEAD").exists() {
         run_git_env(&["init", "-q", "--bare", store.as_str()], &[])?;
     }
     let git_dir = format!("--git-dir={store}");
-    // Each source under its own refs, so a copy never moves the refs a
-    // merge check reads (`refs/trackers/…`); the objects are shared anyway.
+    // Each source under its own refs: forks of two trackers share this store.
     let mut hasher = Sha256::new();
     hasher.update(plan.from.url.as_bytes());
     let key: String = hasher
