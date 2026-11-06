@@ -1560,18 +1560,15 @@ impl BranchManager {
         paths: &[Utf8PathBuf],
     ) -> Result<CreateCodeTrackerOutcome> {
         validate_name(name)?;
-        self.refuse_root(name, "it always exists")?;
-        self.require_migrated()?;
-        // Names are unique across a project, wherever each is defined.
-        if self
-            .all_definitions()
-            .iter()
-            .any(|other| other.name == name)
-        {
-            return Err(NewgitError::Unsupported(format!(
-                "a tracker named `{name}` already exists"
-            )));
+        if name.contains(crate::tracker::ID_SEPARATOR) {
+            return Err(NewgitError::InvalidName(name.to_owned()));
         }
+        self.require_migrated()?;
+        // `t3code/repos` or just `repos`: where it goes is `--path`.
+        let (asked_parent, name) = match name.rsplit_once('/') {
+            Some((parent, leaf)) => (Some(parent), leaf),
+            None => (None, name),
+        };
         let [mount] = paths else {
             return Err(NewgitError::Unsupported(format!(
                 "a tracker in Git is mounted at one path: `newgit tracker create {name} --git \
@@ -1599,6 +1596,18 @@ impl BranchManager {
             })
             .max_by_key(|tracker| tracker.mount.components().count())
             .cloned();
+        let parent_path = parent
+            .as_ref()
+            .map(|parent| crate::tracker::tracker_path(&parent.name));
+        if let Some(asked) = asked_parent
+            && parent_path.as_deref() != Some(asked)
+        {
+            return Err(NewgitError::Unsupported(format!(
+                "`{asked}/{name}` is not where --path {} puts it: that is `{}`",
+                definition.mount,
+                parent_path.map_or_else(|| name.to_owned(), |path| format!("{path}/{name}"))
+            )));
+        }
         let (definition, placed) = match &parent {
             Some(parent) => {
                 let relative = definition
@@ -1612,6 +1621,18 @@ impl BranchManager {
             }
             None => (definition.clone(), definition),
         };
+        self.refuse_root(&placed.name, "it always exists")?;
+        // Names are unique within their parent, as in a directory.
+        if self
+            .all_definitions()
+            .iter()
+            .any(|other| other.name == placed.name)
+        {
+            return Err(NewgitError::Unsupported(format!(
+                "a tracker named `{}` already exists",
+                crate::tracker::tracker_path(&placed.name)
+            )));
+        }
         let mut all: Vec<TrackerDefinition> =
             self.trackers.iter().chain(&self.carved).cloned().collect();
         all.push(self.root.clone());
@@ -1691,7 +1712,7 @@ impl BranchManager {
         let pinned = self
             .source
             .rev_parse(&local_tracker_ref(
-                name,
+                &placed.name,
                 &format!("instances/{PROJECT_ROOT_INSTANCE}"),
             ))
             .ok();
@@ -2125,6 +2146,101 @@ impl BranchManager {
         std::iter::once(self.root.clone())
             .chain(self.carved.iter().cloned())
             .collect()
+    }
+
+    /// Where this project sits in the one namespace (#201): a project on a
+    /// remote at `/remote/<owner>/<project>`, one only here at
+    /// `/user/<project>`.
+    pub fn namespace_root(&self) -> String {
+        match &self.remote {
+            Some(link) => format!("/remote/{}", link.project),
+            None => format!("/user/{}", self.config.project.name),
+        }
+    }
+
+    /// The tracker `cwd` is in, as a filesystem's working directory: the
+    /// deepest tracker in Git mounted over it, or root.
+    pub fn tracker_at(&self, cwd: &Utf8Path) -> String {
+        // The enclosing checkout, the project root's or a workspace's: found
+        // on disk, since `cwd` and a configured path may spell one directory
+        // differently (a symlink on the way there).
+        let Some(top) = cwd.ancestors().find(|dir| dir.join(".git").exists()) else {
+            return self.root.name.clone();
+        };
+        let Ok(relative) = cwd.strip_prefix(top) else {
+            return self.root.name.clone();
+        };
+        self.carved
+            .iter()
+            .filter(|definition| definition.mounted() && relative.starts_with(&definition.mount))
+            .max_by_key(|definition| definition.mount.components().count())
+            .map_or_else(
+                || self.root.name.clone(),
+                |definition| definition.name.clone(),
+            )
+    }
+
+    /// The id of the tracker `given` names from `cwd`, read as a filesystem
+    /// reads a path: from the tracker `cwd` is in, `..` going up, and from the
+    /// top of the namespace with a leading `/`. A name is never looked for
+    /// further up, so it means one thing wherever it is typed.
+    pub fn resolve_tracker(&self, cwd: &Utf8Path, given: &str) -> Result<String> {
+        let here = self.tracker_at(cwd);
+        let top = self.namespace_root();
+        let (mut path, rest): (Vec<String>, &str) = if given.starts_with('/') {
+            if given == top {
+                (Vec::new(), "")
+            } else if let Some(rest) = given.strip_prefix(&format!("{top}/")) {
+                (Vec::new(), rest)
+            } else {
+                return Err(NewgitError::Unsupported(format!(
+                    "`{given}` is not in this project, which is `{top}`"
+                )));
+            }
+        } else if here == self.root.name {
+            (Vec::new(), given)
+        } else {
+            (
+                here.split(crate::tracker::ID_SEPARATOR)
+                    .map(ToOwned::to_owned)
+                    .collect(),
+                given,
+            )
+        };
+        for part in rest.split('/').filter(|part| !part.is_empty()) {
+            match part {
+                "." => {}
+                ".." => {
+                    if path.pop().is_none() {
+                        return Err(NewgitError::Unsupported(format!(
+                            "`{given}` goes above this project, which is `{top}`"
+                        )));
+                    }
+                }
+                name => path.push(name.to_owned()),
+            }
+        }
+        if path.is_empty() {
+            return Ok(self.root.name.clone());
+        }
+        let id = path.join(crate::tracker::ID_SEPARATOR);
+        let exists = |id: &str| {
+            self.all_definitions()
+                .iter()
+                .any(|tracker| tracker.name == id)
+        };
+        if exists(&id) || here == self.root.name {
+            return Ok(id);
+        }
+        let hint = if exists(given) {
+            format!(": from anywhere it is `{top}/{given}`")
+        } else {
+            String::new()
+        };
+        Err(NewgitError::Unsupported(format!(
+            "no tracker `{given}` in `{}`{hint}",
+            crate::tracker::tracker_path(&here)
+        )))
     }
 
     /// Every definition, trackers outside Git included: what names the owner of
@@ -2722,13 +2838,14 @@ impl BranchManager {
     /// Refuse a tracker command aimed at root or a tracker in Git, saying what
     /// to do instead: both are committed with Git.
     fn refuse_root(&self, tracker: &str, action: &str) -> Result<()> {
+        let shown = crate::tracker::tracker_path(tracker);
         if self
             .carved
             .iter()
             .any(|definition| definition.name == tracker)
         {
             return Err(NewgitError::Unsupported(format!(
-                "`{tracker}` is a tracker in Git: its content is committed, and newgit splits your \
+                "`{shown}` is a tracker in Git: its content is committed, and newgit splits your \
                  commits into it — {action}"
             )));
         }
@@ -5673,7 +5790,9 @@ impl BranchManager {
                 let target = if known(needed) {
                     if choice.drops.contains(needed) {
                         return Err(NewgitError::Unsupported(format!(
-                            "`{name}` requires `{needed}`, so it cannot be dropped"
+                            "`{}` requires `{}`, so it cannot be dropped",
+                            crate::tracker::tracker_path(&name),
+                            crate::tracker::tracker_path(needed)
                         )));
                     }
                     Some(needed.clone())
@@ -5860,8 +5979,9 @@ impl BranchManager {
             });
             if needs {
                 return Err(NewgitError::Unsupported(format!(
-                    "`{}` requires `{tracker}`, so it cannot be dropped while `{}` is bound",
-                    definition.name, definition.name
+                    "`{name}` requires `{}`, so it cannot be dropped while `{name}` is bound",
+                    crate::tracker::tracker_path(tracker),
+                    name = crate::tracker::tracker_path(&definition.name)
                 )));
             }
         }
@@ -8567,7 +8687,10 @@ impl BranchManager {
                     "`{}` is rooted at `{root}` (audience {root_audience}), which mounts `{}` \
                      (audience {}), so exporting would send it past its audience. Nothing was \
                      exported. Give `{}` the audience `{root_audience}`, or stop exporting `{root}`",
-                    target.name, child.name, child.audience, child.name
+                    target.name,
+                    crate::tracker::tracker_path(&child.name),
+                    child.audience,
+                    crate::tracker::tracker_path(&child.name)
                 )));
             }
         }

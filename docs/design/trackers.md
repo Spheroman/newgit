@@ -169,8 +169,24 @@ and `electron`'s repository, exported on its own, lost the files.
 Who may change that definition is who may change `electron`: the file is
 `electron`'s, by the same rule as any definition. A name `access` has a file
 for is never taken by a nested definition, even if that file does not parse,
-and names are unique across a project. Only a tracker in Git is defined
+and names are unique within a parent. Only a tracker in Git is defined
 inside another, and it needs a `mount` of its own.
+
+**A tracker is named by its path (decided 2026-11-06).** A name is local to its
+parent, as a file's is to its directory: `repos.toml` and `.newgit/pins/repos`
+in `t3code`'s own tree, so that tree says nothing of where `t3code` sits. Two
+parents can each have a `docs`. Commands read a path as a filesystem does: from
+the tracker the working directory is in, `..` going up, and from the top of the
+one namespace with a leading `/`, which is `/remote/<owner>/<project>` for a
+project on a remote and `/user/<project>` for one that is not. A name is never
+looked for further up, so it means one thing wherever it is typed.
+
+What refs, records, and remote repos hold is an id, `t3code__repos`, with no
+slash: `refs/trackers/<tracker>/...` holds the tracker's own branches, so a
+child at `t3code/instances` would land among them, and a remote repo's name
+has one part per field. An id names the parent, so the remote reads a nested
+definition from that one tracker, and no other can answer for it. `__` is
+reserved. People never type an id or see one.
 
 **A child exists only in its parent (decided 2026-11-06).** `native` is bound
 only where `electron` is: dropping `electron` drops it and says so, and asking
@@ -482,9 +498,7 @@ rooted at `T` **(decided)**:
 - a path nothing owns, because every claim excludes it;
 - a path under `.newgit/pins/`, which only newgit writes;
 - a commit whose message would be carried by trackers of different
-  audiences (next section);
-- a commit that edits both copies of a tracker mounted twice (see *Rooting
-  at any tracker*).
+  audiences (next section).
 
 **Which commit carries the message.** `V`'s author, dates, and message go on
 the commit that holds the work:
@@ -767,15 +781,15 @@ workspace `package.json`) is an error naming the parent to root at instead
 **(decided)**. Rooting at the parent automatically would quietly give you a
 repository you didn't ask for.
 
-**The same tracker mounted twice in one view (decided, built)** (newgit
-mounts `ui-kit@v2`, and `design-system` mounts `ui-kit@v1`) is allowed. Each
-parent pins its own copy, so the two copies sit at their own commits, which
-is what #202 needs for packages (one version per dependent, as
-`node_modules` nests). An edit at either path splits into `ui-kit` on top of
-that copy's pin. A commit that edits both copies is refused: `ui-kit is
-mounted twice; edit one`. A branch's index lists one commit per tracker
-name, so only the first copy is listed; the second copy's commits are in the
-store but not on a branch list yet.
+**Two trackers of one name are two trackers (decided 2026-11-06, replacing
+"the same tracker mounted twice").** A name is local to its parent, so a `ui`
+in root and a `ui` in `app` are different trackers with different histories,
+as two directories named `ui` are different directories. An edit to both
+splits into both. Sharing one history by reusing its name, which is how
+`ui-kit@v2` here and `ui-kit@v1` there used to work, is gone. That capability
+comes back on purpose as a mount that names what it mounts: a shared tracker
+as a link to one place at one version, and a dependency as a remote tracker at
+a version pinned by the parent (#201, #202). Neither is built.
 
 **Layering** (a lower tracker supplies defaults, the upper takes the writes)
 is not built **(decided)**. Separate file names (`.env` and `.env.local`)
@@ -1181,9 +1195,8 @@ something:
 7. **A merge commits at the root's ref,** with pin moves checked by the
    Worker before the push.
 8. **`project` folds into the root tracker.**
-9. **The same tracker may be mounted twice;** a commit editing both copies is
-   refused. Layering is not built. Rooting at a child that requires its
-   parent is refused.
+9. **Layering is not built.** Rooting at a child that requires its parent is
+   refused.
 10. **Spheroman/newgit mirrors t3code too.** Replaced on 2026-11-05: it does
     not.
 
@@ -1222,8 +1235,7 @@ this is the list.
 - **Trackers outside Git may have a `mount`.** They are never pinned.
 - **Split refuses more than the design listed:** unowned paths (every claim
   excludes them) and paths owned by a tracker outside Git, besides unbound
-  trackers, `.newgit/pins/`, mixed audience, and edits to both copies of a
-  tracker mounted twice.
+  trackers, `.newgit/pins/`, and mixed audience.
 - **Exporting root ships `.newgit/`** (config, resources, scripts, exports),
   because `project` folded into root. Only `.newgit/trackers/` follows
   `access`'s audience.

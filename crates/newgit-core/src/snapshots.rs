@@ -209,12 +209,13 @@ pub fn fetch_pins(
             objects = Objects::open(repo)?;
         }
         let mut next: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
-        for commits in level.values() {
+        for (tracker, commits) in &level {
             for commit in commits {
                 let Some(found) = objects.try_commit(commit)? else {
                     continue;
                 };
                 for (child, pin) in compose::pins_in(&mut objects, &found.tree)? {
+                    let child = crate::tracker::child_id(tracker, &child);
                     if seen.insert((child.clone(), pin.clone())) {
                         next.entry(child).or_default().insert(pin);
                     }

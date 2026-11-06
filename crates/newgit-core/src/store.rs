@@ -14,7 +14,7 @@ use crate::installs::InstallStore;
 use crate::lock::InstanceLock;
 use crate::materializer::{WorkspaceMarker, create_dir_all};
 use crate::resource::ResourceDefinition;
-use crate::tracker::{TrackerDefinition, resolve_ownership};
+use crate::tracker::{ID_SEPARATOR, TrackerDefinition, child_id, leaf_name, resolve_ownership};
 
 const LOCAL_GITIGNORE: &str = "\
 # newgit local state — never committed
@@ -440,6 +440,10 @@ impl MetadataStore {
                 let Some(name) = entry.file_stem() else {
                     continue;
                 };
+                // A tracker's definition of itself, which compose ignores too.
+                if name == leaf_name(&parent) {
+                    continue;
+                }
                 let skipped = match TrackerDefinition::from_file(name, &entry) {
                     Err(error) => Err(error.to_string()),
                     Ok(child) if !child.git => {
@@ -448,7 +452,14 @@ impl MetadataStore {
                     Ok(child) if !child.mounted() => {
                         Err("it needs a `mount` of its own inside its parent".to_owned())
                     }
-                    Ok(_) if definitions.iter().any(|other| other.name == name) => {
+                    Ok(_) if name.contains(ID_SEPARATOR) => {
+                        Err(format!("`{ID_SEPARATOR}` is reserved in a tracker's name"))
+                    }
+                    Ok(_)
+                        if definitions
+                            .iter()
+                            .any(|other| other.name == child_id(&parent, name)) =>
+                    {
                         Err("a tracker of that name already exists".to_owned())
                     }
                     Ok(child) => Ok(child),

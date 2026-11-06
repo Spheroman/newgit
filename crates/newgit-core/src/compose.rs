@@ -31,7 +31,9 @@ use camino::{Utf8Path, Utf8PathBuf};
 
 use crate::error::{NewgitError, Result};
 use crate::objects::{Commit, EMPTY_TREE, GITLINK_MODE, Objects, TREE_MODE, run};
-use crate::tracker::{DEFINITIONS_DIR, TrackerDefinition, owner_of};
+use crate::tracker::{
+    DEFINITIONS_DIR, TrackerDefinition, child_id, leaf_name, owner_of, tracker_path,
+};
 
 /// Where a parent keeps the commits of the children it mounts.
 pub const PINS_DIR: &str = ".newgit/pins";
@@ -399,7 +401,7 @@ impl Composer<'_> {
         for id in &walk {
             let commit = self.objects.commit(id)?;
             let all_pins = pins_in(&mut self.objects, &commit.tree)?;
-            let mounts = self.expand_children(&commit, &all_pins)?;
+            let mounts = self.expand_children(name, &commit, &all_pins)?;
             shapes.push((commit, all_pins, mounts));
         }
 
@@ -414,19 +416,21 @@ impl Composer<'_> {
     /// each of them is mounted.
     fn expand_children(
         &mut self,
+        owner: &str,
         commit: &Commit,
         all_pins: &BTreeMap<String, String>,
     ) -> Result<BTreeMap<String, String>> {
         let mut readable = BTreeMap::new();
         for (child, pin) in all_pins {
-            if !(self.options.readable)(child) {
+            let id = child_id(owner, child);
+            if !(self.options.readable)(&id) {
                 continue;
             }
             // A pin its tracker's own history does not hold (another
             // tracker's commit under this name, or one never pushed) is left
             // out at this commit, as for a reader who may not read it: what
             // the reader gets is never someone else's content.
-            let admitted = self.options.admit.is_none_or(|admit| admit(child, pin));
+            let admitted = self.options.admit.is_none_or(|admit| admit(&id, pin));
             if admitted && self.objects.has_commit(pin)? {
                 readable.insert(child.clone(), pin.clone());
             }
@@ -439,7 +443,7 @@ impl Composer<'_> {
             &readable,
         )?;
         for (child, pin) in &readable {
-            self.expand_child(child, pin)?;
+            self.expand_child(&child_id(owner, child), pin)?;
         }
         Ok(mounts)
     }
@@ -457,16 +461,16 @@ impl Composer<'_> {
             )));
         }
         self.composing.push(name.to_owned());
-        let result = self.child_tree(pin);
+        let result = self.child_tree(name, pin);
         self.composing.pop();
         self.children.insert(pin.to_owned(), result?);
         Ok(())
     }
 
-    fn child_tree(&mut self, pin: &str) -> Result<String> {
+    fn child_tree(&mut self, name: &str, pin: &str) -> Result<String> {
         let commit = self.objects.commit(pin)?;
         let all_pins = pins_in(&mut self.objects, &commit.tree)?;
-        let mounts = self.expand_children(&commit, &all_pins)?;
+        let mounts = self.expand_children(name, &commit, &all_pins)?;
         let own = self.objects.set_path(&commit.tree, PINS_DIR, None)?;
         self.with_children(&own, &by_depth(&mounts), &all_pins)
     }
@@ -819,12 +823,12 @@ pub(crate) fn index_with(objects: &mut Objects, root: &str, commit: &str) -> Res
         if state.contains_key(&name) {
             continue;
         }
-        state.insert(name, commit.clone());
+        state.insert(name.clone(), commit.clone());
         let Some(found) = objects.try_commit(&commit)? else {
             continue;
         };
         for (child, pin) in pins_in(objects, &found.tree)?.into_iter().rev() {
-            stack.push((child, pin));
+            stack.push((child_id(&name, &child), pin));
         }
     }
     Ok(state)
@@ -1001,8 +1005,6 @@ pub enum Refusal {
         /// Each tracker carrying it, with its audience.
         trackers: Vec<(String, String)>,
     },
-    /// One commit edits both copies of a tracker mounted twice.
-    MountedTwice { commit: String, tracker: String },
 }
 
 impl std::fmt::Display for Refusal {
@@ -1011,7 +1013,8 @@ impl std::fmt::Display for Refusal {
             Refusal::Unbound { path, tracker } => write!(
                 f,
                 "`{path}` belongs to `{tracker}`, which this instance has not bound: \
-                 `newgit tracker use {tracker}`"
+                 `newgit tracker use {tracker}`",
+                tracker = tracker_path(tracker)
             ),
             Refusal::OutsideGit {
                 commit,
@@ -1058,11 +1061,6 @@ impl std::fmt::Display for Refusal {
                     short(commit)
                 )
             }
-            Refusal::MountedTwice { commit, tracker } => write!(
-                f,
-                "commit {} edits both copies of `{tracker}`: {tracker} is mounted twice; edit one",
-                short(commit)
-            ),
         }
     }
 }
@@ -1511,15 +1509,21 @@ impl<'a> Splitter<'a> {
             if at.as_str() == "."
                 && !definitions
                     .iter()
-                    .any(|definition| definition.name == owner)
+                    .any(|definition| definition.name == leaf_name(&owner))
             {
                 let mut root = TrackerDefinition::root();
                 root.name = owner.clone();
                 out.push(root);
             }
             for mut definition in definitions {
+                let itself = definition.name == leaf_name(&owner);
+                definition.name = if itself {
+                    owner.clone()
+                } else {
+                    child_id(&owner, &definition.name)
+                };
                 if at.as_str() != "." {
-                    if definition.name == owner {
+                    if itself {
                         continue;
                     }
                     let place = |path: &Utf8PathBuf| {
@@ -1533,7 +1537,7 @@ impl<'a> Splitter<'a> {
                     definition.exclusions = definition.exclusions.iter().map(place).collect();
                     definition.mount = place(&definition.mount);
                 }
-                if definition.git && definition.mounted() && definition.name != owner {
+                if definition.git && definition.mounted() && !itself {
                     let relative = definition
                         .mount
                         .strip_prefix(&at)
@@ -1583,9 +1587,10 @@ impl<'a> Splitter<'a> {
         made: &mut Vec<(String, String)>,
     ) -> std::result::Result<(String, BTreeMap<String, String>), SplitError> {
         let definitions = self.definitions_in(tree)?;
+        let own_name = leaf_name(tracker);
         let mut children: Vec<TrackerDefinition> = definitions
             .iter()
-            .filter(|definition| definition.git && definition.name != tracker)
+            .filter(|definition| definition.git && definition.name != own_name)
             .cloned()
             .collect();
         children.sort_by(|left, right| {
@@ -1603,7 +1608,7 @@ impl<'a> Splitter<'a> {
         for child in &children {
             let mount = child.mount.as_str();
             let shares_mount = definitions.iter().any(|other| {
-                other.name != child.name && other.name != tracker && other.mount == child.mount
+                other.name != child.name && other.name != own_name && other.mount == child.mount
             });
             let whole = mount != "."
                 && !shares_mount
@@ -1660,7 +1665,7 @@ impl<'a> Splitter<'a> {
                 let mut out: Vec<String> =
                     child.exclusions.iter().map(|path| relative(path)).collect();
                 for other in definitions.iter().filter(|other| {
-                    other.name != child.name && other.name != tracker && other.mount == child.mount
+                    other.name != child.name && other.name != own_name && other.mount == child.mount
                 }) {
                     for claim in &other.paths {
                         if other.claim_on(claim) > child.claim_on(claim) {
@@ -1691,6 +1696,7 @@ impl<'a> Splitter<'a> {
                 }
                 (part != EMPTY_TREE).then_some(part)
             };
+            let id = child_id(tracker, &child.name);
             let mut before: Vec<String> = Vec::new();
             for pins_then in &parent_pins {
                 if let Some(pin) = pins_then.get(&child.name)
@@ -1716,7 +1722,7 @@ impl<'a> Splitter<'a> {
                     NewgitError::Unsupported(format!(
                         "commit {} merges two lines of `{}`, which is not here to merge",
                         short(&commit.id),
-                        child.name
+                        tracker_path(&id)
                     ))
                 })?;
                 pins.insert(child.name.clone(), pin);
@@ -1730,7 +1736,7 @@ impl<'a> Splitter<'a> {
                 }
                 let mut descends = true;
                 for other in &before {
-                    if other != pin && !self.descends_from(&child.name, other, pin)? {
+                    if other != pin && !self.descends_from(&id, other, pin)? {
                         descends = false;
                     }
                 }
@@ -1743,24 +1749,18 @@ impl<'a> Splitter<'a> {
                 pins.insert(child.name.clone(), pin);
                 continue;
             }
-            if !(self.options.bound)(&child.name) {
+            if !(self.options.bound)(&id) {
                 let changed = self
                     .first_change(&before, &part_tree, mount)?
                     .unwrap_or_else(|| mount.to_owned());
                 return Err(SplitError::Refused(Refusal::Unbound {
                     path: changed,
-                    tracker: child.name.clone(),
+                    tracker: id,
                 }));
             }
-            if made.iter().any(|(name, _)| name == &child.name) {
-                return Err(SplitError::Refused(Refusal::MountedTwice {
-                    commit: commit.id.clone(),
-                    tracker: child.name.clone(),
-                }));
-            }
-            let piece = self.split_child(commit, &child.name, &part_tree, &before, made)?;
+            let piece = self.split_child(commit, &id, &part_tree, &before, made)?;
             if piece.new {
-                made.push((child.name.clone(), piece.commit.clone()));
+                made.push((id, piece.commit.clone()));
             }
             pins.insert(child.name.clone(), piece.commit);
         }

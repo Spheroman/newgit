@@ -19,7 +19,7 @@ use newgit_core::source::{RefUpdate, find_repo_root};
 use newgit_core::store::Context;
 use newgit_core::supervisor::StopOutcome;
 use newgit_core::templates::{RESOURCE_TEMPLATES, resource_template, resource_template_names};
-use newgit_core::tracker::{Storage, TrackerDefinition};
+use newgit_core::tracker::{ID_SEPARATOR, ROOT_TRACKER, Storage, TrackerDefinition, tracker_path};
 use newgit_core::{MetadataStore, ProjectConfig};
 
 mod claude_code;
@@ -586,6 +586,20 @@ struct RunArgs {
     command: Vec<String>,
 }
 
+/// `id`'s path from tracker `here`, as `ls` would name it: `.` for `here`
+/// itself.
+fn relative_to(here: &str, id: &str) -> String {
+    if id == here {
+        return if here == ROOT_TRACKER { id } else { "." }.to_owned();
+    }
+    let path = tracker_path(id);
+    if here == ROOT_TRACKER {
+        return path;
+    }
+    let above = format!("{}/", tracker_path(here));
+    path.strip_prefix(&above).unwrap_or(&path).to_owned()
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
@@ -651,7 +665,7 @@ fn main() -> Result<()> {
             tracker,
             instance,
             git_args,
-        } => tracker_log(&tracker, instance, &git_args),
+        } => tracker_log(&tracker_id(&tracker)?, instance, &git_args),
         Command::Checkpoints { instance } => checkpoints(instance),
         Command::Export(args) => export(args),
         Command::Cleanup {
@@ -691,7 +705,7 @@ fn main() -> Result<()> {
         } => pull_remote(&target),
         Command::Pull {
             tracker, instance, ..
-        } => pull(instance, &tracker.unwrap_or_default()),
+        } => pull(instance, &tracker_id(&tracker.unwrap_or_default())?),
         Command::EndpointCompose => {
             let plan: newgit_core::endpoint::Plan = serde_json::from_reader(std::io::stdin())
                 .context("the plan on stdin is not JSON newgit can read")?;
@@ -1314,8 +1328,16 @@ fn spawn(args: SpawnArgs) -> Result<()> {
         &args.name,
         args.from.as_deref(),
         &newgit_core::manager::BindingChoice {
-            uses: args.uses.clone(),
-            drops: args.drops.clone(),
+            uses: args
+                .uses
+                .iter()
+                .map(|tracker| tracker_id(tracker))
+                .collect::<Result<_>>()?,
+            drops: args
+                .drops
+                .iter()
+                .map(|tracker| tracker_id(tracker))
+                .collect::<Result<_>>()?,
             private: args.private,
         },
     )?;
@@ -2042,7 +2064,23 @@ fn shell_quote(value: &str) -> String {
     }
 }
 
-fn tracker(command: TrackerCommand) -> Result<()> {
+/// `given`, a tracker as typed here, as its id: a path from where this runs.
+fn tracker_id(given: &str) -> Result<String> {
+    let manager = BranchManager::open(context_here()?.store)?;
+    Ok(manager.resolve_tracker(&current_dir()?, given)?)
+}
+
+fn tracker(mut command: TrackerCommand) -> Result<()> {
+    if let TrackerCommand::Track { tracker, .. }
+    | TrackerCommand::Capture { tracker, .. }
+    | TrackerCommand::Merge { tracker, .. }
+    | TrackerCommand::Checkout { tracker, .. }
+    | TrackerCommand::Pull { tracker, .. }
+    | TrackerCommand::Use { tracker, .. }
+    | TrackerCommand::Drop { tracker, .. } = &mut command
+    {
+        *tracker = tracker_id(tracker)?;
+    }
     match command {
         TrackerCommand::Create {
             name,
@@ -2303,6 +2341,18 @@ fn tracker(command: TrackerCommand) -> Result<()> {
                 .collect();
             pathless.sort_by_key(|definition| (definition.role.clone(), definition.name.clone()));
             ordered.extend(pathless.into_iter().map(|definition| (0, definition)));
+            // As `ls` lists a directory: what is here, not the whole tree.
+            let here = manager.tracker_at(&current_dir()?);
+            if here != manager.root_tracker().name {
+                let below = format!("{here}{ID_SEPARATOR}");
+                ordered.retain(|(_, definition)| {
+                    definition.name == here || definition.name.starts_with(&below)
+                });
+                let top = ordered.iter().map(|(depth, _)| *depth).min().unwrap_or(0);
+                for (depth, _) in &mut ordered {
+                    *depth -= top;
+                }
+            }
             let rows: Vec<_> = ordered
                 .iter()
                 .map(|(depth, definition)| {
@@ -2311,7 +2361,8 @@ fn tracker(command: TrackerCommand) -> Result<()> {
                         Some(_) => "* ",
                         None => "",
                     };
-                    let name = format!("{mark}{}{}", "  ".repeat(*depth), definition.name);
+                    let name = relative_to(&here, &definition.name);
+                    let name = format!("{mark}{}{name}", "  ".repeat(*depth));
                     let in_git = if definition.git { "yes" } else { "no" };
                     let mut role = definition.role.clone().unwrap_or_else(|| "-".to_owned());
                     if definition.priority != 0 {
@@ -2445,6 +2496,7 @@ fn tracker(command: TrackerCommand) -> Result<()> {
         TrackerCommand::Use { tracker, instance } => {
             let (manager, instance) = manager_and_instance(instance)?;
             let change = manager.use_tracker(&instance, &tracker)?;
+            let tracker = tracker_path(&tracker);
             if change.already {
                 println!("`{tracker}` is already bound in `{instance}`");
                 return Ok(());
@@ -2455,6 +2507,7 @@ fn tracker(command: TrackerCommand) -> Result<()> {
             }
             print_parked(&change.parked);
             for other in &change.brought {
+                let other = tracker_path(other);
                 println!("  bound `{other}` too: it goes with `{tracker}`");
             }
             if !change.started.is_empty() {
@@ -2491,12 +2544,14 @@ fn tracker(command: TrackerCommand) -> Result<()> {
                 _ => Uncommitted::Refuse,
             };
             let change = manager.drop_tracker(&instance, &tracker, how)?;
+            let tracker = tracker_path(&tracker);
             if change.already {
                 println!("`{tracker}` is already dropped from `{instance}`");
                 return Ok(());
             }
             println!("Dropped `{tracker}` from `{instance}`");
             for child in &change.children {
+                let child = tracker_path(child);
                 println!("  dropped `{child}` too: it exists only in `{tracker}`");
             }
             print_parked(&change.parked);
@@ -2799,12 +2854,12 @@ fn push_project_root(manager: &BranchManager, updates: &[RefUpdate]) -> Result<(
     use newgit_core::manager::TrackerMergeAction;
     let outcome = manager.receive_project_push(updates)?;
     print_warnings(&outcome.merge.warnings);
-    let moved: Vec<&str> = outcome
+    let moved: Vec<String> = outcome
         .merge
         .trackers
         .iter()
         .filter(|merge| merge.action != TrackerMergeAction::Unchanged)
-        .map(|merge| merge.tracker.as_str())
+        .map(|merge| tracker_path(&merge.tracker))
         .collect();
     if moved.is_empty() {
         println!("newgit: `main` already has this");
@@ -3399,7 +3454,7 @@ fn export_to_remote(name: &str, options: RemoteExportOptions) -> Result<()> {
             ),
             ExportReason::Mounted => println!(
                 "  tracker:  {:<width$}  mounted in the root @ {at}",
-                tracker.name
+                tracker_path(&tracker.name)
             ),
             ExportReason::Withheld => println!(
                 "  withheld: {:<width$}  (audience {})",
@@ -4247,7 +4302,7 @@ fn merge(instance: Option<String>, into: &str) -> Result<()> {
         };
         println!(
             "  {:<12} {what:<12} {}",
-            merge.tracker,
+            tracker_path(&merge.tracker),
             &merge.commit[..merge.commit.len().min(12)]
         );
     }

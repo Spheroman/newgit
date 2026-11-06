@@ -130,23 +130,6 @@ impl Repo {
         )
         .unwrap_or_else(|error| panic!("split {tip}: {error}"))
     }
-
-    fn try_split(&self, tip: &str) -> Result<compose::SplitOutcome, String> {
-        let bound = |_: &str| true;
-        let audience = |_: &str| None;
-        compose::split(
-            &self.dir,
-            tip,
-            &SplitOptions {
-                root: "root",
-                bound: &bound,
-                audience: &audience,
-                newgit_made: None,
-                need_history: &|_| Ok(()),
-            },
-        )
-        .map_err(|error| error.to_string())
-    }
 }
 
 /// A fresh bare repository holding only the tracker commits `refs` name —
@@ -445,7 +428,7 @@ fn nested_mounts_compose_and_split_through_the_child() {
         "app mounts lib",
     );
     let outcome = repo.split(&nested);
-    let lib = &outcome.index["lib"];
+    let lib = &outcome.index["app__lib"];
     assert_eq!(files(&repo.dir, lib), vec!["index.js"]);
     let app_files = files(&repo.dir, &outcome.index["app"]);
     assert!(
@@ -467,11 +450,12 @@ fn nested_mounts_compose_and_split_through_the_child() {
     assert_eq!(composed.as_deref(), Some(edit.as_str()));
 }
 
+/// A name is local to its parent, as a file's is to its directory: two
+/// parents with a `ui` have two trackers, each at its own version.
 #[test]
-fn the_same_tracker_mounted_twice_refuses_a_commit_editing_both() {
+fn two_parents_with_a_tracker_of_one_name_have_two_trackers() {
     let (_guard, temp) = tempdir();
     let (repo, _) = carved_project(&temp);
-    // Root mounts `ui` at `ui`, and the app mounts its own copy at `vendor/ui`.
     let both = repo.commit(
         &[
             (".newgit/trackers/ui.toml", Some(&mounted("ui"))),
@@ -482,13 +466,22 @@ fn the_same_tracker_mounted_twice_refuses_a_commit_editing_both() {
             ),
             ("apps/app/vendor/ui/button.js", Some("v1\n")),
         ],
-        "mount ui twice",
+        "one ui each",
     );
-    // A commit bringing both copies in at once edits both: refused.
-    let refused = repo.try_split(&both).expect_err("both copies changed");
-    assert!(
-        refused.contains("ui is mounted twice; edit one"),
-        "{refused}"
+    let outcome = repo.split(&both);
+    assert_eq!(
+        git(
+            &repo.dir,
+            &["show", &format!("{}:button.js", outcome.index["ui"])]
+        ),
+        "v2"
+    );
+    assert_eq!(
+        git(
+            &repo.dir,
+            &["show", &format!("{}:button.js", outcome.index["app__ui"])]
+        ),
+        "v1"
     );
 }
 
@@ -853,7 +846,7 @@ fn a_diamond_of_merges_through_two_trackers_round_trips() {
 }
 
 #[test]
-fn an_edit_to_one_copy_of_a_tracker_mounted_twice_splits_into_that_copy() {
+fn an_edit_to_one_of_two_trackers_of_one_name_splits_into_that_one() {
     let (_guard, temp) = tempdir();
     let (repo, _) = carved_project(&temp);
     let first = repo.commit(
@@ -883,8 +876,6 @@ fn an_edit_to_one_copy_of_a_tracker_mounted_twice_splits_into_that_copy() {
         let _ = outcome;
         repo.split(&edit)
     };
-    // Composed here: an index lists one copy of a tracker per name, so a
-    // fresh repository fed from the index alone lacks the other's commits.
     let composed = compose_in(&repo.dir, &outcome.root, &["*"]);
     assert_eq!(composed.as_deref(), Some(edit.as_str()));
     assert_eq!(

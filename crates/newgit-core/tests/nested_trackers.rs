@@ -47,7 +47,7 @@ fn imported(temp: &camino::Utf8Path) -> (MetadataStore, Utf8PathBuf, Utf8PathBuf
 fn carve(store: &MetadataStore) {
     manager(store)
         .create_git_tracker(
-            "t3code-repos",
+            "repos",
             "project-devs",
             &[Utf8PathBuf::from("apps/t3code/.repos")],
         )
@@ -84,7 +84,7 @@ fn a_tracker_carved_inside_a_mount_is_its_parents_child() {
     let repo = store.paths().project_root.clone();
     carve(&store);
 
-    let definition = "apps/t3code/.newgit/trackers/t3code-repos.toml";
+    let definition = "apps/t3code/.newgit/trackers/repos.toml";
     assert!(repo.join(definition).is_file(), "defined in its parent");
     let text = std::fs::read_to_string(repo.join(definition)).expect("read");
     assert!(text.contains("mount = \".repos\""), "relative: {text}");
@@ -95,11 +95,8 @@ fn a_tracker_carved_inside_a_mount_is_its_parents_child() {
         !parent_files.iter().any(|file| file.starts_with(".repos/")),
         "the parent gave its files up: {parent_files:?}"
     );
-    assert!(
-        has(&parent_files, ".newgit/pins/t3code-repos"),
-        "{parent_files:?}"
-    );
-    let child = tracker_main(&store, "t3code-repos");
+    assert!(has(&parent_files, ".newgit/pins/repos"), "{parent_files:?}");
+    let child = tracker_main(&store, "t3code__repos");
     assert!(has(&tree(&repo, &child), "effect/LLMS.md"));
 
     let view = tree(&repo, "main");
@@ -124,12 +121,12 @@ fn an_export_rooted_at_the_parent_still_holds_the_child() {
     let child = exported
         .trackers
         .iter()
-        .find(|tracker| tracker.name == "t3code-repos")
+        .find(|tracker| tracker.name == "t3code__repos")
         .expect("the report names the child");
     assert_eq!(child.reason, ExportReason::Mounted);
     assert_eq!(
         child.commit.as_deref(),
-        Some(tracker_main(&store, "t3code-repos").as_str()),
+        Some(tracker_main(&store, "t3code__repos").as_str()),
         "the commit it ships"
     );
     assert!(!child.unmerged, "merged: there is nothing it left behind");
@@ -150,7 +147,7 @@ fn an_export_rooted_at_the_parent_still_holds_the_child() {
         .iter()
         .filter(|file| !files_before.contains(file))
         .collect();
-    assert_eq!(added, [".newgit/trackers/t3code-repos.toml"]);
+    assert_eq!(added, [".newgit/trackers/repos.toml"]);
     assert!(
         files_before.iter().all(|file| files.contains(file)),
         "nothing the fork had is gone"
@@ -179,7 +176,7 @@ fn an_export_refuses_a_child_narrower_than_its_root_naming_it() {
     carve(&store);
     export(&store);
     let tip = git(&github, &["rev-parse", "newgit"]);
-    let path = repo.join("apps/t3code/.newgit/trackers/t3code-repos.toml");
+    let path = repo.join("apps/t3code/.newgit/trackers/repos.toml");
     let text = std::fs::read_to_string(&path).expect("read");
     std::fs::write(
         &path,
@@ -187,14 +184,14 @@ fn an_export_refuses_a_child_narrower_than_its_root_naming_it() {
     )
     .expect("write");
     git(&repo, &["add", "-A"]);
-    git(&repo, &["commit", "-q", "-m", "Narrow t3code-repos"]);
+    git(&repo, &["commit", "-q", "-m", "Narrow t3code__repos"]);
     manager(&store).merge("main", "main").expect("publish");
 
     let error = manager(&store)
         .export_to_remote(TARGET, RemoteExportOptions::default())
         .expect_err("refused");
     let text = error.to_string();
-    assert!(text.contains("`t3code-repos`"), "{text}");
+    assert!(text.contains("`t3code/repos`"), "{text}");
     assert!(text.contains("user:ana"), "{text}");
     assert_eq!(
         git(&github, &["rev-parse", "newgit"]),
@@ -211,7 +208,7 @@ fn a_commit_on_the_target_goes_to_the_trackers_that_own_its_files() {
     carve(&store);
     export(&store);
     let parent_before = tracker_main(&store, "t3code");
-    let child_before = tracker_main(&store, "t3code-repos");
+    let child_before = tracker_main(&store, "t3code__repos");
 
     let work = temp.join("github-work");
     git(
@@ -257,7 +254,7 @@ fn a_commit_on_the_target_goes_to_the_trackers_that_own_its_files() {
     manager(&store).merge("main", "main").expect("publish");
 
     let parent = tracker_main(&store, "t3code");
-    let child = tracker_main(&store, "t3code-repos");
+    let child = tracker_main(&store, "t3code__repos");
     assert_ne!(parent, parent_before);
     assert_ne!(child, child_before, "the child moved, not only the parent");
     assert_eq!(
@@ -293,7 +290,7 @@ fn an_upstream_merged_on_the_target_reaches_the_child() {
     let repo = store.paths().project_root.clone();
     carve(&store);
     export(&store);
-    let child_before = tracker_main(&store, "t3code-repos");
+    let child_before = tracker_main(&store, "t3code__repos");
 
     commit_as(
         &upstream,
@@ -345,7 +342,7 @@ fn an_upstream_merged_on_the_target_reaches_the_child() {
         "upstream"
     );
     let parent = tracker_main(&store, "t3code");
-    let child = tracker_main(&store, "t3code-repos");
+    let child = tracker_main(&store, "t3code__repos");
     assert_ne!(child, child_before, "the child took the bump");
     assert_eq!(
         git(&repo, &["show", &format!("{child}:effect/LLMS.md")]),
@@ -397,14 +394,14 @@ fn a_target_that_does_not_ship_the_parent_leaves_the_child_out_too() {
 
 fn on_request(store: &MetadataStore) {
     let repo = store.paths().project_root.clone();
-    let path = repo.join("apps/t3code/.newgit/trackers/t3code-repos.toml");
+    let path = repo.join("apps/t3code/.newgit/trackers/repos.toml");
     let mut text = std::fs::read_to_string(&path).expect("read");
     text.push_str("priority = -1\n");
     std::fs::write(&path, text).expect("write");
     git(&repo, &["add", "-A"]);
     git(
         &repo,
-        &["commit", "-q", "-m", "Bind t3code-repos only when asked"],
+        &["commit", "-q", "-m", "Bind t3code__repos only when asked"],
     );
     manager(store).merge("main", "main").expect("publish");
 }
@@ -428,7 +425,7 @@ fn a_child_can_stay_out_of_a_workspace_and_its_parents_work_merges_without_it() 
     let spawned = manager(&store)
         .spawn_binding("feature", None, &BindingChoice::default())
         .expect("spawn");
-    assert!(spawned.branch.dropped.contains("t3code-repos"));
+    assert!(spawned.branch.dropped.contains("t3code__repos"));
     assert!(!spawned.branch.dropped.contains("t3code"));
     let workspace = spawned.branch.workspace_path.clone();
     assert!(!workspace.join("apps/t3code/.repos").exists());
@@ -490,18 +487,18 @@ fn a_child_is_bound_only_where_its_parent_is() {
     // Parent left out: the child cannot exist without it.
     assert_eq!(
         spawned_without(&store, "neither", &choice(&[], &["t3code"])),
-        ["t3code", "t3code-repos"]
+        ["t3code", "t3code__repos"]
     );
     // Asked for by name: it brings its parent.
-    assert!(spawned_without(&store, "asked", &choice(&["t3code-repos"], &[])).is_empty());
+    assert!(spawned_without(&store, "asked", &choice(&["t3code__repos"], &[])).is_empty());
     // Its own negative priority keeps it out while the parent is bound.
     on_request(&store);
     assert_eq!(
         spawned_without(&store, "parent-only", &BindingChoice::default()),
-        ["t3code-repos"]
+        ["t3code__repos"]
     );
     assert_eq!(
-        spawned_without(&store, "parent-asked", &choice(&["t3code-repos"], &[])),
+        spawned_without(&store, "parent-asked", &choice(&["t3code__repos"], &[])),
         Vec::<String>::new()
     );
 }
@@ -515,7 +512,7 @@ fn a_parent_on_request_brings_a_child_that_is_not() {
     parent_on_request(&store);
     assert_eq!(
         spawned_without(&store, "default", &BindingChoice::default()),
-        ["t3code", "t3code-repos"],
+        ["t3code", "t3code__repos"],
         "neither, though the child's own priority would bind it"
     );
     assert!(
@@ -526,7 +523,7 @@ fn a_parent_on_request_brings_a_child_that_is_not() {
     let used = manager(&store)
         .use_tracker("default", "t3code")
         .expect("use");
-    assert_eq!(used.brought, ["t3code-repos"]);
+    assert_eq!(used.brought, ["t3code__repos"]);
     let branch = store.find_branch("default").expect("record");
     assert!(
         branch
@@ -546,14 +543,14 @@ fn with_both_on_request_a_parent_can_come_without_its_child() {
     parent_on_request(&store);
     assert_eq!(
         spawned_without(&store, "neither", &BindingChoice::default()),
-        ["t3code", "t3code-repos"]
+        ["t3code", "t3code__repos"]
     );
     let used = manager(&store)
         .use_tracker("neither", "t3code")
         .expect("use");
     assert!(used.brought.is_empty(), "{:?}", used.brought);
     let branch = store.find_branch("neither").expect("record");
-    assert!(branch.dropped.contains("t3code-repos"));
+    assert!(branch.dropped.contains("t3code__repos"));
     assert!(branch.workspace_path.join("apps/t3code/src").exists());
     assert!(!branch.workspace_path.join("apps/t3code/.repos").exists());
 }
@@ -569,7 +566,7 @@ fn asking_for_a_child_brings_its_parent_and_dropping_the_parent_takes_it() {
     assert!(!spawned.branch.workspace_path.join("apps/t3code").exists());
 
     let used = manager(&store)
-        .use_tracker("x", "t3code-repos")
+        .use_tracker("x", "t3code__repos")
         .expect("use");
     assert_eq!(used.brought, ["t3code"]);
     let branch = store.find_branch("x").expect("record");
@@ -585,9 +582,9 @@ fn asking_for_a_child_brings_its_parent_and_dropping_the_parent_takes_it() {
     let dropped = manager(&store)
         .drop_tracker("x", "t3code", Uncommitted::Refuse)
         .expect("drop");
-    assert_eq!(dropped.children, ["t3code-repos"], "says what else went");
+    assert_eq!(dropped.children, ["t3code__repos"], "says what else went");
     let branch = store.find_branch("x").expect("record");
-    assert!(branch.dropped.contains("t3code") && branch.dropped.contains("t3code-repos"));
+    assert!(branch.dropped.contains("t3code") && branch.dropped.contains("t3code__repos"));
     assert!(!branch.workspace_path.join("apps/t3code").exists());
 }
 
@@ -597,11 +594,11 @@ fn a_spawn_asking_for_a_child_of_a_dropped_parent_is_refused_by_name() {
     let (store, _, _) = imported(&temp);
     carve(&store);
     let error = manager(&store)
-        .spawn_binding("both", None, &choice(&["t3code-repos"], &["t3code"]))
+        .spawn_binding("both", None, &choice(&["t3code__repos"], &["t3code"]))
         .expect_err("refused");
     let text = error.to_string();
     assert!(
-        text.contains("`t3code`") && text.contains("`t3code-repos`"),
+        text.contains("`t3code`") && text.contains("`t3code/repos`"),
         "{text}"
     );
 }
@@ -683,12 +680,12 @@ fn a_name_already_taken_cannot_be_carved_again() {
     carve(&store);
     let error = manager(&store)
         .create_git_tracker(
-            "t3code-repos",
+            "repos",
             "project-devs",
-            &[Utf8PathBuf::from("apps/t3code/src")],
+            &[Utf8PathBuf::from("apps/t3code/.repos")],
         )
         .expect_err("refused");
-    assert!(error.to_string().contains("`t3code-repos`"), "{error}");
+    assert!(error.to_string().contains("`t3code/repos`"), "{error}");
 }
 
 /// The notes that recognise exported commits are local to the machine that
@@ -733,4 +730,163 @@ fn a_pull_on_a_machine_that_never_exported_recognises_what_was_exported() {
         parent_before,
         "one commit on top: nothing was split again"
     );
+}
+
+/// A tracker's path in the one namespace, as a filesystem reads one.
+#[test]
+fn a_tracker_is_named_as_a_path_from_where_you_stand() {
+    let (_guard, temp) = tempdir();
+    let (store, _, _) = imported(&temp);
+    carve(&store);
+    let repo = store.paths().project_root.clone();
+    let manager = manager(&store);
+    let top = manager.namespace_root();
+    assert_eq!(top, "/user/proj", "this project is on no remote");
+
+    // From the top of the project.
+    let id = |cwd: &camino::Utf8Path, given: &str| manager.resolve_tracker(cwd, given);
+    assert_eq!(id(&repo, "t3code").expect("resolve"), "t3code");
+    assert_eq!(id(&repo, "t3code/repos").expect("resolve"), "t3code__repos");
+    assert_eq!(id(&repo, "root").expect("resolve"), "root");
+
+    // From inside `t3code`.
+    let inside = repo.join("apps/t3code/src");
+    assert_eq!(manager.tracker_at(&inside), "t3code");
+    assert_eq!(id(&inside, "repos").expect("resolve"), "t3code__repos");
+    assert_eq!(id(&inside, "./repos").expect("resolve"), "t3code__repos");
+    assert_eq!(id(&inside, "..").expect("resolve"), "root");
+    assert_eq!(id(&inside, "../access").expect("resolve"), "access");
+
+    // Inside the child, and in a workspace rather than the project root.
+    assert_eq!(
+        manager.tracker_at(&repo.join("apps/t3code/.repos/effect")),
+        "t3code__repos"
+    );
+    let workspace = manager
+        .spawn("x", None)
+        .expect("spawn")
+        .branch
+        .workspace_path;
+    assert_eq!(
+        manager.tracker_at(&workspace.join("apps/t3code/.repos")),
+        "t3code__repos"
+    );
+    assert_eq!(manager.tracker_at(&workspace), "root");
+
+    // Absolute: the same from anywhere.
+    let absolute = format!("{top}/t3code/repos");
+    assert_eq!(id(&repo, &absolute).expect("resolve"), "t3code__repos");
+    assert_eq!(id(&inside, &absolute).expect("resolve"), "t3code__repos");
+    assert_eq!(id(&inside, &top).expect("resolve"), "root");
+
+    // A name is not looked for further up: it means one thing where typed.
+    let text = id(&inside, "access").expect_err("refused").to_string();
+    assert!(text.contains(&format!("{top}/access")), "{text}");
+    let text = id(&repo, "..").expect_err("refused").to_string();
+    assert!(text.contains("above this project"), "{text}");
+    let text = id(&repo, "/remote/someone/else/x")
+        .expect_err("refused")
+        .to_string();
+    assert!(text.contains("not in this project"), "{text}");
+}
+
+/// A symlink on the way to a project spells the same directory another way:
+/// the tracker you are in is found on disk, not by comparing strings.
+#[test]
+fn where_you_stand_does_not_depend_on_how_the_project_is_spelled() {
+    let (_guard, temp) = tempdir();
+    let (store, _, _) = imported(&temp);
+    carve(&store);
+    let repo = store.paths().project_root.clone();
+    let alias = temp.join("alias");
+    std::os::unix::fs::symlink(&repo, &alias).expect("symlink");
+    let spelled =
+        newgit_core::manager::BranchManager::open(MetadataStore::at(&alias)).expect("manager");
+    assert_eq!(spelled.tracker_at(&repo.join("apps/t3code/src")), "t3code");
+    assert_eq!(
+        spelled
+            .resolve_tracker(&repo.join("apps/t3code/src"), "repos")
+            .expect("resolve"),
+        "t3code__repos"
+    );
+}
+
+/// Two parents can each have a `docs`, as two directories can.
+#[test]
+fn names_are_unique_within_a_parent_not_across_a_project() {
+    let (_guard, temp) = tempdir();
+    let (store, _, _) = imported(&temp);
+    let repo = store.paths().project_root.clone();
+    commit_as(
+        &repo,
+        "ana",
+        1_700_000_000,
+        &[
+            ("docs/index.md", "root docs\n"),
+            ("apps/t3code/docs/index.md", "t3code docs\n"),
+        ],
+        "Docs twice",
+    );
+    manager(&store).merge("main", "main").expect("publish");
+    manager(&store)
+        .create_git_tracker("docs", "project-devs", &[Utf8PathBuf::from("docs")])
+        .expect("root's");
+    manager(&store)
+        .create_git_tracker(
+            "docs",
+            "project-devs",
+            &[Utf8PathBuf::from("apps/t3code/docs")],
+        )
+        .expect("t3code's");
+    manager(&store).merge("main", "main").expect("publish");
+    assert_eq!(
+        git(
+            &repo,
+            &[
+                "show",
+                &format!("{}:index.md", tracker_main(&store, "docs"))
+            ]
+        ),
+        "root docs"
+    );
+    assert_eq!(
+        git(
+            &repo,
+            &[
+                "show",
+                &format!("{}:index.md", tracker_main(&store, "t3code__docs"))
+            ]
+        ),
+        "t3code docs"
+    );
+    let view = tree(&repo, "main");
+    assert!(has(&view, "docs/index.md") && has(&view, "apps/t3code/docs/index.md"));
+}
+
+#[test]
+fn a_full_path_must_say_where_path_puts_it_and_the_separator_is_reserved() {
+    let (_guard, temp) = tempdir();
+    let (store, _, _) = imported(&temp);
+    manager(&store)
+        .create_git_tracker(
+            "t3code/repos",
+            "project-devs",
+            &[Utf8PathBuf::from("apps/t3code/.repos")],
+        )
+        .expect("the full path is the same tracker");
+    let error = manager(&store)
+        .create_git_tracker(
+            "elsewhere/src",
+            "project-devs",
+            &[Utf8PathBuf::from("apps/t3code/src")],
+        )
+        .expect_err("refused");
+    assert!(error.to_string().contains("t3code/src"), "{error}");
+    manager(&store)
+        .create_git_tracker(
+            "a__b",
+            "project-devs",
+            &[Utf8PathBuf::from("apps/t3code/src")],
+        )
+        .expect_err("reserved");
 }
