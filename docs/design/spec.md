@@ -405,7 +405,12 @@ its time checking files out (2.3s of 2.5s on T3 Code's 28.6k files).
 newgit keeps one clean checkout of the project repository beside the
 workspaces, `<workspace root>/.source-template`, with no local branches.
 `spawn` fetches it from the project repository, checks out the instance's
-revision, and copies the whole tree with one `clonefile(2)`. Then the copy
+revision, and copies the whole tree with one `clonefile(2)`. An instance that
+leaves trackers out is copied from a template of its own binding,
+`<workspace root>/.source-template-<key>`, sparse from before its first
+checkout: nothing it leaves out is written, so leaving files out makes a spawn
+faster, not slower. The same goes for a plain `git clone`, where there is no
+template. `newgit cleanup` removes a template no live binding uses. Then the copy
 gets its own branch, with the upstream `git clone --branch` would set, and
 `core.checkStat=minimal` plus `core.trustctime=false`. Without those two
 settings Git would re-hash every file on the first `git status`, because

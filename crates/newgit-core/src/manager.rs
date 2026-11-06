@@ -26,7 +26,7 @@ use crate::installs::{Admission, InstallReport, InstallStore, TreeRender};
 use crate::lock::{InstanceLock, LOCKED_ENV, locked_env_value};
 use crate::materializer::{
     Materializer, RealDirMaterializer, SOURCE_TEMPLATE_DIR, exclude_produced_paths,
-    exclude_tracker_paths, unexclude_tracker_paths,
+    exclude_tracker_paths, template_for, unexclude_tracker_paths,
 };
 use crate::ports;
 use crate::remote::{Acting, Remote, RemoteLink, Scope, basic_auth_header};
@@ -2951,9 +2951,11 @@ impl BranchManager {
         }
 
         branch.dropped = dropped;
-        let template_warning = self
-            .materializer()
-            .materialize_reporting(&self.source, &branch)?;
+        let template_warning = self.materializer().materialize_reporting(
+            &self.source,
+            &branch,
+            &self.sparse_patterns(&branch.dropped),
+        )?;
         if !branch.dropped.is_empty() {
             self.apply_sparse(&branch)?;
         }
@@ -7433,12 +7435,22 @@ impl BranchManager {
         // archived while its directory survived.
         let workspace_root = self.config.workspace_root(&self.store.paths().project_root);
         let claimed = [branches.as_slice(), revived.as_slice()].concat();
-        let (orphans, unrecognized) = orphan_workspaces(&workspace_root, &claimed)?;
+        // A template stays for as long as a live binding would use it, and
+        // the next spawn rebuilds one that went.
+        let in_use: BTreeSet<Utf8PathBuf> = match self.materializer().source_template {
+            Some(template) => live
+                .iter()
+                .map(|branch| template_for(&template, &self.sparse_patterns(&branch.dropped)))
+                .collect(),
+            None => BTreeSet::new(),
+        };
+        let (orphans, unrecognized) = orphan_workspaces(&workspace_root, &claimed, &in_use)?;
         outcome.warnings.extend(unrecognized);
         for orphan in orphans {
             if !dry_run {
                 std::fs::remove_dir_all(&orphan)
                     .map_err(|source| NewgitError::io(&orphan, source))?;
+                let _ = std::fs::remove_file(format!("{orphan}.lock"));
             }
             outcome.orphan_workspaces.push(orphan);
         }
