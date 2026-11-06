@@ -648,9 +648,12 @@ A cold `git fetch` is bounded by root's size plus its pins. For a project whose
 large history is a mount, that is about 32 seconds and 113 MB for one pin
 (measured from a laptop against the real t3code repo) and, unmeasured, more
 for several. Where root itself is the large history, it is what it was:
-that request waits for all of it. Nothing in `src/endpoint.ts` times the wait
-out; the Worker holds the request open for as long as the client stays
-connected, and the plan's read passwords last an hour.
+that request waits for all of it. A request with no response started is cut
+off at five minutes (`Network connection lost`, measured twice at 5:07), and a
+cold compose of newgit with t3code took longer than that. So `info/refs` sends
+its headers at once and its body when the view is ready, and a failure is an
+`ERR` line, which Git prints as a `remote error`. The compose carries on if the
+client leaves, and the plan's read passwords last an hour.
 
 The client's `newgit clone` and tracker merges still fetch whole histories: a
 real merge in a child needs them.

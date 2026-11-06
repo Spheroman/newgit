@@ -13,8 +13,9 @@
 //
 // A view needs root's history and each commit it pins, so a fetch waits only
 // for those, in this request (docs/design/remote.md, *Fetching what a view
-// needs*). Where root itself is the large history it waits for all of it;
-// nothing here times that out.
+// needs*). Where root itself is the large history it waits for all of it.
+// `info/refs` starts its response first, since a request with none started is
+// cut off at five minutes.
 //
 // A merge's checks (`newgit endpoint-ancestry`, `newgit endpoint-index`) run
 // in the background: the first time a large history is here (t3code, 365
@@ -256,12 +257,13 @@ export function pullKey(plan: Pick<PullPlan, "list" | "mirror" | "peek">): strin
 }
 
 /**
- * 4 GiB, half a vCPU, 8 GB of disk. Left unset, a container gets the smallest
- * size, which lost its connection composing Spheroman/t3code. It goes on every
- * start, a restore included, since a Durable Object-managed container takes its
- * size here and wrangler.jsonc refuses `instance_type`.
+ * 4 GiB, half a vCPU, 8 GB of disk, for a store holding a large tracker. It
+ * goes on every start, a restore included, since a Durable Object-managed
+ * container takes its size here and wrangler.jsonc refuses `instance_type`.
  */
 const ENDPOINT_INSTANCE = "standard-1";
+
+const COULD_NOT_COMPOSE = "newgit could not compose this view; the remote logged why";
 
 /** Snapshot at most this often, after a compose changed what is on disk. */
 const SNAPSHOT_EVERY_MS = 10 * 60_000;
@@ -573,45 +575,13 @@ export class GitEndpoint extends DurableObject<Env> {
 		const plan = atob(encoded);
 		if (kind === "ancestry" || kind === "index" || kind === "copy" || kind === "pull")
 			return this.check(kind, plan, url.searchParams.has("peek"));
-		const container = await this.ensureRunning();
-
-		const compose = await container.exec(["newgit", "endpoint-compose"], {
-			stdin: new Response(plan).body!,
-			stdout: "pipe",
-			stderr: "pipe",
-		});
-		const composed = await compose.output();
-		if (composed.exitCode !== 0) {
-			const why = new TextDecoder().decode(composed.stderr).trim();
-			console.error("endpoint-compose failed", why);
-			return new Response("newgit could not compose this view; the remote logged why\n", { status: 502 });
-		}
-		const view = new TextDecoder().decode(composed.stdout).trim();
-		await this.ctx.storage.put("composed_at", Date.now());
-		await this.snapshotSoon();
-
 		const protocol = request.headers.get("git-protocol");
 		const env: Record<string, string> = protocol ? { GIT_PROTOCOL: protocol } : {};
-		if (kind === "advertise") {
-			const process = await container.exec(["git", "upload-pack", "--stateless-rpc", "--advertise-refs", view], {
-				env,
-				stdout: "pipe",
-				stderr: "ignore",
-			});
-			const { stdout } = await process.output();
-			// Protocol v2 answers with its capability advertisement directly;
-			// v0 needs the service preamble first.
-			const body =
-				protocol && protocol.includes("version=2")
-					? new Uint8Array(stdout)
-					: concat(pkt("# service=git-upload-pack\n"), new TextEncoder().encode("0000"), new Uint8Array(stdout));
-			return new Response(body, {
-				headers: {
-					"content-type": "application/x-git-upload-pack-advertisement",
-					"cache-control": "no-cache",
-				},
-			});
-		}
+		if (kind === "advertise") return this.advertise(plan, protocol, env);
+
+		const container = await this.ensureRunning();
+		const view = await this.compose(container, plan);
+		if (view === undefined) return new Response(`${COULD_NOT_COMPOSE}\n`, { status: 502 });
 
 		let input = request.body ?? new ReadableStream();
 		if (request.headers.get("content-encoding") === "gzip") input = input.pipeThrough(new DecompressionStream("gzip"));
@@ -624,6 +594,70 @@ export class GitEndpoint extends DurableObject<Env> {
 		return new Response(process.stdout, {
 			headers: {
 				"content-type": "application/x-git-upload-pack-result",
+				"cache-control": "no-cache",
+			},
+		});
+	}
+
+	/** Compose `plan` and return the view's path, or nothing when it failed, which is logged. */
+	private async compose(container: Container, plan: string): Promise<string | undefined> {
+		const compose = await container.exec(["newgit", "endpoint-compose"], {
+			stdin: new Response(plan).body!,
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		const composed = await compose.output();
+		if (composed.exitCode !== 0) {
+			console.error("endpoint-compose failed", new TextDecoder().decode(composed.stderr).trim());
+			return undefined;
+		}
+		const view = new TextDecoder().decode(composed.stdout).trim();
+		await this.ctx.storage.put("composed_at", Date.now());
+		await this.snapshotSoon();
+		return view;
+	}
+
+	/**
+	 * Answer `info/refs`, the request a first fetch waits on while the view is
+	 * composed: minutes, the first time after a deploy. A request with no
+	 * response started is cut off at five minutes (`Network connection lost`),
+	 * so the headers go now and the body when the view is ready. The status is
+	 * spent by then, so a failure is an `ERR` line, which Git prints as a
+	 * `remote error`.
+	 */
+	private advertise(plan: string, protocol: string | null, env: Record<string, string>): Response {
+		const { readable, writable } = new TransformStream<Uint8Array, Uint8Array>();
+		const writer = writable.getWriter();
+		const answer = async (): Promise<Uint8Array> => {
+			const container = await this.ensureRunning();
+			const view = await this.compose(container, plan);
+			if (view === undefined) return pkt(`ERR ${COULD_NOT_COMPOSE}\n`);
+			const process = await container.exec(["git", "upload-pack", "--stateless-rpc", "--advertise-refs", view], {
+				env,
+				stdout: "pipe",
+				stderr: "ignore",
+			});
+			const { stdout } = await process.output();
+			// Protocol v2 answers with its capability advertisement directly;
+			// v0 needs the service preamble first.
+			return protocol && protocol.includes("version=2")
+				? new Uint8Array(stdout)
+				: concat(pkt("# service=git-upload-pack\n"), new TextEncoder().encode("0000"), new Uint8Array(stdout));
+		};
+		this.ctx.waitUntil(
+			answer()
+				.catch((error: unknown) => {
+					console.error("endpoint advertise failed", error);
+					return pkt(`ERR ${COULD_NOT_COMPOSE}\n`);
+				})
+				.then((body) => writer.write(body))
+				.then(() => writer.close())
+				// The client left: compose has kept what it fetched for next time.
+				.catch(() => {}),
+		);
+		return new Response(readable, {
+			headers: {
+				"content-type": "application/x-git-upload-pack-advertisement",
 				"cache-control": "no-cache",
 			},
 		});
