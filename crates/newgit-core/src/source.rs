@@ -1110,7 +1110,10 @@ impl GitSource {
             if paths.is_empty() {
                 continue;
             }
-            let mut args = vec!["-C", ws, "reset", "--quiet", rev, "--"];
+            // `--no-refresh`: this index has no stat data, so the refresh a
+            // mixed reset ends with would hash every tracked file, for a
+            // tree that never looks at the working tree.
+            let mut args = vec!["-C", ws, "reset", "--quiet", "--no-refresh", rev, "--"];
             args.extend(paths.iter().map(|path| path.as_str()));
             run_git_env(&args, &env)?;
         }

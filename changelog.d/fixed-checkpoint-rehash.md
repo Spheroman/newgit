@@ -7,3 +7,6 @@
   files), a checkpoint went from 2.3s to 0.45s and `undo` from 2.8s to 0.9s.
   It now starts from a copy of the real index, so only files that changed
   are hashed. What a snapshot contains is unchanged.
+
+  `undo` in an instance that leaves a tracker out had the same problem in
+  the tree it restores from, and no longer rehashes either.
