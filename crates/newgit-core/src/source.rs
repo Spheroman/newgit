@@ -740,13 +740,14 @@ impl GitSource {
     /// dangling commit on top of HEAD, without touching HEAD, the real
     /// index, or the worktree. Returns `None` when the worktree is clean.
     ///
-    /// Mechanics: a throwaway `GIT_INDEX_FILE` seeded from HEAD, `git add -A`
-    /// into it, `git write-tree`, and `git commit-tree` — all public
-    /// interface, nothing reaches into `.git` internals.
+    /// Mechanics: a throwaway `GIT_INDEX_FILE` holding HEAD (see
+    /// [`Self::seed_scratch_index`]), `git add -A` into it, `git write-tree`,
+    /// and `git commit-tree` — all public interface, nothing reaches into
+    /// `.git` internals.
     ///
     /// `rendered` paths are marked skip-worktree *in the throwaway index*.
-    /// The real index carries that bit already, but a fresh index seeded from
-    /// HEAD does not, so without this `git add -A` would sweep the instance's
+    /// The real index carries that bit already, but the seeded index has it
+    /// cleared, so without this `git add -A` would sweep the instance's
     /// rendered ports into the checkpoint — the one place skip-worktree does
     /// not protect on its own.
     ///
@@ -775,7 +776,11 @@ impl GitSource {
         let env = [("GIT_INDEX_FILE".to_owned(), index.to_owned())];
 
         let ws = workspace.as_str();
-        run_git_env(&["-C", ws, "read-tree", "HEAD"], &env)?;
+        if Self::seed_scratch_index(workspace, Utf8Path::new(index), &env).is_err() {
+            // Slower, not wrong: every file is hashed again.
+            let _ = std::fs::remove_file(index);
+            run_git_env(&["-C", ws, "read-tree", "HEAD"], &env)?;
+        }
         if !rendered.is_empty() {
             let mut args: Vec<&str> = vec!["-C", ws, "update-index", "--skip-worktree", "--"];
             args.extend(rendered.iter().map(|path| path.as_str()));
@@ -842,6 +847,83 @@ impl GitSource {
             &ident,
         )
         .map(Some)
+    }
+
+    /// Put HEAD in the throwaway index `index`, keeping what the workspace's
+    /// real index knows about the files on disk. `git read-tree HEAD` alone
+    /// makes an index with no stat data, so the `git add -A` after it reads
+    /// and hashes every tracked file, which on a 30,000-file project is
+    /// seconds on every checkpoint. Copying the real index keeps that data:
+    /// only files that actually changed are hashed.
+    ///
+    /// What the snapshot means must not change, so nothing of the real index
+    /// but its stat data survives:
+    /// - `read-tree --reset` puts HEAD's entries in, dropping what is staged,
+    ///   conflict stages and intent-to-add entries included; `-m` refuses
+    ///   those. An entry the same as HEAD's keeps its stat data.
+    /// - `--no-sparse-checkout` keeps the sparse patterns from being applied.
+    /// - skip-worktree and assume-unchanged bits are cleared, or an edit to a
+    ///   file carrying one would not be seen. The rendered paths are marked
+    ///   again by the caller.
+    /// - The copy keeps the original's mtime. Git trusts an entry only if it
+    ///   is older than its index file, which is how it notices a file edited
+    ///   in the second the index was written; a copy dated now would
+    ///   vouch for that file and the snapshot would miss the edit.
+    fn seed_scratch_index(
+        workspace: &Utf8Path,
+        index: &Utf8Path,
+        env: &[(String, String)],
+    ) -> Result<()> {
+        let ws = workspace.as_str();
+        let real = run_git(&[
+            "-C",
+            ws,
+            "rev-parse",
+            "--path-format=absolute",
+            "--git-path",
+            "index",
+        ])?;
+        let io = |source| NewgitError::io(index, source);
+        std::fs::copy(&real, index).map_err(io)?;
+        let modified = std::fs::metadata(&real)
+            .and_then(|real| real.modified())
+            .map_err(io)?;
+        std::fs::File::options()
+            .write(true)
+            .open(index)
+            .and_then(|copy| copy.set_modified(modified))
+            .map_err(io)?;
+        run_git_env(
+            &[
+                "-C",
+                ws,
+                "read-tree",
+                "--reset",
+                "--no-sparse-checkout",
+                "HEAD",
+            ],
+            env,
+        )?;
+        let listed = run_git_env(&["-C", ws, "ls-files", "-z", "-v"], env)?;
+        let marked: String = listed
+            .split('\0')
+            .filter_map(|entry| entry.split_once(' '))
+            .filter(|(tag, _)| *tag != "H")
+            .flat_map(|(_, path)| [path, "\0"])
+            .collect();
+        if marked.is_empty() {
+            return Ok(());
+        }
+        // One flag a run: given both, `update-index` applies the first it
+        // checks to each path and ignores the other.
+        for flag in ["--no-skip-worktree", "--no-assume-unchanged"] {
+            run_git_input_env(
+                &["-C", ws, "update-index", flag, "-z", "--stdin"],
+                &marked,
+                env,
+            )?;
+        }
+        Ok(())
     }
 
     /// What `git status` reports under `paths` and outside `except` in a
@@ -1786,9 +1868,15 @@ fn too_large(error: &NewgitError) -> Option<(f64, f64)> {
 
 /// `git <args>` with `input` on its stdin; its stdout, trimmed.
 fn run_git_input(args: &[&str], input: &str) -> Result<String> {
+    run_git_input_env(args, input, &[])
+}
+
+/// [`run_git_input`], with `env` set for it.
+fn run_git_input_env(args: &[&str], input: &str, env: &[(String, String)]) -> Result<String> {
     use std::io::Write as _;
     let mut child = Command::new("git")
         .args(args)
+        .envs(env.iter().map(|(key, value)| (key, value)))
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
