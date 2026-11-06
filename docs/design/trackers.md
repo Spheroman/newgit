@@ -343,6 +343,11 @@ trackers **(decided)**:
    the pin was dropped, so there is nothing to join. Any other merge stays.
    Someone who cannot read a tracker sees different ids from the first commit
    that touched it (see *One name for a commit*).
+
+   A pin counts if its tracker's repo serves that commit, whether or not a
+   branch reaches it **(decided)**: the reader may read that tracker anyway,
+   and a merge's check on a pin is unchanged. So a commit force-pushed away
+   stays reachable through a pin until the remote garbage-collects it.
 5. **Originals are reused.** Commits are written byte for byte, so when
    `V(R)`'s parents, tree, and metadata come out as the view commit `R` was
    split from (its `Newgit-Split`), compose emits that object, signature and

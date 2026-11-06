@@ -131,6 +131,12 @@ impl Stores {
     /// add it to `held`. A commit its tracker's repo does not have stays out
     /// of `held`. One request at a time: two shallow fetches in one store
     /// fight over its `shallow` file.
+    ///
+    /// A commit the remote refuses by id may still be in the repo, since a
+    /// remote need not serve what no branch names, and a pin wrongly left
+    /// out stays out for as long as the view is cached. So a refusal is
+    /// settled by that tracker's whole history, once the lock is let go: that
+    /// can take minutes, and nobody else should wait on it.
     fn snapshot(
         &self,
         repos: &BTreeMap<String, Source>,
@@ -156,6 +162,7 @@ impl Stores {
         lock.lock()
             .map_err(|source| NewgitError::io(&path, source))?;
         let git_dir = format!("--git-dir={}", self.snapshots);
+        let mut refused: BTreeMap<&String, (&Source, Vec<String>)> = BTreeMap::new();
         for (tracker, commits) in wanted {
             // Whoever held the lock may have brought these in.
             let known = held.entry(tracker.clone()).or_default();
@@ -171,15 +178,35 @@ impl Stores {
                 &missing,
                 Some(&source.auth),
             )?;
-            if !absent.is_empty() {
-                eprintln!("newgit: `{tracker}`'s repo does not have pinned commits {absent:?}");
-            }
             let known = held.entry(tracker.clone()).or_default();
             known.extend(
                 missing
                     .into_iter()
                     .filter(|commit| !absent.contains(commit)),
             );
+            if !absent.is_empty() {
+                refused.insert(tracker, (source, absent));
+            }
+        }
+        drop(lock);
+        for (tracker, (source, commits)) in refused {
+            eprintln!(
+                "newgit: `{tracker}`'s repo refused pinned commits {commits:?}: fetching its \
+                 whole history to settle it"
+            );
+            GitSource::fetch_refs(
+                &[&format!("--git-dir={}", self.whole)],
+                &source.url,
+                &[format!("+refs/heads/*:refs/trackers/{tracker}/heads/*")],
+                Some(&source.auth),
+            )?;
+            let (reachable, absent): (Vec<String>, Vec<String>) = commits
+                .into_iter()
+                .partition(|commit| in_tracker(&self.whole, tracker, commit));
+            if !absent.is_empty() {
+                eprintln!("newgit: `{tracker}`'s repo does not have pinned commits {absent:?}");
+            }
+            held.entry(tracker.clone()).or_default().extend(reachable);
         }
         Ok(())
     }

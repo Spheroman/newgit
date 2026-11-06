@@ -1500,7 +1500,7 @@ impl GitSource {
     }
 
     /// Fetch exactly `commits` from `url`, each one commit deep, each to
-    /// `<prefix><commit>`, and return those the repo does not have.
+    /// `<prefix><commit>`, and return those the remote refused.
     ///
     /// The store this fetches into stays shallow on purpose, so it must
     /// never see [`Self::fetch_refs`], which takes a shallow store for a
@@ -1511,9 +1511,14 @@ impl GitSource {
     /// nothing. So a ref under `prefix` proves `url` has the commit, however
     /// many other repos' commits share the store.
     ///
+    /// A refusal does not prove the repo lacks a commit: a remote may hold it
+    /// and only serve what a branch names. Only a whole fetch can tell.
+    ///
     /// They come in one fetch, so what the commits share comes once. A
-    /// fetch that fails is halved, down to one commit, which is what tells
-    /// a commit the repo lacks from a remote that dropped the fetch.
+    /// fetch the remote dropped or refused is halved, down to one commit,
+    /// which is what finds the commit it refused. Anything else (a password
+    /// it will not take, a repo that is not there) is the same for every
+    /// commit, so it is returned at once.
     pub fn fetch_snapshots(
         location: &[&str],
         url: &str,
@@ -1571,12 +1576,15 @@ impl GitSource {
                 }
             }
         }
-        if fetch().is_err() {
-            let (left, right) = commits.split_at(commits.len() / 2);
-            Self::fetch_snapshot_batch(location, url, prefix, left, auth, absent)?;
-            Self::fetch_snapshot_batch(location, url, prefix, right, auth, absent)?;
+        match fetch() {
+            Ok(()) => Ok(()),
+            Err(error) if dropped(&error) || not_there(&error) => {
+                let (left, right) = commits.split_at(commits.len() / 2);
+                Self::fetch_snapshot_batch(location, url, prefix, left, auth, absent)?;
+                Self::fetch_snapshot_batch(location, url, prefix, right, auth, absent)
+            }
+            Err(error) => Err(error),
         }
-        Ok(())
     }
 }
 
@@ -1683,9 +1691,9 @@ fn dropped(error: &NewgitError) -> bool {
     .any(|sign| stderr.contains(sign))
 }
 
-/// Whether the remote answered that it has no such commit. Anything else
-/// is a failure, not an answer: a pin left out of a view stays out of it for
-/// as long as the view is cached.
+/// Whether the remote refused to serve a commit by id: it has none, or will
+/// not say. Anything else is a failure, not an answer: a pin left out of a
+/// view stays out of it for as long as the view is cached.
 fn not_there(error: &NewgitError) -> bool {
     let NewgitError::SourceCommand { stderr, .. } = error else {
         return false;

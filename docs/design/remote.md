@@ -624,17 +624,22 @@ container keeps three repositories under `/work`:
 
 The ref is the proof a commit is that tracker's. A shallow fetch asks the
 remote even for a commit the store already holds, and the remote refuses an
-id it lacks, so one tracker's commit cannot pass as another's. A commit the
-repo refuses is left out, as a pin always was; any other failure fails the
-request rather than cache a view missing a child. One tracker's pins come in
-one fetch, halved when it fails, so what they share comes once. Only a branch
-whose view is not composed yet walks root's history for pins.
+id it lacks, so one tracker's commit cannot pass as another's. A refusal does
+not prove the repo lacks a commit, though: a remote may hold it and only serve
+what a branch names. So a pin refused by id is settled by fetching that
+tracker whole into `trackers.git`, and left out only if no branch reaches it
+there either. A pin a repo really lacks therefore costs the first request on
+a fresh container that tracker's whole history, once. Any other failure fails
+the request rather than cache a view missing a child. One tracker's pins come
+in one fetch, halved only when the remote dropped or refused it, so what they
+share comes once. Only a branch whose view is not composed yet walks root's
+history for pins.
 
 What each costs on a fresh container:
 
 | | Waits | Fetches |
 |---|---|---|
-| `git fetch`, first | that request | root's whole history, then one shallow fetch per tracker |
+| `git fetch`, first | that request | root's whole history, then one shallow fetch per tracker, and a whole tracker whose pin was refused |
 | `git fetch`, next, branch unchanged | nothing | nothing |
 | index check | background | root's new commits, and the one commit's pins |
 | ancestry check, and a copy | background | that tracker's whole history, as it always did: 5 minutes for t3code, over 40 if stepped |
