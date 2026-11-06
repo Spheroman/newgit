@@ -225,6 +225,7 @@ mod tests {
             requires: Vec::new(),
             resources: Vec::new(),
             excluded: Vec::new(),
+            parent: None,
         }
     }
 

@@ -1223,6 +1223,11 @@ function ownerOf(facts: Map<string, TrackerFacts>, path: string): string | undef
  * changing the tracker that owns its file, and only that tracker's
  * maintainers merge it. The file is read from its owner's repo, relative to
  * the owner's mount. Resolved to a fixed point, a few reads per round.
+ *
+ * A tracker `access` does not name may be defined inside a mounted tracker in
+ * Git, in that tracker's own `.newgit/trackers/`: its child, governed by it
+ * (see [`addNested`]). `access` wins any name it defines, so a tracker cannot
+ * redefine one it does not own, and a name two trackers define is nobody's.
  */
 export async function loadDefinitions(
 	repos: Repos,
@@ -1238,6 +1243,9 @@ export async function loadDefinitions(
 		[...all].map((name) => [name, { tracker: "access", mount: ACCESS_MOUNT }]),
 	);
 	let facts = new Map<string, TrackerFacts>();
+	// Names a file already answers for, even one that does not parse: that
+	// is an error to fix, not a name free for a nested definition to take.
+	const written = new Set<string>();
 	for (let round = 0; round < 4; round++) {
 		facts = new Map();
 		for (const name of all) {
@@ -1251,6 +1259,7 @@ export async function loadDefinitions(
 			// definitions. Delete once every project on the remote migrated.
 			if (text === null && from.tracker === "access")
 				text = await repos.readFile(repoName({ kind: "tracker", project, tracker: "access" }), branch, file(name));
+			if (text !== null) written.add(name);
 			const read = text === null ? implicitFacts(name) : parseFacts(text, from.tracker);
 			if (read !== undefined) facts.set(name, { ...read, source: from.tracker });
 		}
@@ -1264,9 +1273,51 @@ export async function loadDefinitions(
 				moved = true;
 			}
 		}
-		if (!moved) return facts;
+		if (!moved) break;
 	}
+	await addNested(repos, project, branch, facts, [...all].filter((name) => !written.has(name)));
 	return facts;
+}
+
+/**
+ * Add the trackers in `names` that `facts` lacks and a mounted tracker in Git
+ * defines in its own tree, as the client's `load_nested_definitions` does:
+ * mounted relative to that parent, and held by it. A child can be a parent, so
+ * this goes one level of mounts at a time.
+ *
+ * Fails closed: a name more than one tracker defines stays undefined. Taking
+ * the first would let the maintainers of any tracker that sorts earlier
+ * rewrite the audience of a child that is not theirs.
+ */
+async function addNested(
+	repos: Repos,
+	project: ProjectId,
+	branch: string,
+	facts: Map<string, TrackerFacts>,
+	names: string[],
+): Promise<void> {
+	for (let level = 0; level < 4; level++) {
+		const missing = names.filter((name) => !facts.has(name));
+		if (missing.length === 0) return;
+		const parents = [...facts].filter(
+			([, parent]) => parent.git && parent.mount !== "." && parent.mount !== ACCESS_MOUNT,
+		);
+		let found = false;
+		for (const name of missing) {
+			const defining: { parent: string; mount: string; text: string }[] = [];
+			for (const [parent, { mount }] of parents) {
+				const repo = repoName({ kind: "tracker", project, tracker: parent });
+				const text = await repos.readFile(repo, branch, `${ACCESS_MOUNT}/${name}.toml`);
+				if (text !== null) defining.push({ parent, mount, text });
+			}
+			const only = defining.length === 1 ? defining[0] : undefined;
+			const read = only === undefined ? undefined : parseFacts(only.text, only.parent);
+			if (only === undefined || read === undefined) continue;
+			facts.set(name, { ...read, mount: placeClaim(only.mount, read.mount) });
+			found = true;
+		}
+		if (!found) return;
+	}
 }
 
 /**

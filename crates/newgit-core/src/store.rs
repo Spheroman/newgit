@@ -406,16 +406,89 @@ impl MetadataStore {
             };
             definitions.push(TrackerDefinition::from_file(name, &entry)?);
         }
+        self.load_nested_definitions(&mut definitions)?;
         resolve_ownership(&mut definitions)?;
         Ok(definitions)
     }
 
+    /// Add what each mounted tracker in Git defines in its own
+    /// `.newgit/trackers/` (docs/design/trackers.md, *Where a definition
+    /// lives*), and what those define in turn. They are read from the project
+    /// root's working tree, as root's own are.
+    ///
+    /// These files arrive with other people's commits, so one that cannot be
+    /// a child is said and skipped: refused here, it would stop every
+    /// command, the one that would fix it included. A directory with a
+    /// `config.toml` beside it is another project's, imported whole, and its
+    /// definitions are none of this project's.
+    fn load_nested_definitions(&self, definitions: &mut Vec<TrackerDefinition>) -> Result<()> {
+        let mut parents: Vec<(String, Utf8PathBuf)> = definitions
+            .iter()
+            .filter(|definition| definition.git && definition.mounted())
+            .map(|definition| (definition.name.clone(), definition.mount.clone()))
+            .collect();
+        while let Some((parent, mount)) = parents.pop() {
+            let metadata = self.paths.project_root.join(&mount).join(".newgit");
+            let dir = metadata.join("trackers");
+            if !dir.is_dir() || metadata.join("config.toml").is_file() {
+                continue;
+            }
+            for entry in read_dir_sorted(&dir)? {
+                if entry.extension() != Some("toml") {
+                    continue;
+                }
+                let Some(name) = entry.file_stem() else {
+                    continue;
+                };
+                let skipped = match TrackerDefinition::from_file(name, &entry) {
+                    Err(error) => Err(error.to_string()),
+                    Ok(child) if !child.git => {
+                        Err("only a tracker in Git is defined inside another".to_owned())
+                    }
+                    Ok(child) if !child.mounted() => {
+                        Err("it needs a `mount` of its own inside its parent".to_owned())
+                    }
+                    Ok(_) if definitions.iter().any(|other| other.name == name) => {
+                        Err("a tracker of that name already exists".to_owned())
+                    }
+                    Ok(child) => Ok(child),
+                };
+                match skipped {
+                    Ok(mut child) => {
+                        child.nest_under(&parent, &mount);
+                        parents.push((child.name.clone(), child.mount.clone()));
+                        definitions.push(child);
+                    }
+                    Err(reason) => eprintln!("newgit: ignoring {entry}: {reason}"),
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub fn create_tracker_definition(&self, definition: &TrackerDefinition) -> Result<Utf8PathBuf> {
-        create_dir_all(&self.paths.trackers)?;
-        let path = self
-            .paths
-            .trackers
-            .join(format!("{}.toml", definition.name));
+        let directory = self.paths.trackers.clone();
+        self.create_tracker_definition_in(&directory, definition)
+    }
+
+    /// [`Self::create_tracker_definition`], in the `.newgit/trackers/` of the
+    /// tracker mounted at `mount`, for a tracker it defines itself.
+    pub fn create_nested_tracker_definition(
+        &self,
+        mount: &Utf8Path,
+        definition: &TrackerDefinition,
+    ) -> Result<Utf8PathBuf> {
+        let directory = self.paths.project_root.join(mount).join(".newgit/trackers");
+        self.create_tracker_definition_in(&directory, definition)
+    }
+
+    fn create_tracker_definition_in(
+        &self,
+        directory: &Utf8Path,
+        definition: &TrackerDefinition,
+    ) -> Result<Utf8PathBuf> {
+        create_dir_all(directory)?;
+        let path = directory.join(format!("{}.toml", definition.name));
         if path.exists() {
             return Err(NewgitError::AlreadyExists(path));
         }

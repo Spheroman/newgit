@@ -70,7 +70,7 @@ fn the_first_export_of_an_import_is_a_no_op_fast_forward_of_its_upstream() {
 }
 
 #[test]
-fn a_root_that_mounts_a_tracker_in_git_is_refused_naming_it() {
+fn a_root_that_mounts_a_tracker_in_git_ships_what_it_mounts() {
     let (_guard, temp) = tempdir();
     let upstream = upstream(&temp);
     let store = project(&temp);
@@ -94,13 +94,12 @@ fn a_root_that_mounts_a_tracker_in_git_is_refused_naming_it() {
     );
     manager(&store).merge("main", "main").expect("merge");
     rooted(&store, &github);
-    let before = git(&github, &["rev-parse", "newgit"]);
-    let error = manager(&store)
+    manager(&store)
         .export_to_remote(TARGET, RemoteExportOptions::default())
-        .expect_err("refused");
-    let text = error.to_string();
-    assert!(text.contains("mounts `ui`"), "{text}");
-    assert_eq!(git(&github, &["rev-parse", "newgit"]), before);
+        .expect("export");
+    let files = git(&github, &["ls-tree", "-r", "--name-only", "newgit"]);
+    assert!(files.lines().any(|line| line == "ui/button.ts"), "{files}");
+    assert!(!files.contains(".newgit/pins"), "{files}");
 }
 
 #[test]

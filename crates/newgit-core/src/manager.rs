@@ -982,6 +982,8 @@ pub enum ExportReason {
     Listed,
     /// The target is rooted at it (`root`).
     Root,
+    /// The target is rooted at a tracker that mounts it.
+    Mounted,
     /// Neither: its history stays out.
     Withheld,
 }
@@ -1560,6 +1562,16 @@ impl BranchManager {
         validate_name(name)?;
         self.refuse_root(name, "it always exists")?;
         self.require_migrated()?;
+        // Names are unique across a project, wherever each is defined.
+        if self
+            .all_definitions()
+            .iter()
+            .any(|other| other.name == name)
+        {
+            return Err(NewgitError::Unsupported(format!(
+                "a tracker named `{name}` already exists"
+            )));
+        }
         let [mount] = paths else {
             return Err(NewgitError::Unsupported(format!(
                 "a tracker in Git is mounted at one path: `newgit tracker create {name} --git \
@@ -1572,12 +1584,38 @@ impl BranchManager {
                 "`{name}` would be mounted at `.`, beside root: carve a directory (`--path apps/{name}`)"
             )));
         }
-        // Inside another tracker's mount is a deeper mount of root's: the
-        // deepest mount wins, so the outer tracker gives those files up.
+        // Inside another tracker's mount it is that tracker's child: defined
+        // in its own `.newgit/trackers/`, mounted relative to it, and pinned
+        // by its commits, so it goes wherever that tracker goes. The deepest
+        // mount wins, so the outer tracker gives those files up.
+        let parent = self
+            .carved
+            .iter()
+            .filter(|tracker| {
+                tracker.name != crate::tracker::ACCESS_TRACKER
+                    && tracker.mounted()
+                    && tracker.mount != definition.mount
+                    && definition.mount.starts_with(&tracker.mount)
+            })
+            .max_by_key(|tracker| tracker.mount.components().count())
+            .cloned();
+        let (definition, placed) = match &parent {
+            Some(parent) => {
+                let relative = definition
+                    .mount
+                    .strip_prefix(&parent.mount)
+                    .expect("filtered to mounts under it");
+                let definition = TrackerDefinition::in_git(name, audience.to_owned(), relative)?;
+                let mut placed = definition.clone();
+                placed.nest_under(&parent.name, &parent.mount);
+                (definition, placed)
+            }
+            None => (definition.clone(), definition),
+        };
         let mut all: Vec<TrackerDefinition> =
             self.trackers.iter().chain(&self.carved).cloned().collect();
         all.push(self.root.clone());
-        all.push(definition.clone());
+        all.push(placed.clone());
         crate::tracker::resolve_ownership(&mut all)?;
 
         let root = self.store.paths().project_root.clone();
@@ -1597,31 +1635,46 @@ impl BranchManager {
                  checked out there: `git switch {branch}` first"
             )));
         }
-        let path = self.store.create_tracker_definition(&definition)?;
+        let path = match &parent {
+            Some(parent) => self
+                .store
+                .create_nested_tracker_definition(&parent.mount, &definition)?,
+            None => self.store.create_tracker_definition(&definition)?,
+        };
         let relative = path
             .strip_prefix(&root)
             .map(Utf8Path::to_path_buf)
             .unwrap_or_else(|_| path.clone());
-        let message = format!("Create tracker `{name}` at {}", definition.mount);
-        let committed =
-            crate::source::run_git_env(&["-C", root.as_str(), "add", "--", relative.as_str()], &[])
-                .and_then(|_| {
-                    crate::source::run_git_env(
-                        &[
-                            "-C",
-                            root.as_str(),
-                            "commit",
-                            "-q",
-                            "--no-verify",
-                            "-m",
-                            &message,
-                            "--only",
-                            "--",
-                            relative.as_str(),
-                        ],
-                        &[],
-                    )
-                });
+        let message = format!("Create tracker `{name}` at {}", placed.mount);
+        // Forced: inside an imported tracker, its `.gitignore` is upstream's.
+        let committed = crate::source::run_git_env(
+            &[
+                "-C",
+                root.as_str(),
+                "add",
+                "--force",
+                "--",
+                relative.as_str(),
+            ],
+            &[],
+        )
+        .and_then(|_| {
+            crate::source::run_git_env(
+                &[
+                    "-C",
+                    root.as_str(),
+                    "commit",
+                    "-q",
+                    "--no-verify",
+                    "-m",
+                    &message,
+                    "--only",
+                    "--",
+                    relative.as_str(),
+                ],
+                &[],
+            )
+        });
         if let Err(error) = committed {
             let _ = std::fs::remove_file(&path);
             return Err(error);
@@ -1644,7 +1697,7 @@ impl BranchManager {
             .ok();
         Ok(CreateCodeTrackerOutcome {
             path,
-            source: self.root.name.clone(),
+            source: parent.map_or_else(|| self.root.name.clone(), |parent| parent.name),
             commits: u32::from(pinned.is_some()),
         })
     }
@@ -2602,7 +2655,7 @@ impl BranchManager {
                     .iter()
                     .find(|definition| definition.name == tracker)
                     .is_some_and(|definition| {
-                        export_reason(target, definition) != ExportReason::Withheld
+                        export_reason(target, definition, &definitions) != ExportReason::Withheld
                     })
             },
         )
@@ -3889,7 +3942,7 @@ impl BranchManager {
                     .iter()
                     .find(|definition| definition.name == tracker)
                     .is_some_and(|definition| {
-                        export_reason(target, definition) != ExportReason::Withheld
+                        export_reason(target, definition, &definitions) != ExportReason::Withheld
                     })
             },
         )
@@ -7732,10 +7785,12 @@ impl BranchManager {
         // Rooted at a tracker, `main` is that tracker's own `main`: a branch
         // is a ref of the root a view is rooted at.
         let list = match &target.root {
-            Some(tracker) => self
-                .tracker_branch_commit(tracker, PROJECT_ROOT_INSTANCE)?
-                .map(|commit| BTreeMap::from([(tracker.clone(), commit)]))
-                .unwrap_or_default(),
+            Some(tracker) => match self.tracker_branch_commit(tracker, PROJECT_ROOT_INSTANCE)? {
+                Some(commit) => {
+                    crate::compose::index(&self.store.paths().project_root, tracker, &commit)?
+                }
+                None => BTreeMap::new(),
+            },
             None => self.branch_list(
                 client
                     .as_ref()
@@ -8032,6 +8087,57 @@ impl BranchManager {
         }
     }
 
+    /// `commit` of `tracker` composed rooted at it, every child included: the
+    /// view an export of it sent, which notes each of its commits so a split
+    /// finds them again.
+    fn compose_rooted(&self, target: &ExportTarget, tracker: &str, commit: &str) -> Result<String> {
+        self.bring_pins(commit, &BTreeMap::new())?;
+        let project = self.store.paths().project_root.clone();
+        let everything = |_: &str| true;
+        crate::compose::compose(
+            &project,
+            tracker,
+            &[(export_ref(&target.name, "pull-base"), commit.to_owned())],
+            &crate::compose::ComposeOptions {
+                readable: &everything,
+                admit: None,
+            },
+        )?
+        .into_iter()
+        .next()
+        .and_then(|view| view.tip)
+        .ok_or_else(|| {
+            NewgitError::Unsupported(format!(
+                "`{tracker}` at {} composes to nothing",
+                short(commit)
+            ))
+        })
+    }
+
+    /// Split view commit `tip` rooted at `tracker`, as
+    /// [`Self::split_view_made`] does rooted at the project's root.
+    fn split_rooted(&self, tracker: &str, tip: &str) -> Result<crate::compose::SplitOutcome> {
+        let project = self.store.paths().project_root.clone();
+        let definitions = self.carved_definitions();
+        let audience = |name: &str| {
+            definitions
+                .iter()
+                .find(|definition| definition.name == name)
+                .map(|definition| definition.audience.clone())
+        };
+        Ok(crate::compose::split(
+            &project,
+            tip,
+            &crate::compose::SplitOptions {
+                root: tracker,
+                bound: &|_| true,
+                audience: &audience,
+                newgit_made: None,
+                need_history: &|tracker| self.need_history(tracker),
+            },
+        )?)
+    }
+
     fn pull_rooted(
         &self,
         target: &ExportTarget,
@@ -8063,9 +8169,22 @@ impl BranchManager {
             (None, Some(here)) => Some(here.clone()),
             _ => published,
         };
+        // A root that mounts trackers in Git is exported as a view, so what
+        // comes back is view commits: split, each file goes to the tracker
+        // that owns it. Adopted as they are, a change under a child's mount
+        // would sit in the parent, hidden by the child.
+        let children: Vec<&TrackerDefinition> = self
+            .carved
+            .iter()
+            .filter(|child| child.parent.as_deref() == Some(tracker))
+            .collect();
+        let exported = match (&ours, children.is_empty()) {
+            (Some(ours), false) => Some(self.compose_rooted(target, tracker, ours)?),
+            _ => None,
+        };
         let mut new_args = vec![theirs];
-        if let Some(ours) = &ours {
-            new_args.extend(["--not", ours.as_str()]);
+        if let Some(seen) = exported.as_ref().or(ours.as_ref()) {
+            new_args.extend(["--not", seen.as_str()]);
         }
         let all = self.all_definitions();
         if let Some((commit, path, owner)) = crate::compose::find_outside_git_under(
@@ -8090,6 +8209,21 @@ impl BranchManager {
             .parse()
             .unwrap_or(0);
         let from = format!("{} {}", recorded_source(&target.url), target.branch);
+        let mut moved_children: Vec<(String, String)> = Vec::new();
+        let split_tip = if children.is_empty() {
+            None
+        } else {
+            let outcome = self.split_rooted(tracker, theirs)?;
+            for child in self.carved.iter().filter(|child| child.name != tracker) {
+                if let Some(commit) = outcome.index.get(&child.name)
+                    && !self.local_main_has(&child.name, commit)?
+                {
+                    moved_children.push((child.name.clone(), commit.clone()));
+                }
+            }
+            Some(outcome.root)
+        };
+        let theirs = split_tip.as_deref().unwrap_or(theirs);
         let (main, merged) = match &ours {
             None => (theirs.to_owned(), false),
             Some(ours) if ours == theirs || self.source.is_ancestor(theirs, ours)? => {
@@ -8111,11 +8245,12 @@ impl BranchManager {
             },
         };
         // `main` moves with the pin, after the project root has taken it.
-        let mains: Vec<(String, String)> = if ours.as_deref() != Some(main.as_str()) {
+        let mut mains: Vec<(String, String)> = if ours.as_deref() != Some(main.as_str()) {
             vec![(tracker.to_owned(), main.clone())]
         } else {
             Vec::new()
         };
+        mains.extend(moved_children);
         let pulled = self.move_pin(None, &definition, &main, &from, &mains)?;
         Ok(PullRemoteOutcome {
             target: target.name.clone(),
@@ -8170,10 +8305,11 @@ impl BranchManager {
         .map(ToOwned::to_owned)
         .collect();
         let mut recognise = Recognise::new(&project, &self.root.name)?;
+        let code = self.carved_definitions();
         let withheld: Vec<TrackerDefinition> = self
             .carved
             .iter()
-            .filter(|definition| export_reason(target, definition) == ExportReason::Withheld)
+            .filter(|definition| export_reason(target, definition, &code) == ExportReason::Withheld)
             .cloned()
             .collect();
         let mapped =
@@ -8324,51 +8460,39 @@ impl BranchManager {
         Ok(targets)
     }
 
-    /// A target rooted at `tracker` ships its own history only while that is
-    /// its view: refuse once any commit of it at `commit` pins a tracker in
-    /// Git, naming the child.
-    fn refuse_rooted_mounts(
+    /// A target's `root` names the tracker, not what it mounts, so nobody
+    /// chose to send a child whose audience is narrower than the root's.
+    /// Left out, the target's repository would lose those files; sent, they
+    /// reach people the child's audience does not include. So: refused.
+    fn refuse_narrower_children(
         &self,
         target: &ExportTarget,
-        tracker: &str,
-        commit: &str,
+        root: &str,
+        trackers: &[ExportedTracker],
     ) -> Result<()> {
-        let root = self.store.paths().project_root.clone();
-        let pinning = crate::source::run_git_env(
-            &[
-                "-C",
-                root.as_str(),
-                "rev-list",
-                "-1",
-                commit,
-                "--",
-                crate::compose::PINS_DIR,
-            ],
-            &[],
-        )?;
-        let pinning = pinning.trim();
-        if pinning.is_empty() {
+        let audience = |name: &str| {
+            trackers
+                .iter()
+                .find(|tracker| tracker.name == name)
+                .map(|tracker| tracker.audience.as_str())
+        };
+        let Some(root_audience) = audience(root) else {
             return Ok(());
+        };
+        for child in trackers
+            .iter()
+            .filter(|tracker| tracker.reason == ExportReason::Mounted)
+        {
+            if child.audience != root_audience && child.audience != "public" {
+                return Err(NewgitError::Unsupported(format!(
+                    "`{}` is rooted at `{root}` (audience {root_audience}), which mounts `{}` \
+                     (audience {}), so exporting would send it past its audience. Nothing was \
+                     exported. Give `{}` the audience `{root_audience}`, or stop exporting `{root}`",
+                    target.name, child.name, child.audience, child.name
+                )));
+            }
         }
-        let mut objects = crate::objects::Objects::open(&root)?;
-        let found = objects.commit(pinning)?;
-        let mut children: BTreeSet<String> = crate::compose::pins_in(&mut objects, &found.tree)?
-            .into_keys()
-            .collect();
-        if let Some(parent) = found.parents.first() {
-            let parent = objects.commit(parent)?;
-            children.extend(crate::compose::pins_in(&mut objects, &parent.tree)?.into_keys());
-        }
-        let named: Vec<String> = children.iter().map(|child| format!("`{child}`")).collect();
-        Err(NewgitError::Unsupported(format!(
-            "`{}` is rooted at `{tracker}`, which mounts {}, a tracker in Git (commit {}), so \
-             its view is not its own history and it cannot be exported as its own root yet. \
-             Export the project instead: drop `root` from .newgit/exports/{}.toml",
-            target.name,
-            named.join(", "),
-            short(pinning),
-            target.name
-        )))
+        Ok(())
     }
 
     /// Compose `list` (tracker → commit) as `target` sees it — its trackers
@@ -8387,7 +8511,7 @@ impl BranchManager {
             .map(|definition| ExportedTracker {
                 name: definition.name.clone(),
                 audience: definition.audience.clone(),
-                reason: export_reason(target, definition),
+                reason: export_reason(target, definition, &code),
                 commit: list.get(&definition.name).cloned(),
                 unmerged: false,
             })
@@ -8405,15 +8529,15 @@ impl BranchManager {
             .get(&root_name)
             .filter(|_| shipped.contains(&root_name));
         if target.root.is_some() {
-            let Some(root_commit) = root_commit else {
+            if root_commit.is_none() {
                 return Err(NewgitError::Unsupported(format!(
                     "nothing to export to `{}`: `{root_name}` has no history on `{branch}` yet",
                     target.name
                 )));
-            };
+            }
             // Rooted there, its history is the view's shape.
             self.need_history(&root_name)?;
-            self.refuse_rooted_mounts(target, &root_name, root_commit)?;
+            self.refuse_narrower_children(target, &root_name, &trackers)?;
         }
         let Some(root_commit) = root_commit else {
             return Err(NewgitError::Unsupported(format!(
@@ -12722,13 +12846,26 @@ struct ImportedCode {
 /// decided, for composing an export and for routing `gh` alike. A target
 /// rooted at a tracker ships that tracker alone (one that mounts another in
 /// Git is refused when composed).
-fn export_reason(target: &ExportTarget, definition: &TrackerDefinition) -> ExportReason {
+fn export_reason(
+    target: &ExportTarget,
+    definition: &TrackerDefinition,
+    all: &[TrackerDefinition],
+) -> ExportReason {
     if let Some(root) = &target.root {
-        return if root == &definition.name {
-            ExportReason::Root
-        } else {
-            ExportReason::Withheld
-        };
+        if root == &definition.name {
+            return ExportReason::Root;
+        }
+        let mut above = definition.parent.as_ref();
+        while let Some(parent) = above {
+            if parent == root {
+                return ExportReason::Mounted;
+            }
+            above = all
+                .iter()
+                .find(|definition| &definition.name == parent)
+                .and_then(|definition| definition.parent.as_ref());
+        }
+        return ExportReason::Withheld;
     }
     if !target.lists(&definition.name, &definition.audience) {
         ExportReason::Withheld

@@ -289,7 +289,7 @@ fn undo_reapplies_a_bound_tracker_nested_in_a_dropped_one() {
     assert_eq!(read(&workspace, "apps/b/index.js"), None);
     assert_eq!(
         git(&workspace, &["ls-files", "-t", "--", "apps/b"]),
-        "S apps/b/index.js\nH apps/b/inner/x.js\nS apps/b/keep.js"
+        "S apps/b/.newgit/trackers/inner.toml\nS apps/b/index.js\nH apps/b/inner/x.js\nS apps/b/keep.js"
     );
     assert_eq!(
         status(&workspace),

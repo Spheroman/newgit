@@ -3394,6 +3394,10 @@ fn export_to_remote(name: &str, options: RemoteExportOptions) -> Result<()> {
                 "  tracker:  {:<width$}  the root (named by .newgit/exports/{}.toml), its own files at the top @ {at}",
                 tracker.name, target.name
             ),
+            ExportReason::Mounted => println!(
+                "  tracker:  {:<width$}  mounted in the root @ {at}",
+                tracker.name
+            ),
             ExportReason::Withheld => println!(
                 "  withheld: {:<width$}  (audience {})",
                 tracker.name, tracker.audience

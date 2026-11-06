@@ -60,6 +60,10 @@ pub struct TrackerDefinition {
     /// from the full set of definitions ([`resolve_ownership`]); not part of
     /// the definition file.
     pub excluded: Vec<Utf8PathBuf>,
+    /// The tracker in Git that defines this one in its own
+    /// `.newgit/trackers/`, so its own commits pin it and it goes wherever
+    /// that tracker goes. `None`: root's, defined in `access`.
+    pub parent: Option<String>,
     /// `sha256:<hex12>` of the definition file contents.
     pub definition_rev: String,
 }
@@ -190,6 +194,7 @@ impl TrackerDefinition {
             requires: Vec::new(),
             resources: Vec::new(),
             excluded: Vec::new(),
+            parent: None,
             definition_rev: String::new(),
         };
         definition.validate()?;
@@ -221,11 +226,28 @@ impl TrackerDefinition {
             requires: Vec::new(),
             resources: Vec::new(),
             excluded: Vec::new(),
+            parent: None,
             definition_rev: String::new(),
         };
         definition.validate()?;
         definition.definition_rev = definition.compute_definition_rev()?;
         Ok(definition)
+    }
+
+    /// Move a definition read from `parent`'s own `.newgit/trackers/`, whose
+    /// paths are relative to `parent`, to where `parent` is mounted at `at`.
+    pub fn nest_under(&mut self, parent: &str, at: &Utf8Path) {
+        let place = |path: &Utf8PathBuf| {
+            if path.as_str() == "." {
+                at.to_path_buf()
+            } else {
+                normalize_path(&at.join(path))
+            }
+        };
+        self.paths = self.paths.iter().map(place).collect();
+        self.exclusions = self.exclusions.iter().map(place).collect();
+        self.mount = place(&self.mount);
+        self.parent = Some(parent.to_owned());
     }
 
     pub fn from_file(name: &str, path: &Utf8Path) -> Result<Self> {
@@ -270,6 +292,7 @@ impl TrackerDefinition {
             requires: file.requires,
             resources: file.resources,
             excluded: Vec::new(),
+            parent: None,
             definition_rev: format!("sha256:{hex}"),
         };
         definition.validate()?;
@@ -416,6 +439,7 @@ impl TrackerDefinition {
             requires: Vec::new(),
             resources: Vec::new(),
             excluded: Vec::new(),
+            parent: None,
             definition_rev: String::new(),
         };
         definition.definition_rev = definition
@@ -446,6 +470,7 @@ impl TrackerDefinition {
             requires: Vec::new(),
             resources: Vec::new(),
             excluded: Vec::new(),
+            parent: None,
             definition_rev: String::new(),
         };
         definition.definition_rev = definition
@@ -908,6 +933,7 @@ mod tests {
             requires: Vec::new(),
             resources: Vec::new(),
             excluded: Vec::new(),
+            parent: None,
             definition_rev: "sha256:000000000000".to_owned(),
         }
     }
