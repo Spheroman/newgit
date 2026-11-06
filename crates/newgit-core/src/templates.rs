@@ -495,10 +495,13 @@ mode = "command"
 # without it `checkpoint --verify` always fails. `supabase db dump` has no
 # way to pass pg_dump `--restrict-key`, which is what `command-snapshot`
 # uses for this; that template's checkpoint explains what a fixed key gives
-# up. A dump with no `\restrict` line is left alone.
+# up. The CLI writes the pair as SQL comments, `-- \restrict <key>` and
+# `-- \unrestrict <key>`, where a plain pg_dump writes them bare, so the
+# match takes the line either way. A dump with no `\restrict` line is left
+# alone.
 command = '''
 supabase db dump --local --data-only -f {{snapshot.path}}/db.sql || exit 1
-key=$(sed -n 's/^\\restrict //p' {{snapshot.path}}/db.sql | head -n 1)
+key=$(sed -n 's/^\(-- \)\{0,1\}\\restrict //p' {{snapshot.path}}/db.sql | head -n 1)
 if [ -n "$key" ]; then
   sed "s/$key/newgit/" {{snapshot.path}}/db.sql > {{snapshot.path}}/db.sql.tmp || exit 1
   mv {{snapshot.path}}/db.sql.tmp {{snapshot.path}}/db.sql || exit 1
@@ -509,25 +512,36 @@ into_tracker = "db-snapshots"
 
 [restore]
 mode = "command"
-# reset (replays migrations, which insert their own seed rows), empty what
-# this role may truncate, then load the data-only dump. Loading straight
-# onto a freshly reset database dies on duplicate keys.
+# reset (replays the migrations, then the seed), empty every table the dump
+# carries, then load the data-only dump. Loading straight onto a freshly
+# reset database dies on duplicate keys.
 #
-# `has_table_privilege` is the filter, not a schema list: a table the dump
-# could not read because a stricter role owns it (Supabase's storage and
-# auth internals) is not one the restore has any business emptying either,
-# and trying fails on a permission error before the load ever runs.
+# The dump carries `auth` and `storage` as well as `public`, and the reset
+# puts rows back into all three: a migration's `insert into
+# storage.buckets`, a seed's `insert into auth.users`, the buckets
+# config.toml declares. So all three are emptied, except the migration
+# history the dump leaves out (`auth.schema_migrations`,
+# `storage.migrations`), which Auth and Storage read to decide what to
+# migrate. `has_table_privilege` skips what this role may not truncate. No
+# `restart identity`: the load sets every sequence the dump carries, and
+# only a sequence's owner may restart it, which `postgres` is not for
+# `auth`'s.
+#
+# A schema of your own that a migration or the seed writes rows into goes
+# in the list too. `ON_ERROR_STOP` stops the restore when a truncate
+# fails, instead of loading on top of what it could not empty.
 command = """
-supabase db reset && docker exec -i {{exports.RESOURCE_DB_CONTAINER}} psql --quiet -U postgres -d postgres <<'SQL' && docker exec -i {{exports.RESOURCE_DB_CONTAINER}} psql --quiet -U postgres -d postgres < {{state_ref}}
+supabase db reset && docker exec -i {{exports.RESOURCE_DB_CONTAINER}} psql --quiet -v ON_ERROR_STOP=1 -U postgres -d postgres <<'SQL' && docker exec -i {{exports.RESOURCE_DB_CONTAINER}} psql --quiet -U postgres -d postgres < {{state_ref}}
 do $$
 declare t record;
 begin
   for t in
     select schemaname, tablename from pg_tables
-     where schemaname = 'public'
+     where schemaname in ('public', 'auth', 'storage')
+       and (schemaname, tablename) not in (('auth', 'schema_migrations'), ('storage', 'migrations'))
        and has_table_privilege(format('%I.%I', schemaname, tablename), 'truncate')
   loop
-    execute format('truncate table %I.%I restart identity cascade', t.schemaname, t.tablename);
+    execute format('truncate table %I.%I cascade', t.schemaname, t.tablename);
   end loop;
 end $$;
 SQL

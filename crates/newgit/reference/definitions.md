@@ -674,11 +674,13 @@ every verify fail. Common dump tools do this by default: `pg_dump` since
 17.6 (and the matching back-branch releases) opens and closes every dump with
 `\restrict <token>` / `\unrestrict <token>`, a fresh random token per run.
 Pass `--restrict-key=<fixed>` to make it stable, as the bundled Postgres
-templates do (their comments say what a fixed key gives up). Anything else
-that stamps a run does the same: a timestamp in the output, or `pg_dump
---verbose`'s `-- Started on` / `-- Completed on` comments. `--verify` names
-this case when it happens rather than blaming `[restore]`; it does not paper
-over it.
+templates do (their comments say what a fixed key gives up). `supabase db
+dump` cannot pass it, and writes the pair as SQL comments (`-- \restrict
+<token>`), so the `supabase` template swaps the token for a fixed one after
+dumping. Anything else that stamps a run does the same: a timestamp in the
+output, or `pg_dump --verbose`'s `-- Started on` / `-- Completed on`
+comments. `--verify` names this case when it happens rather than blaming
+`[restore]`; it does not paper over it.
 
 ### `[restore]`
 

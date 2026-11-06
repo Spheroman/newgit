@@ -1,0 +1,136 @@
+#!/bin/sh
+# Stands in for the Supabase CLI in the `supabase` template's tests. It
+# answers the two commands the template's [checkpoint] and [restore] run,
+# `db dump --local --data-only -f <file>` and `db reset`, and refuses
+# anything else, so a template that starts calling something new fails here
+# rather than reaching a real CLI and a real stack.
+#
+# The "database" is a directory, $FAKE_SUPABASE_DB/supabase_db_<project_id>:
+# the name of the container the template's restore `docker exec`s into,
+# with `project_id` read from supabase/config.toml as the CLI reads it. Each
+# table is a file `<schema>.<table>` with one row per line, and a row's
+# first column is the table's key. The fake `docker` beside this script
+# reads and writes the same files.
+set -eu
+
+die() {
+  echo "fake supabase: $*" >&2
+  exit 64
+}
+
+[ -n "${FAKE_SUPABASE_DB:-}" ] || die "FAKE_SUPABASE_DB is not set"
+[ -f supabase/config.toml ] || die "no supabase/config.toml in $(pwd)"
+project_id=$(sed -n 's/^project_id = "\(.*\)"$/\1/p' supabase/config.toml)
+[ -n "$project_id" ] || die "no project_id in $(pwd)/supabase/config.toml"
+db="$FAKE_SUPABASE_DB/supabase_db_$project_id"
+tab=$(printf '\t')
+
+# `db dump --data-only`, laid out as the CLI's dump_data.sh writes it:
+# pg_dump's output between `SET session_replication_role` and `RESET ALL`,
+# every schema but the CLI's own and the services' migration history, one
+# INSERT per table carrying all its rows, and pg_dump's `\restrict` pair with
+# a fresh random key, commented out by the CLI's sed.
+# FAKE_SUPABASE_RESTRICT=bare writes the pair as a plain pg_dump does.
+dump() {
+  out='' data_only='' local_only=''
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --local) local_only=1 ;;
+      --data-only) data_only=1 ;;
+      -f)
+        [ $# -ge 2 ] || die "-f needs a path"
+        out=$2
+        shift
+        ;;
+      *) die "unexpected db dump argument: $1" ;;
+    esac
+    shift
+  done
+  [ -n "$local_only" ] || die "db dump without --local dumps the linked project"
+  [ -n "$data_only" ] || die "db dump without --data-only"
+  [ -n "$out" ] || die "db dump without -f"
+  [ -d "$db" ] || die "no database for $project_id; run db reset first"
+
+  case "${FAKE_SUPABASE_RESTRICT:-commented}" in
+    commented) comment='-- ' ;;
+    bare) comment='' ;;
+    *) die "FAKE_SUPABASE_RESTRICT is commented or bare" ;;
+  esac
+  key=$(od -An -N24 -tx1 /dev/urandom | tr -d ' \n')
+  {
+    printf 'SET session_replication_role = replica;\n\n'
+    printf '%s\n' '--' '-- PostgreSQL database dump' '--' ''
+    printf '%s\\restrict %s\n\n' "$comment" "$key"
+    for table in $(ls "$db" | LC_ALL=C sort); do
+      case "$table" in
+        supabase_migrations.* | auth.schema_migrations | storage.migrations) continue ;;
+      esac
+      [ -s "$db/$table" ] || continue
+      printf 'INSERT INTO "%s"."%s" VALUES\n' "${table%%.*}" "${table#*.}"
+      sed -e "s/^/$tab/" -e '$!s/$/,/' -e '$s/$/;/' "$db/$table"
+      printf '\n'
+    done
+    printf '%s\n' '--' '-- PostgreSQL database dump complete' '--' ''
+    printf '%s\\unrestrict %s\n\n' "$comment" "$key"
+    printf 'RESET ALL;\n'
+  } >"$out"
+}
+
+# `db reset`: a new database holding what the image and the services' own
+# migrations leave in it, then the project's migrations, then its seed
+# ([db.seed] is on by default). A row a migration or the seed inserts ends
+# with the number of the reset that made it, standing in for a `created_at
+# default now()`: a reset's copy of a seeded row is never the one an earlier
+# checkpoint dumped.
+reset() {
+  [ $# -eq 0 ] || die "unexpected db reset arguments: $*"
+  resets=$(($(cat "$db.resets" 2>/dev/null || echo 0) + 1))
+  rm -rf "$db"
+  mkdir -p "$db"
+  echo "$resets" >"$db.resets"
+  : >"$db/auth.users"
+  echo "('20240101000000')" >"$db/auth.schema_migrations"
+  : >"$db/storage.buckets"
+  : >"$db/storage.objects"
+  echo "(0, 'create-migrations-table')" >"$db/storage.migrations"
+  : >"$db/supabase_migrations.schema_migrations"
+  for migration in supabase/migrations/*.sql; do
+    [ -f "$migration" ] || continue
+    replay "$migration"
+    version=${migration##*/}
+    echo "('${version%%_*}')" >>"$db/supabase_migrations.schema_migrations"
+  done
+  [ ! -f supabase/seed.sql ] || replay supabase/seed.sql
+}
+
+# One statement per line, and only the two kinds the fixtures use.
+replay() {
+  while IFS= read -r line; do
+    case "$line" in
+      '' | --*) ;;
+      'create table '*)
+        table=$(printf '%s\n' "$line" | sed 's/^create table \([a-z_]*\.[a-z_]*\) .*/\1/')
+        [ -e "$db/$table" ] || : >"$db/$table"
+        ;;
+      'insert into '*' values ('*');')
+        table=$(printf '%s\n' "$line" | sed 's/^insert into \([a-z_]*\.[a-z_]*\) .*/\1/')
+        [ -e "$db/$table" ] || die "$1: $table does not exist"
+        values=$(printf '%s\n' "$line" | sed 's/.* values (\(.*\));$/\1/')
+        printf "(%s, 'reset %s')\n" "$values" "$resets" >>"$db/$table"
+        ;;
+      *) die "$1: cannot replay: $line" ;;
+    esac
+  done <"$1"
+}
+
+case "${1:-} ${2:-}" in
+  'db dump')
+    shift 2
+    dump "$@"
+    ;;
+  'db reset')
+    shift 2
+    reset "$@"
+    ;;
+  *) die "unexpected command: supabase $*" ;;
+esac
