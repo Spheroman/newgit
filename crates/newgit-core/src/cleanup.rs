@@ -5,7 +5,7 @@ use camino::{Utf8Path, Utf8PathBuf};
 use crate::branch::BranchInstance;
 use crate::checkpoint::CheckpointLog;
 use crate::error::{NewgitError, Result};
-use crate::materializer::{SOURCE_TEMPLATE_DIR, workspace_marker_path};
+use crate::materializer::{SOURCE_TEMPLATE_DIR, SPARSE_TEMPLATE_PREFIX, workspace_marker_path};
 use crate::resource::Ownership;
 use crate::store::{MetadataStore, read_subdirs_sorted};
 use crate::tracker_repo::{parse_tracker_state_ref, tracker_names};
@@ -280,9 +280,13 @@ impl SnapshotRoots {
 /// user-configurable and might point somewhere shared, and "newgit deleted a
 /// directory it did not create" is not a failure mode worth risking to
 /// reclaim disk. Anything else is reported as unrecognized and left alone.
+///
+/// A sparse template (`templates`: those a live binding uses) has no marker,
+/// but its name says newgit made it, and one no binding uses is garbage too.
 pub fn orphan_workspaces(
     workspace_root: &Utf8Path,
     branches: &[BranchInstance],
+    templates: &BTreeSet<Utf8PathBuf>,
 ) -> Result<(Vec<Utf8PathBuf>, Vec<String>)> {
     let claimed: BTreeSet<&Utf8Path> = branches
         .iter()
@@ -293,6 +297,15 @@ pub fn orphan_workspaces(
     let mut warnings = Vec::new();
     for dir in read_subdirs_sorted(workspace_root)? {
         if claimed.contains(dir.as_path()) || dir.file_name() == Some(SOURCE_TEMPLATE_DIR) {
+            continue;
+        }
+        if dir
+            .file_name()
+            .is_some_and(|name| name.starts_with(SPARSE_TEMPLATE_PREFIX))
+        {
+            if !templates.contains(&dir) {
+                orphans.push(dir);
+            }
             continue;
         }
         if workspace_marker_path(&dir).is_file() || is_empty_dir(&dir)? {

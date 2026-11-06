@@ -134,17 +134,48 @@ impl GitSource {
 
     /// Materialize `branch` as a full standalone clone at `destination`.
     /// A local-path clone hardlinks objects; never `--shared`/`--reference`.
-    pub fn clone_to(&self, branch: &str, destination: &Utf8Path) -> Result<()> {
+    ///
+    /// With `sparse`, the patterns are set before anything is checked out,
+    /// so what they leave out is never written.
+    pub fn clone_to(&self, branch: &str, destination: &Utf8Path, sparse: &[String]) -> Result<()> {
+        if sparse.is_empty() {
+            return run_git(&[
+                "clone",
+                "--quiet",
+                "--branch",
+                branch,
+                "--",
+                self.root.as_str(),
+                destination.as_str(),
+            ])
+            .map(|_| ());
+        }
         run_git(&[
             "clone",
             "--quiet",
+            "--no-checkout",
             "--branch",
             branch,
             "--",
             self.root.as_str(),
             destination.as_str(),
-        ])
-        .map(|_| ())
+        ])?;
+        // `--force`: without it a file that cannot be written is an error on
+        // stderr and exit 0, and the workspace would silently lack it.
+        let checked_out = set_sparse(destination, sparse).and_then(|()| {
+            run_git(&[
+                "-C",
+                destination.as_str(),
+                "checkout",
+                "--quiet",
+                "--force",
+                branch,
+            ])
+        });
+        if checked_out.is_err() {
+            let _ = std::fs::remove_dir_all(destination);
+        }
+        checked_out.map(|_| ())
     }
 
     /// Materialize `branch` at `destination` by cloning `template`, a
@@ -177,12 +208,16 @@ impl GitSource {
     /// An error leaves nothing at `destination` and the caller falls back
     /// to `clone_to`. A template a Git command failed on is deleted and
     /// rebuilt by the next spawn.
+    ///
+    /// `sparse` is what `template` is checked out with, which the workspace
+    /// inherits (see [`crate::materializer::template_for`]).
     pub fn clone_via_template(
         &self,
         template: &Utf8Path,
         branch: &str,
         rev: &str,
         destination: &Utf8Path,
+        sparse: &[String],
     ) -> Result<()> {
         if let (Some(from), Some(to)) = (template.parent(), destination.parent())
             && !same_device(from, to)?
@@ -202,7 +237,7 @@ impl GitSource {
         lock.lock()
             .map_err(|source| NewgitError::io(&lock_path, source))?;
 
-        if let Err(error) = self.prepare_template(template, rev) {
+        if let Err(error) = self.prepare_template(template, rev, sparse) {
             let _ = std::fs::remove_dir_all(template);
             return Err(error);
         }
@@ -248,7 +283,7 @@ impl GitSource {
 
     /// Bring the template to `rev`, cloning it from the store first if it
     /// does not exist yet.
-    fn prepare_template(&self, template: &Utf8Path, rev: &str) -> Result<()> {
+    fn prepare_template(&self, template: &Utf8Path, rev: &str, sparse: &[String]) -> Result<()> {
         let git = |args: &[&str]| {
             let mut full = vec!["-C", template.as_str()];
             full.extend_from_slice(args);
@@ -272,6 +307,7 @@ impl GitSource {
                 self.root.as_str(),
                 template.as_str(),
             ])?;
+            set_sparse(template, sparse)?;
         }
         git(&["checkout", "--quiet", "--force", "--detach", rev])?;
         if fresh {
@@ -2002,6 +2038,16 @@ fn settle_index(repo: &Utf8Path) -> Result<()> {
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
     run_git(&["-C", repo.as_str(), "update-index", "-q", "--refresh"]).map(|_| ())
+}
+
+/// Set `repo`'s sparse-checkout patterns, before anything is checked out.
+fn set_sparse(repo: &Utf8Path, patterns: &[String]) -> Result<()> {
+    if patterns.is_empty() {
+        return Ok(());
+    }
+    let mut args = vec!["-C", repo.as_str(), "sparse-checkout", "set", "--no-cone"];
+    args.extend(patterns.iter().map(String::as_str));
+    run_git(&args).map(|_| ())
 }
 
 /// Whether two existing directories are on the same filesystem.
