@@ -622,17 +622,22 @@ different history.
   `pull_view`'s recognition, not ancestry, because a mirror withholding a
   tracker has other ids than the view: each export target is composed so its
   commits carry notes, and a commit counts when its id, a note, or a
-  `Newgit-Split` trailer ties it to root's history. A pull request merged on
-  the mirror and not pulled yet is a commit `main` does not contain, so it
-  stops too.
+  `Newgit-Split` trailer ties it to root's history. So does a path the view
+  would write over an ignored or untracked file that differs.
+- **The mirror being ahead is not local work.** A commit reachable from the
+  clone's own `refs/remotes/origin/<branch>` is safe on the mirror: a pull
+  request merged there and not landed yet. It joins anyway and says how many,
+  and that the webhook lands them or a member runs `newgit pull --remote
+  <target>`. `init` does not land them.
 - **Not a member, or no such project (403, 404):** it adopts locally as it
   always did, says this copy is not linked, and writes
-  `.newgit/local/unlinked`. While that file is there the manager has no
-  remote, `newgit remote show` says NOT LINKED, `newgit remote add` and
-  `members` refuse, and `newgit merge`, `git push`, and `newgit export
-  --remote` refuse rather than move anything; a project root's `git push` is
-  routed through newgit so that it can. Running `newgit init` again joins
-  once that person is a member.
+  `.newgit/local/unlinked`. While that file is there the copy is a project
+  with no remote: `newgit merge` stays on this machine, because there is no
+  remote for it to move, and `git push` goes to `origin`, so someone's own fork
+  works. `newgit remote show` says NOT LINKED, and `remote add` and `members`
+  refuse. `newgit export --remote` refuses too: a local adoption's root is the
+  mirror's own history, so a forced export would rewrite the mirror's ids.
+  Running `newgit init` again joins once that person is a member.
 - **Anything else from the remote** (a 5xx, no network) is not an answer, so
   it stops with nothing changed rather than adopt.
 - **Already joined,** `newgit init` does nothing and says so. A project is

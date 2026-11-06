@@ -1696,6 +1696,29 @@ fn dropped(error: &NewgitError) -> bool {
     .any(|sign| stderr.contains(sign))
 }
 
+/// Whether a push may have failed because it came from a shallow repository:
+/// the remote objecting to its `shallow` lines, in Git's words or as a request
+/// it would not take. A credential or a lease that failed is neither. A 500 is
+/// here because it is what a push that is dropped ends as once smaller pushes
+/// have failed too, and by then there is nothing left to try.
+pub fn refused_shallow(error: &NewgitError) -> bool {
+    let NewgitError::SourceCommand { stderr, .. } = error else {
+        return false;
+    };
+    [
+        "shallow",
+        "protocol error",
+        "bad line length",
+        "HTTP 400",
+        "HTTP 415",
+        "HTTP 422",
+        "HTTP 500",
+        "HTTP 501",
+    ]
+    .iter()
+    .any(|sign| stderr.contains(sign))
+}
+
 /// Whether the remote refused to serve a commit by id: it has none, or will
 /// not say. Anything else is a failure, not an answer: a pin left out of a
 /// view stays out of it for as long as the view is cached.

@@ -291,6 +291,15 @@ fn a_checkpoint_spawns_on_a_snapshot_clone_with_no_history() {
         "mine\n"
     );
     assert_eq!(local_commits(&reader), 1, "no history came with it");
+    assert_eq!(
+        git(&at, &["log", "-1", "--format=%s"]),
+        "work in t3code",
+        "the checkpoint's own commit"
+    );
+    assert!(
+        snapshot_held(&reader),
+        "and no push fell back to fetching everything"
+    );
 }
 
 #[test]

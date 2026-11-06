@@ -2185,6 +2185,32 @@ impl BranchManager {
         )
     }
 
+    /// Run `push`, a push from the project repo to a tracker's repo. A
+    /// shallow repo's push names every shallow commit, and a remote may
+    /// refuse those lines outright. So when one that looks like that fails
+    /// here, every tracker held as snapshots gets its history, which leaves
+    /// nothing to name, and the push runs once more. Pushing from anywhere
+    /// else instead is no way round it: the outbox borrows these objects
+    /// through alternates without the `shallow` file.
+    fn pushing(&self, push: impl Fn() -> Result<()>) -> Result<()> {
+        let error = match push() {
+            Ok(()) => return Ok(()),
+            Err(error) => error,
+        };
+        let held = crate::snapshots::held(&self.store.paths().project_root)?;
+        if held.is_empty() || !crate::source::refused_shallow(&error) {
+            return Err(error);
+        }
+        eprintln!(
+            "the remote refused a push from this snapshot clone ({error}); fetching every \
+             mounted tracker's history and pushing again"
+        );
+        for tracker in held.keys() {
+            self.need_history(tracker)?;
+        }
+        push()
+    }
+
     /// Bring what composing root commit `commit` needs and this project does
     /// not hold yet: every commit its history pins of the trackers held as
     /// snapshots, and of `also` (tracker → a commit a list names). Composing
@@ -3818,6 +3844,17 @@ impl BranchManager {
                 else {
                     return true;
                 };
+                // Neither way round means nothing across a shallow cut, and
+                // this answer decides where the branch is exported.
+                if !self.source.is_ancestor(&tip, &main).unwrap_or(true)
+                    && !self.source.is_ancestor(&main, &tip).unwrap_or(true)
+                    && let Err(error) = self.need_history(&definition.name)
+                {
+                    eprintln!(
+                        "newgit: could not fetch `{}`'s history: {error}",
+                        definition.name
+                    );
+                }
                 if self.source.is_ancestor(&tip, &main).unwrap_or(true) {
                     return false;
                 }
@@ -8571,38 +8608,37 @@ impl BranchManager {
     /// Where a `git push` from a workspace publishes: the store's own
     /// `origin`, the project's real remote. `None` when there is none.
     pub fn publish_url(&self) -> Result<Option<String>> {
-        // An unlinked copy's push URL is the outbox, there to refuse.
-        self.source
-            .remote_url(PUBLISH_REMOTE, self.unlinked.is_none())
+        self.source.remote_url(PUBLISH_REMOTE, true)
     }
 
-    /// Stop anything that would publish from a copy that is not linked to
-    /// the remote its config names: its `main` is a local adoption, not
-    /// the project's, and must never be what moves the project's.
+    /// An unlinked copy acts as a project with no remote, but it may not
+    /// export: its root is the mirror's own history, so a forced export
+    /// would rewrite the mirror's ids.
     fn refuse_unlinked(&self) -> Result<()> {
         match &self.unlinked {
             Some(project) => Err(NewgitError::Unsupported(format!(
-                "this copy is not linked to `{project}`, so nothing here can publish to it: \
-                 once you are logged in and a member, `newgit init` joins it"
+                "this copy is not linked to `{project}`, so it may not export to that project's \
+                 targets: once you are logged in and a member, `newgit init` joins it"
             ))),
             None => Ok(()),
         }
     }
 
-    /// Send `git push` from the project root of an unlinked copy through
-    /// newgit, which refuses it. `origin` still fetches from where it did.
-    pub fn route_unlinked(&self) -> Result<()> {
-        if self.unlinked.is_none() {
-            return Ok(());
-        }
-        let outbox = self.outbox();
-        self.ensure_push_route(&outbox)?;
-        GitSource::workspace_route_origin(
-            &self.store.paths().project_root,
-            None,
-            &outbox,
-            &self.receive_pack_command(PROJECT_ROOT_INSTANCE),
-        )
+    /// The export target a mirror at `url` is: the one pushing there, or
+    /// failing that the first that is not rooted. What to name when saying
+    /// how its commits land.
+    pub fn mirror_target(&self, url: &str) -> Option<String> {
+        let targets = self.export_targets().ok()?;
+        let bare = |text: &str| {
+            text.trim_end_matches('/')
+                .trim_end_matches(".git")
+                .to_owned()
+        };
+        targets
+            .iter()
+            .find(|target| bare(&target.push_url()) == bare(url))
+            .or_else(|| targets.iter().find(|target| target.root.is_none()))
+            .map(|target| target.name.clone())
     }
 
     /// The commits of `repo`'s `HEAD` and its branch `branch` that this
@@ -8611,7 +8647,7 @@ impl BranchManager {
     /// export target's view of a commit here is, or notes or a
     /// `Newgit-Split` trailer say it came from here. A clone of a mirror
     /// withholding a tracker has other ids than the view, and all of them
-    /// are the project's.
+    /// are the project's. Returns their ids.
     pub fn commits_not_in(&self, repo: &Utf8Path, branch: &str) -> Result<Vec<String>> {
         let project = self.store.paths().project_root.clone();
         let git = |args: &[&str]| {
@@ -8663,11 +8699,7 @@ impl BranchManager {
         let mut foreign = Vec::new();
         for commit in walk.lines().map(str::trim).filter(|line| !line.is_empty()) {
             if recognise.view_of(self, commit)?.is_none() {
-                foreign.push(
-                    git(&["log", "-1", "--format=%h %s", commit])?
-                        .trim()
-                        .to_owned(),
-                );
+                foreign.push(commit.to_owned());
             }
         }
         for name in ["head", "branch"] {
@@ -8685,7 +8717,6 @@ impl BranchManager {
     /// On a newgit remote there is nothing to mirror: a push publishes the
     /// instance's work into its trackers' forks, not one history somewhere.
     pub fn serve_push(&self, instance: &str) -> Result<Utf8PathBuf> {
-        self.refuse_unlinked()?;
         if instance == PROJECT_ROOT_INSTANCE {
             return self.serve_project_push();
         }
@@ -9487,7 +9518,6 @@ impl BranchManager {
     /// instance `main` — so its own commits reach the shared branch the same
     /// way.
     pub fn merge(&self, instance: &str, into: &str) -> Result<MergeOutcome> {
-        self.refuse_unlinked()?;
         self.require_resolvable_graph()?;
         self.require_migrated()?;
         // The instance's lock, held to the end; the project root has none.
@@ -9682,14 +9712,16 @@ impl BranchManager {
                         commit: &str,
                         target: &str,
                         lease: Option<&str>| {
-                GitSource::push_leased(
-                    &["-C", project.as_str()],
-                    auth.remote.as_deref().unwrap_or_default(),
-                    commit,
-                    target,
-                    lease,
-                    Some(&basic_auth_header(auth)),
-                )
+                self.pushing(|| {
+                    GitSource::push_leased(
+                        &["-C", project.as_str()],
+                        auth.remote.as_deref().unwrap_or_default(),
+                        commit,
+                        target,
+                        lease,
+                        Some(&basic_auth_header(auth)),
+                    )
+                })
             };
             // A tracker new to the branch comes in through a repo seeded
             // for it.
@@ -9929,15 +9961,17 @@ impl BranchManager {
             }
             let fork = remote.fork(project, &branch.slug, tracker)?;
             let credential = remote.credential(project, &fork.repo, Scope::Write)?;
-            GitSource::push_refs(
-                &["-C", root.as_str()],
-                fork.remote.as_deref().unwrap_or_default(),
-                &[
-                    format!("+{head_commit}:refs/heads/{}", branch.slug),
-                    format!("+{tip_commit}:{}", fork_checkpoint_ref(&record.id)),
-                ],
-                Some(&basic_auth_header(&credential)),
-            )?;
+            self.pushing(|| {
+                GitSource::push_refs(
+                    &["-C", root.as_str()],
+                    fork.remote.as_deref().unwrap_or_default(),
+                    &[
+                        format!("+{head_commit}:refs/heads/{}", branch.slug),
+                        format!("+{tip_commit}:{}", fork_checkpoint_ref(&record.id)),
+                    ],
+                    Some(&basic_auth_header(&credential)),
+                )
+            })?;
         }
         Ok(crate::checkpoint::CodeState { head, tip })
     }
@@ -9969,9 +10003,7 @@ impl BranchManager {
         let root = self.store.paths().project_root.clone();
         let forks = remote.instance(project, from_slug)?.forks;
         let mut readable: BTreeSet<String> = BTreeSet::new();
-        // Trackers fetched as snapshots: from the author's fork when they
-        // have one, then from the tracker's own repo.
-        let mut fork_sources: BTreeMap<String, crate::snapshots::Source> = BTreeMap::new();
+        // Where whatever the author's fork did not bring is fetched from.
         let mut snapshot_sources: BTreeMap<String, crate::snapshots::Source> = BTreeMap::new();
         let names: BTreeSet<&String> = code.head.keys().chain(code.tip.keys()).collect();
         for tracker in names {
@@ -9993,23 +10025,39 @@ impl BranchManager {
             let url = credential.remote.as_deref().unwrap_or_default();
             let auth = basic_auth_header(&credential);
             if self.snapshots_here(tracker)? {
-                let source = crate::snapshots::Source {
-                    url: url.to_owned(),
-                    auth,
-                };
-                let primary = if forked {
+                let source = if forked {
+                    // Not one commit deep: this instance's own checkpoint
+                    // pushes these commits on to its fork, which has none of
+                    // them, and a remote refuses a commit with its parents
+                    // cut. A plain fetch stops at the pin they are built on.
+                    let imported = format!("refs/newgit/imported-trackers/{tracker}");
+                    for refspec in [
+                        format!("+refs/heads/{from_slug}:{imported}/heads/{from_slug}"),
+                        format!(
+                            "+{}:{imported}/checkpoint",
+                            fork_checkpoint_ref(checkpoint_id)
+                        ),
+                    ] {
+                        let _ = GitSource::fetch_refs(
+                            &["-C", root.as_str()],
+                            url,
+                            &[refspec],
+                            Some(&auth),
+                        );
+                    }
                     let repo = format!("{}.t.{tracker}", project.replace('/', "."));
                     let credential = remote.credential(project, &repo, Scope::Read)?;
-                    let upstream = crate::snapshots::Source {
+                    crate::snapshots::Source {
                         url: credential.remote.clone().unwrap_or_default(),
                         auth: basic_auth_header(&credential),
-                    };
-                    fork_sources.insert(tracker.clone(), source);
-                    upstream
+                    }
                 } else {
-                    source
+                    crate::snapshots::Source {
+                        url: url.to_owned(),
+                        auth,
+                    }
                 };
-                snapshot_sources.insert(tracker.clone(), primary);
+                snapshot_sources.insert(tracker.clone(), source);
                 readable.insert(tracker.clone());
                 continue;
             }
@@ -10058,15 +10106,16 @@ impl BranchManager {
         }
         if !snapshot_sources.is_empty() {
             let tips = [head_root.clone(), tip_root.clone()];
+            let held = crate::snapshots::held(&root)?;
+            for tracker in crate::snapshots::cutting_root(&root, &tips, &held)? {
+                self.need_history(&tracker)?;
+            }
             for commits in [&code.head, &code.tip] {
                 let named: BTreeMap<String, String> = commits
                     .iter()
                     .filter(|(tracker, _)| snapshot_sources.contains_key(*tracker))
                     .map(|(tracker, commit)| (tracker.clone(), commit.clone()))
                     .collect();
-                crate::snapshots::fetch_pins(&root, &tips, &named, &mut |tracker| {
-                    Ok(fork_sources.get(tracker).cloned())
-                })?;
                 let absent = crate::snapshots::fetch_pins(&root, &tips, &named, &mut |tracker| {
                     Ok(snapshot_sources.get(tracker).cloned())
                 })?;
@@ -12637,7 +12686,8 @@ fn export_reason(target: &ExportTarget, definition: &TrackerDefinition) -> Expor
 /// of them `gh` resolves to.
 struct ExportRouting<'a> {
     /// Where the branch is exported: the targets that ship a tracker the work
-    /// touched. When none does, every target that takes branches.
+    /// touched. When none does, every target that takes branches, except
+    /// one rooted at a tracker the work did not touch.
     exporting: Vec<&'a ExportTarget>,
     /// The one target `gh pr create` opens a pull request against — only when
     /// the work belongs to exactly one.
@@ -12657,15 +12707,24 @@ fn route_to_targets<'a>(
         .copied()
         .filter(|target| touched.iter().any(|tracker| ships(target, tracker)))
         .collect();
-    let exporting = if covering.is_empty() {
+    let candidates = if covering.is_empty() {
         taking
     } else {
         covering
     };
-    let resolved = match exporting.as_slice() {
-        [only] => Some(only.name.as_str()),
+    // A target rooted at a tracker the work left alone has nothing to take,
+    // and composing it for nothing would fetch that tracker's whole history.
+    let exported = |target: &&ExportTarget| {
+        target
+            .root
+            .as_ref()
+            .is_none_or(|tracker| touched.contains(tracker))
+    };
+    let resolved = match candidates.as_slice() {
+        [only] if exported(only) => Some(only.name.as_str()),
         _ => None,
     };
+    let exporting = candidates.iter().copied().filter(exported).collect();
     ExportRouting {
         exporting,
         resolved,

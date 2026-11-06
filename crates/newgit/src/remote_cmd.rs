@@ -634,7 +634,7 @@ pub fn init_named_project(root: &camino::Utf8Path, url: &str, key: &str) -> Resu
     std::fs::create_dir_all(&scratch)?;
     let result = join_from(&client, key, &view, &list, root, &scratch);
     let _ = std::fs::remove_dir_all(&scratch);
-    let fetched = result?;
+    let (fetched, ahead, target) = result?;
 
     link_project(&MetadataStore::adopt(root)?, url, &view)?;
     println!("Joined `{key}` on {url}");
@@ -648,6 +648,13 @@ pub fn init_named_project(root: &camino::Utf8Path, url: &str, key: &str) -> Resu
     for warning in &fetched.warnings {
         println!("  warning: {warning}");
     }
+    if ahead > 0 {
+        println!(
+            "  the mirror has {ahead} commit{} the project has not landed yet; the webhook \
+             lands them, or a member runs `newgit pull --remote {target}`",
+            if ahead == 1 { "" } else { "s" },
+        );
+    }
     Ok(())
 }
 
@@ -660,18 +667,91 @@ fn join_from(
     list: &std::collections::BTreeMap<String, String>,
     root: &camino::Utf8Path,
     scratch: &camino::Utf8Path,
-) -> Result<Fetched> {
+) -> Result<(Fetched, usize, String)> {
     let fetched = fetch_project(client, key, view, list, scratch, false)?;
     let branch = view.default_branch.as_str();
     let project = BranchManager::open(MetadataStore::adopt(scratch)?)?;
     let foreign = project.commits_not_in(root, branch)?;
-    if !foreign.is_empty() {
+    // What the clone's own `origin` has is the mirror being ahead of the
+    // project, a pull request not landed yet. It is safe there, so it stops
+    // nothing. Anything else is only here.
+    let at_origin = format!("refs/remotes/origin/{branch}");
+    let in_root = |args: &[&str]| {
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(root.as_str())
+            .args(args)
+            .output()
+            .context("could not run git")
+    };
+    let mut ahead = 0;
+    let mut local = Vec::new();
+    for commit in &foreign {
+        let on_origin = in_root(&["merge-base", "--is-ancestor", commit, &at_origin])?;
+        if on_origin.status.success() {
+            ahead += 1;
+        } else {
+            let line = in_root(&["log", "-1", "--format=%h %s", commit])?;
+            local.push(String::from_utf8_lossy(&line.stdout).trim().to_owned());
+        }
+    }
+    if !local.is_empty() {
         bail!(
             "this repository has {} commit(s) `{key}`'s `{branch}` does not contain, so nothing \
              changed. Put them on the project first, or move them aside, then `newgit init` \
              again:\n  {}",
-            foreign.len(),
-            foreign.join("\n  ")
+            local.len(),
+            local.join("\n  ")
+        );
+    }
+    let origin = in_root(&["config", "--get", "remote.origin.url"])?;
+    let target = project
+        .mirror_target(String::from_utf8_lossy(&origin.stdout).trim())
+        .unwrap_or_else(|| "<target>".to_owned());
+
+    // Checking out the view would replace these, and Git would not stop it:
+    // a path it does not track, ignored or not, is not its to protect.
+    let mut in_the_way = Vec::new();
+    let tracked = in_root(&["ls-files", "-z"])?;
+    let tracked: std::collections::BTreeSet<&[u8]> =
+        tracked.stdout.split(|byte| *byte == 0).collect();
+    let tree = std::process::Command::new("git")
+        .arg("-C")
+        .arg(scratch.as_str())
+        .args(["ls-tree", "-r", "-z", &fetched.head])
+        .output()
+        .context("could not run git")?;
+    for entry in tree.stdout.split(|byte| *byte == 0) {
+        let entry = String::from_utf8_lossy(entry);
+        let Some((meta, path)) = entry.split_once('\t') else {
+            continue;
+        };
+        if tracked.contains(path.as_bytes()) {
+            continue;
+        }
+        let at = camino::Utf8Path::new(path);
+        let file_above = at
+            .ancestors()
+            .skip(1)
+            .filter(|parent| !parent.as_str().is_empty())
+            .any(|parent| root.join(parent).is_file());
+        if file_above {
+            in_the_way.push(path.to_owned());
+        } else if std::fs::symlink_metadata(root.join(at)).is_ok() {
+            let blob = meta.split_whitespace().nth(2).unwrap_or_default();
+            let hashed = in_root(&["hash-object", "--", path])?;
+            if String::from_utf8_lossy(&hashed.stdout).trim() != blob {
+                in_the_way.push(path.to_owned());
+            }
+        }
+    }
+    if !in_the_way.is_empty() {
+        bail!(
+            "joining `{key}` checks out {} file(s) where this repository has an ignored or \
+             untracked one that differs, so nothing changed. Move them aside, then `newgit \
+             init` again:\n  {}",
+            in_the_way.len(),
+            in_the_way.join("\n  ")
         );
     }
 
@@ -718,10 +798,7 @@ fn join_from(
             "+refs/notes/*:refs/notes/*",
         ],
     )?;
-    git(
-        &at,
-        &["update-ref", &format!("refs/heads/{branch}"), &fetched.head],
-    )?;
+    // One step for the branch and the tree, so stopping here strands neither.
     git(
         &at,
         &["symbolic-ref", "HEAD", &format!("refs/heads/{branch}")],
@@ -734,23 +811,23 @@ fn join_from(
     }
     // The definitions are on disk now, so the project opens as what it is.
     BranchManager::open(MetadataStore::adopt(root)?)?.check_out_composed(branch)?;
-    Ok(fetched)
+    Ok((fetched, ahead, target))
 }
 
 /// Adopt the repository as `newgit init` always has, marked so it cannot
-/// pass for linked: everything that would publish refuses, and
+/// pass for linked. It acts as a project with no remote, and
 /// `newgit remote show` says so.
 fn adopt_unlinked(root: &camino::Utf8Path, url: &str, key: &str, why: &str) -> Result<()> {
     let (store, done) = MetadataStore::adopt_in_place(root)?;
     std::fs::write(store.paths().unlinked_file(), format!("{key}\n"))?;
-    BranchManager::open(store)?.route_unlinked()?;
     println!("Adopted the existing .newgit/ at {root}");
     for line in &done {
         println!("  {line}");
     }
     println!("  NOT LINKED: this copy is not linked to `{key}` on {url} ({why})");
-    println!("  it is a local project of its own: mounted trackers are not here, and");
-    println!("  `newgit merge`, `git push`, and exports refuse rather than touch `{key}`");
+    println!("  it is a local project of its own, and mounted trackers are not here");
+    println!("  `newgit merge` stays on this machine and `git push` goes to your `origin`,");
+    println!("  neither can touch `{key}`; `newgit export --remote` refuses");
     println!("  once you are a member, `newgit init` joins it");
     Ok(())
 }
@@ -791,7 +868,7 @@ fn show(json: bool) -> Result<()> {
             );
         } else {
             println!("NOT LINKED: this copy's config names `{project}`, but it is not joined");
-            println!("  mounted trackers are not here, and nothing here can publish to it");
+            println!("  mounted trackers are not here, and nothing here reaches that project");
             println!("  once you are logged in and a member, `newgit init` joins it");
         }
         return Ok(());

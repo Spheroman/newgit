@@ -256,63 +256,81 @@ fn a_clone_behind_main_joins() {
 }
 
 #[test]
-fn a_non_member_gets_a_copy_that_says_it_is_not_linked_and_cannot_publish() {
+fn a_non_member_gets_a_copy_that_says_it_is_not_linked_and_acts_as_if_it_has_no_remote() {
     let (_guard, temp) = tempdir();
     let fixture = setup(&temp);
     let mirror = mirrored(&fixture);
-    let dir = github_clone(&fixture, &mirror, "outsider");
+
+    // Their own fork of the mirror, which they cloned.
+    let fork = temp.join("fork.git");
+    git(
+        &temp,
+        &["clone", "-q", "--bare", mirror.as_str(), fork.as_str()],
+    );
+    let dir = github_clone(&fixture, &fork, "outsider");
     not_a_member(&fixture);
     let origin = git(&dir, &["remote", "get-url", "origin"]);
-    let main = git(
-        &fixture.remote.repo("jack.store.t.root"),
-        &["rev-parse", "main"],
-    );
+    let root_repo = fixture.remote.repo("jack.store.t.root");
+    let remote_main = git(&root_repo, &["rev-parse", "main"]);
     let mirrored_tip = git(&mirror, &["rev-parse", "main"]);
 
     let stdout = fixture.ok(&dir, &["init"]);
     assert!(stdout.contains("NOT LINKED"), "{stdout}");
     assert!(stdout.contains("mounted trackers are not here"), "{stdout}");
     assert_eq!(git(&dir, &["remote", "get-url", "origin"]), origin);
+    assert_eq!(
+        git_output(&dir, &["config", "--get", "remote.origin.pushurl"])
+            .status
+            .code(),
+        Some(1),
+        "pushes go where they always did"
+    );
 
     let shown = fixture.ok(&dir, &["remote", "show"]);
     assert!(shown.contains("NOT LINKED"), "{shown}");
     let json: Value =
         serde_json::from_str(fixture.ok(&dir, &["remote", "show", "--json"]).trim()).expect("json");
     assert_eq!(json["linked"], false);
+    let refused = fixture.newgit(&dir, &["members", "list"]);
+    assert!(!refused.status.success());
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("not linked"));
+    let refused = fixture.newgit(&dir, &["remote", "add"]);
+    assert!(!refused.status.success());
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("not linked"));
 
+    // `newgit merge main` runs, and there is no remote for it to move.
     std::fs::write(dir.join("local.txt"), "mine\n").expect("write");
     git(&dir, &["add", "-A"]);
     git(&dir, &["commit", "-q", "-m", "local work"]);
+    fixture.ok(&dir, &["merge", "main"]);
+    assert_eq!(
+        git(&root_repo, &["rev-parse", "main"]),
+        remote_main,
+        "the remote's `main` did not move"
+    );
 
-    let stderr = fails(&fixture, &dir, &["merge", "main"]);
-    assert!(stderr.contains("not linked"), "{stderr}");
-    let stderr = fails(&fixture, &dir, &["export", "--remote", "github"]);
-    assert!(stderr.contains("not linked"), "{stderr}");
-    let pushed = git_output(&dir, &["push", "origin", "main"]);
-    assert!(!pushed.status.success());
-    let stderr = String::from_utf8_lossy(&pushed.stderr);
-    assert!(stderr.contains("not linked"), "{stderr}");
+    // `git push origin main` reaches their fork, as in any repository.
+    let tip = git(&dir, &["rev-parse", "main"]);
+    git(&dir, &["push", "-q", "origin", "main"]);
+    assert_eq!(git(&fork, &["rev-parse", "main"]), tip);
 
-    // From an instance too, and work there still runs.
+    // So does a push from an instance.
     fixture.ok(&dir, &["spawn", "local-work"]);
     let workspace = Utf8PathBuf::from(fixture.ok(&dir, &["status", "local-work", "--path"]).trim());
     std::fs::write(workspace.join("more.txt"), "more\n").expect("write");
     git(&workspace, &["add", "-A"]);
     git(&workspace, &["commit", "-q", "-m", "more"]);
-    let pushed = git_output(&workspace, &["push", "origin", "HEAD"]);
-    assert!(!pushed.status.success());
-    let stderr = String::from_utf8_lossy(&pushed.stderr);
-    assert!(stderr.contains("not linked"), "{stderr}");
-
+    git(&workspace, &["push", "-q", "origin", "HEAD"]);
     assert_eq!(
-        git(
-            &fixture.remote.repo("jack.store.t.root"),
-            &["rev-parse", "main"]
-        ),
-        main,
-        "the remote's `main` did not move"
+        git(&fork, &["rev-parse", "refs/heads/local-work"]),
+        git(&workspace, &["rev-parse", "HEAD"])
     );
+
+    // An export would force the mirror onto ids of its own making.
+    let stderr = fails(&fixture, &dir, &["export", "--remote", "github"]);
+    assert!(stderr.contains("not linked"), "{stderr}");
     assert_eq!(git(&mirror, &["rev-parse", "main"]), mirrored_tip);
+    assert_eq!(git(&root_repo, &["rev-parse", "main"]), remote_main);
 }
 
 #[test]
@@ -365,4 +383,89 @@ fn the_project_the_config_came_from_has_nothing_to_join() {
     let stdout = fixture.ok(&fixture.store, &["init"]);
     assert!(stdout.contains("nothing to do"), "{stdout}");
     assert_eq!(git(&fixture.store, &["rev-parse", "HEAD"]), before);
+}
+
+/// A pull request merged on the mirror, not landed on the project.
+fn merged_on_mirror(fixture: &Fixture, mirror: &Utf8Path) {
+    let elsewhere = github_clone(fixture, mirror, "pull-request");
+    std::fs::write(elsewhere.join("pr.txt"), "pr\n").expect("write");
+    git(&elsewhere, &["add", "-A"]);
+    git(&elsewhere, &["commit", "-q", "-m", "merged on the mirror"]);
+    git(&elsewhere, &["push", "-q", "origin", "main"]);
+}
+
+#[test]
+fn a_mirror_ahead_of_the_project_joins_and_says_so() {
+    let (_guard, temp) = tempdir();
+    let fixture = setup(&temp);
+    let mirror = mirrored(&fixture);
+    merged_on_mirror(&fixture, &mirror);
+    let dir = github_clone(&fixture, &mirror, "ahead-mirror");
+
+    let stdout = fixture.ok(&dir, &["init"]);
+    assert!(stdout.contains("Joined"), "{stdout}");
+    assert!(
+        stdout.contains("the mirror has 1 commit the project has not landed yet")
+            && stdout.contains("`newgit pull --remote github`"),
+        "{stdout}"
+    );
+    assert_eq!(
+        git(&dir, &["rev-parse", "HEAD"]),
+        git(&fixture.store, &["rev-parse", "HEAD"]),
+        "landing them is not `init`'s to do"
+    );
+    assert!(!dir.join("pr.txt").exists());
+    assert!(dir.join("apps/t3code/app.ts").exists());
+}
+
+#[test]
+fn a_local_commit_on_a_mirror_ahead_still_stops_it_naming_only_that() {
+    let (_guard, temp) = tempdir();
+    let fixture = setup(&temp);
+    let mirror = mirrored(&fixture);
+    merged_on_mirror(&fixture, &mirror);
+    let dir = github_clone(&fixture, &mirror, "both");
+    std::fs::write(dir.join("local.txt"), "mine\n").expect("write");
+    git(&dir, &["add", "-A"]);
+    git(&dir, &["commit", "-q", "-m", "a commit only here"]);
+    let before = state(&dir);
+
+    let stderr = fails(&fixture, &dir, &["init"]);
+    assert!(stderr.contains("a commit only here"), "{stderr}");
+    assert!(!stderr.contains("merged on the mirror"), "{stderr}");
+    assert_eq!(state(&dir), before);
+}
+
+#[test]
+fn an_ignored_file_the_view_would_overwrite_stops_it() {
+    let (_guard, temp) = tempdir();
+    let fixture = setup(&temp);
+    let mirror = mirrored(&fixture);
+    let dir = github_clone(&fixture, &mirror, "ignored");
+    std::fs::create_dir_all(dir.join("apps/t3code")).expect("mkdir");
+    std::fs::write(dir.join("apps/t3code/app.ts"), "my own\n").expect("write");
+    std::fs::write(dir.join(".git/info/exclude"), "apps/\n").expect("write");
+    let before = state(&dir);
+
+    let stderr = fails(&fixture, &dir, &["init"]);
+    assert!(stderr.contains("apps/t3code/app.ts"), "{stderr}");
+    assert_eq!(state(&dir), before);
+    assert_eq!(
+        std::fs::read_to_string(dir.join("apps/t3code/app.ts")).expect("read"),
+        "my own\n"
+    );
+}
+
+#[test]
+fn an_ignored_file_matching_the_view_is_no_reason_to_stop() {
+    let (_guard, temp) = tempdir();
+    let fixture = setup(&temp);
+    let mirror = mirrored(&fixture);
+    let dir = github_clone(&fixture, &mirror, "same");
+    std::fs::create_dir_all(dir.join("apps/t3code")).expect("mkdir");
+    std::fs::write(dir.join("apps/t3code/app.ts"), "app\n").expect("write");
+    std::fs::write(dir.join(".git/info/exclude"), "apps/\n").expect("write");
+
+    let stdout = fixture.ok(&dir, &["init"]);
+    assert!(stdout.contains("Joined"), "{stdout}");
 }

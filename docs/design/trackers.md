@@ -333,6 +333,12 @@ for someone who knows they will work in a child.
   cannot find, so before composing, `bring_pins` fetches every snapshot root's
   history lacks.
 
+- **A remote may refuse a push from a shallow repo.** `git push` names every
+  entry in `shallow`. When one that looks refused fails, every tracker held as
+  snapshots gets its history, which empties the file, and the push runs once
+  more, saying so. Pushing from the outbox instead is no way round it: it
+  borrows these objects through alternates without the `shallow` file.
+
 **History arrives in one place, `need_history`.** It fetches the tracker
 whole into `trackers.git`, where a dropped fetch steps and resumes as any
 whole fetch does, and `--unshallow`s the project from there, which deepens
@@ -350,9 +356,10 @@ split, checkpoint, push, and an ordinary merge fetch no history.
 | A split where a view merge joins two lines of a child, with a tree equal to one of them | Asks whether that one descends from the other; "no" → `need_history` |
 | `newgit pull <tracker>` | Fast-forward: no history, `follow` lands on the pin and is counted. Otherwise `need_history`, so a pin is never moved backwards |
 | `newgit pull --remote` from a rooted target, a rooted export, `newgit log <tracker>`, `tracker migrate` | `need_history` first: each walks the history itself |
-| `spawn --from-checkpoint` | Fetches the checkpoint's pins, from the author's fork and then the tracker's repo; no history |
+| `spawn --from-checkpoint` | A plain fetch from the author's fork stops at the pin, so the checkpoint's commits are whole enough to push on; other pins come from the tracker's repo; no history unless root's walk reaches a snapshot |
 | A tracker's commits judged before a push | Stops at the pin, which is what the remote already holds |
-| "Is this tracker behind?" at spawn, `gh` routing, an export's "unmerged" | Advisory: a false "no" says less or names a tracker it need not. Decides nothing |
+| Which tracker an instance touched, for where its branch is exported | Asks both ways round; neither → `need_history`. A false "touched" would send the branch to the wrong repo |
+| "Is this tracker behind?" at spawn, an export's "unmerged" | Advisory: a false "no" says less or names a tracker it need not. Decides nothing |
 
 ### Compose
 

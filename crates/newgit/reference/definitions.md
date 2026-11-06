@@ -1760,10 +1760,13 @@ clone of a project's mirror asks that remote what to do. Logged in and a
 member, it joins: root's history and pinned snapshots are fetched, the
 composed `main` checked out, and `origin` pointed at the remote, as `newgit
 clone` leaves things. Uncommitted changes, or commits `main` does not contain,
-stop it before anything moves. Not logged in, it stops and says to run `newgit
-login`. Anyone else gets a local copy marked not linked, which `newgit remote
-show` says, and from which `newgit merge`, `git push`, and `newgit export
---remote` refuse; `newgit init` joins it once they are a member.
+stop it before anything moves, unless they are on the clone's own `origin`:
+that is the mirror ahead of the project, which it joins anyway and reports.
+Not logged in, it stops and says to run `newgit login`. Anyone else gets a
+local copy marked not linked, which `newgit remote show` says. It acts as a
+project with no remote: `newgit merge` stays local, `git push` goes to
+`origin`, and `newgit export --remote` refuses. `newgit init` joins it once
+they are a member.
 
 Your own settings live in `~/.newgit/config.toml`, which newgit never
 writes. The one it reads is your default tracker per role, which beats the
