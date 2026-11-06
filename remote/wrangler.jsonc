@@ -36,9 +36,6 @@
     {
       "class_name": "GitEndpoint",
       "scheduling_policy": "durable_object",
-      // 4 GiB, half a vCPU, 8 GB of disk. Left unset, it got the smallest size,
-      // which lost its connection mid-compose on Spheroman/t3code.
-      "instance_type": "standard-1",
       "images": { "endpoint": { "dockerfile": "./endpoint.Dockerfile", "build_context": ".." } }
     }
   ],

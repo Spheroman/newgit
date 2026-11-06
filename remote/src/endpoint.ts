@@ -255,6 +255,14 @@ export function pullKey(plan: Pick<PullPlan, "list" | "mirror" | "peek">): strin
 	return `pull${plan.peek ? " peek" : ""} ${plan.mirror.url} ${plan.mirror.commit} ${plan.list.root}`;
 }
 
+/**
+ * 4 GiB, half a vCPU, 8 GB of disk. Left unset, a container gets the smallest
+ * size, which lost its connection composing Spheroman/t3code. It goes on every
+ * start, a restore included, since a Durable Object-managed container takes its
+ * size here and wrangler.jsonc refuses `instance_type`.
+ */
+const ENDPOINT_INSTANCE = "standard-1";
+
 /** Snapshot at most this often, after a compose changed what is on disk. */
 const SNAPSHOT_EVERY_MS = 10 * 60_000;
 
@@ -419,14 +427,15 @@ export class GitEndpoint extends DurableObject<Env> {
 				container.start({
 					containerSnapshot: { id: snapshot },
 					enableInternet: true,
+					instance: ENDPOINT_INSTANCE,
 				});
 			} catch {
 				await storage.delete(["snapshot", "snapshot_image"]);
-				container.start({ image, enableInternet: true });
+				container.start({ image, enableInternet: true, instance: ENDPOINT_INSTANCE });
 			}
 		} else {
 			await storage.delete(["snapshot", "snapshot_image"]);
-			container.start({ image, enableInternet: true });
+			container.start({ image, enableInternet: true, instance: ENDPOINT_INSTANCE });
 		}
 		const deadline = Date.now() + 60_000;
 		for (;;) {
