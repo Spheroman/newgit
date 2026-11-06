@@ -10,8 +10,11 @@ mod imports;
 use camino::{Utf8Path, Utf8PathBuf};
 use imports::*;
 use newgit_core::SourceSubstrate;
+#[cfg(target_os = "macos")]
 use newgit_core::cleanup::ArchivedCheckpoints;
-use newgit_core::manager::{BindingChoice, SourceBranchPolicy};
+use newgit_core::manager::BindingChoice;
+#[cfg(target_os = "macos")]
+use newgit_core::manager::SourceBranchPolicy;
 use newgit_core::source::GitSource;
 use newgit_core::store::MetadataStore;
 
@@ -138,6 +141,7 @@ fn a_failed_plain_clone_leaves_nothing_behind() {
     assert!(!destination.exists());
 }
 
+#[cfg(target_os = "macos")]
 fn sparse_templates(temp: &Utf8Path) -> Vec<Utf8PathBuf> {
     let mut found: Vec<Utf8PathBuf> = std::fs::read_dir(temp.join("workspaces"))
         .expect("workspaces")

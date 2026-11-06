@@ -2957,7 +2957,7 @@ impl BranchManager {
             &self.sparse_patterns(&branch.dropped),
         )?;
         if !branch.dropped.is_empty() {
-            self.apply_sparse(&branch)?;
+            self.apply_sparse_to(&branch, true)?;
         }
 
         // Before any lane content lands, make the clone's Git ignore the
@@ -6203,6 +6203,14 @@ impl BranchManager {
     /// The marks go on before `set`, which deletes a file it newly leaves
     /// out if the file holds what the index does.
     fn apply_sparse(&self, branch: &BranchInstance) -> Result<()> {
+        self.apply_sparse_to(branch, false)
+    }
+
+    /// [`Self::apply_sparse`]. `fresh`: the workspace was cloned with these
+    /// patterns a moment ago, so setting the same ones again has nothing to
+    /// do but read the whole index. Only a fresh one can skip it: elsewhere
+    /// the set is also what puts a stray file back in line.
+    fn apply_sparse_to(&self, branch: &BranchInstance, fresh: bool) -> Result<()> {
         let workspace = branch.workspace_path.as_str();
         let rendered = GitSource::workspace_indexed(
             &branch.workspace_path,
@@ -6229,6 +6237,12 @@ impl BranchManager {
         // what an install reads is the same.
         for path in &rendered {
             patterns.push(format!("!/{path}"));
+        }
+        let current =
+            std::fs::read_to_string(branch.workspace_path.join(".git/info/sparse-checkout"))
+                .unwrap_or_default();
+        if fresh && current.lines().eq(patterns.iter().map(String::as_str)) {
+            return Ok(());
         }
         let mut args = vec!["-C", workspace, "sparse-checkout", "set", "--no-cone"];
         args.extend(patterns.iter().map(String::as_str));
