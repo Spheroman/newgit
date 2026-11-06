@@ -80,6 +80,14 @@ export interface Caller {
 export const CREDENTIAL_TTL_SECONDS = 15 * 60;
 
 /**
+ * Read credentials last this long: a stepped fetch of a large history
+ * (t3code's 365 MiB) outlasts fifteen minutes. Each is recorded and revoked
+ * with the login or instance it was minted for, so losing membership still
+ * bites at once.
+ */
+export const READ_CREDENTIAL_TTL_SECONDS = 60 * 60;
+
+/**
  * The read passwords a merge check fetches with: as long as the check may
  * run (`CHECK_LIMIT_MS`, 45 minutes) and a little more, since a fetch of a
  * large history starts minutes in and must not lose its password part way.
@@ -985,7 +993,7 @@ async function gitEndpoint(request: Request, env: Env, deps: Deps, match: RegExp
 
 	for (const tracker of needed) {
 		const name = repoName({ kind: "tracker", project: id, tracker });
-		const minted = await deps.repos.mint(name, "read", CREDENTIAL_TTL_SECONDS);
+		const minted = await deps.repos.mint(name, "read", READ_CREDENTIAL_TTL_SECONDS);
 		await userStub(env, caller.login).recordRepoToken(caller.tokenId, name, minted.id, minted.expiresAt);
 		plan.repos[tracker] = { url: deps.repos.url(name), auth: `Authorization: Basic ${btoa(`x:${minted.password}`)}` };
 	}
@@ -1076,7 +1084,7 @@ async function credential(
 			throw new HttpError(404, `${name} does not exist yet`);
 		remote = (await deps.repos.create(name)).remote;
 	}
-	const minted = await deps.repos.mint(name, scope, CREDENTIAL_TTL_SECONDS);
+	const minted = await deps.repos.mint(name, scope, scope === "read" ? READ_CREDENTIAL_TTL_SECONDS : CREDENTIAL_TTL_SECONDS);
 	await userStub(env, caller.login).recordRepoToken(caller.tokenId, name, minted.id, minted.expiresAt);
 	return { repo: name, remote, scope, username: "x", password: minted.password, expires_at: minted.expiresAt };
 }
