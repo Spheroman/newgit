@@ -338,6 +338,22 @@ impl TrackerDefinition {
             // change what"). Only a tracker in Git may: one outside Git would
             // keep the definition out of Git.
             if is_definition_file(path) {
+                // Governance only delegates downward (#228): `access`'s
+                // definition is always its own, and no tracker may govern
+                // itself. The remote ignores such a claim; refusing it here
+                // keeps the local view from reading a definition the remote
+                // never would.
+                let file = path.file_stem().unwrap_or_default();
+                if file == ACCESS_TRACKER || file == self.name {
+                    return Err(self.invalid(format!(
+                        "path `{path}` is {} definition, which no tracker may own but `access`",
+                        if file == self.name {
+                            "this tracker's own".to_owned()
+                        } else {
+                            "`access`'s".to_owned()
+                        }
+                    )));
+                }
                 if self.carved() {
                     continue;
                 }

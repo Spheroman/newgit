@@ -786,6 +786,20 @@ scripts, config, exports — is root's, which anyone who merges may change.
 The remote reads each definition from the tracker that owns its file, at
 that tracker's own `main` (whatever the project's default branch is called),
 to a fixed point.
+
+**Governance only delegates downward (decided, #228).** Ownership alone
+would let a tracker handed one definition claim any other, `access`'s
+included, and with it the whole project: the claim is a change to the
+claimant's definition, which only the claimant's governors approve, not
+whoever governs the claimed file. So a claim on `<T>.toml` counts only when
+the claiming tracker's own definition is held by the tracker that holds
+`<T>.toml` — then the claim is written in that holder's repo, and the people
+who govern `T` are the ones who approved it. A tracker keeps what it holds
+while it still claims it; `access.toml` is always `access`'s; no tracker
+holds its own definition; and no claim closes a loop, so every chain of
+holders ends at `access`. A claim that doesn't count is ignored by the
+remote (the file stays with its holder). The client refuses the two it can
+see in a single definition, a claim on `access.toml` or on the tracker's own.
 *(Not enforced for trackers outside Git yet, and open: the remote gives a
 write credential for the repo of a tracker outside Git to anyone in its
 audience, and that credential can push the repo's `main` directly. For
