@@ -456,36 +456,153 @@ fn a_child_can_stay_out_of_a_workspace_and_its_parents_work_merges_without_it() 
     );
 }
 
-/// As for any tracker nested in another: a binding is each tracker's own,
-/// and `requires` is what ties one to another.
+fn parent_on_request(store: &MetadataStore) {
+    let repo = store.paths().project_root.clone();
+    let path = store.paths().trackers.join("t3code.toml");
+    let mut text = std::fs::read_to_string(&path).expect("read");
+    text.push_str("priority = -1\n");
+    std::fs::write(&path, text).expect("write");
+    git(&repo, &["add", "-A"]);
+    git(
+        &repo,
+        &["commit", "-q", "-m", "Bind t3code only when asked"],
+    );
+    manager(store).merge("main", "main").expect("publish");
+}
+
+fn spawned_without(store: &MetadataStore, name: &str, choice: &BindingChoice) -> Vec<String> {
+    let spawned = manager(store)
+        .spawn_binding(name, None, choice)
+        .expect("spawn");
+    let mut dropped: Vec<String> = spawned.branch.dropped.into_iter().collect();
+    dropped.retain(|tracker| tracker.starts_with("t3code"));
+    dropped
+}
+
 #[test]
-fn dropping_a_parent_leaves_its_child_bound() {
+fn a_child_is_bound_only_where_its_parent_is() {
+    let (_guard, temp) = tempdir();
+    let (store, _, _) = imported(&temp);
+    carve(&store);
+
+    // Bound by default: it comes with its parent.
+    assert!(spawned_without(&store, "both", &BindingChoice::default()).is_empty());
+    // Parent left out: the child cannot exist without it.
+    assert_eq!(
+        spawned_without(&store, "neither", &choice(&[], &["t3code"])),
+        ["t3code", "t3code-repos"]
+    );
+    // Asked for by name: it brings its parent.
+    assert!(spawned_without(&store, "asked", &choice(&["t3code-repos"], &[])).is_empty());
+    // Its own negative priority keeps it out while the parent is bound.
+    on_request(&store);
+    assert_eq!(
+        spawned_without(&store, "parent-only", &BindingChoice::default()),
+        ["t3code-repos"]
+    );
+    assert_eq!(
+        spawned_without(&store, "parent-asked", &choice(&["t3code-repos"], &[])),
+        Vec::<String>::new()
+    );
+}
+
+/// The parent on request, the child ready to come with it.
+#[test]
+fn a_parent_on_request_brings_a_child_that_is_not() {
+    let (_guard, temp) = tempdir();
+    let (store, _, _) = imported(&temp);
+    carve(&store);
+    parent_on_request(&store);
+    assert_eq!(
+        spawned_without(&store, "default", &BindingChoice::default()),
+        ["t3code", "t3code-repos"],
+        "neither, though the child's own priority would bind it"
+    );
+    assert!(
+        spawned_without(&store, "asked", &choice(&["t3code"], &[])).is_empty(),
+        "both"
+    );
+
+    let used = manager(&store)
+        .use_tracker("default", "t3code")
+        .expect("use");
+    assert_eq!(used.brought, ["t3code-repos"]);
+    let branch = store.find_branch("default").expect("record");
+    assert!(
+        branch
+            .workspace_path
+            .join("apps/t3code/.repos/effect/LLMS.md")
+            .exists()
+    );
+}
+
+/// Both on request: the way to keep all of t3code out by default.
+#[test]
+fn with_both_on_request_a_parent_can_come_without_its_child() {
+    let (_guard, temp) = tempdir();
+    let (store, _, _) = imported(&temp);
+    carve(&store);
+    on_request(&store);
+    parent_on_request(&store);
+    assert_eq!(
+        spawned_without(&store, "neither", &BindingChoice::default()),
+        ["t3code", "t3code-repos"]
+    );
+    let used = manager(&store)
+        .use_tracker("neither", "t3code")
+        .expect("use");
+    assert!(used.brought.is_empty(), "{:?}", used.brought);
+    let branch = store.find_branch("neither").expect("record");
+    assert!(branch.dropped.contains("t3code-repos"));
+    assert!(branch.workspace_path.join("apps/t3code/src").exists());
+    assert!(!branch.workspace_path.join("apps/t3code/.repos").exists());
+}
+
+#[test]
+fn asking_for_a_child_brings_its_parent_and_dropping_the_parent_takes_it() {
     let (_guard, temp) = tempdir();
     let (store, _, _) = imported(&temp);
     carve(&store);
     let spawned = manager(&store)
-        .spawn_binding("no-parent", None, &choice(&[], &["t3code"]))
+        .spawn_binding("x", None, &choice(&[], &["t3code"]))
         .expect("spawn");
-    assert!(!spawned.branch.dropped.contains("t3code-repos"));
-    let workspace = spawned.branch.workspace_path;
-    assert!(workspace.join("apps/t3code/.repos/effect/LLMS.md").exists());
-    assert!(!workspace.join("apps/t3code/src").exists());
+    assert!(!spawned.branch.workspace_path.join("apps/t3code").exists());
 
-    manager(&store)
-        .use_tracker("no-parent", "t3code")
+    let used = manager(&store)
+        .use_tracker("x", "t3code-repos")
         .expect("use");
-    manager(&store)
-        .drop_tracker("no-parent", "t3code-repos", Uncommitted::Refuse)
-        .expect("drop");
-    assert!(!workspace.join("apps/t3code/.repos").exists());
-    assert!(workspace.join("apps/t3code/src").exists());
+    assert_eq!(used.brought, ["t3code"]);
+    let branch = store.find_branch("x").expect("record");
+    assert!(branch.dropped.is_empty(), "{:?}", branch.dropped);
     assert!(
-        manager(&store)
-            .spawn_binding("both-out", None, &choice(&[], &["t3code", "t3code-repos"]))
-            .expect("spawn")
-            .branch
-            .dropped
-            .contains("t3code-repos")
+        branch
+            .workspace_path
+            .join("apps/t3code/.repos/effect/LLMS.md")
+            .exists()
+    );
+    assert!(branch.workspace_path.join("apps/t3code/src").exists());
+
+    let dropped = manager(&store)
+        .drop_tracker("x", "t3code", Uncommitted::Refuse)
+        .expect("drop");
+    assert_eq!(dropped.children, ["t3code-repos"], "says what else went");
+    let branch = store.find_branch("x").expect("record");
+    assert!(branch.dropped.contains("t3code") && branch.dropped.contains("t3code-repos"));
+    assert!(!branch.workspace_path.join("apps/t3code").exists());
+}
+
+#[test]
+fn a_spawn_asking_for_a_child_of_a_dropped_parent_is_refused_by_name() {
+    let (_guard, temp) = tempdir();
+    let (store, _, _) = imported(&temp);
+    carve(&store);
+    let error = manager(&store)
+        .spawn_binding("both", None, &choice(&["t3code-repos"], &["t3code"]))
+        .expect_err("refused");
+    let text = error.to_string();
+    assert!(
+        text.contains("`t3code`") && text.contains("`t3code-repos`"),
+        "{text}"
     );
 }
 

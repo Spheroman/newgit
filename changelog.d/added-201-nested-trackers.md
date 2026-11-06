@@ -13,6 +13,10 @@
   `access` keeps any name it has a file for. The remote has to be deployed
   before a project merges one.
 
+  A child is bound only where its parent is: dropping the parent drops it,
+  and asking for it brings the parent. With its parent bound, its own
+  `priority` decides, so `-1` keeps it out until asked for.
+
   This replaces the decision that such a tracker is a deeper mount of
   root's. A tracker carved that way before this release keeps working as
   one.

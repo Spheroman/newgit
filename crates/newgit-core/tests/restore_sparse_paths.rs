@@ -174,6 +174,21 @@ fn setup(temp: &Utf8Path, trackers: &[(&str, &str)]) -> MetadataStore {
     git(&repo, &["add", "-A"]);
     git(&repo, &["commit", "-q", "-m", "newgit"]);
     for (name, path) in trackers {
+        if *name == "inner" {
+            // Root's, not `b`'s: carved, it would be `b`'s child and go with
+            // it. This is the tracker that stays when what surrounds it goes.
+            std::fs::write(
+                store.paths().trackers.join("inner.toml"),
+                format!(
+                    "audience = \"project-devs\"\nstorage = \"local\"\ngit = true\n\
+                     mount = \"{path}\"\npaths = [\".\"]\n"
+                ),
+            )
+            .expect("define inner");
+            git(&repo, &["add", "-A"]);
+            git(&repo, &["commit", "-q", "-m", "inner"]);
+            continue;
+        }
         BranchManager::open(store.clone())
             .expect("manager")
             .create_git_tracker(name, "project-devs", &[Utf8PathBuf::from(*path)])
@@ -289,7 +304,7 @@ fn undo_reapplies_a_bound_tracker_nested_in_a_dropped_one() {
     assert_eq!(read(&workspace, "apps/b/index.js"), None);
     assert_eq!(
         git(&workspace, &["ls-files", "-t", "--", "apps/b"]),
-        "S apps/b/.newgit/trackers/inner.toml\nS apps/b/index.js\nH apps/b/inner/x.js\nS apps/b/keep.js"
+        "S apps/b/index.js\nH apps/b/inner/x.js\nS apps/b/keep.js"
     );
     assert_eq!(
         status(&workspace),

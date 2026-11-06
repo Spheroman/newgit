@@ -170,9 +170,16 @@ Who may change that definition is who may change `electron`: the file is
 `electron`'s, by the same rule as any definition. A name `access` has a file
 for is never taken by a nested definition, even if that file does not parse,
 and names are unique across a project. Only a tracker in Git is defined
-inside another, and it needs a `mount` of its own. A binding stays each
-tracker's own: dropping `electron` leaves a bound `native` in the working
-tree, and `requires` is what ties one to the other.
+inside another, and it needs a `mount` of its own.
+
+**A child exists only in its parent (decided 2026-11-06).** `native` is bound
+only where `electron` is: dropping `electron` drops it and says so, and asking
+for `native` by name brings `electron`. Where the parent is bound, the child's
+own `priority` decides as usual: `-1` keeps it out until asked for, and
+anything else brings it along, on `tracker use electron` too. So a large
+directory can stay out of workspaces that want its parent, and with both at
+`-1`, `tracker use electron` brings only `electron`. A tracker root defines
+deep inside another is not its child, and stays when what surrounds it goes.
 
 **The definition is the `.gitignore`.** Generating the view's `.gitignore`
 from claims, and turning an agent's edit of it into a definition change, is

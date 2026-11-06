@@ -2455,7 +2455,7 @@ fn tracker(command: TrackerCommand) -> Result<()> {
             }
             print_parked(&change.parked);
             for other in &change.brought {
-                println!("  bound `{other}` too: `{tracker}` requires it");
+                println!("  bound `{other}` too: it goes with `{tracker}`");
             }
             if !change.started.is_empty() {
                 println!("  bound what it brings: {}", change.started.join(", "));
@@ -2496,6 +2496,9 @@ fn tracker(command: TrackerCommand) -> Result<()> {
                 return Ok(());
             }
             println!("Dropped `{tracker}` from `{instance}`");
+            for child in &change.children {
+                println!("  dropped `{child}` too: it exists only in `{tracker}`");
+            }
             print_parked(&change.parked);
             print_rebuilt(&change.rebuilt);
             if change.stashed {

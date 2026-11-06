@@ -5637,14 +5637,37 @@ impl BranchManager {
                 bound.insert(chosen);
             }
         }
-        // What they require, transitively.
+        // A child exists only in its parent, so one whose parent is not bound
+        // is not either, unless it was asked for by name: then its parent
+        // comes with it, below.
+        loop {
+            let orphans: Vec<String> = bound
+                .iter()
+                .filter(|name| !choice.uses.contains(*name))
+                .filter(|name| {
+                    selectable
+                        .iter()
+                        .find(|definition| &definition.name == *name)
+                        .and_then(|definition| definition.parent.as_ref())
+                        .is_some_and(|parent| !bound.contains(parent))
+                })
+                .cloned()
+                .collect();
+            if orphans.is_empty() {
+                break;
+            }
+            for orphan in orphans {
+                bound.remove(&orphan);
+            }
+        }
+        // What they require, transitively, and each one's parent.
         let mut queue: Vec<String> = bound.iter().cloned().collect();
         while let Some(name) = queue.pop() {
             let Some(definition) = selectable.iter().find(|definition| definition.name == name)
             else {
                 continue;
             };
-            for needed in &definition.requires {
+            for needed in definition.requires.iter().chain(&definition.parent) {
                 let target = if known(needed) {
                     if choice.drops.contains(needed) {
                         return Err(NewgitError::Unsupported(format!(
@@ -5797,6 +5820,21 @@ impl BranchManager {
             change.already = true;
             return Ok(change);
         }
+        // A child exists only in its parent, so it goes first.
+        let children: Vec<String> = self
+            .carved
+            .iter()
+            .filter(|child| child.parent.as_deref() == Some(tracker))
+            .filter(|child| !branch.dropped.contains(&child.name))
+            .map(|child| child.name.clone())
+            .collect();
+        for child in children {
+            let dropped = self.drop_tracker_inner(instance, &child, uncommitted)?;
+            change.parked.extend(dropped.parked);
+            change.children.extend(dropped.children);
+            change.children.push(child);
+        }
+        branch = self.store.find_branch(instance)?;
         // Nothing bound may be left without what it requires.
         let role = self
             .selectable()
@@ -6042,8 +6080,8 @@ impl BranchManager {
         branch.updated_at = Utc::now();
         self.store.save_branch_record(&branch)?;
 
-        // What it requires comes with it.
-        for needed in &definition.requires {
+        // What it requires comes with it, and its parent, which holds it.
+        for needed in definition.requires.iter().chain(&definition.parent) {
             let branch = self.store.find_branch(instance)?;
             let selectable = self.selectable();
             let target = if selectable.iter().any(|d| &d.name == needed) {
@@ -6065,6 +6103,21 @@ impl BranchManager {
             {
                 self.use_tracker_inner(instance, &target, false)?;
                 change.brought.push(target);
+            }
+        }
+        // So do its children, as a spawn would bind them: a negative
+        // priority still waits to be asked for.
+        let children: Vec<String> = self
+            .carved
+            .iter()
+            .filter(|child| child.parent.as_deref() == Some(tracker))
+            .filter(|child| child.priority >= 0 && child.role.is_none())
+            .map(|child| child.name.clone())
+            .collect();
+        for child in children {
+            if self.store.find_branch(instance)?.dropped.contains(&child) {
+                self.use_tracker_inner(instance, &child, false)?;
+                change.brought.push(child);
             }
         }
         // And the resources it brings start, once everything it brings is
@@ -12771,7 +12824,10 @@ pub struct BindingChange {
     pub seeded: bool,
     /// Trackers in the same role a use dropped to make way.
     pub replaced: Vec<String>,
-    /// Trackers a use bound because it requires them.
+    /// Children a drop took with it: a child exists only in its parent.
+    pub children: Vec<String>,
+    /// Trackers a use bound because it requires them, or holds or is held by
+    /// them.
     pub brought: Vec<String>,
     /// Resources a use bound and prepared.
     pub started: Vec<String>,
