@@ -736,6 +736,13 @@ impl NewgitPaths {
         self.local.join("project-branch")
     }
 
+    /// Present while this copy names a remote project in its committed
+    /// config but is not linked to it: `newgit init` could not join. Holds
+    /// the project's key.
+    pub fn unlinked_file(&self) -> Utf8PathBuf {
+        self.local.join("unlinked")
+    }
+
     pub fn new(project_root: Utf8PathBuf) -> Self {
         let metadata_root = project_root.join(".newgit");
         Self {

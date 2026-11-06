@@ -127,6 +127,7 @@ impl Repo {
                 bound: &bound,
                 audience: &audience,
                 newgit_made: None,
+                need_history: &|_| Ok(()),
             },
         )
         .unwrap_or_else(|error| panic!("split {tip}: {error}"))
@@ -143,6 +144,7 @@ impl Repo {
                 bound: &bound,
                 audience: &audience,
                 newgit_made: None,
+                need_history: &|_| Ok(()),
             },
         )
         .map_err(|error| error.to_string())
@@ -249,6 +251,7 @@ fn try_split_audience(repo: &Repo, tip: &str) -> Result<compose::SplitOutcome, S
             bound: &bound,
             audience: &audience,
             newgit_made: None,
+            need_history: &|_| Ok(()),
         },
     )
     .map_err(|error| error.to_string())

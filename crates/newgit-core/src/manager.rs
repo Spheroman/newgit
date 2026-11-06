@@ -71,6 +71,10 @@ pub struct BranchManager {
     graph: ResourceGraph,
     /// The project's remote, when `[remote]` is configured.
     remote: Option<RemoteLink>,
+    /// The project `[remote]` names when this copy is not linked to it
+    /// (`newgit init` could not join): `remote` is `None`, and everything
+    /// that would publish refuses, naming this.
+    unlinked: Option<String>,
     /// The tracker owning everything no other tracker claims. Held apart
     /// from `trackers`, the ones newgit captures from files: root's history
     /// is the project's own Git history, committed with Git.
@@ -1398,10 +1402,14 @@ impl BranchManager {
         } else {
             InstallStore::at(store.paths().installs.clone())
         };
+        let unlinked = std::fs::read_to_string(store.paths().unlinked_file())
+            .ok()
+            .map(|project| project.trim().to_owned());
         let remote = config
             .remote
             .as_ref()
             .zip(config.remote_project())
+            .filter(|_| unlinked.is_none())
             .map(|(section, project)| RemoteLink::http(project, &section.url));
         Ok(Self {
             store,
@@ -1412,6 +1420,7 @@ impl BranchManager {
             resources,
             graph,
             remote,
+            unlinked,
             root,
             carved,
             locks: Mutex::new(BTreeMap::new()),
@@ -2031,7 +2040,14 @@ impl BranchManager {
 
     /// The reverse: the branches of a tracker in Git, made in the project repo,
     /// fetched into the store under the tracker's own refs.
+    ///
+    /// The store is never shallow, so a tracker held as snapshots stays in
+    /// the project repo, and [`Self::need_history`] brings its refs across.
     fn publish_carved_refs(&self, tracker: &str, branches: &[&str]) -> Result<()> {
+        let project = &self.store.paths().project_root;
+        if crate::snapshots::held(project)?.contains_key(tracker) {
+            return Ok(());
+        }
         let store = self.store.paths().tracker_store.clone();
         crate::tracker_repo::ensure_store(&store)?;
         let refspecs: Vec<String> = branches
@@ -2074,9 +2090,147 @@ impl BranchManager {
         self.fetch_carved_trackers()
     }
 
+    /// Whether `tracker` is fetched as snapshots here: it is held that way
+    /// now, or it is new to a project that holds any. A project cloned
+    /// `--full`, or from before snapshots, is never shallow, so never this.
+    fn snapshots_here(&self, tracker: &str) -> Result<bool> {
+        let project = &self.store.paths().project_root;
+        let held = crate::snapshots::held(project)?;
+        if held.contains_key(tracker) {
+            return Ok(true);
+        }
+        Ok(!held.is_empty()
+            && tracker != self.root.name
+            && self
+                .source
+                .refs_under(&format!("refs/newgit/trackers/{tracker}/"))?
+                .is_empty())
+    }
+
+    /// Bring `tracker`'s whole history here, the first time something needs
+    /// it: the one way history arrives on a project cloned with snapshots.
+    /// Anything that asks about a child's ancestry calls this first, because
+    /// Git answers from a shallow commit as though it had no parents, which
+    /// reads as a wrong answer, not a failure. Nothing for a tracker whose
+    /// history is here, which is every tracker of a full clone.
+    ///
+    /// The history lands in `trackers.git`, which is never shallow, so a
+    /// fetch the remote drops steps and resumes as any whole fetch does.
+    /// `--unshallow` from there deepens only what that store knows, so every
+    /// other tracker stays a snapshot.
+    pub fn need_history(&self, tracker: &str) -> Result<()> {
+        let project = self.store.paths().project_root.clone();
+        let snapshot =
+            || -> Result<bool> { Ok(crate::snapshots::held(&project)?.contains_key(tracker)) };
+        if !snapshot()? {
+            return Ok(());
+        }
+        let Some(link) = &self.remote else {
+            return Err(NewgitError::Unsupported(format!(
+                "`{tracker}` is here only as pinned snapshots, and this project has no remote \
+                 to fetch its history from"
+            )));
+        };
+        let _lock = crate::snapshots::lock(&project)?;
+        // Whoever held the lock may have brought it.
+        if !snapshot()? {
+            return Ok(());
+        }
+        let store = self.store.paths().tracker_store.clone();
+        crate::tracker_repo::ensure_store(&store)?;
+        let client = link.connect(Acting::Login)?;
+        let repo = format!("{}.t.{tracker}", link.project.replace('/', "."));
+        let credential = client.credential(&link.project, &repo, Scope::Read)?;
+        let host = link
+            .url
+            .split_once("://")
+            .map_or(link.url.as_str(), |(_, host)| host);
+        eprintln!("fetching {tracker}'s history from {host}; this happens once");
+        GitSource::fetch_refs(
+            &[&format!("--git-dir={store}")],
+            credential.remote.as_deref().unwrap_or_default(),
+            &[format!("+refs/heads/*:refs/history/{tracker}/*")],
+            Some(&basic_auth_header(&credential)),
+        )?;
+        crate::source::run_git_env(
+            &[
+                "-C",
+                project.as_str(),
+                "fetch",
+                "--quiet",
+                "--no-write-fetch-head",
+                "--no-tags",
+                "--unshallow",
+                "--",
+                store.as_str(),
+                &format!("+refs/history/{tracker}/*:refs/newgit/remote/{tracker}/*"),
+            ],
+            &[],
+        )?;
+        if snapshot()? {
+            return Err(NewgitError::Unsupported(format!(
+                "`{tracker}`'s repo does not hold the commits root pins, so its history stops \
+                 at them here"
+            )));
+        }
+        // Everything made here while it was snapshots: the store has it from
+        // now on, as for any tracker.
+        GitSource::fetch_refs(
+            &[&format!("--git-dir={store}")],
+            project.as_str(),
+            &[format!(
+                "+refs/newgit/trackers/{tracker}/*:refs/trackers/{tracker}/*"
+            )],
+            None,
+        )
+    }
+
+    /// Bring what composing root commit `commit` needs and this project does
+    /// not hold yet: every commit its history pins of the trackers held as
+    /// snapshots, and of `also` (tracker → a commit a list names). Composing
+    /// leaves out a pin it cannot find, so without this a commit brought
+    /// from the remote would compose to a view missing a child. Nothing, not
+    /// even a walk, in a project that holds no snapshots.
+    fn bring_pins(&self, commit: &str, also: &BTreeMap<String, String>) -> Result<()> {
+        let project = self.store.paths().project_root.clone();
+        let held = crate::snapshots::held(&project)?;
+        if held.is_empty() && also.is_empty() {
+            return Ok(());
+        }
+        let tips = [commit.to_owned()];
+        for tracker in crate::snapshots::cutting_root(&project, &tips, &held)? {
+            self.need_history(&tracker)?;
+        }
+        let Some(link) = &self.remote else {
+            return Ok(());
+        };
+        let wanted: BTreeSet<&String> = held.keys().chain(also.keys()).collect();
+        let mut client = None;
+        let absent = crate::snapshots::fetch_pins(&project, &tips, also, &mut |tracker| {
+            if !wanted.contains(&tracker.to_owned()) {
+                return Ok(None);
+            }
+            if client.is_none() {
+                client = Some(link.connect(Acting::Login)?);
+            }
+            let client = client.as_ref().expect("connected just now");
+            let repo = format!("{}.t.{tracker}", link.project.replace('/', "."));
+            let credential = client.credential(&link.project, &repo, Scope::Read)?;
+            Ok(Some(crate::snapshots::Source {
+                url: credential.remote.clone().unwrap_or_default(),
+                auth: basic_auth_header(&credential),
+            }))
+        })?;
+        for (tracker, commit) in absent {
+            eprintln!("newgit: `{tracker}`'s repo does not have pinned commit {commit}");
+        }
+        Ok(())
+    }
+
     /// Compose root commit `commit` into the view at `view_ref` here, for a
     /// reader of every tracker this machine has: the view commit.
     fn compose_here(&self, view_ref: &str, commit: &str) -> Result<Option<String>> {
+        self.bring_pins(commit, &BTreeMap::new())?;
         let project = self.store.paths().project_root.clone();
         let everything = |_: &str| true;
         let views = crate::compose::compose(
@@ -2125,6 +2279,7 @@ impl BranchManager {
                 bound: &bound,
                 audience: &audience,
                 newgit_made,
+                need_history: &|tracker| self.need_history(tracker),
             },
         )?)
     }
@@ -2459,6 +2614,9 @@ impl BranchManager {
                 .carved
                 .iter()
                 .any(|definition| definition.name == tracker);
+        if in_git {
+            self.need_history(tracker)?;
+        }
         let reference = match instance {
             Some(instance) => {
                 let branch = self.store.find_branch(instance)?;
@@ -7520,6 +7678,7 @@ impl BranchManager {
         name: &str,
         options: RemoteExportOptions,
     ) -> Result<RemoteExportOutcome> {
+        self.refuse_unlinked()?;
         let target = self.export_target(name)?;
 
         self.prepare_projection()?;
@@ -7821,6 +7980,9 @@ impl BranchManager {
         let target = self.export_target(name)?;
         self.prepare_projection()?;
         self.sync_project_root()?;
+        if let Some(tracker) = &target.root {
+            self.need_history(tracker)?;
+        }
         let theirs = self.fetch_target(&target)?.ok_or_else(|| {
             NewgitError::Unsupported(format!(
                 "`{}` has no branch `{}` to pull from yet",
@@ -8212,6 +8374,8 @@ impl BranchManager {
                     target.name
                 )));
             };
+            // Rooted there, its history is the view's shape.
+            self.need_history(&root_name)?;
             self.refuse_rooted_mounts(target, &root_name, root_commit)?;
         }
         let Some(root_commit) = root_commit else {
@@ -8221,6 +8385,7 @@ impl BranchManager {
             )));
         };
 
+        self.bring_pins(root_commit, &BTreeMap::new())?;
         let root = self.store.paths().project_root.clone();
         let all = self.all_definitions();
         let may_ship = |tracker: &str| shipped.contains(tracker);
@@ -8406,7 +8571,109 @@ impl BranchManager {
     /// Where a `git push` from a workspace publishes: the store's own
     /// `origin`, the project's real remote. `None` when there is none.
     pub fn publish_url(&self) -> Result<Option<String>> {
-        self.source.remote_url(PUBLISH_REMOTE, true)
+        // An unlinked copy's push URL is the outbox, there to refuse.
+        self.source
+            .remote_url(PUBLISH_REMOTE, self.unlinked.is_none())
+    }
+
+    /// Stop anything that would publish from a copy that is not linked to
+    /// the remote its config names: its `main` is a local adoption, not
+    /// the project's, and must never be what moves the project's.
+    fn refuse_unlinked(&self) -> Result<()> {
+        match &self.unlinked {
+            Some(project) => Err(NewgitError::Unsupported(format!(
+                "this copy is not linked to `{project}`, so nothing here can publish to it: \
+                 once you are logged in and a member, `newgit init` joins it"
+            ))),
+            None => Ok(()),
+        }
+    }
+
+    /// Send `git push` from the project root of an unlinked copy through
+    /// newgit, which refuses it. `origin` still fetches from where it did.
+    pub fn route_unlinked(&self) -> Result<()> {
+        if self.unlinked.is_none() {
+            return Ok(());
+        }
+        let outbox = self.outbox();
+        self.ensure_push_route(&outbox)?;
+        GitSource::workspace_route_origin(
+            &self.store.paths().project_root,
+            None,
+            &outbox,
+            &self.receive_pack_command(PROJECT_ROOT_INSTANCE),
+        )
+    }
+
+    /// The commits of `repo`'s `HEAD` and its branch `branch` that this
+    /// project's `branch` does not contain, as [`Self::pull_view`] tells:
+    /// a commit counts as contained when its id is here, or it is what an
+    /// export target's view of a commit here is, or notes or a
+    /// `Newgit-Split` trailer say it came from here. A clone of a mirror
+    /// withholding a tracker has other ids than the view, and all of them
+    /// are the project's.
+    pub fn commits_not_in(&self, repo: &Utf8Path, branch: &str) -> Result<Vec<String>> {
+        let project = self.store.paths().project_root.clone();
+        let git = |args: &[&str]| {
+            let mut full = vec!["-C", project.as_str()];
+            full.extend_from_slice(args);
+            crate::source::run_git_env(&full, &[])
+        };
+        const LOCAL: &str = "refs/newgit/join";
+        let mut refspecs = vec![format!("+HEAD:{LOCAL}/head")];
+        if crate::source::run_git_env(
+            &[
+                "-C",
+                repo.as_str(),
+                "rev-parse",
+                "-q",
+                "--verify",
+                &format!("refs/heads/{branch}"),
+            ],
+            &[],
+        )
+        .is_ok()
+        {
+            refspecs.push(format!("+refs/heads/{branch}:{LOCAL}/branch"));
+        }
+        let mut fetch = vec!["fetch", "--quiet", "--no-tags", "--", repo.as_str()];
+        fetch.extend(refspecs.iter().map(String::as_str));
+        git(&fetch)?;
+
+        // A target's view of each commit, and the notes that say what it is.
+        let main = self
+            .source
+            .rev_parse(&local_tracker_ref(&self.root.name, "main"))?;
+        let list = crate::compose::index(&project, &self.root.name, &main)?;
+        for target in self.export_targets().unwrap_or_default() {
+            if target.root.is_none() {
+                // One that cannot compose has no commits to recognise.
+                let _ = self.compose_export(&target, &list, PROJECT_ROOT_INSTANCE);
+            }
+        }
+
+        let walk = git(&[
+            "rev-list",
+            &format!("--glob={LOCAL}/*"),
+            "--not",
+            &format!("--exclude={LOCAL}/*"),
+            "--all",
+        ])?;
+        let mut recognise = Recognise::new(&project, &self.root.name)?;
+        let mut foreign = Vec::new();
+        for commit in walk.lines().map(str::trim).filter(|line| !line.is_empty()) {
+            if recognise.view_of(self, commit)?.is_none() {
+                foreign.push(
+                    git(&["log", "-1", "--format=%h %s", commit])?
+                        .trim()
+                        .to_owned(),
+                );
+            }
+        }
+        for name in ["head", "branch"] {
+            let _ = self.source.delete_ref(&format!("{LOCAL}/{name}"));
+        }
+        Ok(foreign)
     }
 
     /// The first half of a `git push` from a workspace, run before Git
@@ -8418,6 +8685,7 @@ impl BranchManager {
     /// On a newgit remote there is nothing to mirror: a push publishes the
     /// instance's work into its trackers' forks, not one history somewhere.
     pub fn serve_push(&self, instance: &str) -> Result<Utf8PathBuf> {
+        self.refuse_unlinked()?;
         if instance == PROJECT_ROOT_INSTANCE {
             return self.serve_project_push();
         }
@@ -9173,15 +9441,33 @@ impl BranchManager {
             .ok_or_else(|| {
                 NewgitError::Unsupported(format!("{project} has no branch `{branch}`"))
             })?;
-        for tracker in list.keys() {
+        let mut snapshots = BTreeMap::new();
+        for (tracker, commit) in &list {
             let repo = format!("{}.t.{tracker}", project.replace('/', "."));
             let credential = client.credential(project, &repo, Scope::Read)?;
-            GitSource::fetch_refs(
-                &["-C", root.as_str()],
-                credential.remote.as_deref().unwrap_or_default(),
-                &[format!("+refs/heads/*:refs/newgit/remote/{tracker}/*")],
-                Some(&basic_auth_header(&credential)),
-            )?;
+            let url = credential.remote.as_deref().unwrap_or_default();
+            let auth = basic_auth_header(&credential);
+            let mut refspecs = vec![format!("+refs/heads/*:refs/newgit/remote/{tracker}/*")];
+            if self.snapshots_here(tracker)? {
+                // Only the branches this asks about. A shallow commit ends
+                // what the remote sends, so a branch on top of a pin costs
+                // its new commits; every other branch would cost its whole
+                // history.
+                snapshots.insert(tracker.clone(), commit.clone());
+                refspecs.clear();
+                for name in BTreeSet::from(["main", branch]) {
+                    let head = format!("refs/heads/{name}");
+                    if GitSource::remote_ref(url, &head, Some(&auth))?.is_some() {
+                        refspecs.push(format!("+{head}:refs/newgit/remote/{tracker}/{name}"));
+                    }
+                }
+            }
+            if !refspecs.is_empty() {
+                GitSource::fetch_refs(&["-C", root.as_str()], url, &refspecs, Some(&auth))?;
+            }
+        }
+        if let Some(commit) = list.get(&self.root.name) {
+            self.bring_pins(commit, &snapshots)?;
         }
         Ok(list)
     }
@@ -9201,6 +9487,7 @@ impl BranchManager {
     /// instance `main` — so its own commits reach the shared branch the same
     /// way.
     pub fn merge(&self, instance: &str, into: &str) -> Result<MergeOutcome> {
+        self.refuse_unlinked()?;
         self.require_resolvable_graph()?;
         self.require_migrated()?;
         // The instance's lock, held to the end; the project root has none.
@@ -9344,6 +9631,14 @@ impl BranchManager {
                     .rev_parse(&local_tracker_ref(&merge.tracker, "main"))
                     .ok()
             };
+            // Git's "yes" holds on a snapshot; only its "no" means nothing.
+            // Neither way round is a real merge, and a merge needs a base.
+            if let Some(main) = &current
+                && !self.source.is_ancestor(&merge.commit, main)?
+                && !self.source.is_ancestor(main, &merge.commit)?
+            {
+                self.need_history(&merge.tracker)?;
+            }
             let caught_up = match &current {
                 None => merge.commit.clone(),
                 Some(main) if self.source.is_ancestor(&merge.commit, main)? => continue,
@@ -9674,6 +9969,10 @@ impl BranchManager {
         let root = self.store.paths().project_root.clone();
         let forks = remote.instance(project, from_slug)?.forks;
         let mut readable: BTreeSet<String> = BTreeSet::new();
+        // Trackers fetched as snapshots: from the author's fork when they
+        // have one, then from the tracker's own repo.
+        let mut fork_sources: BTreeMap<String, crate::snapshots::Source> = BTreeMap::new();
+        let mut snapshot_sources: BTreeMap<String, crate::snapshots::Source> = BTreeMap::new();
         let names: BTreeSet<&String> = code.head.keys().chain(code.tip.keys()).collect();
         for tracker in names {
             let forked = forks.contains(tracker);
@@ -9693,6 +9992,27 @@ impl BranchManager {
             };
             let url = credential.remote.as_deref().unwrap_or_default();
             let auth = basic_auth_header(&credential);
+            if self.snapshots_here(tracker)? {
+                let source = crate::snapshots::Source {
+                    url: url.to_owned(),
+                    auth,
+                };
+                let primary = if forked {
+                    let repo = format!("{}.t.{tracker}", project.replace('/', "."));
+                    let credential = remote.credential(project, &repo, Scope::Read)?;
+                    let upstream = crate::snapshots::Source {
+                        url: credential.remote.clone().unwrap_or_default(),
+                        auth: basic_auth_header(&credential),
+                    };
+                    fork_sources.insert(tracker.clone(), source);
+                    upstream
+                } else {
+                    source
+                };
+                snapshot_sources.insert(tracker.clone(), primary);
+                readable.insert(tracker.clone());
+                continue;
+            }
             GitSource::fetch_refs(
                 &["-C", root.as_str()],
                 url,
@@ -9735,6 +10055,33 @@ impl BranchManager {
             return Err(NewgitError::Unsupported(format!(
                 "checkpoint {from_slug}/{checkpoint_id} composes to nothing you may read"
             )));
+        }
+        if !snapshot_sources.is_empty() {
+            let tips = [head_root.clone(), tip_root.clone()];
+            for commits in [&code.head, &code.tip] {
+                let named: BTreeMap<String, String> = commits
+                    .iter()
+                    .filter(|(tracker, _)| snapshot_sources.contains_key(*tracker))
+                    .map(|(tracker, commit)| (tracker.clone(), commit.clone()))
+                    .collect();
+                crate::snapshots::fetch_pins(&root, &tips, &named, &mut |tracker| {
+                    Ok(fork_sources.get(tracker).cloned())
+                })?;
+                let absent = crate::snapshots::fetch_pins(&root, &tips, &named, &mut |tracker| {
+                    Ok(snapshot_sources.get(tracker).cloned())
+                })?;
+                if let Some((tracker, commit)) = absent.iter().find(|(_, commit)| {
+                    code.head
+                        .values()
+                        .chain(code.tip.values())
+                        .any(|named| named == commit)
+                }) {
+                    return Err(NewgitError::Unsupported(format!(
+                        "`{tracker}`'s commit {commit} for checkpoint {from_slug}/{checkpoint_id} \
+                         is not on the remote"
+                    )));
+                }
+            }
         }
         let may_read = |tracker: &str| readable.contains(tracker);
         let base = format!("refs/newgit/views/imported/{from_slug}/{checkpoint_id}");
@@ -9876,6 +10223,12 @@ impl BranchManager {
             )));
         };
         let new = new.to_owned();
+        // A fast-forward lands on the pin, so its commits can be counted
+        // from here. Anything else could be a pin moving backwards, which
+        // only the history can tell.
+        if new != old && !self.source.is_ancestor(&old, &new)? {
+            self.need_history(tracker)?;
+        }
         if new == old || self.source.is_ancestor(&new, &old)? {
             for (tracker, main) in mains {
                 self.source

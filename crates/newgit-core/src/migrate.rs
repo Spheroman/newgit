@@ -86,6 +86,10 @@ impl BranchManager {
                 .push("Nothing to migrate: this project is on roots and mounts already".to_owned());
             return Ok(outcome);
         }
+        // Migrating rewrites every tracker's history, so all of it comes first.
+        for definition in &self.carved {
+            self.need_history(&definition.name)?;
+        }
         let project = self.store.paths().project_root.clone();
         let store = self.store.paths().tracker_store.clone();
         let project_git = |args: &[&str]| {

@@ -860,6 +860,7 @@ pub fn view_definitions(repo: &Utf8Path, root: &str, tree: &str) -> Result<Vec<T
         bound: &bound,
         audience: &audience,
         newgit_made: None,
+        need_history: &|_| Ok(()),
     };
     Splitter::new(Objects::open(repo)?, &options).flattened(tree, Utf8Path::new("."))
 }
@@ -1110,6 +1111,9 @@ pub struct SplitOptions<'a> {
     /// trackers of different audiences: a carve, `Create tracker `x``, which
     /// says nothing the definition it adds does not.
     pub newgit_made: Option<&'a str>,
+    /// Called before a question about a tracker's ancestry: its history
+    /// must be here for the answer to mean anything.
+    pub need_history: &'a dyn Fn(&str) -> Result<()>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1726,7 +1730,7 @@ impl<'a> Splitter<'a> {
                 }
                 let mut descends = true;
                 for other in &before {
-                    if other != pin && !self.is_ancestor(other, pin)? {
+                    if other != pin && !self.descends_from(&child.name, other, pin)? {
                         descends = false;
                     }
                 }
@@ -1849,6 +1853,16 @@ impl<'a> Splitter<'a> {
                 stderr: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
             }),
         }
+    }
+
+    /// Whether `descendant` of `tracker` has `ancestor` behind it. A "yes"
+    /// holds on a snapshot; a "no" means nothing until the history is here.
+    fn descends_from(&mut self, tracker: &str, ancestor: &str, descendant: &str) -> Result<bool> {
+        if self.is_ancestor(ancestor, descendant)? {
+            return Ok(true);
+        }
+        (self.options.need_history)(tracker)?;
+        self.is_ancestor(ancestor, descendant)
     }
 
     /// The one of `commits` every other is an ancestor of.

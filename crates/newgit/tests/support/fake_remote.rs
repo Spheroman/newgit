@@ -77,6 +77,9 @@ struct State {
     /// Answer this many fork requests `202 {"forking": true}`, as the real
     /// remote does while Artifacts copies a large repository.
     forking: usize,
+    /// Projects whose members do not include the caller: the real remote's
+    /// 403.
+    not_a_member: std::collections::BTreeSet<String>,
 }
 
 /// A tracker's definition as the remote reads it, from `access`'s `main`:
@@ -403,6 +406,9 @@ fn route(
         }
         ("GET", ["v1", "projects", owner, name]) => {
             let key = format!("{owner}/{name}");
+            if state.not_a_member.contains(&key) {
+                return (403, json!({ "error": format!("not a member of {key}") }));
+            }
             let Some(branches) = state.branches.get(&key) else {
                 return (404, json!({ "error": format!("no project `{key}`") }));
             };

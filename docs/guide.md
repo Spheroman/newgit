@@ -346,7 +346,9 @@ Remote:
   your account; `owner/name` joins one that exists
 - `newgit remote delete <owner>/<name>` — the owner deletes the project
   from the remote: every repo, record, and token pinned to it. Not undoable
-- `newgit clone <owner>/<name> [dir] [--url <url>]`
+- `newgit clone <owner>/<name> [dir] [--url <url>] [--full]` — root's whole
+  history and the commits it pins; a mounted tracker's history comes the first
+  time something needs it, once. `--full` fetches every history now
 - `newgit merge [instance] [--into <branch>]` — the merge commit is made in
   your view and committed at root's ref; `newgit merge main` merges the
   project root

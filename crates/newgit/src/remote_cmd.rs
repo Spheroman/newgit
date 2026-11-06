@@ -154,6 +154,12 @@ fn add(url: Option<String>, project: Option<String>, json: bool) -> Result<()> {
         bail!("run `newgit remote add` in the project's store, not inside a workspace");
     }
     let store = context.store;
+    if let Some(project) = unlinked_project(&store) {
+        bail!(
+            "this copy names `{project}` but is not linked to it: `newgit init` joins it once \
+             you are logged in and a member"
+        );
+    }
     let mut config = store.load_config()?;
     let url = url
         .or_else(|| config.remote.as_ref().map(|section| section.url.clone()))
@@ -232,11 +238,17 @@ fn add(url: Option<String>, project: Option<String>, json: bool) -> Result<()> {
     Ok(())
 }
 
-/// `newgit clone <owner>/<name> [dir]`: every tracker in Git you may read is
-/// fetched into a new tracker store, the default branch's list composed from
-/// them into an ordinary Git repository, and newgit set up around it — so
-/// the clone spawns, checkpoints, and syncs like the project it came from.
-pub fn clone(project: &str, dir: Option<camino::Utf8PathBuf>, url: Option<String>) -> Result<()> {
+/// `newgit clone <owner>/<name> [dir]`: root's whole history and each commit
+/// it pins of the trackers in Git you may read (with `full`, every tracker's
+/// whole history), the default branch's list composed from them into an
+/// ordinary Git repository, and newgit set up around it — so the clone
+/// spawns, checkpoints, and syncs like the project it came from.
+pub fn clone(
+    project: &str,
+    dir: Option<camino::Utf8PathBuf>,
+    url: Option<String>,
+    full: bool,
+) -> Result<()> {
     if !newgit_core::config::is_project_key(project) {
         bail!("`{project}` is not a project: use `<owner>/<name>`");
     }
@@ -262,7 +274,12 @@ pub fn clone(project: &str, dir: Option<camino::Utf8PathBuf>, url: Option<String
     let existed = dir.exists();
     std::fs::create_dir_all(&dir)?;
     // A clone that fails partway leaves nothing behind.
-    let result = clone_into(&client, project, &url, &view, &list, &dir);
+    let result = fetch_project(&client, project, &view, &list, &dir, full).and_then(|fetched| {
+        let store = MetadataStore::adopt(&dir)?;
+        link_project(&store, &url, &view)?;
+        fetched.report(&view, &dir);
+        Ok(())
+    });
     if result.is_err() {
         if existed {
             for entry in std::fs::read_dir(&dir)?.flatten() {
@@ -276,14 +293,60 @@ pub fn clone(project: &str, dir: Option<camino::Utf8PathBuf>, url: Option<String
     result
 }
 
-fn clone_into(
+/// What [`fetch_project`] brought, for its report.
+struct Fetched {
+    head: String,
+    trackers: usize,
+    snapshots: usize,
+    warnings: Vec<String>,
+}
+
+impl Fetched {
+    fn report(&self, view: &remote::ProjectView, dir: &camino::Utf8Path) {
+        println!("Cloned `{}` into {dir}", view.key);
+        println!(
+            "  {}: {} ({} trackers in Git)",
+            view.default_branch,
+            &self.head[..self.head.len().min(12)],
+            self.trackers
+        );
+        if self.snapshots > 0 {
+            println!(
+                "  history: root's whole; {} as pinned snapshots, each one's history fetched \
+                 the first time it is needed (`--full` fetches them all now)",
+                self.snapshots
+            );
+        }
+        for warning in &self.warnings {
+            println!("  warning: {warning}");
+        }
+    }
+}
+
+/// Link the project at `store` to `url`: `[remote]`, and `origin` the
+/// remote's endpoint. The last step of a clone and of `newgit init` joining.
+fn link_project(store: &MetadataStore, url: &str, view: &remote::ProjectView) -> Result<()> {
+    let mut config = store.load_config()?;
+    config.remote = Some(RemoteSection {
+        url: url.to_owned(),
+        project: Some(view.key.clone()),
+    });
+    store.write_config(&config)?;
+    BranchManager::open(store.clone())?.route_project_root()?;
+    Ok(())
+}
+
+/// Make `dir`, a new repository, hold the project: root's whole history and
+/// what it pins (every history with `full`), its definitions, and the
+/// default branch composed and checked out. Not linked yet.
+fn fetch_project(
     client: &HttpRemote,
     project: &str,
-    url: &str,
     view: &remote::ProjectView,
     list: &std::collections::BTreeMap<String, String>,
     dir: &camino::Utf8Path,
-) -> Result<()> {
+    full: bool,
+) -> Result<Fetched> {
     let git = |args: &[&str]| -> Result<String> {
         let output = std::process::Command::new("git")
             .arg("-C")
@@ -302,12 +365,15 @@ fn clone_into(
     };
     git(&["init", "-q", "-b", &view.default_branch])?;
 
-    // Every tracker in Git you may read, into the tracker store.
+    // Root's whole history into the tracker store, and, with `--full`, every
+    // tracker's. Any other tracker in Git you may read is a snapshot: its
+    // pinned commits, fetched below.
     let paths = MetadataStore::at(dir).paths().clone();
     newgit_core::tracker_repo::ensure_store(&paths.tracker_store)?;
     let prefix = project.replace('/', ".");
     let mut warnings = Vec::new();
     let mut fetched = Vec::new();
+    let mut sources = std::collections::BTreeMap::new();
     for (tracker, commit) in list {
         let repo = format!("{prefix}.t.{tracker}");
         let credential = match client.credential(project, &repo, Scope::Read) {
@@ -317,6 +383,17 @@ fn clone_into(
                 continue;
             }
         };
+        if !full && tracker != "root" {
+            sources.insert(
+                tracker.clone(),
+                newgit_core::snapshots::Source {
+                    url: credential.remote.clone().unwrap_or_default(),
+                    auth: remote::basic_auth_header(&credential),
+                },
+            );
+            fetched.push(tracker.clone());
+            continue;
+        }
         newgit_core::source::GitSource::fetch_refs(
             &[&format!("--git-dir={}", paths.tracker_store)],
             credential.remote.as_deref().unwrap_or_default(),
@@ -349,17 +426,53 @@ fn clone_into(
         }
     }
 
-    // Its definitions first, so newgit knows what composes the rest:
-    // `.newgit/` from root (its pins left out), and `.newgit/trackers/` from
-    // `access`, which is mounted there and keeps them at its own root.
-    for tracker in ["root", "access"] {
+    // Root into the project repo, and then what it pins, one commit deep.
+    // Root is first so a commit it shares with a child stays whole.
+    let bring = |tracker: &str| {
         git(&[
             "fetch",
             "-q",
             paths.tracker_store.as_str(),
             &format!("+refs/trackers/{tracker}/main:refs/newgit/trackers/{tracker}/main"),
-        ])?;
+        ])
+    };
+    bring("root")?;
+    if full {
+        bring("access")?;
+    } else {
+        let named: std::collections::BTreeMap<String, String> = list
+            .iter()
+            .filter(|(tracker, _)| sources.contains_key(*tracker))
+            .map(|(tracker, commit)| (tracker.clone(), commit.clone()))
+            .collect();
+        let absent = newgit_core::snapshots::fetch_pins(
+            dir,
+            std::slice::from_ref(&list["root"]),
+            &named,
+            &mut |tracker| Ok(sources.get(tracker).cloned()),
+        )?;
+        for (tracker, commit) in &absent {
+            if tracker == "access" && list.get(tracker) == Some(commit) {
+                bail!("{prefix}.t.access does not have `access`'s commit {commit}");
+            }
+            warnings.push(format!(
+                "`{tracker}`'s repo does not have pinned commit {commit}, so it is left out there"
+            ));
+        }
+        for (tracker, commit) in &named {
+            if !absent.iter().any(|(_, gone)| gone == commit) {
+                git(&[
+                    "update-ref",
+                    &format!("refs/newgit/trackers/{tracker}/main"),
+                    commit,
+                ])?;
+            }
+        }
     }
+
+    // Its definitions first, so newgit knows what composes the rest:
+    // `.newgit/` from root (its pins left out), and `.newgit/trackers/` from
+    // `access`, which is mounted there and keeps them at its own root.
     git(&[
         "checkout",
         "refs/newgit/trackers/root/main",
@@ -400,33 +513,257 @@ fn clone_into(
         bail!("could not unpack `access`'s definitions");
     }
     let store = MetadataStore::adopt(dir)?;
-    let manager = BranchManager::open(store.clone())?;
-    let head = manager.check_out_composed(&view.default_branch)?;
+    let head = BranchManager::open(store)?.check_out_composed(&view.default_branch)?;
+    Ok(Fetched {
+        head,
+        trackers: fetched.len(),
+        snapshots: sources.len(),
+        warnings,
+    })
+}
 
-    let mut config = store.load_config()?;
-    config.remote = Some(RemoteSection {
-        url: url.to_owned(),
-        project: Some(view.key.clone()),
-    });
-    store.write_config(&config)?;
-    BranchManager::open(store.clone())?.route_project_root()?;
+/// `newgit init` in a repository whose committed config names `key` on the
+/// remote at `url`: a clone of the project's mirror. A member joins it in
+/// place and ends where `newgit clone` ends; nobody else may touch it, so
+/// they get a local adoption that says plainly it is not linked. Being told
+/// no by the remote is an answer; not being able to ask is not, and changes
+/// nothing.
+pub fn init_named_project(root: &camino::Utf8Path, url: &str, key: &str) -> Result<()> {
+    let url = url.trim_end_matches('/');
+    let store = MetadataStore::at(root);
+    let local_git = |args: &[&str]| {
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(root.as_str())
+            .args(args)
+            .output()
+            .context("could not run git")
+    };
+    let seeded = std::process::Command::new("git")
+        .arg(format!("--git-dir={}", store.paths().tracker_store))
+        .args(["rev-parse", "-q", "--verify", "refs/trackers/root/main"])
+        .output()
+        .is_ok_and(|output| output.status.success());
+    let unlinked = store.paths().unlinked_file().is_file();
+    // Linking is the last step, so a join that stopped short joins again.
+    let origin = local_git(&["config", "--get", "remote.origin.url"])?;
+    let routed = String::from_utf8_lossy(&origin.stdout).trim() == format!("{url}/{key}.git");
+    if seeded && routed && !unlinked {
+        println!("newgit is already set up here, linked to `{key}`: nothing to do");
+        return Ok(());
+    }
 
-    println!("Cloned `{}` into {dir}", view.key);
+    let login = || {
+        format!(
+            "this project is `{key}` on {url}, and you are not logged in there, so nothing \
+             changed: run `newgit login`, then `newgit init` again"
+        )
+    };
+    let client = match remote::login_remote(url) {
+        Ok(client) => client,
+        Err(NewgitError::NotLoggedIn(_)) => bail!(login()),
+        Err(error) => return Err(error.into()),
+    };
+    let view = match client.project(key) {
+        Ok(view) => view,
+        Err(NewgitError::Remote { status: 401, .. }) => bail!(login()),
+        Err(NewgitError::Remote {
+            status: 403 | 404,
+            message,
+        }) => return adopt_unlinked(root, url, key, &message),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("could not ask {url} about `{key}`, so nothing changed"));
+        }
+    };
+    let list = view
+        .default_list()
+        .cloned()
+        .with_context(|| format!("`{key}` has no `{}` branch yet", view.default_branch))?;
+
+    // Everything that stops it, before anything moves.
+    // Except the definitions an earlier local adoption wrote: not work, and
+    // the project's own replace them.
+    let status = local_git(&["status", "--porcelain", "--untracked-files=all"])?;
+    let changes: Vec<String> = String::from_utf8_lossy(&status.stdout)
+        .lines()
+        .filter(|line| {
+            !(seeded
+                && matches!(
+                    *line,
+                    "?? .newgit/trackers/root.toml" | "?? .newgit/trackers/access.toml"
+                ))
+        })
+        .map(ToOwned::to_owned)
+        .collect();
+    let changes = changes.join("\n");
+    if !changes.is_empty() {
+        bail!(
+            "this repository has uncommitted changes, so nothing changed. Joining `{key}` \
+             checks out its `{}`; commit or stash these, then `newgit init` again:\n{changes}",
+            view.default_branch
+        );
+    }
+    let shallow = local_git(&["rev-parse", "--is-shallow-repository"])?;
+    if String::from_utf8_lossy(&shallow.stdout).trim() == "true" {
+        bail!(
+            "this is a shallow clone, so nothing changed: `git fetch --unshallow`, then \
+             `newgit init` again"
+        );
+    }
+    let instances = store.load_branches().unwrap_or_default();
+    if !instances.is_empty() {
+        let names: Vec<&str> = instances
+            .iter()
+            .map(|branch| branch.name.as_str())
+            .collect();
+        bail!(
+            "this local copy has instances (`{}`) on its own history, which joining `{key}` \
+             would strand, so nothing changed: merge what you want to keep elsewhere, \
+             `newgit remove` them, then `newgit init` again",
+            names.join("`, `")
+        );
+    }
+
+    // Everything is fetched and judged in a repository of its own, so a
+    // refusal or a failure leaves nothing behind.
+    let git_dir = local_git(&["rev-parse", "--absolute-git-dir"])?;
+    let git_dir = camino::Utf8PathBuf::from(String::from_utf8_lossy(&git_dir.stdout).trim());
+    let scratch = git_dir.join("newgit-join");
+    let _ = std::fs::remove_dir_all(&scratch);
+    std::fs::create_dir_all(&scratch)?;
+    let result = join_from(&client, key, &view, &list, root, &scratch);
+    let _ = std::fs::remove_dir_all(&scratch);
+    let fetched = result?;
+
+    link_project(&MetadataStore::adopt(root)?, url, &view)?;
+    println!("Joined `{key}` on {url}");
     println!(
         "  {}: {} ({} trackers in Git)",
         view.default_branch,
-        &head[..head.len().min(12)],
-        fetched.len()
+        &fetched.head[..fetched.head.len().min(12)],
+        fetched.trackers
     );
-    for warning in &warnings {
+    println!("  origin: {}", view.endpoint);
+    for warning in &fetched.warnings {
         println!("  warning: {warning}");
     }
+    Ok(())
+}
+
+/// Fetch the project into `scratch` as a clone would, refuse if `root` has
+/// commits it does not contain, then move it all into `root`.
+fn join_from(
+    client: &HttpRemote,
+    key: &str,
+    view: &remote::ProjectView,
+    list: &std::collections::BTreeMap<String, String>,
+    root: &camino::Utf8Path,
+    scratch: &camino::Utf8Path,
+) -> Result<Fetched> {
+    let fetched = fetch_project(client, key, view, list, scratch, false)?;
+    let branch = view.default_branch.as_str();
+    let project = BranchManager::open(MetadataStore::adopt(scratch)?)?;
+    let foreign = project.commits_not_in(root, branch)?;
+    if !foreign.is_empty() {
+        bail!(
+            "this repository has {} commit(s) `{key}`'s `{branch}` does not contain, so nothing \
+             changed. Put them on the project first, or move them aside, then `newgit init` \
+             again:\n  {}",
+            foreign.len(),
+            foreign.join("\n  ")
+        );
+    }
+
+    let git = |location: &[&str], args: &[&str]| -> Result<()> {
+        let output = std::process::Command::new("git")
+            .args(location)
+            .args(args)
+            .output()
+            .context("could not run git")?;
+        if !output.status.success() {
+            bail!(
+                "git {} failed: {}",
+                args.join(" "),
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        Ok(())
+    };
+    // `root` takes the tracker store, the refs composing and splitting use,
+    // and the composed branch. Its other branches stay as they are.
+    let here = MetadataStore::at(root);
+    std::fs::create_dir_all(&here.paths().local)?;
+    newgit_core::tracker_repo::ensure_store(&here.paths().tracker_store)?;
+    let theirs = MetadataStore::at(scratch);
+    git(
+        &[&format!("--git-dir={}", here.paths().tracker_store)],
+        &[
+            "fetch",
+            "-q",
+            theirs.paths().tracker_store.as_str(),
+            "+refs/trackers/*:refs/trackers/*",
+        ],
+    )?;
+    let at = ["-C", root.as_str()];
+    git(
+        &at,
+        &[
+            "fetch",
+            "-q",
+            "--no-tags",
+            "--update-shallow",
+            scratch.as_str(),
+            "+refs/newgit/*:refs/newgit/*",
+            "+refs/notes/*:refs/notes/*",
+        ],
+    )?;
+    git(
+        &at,
+        &["update-ref", &format!("refs/heads/{branch}"), &fetched.head],
+    )?;
+    git(
+        &at,
+        &["symbolic-ref", "HEAD", &format!("refs/heads/{branch}")],
+    )?;
+    git(&at, &["reset", "-q", "--hard", &fetched.head])?;
+    match std::fs::remove_file(here.paths().unlinked_file()) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    // The definitions are on disk now, so the project opens as what it is.
+    BranchManager::open(MetadataStore::adopt(root)?)?.check_out_composed(branch)?;
+    Ok(fetched)
+}
+
+/// Adopt the repository as `newgit init` always has, marked so it cannot
+/// pass for linked: everything that would publish refuses, and
+/// `newgit remote show` says so.
+fn adopt_unlinked(root: &camino::Utf8Path, url: &str, key: &str, why: &str) -> Result<()> {
+    let (store, done) = MetadataStore::adopt_in_place(root)?;
+    std::fs::write(store.paths().unlinked_file(), format!("{key}\n"))?;
+    BranchManager::open(store)?.route_unlinked()?;
+    println!("Adopted the existing .newgit/ at {root}");
+    for line in &done {
+        println!("  {line}");
+    }
+    println!("  NOT LINKED: this copy is not linked to `{key}` on {url} ({why})");
+    println!("  it is a local project of its own: mounted trackers are not here, and");
+    println!("  `newgit merge`, `git push`, and exports refuse rather than touch `{key}`");
+    println!("  once you are a member, `newgit init` joins it");
     Ok(())
 }
 
 fn linked() -> Result<(RemoteSection, String, HttpRemote)> {
     let context = MetadataStore::discover(&crate::current_dir()?)?;
     let config = context.store.load_config()?;
+    if let Some(project) = unlinked_project(&context.store) {
+        bail!(
+            "this copy is not linked to `{project}`: once you are logged in and a member, \
+             `newgit init` joins it"
+        );
+    }
     let section = config.remote.clone().ok_or(NewgitError::NoRemote)?;
     let name = config
         .remote_project()
@@ -436,7 +773,29 @@ fn linked() -> Result<(RemoteSection, String, HttpRemote)> {
     Ok((section, name, client))
 }
 
+/// The project this copy's config names but is not linked to, if so.
+fn unlinked_project(store: &MetadataStore) -> Option<String> {
+    std::fs::read_to_string(store.paths().unlinked_file())
+        .ok()
+        .map(|project| project.trim().to_owned())
+}
+
 fn show(json: bool) -> Result<()> {
+    let store = MetadataStore::discover(&crate::current_dir()?)?.store;
+    if let Some(project) = unlinked_project(&store) {
+        let url = store.load_config()?.remote.map(|section| section.url);
+        if json {
+            println!(
+                "{}",
+                serde_json::json!({ "linked": false, "project": project, "url": url })
+            );
+        } else {
+            println!("NOT LINKED: this copy's config names `{project}`, but it is not joined");
+            println!("  mounted trackers are not here, and nothing here can publish to it");
+            println!("  once you are logged in and a member, `newgit init` joins it");
+        }
+        return Ok(());
+    }
     let (section, name, client) = linked()?;
     let view = client.project(&name)?;
     let members: Vec<&str> = view
@@ -448,7 +807,7 @@ fn show(json: bool) -> Result<()> {
         println!(
             "{}",
             serde_json::json!({
-                "url": section.url, "project": view.key, "owner": view.owner,
+                "linked": true, "url": section.url, "project": view.key, "owner": view.owner,
                 "endpoint": view.endpoint, "members": members,
                 "default_branch": view.default_branch,
                 "branches": view.branches.iter().map(|branch| serde_json::json!({

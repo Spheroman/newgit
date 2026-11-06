@@ -71,8 +71,9 @@ this repository is `spheroman/newgit` on newgit.dev, and GitHub's
 - The Git endpoint: `git clone https://newgit.dev/<owner>/<name>.git` with
   plain Git, each reader's view composed from the trackers they may read,
   with canonical-id notes on rebuilt commits.
-- `newgit clone`, and `spawn --from-checkpoint` with the spawner's own
-  per-user trackers.
+- `newgit clone`: root's whole history and the commits it pins, with each
+  mounted tracker's history on demand (`--full` fetches them all), and
+  `spawn --from-checkpoint` with the spawner's own per-user trackers.
 - Private instances (`spawn --private`), hidden from everyone until merged.
 - `newgit remote delete <owner>/<name>`: the owner deletes the project —
   every token pinned to it revoked first, then every repo under its prefix,
@@ -600,6 +601,44 @@ memory and in `waitUntil`; the polls are what keep the object alive. An
 object evicted mid-check forgets it, and the next request starts it again,
 against a store that keeps what the first fetched.
 
+#### Joining from a GitHub clone
+
+Most people meet a project on GitHub, and its mirror carries
+`.newgit/config.toml` with `[remote]` in it. So `newgit init` in a repository
+whose committed config names a remote project asks the remote what to do,
+because adopting it as a project of its own would look linked and be a
+different history.
+
+- **Not logged in:** it stops before changing anything and says to run
+  `newgit login`, then `newgit init` again.
+- **A member:** it joins in place, ending where `newgit clone` ends: root's
+  whole history, pinned snapshots, the composed default branch checked out,
+  `origin` on the endpoint. It runs the clone's own code in a scratch
+  repository inside `.git`, then moves the result in, so a refusal or a failed
+  fetch leaves nothing behind. The repository's other branches are kept.
+- **Work is never lost.** Uncommitted changes (untracked files included), a
+  shallow clone, an adopted copy's instances, or commits the composed default
+  branch does not contain stop it first, naming them. "Contains" is
+  `pull_view`'s recognition, not ancestry, because a mirror withholding a
+  tracker has other ids than the view: each export target is composed so its
+  commits carry notes, and a commit counts when its id, a note, or a
+  `Newgit-Split` trailer ties it to root's history. A pull request merged on
+  the mirror and not pulled yet is a commit `main` does not contain, so it
+  stops too.
+- **Not a member, or no such project (403, 404):** it adopts locally as it
+  always did, says this copy is not linked, and writes
+  `.newgit/local/unlinked`. While that file is there the manager has no
+  remote, `newgit remote show` says NOT LINKED, `newgit remote add` and
+  `members` refuse, and `newgit merge`, `git push`, and `newgit export
+  --remote` refuse rather than move anything; a project root's `git push` is
+  routed through newgit so that it can. Running `newgit init` again joins
+  once that person is a member.
+- **Anything else from the remote** (a 5xx, no network) is not an answer, so
+  it stops with nothing changed rather than adopt.
+- **Already joined,** `newgit init` does nothing and says so. A project is
+  joined when its store holds root and `origin` is the endpoint, which a copy
+  adopted by a build older than this is not, so that copy joins too.
+
 #### Fetching what a view needs
 
 A view needs root's history, which is its shape, and a child's files at each
@@ -652,8 +691,11 @@ that request waits for all of it. Nothing in `src/endpoint.ts` times the wait
 out; the Worker holds the request open for as long as the client stays
 connected, and the plan's read passwords last an hour.
 
-The client's `newgit clone` and tracker merges still fetch whole histories: a
-real merge in a child needs them.
+`newgit clone` works the same way: root whole and each pin `--depth=1`, with
+a tracker's history fetched the first time something needs it, or all of it
+up front with `--full`. The client's store differs from the three here, and
+[trackers.md](trackers.md), *Snapshots*, says why and lists what asks for
+history.
 
 A fetch the remote drops (Artifacts fails some whole fetches with an HTTP
 500, `expected 'packfile'`) is tried whole twice more, a few seconds apart,

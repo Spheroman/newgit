@@ -1057,6 +1057,7 @@ fn land(plan: &PullPlan, store: &Utf8Path) -> Result<PullAnswer> {
                 bound: &bound,
                 audience: &audience,
                 newgit_made: None,
+                need_history: &|_| Ok(()),
             },
         )?
         .root)

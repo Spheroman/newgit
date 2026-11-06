@@ -128,6 +128,7 @@ impl Repo {
                 bound: &bound,
                 audience: &audience,
                 newgit_made: None,
+                need_history: &|_| Ok(()),
             },
         )
         .unwrap_or_else(|error| panic!("split {tip}: {error}"))
