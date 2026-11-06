@@ -798,8 +798,13 @@ paint them into a corner:
   branch heads, and per-audience registries stay as the #201 comments
   propose. They are a remote redesign, later. The root's ref as the commit
   point already answers #201 item 3 for one root.
-- **Remote naming** flattens to `<owner>/<tracker>` with that redesign. Today
-  it is `<owner>/<project>`.
+- **Remote naming** follows a tracker's home with that redesign **(decided
+  2026-11-06, replacing a flat `<owner>/<tracker>`)**: `spheroman/newgit`,
+  `spheroman/newgit/t3code`, `spheroman/newgit/t3code/repos`. A tracker has
+  one home and so one name, and any number of mounts; mounting never changes
+  the name, and moving it to another home is a rename, with a redirect.
+  `Spheroman/t3code` on GitHub is an export target, nested no deeper only
+  because GitHub cannot. Today a name is `<owner>/<project>`.
 - **A fork keeps its upstream's audience as a ceiling** (#227), unchanged.
 
 **#202.** The four decisions this design leaves room for: mounts accept a
