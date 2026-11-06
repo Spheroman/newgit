@@ -412,7 +412,11 @@ show in `git status` and `git add -A` cannot commit them — which also means
 **real edits to a rendered file do not survive the workspace.** newgit says
 so at bind. For a tracker-owned file, `tracker capture` reverses the
 substitution, so edits you make beside the rendered value reach the lane and
-your port does not.
+your port does not. A render writes only a regular file of its own: a
+rendered path that is a symlink, or lies under a symlinked directory, is
+refused by name rather than written through to wherever the link leads,
+and a hard link there is replaced by a new file, so its other names keep
+what they held ([spec](design/spec.md#render)).
 
 Several resources may render one file — `db` its URL and `web` its port into
 the app's `.env.local` — each declaring only the values it owns. They apply
