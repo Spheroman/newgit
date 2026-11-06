@@ -1498,6 +1498,86 @@ impl GitSource {
             }
         }
     }
+
+    /// Fetch exactly `commits` from `url`, each one commit deep, each to
+    /// `<prefix><commit>`, and return those the repo does not have.
+    ///
+    /// The store this fetches into stays shallow on purpose, so it must
+    /// never see [`Self::fetch_refs`], which takes a shallow store for a
+    /// stepped fetch that stopped part way and deepens it to the end.
+    ///
+    /// `--depth` also makes Git ask the remote even for a commit the store
+    /// holds already, where a plain fetch would see the object and ask
+    /// nothing. So a ref under `prefix` proves `url` has the commit, however
+    /// many other repos' commits share the store.
+    ///
+    /// They come in one fetch, so what the commits share comes once. A
+    /// fetch that fails is halved, down to one commit, which is what tells
+    /// a commit the repo lacks from a remote that dropped the fetch.
+    pub fn fetch_snapshots(
+        location: &[&str],
+        url: &str,
+        prefix: &str,
+        commits: &[String],
+        auth: Option<&str>,
+    ) -> Result<Vec<String>> {
+        let mut absent = Vec::new();
+        for batch in commits.chunks(SNAPSHOT_BATCH) {
+            Self::fetch_snapshot_batch(location, url, prefix, batch, auth, &mut absent)?;
+        }
+        Ok(absent)
+    }
+
+    fn fetch_snapshot_batch(
+        location: &[&str],
+        url: &str,
+        prefix: &str,
+        commits: &[String],
+        auth: Option<&str>,
+        absent: &mut Vec<String>,
+    ) -> Result<()> {
+        let refspecs: Vec<String> = commits
+            .iter()
+            .map(|commit| format!("+{commit}:{prefix}{commit}"))
+            .collect();
+        let fetch = || {
+            let mut args: Vec<&str> = location.to_vec();
+            args.extend([
+                "fetch",
+                "--quiet",
+                "--no-write-fetch-head",
+                "--no-tags",
+                "--depth=1",
+                "--",
+                url,
+            ]);
+            args.extend(refspecs.iter().map(String::as_str));
+            run_git_env(&args, &auth_env(auth)).map(|_| ())
+        };
+        if let [commit] = commits {
+            let mut tries = WHOLE_FETCH_BACKOFF.iter();
+            loop {
+                match fetch() {
+                    Ok(()) => return Ok(()),
+                    Err(error) if not_there(&error) => {
+                        absent.push(commit.clone());
+                        return Ok(());
+                    }
+                    Err(error) if dropped(&error) => match tries.next() {
+                        Some(wait) => std::thread::sleep(*wait),
+                        None => return Err(error),
+                    },
+                    Err(error) => return Err(error),
+                }
+            }
+        }
+        if fetch().is_err() {
+            let (left, right) = commits.split_at(commits.len() / 2);
+            Self::fetch_snapshot_batch(location, url, prefix, left, auth, absent)?;
+            Self::fetch_snapshot_batch(location, url, prefix, right, auth, absent)?;
+        }
+        Ok(())
+    }
 }
 
 /// Git config for one command, carrying an `Authorization` header. Passed in
@@ -1570,6 +1650,9 @@ const WHOLE_FETCH_BACKOFF: [std::time::Duration; 2] = [
 /// The commits a stepped fetch asks for first, and deepens by.
 const FIRST_BAND: u32 = 2048;
 
+/// The most commits one snapshot fetch asks for: what fits a command line.
+const SNAPSHOT_BATCH: usize = 256;
+
 /// Where a push too big for the remote is staged step by step, deleted
 /// once the real push lands.
 const STAGING_REF: &str = "refs/heads/newgit-staging";
@@ -1595,6 +1678,22 @@ fn dropped(error: &NewgitError) -> bool {
         "expected 'packfile'",
         "early EOF",
         "bad pack header",
+    ]
+    .iter()
+    .any(|sign| stderr.contains(sign))
+}
+
+/// Whether the remote answered that it has no such commit. Anything else
+/// is a failure, not an answer: a pin left out of a view stays out of it for
+/// as long as the view is cached.
+fn not_there(error: &NewgitError) -> bool {
+    let NewgitError::SourceCommand { stderr, .. } = error else {
+        return false;
+    };
+    [
+        "not our ref",
+        "couldn't find remote ref",
+        "unadvertised object",
     ]
     .iter()
     .any(|sign| stderr.contains(sign))

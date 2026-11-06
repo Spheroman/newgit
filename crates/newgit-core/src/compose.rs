@@ -9,10 +9,13 @@
 //!
 //! - [`compose`] walks a root's history and expands every readable pin into
 //!   files under its mount. That is all a child contributes: its tree at the
-//!   pin. A child's own history stays in its own repo and no view reaches
-//!   it, so a commit that adds a mount or moves a pin, from whatever history,
-//!   is one ordinary view commit. Rebuilt commits come back as the originals
-//!   they were split from, signatures included, wherever their bytes allow.
+//!   pin, and the author, dates, and message of that one commit when it holds
+//!   the work. A child's parents are never read, so its own history stays in
+//!   its own repo, no view reaches it, and a store holding root's history and
+//!   each pinned commit alone composes the very same ids. A commit that adds
+//!   a mount or moves a pin, from whatever history, is one ordinary view
+//!   commit. Rebuilt commits come back as the originals they were split from,
+//!   signatures included, wherever their bytes allow.
 //! - [`split`] takes view commits (an agent's work, a merge) and makes one
 //!   root commit for each, with a commit in each child the work changed and
 //!   every other pin reused.
@@ -280,6 +283,18 @@ fn depth(mount: &str) -> usize {
     }
 }
 
+/// `mounts` in the order they are grafted: shallowest first.
+fn by_depth(mounts: &BTreeMap<String, String>) -> Vec<(&String, &String)> {
+    let mut ordered: Vec<(&String, &String)> = mounts.iter().collect();
+    ordered.sort_by(|(left_name, left), (right_name, right)| {
+        depth(left)
+            .cmp(&depth(right))
+            .then_with(|| left.cmp(right))
+            .then_with(|| left_name.cmp(right_name))
+    });
+    ordered
+}
+
 #[derive(Debug, Clone)]
 struct Composed {
     /// The view commit.
@@ -287,27 +302,29 @@ struct Composed {
     tree: String,
 }
 
-/// A tracker commit with its pins and where each readable one is mounted.
+/// A root commit with its pins and where each readable one is mounted.
 type Shape = (Commit, BTreeMap<String, String>, BTreeMap<String, String>);
 
 struct Composer<'a> {
     objects: Objects,
     options: &'a ComposeOptions<'a>,
-    /// Tracker commit → its view commit.
+    /// Root commit → its view commit.
     views: HashMap<String, Composed>,
-    /// Tracker commit → the children its view expanded.
+    /// Pinned child commit → its tree as this reader sees it.
+    children: HashMap<String, String>,
+    /// Root commit → the children its view expanded.
     expanded: HashMap<String, BTreeSet<String>>,
-    /// Tips already composed, per tracker: a later walk stops at them.
-    done: HashMap<String, Vec<String>>,
-    /// Trackers being composed right now, outermost first: a cycle guard.
+    /// Trackers being expanded right now, outermost first: a cycle guard.
     composing: Vec<String>,
     notes: Vec<(String, String)>,
     canonical: Vec<(String, String)>,
 }
 
 /// Compose the views rooted at tracker `root`, one per `(view ref, root
-/// commit)` in `tips`, into `repo`, which must hold every tracker commit
-/// the reader may read. Each view ref is set to its view's tip.
+/// commit)` in `tips`, into `repo`, which must hold root's history and, of
+/// every child the reader may read, each commit that history pins (and what
+/// those pin): no child's parents are read. Each view ref is set to its
+/// view's tip.
 pub fn compose(
     repo: &Utf8Path,
     root: &str,
@@ -318,8 +335,8 @@ pub fn compose(
         objects: Objects::open(repo)?,
         options,
         views: HashMap::new(),
+        children: HashMap::new(),
         expanded: HashMap::new(),
-        done: HashMap::new(),
         composing: Vec::new(),
         notes: Vec::new(),
         canonical: Vec::new(),
@@ -334,7 +351,8 @@ pub fn compose(
             .collect());
     }
     let commits: Vec<String> = tips.iter().map(|(_, commit)| commit.clone()).collect();
-    composer.compose_tracker(root, &commits)?;
+    composer.composing.push(root.to_owned());
+    composer.compose_root(root, &commits)?;
     composer.objects.flush()?;
     let mut views = Vec::new();
     for (view_ref, commit) in tips {
@@ -362,13 +380,74 @@ pub fn compose(
 }
 
 impl Composer<'_> {
-    fn compose_tracker(&mut self, name: &str, tips: &[String]) -> Result<()> {
-        let tips: Vec<String> = tips
-            .iter()
-            .filter(|tip| !self.views.contains_key(*tip))
-            .cloned()
+    fn compose_root(&mut self, name: &str, tips: &[String]) -> Result<()> {
+        let mut args = vec![
+            "rev-list".to_owned(),
+            "--topo-order".to_owned(),
+            "--reverse".to_owned(),
+        ];
+        args.extend(tips.iter().cloned());
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        let walk: Vec<String> = git(self.objects.repo(), &args)?
+            .lines()
+            .map(ToOwned::to_owned)
             .collect();
-        if tips.is_empty() {
+
+        // First every child this history pins, so a commit always mounts a
+        // tree that is already expanded.
+        let mut shapes: Vec<Shape> = Vec::with_capacity(walk.len());
+        for id in &walk {
+            let commit = self.objects.commit(id)?;
+            let all_pins = pins_in(&mut self.objects, &commit.tree)?;
+            let mounts = self.expand_children(&commit, &all_pins)?;
+            shapes.push((commit, all_pins, mounts));
+        }
+
+        let mut own_trees: HashMap<String, String> = HashMap::new();
+        for (commit, all_pins, mounts) in shapes {
+            self.compose_one(name, &commit, &all_pins, &mounts, &mut own_trees)?;
+        }
+        Ok(())
+    }
+
+    /// Expand each child `commit` pins that this reader gets, and say where
+    /// each of them is mounted.
+    fn expand_children(
+        &mut self,
+        commit: &Commit,
+        all_pins: &BTreeMap<String, String>,
+    ) -> Result<BTreeMap<String, String>> {
+        let mut readable = BTreeMap::new();
+        for (child, pin) in all_pins {
+            if !(self.options.readable)(child) {
+                continue;
+            }
+            // A pin its tracker's own history does not hold (another
+            // tracker's commit under this name, or one never pushed) is left
+            // out at this commit, as for a reader who may not read it: what
+            // the reader gets is never someone else's content.
+            let admitted = self.options.admit.is_none_or(|admit| admit(child, pin));
+            if admitted && self.objects.has_commit(pin)? {
+                readable.insert(child.clone(), pin.clone());
+            }
+        }
+        let mounts = mounts_of(
+            &mut self.objects,
+            &commit.id,
+            &commit.tree,
+            all_pins,
+            &readable,
+        )?;
+        for (child, pin) in &readable {
+            self.expand_child(child, pin)?;
+        }
+        Ok(mounts)
+    }
+
+    /// `pin`'s tree as this reader sees it, kept in `children`: this one
+    /// commit and what it pins, never its parents.
+    fn expand_child(&mut self, name: &str, pin: &str) -> Result<()> {
+        if self.children.contains_key(pin) {
             return Ok(());
         }
         if self.composing.iter().any(|outer| outer == name) {
@@ -378,72 +457,38 @@ impl Composer<'_> {
             )));
         }
         self.composing.push(name.to_owned());
-        let result = self.compose_walk(name, &tips);
+        let result = self.child_tree(pin);
         self.composing.pop();
-        result
+        self.children.insert(pin.to_owned(), result?);
+        Ok(())
     }
 
-    fn compose_walk(&mut self, name: &str, tips: &[String]) -> Result<()> {
-        let mut args = vec![
-            "rev-list".to_owned(),
-            "--topo-order".to_owned(),
-            "--reverse".to_owned(),
-        ];
-        args.extend(tips.iter().cloned());
-        if let Some(done) = self.done.get(name) {
-            args.push("--not".to_owned());
-            args.extend(done.iter().cloned());
-        }
-        let args: Vec<&str> = args.iter().map(String::as_str).collect();
-        let walk: Vec<String> = git(self.objects.repo(), &args)?
-            .lines()
-            .map(ToOwned::to_owned)
-            .filter(|commit| !self.views.contains_key(commit))
-            .collect();
-        self.done
-            .entry(name.to_owned())
-            .or_default()
-            .extend(tips.iter().cloned());
+    fn child_tree(&mut self, pin: &str) -> Result<String> {
+        let commit = self.objects.commit(pin)?;
+        let all_pins = pins_in(&mut self.objects, &commit.tree)?;
+        let mounts = self.expand_children(&commit, &all_pins)?;
+        let own = self.objects.set_path(&commit.tree, PINS_DIR, None)?;
+        self.with_children(&own, &by_depth(&mounts), &all_pins)
+    }
 
-        // First every child this history pins, so a parent always mounts a
-        // view that is already composed.
-        let mut shapes: Vec<Shape> = Vec::with_capacity(walk.len());
-        let mut child_tips: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
-        for id in &walk {
-            let commit = self.objects.commit(id)?;
-            let all_pins = pins_in(&mut self.objects, &commit.tree)?;
-            let mut readable = BTreeMap::new();
-            for (child, pin) in &all_pins {
-                if !(self.options.readable)(child) {
-                    continue;
-                }
-                // A pin its tracker's own history does not hold (another
-                // tracker's commit under this name, or one never pushed) is
-                // left out at this commit, as for a reader who may not read
-                // it: what the reader gets is never someone else's content.
-                let admitted = self.options.admit.is_none_or(|admit| admit(child, pin));
-                if !admitted || !self.objects.has_commit(pin)? {
-                    continue;
-                }
-                readable.insert(child.clone(), pin.clone());
-                child_tips
-                    .entry(child.clone())
-                    .or_default()
-                    .insert(pin.clone());
-            }
-            let mounts = mounts_of(&mut self.objects, id, &commit.tree, &all_pins, &readable)?;
-            shapes.push((commit, all_pins, mounts));
+    /// `own` with each child in `ordered` grafted at its mount.
+    fn with_children(
+        &mut self,
+        own: &str,
+        ordered: &[(&String, &String)],
+        all_pins: &BTreeMap<String, String>,
+    ) -> Result<String> {
+        let mut tree = own.to_owned();
+        for (child, mount) in ordered {
+            let pin = &all_pins[*child];
+            let view = self
+                .children
+                .get(pin)
+                .cloned()
+                .ok_or_else(|| missing(pin))?;
+            tree = graft(&mut self.objects, &tree, mount, &view)?;
         }
-        for (child, pins) in child_tips {
-            let pins: Vec<String> = pins.into_iter().collect();
-            self.compose_tracker(&child, &pins)?;
-        }
-
-        let mut own_trees: HashMap<String, String> = HashMap::new();
-        for (commit, all_pins, mounts) in shapes {
-            self.compose_one(name, &commit, &all_pins, &mounts, &mut own_trees)?;
-        }
-        Ok(())
+        Ok(tree)
     }
 
     fn own_tree(&mut self, commit: &Commit, cache: &mut HashMap<String, String>) -> Result<String> {
@@ -464,19 +509,8 @@ impl Composer<'_> {
         own_trees: &mut HashMap<String, String>,
     ) -> Result<()> {
         let own = self.own_tree(commit, own_trees)?;
-        let mut ordered: Vec<(&String, &String)> = mounts.iter().collect();
-        ordered.sort_by(|(left_name, left), (right_name, right)| {
-            depth(left)
-                .cmp(&depth(right))
-                .then_with(|| left.cmp(right))
-                .then_with(|| left_name.cmp(right_name))
-        });
-        let mut tree = own.clone();
-        for (child, mount) in &ordered {
-            let pin = &all_pins[*child];
-            let view = self.views.get(pin).cloned().ok_or_else(|| missing(pin))?;
-            tree = graft(&mut self.objects, &tree, mount, &view.tree)?;
-        }
+        let ordered = by_depth(mounts);
+        let tree = self.with_children(&own, &ordered, all_pins)?;
 
         // A single-parent commit whose only change was to children this
         // reader may not read is dropped: the commit after it moves onto
@@ -551,10 +585,12 @@ impl Composer<'_> {
                 match holder {
                     Some(holder) => {
                         let holder = self.objects.commit(&holder)?;
+                        let message = parse_split(&holder.message)
+                            .map_or(holder.message.clone(), |carried| carried.message);
                         (
                             holder.author,
                             holder.committer,
-                            holder.message,
+                            message,
                             split.headers.clone(),
                             split.source.clone(),
                         )
@@ -602,9 +638,10 @@ impl Composer<'_> {
         Ok(())
     }
 
-    /// The child view commit holding the work of a split commit that
-    /// changed none of its own files: the first child, by mount, whose pin
-    /// moved at this commit.
+    /// The child commit holding the work of a split commit that changed
+    /// none of its own files: the first child, by mount, whose pin moved at
+    /// this commit. It carries the work's metadata (*Which commit carries the
+    /// message* in docs/design/trackers.md), so it is read as it stands.
     fn work_holder(
         &mut self,
         ordered: &[(&String, &String)],
@@ -612,22 +649,21 @@ impl Composer<'_> {
         parent_commits: &[Commit],
     ) -> Result<Option<String>> {
         for (child, _) in ordered {
-            let tip = self.views[&all_pins[*child]].id.clone();
+            let tip = &all_pins[*child];
             let mut moved = true;
             for parent in parent_commits {
                 let parent_pins = pins_in(&mut self.objects, &parent.tree)?;
-                if let Some(pin) = parent_pins.get(*child)
+                if parent_pins.get(*child) == Some(tip)
                     && self
                         .expanded
                         .get(&parent.id)
                         .is_some_and(|expanded| expanded.contains(*child))
-                    && self.views.get(pin).is_some_and(|view| view.id == tip)
                 {
                     moved = false;
                 }
             }
             if moved {
-                return Ok(Some(tip));
+                return Ok(Some(tip.clone()));
             }
         }
         Ok(None)

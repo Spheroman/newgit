@@ -295,10 +295,12 @@ stays in the instance's binding record and in checkpoints.
 
 ### Compose
 
-Compose is defined over views, recursively: a child's view (rooted at the
-child) is composed first, and what a parent mounts is that view. A
-grandchild's history therefore reaches the root exactly as it reaches the
-child.
+Compose walks one history, the root's. A child is expanded at each commit
+that history pins, and a grandchild at each commit those pin: a child's tree
+with its own pins expanded is what a parent mounts. No child's parents are
+read, so a store holding root's history and each pinned commit composes the
+same ids as one holding every history. The remote relies on this (*Fetching
+what a view needs* in [remote.md](remote.md#fetching-what-a-view-needs)).
 
 For a view rooted at tracker `T`, for a reader who may read some set of
 trackers **(decided)**:
@@ -314,7 +316,7 @@ trackers **(decided)**:
      trailers stripped and the recorded headers put back. When `R` holds
      none of `T`'s own changes, and a child commit holds the work (see
      *Split*), the metadata comes from that child commit: the child whose
-     pin moved at a commit split from a view commit.
+     pin moved at a commit split from a view commit, read as it stands.
 3. **A child is its tree at the pin, never its history (decided
    2026-11-05).** A tracker's history stays in its own repo, and no view
    reaches it. Two things can happen at `R`, and both are one view commit:
@@ -333,7 +335,10 @@ trackers **(decided)**:
 4. **Readers.** A child the reader may not read is left out of the tree, and
    so is everything mounted inside it. A single-parent view commit whose only
    change was to such a child is dropped, and the commit after it moves onto
-   its parent. A merge goes the same way only when its sides differ in such
+   its parent. Only a pin of `T` itself counts: a commit moving a child they
+   may read, whose move changed only something mounted inside that child,
+   stays, with no change to its tree, because telling would take the child's
+   history. A merge goes the same way only when its sides differ in such
    a child and what is left adds nothing to one parent: the side that moved
    the pin was dropped, so there is nothing to join. Any other merge stays.
    Someone who cannot read a tracker sees different ids from the first commit

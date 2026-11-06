@@ -575,11 +575,13 @@ writing the branch's list in the project's Durable Object as an index. (The
 Worker's Artifacts binding cannot write refs, so the merge's Git work is the
 merger's; root's ref is the truth and the list says which repos to fetch.)
 
-Both of the container's checks — the begin's ancestry check (`newgit
-endpoint-ancestry`) and the finish's index check (`newgit endpoint-index`) —
-fetch every tracker they look at into the container's store, and the first
-time a large history is there that takes many minutes (Spheroman/t3code,
-365 MiB: about five minutes in one fetch). So they run in the background.
+The begin's ancestry check (`newgit endpoint-ancestry`) fetches every tracker
+it looks at, whole, into the container's store, and the first time a large
+history is there that takes many minutes (Spheroman/t3code, 365 MiB: about
+five minutes in one fetch, over forty when Artifacts drops it and stepping
+takes over). The finish's index check (`newgit endpoint-index`) needs root's
+history and one commit's pins (*Fetching what a view needs*). Both run in the
+background.
 The endpoint's Durable Object keys each check by its kind and its plan
 without credentials. The first request starts it and every request until it
 ends is answered `202 {"checking": true}` with `Retry-After: 10`; the first
@@ -597,6 +599,56 @@ holds while the client keeps asking. The checks are held in the object's
 memory and in `waitUntil`; the polls are what keep the object alive. An
 object evicted mid-check forgets it, and the next request starts it again,
 against a store that keeps what the first fetched.
+
+#### Fetching what a view needs
+
+A view needs root's history, which is its shape, and a child's files at each
+commit that history pins, never the child's history. Each deploy starts the
+container from a fresh image, and every merge to `main` deploys, so a view
+waiting for whole histories cost the first request after every deploy
+minutes. So `endpoint-compose` fetches what it needs and no more, and the
+container keeps three repositories under `/work`:
+
+- **`trackers.git`** holds whole histories: root's, and any tracker a check,
+  a copy, or a pull fetched. Every question about ancestry is asked here.
+- **`snapshots.git`** is shallow on purpose: pinned commits, each fetched
+  `--depth=1` by id into `refs/snapshots/<tracker>/<commit>`. It never goes
+  through `fetch_refs`, which deepens any store it finds shallow. Root is
+  never here: its `shallow` file would end root's history at any commit root
+  shares with a child.
+- **`compose.git`** reads both through alternates and holds what composing
+  writes. It never fetches: Git takes an alternate's refs for complete
+  history, so a store that fetches must not have a shallow alternate. That is
+  why `trackers.git` has none, and why a wrong "not forward" cannot come of
+  this: a merge's check never meets a shallow commit.
+
+The ref is the proof a commit is that tracker's. A shallow fetch asks the
+remote even for a commit the store already holds, and the remote refuses an
+id it lacks, so one tracker's commit cannot pass as another's. A commit the
+repo refuses is left out, as a pin always was; any other failure fails the
+request rather than cache a view missing a child. One tracker's pins come in
+one fetch, halved when it fails, so what they share comes once. Only a branch
+whose view is not composed yet walks root's history for pins.
+
+What each costs on a fresh container:
+
+| | Waits | Fetches |
+|---|---|---|
+| `git fetch`, first | that request | root's whole history, then one shallow fetch per tracker |
+| `git fetch`, next, branch unchanged | nothing | nothing |
+| index check | background | root's new commits, and the one commit's pins |
+| ancestry check, and a copy | background | that tracker's whole history, as it always did: 5 minutes for t3code, over 40 if stepped |
+
+A cold `git fetch` is bounded by root's size plus its pins. For a project whose
+large history is a mount, that is about 32 seconds and 113 MB for one pin
+(measured from a laptop against the real t3code repo) and, unmeasured, more
+for several. Where root itself is the large history, it is what it was:
+that request waits for all of it. Nothing in `src/endpoint.ts` times the wait
+out; the Worker holds the request open for as long as the client stays
+connected, and the plan's read passwords last an hour.
+
+The client's `newgit clone` and tracker merges still fetch whole histories: a
+real merge in a child needs them.
 
 A fetch the remote drops (Artifacts fails some whole fetches with an HTTP
 500, `expected 'packfile'`) is tried whole twice more, a few seconds apart,

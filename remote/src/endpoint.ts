@@ -11,6 +11,11 @@
 // (docs/design/remote.md, *Measurements*). The runtime's inactivity timeout
 // is the backstop, in case the alarm never runs.
 //
+// A view needs root's history and each commit it pins, so a fetch waits only
+// for those, in this request (docs/design/remote.md, *Fetching what a view
+// needs*). Where root itself is the large history it waits for all of it;
+// nothing here times that out.
+//
 // A merge's checks (`newgit endpoint-ancestry`, `newgit endpoint-index`) run
 // in the background: the first time a large history is here (t3code, 365
 // MiB) fetching it takes many minutes, longer than any one request should

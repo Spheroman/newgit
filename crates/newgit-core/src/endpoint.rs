@@ -10,8 +10,13 @@
 //!
 //! Views are cached by plan: the same lists compose to the same repository,
 //! so a second fetch of an unchanged branch serves at once.
+//!
+//! A view needs root's history and, of every child, only the commits that
+//! history pins, so that is all composing fetches ([`Stores`]). What needs a
+//! child's history (a merge's ancestry check, a fork's copy, a mirror's
+//! pull) fetches it whole, into a store of its own, in the background.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use camino::{Utf8Path, Utf8PathBuf};
 use serde::Deserialize;
@@ -46,47 +51,235 @@ pub struct Source {
     pub auth: String,
 }
 
-/// Compose `plan` into a bare repository and return its path.
-pub fn compose_view(plan: &Plan) -> Result<Utf8PathBuf> {
-    let store = plan.dir.join("trackers.git");
-    let views = plan.dir.join("views");
-    std::fs::create_dir_all(&views).map_err(|source| NewgitError::io(&views, source))?;
-    if !store.join("HEAD").exists() {
-        run_git_env(&["init", "-q", "--bare", store.as_str()], &[])?;
+/// The container's repositories. Three, because a shallow commit must never
+/// meet a question about history:
+///
+/// - `trackers.git` holds whole histories: root's, and any tracker a check,
+///   a copy, or a pull needed. Every question about ancestry is asked here.
+/// - `snapshots.git` is shallow on purpose: pinned commits, one commit deep,
+///   each under `refs/snapshots/<tracker>/<commit>` as proof that tracker's
+///   repo has it. It holds nothing else. Its `shallow` file would cut any
+///   walk that met one of its commits, so root is never here: a commit root
+///   shares with a child would end root's history.
+/// - `compose.git` reads both through alternates and holds what composing
+///   writes. It never fetches: Git takes an alternate's refs for complete
+///   history, which is why this is the only repository that has one.
+struct Stores {
+    whole: Utf8PathBuf,
+    snapshots: Utf8PathBuf,
+    composing: Utf8PathBuf,
+}
+
+/// Tracker → the commits proved to be in its own repo.
+type Held = BTreeMap<String, HashSet<String>>;
+
+impl Stores {
+    fn open(dir: &Utf8Path) -> Result<Self> {
+        std::fs::create_dir_all(dir).map_err(|source| NewgitError::io(dir, source))?;
+        let stores = Self {
+            whole: dir.join("trackers.git"),
+            snapshots: dir.join("snapshots.git"),
+            composing: dir.join("compose.git"),
+        };
+        for store in [&stores.whole, &stores.snapshots, &stores.composing] {
+            if !store.join("HEAD").exists() {
+                run_git_env(&["init", "-q", "--bare", store.as_str()], &[])?;
+            }
+        }
+        // Renamed in, so a compose running beside this never reads it empty
+        // and takes every pin for missing.
+        let info = stores.composing.join("objects/info");
+        let alternates = info.join("alternates");
+        if !alternates.exists() {
+            let staging = info.join(format!("alternates.tmp-{}", std::process::id()));
+            let text = format!("{}/objects\n{}/objects\n", stores.whole, stores.snapshots);
+            std::fs::create_dir_all(&info).map_err(|source| NewgitError::io(&info, source))?;
+            std::fs::write(&staging, text).map_err(|source| NewgitError::io(&staging, source))?;
+            std::fs::rename(&staging, &alternates)
+                .map_err(|source| NewgitError::io(&alternates, source))?;
+        }
+        Ok(stores)
     }
 
-    // Fetch each tracker whose commits are not in its own history here yet.
-    // A commit counts for a tracker only if that tracker's repo has it: the
-    // store is shared by every reader of this project, so a commit being
-    // *somewhere* in it proves nothing — a branch could name another
-    // tracker's commit under this tracker's name.
-    let mut wanted: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    /// What is proved for `trackers`: each one's history in the whole store,
+    /// and its snapshots.
+    fn held<'a>(&self, trackers: impl Iterator<Item = &'a String>) -> Held {
+        let mut held = tracker_histories(&self.whole, trackers);
+        for (tracker, commits) in &mut held {
+            commits.extend(self.snapshots_of(tracker));
+        }
+        held
+    }
+
+    fn snapshots_of(&self, tracker: &str) -> Vec<String> {
+        run_git_env(
+            &[
+                &format!("--git-dir={}", self.snapshots),
+                "for-each-ref",
+                "--format=%(objectname)",
+                &format!("refs/snapshots/{tracker}/"),
+            ],
+            &[],
+        )
+        .unwrap_or_default()
+        .lines()
+        .map(ToOwned::to_owned)
+        .collect()
+    }
+
+    /// Fetch whichever of `wanted` (tracker → commits) is not held yet, and
+    /// add it to `held`. A commit its tracker's repo does not have stays out
+    /// of `held`. One request at a time: two shallow fetches in one store
+    /// fight over its `shallow` file.
+    fn snapshot(
+        &self,
+        repos: &BTreeMap<String, Source>,
+        wanted: &BTreeMap<String, BTreeSet<String>>,
+        held: &mut Held,
+    ) -> Result<()> {
+        let lacking = |held: &Held, tracker: &str, commits: &BTreeSet<String>| -> Vec<String> {
+            let known = held.get(tracker);
+            commits
+                .iter()
+                .filter(|commit| !known.is_some_and(|known| known.contains(*commit)))
+                .cloned()
+                .collect()
+        };
+        if wanted
+            .iter()
+            .all(|(tracker, commits)| lacking(held, tracker, commits).is_empty())
+        {
+            return Ok(());
+        }
+        let path = self.snapshots.join("newgit-fetch.lock");
+        let lock = std::fs::File::create(&path).map_err(|source| NewgitError::io(&path, source))?;
+        lock.lock()
+            .map_err(|source| NewgitError::io(&path, source))?;
+        let git_dir = format!("--git-dir={}", self.snapshots);
+        for (tracker, commits) in wanted {
+            // Whoever held the lock may have brought these in.
+            let known = held.entry(tracker.clone()).or_default();
+            known.extend(self.snapshots_of(tracker));
+            let missing = lacking(held, tracker, commits);
+            let Some(source) = repos.get(tracker).filter(|_| !missing.is_empty()) else {
+                continue;
+            };
+            let absent = GitSource::fetch_snapshots(
+                &[&git_dir],
+                &source.url,
+                &format!("refs/snapshots/{tracker}/"),
+                &missing,
+                Some(&source.auth),
+            )?;
+            if !absent.is_empty() {
+                eprintln!("newgit: `{tracker}`'s repo does not have pinned commits {absent:?}");
+            }
+            let known = held.entry(tracker.clone()).or_default();
+            known.extend(
+                missing
+                    .into_iter()
+                    .filter(|commit| !absent.contains(commit)),
+            );
+        }
+        Ok(())
+    }
+
+    /// Fetch every commit `commits` (root's) pin, and every commit those
+    /// pin in turn, for the trackers in `repos`: a reader's others are not
+    /// theirs to expand. A pin must be here before its own pins can be read,
+    /// so this goes one level of mounts at a time.
+    fn snapshot_pins(
+        &self,
+        repos: &BTreeMap<String, Source>,
+        commits: &[String],
+        held: &mut Held,
+    ) -> Result<()> {
+        let mut seen: HashSet<(String, String)> = HashSet::new();
+        let mut level: BTreeMap<String, BTreeSet<String>> =
+            BTreeMap::from([(ROOT_TRACKER.to_owned(), commits.iter().cloned().collect())]);
+        loop {
+            let mut next: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+            let mut objects = Objects::open(&self.composing)?;
+            for (tracker, commits) in &level {
+                for commit in commits {
+                    if tracker != ROOT_TRACKER
+                        && !held.get(tracker).is_some_and(|set| set.contains(commit))
+                    {
+                        continue;
+                    }
+                    let Some(found) = objects.try_commit(commit)? else {
+                        continue;
+                    };
+                    for (child, pin) in compose::pins_in(&mut objects, &found.tree)? {
+                        if repos.contains_key(&child) && seen.insert((child.clone(), pin.clone())) {
+                            next.entry(child).or_default().insert(pin);
+                        }
+                    }
+                }
+            }
+            if next.is_empty() {
+                return Ok(());
+            }
+            self.snapshot(repos, &next, held)?;
+            level = next;
+        }
+    }
+}
+
+/// Compose `plan` into a bare repository and return its path.
+pub fn compose_view(plan: &Plan) -> Result<Utf8PathBuf> {
+    let stores = Stores::open(&plan.dir)?;
+    let views = plan.dir.join("views");
+    std::fs::create_dir_all(&views).map_err(|source| NewgitError::io(&views, source))?;
+
+    let mut wanted: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     for list in plan.branches.values() {
         for (tracker, commit) in list {
-            wanted.entry(tracker).or_default().push(commit);
+            wanted
+                .entry(tracker.clone())
+                .or_default()
+                .insert(commit.clone());
         }
     }
-    for tracker in plan.repos.keys() {
-        wanted.entry(tracker).or_default();
+    if let Some(tracker) = wanted.keys().find(|name| !plan.repos.contains_key(*name)) {
+        return Err(NewgitError::Unsupported(format!(
+            "the plan names `{tracker}` but not where it is"
+        )));
     }
-    for (tracker, commits) in &wanted {
-        if !commits.is_empty()
-            && commits
-                .iter()
-                .all(|commit| in_tracker(&store, tracker, commit))
-        {
-            continue;
-        }
-        let source = plan.repos.get(*tracker).ok_or_else(|| {
-            NewgitError::Unsupported(format!("the plan names `{tracker}` but not where it is"))
+    let mut held = stores.held(plan.repos.keys());
+
+    // Root's history is the view's shape, so all of it, unless every branch's
+    // commit is in it already. A commit counts for a tracker only if that
+    // tracker's repo has it: a commit being *somewhere* here proves nothing
+    // — a branch could name another tracker's commit under this tracker's
+    // name.
+    let roots = wanted.remove(ROOT_TRACKER).unwrap_or_default();
+    let known = |held: &Held, commit: &String| {
+        held.get(ROOT_TRACKER)
+            .is_some_and(|history| history.contains(commit))
+    };
+    if !roots.iter().all(|commit| known(&held, commit)) {
+        let source = plan.repos.get(ROOT_TRACKER).ok_or_else(|| {
+            NewgitError::Unsupported(format!(
+                "the plan names `{ROOT_TRACKER}` but not where it is"
+            ))
         })?;
         GitSource::fetch_refs(
-            &[&format!("--git-dir={store}")],
+            &[&format!("--git-dir={}", stores.whole)],
             &source.url,
-            &[format!("+refs/heads/*:refs/trackers/{tracker}/heads/*")],
+            &[format!(
+                "+refs/heads/*:refs/trackers/{ROOT_TRACKER}/heads/*"
+            )],
             Some(&source.auth),
         )?;
+        held.extend(tracker_histories(
+            &stores.whole,
+            [ROOT_TRACKER.to_owned()].iter(),
+        ));
     }
+    // What each branch names now, so a view composed already serves at once.
+    stores.snapshot(&plan.repos, &wanted, &mut held)?;
+
     // A branch naming a commit its tracker does not have is left out —
     // logged, not served, and not allowed to take the others down with it.
     let mut plan = plan.clone();
@@ -96,7 +289,11 @@ pub fn compose_view(plan: &Plan) -> Result<Utf8PathBuf> {
     plan.branches.retain(|branch, list| {
         let bad: Vec<String> = list
             .iter()
-            .filter(|(tracker, commit)| !in_tracker(&store, tracker, commit))
+            .filter(|(tracker, commit)| {
+                !held
+                    .get(*tracker)
+                    .is_some_and(|commits| commits.contains(*commit))
+            })
             .map(|(tracker, _)| tracker.clone())
             .collect();
         if !bad.is_empty() {
@@ -123,12 +320,31 @@ pub fn compose_view(plan: &Plan) -> Result<Utf8PathBuf> {
         return Ok(view);
     }
 
-    let histories = tracker_histories(&store, plan.repos.keys());
+    // Composing is about to happen: every commit root's history pins, not
+    // only what the branches name now.
+    let store = stores.composing.clone();
+    let tips: Vec<String> = plan
+        .branches
+        .values()
+        .map(|list| list[ROOT_TRACKER].clone())
+        .collect();
+    let mut walk = vec![
+        format!("--git-dir={store}"),
+        "rev-list".to_owned(),
+        "--topo-order".to_owned(),
+    ];
+    walk.extend(tips);
+    let walk: Vec<&str> = walk.iter().map(String::as_str).collect();
+    let history: Vec<String> = run_git_env(&walk, &[])?
+        .lines()
+        .map(ToOwned::to_owned)
+        .collect();
+    stores.snapshot_pins(&plan.repos, &history, &mut held)?;
+
     for (branch, list) in &plan.branches {
         let readable = |tracker: &str| list.contains_key(tracker);
         let admit = |tracker: &str, commit: &str| {
-            histories
-                .get(tracker)
+            held.get(tracker)
                 .is_some_and(|history| history.contains(commit))
         };
         compose::compose(
@@ -426,17 +642,18 @@ pub struct IndexAnswer {
 }
 
 pub fn check_index(plan: &IndexPlan) -> Result<IndexAnswer> {
-    let store = plan.dir.join("trackers.git");
-    std::fs::create_dir_all(&plan.dir).map_err(|source| NewgitError::io(&plan.dir, source))?;
-    if !store.join("HEAD").exists() {
-        run_git_env(&["init", "-q", "--bare", store.as_str()], &[])?;
-    }
-    let git_dir = format!("--git-dir={store}");
-    for (tracker, source) in &plan.repos {
+    let stores = Stores::open(&plan.dir)?;
+    if let Some(source) = plan.repos.get(ROOT_TRACKER) {
         GitSource::fetch_refs(
-            &[&git_dir, "-c", "fetch.prune=true"],
+            &[
+                &format!("--git-dir={}", stores.whole),
+                "-c",
+                "fetch.prune=true",
+            ],
             &source.url,
-            &[format!("+refs/heads/*:refs/trackers/{tracker}/heads/*")],
+            &[format!(
+                "+refs/heads/*:refs/trackers/{ROOT_TRACKER}/heads/*"
+            )],
             Some(&source.auth),
         )?;
     }
@@ -446,13 +663,16 @@ pub fn check_index(plan: &IndexPlan) -> Result<IndexAnswer> {
             actual: BTreeMap::new(),
         });
     };
-    if !in_tracker(&store, ROOT_TRACKER, root) {
+    if !in_tracker(&stores.whole, ROOT_TRACKER, root) {
         return Ok(IndexAnswer {
             matches: false,
             actual: BTreeMap::new(),
         });
     }
-    let actual = compose::index(&store, ROOT_TRACKER, root)?;
+    // An index is this one commit's pins, all the way down: no history.
+    let mut held = stores.held(plan.repos.keys());
+    stores.snapshot_pins(&plan.repos, std::slice::from_ref(root), &mut held)?;
+    let actual = compose::index(&stores.composing, ROOT_TRACKER, root)?;
     Ok(IndexAnswer {
         matches: actual == plan.list,
         actual,
