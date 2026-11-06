@@ -9925,7 +9925,8 @@ impl BranchManager {
     /// Publish an instance's work for checkpoint `record`: its committed work
     /// (split already) and its uncommitted work (split here, off the branch),
     /// as a root commit each, indexed. A tracker the instance changed — its
-    /// commit is not the default branch's — is forked the first time and
+    /// commit is neither the default branch's nor the one it last shared
+    /// with it (`pins_shared_with_main`) — is forked the first time and
     /// gets its branch (`refs/heads/<instance>`) and the checkpoint's commit
     /// pushed there. Returns the checkpoint as indexes.
     fn publish_code(
@@ -9946,6 +9947,7 @@ impl BranchManager {
 
         let view = remote.project(project)?;
         let main = view.default_list().cloned().unwrap_or_default();
+        let mut shared = None;
         for (tracker, tip_commit) in &tip {
             let head_commit = head.get(tracker).unwrap_or(tip_commit);
             if main.get(tracker) == Some(head_commit) && head_commit == tip_commit {
@@ -9958,6 +9960,15 @@ impl BranchManager {
                      joins it through `newgit merge`",
                     view.default_branch
                 )));
+            }
+            // Behind `main` is not changed: `main` moved, not this instance.
+            if head_commit == tip_commit {
+                let pins = shared.get_or_insert_with(|| {
+                    self.pins_shared_with_main(remote, project, &head, &main)
+                });
+                if pins.get(tracker) == Some(head_commit) {
+                    continue;
+                }
             }
             let fork = remote.fork(project, &branch.slug, tracker)?;
             let credential = remote.credential(project, &fork.repo, Scope::Write)?;
@@ -9974,6 +9985,52 @@ impl BranchManager {
             })?;
         }
         Ok(crate::checkpoint::CodeState { head, tip })
+    }
+
+    /// What the root commit an instance last shared with `main` pins. Those
+    /// commits are on the remote already, so a tracker still at one has
+    /// nothing to send, and no fork to make: a large tracker's costs minutes.
+    /// Empty when it cannot be told, which only means forking as before.
+    fn pins_shared_with_main(
+        &self,
+        remote: &dyn Remote,
+        project: &str,
+        head: &BTreeMap<String, String>,
+        main: &BTreeMap<String, String>,
+    ) -> BTreeMap<String, String> {
+        let pins = || -> Result<BTreeMap<String, String>> {
+            let (Some(ours), Some(theirs)) = (head.get(&self.root.name), main.get(&self.root.name))
+            else {
+                return Ok(BTreeMap::new());
+            };
+            let root = self.store.paths().project_root.clone();
+            let holds = |commit: &str| {
+                let object = format!("{commit}^{{commit}}");
+                crate::source::run_git_env(&["-C", root.as_str(), "cat-file", "-e", &object], &[])
+                    .is_ok()
+            };
+            if !holds(theirs) {
+                let repo = format!("{}.t.{}", project.replace('/', "."), self.root.name);
+                let credential = remote.credential(project, &repo, Scope::Read)?;
+                GitSource::fetch_refs(
+                    &["-C", root.as_str()],
+                    credential.remote.as_deref().unwrap_or_default(),
+                    &[format!("+refs/heads/main:{ROOT_MAIN_ON_REMOTE}")],
+                    Some(&basic_auth_header(&credential)),
+                )?;
+            }
+            let base = crate::source::run_git_env(
+                &["-C", root.as_str(), "merge-base", ours, theirs],
+                &[],
+            )?;
+            let mut objects = crate::objects::Objects::open(&root)?;
+            let tree = objects.commit(base.trim())?.tree;
+            crate::compose::pins_in(&mut objects, &tree)
+        };
+        pins().unwrap_or_else(|error| {
+            eprintln!("newgit: could not tell what this instance shares with `main`: {error}");
+            BTreeMap::new()
+        })
     }
 
     /// Bring a checkpoint's code here and compose it: each tracker in Git
@@ -12806,6 +12863,10 @@ pub fn tracker_repo(project: &str, definition: &TrackerDefinition, login: &str) 
         format!("{prefix}.t.{}", definition.name)
     }
 }
+
+/// Where a sync keeps root's `main` when it had to fetch it, to find what an
+/// instance shares with it.
+const ROOT_MAIN_ON_REMOTE: &str = "refs/newgit/remote-root/main";
 
 /// An instance's fork of one tracker in Git on the remote.
 pub fn fork_repo(project: &str, instance: &str, tracker: &str) -> String {
