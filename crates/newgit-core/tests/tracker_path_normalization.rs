@@ -234,6 +234,52 @@ fn only_a_git_tracker_may_own_a_definition_and_nothing_else_in_newgit_opens() {
     }
 }
 
+/// Governance only delegates downward (#228): a tracker handed one
+/// definition must not take `access`'s, which would hand it every definition,
+/// and no tracker may own its own, which would let whoever maintains it shut
+/// everyone else out. The remote ignores either claim; the client refuses
+/// it, whether written as a view path or relative to a mount beside `access`.
+#[test]
+fn no_tracker_may_own_accesss_definition_or_its_own() {
+    for (name, path) in [
+        ("web", ".newgit/trackers/access.toml"),
+        ("web", ".newgit/trackers/web.toml"),
+        ("web", "./.newgit/trackers/web.toml"),
+    ] {
+        let error =
+            TrackerDefinition::in_git(name, "project-devs".to_owned(), camino::Utf8Path::new(path))
+                .expect_err(path);
+        assert!(
+            error
+                .to_string()
+                .contains("no tracker may own but `access`"),
+            "`{path}`: {error}"
+        );
+    }
+
+    for claim in ["access.toml", "web.toml"] {
+        let text = format!(
+            "audience = \"project-devs\"\nstorage = \"local\"\ngit = true\nmount = \".newgit/trackers\"\npaths = [\"{claim}\"]\n"
+        );
+        let error = TrackerDefinition::from_text("web", camino::Utf8Path::new("web.toml"), &text)
+            .expect_err(claim);
+        assert!(
+            error
+                .to_string()
+                .contains("no tracker may own but `access`"),
+            "`{claim}`: {error}"
+        );
+    }
+
+    // Another tracker's definition is still fine to own.
+    TrackerDefinition::in_git(
+        "admin",
+        "project-devs".to_owned(),
+        camino::Utf8Path::new(".newgit/trackers/web.toml"),
+    )
+    .expect("admin may own web's definition");
+}
+
 /// Governance layers by mounting: an `admin` tracker mounted beside
 /// `access` at `.newgit/trackers`, claiming `web.toml`, owns that file (the
 /// longest claim at a mount wins), so only admin's maintainers change `web`'s
@@ -251,7 +297,8 @@ fn an_admin_tracker_mounted_beside_access_owns_the_definition_it_claims() {
         .expect("create web");
     std::fs::write(
         root.join(".newgit/trackers/admin.toml"),
-        "audience = \"project-devs\"\nstorage = \"local\"\ngit = true\nmount = \".newgit/trackers\"\npaths = [\"web.toml\", \"admin.toml\"]\nmaintainers = \"owner\"\n",
+        // Not its own definition: that stays `access`'s (#228).
+        "audience = \"project-devs\"\nstorage = \"local\"\ngit = true\nmount = \".newgit/trackers\"\npaths = [\"web.toml\"]\nmaintainers = \"owner\"\n",
     )
     .expect("write admin");
     git(&root, &["add", "."]);
@@ -265,10 +312,7 @@ fn an_admin_tracker_mounted_beside_access_owns_the_definition_it_claims() {
         .expect("access is a tracker in Git");
     assert_eq!(
         access.excluded,
-        [
-            Utf8PathBuf::from(".newgit/trackers/admin.toml"),
-            Utf8PathBuf::from(".newgit/trackers/web.toml")
-        ]
+        [Utf8PathBuf::from(".newgit/trackers/web.toml")]
     );
     m.sync_project_root().expect("split");
     let store_git = m.store().paths().tracker_store.clone();
@@ -284,9 +328,10 @@ fn an_admin_tracker_mounted_beside_access_owns_the_definition_it_claims() {
             .expect("git");
         String::from_utf8_lossy(&output.stdout).trim().to_owned()
     };
-    assert_eq!(files("admin"), "admin.toml\nweb.toml");
+    assert_eq!(files("admin"), "web.toml");
     let access_files = files("access");
     assert!(!access_files.contains("web.toml"), "{access_files}");
+    assert!(access_files.contains("admin.toml"), "{access_files}");
     assert!(access_files.contains("root.toml"), "{access_files}");
     // And the view is the project's own history, composed from all three.
     let spawned = m.spawn("feature-a", None).expect("spawn");
