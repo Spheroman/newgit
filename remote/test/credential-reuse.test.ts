@@ -32,7 +32,7 @@ async function call(token: string, method: string, path: string, body?: unknown)
 			body: body === undefined ? undefined : JSON.stringify(body),
 		}),
 		env,
-		{ repos, fetcher: fetch, waitUntil: () => {}, endpoint: noEndpoint, copy: fakeCopy },
+		{ repos, fetcher: fetch, waitUntil: () => {}, endpoint: noEndpoint, copy: fakeCopy(repos) },
 	);
 	return { status: response.status, body: (await response.json()) as any };
 }
