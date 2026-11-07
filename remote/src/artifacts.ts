@@ -11,6 +11,21 @@ export interface MintedToken {
 
 import { parseAdvertisement, parseReport, type RefUpdate, receivePackBody } from "./refs";
 
+/** What the Worker reads of a commit, straight from Artifacts. */
+export interface CommitFacts {
+	hash: string;
+	tree: string;
+	parents: string[];
+	/** Committer time, in Unix seconds. */
+	committedAt: number;
+}
+
+export interface TreeEntry {
+	name: string;
+	hash: string;
+	type: "tree" | "blob" | "symlink" | "gitlink" | "exec";
+}
+
 export interface Repos {
 	create(name: string): Promise<{ remote: string }>;
 	/** The repo's Git remote, or null when it does not exist. */
@@ -27,6 +42,12 @@ export interface Repos {
 	readFile(name: string, ref: string, path: string): Promise<string | null>;
 	/** Every ref the repo has, at its commit. */
 	refs(name: string): Promise<Record<string, string>>;
+	/** A commit's tree and parents, or null when the repo does not have it. */
+	readCommit(name: string, hash: string): Promise<CommitFacts | null>;
+	/** A tree's immediate entries, or null when the repo does not have it. */
+	readTree(name: string, hash: string): Promise<TreeEntry[] | null>;
+	/** The commit branch `branch` is at, or null when there is none. */
+	branchHead(name: string, branch: string): Promise<string | null>;
 	/**
 	 * Move refs to commits the repo already has, each by compare-and-swap on
 	 * its `old`. Per ref, whether it moved: one that did not held something else.
@@ -110,6 +131,45 @@ export class ArtifactsRepos implements Repos {
 			const resolved = ref === "HEAD" ? (await repo.info()).defaultBranch : ref;
 			const blob = await repo.readFile({ ref: resolved, path });
 			return blob === null ? null : await blob.text();
+		} catch (error) {
+			if (isNotFound(error)) return null;
+			throw error;
+		}
+	}
+
+	async readCommit(name: string, hash: string) {
+		try {
+			using repo = await this.artifacts.get(name);
+			const commit = await repo.readCommit(hash);
+			if (commit === null) return null;
+			return {
+				hash: commit.hash,
+				tree: commit.treeHash,
+				parents: commit.parents,
+				committedAt: commit.committedAt,
+			};
+		} catch (error) {
+			if (isNotFound(error)) return null;
+			throw error;
+		}
+	}
+
+	async readTree(name: string, hash: string) {
+		try {
+			using repo = await this.artifacts.get(name);
+			const entries = await repo.readTree(hash);
+			return entries === null ? null : entries.map(({ name, hash, type }) => ({ name, hash, type }));
+		} catch (error) {
+			if (isNotFound(error)) return null;
+			throw error;
+		}
+	}
+
+	async branchHead(name: string, branch: string) {
+		try {
+			using repo = await this.artifacts.get(name);
+			const [head] = await repo.log({ ref: `refs/heads/${branch}`, limit: 1 });
+			return head?.hash ?? null;
 		} catch (error) {
 			if (isNotFound(error)) return null;
 			throw error;

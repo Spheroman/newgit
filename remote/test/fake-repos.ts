@@ -1,4 +1,4 @@
-import type { MintedToken, Repos } from "../src/artifacts";
+import type { CommitFacts, MintedToken, Repos, TreeEntry } from "../src/artifacts";
 import type { RefUpdate } from "../src/refs";
 import type { CopyAnswer, CopyPlan } from "../src/endpoint";
 
@@ -58,6 +58,33 @@ export class FakeRepos implements Repos {
 			this.updates.push({ name, update, moved: moved[update.ref] });
 		}
 		return moved;
+	}
+
+	/** Commits and trees by repo and hash, for the Worker's own reads. Empty: it asks Git. */
+	readonly commits = new Map<string, Map<string, CommitFacts>>();
+	readonly trees = new Map<string, Map<string, TreeEntry[]>>();
+	/** How many object reads the Worker made. */
+	reads = 0;
+	async readCommit(name: string, hash: string) {
+		this.reads++;
+		return this.commits.get(name)?.get(hash) ?? null;
+	}
+	async readTree(name: string, hash: string) {
+		this.reads++;
+		return this.trees.get(name)?.get(hash) ?? null;
+	}
+	async branchHead(name: string, branch: string) {
+		return this.refsOf.get(name)?.get(`refs/heads/${branch}`) ?? null;
+	}
+	addCommit(name: string, commit: CommitFacts) {
+		const commits = this.commits.get(name) ?? new Map<string, CommitFacts>();
+		this.commits.set(name, commits);
+		commits.set(commit.hash, commit);
+	}
+	addTree(name: string, hash: string, entries: TreeEntry[]) {
+		const trees = this.trees.get(name) ?? new Map<string, TreeEntry[]>();
+		this.trees.set(name, trees);
+		trees.set(hash, entries);
 	}
 
 	/** Set a ref, as a push would. */

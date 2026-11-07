@@ -57,6 +57,7 @@ import { githubWebhook } from "./webhook";
 type Checking = typeof CHECKING;
 import type { Branch, Instance, ProjectDO, TrackerList } from "./project";
 import { type RefMove, followLanding } from "./follow";
+import { ASK_GIT, nativeAncestry, nativeIndex } from "./walk";
 import type { UserDO } from "./users";
 
 export { BudgetDO } from "./budget";
@@ -588,14 +589,23 @@ async function route(request: Request, env: Env, deps: Deps): Promise<Response> 
 		// forward: the safe answer.
 		const children = trackers.filter((tracker) => tracker !== "root" && tracker in base && tracker in list);
 		const moves = new Map<string, AncestryAnswer>();
-		if (children.length > 0 && deps.ancestry) {
-			const plan: AncestryPlan = { dir: "/work", repos: checkRepos(deps, id, children), checks: [] };
-			for (const tracker of children) plan.checks.push({ tracker, old: base[tracker], new: list[tracker] });
-			// The first time a large history is here the check takes minutes:
-			// the client asks again until it has the answer.
-			const answers = await deps.ancestry(key, plan, () => checkCredentials(env, deps, caller, id, children));
-			if (isChecking(answers)) return stillChecking();
-			for (const answer of answers) moves.set(answer.tracker, answer);
+		if (children.length > 0) {
+			const checks = children.map((tracker) => ({ tracker, old: base[tracker], new: list[tracker] }));
+			// Read from Artifacts here, in milliseconds; only a walk too long
+			// to make here goes to the container's Git.
+			let answers: AncestryAnswer[] | Checking | typeof ASK_GIT = await nativeAncestry(
+				deps.repos,
+				(tracker) => repoName({ kind: "tracker", project: id, tracker }),
+				checks,
+			);
+			if (answers === ASK_GIT && deps.ancestry) {
+				const plan: AncestryPlan = { dir: "/work", repos: checkRepos(deps, id, children), checks };
+				// The first time a large history is there the check takes
+				// minutes: the client asks again until it has the answer.
+				answers = await deps.ancestry(key, plan, () => checkCredentials(env, deps, caller, id, children));
+				if (isChecking(answers)) return stillChecking();
+			}
+			if (answers !== ASK_GIT) for (const answer of answers) moves.set(answer.tracker, answer);
 		}
 		// Everything is checked before the lock is taken: a refused merge
 		// holds nothing.
@@ -717,13 +727,22 @@ async function route(request: Request, env: Env, deps: Deps): Promise<Response> 
 				// had its pins checked for nothing.
 				// A finish asked again after it landed (its answer never
 				// arrived) checks nothing again, and follows again.
-				if (deps.index && pending?.landed !== true && !sameIndex(current, list)) {
+				if (pending?.landed !== true && !sameIndex(current, list)) {
 					const trackers = Object.keys(list);
-					const plan: IndexPlan = { dir: "/work", repos: checkRepos(deps, id, trackers), list };
-					const checked = await deps.index(key, plan, () => checkCredentials(env, deps, caller, id, trackers));
-					// Still running: the client asks again. Nothing waits meanwhile.
-					if (isChecking(checked)) return stillChecking();
-					if (checked.matches !== true)
+					// Each commit's pins, read from Artifacts here; the
+					// container's Git only when a commit cannot be read.
+					let checked: IndexAnswer | Checking | typeof ASK_GIT = await nativeIndex(
+						deps.repos,
+						(tracker) => repoName({ kind: "tracker", project: id, tracker }),
+						list,
+					);
+					if (checked === ASK_GIT && deps.index) {
+						const plan: IndexPlan = { dir: "/work", repos: checkRepos(deps, id, trackers), list };
+						checked = await deps.index(key, plan, () => checkCredentials(env, deps, caller, id, trackers));
+						// Still running: the client asks again. Nothing waits meanwhile.
+						if (isChecking(checked)) return stillChecking();
+					}
+					if (checked !== ASK_GIT && checked.matches !== true)
 						throw new HttpError(
 							400,
 							"root's commit does not pin what this index says: push the root commit the merge made to its landing ref, then finish",

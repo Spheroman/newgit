@@ -589,7 +589,17 @@ landing stands. A commit on root's branch that no list ever named is kept at
 truth. A finish that ran and was never heard is finished again and says it
 landed.
 
-The begin's ancestry check (`newgit endpoint-ancestry`) fetches every tracker
+Both checks are answered in the Worker first, from Artifacts' own reads
+(`readCommit`, `readTree`; `remote/src/walk.ts`), with no container. An
+index is each tracker commit's pins, which always sit at
+`.newgit/pins/<name>`, so it is three tree reads per commit. Where a pin
+moves is a walk back along every parent from the new pin, which stops below
+the old pin's date (less a day, for wrong clocks), as Git's own walk does.
+Only a commit the Worker cannot read, or a walk past 200 commits, goes to
+the container as below. Artifacts' binding cannot write and has no
+`merge-base`, but these checks need neither.
+
+In the container, the begin's ancestry check (`newgit endpoint-ancestry`) fetches every tracker
 it looks at, whole, into the container's store, and the first time a large
 history is there that takes many minutes (Spheroman/t3code, 365 MiB: about
 five minutes in one fetch, over forty when Artifacts drops it and stepping
@@ -597,8 +607,11 @@ takes over). The finish's index check (`newgit endpoint-index`) needs root's
 history and one commit's pins (*Fetching what a view needs*). Both run in the
 background.
 The endpoint's Durable Object keys each check by its kind and its plan
-without credentials. The first request starts it and every request until it
-ends is answered `202 {"checking": true}` with `Retry-After: 10`; the first
+without credentials. The first request starts it. Each request waits for it
+up to 20 seconds (a request may run as long as its caller stays connected),
+so a check that ends by then is answered by the request that asked. Past
+that, the request is answered `202 {"checking": true}` with
+`Retry-After: 10`; the first
 one after gets Git's answer, or the 502 with Git's error, and the answer is
 forgotten. An answer nobody collects is dropped after five minutes, and a
 check running past 45 minutes counts as failed. The Worker asks with a

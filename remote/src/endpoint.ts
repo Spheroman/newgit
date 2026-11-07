@@ -207,6 +207,15 @@ export class BackgroundChecks {
 		return entry.run;
 	}
 
+	/** Wait for check `key` to end, `ms` at most. */
+	async settled(key: string, ms: number): Promise<void> {
+		const run = this.entries.get(key)?.run;
+		if (!run) return;
+		let timer: ReturnType<typeof setTimeout> | undefined;
+		await Promise.race([run, new Promise<void>((resolve) => (timer = setTimeout(resolve, ms)))]);
+		if (timer !== undefined) clearTimeout(timer);
+	}
+
 	/** How many checks are running: the idle alarm must not stop the container under them. */
 	running(): number {
 		this.prune();
@@ -268,6 +277,12 @@ const COULD_NOT_COMPOSE = "newgit could not compose this view; the remote logged
 
 /** Snapshot at most this often, after a compose changed what is on disk. */
 const SNAPSHOT_EVERY_MS = 10 * 60_000;
+
+/**
+ * How long a request for a background check waits for it to end before
+ * answering 202: well inside the client's sixty seconds per request.
+ */
+const HOLD_MS = 20_000;
 
 /** How long the container runs after its last request. */
 export const IDLE_MS = 10 * 60_000;
@@ -527,7 +542,23 @@ export class GitEndpoint extends DurableObject<Env> {
 		const parsed = JSON.parse(plan);
 		const key =
 			kind === "copy" ? copyKey(parsed) : kind === "pull" ? pullKey(parsed) : await checkKey(kind, parsed);
-		const known = this.checks.collect(key);
+		let known = this.checks.collect(key);
+		if (known === undefined) {
+			if (peek) return new Response("no such check\n", { status: 404 });
+			// Held by `checks` and by `waitUntil`: the object stays up while the
+			// merger's requests keep arriving, and the promise is what they collect.
+			this.ctx.waitUntil(
+				this.checks.start(key, () => this.runCheck(kind, plan), kind === "copy" ? COPY_LIMIT_MS : CHECK_LIMIT_MS),
+			);
+			known = "running";
+		}
+		// Waiting here costs nothing (a request may run as long as its caller
+		// stays), so a check that ends within `HOLD_MS` is answered by the
+		// request that asked, not by one ten seconds later.
+		if (known === "running") {
+			await this.checks.settled(key, HOLD_MS);
+			known = this.checks.collect(key) ?? "running";
+		}
 		if (known === "running") return Response.json(CHECKING, { status: 202 });
 		if (known?.ok)
 			return new Response(known.json, {
@@ -535,14 +566,7 @@ export class GitEndpoint extends DurableObject<Env> {
 			});
 		// Only the merger asked, and Git's errors carry no credential (the
 		// plan passes them as a header): say why, so a failure is fixable.
-		if (known) return new Response(`newgit endpoint-${kind} failed: ${known.why.slice(-800)}\n`, { status: 502 });
-		if (peek) return new Response("no such check\n", { status: 404 });
-		// Held by `checks` and by `waitUntil`: the object stays up while the
-		// merger's polls keep arriving, and the promise is what they collect.
-		this.ctx.waitUntil(
-			this.checks.start(key, () => this.runCheck(kind, plan), kind === "copy" ? COPY_LIMIT_MS : CHECK_LIMIT_MS),
-		);
-		return Response.json(CHECKING, { status: 202 });
+		return new Response(`newgit endpoint-${kind} failed: ${known.why.slice(-800)}\n`, { status: 502 });
 	}
 
 	private async runCheck(kind: BackgroundKind, plan: string): Promise<CheckOutcome> {
