@@ -172,6 +172,8 @@ for is never taken by a nested definition, even if that file does not parse,
 and names are unique within a parent. Only a tracker in Git is defined
 inside another, and it needs a `mount` of its own.
 
+**Landing is moving to anchors:** see [anchoring.md](anchoring.md), a draft.
+
 **A tracker is named by its path (decided 2026-11-06).** A name is local to its
 parent, as a file's is to its directory: `repos.toml` and `.newgit/pins/repos`
 in `t3code`'s own tree, so that tree says nothing of where `t3code` sits. Two
