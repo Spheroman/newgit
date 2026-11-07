@@ -172,6 +172,8 @@ for is never taken by a nested definition, even if that file does not parse,
 and names are unique within a parent. Only a tracker in Git is defined
 inside another, and it needs a `mount` of its own.
 
+**Landing is moving to anchors:** see [anchoring.md](anchoring.md), a draft.
+
 **A tracker is named by its path (decided 2026-11-06).** A name is local to its
 parent, as a file's is to its directory: `repos.toml` and `.newgit/pins/repos`
 in `t3code`'s own tree, so that tree says nothing of where `t3code` sits. Two
@@ -781,6 +783,13 @@ history. That is the view an export target's `root` ships, children and all
 workspace `package.json`) is an error naming the parent to root at instead
 **(decided)**. Rooting at the parent automatically would quietly give you a
 repository you didn't ask for.
+
+**A tracker cannot be carved around another yet (decided 2026-11-06).** Carved
+around `lib`, `a` would not hold it: `lib` stays its old parent's, and a view
+rooted at `a` would lack `apps/a/lib`. Making it a child is a move, which changes
+its id, so `tracker create` refuses and names it. An export rooted at a tracker
+refuses too if a tracker from elsewhere sits inside it, which a definition
+written by hand can still arrange: it never loses files without a word.
 
 **Two trackers of one name are two trackers (decided 2026-11-06, replacing
 "the same tracker mounted twice").** A name is local to its parent, so a `ui`

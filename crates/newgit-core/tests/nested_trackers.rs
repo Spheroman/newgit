@@ -1081,3 +1081,71 @@ fn an_export_target_names_trackers_as_paths() {
         .expect("target");
     assert_eq!(target.trackers, ["root", "t3code__repos"]);
 }
+
+/// Found by the fuzz test: carved the other way round, the inner tracker stays
+/// root's, and a view rooted at the outer one silently lacks its files.
+#[test]
+fn a_tracker_cannot_be_carved_around_another() {
+    let (_guard, temp) = tempdir();
+    let (store, _, _) = imported(&temp);
+    let repo = store.paths().project_root.clone();
+    commit_as(
+        &repo,
+        "ana",
+        1_700_000_000,
+        &[("libs/inner/a.txt", "a\n"), ("libs/b.txt", "b\n")],
+        "Libraries",
+    );
+    manager(&store).merge("main", "main").expect("publish");
+    manager(&store)
+        .create_git_tracker("inner", "project-devs", &[Utf8PathBuf::from("libs/inner")])
+        .expect("carve the inner one");
+    let error = manager(&store)
+        .create_git_tracker("libs", "project-devs", &[Utf8PathBuf::from("libs")])
+        .expect_err("refused");
+    let text = error.to_string();
+    assert!(
+        text.contains("`inner`") && text.contains("carved around"),
+        "{text}"
+    );
+}
+
+/// A definition written by hand can still get there, and an export must not
+/// lose those files without a word.
+#[test]
+fn an_export_refuses_a_tracker_inside_its_root_that_is_not_its_child() {
+    let (_guard, temp) = tempdir();
+    let (store, _, github) = imported(&temp);
+    let repo = store.paths().project_root.clone();
+    export(&store);
+    let tip = git(&github, &["rev-parse", "newgit"]);
+    std::fs::write(
+        store.paths().trackers.join("stray.toml"),
+        "audience = \"project-devs\"\nstorage = \"local\"\ngit = true\nmount = \"apps/t3code/src\"\npaths = [\".\"]\n",
+    )
+    .expect("write");
+    git(&repo, &["add", "-A"]);
+    git(
+        &repo,
+        &[
+            "commit",
+            "-q",
+            "-m",
+            "A tracker inside t3code, defined by root",
+        ],
+    );
+    manager(&store).merge("main", "main").expect("publish");
+    let error = manager(&store)
+        .export_to_remote(TARGET, RemoteExportOptions::default())
+        .expect_err("refused");
+    let text = error.to_string();
+    assert!(
+        text.contains("`stray`") && text.contains("lose its files"),
+        "{text}"
+    );
+    assert_eq!(
+        git(&github, &["rev-parse", "newgit"]),
+        tip,
+        "nothing was sent"
+    );
+}

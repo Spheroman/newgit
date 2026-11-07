@@ -1597,6 +1597,22 @@ impl BranchManager {
             })
             .max_by_key(|tracker| tracker.mount.components().count())
             .cloned();
+        // Carved around a tracker, this one would not hold it: that tracker
+        // stays its old parent's, and a view rooted here would lack its files.
+        // Making it a child is a move, which changes its id.
+        if let Some(inside) = self.carved.iter().find(|tracker| {
+            tracker.mounted()
+                && tracker.mount != definition.mount
+                && tracker.mount.starts_with(&definition.mount)
+        }) {
+            return Err(NewgitError::Unsupported(format!(
+                "`{}` is mounted inside `{}`, and a tracker cannot be carved around another yet: \
+                 it would not become this one's child, and a view rooted here would lack its \
+                 files",
+                crate::tracker::tracker_path(&inside.name),
+                definition.mount
+            )));
+        }
         let parent_path = parent
             .as_ref()
             .map(|parent| crate::tracker::tracker_path(&parent.name));
@@ -8768,6 +8784,30 @@ impl BranchManager {
         root: &str,
         trackers: &[ExportedTracker],
     ) -> Result<()> {
+        // Mounted inside the root but not by it: a view rooted there lacks
+        // its files, and the target would lose them without a word.
+        let at = self
+            .carved
+            .iter()
+            .find(|definition| definition.name == root)
+            .map(|definition| definition.mount.clone());
+        if let Some(at) = at
+            && let Some(inside) = trackers.iter().find(|tracker| {
+                tracker.reason == ExportReason::Withheld
+                    && self.carved.iter().any(|definition| {
+                        definition.name == tracker.name
+                            && definition.mount != at
+                            && definition.mount.starts_with(&at)
+                    })
+            })
+        {
+            return Err(NewgitError::Unsupported(format!(
+                "`{}` is rooted at `{root}`, and `{}` is mounted inside it but belongs to another \
+                 tracker, so exporting would lose its files. Nothing was exported",
+                target.name,
+                crate::tracker::tracker_path(&inside.name)
+            )));
+        }
         let audience = |name: &str| {
             trackers
                 .iter()
