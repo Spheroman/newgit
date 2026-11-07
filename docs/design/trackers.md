@@ -782,6 +782,13 @@ workspace `package.json`) is an error naming the parent to root at instead
 **(decided)**. Rooting at the parent automatically would quietly give you a
 repository you didn't ask for.
 
+**A tracker cannot be carved around another yet (decided 2026-11-06).** Carved
+around `lib`, `a` would not hold it: `lib` stays its old parent's, and a view
+rooted at `a` would lack `apps/a/lib`. Making it a child is a move, which changes
+its id, so `tracker create` refuses and names it. An export rooted at a tracker
+refuses too if a tracker from elsewhere sits inside it, which a definition
+written by hand can still arrange: it never loses files without a word.
+
 **Two trackers of one name are two trackers (decided 2026-11-06, replacing
 "the same tracker mounted twice").** A name is local to its parent, so a `ui`
 in root and a `ui` in `app` are different trackers with different histories,
