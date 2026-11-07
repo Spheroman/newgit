@@ -10,7 +10,7 @@ const sha = (c: string) => c.repeat(40);
 async function project() {
 	const repos = new FakeRepos();
 	const name = `web-${crypto.randomUUID().slice(0, 8)}`;
-	const { token } = await issue(env, { kind: "login", login: "jack", ttlSeconds: LOGIN_TTL_SECONDS });
+	const { token, id } = await issue(env, { kind: "login", login: "jack", ttlSeconds: LOGIN_TTL_SECONDS });
 	const deps = {
 		repos,
 		fetcher: fetch,
@@ -22,7 +22,7 @@ async function project() {
 			new Request(`https://newgit.dev${route}`, {
 				method,
 				headers: { "content-type": "application/json", authorization: `Bearer ${token}` },
-				body: JSON.stringify(body),
+				body: body === undefined ? undefined : JSON.stringify(body),
 			}),
 			env,
 			deps,
@@ -34,16 +34,18 @@ async function project() {
 	await api("PUT", `/v1/projects/jack/${name}/branches/main`, {
 		list: { root: sha("a"), access: sha("b"), web: sha("c") },
 	});
-	const git = () =>
+	const gitAs = (who: string) =>
 		handle(
 			new Request(`https://newgit.dev/jack/${name}.git/info/refs?service=git-upload-pack`, {
-				headers: { authorization: `Basic ${btoa(`x:${token}`)}` },
+				headers: { authorization: `Basic ${btoa(`x:${who}`)}` },
 			}),
 			env,
 			deps,
 		);
-	return { git, token };
+	return { git: () => gitAs(token), gitAs, token, id, repos, api, name };
 }
+
+const header = (response: Response) => response.headers.get("server-timing") ?? "";
 
 describe("a Git request", () => {
 	it("says where its time went, and how many Artifacts calls it took", async () => {
@@ -68,5 +70,60 @@ describe("a Git request", () => {
 		expect(header).not.toContain("jack");
 		expect(header).not.toContain("access");
 		expect(header).not.toContain(token);
+	});
+
+	it("reuses the read passwords it minted, and records each once", async () => {
+		const { git, repos } = await project();
+		await git();
+		const minted = repos.minted.length;
+		const second = await git();
+		expect(second.status).toBe(200);
+		expect(repos.minted.length).toBe(minted);
+		expect(header(second)).not.toContain("mints;");
+		expect(header(second)).not.toContain("record;dur");
+	});
+
+	it("refuses a revoked token before any password is reused", async () => {
+		const { git, id, api, repos } = await project();
+		await git();
+		const minted = repos.minted.length;
+		expect((await api("DELETE", `/v1/tokens/${id}`, undefined)).status).toBe(200);
+		expect((await git()).status).toBe(401);
+		expect(repos.minted.length).toBe(minted);
+	});
+
+	it("mints again when a password is near expiring", async () => {
+		const { git, repos } = await project();
+		const mint = repos.mint.bind(repos);
+		repos.mint = async (name, scope) => ({
+			...(await mint(name, scope)),
+			expiresAt: new Date(Date.now() + 5 * 60_000).toISOString(),
+		});
+		const before = repos.minted.length;
+		await git();
+		const first = repos.minted.length - before;
+		expect(first).toBe(3);
+		await git();
+		expect(repos.minted.length - before).toBe(first * 2);
+	});
+
+	it("serves a removed member nothing, whatever it holds", async () => {
+		const { api, name, gitAs } = await project();
+		expect((await api("POST", `/v1/projects/jack/${name}/members`, { login: "ana" })).status).toBeLessThan(300);
+		const ana = (await issue(env, { kind: "login", login: "ana", ttlSeconds: LOGIN_TTL_SECONDS })).token;
+		expect((await gitAs(ana)).status).toBe(200);
+		expect((await api("DELETE", `/v1/projects/jack/${name}/members/ana`, undefined)).status).toBeLessThan(300);
+		expect((await gitAs(ana)).status).toBeGreaterThanOrEqual(400);
+	});
+
+	it("stops serving a tracker whose audience narrows, whatever it holds", async () => {
+		const { api, name, gitAs, repos } = await project();
+		expect((await api("POST", `/v1/projects/jack/${name}/members`, { login: "ana" })).status).toBeLessThan(300);
+		const ana = (await issue(env, { kind: "login", login: "ana", ttlSeconds: LOGIN_TTL_SECONDS })).token;
+		const served = await gitAs(ana);
+		expect(served.headers.get("server-timing")).toContain('trackers;desc="3"');
+		repos.write(`jack.${name}.t.access`, "web.toml", 'audience = "user:jack"\ngit = true\nmount = "web"\n');
+		const narrowed = await gitAs(ana);
+		expect(narrowed.headers.get("server-timing")).toContain('trackers;desc="2"');
 	});
 });
