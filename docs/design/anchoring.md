@@ -158,6 +158,7 @@ the source of truth, and a mirror may trail it.
 ## Build order
 
 1. Fuzz test compose and split round trips. Everything here leans on them.
+   **Done** (`crates/newgit-core/tests/compose_fuzz.rs`).
 2. Per-tracker heads and a log, behind today's API, keyed by tracker path rather
    than by project.
 3. Landing without the lock: objects first, then one compare-and-swap, still
