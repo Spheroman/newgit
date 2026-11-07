@@ -159,7 +159,8 @@ the source of truth, and a mirror may trail it.
 
 1. Fuzz test compose and split round trips. Everything here leans on them.
 2. Per-tracker heads and a log, behind today's API, keyed by tracker path rather
-   than by project.
+   than by project. **Heads and the log done** (`ProjectDO`'s `heads` and
+   `head_log`); keying them by path waits for step 8.
 3. Landing without the lock: objects first, then one compare-and-swap, still
    always at root. This alone removes the queue.
 4. Anchors, roll-up on read, and subscriptions. `merge` stops having to move root.

@@ -117,7 +117,14 @@ export class ProjectDO extends DurableObject<Env> {
 			CREATE TABLE IF NOT EXISTS checkpoints (
 				instance TEXT NOT NULL, id TEXT NOT NULL, created_by TEXT NOT NULL, agent TEXT,
 				created_at TEXT NOT NULL, record TEXT NOT NULL, PRIMARY KEY (instance, id));
+			CREATE TABLE IF NOT EXISTS heads (
+				branch TEXT NOT NULL, tracker TEXT NOT NULL, commit_id TEXT NOT NULL,
+				PRIMARY KEY (branch, tracker));
+			CREATE TABLE IF NOT EXISTS head_log (
+				seq INTEGER PRIMARY KEY AUTOINCREMENT, branch TEXT NOT NULL, tracker TEXT NOT NULL,
+				old TEXT, new TEXT, moved_by TEXT NOT NULL, moved_at TEXT NOT NULL);
 		`);
+		this.adoptLists();
 		// Projects made before private instances: add the column (a no-op error otherwise).
 		try {
 			this.sql.exec("ALTER TABLE instances ADD COLUMN private INTEGER NOT NULL DEFAULT 0");
@@ -127,6 +134,80 @@ export class ProjectDO extends DurableObject<Env> {
 		try {
 			this.sql.exec("ALTER TABLE forks ADD COLUMN complete INTEGER NOT NULL DEFAULT 1");
 		} catch {}
+	}
+
+	/**
+	 * Give every branch from before per-tracker heads its heads, from its
+	 * list, once. Logged as moved by nobody, from nothing: what was there.
+	 */
+	private adoptLists(): void {
+		const unadopted = this.sql
+			.exec<BranchRow>(
+				"SELECT * FROM branches WHERE name NOT IN (SELECT DISTINCT branch FROM heads)",
+			)
+			.toArray();
+		if (unadopted.length === 0) return;
+		this.ctx.storage.transactionSync(() => {
+			for (const row of unadopted) {
+				const list = JSON.parse(row.list) as TrackerList;
+				this.moveHeads(row.name, {}, list, "", row.updated_at);
+			}
+		});
+	}
+
+	/**
+	 * Set `name`'s heads from `from` to `to`, logging each tracker that moves,
+	 * and keep the branch's list in step. Run inside a transaction.
+	 *
+	 * The list is written too, so a Worker from before heads, after a rollback,
+	 * still reads the truth. It goes once no deploy can be rolled back past this.
+	 */
+	private moveHeads(name: string, from: TrackerList, to: TrackerList, by: string, at: string): void {
+		for (const tracker of new Set([...Object.keys(from), ...Object.keys(to)])) {
+			const old = from[tracker] ?? null;
+			const now = to[tracker] ?? null;
+			if (old === now) continue;
+			if (now === null) this.sql.exec("DELETE FROM heads WHERE branch = ? AND tracker = ?", name, tracker);
+			else this.sql.exec("INSERT OR REPLACE INTO heads VALUES (?, ?, ?)", name, tracker, now);
+			this.sql.exec(
+				"INSERT INTO head_log (branch, tracker, old, new, moved_by, moved_at) VALUES (?, ?, ?, ?, ?, ?)",
+				name,
+				tracker,
+				old,
+				now,
+				by,
+				at,
+			);
+		}
+		this.sql.exec("UPDATE branches SET list = ?, updated_at = ? WHERE name = ?", JSON.stringify(to), at, name);
+	}
+
+	/** Each tracker's head on `name`: what a branch's list is now. */
+	private headsOf(name: string): TrackerList {
+		const list: TrackerList = {};
+		for (const row of this.sql
+			.exec<{ tracker: string; commit_id: string }>(
+				"SELECT tracker, commit_id FROM heads WHERE branch = ? ORDER BY tracker",
+				name,
+			)
+			.toArray())
+			list[row.tracker] = row.commit_id;
+		return list;
+	}
+
+	/** Every head that moved on `name` after `since` (0: all of them), oldest first. */
+	headLog(name: string, since = 0): HeadMove[] {
+		return this.sql
+			.exec<HeadMoveRow>("SELECT * FROM head_log WHERE branch = ? AND seq > ? ORDER BY seq", name, since)
+			.toArray()
+			.map((row) => ({
+				seq: row.seq,
+				tracker: row.tracker,
+				old: row.old,
+				new: row.new,
+				movedBy: row.moved_by,
+				movedAt: row.moved_at,
+			}));
 	}
 
 	/** Create the project. Returns false when it already exists. */
@@ -176,11 +257,14 @@ export class ProjectDO extends DurableObject<Env> {
 
 	branch(name: string): Branch | null {
 		const row = this.sql.exec<BranchRow>("SELECT * FROM branches WHERE name = ?", name).toArray()[0];
-		return row ? toBranch(row) : null;
+		return row ? { ...toBranch(row), list: this.headsOf(name) } : null;
 	}
 
 	branches(): Branch[] {
-		return this.sql.exec<BranchRow>("SELECT * FROM branches ORDER BY name").toArray().map(toBranch);
+		return this.sql
+			.exec<BranchRow>("SELECT * FROM branches ORDER BY name")
+			.toArray()
+			.map((row) => ({ ...toBranch(row), list: this.headsOf(row.name) }));
 	}
 
 	/**
@@ -191,7 +275,10 @@ export class ProjectDO extends DurableObject<Env> {
 	createBranch(name: string, list: TrackerList, by: string): Branch | null {
 		if (this.branch(name) !== null) return null;
 		const now = new Date().toISOString();
-		this.sql.exec("INSERT INTO branches VALUES (?, ?, ?, ?, ?)", name, JSON.stringify(list), by, now, now);
+		this.ctx.storage.transactionSync(() => {
+			this.sql.exec("INSERT INTO branches VALUES (?, ?, ?, ?, ?)", name, JSON.stringify(list), by, now, now);
+			this.moveHeads(name, {}, list, by, now);
+		});
 		return this.branch(name);
 	}
 
@@ -260,13 +347,10 @@ export class ProjectDO extends DurableObject<Env> {
 		if (lock === null || lock.by !== by || Date.parse(lock.until) <= Date.now())
 			return { ok: false, reason: "unlocked" };
 		if (!sameList(branch.list, base)) return { ok: false, reason: "moved", list: branch.list };
-		this.sql.exec(
-			"UPDATE branches SET list = ?, updated_at = ? WHERE name = ?",
-			JSON.stringify(list),
-			new Date().toISOString(),
-			name,
-		);
-		this.sql.exec("DELETE FROM meta WHERE key = ?", `merge:${name}`);
+		this.ctx.storage.transactionSync(() => {
+			this.moveHeads(name, base, list, by, new Date().toISOString());
+			this.sql.exec("DELETE FROM meta WHERE key = ?", `merge:${name}`);
+		});
 		return { ok: true, branch: this.branch(name)!, tokens: lock.tokens ?? [] };
 	}
 
@@ -597,6 +681,26 @@ interface InstanceRow extends Record<string, SqlStorageValue> {
 	created_at: string;
 	updated_at: string;
 	private: number;
+}
+
+/** One head moving: `old` null when the tracker joined, `new` null when it left. */
+export interface HeadMove {
+	seq: number;
+	tracker: string;
+	old: string | null;
+	new: string | null;
+	/** Empty for heads adopted from a list made before heads. */
+	movedBy: string;
+	movedAt: string;
+}
+
+interface HeadMoveRow extends Record<string, SqlStorageValue> {
+	seq: number;
+	tracker: string;
+	old: string | null;
+	new: string | null;
+	moved_by: string;
+	moved_at: string;
 }
 
 interface BranchRow extends Record<string, SqlStorageValue> {
