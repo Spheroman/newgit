@@ -200,6 +200,7 @@ fn a_pin_of_a_commit_root_already_has_is_not_cut() {
     );
     let absent = snapshots::fetch_pins(
         &project,
+        "root",
         std::slice::from_ref(&tip),
         &BTreeMap::new(),
         &mut |_| Ok(Some(source(&child))),

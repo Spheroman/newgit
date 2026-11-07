@@ -25,8 +25,8 @@ describe("a tracker defined inside another", () => {
 	it("is found in its parent, mounted relative to it, and held by it", async () => {
 		const fake = await repos();
 		fake.write(repo("t3code"), ".newgit/trackers/vendored.toml", definition("user:ana", ".repos"));
-		const facts = await loadDefinitions(fake, project, ["t3code", "vendored"]);
-		const vendored = facts.get("vendored");
+		const facts = await loadDefinitions(fake, project, ["t3code", "t3code__vendored"]);
+		const vendored = facts.get("t3code__vendored");
 		expect(vendored?.mount).toBe("apps/t3code/.repos");
 		expect(vendored?.source).toBe("t3code");
 		expect(vendored?.git).toBe(true);
@@ -34,12 +34,12 @@ describe("a tracker defined inside another", () => {
 	});
 
 	it("is found through a parent that is itself nested", async () => {
-		const fake = await repos(["vendored"]);
+		const fake = await repos(["t3code__vendored"]);
 		fake.write(repo("t3code"), ".newgit/trackers/vendored.toml", definition("project-devs", ".repos"));
-		fake.write(repo("vendored"), ".newgit/trackers/effect.toml", definition("project-devs", "effect"));
-		const facts = await loadDefinitions(fake, project, ["t3code", "vendored", "effect"]);
-		expect(facts.get("effect")?.mount).toBe("apps/t3code/.repos/effect");
-		expect(facts.get("effect")?.source).toBe("vendored");
+		fake.write(repo("t3code__vendored"), ".newgit/trackers/effect.toml", definition("project-devs", "effect"));
+		const facts = await loadDefinitions(fake, project, ["t3code", "t3code__vendored", "t3code__vendored__effect"]);
+		expect(facts.get("t3code__vendored__effect")?.mount).toBe("apps/t3code/.repos/effect");
+		expect(facts.get("t3code__vendored__effect")?.source).toBe("t3code__vendored");
 	});
 
 	it("cannot redefine a tracker `access` defines", async () => {
@@ -59,15 +59,18 @@ describe("a tracker defined inside another", () => {
 		expect(facts.has("billing")).toBe(false);
 	});
 
-	// Otherwise whoever maintains a tracker that sorts first decides the
-	// audience of a child that is not theirs.
-	it("leaves a name two trackers define undefined", async () => {
+	// The id says whose it is, so another tracker's maintainers cannot answer
+	// for a child that is not theirs.
+	it("is read only from the parent its id names", async () => {
 		const fake = await repos(["plugins"]);
 		fake.write(repo("access"), "plugins.toml", definition("project-devs", "apps/plugins"));
 		fake.write(repo("t3code"), ".newgit/trackers/vendored.toml", definition("user:ana", ".repos"));
 		fake.write(repo("plugins"), ".newgit/trackers/vendored.toml", definition("public", "vendored"));
-		const facts = await loadDefinitions(fake, project, ["plugins", "t3code", "vendored"]);
-		expect(facts.has("vendored")).toBe(false);
+		const facts = await loadDefinitions(fake, project, ["plugins", "t3code", "t3code__vendored", "plugins__vendored"]);
+		expect(facts.get("t3code__vendored")?.source).toBe("t3code");
+		expect(facts.get("t3code__vendored")?.mount).toBe("apps/t3code/.repos");
+		expect(facts.get("plugins__vendored")?.source).toBe("plugins");
+		expect(facts.get("plugins__vendored")?.mount).toBe("apps/plugins/vendored");
 	});
 
 	it("leaves a tracker nobody defines undefined", async () => {
@@ -104,7 +107,7 @@ describe("merging a tracker defined inside another", () => {
 			);
 			return { status: response.status, body: (await response.json()) as any };
 		};
-		const main = { root: sha("a"), access: sha("b"), t3code: sha("c"), vendored: sha("d") };
+		const main = { root: sha("a"), access: sha("b"), t3code: sha("c"), t3code__vendored: sha("d") };
 		const path = (rest: string) => `/v1/projects/jack/${name}${rest}`;
 		await call(jack, "POST", "/v1/projects", { name, trackers: Object.keys(main) });
 		await call(jack, "PUT", path("/branches/main"), { list: main });
@@ -114,11 +117,11 @@ describe("merging a tracker defined inside another", () => {
 		const merge = (token: string) =>
 			call(token, "POST", path("/branches/main/merge"), {
 				base: main,
-				list: { ...main, root: sha("1"), vendored: sha("2") },
+				list: { ...main, root: sha("1"), t3code__vendored: sha("2") },
 			});
 		const refused = await merge(jack);
 		expect(refused.status).toBe(403);
-		expect(refused.body.error).toContain("only ana maintains `vendored`");
+		expect(refused.body.error).toContain("only ana maintains `t3code__vendored`");
 		expect((await merge(ana)).status).toBe(200);
 	});
 });

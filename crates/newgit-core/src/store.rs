@@ -14,7 +14,9 @@ use crate::installs::InstallStore;
 use crate::lock::InstanceLock;
 use crate::materializer::{WorkspaceMarker, create_dir_all};
 use crate::resource::ResourceDefinition;
-use crate::tracker::{TrackerDefinition, resolve_ownership};
+use crate::tracker::{
+    ID_SEPARATOR, TrackerDefinition, child_id, leaf_name, name_fits_id, resolve_ownership,
+};
 
 const LOCAL_GITIGNORE: &str = "\
 # newgit local state — never committed
@@ -404,9 +406,15 @@ impl MetadataStore {
             let Some(name) = entry.file_stem() else {
                 continue;
             };
+            // Its id could be a child's, and two trackers would share refs.
+            if !name_fits_id(name) {
+                eprintln!("newgit: ignoring {entry}: `{name}` cannot be a tracker's name");
+                continue;
+            }
             definitions.push(TrackerDefinition::from_file(name, &entry)?);
         }
         self.load_nested_definitions(&mut definitions)?;
+        resolve_requires(&mut definitions);
         resolve_ownership(&mut definitions)?;
         Ok(definitions)
     }
@@ -433,6 +441,8 @@ impl MetadataStore {
             if !dir.is_dir() || metadata.join("config.toml").is_file() {
                 continue;
             }
+            // The rules a child is held to are [`crate::compose`]'s too, so
+            // what is skipped here is nobody's child there either.
             for entry in read_dir_sorted(&dir)? {
                 if entry.extension() != Some("toml") {
                     continue;
@@ -440,6 +450,10 @@ impl MetadataStore {
                 let Some(name) = entry.file_stem() else {
                     continue;
                 };
+                // A tracker's definition of itself, which compose ignores too.
+                if name == leaf_name(&parent) {
+                    continue;
+                }
                 let skipped = match TrackerDefinition::from_file(name, &entry) {
                     Err(error) => Err(error.to_string()),
                     Ok(child) if !child.git => {
@@ -448,7 +462,14 @@ impl MetadataStore {
                     Ok(child) if !child.mounted() => {
                         Err("it needs a `mount` of its own inside its parent".to_owned())
                     }
-                    Ok(_) if definitions.iter().any(|other| other.name == name) => {
+                    Ok(_) if !name_fits_id(name) => {
+                        Err(format!("`{name}` cannot be a tracker's name"))
+                    }
+                    Ok(_)
+                        if definitions
+                            .iter()
+                            .any(|other| other.name == child_id(&parent, name)) =>
+                    {
                         Err("a tracker of that name already exists".to_owned())
                     }
                     Ok(child) => Ok(child),
@@ -551,7 +572,12 @@ impl MetadataStore {
             let Some(name) = entry.file_stem() else {
                 continue;
             };
-            targets.push(ExportTarget::from_file(name, &entry)?);
+            let mut target = ExportTarget::from_file(name, &entry)?;
+            // Written as paths from the top of the project.
+            let id = |path: &str| path.replace('/', ID_SEPARATOR);
+            target.root = target.root.as_deref().map(id);
+            target.trackers = target.trackers.iter().map(|path| id(path)).collect();
+            targets.push(target);
         }
         Ok(targets)
     }
@@ -954,6 +980,38 @@ pub(crate) fn read_dir_sorted(path: &Utf8Path) -> Result<Vec<Utf8PathBuf>> {
     }
     entries.sort();
     Ok(entries)
+}
+
+/// A nested definition's `requires` says what it needs as a path from its
+/// parent's tree, as the rest of that tree does: `vendor` is its sibling, and
+/// `../shared` goes up. Anything that names no tracker from there is left as
+/// written, for a role or a tracker at the top of the project.
+fn resolve_requires(definitions: &mut [TrackerDefinition]) {
+    let ids: Vec<String> = definitions
+        .iter()
+        .map(|definition| definition.name.clone())
+        .collect();
+    for definition in definitions {
+        let Some(parent) = definition.parent.clone() else {
+            continue;
+        };
+        for needed in &mut definition.requires {
+            let mut path: Vec<&str> = parent.split(ID_SEPARATOR).collect();
+            for part in needed.split('/') {
+                match part {
+                    "" | "." => {}
+                    ".." => {
+                        path.pop();
+                    }
+                    name => path.push(name),
+                }
+            }
+            let id = path.join(ID_SEPARATOR);
+            if ids.contains(&id) {
+                *needed = id;
+            }
+        }
+    }
 }
 
 #[cfg(test)]

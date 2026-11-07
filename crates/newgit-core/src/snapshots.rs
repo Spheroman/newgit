@@ -145,7 +145,7 @@ fn root_walk(repo: &Utf8Path, tips: &[String]) -> Result<HashSet<String>> {
         .collect())
 }
 
-/// Fetch whichever of the commits root's history from `tips` pins, and those
+/// Fetch whichever of the commits `root`'s history from `tips` pins, and those
 /// commits pin in turn, `repo` does not have, each one commit deep, from
 /// the repo `source` names for its tracker (`None`: not one to fetch, as a
 /// tracker this person may not read). `extra` (tracker → commit) are fetched
@@ -156,6 +156,7 @@ fn root_walk(repo: &Utf8Path, tips: &[String]) -> Result<HashSet<String>> {
 /// and if it is whole, that cuts whatever history it is on.
 pub fn fetch_pins(
     repo: &Utf8Path,
+    root: &str,
     tips: &[String],
     extra: &BTreeMap<String, String>,
     source: &mut dyn FnMut(&str) -> Result<Option<Source>>,
@@ -166,6 +167,7 @@ pub fn fetch_pins(
     for commit in root_walk(repo, tips)? {
         let found = objects.commit(&commit)?;
         for (child, pin) in compose::pins_in(&mut objects, &found.tree)? {
+            let child = crate::tracker::child_id(root, &child);
             if seen.insert((child.clone(), pin.clone())) {
                 level.entry(child).or_default().insert(pin);
             }
@@ -209,12 +211,13 @@ pub fn fetch_pins(
             objects = Objects::open(repo)?;
         }
         let mut next: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
-        for commits in level.values() {
+        for (tracker, commits) in &level {
             for commit in commits {
                 let Some(found) = objects.try_commit(commit)? else {
                     continue;
                 };
                 for (child, pin) in compose::pins_in(&mut objects, &found.tree)? {
+                    let child = crate::tracker::child_id(tracker, &child);
                     if seen.insert((child.clone(), pin.clone())) {
                         next.entry(child).or_default().insert(pin);
                     }

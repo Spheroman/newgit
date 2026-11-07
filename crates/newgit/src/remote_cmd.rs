@@ -447,6 +447,7 @@ fn fetch_project(
             .collect();
         let absent = newgit_core::snapshots::fetch_pins(
             dir,
+            "root",
             std::slice::from_ref(&list["root"]),
             &named,
             &mut |tracker| Ok(sources.get(tracker).cloned()),

@@ -71,6 +71,43 @@ pub struct TrackerDefinition {
 /// The tracker owning everything no other tracker claims.
 pub const ROOT_TRACKER: &str = "root";
 
+/// What joins a tracker's id to its parent's: `t3code__repos` is the child
+/// `repos` of `t3code`. An id is what refs, records, and remote repos hold; a
+/// slash would land inside the parent's own ref space and is no part of a
+/// remote repo's name. People see paths ([`tracker_path`]). Reserved, so no
+/// one tracker's name can look like two.
+pub const ID_SEPARATOR: &str = "__";
+
+/// The id of `parent`'s child `name`, which is the name a pin and a definition
+/// file have in `parent`'s own tree. Root's children are their own ids.
+pub fn child_id(parent: &str, name: &str) -> String {
+    if parent == ROOT_TRACKER {
+        name.to_owned()
+    } else {
+        format!("{parent}{ID_SEPARATOR}{name}")
+    }
+}
+
+/// The name `id` has in its parent's tree.
+pub fn leaf_name(id: &str) -> &str {
+    id.rsplit(ID_SEPARATOR).next().unwrap_or(id)
+}
+
+/// Whether `name` can be part of an id: no `__`, which joins an id's parts, and
+/// no `_` at either end, which would run into the join (`a_` + `b` and `a` +
+/// `_b` would both be `a___b`).
+pub fn name_fits_id(name: &str) -> bool {
+    !name.contains(ID_SEPARATOR) && !name.starts_with('_') && !name.ends_with('_')
+}
+
+/// The most an id can hold: a remote repo's name gives it one part of 63.
+pub const MAX_ID_LEN: usize = 63;
+
+/// The tracker's path from the top of its project: `t3code/repos`.
+pub fn tracker_path(id: &str) -> String {
+    id.replace(ID_SEPARATOR, "/")
+}
+
 /// The tracker that carried `.newgit/` before it folded into the root
 /// tracker (docs/design/trackers.md, *Migration*). Only `newgit tracker
 /// migrate` still knows it.
@@ -247,6 +284,7 @@ impl TrackerDefinition {
         self.paths = self.paths.iter().map(place).collect();
         self.exclusions = self.exclusions.iter().map(place).collect();
         self.mount = place(&self.mount);
+        self.name = child_id(parent, &self.name);
         self.parent = Some(parent.to_owned());
     }
 

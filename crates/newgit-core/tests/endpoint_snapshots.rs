@@ -377,7 +377,7 @@ fn plan_for(project: &Published, container: &Utf8Path, readable: &[&str]) -> Pla
     }
 }
 
-const EVERYONE: [&str; 5] = ["root", "access", "app", "lib", "t3code"];
+const EVERYONE: [&str; 5] = ["root", "access", "app", "app__lib", "t3code"];
 
 #[test]
 fn snapshots_compose_the_ids_whole_histories_do_for_every_reader() {
@@ -389,13 +389,13 @@ fn snapshots_compose_the_ids_whole_histories_do_for_every_reader() {
     let readers: [&[&str]; 6] = [
         &EVERYONE,
         // Can't read a child.
-        &["root", "access", "app", "lib"],
+        &["root", "access", "app", "app__lib"],
         // Can't read a child, and so nothing mounted inside it.
         &["root", "access", "t3code"],
         // Can read a child but not what it mounts.
         &["root", "access", "app", "t3code"],
         // Can't read `access`, which says where everything is mounted.
-        &["root", "app", "lib", "t3code"],
+        &["root", "app", "app__lib", "t3code"],
         &["root"],
     ];
     for readable in readers {

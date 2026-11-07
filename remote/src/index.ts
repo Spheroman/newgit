@@ -1278,8 +1278,8 @@ function nextHolders(facts: Map<string, TrackerFacts>, holder: Map<string, strin
  *
  * A tracker `access` does not name may be defined inside a mounted tracker in
  * Git, in that tracker's own `.newgit/trackers/`: its child, governed by it
- * (see [`addNested`]). `access` wins any name it defines, so a tracker cannot
- * redefine one it does not own, and a name two trackers define is nobody's.
+ * (see [`addNested`]). Its id, `t3code__repos`, names that parent, so a tracker
+ * cannot define another's child, and `access` keeps every name it defines.
  */
 export async function loadDefinitions(
 	repos: Repos,
@@ -1332,15 +1332,15 @@ export async function loadDefinitions(
 	return facts;
 }
 
+/** What joins a tracker's id to its parent's, as `t3code__repos`. */
+const ID_SEPARATOR = "__";
+
 /**
- * Add the trackers in `names` that `facts` lacks and a mounted tracker in Git
- * defines in its own tree, as the client's `load_nested_definitions` does:
- * mounted relative to that parent, and held by it. A child can be a parent, so
- * this goes one level of mounts at a time.
- *
- * Fails closed: a name more than one tracker defines stays undefined. Taking
- * the first would let the maintainers of any tracker that sorts earlier
- * rewrite the audience of a child that is not theirs.
+ * Add the trackers in `names` that `facts` lacks and whose id says a mounted
+ * tracker in Git defines them: `t3code__repos` is `repos.toml` in `t3code`'s
+ * own tree, mounted relative to it, and held by it. The id names the one
+ * place to look, so no other tracker can answer for it. A child can be a
+ * parent, so this goes one level of mounts at a time.
  */
 async function addNested(
 	repos: Repos,
@@ -1349,27 +1349,18 @@ async function addNested(
 	facts: Map<string, TrackerFacts>,
 	names: string[],
 ): Promise<void> {
-	for (let level = 0; level < 4; level++) {
-		const missing = names.filter((name) => !facts.has(name));
-		if (missing.length === 0) return;
-		const parents = [...facts].filter(
-			([, parent]) => parent.git && parent.mount !== "." && parent.mount !== ACCESS_MOUNT,
-		);
-		let found = false;
-		for (const name of missing) {
-			const defining: { parent: string; mount: string; text: string }[] = [];
-			for (const [parent, { mount }] of parents) {
-				const repo = repoName({ kind: "tracker", project, tracker: parent });
-				const text = await repos.readFile(repo, branch, `${ACCESS_MOUNT}/${name}.toml`);
-				if (text !== null) defining.push({ parent, mount, text });
-			}
-			const only = defining.length === 1 ? defining[0] : undefined;
-			const read = only === undefined ? undefined : parseFacts(only.text, only.parent);
-			if (only === undefined || read === undefined) continue;
-			facts.set(name, { ...read, mount: placeClaim(only.mount, read.mount) });
-			found = true;
-		}
-		if (!found) return;
+	const nested = names.filter((name) => name.includes(ID_SEPARATOR));
+	nested.sort((left, right) => left.split(ID_SEPARATOR).length - right.split(ID_SEPARATOR).length);
+	for (const name of nested) {
+		const at = name.lastIndexOf(ID_SEPARATOR);
+		const parent = name.slice(0, at);
+		const holder = facts.get(parent);
+		if (holder === undefined || !holder.git || holder.mount === "." || holder.mount === ACCESS_MOUNT) continue;
+		const repo = repoName({ kind: "tracker", project, tracker: parent });
+		const stem = name.slice(at + ID_SEPARATOR.length);
+		const text = await repos.readFile(repo, branch, `${ACCESS_MOUNT}/${stem}.toml`);
+		const read = text === null ? undefined : parseFacts(text, parent);
+		if (read !== undefined) facts.set(name, { ...read, mount: placeClaim(holder.mount, read.mount) });
 	}
 }
 

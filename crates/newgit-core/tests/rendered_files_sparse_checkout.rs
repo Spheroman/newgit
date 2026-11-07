@@ -580,7 +580,7 @@ fn tracker_drop_leaves_a_file_written_again_in_a_nested_dropped_trackers_paths()
         .branch
         .workspace_path;
     manager
-        .drop_tracker("x", "inner", Uncommitted::Refuse)
+        .drop_tracker("x", "b__inner", Uncommitted::Refuse)
         .expect("drop inner");
     write(
         &workspace,
@@ -598,6 +598,6 @@ fn tracker_drop_leaves_a_file_written_again_in_a_nested_dropped_trackers_paths()
     );
 
     manager.use_tracker("x", "b").expect("use b");
-    manager.use_tracker("x", "inner").expect("use inner");
+    manager.use_tracker("x", "b__inner").expect("use inner");
     assert_eq!(status(&workspace), " M apps/b/inner/x.js");
 }

@@ -67,7 +67,9 @@ at the carve. Carved inside another mounted tracker, it is that tracker's
 child, defined in that tracker's own `.newgit/trackers/`: bound only where its
 parent is, and brought along with it unless its own `priority` is negative. So
 a large directory can stay out of workspaces while the parent's own repository
-still holds it. Without `--git` a tracker stays outside Git: captured, never
+still holds it. Trackers are named like files: `t3code/repos` from the top of a
+project, `repos` from inside `apps/t3code`, `..` to go up, and a leading `/` for
+the full path, such as `/remote/<owner>/<project>/t3code/repos`. Without `--git` a tracker stays outside Git: captured, never
 committed.
 
 An instance works on what it binds:

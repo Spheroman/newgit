@@ -239,6 +239,7 @@ impl Stores {
                         continue;
                     };
                     for (child, pin) in compose::pins_in(&mut objects, &found.tree)? {
+                        let child = crate::tracker::child_id(tracker, &child);
                         if repos.contains_key(&child) && seen.insert((child.clone(), pin.clone())) {
                             next.entry(child).or_default().insert(pin);
                         }
