@@ -2512,10 +2512,18 @@ impl BranchManager {
         let dropped = if slug == PROJECT_ROOT_INSTANCE {
             BTreeSet::new()
         } else {
-            self.store
-                .find_branch(slug)
-                .map(|branch| branch.dropped)
-                .unwrap_or_default()
+            let branch = self.store.find_branch(slug).ok();
+            if let Some(branch) = &branch {
+                // Failing leaves the split to make commits of its own, which
+                // work, but a mirror will see as new.
+                if let Err(error) = self.learn_view_from(&branch.workspace_path, tip) {
+                    eprintln!(
+                        "newgit: could not read what the remote made of `main`, so commits \
+                         exported from `{slug}` may not match a mirror's: {error}"
+                    );
+                }
+            }
+            branch.map(|branch| branch.dropped).unwrap_or_default()
         };
         let outcome = self.split_view(tip, &dropped)?;
         let branch = format!("instances/{slug}");
@@ -2686,17 +2694,73 @@ impl BranchManager {
         )) else {
             return Ok(());
         };
-        let shared = self.source.merge_base(tip, &fetched)?;
-        if crate::compose::read_root(&project, &shared)?.is_some() {
+        self.learn_view(link, Acting::Login, &project, tip, &fetched)
+    }
+
+    /// [`Self::learn_pulled_view`] for an instance, against what its workspace
+    /// fetched: a workspace's `git pull` brings view commits this repo's own
+    /// `origin` has not heard of, and without their notes a split would make
+    /// root commits of its own that have lost what a mirror merged.
+    fn learn_view_from(&self, workspace: &Utf8Path, tip: &str) -> Result<()> {
+        let Some(link) = &self.remote else {
+            return Ok(());
+        };
+        let main = format!("refs/remotes/{PUBLISH_REMOTE}/{PROJECT_ROOT_INSTANCE}");
+        let Ok(fetched) = crate::source::run_git_env(
+            &[
+                "-C",
+                workspace.as_str(),
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                &main,
+            ],
+            &[],
+        ) else {
+            return Ok(());
+        };
+        // Not merged yet, so not in anything being split.
+        if self
+            .source
+            .rev_parse(&format!("{fetched}^{{commit}}"))
+            .is_err()
+        {
             return Ok(());
         }
-        let client = link.connect(Acting::Login)?;
+        let project = self.store.paths().project_root.clone();
+        // As the workspace: a push from it may have no login behind it.
+        self.learn_view(link, Acting::Workspace(workspace), &project, tip, &fetched)
+    }
+
+    /// Note the view commits `tip` shares with `fetched`, the remote's `main`,
+    /// by composing that `main` here, unless the commit they share is noted.
+    fn learn_view(
+        &self,
+        link: &RemoteLink,
+        acting: Acting<'_>,
+        project: &Utf8Path,
+        tip: &str,
+        fetched: &str,
+    ) -> Result<()> {
+        let shared = self.source.merge_base(tip, fetched)?;
+        // A note is only as good as its root commit: one this repo split for
+        // itself is not the one the remote made, and has lost what a mirror
+        // merged. Composing `main` below writes the right one over it.
+        let remote_root = self.source.rev_parse(ROOT_MAIN_ON_REMOTE).ok();
+        if let Some((_, root)) = crate::compose::read_root(project, &shared)?
+            && remote_root
+                .is_some_and(|remote| self.source.is_ancestor(&root, &remote).unwrap_or(true))
+        {
+            return Ok(());
+        }
+        let client = link.connect(acting)?;
         let list = self.branch_list(
             Some((client.as_ref(), link.project.as_str())),
             PROJECT_ROOT_INSTANCE,
         )?;
         if let Some(root) = list.get(&self.root.name) {
             self.compose_here("refs/newgit/views/branches/main", root)?;
+            self.source.update_ref(ROOT_MAIN_ON_REMOTE, root)?;
         }
         Ok(())
     }
