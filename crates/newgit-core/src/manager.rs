@@ -13587,6 +13587,15 @@ fn off_branch_warning(
     )
 }
 
+/// Where the tracker store remembers what it last sent to `repo`'s
+/// `destination`: a ref, so Git keeps the commit it names.
+fn sent_ref(repo: &str, destination: &str) -> String {
+    format!(
+        "refs/newgit/sent/{repo}/{}",
+        destination.trim_start_matches("refs/")
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use std::ffi::OsString;
@@ -13672,13 +13681,4 @@ mod tests {
             "and its target is not created"
         );
     }
-}
-
-/// Where the tracker store remembers what it last sent to `repo`'s
-/// `destination`: a ref, so Git keeps the commit it names.
-fn sent_ref(repo: &str, destination: &str) -> String {
-    format!(
-        "refs/newgit/sent/{repo}/{}",
-        destination.trim_start_matches("refs/")
-    )
 }
