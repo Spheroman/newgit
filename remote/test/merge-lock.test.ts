@@ -77,7 +77,7 @@ describe("a merge whose finish waits on a long check", () => {
 		expect((await call(jack, "POST", path("/branches/main/merge"), { base: main, list: moved })).status).toBe(200);
 		const handed = repos.minted.slice(before).map((token) => token.id);
 		expect(handed.length).toBeGreaterThan(0);
-		vi.setSystemTime(Date.now() + 41 * 60 * 1000);
+		vi.setSystemTime(Date.now() + 71 * 60 * 1000);
 		const other = { ...main, root: sha("e") };
 		expect((await call(jack, "POST", path("/branches/main/merge"), { base: main, list: other })).status).toBe(200);
 		expect(handed.every((id) => repos.revokedTokens.has(id))).toBe(true);

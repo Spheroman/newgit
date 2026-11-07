@@ -39,6 +39,11 @@ interface PendingMerge {
 	tokens: HandedToken[];
 	/** Past this it is forgotten and its passwords cancelled. */
 	until: string;
+	/**
+	 * It landed. Kept until `until`, so a finish asked again (one whose
+	 * answer never arrived) can still follow, with the moves it was allowed.
+	 */
+	landed?: boolean;
 }
 
 export type MergeStart =
@@ -368,8 +373,17 @@ export class ProjectDO extends DurableObject<Env> {
 		if (branch === null) return { ok: false, reason: "missing" };
 		const merge = this.pendingMerge(name, list);
 		const done = { tokens: merge?.tokens ?? [], writes: merge?.writes ?? [] };
+		// Kept as landed, its passwords handed back once to cancel.
+		const landed = () => {
+			if (merge !== null)
+				this.sql.exec(
+					"INSERT OR REPLACE INTO meta VALUES (?, ?)",
+					pendingKey(name, list),
+					JSON.stringify({ ...merge, tokens: [], landed: true }),
+				);
+		};
 		if (sameList(branch.list, list)) {
-			this.sql.exec("DELETE FROM meta WHERE key = ?", pendingKey(name, list));
+			landed();
 			return { ok: true, branch, ...done, already: true };
 		}
 		const moving = [...new Set([...Object.keys(base), ...Object.keys(list), "root"])].filter(
@@ -379,7 +393,7 @@ export class ProjectDO extends DurableObject<Env> {
 			return { ok: false, reason: "moved", list: branch.list };
 		this.ctx.storage.transactionSync(() => {
 			this.moveHeads(name, branch.list, list, by, new Date().toISOString());
-			this.sql.exec("DELETE FROM meta WHERE key = ?", pendingKey(name, list));
+			landed();
 		});
 		return { ok: true, branch: this.branch(name)!, ...done, already: false };
 	}

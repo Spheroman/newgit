@@ -195,10 +195,15 @@ impl Stores {
                 "newgit: `{tracker}`'s repo refused pinned commits {commits:?}: fetching its \
                  whole history to settle it"
             );
+            // A merge's commit waits at a landing ref until it lands, and an
+            // index check pins it before then.
             GitSource::fetch_refs(
                 &[&format!("--git-dir={}", self.whole)],
                 &source.url,
-                &[format!("+refs/heads/*:refs/trackers/{tracker}/heads/*")],
+                &[
+                    format!("+refs/heads/*:refs/trackers/{tracker}/heads/*"),
+                    format!("+refs/newgit/landing/*:refs/trackers/{tracker}/landing/*"),
+                ],
                 Some(&source.auth),
             )?;
             let (reachable, absent): (Vec<String>, Vec<String>) = commits

@@ -89,6 +89,11 @@ async function followRoot(repos: Repos, heads: Heads, name: string, branch: stri
 				updates.push({ ref: `refs/newgit/stray/${held}`, old: null, new: held });
 		}
 		if (refs[landing] !== undefined) updates.push({ ref: landing, old: refs[landing], new: null });
+		// A landing that followed before this one's head moved on leaves its
+		// own: any landed commit's landing ref goes.
+		for (const [other, commit] of Object.entries(refs))
+			if (other.startsWith("refs/newgit/landing/") && other !== landing && (await heads.wasHead(branch, "root", commit)))
+				updates.push({ ref: other, old: commit, new: null });
 		if (updates.length === 0) return null;
 		const moved = await repos.updateRefs(name, updates);
 		if (held === head || moved[ref]) return null;

@@ -608,8 +608,9 @@ polling mints nothing. Those passwords go only to the container, never to
 the merger, and are recorded against the merger's token like any other, so
 revoking it revokes them. The client asks again every ten seconds while it gets
 202, says so once a minute, and gives up after an hour; every request is
-short. Nothing is held while it does: the merge is remembered for forty
-minutes, and its passwords for ten, which is enough to push. The checks are held in the object's
+short. Nothing is held while it does: the merge is remembered for seventy
+minutes (past the client's hour, and for a finish asked again after it
+lands, which follows again), and its passwords for ten, enough to push. The checks are held in the object's
 memory and in `waitUntil`; the polls are what keep the object alive. An
 object evicted mid-check forgets it, and the next request starts it again,
 against a store that keeps what the first fetched.

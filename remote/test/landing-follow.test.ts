@@ -133,12 +133,30 @@ describe("a landing", () => {
 		expect(refs[`refs/newgit/stray/${sha("7")}`]).toBe(sha("7"));
 	});
 
-	it("finished again after it landed (a run that never heard), says it landed", async () => {
-		const moved = { ...main, root: sha("c") };
-		expect((await merge(moved)).status).toBe(200);
-		const again = await call(jack, "PUT", path("/branches/main"), { base: main, list: moved });
-		expect(again.status).toBe(200);
+	it("finished again after it landed (a run that never heard), follows again", async () => {
+		onMain = false;
+		const moved = { root: sha("c"), t3code: sha("d") };
+		const asked = [{ tracker: "t3code", branch: "main", old: sha("b"), new: sha("d") }];
+		expect((await merge(moved, asked)).status).toBe(200);
+		// As if the request had dropped before anything followed.
+		repos.setRef(rootRepo(), "refs/heads/main", main.root);
+		repos.setRef(t3Repo(), "refs/heads/main", main.t3code);
+		const again = await call(jack, "PUT", path("/branches/main"), { base: main, list: moved, moves: asked });
+		expect(again.status, JSON.stringify(again.body)).toBe(200);
 		expect(again.body.list).toEqual(moved);
+		expect((await refsOf(rootRepo()))["refs/heads/main"]).toBe(sha("c"));
+		expect((await refsOf(t3Repo()))["refs/heads/main"], "the catch-up it was allowed").toBe(sha("d"));
+	});
+
+	it("clears the landing ref an earlier landing left when it followed late", async () => {
+		const first = { ...main, root: sha("c") };
+		expect((await merge(first)).status).toBe(200);
+		// The first landing's follow had not cleared its own yet.
+		repos.setRef(rootRepo(), landingRef(sha("c")), sha("c"));
+		const second = { ...main, root: sha("d") };
+		expect((await merge(second, [], first)).status).toBe(200);
+		const refs = await refsOf(rootRepo());
+		expect(Object.keys(refs).filter((ref) => ref.startsWith("refs/newgit/landing/"))).toEqual([]);
 	});
 });
 

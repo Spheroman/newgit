@@ -124,12 +124,13 @@ export function isChecking(answer: unknown): answer is Checking {
 /** A merge's write passwords last this long: pushing the trackers' commits to landing refs. */
 const MERGE_PUSH_SECONDS = 10 * 60;
 /**
- * A merge begun and not landed is remembered this long: its pushes, and then
- * the remote's check of its index, which the first time a large history is
- * there takes many minutes. Nothing waits on it meanwhile; it only bounds
- * how long its record and passwords live.
+ * A merge begun is remembered this long: its pushes, then the remote's
+ * check of its index (the first time a large history is there, many
+ * minutes), past the hour the client keeps asking, and after it lands, for
+ * a finish asked again. Nothing waits on it; it only bounds how long its
+ * record lives.
  */
-const MERGE_PENDING_SECONDS = 40 * 60;
+const MERGE_PENDING_SECONDS = 70 * 60;
 
 export interface Deps {
 	repos: Repos;
@@ -704,20 +705,19 @@ async function route(request: Request, env: Env, deps: Deps): Promise<Response> 
 				// The index the merge began with, exactly: every pin in it was
 				// checked then, so nothing else may land.
 				const pending = await project.pendingMerge(branch, list);
-				if (pending === null) {
-					// Landed already, by a run that stopped before it heard:
-					// say so again.
-					if (sameIndex((await project.branch(branch))?.list, list))
-						return json({ ...(await project.branch(branch)), behind: [] });
+				const current = (await project.branch(branch))?.list;
+				// Landed long ago, its record gone: root's branch still follows.
+				if (pending === null && !sameIndex(current, list))
 					throw new HttpError(400, "this is not the index a merge began with: start the merge again");
-				}
-				if (pending.by !== login)
+				if (pending !== null && pending.by !== login)
 					throw new HttpError(409, `${pending.by} began this merge; only they may land it`);
-				const asked = checkMoves(moves, pending.writes, branch, list);
+				const asked = checkMoves(moves, pending?.writes ?? [], branch, list);
 				// And what root's commit really pins: the Git endpoint composes
 				// from the gitlinks, so an index that says otherwise would have
 				// had its pins checked for nothing.
-				if (deps.index) {
+				// A finish asked again after it landed (its answer never
+				// arrived) checks nothing again, and follows again.
+				if (deps.index && pending?.landed !== true && !sameIndex(current, list)) {
 					const trackers = Object.keys(list);
 					const plan: IndexPlan = { dir: "/work", repos: checkRepos(deps, id, trackers), list };
 					const checked = await deps.index(key, plan, () => checkCredentials(env, deps, caller, id, trackers));
