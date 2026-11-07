@@ -351,7 +351,7 @@ resources = ["staging-tunnel"]
 | `priority` | integer | no | `0` | which tracker of a role an instance binds by default (the highest), unless your own default says otherwise (`[projects.<project>.roles]` in `~/.newgit/config.toml`). Negative means only when asked for (`--use`), for a role-less tracker too. |
 | `requires` | array of strings | no | `[]` | trackers or roles it cannot do without: binding it binds them, and they cannot be dropped while it is bound. |
 | `resources` | array of strings | no | `[]` | resources it brings: they bind only while it is bound. `newgit tracker use` binds and prepares them and starts their `autostart` action; `drop` stops them and releases their binding. |
-| `maintainers` | string | no | its `audience` | who may merge changes to it on a remote: `owner` (the project's owner), `project-devs`, or `user:<login>`. Changing a tracker's definition is changing the tracker that owns its file in `.newgit/trackers/` — `access` unless a tracker in Git mounted beside it at `.newgit/trackers` claims the file — so governance layers: an `admin` tracker with `mount = ".newgit/trackers"` and `paths = ["web.toml"]` decides who changes `web`'s paths, audience, and maintainers. |
+| `maintainers` | string | no | its `audience` | who may merge changes to it on a remote: `owner` (the project's owner), `project-devs`, or `user:<login>`. Changing a tracker's definition is changing the tracker that owns its file in `.newgit/trackers/` — `access` unless a tracker in Git mounted beside it at `.newgit/trackers` claims the file — so governance layers: an `admin` tracker with `mount = ".newgit/trackers"` and `paths = ["web.toml"]` decides who changes `web`'s paths, audience, and maintainers. Governance only delegates downward: a claim on `<T>.toml` counts only when the claiming tracker's own definition is held by whoever holds `<T>.toml`, and no tracker may claim `access.toml` or its own definition (refused here; ignored by the remote). |
 
 The paths of a tracker outside Git stay out of Git: `newgit tracker track` adds them to
 the store's `.gitignore`, and each workspace's Git is told to ignore them too,
@@ -674,11 +674,13 @@ every verify fail. Common dump tools do this by default: `pg_dump` since
 17.6 (and the matching back-branch releases) opens and closes every dump with
 `\restrict <token>` / `\unrestrict <token>`, a fresh random token per run.
 Pass `--restrict-key=<fixed>` to make it stable, as the bundled Postgres
-templates do (their comments say what a fixed key gives up). Anything else
-that stamps a run does the same: a timestamp in the output, or `pg_dump
---verbose`'s `-- Started on` / `-- Completed on` comments. `--verify` names
-this case when it happens rather than blaming `[restore]`; it does not paper
-over it.
+templates do (their comments say what a fixed key gives up). `supabase db
+dump` cannot pass it, and writes the pair as SQL comments (`-- \restrict
+<token>`), so the `supabase` template swaps the token for a fixed one after
+dumping. Anything else that stamps a run does the same: a timestamp in the
+output, or `pg_dump --verbose`'s `-- Started on` / `-- Completed on`
+comments. `--verify` names this case when it happens rather than blaming
+`[restore]`; it does not paper over it.
 
 ### `[restore]`
 

@@ -41,6 +41,7 @@ use crate::supervisor::{ProcessState, StopOutcome, Supervisor, run_captured, run
 use crate::templates::{instantiate, resource_template};
 use crate::tracker::{
     Storage, TrackerDefinition, collect_files, collect_owned_files, content_rev, normalize_path,
+    symlinked_parent,
 };
 use crate::tracker_repo::{
     Branch, CaptureAt, TrackerRepo, clear_owned_paths, copy_file, parse_tracker_state_ref,
@@ -445,7 +446,7 @@ struct RenderedRestore {
 impl RenderedRestore {
     fn restore(self) -> Result<()> {
         for (path, contents) in self.files {
-            std::fs::write(&path, contents).map_err(|source| NewgitError::io(path, source))?;
+            write_rendered(&path, &contents)?;
         }
         Ok(())
     }
@@ -3340,6 +3341,12 @@ impl BranchManager {
         let log = self.checkpoint_log(&branch);
         record.id = log.next_id()?;
         record.branch = branch.name.clone();
+        // Taken on the new instance's own branch, which `spawn_inner` made at
+        // the checkpoint's head. The branch the author's workspace was on, or
+        // its detached HEAD, is the author's: the undo below would put this
+        // workspace there (#315).
+        record.source.checked_out = Some(branch.source_ref.clone());
+        record.source.detached = false;
         record.message = Some(format!(
             "spawned from {from_slug}/{checkpoint_id} (by {}{})",
             found.created_by,
@@ -4423,6 +4430,11 @@ impl BranchManager {
                 paths.push(&spec.path);
             }
         }
+        // Every target is judged before any is written, so a refused render
+        // leaves all of this resource's files as they were.
+        for path in &paths {
+            refuse_render_through_link(&branch.workspace_path, &definition.name, path)?;
+        }
 
         let bound = self.bound_vars(branch);
         let context = RenderContext {
@@ -4472,8 +4484,7 @@ impl BranchManager {
             if let Some(parent) = target.parent() {
                 crate::materializer::create_dir_all(parent)?;
             }
-            std::fs::write(&target, contents)
-                .map_err(|source| NewgitError::io(target.clone(), source))?;
+            write_rendered(&target, &contents)?;
 
             if owner.is_none() {
                 source_owned.push(path.clone());
@@ -4528,10 +4539,10 @@ impl BranchManager {
             record.tracker.as_deref() == Some(tracker.name.as_str())
         }) {
             let path = branch.workspace_path.join(&relative);
-            // Only a regular file is un-rendered in place. Through a
-            // symlink this would read, and then write, wherever it leads;
+            // Only a regular file reached without a symlink is un-rendered:
+            // through one, this would read wherever the link leads, and
             // capture keeps or refuses the link itself.
-            if !std::fs::symlink_metadata(&path).is_ok_and(|meta| meta.is_file()) {
+            if !rewritable(&branch.workspace_path, &relative) {
                 continue;
             }
             let Ok(current) = std::fs::read_to_string(&path) else {
@@ -4570,8 +4581,7 @@ impl BranchManager {
             if reversed == current {
                 continue;
             }
-            std::fs::write(&path, &reversed)
-                .map_err(|source| NewgitError::io(path.clone(), source))?;
+            write_rendered(&path, &reversed)?;
             restore.files.push((path, current));
         }
         Ok(restore)
@@ -4758,7 +4768,7 @@ impl BranchManager {
     ) -> Result<()> {
         for record in &binding.rendered {
             let path = branch.workspace_path.join(&record.path);
-            if !std::fs::symlink_metadata(&path).is_ok_and(|meta| meta.is_file()) {
+            if !rewritable(&branch.workspace_path, &record.path) {
                 continue;
             }
             let Ok(current) = std::fs::read_to_string(&path) else {
@@ -4778,8 +4788,7 @@ impl BranchManager {
             let reversed =
                 render::reverse_rendered(&current, &record.path, &committed, &claim).content;
             if reversed != current {
-                std::fs::write(&path, &reversed)
-                    .map_err(|source| NewgitError::io(path.clone(), source))?;
+                write_rendered(&path, &reversed)?;
             }
         }
         Ok(())
@@ -4819,6 +4828,11 @@ impl BranchManager {
     fn render_drift(&self, branch: &BranchInstance) -> Vec<String> {
         let mut drifted = Vec::new();
         for path in rendered_paths(branch, |_| true) {
+            // Through a link the render refuses rather than rewrites (#283),
+            // so nothing there is about to be discarded.
+            if !rewritable(&branch.workspace_path, &path) {
+                continue;
+            }
             let tracker = branch
                 .resources
                 .values()
@@ -12758,6 +12772,111 @@ fn rendered_paths(
     paths
 }
 
+/// Refuse to render `path` through a symlink, at the path itself or at a
+/// directory above it (#283). Under a linked directory the render's write
+/// would land wherever the link leads, which can be anywhere the user can
+/// write. A link at the path is refused by name, saying where it leads, so
+/// whoever put it there decides what belongs at the path. Judged with `lstat`
+/// alone: nothing is followed to decide.
+fn refuse_render_through_link(workspace: &Utf8Path, resource: &str, path: &Utf8Path) -> Result<()> {
+    if let Some((link, target)) = symlinked_parent(workspace, path) {
+        return Err(NewgitError::RenderUnderSymlinkedParent {
+            resource: resource.to_owned(),
+            path: path.to_path_buf(),
+            link,
+            target,
+        });
+    }
+    let absolute = workspace.join(path);
+    if std::fs::symlink_metadata(&absolute).is_ok_and(|meta| meta.is_symlink()) {
+        let target =
+            std::fs::read_link(&absolute).map_err(|source| NewgitError::io(&absolute, source))?;
+        return Err(NewgitError::RenderThroughSymlink {
+            resource: resource.to_owned(),
+            path: path.to_path_buf(),
+            target: Utf8PathBuf::from(target.to_string_lossy().into_owned()),
+        });
+    }
+    Ok(())
+}
+
+/// Whether newgit rewrites a rendered file: a regular file, reached without
+/// going through a symlink. A render refuses anything else
+/// (`refuse_render_through_link`), and taking its values back out, or
+/// reporting drift in it, leaves it alone.
+fn rewritable(workspace: &Utf8Path, path: &Utf8Path) -> bool {
+    symlinked_parent(workspace, path).is_none()
+        && std::fs::symlink_metadata(workspace.join(path)).is_ok_and(|meta| meta.is_file())
+}
+
+/// Write a rendered file, or one with its values taken back out, without
+/// writing through a link (#283).
+///
+/// The file is opened without following a symlink at the path (`O_NOFOLLOW`)
+/// and judged by what was opened, not by the path, so a link swapped in at
+/// the path after the render checked it is never written. A file with one
+/// name is then rewritten in place, as it always was: a process holding it
+/// open, or a container that bind-mounts it alone, sees the new content. A
+/// file with more than one name is a hard link, and a write into it would
+/// change its other names too, so it is replaced instead (`replace_file`). A
+/// missing file is created with `O_EXCL`, which does not follow a link either,
+/// and gets the mode `std::fs::write` would give it.
+fn write_rendered(path: &Utf8Path, contents: &str) -> Result<()> {
+    use std::io::Write as _;
+    use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
+
+    let io = |source| NewgitError::io(path, source);
+    let opened = std::fs::OpenOptions::new()
+        .write(true)
+        .custom_flags(nix::fcntl::OFlag::O_NOFOLLOW.bits())
+        .open(path);
+    let mut file = match opened {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(path)
+                .map_err(io)?;
+            return file.write_all(contents.as_bytes()).map_err(io);
+        }
+        Err(source) => return Err(io(source)),
+    };
+    let metadata = file.metadata().map_err(io)?;
+    if !metadata.is_file() {
+        return Err(io(std::io::Error::other("not a regular file")));
+    }
+    if metadata.nlink() > 1 {
+        drop(file);
+        return replace_file(path, contents, metadata.permissions());
+    }
+    file.set_len(0).map_err(io)?;
+    file.write_all(contents.as_bytes()).map_err(io)
+}
+
+/// Replace the file at `path` with `contents`, keeping its `mode`: the
+/// content goes to a temporary file beside the path, which is renamed over
+/// it. The file's other names keep what they held, and the path gets a file
+/// of its own.
+fn replace_file(path: &Utf8Path, contents: &str, mode: std::fs::Permissions) -> Result<()> {
+    use std::io::Write as _;
+
+    let dir = path.parent().unwrap_or_else(|| Utf8Path::new("."));
+    let mut temp = tempfile::Builder::new()
+        .prefix(".")
+        .suffix(".newgit-rendering")
+        .tempfile_in(dir)
+        .map_err(|source| NewgitError::io(dir, source))?;
+    temp.as_file()
+        .set_permissions(mode)
+        .map_err(|source| NewgitError::io(path, source))?;
+    temp.write_all(contents.as_bytes())
+        .map_err(|source| NewgitError::io(path, source))?;
+    temp.persist(path)
+        .map_err(|error| NewgitError::io(path, error.error))?;
+    Ok(())
+}
+
 /// How many lines differ between the expected render and what is on disk —
 /// enough to say how big the discarded edit is without printing a diff.
 fn differing_lines(expected: &str, actual: &str) -> usize {
@@ -13311,5 +13430,26 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let exe = binary(temp.path(), "manager-tests");
         assert_eq!(hook_program(Some(&exe), None), "newgit");
+    }
+
+    /// As if the link appeared after the render checked the path (#283).
+    #[test]
+    fn a_rendered_write_never_follows_a_link_at_the_path() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let dir = camino::Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).expect("utf8");
+        let target = dir.join("target.env");
+        std::fs::write(&target, "MINE=1\n").expect("write");
+        let link = dir.join("app.env");
+        std::os::unix::fs::symlink(&target, &link).expect("symlink");
+        super::write_rendered(&link, "API=1\n").expect_err("a link at the path is not opened");
+        assert_eq!(std::fs::read_to_string(&target).expect("read"), "MINE=1\n");
+
+        let dangling = dir.join("db.env");
+        std::os::unix::fs::symlink(dir.join("new.env"), &dangling).expect("symlink");
+        super::write_rendered(&dangling, "DB=1\n").expect_err("nor is a dangling one");
+        assert!(
+            !dir.join("new.env").exists(),
+            "and its target is not created"
+        );
     }
 }

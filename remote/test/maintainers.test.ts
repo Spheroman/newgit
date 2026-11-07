@@ -169,4 +169,59 @@ describe("maintainers", () => {
 		expect((await begin(ana, ["web"])).status).toBe(403);
 		expect((await begin(jack, ["web"])).status).toBe(200);
 	});
+
+	// Every merge moves root, so `begin(token, [])` asks only whether `token`
+	// may change root.
+	const delegate = (paths: string[]) =>
+		`audience = "project-devs"\ngit = true\nmaintainers = "user:ana"\nmount = ".newgit/trackers"\npaths = ${JSON.stringify(paths)}\n`;
+	const anasAlone = 'audience = "project-devs"\ngit = true\nmaintainers = "user:ana"\n';
+
+	it("delegate only downward: a tracker handed one definition cannot take `access`'s (#228)", async () => {
+		// The owner hands ana web's definition, and nothing else.
+		define("access", "admin", delegate(["web.toml"]));
+		// ana makes web claim access's definition, and writes one there that
+		// makes her `access`'s maintainer: every definition it holds, hers.
+		define("admin", "web", delegate(["access.toml"]));
+		define("web", "access", delegate(["."]));
+
+		const owner = await begin(jack, ["access"]);
+		expect(owner.status).toBe(200);
+		const member = await begin(ana, ["access"]);
+		expect(member.status).toBe(403);
+		expect(member.body.error).toContain("project's owner");
+		expect((await begin(jack, [])).status).toBe(200);
+	});
+
+	it("delegate only downward: a claim on a definition the claimant's holder does not hold does not count", async () => {
+		// web is admin's to define; root's definition is access's, not admin's.
+		define("access", "admin", delegate(["web.toml"]));
+		define("admin", "web", delegate(["root.toml", "admin.toml"]));
+		define("web", "root", anasAlone);
+		define("web", "admin", delegate(["web.toml"]).replace("user:ana", "user:jack"));
+
+		// admin is defined as access has it, ana's; root is still every
+		// member's, so admin is the only thing refused.
+		const owner = await begin(jack, ["admin"]);
+		expect(owner.status).toBe(403);
+		expect(owner.body.error).toContain("only ana maintains `admin`");
+		expect(owner.body.error).not.toContain("`root`");
+		expect((await begin(ana, ["admin"])).status).toBe(200);
+	});
+
+	it("are never a tracker's own: claiming its own definition does not let a tracker govern itself", async () => {
+		define("access", "web", delegate(["web.toml"]).replace('"user:ana"', '"project-devs"'));
+		define("web", "web", anasAlone);
+		// Read from access, web is every member's to merge, the owner's too.
+		expect((await begin(jack, ["web"])).status).toBe(200);
+	});
+
+	it("still delegate what the holder holds: access may hand root's definition to admin", async () => {
+		define("access", "admin", delegate(["root.toml", "web.toml"]));
+		define("admin", "root", anasAlone);
+		define("admin", "web", 'audience = "project-devs"\ngit = true\n');
+		const owner = await begin(jack, []);
+		expect(owner.status).toBe(403);
+		expect(owner.body.error).toContain("only ana maintains `root`");
+		expect((await begin(ana, [])).status).toBe(200);
+	});
 });

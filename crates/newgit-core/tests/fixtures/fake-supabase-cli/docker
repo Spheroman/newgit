@@ -1,0 +1,130 @@
+#!/bin/sh
+# Stands in for `docker exec -i <container> psql ...` in the `supabase`
+# template's tests, against the tables the fake `supabase` beside this
+# script keeps (see there). It refuses anything else.
+#
+# It does not run SQL. Input that starts with `do $$` is the restore's
+# truncate: the fake reads which schemas its `where` clause names
+# (`schemaname = '<s>'` or `schemaname in ('<s>', ...)`) and which
+# `('<schema>', '<table>')` pairs it leaves out with `not in`, and empties
+# every other table in those schemas. `has_table_privilege` counts as true
+# for every table, as it was on Supabase images where `postgres` was a
+# member of `supabase_auth_admin` and `supabase_storage_admin`, so the
+# statement's own exclusions are all that keeps the migration history.
+#
+# Any other input is a dump to load. Each `INSERT INTO "<schema>"."<table>"
+# VALUES` adds all of its rows or, when one has a key the table already
+# holds, none, as Postgres does, and says so on stderr. Like psql, the fake
+# then carries on with the next statement, unless ON_ERROR_STOP is set.
+set -eu
+
+die() {
+  echo "fake docker: $*" >&2
+  exit 64
+}
+
+[ "${1:-}" = exec ] && [ "${2:-}" = -i ] && [ "${4:-}" = psql ] ||
+  die "unexpected command: docker $*"
+container=$3
+shift 4
+on_error_stop=''
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --quiet) ;;
+    -U)
+      [ "${2:-}" = postgres ] || die "psql as ${2:-nobody}"
+      shift
+      ;;
+    -d)
+      [ "${2:-}" = postgres ] || die "psql into ${2:-nothing}"
+      shift
+      ;;
+    -v)
+      [ "${2:-}" = ON_ERROR_STOP=1 ] || die "unexpected psql variable: ${2:-}"
+      on_error_stop=1
+      shift
+      ;;
+    *) die "unexpected psql argument: $1" ;;
+  esac
+  shift
+done
+[ -n "${FAKE_SUPABASE_DB:-}" ] || die "FAKE_SUPABASE_DB is not set"
+db="$FAKE_SUPABASE_DB/$container"
+if [ ! -d "$db" ]; then
+  echo "Error response from daemon: No such container: $container" >&2
+  exit 1
+fi
+input="$db.psql-input"
+rows="$db.psql-rows"
+tab=$(printf '\t')
+cat >"$input"
+
+error() {
+  printf '%s\n' "$*" >&2
+  [ -z "$on_error_stop" ] || exit 3
+}
+
+truncate_tables() {
+  schemas=$(sed -n \
+    -e "s/.*schemaname = '\([^']*\)'.*/\1/p" \
+    -e "s/.*schemaname in (\([^)]*\)).*/\1/p" "$input" |
+    tr ',' '\n' | tr -d " '")
+  [ -n "$schemas" ] || die "no schema list in the truncate"
+  kept=$(grep 'not in (' "$input" |
+    grep -o "('[^']*', *'[^']*')" |
+    sed "s/('\([^']*\)', *'\([^']*\)')/\1.\2/" || true)
+  for file in "$db"/*; do
+    table=${file##*/}
+    printf '%s\n' "$schemas" | grep -qxF "${table%%.*}" || continue
+    if printf '%s\n' "$kept" | grep -qxF "$table"; then
+      continue
+    fi
+    : >"$file"
+  done
+}
+
+insert() {
+  if [ ! -e "$db/$1" ]; then
+    error "ERROR:  relation \"$1\" does not exist"
+    return 0
+  fi
+  duplicate=$(cat "$db/$1" "$rows" | sed 's/^(\([^,)]*\).*/\1/' |
+    LC_ALL=C sort | uniq -d | head -n 1)
+  if [ -n "$duplicate" ]; then
+    error "ERROR:  duplicate key value violates unique constraint \"${1#*.}_pkey\"
+DETAIL:  Key ($duplicate) already exists."
+    return 0
+  fi
+  cat "$rows" >>"$db/$1"
+}
+
+load() {
+  table=''
+  while IFS= read -r line; do
+    case "$line" in
+      'INSERT INTO "'*'"."'*'" VALUES')
+        table=$(printf '%s\n' "$line" |
+          sed 's/^INSERT INTO "\([^"]*\)"\."\([^"]*\)" VALUES$/\1.\2/')
+        : >"$rows"
+        ;;
+      "$tab"*)
+        [ -n "$table" ] || die "a row outside an INSERT: $line"
+        row=${line#"$tab"}
+        case "$row" in
+          *';')
+            printf '%s\n' "${row%;}" >>"$rows"
+            insert "$table"
+            table=''
+            ;;
+          *',') printf '%s\n' "${row%,}" >>"$rows" ;;
+          *) die "unexpected row: $line" ;;
+        esac
+        ;;
+    esac
+  done <"$input"
+}
+
+case "$(head -n 1 "$input")" in
+  'do $$'*) truncate_tables ;;
+  *) load ;;
+esac

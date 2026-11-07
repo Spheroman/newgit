@@ -1216,13 +1216,65 @@ function ownerOf(facts: Map<string, TrackerFacts>, path: string): string | undef
 }
 
 /**
+ * Which tracker holds each definition file next, given who holds them now
+ * (`holder`, tracker by tracker) and the definitions as read from those
+ * holders (`facts`). Governance only delegates downward:
+ *
+ * - `access.toml` is always `access`'s, and no tracker holds its own.
+ * - A tracker may take `<T>.toml` only from the tracker that holds its own
+ *   definition. Its claim is then written in that holder's repo, so the
+ *   maintainers who already govern `T` are the ones who approved it. A claim
+ *   on anything else — `access`'s, a parent's, a sibling's held by someone
+ *   else — does not count (#228).
+ * - A tracker keeps what it holds while it still claims it: whoever governs
+ *   it governs what it holds.
+ * - No move closes a loop, so every chain of holders ends at `access`.
+ *
+ * Among the trackers that may take a file, the ownership rules decide
+ * ([`ownerOf`]); when none claims it, it is `access`'s. Files are settled
+ * one at a time in name order, each against the moves already made, so the
+ * outcome is the same on every read.
+ */
+function nextHolders(facts: Map<string, TrackerFacts>, holder: Map<string, string>): Map<string, string> {
+	const next = new Map(holder);
+	const above = (name: string, target: string): boolean => {
+		// Whether `target` is `name` or on its chain of holders.
+		for (let at: string | undefined = name, steps = 0; at !== undefined && steps <= next.size; steps++) {
+			if (at === target) return true;
+			if (at === "access") return false;
+			at = next.get(at);
+		}
+		return true; // a chain that does not end at `access` is never safe to join
+	};
+	for (const name of [...holder.keys()].sort()) {
+		if (name === "access") {
+			next.set(name, "access");
+			continue;
+		}
+		const current = holder.get(name)!;
+		const eligible = new Map<string, TrackerFacts>();
+		for (const [candidate, candidateFacts] of facts) {
+			if (candidate === name) continue;
+			const delegated = (next.get(candidate) ?? "access") === current;
+			const keeps = candidate === current;
+			if (!delegated && !keeps) continue;
+			if (above(candidate, name)) continue;
+			eligible.set(candidate, candidateFacts);
+		}
+		next.set(name, ownerOf(eligible, `${ACCESS_MOUNT}/${name}.toml`) ?? "access");
+	}
+	return next;
+}
+
+/**
  * Every named tracker's committed definition on the project's default
  * branch. A definition is the view's `.newgit/trackers/<name>.toml`: `access`'s
  * `<name>.toml`, unless a tracker in Git owns that path by the ownership rules
- * — which is how governance layers: changing a tracker's definition is
- * changing the tracker that owns its file, and only that tracker's
- * maintainers merge it. The file is read from its owner's repo, relative to
- * the owner's mount. Resolved to a fixed point, a few reads per round.
+ * and may hold it ([`nextHolders`]) — which is how governance layers:
+ * changing a tracker's definition is changing the tracker that owns its file,
+ * and only that tracker's maintainers merge it. The file is read from its
+ * owner's repo, relative to the owner's mount. Resolved to a fixed point, a
+ * few reads per round.
  *
  * A tracker `access` does not name may be defined inside a mounted tracker in
  * Git, in that tracker's own `.newgit/trackers/`: its child, governed by it
@@ -1263,9 +1315,10 @@ export async function loadDefinitions(
 			const read = text === null ? implicitFacts(name) : parseFacts(text, from.tracker);
 			if (read !== undefined) facts.set(name, { ...read, source: from.tracker });
 		}
+		const holders = nextHolders(facts, new Map([...source].map(([name, from]) => [name, from.tracker])));
 		let moved = false;
 		for (const name of all) {
-			const owner = ownerOf(facts, file(name)) ?? "access";
+			const owner = holders.get(name) ?? "access";
 			const mount = facts.get(owner)?.mount ?? ACCESS_MOUNT;
 			const was = source.get(name)!;
 			if (was.tracker !== owner || was.mount !== mount) {

@@ -20,14 +20,42 @@ use newgit_core::store::MetadataStore;
 /// `prepare` to stop first, and the match quietly stopped protecting anyone.
 #[allow(dead_code)]
 pub fn add_supabase_without_starting_it(repo: &Utf8Path) {
+    add_supabase_stubbed(repo, None);
+}
+
+/// [`add_supabase_without_starting_it`], except that `[checkpoint]` and
+/// `[restore]` keep the template's own commands, each run after `prelude`:
+/// shell that puts stand-ins for `supabase` and `docker` first on `PATH`.
+/// Nothing else the template runs is left to reach a real stack.
+#[allow(dead_code)]
+pub fn add_supabase_with_snapshot_commands(repo: &Utf8Path, prelude: &str) {
+    add_supabase_stubbed(repo, Some(prelude));
+}
+
+fn add_supabase_stubbed(repo: &Utf8Path, snapshot_prelude: Option<&str>) {
     let outcome = BranchManager::open(MetadataStore::at(repo.to_owned()))
         .expect("manager")
         .add_resource("supabase", "supabase")
         .expect("add supabase");
 
     let definition = std::fs::read_to_string(&outcome.path).expect("read definition");
-    let mut table: toml::Table = definition.parse().expect("the definition parses");
+    let template: toml::Table = definition.parse().expect("the definition parses");
+    let mut table = template.clone();
     let stubbed = stub_commands(&mut table);
+    if let Some(prelude) = snapshot_prelude {
+        for section in ["checkpoint", "restore"] {
+            let command = template
+                .get(section)
+                .and_then(|value| value.get("command"))
+                .and_then(toml::Value::as_str)
+                .unwrap_or_else(|| panic!("the supabase template has no `[{section}]` command"));
+            let slot = table
+                .get_mut(section)
+                .and_then(|value| value.get_mut("command"))
+                .expect("stubbed in place");
+            *slot = toml::Value::String(format!("{prelude}{command}"));
+        }
+    }
     assert!(
         table["actions"]["prepare"]["command"].as_str() == Some("true"),
         "the supabase template no longer has an `[actions.prepare]` command to stub"
