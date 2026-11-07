@@ -163,7 +163,10 @@ the source of truth, and a mirror may trail it.
    than by project. **Heads and the log done** (`ProjectDO`'s `heads` and
    `head_log`); keying them by path waits for step 8.
 3. Landing without the lock: objects first, then one compare-and-swap, still
-   always at root. This alone removes the queue.
+   always at root. This alone removes the queue. **Done**: commits wait at
+   `refs/newgit/landing/<commit>`, `ProjectDO.land` is the compare-and-swap,
+   and the Worker moves the repos' branches after it (`remote/src/follow.ts`).
+   Merges and webhook pulls no longer lock.
 4. Anchors, roll-up on read, and subscriptions. `merge` stops having to move root.
 5. `history`, and the sweep.
 6. `status`, exports, and the webhook follow the log.

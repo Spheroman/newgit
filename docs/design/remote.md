@@ -558,8 +558,10 @@ moves nothing and names each file's tracker), and split like any other
 commit, so a merger's signed merge comes back as itself
 ([trackers.md](trackers.md), *Checkpoints, merges, and pull*). `newgit merge
 main` merges the project root instead, which is how trackers made after
-`remote add` reach the remote. On the remote it begins under a short lock
-with the index it was based on and the index it will make. The Worker has
+`remote add` reach the remote. On the remote it begins with the index it was
+based on and the index it will make. Nothing is locked: another merge may
+begin beside it, and whichever lands second finds the list moved and merges
+again. The Worker has
 the Git endpoint's container (which runs Git) say how each child's pin moves
 along that child's history: forward along its `main` needs only root's
 maintainers; back, sideways, or off `main` needs the child's, who get a
@@ -568,13 +570,24 @@ catch up; a merge into another branch keeps the child's commit on the
 child's branch of that name and moves no child's `main`. Root always needs
 its own. Before the new
 index is written, the container checks root's pushed commit pins exactly
-that, and the merge may finish only with the index it began with. It pushes each moved tracker's commit with
-passwords minted for that merge, moves root's ref by one compare-and-swap,
-catches each child's `main` up with what root now pins (on a merge into
-`main`), and finishes by
-writing the branch's list in the project's Durable Object as an index. (The
-Worker's Artifacts binding cannot write refs, so the merge's Git work is the
-merger's; root's ref is the truth and the list says which repos to fetch.)
+that, and the merge may finish only with the index it began with.
+
+Objects first: the client pushes each commit, with passwords minted for that
+merge, to a landing ref in its tracker's repo
+(`refs/newgit/landing/<commit>`), which nothing reads. The finish is the
+merge's one commit point: the branch's list in the project's Durable Object
+moves by compare-and-swap on the heads the merge moves, root's always among
+them. Only then do the repos' branches follow, moved by the Worker itself
+with a ref-only push (Git's smart HTTP, an empty pack, each update leased on
+the value it must hold; `remote/src/refs.ts`): root's branch to root's head
+*now*, so two landings following in either order leave it right, and each
+child branch the merge asked to move (a child's `main` catching up on a
+merge into `main`, or the child's branch of the same name on another).
+What cannot follow (a child's `main` moved meanwhile) is said, and the
+landing stands. A commit on root's branch that no list ever named is kept at
+`refs/newgit/stray/<commit>` and the branch still follows: the list is the
+truth. A finish that ran and was never heard is finished again and says it
+landed.
 
 The begin's ancestry check (`newgit endpoint-ancestry`) fetches every tracker
 it looks at, whole, into the container's store, and the first time a large
@@ -595,8 +608,8 @@ polling mints nothing. Those passwords go only to the container, never to
 the merger, and are recorded against the merger's token like any other, so
 revoking it revokes them. The client asks again every ten seconds while it gets
 202, says so once a minute, and gives up after an hour; every request is
-short. The finish extends the merge's lock on every request, so the lock
-holds while the client keeps asking. The checks are held in the object's
+short. Nothing is held while it does: the merge is remembered for forty
+minutes, and its passwords for ten, which is enough to push. The checks are held in the object's
 memory and in `waitUntil`; the polls are what keep the object alive. An
 object evicted mid-check forgets it, and the next request starts it again,
 against a store that keeps what the first fetched.
@@ -777,21 +790,22 @@ check, nobody else is asking. First `newgit endpoint-pull` looks, with read
 passwords and no lock: it fetches the mirror's branch, confirms the event's
 commit is on it, composes `main` as the target sees it, and walks what the
 mirror has beyond that. If that is nothing, the event was our own export or
-a redelivery, and it ends there, so every export coming back costs `newgit
-merge` no wait, however cold the container. Otherwise the pull takes `main`'s
-merge lock as `the GitHub webhook`, waiting while anyone else holds it, and
-extends the lock as it runs, and the container does the same again and
-lands it. The commits come in with the withheld trackers' files put back
+a redelivery, and it ends there. Otherwise the pull notes `main`'s index as
+its base and the container does the same again and lands it, as a merge
+does, by `the GitHub webhook`; nothing is locked, so a merge meanwhile
+waits for nothing. The commits come in with the withheld trackers' files put back
 and split, so their pins carry over; if `main` moved meanwhile, a merge made
 in the view, dated by the mirror's commit so a retry makes the same one.
-Root's ref moves by compare-and-swap, each child's `main` catches up, and
-the Worker moves the index, ending the lock and cancelling its passwords.
-Every commit comes out the same on a second run, so a run that stopped after
-root moved finishes with what it pushed.
+The container pushes every commit to its landing ref and says which child
+`main`s catch up; the Worker lands the list by compare-and-swap and the
+branches follow, as for a merge. If a merge landed first, the
+compare-and-swap fails and the pull starts again from `main` as it is now.
+Every commit comes out the same on a second run, so a run that stopped
+finishes with what it pushed.
 
 **The same refusals as a pull.** A file a tracker outside Git owns, a commit
 touching a withheld tracker's mount, a conflict with `main`, a tracker the
-pusher does not maintain: refused, logged, nothing moved, lock released.
+pusher does not maintain: refused, logged, nothing moved.
 
 **Work the mirror never saw.** A branch exported for a pull request leaves
 out what the target withholds, so an instance's edit under `apps/t3code` is

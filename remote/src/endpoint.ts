@@ -39,6 +39,8 @@
 
 import { DurableObject } from "cloudflare:workers";
 
+import type { RefMove } from "./follow";
+
 /** What the Worker hands the container: `newgit endpoint-compose`'s input. */
 export interface EndpointPlan {
 	dir: string;
@@ -96,7 +98,7 @@ export interface PullPlan {
 	mirror: { url: string; branch: string; commit: string };
 	/** Instances whose work in a withheld tracker may be behind this commit. */
 	instances: MirrorInstance[];
-	/** Only say whether there is anything to land: no lock, and nothing moves. */
+	/** Only say whether there is anything to land: nothing is pushed. */
 	peek?: boolean;
 }
 
@@ -110,8 +112,7 @@ export interface MirrorInstance {
 export type PullAnswer =
 	| { outcome: "nothing" }
 	| { outcome: "work" }
-	| { outcome: "moved"; why: string }
-	| { outcome: "landed"; list: Record<string, string>; commits: number }
+	| { outcome: "landed"; list: Record<string, string>; commits: number; moves?: RefMove[] }
 	| { outcome: "refused"; why: string };
 
 export interface IndexAnswer {

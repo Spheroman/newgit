@@ -97,8 +97,8 @@ describe("a merge's finish while the index check runs", () => {
 		expect((await call(jack, "POST", path("/branches/main/merge"), { base: main, list: moved })).status).toBe(200);
 		const readsBefore = repos.minted.filter((token) => token.scope === "read").length;
 
-		// Eight polls, four minutes apart: 32 minutes, past the ten-minute
-		// merge lock and past any one extension of it.
+		// Eight polls, four minutes apart: 32 minutes, longer than a merge's
+		// write passwords last.
 		stillRunning = 8;
 		minutesPerPoll = 4;
 		for (let poll = 0; poll < 8; poll++) {
@@ -106,14 +106,10 @@ describe("a merge's finish while the index check runs", () => {
 			expect(answer.status, `poll ${poll}: ${JSON.stringify(answer.body)}`).toBe(202);
 			expect(answer.body).toEqual({ checking: true });
 			expect(answer.retryAfter).toBe("10");
-			// Still jack's merge: nobody else may begin one.
-			const other = await call(ana, "POST", path("/branches/main/merge"), {
-				base: main,
-				list: { ...main, root: sha("b") },
-			});
-			expect(other.status).toBe(409);
-			expect(other.body.error).toContain("jack is merging");
 		}
+		// Nothing is held meanwhile: ana may begin a merge of her own.
+		const theirs = { ...main, root: sha("b") };
+		expect((await call(ana, "POST", path("/branches/main/merge"), { base: main, list: theirs })).status).toBe(200);
 		expect((await call(jack, "GET", path("/branches/main"))).body.list, "nothing moved yet").toEqual(main);
 
 		const landed = await call(jack, "PUT", path("/branches/main"), { base: main, list: moved });

@@ -30,8 +30,8 @@ fn a_502_when_the_merge_finishes_resumes_to_the_same_end() {
     fixture.remote.state.lock().expect("state").fail_finish_once = true;
     let failed = migrate(fixture);
     assert!(!failed.status.success(), "the 502 stops it");
-    // Root's `main` moved, the list did not: the half-moved remote.
-    assert_ne!(root_main_on_remote(fixture), old.main);
+    // Nothing moved: the commits wait at landing refs until the list lands.
+    assert_eq!(root_main_on_remote(fixture), old.main);
     assert_eq!(
         fixture.remote.state.lock().expect("state").branches["jack/store"]["main"]["project"],
         json!(old.main)

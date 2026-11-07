@@ -98,20 +98,23 @@ describe("`main` not being what the pull began from", () => {
 	it("starts again from `main` rather than retrying a stale base", async () => {
 		await deliver({ hold: true });
 		setAnswers([
-			{ outcome: "moved", why: "a merge is landing" },
+			CHECKING,
+			{ outcome: "landed", list: { ...main, root: sha("8") }, commits: 1 },
 			{ outcome: "landed", list: { ...merged, root: sha("9") }, commits: 1 },
 		]);
+		expect(await advance(), "the pull began, on `main` as it was").toBe(true);
+		// `main` moves before the pull lands: its compare-and-swap fails.
+		await startMerge();
+		expect((await call(jack, "PUT", path("/branches/main"), { base: main, list: merged })).status).toBe(200);
 		expect(await advance()).toBe(true);
 		const [waiting] = await stub().pulls();
 		expect(waiting.attempts, "not a failure").toBe(0);
 		expect(waiting.base, "the base is forgotten").toBeUndefined();
+		expect((await index()).root, "nothing it made landed").toBe(sha("f"));
 
-		// `main` moves meanwhile, and the next step begins from there.
-		await stub().releaseMerge("main", "the GitHub webhook");
-		await startMerge();
-		expect((await call(jack, "PUT", path("/branches/main"), { base: main, list: merged })).status).toBe(200);
+		// The next step begins from there.
 		expect(await advance()).toBe(false);
-		expect(plans.map((plan) => plan.list.root)).toEqual([sha("a"), sha("f")]);
+		expect(plans.map((plan) => plan.list.root)).toEqual([sha("a"), sha("a"), sha("f")]);
 		expect((await index()).root).toBe(sha("9"));
 	});
 });

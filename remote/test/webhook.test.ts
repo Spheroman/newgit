@@ -138,18 +138,20 @@ describe("a good event", () => {
 		expect(again.status).toBe(200);
 	});
 
-	it("waits for the container, keeping the lock and starting it once", async () => {
+	it("waits for the container, starting it once, and holds nothing meanwhile", async () => {
 		setAnswers([CHECKING, CHECKING, { outcome: "landed", list: { ...main, root: sha("c") }, commits: 1 }]);
 		await deliver();
 		expect(await advance()).toBe(true);
 		expect(await index()).toEqual(main);
 		const moved = { ...main, root: sha("f") };
 		const during = await call(jack, "POST", path("/branches/main/merge"), { base: main, list: moved });
-		expect(during.status).toBe(409);
-		expect(during.body.error).toContain("the GitHub webhook");
+		expect(during.status, "a merge may begin beside the pull").toBe(200);
 		expect(await advance()).toBe(false);
 		expect((await index()).root).toBe(sha("c"));
 		expect(new Set(plans.map(pullKey)).size).toBe(1);
+		// The pull landed first, so the merge finds `main` moved.
+		const late = await call(jack, "PUT", path("/branches/main"), { base: main, list: moved });
+		expect(late.status).toBe(409);
 	});
 
 	it("does nothing on a redelivery, or on an event for our own export", async () => {
@@ -182,21 +184,22 @@ describe("a good event", () => {
 	});
 });
 
-describe("the merge lock", () => {
-	it("waits for a merge in flight rather than fighting it, then goes on", async () => {
+describe("a merge beside a pull", () => {
+	it("lands first, and the pull starts again from what it left", async () => {
 		const merged = { ...main, root: sha("c") };
 		const begun = await call(jack, "POST", path("/branches/main/merge"), { base: main, list: merged });
 		expect(begun.status).toBe(200);
 
+		setAnswers([CHECKING, { outcome: "landed", list: { ...main, root: sha("8") }, commits: 1 }]);
 		expect((await deliver()).status).toBe(202);
-		expect(plans).toEqual([]);
-		expect(await advance()).toBe(true);
-		expect(plans).toEqual([]);
+		expect(plans.at(-1)?.list, "the pull runs beside the merge").toEqual(main);
 
 		expect((await call(jack, "PUT", path("/branches/main"), { base: main, list: merged })).status).toBe(200);
+		expect(await advance(), "its landing found `main` moved").toBe(true);
+		expect((await index()).root).toBe(sha("c"));
 		setAnswers([{ outcome: "landed", list: { ...merged, root: sha("9") }, commits: 1 }]);
 		expect(await advance()).toBe(false);
-		expect(plans[0].list, "it starts from what the merge left").toEqual(merged);
+		expect(plans.at(-1)?.list, "it starts from what the merge left").toEqual(merged);
 		expect((await index()).root).toBe(sha("9"));
 	});
 

@@ -55,7 +55,8 @@ import {
 import { githubWebhook } from "./webhook";
 
 type Checking = typeof CHECKING;
-import type { Instance, ProjectDO } from "./project";
+import type { Branch, Instance, ProjectDO, TrackerList } from "./project";
+import { type RefMove, followLanding } from "./follow";
 import type { UserDO } from "./users";
 
 export { BudgetDO } from "./budget";
@@ -120,15 +121,15 @@ export function isChecking(answer: unknown): answer is Checking {
 	return typeof answer === "object" && answer !== null && (answer as { checking?: unknown }).checking === true;
 }
 
-/** A merge holds its branch this long at most: pushing the trackers' commits. */
-const MERGE_LOCK_SECONDS = 10 * 60;
+/** A merge's write passwords last this long: pushing the trackers' commits to landing refs. */
+const MERGE_PUSH_SECONDS = 10 * 60;
 /**
- * How long each request of a merge's finish holds its lock while the remote
- * checks the index. The client asks again every few seconds while the check
- * runs, and each request extends the lock again, so it holds for as long as
- * the client keeps asking.
+ * A merge begun and not landed is remembered this long: its pushes, and then
+ * the remote's check of its index, which the first time a large history is
+ * there takes many minutes. Nothing waits on it meanwhile; it only bounds
+ * how long its record and passwords live.
  */
-const INDEX_CHECK_SECONDS = 20 * 60;
+const MERGE_PENDING_SECONDS = 40 * 60;
 
 export interface Deps {
 	repos: Repos;
@@ -643,12 +644,10 @@ async function route(request: Request, env: Env, deps: Deps): Promise<Response> 
 			}
 			if (tracker === "root" || (!dropped && answer?.onMain !== true)) writes.push(tracker);
 		}
-		const started = await project.beginMerge(branch, base, login, MERGE_LOCK_SECONDS, list);
+		const started = await project.beginMerge(branch, base, login, MERGE_PENDING_SECONDS, list, writes);
 		if (!started.ok) {
 			if (started.reason === "missing") throw new HttpError(404, `no branch \`${branch}\` in ${key}`);
-			if (started.reason === "moved")
-				throw new HttpError(409, `\`${branch}\` moved since you looked: merge again onto what it is now`);
-			throw new HttpError(409, `${started.by} is merging into \`${branch}\` until ${started.until}`);
+			throw new HttpError(409, `\`${branch}\` moved since you looked: merge again onto what it is now`);
 		}
 		await revokeRepoTokens(deps, started.stale);
 		const credentials = [];
@@ -657,8 +656,8 @@ async function route(request: Request, env: Env, deps: Deps): Promise<Response> 
 			const ref: RepoRef = { kind: "tracker", project: id, tracker };
 			const name = repoName(ref);
 			if ((await deps.repos.remote(name)) === null) throw new HttpError(404, `${name} does not exist`);
-			// No longer-lived than the lock, and cancelled when the merge ends.
-			const minted = await deps.repos.mint(name, "write", MERGE_LOCK_SECONDS);
+			// Enough to push to landing refs, and cancelled when the merge lands.
+			const minted = await deps.repos.mint(name, "write", MERGE_PUSH_SECONDS);
 			handed.push({ repo: name, artifactsId: minted.id });
 			await userStub(env, login).recordRepoToken(caller.tokenId, name, minted.id, minted.expiresAt);
 			credentials.push({
@@ -670,7 +669,7 @@ async function route(request: Request, env: Env, deps: Deps): Promise<Response> 
 				expires_at: minted.expiresAt,
 			});
 		}
-		await project.recordMergeTokens(branch, handed);
+		await project.recordMergeTokens(branch, list, handed);
 		return json({ branch, until: started.until, credentials });
 	}
 
@@ -685,9 +684,11 @@ async function route(request: Request, env: Env, deps: Deps): Promise<Response> 
 		if (method === "PUT") {
 			requireHuman(caller, "create or move branches");
 			requirePart("branch name", branch);
-			const { list, base } = await body<{ list?: Record<string, string>; base?: Record<string, string> }>(
-				request,
-			);
+			const { list, base, moves } = await body<{
+				list?: Record<string, string>;
+				base?: Record<string, string>;
+				moves?: RefMove[];
+			}>(request);
 			if (!list || typeof list !== "object" || Object.keys(list).length === 0)
 				throw new HttpError(400, "list is required: one commit per tracker in Git, by tracker name");
 			for (const [tracker, commit] of Object.entries(list)) {
@@ -702,37 +703,38 @@ async function route(request: Request, env: Env, deps: Deps): Promise<Response> 
 				requireHuman(caller, "merge");
 				// The index the merge began with, exactly: every pin in it was
 				// checked then, so nothing else may land.
-				if (!(await project.mergeTargets(branch, list)))
-					throw new HttpError(400, "this is not the index the merge began with: start the merge again");
-				// And what root's pushed commit really pins: the Git endpoint
-				// composes from the gitlinks, so an index that says otherwise
-				// would have had its pins checked for nothing.
+				const pending = await project.pendingMerge(branch, list);
+				if (pending === null) {
+					// Landed already, by a run that stopped before it heard:
+					// say so again.
+					if (sameIndex((await project.branch(branch))?.list, list))
+						return json({ ...(await project.branch(branch)), behind: [] });
+					throw new HttpError(400, "this is not the index a merge began with: start the merge again");
+				}
+				if (pending.by !== login)
+					throw new HttpError(409, `${pending.by} began this merge; only they may land it`);
+				const asked = checkMoves(moves, pending.writes, branch, list);
+				// And what root's commit really pins: the Git endpoint composes
+				// from the gitlinks, so an index that says otherwise would have
+				// had its pins checked for nothing.
 				if (deps.index) {
-					// The check can take minutes the first time a large history is
-					// here; the merge stays this caller's for as long as it runs.
-					if (!(await project.extendMerge(branch, login, INDEX_CHECK_SECONDS)))
-						throw new HttpError(409, `you hold no merge into \`${branch}\`: start one with \`newgit merge\``);
 					const trackers = Object.keys(list);
 					const plan: IndexPlan = { dir: "/work", repos: checkRepos(deps, id, trackers), list };
 					const checked = await deps.index(key, plan, () => checkCredentials(env, deps, caller, id, trackers));
-					// Still running: the client asks again, and this request's
-					// extension above holds the lock until it does.
+					// Still running: the client asks again. Nothing waits meanwhile.
 					if (isChecking(checked)) return stillChecking();
 					if (checked.matches !== true)
 						throw new HttpError(
 							400,
-							"root's commit on the branch does not pin what this index says: push the root commit the merge made, then finish",
+							"root's commit does not pin what this index says: push the root commit the merge made to its landing ref, then finish",
 						);
 				}
-				const finished = await project.finishMerge(branch, base, list, login);
-				if (!finished.ok) {
-					if (finished.reason === "missing") throw new HttpError(404, `no branch \`${branch}\` in ${key}`);
-					if (finished.reason === "unlocked")
-						throw new HttpError(409, `you hold no merge into \`${branch}\`: start one with \`newgit merge\``);
+				const landed = await landAndFollow(deps, project, id, branch, base, list, login, asked);
+				if (!landed.ok) {
+					if (landed.reason === "missing") throw new HttpError(404, `no branch \`${branch}\` in ${key}`);
 					throw new HttpError(409, `\`${branch}\` moved since you looked: merge again onto what it is now`);
 				}
-				await revokeRepoTokens(deps, finished.tokens);
-				return json(finished.branch);
+				return json({ ...landed.branch, behind: landed.behind });
 			}
 			const created = await project.createBranch(branch, list, login);
 			if (created === null)
@@ -1712,6 +1714,70 @@ async function copyCredentials(
  * Revoke repo passwords at Artifacts. Best effort per password: one already
  * gone (expired, or its repo deleted) must not stop the rest.
  */
+/**
+ * Land a merge into `branch` (the one compare-and-swap that is its commit
+ * point), cancel its passwords, and have the repos' branches follow. What
+ * could not follow is in `behind`; the landing stands regardless.
+ */
+export async function landAndFollow(
+	deps: Deps,
+	project: DurableObjectStub<ProjectDO>,
+	id: ProjectId,
+	branch: string,
+	base: TrackerList,
+	list: TrackerList,
+	by: string,
+	moves: RefMove[],
+): Promise<{ ok: true; branch: Branch; behind: string[] } | { ok: false; reason: "missing" | "moved" }> {
+	const landed = await project.land(branch, base, list, by);
+	if (!landed.ok) return { ok: false, reason: landed.reason };
+	await revokeRepoTokens(deps, landed.tokens);
+	const behind = await followLanding(
+		deps.repos,
+		{
+			head: (name, tracker) => project.head(name, tracker),
+			wasHead: (name, tracker, commit) => project.wasHead(name, tracker, commit),
+		},
+		(tracker) => repoName({ kind: "tracker", project: id, tracker }),
+		branch,
+		moves,
+	);
+	if (behind.length > 0) console.log(JSON.stringify({ landing: "behind", project: projectKey(id), branch, behind }));
+	return { ok: true, branch: (await project.branch(branch)) ?? landed.branch, behind };
+}
+
+/**
+ * The branch moves a merge's finish asks for, each one the merge may make:
+ * a tracker it was handed a write password for, its `main` (catching up) or
+ * the branch merged into, and, there, the commit the index pins.
+ */
+function checkMoves(moves: unknown, writes: string[], branch: string, list: TrackerList): RefMove[] {
+	if (moves === undefined) return [];
+	if (!Array.isArray(moves)) throw new HttpError(400, "moves must be a list");
+	const sha = /^[0-9a-f]{40}$/;
+	return moves.map((move: Partial<RefMove>) => {
+		const { tracker, branch: target, old, new: next } = move;
+		if (typeof tracker !== "string" || typeof target !== "string" || typeof next !== "string" || !sha.test(next))
+			throw new HttpError(400, "each move names a tracker, a branch, and a full commit id");
+		if (old !== null && (typeof old !== "string" || !sha.test(old)))
+			throw new HttpError(400, `\`${tracker}\`'s move must name a full commit id it moves from, or null`);
+		if (tracker === "root") throw new HttpError(400, "root's branch follows the list; it is not asked for");
+		if (!writes.includes(tracker))
+			throw new HttpError(403, `this merge was not handed \`${tracker}\` to write, so it may not move it`);
+		if (target !== "main" && target !== branch)
+			throw new HttpError(400, `a merge into \`${branch}\` moves \`${tracker}\`'s \`main\` or \`${branch}\`, not \`${target}\``);
+		if (target === branch && branch !== "main" && list[tracker] !== next)
+			throw new HttpError(400, `\`${tracker}\`'s \`${branch}\` moves to the commit the index pins`);
+		return { tracker, branch: target, old: old ?? null, new: next };
+	});
+}
+
+function sameIndex(left: TrackerList | undefined, right: TrackerList): boolean {
+	if (left === undefined) return false;
+	const keys = Object.keys(left);
+	return keys.length === Object.keys(right).length && keys.every((key) => left[key] === right[key]);
+}
+
 export async function revokeRepoTokens(deps: Deps, tokens: { repo: string; artifactsId: string }[]) {
 	await Promise.allSettled(tokens.map((token) => deps.repos.revokeToken(token.repo, token.artifactsId)));
 }

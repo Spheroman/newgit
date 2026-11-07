@@ -5,36 +5,33 @@
 // moves the queue on with `advancePulls`, which is also what keeps the
 // endpoint awake while its pull runs: nobody else is polling it.
 //
-// A pull first looks, without any lock, and ends there when there is nothing
-// to land: every export of ours comes back as an event. Otherwise it lands as
-// a merge does. It takes `main`'s merge lock, the container moves root's ref
-// by compare-and-swap, and the index moves last. If someone else holds the
-// lock it waits and tries again. Every step can run twice: a redelivery, an
-// evicted object, or a retry finds the work done and ends.
+// A pull first looks, and ends there when there is nothing to land: every
+// export of ours comes back as an event. Otherwise it lands as a merge does.
+// The container pushes its commits to landing refs, `main`'s list moves by
+// compare-and-swap, and the repos' branches follow. A merge that landed
+// meanwhile sends it back to start from `main` as it is. Every step can run
+// twice: a redelivery, an evicted object, or a retry finds the work done.
 
 import { parse as parseToml } from "smol-toml";
 
-import { type Deps, HttpError, isChecking, loadDefinitions, projectStub, revokeRepoTokens } from "./index";
+import { type Deps, HttpError, isChecking, landAndFollow, loadDefinitions, projectStub, revokeRepoTokens } from "./index";
 import { pausedBy } from "./budget";
 import type { MirrorInstance, PullPlan } from "./endpoint";
 import { decide, mayMaintain, type ProjectId, projectKey, repoName } from "./names";
 
-/** Who holds `main`'s merge lock during a pull. Not a login: logins have no spaces. */
+/** Who a pull lands as, in `main`'s log. Not a login: logins have no spaces. */
 export const WEBHOOK_MERGER = "the GitHub webhook";
 
 /** The branch a mirror's main branch stands for, as an export pushes it. */
 export const PULL_BRANCH = "main";
 
-/** How often the alarm looks at a pull: a poll of the container, or of a lock. */
+/** How often the alarm looks at a pull: a poll of the container. */
 export const PULL_POLL_MS = 15_000;
 
 /** How soon after an event the alarm first runs: GitHub has had its answer. */
 export const PULL_START_MS = 1_000;
 
-/** A pull holds the lock this long past each poll, so a stalled one lets go. */
-export const PULL_LOCK_SECONDS = 20 * 60;
-
-/** Past this, a pull waiting on a lock gives up; a redelivery starts it again. */
+/** Past this, a pull still not landed gives up; a redelivery starts it again. */
 export const PULL_LIMIT_MS = 2 * 60 * 60_000;
 
 /** How many times a failure is retried before a redelivery has to. */
@@ -69,7 +66,7 @@ export interface MirrorPull {
 	peeked?: boolean;
 	/** Read passwords handed out for looks, to cancel when the pull ends. */
 	tokens?: { repo: string; artifactsId: string }[];
-	/** `main`'s index when this pull took the lock; unset until then. */
+	/** `main`'s index when this pull began to land; unset until then. */
 	base?: Record<string, string>;
 }
 
@@ -362,7 +359,6 @@ export async function advancePulls(env: Env, deps: Deps, id: ProjectId): Promise
 		done = true;
 	}
 	if (done) {
-		await revokeRepoTokens(deps, await project.releaseMerge(PULL_BRANCH, WEBHOOK_MERGER));
 		await revokeRepoTokens(deps, await project.dropPull(pull));
 	}
 	return (await project.pulls()).length > 0;
@@ -406,8 +402,7 @@ async function advance(env: Env, deps: Deps, id: ProjectId, pull: MirrorPull): P
 	};
 	if (!deps.pull) throw new HttpError(501, "this remote has no Git endpoint to pull with");
 
-	// First a look, without the lock: every export comes back as an event,
-	// and a merge should not have to wait while the container finds that out.
+	// First a look: every export comes back as an event, and most end here.
 	if (!pull.peeked) {
 		const list = (await project.branch(PULL_BRANCH))?.list;
 		if (list === undefined) throw new HttpError(404, `no branch \`${PULL_BRANCH}\` in ${key}`);
@@ -421,8 +416,7 @@ async function advance(env: Env, deps: Deps, id: ProjectId, pull: MirrorPull): P
 		await project.markPeeked(pull);
 	}
 
-	// Asked only now: our own exports end above, and cost GitHub no call. No
-	// lock is held while "no pull request" waits to be believed.
+	// Asked only now: our own exports end above, and cost GitHub no call.
 	if (instances === undefined) {
 		const now = Date.now();
 		if (pull.lookup !== undefined && now - pull.lookup.last < PULL_INDEX_ASK_MS) return false;
@@ -436,39 +430,27 @@ async function advance(env: Env, deps: Deps, id: ProjectId, pull: MirrorPull): P
 		await project.setPullInstances(pull, instances);
 	}
 
-	const begun = await project.beginPull(pull, PULL_LOCK_SECONDS);
-	if (!begun.ok) {
-		// Someone is merging, which is theirs to finish. Try again later.
-		if (begun.reason === "locked") {
-			console.log(JSON.stringify({ webhook: "waiting for a merge", project: key, by: begun.by, until: begun.until }));
-			return false;
-		}
-		throw new HttpError(404, `no branch \`${PULL_BRANCH}\` in ${key}`);
-	}
-	await revokeRepoTokens(deps, begun.stale);
-	if (!(await project.extendMerge(PULL_BRANCH, WEBHOOK_MERGER, PULL_LOCK_SECONDS))) {
-		// The lock lapsed; the next step takes it again from where `main` is.
-		await project.restartPull(pull);
-		return false;
-	}
+	const begun = await project.beginPull(pull);
+	if (!begun.ok) throw new HttpError(404, `no branch \`${PULL_BRANCH}\` in ${key}`);
 	const answer = await deps.pull(key, plan(begun.base), async () => {
 		const { handed, minted } = await mint(begun.base, (tracker) =>
 			pull.writable.includes(tracker) ? "write" : "read",
 		);
-		await project.recordMergeTokens(PULL_BRANCH, handed);
+		await project.notePullTokens(pull, handed);
 		return minted;
 	});
 	if (isChecking(answer)) return false;
 
-	if (answer.outcome === "moved") throw new HttpError(409, answer.why);
 	if (answer.outcome === "landed") {
-		const finished = await project.finishMerge(PULL_BRANCH, begun.base, answer.list, WEBHOOK_MERGER);
-		if (!finished.ok) throw new HttpError(409, `the pull could not finish: ${finished.reason}`);
-		await revokeRepoTokens(deps, finished.tokens);
-		console.log(JSON.stringify({ webhook: "landed", ...log, commits: answer.commits, root: answer.list.root }));
+		// The commit point: `main`'s list, by compare-and-swap. A merge that
+		// landed meanwhile sends this pull back to start from it.
+		const landed = await landAndFollow(deps, project, id, PULL_BRANCH, begun.base, answer.list, WEBHOOK_MERGER, answer.moves ?? []);
+		if (!landed.ok) throw new HttpError(409, `the pull could not land: \`${PULL_BRANCH}\` ${landed.reason}`);
+		console.log(
+			JSON.stringify({ webhook: "landed", ...log, commits: answer.commits, root: answer.list.root, behind: landed.behind }),
+		);
 		return true;
 	}
-	await revokeRepoTokens(deps, await project.releaseMerge(PULL_BRANCH, WEBHOOK_MERGER));
 	if (answer.outcome === "work") throw new HttpError(500, "a landing answered as a peek");
 	return ended(answer);
 }

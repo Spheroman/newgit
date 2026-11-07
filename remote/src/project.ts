@@ -10,7 +10,7 @@ import { DurableObject } from "cloudflare:workers";
 
 import { liveDeps } from "./index";
 import type { MirrorInstance } from "./endpoint";
-import { type MirrorPull, PULL_BRANCH, PULL_POLL_MS, PULL_START_MS, WEBHOOK_MERGER, advancePulls } from "./webhook";
+import { type MirrorPull, PULL_BRANCH, PULL_POLL_MS, PULL_START_MS, advancePulls } from "./webhook";
 
 export interface ProjectInfo {
 	name: string;
@@ -22,30 +22,41 @@ export interface ProjectInfo {
 /** A branch: one commit per tracker in Git, by tracker name. */
 export type TrackerList = Record<string, string>;
 
-interface MergeLock {
+/** Write passwords handed out, to cancel when what they were for ends. */
+export type HandedToken = { repo: string; artifactsId: string };
+
+/**
+ * A merge begun and not landed: what was checked when it began, so its
+ * landing lands exactly that. Many can be in flight at once; landing is the
+ * only moment two of them meet.
+ */
+interface PendingMerge {
 	by: string;
+	/** The index it lands: every pin in it was checked when it began. */
+	target: TrackerList;
+	/** The trackers it was handed a write password for: the refs it may ask to move. */
+	writes: string[];
+	tokens: HandedToken[];
+	/** Past this it is forgotten and its passwords cancelled. */
 	until: string;
-	/** The index the merge began with: every pin in it was checked then. */
-	target?: TrackerList;
-	/** Write passwords handed out for it. */
-	tokens?: { repo: string; artifactsId: string }[];
 }
 
 export type MergeStart =
-	| { ok: true; until: string; stale: { repo: string; artifactsId: string }[] }
+	| { ok: true; until: string; stale: HandedToken[] }
 	| { ok: false; reason: "missing" }
-	| { ok: false; reason: "moved"; list: TrackerList }
-	| { ok: false; reason: "locked"; by: string; until: string };
-
-export type PullStart =
-	| { ok: true; base: TrackerList; stale: { repo: string; artifactsId: string }[] }
-	| { ok: false; reason: "missing" }
-	| { ok: false; reason: "locked"; by: string; until: string };
-
-export type MergeFinish =
-	| { ok: true; branch: Branch; tokens: { repo: string; artifactsId: string }[] }
-	| { ok: false; reason: "missing" | "unlocked" }
 	| { ok: false; reason: "moved"; list: TrackerList };
+
+export type PullStart = { ok: true; base: TrackerList } | { ok: false; reason: "missing" };
+
+export type Landing =
+	| { ok: true; branch: Branch; tokens: HandedToken[]; writes: string[]; already: boolean }
+	| { ok: false; reason: "missing" }
+	| { ok: false; reason: "moved"; list: TrackerList };
+
+/** Where a pending merge is kept: by branch, and by the root commit it lands. */
+function pendingKey(name: string, target: TrackerList): string {
+	return `merge:${name}:${target.root ?? ""}`;
+}
 
 function samePull(left: MirrorPull, right: MirrorPull): boolean {
 	return left.target === right.target && left.commit === right.commit;
@@ -283,9 +294,11 @@ export class ProjectDO extends DurableObject<Env> {
 	}
 
 	/**
-	 * Start merging into `name`: refused unless its list is still `base`
-	 * (someone else merged first: merge again) and no other merge into it is
-	 * in flight. Takes the branch's merge lock for `seconds`.
+	 * Begin a merge into `name` that makes `target`: refused if its list is no
+	 * longer `base` (someone else landed first: merge again). Nothing is
+	 * locked: another merge may begin beside it, and whichever lands second
+	 * finds the list moved. Merges begun more than `seconds` ago and never
+	 * landed are forgotten here; their passwords come back to cancel.
 	 */
 	beginMerge(
 		name: string,
@@ -293,90 +306,103 @@ export class ProjectDO extends DurableObject<Env> {
 		by: string,
 		seconds: number,
 		target: TrackerList,
+		writes: string[] = [],
 	): MergeStart {
 		const branch = this.branch(name);
 		if (branch === null) return { ok: false, reason: "missing" };
 		if (!sameList(branch.list, base)) return { ok: false, reason: "moved", list: branch.list };
-		const lock = this.mergeLock(name);
-		if (lock !== null && lock.by !== by && Date.parse(lock.until) > Date.now())
-			return { ok: false, reason: "locked", by: lock.by, until: lock.until };
-		// Whatever the lock it replaces handed out is cancelled: a merge that
-		// stalled past its lock cannot push over this one.
-		const stale = lock?.tokens ?? [];
-		const until = new Date(Date.now() + seconds * 1000).toISOString();
-		this.sql.exec(
-			"INSERT OR REPLACE INTO meta VALUES (?, ?)",
-			`merge:${name}`,
-			JSON.stringify({ by, until, target, tokens: [] }),
-		);
+		const stale: HandedToken[] = [];
+		const now = Date.now();
+		for (const [key, merge] of this.pendingMerges(name)) {
+			if (Date.parse(merge.until) > now) continue;
+			stale.push(...merge.tokens);
+			this.sql.exec("DELETE FROM meta WHERE key = ?", key);
+		}
+		const until = new Date(now + seconds * 1000).toISOString();
+		const key = pendingKey(name, target);
+		// The same merge begun again (a run that stopped): its passwords from
+		// before are cancelled, and it starts over.
+		stale.push(...(this.pendingMerge(name, target)?.tokens ?? []));
+		const merge: PendingMerge = { by, target, writes, tokens: [], until };
+		this.sql.exec("INSERT OR REPLACE INTO meta VALUES (?, ?)", key, JSON.stringify(merge));
 		return { ok: true, until, stale };
 	}
 
-	/**
-	 * Hold the merge into `name` that `by` holds for `seconds` more, from
-	 * now: what the finish does before the remote runs Git over every tracker
-	 * the merge moves, which the first time a large history is there takes
-	 * longer than the lock began with. Refused, changing nothing, unless `by`
-	 * holds it now.
-	 */
-	extendMerge(name: string, by: string, seconds: number): boolean {
-		const lock = this.mergeLock(name);
-		if (lock === null || lock.by !== by || Date.parse(lock.until) <= Date.now()) return false;
-		lock.until = new Date(Date.now() + seconds * 1000).toISOString();
-		this.sql.exec("INSERT OR REPLACE INTO meta VALUES (?, ?)", `merge:${name}`, JSON.stringify(lock));
-		return true;
+	/** The write passwords handed out for the merge into `name` that makes `target`. */
+	recordMergeTokens(name: string, target: TrackerList, tokens: HandedToken[]): void {
+		const merge = this.pendingMerge(name, target);
+		if (merge === null) return;
+		merge.tokens = [...merge.tokens, ...tokens];
+		this.sql.exec("INSERT OR REPLACE INTO meta VALUES (?, ?)", pendingKey(name, target), JSON.stringify(merge));
 	}
 
-	/** The write passwords handed out for the merge in flight, to cancel when it ends. */
-	recordMergeTokens(name: string, tokens: { repo: string; artifactsId: string }[]): void {
-		const lock = this.mergeLock(name);
-		if (lock === null) return;
-		lock.tokens = [...(lock.tokens ?? []), ...tokens];
-		this.sql.exec("INSERT OR REPLACE INTO meta VALUES (?, ?)", `merge:${name}`, JSON.stringify(lock));
+	/** The merge into `name` that makes exactly `target`, begun and not landed. */
+	pendingMerge(name: string, target: TrackerList): PendingMerge | null {
+		const row = this.sql
+			.exec<{ value: string }>("SELECT value FROM meta WHERE key = ?", pendingKey(name, target))
+			.toArray()[0];
+		const merge = row ? (JSON.parse(row.value) as PendingMerge) : null;
+		return merge !== null && sameList(merge.target, target) ? merge : null;
+	}
+
+	private pendingMerges(name: string): [string, PendingMerge][] {
+		return this.sql
+			.exec<{ key: string; value: string }>(
+				"SELECT key, value FROM meta WHERE substr(key, 1, ?) = ?",
+				`merge:${name}:`.length,
+				`merge:${name}:`,
+			)
+			.toArray()
+			.map((row) => [row.key, JSON.parse(row.value) as PendingMerge]);
 	}
 
 	/**
-	 * Finish a merge: move `name`'s list from `base` to `list` in one write,
-	 * and release the lock. Refused unless `by` holds the lock and the list is
-	 * still `base` — every tracker moves together, or none does.
+	 * Land: move `name`'s list from `base` to `list` in one write. The commit
+	 * point of every merge, and the only one: a compare-and-swap on the heads
+	 * the merge moves, root's always among them, so a merge that began on a
+	 * list someone else has since moved finds it moved. Already `list` (a run
+	 * that landed and stopped before it heard): landed, and says so.
 	 */
-	finishMerge(name: string, base: TrackerList, list: TrackerList, by: string): MergeFinish {
+	land(name: string, base: TrackerList, list: TrackerList, by: string): Landing {
 		const branch = this.branch(name);
 		if (branch === null) return { ok: false, reason: "missing" };
-		const lock = this.mergeLock(name);
-		if (lock === null || lock.by !== by || Date.parse(lock.until) <= Date.now())
-			return { ok: false, reason: "unlocked" };
-		if (!sameList(branch.list, base)) return { ok: false, reason: "moved", list: branch.list };
+		const merge = this.pendingMerge(name, list);
+		const done = { tokens: merge?.tokens ?? [], writes: merge?.writes ?? [] };
+		if (sameList(branch.list, list)) {
+			this.sql.exec("DELETE FROM meta WHERE key = ?", pendingKey(name, list));
+			return { ok: true, branch, ...done, already: true };
+		}
+		const moving = [...new Set([...Object.keys(base), ...Object.keys(list), "root"])].filter(
+			(tracker) => tracker === "root" || base[tracker] !== list[tracker],
+		);
+		if (moving.some((tracker) => (branch.list[tracker] ?? null) !== (base[tracker] ?? null)))
+			return { ok: false, reason: "moved", list: branch.list };
 		this.ctx.storage.transactionSync(() => {
-			this.moveHeads(name, base, list, by, new Date().toISOString());
-			this.sql.exec("DELETE FROM meta WHERE key = ?", `merge:${name}`);
+			this.moveHeads(name, branch.list, list, by, new Date().toISOString());
+			this.sql.exec("DELETE FROM meta WHERE key = ?", pendingKey(name, list));
 		});
-		return { ok: true, branch: this.branch(name)!, tokens: lock.tokens ?? [] };
+		return { ok: true, branch: this.branch(name)!, ...done, already: false };
 	}
 
-	/**
-	 * Let go of the merge into `name` that `by` holds, moving nothing: the
-	 * passwords handed out for it, to cancel. A lock someone else took since
-	 * is left alone.
-	 */
-	releaseMerge(name: string, by: string): { repo: string; artifactsId: string }[] {
-		const lock = this.mergeLock(name);
-		if (lock === null || lock.by !== by) return [];
-		this.sql.exec("DELETE FROM meta WHERE key = ?", `merge:${name}`);
-		return lock.tokens ?? [];
+	/** `tracker`'s head on `name` now, or null. */
+	head(name: string, tracker: string): string | null {
+		return this.headsOf(name)[tracker] ?? null;
 	}
 
-	/** Whether `list` is exactly the index the merge in flight into `name` began with. */
-	mergeTargets(name: string, list: TrackerList): boolean {
-		const target = this.mergeLock(name)?.target;
-		return target !== undefined && sameList(target, list);
-	}
-
-	private mergeLock(name: string): MergeLock | null {
-		const row = this.sql
-			.exec<{ value: string }>("SELECT value FROM meta WHERE key = ?", `merge:${name}`)
-			.toArray()[0];
-		return row ? (JSON.parse(row.value) as MergeLock) : null;
+	/** Whether `commit` has been `tracker`'s head on `name`, now or before. */
+	wasHead(name: string, tracker: string, commit: string): boolean {
+		if (this.headsOf(name)[tracker] === commit) return true;
+		return (
+			this.sql
+				.exec(
+					"SELECT 1 FROM head_log WHERE branch = ? AND tracker = ? AND (old = ? OR new = ?) LIMIT 1",
+					name,
+					tracker,
+					commit,
+					commit,
+				)
+				.toArray().length > 0
+		);
 	}
 
 	/** Webhook pulls waiting or running, oldest first (src/webhook.ts). */
@@ -459,29 +485,25 @@ export class ProjectDO extends DurableObject<Env> {
 		return attempts;
 	}
 
-	/** The lock lapsed: forget the index it began with. */
+	/** `main` moved under the pull: forget the index it began with. */
 	restartPull(pull: MirrorPull): void {
 		this.writePulls(this.pulls().map((known) => (samePull(known, pull) ? { ...known, base: undefined } : known)));
 	}
 
 	/**
-	 * Take `main`'s merge lock for a pull, or find it taken already: the
-	 * index it began with. Refused while anyone else's merge is in flight.
+	 * The index a pull lands on: `main`'s list when the pull began, kept for
+	 * every step after. Nothing is locked; landing finds out whether `main`
+	 * moved meanwhile.
 	 */
-	beginPull(pull: MirrorPull, seconds: number): PullStart {
+	beginPull(pull: MirrorPull): PullStart {
 		const known = this.pulls().find((candidate) => samePull(candidate, pull));
-		if (known?.base !== undefined) return { ok: true, base: known.base, stale: [] };
+		if (known?.base !== undefined) return { ok: true, base: known.base };
 		const branch = this.branch(PULL_BRANCH);
 		if (branch === null) return { ok: false, reason: "missing" };
-		const started = this.beginMerge(PULL_BRANCH, branch.list, WEBHOOK_MERGER, seconds, branch.list);
-		if (!started.ok) {
-			if (started.reason === "locked") return started;
-			return { ok: false, reason: "missing" };
-		}
 		this.writePulls(
 			this.pulls().map((candidate) => (samePull(candidate, pull) ? { ...candidate, base: branch.list } : candidate)),
 		);
-		return { ok: true, base: branch.list, stale: started.stale };
+		return { ok: true, base: branch.list };
 	}
 
 	/**

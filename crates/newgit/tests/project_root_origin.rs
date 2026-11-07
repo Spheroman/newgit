@@ -254,6 +254,15 @@ fn git_pull_brings_in_a_change_that_landed_on_the_mirror() {
         .get_mut(&project)
         .expect("project")
         .insert("main".to_owned(), answer["list"].clone());
+    // And, as the Worker does once the list lands, root's `main` follows.
+    git(
+        &fixture.remote.repo("jack.store.t.root"),
+        &[
+            "update-ref",
+            "refs/heads/main",
+            answer["list"]["root"].as_str().expect("root"),
+        ],
+    );
 
     let before = git(store, &["rev-parse", "HEAD"]);
     let output = git_as_user(&fixture, store, &["pull", "--ff-only"]);

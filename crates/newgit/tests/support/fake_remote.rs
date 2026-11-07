@@ -522,21 +522,53 @@ fn route(
             }
             if !body["base"].is_null() {
                 let target = format!("{owner}/{name}/{branch}");
+                let landed = state
+                    .branches
+                    .get(&format!("{owner}/{name}"))
+                    .and_then(|branches| branches.get(*branch))
+                    == Some(&body["list"]);
+                if landed && !state.merge_targets.contains_key(&target) {
+                    return (200, json!({ "name": branch, "list": body["list"], "behind": [] }));
+                }
                 if state.merge_targets.get(&target) != Some(&body["list"]) {
                     return (
                         400,
                         json!({ "error": "this is not the index the merge began with" }),
                     );
                 }
-                let branches = state.branches.entry(format!("{owner}/{name}")).or_default();
+                let key = format!("{owner}/{name}");
+                let branches = state.branches.entry(key.clone()).or_default();
                 if branches.get(*branch) != Some(&body["base"]) {
                     return (
                         409,
                         json!({ "error": "the branch moved since you looked: merge again" }),
                     );
                 }
+                // The commit point; then, like the Worker, the repos follow:
+                // root's branch to the list, each asked-for move by
+                // compare-and-swap, and the landing refs go.
                 branches.insert((*branch).to_owned(), body["list"].clone());
-                return (200, json!({ "name": branch, "list": body["list"] }));
+                state.merge_targets.remove(&target);
+                let repo_of = |tracker: &str| {
+                    repos.join(format!("{}.t.{tracker}.git", key.replace('/', ".")))
+                };
+                let root = body["list"]["root"].as_str().unwrap_or_default().to_owned();
+                let root_repo = repo_of("root");
+                git(&root_repo, &["update-ref", &format!("refs/heads/{branch}"), &root]);
+                let _ = git_output(&root_repo, &["update-ref", "-d", &format!("refs/newgit/landing/{root}")]);
+                let mut behind = Vec::new();
+                for step in body["moves"].as_array().cloned().unwrap_or_default() {
+                    let tracker = step["tracker"].as_str().unwrap_or_default();
+                    let new = step["new"].as_str().unwrap_or_default();
+                    let old = step["old"].as_str().unwrap_or("0000000000000000000000000000000000000000");
+                    let repo = repo_of(tracker);
+                    let target_ref = format!("refs/heads/{}", step["branch"].as_str().unwrap_or_default());
+                    if !git_output(&repo, &["update-ref", &target_ref, new, old]).status.success() {
+                        behind.push(format!("`{tracker}`'s `{}` moved while this merge ran", step["branch"]));
+                    }
+                    let _ = git_output(&repo, &["update-ref", "-d", &format!("refs/newgit/landing/{new}")]);
+                }
+                return (200, json!({ "name": branch, "list": body["list"], "behind": behind }));
             }
             let branches = state.branches.entry(format!("{owner}/{name}")).or_default();
             if branches.contains_key(*branch) {

@@ -1013,33 +1013,35 @@ impl BranchManager {
                 }
             }
             let credentials = client.begin_merge(&key, branch, base, target)?;
+            // Objects first, at landing refs; the remote lands the list, then
+            // moves root's branch and each child's `main` to what it pins.
+            let mut moves = Vec::new();
             for credential in &credentials {
                 let Some(commit) = target.get(&credential.tracker) else {
                     continue;
                 };
-                let reference = if credential.tracker == root {
-                    format!("refs/heads/{branch}")
-                } else {
-                    "refs/heads/main".to_owned()
-                };
                 let url = credential.credential.remote.clone().unwrap_or_default();
                 let auth = basic_auth_header(&credential.credential);
-                // On what the repo holds now: a run that stopped after this
-                // push finds it done.
-                let held = GitSource::remote_ref(&url, &reference, Some(&auth))?;
-                if held.as_deref() == Some(commit.as_str()) {
-                    continue;
-                }
                 GitSource::push_leased(
                     &["-C", project.as_str()],
                     &url,
                     commit,
-                    &reference,
-                    held.as_deref(),
+                    &crate::remote::landing_ref(commit),
+                    None,
                     Some(&auth),
                 )?;
+                if credential.tracker != root {
+                    moves.push(crate::remote::RefMove {
+                        tracker: credential.tracker.clone(),
+                        branch: "main".to_owned(),
+                        old: GitSource::remote_ref(&url, "refs/heads/main", Some(&auth))?,
+                        new: commit.clone(),
+                    });
+                }
             }
-            client.finish_merge(&key, branch, base, target)?;
+            for behind in client.finish_merge(&key, branch, base, target, &moves)? {
+                outcome.lines.push(behind);
+            }
             outcome.lines.push(format!(
                 "On {key}: `{branch}` is root {}, its list the new index",
                 short(&target[&root])

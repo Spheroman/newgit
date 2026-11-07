@@ -33,7 +33,7 @@ describe("per-tracker heads", () => {
 			const before = instance.headLog("main").at(-1)!.seq;
 			const list = { root: sha("1"), access: sha("b"), web: sha("2"), added: sha("3") };
 			expect(instance.beginMerge("main", base, "ana", 60, list).ok).toBe(true);
-			expect(instance.finishMerge("main", base, list, "ana").ok).toBe(true);
+			expect(instance.land("main", base, list, "ana").ok).toBe(true);
 			expect(instance.branch("main")?.list).toEqual(list);
 			const moves = instance.headLog("main", before);
 			expect(moves.map((move) => [move.tracker, move.old, move.new]).sort()).toEqual(
@@ -56,7 +56,7 @@ describe("per-tracker heads", () => {
 			const logged = instance.headLog("main").length;
 			const stale = { root: sha("9"), access: sha("b") };
 			expect(instance.beginMerge("main", stale, "ana", 60, base).ok).toBe(false);
-			expect(instance.finishMerge("main", stale, { root: sha("1"), access: sha("b") }, "ana").ok).toBe(
+			expect(instance.land("main", stale, { root: sha("1"), access: sha("b") }, "ana").ok).toBe(
 				false,
 			);
 			expect(instance.branch("main")?.list).toEqual(base);
@@ -71,7 +71,7 @@ describe("per-tracker heads", () => {
 			instance.createBranch("main", base, "jack");
 			const list = { root: sha("1"), access: sha("b") };
 			instance.beginMerge("main", base, "ana", 60, list);
-			instance.finishMerge("main", base, list, "ana");
+			instance.land("main", base, list, "ana");
 			const row = state.storage.sql
 				.exec<{ list: string }>("SELECT list FROM branches WHERE name = 'main'")
 				.toArray()[0];

@@ -7,8 +7,9 @@ import { FakeRepos, noEndpoint } from "./fake-repos";
 
 // A merge's finish runs Git over every tracker the merge moves before it
 // lands, and the first time a large history is there (Spheroman/t3code,
-// 365 MiB) that takes longer than the ten-minute merge lock. The lock was
-// gone by the time the check answered, and the finish was refused (#144).
+// 365 MiB) took longer than the ten-minute merge lock there was then. The
+// lock was gone by the time the check answered, and the finish was refused
+// (#144). There is no lock now; a merge begun is remembered long enough.
 // New tests live in their own file per AGENTS.md's "Working in parallel".
 
 let repos: FakeRepos;
@@ -59,7 +60,7 @@ async function call(token: string, method: string, route: string, body?: unknown
 }
 
 describe("a merge whose finish waits on a long check", () => {
-	it("still holds its lock when an eleven-minute check answers", async () => {
+	it("still lands when an eleven-minute check answers", async () => {
 		vi.useFakeTimers({ toFake: ["Date"] });
 		const moved = { ...main, root: sha("c") };
 		expect((await call(jack, "POST", path("/branches/main/merge"), { base: main, list: moved })).status).toBe(200);
@@ -69,13 +70,19 @@ describe("a merge whose finish waits on a long check", () => {
 		expect((await call(jack, "GET", path("/branches/main"))).body.list).toEqual(moved);
 	});
 
-	it("is refused when the lock had already ended before the finish", async () => {
+	it("is forgotten, its passwords cancelled, when another begins long after it", async () => {
 		vi.useFakeTimers({ toFake: ["Date"] });
 		const moved = { ...main, root: sha("c") };
+		const before = repos.minted.length;
 		expect((await call(jack, "POST", path("/branches/main/merge"), { base: main, list: moved })).status).toBe(200);
-		vi.setSystemTime(Date.now() + 11 * 60 * 1000);
+		const handed = repos.minted.slice(before).map((token) => token.id);
+		expect(handed.length).toBeGreaterThan(0);
+		vi.setSystemTime(Date.now() + 41 * 60 * 1000);
+		const other = { ...main, root: sha("e") };
+		expect((await call(jack, "POST", path("/branches/main/merge"), { base: main, list: other })).status).toBe(200);
+		expect(handed.every((id) => repos.revokedTokens.has(id))).toBe(true);
 		const finished = await call(jack, "PUT", path("/branches/main"), { base: main, list: moved });
-		expect(finished.status).toBe(409);
-		expect(finished.body.error).toContain("you hold no merge");
+		expect(finished.status).toBe(400);
+		expect(finished.body.error).toContain("start the merge again");
 	});
 });

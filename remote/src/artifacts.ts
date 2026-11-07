@@ -9,6 +9,8 @@ export interface MintedToken {
 	expiresAt: string;
 }
 
+import { parseAdvertisement, parseReport, type RefUpdate, receivePackBody } from "./refs";
+
 export interface Repos {
 	create(name: string): Promise<{ remote: string }>;
 	/** The repo's Git remote, or null when it does not exist. */
@@ -23,6 +25,13 @@ export interface Repos {
 	revokeToken(name: string, tokenId: string): Promise<boolean>;
 	/** A file's text at `ref`, or null when the repo, ref, or path is missing. */
 	readFile(name: string, ref: string, path: string): Promise<string | null>;
+	/** Every ref the repo has, at its commit. */
+	refs(name: string): Promise<Record<string, string>>;
+	/**
+	 * Move refs to commits the repo already has, each by compare-and-swap on
+	 * its `old`. Per ref, whether it moved: one that did not held something else.
+	 */
+	updateRefs(name: string, updates: RefUpdate[]): Promise<Record<string, boolean>>;
 }
 
 /** Artifacts tokens are `art_v…_<secret>?expires=<unix>`; Git wants the part before `?`. */
@@ -106,4 +115,45 @@ export class ArtifactsRepos implements Repos {
 			throw error;
 		}
 	}
+
+	async refs(name: string) {
+		return this.withPassword(name, async (auth) => {
+			const response = await fetch(`${this.url(name)}/info/refs?service=git-receive-pack`, {
+				headers: { authorization: auth, "user-agent": USER_AGENT },
+			});
+			if (!response.ok) throw new Error(`${name}: listing refs answered ${response.status}`);
+			return parseAdvertisement(new Uint8Array(await response.arrayBuffer()));
+		});
+	}
+
+	async updateRefs(name: string, updates: RefUpdate[]) {
+		if (updates.length === 0) return {};
+		return this.withPassword(name, async (auth) => {
+			const response = await fetch(`${this.url(name)}/git-receive-pack`, {
+				method: "POST",
+				headers: {
+					authorization: auth,
+					"user-agent": USER_AGENT,
+					"content-type": "application/x-git-receive-pack-request",
+					accept: "application/x-git-receive-pack-result",
+				},
+				body: await receivePackBody(updates),
+			});
+			if (!response.ok) throw new Error(`${name}: moving refs answered ${response.status}`);
+			return parseReport(new Uint8Array(await response.arrayBuffer()), updates);
+		});
+	}
+
+	/** Run `use` with a write password that lives a minute and is gone after. */
+	private async withPassword<T>(name: string, use: (auth: string) => Promise<T>): Promise<T> {
+		const token = await this.mint(name, "write", 60);
+		try {
+			return await use(`Basic ${btoa(`x:${token.password}`)}`);
+		} finally {
+			await this.revokeToken(name, token.id).catch(() => false);
+		}
+	}
 }
+
+/** Named, as Git names itself: a bare client can be turned away at the door. */
+const USER_AGENT = "newgit-remote";

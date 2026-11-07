@@ -108,7 +108,9 @@ fn answer(
     let mut plan = remote.plan(list, commit);
     plan.instances = instances;
     plan.peek = peek;
-    pull_mirror(&plan).expect("pull")
+    let answer = pull_mirror(&plan).expect("pull");
+    remote.follow(&answer);
+    answer
 }
 
 #[test]
@@ -147,7 +149,7 @@ fn after_newgit_merge_the_mirrors_commit_is_recognised_and_nothing_lands_twice()
     // The redelivery: the instance's pin is on `main` now, so nothing stops
     // it, and the merge on the mirror is all that is new.
     let list = match answer(&remote, &base, &theirs, vec![instance.clone()], false) {
-        PullAnswer::Landed { list, commits } => {
+        PullAnswer::Landed { list, commits, .. } => {
             assert_eq!(commits, 1, "only the mirror's merge commit");
             list
         }
@@ -281,10 +283,12 @@ fn a_look_says_what_a_landing_would_and_moves_nothing() {
 }
 
 #[test]
-fn an_index_behind_roots_ref_says_main_moved() {
+fn a_pull_moves_no_branch_itself() {
     let (_guard, temp) = tempdir();
     let remote = remote(&temp);
-    // Root's ref moved and the index the plan was made from did not.
+    // Only the Worker's compare-and-swap on the list lands anything: the
+    // container leaves the commit at its landing ref and `main` alone, so a
+    // pull made from an index that has moved since lands nothing.
     let stale = remote.index();
     let repo = remote.store.paths().project_root.clone();
     std::fs::write(repo.join("ours.txt"), "ours\n").expect("write");
@@ -294,9 +298,21 @@ fn an_index_behind_roots_ref_says_main_moved() {
     remote.publish();
     let root = remote.main("root");
     let theirs = remote.commit_on_mirror("pr", &[("pr.txt", "pr\n")], "from GitHub");
-    assert!(matches!(
-        answer(&remote, &stale, &theirs, Vec::new(), false),
-        PullAnswer::Moved { .. }
-    ));
-    assert_eq!(remote.main("root"), root);
+    let mut plan = remote.plan(&stale, &theirs);
+    plan.instances = Vec::new();
+    let PullAnswer::Landed { list, .. } = pull_mirror(&plan).expect("pull") else {
+        panic!("it lands as far as the container goes");
+    };
+    assert_eq!(remote.main("root"), root, "root's `main` is where it was");
+    assert_eq!(
+        git(
+            &remote.repos["root"],
+            &[
+                "rev-parse",
+                &newgit_core::remote::landing_ref(&list["root"])
+            ]
+        ),
+        list["root"],
+        "its commit waits at a landing ref"
+    );
 }

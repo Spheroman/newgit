@@ -88,9 +88,62 @@ impl Remote {
         list: &BTreeMap<String, String>,
         commit: &str,
     ) -> BTreeMap<String, String> {
-        match pull_mirror(&self.plan(list, commit)).expect("pull") {
+        let answer = pull_mirror(&self.plan(list, commit)).expect("pull");
+        self.follow(&answer);
+        match answer {
             PullAnswer::Landed { list, .. } => list,
             other => panic!("{other:?}"),
+        }
+    }
+
+    /// What the Worker does once a pull's list lands: root's `main` follows
+    /// it, each move is made, and the landing refs go. The container moves
+    /// no branch itself.
+    pub fn follow(&self, answer: &PullAnswer) {
+        let PullAnswer::Landed { list, moves, .. } = answer else {
+            return;
+        };
+        let root = &self.repos["root"];
+        assert_eq!(
+            git(
+                root,
+                &[
+                    "rev-parse",
+                    &newgit_core::remote::landing_ref(&list["root"])
+                ]
+            ),
+            list["root"],
+            "the root commit waits at its landing ref"
+        );
+        git(root, &["update-ref", "refs/heads/main", &list["root"]]);
+        git(
+            root,
+            &[
+                "update-ref",
+                "-d",
+                &newgit_core::remote::landing_ref(&list["root"]),
+            ],
+        );
+        for step in moves {
+            let repo = &self.repos[&step.tracker];
+            let old = step.old.clone().unwrap_or_else(|| "0".repeat(40));
+            git(
+                repo,
+                &[
+                    "update-ref",
+                    &format!("refs/heads/{}", step.branch),
+                    &step.new,
+                    &old,
+                ],
+            );
+            git(
+                repo,
+                &[
+                    "update-ref",
+                    "-d",
+                    &newgit_core::remote::landing_ref(&step.new),
+                ],
+            );
         }
     }
 

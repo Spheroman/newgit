@@ -87,7 +87,7 @@ describe("merging into a branch", () => {
 			list: { root: sha("c"), t3code: sha("e") },
 		});
 		expect(sneaky.status).toBe(400);
-		expect(sneaky.body.error).toContain("not the index the merge began with");
+		expect(sneaky.body.error).toContain("not the index a merge began with");
 		expect(started.status).toBe(200);
 		expect((await call(jack, "PUT", path("/branches/main"), { base: main, list: moved })).status).toBe(200);
 		expect(repos.revokedTokens.has(minted)).toBe(true);
@@ -105,15 +105,20 @@ describe("merging into a branch", () => {
 		expect(refused.body.error).toContain("merge again");
 	});
 
-	it("lets one merge into a branch at a time", async () => {
-		expect((await begin(jack, main, { ...main, root: sha("c") })).status).toBe(200);
-		const second = await begin(ana, main, { ...main, root: sha("d") });
-		expect(second.status).toBe(409);
-		expect(second.body.error).toContain("jack is merging");
-		// Ana cannot finish a merge she does not hold.
-		const sneak = await call(ana, "PUT", path("/branches/main"), { base: main, list: { ...main, root: sha("c") } });
+	it("lets two merges begin at once, and lands whichever finishes first", async () => {
+		const jacks = { ...main, root: sha("c") };
+		const anas = { ...main, root: sha("d") };
+		expect((await begin(jack, main, jacks)).status).toBe(200);
+		expect((await begin(ana, main, anas)).status, "nothing is locked").toBe(200);
+		// Ana cannot land the merge jack began.
+		const sneak = await call(ana, "PUT", path("/branches/main"), { base: main, list: jacks });
 		expect(sneak.status).toBe(409);
-		expect((await call(jack, "GET", path("/branches/main"))).body.list).toEqual(main);
+		expect(sneak.body.error).toContain("jack began this merge");
+		expect((await call(ana, "PUT", path("/branches/main"), { base: main, list: anas })).status).toBe(200);
+		const late = await call(jack, "PUT", path("/branches/main"), { base: main, list: jacks });
+		expect(late.status).toBe(409);
+		expect(late.body.error).toContain("merge again");
+		expect((await call(jack, "GET", path("/branches/main"))).body.list).toEqual(anas);
 	});
 
 	it("is a person's decision: agent tokens are refused", async () => {

@@ -10195,7 +10195,6 @@ impl BranchManager {
                     .map(|(tracker, _, commit)| (tracker.as_str(), commit.as_str())),
             );
             self.refuse_unpublished_trackers(&pushed)?;
-            let branch_ref = format!("refs/heads/{into}");
             let push = |auth: &crate::remote::RepoCredential,
                         commit: &str,
                         target: &str,
@@ -10230,29 +10229,16 @@ impl BranchManager {
                     .find(|credential| credential.tracker == tracker)
                     .map(|credential| &credential.credential)
             };
-            // The commit point: root's ref, by compare-and-swap on what root's
-            // repo holds there now — none yet for a branch made as a list —
-            // which must be what the index says.
-            let held = self
-                .source
-                .rev_parse(&format!("refs/newgit/remote/{}/{into}", self.root.name))
-                .ok();
-            // Already this merge's own commit: a run before this one pushed it
-            // and stopped before the finish (a timeout, a 502). Finish it.
-            let resumed = held.as_deref() == Some(merged_root.as_str());
-            if held.is_some() && held != base_root && !resumed {
-                return Err(NewgitError::Unsupported(format!(
-                    "root's `{into}` on {project_key} is not the commit `{into}`'s index names, so \
-                     another merge is landing: run `newgit merge` again"
-                )));
+            // Objects first: each commit waits at a landing ref no one reads,
+            // so nothing is held and another merge may run beside this one.
+            // Pushing again after a run that stopped is harmless.
+            let land_at = |auth: &crate::remote::RepoCredential, commit: &str| {
+                push(auth, commit, &crate::remote::landing_ref(commit), None)
+            };
+            if let Some(auth) = credential_for(&self.root.name) {
+                land_at(auth, &merged_root)?;
             }
-            if !resumed && let Some(auth) = credential_for(&self.root.name) {
-                push(auth, &merged_root, &branch_ref, held.as_deref()).map_err(|_| {
-                    NewgitError::Unsupported(format!(
-                        "`{into}` moved while this merge ran: run `newgit merge` again"
-                    ))
-                })?;
-            }
+            let mut ref_moves = Vec::new();
             // On a branch other than `main`, a child's commit is kept on the
             // child's branch of the same name: its `main` is `main`'s to move.
             if into != "main" {
@@ -10262,30 +10248,33 @@ impl BranchManager {
                     let Some(auth) = credential_for(&merge.tracker) else {
                         continue;
                     };
-                    let held = self
-                        .source
-                        .rev_parse(&format!("refs/newgit/remote/{}/{into}", merge.tracker))
-                        .ok();
-                    push(auth, &merge.commit, &branch_ref, held.as_deref()).map_err(|_| {
-                        NewgitError::Unsupported(format!(
-                            "`{}`'s `{into}` moved while this merge ran: run `newgit merge` again",
-                            merge.tracker
-                        ))
-                    })?;
+                    land_at(auth, &merge.commit)?;
+                    ref_moves.push(crate::remote::RefMove {
+                        tracker: merge.tracker.clone(),
+                        branch: into.to_owned(),
+                        old: self
+                            .source
+                            .rev_parse(&format!("refs/newgit/remote/{}/{into}", merge.tracker))
+                            .ok(),
+                        new: merge.commit.clone(),
+                    });
                 }
             }
             for (tracker, before, caught_up) in &mains {
                 let Some(auth) = credential_for(tracker) else {
                     continue;
                 };
-                push(auth, caught_up, "refs/heads/main", before.as_deref()).map_err(|_| {
-                    NewgitError::Unsupported(format!(
-                        "`{tracker}`'s `main` moved while this merge ran: run `newgit merge` \
-                         again (`{into}` has the merge; `{tracker}`'s `main` catches up then)"
-                    ))
-                })?;
+                land_at(auth, caught_up)?;
+                ref_moves.push(crate::remote::RefMove {
+                    tracker: tracker.clone(),
+                    branch: "main".to_owned(),
+                    old: before.clone(),
+                    new: caught_up.clone(),
+                });
             }
-            client.finish_merge(project_key, into, &base, &list)?;
+            // The commit point, and the only one: the remote moves the list
+            // by compare-and-swap, then root's branch and each move follow.
+            warnings.extend(client.finish_merge(project_key, into, &base, &list, &ref_moves)?);
         }
         // Here: root's branch by compare-and-swap, then the children's.
         let root_ref = local_tracker_ref(&self.root.name, into);

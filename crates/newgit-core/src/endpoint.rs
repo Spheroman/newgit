@@ -680,9 +680,11 @@ pub fn check_index(plan: &IndexPlan) -> Result<IndexAnswer> {
                 "fetch.prune=true",
             ],
             &source.url,
-            &[format!(
-                "+refs/heads/*:refs/trackers/{ROOT_TRACKER}/heads/*"
-            )],
+            // A merge's root commit waits at its landing ref until it lands.
+            &[
+                format!("+refs/heads/*:refs/trackers/{ROOT_TRACKER}/heads/*"),
+                format!("+refs/newgit/landing/*:refs/trackers/{ROOT_TRACKER}/landing/*"),
+            ],
             Some(&source.auth),
         )?;
     }
@@ -841,14 +843,12 @@ pub enum PullAnswer {
     Nothing,
     /// A peek found something to land.
     Work,
-    /// `main`'s index is not what root's ref says: start again from what it
-    /// is now.
-    Moved { why: String },
-    /// `main` moved: root's ref and the `main` of each tracker changed. The
-    /// Worker writes `list` as the index.
+    /// Ready to land: every commit is at its landing ref. The Worker lands
+    /// `list` as `main`'s index, then moves root's `main` and makes `moves`.
     Landed {
         list: BTreeMap<String, String>,
         commits: usize,
+        moves: Vec<crate::remote::RefMove>,
     },
     /// Nothing moved, for this reason.
     Refused { why: String },
@@ -1139,53 +1139,40 @@ fn land(plan: &PullPlan, store: &Utf8Path) -> Result<PullAnswer> {
         mains.push((tracker.clone(), main, caught_up));
     }
 
-    // The commit point: root's ref, by compare-and-swap. Already this
-    // commit: a run before this one pushed it and stopped.
+    // Objects first: every commit waits at a landing ref no one reads. The
+    // Worker lands `list` by compare-and-swap, and only then do root's
+    // `main` and each child's follow. Pushing again is harmless.
     let source_of = |tracker: &str| {
         plan.repos.get(tracker).ok_or_else(|| {
             NewgitError::Unsupported(format!("the plan does not say where `{tracker}` is"))
         })
     };
-    let held = git(&[
-        "rev-parse",
-        "-q",
-        "--verify",
-        "refs/trackers/root/heads/main",
-    ])
-    .ok();
-    if held.as_deref() != Some(root.as_str()) {
-        if held.as_deref() != Some(base.as_str()) {
-            return Ok(PullAnswer::Moved {
-                why: format!(
-                    "root's `main` is not the commit `main`'s index names ({base}): a merge is \
-                     landing"
-                ),
-            });
-        }
-        let source = source_of(ROOT_TRACKER)?;
-        GitSource::push_leased(
-            &[&git_dir],
-            &source.url,
-            &root,
-            "refs/heads/main",
-            held.as_deref(),
-            Some(&source.auth),
-        )?;
-    }
-    for (tracker, before, caught_up) in &mains {
+    let land_at = |tracker: &str, commit: &str| -> Result<()> {
         let source = source_of(tracker)?;
         GitSource::push_leased(
             &[&git_dir],
             &source.url,
-            caught_up,
-            "refs/heads/main",
-            before.as_deref(),
+            commit,
+            &crate::remote::landing_ref(commit),
+            None,
             Some(&source.auth),
-        )?;
+        )
+    };
+    land_at(ROOT_TRACKER, &root)?;
+    let mut moves = Vec::new();
+    for (tracker, before, caught_up) in mains {
+        land_at(&tracker, &caught_up)?;
+        moves.push(crate::remote::RefMove {
+            tracker,
+            branch: "main".to_owned(),
+            old: before,
+            new: caught_up,
+        });
     }
     Ok(PullAnswer::Landed {
         list,
         commits: walk.len(),
+        moves,
     })
 }
 

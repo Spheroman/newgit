@@ -1,4 +1,5 @@
 import type { MintedToken, Repos } from "../src/artifacts";
+import type { RefUpdate } from "../src/refs";
 import type { CopyAnswer, CopyPlan } from "../src/endpoint";
 
 /** The password the fake mints for a repo and scope: recognisable, not random. */
@@ -9,6 +10,10 @@ export class FakeRepos implements Repos {
 	readonly repos = new Map<string, Map<string, string>>();
 	readonly minted: { name: string; scope: string; id: string }[] = [];
 	readonly revokedTokens = new Set<string>();
+	/** Each repo's refs, by name, as Git would hold them. */
+	readonly refsOf = new Map<string, Map<string, string>>();
+	/** Every ref update asked for, in order, and whether it held. */
+	readonly updates: { name: string; update: RefUpdate; moved: boolean }[] = [];
 
 	async create(name: string) {
 		if (this.repos.has(name)) throw Object.assign(new Error("exists"), { code: "ALREADY_EXISTS" });
@@ -35,6 +40,31 @@ export class FakeRepos implements Repos {
 	}
 	async readFile(name: string, _ref: string, path: string) {
 		return this.repos.get(name)?.get(path) ?? null;
+	}
+
+	async refs(name: string) {
+		return Object.fromEntries(this.refsOf.get(name) ?? []);
+	}
+	async updateRefs(name: string, updates: RefUpdate[]) {
+		const refs = this.refsOf.get(name) ?? new Map<string, string>();
+		this.refsOf.set(name, refs);
+		const moved: Record<string, boolean> = {};
+		for (const update of updates) {
+			moved[update.ref] = (refs.get(update.ref) ?? null) === update.old;
+			if (moved[update.ref]) {
+				if (update.new === null) refs.delete(update.ref);
+				else refs.set(update.ref, update.new);
+			}
+			this.updates.push({ name, update, moved: moved[update.ref] });
+		}
+		return moved;
+	}
+
+	/** Set a ref, as a push would. */
+	setRef(name: string, ref: string, commit: string) {
+		const refs = this.refsOf.get(name) ?? new Map<string, string>();
+		this.refsOf.set(name, refs);
+		refs.set(ref, commit);
 	}
 
 	/** Commit a file to a repo's trunk, as a merge would. */

@@ -214,14 +214,17 @@ pub trait Remote {
         base: &std::collections::BTreeMap<String, String>,
         list: &std::collections::BTreeMap<String, String>,
     ) -> Result<Vec<SeedCredential>>;
-    /// Finish it: `branch`'s list moves from `base` to `list` in one write.
+    /// Land it: `branch`'s list moves from `base` to `list` in one
+    /// compare-and-swap, the merge's only commit point. Root's branch then
+    /// follows, and each of `moves` is made. What could not follow, said.
     fn finish_merge(
         &self,
         project: &str,
         branch: &str,
         base: &std::collections::BTreeMap<String, String>,
         list: &std::collections::BTreeMap<String, String>,
-    ) -> Result<()>;
+        moves: &[RefMove],
+    ) -> Result<Vec<String>>;
     fn add_member(&self, project: &str, login: &str) -> Result<bool>;
     fn remove_member(&self, project: &str, login: &str) -> Result<bool>;
     /// Delete the project: its repos, its record, and every token pinned to
@@ -660,17 +663,23 @@ impl Remote for HttpRemote {
         branch: &str,
         base: &std::collections::BTreeMap<String, String>,
         list: &std::collections::BTreeMap<String, String>,
-    ) -> Result<()> {
-        let _: serde_json::Value = self.send_checked(
+        moves: &[RefMove],
+    ) -> Result<Vec<String>> {
+        #[derive(Deserialize)]
+        struct Landed {
+            #[serde(default)]
+            behind: Vec<String>,
+        }
+        let landed: Landed = self.send_checked(
             "PUT",
             &format!(
                 "/v1/projects/{}/branches/{}",
                 project_path(project),
                 segment(branch)
             ),
-            serde_json::json!({ "base": base, "list": list }),
+            serde_json::json!({ "base": base, "list": list, "moves": moves }),
         )?;
-        Ok(())
+        Ok(landed.behind)
     }
 
     fn fork(&self, project: &str, instance: &str, tracker: &str) -> Result<RepoLocation> {
@@ -977,6 +986,23 @@ pub fn workspace_token(workspace: &Utf8Path) -> Result<Option<String>> {
 }
 
 /// Git's `Authorization` header for a repo credential, for one command.
+/// Where a merge's commit waits in a tracker's repo until the remote lands
+/// it: objects first, then the list moves, then the branches follow.
+pub fn landing_ref(commit: &str) -> String {
+    format!("refs/newgit/landing/{commit}")
+}
+
+/// A branch of a tracker's repo a merge asks the remote to move once it has
+/// landed: by compare-and-swap on `old` (none: absent), to a commit already
+/// at its landing ref.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RefMove {
+    pub tracker: String,
+    pub branch: String,
+    pub old: Option<String>,
+    pub new: String,
+}
+
 pub fn basic_auth_header(credential: &RepoCredential) -> String {
     use base64_lite::encode;
     format!(
