@@ -9,4 +9,6 @@
   top of the one namespace, `/remote/<owner>/<project>/t3code/repos`, or
   `/user/<project>/...` for a project on no remote. `tracker list` shows what
   is here. A name is never looked for further up, so it means one thing
-  wherever it is typed. `__` is reserved in a tracker's name.
+  wherever it is typed. `requires` in a nested definition, and `root` and
+  `trackers` in an export target, take paths too. `__` is reserved in a
+  tracker's name, and a name cannot start or end with `_`.

@@ -32,7 +32,8 @@ use camino::{Utf8Path, Utf8PathBuf};
 use crate::error::{NewgitError, Result};
 use crate::objects::{Commit, EMPTY_TREE, GITLINK_MODE, Objects, TREE_MODE, run};
 use crate::tracker::{
-    DEFINITIONS_DIR, TrackerDefinition, child_id, leaf_name, owner_of, tracker_path,
+    DEFINITIONS_DIR, ROOT_TRACKER, TrackerDefinition, child_id, leaf_name, name_fits_id, owner_of,
+    tracker_path,
 };
 
 /// Where a parent keeps the commits of the children it mounts.
@@ -1505,7 +1506,7 @@ impl<'a> Splitter<'a> {
             if guard > 64 {
                 break;
             }
-            let definitions = self.definitions_in(&tree)?;
+            let definitions = self.definitions_in(&tree, &owner)?;
             if at.as_str() == "."
                 && !definitions
                     .iter()
@@ -1553,11 +1554,24 @@ impl<'a> Splitter<'a> {
         Ok(out)
     }
 
-    /// The definitions a tree holds in its own `.newgit/trackers/`.
-    fn definitions_in(&mut self, tree: &str) -> Result<Vec<TrackerDefinition>> {
+    /// The definitions `owner`'s `tree` holds in its own `.newgit/trackers/`.
+    /// Any tracker but root is held to what makes a child, as the store's
+    /// `load_nested_definitions` is: what either skips is nobody's child, so
+    /// a split never carves a tracker the project cannot name. A tree with a
+    /// `.newgit/config.toml` is another project's, imported whole.
+    fn definitions_in(&mut self, tree: &str, owner: &str) -> Result<Vec<TrackerDefinition>> {
         let Some(directory) = self.objects.subtree(tree, DEFINITIONS_DIR)? else {
             return Ok(Vec::new());
         };
+        let nested = owner != ROOT_TRACKER;
+        if nested
+            && self
+                .objects
+                .entry_at(tree, ".newgit/config.toml")?
+                .is_some()
+        {
+            return Ok(Vec::new());
+        }
         let mut out = Vec::new();
         for entry in self.objects.tree(&directory)? {
             let name = String::from_utf8_lossy(&entry.name).into_owned();
@@ -1567,9 +1581,20 @@ impl<'a> Splitter<'a> {
             if entry.is_tree() {
                 continue;
             }
+            if !name_fits_id(tracker) {
+                continue;
+            }
             let text = read_blob_text(&mut self.objects, &entry.id)?;
             let path = Utf8PathBuf::from(format!("{DEFINITIONS_DIR}/{name}"));
-            out.push(TrackerDefinition::from_text(tracker, &path, &text)?);
+            let definition = TrackerDefinition::from_text(tracker, &path, &text);
+            if !nested {
+                out.push(definition?);
+            } else if let Ok(definition) = definition
+                && definition.git
+                && definition.mounted()
+            {
+                out.push(definition);
+            }
         }
         Ok(out)
     }
@@ -1586,7 +1611,7 @@ impl<'a> Splitter<'a> {
         parents: &[String],
         made: &mut Vec<(String, String)>,
     ) -> std::result::Result<(String, BTreeMap<String, String>), SplitError> {
-        let definitions = self.definitions_in(tree)?;
+        let definitions = self.definitions_in(tree, tracker)?;
         let own_name = leaf_name(tracker);
         let mut children: Vec<TrackerDefinition> = definitions
             .iter()

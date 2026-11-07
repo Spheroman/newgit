@@ -890,3 +890,194 @@ fn a_full_path_must_say_where_path_puts_it_and_the_separator_is_reserved() {
         )
         .expect_err("reserved");
 }
+
+/// On a snapshot clone, what a rooted view needs is fetched by id: under a
+/// bare name nothing is fetched, and the view silently lacks the child.
+#[test]
+fn a_rooted_view_asks_for_its_childrens_commits_by_id() {
+    let (_guard, temp) = tempdir();
+    let (store, _, _) = imported(&temp);
+    carve(&store);
+    let repo = store.paths().project_root.clone();
+    let parent = tracker_main(&store, "t3code");
+    git(&repo, &["update-ref", "refs/heads/t3code-tip", &parent]);
+    // Holds the parent's commit but not its child's.
+    let snapshot = temp.join("snapshot");
+    git(&temp, &["init", "-q", "--bare", snapshot.as_str()]);
+    git(
+        &snapshot,
+        &[
+            "fetch",
+            "-q",
+            "--depth=1",
+            repo.as_str(),
+            "refs/heads/t3code-tip",
+        ],
+    );
+    let mut asked = Vec::new();
+    newgit_core::snapshots::fetch_pins(
+        &snapshot,
+        "t3code",
+        &[parent],
+        &std::collections::BTreeMap::new(),
+        &mut |tracker| {
+            asked.push(tracker.to_owned());
+            Ok(None)
+        },
+    )
+    .expect("fetch");
+    assert_eq!(asked, ["t3code__repos"]);
+}
+
+/// A repository that is a newgit project itself, committed under a mount: its
+/// definitions are none of this project's, on either side of a split.
+#[test]
+fn a_split_carves_nothing_out_of_another_projects_definitions() {
+    let (_guard, temp) = tempdir();
+    let (store, _, _) = imported(&temp);
+    let repo = store.paths().project_root.clone();
+    let in_git = "audience = \"project-devs\"\nstorage = \"local\"\ngit = true\n";
+    commit_as(
+        &repo,
+        "ana",
+        1_700_000_000,
+        &[
+            (
+                "apps/t3code/.newgit/config.toml",
+                "[project]\nname = \"other\"\n",
+            ),
+            (
+                "apps/t3code/.newgit/trackers/lib.toml",
+                &format!("{in_git}mount = \"src\"\npaths = [\".\"]\n"),
+            ),
+        ],
+        "Another project's metadata",
+    );
+    manager(&store).merge("main", "main").expect("publish");
+    let parent = tracker_main(&store, "t3code");
+    assert!(
+        has(&tree(&repo, &parent), "src/app.ts"),
+        "nothing carved out"
+    );
+    assert!(store_ref(&store, "refs/trackers/t3code__lib/main").is_none());
+}
+
+/// A child only `git = false` or unparseable is no child, so it refuses
+/// nothing: its paths are its parent's.
+#[test]
+fn a_nested_definition_the_project_ignores_is_ignored_by_a_split_too() {
+    let (_guard, temp) = tempdir();
+    let (store, _, _) = imported(&temp);
+    let repo = store.paths().project_root.clone();
+    commit_as(
+        &repo,
+        "ana",
+        1_700_000_000,
+        &[
+            (
+                "apps/t3code/.newgit/trackers/env.toml",
+                "audience = \"project-devs\"\nstorage = \"local\"\npaths = [\".env\"]\n",
+            ),
+            ("apps/t3code/.newgit/trackers/broken.toml", "not toml ["),
+            ("apps/t3code/.env", "A=1\n"),
+        ],
+        "Things that are not children",
+    );
+    manager(&store).merge("main", "main").expect("publish");
+    assert!(has(&tree(&repo, &tracker_main(&store, "t3code")), ".env"));
+}
+
+#[test]
+fn every_way_of_naming_a_tracker_refuses_a_name_that_cannot_be_an_id() {
+    let (_guard, temp) = tempdir();
+    let (store, upstream, _) = imported(&temp);
+    for bad in ["a__b", "trailing_"] {
+        manager(&store)
+            .create_git_tracker(bad, "project-devs", &[Utf8PathBuf::from("apps/t3code/src")])
+            .expect_err("create --git");
+        manager(&store)
+            .import_git_tracker(
+                bad,
+                "project-devs",
+                camino::Utf8Path::new("apps/other"),
+                upstream.as_str(),
+                Some("newgit"),
+            )
+            .expect_err("import");
+        manager(&store)
+            .create_tracker(
+                bad,
+                "project-devs",
+                newgit_core::tracker::Storage::Local,
+                false,
+            )
+            .expect_err("create");
+    }
+    // Written by hand: skipped, so it cannot share a child's refs.
+    let hand = store.paths().trackers.join("a__b.toml");
+    std::fs::write(
+        &hand,
+        "audience = \"project-devs\"\nstorage = \"local\"\ngit = true\nmount = \"h\"\npaths = [\".\"]\n",
+    )
+    .expect("write");
+    assert!(!definition_names(&store).iter().any(|name| name == "a__b"));
+    std::fs::remove_file(hand).expect("remove");
+    let long = "x".repeat(40);
+    let error = manager(&store)
+        .create_git_tracker(
+            &long,
+            "project-devs",
+            &[Utf8PathBuf::from("apps/t3code/src")],
+        )
+        .map(|_| ())
+        .and_then(|()| {
+            manager(&store).create_git_tracker(
+                &"y".repeat(40),
+                "project-devs",
+                &[Utf8PathBuf::from("apps/t3code/src/deep")],
+            )
+        });
+    assert!(error.is_err(), "too long for a remote repo's name");
+}
+
+/// `requires` is a path from the parent's tree, like everything else there.
+#[test]
+fn a_nested_requires_names_a_sibling_as_a_path() {
+    let (_guard, temp) = tempdir();
+    let (store, _, _) = imported(&temp);
+    let in_git = "audience = \"project-devs\"\nstorage = \"local\"\ngit = true\n";
+    define_in_t3code(
+        &store,
+        "needs",
+        &format!("{in_git}mount = \"n\"\npaths = [\".\"]\nrequires = [\"vendor\", \"../site\"]\n"),
+    );
+    define_in_t3code(
+        &store,
+        "vendor",
+        &format!("{in_git}mount = \"v\"\npaths = [\".\"]\n"),
+    );
+    let definitions = store.load_tracker_definitions().expect("definitions");
+    let needs = definitions
+        .iter()
+        .find(|definition| definition.name == "t3code__needs")
+        .expect("needs");
+    assert_eq!(needs.requires, ["t3code__vendor", "../site"]);
+}
+
+/// An export file says `t3code/repos`, not an id.
+#[test]
+fn an_export_target_names_trackers_as_paths() {
+    let (_guard, temp) = tempdir();
+    let (store, _, _) = imported(&temp);
+    define_target(
+        &store,
+        "paths",
+        "url = \"/nowhere\"\nbranch = \"main\"\ntrackers = [\"root\", \"t3code/repos\"]\n",
+    );
+    let targets = store.load_export_targets().expect("targets");
+    let target = targets
+        .iter()
+        .find(|target| target.name == "paths")
+        .expect("target");
+    assert_eq!(target.trackers, ["root", "t3code__repos"]);
+}

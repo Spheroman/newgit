@@ -1561,15 +1561,15 @@ impl BranchManager {
         paths: &[Utf8PathBuf],
     ) -> Result<CreateCodeTrackerOutcome> {
         validate_name(name)?;
-        if name.contains(crate::tracker::ID_SEPARATOR) {
-            return Err(NewgitError::InvalidName(name.to_owned()));
-        }
         self.require_migrated()?;
         // `t3code/repos` or just `repos`: where it goes is `--path`.
         let (asked_parent, name) = match name.rsplit_once('/') {
             Some((parent, leaf)) => (Some(parent), leaf),
             None => (None, name),
         };
+        if !crate::tracker::name_fits_id(name) {
+            return Err(NewgitError::InvalidName(name.to_owned()));
+        }
         let [mount] = paths else {
             return Err(NewgitError::Unsupported(format!(
                 "a tracker in Git is mounted at one path: `newgit tracker create {name} --git \
@@ -1623,6 +1623,21 @@ impl BranchManager {
             None => (definition.clone(), definition),
         };
         self.refuse_root(&placed.name, "it always exists")?;
+        if let Some(parent) = &parent
+            && name == crate::tracker::leaf_name(&parent.name)
+        {
+            return Err(NewgitError::Unsupported(format!(
+                "`{name}` cannot be `{name}`'s child: a tracker's own name in its \
+                 `.newgit/trackers/` is its own definition"
+            )));
+        }
+        if placed.name.len() > crate::tracker::MAX_ID_LEN {
+            return Err(NewgitError::Unsupported(format!(
+                "`{}` is too deep a name: a tracker's whole path has to fit in {} characters",
+                crate::tracker::tracker_path(&placed.name),
+                crate::tracker::MAX_ID_LEN
+            )));
+        }
         // Names are unique within their parent, as in a directory.
         if self
             .all_definitions()
@@ -1746,6 +1761,9 @@ impl BranchManager {
         branch: Option<&str>,
     ) -> Result<ImportGitTrackerOutcome> {
         validate_name(name)?;
+        if !crate::tracker::name_fits_id(name) {
+            return Err(NewgitError::InvalidName(name.to_owned()));
+        }
         self.refuse_root(name, "it always exists")?;
         self.require_migrated()?;
         let definition = TrackerDefinition::in_git(name, audience.to_owned(), mount)?;
@@ -2387,7 +2405,7 @@ impl BranchManager {
     /// leaves out a pin it cannot find, so without this a commit brought
     /// from the remote would compose to a view missing a child. Nothing, not
     /// even a walk, in a project that holds no snapshots.
-    fn bring_pins(&self, commit: &str, also: &BTreeMap<String, String>) -> Result<()> {
+    fn bring_pins(&self, root: &str, commit: &str, also: &BTreeMap<String, String>) -> Result<()> {
         let project = self.store.paths().project_root.clone();
         let held = crate::snapshots::held(&project)?;
         if held.is_empty() && also.is_empty() {
@@ -2402,7 +2420,7 @@ impl BranchManager {
         };
         let wanted: BTreeSet<&String> = held.keys().chain(also.keys()).collect();
         let mut client = None;
-        let absent = crate::snapshots::fetch_pins(&project, &tips, also, &mut |tracker| {
+        let absent = crate::snapshots::fetch_pins(&project, root, &tips, also, &mut |tracker| {
             if !wanted.contains(&tracker.to_owned()) {
                 return Ok(None);
             }
@@ -2426,7 +2444,7 @@ impl BranchManager {
     /// Compose root commit `commit` into the view at `view_ref` here, for a
     /// reader of every tracker this machine has: the view commit.
     fn compose_here(&self, view_ref: &str, commit: &str) -> Result<Option<String>> {
-        self.bring_pins(commit, &BTreeMap::new())?;
+        self.bring_pins(&self.root.name, commit, &BTreeMap::new())?;
         let project = self.store.paths().project_root.clone();
         let everything = |_: &str| true;
         let views = crate::compose::compose(
@@ -6829,6 +6847,9 @@ impl BranchManager {
         merge_with_source: bool,
     ) -> Result<AddTrackerOutcome> {
         validate_name(name)?;
+        if !crate::tracker::name_fits_id(name) {
+            return Err(NewgitError::InvalidName(name.to_owned()));
+        }
         self.refuse_root(name, "it always exists")?;
         // A remote tracker with nowhere to sync would behave exactly like a
         // local one while claiming otherwise. Refuse it here, where the claim
@@ -8304,7 +8325,7 @@ impl BranchManager {
     /// view an export of it sent, which notes each of its commits so a split
     /// finds them again.
     fn compose_rooted(&self, target: &ExportTarget, tracker: &str, commit: &str) -> Result<String> {
-        self.bring_pins(commit, &BTreeMap::new())?;
+        self.bring_pins(tracker, commit, &BTreeMap::new())?;
         let project = self.store.paths().project_root.clone();
         let everything = |_: &str| true;
         crate::compose::compose(
@@ -8762,7 +8783,7 @@ impl BranchManager {
             )));
         };
 
-        self.bring_pins(root_commit, &BTreeMap::new())?;
+        self.bring_pins(&root_name, root_commit, &BTreeMap::new())?;
         let root = self.store.paths().project_root.clone();
         let all = self.all_definitions();
         let may_ship = |tracker: &str| shipped.contains(tracker);
@@ -9838,7 +9859,7 @@ impl BranchManager {
             }
         }
         if let Some(commit) = list.get(&self.root.name) {
-            self.bring_pins(commit, &snapshots)?;
+            self.bring_pins(&self.root.name, commit, &snapshots)?;
         }
         Ok(list)
     }
@@ -10513,9 +10534,13 @@ impl BranchManager {
                     .filter(|(tracker, _)| snapshot_sources.contains_key(*tracker))
                     .map(|(tracker, commit)| (tracker.clone(), commit.clone()))
                     .collect();
-                let absent = crate::snapshots::fetch_pins(&root, &tips, &named, &mut |tracker| {
-                    Ok(snapshot_sources.get(tracker).cloned())
-                })?;
+                let absent = crate::snapshots::fetch_pins(
+                    &root,
+                    &self.root.name,
+                    &tips,
+                    &named,
+                    &mut |tracker| Ok(snapshot_sources.get(tracker).cloned()),
+                )?;
                 if let Some((tracker, commit)) = absent.iter().find(|(_, commit)| {
                     code.head
                         .values()

@@ -93,6 +93,16 @@ pub fn leaf_name(id: &str) -> &str {
     id.rsplit(ID_SEPARATOR).next().unwrap_or(id)
 }
 
+/// Whether `name` can be part of an id: no `__`, which joins an id's parts, and
+/// no `_` at either end, which would run into the join (`a_` + `b` and `a` +
+/// `_b` would both be `a___b`).
+pub fn name_fits_id(name: &str) -> bool {
+    !name.contains(ID_SEPARATOR) && !name.starts_with('_') && !name.ends_with('_')
+}
+
+/// The most an id can hold: a remote repo's name gives it one part of 63.
+pub const MAX_ID_LEN: usize = 63;
+
 /// The tracker's path from the top of its project: `t3code/repos`.
 pub fn tracker_path(id: &str) -> String {
     id.replace(ID_SEPARATOR, "/")

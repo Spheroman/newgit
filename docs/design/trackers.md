@@ -186,7 +186,8 @@ slash: `refs/trackers/<tracker>/...` holds the tracker's own branches, so a
 child at `t3code/instances` would land among them, and a remote repo's name
 has one part per field. An id names the parent, so the remote reads a nested
 definition from that one tracker, and no other can answer for it. `__` is
-reserved. People never type an id or see one.
+reserved, and a name cannot start or end with `_`, so two paths never make one
+id. People never type an id.
 
 **A child exists only in its parent (decided 2026-11-06).** `native` is bound
 only where `electron` is: dropping `electron` drops it and says so, and asking

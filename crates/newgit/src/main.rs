@@ -2077,7 +2077,8 @@ fn tracker(mut command: TrackerCommand) -> Result<()> {
     | TrackerCommand::Checkout { tracker, .. }
     | TrackerCommand::Pull { tracker, .. }
     | TrackerCommand::Use { tracker, .. }
-    | TrackerCommand::Drop { tracker, .. } = &mut command
+    | TrackerCommand::Drop { tracker, .. }
+    | TrackerCommand::Remove { name: tracker } = &mut command
     {
         *tracker = tracker_id(tracker)?;
     }
