@@ -41,6 +41,27 @@ export async function nativeIndex(
 	repoOf: (tracker: string) => string,
 	list: Record<string, string>,
 ): Promise<IndexAnswer | typeof ASK_GIT> {
+	return orAskGit("index", () => readIndex(repos, repoOf, list));
+}
+
+/**
+ * Anything Artifacts throws makes the question Git's: a read here is only
+ * ever a faster way to the same answer.
+ */
+async function orAskGit<T>(what: string, read: () => Promise<T | typeof ASK_GIT>): Promise<T | typeof ASK_GIT> {
+	try {
+		return await read();
+	} catch (error) {
+		console.error(JSON.stringify({ walk: what, askingGit: error instanceof Error ? error.message : String(error) }));
+		return ASK_GIT;
+	}
+}
+
+async function readIndex(
+	repos: Repos,
+	repoOf: (tracker: string) => string,
+	list: Record<string, string>,
+): Promise<IndexAnswer | typeof ASK_GIT> {
 	const root = list.root;
 	if (root === undefined) return { matches: false, actual: {} };
 	const actual: Record<string, string> = {};
@@ -80,6 +101,14 @@ async function pinsIn(repos: Repos, name: string, tree: string): Promise<Record<
  * past its limit.
  */
 export async function nativeAncestry(
+	repos: Repos,
+	repoOf: (tracker: string) => string,
+	checks: { tracker: string; old: string; new: string }[],
+): Promise<AncestryAnswer[] | typeof ASK_GIT> {
+	return orAskGit("ancestry", () => readAncestry(repos, repoOf, checks));
+}
+
+async function readAncestry(
 	repos: Repos,
 	repoOf: (tracker: string) => string,
 	checks: { tracker: string; old: string; new: string }[],

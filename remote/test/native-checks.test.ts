@@ -201,3 +201,20 @@ describe("a background check's request", () => {
 		expect(checks.collect("slow")).toBe("running");
 	});
 });
+
+describe("a read that throws", () => {
+	it("makes the question Git's", async () => {
+		const throwing = new FakeRepos();
+		throwing.readCommit = async () => {
+			throw new Error("INTERNAL");
+		};
+		const quiet = console.error;
+		console.error = () => {};
+		try {
+			expect(await nativeIndex(throwing, repoOf, { root: sha("a") })).toBe(ASK_GIT);
+			expect(await nativeAncestry(throwing, repoOf, [{ tracker: "t", old: sha("a"), new: sha("b") }])).toBe(ASK_GIT);
+		} finally {
+			console.error = quiet;
+		}
+	});
+});
