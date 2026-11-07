@@ -900,6 +900,94 @@ async function route(request: Request, env: Env, deps: Deps): Promise<Response> 
 
 // ── The Git endpoint ──────────────────────────────────────────────────────
 
+/**
+ * Where a Git request's time went, as a `Server-Timing` header any client can
+ * read with `GIT_TRACE_CURL=1`: durations and counts only, never a name.
+ * `endpoint` ends when the container's response starts, so a body it streams
+ * is not in it. Time in one stage adds up across its calls.
+ */
+class Timing {
+	private readonly started = Date.now();
+	private readonly spent = new Map<string, number>();
+	private readonly counts = new Map<string, number>();
+
+	async span<T>(stage: string, work: () => Promise<T>): Promise<T> {
+		const start = Date.now();
+		try {
+			return await work();
+		} finally {
+			this.spent.set(stage, (this.spent.get(stage) ?? 0) + Date.now() - start);
+		}
+	}
+
+	set(name: string, value: number) {
+		this.counts.set(name, value);
+	}
+
+	/** `repos`, counting what a request asks Artifacts for. */
+	counting(repos: Repos): Repos {
+		const count = (name: string) => this.counts.set(name, (this.counts.get(name) ?? 0) + 1);
+		return new Proxy(repos, {
+			get: (target, property, receiver) => {
+				const value = Reflect.get(target, property, receiver);
+				if (typeof value !== "function") return value;
+				return (...args: unknown[]) => {
+					if (property === "readFile") count("reads");
+					if (property === "mint") count("mints");
+					return value.apply(target, args);
+				};
+			},
+		});
+	}
+
+	/** `response`, saying so. Git ignores the header. */
+	on(response: Response): Response {
+		const stages = [...this.spent].map(([stage, ms]) => `${stage};dur=${ms}`);
+		const counts = [...this.counts].map(([name, value]) => `${name};desc="${value}"`);
+		const header = [`total;dur=${Date.now() - this.started}`, ...stages, ...counts].join(", ");
+		const timed = new Response(response.body, response);
+		timed.headers.set("server-timing", header);
+		return timed;
+	}
+}
+
+/**
+ * Read passwords a Git request already minted, in this isolate's memory only.
+ * Minting and recording one is most of a request (0.5s of 0.75s with three
+ * trackers), for a password that lasts an hour.
+ *
+ * Reusing one decides nothing about access: every request still authenticates
+ * its token and asks who may read each tracker, and only then looks here, so a
+ * revoked token or a removed member never reaches it. These go to the endpoint
+ * container, never to the caller. A key holds the token, as a password's
+ * record does, so revoking that token revokes what was reused.
+ */
+class ReadPasswords {
+	private readonly passwords = new Map<string, { password: string; until: number }>();
+
+	/** One this close to expiring could lapse during a long fetch. */
+	private static readonly MARGIN_MS = 10 * 60_000;
+	private static readonly MOST = 2000;
+
+	get(key: string): string | undefined {
+		const held = this.passwords.get(key);
+		if (held === undefined) return undefined;
+		if (held.until - ReadPasswords.MARGIN_MS > Date.now()) return held.password;
+		this.passwords.delete(key);
+		return undefined;
+	}
+
+	set(key: string, password: string, expiresAt: string) {
+		if (this.passwords.size >= ReadPasswords.MOST) {
+			const oldest = this.passwords.keys().next();
+			if (!oldest.done) this.passwords.delete(oldest.value);
+		}
+		this.passwords.set(key, { password, until: Date.parse(expiresAt) });
+	}
+}
+
+const readPasswords = new ReadPasswords();
+
 /** `/<owner>/<name>.git/info/refs` and `/<owner>/<name>.git/git-upload-pack`. */
 const GIT_ROUTE = /^\/([^/]+)\/([^/]+?)\.git\/(info\/refs|git-upload-pack|git-receive-pack)$/;
 
@@ -912,6 +1000,18 @@ const GIT_ROUTE = /^\/([^/]+)\/([^/]+?)\.git\/(info\/refs|git-upload-pack|git-re
  * Read-only: pushes go through a newgit workspace, which splits them.
  */
 async function gitEndpoint(request: Request, env: Env, deps: Deps, match: RegExpMatchArray): Promise<Response> {
+	const timing = new Timing();
+	const response = await answerGit(request, env, { ...deps, repos: timing.counting(deps.repos) }, match, timing);
+	return timing.on(response);
+}
+
+async function answerGit(
+	request: Request,
+	env: Env,
+	deps: Deps,
+	match: RegExpMatchArray,
+	timing: Timing,
+): Promise<Response> {
 	const url = new URL(request.url);
 	const service = match[3] === "info/refs" ? url.searchParams.get("service") : match[3];
 	if (service === "git-receive-pack")
@@ -935,7 +1035,7 @@ async function gitEndpoint(request: Request, env: Env, deps: Deps, match: RegExp
 		token = header.slice("Bearer ".length);
 	}
 	if (!token) throw new HttpError(401, "log in with `newgit login`; the credential helper answers for this URL");
-	const caller = await callerFor(token, env);
+	const caller = await timing.span("auth", () => callerFor(token, env));
 
 	let id: ProjectId | null = null;
 	try {
@@ -948,21 +1048,24 @@ async function gitEndpoint(request: Request, env: Env, deps: Deps, match: RegExp
 	if (caller.project !== undefined && caller.project !== key)
 		throw new HttpError(403, `this token is for ${caller.project} only`);
 	const project = projectStub(env, id);
-	const info = await project.info();
+	const info = await timing.span("project", () => project.info());
 	if (info === null) throw new HttpError(404, `no project \`${key}\``);
-	const who = { login: caller.login, member: await project.isMember(caller.login) };
+	const member = await timing.span("project", () => project.isMember(caller.login));
+	const who = { login: caller.login, member };
 
-	const branches = await project.branches();
+	const branches = await timing.span("project", () => project.branches());
 	const main = branches.find((branch) => branch.name === info.defaultBranch)?.list;
 	if (!main?.root) throw new HttpError(404, `${key} has no \`${info.defaultBranch}\` branch yet`);
 
 	// Policy, read as the remote reads it: each definition from the tracker
 	// that owns its file, at that tracker's `main`. Shape (pins, mounts) is the
 	// container's to read from the commits themselves.
-	const facts = await loadDefinitions(
-		deps.repos,
-		id,
-		branches.flatMap((branch) => Object.keys(branch.list)),
+	const facts = await timing.span("definitions", () =>
+		loadDefinitions(
+			deps.repos,
+			id,
+			branches.flatMap((branch) => Object.keys(branch.list)),
+		),
 	);
 	const readable = (tracker: string) => {
 		const tracker_facts = facts.get(tracker);
@@ -993,11 +1096,23 @@ async function gitEndpoint(request: Request, env: Env, deps: Deps, match: RegExp
 
 	for (const tracker of needed) {
 		const name = repoName({ kind: "tracker", project: id, tracker });
-		const minted = await deps.repos.mint(name, "read", READ_CREDENTIAL_TTL_SECONDS);
-		await userStub(env, caller.login).recordRepoToken(caller.tokenId, name, minted.id, minted.expiresAt);
-		plan.repos[tracker] = { url: deps.repos.url(name), auth: `Authorization: Basic ${btoa(`x:${minted.password}`)}` };
+		const key = `${caller.tokenId}:${name}`;
+		let password = readPasswords.get(key);
+		if (password === undefined) {
+			const minted = await timing.span("mint", () => deps.repos.mint(name, "read", READ_CREDENTIAL_TTL_SECONDS));
+			await timing.span("record", () =>
+				userStub(env, caller.login).recordRepoToken(caller.tokenId, name, minted.id, minted.expiresAt),
+			);
+			password = minted.password;
+			readPasswords.set(key, password, minted.expiresAt);
+		}
+		plan.repos[tracker] = { url: deps.repos.url(name), auth: `Authorization: Basic ${btoa(`x:${password}`)}` };
 	}
-	return deps.endpoint(key, service === match[3] ? "upload-pack" : "advertise", plan, request);
+	timing.set("branches", Object.keys(plan.branches).length);
+	timing.set("trackers", needed.size);
+	return timing.span("endpoint", () =>
+		deps.endpoint(key, service === match[3] ? "upload-pack" : "advertise", plan, request),
+	);
 }
 
 /** Where `/` sends a visitor when this remote publishes no landing page. */
