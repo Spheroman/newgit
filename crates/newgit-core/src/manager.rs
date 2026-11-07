@@ -2860,7 +2860,13 @@ impl BranchManager {
             return Ok(());
         }
         let owned: Vec<ExportTarget> = targets.into_iter().cloned().collect();
-        self.route_export_remotes(&root, PROJECT_ROOT_INSTANCE, &owned, &outbox)?;
+        self.route_export_remotes(
+            &root,
+            PROJECT_ROOT_INSTANCE,
+            &owned,
+            &outbox,
+            &BTreeSet::new(),
+        )?;
         let definitions = self.carved_definitions();
         let resolved = route_to_targets(
             &owned,
@@ -4007,7 +4013,13 @@ impl BranchManager {
         )?;
         if branch.remote.is_some() {
             let targets = self.export_targets()?;
-            self.route_export_remotes(&branch.workspace_path, &branch.name, &targets, &outbox)?;
+            self.route_export_remotes(
+                &branch.workspace_path,
+                &branch.name,
+                &targets,
+                &outbox,
+                &branch.dropped,
+            )?;
             self.resolve_gh(branch, &targets)?;
         }
         Ok(())
@@ -4054,6 +4066,7 @@ impl BranchManager {
         instance: &str,
         targets: &[ExportTarget],
         outbox: &Utf8Path,
+        dropped: &BTreeSet<String>,
     ) -> Result<()> {
         let workspace = workspace.as_str();
         let config = |key: &str, value: &str| {
@@ -4078,9 +4091,19 @@ impl BranchManager {
                 ),
             )?;
             // What the target's own branch holds, as of the last export from
-            // here, so `gh pr create --fill` can list the PR's commits.
+            // here, so `gh pr create --fill` can list the PR's commits. Not
+            // for a target rooted at a tracker this instance leaves out: no
+            // work of its can go there, and that branch is the tracker's whole
+            // history as exported, with ids of its own, so fetching it is
+            // most of a spawn (192,069 objects for t3code). A `tracker use`
+            // routes again, at the checkpoint that follows.
             let main = export_ref(&target.name, PROJECT_ROOT_INSTANCE);
+            let left_out = target
+                .root
+                .as_ref()
+                .is_some_and(|root| dropped.contains(root));
             if workspace != self.store.paths().project_root.as_str()
+                && !left_out
                 && self.source.rev_parse(&main).is_ok()
             {
                 crate::source::run_git_env(
@@ -10435,7 +10458,7 @@ impl BranchManager {
                     continue;
                 }
             }
-            let fork = remote.fork(project, &branch.slug, tracker)?;
+            let fork = self.fork_of(remote, project, branch, tracker)?;
             let credential = remote.credential(project, &fork.repo, Scope::Write)?;
             self.pushing(|| {
                 GitSource::push_refs(
@@ -11061,6 +11084,74 @@ impl BranchManager {
     /// merge would put there. The record that goes up leaves it out too, so
     /// it never names a rev the remote does not have. Any other failure
     /// still fails the sync.
+    /// Where `branch`'s fork of `tracker` is, remembered once the remote has
+    /// made it: asking again costs a round trip on every checkpoint.
+    fn fork_of(
+        &self,
+        remote: &dyn Remote,
+        project: &str,
+        branch: &BranchInstance,
+        tracker: &str,
+    ) -> Result<crate::remote::RepoLocation> {
+        let path = self
+            .store
+            .paths()
+            .project_root
+            .join(".newgit/local/forks")
+            .join(&branch.slug)
+            .join(format!("{tracker}.json"));
+        if let Some(fork) = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|text| serde_json::from_str(&text).ok())
+        {
+            return Ok(fork);
+        }
+        let fork = remote.fork(project, &branch.slug, tracker)?;
+        // Only a fork that exists: one still being made is asked about again.
+        if fork.remote.is_some()
+            && let Some(parent) = path.parent()
+            && std::fs::create_dir_all(parent).is_ok()
+            && let Ok(text) = serde_json::to_string(&fork)
+        {
+            let _ = std::fs::write(&path, text);
+        }
+        Ok(fork)
+    }
+
+    /// Whether every ref `refspecs` sends to `repo` is, as it stands, what
+    /// was last sent there: a tracker this checkpoint did not change.
+    fn pushed_already(&self, repo: &str, refspecs: &[String]) -> bool {
+        let store = format!("--git-dir={}", self.store.paths().tracker_store);
+        refspecs.iter().all(|refspec| {
+            let Some((source, destination)) = refspec.trim_start_matches('+').split_once(':')
+            else {
+                return false;
+            };
+            let rev = |name: &str| {
+                crate::source::run_git_env(&[&store, "rev-parse", "-q", "--verify", name], &[]).ok()
+            };
+            match (rev(source), rev(&sent_ref(repo, destination))) {
+                (Some(now), Some(sent)) => now == sent,
+                _ => false,
+            }
+        })
+    }
+
+    /// Remember what `refspecs` just sent to `repo` (see [`Self::pushed_already`]).
+    fn record_pushed(&self, repo: &str, refspecs: &[String]) {
+        let store = format!("--git-dir={}", self.store.paths().tracker_store);
+        for refspec in refspecs {
+            let Some((source, destination)) = refspec.trim_start_matches('+').split_once(':')
+            else {
+                continue;
+            };
+            let _ = crate::source::run_git_env(
+                &[&store, "update-ref", &sent_ref(repo, destination), source],
+                &[],
+            );
+        }
+    }
+
     fn sync_checkpoint(
         &self,
         branch: &mut BranchInstance,
@@ -11105,6 +11196,18 @@ impl BranchManager {
                 definition,
                 login.as_deref().unwrap_or_default(),
             );
+            let prefix = format!("refs/trackers/{}", state.name);
+            let pin = format!("{prefix}/pins/{rev}");
+            let instance = format!("{prefix}/instances/{}", branch.slug);
+            let mut refspecs = vec![format!("{pin}:{pin}"), format!("+{instance}:{instance}")];
+            if definition.audience == "user" && self.lane(&state.name).main().is_some() {
+                let main = format!("{prefix}/main");
+                refspecs.push(format!("+{main}:{main}"));
+            }
+            // Sent already, every ref as it is now: no credential and no push.
+            if self.pushed_already(&repo, &refspecs) {
+                continue;
+            }
             let credential = match remote.credential(&binding.project, &repo, Scope::Write) {
                 Ok(credential) => credential,
                 // 404 is a tracker whose definition is not on the default
@@ -11121,25 +11224,13 @@ impl BranchManager {
                 Err(error) => return Err(error),
             };
             let url = credential.remote.clone().unwrap_or_default();
-            let prefix = format!("refs/trackers/{}", state.name);
-            let pin = format!("{prefix}/pins/{rev}");
-            let instance = format!("{prefix}/instances/{}", branch.slug);
-            // The pin keeps the checkpoint's commit; the instance's branch is
-            // its history (forced: a checkout can move it back).
-            let mut refspecs = vec![format!("{pin}:{pin}"), format!("+{instance}:{instance}")];
-            // A per-user tracker's repo is the user's own, and its `main` is
-            // what "your own content" means on another machine. A shared
-            // tracker's `main` moves only by merge, never by a sync.
-            if definition.audience == "user" && self.lane(&state.name).main().is_some() {
-                let main = format!("{prefix}/main");
-                refspecs.push(format!("+{main}:{main}"));
-            }
             GitSource::push_refs(
                 &[&format!("--git-dir={}", self.store.paths().tracker_store)],
                 &url,
                 &refspecs,
                 Some(&basic_auth_header(&credential)),
             )?;
+            self.record_pushed(&repo, &refspecs);
         }
 
         record
@@ -13581,4 +13672,13 @@ mod tests {
             "and its target is not created"
         );
     }
+}
+
+/// Where the tracker store remembers what it last sent to `repo`'s
+/// `destination`: a ref, so Git keeps the commit it names.
+fn sent_ref(repo: &str, destination: &str) -> String {
+    format!(
+        "refs/newgit/sent/{repo}/{}",
+        destination.trim_start_matches("refs/")
+    )
 }

@@ -31,7 +31,7 @@ pub struct Me {
     pub project: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, serde::Serialize)]
 pub struct RepoLocation {
     pub repo: String,
     /// `None` when the repo does not exist yet.
@@ -449,6 +449,28 @@ impl HttpRemote {
     }
 
     fn request_with(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<serde_json::Value>,
+    ) -> Result<Reply> {
+        let started = std::time::Instant::now();
+        let reply = self.request_untimed(method, path, body);
+        // `NEWGIT_TRACE=1`: each call to the remote and how long it took, as
+        // `GIT_TRACE` says what Git ran. Method, path, and status only.
+        if std::env::var_os("NEWGIT_TRACE").is_some_and(|value| !value.is_empty() && value != "0") {
+            let status = reply
+                .as_ref()
+                .map_or_else(|_| "failed".to_owned(), |reply| reply.status.to_string());
+            eprintln!(
+                "newgit trace: {method} {path} {status} {}ms",
+                started.elapsed().as_millis()
+            );
+        }
+        reply
+    }
+
+    fn request_untimed(
         &self,
         method: &str,
         path: &str,

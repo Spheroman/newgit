@@ -988,6 +988,39 @@ class ReadPasswords {
 
 const readPasswords = new ReadPasswords();
 
+/**
+ * Credentials the credentials route minted, in this isolate's memory, for the
+ * same reason as [`ReadPasswords`]: a checkpoint asks for one per tracker it
+ * syncs, and minting and recording each was most of a second. Every request
+ * still decides what the caller may do first, and only then looks here; a key
+ * holds the token, so revoking it revokes what was reused.
+ */
+class MintedPasswords {
+	private readonly held = new Map<string, { password: string; expiresAt: string; remote: string }>();
+
+	/** One this close to expiring could lapse during a long push. */
+	private static readonly MARGIN_MS = 10 * 60_000;
+	private static readonly MOST = 2000;
+
+	get(key: string): { password: string; expiresAt: string; remote: string } | undefined {
+		const held = this.held.get(key);
+		if (held === undefined) return undefined;
+		if (Date.parse(held.expiresAt) - MintedPasswords.MARGIN_MS > Date.now()) return held;
+		this.held.delete(key);
+		return undefined;
+	}
+
+	set(key: string, password: string, expiresAt: string, remote: string) {
+		if (this.held.size >= MintedPasswords.MOST) {
+			const oldest = this.held.keys().next();
+			if (!oldest.done) this.held.delete(oldest.value);
+		}
+		this.held.set(key, { password, expiresAt, remote });
+	}
+}
+
+const mintedPasswords = new MintedPasswords();
+
 /** `/<owner>/<name>.git/info/refs` and `/<owner>/<name>.git/git-upload-pack`. */
 const GIT_ROUTE = /^\/([^/]+)\/([^/]+?)\.git\/(info\/refs|git-upload-pack|git-receive-pack)$/;
 
@@ -1191,6 +1224,12 @@ async function credential(
 	// is not there to write, or read, until the fork route says it is.
 	if (ref.kind === "fork" && !(await project.forkComplete(ref.instance, ref.tracker)))
 		throw new HttpError(404, `${name} does not exist yet`);
+	// Minted for this token already and not near expiring: hand it out
+	// again, after every check above, as the Git endpoint does.
+	const key = `${caller.tokenId}:${scope}:${name}`;
+	const held = mintedPasswords.get(key);
+	if (held !== undefined)
+		return { repo: name, remote: held.remote, scope, username: "x", password: held.password, expires_at: held.expiresAt };
 	let remote = await deps.repos.remote(name);
 	if (remote === null) {
 		// The repo of a tracker outside Git is created on its first write. The repos of
@@ -1201,6 +1240,7 @@ async function credential(
 	}
 	const minted = await deps.repos.mint(name, scope, scope === "read" ? READ_CREDENTIAL_TTL_SECONDS : CREDENTIAL_TTL_SECONDS);
 	await userStub(env, caller.login).recordRepoToken(caller.tokenId, name, minted.id, minted.expiresAt);
+	mintedPasswords.set(key, minted.password, minted.expiresAt, remote);
 	return { repo: name, remote, scope, username: "x", password: minted.password, expires_at: minted.expiresAt };
 }
 
