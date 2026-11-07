@@ -951,6 +951,43 @@ class Timing {
 	}
 }
 
+/**
+ * Read passwords a Git request already minted, in this isolate's memory only.
+ * Minting and recording one is most of a request (0.5s of 0.75s with three
+ * trackers), for a password that lasts an hour.
+ *
+ * Reusing one decides nothing about access: every request still authenticates
+ * its token and asks who may read each tracker, and only then looks here, so a
+ * revoked token or a removed member never reaches it. These go to the endpoint
+ * container, never to the caller. A key holds the token, as a password's
+ * record does, so revoking that token revokes what was reused.
+ */
+class ReadPasswords {
+	private readonly passwords = new Map<string, { password: string; until: number }>();
+
+	/** One this close to expiring could lapse during a long fetch. */
+	private static readonly MARGIN_MS = 10 * 60_000;
+	private static readonly MOST = 2000;
+
+	get(key: string): string | undefined {
+		const held = this.passwords.get(key);
+		if (held === undefined) return undefined;
+		if (held.until - ReadPasswords.MARGIN_MS > Date.now()) return held.password;
+		this.passwords.delete(key);
+		return undefined;
+	}
+
+	set(key: string, password: string, expiresAt: string) {
+		if (this.passwords.size >= ReadPasswords.MOST) {
+			const oldest = this.passwords.keys().next();
+			if (!oldest.done) this.passwords.delete(oldest.value);
+		}
+		this.passwords.set(key, { password, until: Date.parse(expiresAt) });
+	}
+}
+
+const readPasswords = new ReadPasswords();
+
 /** `/<owner>/<name>.git/info/refs` and `/<owner>/<name>.git/git-upload-pack`. */
 const GIT_ROUTE = /^\/([^/]+)\/([^/]+?)\.git\/(info\/refs|git-upload-pack|git-receive-pack)$/;
 
@@ -1059,11 +1096,17 @@ async function answerGit(
 
 	for (const tracker of needed) {
 		const name = repoName({ kind: "tracker", project: id, tracker });
-		const minted = await timing.span("mint", () => deps.repos.mint(name, "read", READ_CREDENTIAL_TTL_SECONDS));
-		await timing.span("record", () =>
-			userStub(env, caller.login).recordRepoToken(caller.tokenId, name, minted.id, minted.expiresAt),
-		);
-		plan.repos[tracker] = { url: deps.repos.url(name), auth: `Authorization: Basic ${btoa(`x:${minted.password}`)}` };
+		const key = `${caller.tokenId}:${name}`;
+		let password = readPasswords.get(key);
+		if (password === undefined) {
+			const minted = await timing.span("mint", () => deps.repos.mint(name, "read", READ_CREDENTIAL_TTL_SECONDS));
+			await timing.span("record", () =>
+				userStub(env, caller.login).recordRepoToken(caller.tokenId, name, minted.id, minted.expiresAt),
+			);
+			password = minted.password;
+			readPasswords.set(key, password, minted.expiresAt);
+		}
+		plan.repos[tracker] = { url: deps.repos.url(name), auth: `Authorization: Basic ${btoa(`x:${password}`)}` };
 	}
 	timing.set("branches", Object.keys(plan.branches).length);
 	timing.set("trackers", needed.size);
