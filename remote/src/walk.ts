@@ -204,3 +204,39 @@ async function sameBut(
 		return below.length === 0 || x?.hash === y?.hash;
 	return sameBut(repos, name, x.hash, y.hash, below);
 }
+
+/**
+ * Whether any commit `next` adds to `base` changes anything but pins, each
+ * against its first parent. The history a merge brings into a tracker it
+ * does not touch must be pins-only too, or the tracker is touched after
+ * all: a root file edited and edited back is still root's to approve.
+ * The walk stops at `base` and at any commit `isApproved` already says the
+ * tracker's head has been. A commit with no parent counts as touching.
+ * `ASK_GIT` when it cannot be read or runs past `WALK_LIMIT`.
+ */
+export async function historyTouches(
+	repos: Repos,
+	name: string,
+	base: string,
+	next: string,
+	isApproved: (commit: string) => Promise<boolean>,
+): Promise<boolean | typeof ASK_GIT> {
+	return orAskGit("history", async () => {
+		const seen = new Set<string>();
+		const frontier = [next];
+		while (frontier.length > 0) {
+			const hash = frontier.pop()!;
+			if (hash === base || seen.has(hash)) continue;
+			seen.add(hash);
+			if (seen.size > WALK_LIMIT) return ASK_GIT;
+			if (await isApproved(hash)) continue;
+			const commit = await repos.readCommit(name, hash);
+			if (commit === null) return ASK_GIT;
+			if (commit.parents.length === 0) return true;
+			const only = await onlyPinsMoved(repos, name, commit.parents[0], hash);
+			if (only !== true) return only === ASK_GIT ? ASK_GIT : true;
+			frontier.push(...commit.parents);
+		}
+		return false;
+	});
+}

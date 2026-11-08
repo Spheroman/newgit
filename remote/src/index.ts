@@ -57,7 +57,7 @@ import { githubWebhook } from "./webhook";
 type Checking = typeof CHECKING;
 import type { Branch, Instance, ProjectDO, TrackerList } from "./project";
 import { type RefMove, followHead, followLanding } from "./follow";
-import { ASK_GIT, nativeAncestry, nativeIndex, onlyPinsMoved } from "./walk";
+import { ASK_GIT, historyTouches, nativeAncestry, nativeIndex, onlyPinsMoved } from "./walk";
 import { anchorOf, within } from "./anchor";
 import { parentOf } from "./project";
 import { type RollupStore, rollUp } from "./rollup";
@@ -639,7 +639,7 @@ async function route(request: Request, env: Env, deps: Deps): Promise<Response> 
 		// files it changed. A tracker whose commit moved only pins is not
 		// touched; it rolls up. Adding or dropping a tracker changes its
 		// parent's mounts, so it lands at root, as does anything unreadable.
-		const anchor = await anchorFor(deps, id, base, list, trackers);
+		const anchor = await anchorFor(deps, id, base, list, trackers, project, branch);
 		// Everything is checked before the merge begins: a refused merge
 		// holds nothing.
 		const who = { login, member };
@@ -808,7 +808,8 @@ async function route(request: Request, env: Env, deps: Deps): Promise<Response> 
 				const moved = [...new Set([...Object.keys(base), ...Object.keys(list)])].filter(
 					(tracker) => base[tracker] !== list[tracker],
 				);
-				const anchor = pending?.landed === true ? began : await anchorFor(deps, id, base, list, moved);
+				const anchor =
+					pending?.landed === true ? began : await anchorFor(deps, id, base, list, moved, project, branch);
 				if (!within(anchor, began))
 					throw new HttpError(409, `this merge touches more than it did when it began: start the merge again`);
 				const landed = await landAndFollow(deps, project, id, branch, base, list, login, asked, true, anchor);
@@ -1989,12 +1990,23 @@ async function anchorFor(
 	base: TrackerList,
 	list: TrackerList,
 	trackers: string[],
+	project?: DurableObjectStub<ProjectDO>,
+	branch = "main",
 ): Promise<string> {
 	if (trackers.some((tracker) => !(tracker in base) || !(tracker in list))) return "root";
 	const touched: string[] = [];
 	for (const tracker of trackers) {
-		const only = await onlyPinsMoved(deps.repos, repoName({ kind: "tracker", project: id, tracker }), base[tracker], list[tracker]);
-		if (only !== true) touched.push(tracker);
+		const name = repoName({ kind: "tracker", project: id, tracker });
+		// Neither what it ends at nor any commit on the way may change more
+		// than pins: what it brings in is in the tracker's history for good.
+		const only = await onlyPinsMoved(deps.repos, name, base[tracker], list[tracker]);
+		const history =
+			only === true && project !== undefined
+				? await historyTouches(deps.repos, name, base[tracker], list[tracker], (commit) =>
+						project.wasHead(branch, tracker, commit),
+					)
+				: true;
+		if (only !== true || history !== false) touched.push(tracker);
 	}
 	// A tracker that moved only pins and sits beside the anchor, not above
 	// it, would be left out: it is covered too.

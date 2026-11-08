@@ -173,10 +173,13 @@ async function commitsFor(
 
 /**
  * The commit a change made in the parent, when it may join the parent's
- * history: one parent, a commit the parent's head really was, and a tree
- * that is exactly that commit's with this one pin moved. So it brings no
- * history and no content the change's approval did not cover. Anything
- * else is left out, and the roll-up writes its own commit instead.
+ * history: its first parent a commit the parent's head really was, and its
+ * tree exactly that commit's with this one pin moved. Whatever else it
+ * brings (an instance's own commits, merged) was checked to move nothing but
+ * pins when the change landed (`historyTouches`), or the change would have
+ * landed at the parent. Kept, it keeps the parent's history a descendant
+ * of the merger's, so their next merge is not three-way against an old base.
+ * Anything else is left out, and the roll-up writes its own commit.
  */
 async function keptCommit(
 	repos: Repos,
@@ -187,7 +190,7 @@ async function keptCommit(
 ) {
 	if (move.via === null) return null;
 	const via = await repos.readCommit(name, move.via).catch(() => null);
-	if (via === null || via.parents.length !== 1 || !(await wasHead(via.parents[0]))) return null;
+	if (via === null || via.parents.length === 0 || !(await wasHead(via.parents[0]))) return null;
 	const base = await commitTree(repos, name, via.parents[0]).catch(() => null);
 	if (base === null) return null;
 	const expected = await replacePin(repos, name, base, leaf, move.new!).catch(() => null);

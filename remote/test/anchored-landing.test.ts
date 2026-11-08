@@ -166,21 +166,53 @@ describe("a merge two levels down", () => {
 });
 
 describe("a change's own commit in root", () => {
-	it("joins root's history only as exactly a pin move: a smuggled parent is left out", async () => {
+	it("is kept, merge and all, when everything it brings moves only pins", async () => {
+		// An instance that began before `site` moved: its root commits pin its
+		// `t3code` work, and its merge with `main` is the client's root commit.
+		const t3code = await commitIn("t3code", {}, [main.t3code], other);
+		repos.setRef(repo("t3code"), "refs/heads/main", t3code);
+		const theirs = await commitIn("root", { t3code, site: main.site, access: main.access }, [main.root]);
+		const site = await change("site", main);
+		expect((await site.finish()).status).toBe(200);
+		const now = (await heads()).list;
+		const pins = { t3code, site: now.site, access: main.access };
+		const merged = await commitIn("root", pins, [now.root, theirs]);
+		const list = { ...now, root: merged, t3code };
+		const begun = await call(jack, "POST", path("/branches/main/merge"), { base: now, list });
+		expect(begun.status, JSON.stringify(begun.body)).toBe(200);
+		repos.setRef(repo("root"), landingRef(merged), merged);
+		const landed = await call(jack, "PUT", path("/branches/main"), { base: now, list });
+		expect(landed.body.anchor).toBe("t3code");
+		expect((await heads()).list.root, "root's history is the merger's").toBe(merged);
+	});
+
+	it("that brings a commit changing root makes the change root's to approve", async () => {
 		const next = await commitIn("t3code", {}, [main.t3code], other);
 		repos.setRef(repo("t3code"), "refs/heads/main", next);
-		const smuggled = await commitIn("root", {}, [], other);
-		// The right tree, but a second parent no one approved.
+		// A root file edited and edited back: the end pins only, the way not.
+		const edited = await commitIn("root", { t3code: main.t3code, site: main.site, access: main.access }, [main.root], other);
 		const pins = { t3code: next, site: main.site, access: main.access };
-		const crafted = await commitIn("root", pins, [main.root, smuggled]);
+		const back = await commitIn("root", pins, [edited]);
+		const list = { ...main, root: back, t3code: next };
+		expect((await call(ana, "POST", path("/branches/main/merge"), { base: main, list })).status).toBe(403);
+		const begun = await call(jack, "POST", path("/branches/main/merge"), { base: main, list });
+		expect(begun.body.anchor).toBe("root");
+		repos.setRef(repo("root"), landingRef(back), back);
+		const landed = await call(jack, "PUT", path("/branches/main"), { base: main, list });
+		expect(landed.body.anchor).toBe("root");
+	});
+
+	it("whose first parent was never root's head is left out, and root writes its own", async () => {
+		const next = await commitIn("t3code", {}, [main.t3code], other);
+		repos.setRef(repo("t3code"), "refs/heads/main", next);
+		const pins = { t3code: next, site: main.site, access: main.access };
+		const stranger = await commitIn("root", { t3code: main.t3code, site: main.site, access: main.access }, []);
+		const crafted = await commitIn("root", pins, [stranger]);
 		const list = { ...main, root: crafted, t3code: next };
-		expect((await call(jack, "POST", path("/branches/main/merge"), { base: main, list })).status).toBe(200);
-		repos.setRef(repo("root"), landingRef(crafted), crafted);
-		expect((await call(jack, "PUT", path("/branches/main"), { base: main, list })).status).toBe(200);
-		const head = (await heads()).list.root;
-		expect(head, "not fast-forwarded to").not.toBe(crafted);
-		const made = await repos.readCommit(repo("root"), head);
-		expect(made?.parents).toEqual([main.root]);
+		// From `main.root` to `crafted` without passing a head: its parent
+		// has no parent, so it counts as touching root.
+		const begun = await call(jack, "POST", path("/branches/main/merge"), { base: main, list });
+		expect(begun.body.anchor).toBe("root");
 	});
 });
 

@@ -600,11 +600,16 @@ Worker, so no write password is needed) is what makes the approval follow
 the anchor too. `begin` compares the base only for the trackers the merge
 moves; root is the finish's to compare. A pin that only follows its tracker's own `main` is the parent's
 choice, so its parent's maintainers are asked for that, as root's were
-before. The change's own commit in a parent joins the parent's history only
-when it is exactly a pin move: one parent, a commit the parent's head really
-was, and that commit's tree with this one pin moved. Otherwise the roll-up
-writes its own commit, so a change brings no history its approval did not
-cover. Anything read rolls up first, so a reader never sees a list root's
+before. A tracker above the anchor counts as touched if any commit the merge adds
+to its history changes more than pins, each against its first parent, not
+only if the merge's end does: a root file edited and edited back is root's
+to approve. The change's own commit in a parent (a client's merge
+commit, with the instance's own commits behind it) is kept as the parent's
+history when its first parent was really the parent's head and its tree is
+that head's with the pin moved; what else it brings passed that check. Kept,
+the parent's history descends from the merger's, so their next merge is not
+three-way against an old base (seen live when roll-ups wrote their own
+commits instead). Otherwise the roll-up writes its own commit. Anything read rolls up first, so a reader never sees a list root's
 commit does not pin; a roll-up that fails is served as root's last commit,
 marked `behind`. `begin` answers with the `anchor`, and `newgit merge` says
 where it landed when that is below root.
