@@ -99,8 +99,17 @@ describe("merging into a branch", () => {
 	});
 
 	it("refuses a merge onto an index that has moved since", async () => {
+		// A tracker it moves has moved: refused as it begins.
+		const behind = { ...main, t3code: sha("f") };
+		const early = await begin(jack, behind, { ...behind, root: sha("c"), t3code: sha("e") });
+		expect(early.status).toBe(409);
+		expect(early.body.error).toContain("merge again");
+		// Only root has: whether that matters is known where it lands, and
+		// one landing at root finds it moved.
 		const stale = { ...main, root: sha("f") };
-		const refused = await begin(jack, stale, { ...stale, root: sha("c") });
+		const list = { ...stale, root: sha("c") };
+		expect((await begin(jack, stale, list)).status).toBe(200);
+		const refused = await call(jack, "PUT", path("/branches/main"), { base: stale, list });
 		expect(refused.status).toBe(409);
 		expect(refused.body.error).toContain("merge again");
 	});

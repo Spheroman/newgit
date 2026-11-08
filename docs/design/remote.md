@@ -584,14 +584,21 @@ its own. Before the new
 index is written, the container checks root's pushed commit pins exactly
 that, and the merge may finish only with the index it began with.
 
-**Where it lands.** At `begin` the remote works out the merge's anchor
+**Where it lands.** At the finish, once the merge's commits are there to
+read, the remote works out the merge's anchor
 (docs/design/anchoring.md): the lowest tracker covering every one whose own
 files the merge changed. A tracker whose commit moved only pins is not
 touched. Only the anchor and the trackers inside it are compared with the
 base and land; the trackers above roll up to it afterwards, written by the
 Worker (`remote/src/rollup.ts`). So two merges at different anchors do not
 wait on each other, and approval is the touched trackers' maintainers', not
-root's. A pin that only follows its tracker's own `main` is the parent's
+root's, as far as `begin` can tell: the client sends its commits with the
+passwords `begin` hands it, so a `begin` that cannot read them yet asks as
+for a landing at root, and a finish that finds the merge touching more than
+`begin` saw is refused. Uploading the commits before `begin` (through the
+Worker, so no write password is needed) is what makes the approval follow
+the anchor too. `begin` compares the base only for the trackers the merge
+moves; root is the finish's to compare. A pin that only follows its tracker's own `main` is the parent's
 choice, so its parent's maintainers are asked for that, as root's were
 before. The change's own commit in a parent joins the parent's history only
 when it is exactly a pin move: one parent, a commit the parent's head really

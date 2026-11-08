@@ -252,3 +252,48 @@ describe("a read while root cannot roll up", () => {
 		}
 	});
 });
+
+describe("merges whose commits arrive after they begin, as a client sends them", () => {
+	/** `change`, with root's commit kept from the remote until after `begin`. */
+	async function late(tracker: string, base: Record<string, string>, token = jack) {
+		const next = await commitIn(tracker, {}, [base[tracker]], other);
+		repos.setRef(repo(tracker), "refs/heads/main", next);
+		const pins = Object.fromEntries(Object.entries(base).filter(([name]) => name !== "root"));
+		const root = await commitIn("root", { ...pins, [tracker]: next }, [base.root]);
+		const held = repos.commits.get(repo("root"))!.get(root)!;
+		repos.commits.get(repo("root"))!.delete(root);
+		const list = { ...base, root, [tracker]: next };
+		const begun = await call(token, "POST", path("/branches/main/merge"), { base, list });
+		return {
+			begun,
+			list,
+			finish: () => {
+				repos.addCommit(repo("root"), held);
+				repos.setRef(repo("root"), landingRef(root), root);
+				return call(token, "PUT", path("/branches/main"), { base, list });
+			},
+		};
+	}
+
+	it("both land below root, begun together; root rolls up with a commit of its own", async () => {
+		const one = await late("t3code", main);
+		const two = await late("site", main);
+		expect(one.begun.status).toBe(200);
+		expect(two.begun.status).toBe(200);
+		const first = await one.finish();
+		expect(first.body.anchor).toBe("t3code");
+		const second = await two.finish();
+		expect(second.status, JSON.stringify(second.body)).toBe(200);
+		expect(second.body.anchor).toBe("site");
+		const now = await heads();
+		expect(now.list.t3code).toBe(one.list.t3code);
+		expect(now.list.site).toBe(two.list.site);
+		expect(await nativeIndex(repos, (tracker) => repo(tracker), now.list)).toMatchObject({ matches: true });
+		expect(repos.pushed.some((push) => push.name === repo("root")), "a pack was pushed to root").toBe(true);
+	});
+
+	it("still asks root's maintainers when it begins, since it cannot tell yet", async () => {
+		const merge = await late("t3code", main, ana);
+		expect(merge.begun.status).toBe(403);
+	});
+});

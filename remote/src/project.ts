@@ -454,9 +454,13 @@ export class ProjectDO extends DurableObject<Env> {
 	): MergeStart {
 		const branch = this.branch(name);
 		if (branch === null) return { ok: false, reason: "missing" };
-		// Only what lands must still be as the merge saw it: above its
-		// anchor, other changes may have rolled up meanwhile.
-		if (!sameList(subtree(branch.list, anchor), subtree(base, anchor)))
+		// Every tracker it moves must still be where the merge saw it. Root is
+		// left to the landing: only there is it known whether the merge
+		// touches root, or lands below and lets root roll up meanwhile.
+		const moves = [...new Set([...Object.keys(base), ...Object.keys(target)])].filter(
+			(tracker) => tracker !== "root" && base[tracker] !== target[tracker],
+		);
+		if (moves.some((tracker) => (branch.list[tracker] ?? null) !== (base[tracker] ?? null)))
 			return { ok: false, reason: "moved", list: branch.list };
 		const stale: HandedToken[] = [];
 		const now = Date.now();
@@ -510,7 +514,7 @@ export class ProjectDO extends DurableObject<Env> {
 	 * list someone else has since moved finds it moved. Already `list` (a run
 	 * that landed and stopped before it heard): landed, and says so.
 	 */
-	land(name: string, base: TrackerList, list: TrackerList, by: string): Landing {
+	land(name: string, base: TrackerList, list: TrackerList, by: string, at?: string): Landing {
 		const branch = this.branch(name);
 		if (branch === null) return { ok: false, reason: "missing" };
 		const merge = this.pendingMerge(name, list);
@@ -521,15 +525,16 @@ export class ProjectDO extends DurableObject<Env> {
 				this.sql.exec(
 					"INSERT OR REPLACE INTO meta VALUES (?, ?)",
 					pendingKey(name, list),
-					JSON.stringify({ ...merge, tokens: [], landed: true }),
+					JSON.stringify({ ...merge, tokens: [], landed: true, anchor }),
 				);
 		};
-		const anchored = merge?.anchor ?? "root";
-		if (anchored === "root" ? sameList(branch.list, list) : sameList(subtree(branch.list, anchored), subtree(list, anchored)) && merge?.landed === true) {
+		// Where it lands: `at`, worked out once its commits are there to read;
+		// otherwise where it was seen to land when it began.
+		const anchor = at ?? merge?.anchor ?? "root";
+		if (merge?.landed === true || (merge === null && sameList(branch.list, list))) {
 			landed();
 			return { ok: true, branch, ...done, already: true };
 		}
-		const anchor = merge?.anchor ?? "root";
 		if (anchor !== "root") return this.landAt(name, anchor, branch, base, list, by, landed, done);
 		const moving = [...new Set([...Object.keys(base), ...Object.keys(list), "root"])].filter(
 			(tracker) => tracker === "root" || base[tracker] !== list[tracker],

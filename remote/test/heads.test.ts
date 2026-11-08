@@ -55,7 +55,8 @@ describe("per-tracker heads", () => {
 			instance.createBranch("main", base, "jack");
 			const logged = instance.headLog("main").length;
 			const stale = { root: sha("9"), access: sha("b") };
-			expect(instance.beginMerge("main", stale, "ana", 60, base).ok).toBe(false);
+			// A tracker it moves (`access`) is not where it saw it.
+			expect(instance.beginMerge("main", { ...base, access: sha("c") }, "ana", 60, { ...base, access: sha("d") }).ok).toBe(false);
 			expect(instance.land("main", stale, { root: sha("1"), access: sha("b") }, "ana").ok).toBe(
 				false,
 			);

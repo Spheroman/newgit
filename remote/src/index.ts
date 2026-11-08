@@ -801,12 +801,22 @@ async function route(request: Request, env: Env, deps: Deps): Promise<Response> 
 							"root's commit does not pin what this index says: push the root commit the merge made to its landing ref, then finish",
 						);
 				}
-				const landed = await landAndFollow(deps, project, id, branch, base, list, login, asked, true);
+				// Where it lands, now that its commits are here to read. Never
+				// above where it was seen to land when it began: what it
+				// touches beyond that was not approved.
+				const began = pending?.anchor ?? "root";
+				const moved = [...new Set([...Object.keys(base), ...Object.keys(list)])].filter(
+					(tracker) => base[tracker] !== list[tracker],
+				);
+				const anchor = pending?.landed === true ? began : await anchorFor(deps, id, base, list, moved);
+				if (!within(anchor, began))
+					throw new HttpError(409, `this merge touches more than it did when it began: start the merge again`);
+				const landed = await landAndFollow(deps, project, id, branch, base, list, login, asked, true, anchor);
 				if (!landed.ok) {
 					if (landed.reason === "missing") throw new HttpError(404, `no branch \`${branch}\` in ${key}`);
 					throw new HttpError(409, `\`${branch}\` moved since you looked: merge again onto what it is now`);
 				}
-				return json({ ...landed.branch, behind: landed.behind });
+				return json({ ...landed.branch, behind: landed.behind, anchor: landed.anchor });
 			}
 			const created = await project.createBranch(branch, list, login);
 			if (created === null)
@@ -2009,8 +2019,9 @@ export async function landAndFollow(
 	by: string,
 	moves: RefMove[],
 	background = false,
-): Promise<{ ok: true; branch: Branch; behind: string[] } | { ok: false; reason: "missing" | "moved" }> {
-	const landed = await project.land(branch, base, list, by);
+	anchor?: string,
+): Promise<{ ok: true; branch: Branch; behind: string[]; anchor: string } | { ok: false; reason: "missing" | "moved" }> {
+	const landed = await project.land(branch, base, list, by, anchor);
 	if (!landed.ok) return { ok: false, reason: landed.reason };
 	await revokeRepoTokens(deps, landed.tokens);
 	// The landing is the truth from here; the branches follow after the
@@ -2036,7 +2047,7 @@ export async function landAndFollow(
 					console.log(JSON.stringify({ landing: "behind", project: projectKey(id), branch, behind }));
 			})),
 		);
-		return { ok: true, branch: (await project.branch(branch)) ?? landed.branch, behind: [] };
+		return { ok: true, branch: (await project.branch(branch)) ?? landed.branch, behind: [], anchor: anchor ?? "root" };
 	}
 	const behind = await followLanding(
 		deps.repos,
@@ -2049,7 +2060,7 @@ export async function landAndFollow(
 		moves,
 	);
 	if (behind.length > 0) console.log(JSON.stringify({ landing: "behind", project: projectKey(id), branch, behind }));
-	return { ok: true, branch: (await project.branch(branch)) ?? landed.branch, behind };
+	return { ok: true, branch: (await project.branch(branch)) ?? landed.branch, behind, anchor: anchor ?? "root" };
 }
 
 /**
