@@ -50,7 +50,43 @@
     // secret, so naming it here is what publishes the page (src/index.ts,
     // `landingPage`).
     "LANDING_PAGE": { "project": "spheroman/newgit", "tracker": "site", "path": "remote/site/index.html" }
-  }
+  },
+  // A remote of its own for trying changes before they merge: its own
+  // Worker, Artifacts namespace, Durable Objects, and container, on
+  // workers.dev and nowhere near newgit.dev. `remote/scripts/dev.sh` deploys
+  // it from the working tree (docs/design/remote.md, *A dev remote*). Bindings
+  // are not inherited by an environment, so each is repeated here.
+  "env": {
+    "dev": {
+      "name": "newgit-dev",
+      "routes": [],
+      "workers_dev": true,
+      "artifacts": [{ "binding": "ARTIFACTS", "namespace": "newgit-dev" }],
+      "durable_objects": {
+        "bindings": [
+          { "class_name": "ProjectDO", "name": "PROJECTS" },
+          { "class_name": "UserDO", "name": "USERS" },
+          { "class_name": "GitEndpoint", "name": "ENDPOINTS" },
+          { "class_name": "BudgetDO", "name": "BUDGET" }
+        ]
+      },
+      "triggers": { "crons": [] },
+      "containers": [
+        {
+          "class_name": "GitEndpoint",
+          "scheduling_policy": "durable_object",
+          "images": { "endpoint": { "dockerfile": "./endpoint.Dockerfile", "build_context": ".." } }
+        }
+      ],
+      "vars": {
+        "GITHUB_CLIENT_ID": "Ov23liKp3f44HWjSOE9L",
+        "CLOUDFLARE_ACCOUNT_ID": "bce0b38de721f350c8d8a51d0520337d",
+        "ARTIFACTS_GIT_BASE": "https://bce0b38de721f350c8d8a51d0520337d.artifacts.cloudflare.net/git/newgit-dev",
+        // Opens `POST /v1/dev/login` (with the DEV_LOGIN_SECRET secret). Never on prod.
+        "DEV_REMOTE": "1"
+      }
+    }
+  },
   // Secrets: TOKEN_KEY (signs newgit tokens), ALLOWED_LOGINS (who may use
   // this remote; unset admits no one), BLOCKED_LOGINS (who may not, even
   // under `*`), ADMIN_LOGINS (may delete any project, and are not capped),

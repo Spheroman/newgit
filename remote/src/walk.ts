@@ -210,9 +210,16 @@ async function sameBut(
  * against its first parent. The history a merge brings into a tracker it
  * does not touch must be pins-only too, or the tracker is touched after
  * all: a root file edited and edited back is still root's to approve.
- * The walk stops at `base` and at any commit `isApproved` already says the
- * tracker's head has been. A commit with no parent counts as touching.
- * `ASK_GIT` when it cannot be read or runs past `WALK_LIMIT`.
+ *
+ * "Adds" is what `next` reaches and `base` does not, found as Git finds a
+ * merge base: walking back from both at once, newest commit first, marking
+ * which side reaches each. A commit's mark is settled once every newer one
+ * is walked, so a commit only `next` reaches is checked then; a commit
+ * already in history (an older landing's, below the base) is not. A commit
+ * `isApproved` says the head has been counts as reached from `base`. Clocks
+ * that lie can only make a commit look added, which checks more, never
+ * less. A commit with no parent counts as touching. `ASK_GIT` when it
+ * cannot be read or runs past `WALK_LIMIT`.
  */
 export async function historyTouches(
 	repos: Repos,
@@ -222,20 +229,51 @@ export async function historyTouches(
 	isApproved: (commit: string) => Promise<boolean>,
 ): Promise<boolean | typeof ASK_GIT> {
 	return orAskGit("history", async () => {
-		const seen = new Set<string>();
-		const frontier = [next];
-		while (frontier.length > 0) {
-			const hash = frontier.pop()!;
-			if (hash === base || seen.has(hash)) continue;
-			seen.add(hash);
-			if (seen.size > WALK_LIMIT) return ASK_GIT;
-			if (await isApproved(hash)) continue;
-			const commit = await repos.readCommit(name, hash);
-			if (commit === null) return ASK_GIT;
-			if (commit.parents.length === 0) return true;
-			const only = await onlyPinsMoved(repos, name, commit.parents[0], hash);
-			if (only !== true) return only === ASK_GIT ? ASK_GIT : true;
-			frontier.push(...commit.parents);
+		const NEXT = 1;
+		const BASE = 2;
+		const marks = new Map<string, number>();
+		const commits = new Map<string, CommitFacts>();
+		const queued = new Set<string>();
+		const read = async (hash: string) => {
+			const known = commits.get(hash);
+			if (known !== undefined) return known;
+			const found = await repos.readCommit(name, hash);
+			if (found !== null) commits.set(hash, found);
+			return found;
+		};
+		const mark = async (hash: string, side: number) => {
+			const was = marks.get(hash) ?? 0;
+			if (side === NEXT && was === 0 && (await isApproved(hash))) side |= BASE;
+			if ((was | side) === was) return;
+			marks.set(hash, was | side);
+			queued.add(hash);
+		};
+		await mark(base, BASE);
+		await mark(next, NEXT);
+		let walked = 0;
+		// Walk while anything only `next` reaches is left to settle.
+		while ([...queued].some((hash) => marks.get(hash) === NEXT)) {
+			if (++walked > WALK_LIMIT) return ASK_GIT;
+			let newest: string | undefined;
+			let newestAt = -Infinity;
+			for (const hash of queued) {
+				const commit = await read(hash);
+				if (commit === null) return ASK_GIT;
+				if (commit.committedAt > newestAt) {
+					newest = hash;
+					newestAt = commit.committedAt;
+				}
+			}
+			const hash = newest!;
+			queued.delete(hash);
+			const commit = commits.get(hash)!;
+			const side = marks.get(hash)!;
+			if (side === NEXT) {
+				if (commit.parents.length === 0) return true;
+				const only = await onlyPinsMoved(repos, name, commit.parents[0], hash);
+				if (only !== true) return only === ASK_GIT ? ASK_GIT : true;
+			}
+			for (const parent of commit.parents) await mark(parent, side);
 		}
 		return false;
 	});

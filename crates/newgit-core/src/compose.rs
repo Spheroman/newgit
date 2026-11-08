@@ -2122,6 +2122,36 @@ pub(crate) fn write_notes(
     if notes.is_empty() {
         return Ok(());
     }
+    // Another newgit in the same store (two merges at once, from one
+    // project root) may write notes between our reading the ref and moving
+    // it: Git then refuses a ref that is not a fast-forward. Built again on
+    // its notes, ours are added to theirs.
+    let mut attempt = 0;
+    loop {
+        match write_notes_once(repo, notes_ref, label, notes) {
+            Err(NewgitError::SourceCommand { stderr, .. })
+                if attempt < 20
+                    && (stderr.contains("not updating") || stderr.contains("cannot lock ref")) =>
+            {
+                attempt += 1;
+                // Apart, so writers that met do not meet again.
+                let nanos = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|elapsed| elapsed.subsec_nanos())
+                    .unwrap_or_default();
+                std::thread::sleep(std::time::Duration::from_millis(5 + u64::from(nanos % 40)));
+            }
+            other => return other,
+        }
+    }
+}
+
+fn write_notes_once(
+    repo: &Utf8Path,
+    notes_ref: &str,
+    label: &str,
+    notes: &[(String, String)],
+) -> Result<()> {
     let parent = git(repo, &["rev-parse", "-q", "--verify", notes_ref])
         .ok()
         .map(|parent| parent.trim().to_owned())
@@ -2250,3 +2280,7 @@ mod tests {
         assert!(parse_split(b"subject\n\nNewgit-Split: not-an-id\n").is_none());
     }
 }
+
+#[cfg(test)]
+#[path = "compose_notes_race_tests.rs"]
+mod notes_race_tests;

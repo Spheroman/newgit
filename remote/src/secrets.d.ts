@@ -34,6 +34,13 @@ interface SecretEnv {
 	 * set as the webhook's secret. Unset, the route answers 503.
 	 */
 	GITHUB_WEBHOOK_SECRET?: string;
+	/**
+	 * The dev remote's own way in (`POST /v1/dev/login`), for agents trying
+	 * a change without a browser. Answered only where `DEV_REMOTE` is "1".
+	 */
+	DEV_LOGIN_SECRET?: string;
+	/** "1" only on the dev remote (wrangler.jsonc's `env.dev` vars). */
+	DEV_REMOTE?: string;
 }
 interface Env extends SecretEnv {}
 declare namespace Cloudflare {

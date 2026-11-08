@@ -358,6 +358,24 @@ async function route(request: Request, env: Env, deps: Deps): Promise<Response> 
 		return json({ status: "done", login: result.login, token: issued.token, token_id: issued.id });
 	}
 
+	// ── The dev remote's own way in ────────────────────────────────────────
+	// Only on a Worker its config marks the dev remote (wrangler.jsonc's
+	// `env.dev`), and only for a caller holding its DEV_LOGIN_SECRET: so an
+	// agent can try a change there without GitHub's device flow, which needs
+	// a person at a browser. Everything after is the same: the token is a
+	// login token, and ALLOWED_LOGINS still decides who may use it. Not on
+	// newgit.dev, whose config sets no DEV_REMOTE.
+	if (method === "POST" && path === "/v1/dev/login") {
+		if (env.DEV_REMOTE !== "1" || !env.DEV_LOGIN_SECRET) throw new HttpError(404, `no route for ${method} ${path}`);
+		if (!(await sameSecret(request.headers.get("x-dev-login") ?? "", env.DEV_LOGIN_SECRET)))
+			throw new HttpError(401, "not this dev remote's secret");
+		const { login: who } = await body<{ login?: string }>(request);
+		if (!who) throw new HttpError(400, "login is required");
+		await requireInvited(env, who);
+		const issued = await issue(env, { kind: "login", login: who.toLowerCase(), ttlSeconds: LOGIN_TTL_SECONDS });
+		return json({ status: "done", login: who.toLowerCase(), token: issued.token, token_id: issued.id });
+	}
+
 	const caller = await authenticate(request, env);
 	const login = caller.login;
 
@@ -1731,6 +1749,16 @@ function projectCap(env: Env): number {
 }
 
 /** Sign a token and record it with its user, so it can later be revoked. */
+/** Whether `given` is `secret`, compared in constant time (by their SHA-256). */
+async function sameSecret(given: string, secret: string): Promise<boolean> {
+	const digest = async (text: string) =>
+		new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(text)));
+	const [a, b] = await Promise.all([digest(given), digest(secret)]);
+	let differ = 0;
+	for (let index = 0; index < a.length; index++) differ |= a[index] ^ b[index];
+	return differ === 0;
+}
+
 export async function issue(env: Env, spec: NewToken) {
 	const { token, claims } = await signToken(env.TOKEN_KEY, spec);
 	const record = await userStub(env, claims.sub).register(claims);
@@ -2041,6 +2069,10 @@ export async function landAndFollow(
 	// logged, and the next landing (or a finish asked again) brings root's
 	// branch along.
 	if (background) {
+		// Landed below root: root rolls up before the answer, so the merger
+		// learns what root is now (other landings beside this one included)
+		// and starts its next work from that, not only from its own commit.
+		if (anchor !== undefined && anchor !== "root") await settle(deps, project, id, branch);
 		deps.waitUntil(
 			// A landing below root left root to roll up: done now, after the
 			// answer, so nobody's next read pays for it.

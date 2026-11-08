@@ -1572,7 +1572,27 @@ impl GitSource {
             args.extend(extra);
             args.extend(["--", url]);
             args.extend(refspecs.iter().map(String::as_str));
-            run_git_env(&args, &auth_env(auth)).map(|_| ())
+            // Another newgit in the same store (two merges at once, from one
+            // project root) may be moving the same tracking ref: fetching is
+            // idempotent, so wait a moment and fetch again.
+            let mut attempt = 0;
+            loop {
+                match run_git_env(&args, &auth_env(auth)) {
+                    Err(NewgitError::SourceCommand { stderr, .. })
+                        if attempt < 10 && stderr.contains("cannot lock ref") =>
+                    {
+                        attempt += 1;
+                        let nanos = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|elapsed| elapsed.subsec_nanos())
+                            .unwrap_or_default();
+                        std::thread::sleep(std::time::Duration::from_millis(
+                            20 + u64::from(nanos % 80),
+                        ));
+                    }
+                    other => return other.map(|_| ()),
+                }
+            }
         };
         // Snapshots are shallow on purpose (`crate::snapshots`): deepening
         // them here is how a snapshot clone would end up fetching every

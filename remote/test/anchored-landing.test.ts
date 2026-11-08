@@ -202,6 +202,27 @@ describe("a change's own commit in root", () => {
 		expect(landed.body.anchor).toBe("root");
 	});
 
+	it("may bring commits root already has below its head: those are root's history, not the change", async () => {
+		// Root moved two commits at once: `edit` changed a file, its child is
+		// the head. `edit` was never a head itself.
+		const edit = await commitIn("root", { t3code: main.t3code, site: main.site, access: main.access }, [main.root], other);
+		const after = await commitIn("root", { t3code: main.t3code, site: main.site, access: main.access }, [edit], other);
+		const grown = { ...main, root: after };
+		expect((await call(jack, "POST", path("/branches/main/merge"), { base: main, list: grown })).status).toBe(200);
+		repos.setRef(repo("root"), landingRef(after), after);
+		expect((await call(jack, "PUT", path("/branches/main"), { base: main, list: grown })).status).toBe(200);
+		// An instance began at `edit` (as one spawned before a project root's
+		// commit reached the remote does), and changed only `t3code`.
+		const next = await commitIn("t3code", {}, [main.t3code], blob.replace("4", "6"));
+		repos.setRef(repo("t3code"), "refs/heads/main", next);
+		const theirs = await commitIn("root", { t3code: next, site: main.site, access: main.access }, [edit], other);
+		const merged = await commitIn("root", { t3code: next, site: main.site, access: main.access }, [after, theirs], other);
+		const list = { ...grown, root: merged, t3code: next };
+		const begun = await call(jack, "POST", path("/branches/main/merge"), { base: grown, list });
+		expect(begun.status, JSON.stringify(begun.body)).toBe(200);
+		expect(begun.body.anchor, "`edit` is below root's head: not the change's").toBe("t3code");
+	});
+
 	it("whose first parent was never root's head is left out, and root writes its own", async () => {
 		const next = await commitIn("t3code", {}, [main.t3code], other);
 		repos.setRef(repo("t3code"), "refs/heads/main", next);

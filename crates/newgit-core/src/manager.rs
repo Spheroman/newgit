@@ -10188,6 +10188,9 @@ impl BranchManager {
         }
 
         let mut anchor = None;
+        // What root is once this merge is in: its own commit, unless it
+        // landed below root and root rolled up to something more.
+        let mut landed_root = merged_root.clone();
         if !moved.is_empty()
             && let Some((client, project_key)) = &client
         {
@@ -10287,6 +10290,29 @@ impl BranchManager {
             // Where it landed is the finish's to say: `begin` cannot read
             // the merge's commits yet, which arrive after it.
             anchor = landed.anchor.or(anchor);
+            // Landed below root: root rolled up to it on the remote, perhaps
+            // with other landings beside it, so root is now the remote's,
+            // not this merge's own commit. Bring that here, and everything
+            // it pins, so the next spawn starts from what landed: two merges
+            // at once would otherwise each leave only their own.
+            // The merge has landed whatever happens here, so a failure is
+            // said, not taken for the merge failing.
+            if anchor
+                .as_deref()
+                .is_some_and(|anchor| anchor != self.root.name)
+            {
+                match self.branch_list(Some((client.as_ref(), project_key.as_str())), into) {
+                    Ok(after) => {
+                        if let Some(root) = after.get(&self.root.name) {
+                            landed_root = root.clone();
+                        }
+                    }
+                    Err(error) => warnings.push(format!(
+                        "landed, but root's new `{into}` was not brought here ({error}); the \
+                         next `newgit merge` or spawn brings it"
+                    )),
+                }
+            }
         }
         // Here: root's branch by compare-and-swap, then the children's.
         let root_ref = local_tracker_ref(&self.root.name, into);
@@ -10308,7 +10334,7 @@ impl BranchManager {
                     "`{into}` moved while this merge ran: merge again onto what it is now"
                 ))
             })?,
-            _ => self.source.update_ref(&root_ref, &merged_root)?,
+            _ => self.source.update_ref(&root_ref, &landed_root)?,
         }
         self.publish_carved_refs(&self.root.name, &[into])?;
         for (tracker, _, caught_up) in &mains {
@@ -10328,7 +10354,7 @@ impl BranchManager {
         // The merge is done; bringing the project root along is a courtesy,
         // and its failing is said, not mistaken for the merge failing.
         let project_root = if name != PROJECT_ROOT_INSTANCE && into == PROJECT_ROOT_INSTANCE {
-            match self.catch_up_project_root(&merged_root) {
+            match self.catch_up_project_root(&landed_root) {
                 Ok(note) => note,
                 Err(error) => Some(format!(
                     "the project root was not brought along to the merge: {error}"

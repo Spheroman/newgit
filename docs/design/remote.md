@@ -1245,6 +1245,30 @@ through a checkpoint), [#107] (the push outbox is never garbage-collected),
 
 ---
 
+## A dev remote
+
+A remote of its own for trying a change before it merges: wrangler.jsonc's
+`env.dev`, deployed as `newgit-dev` on workers.dev
+(`https://newgit-dev.jackwen04.workers.dev`). It has its own Artifacts
+namespace (`newgit-dev`), Durable Objects, and container, and shares nothing
+with newgit.dev. Merging to `main` deploys prod after CI (about twenty
+minutes), so probing prod to find out whether a change works costs that per
+try; the dev remote costs about a minute.
+
+- `remote/scripts/dev.sh` deploys the working tree. It reuses prod's newest
+  container image (pinned by digest, which Wrangler requires of a managed
+  image), so a Worker-only change needs no Docker; `--build` builds the
+  container too, where Docker is.
+- `remote/scripts/dev-login.sh` logs in without a browser. The dev remote
+  answers `POST /v1/dev/login` for a caller holding its `DEV_LOGIN_SECRET`,
+  and only where its config sets `DEV_REMOTE = "1"`, which only `env.dev`
+  does. newgit.dev has no such route: GitHub's device flow is the only way
+  in there. The token is a login token like any other, and `ALLOWED_LOGINS`
+  still decides who may use it. The secrets are in `~/.newgit/dev-remote.env`
+  on the machine that made it.
+- A project there is made with `newgit remote add --url
+  https://newgit-dev.jackwen04.workers.dev`.
+
 ## Measurements
 
 The spikes behind this design (2026-10-04 and 05) and the first live run
