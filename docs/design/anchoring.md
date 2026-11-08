@@ -168,6 +168,16 @@ the source of truth, and a mirror may trail it.
    and the Worker moves the repos' branches after it (`remote/src/follow.ts`).
    Merges and webhook pulls no longer lock.
 4. Anchors, roll-up on read, and subscriptions. `merge` stops having to move root.
+   **Roll-up done** (`remote/src/rollup.ts`). The Worker writes a parent's
+   next commits itself, with no container. They are its tree with pins under
+   `.newgit/pins/` replaced, one commit per change, deepest first. A change's
+   own commit in the parent is kept: fast-forwarded to when it sits on the
+   head, merged when the head moved on. The objects are encoded as Git
+   encodes them (`remote/src/objects.ts`, checked against hashes Git made),
+   pushed as a pack, and land by one compare-and-swap of the parent's head
+   (`ProjectDO.rolledUp`). `ProjectDO` logs which commit a change made in its
+   parent (`head_log.via`) and how far each parent has rolled up
+   (`rollups`). Next: landing at the anchor, and reads rolling up first.
 5. `history`, and the sweep.
 6. `status`, exports, and the webhook follow the log.
 7. `follow` says pinned.

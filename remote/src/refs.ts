@@ -44,15 +44,18 @@ async function emptyPack(): Promise<Uint8Array> {
 	return concat(header, new Uint8Array(await crypto.subtle.digest("SHA-1", header)));
 }
 
-/** The body of a `git-receive-pack` request that makes `updates` and sends nothing else. */
-export async function receivePackBody(updates: RefUpdate[]): Promise<Uint8Array> {
+/**
+ * The body of a `git-receive-pack` request that makes `updates`, sending
+ * `pack` (`objects.ts`) or, without one, no objects at all.
+ */
+export async function receivePackBody(updates: RefUpdate[], pack?: Uint8Array): Promise<Uint8Array> {
 	const lines = updates.map((update, index) => {
 		const line = `${update.old ?? ZERO} ${update.new ?? ZERO} ${update.ref}`;
 		return pkt(index === 0 ? `${line}\0report-status\n` : `${line}\n`);
 	});
 	// Only deletes send no pack at all: Git refuses one then.
-	const pack = updates.every((update) => update.new === null) ? new Uint8Array() : await emptyPack();
-	return concat(...lines, encoder.encode("0000"), pack);
+	const sent = pack ?? (updates.every((update) => update.new === null) ? new Uint8Array() : await emptyPack());
+	return concat(...lines, encoder.encode("0000"), sent);
 }
 
 /** Split pkt-lines; a flush ends nothing here, it is only skipped. */

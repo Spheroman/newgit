@@ -58,6 +58,18 @@ export type Landing =
 	| { ok: false; reason: "missing" }
 	| { ok: false; reason: "moved"; list: TrackerList };
 
+function toMove(row: HeadMoveRow): HeadMove {
+	return {
+		seq: row.seq,
+		tracker: row.tracker,
+		old: row.old,
+		new: row.new,
+		movedBy: row.moved_by,
+		movedAt: row.moved_at,
+		via: row.via ?? null,
+	};
+}
+
 /** Where a pending merge is kept: by branch, and by the root commit it lands. */
 function pendingKey(name: string, target: TrackerList): string {
 	return `merge:${name}:${target.root ?? ""}`;
@@ -138,9 +150,22 @@ export class ProjectDO extends DurableObject<Env> {
 				PRIMARY KEY (branch, tracker));
 			CREATE TABLE IF NOT EXISTS head_log (
 				seq INTEGER PRIMARY KEY AUTOINCREMENT, branch TEXT NOT NULL, tracker TEXT NOT NULL,
-				old TEXT, new TEXT, moved_by TEXT NOT NULL, moved_at TEXT NOT NULL);
+				old TEXT, new TEXT, moved_by TEXT NOT NULL, moved_at TEXT NOT NULL, via TEXT);
+			CREATE TABLE IF NOT EXISTS rollups (
+				branch TEXT NOT NULL, tracker TEXT NOT NULL, seq INTEGER NOT NULL,
+				PRIMARY KEY (branch, tracker));
 		`);
+		// The log from before it named a change's commit in the parent.
+		try {
+			this.sql.exec("ALTER TABLE head_log ADD COLUMN via TEXT");
+		} catch {}
 		this.adoptLists();
+		// Every head is rolled up through the log as it is now unless it says
+		// otherwise: a commit made by a merge pins its children already.
+		this.sql.exec(
+			`INSERT OR IGNORE INTO rollups (branch, tracker, seq)
+			 SELECT branch, tracker, (SELECT COALESCE(MAX(seq), 0) FROM head_log) FROM heads`,
+		);
 		// Projects made before private instances: add the column (a no-op error otherwise).
 		try {
 			this.sql.exec("ALTER TABLE instances ADD COLUMN private INTEGER NOT NULL DEFAULT 0");
@@ -196,6 +221,78 @@ export class ProjectDO extends DurableObject<Env> {
 			);
 		}
 		this.sql.exec("UPDATE branches SET list = ?, updated_at = ? WHERE name = ?", JSON.stringify(to), at, name);
+		// A list lands whole, its root commit checked to pin every head in
+		// it: each tracker it moved has nothing left to roll up.
+		const through = this.lastSeq();
+		for (const tracker of Object.keys(to))
+			if (from[tracker] !== to[tracker])
+				this.sql.exec("INSERT OR REPLACE INTO rollups VALUES (?, ?, ?)", name, tracker, through);
+	}
+
+	private lastSeq(): number {
+		return this.sql.exec<{ seq: number }>("SELECT COALESCE(MAX(seq), 0) AS seq FROM head_log").one().seq;
+	}
+
+	/**
+	 * Move one head by compare-and-swap, logged: refused, changing nothing,
+	 * unless `tracker`'s head on `name` is `old` now. `via` is the commit the
+	 * change made in the tracker's parent, if any.
+	 */
+	moveHead(name: string, tracker: string, old: string | null, next: string, by: string, via: string | null = null): boolean {
+		if (this.head(name, tracker) !== old) return false;
+		this.ctx.storage.transactionSync(() => {
+			this.writeHead(name, tracker, old, next, by, via);
+			if (old === null) this.sql.exec("INSERT OR REPLACE INTO rollups VALUES (?, ?, ?)", name, tracker, this.lastSeq());
+		});
+		return true;
+	}
+
+	private writeHead(name: string, tracker: string, old: string | null, next: string, by: string, via: string | null) {
+		const at = new Date().toISOString();
+		this.sql.exec("INSERT OR REPLACE INTO heads VALUES (?, ?, ?)", name, tracker, next);
+		this.sql.exec(
+			"INSERT INTO head_log (branch, tracker, old, new, moved_by, moved_at, via) VALUES (?, ?, ?, ?, ?, ?, ?)",
+			name,
+			tracker,
+			old,
+			next,
+			by,
+			at,
+			via,
+		);
+		const list = this.headsOf(name);
+		this.sql.exec("UPDATE branches SET list = ?, updated_at = ? WHERE name = ?", JSON.stringify(list), at, name);
+	}
+
+	/**
+	 * What `parent` has not rolled up on `name`: every move of a tracker
+	 * mounted in it since its last roll-up (or the list that last moved
+	 * it), oldest first.
+	 */
+	pending(name: string, parent: string): HeadMove[] {
+		const through =
+			this.sql
+				.exec<{ seq: number }>("SELECT seq FROM rollups WHERE branch = ? AND tracker = ?", name, parent)
+				.toArray()[0]?.seq ?? 0;
+		return this.sql
+			.exec<HeadMoveRow>("SELECT * FROM head_log WHERE branch = ? AND seq > ? ORDER BY seq", name, through)
+			.toArray()
+			.filter((row) => parentOf(row.tracker) === parent && row.new !== null)
+			.map(toMove);
+	}
+
+	/**
+	 * A roll-up's one commit point: `parent`'s head from `old` to `next`, by
+	 * compare-and-swap, and everything through log entry `through` rolled up.
+	 */
+	rolledUp(name: string, parent: string, old: string, next: string, through: number): boolean {
+		if (this.head(name, parent) !== old) return false;
+		this.ctx.storage.transactionSync(() => {
+			// Nothing new to write is still progress, and moves nothing above.
+			if (next !== old) this.writeHead(name, parent, old, next, "roll-up", null);
+			this.sql.exec("INSERT OR REPLACE INTO rollups VALUES (?, ?, ?)", name, parent, through);
+		});
+		return true;
 	}
 
 	/** Each tracker's head on `name`: what a branch's list is now. */
@@ -216,14 +313,7 @@ export class ProjectDO extends DurableObject<Env> {
 		return this.sql
 			.exec<HeadMoveRow>("SELECT * FROM head_log WHERE branch = ? AND seq > ? ORDER BY seq", name, since)
 			.toArray()
-			.map((row) => ({
-				seq: row.seq,
-				tracker: row.tracker,
-				old: row.old,
-				new: row.new,
-				movedBy: row.moved_by,
-				movedAt: row.moved_at,
-			}));
+			.map(toMove);
 	}
 
 	/** Create the project. Returns false when it already exists. */
@@ -728,6 +818,12 @@ export interface HeadMove {
 	/** Empty for heads adopted from a list made before heads. */
 	movedBy: string;
 	movedAt: string;
+	/**
+	 * The commit the change that moved this head made in the tracker's
+	 * parent, when it made one: what rolling up keeps as its own entry in
+	 * the parent's history.
+	 */
+	via: string | null;
 }
 
 interface HeadMoveRow extends Record<string, SqlStorageValue> {
@@ -737,6 +833,14 @@ interface HeadMoveRow extends Record<string, SqlStorageValue> {
 	new: string | null;
 	moved_by: string;
 	moved_at: string;
+	via: string | null;
+}
+
+/** The tracker `id` is mounted in: `t3code__repos` in `t3code`, `t3code` in `root`. */
+export function parentOf(id: string): string | null {
+	if (id === "root") return null;
+	const at = id.lastIndexOf("__");
+	return at < 0 ? "root" : id.slice(0, at);
 }
 
 interface BranchRow extends Record<string, SqlStorageValue> {

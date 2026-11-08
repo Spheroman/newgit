@@ -44,7 +44,7 @@ export async function followLanding(
 ): Promise<string[]> {
 	const behind: string[] = [];
 	try {
-		const lagging = await followRoot(repos, heads, repoOf("root"), branch);
+		const lagging = await followHead(repos, heads, repoOf("root"), branch, "root");
 		if (lagging !== null) behind.push(lagging);
 	} catch (error) {
 		behind.push(`root's \`${branch}\` did not follow its head yet: ${message(error)}`);
@@ -69,15 +69,21 @@ export async function followLanding(
 }
 
 /**
- * Root's `branch` to root's head. A commit there that no list ever named
+ * `tracker`'s `branch` in its repo `name` to its head. A commit there that no list ever named
  * (pushed past the remote, or by a client from before landing refs) is kept
  * at `refs/newgit/stray/<commit>`, never lost, and the branch still follows:
  * the list is the truth. Null when it follows, or what is behind.
  */
-async function followRoot(repos: Repos, heads: Heads, name: string, branch: string): Promise<string | null> {
+export async function followHead(
+	repos: Repos,
+	heads: Heads,
+	name: string,
+	branch: string,
+	tracker: string,
+): Promise<string | null> {
 	const ref = `refs/heads/${branch}`;
 	for (let attempt = 0; attempt < FOLLOW_ATTEMPTS; attempt++) {
-		const head = await heads.head(branch, "root");
+		const head = await heads.head(branch, tracker);
 		if (head === null) return null;
 		const refs = await repos.refs(name);
 		const held = refs[ref] ?? null;
@@ -85,20 +91,20 @@ async function followRoot(repos: Repos, heads: Heads, name: string, branch: stri
 		const updates: RefUpdate[] = [];
 		if (held !== head) {
 			updates.push({ ref, old: held, new: head });
-			if (held !== null && !(await heads.wasHead(branch, "root", held)))
+			if (held !== null && !(await heads.wasHead(branch, tracker, held)))
 				updates.push({ ref: `refs/newgit/stray/${held}`, old: null, new: held });
 		}
 		if (refs[landing] !== undefined) updates.push({ ref: landing, old: refs[landing], new: null });
 		// A landing that followed before this one's head moved on leaves its
 		// own: any landed commit's landing ref goes.
 		for (const [other, commit] of Object.entries(refs))
-			if (other.startsWith("refs/newgit/landing/") && other !== landing && (await heads.wasHead(branch, "root", commit)))
+			if (other.startsWith("refs/newgit/landing/") && other !== landing && (await heads.wasHead(branch, tracker, commit)))
 				updates.push({ ref: other, old: commit, new: null });
 		if (updates.length === 0) return null;
 		const moved = await repos.updateRefs(name, updates);
 		if (held === head || moved[ref]) return null;
 	}
-	return `root's \`${branch}\` kept moving under this landing; the next one brings it to the list`;
+	return `\`${tracker.split("__").join("/")}\`'s \`${branch}\` kept moving under this landing; the next one brings it to the list`;
 }
 
 function message(error: unknown): string {

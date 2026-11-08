@@ -1,4 +1,5 @@
 import type { CommitFacts, MintedToken, Repos, TreeEntry } from "../src/artifacts";
+import type { GitObject } from "../src/objects";
 import type { RefUpdate } from "../src/refs";
 import type { CopyAnswer, CopyPlan } from "../src/endpoint";
 
@@ -49,7 +50,14 @@ export class FakeRepos implements Repos {
 	async refs(name: string) {
 		return Object.fromEntries(this.refsOf.get(name) ?? []);
 	}
-	async updateRefs(name: string, updates: RefUpdate[]) {
+	/** Every object pushed, by repo. */
+	readonly pushed: { name: string; objects: GitObject[] }[] = [];
+	async updateRefs(name: string, updates: RefUpdate[], objects: GitObject[] = []) {
+		if (objects.length > 0) this.pushed.push({ name, objects });
+		for (const object of objects) {
+			if (object.type === "tree") this.addTree(name, object.hash, parseTree(object.body));
+			else this.addCommit(name, parseCommit(object.hash, object.body));
+		}
 		const refs = this.refsOf.get(name) ?? new Map<string, string>();
 		this.refsOf.set(name, refs);
 		const moved: Record<string, boolean> = {};
@@ -131,3 +139,38 @@ export function fakeCopy(repos: FakeRepos) {
 
 /** For tests that never reach the Git endpoint. */
 export const noEndpoint = async () => new Response("no endpoint in this test", { status: 501 });
+
+const TYPES: Record<string, TreeEntry["type"]> = {
+	"40000": "tree",
+	"100644": "blob",
+	"100755": "exec",
+	"120000": "symlink",
+	"160000": "gitlink",
+};
+
+/** A tree object's entries, as Artifacts' `readTree` would list them. */
+function parseTree(body: Uint8Array): TreeEntry[] {
+	const entries: TreeEntry[] = [];
+	let at = 0;
+	while (at < body.length) {
+		const nul = body.indexOf(0, at);
+		const [mode, name] = new TextDecoder().decode(body.subarray(at, nul)).split(/ (.*)/s);
+		const hash = [...body.subarray(nul + 1, nul + 21)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+		entries.push({ name, hash, type: TYPES[mode] });
+		at = nul + 21;
+	}
+	return entries;
+}
+
+/** A commit object's tree, parents, and committer time. */
+function parseCommit(hash: string, body: Uint8Array): CommitFacts {
+	const head = new TextDecoder().decode(body).split("\n\n")[0].split("\n");
+	const field = (name: string) => head.filter((line) => line.startsWith(`${name} `)).map((line) => line.slice(name.length + 1));
+	const committer = field("committer")[0] ?? "";
+	return {
+		hash,
+		tree: field("tree")[0],
+		parents: field("parent"),
+		committedAt: Number(committer.split(" ").at(-2)),
+	};
+}

@@ -9,6 +9,7 @@ export interface MintedToken {
 	expiresAt: string;
 }
 
+import { type GitObject, packObjects } from "./objects";
 import { parseAdvertisement, parseReport, type RefUpdate, receivePackBody } from "./refs";
 
 /** What the Worker reads of a commit, straight from Artifacts. */
@@ -49,10 +50,10 @@ export interface Repos {
 	/** The commit branch `branch` is at, or null when there is none. */
 	branchHead(name: string, branch: string): Promise<string | null>;
 	/**
-	 * Move refs to commits the repo already has, each by compare-and-swap on
-	 * its `old`. Per ref, whether it moved: one that did not held something else.
+	 * Move refs, each by compare-and-swap on its `old`, sending `objects`
+	 * first when they are new to the repo. Per ref, whether it moved: one that did not held something else.
 	 */
-	updateRefs(name: string, updates: RefUpdate[]): Promise<Record<string, boolean>>;
+	updateRefs(name: string, updates: RefUpdate[], objects?: GitObject[]): Promise<Record<string, boolean>>;
 }
 
 /** Artifacts tokens are `art_v…_<secret>?expires=<unix>`; Git wants the part before `?`. */
@@ -186,8 +187,9 @@ export class ArtifactsRepos implements Repos {
 		});
 	}
 
-	async updateRefs(name: string, updates: RefUpdate[]) {
+	async updateRefs(name: string, updates: RefUpdate[], objects?: GitObject[]) {
 		if (updates.length === 0) return {};
+		const pack = objects !== undefined && objects.length > 0 ? await packObjects(objects) : undefined;
 		return this.withPassword(name, async (auth) => {
 			const response = await fetch(`${this.url(name)}/git-receive-pack`, {
 				method: "POST",
@@ -197,7 +199,7 @@ export class ArtifactsRepos implements Repos {
 					"content-type": "application/x-git-receive-pack-request",
 					accept: "application/x-git-receive-pack-result",
 				},
-				body: await receivePackBody(updates),
+				body: await receivePackBody(updates, pack),
 			});
 			if (!response.ok) throw new Error(`${name}: moving refs answered ${response.status}`);
 			return parseReport(new Uint8Array(await response.arrayBuffer()), updates);
