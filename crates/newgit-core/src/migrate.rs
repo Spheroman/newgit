@@ -1012,7 +1012,7 @@ impl BranchManager {
                     )?;
                 }
             }
-            let credentials = client.begin_merge(&key, branch, base, target)?;
+            let credentials = client.begin_merge(&key, branch, base, target)?.credentials;
             // Objects first, at landing refs; the remote lands the list, then
             // moves root's branch and each child's `main` to what it pins.
             let mut moves = Vec::new();

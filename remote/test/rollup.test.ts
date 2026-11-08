@@ -75,6 +75,7 @@ const store = (): RollupStore => ({
 	trackers: async (branch) => Object.keys((await project.branch(branch))?.list ?? {}),
 	pending: (branch, parent) => project.pending(branch, parent),
 	rolledUp: (branch, parent, old, next, through) => project.rolledUp(branch, parent, old, next, through),
+	wasHead: (branch, tracker, commit) => project.wasHead(branch, tracker, commit),
 });
 
 /** A tracker's commit: a file of its own, and `pins` at `.newgit/pins/`. */

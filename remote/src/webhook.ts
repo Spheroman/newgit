@@ -14,7 +14,16 @@
 
 import { parse as parseToml } from "smol-toml";
 
-import { type Deps, HttpError, isChecking, landAndFollow, loadDefinitions, projectStub, revokeRepoTokens } from "./index";
+import {
+	type Deps,
+	HttpError,
+	isChecking,
+	landAndFollow,
+	loadDefinitions,
+	projectStub,
+	revokeRepoTokens,
+	settle,
+} from "./index";
 import { pausedBy } from "./budget";
 import type { MirrorInstance, PullPlan } from "./endpoint";
 import { decide, mayMaintain, type ProjectId, projectKey, repoName } from "./names";
@@ -401,6 +410,11 @@ async function advance(env: Env, deps: Deps, id: ProjectId, pull: MirrorPull): P
 		return true;
 	};
 	if (!deps.pull) throw new HttpError(501, "this remote has no Git endpoint to pull with");
+	// A pull looks at, and lands on, `main` as a read sees it: whatever
+	// landed below root rolled up first.
+	// One that cannot counts as a failed attempt, retried and then given up.
+	if (!(await settle(deps, project, id, PULL_BRANCH)))
+		throw new Error(`root could not roll up on \`${PULL_BRANCH}\`; the pull waits for it`);
 
 	// First a look: every export comes back as an event, and most end here.
 	if (!pull.peeked) {

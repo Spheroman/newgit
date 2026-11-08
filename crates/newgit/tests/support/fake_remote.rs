@@ -61,6 +61,9 @@ struct State {
     denied_trackers: std::collections::BTreeSet<String>,
     /// Branch → the index the merge in flight began with.
     merge_targets: BTreeMap<String, Value>,
+    /// Where the next merges land, as the real remote says it: unset, a
+    /// remote from before anchors.
+    anchor: Option<String>,
     /// Failure injection: answer the next merge finish with a 502.
     fail_finish_once: bool,
     /// Answer this many merge finishes `202 {"checking": true}`, as the real
@@ -508,7 +511,7 @@ fn route(
                 .insert(format!("{key}/{branch}"), body["list"].clone());
             (
                 200,
-                json!({ "branch": branch, "until": "later", "credentials": credentials }),
+                json!({ "branch": branch, "until": "later", "credentials": credentials, "anchor": state.anchor }),
             )
         }
         ("PUT", ["v1", "projects", owner, name, "branches", branch]) => {

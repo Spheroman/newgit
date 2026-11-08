@@ -213,7 +213,7 @@ pub trait Remote {
         branch: &str,
         base: &std::collections::BTreeMap<String, String>,
         list: &std::collections::BTreeMap<String, String>,
-    ) -> Result<Vec<SeedCredential>>;
+    ) -> Result<BegunMerge>;
     /// Land it: `branch`'s list moves from `base` to `list` in one
     /// compare-and-swap, the merge's only commit point. Root's branch then
     /// follows, and each of `moves` is made. What could not follow, said.
@@ -693,12 +693,8 @@ impl Remote for HttpRemote {
         branch: &str,
         base: &std::collections::BTreeMap<String, String>,
         list: &std::collections::BTreeMap<String, String>,
-    ) -> Result<Vec<SeedCredential>> {
-        #[derive(Deserialize)]
-        struct Started {
-            credentials: Vec<SeedCredential>,
-        }
-        let started: Started = self.send_checked(
+    ) -> Result<BegunMerge> {
+        let started: BegunMerge = self.send_checked(
             "POST",
             &format!(
                 "/v1/projects/{}/branches/{}/merge",
@@ -707,7 +703,7 @@ impl Remote for HttpRemote {
             ),
             serde_json::json!({ "base": base, "list": list }),
         )?;
-        Ok(started.credentials)
+        Ok(started)
     }
 
     fn finish_merge(
@@ -1072,6 +1068,17 @@ pub fn workspace_token(workspace: &Utf8Path) -> Result<Option<String>> {
 }
 
 /// Git's `Authorization` header for a repo credential, for one command.
+/// A merge the remote began: a write password for each repo it may push to,
+/// and where it lands.
+#[derive(Debug, Clone, Deserialize)]
+pub struct BegunMerge {
+    pub credentials: Vec<SeedCredential>,
+    /// The lowest tracker covering everything the merge touches; the
+    /// trackers above it roll up to it. None from a remote before anchors.
+    #[serde(default)]
+    pub anchor: Option<String>,
+}
+
 /// Where a merge's commit waits in a tracker's repo until the remote lands
 /// it: objects first, then the list moves, then the branches follow.
 pub fn landing_ref(commit: &str) -> String {

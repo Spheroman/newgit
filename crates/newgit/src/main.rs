@@ -4307,6 +4307,12 @@ fn merge(instance: Option<String>, into: &str) -> Result<()> {
             &merge.commit[..merge.commit.len().min(12)]
         );
     }
+    if let Some(anchor) = outcome.anchor.as_deref().filter(|anchor| *anchor != "root") {
+        println!(
+            "  landed at `{}`; the trackers above it roll up to it",
+            tracker_path(anchor)
+        );
+    }
     if let Some(note) = &outcome.project_root {
         println!("  {note}");
     }

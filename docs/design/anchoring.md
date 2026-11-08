@@ -177,7 +177,21 @@ the source of truth, and a mirror may trail it.
    pushed as a pack, and land by one compare-and-swap of the parent's head
    (`ProjectDO.rolledUp`). `ProjectDO` logs which commit a change made in its
    parent (`head_log.via`) and how far each parent has rolled up
-   (`rollups`). Next: landing at the anchor, and reads rolling up first.
+   (`rollups`). **Landing at the anchor done.** The remote works the anchor
+   out itself at `begin`. A tracker is touched when its commit changed
+   anything besides `.newgit/pins/`, which three tree reads tell. Adding or
+   dropping a tracker, or anything it cannot read, lands at root.
+   - The base is checked, and the heads compare-and-swapped, only inside the
+     anchor. The anchor's move is logged for its parent with the change's
+     commit there (`via`).
+   - Approval comes from the touched trackers' maintainers; above the anchor
+     nobody is asked.
+   - Reads roll up first: the project, `GET /branches`, a branch, the Git
+     endpoint, and a webhook pull. One that cannot serves root's last commit,
+     `behind`. Each landing also rolls root up after its answer, as the
+     sweep's first form.
+   - Subscriptions wait for exports to live on the remote: today the client
+     exports.
 5. `history`, and the sweep.
 6. `status`, exports, and the webhook follow the log.
 7. `follow` says pinned.

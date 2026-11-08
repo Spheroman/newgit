@@ -157,3 +157,50 @@ export async function isAncestor(
 	}
 	return false;
 }
+
+/**
+ * Whether commit `next` changes nothing of `old` but pins: the same tree,
+ * `.newgit/pins/` aside. A parent whose commit only moved pins is not touched
+ * by the change; it rolls up to it. `ASK_GIT` when a tree cannot be read.
+ */
+export async function onlyPinsMoved(
+	repos: Repos,
+	name: string,
+	old: string,
+	next: string,
+): Promise<boolean | typeof ASK_GIT> {
+	return orAskGit("pins", async () => {
+		const [before, after] = await Promise.all([repos.readCommit(name, old), repos.readCommit(name, next)]);
+		if (before === null || after === null) return ASK_GIT;
+		return sameBut(repos, name, before.tree, after.tree, [".newgit", "pins"]);
+	});
+}
+
+/** Whether trees `left` and `right` are the same but for the entry at `skip`. */
+async function sameBut(
+	repos: Repos,
+	name: string,
+	left: string,
+	right: string,
+	skip: string[],
+): Promise<boolean | typeof ASK_GIT> {
+	if (left === right) return true;
+	const [ours, theirs] = await Promise.all([repos.readTree(name, left), repos.readTree(name, right)]);
+	if (ours === null || theirs === null) return ASK_GIT;
+	const [here, ...below] = skip;
+	const byName = (entries: typeof ours) => new Map(entries.map((entry) => [entry.name, entry]));
+	const a = byName(ours);
+	const b = byName(theirs);
+	for (const key of new Set([...a.keys(), ...b.keys()])) {
+		if (key === here) continue;
+		const x = a.get(key);
+		const y = b.get(key);
+		if (x?.hash !== y?.hash || x?.type !== y?.type) return false;
+	}
+	if (here === undefined) return true;
+	const x = a.get(here);
+	const y = b.get(here);
+	if (below.length === 0 || x === undefined || y === undefined || x.type !== "tree" || y.type !== "tree")
+		return below.length === 0 || x?.hash === y?.hash;
+	return sameBut(repos, name, x.hash, y.hash, below);
+}

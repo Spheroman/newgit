@@ -10187,6 +10187,7 @@ impl BranchManager {
             mains.push((merge.tracker.clone(), current, caught_up));
         }
 
+        let mut anchor = None;
         if !moved.is_empty()
             && let Some((client, project_key)) = &client
         {
@@ -10227,7 +10228,9 @@ impl BranchManager {
             // The remote asks Git how each pin moves, and hands a write
             // password for root and for each tracker whose `main` must catch
             // up; whether this merge may make each move is its call, not ours.
-            let credentials = client.begin_merge(project_key, into, &base, &list)?;
+            let begun = client.begin_merge(project_key, into, &base, &list)?;
+            anchor = begun.anchor.clone();
+            let credentials = begun.credentials;
             let credential_for = |tracker: &str| {
                 credentials
                     .iter()
@@ -10338,6 +10341,7 @@ impl BranchManager {
             project_root,
             trackers,
             remote: client.map(|(_, project)| project),
+            anchor,
         })
     }
 
@@ -13228,6 +13232,9 @@ pub struct MergeOutcome {
     pub remote: Option<String>,
     /// What happened to the project root after a merge into `main`.
     pub project_root: Option<String>,
+    /// Where it landed on the remote: the lowest tracker covering everything
+    /// it touched. Root, or a tracker the trackers above roll up to.
+    pub anchor: Option<String>,
 }
 
 /// What a person asks of a spawn beyond the defaults: `--use`, `--drop`,

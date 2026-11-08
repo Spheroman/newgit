@@ -56,8 +56,11 @@ import { githubWebhook } from "./webhook";
 
 type Checking = typeof CHECKING;
 import type { Branch, Instance, ProjectDO, TrackerList } from "./project";
-import { type RefMove, followLanding } from "./follow";
-import { ASK_GIT, nativeAncestry, nativeIndex } from "./walk";
+import { type RefMove, followHead, followLanding } from "./follow";
+import { ASK_GIT, nativeAncestry, nativeIndex, onlyPinsMoved } from "./walk";
+import { anchorOf, within } from "./anchor";
+import { parentOf } from "./project";
+import { type RollupStore, rollUp } from "./rollup";
 import type { UserDO } from "./users";
 
 export { BudgetDO } from "./budget";
@@ -522,7 +525,7 @@ async function route(request: Request, env: Env, deps: Deps): Promise<Response> 
 			key,
 			endpoint: endpointUrl(url, id),
 			members: await project.members(),
-			branches: await project.branches(),
+			branches: await settledBranches(deps, project, id),
 		});
 	}
 
@@ -573,7 +576,7 @@ async function route(request: Request, env: Env, deps: Deps): Promise<Response> 
 
 	// ── Branches ───────────────────────────────────────────────────────────
 	if (method === "GET" && rest === "/branches")
-		return json({ default: info.defaultBranch, branches: await project.branches() });
+		return json({ default: info.defaultBranch, branches: await settledBranches(deps, project, id) });
 	if (method === "PUT" && rest === "/branches/default") {
 		requireOwner(info.owner, login, "change the default branch");
 		requireNotInstance(caller, "change the default branch");
@@ -632,7 +635,12 @@ async function route(request: Request, env: Env, deps: Deps): Promise<Response> 
 			}
 			if (answers !== ASK_GIT) for (const answer of answers) moves.set(answer.tracker, answer);
 		}
-		// Everything is checked before the lock is taken: a refused merge
+		// Where it lands: the lowest tracker covering every one whose own
+		// files it changed. A tracker whose commit moved only pins is not
+		// touched; it rolls up. Adding or dropping a tracker changes its
+		// parent's mounts, so it lands at root, as does anything unreadable.
+		const anchor = await anchorFor(deps, id, base, list, trackers);
+		// Everything is checked before the merge begins: a refused merge
 		// holds nothing.
 		const who = { login, member };
 		const writes: string[] = [];
@@ -666,7 +674,27 @@ async function route(request: Request, env: Env, deps: Deps): Promise<Response> 
 			if (!read.ok) throw new HttpError(403, read.reason);
 			const answer = moves.get(tracker);
 			const forwardOnMain = !dropped && answer?.forward === true && answer.onMain === true;
-			if (tracker !== "root" && forwardOnMain) continue;
+			// Above the anchor nothing is touched, only rolled up, which asks
+			// nobody: the change was approved where it lands. Its commits
+			// there are still sent (root's, and any between not on its
+			// `main` yet), to be kept as the change's own entries.
+			if (anchor !== tracker && within(anchor, tracker)) {
+				if (tracker === "root" || answer?.onMain !== true) writes.push(tracker);
+				continue;
+			}
+			if (tracker !== "root" && forwardOnMain) {
+				// A pin following its tracker's own `main` is the parent's
+				// choice, and its parent's maintainers', as when root moved it.
+				// Below root nobody else is asked, so they are asked here.
+				if (anchor !== "root") {
+					const parent = parentOf(tracker) ?? "root";
+					const parentFacts =
+						(await definitionFacts(deps.repos, id, parent, await listedTrackers(project))) ?? implicitFacts("root")!;
+					const may = mayMaintain(parentFacts.maintainers, who, info.owner, parent);
+					if (!may.ok) throw new HttpError(403, `${may.reason} (\`${tracker}\`'s pin follows its \`main\`, which is \`${parent}\`'s to choose)`);
+				}
+				continue;
+			}
 			// Merging a tracker is its maintainers' (by default, its readers'):
 			// `access`, which holds every definition, is the owner's unless the
 			// definitions say otherwise.
@@ -680,7 +708,7 @@ async function route(request: Request, env: Env, deps: Deps): Promise<Response> 
 			}
 			if (tracker === "root" || (!dropped && answer?.onMain !== true)) writes.push(tracker);
 		}
-		const started = await project.beginMerge(branch, base, login, MERGE_PENDING_SECONDS, list, writes);
+		const started = await project.beginMerge(branch, base, login, MERGE_PENDING_SECONDS, list, writes, anchor);
 		if (!started.ok) {
 			if (started.reason === "missing") throw new HttpError(404, `no branch \`${branch}\` in ${key}`);
 			throw new HttpError(409, `\`${branch}\` moved since you looked: merge again onto what it is now`);
@@ -706,14 +734,14 @@ async function route(request: Request, env: Env, deps: Deps): Promise<Response> 
 			});
 		}
 		await project.recordMergeTokens(branch, list, handed);
-		return json({ branch, until: started.until, credentials });
+		return json({ branch, until: started.until, credentials, anchor });
 	}
 
 	const branchMatch = rest.match(/^\/branches\/([^/]+)$/);
 	if (branchMatch) {
 		const branch = decodeURIComponent(branchMatch[1]);
 		if (method === "GET") {
-			const found = await project.branch(branch);
+			const found = await settledBranch(deps, project, id, branch);
 			if (found === null) throw new HttpError(404, `no branch \`${branch}\` in ${key}`);
 			return json(found);
 		}
@@ -1092,7 +1120,8 @@ async function answerGit(
 	const member = await timing.span("project", () => project.isMember(caller.login));
 	const who = { login: caller.login, member };
 
-	const branches = await timing.span("project", () => project.branches());
+	// What landed rolls up before a view is composed: Git sees whole commits.
+	const branches = await timing.span("project", () => settledBranches(deps, project, id));
 	const main = branches.find((branch) => branch.name === info.defaultBranch)?.list;
 	if (!main?.root) throw new HttpError(404, `${key} has no \`${info.defaultBranch}\` branch yet`);
 
@@ -1852,6 +1881,119 @@ async function makeFork(
 	return fork;
 }
 
+/** What rolling up needs of a project's `ProjectDO`. */
+function rollupStore(project: DurableObjectStub<ProjectDO>): RollupStore {
+	return {
+		head: (branch, tracker) => project.head(branch, tracker),
+		trackers: async (branch) => Object.keys((await project.branch(branch))?.list ?? {}),
+		pending: (branch, parent) => project.pending(branch, parent),
+		rolledUp: (branch, parent, old, next, through) => project.rolledUp(branch, parent, old, next, through),
+		wasHead: (branch, tracker, commit) => project.wasHead(branch, tracker, commit),
+	};
+}
+
+/**
+ * Roll root up on `branch` if anything is pending there, and bring root's
+ * branch in its repo along. False when it could not: the caller serves
+ * root's last commit and says it is behind.
+ */
+export async function settle(
+	deps: Deps,
+	project: DurableObjectStub<ProjectDO>,
+	id: ProjectId,
+	branch: string,
+): Promise<boolean> {
+	const repoOf = (tracker: string) => repoName({ kind: "tracker", project: id, tracker });
+	try {
+		const rolled = await rollUp(deps.repos, rollupStore(project), repoOf, branch, "root");
+		if (rolled.written > 0 || rolled.head !== null) {
+			const heads = {
+				head: (name: string, tracker: string) => project.head(name, tracker),
+				wasHead: (name: string, tracker: string, commit: string) => project.wasHead(name, tracker, commit),
+			};
+			const lagging = await followHead(deps.repos, heads, repoOf("root"), branch, "root").catch(
+				(error: unknown) => `${error instanceof Error ? error.message : String(error)}`,
+			);
+			if (lagging !== null) console.log(JSON.stringify({ rollup: "root's branch lags", project: projectKey(id), branch, lagging }));
+		}
+		return true;
+	} catch (error) {
+		console.error(
+			JSON.stringify({
+				rollup: "failed; serving root's last commit",
+				project: projectKey(id),
+				branch,
+				why: error instanceof Error ? error.message : String(error),
+			}),
+		);
+		return false;
+	}
+}
+
+/**
+ * Every branch as a read should see it: whatever landed rolled up first
+ * (docs/design/anchoring.md, *When a parent catches up*). A branch root
+ * could not roll up is served as root's last commit pins it, `behind`.
+ */
+export async function settledBranches(
+	deps: Deps,
+	project: DurableObjectStub<ProjectDO>,
+	id: ProjectId,
+): Promise<Branch[]> {
+	const pending = await project.pendingBranches();
+	const failed = new Set<string>();
+	await Promise.all(
+		pending.map(async (name) => {
+			if (!(await settle(deps, project, id, name))) failed.add(name);
+		}),
+	);
+	const branches = await project.branches();
+	if (failed.size === 0) return branches;
+	const repoOf = (tracker: string) => repoName({ kind: "tracker", project: id, tracker });
+	return Promise.all(
+		branches.map(async (branch) => {
+			if (!failed.has(branch.name)) return branch;
+			const last = await nativeIndex(deps.repos, repoOf, { root: branch.list.root }).catch((): typeof ASK_GIT => ASK_GIT);
+			return last === ASK_GIT ? { ...branch, behind: true } : { ...branch, list: last.actual, behind: true };
+		}),
+	);
+}
+
+/** One branch as a read should see it (see `settledBranches`). */
+async function settledBranch(
+	deps: Deps,
+	project: DurableObjectStub<ProjectDO>,
+	id: ProjectId,
+	name: string,
+): Promise<Branch | null> {
+	return (await settledBranches(deps, project, id)).find((branch) => branch.name === name) ?? null;
+}
+
+/**
+ * The anchor of a merge from `base` to `list` moving `trackers`: the lowest
+ * tracker covering every one it touches, and every one it moves at all.
+ */
+async function anchorFor(
+	deps: Deps,
+	id: ProjectId,
+	base: TrackerList,
+	list: TrackerList,
+	trackers: string[],
+): Promise<string> {
+	if (trackers.some((tracker) => !(tracker in base) || !(tracker in list))) return "root";
+	const touched: string[] = [];
+	for (const tracker of trackers) {
+		const only = await onlyPinsMoved(deps.repos, repoName({ kind: "tracker", project: id, tracker }), base[tracker], list[tracker]);
+		if (only !== true) touched.push(tracker);
+	}
+	// A tracker that moved only pins and sits beside the anchor, not above
+	// it, would be left out: it is covered too.
+	let anchor = anchorOf(touched);
+	for (const tracker of trackers)
+		if (!within(tracker, anchor) && !within(anchor, tracker)) anchor = anchorOf([anchor, tracker]);
+	return anchor;
+}
+
 /**
  * Land a merge into `branch` (the one compare-and-swap that is its commit
  * point), cancel its passwords, and have the repos' branches follow. What
@@ -1877,6 +2019,9 @@ export async function landAndFollow(
 	// branch along.
 	if (background) {
 		deps.waitUntil(
+			// A landing below root left root to roll up: done now, after the
+			// answer, so nobody's next read pays for it.
+			settle(deps, project, id, branch).then(() =>
 			followLanding(
 				deps.repos,
 				{
@@ -1889,7 +2034,7 @@ export async function landAndFollow(
 			).then((behind) => {
 				if (behind.length > 0)
 					console.log(JSON.stringify({ landing: "behind", project: projectKey(id), branch, behind }));
-			}),
+			})),
 		);
 		return { ok: true, branch: (await project.branch(branch)) ?? landed.branch, behind: [] };
 	}

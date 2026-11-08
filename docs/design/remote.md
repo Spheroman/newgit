@@ -584,6 +584,24 @@ its own. Before the new
 index is written, the container checks root's pushed commit pins exactly
 that, and the merge may finish only with the index it began with.
 
+**Where it lands.** At `begin` the remote works out the merge's anchor
+(docs/design/anchoring.md): the lowest tracker covering every one whose own
+files the merge changed. A tracker whose commit moved only pins is not
+touched. Only the anchor and the trackers inside it are compared with the
+base and land; the trackers above roll up to it afterwards, written by the
+Worker (`remote/src/rollup.ts`). So two merges at different anchors do not
+wait on each other, and approval is the touched trackers' maintainers', not
+root's. A pin that only follows its tracker's own `main` is the parent's
+choice, so its parent's maintainers are asked for that, as root's were
+before. The change's own commit in a parent joins the parent's history only
+when it is exactly a pin move: one parent, a commit the parent's head really
+was, and that commit's tree with this one pin moved. Otherwise the roll-up
+writes its own commit, so a change brings no history its approval did not
+cover. Anything read rolls up first, so a reader never sees a list root's
+commit does not pin; a roll-up that fails is served as root's last commit,
+marked `behind`. `begin` answers with the `anchor`, and `newgit merge` says
+where it landed when that is below root.
+
 Objects first: the client pushes each commit, with passwords minted for that
 merge, to a landing ref in its tracker's repo
 (`refs/newgit/landing/<commit>`), which nothing reads. The finish is the

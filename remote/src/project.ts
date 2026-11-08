@@ -8,6 +8,7 @@
 
 import { DurableObject } from "cloudflare:workers";
 
+import { within } from "./anchor";
 import { liveDeps } from "./index";
 import type { MirrorInstance } from "./endpoint";
 import { type MirrorPull, PULL_BRANCH, PULL_POLL_MS, PULL_START_MS, advancePulls } from "./webhook";
@@ -36,6 +37,11 @@ interface PendingMerge {
 	target: TrackerList;
 	/** The trackers it was handed a write password for: the refs it may ask to move. */
 	writes: string[];
+	/**
+	 * Where it lands: the lowest tracker covering every one it touched.
+	 * Only that tracker and those inside it move; the trackers above roll up.
+	 */
+	anchor?: string;
 	tokens: HandedToken[];
 	/** Past this it is forgotten and its passwords cancelled. */
 	until: string;
@@ -70,6 +76,12 @@ function toMove(row: HeadMoveRow): HeadMove {
 	};
 }
 
+/** `list`'s trackers at or inside `anchor`. */
+function subtree(list: TrackerList, anchor: string): TrackerList {
+	if (anchor === "root") return list;
+	return Object.fromEntries(Object.entries(list).filter(([tracker]) => within(tracker, anchor)));
+}
+
 /** Where a pending merge is kept: by branch, and by the root commit it lands. */
 function pendingKey(name: string, target: TrackerList): string {
 	return `merge:${name}:${target.root ?? ""}`;
@@ -88,6 +100,11 @@ function sameList(left: TrackerList, right: TrackerList): boolean {
 export interface Branch {
 	name: string;
 	list: TrackerList;
+	/**
+	 * Its list is root's last commit, not every head: something landed
+	 * that root could not roll up yet. Only on a branch served that way.
+	 */
+	behind?: boolean;
 	createdBy: string;
 	createdAt: string;
 	updatedAt: string;
@@ -281,6 +298,37 @@ export class ProjectDO extends DurableObject<Env> {
 			.map(toMove);
 	}
 
+	/** The branches with moves not rolled up yet. */
+	pendingBranches(): string[] {
+		return this.sql
+			.exec<{ name: string }>("SELECT name FROM branches ORDER BY name")
+			.toArray()
+			.map((row) => row.name)
+			.filter((name) => this.hasPending(name));
+	}
+
+	/** Whether any tracker on `name` has moves its parent has not rolled up. */
+	hasPending(name: string): boolean {
+		const through = new Map(
+			this.sql
+				.exec<{ tracker: string; seq: number }>("SELECT tracker, seq FROM rollups WHERE branch = ?", name)
+				.toArray()
+				.map((row) => [row.tracker, row.seq]),
+		);
+		const oldest = Math.min(...[...through.values(), Number.MAX_SAFE_INTEGER]);
+		return this.sql
+			.exec<{ tracker: string; seq: number; new: string | null }>(
+				"SELECT tracker, seq, new FROM head_log WHERE branch = ? AND seq > ?",
+				name,
+				oldest === Number.MAX_SAFE_INTEGER ? 0 : oldest,
+			)
+			.toArray()
+			.some((row) => {
+				const parent = parentOf(row.tracker);
+				return parent !== null && row.new !== null && row.seq > (through.get(parent) ?? 0);
+			});
+	}
+
 	/**
 	 * A roll-up's one commit point: `parent`'s head from `old` to `next`, by
 	 * compare-and-swap, and everything through log entry `through` rolled up.
@@ -402,10 +450,14 @@ export class ProjectDO extends DurableObject<Env> {
 		seconds: number,
 		target: TrackerList,
 		writes: string[] = [],
+		anchor = "root",
 	): MergeStart {
 		const branch = this.branch(name);
 		if (branch === null) return { ok: false, reason: "missing" };
-		if (!sameList(branch.list, base)) return { ok: false, reason: "moved", list: branch.list };
+		// Only what lands must still be as the merge saw it: above its
+		// anchor, other changes may have rolled up meanwhile.
+		if (!sameList(subtree(branch.list, anchor), subtree(base, anchor)))
+			return { ok: false, reason: "moved", list: branch.list };
 		const stale: HandedToken[] = [];
 		const now = Date.now();
 		for (const [key, merge] of this.pendingMerges(name)) {
@@ -418,7 +470,7 @@ export class ProjectDO extends DurableObject<Env> {
 		// The same merge begun again (a run that stopped): its passwords from
 		// before are cancelled, and it starts over.
 		stale.push(...(this.pendingMerge(name, target)?.tokens ?? []));
-		const merge: PendingMerge = { by, target, writes, tokens: [], until };
+		const merge: PendingMerge = { by, target, writes, tokens: [], until, anchor };
 		this.sql.exec("INSERT OR REPLACE INTO meta VALUES (?, ?)", key, JSON.stringify(merge));
 		return { ok: true, until, stale };
 	}
@@ -472,10 +524,13 @@ export class ProjectDO extends DurableObject<Env> {
 					JSON.stringify({ ...merge, tokens: [], landed: true }),
 				);
 		};
-		if (sameList(branch.list, list)) {
+		const anchored = merge?.anchor ?? "root";
+		if (anchored === "root" ? sameList(branch.list, list) : sameList(subtree(branch.list, anchored), subtree(list, anchored)) && merge?.landed === true) {
 			landed();
 			return { ok: true, branch, ...done, already: true };
 		}
+		const anchor = merge?.anchor ?? "root";
+		if (anchor !== "root") return this.landAt(name, anchor, branch, base, list, by, landed, done);
 		const moving = [...new Set([...Object.keys(base), ...Object.keys(list), "root"])].filter(
 			(tracker) => tracker === "root" || base[tracker] !== list[tracker],
 		);
@@ -483,6 +538,48 @@ export class ProjectDO extends DurableObject<Env> {
 			return { ok: false, reason: "moved", list: branch.list };
 		this.ctx.storage.transactionSync(() => {
 			this.moveHeads(name, branch.list, list, by, new Date().toISOString());
+			landed();
+		});
+		return { ok: true, branch: this.branch(name)!, ...done, already: false };
+	}
+
+	/**
+	 * Land at `anchor`, below root: a compare-and-swap on the heads inside
+	 * it, and nothing above. Each commit inside it pins the others (the
+	 * merge's index was checked), so they have nothing to roll up; the
+	 * anchor's own move is logged for its parent, with the commit the change
+	 * made there (`via`), and rolls up from there.
+	 */
+	private landAt(
+		name: string,
+		anchor: string,
+		branch: Branch,
+		base: TrackerList,
+		list: TrackerList,
+		by: string,
+		landed: () => void,
+		done: { tokens: HandedToken[]; writes: string[] },
+	): Landing {
+		const inside = [...new Set([...Object.keys(base), ...Object.keys(list)])].filter((tracker) =>
+			within(tracker, anchor),
+		);
+		if (inside.some((tracker) => (branch.list[tracker] ?? null) !== (base[tracker] ?? null)))
+			return { ok: false, reason: "moved", list: branch.list };
+		const parent = parentOf(anchor);
+		const via = parent === null ? null : (list[parent] ?? null);
+		this.ctx.storage.transactionSync(() => {
+			for (const tracker of inside) {
+				const old = branch.list[tracker] ?? null;
+				const next = list[tracker];
+				if (next === undefined || next === old) continue;
+				this.writeHead(name, tracker, old, next, by, tracker === anchor ? via : null);
+			}
+			const through = this.lastSeq();
+			for (const tracker of inside)
+				if (list[tracker] !== undefined && tracker !== anchor)
+					this.sql.exec("INSERT OR REPLACE INTO rollups VALUES (?, ?, ?)", name, tracker, through);
+			// The anchor pins everything inside it too.
+			this.sql.exec("INSERT OR REPLACE INTO rollups VALUES (?, ?, ?)", name, anchor, through);
 			landed();
 		});
 		return { ok: true, branch: this.branch(name)!, ...done, already: false };

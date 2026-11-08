@@ -28,6 +28,8 @@ export interface RollupStore {
 	trackers(branch: string): Promise<string[]>;
 	pending(branch: string, parent: string): Promise<HeadMove[]>;
 	rolledUp(branch: string, parent: string, old: string, next: string, through: number): Promise<boolean>;
+	/** Whether `commit` has ever been `tracker`'s head on `branch`. */
+	wasHead(branch: string, tracker: string, commit: string): Promise<boolean>;
 }
 
 /** Who a roll-up commit is by. */
@@ -79,7 +81,9 @@ export async function rollUp(
 		const head = await store.head(branch, parent);
 		const moves = await store.pending(branch, parent);
 		if (head === null || moves.length === 0) return { head, written };
-		const made = await commitsFor(repos, repoOf(parent), head, moves);
+		const made = await commitsFor(repos, repoOf(parent), head, moves, (commit) =>
+			store.wasHead(branch, parent, commit),
+		);
 		const through = moves.at(-1)!.seq;
 		if (made.head === head) {
 			// Every pin already says it: nothing to write, only to record.
@@ -87,15 +91,30 @@ export async function rollUp(
 			continue;
 		}
 		// Objects first, at a landing ref no one reads; then the head moves.
-		const sent = await repos.updateRefs(
-			repoOf(parent),
-			[{ ref: landingRef(made.head), old: null, new: made.head }],
-			made.objects,
-		);
-		if (!sent[landingRef(made.head)] && !(await landed(repos, repoOf(parent), made.head)))
-			throw new Error(`${repoOf(parent)} did not take the roll-up's commit ${made.head}`);
-		if (await store.rolledUp(branch, parent, head, made.head, through))
-			return { head: made.head, written: written + made.written };
+		// Only fast-forwards to changes' own commits: those are there already.
+		if (made.objects.length > 0) {
+			const sent = await repos.updateRefs(
+				repoOf(parent),
+				[{ ref: landingRef(made.head), old: null, new: made.head }],
+				made.objects,
+			);
+			if (!sent[landingRef(made.head)] && !(await landed(repos, repoOf(parent), made.head)))
+				throw new Error(`${repoOf(parent)} did not take the roll-up's commit ${made.head}`);
+		} else if (!(await landed(repos, repoOf(parent), made.head))) {
+			throw new Error(`${repoOf(parent)} has no commit ${made.head} to fast-forward to`);
+		}
+		const won = await store.rolledUp(branch, parent, head, made.head, through);
+		// Landing refs nothing will make a head: the changes' commits kept as
+		// a merge's second parent, and ours when another roll-up won.
+		const spent = [...made.merged, ...(won ? [] : [made.head])];
+		if (spent.length > 0)
+			await repos
+				.updateRefs(
+					repoOf(parent),
+					spent.map((commit) => ({ ref: landingRef(commit), old: commit, new: null })),
+				)
+				.catch(() => ({}));
+		if (won) return { head: made.head, written: written + made.written };
 	}
 	throw new Error(`\`${pathOf(parent)}\`'s head kept moving while it rolled up`);
 }
@@ -116,8 +135,10 @@ async function commitsFor(
 	name: string,
 	head: string,
 	moves: HeadMove[],
-): Promise<{ head: string; objects: GitObject[]; written: number }> {
+	wasHead: (commit: string) => Promise<boolean>,
+): Promise<{ head: string; objects: GitObject[]; written: number; merged: string[] }> {
 	const objects: GitObject[] = [];
+	const merged: string[] = [];
 	let current = head;
 	let tree = await commitTree(repos, name, head);
 	let written = 0;
@@ -125,13 +146,14 @@ async function commitsFor(
 		const leaf = leafOf(move.tracker);
 		const pinned = await replacePin(repos, name, tree, leaf, move.new!);
 		if (pinned.tree === tree) continue;
-		objects.push(...pinned.objects);
-		const via = move.via === null ? null : await repos.readCommit(name, move.via);
+		const via = await keptCommit(repos, name, move, leaf, wasHead);
 		if (via !== null && via.parents[0] === current && via.tree === pinned.tree) {
+			// Its trees came with it: nothing to send.
 			current = via.hash;
 			tree = pinned.tree;
 			continue;
 		}
+		objects.push(...pinned.objects);
 		const at = Math.floor(Date.parse(move.movedAt) / 1000);
 		const commit = await commitObject({
 			tree: pinned.tree,
@@ -141,11 +163,35 @@ async function commitsFor(
 			message: `Roll up \`${pathOf(move.tracker)}\` to ${move.new!.slice(0, 12)}`,
 		});
 		objects.push(commit);
+		if (via !== null) merged.push(via.hash);
 		current = commit.hash;
 		tree = pinned.tree;
 		written++;
 	}
-	return { head: current, objects: dedupe(objects), written };
+	return { head: current, objects: dedupe(objects), written, merged };
+}
+
+/**
+ * The commit a change made in the parent, when it may join the parent's
+ * history: one parent, a commit the parent's head really was, and a tree
+ * that is exactly that commit's with this one pin moved. So it brings no
+ * history and no content the change's approval did not cover. Anything
+ * else is left out, and the roll-up writes its own commit instead.
+ */
+async function keptCommit(
+	repos: Repos,
+	name: string,
+	move: HeadMove,
+	leaf: string,
+	wasHead: (commit: string) => Promise<boolean>,
+) {
+	if (move.via === null) return null;
+	const via = await repos.readCommit(name, move.via).catch(() => null);
+	if (via === null || via.parents.length !== 1 || !(await wasHead(via.parents[0]))) return null;
+	const base = await commitTree(repos, name, via.parents[0]).catch(() => null);
+	if (base === null) return null;
+	const expected = await replacePin(repos, name, base, leaf, move.new!).catch(() => null);
+	return expected?.tree === via.tree ? via : null;
 }
 
 function dedupe(objects: GitObject[]): GitObject[] {
