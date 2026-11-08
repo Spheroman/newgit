@@ -65,8 +65,8 @@ this repository is `spheroman/newgit` on newgit.dev, and GitHub's
   [--json]` names the project and its members.
 - `newgit members add|remove <login>` (the owner, from a login) and
   `members list [--json]`.
-- `spawn` (forks nothing), checkpoint and `git push` (split into trackers;
-  only changed trackers are forked), `newgit merge` (every tracker on the
+- `spawn` (starts root's fork in the background, nothing else), checkpoint
+  and `git push` (split into trackers; only changed trackers are forked), `newgit merge` (every tracker on the
   branch moves together, or none does).
 - The Git endpoint: `git clone https://newgit.dev/<owner>/<name>.git` with
   plain Git, each reader's view composed from the trackers they may read,
@@ -381,13 +381,21 @@ Artifacts with plain Git.
 newgit's own Artifacts traffic (seeding, checkpoint pushes, merges,
 `clone`, `spawn --from-checkpoint`) does not go through the helper. For
 each repo it asks the Worker for a password (`POST
-/v1/projects/<o>/<p>/credentials`, naming the repo and `read` or
-`write`); the Worker checks the rules and mints a 15-minute one, and
+/v1/projects/<o>/<p>/credentials`, naming the repo, or several as `repos`
+for one answer each in a single request, and `read` or `write`); the
+Worker checks the rules and mints a 15-minute one, and
 newgit hands it to that one `git` command as an `http.extraHeader`, in the
 environment so it never shows in the process list, with the helper
 cleared so nothing caches it. `newgit credential` can still answer for an
 Artifacts URL (asking for write, settling for read) if someone points Git
 at it by hand; that needs `useHttpPath`, or Git omits the repo path.
+
+The rules come from the trackers' definitions, which the Worker reads from
+each holder's `main` (`access`'s, or the tracker whose tree holds a nested
+definition), all of a round's files at once. It keeps what it read, in
+memory, under the commit each holder's `main` was at, and reuses it only
+while every one is still there. So a changed definition is read on the very
+next request: exact, not a time to live.
 
 Who the Worker mints a password for:
 
@@ -432,6 +440,10 @@ branches.
    runs in the background, keyed by the fork, like a merge's checks; the
    route answers `202 {"forking": true}` with `Retry-After: 5` until it is
    done, and the client asks again. Then `200`, as in 1.
+   **Root's fork is started when the instance is made** (`POST
+   /instances`, in the background): nearly every instance changes root,
+   and the copy takes seconds, so the first checkpoint finds it made or
+   under way rather than starting it.
 3. **Whether a fork is complete is recorded in the project's Durable
    Object** (the `forks` table's `complete` column), not in the fork. The
    object already lists each instance's forks, a row there is what the fork
@@ -577,13 +589,14 @@ merge, to a landing ref in its tracker's repo
 (`refs/newgit/landing/<commit>`), which nothing reads. The finish is the
 merge's one commit point: the branch's list in the project's Durable Object
 moves by compare-and-swap on the heads the merge moves, root's always among
-them. Only then do the repos' branches follow, moved by the Worker itself
+them. Only then do the repos' branches follow, after the answer (the merger
+does not wait on them), moved by the Worker itself
 with a ref-only push (Git's smart HTTP, an empty pack, each update leased on
 the value it must hold; `remote/src/refs.ts`): root's branch to root's head
 *now*, so two landings following in either order leave it right, and each
 child branch the merge asked to move (a child's `main` catching up on a
 merge into `main`, or the child's branch of the same name on another).
-What cannot follow (a child's `main` moved meanwhile) is said, and the
+What cannot follow (a child's `main` moved meanwhile) is logged, and the
 landing stands. A commit on root's branch that no list ever named is kept at
 `refs/newgit/stray/<commit>` and the branch still follows: the list is the
 truth. A finish that ran and was never heard is finished again and says it

@@ -240,20 +240,53 @@ pub trait Remote {
     ) -> Result<RegisteredInstance>;
     fn instance(&self, project: &str, name: &str) -> Result<RemoteInstance>;
     fn remove_instance(&self, project: &str, name: &str) -> Result<()>;
-    fn set_head(&self, project: &str, instance: &str, head_rev: &str) -> Result<()>;
     fn credential(&self, project: &str, repo: &str, scope: Scope) -> Result<RepoCredential>;
+    /// Several repos' passwords in one request, in order: each one, or the
+    /// error it would have had alone.
+    fn credentials(
+        &self,
+        project: &str,
+        repos: &[String],
+        scope: Scope,
+    ) -> Result<Vec<Result<RepoCredential>>>;
+    /// Save checkpoint `id`'s record; `head_rev`, when given, is the
+    /// instance's head from now on, moved in the same request.
     fn put_checkpoint(
         &self,
         project: &str,
         instance: &str,
         id: &str,
         record: &serde_json::Value,
+        head_rev: Option<&str>,
     ) -> Result<()>;
     fn checkpoint(&self, project: &str, instance: &str, id: &str) -> Result<RemoteCheckpoint>;
     fn checkpoints(&self, project: &str, instance: Option<&str>) -> Result<Vec<RemoteCheckpoint>>;
     fn revoke_token(&self, id: &str) -> Result<()>;
     /// An agent or instance token replaces itself; the old one is revoked.
     fn renew(&self) -> Result<(String, String)>;
+}
+
+type Cache<T> = std::sync::LazyLock<std::sync::RwLock<std::collections::HashMap<String, T>>>;
+
+/// Who each token is, by remote and token, for this run.
+static ME_CACHE: Cache<Me> = std::sync::LazyLock::new(Default::default);
+/// Each project as last read, by remote and project, until a write.
+static PROJECT_CACHE: Cache<ProjectView> = std::sync::LazyLock::new(Default::default);
+
+fn read_cache<T>(
+    cache: &'static Cache<T>,
+) -> std::sync::RwLockReadGuard<'static, std::collections::HashMap<String, T>> {
+    cache
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+fn write_cache<T>(
+    cache: &'static Cache<T>,
+) -> std::sync::RwLockWriteGuard<'static, std::collections::HashMap<String, T>> {
+    cache
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// The real remote, over HTTPS.
@@ -457,6 +490,11 @@ impl HttpRemote {
         path: &str,
         body: Option<serde_json::Value>,
     ) -> Result<Reply> {
+        // Anything but a read, or a credential, may change a project: what
+        // was read of one is read again.
+        if method != "GET" && !path.ends_with("/credentials") {
+            write_cache(&PROJECT_CACHE).clear();
+        }
         let started = std::time::Instant::now();
         let reply = self.request_untimed(method, path, body);
         // `NEWGIT_TRACE=1`: each call to the remote and how long it took, as
@@ -589,7 +627,14 @@ impl Remote for HttpRemote {
     }
 
     fn me(&self) -> Result<Me> {
-        self.send("GET", "/v1/me", None)
+        // Who a token is never changes: asked once per token per run.
+        let key = format!("{} {}", self.url, self.token.as_deref().unwrap_or_default());
+        if let Some(me) = read_cache(&ME_CACHE).get(&key) {
+            return Ok(me.clone());
+        }
+        let me: Me = self.send("GET", "/v1/me", None)?;
+        write_cache(&ME_CACHE).insert(key, me.clone());
+        Ok(me)
     }
 
     fn create_project(&self, name: &str, trackers: &[String]) -> Result<CreatedProject> {
@@ -601,11 +646,19 @@ impl Remote for HttpRemote {
     }
 
     fn project(&self, project: &str) -> Result<ProjectView> {
-        self.send(
+        // Read once per run until something here changes the remote: a
+        // checkpoint and the merge after it read the same project.
+        let key = format!("{} {project}", self.url);
+        if let Some(view) = read_cache(&PROJECT_CACHE).get(&key) {
+            return Ok(view.clone());
+        }
+        let view: ProjectView = self.send(
             "GET",
             &format!("/v1/projects/{}", project_path(project)),
             None,
-        )
+        )?;
+        write_cache(&PROJECT_CACHE).insert(key, view.clone());
+        Ok(view)
     }
 
     fn create_branch(
@@ -796,19 +849,6 @@ impl Remote for HttpRemote {
         Ok(())
     }
 
-    fn set_head(&self, project: &str, instance: &str, head_rev: &str) -> Result<()> {
-        let _: serde_json::Value = self.send(
-            "PUT",
-            &format!(
-                "/v1/projects/{}/instances/{}/head",
-                project_path(project),
-                segment(instance)
-            ),
-            Some(serde_json::json!({ "head_rev": head_rev })),
-        )?;
-        Ok(())
-    }
-
     fn credential(&self, project: &str, repo: &str, scope: Scope) -> Result<RepoCredential> {
         self.send(
             "POST",
@@ -817,12 +857,55 @@ impl Remote for HttpRemote {
         )
     }
 
+    fn credentials(
+        &self,
+        project: &str,
+        repos: &[String],
+        scope: Scope,
+    ) -> Result<Vec<Result<RepoCredential>>> {
+        if repos.is_empty() {
+            return Ok(Vec::new());
+        }
+        #[derive(Deserialize)]
+        struct Answers {
+            credentials: Vec<serde_json::Value>,
+        }
+        let answers: Answers = self.send(
+            "POST",
+            &format!("/v1/projects/{}/credentials", project_path(project)),
+            Some(serde_json::json!({ "repos": repos, "scope": scope.as_str() })),
+        )?;
+        Ok(answers
+            .credentials
+            .into_iter()
+            .map(
+                |answer| match answer.get("status").and_then(|status| status.as_u64()) {
+                    Some(status) => Err(NewgitError::Remote {
+                        status: status as u16,
+                        message: answer
+                            .get("error")
+                            .and_then(|error| error.as_str())
+                            .unwrap_or_default()
+                            .to_owned(),
+                    }),
+                    None => serde_json::from_value(answer).map_err(|error| NewgitError::Remote {
+                        status: 0,
+                        message: format!(
+                            "the remote answered a credential newgit cannot read: {error}"
+                        ),
+                    }),
+                },
+            )
+            .collect())
+    }
+
     fn put_checkpoint(
         &self,
         project: &str,
         instance: &str,
         id: &str,
         record: &serde_json::Value,
+        head_rev: Option<&str>,
     ) -> Result<()> {
         let _: serde_json::Value = self.send(
             "PUT",
@@ -832,7 +915,10 @@ impl Remote for HttpRemote {
                 segment(instance),
                 segment(id)
             ),
-            Some(serde_json::json!({ "record": record })),
+            Some(match head_rev {
+                Some(head_rev) => serde_json::json!({ "record": record, "head_rev": head_rev }),
+                None => serde_json::json!({ "record": record }),
+            }),
         )?;
         Ok(())
     }

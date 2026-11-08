@@ -1112,7 +1112,7 @@ impl BranchManager {
                     status: 0,
                     message: format!("could not encode checkpoint {}: {error}", found.id),
                 })?;
-                client.put_checkpoint(&key, &found.instance, &found.id, &value)
+                client.put_checkpoint(&key, &found.instance, &found.id, &value, None)
             };
             match rewrite() {
                 Ok(()) => moved += 1,

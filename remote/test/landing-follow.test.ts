@@ -20,6 +20,9 @@ const main = { root: sha("a"), t3code: sha("b") };
 const rootRepo = () => `jack.${name}.t.root`;
 const t3Repo = () => `jack.${name}.t.t3code`;
 
+/** What the Worker left running after its answer. */
+const pending: Promise<unknown>[] = [];
+
 /** Whether each child pin moves along its `main`; off it, the merge gets a write password for it. */
 let onMain = true;
 
@@ -51,9 +54,12 @@ async function call(token: string, method: string, route: string, body?: unknown
 			body: body === undefined ? undefined : JSON.stringify(body),
 		}),
 		env,
-		{ repos, fetcher: fetch, waitUntil: () => {}, endpoint: noEndpoint, ancestry, index },
+		{ repos, fetcher: fetch, waitUntil: (promise) => void pending.push(promise), endpoint: noEndpoint, ancestry, index },
 	);
-	return { status: response.status, body: (await response.json()) as any };
+	const answer = { status: response.status, body: (await response.json()) as any };
+	// The branches follow after the answer: wait for that, as the runtime would.
+	await Promise.all(pending.splice(0));
+	return answer;
 }
 
 /** Begin, push to landing refs as the client does, and finish. */
@@ -73,7 +79,6 @@ describe("a landing", () => {
 		const moved = { ...main, root: sha("c") };
 		const landed = await merge(moved);
 		expect(landed.status).toBe(200);
-		expect(landed.body.behind).toEqual([]);
 		expect(landed.body.list).toEqual(moved);
 		const refs = await refsOf(rootRepo());
 		expect(refs["refs/heads/main"]).toBe(sha("c"));
@@ -101,14 +106,13 @@ describe("a landing", () => {
 		expect((await call(jack, "GET", path("/branches/main"))).body.list, "nothing landed").toEqual(main);
 	});
 
-	it("stands when a child's branch moved meanwhile, and says it did not catch up", async () => {
+	it("stands when a child's branch moved meanwhile, and leaves that branch alone", async () => {
 		onMain = false;
 		const moved = { root: sha("c"), t3code: sha("d") };
 		repos.setRef(t3Repo(), "refs/heads/main", sha("9"));
 		const landed = await merge(moved, [{ tracker: "t3code", branch: "main", old: sha("b"), new: sha("d") }]);
 		expect(landed.status).toBe(200);
 		expect(landed.body.list).toEqual(moved);
-		expect(landed.body.behind.join("\n")).toContain("`t3code`'s `main` moved while this merge ran");
 		expect((await refsOf(t3Repo()))["refs/heads/main"], "left as it was").toBe(sha("9"));
 	});
 

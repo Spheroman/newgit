@@ -653,40 +653,56 @@ fn route(
             (503, json!({ "error": "the remote is down" }))
         }
         ("POST", ["v1", "projects", _, _, "credentials"]) => {
-            let repo = body["repo"].as_str().unwrap_or_default();
-            // Like the real remote: a per-user tracker's repo is its owner's alone.
-            let parts: Vec<&str> = repo.split('.').collect();
-            if parts.len() == 5 && parts[2] == "t" && parts[4] != caller {
-                return (
-                    403,
-                    json!({ "error": format!("{repo} is {}'s own; each user reads only their own", parts[4]) }),
-                );
-            }
-            if parts.len() >= 4 && parts[2] == "t" && state.denied_trackers.contains(parts[3]) {
-                return (
-                    403,
-                    json!({ "error": format!("jack may not write {repo}: not in `{}`'s audience", parts[3]) }),
-                );
-            }
-            if parts.len() >= 4 && parts[2] == "t" && state.undefined_trackers.contains(parts[3]) {
-                return (
-                    404,
-                    json!({ "error": format!("tracker `{}` is not defined on {}/{}'s default branch", parts[3], parts[0], parts[1]) }),
-                );
-            }
-            if !exists(repo) {
-                // The repo of a tracker outside Git is created on first write; the repos
-                // of trackers in Git are seeded and forks made by the fork route.
-                if parts.get(2) == Some(&"t") && body["scope"] == "write" {
-                    git(repos, &["init", "-q", "--bare", &repo_url(repo)]);
-                } else {
+            // One repo, or several at once (`repos`), each answered as alone.
+            let one = |repo: &str| -> (u16, Value) {
+                // Like the real remote: a per-user tracker's repo is its owner's alone.
+                let parts: Vec<&str> = repo.split('.').collect();
+                if parts.len() == 5 && parts[2] == "t" && parts[4] != caller {
                     return (
-                        404,
-                        json!({ "error": format!("{repo} does not exist yet") }),
+                        403,
+                        json!({ "error": format!("{repo} is {}'s own; each user reads only their own", parts[4]) }),
                     );
                 }
+                if parts.len() >= 4 && parts[2] == "t" && state.denied_trackers.contains(parts[3]) {
+                    return (
+                        403,
+                        json!({ "error": format!("jack may not write {repo}: not in `{}`'s audience", parts[3]) }),
+                    );
+                }
+                if parts.len() >= 4 && parts[2] == "t" && state.undefined_trackers.contains(parts[3]) {
+                    return (
+                        404,
+                        json!({ "error": format!("tracker `{}` is not defined on {}/{}'s default branch", parts[3], parts[0], parts[1]) }),
+                    );
+                }
+                if !exists(repo) {
+                    // The repo of a tracker outside Git is created on first write; the repos
+                    // of trackers in Git are seeded and forks made by the fork route.
+                    if parts.get(2) == Some(&"t") && body["scope"] == "write" {
+                        git(repos, &["init", "-q", "--bare", &repo_url(repo)]);
+                    } else {
+                        return (
+                            404,
+                            json!({ "error": format!("{repo} does not exist yet") }),
+                        );
+                    }
+                }
+                (200, credential(repo))
+            };
+            if let Some(list) = body["repos"].as_array() {
+                let answers: Vec<Value> = list
+                    .iter()
+                    .map(|repo| {
+                        let repo = repo.as_str().unwrap_or_default();
+                        match one(repo) {
+                            (200, answer) => answer,
+                            (status, answer) => json!({ "repo": repo, "status": status, "error": answer["error"] }),
+                        }
+                    })
+                    .collect();
+                return (200, json!({ "credentials": answers }));
             }
-            (200, credential(repo))
+            one(body["repo"].as_str().unwrap_or_default())
         }
         ("PUT", ["v1", "projects", _, _, "instances", name, "head"]) => {
             (200, json!({ "name": name, "headRev": body["head_rev"] }))

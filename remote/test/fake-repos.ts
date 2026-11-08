@@ -30,6 +30,7 @@ export class FakeRepos implements Repos {
 		return [...this.repos.keys()].filter((name) => name.startsWith(prefix));
 	}
 	async mint(name: string, scope: "read" | "write"): Promise<MintedToken> {
+		if (!this.repos.has(name)) throw Object.assign(new Error(`${name} not found`), { code: "NOT_FOUND" });
 		const id = `art-${this.minted.length + 1}`;
 		this.minted.push({ name, scope, id });
 		return { id, password: fakePassword(name, scope), expiresAt: "2099-01-01T00:00:00Z" };
@@ -38,7 +39,10 @@ export class FakeRepos implements Repos {
 		this.revokedTokens.add(tokenId);
 		return true;
 	}
+	/** How many files the Worker read. */
+	fileReads = 0;
 	async readFile(name: string, _ref: string, path: string) {
+		this.fileReads++;
 		return this.repos.get(name)?.get(path) ?? null;
 	}
 

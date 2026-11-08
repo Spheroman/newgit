@@ -9961,9 +9961,14 @@ impl BranchManager {
                 NewgitError::Unsupported(format!("{project} has no branch `{branch}`"))
             })?;
         let mut snapshots = BTreeMap::new();
-        for (tracker, commit) in &list {
-            let repo = format!("{}.t.{tracker}", project.replace('/', "."));
-            let credential = client.credential(project, &repo, Scope::Read)?;
+        // Every tracker's read password in one request.
+        let repos: Vec<String> = list
+            .keys()
+            .map(|tracker| format!("{}.t.{tracker}", project.replace('/', ".")))
+            .collect();
+        let credentials = client.credentials(project, &repos, Scope::Read)?;
+        for ((tracker, commit), credential) in list.iter().zip(credentials) {
+            let credential = credential?;
             let url = credential.remote.as_deref().unwrap_or_default();
             let auth = basic_auth_header(&credential);
             let mut refspecs = vec![format!("+refs/heads/*:refs/newgit/remote/{tracker}/*")];
@@ -11169,6 +11174,9 @@ impl BranchManager {
 
         let mut login = None;
         let mut left_out = Vec::new();
+        // What each tracker would send, and where: then every password in
+        // one request, rather than one request per tracker.
+        let mut sends = Vec::new();
         for state in &record.tracker_states {
             let Some(rev) = &state.content_rev else {
                 continue;
@@ -11197,7 +11205,12 @@ impl BranchManager {
             if self.pushed_already(&repo, &refspecs) {
                 continue;
             }
-            let credential = match remote.credential(&binding.project, &repo, Scope::Write) {
+            sends.push((state.name.clone(), repo, refspecs));
+        }
+        let repos: Vec<String> = sends.iter().map(|(_, repo, _)| repo.clone()).collect();
+        let credentials = remote.credentials(&binding.project, &repos, Scope::Write)?;
+        for ((name, repo, refspecs), credential) in sends.into_iter().zip(credentials) {
+            let credential = match credential {
                 Ok(credential) => credential,
                 // 404 is a tracker whose definition is not on the default
                 // branch yet, which a later checkpoint can still bring. A 403
@@ -11207,7 +11220,7 @@ impl BranchManager {
                     status: 404,
                     message,
                 }) => {
-                    left_out.push((state.name.clone(), message));
+                    left_out.push((name, message));
                     continue;
                 }
                 Err(error) => return Err(error),
@@ -11229,8 +11242,13 @@ impl BranchManager {
             status: 0,
             message: format!("could not encode checkpoint {}: {error}", record.id),
         })?;
-        remote.put_checkpoint(&binding.project, &branch.slug, &record.id, &value)?;
-        remote.set_head(&binding.project, &branch.slug, &record.source.head_rev)?;
+        remote.put_checkpoint(
+            &binding.project,
+            &branch.slug,
+            &record.id,
+            &value,
+            Some(&record.source.head_rev),
+        )?;
         Ok(left_out)
     }
 

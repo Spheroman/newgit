@@ -135,6 +135,8 @@ const MERGE_PENDING_SECONDS = 70 * 60;
 
 export interface Deps {
 	repos: Repos;
+	/** Start each new instance's fork of root when it is created (live: yes). */
+	prefork?: boolean;
 	fetcher: typeof fetch;
 	/** Work that may outlive the response. */
 	waitUntil(promise: Promise<unknown>): void;
@@ -237,6 +239,7 @@ export function liveDeps(env: Env, waitUntil: Deps["waitUntil"]): Deps {
 		repos: new ArtifactsRepos(env.ARTIFACTS, env.ARTIFACTS_GIT_BASE),
 		fetcher: fetch,
 		waitUntil,
+		prefork: true,
 		ancestry: async (project, plan, credentials) =>
 			(await askCheck(
 				env,
@@ -457,15 +460,37 @@ async function route(request: Request, env: Env, deps: Deps): Promise<Response> 
 	// Credentials are answered for non-members too: a public tracker is
 	// readable by anyone logged in, and a refusal should say why.
 	if (method === "POST" && rest === "/credentials") {
-		const { repo, scope = "read" } = await body<{ repo?: string; scope?: "read" | "write" }>(request);
-		if (!repo) throw new HttpError(400, "repo is required (a repo name, or a remote URL)");
+		const { repo, repos, scope = "read" } = await body<{
+			repo?: string;
+			repos?: string[];
+			scope?: "read" | "write";
+		}>(request);
 		if (scope !== "read" && scope !== "write") throw new HttpError(400, "scope is read or write");
-		const ref = parseRepoName(repoFromUrlOrName(repo));
-		if (ref === null || projectKey(ref.project) !== key)
-			throw new HttpError(400, `\`${repo}\` is not one of ${key}'s repos`);
-		if (caller.instance !== undefined && scope === "write" && ref.kind === "fork")
-			requireThisInstance(caller, ref.instance);
-		return json(await credential(env, deps, project, ref, scope, caller, member));
+		const one = async (name: string) => {
+			const ref = parseRepoName(repoFromUrlOrName(name));
+			if (ref === null || projectKey(ref.project) !== key)
+				throw new HttpError(400, `\`${name}\` is not one of ${key}'s repos`);
+			if (caller.instance !== undefined && scope === "write" && ref.kind === "fork")
+				requireThisInstance(caller, ref.instance);
+			return credential(env, deps, project, ref, scope, caller, member);
+		};
+		// Several at once, minted together: each answered, or refused with the
+		// status it would have had alone.
+		if (Array.isArray(repos)) {
+			if (repos.length === 0 || repos.length > 50 || repos.some((name) => typeof name !== "string"))
+				throw new HttpError(400, "repos is a list of one to fifty repo names");
+			const answers = await Promise.all(
+				repos.map((name) =>
+					one(name).catch((error: unknown) => {
+						if (!(error instanceof HttpError)) throw error;
+						return { repo: name, status: error.status, error: error.message };
+					}),
+				),
+			);
+			return json({ credentials: answers });
+		}
+		if (!repo) throw new HttpError(400, "repo is required (a repo name, or a remote URL)");
+		return json(await one(repo));
 	}
 
 	// Deleting a project takes everything with it. Its record goes first, so
@@ -748,7 +773,7 @@ async function route(request: Request, env: Env, deps: Deps): Promise<Response> 
 							"root's commit does not pin what this index says: push the root commit the merge made to its landing ref, then finish",
 						);
 				}
-				const landed = await landAndFollow(deps, project, id, branch, base, list, login, asked);
+				const landed = await landAndFollow(deps, project, id, branch, base, list, login, asked, true);
 				if (!landed.ok) {
 					if (landed.reason === "missing") throw new HttpError(404, `no branch \`${branch}\` in ${key}`);
 					throw new HttpError(409, `\`${branch}\` moved since you looked: merge again onto what it is now`);
@@ -774,8 +799,8 @@ async function route(request: Request, env: Env, deps: Deps): Promise<Response> 
 		requirePart("instance name", name);
 		const created = await project.createInstance(name, login, base_rev, caller.agent ?? null, isPrivate === true);
 		if (created === null) throw new HttpError(409, `instance \`${name}\` already exists in ${key}`);
-		// Nothing is forked here: an instance forks a tracker the first time
-		// it changes it. The workspace's own credential is minted here so
+		// An instance forks a tracker the first time it changes it; only
+		// root's is started early, below. The workspace's own credential is minted here so
 		// nobody has to: it writes this instance and nothing else, renews
 		// itself, and is revoked when the instance is removed.
 		const instanceToken = await issue(env, {
@@ -788,6 +813,15 @@ async function route(request: Request, env: Env, deps: Deps): Promise<Response> 
 			instance: name,
 			ttlSeconds: AGENT_TTL_SECONDS,
 		});
+		// Root is what nearly every instance changes first, and its fork is a
+		// copy that takes seconds. Start it now, while the agent works, so the
+		// first checkpoint finds it made rather than waiting on it.
+		if (deps.copy && deps.prefork)
+			deps.waitUntil(
+				makeFork(env, deps, project, id, key, caller, name, "root").catch((error: unknown) =>
+					console.error(JSON.stringify({ prefork: name, why: error instanceof Error ? error.message : String(error) })),
+				),
+			);
 		return json(
 			{ ...created, endpoint: endpointUrl(url, id), token: instanceToken.token, token_id: instanceToken.id },
 			201,
@@ -807,62 +841,10 @@ async function route(request: Request, env: Env, deps: Deps): Promise<Response> 
 		const facts = await definitionFacts(deps.repos, id, tracker, await listedTrackers(project));
 		if (facts === undefined) throw new HttpError(404, `tracker \`${tracker}\` is not defined on ${key}'s \`access\` \`main\``);
 		if (!facts.git) throw new HttpError(400, `\`${tracker}\` is not in Git; instances do not fork it`);
-		const fork = repoName({ kind: "fork", project: id, instance: name, tracker });
-		const source = repoName({ kind: "tracker", project: id, tracker });
-		const done = () => json({ instance: name, tracker, repo: fork, remote: deps.repos.url(fork) });
-		// Whatever Artifacts says, in the answer: only its code and message
-		// explain a failure on a large repository.
-		const artifacts = (step: string) => (error: unknown) => {
-			if (error instanceof HttpError) throw error;
-			const { code, message } = error as { code?: string; message?: string };
-			console.error(JSON.stringify({ fork, step, code, message }));
-			throw new HttpError(
-				502,
-				`Artifacts could not ${step} \`${tracker}\`'s fork for \`${name}\`: ${code ?? "error"}: ${message ?? "no message"}`,
-			);
-		};
-
-		// Complete forks are handed out as they are: the instance's work may be on them.
-		if (await project.forkComplete(name, tracker)) {
-			if ((await deps.repos.remote(fork).catch(artifacts("look up"))) !== null) return done();
-			// Its repo is gone; it is made and copied again below.
-		}
-		if (!deps.copy) throw new HttpError(501, "this remote has no Git endpoint to copy forks with");
-		// The container copies the tracker's branches into an empty repo, in
-		// the background: t3code's 365 MiB takes many minutes. The client asks
-		// again on a 202 until the copy is done.
-		const plan: CopyPlan = {
-			dir: "/work",
-			from: { url: deps.repos.url(source), auth: "" },
-			to: { url: deps.repos.url(fork), auth: "" },
-		};
-		// Starting the copy makes the repo and its passwords; Artifacts'
-		// refusals there are answered as they are, and anything else the copy
-		// itself failed at, with Git's error as the container gave it.
-		let refused: unknown;
-		const answer = await deps
-			.copy(key, plan, async () => {
-				try {
-					// Recorded before the repo exists, so removing the instance
-					// deletes a fork whose copy never finished too.
-					await project.startFork(name, tracker);
-					await emptyFork(deps, fork, artifacts);
-					return await copyCredentials(env, deps, caller, source, fork);
-				} catch (error) {
-					refused = error;
-					throw error;
-				}
-			})
-			.catch((error: unknown) => {
-				if (refused !== undefined) throw refused;
-				const why = error instanceof Error ? error.message : String(error);
-				console.error(JSON.stringify({ fork, step: "copy", why }));
-				throw new HttpError(502, `the remote could not copy \`${tracker}\` into \`${name}\`'s fork: ${why}`);
-			});
-		if (isChecking(answer))
+		const forked = await makeFork(env, deps, project, id, key, caller, name, tracker);
+		if (forked === "forking")
 			return Response.json({ forking: true }, { status: 202, headers: { "retry-after": String(FORK_RETRY_SECONDS) } });
-		await project.completeFork(name, tracker);
-		return done();
+		return json({ instance: name, tracker, repo: forked, remote: deps.repos.url(forked) });
 	}
 
 	const instanceMatch = rest.match(/^\/instances\/([^/]+)(\/head)?$/);
@@ -910,9 +892,12 @@ async function route(request: Request, env: Env, deps: Deps): Promise<Response> 
 			if (owner === undefined) throw new HttpError(404, `no instance \`${instance}\` in ${key}`);
 			requireOwner(owner, login, `checkpoint \`${instance}\``);
 			requireThisInstance(caller, instance);
-			const { record } = await body<{ record?: unknown }>(request);
+			const { record, head_rev } = await body<{ record?: unknown; head_rev?: string }>(request);
 			if (record === undefined) throw new HttpError(400, "record is required");
-			return json(await project.putCheckpoint(instance, checkpoint, login, caller.agent ?? null, record), 201);
+			const saved = await project.putCheckpoint(instance, checkpoint, login, caller.agent ?? null, record);
+			// The instance's head moves with its checkpoint: one request, not two.
+			if (typeof head_rev === "string" && head_rev !== "") await project.setHead(instance, head_rev);
+			return json(saved, 201);
 		}
 	}
 
@@ -1225,12 +1210,17 @@ async function credential(
 ) {
 	const who = { login: caller.login, member };
 	const facts: Facts = {};
+	// Independent lookups, at once.
+	const [instance, listed, complete] = await Promise.all([
+		ref.kind === "fork" ? project.instance(ref.instance) : null,
+		listedTrackers(project),
+		ref.kind === "fork" ? project.forkComplete(ref.instance, ref.tracker) : true,
+	]);
 	if (ref.kind === "fork") {
-		const instance = await project.instance(ref.instance);
 		facts.instanceOwner = instance?.owner;
 		facts.instancePrivate = instance?.private;
 	}
-	facts.tracker = await definitionFacts(deps.repos, ref.project, ref.tracker, await listedTrackers(project));
+	facts.tracker = await definitionFacts(deps.repos, ref.project, ref.tracker, listed);
 	// Not a refusal but an absence, as on the fork route: a client may wait
 	// for the definition to land (a checkpoint leaves the tracker for later),
 	// while a 403 is a "no" it must not wait out.
@@ -1243,23 +1233,30 @@ async function credential(
 	const name = repoName(ref);
 	// A fork whose copy is not done yet holds only part of its tracker: it
 	// is not there to write, or read, until the fork route says it is.
-	if (ref.kind === "fork" && !(await project.forkComplete(ref.instance, ref.tracker)))
-		throw new HttpError(404, `${name} does not exist yet`);
+	if (!complete) throw new HttpError(404, `${name} does not exist yet`);
 	// Minted for this token already and not near expiring: hand it out
 	// again, after every check above, as the Git endpoint does.
 	const key = `${caller.tokenId}:${scope}:${name}`;
 	const held = mintedPasswords.get(key);
 	if (held !== undefined)
 		return { repo: name, remote: held.remote, scope, username: "x", password: held.password, expires_at: held.expiresAt };
-	let remote = await deps.repos.remote(name);
-	if (remote === null) {
-		// The repo of a tracker outside Git is created on its first write. The repos of
-		// trackers in Git are seeded with the project, and forks made by the fork route.
-		if (ref.kind !== "tracker" || scope !== "write" || facts.tracker?.git)
-			throw new HttpError(404, `${name} does not exist yet`);
-		remote = (await deps.repos.create(name)).remote;
+	// The repos of trackers in Git are seeded with the project, and forks
+	// made by the fork route, so only a tracker outside Git is looked up: its
+	// repo is created on its first write. Any other missing repo is the
+	// mint's 404.
+	let remote = deps.repos.url(name);
+	if (ref.kind === "tracker" && !facts.tracker?.git) {
+		const found = await deps.repos.remote(name);
+		if (found !== null) remote = found;
+		else if (scope === "write") remote = (await deps.repos.create(name)).remote;
+		else throw new HttpError(404, `${name} does not exist yet`);
 	}
-	const minted = await deps.repos.mint(name, scope, scope === "read" ? READ_CREDENTIAL_TTL_SECONDS : CREDENTIAL_TTL_SECONDS);
+	const minted = await deps.repos
+		.mint(name, scope, scope === "read" ? READ_CREDENTIAL_TTL_SECONDS : CREDENTIAL_TTL_SECONDS)
+		.catch((error: unknown) => {
+			if ((error as { code?: string }).code === "NOT_FOUND") throw new HttpError(404, `${name} does not exist yet`);
+			throw error;
+		});
 	await userStub(env, caller.login).recordRepoToken(caller.tokenId, name, minted.id, minted.expiresAt);
 	mintedPasswords.set(key, minted.password, minted.expiresAt, remote);
 	return { repo: name, remote, scope, username: "x", password: minted.password, expires_at: minted.expiresAt };
@@ -1457,15 +1454,61 @@ function nextHolders(facts: Map<string, TrackerFacts>, holder: Map<string, strin
  * (see [`addNested`]). Its id, `t3code__repos`, names that parent, so a tracker
  * cannot define another's child, and `access` keeps every name it defines.
  */
+/**
+ * Definitions read before, by project and names, with the `main` each holder
+ * was at when they were read. Reused only while every one of those is
+ * still where it was, so a definition changed on `main` is read again on the
+ * very next request: exact, not a time to live.
+ */
+const definitionsRead = new Map<string, { heads: Map<string, string>; facts: Map<string, TrackerFacts> }>();
+const DEFINITIONS_KEPT = 200;
+
 export async function loadDefinitions(
 	repos: Repos,
 	project: ProjectId,
 	names: Iterable<string>,
 ): Promise<Map<string, TrackerFacts>> {
+	const all = new Set<string>(["root", "access", ...names]);
+	const key = `${projectKey(project)} ${[...all].sort().join(" ")}`;
+	const known = definitionsRead.get(key);
+	if (known !== undefined) {
+		const now = await Promise.all([...known.heads].map(async ([repo, head]) => (await repos.branchHead(repo, "main")) === head));
+		if (now.every(Boolean)) return new Map(known.facts);
+		definitionsRead.delete(key);
+	}
+	// Each holder's `main`, read before any of its files: a file read after
+	// `main` moves on is newer than the head it is kept under, which only
+	// means reading it again next time.
+	const heads = new Map<string, Promise<string | null>>();
+	const reader: Repos = Object.create(repos);
+	reader.readFile = async (name, ref, path) => {
+		if (!heads.has(name)) heads.set(name, repos.branchHead(name, ref));
+		await heads.get(name);
+		return repos.readFile(name, ref, path);
+	};
+	const facts = await readDefinitions(reader, project, all);
+	const settled = new Map<string, string>();
+	let keep = true;
+	for (const [name, head] of heads) {
+		const at = await head;
+		if (at === null) keep = false;
+		else settled.set(name, at);
+	}
+	if (keep) {
+		if (definitionsRead.size >= DEFINITIONS_KEPT) definitionsRead.delete(definitionsRead.keys().next().value!);
+		definitionsRead.set(key, { heads: settled, facts: new Map(facts) });
+	}
+	return facts;
+}
+
+async function readDefinitions(
+	repos: Repos,
+	project: ProjectId,
+	all: Set<string>,
+): Promise<Map<string, TrackerFacts>> {
 	// Policy is each definition holder's own `main` (`access`'s, or the
 	// governing tracker's), whatever the project's default branch is called.
 	const branch = "main";
-	const all = new Set<string>(["root", "access", ...names]);
 	const file = (name: string) => `${ACCESS_MOUNT}/${name}.toml`;
 	const source = new Map<string, { tracker: string; mount: string }>(
 		[...all].map((name) => [name, { tracker: "access", mount: ACCESS_MOUNT }]),
@@ -1476,17 +1519,23 @@ export async function loadDefinitions(
 	const written = new Set<string>();
 	for (let round = 0; round < 4; round++) {
 		facts = new Map();
-		for (const name of all) {
-			const from = source.get(name)!;
-			const path = relativeTo(from.mount, file(name));
-			let text =
-				path === "." ? null : await repos.readFile(repoName({ kind: "tracker", project, tracker: from.tracker }), branch, path);
-			// The layout before mounts kept `access`'s files at their
-			// workspace paths. Read it too, so a remote deployed before a
-			// project migrates (`newgit tracker migrate`) still reads its
-			// definitions. Delete once every project on the remote migrated.
-			if (text === null && from.tracker === "access")
-				text = await repos.readFile(repoName({ kind: "tracker", project, tracker: "access" }), branch, file(name));
+		// Every file of a round at once: they are independent reads.
+		const texts = await Promise.all(
+			[...all].map(async (name) => {
+				const from = source.get(name)!;
+				const path = relativeTo(from.mount, file(name));
+				let text =
+					path === "." ? null : await repos.readFile(repoName({ kind: "tracker", project, tracker: from.tracker }), branch, path);
+				// The layout before mounts kept `access`'s files at their
+				// workspace paths. Read it too, so a remote deployed before a
+				// project migrates (`newgit tracker migrate`) still reads its
+				// definitions. Delete once every project on the remote migrated.
+				if (text === null && from.tracker === "access")
+					text = await repos.readFile(repoName({ kind: "tracker", project, tracker: "access" }), branch, file(name));
+				return [name, from, text] as const;
+			}),
+		);
+		for (const [name, from, text] of texts) {
 			if (text !== null) written.add(name);
 			const read = text === null ? implicitFacts(name) : parseFacts(text, from.tracker);
 			if (read !== undefined) facts.set(name, { ...read, source: from.tracker });
@@ -1734,6 +1783,76 @@ async function copyCredentials(
  * gone (expired, or its repo deleted) must not stop the rest.
  */
 /**
+ * Make `name`'s fork of `tracker`, or find it made: its repo's name, or
+ * "forking" while the copy into it runs. The caller has checked who may.
+ */
+async function makeFork(
+	env: Env,
+	deps: Deps,
+	project: DurableObjectStub<ProjectDO>,
+	id: ProjectId,
+	key: string,
+	caller: Caller,
+	name: string,
+	tracker: string,
+): Promise<string | "forking"> {
+	const fork = repoName({ kind: "fork", project: id, instance: name, tracker });
+	const source = repoName({ kind: "tracker", project: id, tracker });
+	// Whatever Artifacts says, in the answer: only its code and message
+	// explain a failure on a large repository.
+	const artifacts = (step: string) => (error: unknown) => {
+		if (error instanceof HttpError) throw error;
+		const { code, message } = error as { code?: string; message?: string };
+		console.error(JSON.stringify({ fork, step, code, message }));
+		throw new HttpError(
+			502,
+			`Artifacts could not ${step} \`${tracker}\`'s fork for \`${name}\`: ${code ?? "error"}: ${message ?? "no message"}`,
+		);
+	};
+
+	// Complete forks are handed out as they are: the instance's work may be on them.
+	if (await project.forkComplete(name, tracker)) {
+		if ((await deps.repos.remote(fork).catch(artifacts("look up"))) !== null) return fork;
+		// Its repo is gone; it is made and copied again below.
+	}
+	if (!deps.copy) throw new HttpError(501, "this remote has no Git endpoint to copy forks with");
+	// The container copies the tracker's branches into an empty repo, in
+	// the background: t3code's 365 MiB takes many minutes. The client asks
+	// again on a 202 until the copy is done.
+	const plan: CopyPlan = {
+		dir: "/work",
+		from: { url: deps.repos.url(source), auth: "" },
+		to: { url: deps.repos.url(fork), auth: "" },
+	};
+	// Starting the copy makes the repo and its passwords; Artifacts'
+	// refusals there are answered as they are, and anything else the copy
+	// itself failed at, with Git's error as the container gave it.
+	let refused: unknown;
+	const answer = await deps
+		.copy(key, plan, async () => {
+			try {
+				// Recorded before the repo exists, so removing the instance
+				// deletes a fork whose copy never finished too.
+				await project.startFork(name, tracker);
+				await emptyFork(deps, fork, artifacts);
+				return await copyCredentials(env, deps, caller, source, fork);
+			} catch (error) {
+				refused = error;
+				throw error;
+			}
+		})
+		.catch((error: unknown) => {
+			if (refused !== undefined) throw refused;
+			const why = error instanceof Error ? error.message : String(error);
+			console.error(JSON.stringify({ fork, step: "copy", why }));
+			throw new HttpError(502, `the remote could not copy \`${tracker}\` into \`${name}\`'s fork: ${why}`);
+		});
+	if (isChecking(answer)) return "forking";
+	await project.completeFork(name, tracker);
+	return fork;
+}
+
+/**
  * Land a merge into `branch` (the one compare-and-swap that is its commit
  * point), cancel its passwords, and have the repos' branches follow. What
  * could not follow is in `behind`; the landing stands regardless.
@@ -1747,10 +1866,33 @@ export async function landAndFollow(
 	list: TrackerList,
 	by: string,
 	moves: RefMove[],
+	background = false,
 ): Promise<{ ok: true; branch: Branch; behind: string[] } | { ok: false; reason: "missing" | "moved" }> {
 	const landed = await project.land(branch, base, list, by);
 	if (!landed.ok) return { ok: false, reason: landed.reason };
 	await revokeRepoTokens(deps, landed.tokens);
+	// The landing is the truth from here; the branches follow after the
+	// answer, so the merger does not wait on them. What cannot follow is
+	// logged, and the next landing (or a finish asked again) brings root's
+	// branch along.
+	if (background) {
+		deps.waitUntil(
+			followLanding(
+				deps.repos,
+				{
+					head: (name, tracker) => project.head(name, tracker),
+					wasHead: (name, tracker, commit) => project.wasHead(name, tracker, commit),
+				},
+				(tracker) => repoName({ kind: "tracker", project: id, tracker }),
+				branch,
+				moves,
+			).then((behind) => {
+				if (behind.length > 0)
+					console.log(JSON.stringify({ landing: "behind", project: projectKey(id), branch, behind }));
+			}),
+		);
+		return { ok: true, branch: (await project.branch(branch)) ?? landed.branch, behind: [] };
+	}
 	const behind = await followLanding(
 		deps.repos,
 		{
