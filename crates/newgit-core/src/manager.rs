@@ -10282,7 +10282,11 @@ impl BranchManager {
             }
             // The commit point, and the only one: the remote moves the list
             // by compare-and-swap, then root's branch and each move follow.
-            warnings.extend(client.finish_merge(project_key, into, &base, &list, &ref_moves)?);
+            let landed = client.finish_merge(project_key, into, &base, &list, &ref_moves)?;
+            warnings.extend(landed.behind);
+            // Where it landed is the finish's to say: `begin` cannot read
+            // the merge's commits yet, which arrive after it.
+            anchor = landed.anchor.or(anchor);
         }
         // Here: root's branch by compare-and-swap, then the children's.
         let root_ref = local_tracker_ref(&self.root.name, into);

@@ -216,7 +216,8 @@ pub trait Remote {
     ) -> Result<BegunMerge>;
     /// Land it: `branch`'s list moves from `base` to `list` in one
     /// compare-and-swap, the merge's only commit point. Root's branch then
-    /// follows, and each of `moves` is made. What could not follow, said.
+    /// follows, and each of `moves` is made. Where it landed, and what
+    /// could not follow.
     fn finish_merge(
         &self,
         project: &str,
@@ -224,7 +225,7 @@ pub trait Remote {
         base: &std::collections::BTreeMap<String, String>,
         list: &std::collections::BTreeMap<String, String>,
         moves: &[RefMove],
-    ) -> Result<Vec<String>>;
+    ) -> Result<LandedMerge>;
     fn add_member(&self, project: &str, login: &str) -> Result<bool>;
     fn remove_member(&self, project: &str, login: &str) -> Result<bool>;
     /// Delete the project: its repos, its record, and every token pinned to
@@ -713,13 +714,8 @@ impl Remote for HttpRemote {
         base: &std::collections::BTreeMap<String, String>,
         list: &std::collections::BTreeMap<String, String>,
         moves: &[RefMove],
-    ) -> Result<Vec<String>> {
-        #[derive(Deserialize)]
-        struct Landed {
-            #[serde(default)]
-            behind: Vec<String>,
-        }
-        let landed: Landed = self.send_checked(
+    ) -> Result<LandedMerge> {
+        let landed: LandedMerge = self.send_checked(
             "PUT",
             &format!(
                 "/v1/projects/{}/branches/{}",
@@ -728,7 +724,7 @@ impl Remote for HttpRemote {
             ),
             serde_json::json!({ "base": base, "list": list, "moves": moves }),
         )?;
-        Ok(landed.behind)
+        Ok(landed)
     }
 
     fn fork(&self, project: &str, instance: &str, tracker: &str) -> Result<RepoLocation> {
@@ -1075,6 +1071,18 @@ pub struct BegunMerge {
     pub credentials: Vec<SeedCredential>,
     /// The lowest tracker covering everything the merge touches; the
     /// trackers above it roll up to it. None from a remote before anchors.
+    #[serde(default)]
+    pub anchor: Option<String>,
+}
+
+/// A merge the remote landed.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct LandedMerge {
+    /// What could not follow the landing.
+    #[serde(default)]
+    pub behind: Vec<String>,
+    /// Where it landed, worked out once its commits were there to read.
+    /// None from a remote that does not say.
     #[serde(default)]
     pub anchor: Option<String>,
 }

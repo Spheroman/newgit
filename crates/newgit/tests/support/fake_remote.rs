@@ -511,7 +511,9 @@ fn route(
                 .insert(format!("{key}/{branch}"), body["list"].clone());
             (
                 200,
-                json!({ "branch": branch, "until": "later", "credentials": credentials, "anchor": state.anchor }),
+                // As the real remote: `begin` cannot read the merge's commits
+            // yet, so it says root; the finish says where it landed.
+            json!({ "branch": branch, "until": "later", "credentials": credentials, "anchor": "root" }),
             )
         }
         ("PUT", ["v1", "projects", owner, name, "branches", branch]) => {
@@ -571,7 +573,7 @@ fn route(
                     }
                     let _ = git_output(&repo, &["update-ref", "-d", &format!("refs/newgit/landing/{new}")]);
                 }
-                return (200, json!({ "name": branch, "list": body["list"], "behind": behind }));
+                return (200, json!({ "name": branch, "list": body["list"], "behind": behind, "anchor": state.anchor }));
             }
             let branches = state.branches.entry(format!("{owner}/{name}")).or_default();
             if branches.contains_key(*branch) {

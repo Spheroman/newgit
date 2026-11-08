@@ -1039,7 +1039,10 @@ impl BranchManager {
                     });
                 }
             }
-            for behind in client.finish_merge(&key, branch, base, target, &moves)? {
+            for behind in client
+                .finish_merge(&key, branch, base, target, &moves)?
+                .behind
+            {
                 outcome.lines.push(behind);
             }
             outcome.lines.push(format!(

@@ -83,9 +83,7 @@ impl Stores {
             composing: dir.join("compose.git"),
         };
         for store in [&stores.whole, &stores.snapshots, &stores.composing] {
-            if !store.join("HEAD").exists() {
-                run_git_env(&["init", "-q", "--bare", store.as_str()], &[])?;
-            }
+            init_store(store)?;
         }
         // Renamed in, so a compose running beside this never reads it empty
         // and takes every pin for missing.
@@ -615,12 +613,40 @@ pub struct AncestryAnswer {
 /// Answer `plan` from each tracker's own repo, fetched fresh into the
 /// container's store. A commit the repo does not have is neither forward nor
 /// on `main`.
+/// Make bare repo `store` unless it is there. Two checks starting at once on
+/// a new container both found it missing and both ran `git init` in it, and
+/// the second failed on the first's files (seen live: two merges begun
+/// together). So it is made beside and renamed in: one rename wins, and the
+/// other finds it made.
+fn init_store(store: &Utf8Path) -> Result<()> {
+    if store.join("HEAD").exists() {
+        return Ok(());
+    }
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_nanos())
+        .unwrap_or_default();
+    static MADE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let made = MADE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let scratch = Utf8PathBuf::from(format!(
+        "{store}.init-{}-{nanos}-{made}",
+        std::process::id()
+    ));
+    run_git_env(&["init", "-q", "--bare", scratch.as_str()], &[])?;
+    let renamed = std::fs::rename(&scratch, store);
+    if renamed.is_err() {
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+    if store.join("HEAD").exists() {
+        return Ok(());
+    }
+    renamed.map_err(|source| NewgitError::io(store, source))
+}
+
 pub fn check_ancestry(plan: &AncestryPlan) -> Result<Vec<AncestryAnswer>> {
     let store = plan.dir.join("trackers.git");
     std::fs::create_dir_all(&plan.dir).map_err(|source| NewgitError::io(&plan.dir, source))?;
-    if !store.join("HEAD").exists() {
-        run_git_env(&["init", "-q", "--bare", store.as_str()], &[])?;
-    }
+    init_store(&store)?;
     let git_dir = format!("--git-dir={store}");
     let mut answers = Vec::new();
     for check in &plan.checks {
@@ -745,9 +771,7 @@ pub struct CopyAnswer {
 pub fn copy_repo(plan: &CopyPlan) -> Result<CopyAnswer> {
     let store = plan.dir.join("copies.git");
     std::fs::create_dir_all(&plan.dir).map_err(|source| NewgitError::io(&plan.dir, source))?;
-    if !store.join("HEAD").exists() {
-        run_git_env(&["init", "-q", "--bare", store.as_str()], &[])?;
-    }
+    init_store(&store)?;
     let git_dir = format!("--git-dir={store}");
     // Each source under its own refs: forks of two trackers share this store.
     let mut hasher = Sha256::new();
@@ -864,9 +888,7 @@ pub enum PullAnswer {
 pub fn pull_mirror(plan: &PullPlan) -> Result<PullAnswer> {
     let store = plan.dir.join("trackers.git");
     std::fs::create_dir_all(&plan.dir).map_err(|source| NewgitError::io(&plan.dir, source))?;
-    if !store.join("HEAD").exists() {
-        run_git_env(&["init", "-q", "--bare", store.as_str()], &[])?;
-    }
+    init_store(&store)?;
     let git_dir = format!("--git-dir={store}");
     for (tracker, source) in &plan.repos {
         GitSource::fetch_refs(
