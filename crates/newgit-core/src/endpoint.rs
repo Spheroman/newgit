@@ -37,6 +37,10 @@ pub struct Plan {
     /// this reader may read, root among them.
     pub branches: BTreeMap<String, BTreeMap<String, String>>,
     pub default_branch: String,
+    /// Tag → its index cut down as a branch's is, and what an annotated tag
+    /// says. Served as `refs/tags/<name>`.
+    #[serde(default)]
+    pub tags: BTreeMap<String, PlanTag>,
     /// Tracker → where to fetch it: every tracker listed above, and `access`
     /// always — where each pin is mounted is in its content, which the
     /// server reads even when the reader may not, and never serves unless
@@ -51,6 +55,23 @@ pub struct Plan {
 
 fn root_tracker() -> String {
     ROOT_TRACKER.to_owned()
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct PlanTag {
+    pub list: BTreeMap<String, String>,
+    #[serde(default)]
+    pub annotation: Option<TagAnnotation>,
+}
+
+/// What an annotated tag says besides where it points. A view's tag object
+/// is made from this, pointing at the view's commit: the same every time, and
+/// never signed, since a signature covers an object this is not.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, serde::Serialize)]
+pub struct TagAnnotation {
+    /// `Name <email> <seconds> <zone>`, as Git's `tagger` line has it.
+    pub tagger: String,
+    pub message: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -276,7 +297,11 @@ pub fn compose_view(plan: &Plan) -> Result<Utf8PathBuf> {
     std::fs::create_dir_all(&views).map_err(|source| NewgitError::io(&views, source))?;
 
     let mut wanted: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
-    for list in plan.branches.values() {
+    for list in plan
+        .branches
+        .values()
+        .chain(plan.tags.values().map(|tag| &tag.list))
+    {
         for (tracker, commit) in list {
             wanted
                 .entry(tracker.clone())
@@ -321,8 +346,8 @@ pub fn compose_view(plan: &Plan) -> Result<Utf8PathBuf> {
     let mut plan = plan.clone();
     // A child naming a commit its tracker does not have is left out of
     // that branch, as for a reader who may not read it; a root commit that is
-    // not root's leaves the branch unserved. Logged either way.
-    plan.branches.retain(|branch, list| {
+    // not root's leaves the branch unserved. Logged either way. Tags the same.
+    let keep = |what: &str, name: &str, list: &mut BTreeMap<String, String>| {
         let bad: Vec<String> = list
             .iter()
             .filter(|(tracker, commit)| {
@@ -333,7 +358,7 @@ pub fn compose_view(plan: &Plan) -> Result<Utf8PathBuf> {
             .map(|(tracker, _)| tracker.clone())
             .collect();
         if !bad.is_empty() {
-            eprintln!("newgit: branch `{branch}` names commits its trackers do not have: {bad:?}");
+            eprintln!("newgit: {what} `{name}` names commits its trackers do not have: {bad:?}");
         }
         for tracker in &bad {
             if tracker != root {
@@ -341,7 +366,11 @@ pub fn compose_view(plan: &Plan) -> Result<Utf8PathBuf> {
             }
         }
         !bad.iter().any(|tracker| tracker == root) && list.contains_key(root)
-    });
+    };
+    plan.branches
+        .retain(|branch, list| keep("branch", branch, list));
+    plan.tags
+        .retain(|tag, found| keep("tag", tag, &mut found.list));
     if !plan.branches.contains_key(&plan.default_branch) {
         return Err(NewgitError::Unsupported(format!(
             "branch `{}` names commits its trackers do not have",
@@ -362,6 +391,7 @@ pub fn compose_view(plan: &Plan) -> Result<Utf8PathBuf> {
     let tips: Vec<String> = plan
         .branches
         .values()
+        .chain(plan.tags.values().map(|tag| &tag.list))
         .map(|list| list[root].clone())
         .collect();
     let mut walk = vec![
@@ -377,24 +407,65 @@ pub fn compose_view(plan: &Plan) -> Result<Utf8PathBuf> {
         .collect();
     stores.snapshot_pins(&plan.repos, &history, &mut held)?;
 
+    // One compose for every branch and tag that reads the same trackers:
+    // they share most of their history, which composes once.
+    let mut groups: BTreeMap<BTreeSet<&String>, Vec<(String, String)>> = BTreeMap::new();
     for (branch, list) in &plan.branches {
-        let readable = |tracker: &str| list.contains_key(tracker);
-        let admit = |tracker: &str, commit: &str| {
-            held.get(tracker)
-                .is_some_and(|history| history.contains(commit))
+        groups.entry(list.keys().collect()).or_default().push((
+            format!("refs/views/{key}/heads/{branch}"),
+            list[root].clone(),
+        ));
+    }
+    for (tag, found) in &plan.tags {
+        // An annotated tag's object is made below, at the view's commit.
+        let at = if found.annotation.is_some() {
+            format!("refs/views/{key}/tagged/{tag}")
+        } else {
+            format!("refs/views/{key}/tags/{tag}")
         };
+        groups
+            .entry(found.list.keys().collect())
+            .or_default()
+            .push((at, found.list[root].clone()));
+    }
+    let admit = |tracker: &str, commit: &str| {
+        held.get(tracker)
+            .is_some_and(|history| history.contains(commit))
+    };
+    for (trackers, tips) in &groups {
+        let readable = |tracker: &str| trackers.iter().any(|name| name.as_str() == tracker);
         compose::compose(
             &store,
             root,
-            &[(
-                format!("refs/views/{key}/heads/{branch}"),
-                list[root].clone(),
-            )],
+            tips,
             &compose::ComposeOptions {
                 readable: &readable,
                 admit: Some(&admit),
             },
         )?;
+    }
+    for (tag, found) in &plan.tags {
+        if let Some(annotation) = &found.annotation {
+            let tagged = run_git_env(
+                &[
+                    &format!("--git-dir={store}"),
+                    "rev-parse",
+                    "--verify",
+                    &format!("refs/views/{key}/tagged/{tag}"),
+                ],
+                &[],
+            )?;
+            let object = make_tag_object(&store, tagged.trim(), tag, annotation)?;
+            run_git_env(
+                &[
+                    &format!("--git-dir={store}"),
+                    "update-ref",
+                    &format!("refs/views/{key}/tags/{tag}"),
+                    &object,
+                ],
+                &[],
+            )?;
+        }
     }
 
     let notes_ref = format!("refs/views/{key}/notes");
@@ -412,6 +483,7 @@ pub fn compose_view(plan: &Plan) -> Result<Utf8PathBuf> {
             "-q",
             store.as_str(),
             &format!("+refs/views/{key}/heads/*:refs/heads/*"),
+            &format!("+refs/views/{key}/tags/*:refs/tags/*"),
         ],
         &[],
     )?;
@@ -447,6 +519,26 @@ pub fn compose_view(plan: &Plan) -> Result<Utf8PathBuf> {
         }
         Err(source) => Err(NewgitError::io(&view, source)),
     }
+}
+
+/// An annotated tag object for `commit`, as Git's `mktag` writes it: the same
+/// annotation at the same commit is the same object, whoever makes it.
+pub fn make_tag_object(
+    repo: &Utf8Path,
+    commit: &str,
+    name: &str,
+    annotation: &TagAnnotation,
+) -> Result<String> {
+    let mut message = annotation.message.clone();
+    if !message.is_empty() && !message.ends_with('\n') {
+        message.push('\n');
+    }
+    let text = format!(
+        "object {commit}\ntype commit\ntag {name}\ntagger {}\n\n{message}",
+        annotation.tagger
+    );
+    crate::source::run_git_stdin(&[&format!("--git-dir={repo}"), "mktag"], text.as_bytes())
+        .map(|id| id.trim().to_owned())
 }
 
 /// Each tracker's own history: what a pin may name.
@@ -583,6 +675,15 @@ fn plan_key(plan: &Plan) -> String {
         hasher.update(format!("\n{branch}").as_bytes());
         for (tracker, commit) in list {
             hasher.update(format!(" {tracker}={commit}").as_bytes());
+        }
+    }
+    for (tag, found) in &plan.tags {
+        hasher.update(format!("\ntag {tag}").as_bytes());
+        for (tracker, commit) in &found.list {
+            hasher.update(format!(" {tracker}={commit}").as_bytes());
+        }
+        if let Some(annotation) = &found.annotation {
+            hasher.update(format!("\n{}\n{}", annotation.tagger, annotation.message).as_bytes());
         }
     }
     hasher
@@ -853,6 +954,10 @@ pub struct PullPlan {
     /// nothing moves, so an event for our own export costs no merge a wait.
     #[serde(default)]
     pub peek: bool,
+    /// A tag made on the mirror, `mirror.commit` its object: say which root
+    /// commit on `main` it names, rather than landing anything.
+    #[serde(default)]
+    pub tag: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -887,6 +992,11 @@ pub enum PullAnswer {
         commits: usize,
         moves: Vec<crate::remote::RefMove>,
     },
+    /// The mirror's tag names this root commit on `main`, and says this.
+    Tagged {
+        root: String,
+        annotation: Option<TagAnnotation>,
+    },
     /// Nothing moved, for this reason.
     Refused { why: String },
 }
@@ -906,7 +1016,11 @@ pub fn pull_mirror(plan: &PullPlan) -> Result<PullAnswer> {
             Some(&source.auth),
         )?;
     }
-    match land(plan, &store) {
+    let answer = match &plan.tag {
+        Some(name) => find_tag(plan, &store, name),
+        None => land(plan, &store),
+    };
+    match answer {
         Err(NewgitError::SplitRefused(why) | NewgitError::Unsupported(why)) => {
             Ok(PullAnswer::Refused { why })
         }
@@ -1208,6 +1322,136 @@ fn land(plan: &PullPlan, store: &Utf8Path) -> Result<PullAnswer> {
         list,
         commits: walk.len(),
         moves,
+    })
+}
+
+/// The root commit on `main` that tag `name` on the mirror names. The mirror's
+/// commits are `main` composed as the target sees it, so the tagged commit is
+/// in that history under the very id it has there, noted with its root commit.
+fn find_tag(plan: &PullPlan, store: &Utf8Path, name: &str) -> Result<PullAnswer> {
+    let git_dir = format!("--git-dir={store}");
+    let git = |args: &[&str]| -> Result<String> {
+        let mut full = vec![git_dir.as_str()];
+        full.extend_from_slice(args);
+        Ok(run_git_env(&full, &[])?.trim().to_owned())
+    };
+    let base = plan
+        .list
+        .get(ROOT_TRACKER)
+        .ok_or_else(|| NewgitError::Unsupported("`main` names no root commit".to_owned()))?;
+    let tag_ref = format!("refs/mirrors/{}/tags/{name}", plan.target);
+    GitSource::fetch_refs(
+        &[&git_dir],
+        &plan.mirror.url,
+        &[format!("+refs/tags/{name}:{tag_ref}")],
+        None,
+    )?;
+    if git(&["rev-parse", &tag_ref])? != plan.mirror.commit {
+        return Err(NewgitError::Unsupported(format!(
+            "tag `{name}` on {} is no longer {}",
+            plan.mirror.url, plan.mirror.commit
+        )));
+    }
+    let commit = git(&["rev-parse", &format!("{tag_ref}^{{commit}}")])?;
+    let annotation = match git(&["cat-file", "-t", &tag_ref])?.as_str() {
+        "tag" => Some(parse_annotation(
+            &git(&["cat-file", "tag", &tag_ref])?,
+            name,
+        )?),
+        _ => None,
+    };
+
+    let main_tree = {
+        let mut objects = Objects::open(store)?;
+        let tree = compose::view_tree(&mut objects, base)?;
+        objects.flush()?;
+        tree
+    };
+    let all = compose::view_definitions(store, ROOT_TRACKER, &main_tree)?;
+    let target = read_target(store, base, &plan.target)?;
+    if let Some(root) = &target.root {
+        return Err(NewgitError::Unsupported(format!(
+            "`{}` is rooted at `{root}`: its tags name that tracker's commits, not the project's",
+            target.name
+        )));
+    }
+    let ships = |tracker: &str| {
+        all.iter()
+            .find(|definition| definition.git && definition.name == tracker)
+            .is_some_and(|definition| target.lists(&definition.name, &definition.audience))
+    };
+    let histories = tracker_histories(store, plan.repos.keys());
+    let admit = |tracker: &str, commit: &str| {
+        histories
+            .get(tracker)
+            .is_some_and(|history| history.contains(commit))
+    };
+    let exported = compose::compose(
+        store,
+        ROOT_TRACKER,
+        &[("refs/mirrors/view/target".to_owned(), base.clone())],
+        &compose::ComposeOptions {
+            readable: &ships,
+            admit: Some(&admit),
+        },
+    )?
+    .into_iter()
+    .next()
+    .and_then(|view| view.tip)
+    .ok_or_else(|| NewgitError::Unsupported(format!("root commit {base} composes to nothing")))?;
+    let on_main = std::process::Command::new("git")
+        .args([&git_dir, "merge-base", "--is-ancestor", &commit, &exported])
+        .output()
+        .is_ok_and(|output| output.status.success());
+    let root = on_main
+        .then(|| compose::read_root(store, &commit))
+        .transpose()?
+        .flatten()
+        .filter(|(tracker, _)| tracker == ROOT_TRACKER)
+        .map(|(_, root)| root);
+    let Some(root) = root else {
+        return Err(NewgitError::Unsupported(format!(
+            "tag `{name}` on `{}` names {commit}, which is not on `main` as it sees it: a tag names \
+             the project's history, so the commit lands first (a pull request merged there comes \
+             in by its own event; redeliver this one after it has)",
+            target.name
+        )));
+    };
+    Ok(PullAnswer::Tagged { root, annotation })
+}
+
+/// What annotated tag object `text` (`git cat-file tag`) says: its tagger and
+/// its message, without a signature, which covers that object and no other.
+pub fn parse_annotation(text: &str, name: &str) -> Result<TagAnnotation> {
+    let (headers, message) = text.split_once("\n\n").unwrap_or((text, ""));
+    let tagger = headers
+        .lines()
+        .find_map(|line| line.strip_prefix("tagger "))
+        .ok_or_else(|| {
+            NewgitError::Unsupported(format!(
+                "tag `{name}` has no tagger, so it was refused: `git tag -a` writes one"
+            ))
+        })?
+        .to_owned();
+    let message = [
+        "-----BEGIN PGP SIGNATURE-----",
+        "-----BEGIN SSH SIGNATURE-----",
+        "-----BEGIN SIGNED MESSAGE-----",
+    ]
+    .iter()
+    .filter_map(|marker| message.find(marker))
+    .min()
+    .map_or(message, |at| &message[..at]);
+    // Git's output arrives trimmed: a message ends with one newline, as
+    // `git tag -m` writes it.
+    let message = message.trim_end();
+    Ok(TagAnnotation {
+        tagger,
+        message: if message.is_empty() {
+            String::new()
+        } else {
+            format!("{message}\n")
+        },
     })
 }
 

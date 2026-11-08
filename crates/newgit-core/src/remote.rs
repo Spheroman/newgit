@@ -71,6 +71,16 @@ pub struct RemoteBranch {
     pub list: std::collections::BTreeMap<String, String>,
 }
 
+/// A tag: a name for one root commit on root's `main`, with the index that
+/// commit pins. It never moves.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct RemoteTag {
+    pub name: String,
+    pub list: std::collections::BTreeMap<String, String>,
+    #[serde(default)]
+    pub annotation: Option<crate::endpoint::TagAnnotation>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProjectView {
@@ -238,6 +248,18 @@ pub trait Remote: Send + Sync {
         list: &std::collections::BTreeMap<String, String>,
         moves: &[RefMove],
     ) -> Result<LandedMerge>;
+    /// Every tag, by name.
+    fn tags(&self, project: &str) -> Result<Vec<RemoteTag>>;
+    /// Tag root commit `root`, which must be on root's `main`, as `name`.
+    /// The same tag again is answered as it is; another commit, or another
+    /// annotation, is refused: a tag never moves.
+    fn create_tag(
+        &self,
+        project: &str,
+        name: &str,
+        root: &str,
+        annotation: Option<&crate::endpoint::TagAnnotation>,
+    ) -> Result<RemoteTag>;
     fn add_member(&self, project: &str, login: &str) -> Result<bool>;
     fn remove_member(&self, project: &str, login: &str) -> Result<bool>;
     /// Delete the project: its repos, its record, and every token pinned to
@@ -916,6 +938,41 @@ impl Remote for HttpRemote {
                 segment(name)
             ),
             None,
+        )
+    }
+
+    fn tags(&self, project: &str) -> Result<Vec<RemoteTag>> {
+        #[derive(Deserialize)]
+        struct Tags {
+            tags: Vec<RemoteTag>,
+        }
+        let tags: Tags = self.send(
+            "GET",
+            &format!("/v1/projects/{}/tags", project_path(project)),
+            None,
+        )?;
+        Ok(tags.tags)
+    }
+
+    fn create_tag(
+        &self,
+        project: &str,
+        name: &str,
+        root: &str,
+        annotation: Option<&crate::endpoint::TagAnnotation>,
+    ) -> Result<RemoteTag> {
+        // Whether the commit is on `main` may take the remote's Git to say,
+        // for one far back in a long history.
+        self.send_waiting(
+            "PUT",
+            &format!(
+                "/v1/projects/{}/tags/{}",
+                project_path(project),
+                segment(name)
+            ),
+            serde_json::json!({ "root": root, "annotation": annotation }),
+            "checking the tag",
+            "a first look at a long history takes several minutes",
         )
     }
 

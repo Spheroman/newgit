@@ -134,6 +134,7 @@ fn plan(container: &Utf8Path, root: (&Utf8Path, &str), child: (&Utf8Path, &str))
             ]),
         )]),
         default_branch: "main".to_owned(),
+        tags: BTreeMap::new(),
         repos: BTreeMap::from([
             ("root".to_owned(), source(root.0)),
             ("child".to_owned(), source(child.0)),

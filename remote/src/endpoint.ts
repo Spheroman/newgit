@@ -47,7 +47,9 @@ export interface EndpointPlan {
 	/** Each branch's index as this reader may see it: `root`'s commit and the pins they may read. */
 	branches: Record<string, Record<string, string>>;
 	default_branch: string;
-	/** Every tracker a branch lists, and `access` always: mounts are read from its content. */
+	/** Each tag as this reader may see it: its index cut as a branch's is, and what an annotated one says. */
+	tags: Record<string, { list: Record<string, string>; annotation: { tagger: string; message: string } | null }>;
+	/** Every tracker a branch or tag lists, and `access` always: mounts are read from its content. */
 	repos: Record<string, { url: string; auth: string }>;
 	/** The tracker the view is rooted at: `root`, or one a path names. */
 	root?: string;
@@ -102,6 +104,8 @@ export interface PullPlan {
 	instances: MirrorInstance[];
 	/** Only say whether there is anything to land: nothing is pushed. */
 	peek?: boolean;
+	/** A tag made on the mirror, `mirror.commit` its object: find the root commit it names, landing nothing. */
+	tag?: string;
 }
 
 /** An instance, and what it holds of each withheld tracker it forked. */
@@ -115,6 +119,7 @@ export type PullAnswer =
 	| { outcome: "nothing" }
 	| { outcome: "work" }
 	| { outcome: "landed"; list: Record<string, string>; commits: number; moves?: RefMove[] }
+	| { outcome: "tagged"; root: string; annotation: { tagger: string; message: string } | null }
 	| { outcome: "refused"; why: string };
 
 export interface IndexAnswer {

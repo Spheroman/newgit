@@ -374,6 +374,7 @@ fn plan_for(project: &Published, container: &Utf8Path, readable: &[&str]) -> Pla
         dir: container.to_path_buf(),
         branches: BTreeMap::from([("main".to_owned(), list)]),
         default_branch: "main".to_owned(),
+        tags: BTreeMap::new(),
         repos,
     }
 }

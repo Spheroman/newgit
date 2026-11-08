@@ -89,6 +89,8 @@ struct State {
     /// Projects whose members do not include the caller: the real remote's
     /// 403.
     not_a_member: std::collections::BTreeSet<String>,
+    /// Project key → tag name → the tag, as the remote answers it.
+    tags: BTreeMap<String, BTreeMap<String, Value>>,
 }
 
 /// A tracker's definition as the remote reads it, from `access`'s `main`:
@@ -104,6 +106,31 @@ fn definition_text(repos: &Utf8Path, project: &str, tracker: &str) -> Option<Str
                 .success()
                 .then(|| String::from_utf8_lossy(&output.stdout).into_owned())
         })
+}
+
+/// The index root commit `root` pins, all the way down, read from each
+/// tracker's repo as the remote reads it.
+fn index_of(repos: &Utf8Path, project: &str, root: &str) -> BTreeMap<String, String> {
+    let mut index = BTreeMap::new();
+    let mut stack = vec![("root".to_owned(), root.to_owned())];
+    while let Some((tracker, commit)) = stack.pop() {
+        if index.contains_key(&tracker) {
+            continue;
+        }
+        index.insert(tracker.clone(), commit.clone());
+        let repo = repos.join(format!("{}.t.{tracker}.git", project.replace('/', ".")));
+        let listed = git_output(&repo, &["ls-tree", &format!("{commit}:.newgit/pins")]);
+        for line in String::from_utf8_lossy(&listed.stdout).lines() {
+            let Some((meta, name)) = line.split_once('\t') else { continue };
+            let parts: Vec<&str> = meta.split_whitespace().collect();
+            if parts.first() != Some(&"160000") {
+                continue;
+            }
+            let child = if tracker == "root" { name.to_owned() } else { format!("{tracker}__{name}") };
+            stack.push((child, parts[2].to_owned()));
+        }
+    }
+    index
 }
 
 /// Whether `commit` is on tracker `tracker`'s own `main` in its repo.
@@ -258,13 +285,17 @@ fn git_endpoint(
         .trim_start_matches('/')
         .split_once(".git/")
         .expect("an endpoint path");
-    let branches = state
-        .lock()
-        .expect("state")
-        .branches
-        .get(project)
-        .cloned()
-        .unwrap_or_default();
+    let (branches, tags) = {
+        let state = state.lock().expect("state");
+        (
+            state.branches.get(project).cloned().unwrap_or_default(),
+            state.tags.get(project).cloned().unwrap_or_default(),
+        )
+    };
+    let tags: serde_json::Map<String, Value> = tags
+        .iter()
+        .map(|(name, tag)| (name.clone(), json!({ "list": tag["list"], "annotation": tag["annotation"] })))
+        .collect();
     let prefix = project.replace('/', ".");
     let mut plan_repos = serde_json::Map::new();
     for tracker in branches
@@ -284,6 +315,7 @@ fn git_endpoint(
         "dir": repos.with_file_name("endpoint"),
         "branches": branches,
         "default_branch": "main",
+        "tags": tags,
         "repos": plan_repos,
     });
     let mut compose = Command::new(env!("CARGO_BIN_EXE_newgit"))
@@ -794,6 +826,34 @@ fn route(
                 })
                 .collect();
             (200, json!({ "checkpoints": listed }))
+        }
+        ("GET", ["v1", "projects", owner, name, "tags"]) => {
+            let tags: Vec<Value> = state
+                .tags
+                .get(&format!("{owner}/{name}"))
+                .map(|tags| tags.values().cloned().collect())
+                .unwrap_or_default();
+            (200, json!({ "tags": tags }))
+        }
+        ("PUT", ["v1", "projects", owner, name, "tags", rest @ ..]) => {
+            let key = format!("{owner}/{name}");
+            let tag = rest.join("/").replace("%2F", "/");
+            let root = body["root"].as_str().unwrap_or_default().to_owned();
+            if let Some(existing) = state.tags.get(&key).and_then(|tags| tags.get(&tag)) {
+                if existing["list"]["root"] == body["root"] && existing["annotation"] == body["annotation"] {
+                    return (200, existing.clone());
+                }
+                return (409, json!({ "error": format!("tag `{tag}` names another commit already, and a tag never moves") }));
+            }
+            if !on_main(repos, &key, "root", &root) {
+                return (400, json!({ "error": format!("root commit {root} is not on root's `main`: a tag names the project's history, so push the commit to `main` first (`git push origin main {tag}`, or `git push --follow-tags`)") }));
+            }
+            let made = json!({
+                "name": tag, "list": index_of(repos, &key, &root),
+                "annotation": body["annotation"], "createdBy": caller, "createdAt": "now",
+            });
+            state.tags.entry(key).or_default().insert(tag, made.clone());
+            (201, made)
         }
         ("GET", ["v1", "projects", _, _, "checkpoints", instance, id]) => {
             let key = ((*instance).to_owned(), (*id).to_owned());

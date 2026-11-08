@@ -859,6 +859,25 @@ the default (`/branches` routes in `remote/src/index.ts`); the CLI to match,
 <name>`, is planned. (A newgit branch is not the Git branches an agent makes
 inside one workspace.)
 
+**A tag is a frozen list (decided 2026-11-08).** A tag names one point of
+the project's history: a root commit on root's `main`, frozen with the index
+that commit pins, as a checkpoint is a frozen list. ProjectDO keeps them
+(`/tags` routes); nothing is written to root's repository, because a ref
+there would name a root commit, which no reader sees. The Git endpoint
+serves each one as `refs/tags/<name>`, composed for the reader as a branch
+is, so `git fetch` brings it at the commit that reader's `main` has. An
+annotated tag keeps its tagger and message, and each view's tag object is
+made again from them at that view's commit, the same object every time; a
+signature covers one object, so it is not carried. A tag never moves: the
+same tag again is a retry, another commit or annotation is refused, and
+deleting one is the remote's `DELETE /tags/<name>`, by whoever may make it.
+Whoever may merge into root makes and deletes them, from a login, not an
+agent token. A tag comes from `git push origin <tag>` in a linked project
+root, which then pushes it to each export target composed as that target
+sees it, or from a tag made on a mirror (*Coming back*). An instance's push
+carries no tags on a newgit remote, so one there is refused, saying to merge
+and tag from the project root.
+
 | Repo (Artifacts) | Holds | Read | Write |
 |---|---|---|---|
 | `<owner>.<project>.t.<tracker>` | the history of a tracker in Git, at its own root | its audience | seeding, then merges |
@@ -993,7 +1012,11 @@ root commit with the withheld trackers' pins carried over: by hand with
 the mirror's commit in its trailers, headers included, so composing for that
 target gives that very commit back, GitHub's signature and all, and the next
 export is a no-op. For a reader of everything it is a rebuilt commit with a
-canonical note, like any other (*One name for a commit*).
+canonical note, like any other (*One name for a commit*). A tag made on the
+mirror comes back the same way, through the webhook: its commit is in `main`
+composed as the target sees it, under the very id it has there, so the
+remote knows which root commit it names and makes the project's tag there
+(*A tag is a frozen list*).
  Since `.newgit/` is root's, exporting root ships the config,
 resources, scripts, and export targets; only `.newgit/trackers/` follows
 `access`'s audience.
@@ -1196,7 +1219,11 @@ something:
   and names the `newgit export --remote <target>` to rerun. A push does not
   pull, so a target that is ahead is such a failure. Any other branch is
   refused, saying to spawn an instance. Pushing straight to a `branches =
-  true` target is refused, as in a workspace.
+  true` target is refused, as in a workspace. A tag pushed from there (after
+  the branch, when both are) is made on the remote, then on each target; one
+  naming a commit `main` does not have yet is refused, saying to push `main`
+  with it (*A tag is a frozen list*). The outbox holds no tags, so a tag
+  pushed again after a target refused it reaches newgit, not `up-to-date`.
 
 ## Decided with Jack (2026-11-04)
 

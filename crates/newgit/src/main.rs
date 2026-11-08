@@ -2884,21 +2884,22 @@ fn refuse_export_push(store: &Utf8Path, instance: &str, target: &str) -> Result<
 fn push_project_root(manager: &BranchManager, updates: &[RefUpdate]) -> Result<()> {
     use newgit_core::manager::TrackerMergeAction;
     let outcome = manager.receive_project_push(updates)?;
-    print_warnings(&outcome.merge.warnings);
-    let moved: Vec<String> = outcome
-        .merge
-        .trackers
-        .iter()
-        .filter(|merge| merge.action != TrackerMergeAction::Unchanged)
-        .map(|merge| tracker_path(&merge.tracker))
-        .collect();
-    if moved.is_empty() {
-        println!("newgit: `main` already has this");
-    } else {
-        println!("newgit: merged into `main` ({})", moved.join(", "));
-    }
-    if let Some(note) = &outcome.merge.project_root {
-        println!("newgit: {note}");
+    if let Some(merge) = &outcome.merge {
+        print_warnings(&merge.warnings);
+        let moved: Vec<String> = merge
+            .trackers
+            .iter()
+            .filter(|merge| merge.action != TrackerMergeAction::Unchanged)
+            .map(|merge| tracker_path(&merge.tracker))
+            .collect();
+        if moved.is_empty() {
+            println!("newgit: `main` already has this");
+        } else {
+            println!("newgit: merged into `main` ({})", moved.join(", "));
+        }
+        if let Some(note) = &merge.project_root {
+            println!("newgit: {note}");
+        }
     }
     let mut failed = Vec::new();
     for export in &outcome.exports {
@@ -2912,6 +2913,43 @@ fn push_project_root(manager: &BranchManager, updates: &[RefUpdate]) -> Result<(
                 failed.push(export.target.as_str());
             }
         }
+    }
+    let mut tags_failed = Vec::new();
+    for tag in &outcome.tags {
+        let done = "tagged";
+        match &tag.remote {
+            Ok(()) => println!("newgit: {done} `{}` on the remote", tag.name),
+            Err(error) => {
+                eprintln!("newgit: tag `{}` was refused: {error}", tag.name);
+                tags_failed.push(tag.name.as_str());
+                continue;
+            }
+        }
+        for (target, result) in &tag.targets {
+            match result {
+                Ok(true) => println!("newgit: {done} `{}` on `{target}`", tag.name),
+                Ok(false) => {}
+                Err(error) => {
+                    eprintln!(
+                        "newgit: tag `{}` did not reach `{target}`: {error}",
+                        tag.name
+                    );
+                    tags_failed.push(tag.name.as_str());
+                }
+            }
+        }
+    }
+    if !tags_failed.is_empty() {
+        tags_failed.dedup();
+        bail!(
+            "newgit: the push is not finished: {} did not go everywhere. What did go stays; \
+             `git push` the tag again once the reason above is dealt with.",
+            tags_failed
+                .iter()
+                .map(|tag| format!("tag `{tag}`"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
     }
     if failed.is_empty() {
         return Ok(());

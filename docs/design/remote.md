@@ -53,6 +53,10 @@ this repository is `spheroman/newgit` on newgit.dev, and GitHub's
   *Settled while building (2026-11-05)*).
 - A GitHub webhook that lands what is merged on a mirror on `main`
   (*The GitHub webhook*).
+- Tags: `git push origin <tag>` in a linked project root, or a tag made on
+  a mirror, names a root commit on `main`; the Git endpoint serves it as
+  `refs/tags/<name>` for each reader ([trackers.md](trackers.md), *A tag is
+  a frozen list*).
 - GitHub login (device flow), project members, and a recorded,
   individually revocable token for every login, agent, and instance.
 - Open to any GitHub account (`ALLOWED_LOGINS = "*"`, since 2026-11-02),
@@ -935,6 +939,18 @@ branch at the event's commit.
 instance's own: those are in the instance's forks, which the pull does not
 read. The instance's work is already on `main` then, so merging it finds
 nothing to do but a merge commit.
+
+**Tags.** A tag pushed to the mirror (a GitHub release makes one) is
+queued like a pull, behind any pull ahead of it, so a pull request merged
+and then tagged there is on `main` by the time its tag is looked for. The
+container fetches the tag, composes `main` as the target sees it, and finds
+the tagged commit in that history: the note composing leaves on it names
+its root commit. It lands nothing. The Worker then makes the tag as a push
+from the project root would, as whoever pushed it there, who must be able
+to merge into root. Our own export of a tag comes back as an event and
+finds it made; a tag that would move, or a commit not on `main`, is
+refused and logged. A tag deleted on the mirror is ignored: tags never
+move, and deleting one is the remote's to do.
 
 **Only `main`.** The webhook lands on `main`, not the project's
 `defaultBranch`, because an export composes `main` and the container moves

@@ -117,6 +117,27 @@ export interface Branch {
 	updatedAt: string;
 }
 
+/**
+ * A name for one point of the project's history: a frozen list, as a
+ * checkpoint is, whose root commit is on root's `main`. Readers see it as
+ * `refs/tags/<name>`, composed for what they may read.
+ */
+export interface Tag {
+	name: string;
+	list: TrackerList;
+	/** An annotated tag's tagger and message; null for a lightweight one. */
+	annotation: TagAnnotation | null;
+	createdBy: string;
+	createdAt: string;
+}
+
+/** What an annotated tag says besides where it points, as Git writes it. */
+export interface TagAnnotation {
+	/** The `tagger` line's value: `Name <email> <seconds> <zone>`. */
+	tagger: string;
+	message: string;
+}
+
 export interface Instance {
 	name: string;
 	owner: string;
@@ -178,6 +199,9 @@ export class ProjectDO extends DurableObject<Env> {
 			CREATE TABLE IF NOT EXISTS rollups (
 				branch TEXT NOT NULL, tracker TEXT NOT NULL, seq INTEGER NOT NULL,
 				PRIMARY KEY (branch, tracker));
+			CREATE TABLE IF NOT EXISTS tags (
+				name TEXT PRIMARY KEY, list TEXT NOT NULL, annotation TEXT,
+				created_by TEXT NOT NULL, created_at TEXT NOT NULL);
 		`);
 		// The log from before it named a change's commit in the parent.
 		try {
@@ -372,7 +396,7 @@ export class ProjectDO extends DurableObject<Env> {
 	}
 
 	private clearRows(): void {
-		for (const table of ["meta", "members", "branches", "instances", "forks", "checkpoints", "heads", "head_log", "rollups"])
+		for (const table of ["meta", "members", "branches", "instances", "forks", "checkpoints", "heads", "head_log", "rollups", "tags"])
 			this.sql.exec(`DELETE FROM ${table}`);
 	}
 
@@ -953,6 +977,38 @@ export class ProjectDO extends DurableObject<Env> {
 		return this.sql.exec("DELETE FROM instances WHERE name = ?", name).rowsWritten > 0;
 	}
 
+	tag(name: string): Tag | null {
+		const row = this.sql.exec<TagRow>("SELECT * FROM tags WHERE name = ?", name).toArray()[0];
+		return row ? toTag(row) : null;
+	}
+
+	tags(): Tag[] {
+		return this.sql.exec<TagRow>("SELECT * FROM tags ORDER BY name").toArray().map(toTag);
+	}
+
+	/**
+	 * Create a tag. A tag never moves: one that exists already is answered
+	 * as it is, and the caller compares (the same tag again is a retry).
+	 */
+	createTag(name: string, list: TrackerList, annotation: TagAnnotation | null, by: string): { created: boolean; tag: Tag } {
+		const existing = this.tag(name);
+		if (existing !== null) return { created: false, tag: existing };
+		const now = new Date().toISOString();
+		this.sql.exec(
+			"INSERT INTO tags VALUES (?, ?, ?, ?, ?)",
+			name,
+			JSON.stringify(list),
+			annotation === null ? null : JSON.stringify(annotation),
+			by,
+			now,
+		);
+		return { created: true, tag: this.tag(name)! };
+	}
+
+	deleteTag(name: string): boolean {
+		return this.sql.exec("DELETE FROM tags WHERE name = ?", name).rowsWritten > 0;
+	}
+
 	/**
 	 * Record a checkpoint. Written last, after every ref it names was pushed:
 	 * this row is what makes a checkpoint exist across machines. Rewriting
@@ -1078,6 +1134,24 @@ function toBranch(row: BranchRow): Branch {
 		createdBy: row.created_by,
 		createdAt: row.created_at,
 		updatedAt: row.updated_at,
+	};
+}
+
+interface TagRow extends Record<string, SqlStorageValue> {
+	name: string;
+	list: string;
+	annotation: string | null;
+	created_by: string;
+	created_at: string;
+}
+
+function toTag(row: TagRow): Tag {
+	return {
+		name: row.name,
+		list: JSON.parse(row.list) as TrackerList,
+		annotation: row.annotation === null ? null : (JSON.parse(row.annotation) as TagAnnotation),
+		createdBy: row.created_by,
+		createdAt: row.created_at,
 	};
 }
 

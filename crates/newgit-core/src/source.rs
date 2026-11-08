@@ -2034,6 +2034,35 @@ pub fn run_git_env(args: &[&str], env: &[(String, String)]) -> Result<String> {
     }
 }
 
+/// `git <args>` with `input` on its standard input; its output, trimmed.
+pub fn run_git_stdin(args: &[&str], input: &[u8]) -> Result<String> {
+    use std::io::Write as _;
+    let mut child = Command::new("git")
+        .args(args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|source| spawn_error(args, &source))?;
+    {
+        let mut stdin = child.stdin.take().expect("piped stdin");
+        stdin
+            .write_all(input)
+            .map_err(|source| spawn_error(args, &source))?;
+    }
+    let output = child
+        .wait_with_output()
+        .map_err(|source| spawn_error(args, &source))?;
+    if output.status.success() {
+        Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+    } else {
+        Err(NewgitError::SourceCommand {
+            command: format!("git {}", args.join(" ")),
+            stderr: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+        })
+    }
+}
+
 /// Make a fresh checkout's index trust every file it records.
 ///
 /// Git cannot tell a file written in the same second as its index from one

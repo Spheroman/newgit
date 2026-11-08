@@ -231,9 +231,23 @@ impl Recognise {
 /// What a `git push` from the project root did.
 #[derive(Debug)]
 pub struct ProjectPushOutcome {
-    pub merge: MergeOutcome,
+    /// `None` when the push sent only tags.
+    pub merge: Option<MergeOutcome>,
     /// Each target that had something new, or failed.
     pub exports: Vec<ProjectPushExport>,
+    /// Each tag the push made or deleted, in the order it named them.
+    pub tags: Vec<ProjectPushTag>,
+}
+
+/// One tag a push from the project root sent: to the remote first, which
+/// is where the project's tags are, then to each export target.
+#[derive(Debug)]
+pub struct ProjectPushTag {
+    pub name: String,
+    /// The remote's answer. A refusal here leaves the targets untouched.
+    pub remote: std::result::Result<(), String>,
+    /// Each target, in order: pushed (true), there already (false), or why not.
+    pub targets: Vec<(String, std::result::Result<bool, String>)>,
 }
 
 #[derive(Debug)]
@@ -9228,6 +9242,24 @@ impl BranchManager {
     fn serve_project_push(&self) -> Result<Utf8PathBuf> {
         let outbox = self.outbox();
         self.ensure_push_route(&outbox)?;
+        // Nor any tag: a tag pushed before, again after a target refused it,
+        // would be `up-to-date` and never reach the hook.
+        if let Ok(tags) = crate::source::run_git_env(
+            &[
+                "-C",
+                outbox.as_str(),
+                "for-each-ref",
+                "--format=delete %(refname)",
+                "refs/tags/",
+            ],
+            &[],
+        ) && !tags.is_empty()
+        {
+            let _ = crate::source::run_git_stdin(
+                &["-C", outbox.as_str(), "update-ref", "--stdin"],
+                format!("{tags}\n").as_bytes(),
+            );
+        }
         if let Some(branch) = self.project_branch() {
             let _ = crate::source::run_git_env(
                 &[
@@ -9258,10 +9290,13 @@ impl BranchManager {
             .unwrap_or_else(|| PROJECT_ROOT_INSTANCE.to_owned());
         let own_ref = format!("refs/heads/{branch}");
         let spawn = "`newgit spawn <name>` makes an instance, whose branch can be pushed";
-        for update in updates {
+        let (tags, updates): (Vec<&RefUpdate>, Vec<&RefUpdate>) = updates
+            .iter()
+            .partition(|update| update.name.starts_with("refs/tags/"));
+        for update in &updates {
             if update.name != own_ref {
                 return Err(NewgitError::Unsupported(format!(
-                    "the project root pushes only `{branch}`, so `{}` was refused: {spawn}",
+                    "the project root pushes only `{branch}` and tags, so `{}` was refused: {spawn}",
                     update.name
                 )));
             }
@@ -9278,9 +9313,41 @@ impl BranchManager {
                 )));
             }
         }
+        // Every tag is read before anything moves, so one that cannot be
+        // pushed stops the push with nothing landed.
+        let tags: Vec<(String, PushedTag)> = tags
+            .iter()
+            .map(|update| {
+                let name = update.name["refs/tags/".len()..].to_owned();
+                match &update.new {
+                    // Not reached by Git, which deletes only what the outbox
+                    // advertises, and it advertises no tag.
+                    None => Err(NewgitError::Unsupported(format!(
+                        "tag `{name}` is not deleted by a push: a tag names a release others \
+                         may already have"
+                    ))),
+                    Some(new) => self.pushed_tag(&name, new).map(|tag| (name, tag)),
+                }
+            })
+            .collect::<Result<_>>()?;
+        if !tags.is_empty() && self.remote.is_none() {
+            return Err(NewgitError::Unsupported(
+                "tags from the project root go to the project's newgit remote, and this project \
+                 has none: `newgit remote add` links one"
+                    .to_owned(),
+            ));
+        }
         // Before the merge, so a target that cannot be read stops the push
         // with nothing landed.
         let targets = self.export_targets()?;
+        if updates.is_empty() {
+            let tags = self.push_tags(&targets, tags)?;
+            return Ok(ProjectPushOutcome {
+                merge: None,
+                exports: Vec::new(),
+                tags,
+            });
+        }
         let merge = self.merge(PROJECT_ROOT_INSTANCE, PROJECT_ROOT_INSTANCE)?;
         let exports = targets
             .iter()
@@ -9298,7 +9365,179 @@ impl BranchManager {
             })
             .filter(|export| !matches!(&export.result, Ok(outcome) if !outcome.pushed))
             .collect();
-        Ok(ProjectPushOutcome { merge, exports })
+        // After the merge: a tag names a commit on `main`, which the merge
+        // may just have put there.
+        let tags = self.push_tags(&targets, tags)?;
+        Ok(ProjectPushOutcome {
+            merge: Some(merge),
+            exports,
+            tags,
+        })
+    }
+
+    /// Tag `name`, which the push says is `new`: the root commit its commit
+    /// stands for, and what an annotated tag says. Refused when the commit
+    /// is not the project's: a commit this machine split, or adopted.
+    fn pushed_tag(&self, name: &str, new: &str) -> Result<PushedTag> {
+        let project = self.store.paths().project_root.clone();
+        let git = |args: &[&str]| {
+            let mut full = vec!["-C", project.as_str()];
+            full.extend_from_slice(args);
+            crate::source::run_git_env(&full, &[])
+        };
+        let view =
+            git(&["rev-parse", "--verify", "-q", &format!("{new}^{{commit}}")]).map_err(|_| {
+                NewgitError::Unsupported(format!("tag `{name}` names no commit, so it was refused"))
+            })?;
+        let annotation = match git(&["cat-file", "-t", new])?.as_str() {
+            "tag" => Some(crate::endpoint::parse_annotation(
+                &git(&["cat-file", "tag", new])?,
+                name,
+            )?),
+            _ => None,
+        };
+        let root = self.root_commit_of_view(&view)?.ok_or_else(|| {
+            NewgitError::Unsupported(format!(
+                "tag `{name}` names {}, which is not on `main` here: a tag names the project's \
+                 history, so push the commit to `main` first (`git push origin main {name}`, or \
+                 `git push --follow-tags`)",
+                short(&view)
+            ))
+        })?;
+        Ok(PushedTag { root, annotation })
+    }
+
+    /// The root commit view commit `view` stands for: the note splitting or
+    /// composing left on it, or `view` itself in the history newgit adopted.
+    fn root_commit_of_view(&self, view: &str) -> Result<Option<String>> {
+        let project = self.store.paths().project_root.clone();
+        if let Some((tracker, root)) = crate::compose::read_root(&project, view)?
+            && tracker == self.root.name
+        {
+            return Ok(Some(root));
+        }
+        let _ = self.sync_project_root();
+        if let Some((tracker, root)) = crate::compose::read_root(&project, view)?
+            && tracker == self.root.name
+        {
+            return Ok(Some(root));
+        }
+        match self.source.rev_parse(ADOPTED_REF) {
+            Ok(adopted) if self.source.is_ancestor(view, &adopted)? => Ok(Some(view.to_owned())),
+            _ => Ok(None),
+        }
+    }
+
+    /// Make each of `tags` on the remote, then on each export target.
+    fn push_tags(
+        &self,
+        targets: &[ExportTarget],
+        tags: Vec<(String, PushedTag)>,
+    ) -> Result<Vec<ProjectPushTag>> {
+        if tags.is_empty() {
+            return Ok(Vec::new());
+        }
+        let link = self.remote.as_ref().ok_or_else(|| {
+            NewgitError::Unsupported("this project has no newgit remote".to_owned())
+        })?;
+        let client = link.connect(Acting::Login)?;
+        let mut outcomes = Vec::new();
+        for (name, tag) in tags {
+            let made = client.create_tag(&link.project, &name, &tag.root, tag.annotation.as_ref());
+            let (remote, list) = match made {
+                Ok(made) => (Ok(()), Some(made.list)),
+                Err(error) => (Err(error.to_string()), None),
+            };
+            let targets = match &list {
+                Some(list) => targets
+                    .iter()
+                    .map(|target| {
+                        (
+                            target.name.clone(),
+                            self.export_tag(target, &name, list, tag.annotation.as_ref())
+                                .map_err(|error| error.to_string()),
+                        )
+                    })
+                    .collect(),
+                None => Vec::new(),
+            };
+            outcomes.push(ProjectPushTag {
+                name,
+                remote,
+                targets,
+            });
+        }
+        Ok(outcomes)
+    }
+
+    /// Tag `name` on `target`: the tagged index composed as the target sees
+    /// it, pushed to `refs/tags/<name>`. A tag the target has already at the
+    /// same commit is left as it is (one made there, signature and all,
+    /// comes back the same); one at another commit is refused, not moved.
+    fn export_tag(
+        &self,
+        target: &ExportTarget,
+        name: &str,
+        list: &BTreeMap<String, String>,
+        annotation: Option<&crate::endpoint::TagAnnotation>,
+    ) -> Result<bool> {
+        let (_, view) = self.compose_export(target, list, &format!("tags/{name}"))?;
+        let project = self.store.paths().project_root.clone();
+        let tag_ref = format!("refs/tags/{name}");
+        let theirs = crate::source::run_git_env(
+            &[
+                "-C",
+                project.as_str(),
+                "ls-remote",
+                &target.push_url(),
+                &tag_ref,
+                &format!("{tag_ref}^{{}}"),
+            ],
+            &[],
+        )?;
+        let mut there = None;
+        for line in theirs.lines() {
+            if let Some((id, refname)) = line.split_once('\t') {
+                // The peeled line wins: it is the commit an annotated tag names.
+                if refname.ends_with("^{}") || there.is_none() {
+                    there = Some(id.to_owned());
+                }
+            }
+        }
+        if let Some(there) = there {
+            if there == view.tip {
+                return Ok(false);
+            }
+            return Err(NewgitError::Unsupported(format!(
+                "`{}` has tag `{name}` at {} already, not at {}, which `{name}` is as it sees \
+                 it; a tag never moves, so it was left as it is",
+                target.name,
+                short(&there),
+                short(&view.tip)
+            )));
+        }
+        let object = match annotation {
+            Some(annotation) => crate::endpoint::make_tag_object(
+                &project.join(".git"),
+                &view.tip,
+                name,
+                annotation,
+            )?,
+            None => view.tip.clone(),
+        };
+        crate::source::run_git_env(
+            &[
+                "-C",
+                project.as_str(),
+                "push",
+                "--quiet",
+                "--no-verify",
+                &target.push_url(),
+                &format!("{object}:{tag_ref}"),
+            ],
+            &[],
+        )?;
+        Ok(true)
     }
 
     /// The second half, run from the outbox's `pre-receive` hook while the
@@ -9327,6 +9566,20 @@ impl BranchManager {
         };
 
         let own_ref = format!("refs/heads/{}", branch.source_ref);
+        // On a newgit remote an instance's push is its checkpoint's sync,
+        // which carries no tag: one would vanish without a word.
+        if on_remote
+            && let Some(tag) = updates
+                .iter()
+                .find(|update| update.name.starts_with("refs/tags/"))
+        {
+            return Err(NewgitError::Unsupported(format!(
+                "`{}` was not pushed: a tag names the project's history, so it is made from the \
+                 project root once the work is on `main` (`newgit merge {}`, then `git tag` and \
+                 `git push origin <tag>` there)",
+                tag.name, branch.name
+            )));
+        }
         if updates
             .iter()
             .any(|update| update.name == own_ref && update.new.is_none())
@@ -13774,6 +14027,13 @@ pub fn recorded_source(source: &str) -> String {
 }
 
 /// Where an export target's view of `branch` is composed in the project repo.
+/// A tag a push from the project root sends.
+struct PushedTag {
+    /// The root commit the tagged commit stands for.
+    root: String,
+    annotation: Option<crate::endpoint::TagAnnotation>,
+}
+
 fn export_ref(target: &str, branch: &str) -> String {
     format!("refs/newgit/exports/{target}/{branch}")
 }

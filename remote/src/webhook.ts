@@ -21,6 +21,7 @@ import {
 	anchorFor,
 	landAndFollow,
 	loadDefinitions,
+	makeTag,
 	projectStub,
 	revokeRepoTokens,
 	settle,
@@ -80,6 +81,8 @@ export interface MirrorPull {
 	tokens?: { repo: string; artifactsId: string }[];
 	/** `main`'s index when this pull began to land; unset until then. */
 	base?: Record<string, string>;
+	/** A tag made on the mirror: `commit` is its object, and nothing lands but the tag. */
+	tag?: string;
 }
 
 /**
@@ -284,7 +287,10 @@ export async function githubWebhook(request: Request, env: Env, deps: Deps): Pro
 
 	if (definition.root !== undefined)
 		return Response.json({ ignored: "a rooted target's commits are its tracker's: `newgit pull --remote`" });
-	if (payload.ref !== `refs/heads/${definition.branch}`)
+	const tag = payload.ref?.startsWith("refs/tags/") ? payload.ref.slice("refs/tags/".length) : undefined;
+	if (tag !== undefined && payload.deleted === true)
+		return Response.json({ ignored: "a tag is deleted on the remote, not by a mirror: tags never move" });
+	if (tag === undefined && payload.ref !== `refs/heads/${definition.branch}`)
 		return Response.json({ ignored: `not \`${definition.branch}\`` });
 	const commit = payload.after ?? "";
 	if (payload.deleted === true || !/^[0-9a-f]{40}$/.test(commit) || /^0+$/.test(commit))
@@ -317,6 +323,8 @@ export async function githubWebhook(request: Request, env: Env, deps: Deps): Pro
 	if (!writable.includes("root"))
 		return refused(403, `\`${pusher}\` pushed this, and may not merge into ${projectKey(id)}`, context);
 
+	// Queued behind any pull, so a pull request merged and then tagged
+	// there is on `main` by the time its tag is looked for.
 	await project.queuePull({
 		target,
 		repo,
@@ -329,6 +337,7 @@ export async function githubWebhook(request: Request, env: Env, deps: Deps): Pro
 		withheld,
 		queuedAt: Date.now(),
 		attempts: 0,
+		...(tag === undefined ? {} : { tag }),
 	});
 	return Response.json({ queued: commit }, { status: 202 });
 }
@@ -438,6 +447,32 @@ async function advance(env: Env, deps: Deps, id: ProjectId, pull: MirrorPull): P
 	if (!(await settle(deps, project, id, PULL_BRANCH)))
 		throw new Error(`root could not roll up on \`${PULL_BRANCH}\`; the pull waits for it`);
 
+	// A tag lands nothing: the container says which root commit it names,
+	// and the tag is made here, as a push from the project root makes one.
+	// Our own export of a tag comes back as an event too, and finds it made.
+	if (pull.tag !== undefined) {
+		const list = (await project.branch(PULL_BRANCH))?.list;
+		if (list === undefined) throw new HttpError(404, `no branch \`${PULL_BRANCH}\` in ${key}`);
+		const found = await deps.pull(key, { ...plan(list), tag: pull.tag }, async () => {
+			const { handed, minted } = await mint(list, () => "read");
+			await project.notePullTokens(pull, handed);
+			return minted;
+		});
+		if (isChecking(found)) return false;
+		if (found.outcome === "refused") return await ended({ outcome: "refused", why: `tag \`${pull.tag}\`: ${found.why}` });
+		if (found.outcome !== "tagged") throw new HttpError(500, `a tag's look answered \`${found.outcome}\``);
+		try {
+			const made = await makeTag(env, deps, null, project, id, pull.tag, found.root, found.annotation, pull.pusher);
+			if (isChecking(made)) return false;
+			console.log(JSON.stringify({ webhook: made.created ? "tagged" : "tag already there", ...log, tag: pull.tag, root: found.root }));
+		} catch (error) {
+			// A refusal is an answer: a tag that would move, or a commit not on `main`.
+			if (!(error instanceof HttpError) || error.status >= 500) throw error;
+			return await ended({ outcome: "refused", why: `tag \`${pull.tag}\`: ${error.message}` });
+		}
+		return true;
+	}
+
 	// First a look: every export comes back as an event, and most end here.
 	if (!pull.peeked) {
 		const list = (await project.branch(PULL_BRANCH))?.list;
@@ -513,7 +548,8 @@ async function advance(env: Env, deps: Deps, id: ProjectId, pull: MirrorPull): P
 		);
 		return true;
 	}
-	if (answer.outcome === "work") throw new HttpError(500, "a landing answered as a peek");
+	if (answer.outcome === "work" || answer.outcome === "tagged")
+		throw new HttpError(500, `a landing answered \`${answer.outcome}\``);
 	return await ended(answer);
 }
 

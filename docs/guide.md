@@ -393,6 +393,14 @@ true`, every push from a workspace exports its branch there too, and on a
 newgit remote the workspace gets the target as the remote `gh` resolves, so
 an agent's `git push` then `gh pr create` opens a real pull request.
 
+**Tags are the project's.** On a newgit remote, `git tag v1.0 && git push
+origin main v1.0` (or `git push --follow-tags`) in the project root names
+that point of `main` on the remote, then on each export target, each at its
+own view of the commit; a GitHub release made on a mirror comes back as the
+same tag. `git fetch` brings tags from the remote like any other. A tag
+never moves, and names only what `main` has: tag from the project root once
+the work is merged, not from a workspace.
+
 **`[[render]]` puts this instance's ports in the config file your tool
 actually reads.** Most tools take a port from a committed config file rather
 than argv, so a resource declares literal substitutions into one:

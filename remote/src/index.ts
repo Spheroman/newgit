@@ -55,7 +55,7 @@ import {
 import { githubWebhook } from "./webhook";
 
 type Checking = typeof CHECKING;
-import type { Branch, Instance, ProjectDO, TrackerList } from "./project";
+import type { Branch, Instance, ProjectDO, Tag, TagAnnotation, TrackerList } from "./project";
 import { type RefMove, followHead, followLanding } from "./follow";
 import { landingRef } from "./refs";
 import { ASK_GIT, historyTouches, nativeAncestry, nativeIndex, onlyPinsMoved } from "./walk";
@@ -1023,6 +1023,39 @@ async function route(request: Request, env: Env, deps: Deps): Promise<Response> 
 		}
 	}
 
+	// ── Tags ───────────────────────────────────────────────────────────────
+	// A tag names one point of root's `main`, frozen with the index its root
+	// commit pins. It never moves: tagging the same commit again is a retry,
+	// another commit is refused. Readers see it as `refs/tags/<name>` through
+	// the Git endpoint, composed for what they may read.
+	if (method === "GET" && rest === "/tags") return json({ tags: await project.tags() });
+	const tagMatch = rest.match(/^\/tags\/(.+)$/);
+	if (tagMatch) {
+		const name = decodeURIComponent(tagMatch[1]);
+		const problem = tagNameProblem(name);
+		if (problem) throw new HttpError(400, problem);
+		if (method === "GET") {
+			const found = await project.tag(name);
+			if (found === null) throw new HttpError(404, `no tag \`${name}\` in ${key}`);
+			return json(found);
+		}
+		// Naming a release is a person's decision, and whoever may merge into
+		// root's `main` makes it: a tag is a name for a point of its history.
+		requireHuman(caller, "tag");
+		requireNotInstance(caller, "tag");
+		await requireRootMaintainer(deps, id, info, { login, member }, project, "tag");
+		if (method === "DELETE") {
+			if (!(await project.deleteTag(name))) throw new HttpError(404, `no tag \`${name}\` in ${key}`);
+			return json({ name, deleted: true });
+		}
+		if (method === "PUT") {
+			const { root, annotation } = await body<{ root?: string; annotation?: TagAnnotation | null }>(request);
+			const made = await makeTag(env, deps, caller, project, id, name, root, annotation ?? null, login);
+			if (isChecking(made)) return stillChecking();
+			return json(made.tag, made.created ? 201 : 200);
+		}
+	}
+
 	// ── Checkpoints ────────────────────────────────────────────────────────
 	if (method === "GET" && rest === "/checkpoints") {
 		const instance = url.searchParams.get("instance") ?? undefined;
@@ -1276,7 +1309,7 @@ async function answerGit(
 	// The tracker the view is rooted at: root, or the one the path names.
 	const path = (match[3] ?? "").split("/").filter((part) => part !== "").map(decodeURIComponent);
 	const root = path.length === 0 ? "root" : path.join("__");
-	const plan: EndpointPlan = { dir: "/work", branches: {}, default_branch: info.defaultBranch, repos: {}, root };
+	const plan: EndpointPlan = { dir: "/work", branches: {}, default_branch: info.defaultBranch, tags: {}, repos: {}, root };
 	// `access` always: the container reads every mount from its content,
 	// even for a reader who may not read it. It is served only where listed.
 	const needed = new Set<string>(["access"]);
@@ -1292,6 +1325,20 @@ async function answerGit(
 	}
 	if (root !== "root" && Object.keys(plan.branches).length === 0 && !branches.some((branch) => branch.list[root]))
 		throw new HttpError(404, `${key} has no tracker at \`${path.join("/")}\``);
+	// Each tag the same way: a frozen list, served as `refs/tags/<name>`. A
+	// view rooted below root gets the tag at that tracker's commit.
+	if (readable(root)) {
+		for (const tag of await timing.span("project", () => project.tags())) {
+			if (!tag.list[root]) continue;
+			const list: Record<string, string> = {};
+			for (const [tracker, commit] of Object.entries(tag.list)) {
+				if (!within(tracker, root) || !readable(tracker)) continue;
+				list[tracker] = commit;
+				needed.add(tracker);
+			}
+			plan.tags[tag.name] = { list, annotation: tag.annotation };
+		}
+	}
 	if (Object.keys(plan.branches).length === 0)
 		throw new HttpError(who.member ? 403 : 404, who.member ? `nothing in ${key} is yours to read` : `no project \`${key}\``);
 
@@ -2292,6 +2339,122 @@ function sameIndex(left: TrackerList | undefined, right: TrackerList): boolean {
 
 export async function revokeRepoTokens(deps: Deps, tokens: { repo: string; artifactsId: string }[]) {
 	await Promise.allSettled(tokens.map((token) => deps.repos.revokeToken(token.repo, token.artifactsId)));
+}
+
+/**
+ * Why `name` cannot be a tag, as `git check-ref-format` would refuse
+ * `refs/tags/<name>`; null when it can.
+ */
+export function tagNameProblem(name: string): string | null {
+	const bad =
+		name === "" ||
+		name.length > 200 ||
+		name.startsWith("-") ||
+		name.endsWith("/") ||
+		name.endsWith(".") ||
+		name.includes("..") ||
+		name.includes("//") ||
+		name.includes("@{") ||
+		name === "@" ||
+		/[\x00-\x20\x7f~^:?*[\\]/.test(name) ||
+		name.split("/").some((part) => part.startsWith(".") || part.endsWith(".lock"));
+	return bad ? `\`${name}\` is not a tag name Git accepts` : null;
+}
+
+/** Refuse unless `who` may merge into root, which is who may name its history. */
+async function requireRootMaintainer(
+	deps: Deps,
+	id: ProjectId,
+	info: { owner: string },
+	who: { login: string; member: boolean },
+	project: DurableObjectStub<ProjectDO>,
+	action: string,
+) {
+	const facts = (await definitionFacts(deps.repos, id, "root", await listedTrackers(project))) ?? implicitFacts("root")!;
+	const may = mayMaintain(facts.maintainers, who, info.owner, "root");
+	if (!may.ok) throw new HttpError(403, `${may.reason}, so may not ${action}`);
+}
+
+/**
+ * Tag root commit `root` as `name`, with the index it pins. It must be on
+ * root's `main`: a tag names the project's history, not work in flight.
+ * Asked again with the same commit and annotation, it answers the tag that
+ * is there; with another, it refuses, since a tag never moves. `CHECKING`
+ * while the container answers what Artifacts' reads could not.
+ */
+export async function makeTag(
+	env: Env,
+	deps: Deps,
+	caller: Caller | null,
+	project: DurableObjectStub<ProjectDO>,
+	id: ProjectId,
+	name: string,
+	root: unknown,
+	annotation: TagAnnotation | null,
+	by: string,
+): Promise<{ created: boolean; tag: Tag } | Checking> {
+	const key = projectKey(id);
+	if (typeof root !== "string" || !/^[0-9a-f]{40}$/.test(root))
+		throw new HttpError(400, "root must name root's commit by its full id");
+	if (
+		annotation !== null &&
+		(typeof annotation !== "object" || typeof annotation.tagger !== "string" || typeof annotation.message !== "string")
+	)
+		throw new HttpError(400, "annotation is { tagger, message }, or null for a lightweight tag");
+	if (annotation !== null && (annotation.tagger.includes("\n") || !/^.+ <[^<>\n]*> \d+ [+-]\d{4}$/.test(annotation.tagger)))
+		throw new HttpError(400, "annotation.tagger is `Name <email> <seconds> <zone>`, as Git writes it");
+	const existing = await project.tag(name);
+	if (existing !== null) {
+		const same =
+			existing.list.root === root &&
+			JSON.stringify(existing.annotation) === JSON.stringify(annotation);
+		if (same) return { created: false, tag: existing };
+		throw new HttpError(
+			409,
+			`tag \`${name}\` names root commit ${existing.list.root.slice(0, 12)} already, and a tag never moves: delete it first if it is wrong`,
+		);
+	}
+	const repoOf = (tracker: string) => repoName({ kind: "tracker", project: id, tracker });
+	const credentials = (trackers: string[]) =>
+		caller === null
+			? Promise.resolve(
+					Object.fromEntries(
+						trackers.map((tracker) => [tracker, { url: deps.repos.url(repoOf(tracker)), auth: "" }]),
+					),
+				)
+			: checkCredentials(env, deps, caller, id, trackers);
+
+	// On `main`, read from Artifacts; the container's Git when that walk is too long.
+	const check = [{ tracker: "root", old: root, new: root }];
+	let ancestry: AncestryAnswer[] | Checking | typeof ASK_GIT = await nativeAncestry(deps.repos, repoOf, check);
+	if (ancestry === ASK_GIT && deps.ancestry) {
+		const plan: AncestryPlan = { dir: "/work", repos: checkRepos(deps, id, ["root"]), checks: check };
+		ancestry = await deps.ancestry(key, plan, () => credentials(["root"]));
+	}
+	if (isChecking(ancestry)) return CHECKING;
+	if (ancestry === ASK_GIT || ancestry[0]?.onMain !== true)
+		throw new HttpError(
+			400,
+			`root commit ${root.slice(0, 12)} is not on root's \`main\`: a tag names the project's history, so push the commit to \`main\` first (\`git push origin main ${name}\`, or \`git push --follow-tags\`)`,
+		);
+
+	// What it pins, all the way down: the list a reader's view composes from.
+	let index: IndexAnswer | Checking | typeof ASK_GIT = await nativeIndex(deps.repos, repoOf, { root });
+	if (index === ASK_GIT && deps.index) {
+		// Every tracker `main` has: a pin is read from its own tracker's repo.
+		const trackers = [...new Set([...Object.keys((await project.branch("main"))?.list ?? {}), "root", "access"])];
+		const plan: IndexPlan = { dir: "/work", repos: checkRepos(deps, id, trackers), list: { root } };
+		index = await deps.index(key, plan, () => credentials(trackers));
+	}
+	if (isChecking(index)) return CHECKING;
+	if (index === ASK_GIT || index.actual.root !== root)
+		throw new HttpError(503, `what root commit ${root.slice(0, 12)} pins could not be read; try again`);
+	const made = await project.createTag(name, index.actual, annotation, by);
+	// Two made at once: whichever was first stands, and the other is a retry
+	// only if it says the same.
+	if (!made.created && (made.tag.list.root !== root || JSON.stringify(made.tag.annotation) !== JSON.stringify(annotation)))
+		throw new HttpError(409, `tag \`${name}\` was made meanwhile at another commit, and a tag never moves`);
+	return made;
 }
 
 /** A private instance is there only for its owner (and agents acting as them). */

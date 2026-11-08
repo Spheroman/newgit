@@ -76,6 +76,7 @@ impl Remote {
             },
             instances: Vec::new(),
             peek: false,
+            tag: None,
         }
     }
 
