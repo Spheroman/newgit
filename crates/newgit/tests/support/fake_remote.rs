@@ -61,6 +61,10 @@ struct State {
     denied_trackers: std::collections::BTreeSet<String>,
     /// Branch → the index the merge in flight began with.
     merge_targets: BTreeMap<String, Value>,
+    /// Answer uploads 404, as a remote from before them does.
+    refuse_uploads: bool,
+    /// Every commit sent before a merge began, by tracker.
+    uploads: Vec<(String, String)>,
     /// Where the next merges land, as the real remote says it: unset, a
     /// remote from before anchors.
     anchor: Option<String>,
@@ -194,9 +198,12 @@ impl FakeRemote {
                     let _ = stream.write_all(&reply);
                     continue;
                 }
-                let body: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
-                let (status, reply) =
-                    route(&thread_state, &thread_repos, &method, &path, &token, &body);
+                let (status, reply) = if path.contains("/objects/") {
+                    receive_objects(&thread_state, &thread_repos, &path, &body)
+                } else {
+                    let body: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+                    route(&thread_state, &thread_repos, &method, &path, &token, &body)
+                };
                 let text = reply.to_string();
                 // A check still running: ask again at once, so tests do not wait.
                 let retry = if status == 202 { "retry-after: 0\r\n" } else { "" };
@@ -348,6 +355,36 @@ fn git_endpoint(
     )
 }
 
+/// A merge's commits sent before it begins, as the Worker takes them: the
+/// pack into the tracker's repo (completed from what it has, as a thin pack
+/// is), and the commit at its landing ref.
+fn receive_objects(state: &Mutex<State>, repos: &Utf8Path, path: &str, pack: &[u8]) -> (u16, Value) {
+    let mut state = state.lock().expect("state");
+    if state.refuse_uploads {
+        return (404, json!({ "error": format!("no route for POST {path}") }));
+    }
+    let parts: Vec<&str> = path.trim_start_matches('/').split('/').collect();
+    let ["v1", "projects", owner, name, "objects", tracker, commit] = parts.as_slice() else {
+        return (400, json!({ "error": "not an objects path" }));
+    };
+    let repo = repos.join(format!("{owner}.{name}.t.{tracker}.git"));
+    let mut index = Command::new("git")
+        .args(["--git-dir", repo.as_str(), "index-pack", "--stdin", "--fix-thin"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("git runs");
+    index.stdin.take().expect("stdin").write_all(pack).expect("write the pack");
+    let indexed = index.wait_with_output().expect("index-pack");
+    if !indexed.status.success() {
+        return (400, json!({ "error": String::from_utf8_lossy(&indexed.stderr) }));
+    }
+    git(&repo, &["update-ref", &format!("refs/newgit/landing/{commit}"), commit]);
+    state.uploads.push(((*tracker).to_owned(), (*commit).to_owned()));
+    (200, json!({ "tracker": tracker, "commit": commit, "ref": format!("refs/newgit/landing/{commit}") }))
+}
+
 fn route(
     state: &Mutex<State>,
     repos: &Utf8Path,
@@ -482,6 +519,7 @@ fn route(
             names.sort();
             names.dedup();
             let mut credentials = Vec::new();
+            let mut writes = Vec::new();
             for tracker in names {
                 if base.get(tracker) == list.get(tracker) {
                     continue;
@@ -501,9 +539,13 @@ fn route(
                     continue;
                 }
                 if tracker == "root" || !on_main(repos, &key, tracker, new) {
-                    let mut seed = credential(&format!("{owner}.{name}.t.{tracker}"));
-                    seed["tracker"] = json!(tracker);
-                    credentials.push(seed);
+                    writes.push(json!(tracker));
+                    // Sent already: the remote moves its refs itself.
+                    if body["uploaded"] != json!(true) {
+                        let mut seed = credential(&format!("{owner}.{name}.t.{tracker}"));
+                        seed["tracker"] = json!(tracker);
+                        credentials.push(seed);
+                    }
                 }
             }
             state
@@ -513,7 +555,7 @@ fn route(
                 200,
                 // As the real remote: `begin` cannot read the merge's commits
             // yet, so it says root; the finish says where it landed.
-            json!({ "branch": branch, "until": "later", "credentials": credentials, "anchor": "root" }),
+            json!({ "branch": branch, "until": "later", "credentials": credentials, "anchor": "root", "writes": writes }),
             )
         }
         ("PUT", ["v1", "projects", owner, name, "branches", branch]) => {

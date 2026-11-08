@@ -54,6 +54,11 @@ pub use stale_render::{PossiblyStale, StaleRender};
 /// The store remote a workspace's `git push` is forwarded to.
 const PUBLISH_REMOTE: &str = "origin";
 
+/// The largest pack a merge sends the remote before it begins: under the
+/// Worker's own limit (`OBJECTS_MAX_BYTES` in remote/src/index.ts). A larger
+/// one (a first import) is pushed with a write password instead.
+const MERGE_UPLOAD_MAX_BYTES: usize = 90 * 1024 * 1024;
+
 /// Orchestrates branch-instance lifecycle against one store.
 #[derive(Debug)]
 pub struct BranchManager {
@@ -10228,26 +10233,63 @@ impl BranchManager {
                 let seed = client.create_tracker_repo(project_key, &merge.tracker)?;
                 push(&seed.credential, &merge.commit, "refs/heads/main", None)?;
             }
-            // The remote asks Git how each pin moves, and hands a write
-            // password for root and for each tracker whose `main` must catch
-            // up; whether this merge may make each move is its call, not ours.
-            let begun = client.begin_merge(project_key, into, &base, &list)?;
+            // Objects first, sent before the merge begins: the remote pushes
+            // each to its landing ref itself, so `begin` can read them (and
+            // say where the merge lands, and who approves it) and hands out
+            // no write password. Each commit this merge may land is sent;
+            // the remote says which it may move.
+            let mut sends: Vec<(&str, &str)> =
+                vec![(self.root.name.as_str(), merged_root.as_str())];
+            sends.extend(
+                mains
+                    .iter()
+                    .map(|(tracker, _, caught_up)| (tracker.as_str(), caught_up.as_str())),
+            );
+            if into != "main" {
+                sends.extend(
+                    moved
+                        .iter()
+                        .filter(|merge| {
+                            merge.tracker != self.root.name
+                                && merge.action != TrackerMergeAction::New
+                        })
+                        .map(|merge| (merge.tracker.as_str(), merge.commit.as_str())),
+                );
+            }
+            let uploaded = self.upload_merge_objects(client.as_ref(), project_key, &sends)?;
+            // The remote asks Git how each pin moves; whether this merge may
+            // make each move is its call, not ours. Without the upload it
+            // hands a write password for each tracker it may move.
+            let begun = client.begin_merge(project_key, into, &base, &list, uploaded)?;
             anchor = begun.anchor.clone();
             let credentials = begun.credentials;
+            let writes = begun.writes;
+            // What this merge may move: its password, or (sent already) none.
+            enum Lands<'a> {
+                Sent,
+                With(&'a crate::remote::RepoCredential),
+            }
             let credential_for = |tracker: &str| {
+                if uploaded {
+                    return writes
+                        .iter()
+                        .any(|write| write == tracker)
+                        .then_some(Lands::Sent);
+                }
                 credentials
                     .iter()
                     .find(|credential| credential.tracker == tracker)
-                    .map(|credential| &credential.credential)
+                    .map(|credential| Lands::With(&credential.credential))
             };
             // Objects first: each commit waits at a landing ref no one reads,
             // so nothing is held and another merge may run beside this one.
             // Pushing again after a run that stopped is harmless.
-            let land_at = |auth: &crate::remote::RepoCredential, commit: &str| {
-                push(auth, commit, &crate::remote::landing_ref(commit), None)
+            let land_at = |lands: Lands, commit: &str| match lands {
+                Lands::Sent => Ok(()),
+                Lands::With(auth) => push(auth, commit, &crate::remote::landing_ref(commit), None),
             };
-            if let Some(auth) = credential_for(&self.root.name) {
-                land_at(auth, &merged_root)?;
+            if let Some(lands) = credential_for(&self.root.name) {
+                land_at(lands, &merged_root)?;
             }
             let mut ref_moves = Vec::new();
             // On a branch other than `main`, a child's commit is kept on the
@@ -10256,10 +10298,10 @@ impl BranchManager {
                 for merge in moved.iter().filter(|merge| {
                     merge.tracker != self.root.name && merge.action != TrackerMergeAction::New
                 }) {
-                    let Some(auth) = credential_for(&merge.tracker) else {
+                    let Some(lands) = credential_for(&merge.tracker) else {
                         continue;
                     };
-                    land_at(auth, &merge.commit)?;
+                    land_at(lands, &merge.commit)?;
                     ref_moves.push(crate::remote::RefMove {
                         tracker: merge.tracker.clone(),
                         branch: into.to_owned(),
@@ -10272,10 +10314,10 @@ impl BranchManager {
                 }
             }
             for (tracker, before, caught_up) in &mains {
-                let Some(auth) = credential_for(tracker) else {
+                let Some(lands) = credential_for(tracker) else {
                     continue;
                 };
-                land_at(auth, caught_up)?;
+                land_at(lands, caught_up)?;
                 ref_moves.push(crate::remote::RefMove {
                     tracker: tracker.clone(),
                     branch: "main".to_owned(),
@@ -10373,6 +10415,55 @@ impl BranchManager {
             remote: client.map(|(_, project)| project),
             anchor,
         })
+    }
+
+    /// Send each of `sends` (a tracker, and its commit this merge lands) to
+    /// the remote before the merge begins: one thin pack each, of what the
+    /// tracker's repo lacks, judged by what was fetched from it. Whether all
+    /// went; false (and nothing lost) when the remote would not take one,
+    /// too large or from before uploads, and the merge pushes with a
+    /// password as it did.
+    fn upload_merge_objects(
+        &self,
+        client: &dyn Remote,
+        project: &str,
+        sends: &[(&str, &str)],
+    ) -> Result<bool> {
+        let repo = self.store.paths().project_root.clone();
+        for (tracker, commit) in sends {
+            let mut wants = format!("{commit}\n");
+            for have in crate::source::run_git_env(
+                &[
+                    "-C",
+                    repo.as_str(),
+                    "for-each-ref",
+                    "--format=%(objectname)",
+                    &format!("refs/newgit/remote/{tracker}/"),
+                ],
+                &[],
+            )?
+            .lines()
+            {
+                wants.push_str(&format!("^{have}\n"));
+            }
+            let pack = crate::objects::run(
+                std::process::Command::new("git")
+                    .arg("-C")
+                    .arg(repo.as_str())
+                    .args(["pack-objects", "--revs", "--thin", "--stdout", "-q"]),
+                "git pack-objects",
+                Some(wants.as_bytes()),
+            )?;
+            if pack.len() > MERGE_UPLOAD_MAX_BYTES {
+                return Ok(false);
+            }
+            match client.upload_objects(project, tracker, commit, &pack) {
+                Ok(()) => {}
+                Err(NewgitError::UploadRefused(_)) => return Ok(false),
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(true)
     }
 
     /// After a merge into `main`, bring the project root along when it can be

@@ -57,6 +57,7 @@ import { githubWebhook } from "./webhook";
 type Checking = typeof CHECKING;
 import type { Branch, Instance, ProjectDO, TrackerList } from "./project";
 import { type RefMove, followHead, followLanding } from "./follow";
+import { landingRef } from "./refs";
 import { ASK_GIT, historyTouches, nativeAncestry, nativeIndex, onlyPinsMoved } from "./walk";
 import { anchorOf, within } from "./anchor";
 import { parentOf } from "./project";
@@ -124,6 +125,12 @@ const stillChecking = () =>
 export function isChecking(answer: unknown): answer is Checking {
 	return typeof answer === "object" && answer !== null && (answer as { checking?: unknown }).checking === true;
 }
+
+/**
+ * The largest pack the Worker takes for a merge, under Workers' request
+ * limit. A larger one (a first import) is pushed with a write password.
+ */
+const OBJECTS_MAX_BYTES = 90 * 1024 * 1024;
 
 /** A merge's write passwords last this long: pushing the trackers' commits to landing refs. */
 const MERGE_PUSH_SECONDS = 10 * 60;
@@ -480,6 +487,41 @@ async function route(request: Request, env: Env, deps: Deps): Promise<Response> 
 
 	// Credentials are answered for non-members too: a public tracker is
 	// readable by anyone logged in, and a refusal should say why.
+	// A merge's commits, sent before it begins: the Worker pushes them to a
+	// landing ref itself, so `begin` can read them (and work out where the
+	// merge lands, and who approves it) and hands out no write password.
+	const objectsMatch = rest.match(/^\/objects\/([^/]+)\/([0-9a-f]{40})$/);
+	if (method === "POST" && objectsMatch) {
+		requireHuman(caller, "merge");
+		const tracker = decodeURIComponent(objectsMatch[1]);
+		const commit = objectsMatch[2];
+		requirePart("tracker name", tracker);
+		const size = Number(request.headers.get("content-length") ?? "");
+		if (!Number.isFinite(size) || size <= 0) throw new HttpError(411, "send the pack with its length");
+		if (size > OBJECTS_MAX_BYTES)
+			throw new HttpError(413, `a pack this large (${size} bytes) is pushed with a write password, not sent here`);
+		const facts = await definitionFacts(deps.repos, id, tracker, await listedTrackers(project));
+		if (facts === undefined) throw new HttpError(404, `tracker \`${tracker}\` is not defined on ${key}'s \`access\` \`main\``);
+		if (!facts.git) throw new HttpError(400, `\`${tracker}\` is not in Git; \`newgit merge\` never carries it`);
+		const read = decide({ kind: "tracker", project: id, tracker }, "read", { login, member }, { tracker: facts });
+		if (!read.ok) throw new HttpError(403, read.reason);
+		if (request.body === null) throw new HttpError(400, "the pack is the request's body");
+		const name = repoName({ kind: "tracker", project: id, tracker });
+		const ref = landingRef(commit);
+		const sent = await deps.repos
+			.sendPack(name, [{ ref, old: null, new: commit }], request.body)
+			.catch((error: unknown) => {
+				if ((error as { code?: string }).code === "NOT_FOUND") throw new HttpError(404, `${name} does not exist`);
+				throw error;
+			});
+		// Sent before (a run that stopped): the ref is there, and so is the commit.
+		if (!sent[ref] && (await deps.repos.refs(name))[ref] !== commit)
+			throw new HttpError(400, `${name} did not take the pack for ${commit}`);
+		if ((await deps.repos.readCommit(name, commit)) === null)
+			throw new HttpError(400, `the pack sent for ${commit} does not hold it`);
+		return json({ tracker, commit, ref });
+	}
+
 	if (method === "POST" && rest === "/credentials") {
 		const { repo, repos, scope = "read" } = await body<{
 			repo?: string;
@@ -608,9 +650,11 @@ async function route(request: Request, env: Env, deps: Deps): Promise<Response> 
 		// Merging is a person's decision: an agent proposes, a member merges.
 		requireHuman(caller, "merge");
 		const branch = decodeURIComponent(mergeMatch[1]);
-		const { base, list } = await body<{
+		const { base, list, uploaded } = await body<{
 			base?: Record<string, string>;
 			list?: Record<string, string>;
+			/** Its commits are at their landing refs already (`/objects`): no password needed. */
+			uploaded?: boolean;
 		}>(request);
 		if (!base || typeof base !== "object" || !list || typeof list !== "object")
 			throw new HttpError(400, "base (the index you merged onto) and list (the index the merge makes) are required");
@@ -734,7 +778,10 @@ async function route(request: Request, env: Env, deps: Deps): Promise<Response> 
 		await revokeRepoTokens(deps, started.stale);
 		const credentials = [];
 		const handed = [];
-		for (const tracker of writes) {
+		// Sent already: the Worker pushed them, and moves every ref itself.
+		// What the merge may move (`writes`) still stands; nobody gets a
+		// password to move it.
+		for (const tracker of uploaded === true ? [] : writes) {
 			const ref: RepoRef = { kind: "tracker", project: id, tracker };
 			const name = repoName(ref);
 			if ((await deps.repos.remote(name)) === null) throw new HttpError(404, `${name} does not exist`);
@@ -752,7 +799,7 @@ async function route(request: Request, env: Env, deps: Deps): Promise<Response> 
 			});
 		}
 		await project.recordMergeTokens(branch, list, handed);
-		return json({ branch, until: started.until, credentials, anchor });
+		return json({ branch, until: started.until, credentials, anchor, writes });
 	}
 
 	const branchMatch = rest.match(/^\/branches\/([^/]+)$/);

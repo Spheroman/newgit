@@ -185,9 +185,13 @@ the source of truth, and a mirror may trail it.
      anchor. The anchor's move is logged for its parent with the change's
      commit there (`via`).
    - Approval comes from the touched trackers' maintainers; above the anchor
-     nobody is asked. That holds where `begin` can already read the commits.
-     Where it can't (today, always), it asks as for root. Next: upload the
-     commits through the Worker before `begin`.
+     nobody is asked. The client sends its commits before `begin`
+     (`POST /objects/<tracker>/<commit>`, a thin pack the Worker pushes to
+     the landing ref itself), so `begin` reads them, works out the anchor,
+     and asks the right maintainers. It hands out no write password then:
+     the Worker moves every ref. A pack too large for the Worker (90 MiB),
+     or a remote from before uploads, takes the old way, and `begin` asks as
+     for root.
    - Reads roll up first: the project, `GET /branches`, a branch, the Git
      endpoint, and a webhook pull. One that cannot serves root's last commit,
      `behind`. Each landing also rolls root up after its answer, as the

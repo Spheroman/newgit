@@ -592,12 +592,18 @@ touched. Only the anchor and the trackers inside it are compared with the
 base and land; the trackers above roll up to it afterwards, written by the
 Worker (`remote/src/rollup.ts`). So two merges at different anchors do not
 wait on each other, and approval is the touched trackers' maintainers', not
-root's, as far as `begin` can tell: the client sends its commits with the
-passwords `begin` hands it, so a `begin` that cannot read them yet asks as
-for a landing at root, and a finish that finds the merge touching more than
-`begin` saw is refused. Uploading the commits before `begin` (through the
-Worker, so no write password is needed) is what makes the approval follow
-the anchor too. `begin` compares the base only for the trackers the merge
+root's. The client sends each commit it lands before `begin`: `POST
+/v1/projects/<o>/<p>/objects/<tracker>/<commit>`, a thin pack of what the
+tracker's repo lacks (judged by what was fetched from it), which the Worker
+streams into the repo's receive-pack with the commit's landing ref and a
+password of its own that lives a minute. Only a person may send one, for a
+tracker in Git they may read, up to 90 MiB. `begin` with `uploaded: true`
+then reads the commits, works out the anchor, asks the right maintainers,
+answers `writes` (the trackers whose refs the merge may ask to move), and
+mints no write password: the Worker moves every ref. A pack too large, or a
+remote from before uploads, takes the old way: `begin` hands passwords, and
+asks as for a landing at root since it cannot read the commits. A finish
+that finds the merge touching more than `begin` saw is refused. `begin` compares the base only for the trackers the merge
 moves; root is the finish's to compare. A pin that only follows its tracker's own `main` is the parent's
 choice, so its parent's maintainers are asked for that, as root's were
 before. A tracker above the anchor counts as touched if any commit the merge adds

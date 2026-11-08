@@ -79,6 +79,12 @@ pub enum NewgitError {
     #[error("could not reach the newgit remote at {url}: {detail}")]
     RemoteUnreachable { url: String, detail: String },
 
+    /// The remote would not take a merge's commits before it began (too
+    /// large for it, or a remote from before uploads): they are pushed with
+    /// a write password instead.
+    #[error("the remote would not take these commits before the merge began ({0})")]
+    UploadRefused(u16),
+
     #[error("not logged in to {0}; run `newgit login`")]
     NotLoggedIn(String),
 

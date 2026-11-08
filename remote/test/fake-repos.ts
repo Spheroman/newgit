@@ -99,6 +99,18 @@ export class FakeRepos implements Repos {
 		trees.set(hash, entries);
 	}
 
+	/** Packs sent through, by repo: what a client uploaded before a merge. */
+	readonly packs: { name: string; updates: RefUpdate[]; bytes: number }[] = [];
+	/**
+	 * A pack sent through. The fake cannot read a pack: a test adds the
+	 * objects it holds with `addCommit`/`addTree`, and the refs move.
+	 */
+	async sendPack(name: string, updates: RefUpdate[], pack: ReadableStream<Uint8Array>) {
+		const bytes = (await new Response(pack).arrayBuffer()).byteLength;
+		this.packs.push({ name, updates, bytes });
+		return this.updateRefs(name, updates);
+	}
+
 	/** Set a ref, as a push would. */
 	setRef(name: string, ref: string, commit: string) {
 		const refs = this.refsOf.get(name) ?? new Map<string, string>();

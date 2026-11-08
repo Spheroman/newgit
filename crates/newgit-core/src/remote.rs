@@ -213,7 +213,15 @@ pub trait Remote {
         branch: &str,
         base: &std::collections::BTreeMap<String, String>,
         list: &std::collections::BTreeMap<String, String>,
+        uploaded: bool,
     ) -> Result<BegunMerge>;
+    /// Send `pack`, holding `commit` and what `tracker`'s repo lacks of it,
+    /// before a merge begins: the remote pushes it to `commit`'s landing ref
+    /// itself. So `begin` can read the merge's commits, and needs to hand
+    /// out no write password. Too large, or a remote from before this:
+    /// [`UploadRefused`], and the merge pushes with a password as before.
+    fn upload_objects(&self, project: &str, tracker: &str, commit: &str, pack: &[u8])
+    -> Result<()>;
     /// Land it: `branch`'s list moves from `base` to `list` in one
     /// compare-and-swap, the merge's only commit point. Root's branch then
     /// follows, and each of `moves` is made. Where it landed, and what
@@ -694,6 +702,7 @@ impl Remote for HttpRemote {
         branch: &str,
         base: &std::collections::BTreeMap<String, String>,
         list: &std::collections::BTreeMap<String, String>,
+        uploaded: bool,
     ) -> Result<BegunMerge> {
         let started: BegunMerge = self.send_checked(
             "POST",
@@ -702,9 +711,60 @@ impl Remote for HttpRemote {
                 project_path(project),
                 segment(branch)
             ),
-            serde_json::json!({ "base": base, "list": list }),
+            serde_json::json!({ "base": base, "list": list, "uploaded": uploaded }),
         )?;
         Ok(started)
+    }
+
+    fn upload_objects(
+        &self,
+        project: &str,
+        tracker: &str,
+        commit: &str,
+        pack: &[u8],
+    ) -> Result<()> {
+        let path = format!(
+            "/v1/projects/{}/objects/{}/{commit}",
+            project_path(project),
+            segment(tracker)
+        );
+        let started = std::time::Instant::now();
+        // Its own agent: a pack takes longer than the sixty seconds any
+        // other request may.
+        let agent: ureq::Agent = ureq::Agent::config_builder()
+            .http_status_as_error(false)
+            .timeout_global(Some(Duration::from_secs(10 * 60)))
+            .build()
+            .into();
+        let mut request = agent
+            .post(format!("{}{path}", self.url))
+            .header("content-type", "application/x-git-packfile");
+        if let Some(token) = &self.token {
+            request = request.header("authorization", format!("Bearer {token}"));
+        }
+        let unreachable = |error: ureq::Error| NewgitError::RemoteUnreachable {
+            url: self.url.clone(),
+            detail: error.to_string(),
+        };
+        let mut response = request.send(pack).map_err(unreachable)?;
+        let status = response.status().as_u16();
+        let text = response.body_mut().read_to_string().map_err(unreachable)?;
+        if std::env::var_os("NEWGIT_TRACE").is_some_and(|value| !value.is_empty() && value != "0") {
+            eprintln!(
+                "newgit trace: POST {path} {status} {}ms ({} bytes)",
+                started.elapsed().as_millis(),
+                pack.len()
+            );
+        }
+        if (200..300).contains(&status) {
+            return Ok(());
+        }
+        // Too large for the Worker, or a remote without the route: the
+        // merge pushes with a password instead.
+        if status == 413 || status == 404 && text.contains("no route") {
+            return Err(NewgitError::UploadRefused(status));
+        }
+        Err(remote_error_on("POST", &path, status, &text))
     }
 
     fn finish_merge(
@@ -1069,6 +1129,10 @@ pub fn workspace_token(workspace: &Utf8Path) -> Result<Option<String>> {
 #[derive(Debug, Clone, Deserialize)]
 pub struct BegunMerge {
     pub credentials: Vec<SeedCredential>,
+    /// The trackers whose refs this merge may ask to move. Empty from a
+    /// remote that does not say, which hands a password for each instead.
+    #[serde(default)]
+    pub writes: Vec<String>,
     /// The lowest tracker covering everything the merge touches; the
     /// trackers above it roll up to it. None from a remote before anchors.
     #[serde(default)]

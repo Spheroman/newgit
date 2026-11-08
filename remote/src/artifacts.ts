@@ -10,7 +10,7 @@ export interface MintedToken {
 }
 
 import { type GitObject, packObjects } from "./objects";
-import { parseAdvertisement, parseReport, type RefUpdate, receivePackBody } from "./refs";
+import { parseAdvertisement, parseReport, type RefUpdate, receivePackBody, receivePackCommands } from "./refs";
 
 /** What the Worker reads of a commit, straight from Artifacts. */
 export interface CommitFacts {
@@ -54,6 +54,11 @@ export interface Repos {
 	 * first when they are new to the repo. Per ref, whether it moved: one that did not held something else.
 	 */
 	updateRefs(name: string, updates: RefUpdate[], objects?: GitObject[]): Promise<Record<string, boolean>>;
+	/**
+	 * Push `pack`, a Git pack as a client sends one (thin is fine: the repo
+	 * completes it from what it has), with `updates`, streamed through.
+	 */
+	sendPack(name: string, updates: RefUpdate[], pack: ReadableStream<Uint8Array>): Promise<Record<string, boolean>>;
 }
 
 /** Artifacts tokens are `art_v…_<secret>?expires=<unix>`; Git wants the part before `?`. */
@@ -202,6 +207,32 @@ export class ArtifactsRepos implements Repos {
 				body: await receivePackBody(updates, pack),
 			});
 			if (!response.ok) throw new Error(`${name}: moving refs answered ${response.status}`);
+			return parseReport(new Uint8Array(await response.arrayBuffer()), updates);
+		});
+	}
+
+	async sendPack(name: string, updates: RefUpdate[], pack: ReadableStream<Uint8Array>) {
+		return this.withPassword(name, async (auth) => {
+			// The commands, then the client's pack as it arrives: never held whole.
+			const { readable, writable } = new TransformStream<Uint8Array, Uint8Array>();
+			const writing = (async () => {
+				const writer = writable.getWriter();
+				await writer.write(receivePackCommands(updates));
+				writer.releaseLock();
+				await pack.pipeTo(writable);
+			})();
+			const response = await fetch(`${this.url(name)}/git-receive-pack`, {
+				method: "POST",
+				headers: {
+					authorization: auth,
+					"user-agent": USER_AGENT,
+					"content-type": "application/x-git-receive-pack-request",
+					accept: "application/x-git-receive-pack-result",
+				},
+				body: readable,
+			});
+			await writing;
+			if (!response.ok) throw new Error(`${name}: the pack was answered ${response.status}`);
 			return parseReport(new Uint8Array(await response.arrayBuffer()), updates);
 		});
 	}
