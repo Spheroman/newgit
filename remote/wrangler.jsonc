@@ -16,6 +16,8 @@
   "durable_objects": {
     "bindings": [
       { "class_name": "ProjectDO", "name": "PROJECTS" },
+      // One per tracker path: its heads, log, inbox, and outbox (src/tracker-do.ts).
+      { "class_name": "TrackerDO", "name": "TRACKERS" },
       { "class_name": "UserDO", "name": "USERS" },
       // One per project: the Git endpoint's container (src/endpoint.ts).
       { "class_name": "GitEndpoint", "name": "ENDPOINTS" },
@@ -27,7 +29,8 @@
     { "tag": "v1", "new_sqlite_classes": ["ProjectDO"] },
     { "tag": "v2", "new_sqlite_classes": ["UserDO"] },
     { "tag": "v3", "new_sqlite_classes": ["GitEndpoint"] },
-    { "tag": "v4", "new_sqlite_classes": ["BudgetDO"] }
+    { "tag": "v4", "new_sqlite_classes": ["BudgetDO"] },
+    { "tag": "v5", "new_sqlite_classes": ["TrackerDO"] }
   ],
   // Hourly: check the last 7 days' spend against the weekly budget (src/budget.ts).
   "triggers": { "crons": ["0 * * * *"] },
@@ -65,6 +68,8 @@
       "durable_objects": {
         "bindings": [
           { "class_name": "ProjectDO", "name": "PROJECTS" },
+      // One per tracker path: its heads, log, inbox, and outbox (src/tracker-do.ts).
+      { "class_name": "TrackerDO", "name": "TRACKERS" },
           { "class_name": "UserDO", "name": "USERS" },
           { "class_name": "GitEndpoint", "name": "ENDPOINTS" },
           { "class_name": "BudgetDO", "name": "BUDGET" }

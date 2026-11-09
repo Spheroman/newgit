@@ -225,9 +225,13 @@ Facts from the docs (2026-10), because the design leans on each one.
   `newgit remove`. A private instance's forks (`newgit spawn --private`) are
   readable only by its owner, and its record and checkpoints are hidden
   from everyone else until its work is merged.
-- **Branches** are lists — one commit per tracker in Git — in the project's
-  Durable Object, where a merge moves one by compare-and-swap.
-- **The Git endpoint**, `https://newgit.dev/<owner>/<name>.git`, is what
+- **Branches** are lists, one commit per tracker in Git. Each tracker's
+  head lives in its own Durable Object, named by its path
+  (`TrackerDO`, docs/design/anchoring.md, *Step 8*). The project's object
+  keeps which trackers a branch has. A landing moves one tracker by
+  compare-and-swap, or several in two phases.
+- **The Git endpoint**, `https://newgit.dev/<owner>/<name>.git` (or
+  `/<owner>/<name>/<path>.git` for a view rooted at the tracker at that path), is what
   `git clone`, `git pull`, and a workspace's `origin` fetch: each branch
   composed, in the project's container, from the trackers the caller may
   read (*The Git endpoint* in [trackers.md](trackers.md#on-the-remote);

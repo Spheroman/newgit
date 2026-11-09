@@ -42,6 +42,15 @@ pub struct Plan {
     /// server reads even when the reader may not, and never serves unless
     /// listed above.
     pub repos: BTreeMap<String, Source>,
+    /// The tracker the view is rooted at: root's view by default, or the
+    /// tracker a path names (`/spheroman/newgit/t3code.git`), its files at
+    /// the top and its own children mounted.
+    #[serde(default = "root_tracker")]
+    pub root: String,
+}
+
+fn root_tracker() -> String {
+    ROOT_TRACKER.to_owned()
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -260,6 +269,8 @@ impl Stores {
 
 /// Compose `plan` into a bare repository and return its path.
 pub fn compose_view(plan: &Plan) -> Result<Utf8PathBuf> {
+    let root = plan.root.clone();
+    let root = root.as_str();
     let stores = Stores::open(&plan.dir)?;
     let views = plan.dir.join("views");
     std::fs::create_dir_all(&views).map_err(|source| NewgitError::io(&views, source))?;
@@ -285,29 +296,22 @@ pub fn compose_view(plan: &Plan) -> Result<Utf8PathBuf> {
     // tracker's repo has it: a commit being *somewhere* here proves nothing
     // — a branch could name another tracker's commit under this tracker's
     // name.
-    let roots = wanted.remove(ROOT_TRACKER).unwrap_or_default();
+    let roots = wanted.remove(root).unwrap_or_default();
     let known = |held: &Held, commit: &String| {
-        held.get(ROOT_TRACKER)
+        held.get(root)
             .is_some_and(|history| history.contains(commit))
     };
     if !roots.iter().all(|commit| known(&held, commit)) {
-        let source = plan.repos.get(ROOT_TRACKER).ok_or_else(|| {
-            NewgitError::Unsupported(format!(
-                "the plan names `{ROOT_TRACKER}` but not where it is"
-            ))
+        let source = plan.repos.get(root).ok_or_else(|| {
+            NewgitError::Unsupported(format!("the plan names `{root}` but not where it is"))
         })?;
         GitSource::fetch_refs(
             &[&format!("--git-dir={}", stores.whole)],
             &source.url,
-            &[format!(
-                "+refs/heads/*:refs/trackers/{ROOT_TRACKER}/heads/*"
-            )],
+            &[format!("+refs/heads/*:refs/trackers/{root}/heads/*")],
             Some(&source.auth),
         )?;
-        held.extend(tracker_histories(
-            &stores.whole,
-            [ROOT_TRACKER.to_owned()].iter(),
-        ));
+        held.extend(tracker_histories(&stores.whole, [root.to_owned()].iter()));
     }
     // What each branch names now, so a view composed already serves at once.
     stores.snapshot(&plan.repos, &wanted, &mut held)?;
@@ -332,11 +336,11 @@ pub fn compose_view(plan: &Plan) -> Result<Utf8PathBuf> {
             eprintln!("newgit: branch `{branch}` names commits its trackers do not have: {bad:?}");
         }
         for tracker in &bad {
-            if tracker != ROOT_TRACKER {
+            if tracker != root {
                 list.remove(tracker);
             }
         }
-        !bad.iter().any(|tracker| tracker == ROOT_TRACKER) && list.contains_key(ROOT_TRACKER)
+        !bad.iter().any(|tracker| tracker == root) && list.contains_key(root)
     });
     if !plan.branches.contains_key(&plan.default_branch) {
         return Err(NewgitError::Unsupported(format!(
@@ -358,7 +362,7 @@ pub fn compose_view(plan: &Plan) -> Result<Utf8PathBuf> {
     let tips: Vec<String> = plan
         .branches
         .values()
-        .map(|list| list[ROOT_TRACKER].clone())
+        .map(|list| list[root].clone())
         .collect();
     let mut walk = vec![
         format!("--git-dir={store}"),
@@ -381,10 +385,10 @@ pub fn compose_view(plan: &Plan) -> Result<Utf8PathBuf> {
         };
         compose::compose(
             &store,
-            ROOT_TRACKER,
+            root,
             &[(
                 format!("refs/views/{key}/heads/{branch}"),
-                list[ROOT_TRACKER].clone(),
+                list[root].clone(),
             )],
             &compose::ComposeOptions {
                 readable: &readable,
@@ -571,6 +575,10 @@ fn in_tracker(store: &Utf8Path, tracker: &str, commit: &str) -> bool {
 fn plan_key(plan: &Plan) -> String {
     let mut hasher = Sha256::new();
     hasher.update(plan.default_branch.as_bytes());
+    // A view rooted elsewhere is another view, whatever it lists.
+    if plan.root != ROOT_TRACKER {
+        hasher.update(format!("\nroot={}", plan.root).as_bytes());
+    }
     for (branch, list) in &plan.branches {
         hasher.update(format!("\n{branch}").as_bytes());
         for (tracker, commit) in list {

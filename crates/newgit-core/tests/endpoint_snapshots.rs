@@ -370,6 +370,7 @@ fn plan_for(project: &Published, container: &Utf8Path, readable: &[&str]) -> Pla
         .filter(|(tracker, _)| tracker == "access" || list.contains_key(tracker))
         .collect();
     Plan {
+        root: "root".to_owned(),
         dir: container.to_path_buf(),
         branches: BTreeMap::from([("main".to_owned(), list)]),
         default_branch: "main".to_owned(),

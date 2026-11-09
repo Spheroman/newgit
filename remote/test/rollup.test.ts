@@ -104,9 +104,11 @@ async function consistent(): Promise<void> {
 	expect(await nativeIndex(repos, repoOf, list)).toEqual({ matches: true, actual: list });
 }
 
-beforeEach(() => {
+beforeEach(async () => {
 	repos = new FakeRepos();
-	project = env.PROJECTS.getByName(`jack/rollup-${crypto.randomUUID().slice(0, 8)}`);
+	const name = `rollup-${crypto.randomUUID().slice(0, 8)}`;
+	project = env.PROJECTS.getByName(`jack/${name}`);
+	await project.init(name, "jack");
 });
 
 describe("rolling up", () => {

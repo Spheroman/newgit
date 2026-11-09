@@ -8,6 +8,7 @@ interface __BaseEnv_Env {
 	ARTIFACTS_GIT_BASE: "https://bce0b38de721f350c8d8a51d0520337d.artifacts.cloudflare.net/git/newgit";
 	LANDING_PAGE: {"project":"spheroman/newgit","tracker":"site","path":"remote/site/index.html"};
 	PROJECTS: DurableObjectNamespace<import("./index").ProjectDO>;
+	TRACKERS: DurableObjectNamespace<import("./index").TrackerDO>;
 	USERS: DurableObjectNamespace<import("./index").UserDO>;
 	ENDPOINTS: DurableObjectNamespace<import("./index").GitEndpoint>;
 	BUDGET: DurableObjectNamespace<import("./index").BudgetDO>;
@@ -15,7 +16,7 @@ interface __BaseEnv_Env {
 declare namespace Cloudflare {
 	interface GlobalProps {
 		mainModule: typeof import("./index");
-		durableNamespaces: "ProjectDO" | "UserDO" | "GitEndpoint" | "BudgetDO";
+		durableNamespaces: "ProjectDO" | "TrackerDO" | "UserDO" | "GitEndpoint" | "BudgetDO";
 	}
 	interface Env extends __BaseEnv_Env {}
 }

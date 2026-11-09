@@ -67,6 +67,7 @@ import type { UserDO } from "./users";
 export { BudgetDO } from "./budget";
 export { GitEndpoint } from "./endpoint";
 export { ProjectDO } from "./project";
+export { TrackerDO } from "./tracker-do";
 export { UserDO } from "./users";
 
 /** Who a request acts as, after the token was verified and found unrevoked. */
@@ -1179,7 +1180,11 @@ class MintedPasswords {
 const mintedPasswords = new MintedPasswords();
 
 /** `/<owner>/<name>.git/info/refs` and `/<owner>/<name>.git/git-upload-pack`. */
-const GIT_ROUTE = /^\/([^/]+)\/([^/]+?)\.git\/(info\/refs|git-upload-pack|git-receive-pack)$/;
+/**
+ * `/<owner>/<name>.git`, the root's view, or `/<owner>/<name>/<path>.git`, a
+ * view rooted at the tracker at that path (`/spheroman/newgit/t3code.git`).
+ */
+const GIT_ROUTE = /^\/([^/]+)\/([^/]+?)((?:\/[^/]+?)*)\.git\/(info\/refs|git-upload-pack|git-receive-pack)$/;
 
 /**
  * Answer a Git client: `git clone https://newgit.dev/<owner>/<name>.git`
@@ -1203,7 +1208,7 @@ async function answerGit(
 	timing: Timing,
 ): Promise<Response> {
 	const url = new URL(request.url);
-	const service = match[3] === "info/refs" ? url.searchParams.get("service") : match[3];
+	const service = match[4] === "info/refs" ? url.searchParams.get("service") : match[4];
 	if (service === "git-receive-pack")
 		throw new HttpError(
 			403,
@@ -1268,20 +1273,25 @@ async function answerGit(
 
 	// Each branch, cut down to the trackers in Git this caller may read. A
 	// branch is root's ref, so one whose root they cannot read is not served.
-	const plan: EndpointPlan = { dir: "/work", branches: {}, default_branch: info.defaultBranch, repos: {} };
+	// The tracker the view is rooted at: root, or the one the path names.
+	const path = (match[3] ?? "").split("/").filter((part) => part !== "").map(decodeURIComponent);
+	const root = path.length === 0 ? "root" : path.join("__");
+	const plan: EndpointPlan = { dir: "/work", branches: {}, default_branch: info.defaultBranch, repos: {}, root };
 	// `access` always: the container reads every mount from its content,
 	// even for a reader who may not read it. It is served only where listed.
 	const needed = new Set<string>(["access"]);
 	for (const branch of branches) {
-		if (!branch.list.root || !readable("root")) continue;
+		if (!branch.list[root] || !readable(root)) continue;
 		const list: Record<string, string> = {};
 		for (const [tracker, commit] of Object.entries(branch.list)) {
-			if (!readable(tracker)) continue;
+			if (!within(tracker, root) || !readable(tracker)) continue;
 			list[tracker] = commit;
 			needed.add(tracker);
 		}
 		plan.branches[branch.name] = list;
 	}
+	if (root !== "root" && Object.keys(plan.branches).length === 0 && !branches.some((branch) => branch.list[root]))
+		throw new HttpError(404, `${key} has no tracker at \`${path.join("/")}\``);
 	if (Object.keys(plan.branches).length === 0)
 		throw new HttpError(who.member ? 403 : 404, who.member ? `nothing in ${key} is yours to read` : `no project \`${key}\``);
 
@@ -1302,7 +1312,7 @@ async function answerGit(
 	timing.set("branches", Object.keys(plan.branches).length);
 	timing.set("trackers", needed.size);
 	return timing.span("endpoint", () =>
-		deps.endpoint(key, service === match[3] ? "upload-pack" : "advertise", plan, request),
+		deps.endpoint(key, service === match[4] ? "upload-pack" : "advertise", plan, request),
 	);
 }
 

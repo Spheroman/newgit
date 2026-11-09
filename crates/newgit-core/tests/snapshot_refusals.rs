@@ -124,6 +124,7 @@ fn container_refused_ids(temp: &Utf8Path) -> Utf8PathBuf {
 
 fn plan(container: &Utf8Path, root: (&Utf8Path, &str), child: (&Utf8Path, &str)) -> Plan {
     Plan {
+        root: "root".to_owned(),
         dir: container.to_path_buf(),
         branches: BTreeMap::from([(
             "main".to_owned(),

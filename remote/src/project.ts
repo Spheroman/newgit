@@ -9,6 +9,7 @@
 import { DurableObject } from "cloudflare:workers";
 
 import { within } from "./anchor";
+import { type TrackerDO, type TrackerRef, trackerPath } from "./tracker-do";
 import { liveDeps } from "./index";
 import type { MirrorInstance } from "./endpoint";
 import { SWEEP_EVERY_MS, sweep } from "./sweep";
@@ -183,12 +184,6 @@ export class ProjectDO extends DurableObject<Env> {
 			this.sql.exec("ALTER TABLE head_log ADD COLUMN via TEXT");
 		} catch {}
 		this.adoptLists();
-		// Every head is rolled up through the log as it is now unless it says
-		// otherwise: a commit made by a merge pins its children already.
-		this.sql.exec(
-			`INSERT OR IGNORE INTO rollups (branch, tracker, seq)
-			 SELECT branch, tracker, (SELECT COALESCE(MAX(seq), 0) FROM head_log) FROM heads`,
-		);
 		// Projects made before private instances: add the column (a no-op error otherwise).
 		try {
 			this.sql.exec("ALTER TABLE instances ADD COLUMN private INTEGER NOT NULL DEFAULT 0");
@@ -202,172 +197,142 @@ export class ProjectDO extends DurableObject<Env> {
 
 	/**
 	 * Give every branch from before per-tracker heads its heads, from its
-	 * list, once. Logged as moved by nobody, from nothing: what was there.
+	 * list, once, in the legacy table a tracker's own object adopts from.
 	 */
 	private adoptLists(): void {
 		const unadopted = this.sql
-			.exec<BranchRow>(
-				"SELECT * FROM branches WHERE name NOT IN (SELECT DISTINCT branch FROM heads)",
-			)
+			.exec<BranchRow>("SELECT * FROM branches WHERE name NOT IN (SELECT DISTINCT branch FROM heads)")
 			.toArray();
-		if (unadopted.length === 0) return;
-		this.ctx.storage.transactionSync(() => {
-			for (const row of unadopted) {
-				const list = JSON.parse(row.list) as TrackerList;
-				this.moveHeads(row.name, {}, list, "", row.updated_at);
-			}
-		});
+		for (const row of unadopted)
+			for (const [tracker, commit] of Object.entries(JSON.parse(row.list) as TrackerList))
+				if (commit) this.sql.exec("INSERT OR IGNORE INTO heads VALUES (?, ?, ?)", row.name, tracker, commit);
+	}
+
+	// ── Heads: each tracker's own object (src/tracker-do.ts) ─────────────
+
+	/** This project's key, `owner/name`: the root tracker's path. */
+	private key(): string {
+		const info = this.info();
+		return info === null ? "" : `${info.owner.toLowerCase()}/${info.name}`;
+	}
+
+	private refOf(tracker: string): TrackerRef {
+		const project = this.key();
+		// Never an object named for no project: every nameless one would share it.
+		if (project === "") throw new Error("this project does not exist: its trackers have no path");
+		return { project, tracker };
+	}
+
+	private trackerObject(tracker: string): DurableObjectStub<TrackerDO> {
+		return this.env.TRACKERS.getByName(trackerPath(this.refOf(tracker)));
 	}
 
 	/**
-	 * Set `name`'s heads from `from` to `to`, logging each tracker that moves,
-	 * and keep the branch's list in step. Run inside a transaction.
-	 *
-	 * The list is written too, so a Worker from before heads, after a rollback,
-	 * still reads the truth. It goes once no deploy can be rolled back past this.
+	 * A head this object kept before trackers had objects of their own,
+	 * handed to the tracker's object the first time it asks. It keeps no
+	 * copy it would trust after.
 	 */
-	private moveHeads(name: string, from: TrackerList, to: TrackerList, by: string, at: string): void {
-		for (const tracker of new Set([...Object.keys(from), ...Object.keys(to)])) {
-			const old = from[tracker] ?? null;
-			const now = to[tracker] ?? null;
-			if (old === now) continue;
-			if (now === null) this.sql.exec("DELETE FROM heads WHERE branch = ? AND tracker = ?", name, tracker);
-			else this.sql.exec("INSERT OR REPLACE INTO heads VALUES (?, ?, ?)", name, tracker, now);
-			this.sql.exec(
-				"INSERT INTO head_log (branch, tracker, old, new, moved_by, moved_at) VALUES (?, ?, ?, ?, ?, ?)",
-				name,
-				tracker,
-				old,
-				now,
-				by,
-				at,
-			);
-		}
-		this.sql.exec("UPDATE branches SET list = ?, updated_at = ? WHERE name = ?", JSON.stringify(to), at, name);
-		// A list lands whole, its root commit checked to pin every head in
-		// it: each tracker it moved has nothing left to roll up.
-		const through = this.lastSeq();
-		for (const tracker of Object.keys(to))
-			if (from[tracker] !== to[tracker])
-				this.sql.exec("INSERT OR REPLACE INTO rollups VALUES (?, ?, ?)", name, tracker, through);
+	handOff(tracker: string, branch: string): string | null {
+		return (
+			this.sql
+				.exec<{ commit_id: string }>("SELECT commit_id FROM heads WHERE branch = ? AND tracker = ?", branch, tracker)
+				.toArray()[0]?.commit_id ?? null
+		);
 	}
 
-	private lastSeq(): number {
-		return this.sql.exec<{ seq: number }>("SELECT COALESCE(MAX(seq), 0) AS seq FROM head_log").one().seq;
+	/** The trackers `name` lists: which objects to ask for its heads. */
+	private trackersOf(name: string): string[] {
+		const row = this.sql.exec<{ list: string }>("SELECT list FROM branches WHERE name = ?", name).toArray()[0];
+		return row ? Object.keys(JSON.parse(row.list) as TrackerList) : [];
 	}
 
-	/**
-	 * Move one head by compare-and-swap, logged: refused, changing nothing,
-	 * unless `tracker`'s head on `name` is `old` now. `via` is the commit the
-	 * change made in the tracker's parent, if any.
-	 */
-	moveHead(name: string, tracker: string, old: string | null, next: string, by: string, via: string | null = null): boolean {
-		if (this.head(name, tracker) !== old) return false;
-		this.ctx.storage.transactionSync(() => {
-			this.writeHead(name, tracker, old, next, by, via);
-			if (old === null) this.sql.exec("INSERT OR REPLACE INTO rollups VALUES (?, ?, ?)", name, tracker, this.lastSeq());
-		});
-		return true;
-	}
-
-	private writeHead(name: string, tracker: string, old: string | null, next: string, by: string, via: string | null) {
-		const at = new Date().toISOString();
-		this.sql.exec("INSERT OR REPLACE INTO heads VALUES (?, ?, ?)", name, tracker, next);
+	private writeTrackers(name: string, list: TrackerList): void {
 		this.sql.exec(
-			"INSERT INTO head_log (branch, tracker, old, new, moved_by, moved_at, via) VALUES (?, ?, ?, ?, ?, ?, ?)",
+			"UPDATE branches SET list = ?, updated_at = ? WHERE name = ?",
+			JSON.stringify(list),
+			new Date().toISOString(),
 			name,
-			tracker,
-			old,
-			next,
-			by,
-			at,
-			via,
 		);
-		const list = this.headsOf(name);
-		this.sql.exec("UPDATE branches SET list = ?, updated_at = ? WHERE name = ?", JSON.stringify(list), at, name);
-	}
-
-	/**
-	 * What `parent` has not rolled up on `name`: every move of a tracker
-	 * mounted in it since its last roll-up (or the list that last moved
-	 * it), oldest first.
-	 */
-	pending(name: string, parent: string): HeadMove[] {
-		const through =
-			this.sql
-				.exec<{ seq: number }>("SELECT seq FROM rollups WHERE branch = ? AND tracker = ?", name, parent)
-				.toArray()[0]?.seq ?? 0;
-		return this.sql
-			.exec<HeadMoveRow>("SELECT * FROM head_log WHERE branch = ? AND seq > ? ORDER BY seq", name, through)
-			.toArray()
-			.filter((row) => parentOf(row.tracker) === parent && row.new !== null)
-			.map(toMove);
-	}
-
-	/** The branches with moves not rolled up yet. */
-	pendingBranches(): string[] {
-		return this.sql
-			.exec<{ name: string }>("SELECT name FROM branches ORDER BY name")
-			.toArray()
-			.map((row) => row.name)
-			.filter((name) => this.hasPending(name));
-	}
-
-	/** Whether any tracker on `name` has moves its parent has not rolled up. */
-	hasPending(name: string): boolean {
-		const through = new Map(
-			this.sql
-				.exec<{ tracker: string; seq: number }>("SELECT tracker, seq FROM rollups WHERE branch = ?", name)
-				.toArray()
-				.map((row) => [row.tracker, row.seq]),
-		);
-		const oldest = Math.min(...[...through.values(), Number.MAX_SAFE_INTEGER]);
-		return this.sql
-			.exec<{ tracker: string; seq: number; new: string | null }>(
-				"SELECT tracker, seq, new FROM head_log WHERE branch = ? AND seq > ?",
-				name,
-				oldest === Number.MAX_SAFE_INTEGER ? 0 : oldest,
-			)
-			.toArray()
-			.some((row) => {
-				const parent = parentOf(row.tracker);
-				return parent !== null && row.new !== null && row.seq > (through.get(parent) ?? 0);
-			});
-	}
-
-	/**
-	 * A roll-up's one commit point: `parent`'s head from `old` to `next`, by
-	 * compare-and-swap, and everything through log entry `through` rolled up.
-	 */
-	rolledUp(name: string, parent: string, old: string, next: string, through: number): boolean {
-		if (this.head(name, parent) !== old) return false;
-		this.ctx.storage.transactionSync(() => {
-			// Nothing new to write is still progress, and moves nothing above.
-			if (next !== old) this.writeHead(name, parent, old, next, "roll-up", null);
-			this.sql.exec("INSERT OR REPLACE INTO rollups VALUES (?, ?, ?)", name, parent, through);
-		});
-		return true;
 	}
 
 	/** Each tracker's head on `name`: what a branch's list is now. */
-	private headsOf(name: string): TrackerList {
+	private async headsOf(name: string): Promise<TrackerList> {
+		const trackers = this.trackersOf(name);
+		const heads = await Promise.all(
+			trackers.map((tracker) => this.trackerObject(tracker).head(this.refOf(tracker), name)),
+		);
 		const list: TrackerList = {};
-		for (const row of this.sql
-			.exec<{ tracker: string; commit_id: string }>(
-				"SELECT tracker, commit_id FROM heads WHERE branch = ? ORDER BY tracker",
-				name,
-			)
-			.toArray())
-			list[row.tracker] = row.commit_id;
+		trackers.forEach((tracker, index) => {
+			const head = heads[index];
+			if (head !== null) list[tracker] = head;
+		});
 		return list;
 	}
 
-	/** Every head that moved on `name` after `since` (0: all of them), oldest first. */
-	headLog(name: string, since = 0): HeadMove[] {
+	/**
+	 * Move one head by compare-and-swap, in its own object: refused, changing
+	 * nothing, unless it is `old` now. `via` is the commit the change made in
+	 * the tracker's parent, if any.
+	 */
+	async moveHead(
+		name: string,
+		tracker: string,
+		old: string | null,
+		next: string,
+		by: string,
+		via: string | null = null,
+	): Promise<boolean> {
+		const moved = await this.trackerObject(tracker).cas(this.refOf(tracker), name, old, next, by, via);
+		if (moved && !this.trackersOf(name).includes(tracker))
+			this.writeTrackers(name, { ...(JSON.parse(this.listRow(name)) as TrackerList), [tracker]: next });
+		return moved;
+	}
+
+	private listRow(name: string): string {
+		return this.sql.exec<{ list: string }>("SELECT list FROM branches WHERE name = ?", name).toArray()[0]?.list ?? "{}";
+	}
+
+	/** A parent's object heard of a child's move: `name` has something to roll up. */
+	markPending(name: string): void {
+		this.sql.exec("INSERT OR REPLACE INTO meta VALUES (?, '1')", `pending:${name}`);
+	}
+
+	/** What `parent` has not rolled up on `name`, oldest first. */
+	async pending(name: string, parent: string): Promise<HeadMove[]> {
+		return this.trackerObject(parent).pending(this.refOf(parent), name);
+	}
+
+	/** The branches with moves not rolled up yet, as their parents said. */
+	pendingBranches(): string[] {
 		return this.sql
-			.exec<HeadMoveRow>("SELECT * FROM head_log WHERE branch = ? AND seq > ? ORDER BY seq", name, since)
+			.exec<{ key: string }>("SELECT key FROM meta WHERE key LIKE 'pending:%'")
 			.toArray()
-			.map(toMove);
+			.map((row) => row.key.slice("pending:".length));
+	}
+
+	/** Whether any tracker on `name` has moves its parent has not rolled up; none forgets the mark. */
+	async hasPending(name: string): Promise<boolean> {
+		const parents = [...new Set(this.trackersOf(name).map(parentOf))].filter((parent) => parent !== null);
+		const counts = await Promise.all(parents.map((parent) => this.pending(name, parent)));
+		const any = counts.some((moves) => moves.length > 0);
+		if (!any) this.sql.exec("DELETE FROM meta WHERE key = ?", `pending:${name}`);
+		return any;
+	}
+
+	/** A roll-up's one commit point, in the parent's own object. */
+	async rolledUp(name: string, parent: string, old: string, next: string, through: number): Promise<boolean> {
+		return this.trackerObject(parent).rolledUp(this.refOf(parent), name, old, next, through);
+	}
+
+	/** Every head that moved on `name`, every tracker's, oldest first; `since` of them skipped. */
+	async headLog(name: string, since = 0): Promise<HeadMove[]> {
+		const logs = await Promise.all(
+			this.trackersOf(name).map((tracker) => this.trackerObject(tracker).log(this.refOf(tracker), name)),
+		);
+		return logs
+			.flat()
+			.sort((left, right) => left.movedAt.localeCompare(right.movedAt) || left.seq - right.seq)
+			.slice(since);
 	}
 
 	/** Create the project. Returns false when it already exists. */
@@ -375,7 +340,7 @@ export class ProjectDO extends DurableObject<Env> {
 		if (this.info() !== null) return false;
 		// A deleted project's name is free again: start from nothing, even if
 		// a request in flight during the delete wrote a row after it.
-		this.destroy();
+		this.clearRows();
 		const now = new Date().toISOString();
 		this.sql.exec(
 			"INSERT INTO meta VALUES ('name', ?), ('owner', ?), ('created_at', ?), ('default_branch', 'main')",
@@ -392,8 +357,22 @@ export class ProjectDO extends DurableObject<Env> {
 	 * created again. `meta` goes first, so the project is gone to every
 	 * request from then on. The tables stay; this object keeps running on them.
 	 */
-	destroy(): void {
-		for (const table of ["meta", "members", "branches", "instances", "forks", "checkpoints"])
+	async destroy(): Promise<void> {
+		// Its trackers' objects first, while their names are still known: a
+		// project made again under this name starts from nothing.
+		const trackers = new Set(
+			this.sql
+				.exec<{ list: string }>("SELECT list FROM branches")
+				.toArray()
+				.flatMap((row) => Object.keys(JSON.parse(row.list) as TrackerList)),
+		);
+		if (this.info() !== null)
+			await Promise.all([...trackers].map((tracker) => this.trackerObject(tracker).forget(this.refOf(tracker))));
+		this.clearRows();
+	}
+
+	private clearRows(): void {
+		for (const table of ["meta", "members", "branches", "instances", "forks", "checkpoints", "heads", "head_log", "rollups"])
 			this.sql.exec(`DELETE FROM ${table}`);
 	}
 
@@ -410,21 +389,19 @@ export class ProjectDO extends DurableObject<Env> {
 	}
 
 	setDefaultBranch(name: string): boolean {
-		if (this.branch(name) === null) return false;
+		if (this.sql.exec("SELECT 1 FROM branches WHERE name = ?", name).toArray().length === 0) return false;
 		this.sql.exec("INSERT OR REPLACE INTO meta VALUES ('default_branch', ?)", name);
 		return true;
 	}
 
-	branch(name: string): Branch | null {
+	async branch(name: string): Promise<Branch | null> {
 		const row = this.sql.exec<BranchRow>("SELECT * FROM branches WHERE name = ?", name).toArray()[0];
-		return row ? { ...toBranch(row), list: this.headsOf(name) } : null;
+		return row ? { ...toBranch(row), list: await this.headsOf(name) } : null;
 	}
 
-	branches(): Branch[] {
-		return this.sql
-			.exec<BranchRow>("SELECT * FROM branches ORDER BY name")
-			.toArray()
-			.map((row) => ({ ...toBranch(row), list: this.headsOf(row.name) }));
+	async branches(): Promise<Branch[]> {
+		const rows = this.sql.exec<BranchRow>("SELECT * FROM branches ORDER BY name").toArray();
+		return Promise.all(rows.map(async (row) => ({ ...toBranch(row), list: await this.headsOf(row.name) })));
 	}
 
 	/**
@@ -432,13 +409,14 @@ export class ProjectDO extends DurableObject<Env> {
 	 * branch's list moves only by merging (`newgit merge`), never by being
 	 * written over.
 	 */
-	createBranch(name: string, list: TrackerList, by: string): Branch | null {
-		if (this.branch(name) !== null) return null;
+	async createBranch(name: string, list: TrackerList, by: string): Promise<Branch | null> {
+		if (this.sql.exec("SELECT 1 FROM branches WHERE name = ?", name).toArray().length > 0) return null;
 		const now = new Date().toISOString();
-		this.ctx.storage.transactionSync(() => {
-			this.sql.exec("INSERT INTO branches VALUES (?, ?, ?, ?, ?)", name, JSON.stringify(list), by, now, now);
-			this.moveHeads(name, {}, list, by, now);
-		});
+		this.sql.exec("INSERT INTO branches VALUES (?, ?, ?, ?, ?)", name, JSON.stringify(list), by, now, now);
+		// Root last: its children's first moves reach its inbox before it has a
+		// head, and are rolled up through when it gets one.
+		const order = Object.keys(list).sort((left, right) => (left === "root" ? 1 : right === "root" ? -1 : 0));
+		for (const tracker of order) await this.trackerObject(tracker).cas(this.refOf(tracker), name, null, list[tracker], by);
 		return this.branch(name);
 	}
 
@@ -449,7 +427,7 @@ export class ProjectDO extends DurableObject<Env> {
 	 * finds the list moved. Merges begun more than `seconds` ago and never
 	 * landed are forgotten here; their passwords come back to cancel.
 	 */
-	beginMerge(
+	async beginMerge(
 		name: string,
 		base: TrackerList,
 		by: string,
@@ -458,8 +436,8 @@ export class ProjectDO extends DurableObject<Env> {
 		writes: string[] = [],
 		anchor = "root",
 		read = false,
-	): MergeStart {
-		const branch = this.branch(name);
+	): Promise<MergeStart> {
+		const branch = await this.branch(name);
 		if (branch === null) return { ok: false, reason: "missing" };
 		// Every tracker it moves must still be where the merge saw it. Root is
 		// left to the landing: only there is it known whether the merge
@@ -521,11 +499,14 @@ export class ProjectDO extends DurableObject<Env> {
 	 * list someone else has since moved finds it moved. Already `list` (a run
 	 * that landed and stopped before it heard): landed, and says so.
 	 */
-	land(name: string, base: TrackerList, list: TrackerList, by: string, at?: string): Landing {
-		const branch = this.branch(name);
+	async land(name: string, base: TrackerList, list: TrackerList, by: string, at?: string): Promise<Landing> {
+		const branch = await this.branch(name);
 		if (branch === null) return { ok: false, reason: "missing" };
 		const merge = this.pendingMerge(name, list);
 		const done = { tokens: merge?.tokens ?? [], writes: merge?.writes ?? [] };
+		// Where it lands: `at`, worked out once its commits are there to read;
+		// otherwise where it was seen to land when it began.
+		const anchor = at ?? merge?.anchor ?? "root";
 		// Kept as landed, its passwords handed back once to cancel.
 		const landed = () => {
 			if (merge !== null)
@@ -535,87 +516,86 @@ export class ProjectDO extends DurableObject<Env> {
 					JSON.stringify({ ...merge, tokens: [], landed: true, anchor }),
 				);
 		};
-		// Where it lands: `at`, worked out once its commits are there to read;
-		// otherwise where it was seen to land when it began.
-		const anchor = at ?? merge?.anchor ?? "root";
 		if (merge?.landed === true || (merge === null && sameList(branch.list, list))) {
 			landed();
 			return { ok: true, branch, ...done, already: true };
 		}
-		if (anchor !== "root") return this.landAt(name, anchor, branch, base, list, by, landed, done);
-		const moving = [...new Set([...Object.keys(base), ...Object.keys(list), "root"])].filter(
-			(tracker) => tracker === "root" || base[tracker] !== list[tracker],
-		);
+		// What it moves, and nothing else: at root, every tracker whose pin
+		// changed and root itself; below, the anchor and what is inside it.
+		// Only those are compared, and only those move.
+		const moving = [...new Set([...Object.keys(base), ...Object.keys(list), anchor])]
+			.filter((tracker) => within(tracker, anchor))
+			.filter((tracker) => tracker === anchor || base[tracker] !== list[tracker])
+			.sort((left, right) => trackerPath(this.refOf(left)).localeCompare(trackerPath(this.refOf(right))));
 		if (moving.some((tracker) => (branch.list[tracker] ?? null) !== (base[tracker] ?? null)))
 			return { ok: false, reason: "moved", list: branch.list };
-		this.ctx.storage.transactionSync(() => {
-			this.moveHeads(name, branch.list, list, by, new Date().toISOString());
-			landed();
-		});
-		return { ok: true, branch: this.branch(name)!, ...done, already: false };
+		const parent = parentOf(anchor);
+		const viaOf = (tracker: string) => (tracker === anchor && parent !== null ? (list[parent] ?? null) : null);
+		const moved = await this.swap(name, anchor, moving, base, list, by, viaOf);
+		if (!moved) return { ok: false, reason: "moved", list: (await this.branch(name))?.list ?? branch.list };
+		// Which trackers the branch lists: a landing at root may add or drop one.
+		if (anchor === "root") this.writeTrackers(name, list);
+		landed();
+		return { ok: true, branch: (await this.branch(name))!, ...done, already: false };
 	}
 
 	/**
-	 * Land at `anchor`, below root: a compare-and-swap on the heads inside
-	 * it, and nothing above. Each commit inside it pins the others (the
-	 * merge's index was checked), so they have nothing to roll up; the
-	 * anchor's own move is logged for its parent, with the commit the change
-	 * made there (`via`), and rolls up from there.
+	 * Move every tracker in `moving` from `base` to `list`, all or none. One
+	 * tracker is one compare-and-swap in its object. Several are two-phase:
+	 * each reserves in path order, the anchor's object decides, and each
+	 * commits, shallowest first, so a parent has logged the landing before a
+	 * child's move reaches its inbox (and is not taken for something left to
+	 * roll up). A read that meets a reservation asks the anchor what it
+	 * decided, so none sees half of it.
 	 */
-	private landAt(
+	private async swap(
 		name: string,
 		anchor: string,
-		branch: Branch,
+		moving: string[],
 		base: TrackerList,
 		list: TrackerList,
 		by: string,
-		landed: () => void,
-		done: { tokens: HandedToken[]; writes: string[] },
-	): Landing {
-		const inside = [...new Set([...Object.keys(base), ...Object.keys(list)])].filter((tracker) =>
-			within(tracker, anchor),
-		);
-		if (inside.some((tracker) => (branch.list[tracker] ?? null) !== (base[tracker] ?? null)))
-			return { ok: false, reason: "moved", list: branch.list };
-		const parent = parentOf(anchor);
-		const via = parent === null ? null : (list[parent] ?? null);
-		this.ctx.storage.transactionSync(() => {
-			for (const tracker of inside) {
-				const old = branch.list[tracker] ?? null;
-				const next = list[tracker];
-				if (next === undefined || next === old) continue;
-				this.writeHead(name, tracker, old, next, by, tracker === anchor ? via : null);
-			}
-			const through = this.lastSeq();
-			for (const tracker of inside)
-				if (list[tracker] !== undefined && tracker !== anchor)
-					this.sql.exec("INSERT OR REPLACE INTO rollups VALUES (?, ?, ?)", name, tracker, through);
-			// The anchor pins everything inside it too.
-			this.sql.exec("INSERT OR REPLACE INTO rollups VALUES (?, ?, ?)", name, anchor, through);
-			landed();
-		});
-		return { ok: true, branch: this.branch(name)!, ...done, already: false };
+		viaOf: (tracker: string) => string | null,
+	): Promise<boolean> {
+		const object = (tracker: string) => this.trackerObject(tracker);
+		if (moving.length === 1) {
+			const [tracker] = moving;
+			return object(tracker).cas(this.refOf(tracker), name, base[tracker] ?? null, list[tracker] ?? null, by, viaOf(tracker));
+		}
+		const token = crypto.randomUUID();
+		const prepared: string[] = [];
+		const abort = async () => {
+			await Promise.all(prepared.map((tracker) => object(tracker).abort(this.refOf(tracker), token)));
+			return false;
+		};
+		for (const tracker of moving) {
+			const held = await object(tracker).prepare(
+				this.refOf(tracker),
+				name,
+				token,
+				base[tracker] ?? null,
+				list[tracker] ?? null,
+				anchor,
+				by,
+				viaOf(tracker),
+			);
+			if (!held) return abort();
+			prepared.push(tracker);
+		}
+		if ((await object(anchor).decide(this.refOf(anchor), token, "committed")) !== "committed") return abort();
+		const shallowFirst = [...moving].sort((left, right) => left.split("__").length - right.split("__").length);
+		for (const tracker of shallowFirst) await object(tracker).commit(this.refOf(tracker), token);
+		return true;
 	}
 
 	/** `tracker`'s head on `name` now, or null. */
-	head(name: string, tracker: string): string | null {
-		return this.headsOf(name)[tracker] ?? null;
+	async head(name: string, tracker: string): Promise<string | null> {
+		return this.trackerObject(tracker).head(this.refOf(tracker), name);
 	}
 
 	/** Whether `commit` has been `tracker`'s head on `name`, now or before. */
-	wasHead(name: string, tracker: string, commit: string): boolean {
-		if (this.headsOf(name)[tracker] === commit) return true;
-		return (
-			this.sql
-				.exec(
-					"SELECT 1 FROM head_log WHERE branch = ? AND tracker = ? AND (old = ? OR new = ?) LIMIT 1",
-					name,
-					tracker,
-					commit,
-					commit,
-				)
-				.toArray().length > 0
-		);
+	async wasHead(name: string, tracker: string, commit: string): Promise<boolean> {
+		return this.trackerObject(tracker).wasHead(this.refOf(tracker), name, commit);
 	}
 
 	/** Webhook pulls waiting or running, oldest first (src/webhook.ts). */
@@ -726,16 +706,22 @@ export class ProjectDO extends DurableObject<Env> {
 	 * "out of date". (Not `state`: Workers RPC does not expose a Durable
 	 * Object method by that name, though the test runtime does.)
 	 */
-	report(): ProjectState {
+	async report(): Promise<ProjectState> {
 		const ended = this.sql.exec<{ value: string }>("SELECT value FROM meta WHERE key = 'pulls_ended'").toArray()[0];
+		const all = await this.branches();
+		const counts = new Map<string, Record<string, number>>();
+		for (const branch of all) {
+			const pending: Record<string, number> = {};
+			for (const tracker of new Set(Object.keys(branch.list).map(parentOf))) {
+				if (tracker === null) continue;
+				const count = (await this.pending(branch.name, tracker)).length;
+				if (count > 0) pending[tracker] = count;
+			}
+			counts.set(branch.name, pending);
+		}
 		return {
-			branches: this.branches().map((branch) => {
-				const pending: Record<string, number> = {};
-				for (const tracker of new Set(Object.keys(branch.list).map(parentOf))) {
-					if (tracker === null) continue;
-					const count = this.pending(branch.name, tracker).length;
-					if (count > 0) pending[tracker] = count;
-				}
+			branches: all.map((branch) => {
+				const pending = counts.get(branch.name) ?? {};
 				const failed = this.sql
 					.exec<{ value: string }>("SELECT value FROM meta WHERE key = ?", `rollup_failed:${branch.name}`)
 					.toArray()[0];
@@ -766,10 +752,10 @@ export class ProjectDO extends DurableObject<Env> {
 	 * every step after. Nothing is locked; landing finds out whether `main`
 	 * moved meanwhile.
 	 */
-	beginPull(pull: MirrorPull): PullStart {
+	async beginPull(pull: MirrorPull): Promise<PullStart> {
 		const known = this.pulls().find((candidate) => samePull(candidate, pull));
 		if (known?.base !== undefined) return { ok: true, base: known.base };
-		const branch = this.branch(PULL_BRANCH);
+		const branch = await this.branch(PULL_BRANCH);
 		if (branch === null) return { ok: false, reason: "missing" };
 		this.writePulls(
 			this.pulls().map((candidate) => (samePull(candidate, pull) ? { ...candidate, base: branch.list } : candidate)),
@@ -826,25 +812,8 @@ export class ProjectDO extends DurableObject<Env> {
 	 * any branch: a head it has been, or a change's own commit a roll-up
 	 * kept. A landing ref at one is spent.
 	 */
-	knownCommit(tracker: string, commit: string): boolean {
-		return (
-			this.sql
-				.exec(
-					"SELECT 1 FROM head_log WHERE tracker = ? AND (old = ? OR new = ?) LIMIT 1",
-					tracker,
-					commit,
-					commit,
-				)
-				.toArray().length > 0 ||
-			// A change's own commit is logged on the child's move, and sits in
-			// the parent's repo: this one's, when `tracker` is the parent.
-			this.sql
-				.exec<{ tracker: string }>("SELECT tracker FROM head_log WHERE via = ?", commit)
-				.toArray()
-				.some((row) => parentOf(row.tracker) === tracker) ||
-			this.sql.exec("SELECT 1 FROM heads WHERE tracker = ? AND commit_id = ? LIMIT 1", tracker, commit).toArray()
-				.length > 0
-		);
+	async knownCommit(tracker: string, commit: string): Promise<boolean> {
+		return this.trackerObject(tracker).known(this.refOf(tracker), commit);
 	}
 
 	/** How many sweeps have seen each landing ref no head explains, by repo. */

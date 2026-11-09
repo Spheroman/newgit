@@ -231,6 +231,113 @@ the source of truth, and a mirror may trail it.
      `export_rooted_follows_remote.rs` holds it to that.
 7. `follow` says pinned. **Done**, as `pinned = true` (see *Follow and pinned*).
 8. Replace `ProjectDO` and project-shaped repo names, as #201's remote redesign.
+   Designed in *Step 8: the remote by path*. **Items 1–3 done:**
+   - `TrackerDO` per tracker path (`remote/src/tracker-do.ts`), with
+     two-phase landing across several trackers.
+   - Heads handed over lazily from `ProjectDO`.
+   - `/<owner>/<name>/<path>.git` serves a view rooted at that tracker.
+
+   One tracker in two roots comes next.
+
+## Step 8: the remote by path
+
+Agreed with Jack, 2026-11-08: members stay on the root, and one tracker
+in two roots comes after step 8. Build order items 1–3 are built.
+
+Today the remote is project-shaped. `ProjectDO`, one Durable Object per
+`<owner>/<project>`, holds every tracker's heads, its log, and roll-up
+bookkeeping, alongside members, instances, forks, checkpoints, and webhook
+pulls. Repos are named `<owner>.<project>.t.<tracker id>`. Git serves only
+views rooted at root (`/<owner>/<project>.git`). #201 asks for three things:
+atomic merges without a project object, naming by path, and every tracker
+with a `.git` endpoint of its own.
+
+### What a project becomes
+
+There are no projects. A *root* is a tracker with no parent, at a top-level
+path (`spheroman/newgit`). Everything a project held either belongs to a
+tracker or to a root:
+
+| Today on `ProjectDO` | Becomes |
+|---|---|
+| heads, log, roll-ups | each tracker's own (below) |
+| members | the root's readers and maintainers: `project-devs` means them, as it does today |
+| instances, forks, checkpoints | the root's: an instance is a working copy of a root |
+| webhook pulls | the tracker an export target roots at |
+| pending merges | the anchor's |
+
+### One Durable Object per tracker path
+
+`TrackerDO`, named by the tracker's path (`spheroman/newgit/t3code/repos`),
+holds the tracker's heads (one per branch), its log, an *inbox* of its
+children's moves (what it rolls up), and an *outbox* of its own moves (to its
+parent's inbox). A root's `TrackerDO` also holds what the root owns (the
+table above).
+
+Every tracker's heads live in its `TrackerDO`, root's included.
+`ProjectDO`, named `<owner>/<project>` like the root's path, keeps only what
+a root owns (the table above), plus the list of which trackers each branch
+has, so it knows which objects to ask. It coordinates a landing without
+holding anything: correctness comes from each tracker's compare-and-swap
+and reservations. Heads an older remote kept in `ProjectDO` move out
+lazily. The first time a tracker's object is asked for a head it has none
+of, it adopts the one `ProjectDO` kept (`handOff`). Renaming the class to
+say what it is now is cosmetic, and left out.
+
+### Landing across Durable Objects
+
+- **One tracker** (the common case: the anchor moves, nothing inside it
+  does): one compare-and-swap in the anchor's object, then an outbox entry
+  for its parent. Nothing else is touched.
+- **Several** (the anchor and trackers inside it): two-phase.
+  1. *Prepare*, in sorted path order: each tracker checks its head is the
+     base and holds a reservation (new value, the anchor's path, a token,
+     and a time limit).
+  2. The decision goes to the anchor: *committed*.
+  3. *Commit* each reservation.
+
+  A read that meets a prepared reservation asks the anchor what it decided,
+  so no read sees half a landing. A reservation whose time runs out without
+  a decision is aborted. This is the one slow path; only spanning landings
+  take it.
+- **The outbox** is delivered to the parent's inbox at least once, and the
+  parent dedupes by `(child, seq)`. A tracker's first head (from nothing) is
+  not sent: a landing at the parent or above set it, so it is pinned already. The landing has happened once the
+  anchor's head moved. A delivery that fails is retried by the anchor's
+  alarm, so a parent never misses a move.
+
+Roll-up and the sweep work as they do now, per object. A parent rolls up
+from its inbox, and moving its head puts an entry in its own outbox.
+
+### Naming and Git
+
+- **Paths everywhere a person sees one:** `git clone
+  https://newgit.dev/spheroman/newgit/t3code.git` serves a view rooted at
+  `t3code`, composed from its head (#201: "every tracker gets a `.git`
+  endpoint"). `/spheroman/newgit.git` stays the root's view.
+- **Repo names stay** (`spheroman.newgit.t.t3code__repos`): a storage
+  detail, already a function of the path. Renaming them would copy every
+  history (t3code's is 365 MiB) for nothing a person sees.
+
+### Build order within step 8
+
+1. `TrackerDO` with heads, log, inbox, and outbox; `ProjectDO` renamed to
+   it; children adopted lazily. One-tracker landings and roll-ups through it.
+   Tested on the dev remote with a copy of the live project's shape.
+2. Two-phase landing for spanning merges.
+3. Path-addressed Git endpoint (`/<root>/<path>.git`).
+4. A tracker bound in two roots (#201's suggested experiment): a second
+   mount is a symlink to the same `TrackerDO`, and its parents both get its
+   outbox entries.
+
+### Questions for Jack
+
+- **Members:** keep a root's member list as its readers and maintainers
+  (`project-devs`), or should membership itself become per tracker now?
+  Recommended: keep it on the root for step 8, and make it per tracker when
+  #201's audience item ("readers or maintainers of tracker X") is built.
+- **Build order item 4** (one tracker in two roots): in step 8, or after?
+  Recommended: after, since it needs nothing above it to change.
 
 ## Open questions
 

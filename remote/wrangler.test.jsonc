@@ -6,7 +6,9 @@
   "compatibility_date": "2026-10-05",
   "compatibility_flags": ["nodejs_compat"],
   "rules": [{ "type": "Text", "globs": ["**/*.sh"] }],
-  "durable_objects": { "bindings": [{ "class_name": "ProjectDO", "name": "PROJECTS" }, { "class_name": "UserDO", "name": "USERS" }, { "class_name": "BudgetDO", "name": "BUDGET" }] },
-  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["ProjectDO"] }, { "tag": "v2", "new_sqlite_classes": ["UserDO"] }, { "tag": "v3", "new_sqlite_classes": ["BudgetDO"] }],
+  "durable_objects": { "bindings": [{ "class_name": "ProjectDO", "name": "PROJECTS" },
+      // One per tracker path: its heads, log, inbox, and outbox (src/tracker-do.ts).
+      { "class_name": "TrackerDO", "name": "TRACKERS" }, { "class_name": "UserDO", "name": "USERS" }, { "class_name": "BudgetDO", "name": "BUDGET" }] },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["ProjectDO"] }, { "tag": "v2", "new_sqlite_classes": ["UserDO"] }, { "tag": "v3", "new_sqlite_classes": ["BudgetDO"] }, { "tag": "v4", "new_sqlite_classes": ["TrackerDO"] }],
   "vars": { "GITHUB_CLIENT_ID": "test-client", "ARTIFACTS_GIT_BASE": "https://acct.artifacts.example/git/newgit", "CLOUDFLARE_ACCOUNT_ID": "test-account", "TOKEN_KEY": "test-signing-key-not-secret", "ALLOWED_LOGINS": "*", "PROJECTS_PER_LOGIN": "1000" }
 }

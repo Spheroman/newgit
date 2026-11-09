@@ -49,6 +49,8 @@ export interface EndpointPlan {
 	default_branch: string;
 	/** Every tracker a branch lists, and `access` always: mounts are read from its content. */
 	repos: Record<string, { url: string; auth: string }>;
+	/** The tracker the view is rooted at: `root`, or one a path names. */
+	root?: string;
 }
 
 export type EndpointKind = "advertise" | "upload-pack";

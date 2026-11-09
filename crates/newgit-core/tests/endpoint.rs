@@ -114,6 +114,7 @@ fn plan(
         .map(|tracker| ((*tracker).to_owned(), trackers[*tracker].1.clone()))
         .collect();
     Plan {
+        root: "root".to_owned(),
         dir: dir.to_path_buf(),
         branches: BTreeMap::from([("main".to_owned(), list)]),
         default_branch: "main".to_owned(),
