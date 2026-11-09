@@ -20,22 +20,15 @@ env:
 
 jobs:
   test:
-    name: test (${{ matrix.os }})
+    # Keep this name: the ruleset on main requires it.
+    name: test (ubuntu-latest)
     # newgit drives real `git`, spawns real process groups, and binds real
     # ports, so its tests are integration tests by nature. They have to run
     # on both platforms it claims to support — a unit-test-only CI would
-    # prove almost nothing about this codebase.
-    #
-    # macOS runs on main, not on pull requests. The suite is thousands of git
-    # spawns, and GitHub's 3-vCPU macOS runners take ~12 minutes on it, CPU
-    # bound, against ~3 on Ubuntu. A macOS-only break is rare and shows up on
-    # the next main run; to check a branch on macOS before merging, run this
-    # workflow by hand on it (workflow_dispatch runs both).
-    strategy:
-      fail-fast: false
-      matrix:
-        os: ${{ github.event_name == 'pull_request' && fromJSON('["ubuntu-latest"]') || fromJSON('["ubuntu-latest", "macos-latest"]') }}
-    runs-on: ${{ matrix.os }}
+    # prove almost nothing about this codebase. macOS has its own workflow,
+    # ci-macos.yml, so that deploying the remote (which waits on this
+    # workflow, and ships a Linux image) does not wait on the macOS runners.
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
 
@@ -53,8 +46,8 @@ jobs:
         # A misnamed fragment is not picked up by the release script's
         # category globs, so the entry would go missing from the release
         # rather than fail anything. Catch it on the PR that wrote it.
-        # Running on both runners also keeps the script honest about BSD vs
-        # GNU userland, which is the same trap the release workflow hit.
+        # ci-macos.yml runs it too, which keeps the script honest about BSD
+        # vs GNU userland, the same trap the release workflow hit.
         run: ./scripts/release-changelog.sh --check
 
       - name: Identify git
@@ -66,8 +59,7 @@ jobs:
           git config --global init.defaultBranch main
           # The suite runs thousands of git commands, and git follows fetches
           # and commits with its own background maintenance. That is pure
-          # overhead in throwaway repos and slows macOS most of all, where
-          # starting a process is expensive.
+          # overhead in throwaway repos.
           git config --global maintenance.auto false
           git config --global gc.auto 0
           git --version
@@ -82,8 +74,7 @@ jobs:
         # nextest, not `cargo test`: `cargo test` runs the ~110 test binaries
         # one after another, and most hold only a few tests that spend their
         # time waiting on git, so the runner's cores sit idle. nextest runs
-        # tests from every binary at once, which matters most on macOS,
-        # where every git spawn is slow.
+        # tests from every binary at once.
         run: cargo nextest run --workspace --all-targets --no-fail-fast
 
       - name: Release build

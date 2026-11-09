@@ -12,7 +12,10 @@ mise run install   # build and install into ~/.cargo/bin
 CI runs the suite on Linux and macOS, checks the declared MSRV, and smoke
 tests the release binary against a throwaway project — the tests here drive
 real `git`, real process groups, and real ports, so they are integration
-tests by nature.
+tests by nature. On a pull request macOS runs a subset, the tests that
+exercise what differs there; main runs all of it. `.config/nextest.toml`
+lists what the subset skips, and `cargo nextest run --profile macos-pr` runs
+it locally.
 
 ## Workspace layout
 

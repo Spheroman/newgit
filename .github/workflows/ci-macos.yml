@@ -1,0 +1,86 @@
+name: CI (macOS)
+
+# The suite on macOS, in its own workflow so that deploying the remote, which
+# waits on CI and ships a Linux image, does not also wait on these runners.
+#
+# A pull request runs the `macos-pr` nextest profile: the tests that exercise
+# what differs on macOS (clonefile spawns and installs, process groups, APFS
+# paths), skipping git-logic families Ubuntu already covers. Main, and a run
+# started by hand, run everything. .config/nextest.toml says what is skipped
+# and why.
+#
+# Both ways split the tests across two runners. A git spawn costs ~4x on
+# macOS what it does on Linux, and the 3-vCPU runner is CPU bound on them,
+# so more runners is what buys time, not more threads.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_PROFILE_TEST_DEBUG: 0
+
+jobs:
+  test:
+    name: macos (${{ matrix.partition }}/2)
+    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        partition: [1, 2]
+    env:
+      PROFILE: ${{ github.event_name == 'pull_request' && 'macos-pr' || 'default' }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # Both partitions build the same thing; one cache, saved from main,
+          # where pull requests can read it.
+          shared-key: macos
+          save-if: ${{ github.ref == 'refs/heads/main' && matrix.partition == 1 }}
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@nextest
+
+      - name: Check changelog fragments
+        # The release script runs on macOS too, under BSD userland.
+        if: matrix.partition == 1
+        run: ./scripts/release-changelog.sh --check
+
+      - name: Identify git
+        # See ci.yml. Auto-maintenance costs most here, where starting a
+        # process is expensive.
+        run: |
+          git config --global user.name "newgit ci"
+          git config --global user.email "ci@newgit.invalid"
+          git config --global init.defaultBranch main
+          git config --global maintenance.auto false
+          git config --global gc.auto 0
+
+      - name: Clippy
+        # Linting the macOS-only code paths. Off on pull requests to keep them
+        # fast: the test build already proves that code compiles, and a lint
+        # it misses fails the next run on main.
+        if: matrix.partition == 1 && github.event_name != 'pull_request'
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Test
+        # hash, not count: it balances the time between the two halves, and a
+        # test stays in the same half when others are added.
+        run: >-
+          cargo nextest run --workspace --all-targets --no-fail-fast
+          --profile "$PROFILE"
+          --partition hash:${{ matrix.partition }}/2

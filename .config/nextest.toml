@@ -1,0 +1,74 @@
+# The `macos-pr` profile is what macOS runs on a pull request. On main, and on
+# a workflow run started by hand, macOS runs everything.
+#
+# Why a subset at all: every git spawn costs about 4x on macOS what it does
+# on Linux, so the full suite takes ~16 minutes there against ~3 on Ubuntu.
+# Ubuntu already runs every test on every pull request. What macOS adds is
+# the code that differs on macOS, and that sits underneath everything else:
+# spawn clones its source from a template with clonefile (`source.rs`,
+# `manager.rs`), installs are cloned the same way (`installs.rs`), process
+# groups are stopped differently (`supervisor.rs`), and paths and symlinks
+# behave differently on APFS.
+#
+# So this is a list of what to skip, not what to run: a new test file runs on
+# macOS unless it belongs to a family below. Each family is git logic built
+# on top of that layer: compose and split, the remote and its endpoint,
+# clone, merge, push and pull, export, migrate, and how trackers bind. They
+# run on top of a spawn that the tests kept here already cover on macOS.
+# Families are matched by prefix, so their new tests are skipped too;
+# one-off files are named exactly.
+[profile.macos-pr]
+default-filter = '''
+not (
+    binary(/^compose_/)
+    | binary(/^endpoint/)
+    | binary(/^remote/)
+    | binary(/^clone_/)
+    | binary(/^merge/)
+    | binary(/^push/)
+    | binary(/^pull/)
+    | binary(/^fetch_/)
+    | binary(/^export/)
+    | binary(/^migrate/)
+    | binary(/^fork_/)
+    | binary(/^project_root_/)
+    | binary(/^snapshot_/)
+    | binary(/^spawn_from_checkpoint/)
+    | binary(/^install_key_/)
+    | binary(=spawn_from_degraded_checkpoint)
+    | binary(=landed_view_not_split_again)
+    | binary(=init_join)
+    | binary(=init_adopt)
+    | binary(=adopt_remote)
+    | binary(=nested_trackers)
+    | binary(=one_commit_mounts)
+    | binary(=git_trackers)
+    | binary(=pathless_trackers)
+    | binary(=roles)
+    | binary(=binding)
+    | binary(=private_instance)
+    | binary(=message_audience)
+    | binary(=sync_new_tracker)
+    | binary(=status_remote_state)
+    | binary(=status_pinned_note)
+    | binary(=checkpoint_sends_only_changes)
+    | binary(=checkpoint_dropped_tracker_paths)
+    | binary(=undo_after_tracker_drop)
+    | binary(=rendered_files_sparse_checkout)
+    | binary(=restore_sparse_paths)
+    | binary(=remove_source_branch)
+    | binary(=remove_broken_graph)
+    | binary(=stock_merge_messages)
+    | binary(=recorded_source)
+    | binary(=tracker_repos)
+    | binary(=tracker_import)
+    | binary(=tracker_import_cli)
+    | binary(=tracker_merge_remote)
+    | binary(=tracker_use_seeds_from_main)
+    | binary(=tracker_log)
+    | binary(=tracker_ownership)
+    | binary(=tracker_link)
+    | binary(=tracker_history)
+    | binary(=tracker_pinned)
+)
+'''
