@@ -335,20 +335,27 @@ impl GitSource {
     /// into the store as a side effect — and a push of that tag, later,
     /// would then be refused because the store already has it.
     pub fn fetch_ref(&self, from: &Utf8Path, remote_ref: &str, local_ref: &str) -> Result<()> {
-        self.git(&[
-            "fetch",
-            "--quiet",
-            "--no-tags",
-            "--no-write-fetch-head",
-            "--",
-            from.as_str(),
-            &format!("+{remote_ref}:{local_ref}"),
-        ])
-        .map(|_| ())
+        let mut args = vec!["fetch", "--quiet", "--no-write-fetch-head"];
+        args.extend(crate::local_refs::LOCAL_FETCH_FLAGS);
+        let refspec = format!("+{remote_ref}:{local_ref}");
+        args.extend(["--", from.as_str(), &refspec]);
+        self.git(&args).map(|_| ())
+    }
+
+    /// Whether the store holds `commit` and everything it reaches, so a ref
+    /// to it needs no fetch ([`crate::local_refs::holds_complete`]).
+    pub fn holds_complete(&self, commit: &str) -> bool {
+        crate::local_refs::git_dir_of(&self.root)
+            .is_some_and(|git_dir| crate::local_refs::holds_complete(&git_dir, &[commit]))
     }
 
     pub fn update_ref(&self, name: &str, rev: &str) -> Result<()> {
         self.git(&["update-ref", name, rev]).map(|_| ())
+    }
+
+    /// Every `(ref, commit)` set in one transaction.
+    pub fn update_refs(&self, updates: &[(String, String)]) -> Result<()> {
+        crate::local_refs::update_refs(&["-C", self.root.as_str()], updates)
     }
 
     /// Every ref under a namespace, e.g. `refs/newgit/checkpoints/<slug>`.
@@ -1026,23 +1033,37 @@ impl GitSource {
     }
 
     /// Fetch a store ref into a workspace clone (undo may need objects the
-    /// workspace has since discarded).
+    /// workspace has since discarded). Usually it has them all — it made
+    /// them — and then there is nothing to fetch.
     pub fn workspace_fetch_ref(
         workspace: &Utf8Path,
         from: &Utf8Path,
         remote_ref: &str,
     ) -> Result<()> {
-        run_git(&[
+        let held = run_git(&[
+            "-C",
+            from.as_str(),
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            remote_ref,
+        ])
+        .ok()
+        .zip(crate::local_refs::git_dir_of(workspace))
+        .is_some_and(|(commit, git_dir)| crate::local_refs::holds_complete(&git_dir, &[&commit]));
+        if held {
+            return Ok(());
+        }
+        let mut args = vec![
             "-C",
             workspace.as_str(),
             "fetch",
             "--quiet",
             "--no-write-fetch-head",
-            "--",
-            from.as_str(),
-            remote_ref,
-        ])
-        .map(|_| ())
+        ];
+        args.extend(crate::local_refs::LOCAL_FETCH_FLAGS);
+        args.extend(["--", from.as_str(), remote_ref]);
+        run_git(&args).map(|_| ())
     }
 
     /// Put a workspace back to a checkpointed source state: HEAD hard-reset
@@ -1671,9 +1692,21 @@ impl GitSource {
         refspecs: &[String],
         auth: Option<&str>,
     ) -> Result<()> {
+        Self::fetch_refs_with(location, url, refspecs, auth, &[])
+    }
+
+    /// [`Self::fetch_refs`], with `flags` passed to `git fetch`.
+    pub(crate) fn fetch_refs_with(
+        location: &[&str],
+        url: &str,
+        refspecs: &[String],
+        auth: Option<&str>,
+        flags: &[&str],
+    ) -> Result<()> {
         let fetch = |extra: Option<&str>| {
             let mut args: Vec<&str> = location.to_vec();
             args.extend(["fetch", "--quiet", "--no-write-fetch-head"]);
+            args.extend(flags);
             args.extend(extra);
             args.extend(["--", url]);
             args.extend(refspecs.iter().map(String::as_str));

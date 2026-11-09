@@ -1755,11 +1755,13 @@ impl BranchManager {
         self.prepare_projection()?;
         let outcome = self.split_view_made(&tip, &BTreeSet::new(), Some(&tip))?;
         let instance_branch = format!("instances/{PROJECT_ROOT_INSTANCE}");
-        for (tracker, commit) in &outcome.index {
-            self.source
-                .update_ref(&local_tracker_ref(tracker, &instance_branch), commit)?;
-            self.publish_carved_refs(tracker, &[&instance_branch])?;
-        }
+        self.land_tracker_branches(
+            outcome
+                .index
+                .iter()
+                .map(|(tracker, commit)| (tracker.as_str(), commit.as_str())),
+            &instance_branch,
+        )?;
         let pinned = self
             .source
             .rev_parse(&local_tracker_ref(
@@ -2026,7 +2028,7 @@ impl BranchManager {
             self.land_root_commit(PROJECT_ROOT_INSTANCE, &root_commit, &moved, &view)?;
             self.source
                 .update_ref(&local_tracker_ref(name, "main"), &imported)?;
-            self.publish_carved_refs(name, &["main"])?;
+            self.publish_carved_refs(&[(name, "main")])?;
             Ok(ImportGitTrackerOutcome {
                 path: definition_path.clone(),
                 mount: mount.clone(),
@@ -2153,14 +2155,14 @@ impl BranchManager {
         view: &str,
     ) -> Result<()> {
         let branch = format!("instances/{slug}");
-        self.source
-            .update_ref(&local_tracker_ref(&self.root.name, &branch), commit)?;
-        self.publish_carved_refs(&self.root.name, &[&branch])?;
-        for (tracker, child) in children {
-            self.source
-                .update_ref(&local_tracker_ref(tracker, &branch), child)?;
-            self.publish_carved_refs(tracker, &[&branch])?;
-        }
+        self.land_tracker_branches(
+            std::iter::once((self.root.name.as_str(), commit)).chain(
+                children
+                    .iter()
+                    .map(|(tracker, child)| (tracker.as_str(), child.as_str())),
+            ),
+            &branch,
+        )?;
         self.source
             .update_ref(&format!("refs/newgit/views/instances/{slug}"), view)?;
         Ok(())
@@ -2202,7 +2204,9 @@ impl BranchManager {
 
     /// Bring the branches of every tracker in Git from the store into the project
     /// repo (`refs/newgit/trackers/<tracker>/…`), where composing and
-    /// splitting run — one fetch. Trackers in Git only: the content of a tracker
+    /// splitting run — one ref move when the project repo holds their
+    /// history already, one fetch otherwise ([`crate::local_refs::sync`]).
+    /// Trackers in Git only: the content of a tracker
     /// outside Git never enters the project repo, which is the one `git push
     /// --mirror` publishes and every workspace clone hardlinks.
     fn fetch_carved_trackers(&self) -> Result<()> {
@@ -2218,41 +2222,57 @@ impl BranchManager {
                 )
             })
             .collect();
-        GitSource::fetch_refs(
-            &["-C", self.store.paths().project_root.as_str()],
-            store.as_str(),
-            &refspecs,
-            None,
-        )
+        crate::local_refs::sync(&self.store.paths().project_root, &store, &refspecs)
     }
 
-    /// The reverse: the branches of a tracker in Git, made in the project repo,
-    /// fetched into the store under the tracker's own refs.
+    /// The reverse: branches of trackers in Git, made in the project repo,
+    /// copied into the store under each tracker's own refs — every
+    /// `(tracker, branch)` in one ref move or one fetch.
     ///
     /// The store is never shallow, so a tracker held as snapshots stays in
     /// the project repo, and [`Self::need_history`] brings its refs across.
-    fn publish_carved_refs(&self, tracker: &str, branches: &[&str]) -> Result<()> {
-        let project = &self.store.paths().project_root;
-        if crate::snapshots::held(project)?.contains_key(tracker) {
+    fn publish_carved_refs(&self, branches: &[(&str, &str)]) -> Result<()> {
+        if branches.is_empty() {
             return Ok(());
         }
-        let store = self.store.paths().tracker_store.clone();
-        crate::tracker_repo::ensure_store(&store)?;
+        let project = &self.store.paths().project_root;
+        let held = crate::snapshots::held(project)?;
         let refspecs: Vec<String> = branches
             .iter()
-            .map(|branch| {
+            .filter(|(tracker, _)| !held.contains_key(*tracker))
+            .map(|(tracker, branch)| {
                 format!(
                     "+{}:refs/trackers/{tracker}/{branch}",
                     local_tracker_ref(tracker, branch)
                 )
             })
             .collect();
-        GitSource::fetch_refs(
-            &[&format!("--git-dir={store}")],
-            self.store.paths().project_root.as_str(),
-            &refspecs,
-            None,
-        )
+        if refspecs.is_empty() {
+            return Ok(());
+        }
+        let store = self.store.paths().tracker_store.clone();
+        crate::tracker_repo::ensure_store(&store)?;
+        crate::local_refs::sync(&store, project, &refspecs)
+    }
+
+    /// Set each tracker's `branch` in the project repo to its commit, and
+    /// publish them all to the store: what landing a split does.
+    fn land_tracker_branches<'a>(
+        &self,
+        commits: impl IntoIterator<Item = (&'a str, &'a str)>,
+        branch: &str,
+    ) -> Result<()> {
+        let commits: Vec<(&str, &str)> = commits.into_iter().collect();
+        let updates: Vec<(String, String)> = commits
+            .iter()
+            .map(|(tracker, commit)| (local_tracker_ref(tracker, branch), (*commit).to_owned()))
+            .collect();
+        self.source.update_refs(&updates)?;
+        let published: Vec<(&str, &str)> = commits
+            .iter()
+            .map(|(tracker, _)| (*tracker, branch))
+            .collect();
+        self.publish_carved_refs(&published)
     }
 
     /// Root and every tracker in Git: what a view composes.
@@ -2622,11 +2642,13 @@ impl BranchManager {
         };
         let outcome = self.split_view(tip, &dropped)?;
         let branch = format!("instances/{slug}");
-        for (tracker, commit) in &outcome.index {
-            self.source
-                .update_ref(&local_tracker_ref(tracker, &branch), commit)?;
-            self.publish_carved_refs(tracker, &[&branch])?;
-        }
+        self.land_tracker_branches(
+            outcome
+                .index
+                .iter()
+                .map(|(tracker, commit)| (tracker.as_str(), commit.as_str())),
+            &branch,
+        )?;
         Ok(outcome.made.len())
     }
 
@@ -3512,12 +3534,13 @@ impl BranchManager {
         )?;
         let mut branch = spawned.branch.clone();
         // Its tracker branches start where the checkpoint's committed work is.
-        for (tracker, commit) in &imported.trackers {
-            let instance_branch = format!("instances/{}", branch.slug);
-            self.source
-                .update_ref(&local_tracker_ref(tracker, &instance_branch), commit)?;
-            self.publish_carved_refs(tracker, &[&instance_branch])?;
-        }
+        self.land_tracker_branches(
+            imported
+                .trackers
+                .iter()
+                .map(|(tracker, commit)| (tracker.as_str(), commit.as_str())),
+            &format!("instances/{}", branch.slug),
+        )?;
 
         // The record joins the new instance's own history, rewritten to
         // point at what is on this machine.
@@ -9955,12 +9978,17 @@ impl BranchManager {
         let tip = dirty_rev.clone().unwrap_or_else(|| head_rev.clone());
         let workspace_ref = format!("refs/newgit/checkpoints/{id}");
         let store_ref = format!("refs/newgit/checkpoints/{}/{id}", branch.slug);
-        GitSource::workspace_update_ref(&workspace, &workspace_ref, &tip)?;
-        let fetched = self
-            .source
-            .fetch_ref(&workspace, &workspace_ref, &store_ref);
-        GitSource::workspace_delete_ref(&workspace, &workspace_ref)?;
-        fetched?;
+        if self.source.holds_complete(&tip) {
+            // Nothing new since the store last took this workspace's work.
+            self.source.update_ref(&store_ref, &tip)?;
+        } else {
+            GitSource::workspace_update_ref(&workspace, &workspace_ref, &tip)?;
+            let fetched = self
+                .source
+                .fetch_ref(&workspace, &workspace_ref, &store_ref);
+            GitSource::workspace_delete_ref(&workspace, &workspace_ref)?;
+            fetched?;
+        }
         // The instance's branch moves only when the workspace is on it. An
         // agent that ran `git checkout -b try-x` is working on `try-x`, and
         // the store's `base` taking try-x's commits would be newgit making
@@ -10716,21 +10744,31 @@ impl BranchManager {
             })?,
             _ => self.source.update_ref(&root_ref, &landed_root)?,
         }
-        self.publish_carved_refs(&self.root.name, &[into])?;
-        for (tracker, _, caught_up) in &mains {
-            if into == "main" {
-                self.source
-                    .update_ref(&local_tracker_ref(tracker, "main"), caught_up)?;
-                self.publish_carved_refs(tracker, &["main"])?;
-            }
+        let mut children: Vec<(&str, &str)> = Vec::new();
+        if into == "main" {
+            children.extend(
+                mains
+                    .iter()
+                    .map(|(tracker, _, caught_up)| (tracker.as_str(), caught_up.as_str())),
+            );
+        } else {
+            children.extend(
+                moved
+                    .iter()
+                    .filter(|merge| merge.tracker != self.root.name)
+                    .map(|merge| (merge.tracker.as_str(), merge.commit.as_str())),
+            );
         }
-        for merge in &moved {
-            if merge.tracker != self.root.name && into != "main" {
-                self.source
-                    .update_ref(&local_tracker_ref(&merge.tracker, into), &merge.commit)?;
-                self.publish_carved_refs(&merge.tracker, &[into])?;
-            }
-        }
+        let updates: Vec<(String, String)> = children
+            .iter()
+            .map(|(tracker, commit)| (local_tracker_ref(tracker, into), (*commit).to_owned()))
+            .collect();
+        self.source.update_refs(&updates)?;
+        let published: Vec<(&str, &str)> = std::iter::once(self.root.name.as_str())
+            .chain(children.iter().map(|(tracker, _)| *tracker))
+            .map(|tracker| (tracker, into))
+            .collect();
+        self.publish_carved_refs(&published)?;
         // The merge is done; bringing the project root along is a courtesy,
         // and its failing is said, not mistaken for the merge failing.
         let project_root = if name != PROJECT_ROOT_INSTANCE && into == PROJECT_ROOT_INSTANCE {
@@ -11411,11 +11449,12 @@ impl BranchManager {
             self.need_history(tracker)?;
         }
         if new == old || self.source.is_ancestor(&new, &old)? {
-            for (tracker, main) in mains {
-                self.source
-                    .update_ref(&local_tracker_ref(tracker, "main"), main)?;
-                self.publish_carved_refs(tracker, &["main"])?;
-            }
+            self.land_tracker_branches(
+                mains
+                    .iter()
+                    .map(|(tracker, main)| (tracker.as_str(), main.as_str())),
+                "main",
+            )?;
             return Ok(PullOutcome {
                 tracker: tracker.to_owned(),
                 follow: from.to_owned(),
@@ -11478,11 +11517,12 @@ impl BranchManager {
         let taken = self.take_pull(workspace.as_deref(), definition, &view_ref, &view);
         let _ = self.source.delete_ref(&view_ref);
         taken?;
-        for (tracker, main) in mains {
-            self.source
-                .update_ref(&local_tracker_ref(tracker, "main"), main)?;
-            self.publish_carved_refs(tracker, &["main"])?;
-        }
+        self.land_tracker_branches(
+            mains
+                .iter()
+                .map(|(tracker, main)| (tracker.as_str(), main.as_str())),
+            "main",
+        )?;
         self.land_root_commit(&slug, &pulled, &[(tracker.to_owned(), new.clone())], &view)?;
         Ok(PullOutcome {
             tracker: tracker.to_owned(),

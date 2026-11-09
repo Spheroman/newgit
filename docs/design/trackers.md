@@ -609,6 +609,36 @@ refs once made; composing fetches the commits of trackers in Git into the
 project repo under its own refs. Trackers outside Git never enter the view:
 their files are projected into workspaces as today.
 
+**Copying refs between local repos is a ref move when it can be (decided).**
+The project repo, `trackers.git`, and each workspace clone hold real copies,
+but a copy between two of them usually has nothing to transfer: the store
+and the project repo share root's history, and a workspace made the commits
+its checkpoint names. `git fetch` finds that out too, but only after
+starting `upload-pack`, negotiating, and running auto-maintenance on both
+sides, about 25–40 ms each time, and a `spawn` did it several times over.
+So `local_refs::sync` asks the destination first, with the check `git
+fetch` itself runs before deciding it has nothing to transfer (`rev-list
+--objects --stdin --not --all`), and when the destination holds everything
+the refs reach it moves them in one `update-ref --stdin`, about 3 ms.
+Anything else (a missing object, a shallow destination, a ref the source
+lacks) goes to `git fetch` exactly as before. Several refs to one store go
+in one call, never one fetch per tracker. Checkpoint (store ← workspace) and
+undo (workspace ← store) make the same check for their one commit.
+
+Considered and refused: borrowing through `objects/info/alternates` would
+make every copy a ref move, and it is the thing the paragraph above rules
+out. The project repo pruning an object the store borrowed loses a
+tracker's history weeks later, and a workspace is `rm -rf`'d whenever
+someone likes, so nothing may borrow from one. Alternates in the store would
+also carry into every local clone of it.
+
+These copies take the refs they name and nothing else, by the fetch too:
+`--no-tags --no-prune --no-recurse-submodules`. Before, a fetch
+between the project repo and the store followed tags, so a project's tag
+landed in `trackers.git` and came back into the project after the developer
+deleted it; and a `fetch.prune = true` in someone's Git config would have
+deleted the project repo's tracker refs that the store lacks.
+
 **Unbound trackers are out of the working tree, not the history (decided).**
 A tracker the instance does not bind is hidden by Git's sparse checkout:
 `tracker use` widens it, `tracker drop` narrows it, and history never changes

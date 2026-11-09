@@ -11,6 +11,7 @@ pub mod export_target;
 pub mod exports;
 pub mod fresh_base;
 pub mod installs;
+pub mod local_refs;
 pub mod lock;
 pub mod manager;
 pub mod materializer;

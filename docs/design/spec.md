@@ -393,7 +393,10 @@ project repository:
 - A local `git clone` hardlinks objects, so it is fast. Hardlinked objects
   are safe, since gc never rewrites an object file in place. `--shared` and
   `--reference` are not safe, because the other repository's gc can delete
-  what they borrow, and newgit never uses them.
+  what they borrow, and newgit never uses them. Checkpoint and undo copy
+  their commit between workspace and store with a ref move when the other
+  side already holds its whole history, and fetch otherwise
+  ([trackers.md](trackers.md), *Copying refs between local repos*).
 - The agent gets a fully real repository. `.git` is a directory, and `git
   fsck`, `git log`, and everything else check out.
 - Deleting a workspace is `rm -rf`. Nothing to register, prune, or lock.
