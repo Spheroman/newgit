@@ -1488,8 +1488,9 @@ impl GitSource {
     /// Send `commit`'s history to `url` in steps along its first-parent line,
     /// each on [`STAGING_REF`], so that no one push is over the remote's
     /// limit. The steps start from the reported `size` against `limit` and
-    /// halve whenever the remote still refuses one. Stops one short of
-    /// `commit`: the caller's own push sends that, leased as it always is.
+    /// halve whenever the remote still refuses one. `commit` itself is staged
+    /// too, so the caller's own push, leased as it always is, has nothing
+    /// left to send.
     fn push_in_steps(
         location: &[&str],
         url: &str,
@@ -1499,10 +1500,42 @@ impl GitSource {
         size: f64,
         limit: f64,
     ) -> Result<()> {
+        let bases: Vec<&str> = base.filter(|base| !base.is_empty()).into_iter().collect();
+        Self::stage_line(
+            location,
+            url,
+            commit,
+            &bases,
+            auth,
+            size,
+            limit,
+            STAGING_REF,
+        )
+    }
+
+    /// One first-parent line of [`Self::push_in_steps`], staged on `staging`,
+    /// leaving out what `bases` reach (the remote holds that). A merge is one
+    /// step on this line however much its other parents bring: a fork's
+    /// "merge upstream" carries a thousand commits. So a merge still refused
+    /// on its own has those parents' lines staged first, each on a ref of
+    /// its own so the remote keeps advertising both sides, and then goes
+    /// through as just itself.
+    #[allow(clippy::too_many_arguments)]
+    fn stage_line(
+        location: &[&str],
+        url: &str,
+        commit: &str,
+        bases: &[&str],
+        auth: Option<&str>,
+        size: f64,
+        limit: f64,
+        staging: &str,
+    ) -> Result<()> {
         let mut args: Vec<&str> = location.to_vec();
         args.extend(["rev-list", "--first-parent", "--reverse", commit]);
-        if let Some(base) = base.filter(|base| !base.is_empty()) {
-            args.extend(["--not", base]);
+        if !bases.is_empty() {
+            args.push("--not");
+            args.extend(bases);
         }
         let chain: Vec<String> = run_git_env(&args, &[])?
             .lines()
@@ -1515,16 +1548,76 @@ impl GitSource {
         let mut step = start;
         let mut pushed = 0;
         let mut split_files = false;
-        while pushed + 1 < chain.len() {
-            let upto = (pushed + step).min(chain.len() - 1);
-            let refspec = format!("+{}:{STAGING_REF}", chain[upto - 1]);
+        let mut split_merge = false;
+        while pushed < chain.len() {
+            let upto = (pushed + step).min(chain.len());
+            let target = &chain[upto - 1];
+            let refspec = format!("+{target}:{staging}");
             match Self::push_once(location, url, &[refspec], auth) {
                 // Grow back after a step got through: one hard commit should
                 // not leave every commit after it a push of its own.
                 Ok(()) => {
                     pushed = upto;
                     split_files = false;
+                    split_merge = false;
                     step = (step * 2).min(start);
+                }
+                // One merge the remote will not take: stage what its other
+                // parents bring first, then it again.
+                Err(error)
+                    if step == 1
+                        && !split_merge
+                        && (too_large(&error).is_some() || dropped(&error)) =>
+                {
+                    let parents = Self::other_parents(location, target)?;
+                    if parents.is_empty() {
+                        if dropped(&error) && !split_files {
+                            let since = pushed
+                                .checked_sub(1)
+                                .map(|index| chain[index].as_str())
+                                .or(bases.first().copied());
+                            Self::push_large_files(location, url, target, since, auth)?;
+                            split_files = true;
+                            continue;
+                        }
+                        return Err(error);
+                    }
+                    // What the remote holds now: this line so far, or what
+                    // the line started from.
+                    let held: Vec<&str> = match pushed.checked_sub(1) {
+                        Some(index) => vec![chain[index].as_str()],
+                        None => bases.to_vec(),
+                    };
+                    let nested = format!("{staging}-merge");
+                    let staged = parents.iter().try_for_each(|parent| {
+                        Self::stage_line(location, url, parent, &held, auth, size, limit, &nested)
+                    });
+                    // Pushed again below, the merge sends only itself: the
+                    // nested ref keeps its parents advertised until then.
+                    staged?;
+                    let retry =
+                        Self::push_once(location, url, &[format!("+{target}:{staging}")], auth);
+                    let _ = Self::push_once(location, url, &[format!(":{nested}")], auth);
+                    match retry {
+                        Ok(()) => {
+                            pushed = upto;
+                            step = (step * 2).min(start);
+                        }
+                        Err(error) => {
+                            // Itself too big even so: its large files next.
+                            split_merge = true;
+                            if dropped(&error) && !split_files {
+                                let since = pushed
+                                    .checked_sub(1)
+                                    .map(|index| chain[index].as_str())
+                                    .or(bases.first().copied());
+                                Self::push_large_files(location, url, target, since, auth)?;
+                                split_files = true;
+                            } else {
+                                return Err(error);
+                            }
+                        }
+                    }
                 }
                 // One commit the remote still will not take: send its large
                 // files first, one push each, then the commit again.
@@ -1532,8 +1625,8 @@ impl GitSource {
                     let since = pushed
                         .checked_sub(1)
                         .map(|index| chain[index].as_str())
-                        .or(base);
-                    Self::push_large_files(location, url, &chain[upto - 1], since, auth)?;
+                        .or(bases.first().copied());
+                    Self::push_large_files(location, url, target, since, auth)?;
                     split_files = true;
                 }
                 // A step can also be too much for the remote's front end,
@@ -1546,6 +1639,18 @@ impl GitSource {
             }
         }
         Ok(())
+    }
+
+    /// `commit`'s parents after the first: what a merge brings in.
+    fn other_parents(location: &[&str], commit: &str) -> Result<Vec<String>> {
+        let mut args: Vec<&str> = location.to_vec();
+        let spec = format!("{commit}^@");
+        args.extend(["rev-parse", spec.as_str()]);
+        Ok(run_git_env(&args, &[])?
+            .lines()
+            .skip(1)
+            .map(ToOwned::to_owned)
+            .collect())
     }
 
     /// The commit `reference` names in the repository at `url`, or `None`
