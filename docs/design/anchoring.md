@@ -133,7 +133,13 @@ Whether a mount rolls up at all is what `follow` already says:
 - **Pinned** (a private dependency, `/env/prod`): never moves by itself. Promotion
   is a commit moving the pin, and rollback is a revert.
 
-`follow` today names a ref to pull, so saying "pinned" needs a value of its own.
+`follow` names a ref to pull, so "pinned" is a key of its own: `pinned = true`
+in the child's definition, which is the parent's choice, as the mount is.
+On a branch a pinned child's head is the pin, since nothing moves one
+without its parent. Its own development goes on its `main`. A merge that
+moves the pin counts as touching the parent, so it lands there and the
+parent's maintainers approve the promotion. A roll-up never moves the pin.
+`newgit status` says when a pinned child's own `main` is past its pin.
 
 A state holding two independent changes may never have run in CI. Anything that
 needs a tested state should be pinned.
@@ -223,7 +229,7 @@ the source of truth, and a mirror may trail it.
    - An export rooted at a tracker already follows the remote: it fetches
      the tracker's `main`, which the remote moves after each landing.
      `export_rooted_follows_remote.rs` holds it to that.
-7. `follow` says pinned.
+7. `follow` says pinned. **Done**, as `pinned = true` (see *Follow and pinned*).
 8. Replace `ProjectDO` and project-shaped repo names, as #201's remote redesign.
 
 ## Open questions

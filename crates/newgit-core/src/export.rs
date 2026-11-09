@@ -223,6 +223,7 @@ mod tests {
             role: None,
             priority: 0,
             history: crate::tracker::History::Commits,
+            pinned: false,
             requires: Vec::new(),
             resources: Vec::new(),
             excluded: Vec::new(),

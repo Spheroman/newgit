@@ -55,6 +55,11 @@ pub struct TrackerDefinition {
     /// `git log` is complete, or `pins`, one snapshot of where it is now
     /// (docs/design/anchoring.md, *How much history rolls up*).
     pub history: History,
+    /// Whether its parent holds it where it is (`pinned = true`): a change
+    /// landing at it never rolls up into the parent, and moving the
+    /// parent's pin is a change to the parent, its maintainers' to approve.
+    /// For what must not move by itself: a private dependency, `/env/prod`.
+    pub pinned: bool,
     /// Trackers or roles it cannot do without: binding it binds them, and
     /// they cannot be dropped while it is bound.
     pub requires: Vec<String>,
@@ -158,6 +163,8 @@ pub struct TrackerDefinitionFile {
     priority: i32,
     #[serde(default, skip_serializing_if = "is_default_history")]
     history: History,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pinned: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     requires: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -250,6 +257,7 @@ impl TrackerDefinition {
             role: None,
             priority: 0,
             history: History::Commits,
+            pinned: false,
             requires: Vec::new(),
             resources: Vec::new(),
             excluded: Vec::new(),
@@ -283,6 +291,7 @@ impl TrackerDefinition {
             role: None,
             priority: 0,
             history: History::Commits,
+            pinned: false,
             requires: Vec::new(),
             resources: Vec::new(),
             excluded: Vec::new(),
@@ -351,6 +360,7 @@ impl TrackerDefinition {
             role: file.role,
             priority: file.priority,
             history: file.history,
+            pinned: file.pinned,
             requires: file.requires,
             resources: file.resources,
             excluded: Vec::new(),
@@ -492,6 +502,7 @@ impl TrackerDefinition {
             role: self.role.clone(),
             priority: self.priority,
             history: self.history,
+            pinned: self.pinned,
             requires: self.requires.clone(),
             resources: self.resources.clone(),
         }
@@ -516,6 +527,7 @@ impl TrackerDefinition {
             role: None,
             priority: 0,
             history: History::Commits,
+            pinned: false,
             requires: Vec::new(),
             resources: Vec::new(),
             excluded: Vec::new(),
@@ -548,6 +560,7 @@ impl TrackerDefinition {
             role: None,
             priority: 0,
             history: History::Commits,
+            pinned: false,
             requires: Vec::new(),
             resources: Vec::new(),
             excluded: Vec::new(),
@@ -1012,6 +1025,7 @@ mod tests {
             role: None,
             priority: 0,
             history: History::Commits,
+            pinned: false,
             requires: Vec::new(),
             resources: Vec::new(),
             excluded: Vec::new(),

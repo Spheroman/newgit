@@ -639,7 +639,36 @@ async function route(request: Request, env: Env, deps: Deps): Promise<Response> 
 	// ── Branches ───────────────────────────────────────────────────────────
 	// What is not written down yet, read without rolling it up: what
 	// `newgit status` says.
-	if (method === "GET" && rest === "/state") return json(await project.report());
+	if (method === "GET" && rest === "/state") {
+		const report = await project.report();
+		// A pinned tracker's own `main` moved on past the pin its parent
+		// holds: said, so held still never reads as forgotten. (On a branch
+		// its head is the pin: moving it is a change to the parent.)
+		const listed = await listedTrackers(project);
+		const pinned: string[] = [];
+		for (const tracker of listed)
+			if ((await definitionFacts(deps.repos, id, tracker, listed))?.pinned === true) pinned.push(tracker);
+		const mains = new Map<string, string | null>();
+		for (const tracker of pinned)
+			mains.set(
+				tracker,
+				await deps.repos
+					.branchHead(repoName({ kind: "tracker", project: id, tracker }), "main")
+					.catch(() => null),
+			);
+		const branches = await project.branches();
+		return json({
+			...report,
+			branches: report.branches.map((state) => {
+				const list = branches.find((branch) => branch.name === state.name)?.list ?? {};
+				const held = pinned
+					.filter((tracker) => list[tracker] !== undefined && mains.get(tracker) != null)
+					.filter((tracker) => mains.get(tracker) !== list[tracker])
+					.map((tracker) => ({ tracker, pin: list[tracker], main: mains.get(tracker)! }));
+				return held.length === 0 ? state : { ...state, pinned: held };
+			}),
+		});
+	}
 	if (method === "GET" && rest === "/branches")
 		return json({ default: info.defaultBranch, branches: await settledBranches(deps, project, id) });
 	if (method === "PUT" && rest === "/branches/default") {
@@ -1401,6 +1430,11 @@ export interface TrackerFacts {
 	 * snapshot of where it is now (docs/design/anchoring.md).
 	 */
 	history?: "commits" | "pins";
+	/**
+	 * Its parent holds it where it is: never rolled up, and moving its pin
+	 * is a change to the parent (docs/design/anchoring.md, *Follow and pinned*).
+	 */
+	pinned?: boolean;
 }
 
 /** Where `access` is mounted: every definition is `<name>.toml` at its root. */
@@ -1440,6 +1474,7 @@ function parseFacts(text: string, source: string): TrackerFacts | undefined {
 		mount?: unknown;
 		paths?: unknown;
 		history?: unknown;
+		pinned?: unknown;
 	};
 	try {
 		definition = parseToml(text) as typeof definition;
@@ -1459,7 +1494,16 @@ function parseFacts(text: string, source: string): TrackerFacts | undefined {
 	// `git` defaults to false, and is written only when true.
 	// `history` defaults to `commits`, and is written only when `pins`.
 	const history = definition.history === "pins" ? "pins" : "commits";
-	return { audience, git: definition.git === true, maintainers, mount, paths, source, history };
+	return {
+		audience,
+		git: definition.git === true,
+		maintainers,
+		mount,
+		paths,
+		source,
+		history,
+		pinned: definition.pinned === true,
+	};
 }
 
 /** `./a/b/` → `a/b`; the empty path is `.`. */
@@ -2004,8 +2048,10 @@ function rollupStore(project: DurableObjectStub<ProjectDO>, deps: Deps, id: Proj
 	return {
 		// Its definition's `history`: the parent's choice, read as policy is,
 		// from each holder's `main`.
-		historyOf: async (tracker) =>
-			(await definitionFacts(deps.repos, id, tracker, await listedTrackers(project)))?.history ?? "commits",
+		historyOf: async (tracker) => {
+			const facts = await definitionFacts(deps.repos, id, tracker, await listedTrackers(project));
+			return facts?.pinned === true ? "pinned" : (facts?.history ?? "commits");
+		},
 		head: (branch, tracker) => project.head(branch, tracker),
 		trackers: async (branch) => Object.keys((await project.branch(branch))?.list ?? {}),
 		pending: (branch, parent) => project.pending(branch, parent),
@@ -2120,6 +2166,14 @@ export async function anchorFor(
 					)
 				: true;
 		if (only !== true || history !== false) touched.push(tracker);
+	}
+	// A pinned child's pin moving is its parent's change, not a roll-up: the
+	// parent is touched, and its maintainers approve the promotion.
+	const listed = project === undefined ? [] : await listedTrackers(project);
+	for (const tracker of trackers) {
+		const parent = parentOf(tracker);
+		if (parent === null || touched.includes(parent) || !(parent in base) || !(parent in list)) continue;
+		if ((await definitionFacts(deps.repos, id, tracker, listed))?.pinned === true) touched.push(parent);
 	}
 	// A tracker that moved only pins and sits beside the anchor, not above
 	// it, would be left out: it is covered too.

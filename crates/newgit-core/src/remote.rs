@@ -1190,6 +1190,17 @@ pub struct BranchState {
     #[serde(default)]
     pub pending: std::collections::BTreeMap<String, usize>,
     pub rollup_failed: Option<Failed>,
+    /// Pinned trackers whose own `main` moved on past the pin.
+    #[serde(default)]
+    pub pinned: Vec<HeldPin>,
+}
+
+/// A pinned tracker held behind its own `main`: promoting it is moving the pin.
+#[derive(Debug, Clone, Deserialize)]
+pub struct HeldPin {
+    pub tracker: String,
+    pub pin: String,
+    pub main: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1239,6 +1250,17 @@ impl RemoteState {
                     None => note.push_str(" (the next read, or the sweep, writes it down)"),
                 }
                 notes.push(note);
+            }
+        }
+        for branch in &self.branches {
+            for held in &branch.pinned {
+                notes.push(format!(
+                    "`{}`: `{}` is pinned at {}; its own `main` is at {} (moving the pin promotes it)",
+                    branch.name,
+                    held.tracker.split("__").collect::<Vec<_>>().join("/"),
+                    short_commit(&held.pin),
+                    short_commit(&held.main)
+                ));
             }
         }
         for pull in &self.pulls {

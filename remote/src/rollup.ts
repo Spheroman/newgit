@@ -34,7 +34,7 @@ export interface RollupStore {
 	 * How `tracker`'s parent records it (its definition's `history`):
 	 * `commits` unless it says `pins`.
 	 */
-	historyOf?(tracker: string): Promise<"commits" | "pins">;
+	historyOf?(tracker: string): Promise<"commits" | "pins" | "pinned">;
 }
 
 /** Who a roll-up commit is by. */
@@ -86,7 +86,7 @@ export async function rollUp(
 		const head = await store.head(branch, parent);
 		const moves = await store.pending(branch, parent);
 		if (head === null || moves.length === 0) return { head, written };
-		const history = new Map<string, "commits" | "pins">();
+		const history = new Map<string, "commits" | "pins" | "pinned">();
 		for (const tracker of new Set(moves.map((move) => move.tracker)))
 			history.set(tracker, (await store.historyOf?.(tracker)) ?? "commits");
 		const made = await commitsFor(
