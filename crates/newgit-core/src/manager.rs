@@ -2871,12 +2871,39 @@ impl BranchManager {
             return Ok(());
         }
         let client = link.connect(acting)?;
+        // Composed at this root already, its notes intact: composing it again
+        // writes the same notes. Without this, a project root ahead of the
+        // remote's `main` (whose shared commit is noted with a root the remote
+        // never made) recomposed all of `main` on every push, twice: once in
+        // the checkpoint's sync, once in the push. The project's own record
+        // says where `main` is; its trackers are fetched only to compose it.
+        let view = "refs/newgit/views/branches/main";
+        let composed = |root: &str| {
+            self.source.rev_parse(ROOT_MAIN_ON_REMOTE).ok().as_deref() == Some(root)
+                && self.source.rev_parse(view).ok().is_some_and(|commit| {
+                    crate::compose::read_root(project, &commit)
+                        .ok()
+                        .flatten()
+                        .is_some_and(|(_, noted)| noted == root)
+                })
+        };
+        let recorded = client.project(link.project.as_str())?;
+        let main_root = recorded
+            .branches
+            .iter()
+            .find(|branch| branch.name == PROJECT_ROOT_INSTANCE)
+            .and_then(|branch| branch.list.get(&self.root.name));
+        if main_root.is_some_and(|root| composed(root)) {
+            return Ok(());
+        }
         let list = self.branch_list(
             Some((client.as_ref(), link.project.as_str())),
             PROJECT_ROOT_INSTANCE,
         )?;
-        if let Some(root) = list.get(&self.root.name) {
-            self.compose_here("refs/newgit/views/branches/main", root)?;
+        if let Some(root) = list.get(&self.root.name)
+            && !composed(root)
+        {
+            self.compose_here(view, root)?;
             self.source.update_ref(ROOT_MAIN_ON_REMOTE, root)?;
         }
         Ok(())
@@ -4282,6 +4309,14 @@ impl BranchManager {
         branch: &BranchInstance,
         targets: &'a [ExportTarget],
     ) -> ExportRouting<'a> {
+        // Nothing takes branches: nothing to route, and no need to work out
+        // what the instance touched, which diffs every tracker it binds.
+        if !targets.iter().any(|target| target.branches) {
+            return ExportRouting {
+                exporting: Vec::new(),
+                resolved: None,
+            };
+        }
         let definitions = self.carved_definitions();
         route_to_targets(
             targets,
@@ -4301,6 +4336,16 @@ impl BranchManager {
     /// none of the others.
     fn resolve_gh(&self, branch: &BranchInstance, targets: &[ExportTarget]) -> Result<()> {
         let resolved = self.route_branch(branch, targets).resolved;
+        self.point_gh(branch, targets, resolved)
+    }
+
+    /// [`Self::resolve_gh`], with the routing already worked out.
+    fn point_gh(
+        &self,
+        branch: &BranchInstance,
+        targets: &[ExportTarget],
+        resolved: Option<&str>,
+    ) -> Result<()> {
         let workspace = branch.workspace_path.as_str();
         for target in targets.iter().filter(|target| target.branches) {
             let key = format!("remote.{}.gh-resolved", target.name);
@@ -9115,8 +9160,13 @@ impl BranchManager {
                 }];
             }
         };
+        let routing = self.route_branch(branch, &targets);
         let mut list = BTreeMap::new();
-        for definition in self.carved_definitions() {
+        for definition in self
+            .carved_definitions()
+            .into_iter()
+            .filter(|_| !routing.exporting.is_empty())
+        {
             let commit = [format!("instances/{}", branch.slug), "main".to_owned()]
                 .iter()
                 .find_map(|name| {
@@ -9128,7 +9178,6 @@ impl BranchManager {
                 list.insert(definition.name.clone(), commit);
             }
         }
-        let routing = self.route_branch(branch, &targets);
         let exports: Vec<BranchExport> = routing
             .exporting
             .iter()
@@ -9183,7 +9232,7 @@ impl BranchManager {
         // The work is split into trackers by now, so this is where `gh`
         // learns which target it belongs to.
         if branch.remote.is_some() {
-            let _ = self.resolve_gh(branch, &targets);
+            let _ = self.point_gh(branch, &targets, routing.resolved);
         }
         exports
     }
@@ -11197,19 +11246,26 @@ impl BranchManager {
                     // them, and a remote refuses a commit with its parents
                     // cut. A plain fetch stops at the pin they are built on.
                     let imported = format!("refs/newgit/imported-trackers/{tracker}");
-                    for refspec in [
+                    let refspecs = [
                         format!("+refs/heads/{from_slug}:{imported}/heads/{from_slug}"),
                         format!(
                             "+{}:{imported}/checkpoint",
                             fork_checkpoint_ref(checkpoint_id)
                         ),
-                    ] {
-                        let _ = GitSource::fetch_refs(
-                            &["-C", root.as_str()],
-                            url,
-                            &[refspec],
-                            Some(&auth),
-                        );
+                    ];
+                    // Both in one fetch; one at a time only when one of them
+                    // is not on the fork, which fails a fetch of both.
+                    if GitSource::fetch_refs(&["-C", root.as_str()], url, &refspecs, Some(&auth))
+                        .is_err()
+                    {
+                        for refspec in refspecs {
+                            let _ = GitSource::fetch_refs(
+                                &["-C", root.as_str()],
+                                url,
+                                &[refspec],
+                                Some(&auth),
+                            );
+                        }
                     }
                     let repo = self.git_repo(project, tracker);
                     let credential = remote.credential(project, &repo, Scope::Read)?;
@@ -11227,26 +11283,24 @@ impl BranchManager {
                 readable.insert(tracker.clone());
                 continue;
             }
-            GitSource::fetch_refs(
-                &["-C", root.as_str()],
-                url,
-                &[format!(
-                    "+refs/heads/*:refs/newgit/imported-trackers/{tracker}/heads/*"
-                )],
-                Some(&auth),
-            )?;
+            let heads = format!("+refs/heads/*:refs/newgit/imported-trackers/{tracker}/heads/*");
             // A fork holds the checkpoint's own commit only when the tracker
-            // had moved at that checkpoint; otherwise its heads have it.
-            if forked {
-                let _ = GitSource::fetch_refs(
+            // had moved at that checkpoint; otherwise its heads have it. Both
+            // in one fetch, and apart only when the checkpoint's is not there.
+            let checkpoint = format!(
+                "+{}:refs/newgit/imported-trackers/{tracker}/checkpoint",
+                fork_checkpoint_ref(checkpoint_id)
+            );
+            let together = forked
+                && GitSource::fetch_refs(
                     &["-C", root.as_str()],
                     url,
-                    &[format!(
-                        "+{}:refs/newgit/imported-trackers/{tracker}/checkpoint",
-                        fork_checkpoint_ref(checkpoint_id)
-                    )],
+                    &[heads.clone(), checkpoint],
                     Some(&auth),
-                );
+                )
+                .is_ok();
+            if !together {
+                GitSource::fetch_refs(&["-C", root.as_str()], url, &[heads], Some(&auth))?;
             }
             for commit in [code.head.get(tracker), code.tip.get(tracker)]
                 .into_iter()
