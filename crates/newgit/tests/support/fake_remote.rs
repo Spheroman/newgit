@@ -61,6 +61,8 @@ struct State {
     denied_trackers: std::collections::BTreeSet<String>,
     /// Branch → the index the merge in flight began with.
     merge_targets: BTreeMap<String, Value>,
+    /// What `GET /state` answers: nothing pending, no pulls, unless set.
+    remote_state: Value,
     /// Answer uploads 404, as a remote from before them does.
     refuse_uploads: bool,
     /// Every commit sent before a merge began, by tracker.
@@ -696,6 +698,16 @@ fn route(
             }
             (200, json!({ "name": name, "removed": true }))
         }
+        // What the remote has not written down: the fake writes everything
+        // down at once, unless a test says otherwise.
+        ("GET", ["v1", "projects", _, _, "state"]) => (
+            200,
+            if state.remote_state.is_null() {
+                json!({ "branches": [], "pulls": [], "ended": [] })
+            } else {
+                state.remote_state.clone()
+            },
+        ),
         ("POST", ["v1", "projects", _, _, "credentials"]) if state.fail_credentials => {
             (503, json!({ "error": "the remote is down" }))
         }

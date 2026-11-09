@@ -876,6 +876,9 @@ fn show(json: bool) -> Result<()> {
     }
     let (section, name, client) = linked()?;
     let view = client.project(&name)?;
+    // What it has not written down yet, and its webhook pulls: said here
+    // in full, and in `newgit status` when there is anything.
+    let state = client.state(&name, false).ok();
     let members: Vec<&str> = view
         .members
         .iter()
@@ -891,6 +894,11 @@ fn show(json: bool) -> Result<()> {
                 "branches": view.branches.iter().map(|branch| serde_json::json!({
                     "name": branch.name, "list": branch.list,
                 })).collect::<Vec<_>>(),
+                "not_written_down": state.as_ref().map(|state| state.notes()),
+                "webhook_pulls": state.as_ref().map(|state| state.ended.iter().map(|ended| serde_json::json!({
+                    "target": ended.target, "commit": ended.commit, "outcome": ended.outcome,
+                    "why": ended.why, "at": ended.at,
+                })).collect::<Vec<_>>()),
             })
         );
     } else {
@@ -906,6 +914,31 @@ fn show(json: bool) -> Result<()> {
             println!("  branch {}{marker}:", branch.name);
             for (tracker, commit) in &branch.list {
                 println!("    {tracker:<12} {}", &commit[..commit.len().min(12)]);
+            }
+        }
+        match &state {
+            None => println!("  the remote did not say what it has not written down yet"),
+            Some(state) => {
+                let notes = state.notes();
+                if notes.is_empty() {
+                    println!("  everything landed is written down");
+                }
+                for note in notes {
+                    println!("  {note}");
+                }
+                if let Some(last) = state.ended.last() {
+                    println!(
+                        "  last webhook pull: `{}` at {}, {}{} ({})",
+                        last.target,
+                        &last.commit[..last.commit.len().min(12)],
+                        last.outcome,
+                        last.why
+                            .as_deref()
+                            .map(|why| format!(": {why}"))
+                            .unwrap_or_default(),
+                        last.at
+                    );
+                }
             }
         }
     }

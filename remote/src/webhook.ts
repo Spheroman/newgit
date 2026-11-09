@@ -18,6 +18,7 @@ import {
 	type Deps,
 	HttpError,
 	isChecking,
+	anchorFor,
 	landAndFollow,
 	loadDefinitions,
 	projectStub,
@@ -71,6 +72,8 @@ export interface MirrorPull {
 	lookup?: { since: number; last: number };
 	queuedAt: number;
 	attempts: number;
+	/** Why the last attempt failed, for `newgit status` to say. */
+	lastError?: string;
 	/** A look found something to land. */
 	peeked?: boolean;
 	/** Read passwords handed out for looks, to cancel when the pull ends. */
@@ -358,7 +361,7 @@ export async function advancePulls(env: Env, deps: Deps, id: ProjectId): Promise
 			console.log(JSON.stringify({ webhook: "starting again from `main`", ...log, why }));
 			await project.restartPull(pull);
 		} else {
-			const attempts = await project.pullFailed(pull);
+			const attempts = await project.pullFailed(pull, why);
 			done = attempts >= PULL_ATTEMPTS;
 			console.error(JSON.stringify({ webhook: "pull failed", ...log, why, attempts, givingUp: done }));
 		}
@@ -368,6 +371,16 @@ export async function advancePulls(env: Env, deps: Deps, id: ProjectId): Promise
 		done = true;
 	}
 	if (done) {
+		// Said where `newgit status` reads it, not only in the logs.
+		const last = (await project.pulls()).find((known) => known.target === pull.target && known.commit === pull.commit);
+		if (last?.attempts !== undefined && last.attempts > 0)
+			await project.notePullEnded({
+				target: pull.target,
+				commit: pull.commit,
+				outcome: "gave up",
+				why: last.lastError ?? "it ran too long",
+				at: new Date().toISOString(),
+			});
 		await revokeRepoTokens(deps, await project.dropPull(pull));
 	}
 	return (await project.pulls()).length > 0;
@@ -404,9 +417,18 @@ async function advance(env: Env, deps: Deps, id: ProjectId, pull: MirrorPull): P
 		}
 		return { handed, minted };
 	};
-	const ended = (answer: { outcome: "nothing" } | { outcome: "refused"; why: string }) => {
-		if (answer.outcome === "refused") console.error(JSON.stringify({ webhook: "refused", ...log, why: answer.why }));
-		else console.log(JSON.stringify({ webhook: "nothing to bring in", ...log }));
+	const ended = async (answer: { outcome: "nothing" } | { outcome: "refused"; why: string }) => {
+		if (answer.outcome === "refused") {
+			console.error(JSON.stringify({ webhook: "refused", ...log, why: answer.why }));
+			// A refusal is the pusher's to fix: said where `newgit status` reads it.
+			await project.notePullEnded({
+				target: pull.target,
+				commit: pull.commit,
+				outcome: "refused",
+				why: answer.why,
+				at: new Date().toISOString(),
+			});
+		} else console.log(JSON.stringify({ webhook: "nothing to bring in", ...log }));
 		return true;
 	};
 	if (!deps.pull) throw new HttpError(501, "this remote has no Git endpoint to pull with");
@@ -426,7 +448,7 @@ async function advance(env: Env, deps: Deps, id: ProjectId, pull: MirrorPull): P
 			return minted;
 		});
 		if (isChecking(seen)) return false;
-		if (seen.outcome === "nothing" || seen.outcome === "refused") return ended(seen);
+		if (seen.outcome === "nothing" || seen.outcome === "refused") return await ended(seen);
 		await project.markPeeked(pull);
 	}
 
@@ -458,15 +480,41 @@ async function advance(env: Env, deps: Deps, id: ProjectId, pull: MirrorPull): P
 	if (answer.outcome === "landed") {
 		// The commit point: `main`'s list, by compare-and-swap. A merge that
 		// landed meanwhile sends this pull back to start from it.
-		const landed = await landAndFollow(deps, project, id, PULL_BRANCH, begun.base, answer.list, WEBHOOK_MERGER, answer.moves ?? []);
+		// It lands as a merge does: at its anchor, the lowest tracker it
+		// touches, so a change on the mirror to one tracker neither waits on
+		// root nor sends a merge elsewhere back to start (its commits are at
+		// their landing refs, so the anchor can be read).
+		const moved = [...new Set([...Object.keys(begun.base), ...Object.keys(answer.list)])].filter(
+			(tracker) => begun.base[tracker] !== answer.list[tracker],
+		);
+		const anchor = await anchorFor(deps, id, begun.base, answer.list, moved, project, PULL_BRANCH);
+		const landed = await landAndFollow(
+			deps,
+			project,
+			id,
+			PULL_BRANCH,
+			begun.base,
+			answer.list,
+			WEBHOOK_MERGER,
+			answer.moves ?? [],
+			true,
+			anchor,
+		);
 		if (!landed.ok) throw new HttpError(409, `the pull could not land: \`${PULL_BRANCH}\` ${landed.reason}`);
+		await project.notePullEnded({
+			target: pull.target,
+			commit: pull.commit,
+			outcome: "landed",
+			why: anchor === "root" ? undefined : `at \`${anchor.split("__").join("/")}\``,
+			at: new Date().toISOString(),
+		});
 		console.log(
 			JSON.stringify({ webhook: "landed", ...log, commits: answer.commits, root: answer.list.root, behind: landed.behind }),
 		);
 		return true;
 	}
 	if (answer.outcome === "work") throw new HttpError(500, "a landing answered as a peek");
-	return ended(answer);
+	return await ended(answer);
 }
 
 const trackersOf = (list: Record<string, string>) => [...new Set([...Object.keys(list), "access"])];

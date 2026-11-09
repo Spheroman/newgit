@@ -212,7 +212,17 @@ the source of truth, and a mirror may trail it.
      It rolls up every pending branch. It deletes landing refs whose commit
      is in history at once, and others on their third sighting (two hours
      on, past any merge still pending).
-6. `status`, exports, and the webhook follow the log.
+6. `status`, exports, and the webhook follow the log. **Done.**
+   - `GET /v1/projects/<p>/state` says what is not written down yet, without
+     rolling it up: per branch, how many moves each parent has pending, and
+     why its last roll-up failed. It also lists the webhook pulls waiting
+     (with their last error) and how the last ones ended. `newgit status`
+     says it when there is anything; `newgit remote show` always does.
+   - A webhook pull lands at its anchor, as a merge does. A refused or
+     given-up pull is said there, not only in the logs.
+   - An export rooted at a tracker already follows the remote: it fetches
+     the tracker's `main`, which the remote moves after each landing.
+     `export_rooted_follows_remote.rs` holds it to that.
 7. `follow` says pinned.
 8. Replace `ProjectDO` and project-shaped repo names, as #201's remote redesign.
 
@@ -222,11 +232,12 @@ the source of truth, and a mirror may trail it.
   dead client left behind?
 - **Pins and privacy.** A `pins` parent carries no messages, but a pin still says
   a tree exists (#201, "the registry leaks shape").
-- **The webhook.** It lands on root today. A merge on a mirror touching one tracker
-  should anchor like any other.
+- **The webhook.** Resolved: a pull lands at its anchor, as a merge does.
 - **Permission to anchor.** Who may land at a tracker when the change was reviewed
   on a mirror that sees only one view?
-- **Instances behind.** `status` counts commits behind root, which now means
-  something narrower.
+- **Instances behind.** `status` counts commits behind the store's own
+  branches. It says the remote's pending roll-ups beside them now, but an
+  instance's own count still knows nothing of a tracker that moved on the
+  remote and not here.
 - **Where a merge runs.** Git's merge needs the container, the slow part. Roll-ups
   move only pins, and may not need one.

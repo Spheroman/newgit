@@ -222,6 +222,10 @@ pub trait Remote: Send + Sync {
     /// [`UploadRefused`], and the merge pushes with a password as before.
     fn upload_objects(&self, project: &str, tracker: &str, commit: &str, pack: &[u8])
     -> Result<()>;
+    /// What the remote has not written down yet, read without rolling it
+    /// up, and how its webhook pulls stand. `quick`: give up within seconds,
+    /// for `newgit status`, which must not wait on the network.
+    fn state(&self, project: &str, quick: bool) -> Result<RemoteState>;
     /// Land it: `branch`'s list moves from `base` to `list` in one
     /// compare-and-swap, the merge's only commit point. Root's branch then
     /// follows, and each of `moves` is made. Where it landed, and what
@@ -716,6 +720,33 @@ impl Remote for HttpRemote {
         Ok(started)
     }
 
+    fn state(&self, project: &str, quick: bool) -> Result<RemoteState> {
+        let path = format!("/v1/projects/{}/state", project_path(project));
+        if !quick {
+            return self.send("GET", &path, None);
+        }
+        let agent: ureq::Agent = ureq::Agent::config_builder()
+            .http_status_as_error(false)
+            .timeout_global(Some(Duration::from_secs(3)))
+            .build()
+            .into();
+        let mut request = agent.get(format!("{}{path}", self.url));
+        if let Some(token) = &self.token {
+            request = request.header("authorization", format!("Bearer {token}"));
+        }
+        let unreachable = |error: ureq::Error| NewgitError::RemoteUnreachable {
+            url: self.url.clone(),
+            detail: error.to_string(),
+        };
+        let mut response = request.call().map_err(unreachable)?;
+        let status = response.status().as_u16();
+        let text = response.body_mut().read_to_string().map_err(unreachable)?;
+        if !(200..300).contains(&status) {
+            return Err(remote_error_on("GET", &path, status, &text));
+        }
+        parse(&text, status)
+    }
+
     fn upload_objects(
         &self,
         project: &str,
@@ -1137,6 +1168,122 @@ pub struct BegunMerge {
     /// trackers above it roll up to it. None from a remote before anchors.
     #[serde(default)]
     pub anchor: Option<String>,
+}
+
+/// What a remote has not written down yet, and its webhook pulls
+/// (`GET /v1/projects/<p>/state`).
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct RemoteState {
+    #[serde(default)]
+    pub branches: Vec<BranchState>,
+    #[serde(default)]
+    pub pulls: Vec<PullState>,
+    #[serde(default)]
+    pub ended: Vec<PullEnded>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BranchState {
+    pub name: String,
+    /// Per parent, how many moves below it are not rolled up yet.
+    #[serde(default)]
+    pub pending: std::collections::BTreeMap<String, usize>,
+    pub rollup_failed: Option<Failed>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct Failed {
+    pub at: String,
+    pub why: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PullState {
+    pub target: String,
+    pub commit: String,
+    pub queued_at: String,
+    pub attempts: u32,
+    pub last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct PullEnded {
+    pub target: String,
+    pub commit: String,
+    pub outcome: String,
+    pub why: Option<String>,
+    pub at: String,
+}
+
+impl RemoteState {
+    /// What a person should know, one line each: what is not written down
+    /// (and why, when rolling it up failed), pulls waiting or failing, and
+    /// pulls refused or given up. Nothing when all is written down.
+    pub fn notes(&self) -> Vec<String> {
+        let mut notes = Vec::new();
+        for branch in &self.branches {
+            for (parent, count) in &branch.pending {
+                let changes = if *count == 1 { "change" } else { "changes" };
+                let mut note = format!(
+                    "`{}`: `{}` has {count} {changes} below it not rolled up yet",
+                    branch.name,
+                    parent.split("__").collect::<Vec<_>>().join("/")
+                );
+                match &branch.rollup_failed {
+                    Some(failed) => note.push_str(&format!(
+                        "; its last roll-up failed ({}), so reads serve its last commit",
+                        failed.why
+                    )),
+                    None => note.push_str(" (the next read, or the sweep, writes it down)"),
+                }
+                notes.push(note);
+            }
+        }
+        for pull in &self.pulls {
+            let mut note = format!(
+                "the webhook's pull from `{}` at {} is waiting",
+                pull.target,
+                short_commit(&pull.commit)
+            );
+            if let Some(why) = &pull.last_error {
+                note.push_str(&format!(
+                    " ({} failed attempts; last: {why})",
+                    pull.attempts
+                ));
+            }
+            notes.push(note);
+        }
+        // A target's last pull only: one that landed since says the trouble
+        // is over.
+        let mut last: std::collections::BTreeMap<&str, &PullEnded> =
+            std::collections::BTreeMap::new();
+        for ended in &self.ended {
+            last.insert(ended.target.as_str(), ended);
+        }
+        for ended in last.values() {
+            if ended.outcome == "refused" || ended.outcome == "gave up" {
+                notes.push(format!(
+                    "the webhook's pull from `{}` at {} {} ({}): {}",
+                    ended.target,
+                    short_commit(&ended.commit),
+                    if ended.outcome == "refused" {
+                        "was refused"
+                    } else {
+                        "gave up"
+                    },
+                    ended.at,
+                    ended.why.as_deref().unwrap_or("no reason given")
+                ));
+            }
+        }
+        notes
+    }
+}
+
+fn short_commit(commit: &str) -> &str {
+    &commit[..commit.len().min(12)]
 }
 
 /// A merge the remote landed.

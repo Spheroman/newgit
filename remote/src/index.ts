@@ -637,6 +637,9 @@ async function route(request: Request, env: Env, deps: Deps): Promise<Response> 
 	}
 
 	// ── Branches ───────────────────────────────────────────────────────────
+	// What is not written down yet, read without rolling it up: what
+	// `newgit status` says.
+	if (method === "GET" && rest === "/state") return json(await project.report());
 	if (method === "GET" && rest === "/branches")
 		return json({ default: info.defaultBranch, branches: await settledBranches(deps, project, id) });
 	if (method === "PUT" && rest === "/branches/default") {
@@ -2025,6 +2028,7 @@ export async function settle(
 	const repoOf = (tracker: string) => repoName({ kind: "tracker", project: id, tracker });
 	try {
 		const rolled = await rollUp(deps.repos, rollupStore(project, deps, id), repoOf, branch, "root");
+		await project.noteRollup(branch, null);
 		if (rolled.written > 0 || rolled.head !== null) {
 			const heads = {
 				head: (name: string, tracker: string) => project.head(name, tracker),
@@ -2037,6 +2041,7 @@ export async function settle(
 		}
 		return true;
 	} catch (error) {
+		await project.noteRollup(branch, error instanceof Error ? error.message : String(error)).catch(() => {});
 		console.error(
 			JSON.stringify({
 				rollup: "failed; serving root's last commit",
@@ -2092,7 +2097,7 @@ async function settledBranch(
  * The anchor of a merge from `base` to `list` moving `trackers`: the lowest
  * tracker covering every one it touches, and every one it moves at all.
  */
-async function anchorFor(
+export async function anchorFor(
 	deps: Deps,
 	id: ProjectId,
 	base: TrackerList,

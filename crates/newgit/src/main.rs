@@ -2680,7 +2680,37 @@ fn status(name: Option<&str>, path_only: bool) -> Result<()> {
             manager.store().paths().project_root
         );
     }
+    remote_state_notes(&manager);
     Ok(())
+}
+
+/// What the project's remote has not written down yet, and webhook pulls
+/// waiting, failing, or refused: said only when there is something, so
+/// "not written yet" never reads as "out of date" (docs/design/anchoring.md).
+/// Asked within seconds; not logged in, it says nothing.
+fn remote_state_notes(manager: &BranchManager) {
+    let Some(link) = manager.remote_link() else {
+        return;
+    };
+    let asked = link
+        .connect(newgit_core::remote::Acting::Login)
+        .and_then(|client| client.state(&link.project, true));
+    match asked {
+        Ok(state) => {
+            let notes = state.notes();
+            if !notes.is_empty() {
+                println!("\nOn {}:", link.project);
+                for note in notes {
+                    println!("  {note}");
+                }
+            }
+        }
+        Err(newgit_core::NewgitError::NotLoggedIn(_)) => {}
+        Err(error) => println!(
+            "\nOn {}: the remote did not say what it has not written down yet ({error})",
+            link.project
+        ),
+    }
 }
 
 fn status_column(report: &InstanceReport) -> String {

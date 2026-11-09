@@ -692,10 +692,68 @@ export class ProjectDO extends DurableObject<Env> {
 	}
 
 	/** Count a failure. How many there have been. */
-	pullFailed(pull: MirrorPull): number {
+	pullFailed(pull: MirrorPull, why = ""): number {
 		const attempts = (this.pulls().find((known) => samePull(known, pull))?.attempts ?? 0) + 1;
-		this.writePulls(this.pulls().map((known) => (samePull(known, pull) ? { ...known, attempts } : known)));
+		this.writePulls(
+			this.pulls().map((known) => (samePull(known, pull) ? { ...known, attempts, lastError: why } : known)),
+		);
 		return attempts;
+	}
+
+	/** How a webhook pull ended, kept (the last ten) for `newgit status` to say. */
+	notePullEnded(ended: PullEnded): void {
+		const row = this.sql.exec<{ value: string }>("SELECT value FROM meta WHERE key = 'pulls_ended'").toArray()[0];
+		const kept = row ? (JSON.parse(row.value) as PullEnded[]) : [];
+		this.sql.exec("INSERT OR REPLACE INTO meta VALUES ('pulls_ended', ?)", JSON.stringify([...kept, ended].slice(-10)));
+	}
+
+	/** Whether rolling `name` up last worked; why not, when it did not. */
+	noteRollup(name: string, why: string | null): void {
+		if (why === null) this.sql.exec("DELETE FROM meta WHERE key = ?", `rollup_failed:${name}`);
+		else
+			this.sql.exec(
+				"INSERT OR REPLACE INTO meta VALUES (?, ?)",
+				`rollup_failed:${name}`,
+				JSON.stringify({ at: new Date().toISOString(), why }),
+			);
+	}
+
+	/**
+	 * What the remote has not written down yet, read without rolling it up:
+	 * per branch, how many moves each parent has pending and whether its
+	 * last roll-up failed; the webhook pulls waiting, and how the last ones
+	 * ended. What `newgit status` says, so "not written yet" never reads as
+	 * "out of date". (Not `state`: Workers RPC does not expose a Durable
+	 * Object method by that name, though the test runtime does.)
+	 */
+	report(): ProjectState {
+		const ended = this.sql.exec<{ value: string }>("SELECT value FROM meta WHERE key = 'pulls_ended'").toArray()[0];
+		return {
+			branches: this.branches().map((branch) => {
+				const pending: Record<string, number> = {};
+				for (const tracker of new Set(Object.keys(branch.list).map(parentOf))) {
+					if (tracker === null) continue;
+					const count = this.pending(branch.name, tracker).length;
+					if (count > 0) pending[tracker] = count;
+				}
+				const failed = this.sql
+					.exec<{ value: string }>("SELECT value FROM meta WHERE key = ?", `rollup_failed:${branch.name}`)
+					.toArray()[0];
+				return {
+					name: branch.name,
+					pending,
+					...(failed ? { rollupFailed: JSON.parse(failed.value) as { at: string; why: string } } : {}),
+				};
+			}),
+			pulls: this.pulls().map((pull) => ({
+				target: pull.target,
+				commit: pull.commit,
+				queuedAt: new Date(pull.queuedAt).toISOString(),
+				attempts: pull.attempts,
+				...(pull.lastError ? { lastError: pull.lastError } : {}),
+			})),
+			ended: ended ? (JSON.parse(ended.value) as PullEnded[]) : [],
+		};
 	}
 
 	/** `main` moved under the pull: forget the index it began with. */
@@ -987,6 +1045,22 @@ interface InstanceRow extends Record<string, SqlStorageValue> {
 }
 
 /** One head moving: `old` null when the tracker joined, `new` null when it left. */
+/** How a webhook pull ended. */
+export interface PullEnded {
+	target: string;
+	commit: string;
+	outcome: "landed" | "nothing" | "refused" | "gave up";
+	why?: string;
+	at: string;
+}
+
+/** `ProjectDO.state`: what is not written down yet, and the webhook's pulls. */
+export interface ProjectState {
+	branches: { name: string; pending: Record<string, number>; rollupFailed?: { at: string; why: string } }[];
+	pulls: { target: string; commit: string; queuedAt: string; attempts: number; lastError?: string }[];
+	ended: PullEnded[];
+}
+
 export interface HeadMove {
 	seq: number;
 	tracker: string;
