@@ -410,7 +410,13 @@ enum TrackerCommand {
     /// Delete a tracker definition
     Remove { name: String },
     /// List defined trackers
-    List,
+    List {
+        /// Print every tracker as JSON, with what a new instance binds by
+        /// default and what this instance binds — for tools that offer the
+        /// choice `spawn --use`/`--drop` make
+        #[arg(long)]
+        json: bool,
+    },
     /// Snapshot a tracker's content from an instance workspace
     Capture {
         tracker: String,
@@ -2290,12 +2296,14 @@ fn tracker(mut command: TrackerCommand) -> Result<()> {
             );
             Ok(())
         }
-        TrackerCommand::List => {
+        TrackerCommand::List { json } => {
             let context = context_here()?;
             let current = context.current_branch.clone();
             let manager = BranchManager::open(context.store)?;
-            warn_gitignore(&manager);
-            warn_graph(&manager);
+            if !json {
+                warn_gitignore(&manager);
+                warn_graph(&manager);
+            }
             let dropped = current
                 .as_deref()
                 .and_then(|name| manager.store().find_branch(name).ok())
@@ -2304,6 +2312,56 @@ fn tracker(mut command: TrackerCommand) -> Result<()> {
                 .chain(manager.carved_trackers())
                 .chain(manager.tracker_definitions())
                 .collect();
+            if json {
+                // What a spawn with no `--use`/`--drop` would leave out. A
+                // project whose defaults cannot be met (a required role no
+                // tracker fills by default) reports no defaults.
+                let default_dropped = manager
+                    .choose_binding(&newgit_core::manager::BindingChoice::default())
+                    .ok();
+                let root = manager.root_tracker().name.clone();
+                let trackers: Vec<_> = definitions
+                    .iter()
+                    .map(|definition| {
+                        // `root` and `access` are always bound.
+                        let selectable = definition.name != root
+                            && definition.name != newgit_core::tracker::ACCESS_TRACKER;
+                        let default_bound = match &default_dropped {
+                            _ if !selectable => Some(true),
+                            Some(dropped) => Some(!dropped.contains(&definition.name)),
+                            None => None,
+                        };
+                        // Named as `--use`/`--drop` take them: `t3code/repos`.
+                        let path = newgit_core::tracker::tracker_path;
+                        serde_json::json!({
+                            "name": path(&definition.name),
+                            "parent": definition.parent.as_deref().map(path),
+                            "paths": definition.paths,
+                            "git": definition.git,
+                            "role": definition.role,
+                            "priority": definition.priority,
+                            "requires": definition
+                                .requires
+                                .iter()
+                                .map(|name| path(name))
+                                .collect::<Vec<_>>(),
+                            "selectable": selectable,
+                            "default_bound": default_bound,
+                            "bound": dropped
+                                .as_ref()
+                                .map(|dropped| !dropped.contains(&definition.name)),
+                        })
+                    })
+                    .collect();
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "instance": current,
+                        "trackers": trackers,
+                    }))?
+                );
+                return Ok(());
+            }
             // A tree by ownership: each tracker under the tracker whose paths
             // hold its own — root at the top, carved trackers and those outside Git
             // beneath whatever they were carved from.

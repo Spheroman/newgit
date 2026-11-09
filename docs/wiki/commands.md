@@ -56,7 +56,9 @@ Definition management (noun subcommands):
 - `newgit tracker list` — a tree by ownership: whether it is in Git, role, priority,
   maintainers, and (inside a workspace) what is bound. Trackers with no
   `paths` come after the tree, with what deposits into them and what they
-  bring
+  bring. `--json` lists every tracker with `default_bound` (what a `spawn`
+  with no `--use`/`--drop` binds) and `bound` (what this instance binds,
+  `null` outside one), named as `--use` takes them
 - `newgit tracker use <tracker> [instance]` / `newgit tracker drop <tracker>
   [instance] [--stash | --discard]` — a drop parks the resources the tracker
   brought: taken down by `suspend` (else `[cleanup]`), ports kept, and
