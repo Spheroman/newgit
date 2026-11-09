@@ -237,12 +237,13 @@ the source of truth, and a mirror may trail it.
    - Heads handed over lazily from `ProjectDO`.
    - `/<owner>/<name>/<path>.git` serves a view rooted at that tracker.
 
-   One tracker in two roots comes next.
+   - One tracker in two roots, as `link` (docs/design/trackers.md,
+     *Links*). **Done**, checked live on the dev remote.
 
 ## Step 8: the remote by path
 
 Agreed with Jack, 2026-11-08: members stay on the root, and one tracker
-in two roots comes after step 8. Build order items 1–3 are built.
+in two roots comes after step 8. All four build order items are built.
 
 Today the remote is project-shaped. `ProjectDO`, one Durable Object per
 `<owner>/<project>`, holds every tracker's heads, its log, and roll-up
@@ -328,7 +329,7 @@ from its inbox, and moving its head puts an entry in its own outbox.
 3. Path-addressed Git endpoint (`/<root>/<path>.git`).
 4. A tracker bound in two roots (#201's suggested experiment): a second
    mount is a symlink to the same `TrackerDO`, and its parents both get its
-   outbox entries.
+   outbox entries. **Done**, as `link` (docs/design/trackers.md, *Links*).
 
 ### Questions for Jack
 

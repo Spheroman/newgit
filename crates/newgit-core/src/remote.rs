@@ -211,6 +211,11 @@ pub trait Remote: Send + Sync {
     /// Create the repo of a tracker in Git carved after the project was, and
     /// the one write that seeds it.
     fn create_tracker_repo(&self, project: &str, tracker: &str) -> Result<SeedCredential>;
+    /// Record that `tracker` here is `home` (`<owner>/<project>[/<path>]`)
+    /// elsewhere: its repo is its home's, and the merge that adds it reads
+    /// it there. Only who may add the tracker records it, and only a reader
+    /// of its home.
+    fn link_tracker(&self, project: &str, tracker: &str, home: &str) -> Result<()>;
     /// Start merging into `branch`, whose index must still be `base`, to
     /// make index `list`. The remote asks Git how each pin moves: a move
     /// forward along that tracker's own `main` needs only root's
@@ -720,6 +725,15 @@ impl Remote for HttpRemote {
             &format!("/v1/projects/{}/trackers", project_path(project)),
             Some(serde_json::json!({ "name": tracker })),
         )
+    }
+
+    fn link_tracker(&self, project: &str, tracker: &str, home: &str) -> Result<()> {
+        let _: serde_json::Value = self.send(
+            "POST",
+            &format!("/v1/projects/{}/trackers", project_path(project)),
+            Some(serde_json::json!({ "name": tracker, "link": home })),
+        )?;
+        Ok(())
     }
 
     fn begin_merge(

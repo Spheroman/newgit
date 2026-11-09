@@ -109,6 +109,7 @@ authoritative list; in short:
 | `priority` | Which alternative is picked by default: highest readable wins. **Negative: never picked automatically** — only by `--use` or a personal setting. |
 | `history` | How its parent records it rolling up (docs/design/anchoring.md): `commits` (the default), one commit per change so the parent's `git log` is complete; or `pins`, one snapshot of where it is now, carrying none of its messages. The parent's choice, as the mount is. Written only when `pins`. |
 | `pinned` | Whether its parent holds it where it is (docs/design/anchoring.md, *Follow and pinned*): a change landing at it never rolls up into the parent, and moving the parent's pin is a change to the parent, approved by the parent's maintainers; rollback is a revert. For what must not move by itself: a private dependency, `/env/prod`. Default `false`. |
+| `link` | Where it lives when it lives in another project: `"<owner>/<project>[/<path>]"` (see *Links*). Its history, heads, repo, and policy are its home's; only where it is mounted is this project's. Only a tracker in Git. Written by `newgit tracker link`. |
 | `resources` | Resources this tracker brings. A resource is bound iff a bound tracker brings it. |
 | `requires` | Trackers or roles this one needs: bound with it, and not droppable while it is bound. |
 | `git` | Whether its content is committed with Git. `false` (the default): never in the workspace's Git, excluded, never committed, captured by newgit from the files at checkpoint. `true`: a tracker in Git, committed with Git and split into its own history. Written only when `true`. |
@@ -1336,6 +1337,80 @@ this is the list.
   `origin` URL, or only its directory's name.
 
 ---
+
+## Links: one tracker in two roots
+
+Built 2026-11-09 as #201's suggested experiment, after anchoring's step 8.
+A tracker defined with `link = "spheroman/jack-env/dots"` is that project's
+`dots`, mounted here. `newgit tracker link <name> <home> --mount <path>`
+writes the definition and joins the home's `main` as one commit on the
+project root; `newgit merge main` publishes it.
+
+- **One history.** The link has no repo here. Its repo is its home's
+  (`spheroman.jack-env.t.dots`), and its heads are in the home's
+  `TrackerDO`. Each root that links it pins its own commit of it, in its own
+  `.newgit/pins/`.
+- **One `main`, every root told.** The home's object keeps a `linkers`
+  table. A move of the home's `main` goes into its outbox for its own
+  parent and for each linker's parent. Each root then rolls up as it would
+  for a child of its own. A change merged from any root lands at the link
+  (the anchor) and reaches every root.
+- **Policy is the home's.** Reading and merging it is judged by the home's
+  definition and by membership in the home project: linking needs read
+  there, and moving its `main` needs its maintainers there. The remote
+  records a link (`POST /trackers` with `link`) only for whoever may add a
+  tracker here *and* may read the home. A linking root's credentials route
+  answers for the home's repo, by the home's rules, and for no other
+  project's.
+- **Joining and leaving move nothing at home.** A merge that adds the link
+  must name the home's head (otherwise it is stale: 409). Dropping the link
+  changes only this root's pins. Deleting a linking root leaves the home as
+  it was.
+
+Checked live on the dev remote: a home and two roots linking its `dots`. A
+change merged from an instance of one landed at the home, and both roots
+rolled up. `git pull` from the second root's own Git endpoint brought
+`Roll up jack-env to …` with the change in its `.jack-env`. A change from a
+stale instance of the second root, to the same lines, was refused as a
+conflict, and nothing moved.
+
+What was clean:
+
+- Nothing above the tracker objects changed shape. Fan-out was one more row
+  per linker in the outbox, and the roll-up, the two-phase landing, and
+  the endpoint's composition took a linked child like any other.
+- Naming every repo through one per-request function (`repoNamer`, and
+  `git_repo` in the client) was the whole of "where does this tracker
+  live".
+
+What was ugly, and is left that way for now:
+
+- **Branches other than `main`.** The home's object holds a linking root's
+  other branches as `<owner>/<name>:<branch>` (no Git branch has a `:`),
+  told only to that root. It works, but an instance's change to a link
+  lives in the home's object under a name the home never chose. `main` is
+  assumed to be every project's default branch.
+- **A change's own commit is not kept above a link.** `via` (fast-forwarding
+  the parent to the change's own root commit) is dropped for a link, since
+  that commit is one root's and the link has several parents. Each root
+  gets a roll-up commit instead.
+- **Repo `main`s follow by the anchor now.** Before, a child's repo branch
+  moved only when the merging client asked with the right `old`. A link is
+  moved from roots whose clients have different views, so its repo `main`
+  stayed behind, the next root's client fetched a stale `main`, and a merge
+  from it could move the home's `main` *sideways*, dropping the other
+  root's change (seen live, then fixed). The landing's anchor now follows
+  its head as root's branch always did. This is true of every tracker.
+- **A home deleted under its linkers** is not handled. Their links fail
+  to read.
+- **No CLI to unlink** other than dropping the definition by hand.
+
+Not found by this experiment, but found while running it: `newgit pull
+<tracker>` in an instance replaces the tracker's files with its `main`
+rather than merging the instance's own change into it. So the conflict
+message's advice ("bring `main` into the instance's workspace, resolve
+there") loses the instance's change if followed with `pull`. This is true
+of every tracker in Git, not only links.
 
 ## Open questions and known gaps
 

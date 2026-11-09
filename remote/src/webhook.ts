@@ -23,6 +23,7 @@ import {
 	loadDefinitions,
 	makeTag,
 	projectStub,
+	repoNamer,
 	revokeRepoTokens,
 	settle,
 } from "./index";
@@ -399,6 +400,7 @@ export async function advancePulls(env: Env, deps: Deps, id: ProjectId): Promise
 async function advance(env: Env, deps: Deps, id: ProjectId, pull: MirrorPull): Promise<boolean> {
 	const key = projectKey(id);
 	const project = projectStub(env, id);
+	const namer = await repoNamer(project, id);
 	const log = { project: key, target: pull.target, commit: pull.commit, pusher: pull.pusher };
 	let instances = pull.instances;
 	const plan = (list: Record<string, string>): PullPlan => ({
@@ -406,7 +408,7 @@ async function advance(env: Env, deps: Deps, id: ProjectId, pull: MirrorPull): P
 		repos: Object.fromEntries(
 			trackersOf(list).map((tracker) => [
 				tracker,
-				{ url: deps.repos.url(repoName({ kind: "tracker", project: id, tracker })), auth: "" },
+				{ url: deps.repos.url(namer(tracker)), auth: "" },
 			]),
 		),
 		list,
@@ -419,7 +421,7 @@ async function advance(env: Env, deps: Deps, id: ProjectId, pull: MirrorPull): P
 		const handed = [];
 		const minted: PullPlan["repos"] = {};
 		for (const tracker of trackersOf(list)) {
-			const name = repoName({ kind: "tracker", project: id, tracker });
+			const name = namer(tracker);
 			const token = await deps.repos.mint(name, scope(tracker), PULL_CREDENTIAL_SECONDS);
 			handed.push({ repo: name, artifactsId: token.id });
 			minted[tracker] = { url: deps.repos.url(name), auth: `Authorization: Basic ${btoa(`x:${token.password}`)}` };

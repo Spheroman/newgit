@@ -78,8 +78,14 @@ export class TrackerDO extends DurableObject<Env> {
 				anchor TEXT NOT NULL, until INTEGER NOT NULL, decision TEXT,
 				moved_by TEXT NOT NULL, via TEXT);
 			CREATE TABLE IF NOT EXISTS outbox (
-				seq INTEGER PRIMARY KEY AUTOINCREMENT, entry TEXT NOT NULL);
+				seq INTEGER PRIMARY KEY AUTOINCREMENT, entry TEXT NOT NULL, target TEXT);
+			CREATE TABLE IF NOT EXISTS linkers (
+				project TEXT NOT NULL, tracker TEXT NOT NULL, PRIMARY KEY (project, tracker));
 		`);
+		// Outboxes from before links: every entry was for the parent.
+		try {
+			this.sql.exec("ALTER TABLE outbox ADD COLUMN target TEXT");
+		} catch {}
 	}
 
 	// ── Who this is ──────────────────────────────────────────────────────
@@ -181,24 +187,40 @@ export class TrackerDO extends DurableObject<Env> {
 		// Everything in the inbox is pinned by the commit this tracker moved to
 		// in a landing (its index was checked): nothing of it is left to roll up.
 		if (token !== null || old === null) this.markRolled(branch);
-		const parent = parentId(ref.tracker);
 		// A first head (from nothing) is set by a landing at the parent or
 		// above, whose commit pins it already: nothing for the parent to roll up.
-		if (parent !== null && next !== null && old !== null) {
+		if (next === null || old === null) return;
+		// Its own parent, and, for a tracker other roots link, the parent of
+		// it in each: one tracker in several roots, each told of its moves.
+		// `main` is shared with every root linking it; `<owner>/<name>:<branch>`
+		// is that root's own branch, told to it alone, as `<branch>`.
+		const targets: { parent: TrackerRef; child: string; branch: string }[] = [];
+		const parent = parentId(ref.tracker);
+		if (parent !== null && !branch.includes(":"))
+			targets.push({ parent: { project: ref.project, tracker: parent }, child: ref.tracker, branch });
+		for (const linker of this.sql.exec<{ project: string; tracker: string }>("SELECT * FROM linkers").toArray()) {
+			const above = parentId(linker.tracker);
+			const theirs =
+				branch === "main" ? "main" : branch.startsWith(`${linker.project}:`) ? branch.slice(linker.project.length + 1) : null;
+			if (above !== null && theirs !== null)
+				targets.push({ parent: { project: linker.project, tracker: above }, child: linker.tracker, branch: theirs });
+		}
+		for (const target of targets) {
 			const entry: ChildMove = {
-				branch,
-				child: ref.tracker,
+				branch: target.branch,
+				child: target.child,
 				childSeq: seq,
 				old,
 				new: next,
 				by,
 				at,
-				via,
-				token,
+				// A change's own commit in a parent is that parent's: only its own.
+				via: target.parent.project === ref.project ? via : null,
+				token: target.parent.project === ref.project ? token : null,
 			};
-			this.sql.exec("INSERT INTO outbox (entry) VALUES (?)", JSON.stringify(entry));
-			await this.deliver(ref);
+			this.sql.exec("INSERT INTO outbox (entry, target) VALUES (?, ?)", JSON.stringify(entry), JSON.stringify(target.parent));
 		}
+		await this.deliver(ref);
 	}
 
 	private markRolled(branch: string): void {
@@ -213,14 +235,22 @@ export class TrackerDO extends DurableObject<Env> {
 	 */
 	private async deliver(ref: TrackerRef): Promise<void> {
 		const parent = parentId(ref.tracker);
-		if (parent === null) return;
-		const rows = this.sql.exec<{ seq: number; entry: string }>("SELECT seq, entry FROM outbox ORDER BY seq").toArray();
+		const rows = this.sql
+			.exec<{ seq: number; entry: string; target: string | null }>("SELECT seq, entry, target FROM outbox ORDER BY seq")
+			.toArray();
 		for (const row of rows) {
+			const target: TrackerRef | null =
+				row.target !== null
+					? (JSON.parse(row.target) as TrackerRef)
+					: parent === null
+						? null
+						: { project: ref.project, tracker: parent };
+			if (target === null) {
+				this.sql.exec("DELETE FROM outbox WHERE seq = ?", row.seq);
+				continue;
+			}
 			try {
-				await this.stubOf({ project: ref.project, tracker: parent }).receive(
-					{ project: ref.project, tracker: parent },
-					JSON.parse(row.entry) as ChildMove,
-				);
+				await this.stubOf(target).receive(target, JSON.parse(row.entry) as ChildMove);
 				this.sql.exec("DELETE FROM outbox WHERE seq = ?", row.seq);
 			} catch (error) {
 				console.error(JSON.stringify({ outbox: trackerPath(ref), undelivered: String(error) }));
@@ -233,6 +263,12 @@ export class TrackerDO extends DurableObject<Env> {
 	async alarm(): Promise<void> {
 		const ref = this.ref();
 		if (ref !== null) await this.deliver(ref);
+	}
+
+	/** Root `linker.project` links this tracker, as `linker.tracker`: its moves reach that root too. */
+	async addLinker(ref: TrackerRef, linker: TrackerRef): Promise<void> {
+		this.remember(ref);
+		this.sql.exec("INSERT OR IGNORE INTO linkers VALUES (?, ?)", linker.project, linker.tracker);
 	}
 
 	/** A child's move, into the inbox, once; the project hears it has something to roll up. */

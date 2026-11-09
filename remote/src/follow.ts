@@ -31,7 +31,7 @@ export interface Heads {
 const FOLLOW_ATTEMPTS = 3;
 
 /**
- * Bring root's `branch` to its head, then make `moves`. Never throws: the
+ * Bring root's `branch` (and the anchor's) to its head, then make `moves`. Never throws: the
  * landing stands whatever happens here, so what could not follow is said,
  * for the next landing (or anyone) to finish.
  */
@@ -41,23 +41,31 @@ export async function followLanding(
 	repoOf: (tracker: string) => string,
 	branch: string,
 	moves: RefMove[],
+	anchor = "root",
 ): Promise<string[]> {
 	const behind: string[] = [];
-	try {
-		const lagging = await followHead(repos, heads, repoOf("root"), branch, "root");
-		if (lagging !== null) behind.push(lagging);
-	} catch (error) {
-		behind.push(`root's \`${branch}\` did not follow its head yet: ${message(error)}`);
+	// Root's branch, and the anchor's where it landed below root: each to its
+	// head, whoever's view of it the merger had. A tracker several roots
+	// link is moved from any of them, so no one client's `old` is the truth.
+	for (const tracker of anchor === "root" ? ["root"] : ["root", anchor]) {
+		try {
+			const lagging = await followHead(repos, heads, repoOf(tracker), branch, tracker);
+			if (lagging !== null) behind.push(lagging);
+		} catch (error) {
+			behind.push(`\`${tracker.split("__").join("/")}\`'s \`${branch}\` did not follow its head yet: ${message(error)}`);
+		}
 	}
 	for (const move of moves) {
 		try {
 			const name = repoOf(move.tracker);
 			const ref = `refs/heads/${move.branch}`;
 			const updates: RefUpdate[] = [];
-			if (move.old !== move.new) updates.push({ ref, old: move.old, new: move.new });
+			// The anchor's branch followed its head above: only its landing ref is left.
+			const followed = move.tracker === anchor && move.branch === branch;
+			if (move.old !== move.new && !followed) updates.push({ ref, old: move.old, new: move.new });
 			updates.push({ ref: landingRef(move.new), old: move.new, new: null });
 			const moved = await repos.updateRefs(name, updates);
-			if (move.old !== move.new && !moved[ref])
+			if (move.old !== move.new && !followed && !moved[ref])
 				behind.push(
 					`\`${move.tracker}\`'s \`${move.branch}\` moved while this merge ran, so it did not catch up: \`newgit pull ${move.tracker}\` in an instance, and merge that`,
 				);

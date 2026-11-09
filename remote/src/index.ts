@@ -485,6 +485,8 @@ async function route(request: Request, env: Env, deps: Deps): Promise<Response> 
 	const info = await project.info();
 	if (info === null) throw new HttpError(404, `no project \`${key}\``);
 	const member = await project.isMember(login);
+	// Each tracker's repo: its own, or its home's for a link.
+	let namer = await repoNamer(project, id);
 
 	// Credentials are answered for non-members too: a public tracker is
 	// readable by anyone logged in, and a refusal should say why.
@@ -504,10 +506,11 @@ async function route(request: Request, env: Env, deps: Deps): Promise<Response> 
 		const facts = await definitionFacts(deps.repos, id, tracker, await listedTrackers(project));
 		if (facts === undefined) throw new HttpError(404, `tracker \`${tracker}\` is not defined on ${key}'s \`access\` \`main\``);
 		if (!facts.git) throw new HttpError(400, `\`${tracker}\` is not in Git; \`newgit merge\` never carries it`);
-		const read = decide({ kind: "tracker", project: id, tracker }, "read", { login, member }, { tracker: facts });
+		const policy = await whoFor(env, facts, { login, member });
+		const read = decide({ kind: "tracker", project: id, tracker }, "read", policy.who, { tracker: facts });
 		if (!read.ok) throw new HttpError(403, read.reason);
 		if (request.body === null) throw new HttpError(400, "the pack is the request's body");
-		const name = repoName({ kind: "tracker", project: id, tracker });
+		const name = namer(tracker);
 		const ref = landingRef(commit);
 		const sent = await deps.repos
 			.sendPack(name, [{ ref, old: null, new: commit }], request.body)
@@ -532,8 +535,20 @@ async function route(request: Request, env: Env, deps: Deps): Promise<Response> 
 			scope?: "read" | "write";
 		}>(request);
 		if (scope !== "read" && scope !== "write") throw new HttpError(400, "scope is read or write");
+		const links = await project.links();
 		const one = async (name: string) => {
 			const ref = parseRepoName(repoFromUrlOrName(name));
+			// A linked tracker's repo is its home's: answered as its home
+			// answers, by its home's rules and membership there.
+			if (ref !== null && ref.kind === "tracker" && projectKey(ref.project) !== key) {
+				const linked = Object.values(links).some(
+					(home) => home.project === projectKey(ref.project) && home.tracker === ref.tracker,
+				);
+				if (!linked) throw new HttpError(400, `\`${name}\` is not one of ${key}'s repos, nor linked here`);
+				const home = projectStub(env, ref.project);
+				if ((await home.info()) === null) throw new HttpError(404, `no project \`${projectKey(ref.project)}\``);
+				return credential(env, deps, home, ref, scope, caller, await home.isMember(login));
+			}
 			if (ref === null || projectKey(ref.project) !== key)
 				throw new HttpError(400, `\`${name}\` is not one of ${key}'s repos`);
 			if (caller.instance !== undefined && scope === "write" && ref.kind === "fork")
@@ -618,10 +633,31 @@ async function route(request: Request, env: Env, deps: Deps): Promise<Response> 
 		// A new tracker in Git comes with its definition, which is a change to
 		// the tracker that owns its file: only that tracker's maintainers add it.
 		requireHuman(caller, "create tracker in Git repos");
-		const { name: tracker } = await body<{ name?: string }>(request);
+		const { name: tracker, link } = await body<{ name?: string; link?: string }>(request);
 		if (!tracker) throw new HttpError(400, "name is required");
 		requirePart("tracker name", tracker);
 		await requireGovernor(deps, id, info, { login, member }, tracker, await listedTrackers(project));
+		if (link !== undefined) {
+			// A link has no repo of its own: it is its home's tracker, read
+			// there, so only a reader of its home may link it.
+			if (typeof link !== "string") throw new HttpError(400, "link names a tracker: `<owner>/<project>[/<path>]`");
+			const home = homeOf({ link } as TrackerFacts);
+			if (home === null) throw new HttpError(400, `\`${link}\` is not \`<owner>/<project>[/<path>]\``);
+			if (projectKey(home.project) === key) throw new HttpError(400, "a tracker links to another project's");
+			const homeStub = projectStub(env, home.project);
+			const homeInfo = await homeStub.info();
+			if (homeInfo === null) throw new HttpError(404, `no project \`${projectKey(home.project)}\``);
+			const there = (await loadDefinitions(deps.repos, home.project, [home.tracker])).get(home.tracker);
+			if (there === undefined) throw new HttpError(404, `\`${link}\` is not a tracker`);
+			if (!there.git) throw new HttpError(400, `\`${link}\` is not in Git; only a tracker in Git is linked`);
+			const homeWho = { login, member: await homeStub.isMember(login) };
+			const read = decide({ kind: "tracker", project: home.project, tracker: home.tracker }, "read", homeWho, { tracker: there });
+			if (!read.ok) throw new HttpError(403, read.reason);
+			const repo = repoName({ kind: "tracker", project: home.project, tracker: home.tracker });
+			if ((await deps.repos.remote(repo)) === null) throw new HttpError(404, `${repo} does not exist`);
+			await project.addLink(tracker, { project: projectKey(home.project), tracker: home.tracker });
+			return json({ tracker, link, repo }, 201);
+		}
 		const defined = await definitionFacts(deps.repos, id, tracker, await listedTrackers(project));
 		if (defined !== undefined && !defined.git)
 			throw new HttpError(400, `\`${tracker}\` is not in Git; its repo is made by its first sync`);
@@ -654,7 +690,7 @@ async function route(request: Request, env: Env, deps: Deps): Promise<Response> 
 			mains.set(
 				tracker,
 				await deps.repos
-					.branchHead(repoName({ kind: "tracker", project: id, tracker }), "main")
+					.branchHead(namer(tracker), "main")
 					.catch(() => null),
 			);
 		const branches = await project.branches();
@@ -695,6 +731,10 @@ async function route(request: Request, env: Env, deps: Deps): Promise<Response> 
 			throw new HttpError(400, "base (the index you merged onto) and list (the index the merge makes) are required");
 		if (typeof list.root !== "string" || list.root === base.root)
 			throw new HttpError(400, "a merge moves `root`: the branch is root's ref, so the new index names a new root commit");
+		// The links the definitions name, recorded before anything is named:
+		// a merge may be what adds one.
+		await noteLinks(project, await loadDefinitions(deps.repos, id, [...Object.keys(base), ...Object.keys(list)]));
+		namer = await repoNamer(project, id);
 		for (const [tracker, commit] of Object.entries(list)) {
 			requirePart("tracker name", tracker);
 			if (typeof commit !== "string" || !/^[0-9a-f]{40}$/.test(commit))
@@ -720,14 +760,14 @@ async function route(request: Request, env: Env, deps: Deps): Promise<Response> 
 			// to make here goes to the container's Git.
 			let answers: AncestryAnswer[] | Checking | typeof ASK_GIT = await nativeAncestry(
 				deps.repos,
-				(tracker) => repoName({ kind: "tracker", project: id, tracker }),
+				namer,
 				checks,
 			);
 			if (answers === ASK_GIT && deps.ancestry) {
-				const plan: AncestryPlan = { dir: "/work", repos: checkRepos(deps, id, children), checks };
+				const plan: AncestryPlan = { dir: "/work", repos: checkRepos(deps, namer, children), checks };
 				// The first time a large history is there the check takes
 				// minutes: the client asks again until it has the answer.
-				answers = await deps.ancestry(key, plan, () => checkCredentials(env, deps, caller, id, children));
+				answers = await deps.ancestry(key, plan, () => checkCredentials(env, deps, caller, namer, children));
 				if (isChecking(answers)) return stillChecking();
 			}
 			if (answers !== ASK_GIT) for (const answer of answers) moves.set(answer.tracker, answer);
@@ -751,7 +791,7 @@ async function route(request: Request, env: Env, deps: Deps): Promise<Response> 
 				// definition adds it.
 				if (facts !== undefined && !facts.git)
 					throw new HttpError(400, `\`${tracker}\` is not in Git; \`newgit merge\` never carries it`);
-				if ((await deps.repos.remote(repoName({ kind: "tracker", project: id, tracker }))) === null)
+				if ((await deps.repos.remote(namer(tracker))) === null)
 					throw new HttpError(400, `\`${tracker}\` has no repo: a new tracker in Git joins by its own seeded repo`);
 				if (!(await governs_(deps, id, info, who, tracker, await listedTrackers(project))))
 					throw new HttpError(403, `only the maintainers of the tracker holding \`${tracker}\`'s definition may add it`);
@@ -767,7 +807,9 @@ async function route(request: Request, env: Env, deps: Deps): Promise<Response> 
 				);
 			}
 			if (!facts.git) throw new HttpError(400, `\`${tracker}\` is not in Git; \`newgit merge\` never carries it`);
-			const read = decide({ kind: "tracker", project: id, tracker }, "read", who, { tracker: facts });
+			// A link's policy is its home's: membership there counts.
+			const policy = await whoFor(env, facts, who);
+			const read = decide({ kind: "tracker", project: id, tracker }, "read", policy.who, { tracker: facts });
 			if (!read.ok) throw new HttpError(403, read.reason);
 			const answer = moves.get(tracker);
 			const forwardOnMain = !dropped && answer?.forward === true && answer.onMain === true;
@@ -795,7 +837,7 @@ async function route(request: Request, env: Env, deps: Deps): Promise<Response> 
 			// Merging a tracker is its maintainers' (by default, its readers'):
 			// `access`, which holds every definition, is the owner's unless the
 			// definitions say otherwise.
-			const may = mayMaintain(facts.maintainers, who, info.owner, tracker);
+			const may = mayMaintain(facts.maintainers, policy.who, policy.owner ?? info.owner, tracker);
 			if (!may.ok) {
 				const why =
 					tracker === "root" || dropped
@@ -826,8 +868,7 @@ async function route(request: Request, env: Env, deps: Deps): Promise<Response> 
 		// What the merge may move (`writes`) still stands; nobody gets a
 		// password to move it.
 		for (const tracker of uploaded === true ? [] : writes) {
-			const ref: RepoRef = { kind: "tracker", project: id, tracker };
-			const name = repoName(ref);
+			const name = namer(tracker);
 			if ((await deps.repos.remote(name)) === null) throw new HttpError(404, `${name} does not exist`);
 			// Enough to push to landing refs, and cancelled when the merge lands.
 			const minted = await deps.repos.mint(name, "write", MERGE_PUSH_SECONDS);
@@ -895,12 +936,12 @@ async function route(request: Request, env: Env, deps: Deps): Promise<Response> 
 					// container's Git only when a commit cannot be read.
 					let checked: IndexAnswer | Checking | typeof ASK_GIT = await nativeIndex(
 						deps.repos,
-						(tracker) => repoName({ kind: "tracker", project: id, tracker }),
+						namer,
 						list,
 					);
 					if (checked === ASK_GIT && deps.index) {
-						const plan: IndexPlan = { dir: "/work", repos: checkRepos(deps, id, trackers), list };
-						checked = await deps.index(key, plan, () => checkCredentials(env, deps, caller, id, trackers));
+						const plan: IndexPlan = { dir: "/work", repos: checkRepos(deps, namer, trackers), list };
+						checked = await deps.index(key, plan, () => checkCredentials(env, deps, caller, namer, trackers));
 						// Still running: the client asks again. Nothing waits meanwhile.
 						if (isChecking(checked)) return stillChecking();
 					}
@@ -1279,6 +1320,7 @@ async function answerGit(
 	const info = await timing.span("project", () => project.info());
 	if (info === null) throw new HttpError(404, `no project \`${key}\``);
 	const member = await timing.span("project", () => project.isMember(caller.login));
+	const namer = await timing.span("project", () => repoNamer(project, id));
 	const who = { login: caller.login, member };
 
 	// What landed rolls up before a view is composed: Git sees whole commits.
@@ -1296,11 +1338,15 @@ async function answerGit(
 			branches.flatMap((branch) => Object.keys(branch.list)),
 		),
 	);
+	// A link is read as its home says: membership there counts.
+	const linkedWho = new Map<string, { login: string; member: boolean }>();
+	for (const [tracker, tracker_facts] of facts)
+		if (tracker_facts.link !== undefined) linkedWho.set(tracker, (await whoFor(env, tracker_facts, who)).who);
 	const readable = (tracker: string) => {
 		const tracker_facts = facts.get(tracker);
 		return (
 			tracker_facts?.git === true &&
-			decide({ kind: "tracker", project: id, tracker }, "read", who, { tracker: tracker_facts }).ok
+			decide({ kind: "tracker", project: id, tracker }, "read", linkedWho.get(tracker) ?? who, { tracker: tracker_facts }).ok
 		);
 	};
 
@@ -1343,7 +1389,7 @@ async function answerGit(
 		throw new HttpError(who.member ? 403 : 404, who.member ? `nothing in ${key} is yours to read` : `no project \`${key}\``);
 
 	for (const tracker of needed) {
-		const name = repoName({ kind: "tracker", project: id, tracker });
+		const name = namer(tracker);
 		const key = `${caller.tokenId}:${name}`;
 		let password = readPasswords.get(key);
 		if (password === undefined) {
@@ -1492,6 +1538,11 @@ export interface TrackerFacts {
 	 * is a change to the parent (docs/design/anchoring.md, *Follow and pinned*).
 	 */
 	pinned?: boolean;
+	/**
+	 * Where it lives, when another project is its home (`link`): its repo,
+	 * its heads, and its policy are its home's.
+	 */
+	link?: string;
 }
 
 /** Where `access` is mounted: every definition is `<name>.toml` at its root. */
@@ -1532,6 +1583,7 @@ function parseFacts(text: string, source: string): TrackerFacts | undefined {
 		paths?: unknown;
 		history?: unknown;
 		pinned?: unknown;
+		link?: unknown;
 	};
 	try {
 		definition = parseToml(text) as typeof definition;
@@ -1560,6 +1612,7 @@ function parseFacts(text: string, source: string): TrackerFacts | undefined {
 		source,
 		history,
 		pinned: definition.pinned === true,
+		...(typeof definition.link === "string" ? { link: definition.link } : {}),
 	};
 }
 
@@ -1725,6 +1778,13 @@ export async function loadDefinitions(
 		return repos.readFile(name, ref, path);
 	};
 	const facts = await readDefinitions(reader, project, all);
+	// A link's policy is its home's; only where it is mounted is this project's.
+	for (const [name, fact] of facts) {
+		const home = homeOf(fact);
+		if (home === null) continue;
+		const there = (await loadDefinitions(repos, home.project, [home.tracker])).get(home.tracker);
+		if (there !== undefined) facts.set(name, { ...there, mount: fact.mount, source: fact.source, link: fact.link });
+	}
 	const settled = new Map<string, string>();
 	let keep = true;
 	for (const [name, head] of heads) {
@@ -1732,6 +1792,9 @@ export async function loadDefinitions(
 		if (at === null) keep = false;
 		else settled.set(name, at);
 	}
+	// A link's policy comes from its home, whose heads this does not watch:
+	// read again every time, so a change there is never missed.
+	if ([...facts.values()].some((fact) => fact.link !== undefined)) keep = false;
 	if (keep) {
 		if (definitionsRead.size >= DEFINITIONS_KEPT) definitionsRead.delete(definitionsRead.keys().next().value!);
 		definitionsRead.set(key, { heads: settled, facts: new Map(facts) });
@@ -1929,6 +1992,69 @@ function projectCap(env: Env): number {
 }
 
 /** Sign a token and record it with its user, so it can later be revoked. */
+/** A linked tracker's home, from its `link`: its project, and its ID there. */
+export function homeOf(facts: TrackerFacts | undefined): { project: ProjectId; tracker: string } | null {
+	if (facts?.link === undefined) return null;
+	const [owner, name, ...path] = facts.link.split("/");
+	const project = parseProjectKey(`${owner}/${name}`);
+	if (project === null) return null;
+	return { project, tracker: path.length === 0 ? "root" : path.join("__") };
+}
+
+/**
+ * Name each tracker's repo for project `id`: its own, or for a tracker
+ * linked from elsewhere its home's. Read once per request, from the links
+ * the project recorded.
+ */
+export async function repoNamer(
+	project: DurableObjectStub<ProjectDO>,
+	id: ProjectId,
+): Promise<(tracker: string) => string> {
+	const links = await project.links();
+	return (tracker) => {
+		const link = links[tracker];
+		const home = link === undefined ? null : parseProjectKey(link.project);
+		return home === null || link === undefined
+			? repoName({ kind: "tracker", project: id, tracker })
+			: repoName({ kind: "tracker", project: home, tracker: link.tracker });
+	};
+}
+
+/**
+ * The project's links as its definitions say them, recorded on it: its
+ * tracker objects resolve a link to its home's, and the home learns it is
+ * linked from here.
+ */
+async function noteLinks(
+	project: DurableObjectStub<ProjectDO>,
+	facts: Map<string, TrackerFacts>,
+): Promise<void> {
+	const links: Record<string, { project: string; tracker: string }> = {};
+	for (const [tracker, fact] of facts) {
+		const home = homeOf(fact);
+		if (home !== null) links[tracker] = { project: projectKey(home.project), tracker: home.tracker };
+	}
+	await project.setLinks(links, [...facts.keys()]);
+}
+
+/**
+ * Who `who` is to a linked tracker's policy: a member of its home, or not.
+ * Its home's audience and maintainers decide, so membership there counts.
+ */
+async function whoFor(
+	env: Env,
+	facts: TrackerFacts | undefined,
+	who: { login: string; member: boolean },
+): Promise<{ who: { login: string; member: boolean }; owner: string | null }> {
+	const home = homeOf(facts);
+	if (home === null) return { who, owner: null };
+	const stub = projectStub(env, home.project);
+	return {
+		who: { login: who.login, member: await stub.isMember(who.login) },
+		owner: (await stub.info())?.owner ?? null,
+	};
+}
+
 /** Whether `given` is `secret`, compared in constant time (by their SHA-256). */
 async function sameSecret(given: string, secret: string): Promise<boolean> {
 	const digest = async (text: string) =>
@@ -1950,13 +2076,12 @@ function userStub(env: Env, login: string): DurableObjectStub<UserDO> {
 }
 
 /** A merge check's repos, without credentials: enough to ask after one already started. */
-function checkRepos(deps: Deps, project: ProjectId, trackers: string[]): Record<string, { url: string; auth: string }> {
-	return Object.fromEntries(
-		trackers.map((tracker) => [
-			tracker,
-			{ url: deps.repos.url(repoName({ kind: "tracker", project, tracker })), auth: "" },
-		]),
-	);
+function checkRepos(
+	deps: Deps,
+	repoOf: (tracker: string) => string,
+	trackers: string[],
+): Record<string, { url: string; auth: string }> {
+	return Object.fromEntries(trackers.map((tracker) => [tracker, { url: deps.repos.url(repoOf(tracker)), auth: "" }]));
 }
 
 /**
@@ -1968,12 +2093,12 @@ async function checkCredentials(
 	env: Env,
 	deps: Deps,
 	caller: Caller,
-	project: ProjectId,
+	repoOf: (tracker: string) => string,
 	trackers: string[],
 ): Promise<Record<string, { url: string; auth: string }>> {
 	const repos: Record<string, { url: string; auth: string }> = {};
 	for (const tracker of trackers) {
-		const name = repoName({ kind: "tracker", project, tracker });
+		const name = repoOf(tracker);
 		const minted = await deps.repos.mint(name, "read", CHECK_CREDENTIAL_SECONDS);
 		await userStub(env, caller.login).recordRepoToken(caller.tokenId, name, minted.id, minted.expiresAt);
 		repos[tracker] = { url: deps.repos.url(name), auth: `Authorization: Basic ${btoa(`x:${minted.password}`)}` };
@@ -2045,7 +2170,8 @@ async function makeFork(
 	tracker: string,
 ): Promise<string | "forking"> {
 	const fork = repoName({ kind: "fork", project: id, instance: name, tracker });
-	const source = repoName({ kind: "tracker", project: id, tracker });
+	// A link's fork copies its home's repo, as any fork copies its tracker's.
+	const source = (await repoNamer(project, id))(tracker);
 	// Whatever Artifacts says, in the answer: only its code and message
 	// explain a failure on a large repository.
 	const artifacts = (step: string) => (error: unknown) => {
@@ -2128,7 +2254,7 @@ export async function settle(
 	id: ProjectId,
 	branch: string,
 ): Promise<boolean> {
-	const repoOf = (tracker: string) => repoName({ kind: "tracker", project: id, tracker });
+	const repoOf = await repoNamer(project, id);
 	try {
 		const rolled = await rollUp(deps.repos, rollupStore(project, deps, id), repoOf, branch, "root");
 		await project.noteRollup(branch, null);
@@ -2176,7 +2302,7 @@ export async function settledBranches(
 	);
 	const branches = await project.branches();
 	if (failed.size === 0) return branches;
-	const repoOf = (tracker: string) => repoName({ kind: "tracker", project: id, tracker });
+	const repoOf = await repoNamer(project, id);
 	return Promise.all(
 		branches.map(async (branch) => {
 			if (!failed.has(branch.name)) return branch;
@@ -2211,8 +2337,12 @@ export async function anchorFor(
 ): Promise<string> {
 	if (trackers.some((tracker) => !(tracker in base) || !(tracker in list))) return "root";
 	const touched: string[] = [];
+	const repoOf =
+		project === undefined
+			? (tracker: string) => repoName({ kind: "tracker", project: id, tracker })
+			: await repoNamer(project, id);
 	for (const tracker of trackers) {
-		const name = repoName({ kind: "tracker", project: id, tracker });
+		const name = repoOf(tracker);
 		// Neither what it ends at nor any commit on the way may change more
 		// than pins: what it brings in is in the tracker's history for good.
 		const only = await onlyPinsMoved(deps.repos, name, base[tracker], list[tracker]);
@@ -2257,6 +2387,7 @@ export async function landAndFollow(
 	background = false,
 	anchor?: string,
 ): Promise<{ ok: true; branch: Branch; behind: string[]; anchor: string } | { ok: false; reason: "missing" | "moved" }> {
+	const repoOf = await repoNamer(project, id);
 	const landed = await project.land(branch, base, list, by, anchor);
 	if (!landed.ok) return { ok: false, reason: landed.reason };
 	await revokeRepoTokens(deps, landed.tokens);
@@ -2281,9 +2412,10 @@ export async function landAndFollow(
 					head: (name, tracker) => project.head(name, tracker),
 					wasHead: (name, tracker, commit) => project.wasHead(name, tracker, commit),
 				},
-				(tracker) => repoName({ kind: "tracker", project: id, tracker }),
+				repoOf,
 				branch,
 				moves,
+				anchor,
 			).then((behind) => {
 				if (behind.length > 0)
 					console.log(JSON.stringify({ landing: "behind", project: projectKey(id), branch, behind }));
@@ -2297,9 +2429,10 @@ export async function landAndFollow(
 			head: (name, tracker) => project.head(name, tracker),
 			wasHead: (name, tracker, commit) => project.wasHead(name, tracker, commit),
 		},
-		(tracker) => repoName({ kind: "tracker", project: id, tracker }),
+		repoOf,
 		branch,
 		moves,
+		anchor,
 	);
 	if (behind.length > 0) console.log(JSON.stringify({ landing: "behind", project: projectKey(id), branch, behind }));
 	return { ok: true, branch: (await project.branch(branch)) ?? landed.branch, behind, anchor: anchor ?? "root" };
@@ -2414,7 +2547,8 @@ export async function makeTag(
 			`tag \`${name}\` names root commit ${existing.list.root.slice(0, 12)} already, and a tag never moves: delete it first if it is wrong`,
 		);
 	}
-	const repoOf = (tracker: string) => repoName({ kind: "tracker", project: id, tracker });
+	// A linked tracker's repo is its home's.
+	const repoOf = await repoNamer(project, id);
 	const credentials = (trackers: string[]) =>
 		caller === null
 			? Promise.resolve(
@@ -2422,13 +2556,13 @@ export async function makeTag(
 						trackers.map((tracker) => [tracker, { url: deps.repos.url(repoOf(tracker)), auth: "" }]),
 					),
 				)
-			: checkCredentials(env, deps, caller, id, trackers);
+			: checkCredentials(env, deps, caller, repoOf, trackers);
 
 	// On `main`, read from Artifacts; the container's Git when that walk is too long.
 	const check = [{ tracker: "root", old: root, new: root }];
 	let ancestry: AncestryAnswer[] | Checking | typeof ASK_GIT = await nativeAncestry(deps.repos, repoOf, check);
 	if (ancestry === ASK_GIT && deps.ancestry) {
-		const plan: AncestryPlan = { dir: "/work", repos: checkRepos(deps, id, ["root"]), checks: check };
+		const plan: AncestryPlan = { dir: "/work", repos: checkRepos(deps, repoOf, ["root"]), checks: check };
 		ancestry = await deps.ancestry(key, plan, () => credentials(["root"]));
 	}
 	if (isChecking(ancestry)) return CHECKING;
@@ -2443,7 +2577,7 @@ export async function makeTag(
 	if (index === ASK_GIT && deps.index) {
 		// Every tracker `main` has: a pin is read from its own tracker's repo.
 		const trackers = [...new Set([...Object.keys((await project.branch("main"))?.list ?? {}), "root", "access"])];
-		const plan: IndexPlan = { dir: "/work", repos: checkRepos(deps, id, trackers), list: { root } };
+		const plan: IndexPlan = { dir: "/work", repos: checkRepos(deps, repoOf, trackers), list: { root } };
 		index = await deps.index(key, plan, () => credentials(trackers));
 	}
 	if (isChecking(index)) return CHECKING;

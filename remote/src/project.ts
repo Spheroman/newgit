@@ -202,6 +202,8 @@ export class ProjectDO extends DurableObject<Env> {
 			CREATE TABLE IF NOT EXISTS tags (
 				name TEXT PRIMARY KEY, list TEXT NOT NULL, annotation TEXT,
 				created_by TEXT NOT NULL, created_at TEXT NOT NULL);
+			CREATE TABLE IF NOT EXISTS links (
+				tracker TEXT PRIMARY KEY, home_project TEXT NOT NULL, home_tracker TEXT NOT NULL);
 		`);
 		// The log from before it named a change's commit in the parent.
 		try {
@@ -241,10 +243,30 @@ export class ProjectDO extends DurableObject<Env> {
 	}
 
 	private refOf(tracker: string): TrackerRef {
+		// A tracker linked from elsewhere is its home's: its object, its heads.
+		const link = this.sql
+			.exec<{ home_project: string; home_tracker: string }>("SELECT * FROM links WHERE tracker = ?", tracker)
+			.toArray()[0];
+		if (link !== undefined) return { project: link.home_project, tracker: link.home_tracker };
 		const project = this.key();
 		// Never an object named for no project: every nameless one would share it.
 		if (project === "") throw new Error("this project does not exist: its trackers have no path");
 		return { project, tracker };
+	}
+
+	/**
+	 * What a branch here is called in `tracker`'s object. A linked tracker's
+	 * object is its home's: `main` is its home's `main`, which every root
+	 * linking it shares; any other branch is this project's own there,
+	 * `<owner>/<name>:<branch>` (no Git branch has a `:`).
+	 */
+	private branchFor(tracker: string, name: string): string {
+		if (!this.isLink(tracker) || name === "main") return name;
+		return `${this.key()}:${name}`;
+	}
+
+	private isLink(tracker: string): boolean {
+		return this.sql.exec("SELECT 1 FROM links WHERE tracker = ?", tracker).toArray().length > 0;
 	}
 
 	private trackerObject(tracker: string): DurableObjectStub<TrackerDO> {
@@ -261,6 +283,40 @@ export class ProjectDO extends DurableObject<Env> {
 			this.sql
 				.exec<{ commit_id: string }>("SELECT commit_id FROM heads WHERE branch = ? AND tracker = ?", branch, tracker)
 				.toArray()[0]?.commit_id ?? null
+		);
+	}
+
+	/**
+	 * The trackers here that live elsewhere (`link`), and where: what the
+	 * definitions say, as the Worker read them. Each is told it is linked
+	 * from here, so its moves reach this project's parent of it too.
+	 */
+	/**
+	 * The links the definitions on `main` name, for the trackers they
+	 * define (`defined`): those become exactly these. A link recorded for a
+	 * tracker not defined there yet (one a merge is adding) stays.
+	 */
+	async setLinks(links: Record<string, TrackerRef>, defined: string[]): Promise<void> {
+		for (const tracker of defined)
+			if (!(tracker in links)) this.sql.exec("DELETE FROM links WHERE tracker = ?", tracker);
+		for (const [tracker, home] of Object.entries(links)) await this.addLink(tracker, home);
+	}
+
+	/** `tracker` here is `home` elsewhere: its history, heads and repo are there. */
+	async addLink(tracker: string, home: TrackerRef): Promise<void> {
+		const was = this.links()[tracker];
+		this.sql.exec("INSERT OR REPLACE INTO links VALUES (?, ?, ?)", tracker, home.project, home.tracker);
+		if (was?.project !== home.project || was?.tracker !== home.tracker)
+			await this.env.TRACKERS.getByName(trackerPath(home)).addLinker(home, { project: this.key(), tracker });
+	}
+
+	/** The trackers here that live elsewhere, by what this project calls them. */
+	links(): Record<string, TrackerRef> {
+		return Object.fromEntries(
+			this.sql
+				.exec<{ tracker: string; home_project: string; home_tracker: string }>("SELECT * FROM links")
+				.toArray()
+				.map((row) => [row.tracker, { project: row.home_project, tracker: row.home_tracker }]),
 		);
 	}
 
@@ -283,7 +339,7 @@ export class ProjectDO extends DurableObject<Env> {
 	private async headsOf(name: string): Promise<TrackerList> {
 		const trackers = this.trackersOf(name);
 		const heads = await Promise.all(
-			trackers.map((tracker) => this.trackerObject(tracker).head(this.refOf(tracker), name)),
+			trackers.map((tracker) => this.trackerObject(tracker).head(this.refOf(tracker), this.branchFor(tracker, name))),
 		);
 		const list: TrackerList = {};
 		trackers.forEach((tracker, index) => {
@@ -306,7 +362,7 @@ export class ProjectDO extends DurableObject<Env> {
 		by: string,
 		via: string | null = null,
 	): Promise<boolean> {
-		const moved = await this.trackerObject(tracker).cas(this.refOf(tracker), name, old, next, by, via);
+		const moved = await this.trackerObject(tracker).cas(this.refOf(tracker), this.branchFor(tracker, name), old, next, by, via);
 		if (moved && !this.trackersOf(name).includes(tracker))
 			this.writeTrackers(name, { ...(JSON.parse(this.listRow(name)) as TrackerList), [tracker]: next });
 		return moved;
@@ -323,7 +379,7 @@ export class ProjectDO extends DurableObject<Env> {
 
 	/** What `parent` has not rolled up on `name`, oldest first. */
 	async pending(name: string, parent: string): Promise<HeadMove[]> {
-		return this.trackerObject(parent).pending(this.refOf(parent), name);
+		return this.trackerObject(parent).pending(this.refOf(parent), this.branchFor(parent, name));
 	}
 
 	/** The branches with moves not rolled up yet, as their parents said. */
@@ -345,13 +401,13 @@ export class ProjectDO extends DurableObject<Env> {
 
 	/** A roll-up's one commit point, in the parent's own object. */
 	async rolledUp(name: string, parent: string, old: string, next: string, through: number): Promise<boolean> {
-		return this.trackerObject(parent).rolledUp(this.refOf(parent), name, old, next, through);
+		return this.trackerObject(parent).rolledUp(this.refOf(parent), this.branchFor(parent, name), old, next, through);
 	}
 
 	/** Every head that moved on `name`, every tracker's, oldest first; `since` of them skipped. */
 	async headLog(name: string, since = 0): Promise<HeadMove[]> {
 		const logs = await Promise.all(
-			this.trackersOf(name).map((tracker) => this.trackerObject(tracker).log(this.refOf(tracker), name)),
+			this.trackersOf(name).map((tracker) => this.trackerObject(tracker).log(this.refOf(tracker), this.branchFor(tracker, name))),
 		);
 		return logs
 			.flat()
@@ -391,12 +447,29 @@ export class ProjectDO extends DurableObject<Env> {
 				.flatMap((row) => Object.keys(JSON.parse(row.list) as TrackerList)),
 		);
 		if (this.info() !== null)
-			await Promise.all([...trackers].map((tracker) => this.trackerObject(tracker).forget(this.refOf(tracker))));
+			// A link's object is its home's, which outlives this project.
+			await Promise.all(
+				[...trackers]
+					.filter((tracker) => !this.isLink(tracker))
+					.map((tracker) => this.trackerObject(tracker).forget(this.refOf(tracker))),
+			);
 		this.clearRows();
 	}
 
 	private clearRows(): void {
-		for (const table of ["meta", "members", "branches", "instances", "forks", "checkpoints", "heads", "head_log", "rollups", "tags"])
+		for (const table of [
+			"meta",
+			"members",
+			"branches",
+			"instances",
+			"forks",
+			"checkpoints",
+			"heads",
+			"head_log",
+			"rollups",
+			"tags",
+			"links",
+		])
 			this.sql.exec(`DELETE FROM ${table}`);
 	}
 
@@ -440,7 +513,11 @@ export class ProjectDO extends DurableObject<Env> {
 		// Root last: its children's first moves reach its inbox before it has a
 		// head, and are rolled up through when it gets one.
 		const order = Object.keys(list).sort((left, right) => (left === "root" ? 1 : right === "root" ? -1 : 0));
-		for (const tracker of order) await this.trackerObject(tracker).cas(this.refOf(tracker), name, null, list[tracker], by);
+		for (const tracker of order) {
+			// A link's `main` is its home's, there already.
+			if (this.isLink(tracker) && this.branchFor(tracker, name) === "main") continue;
+			await this.trackerObject(tracker).cas(this.refOf(tracker), this.branchFor(tracker, name), null, list[tracker], by);
+		}
 		return this.branch(name);
 	}
 
@@ -547,14 +624,26 @@ export class ProjectDO extends DurableObject<Env> {
 		// What it moves, and nothing else: at root, every tracker whose pin
 		// changed and root itself; below, the anchor and what is inside it.
 		// Only those are compared, and only those move.
+		// A link joining or leaving this root moves nothing in its home: only
+		// this root's pin of it, which its commit carries. Joining, it must be
+		// at its home's head, or its pin is stale.
+		const shared = (tracker: string) =>
+			this.isLink(tracker) && this.branchFor(tracker, name) === "main" && !(tracker in base && tracker in list);
+		for (const tracker of Object.keys(list))
+			if (shared(tracker) && (await this.head(name, tracker)) !== list[tracker])
+				return { ok: false, reason: "moved", list: branch.list };
 		const moving = [...new Set([...Object.keys(base), ...Object.keys(list), anchor])]
 			.filter((tracker) => within(tracker, anchor))
+			.filter((tracker) => !shared(tracker))
 			.filter((tracker) => tracker === anchor || base[tracker] !== list[tracker])
 			.sort((left, right) => trackerPath(this.refOf(left)).localeCompare(trackerPath(this.refOf(right))));
 		if (moving.some((tracker) => (branch.list[tracker] ?? null) !== (base[tracker] ?? null)))
 			return { ok: false, reason: "moved", list: branch.list };
 		const parent = parentOf(anchor);
-		const viaOf = (tracker: string) => (tracker === anchor && parent !== null ? (list[parent] ?? null) : null);
+		// A link's parent here is one of several: its commit is rolled up into
+		// each, this one's own commit kept by none of them.
+		const viaOf = (tracker: string) =>
+			tracker === anchor && parent !== null && !this.isLink(tracker) ? (list[parent] ?? null) : null;
 		const moved = await this.swap(name, anchor, moving, base, list, by, viaOf);
 		if (!moved) return { ok: false, reason: "moved", list: (await this.branch(name))?.list ?? branch.list };
 		// Which trackers the branch lists: a landing at root may add or drop one.
@@ -584,7 +673,7 @@ export class ProjectDO extends DurableObject<Env> {
 		const object = (tracker: string) => this.trackerObject(tracker);
 		if (moving.length === 1) {
 			const [tracker] = moving;
-			return object(tracker).cas(this.refOf(tracker), name, base[tracker] ?? null, list[tracker] ?? null, by, viaOf(tracker));
+			return object(tracker).cas(this.refOf(tracker), this.branchFor(tracker, name), base[tracker] ?? null, list[tracker] ?? null, by, viaOf(tracker));
 		}
 		const token = crypto.randomUUID();
 		const prepared: string[] = [];
@@ -595,7 +684,7 @@ export class ProjectDO extends DurableObject<Env> {
 		for (const tracker of moving) {
 			const held = await object(tracker).prepare(
 				this.refOf(tracker),
-				name,
+				this.branchFor(tracker, name),
 				token,
 				base[tracker] ?? null,
 				list[tracker] ?? null,
@@ -614,12 +703,12 @@ export class ProjectDO extends DurableObject<Env> {
 
 	/** `tracker`'s head on `name` now, or null. */
 	async head(name: string, tracker: string): Promise<string | null> {
-		return this.trackerObject(tracker).head(this.refOf(tracker), name);
+		return this.trackerObject(tracker).head(this.refOf(tracker), this.branchFor(tracker, name));
 	}
 
 	/** Whether `commit` has been `tracker`'s head on `name`, now or before. */
 	async wasHead(name: string, tracker: string, commit: string): Promise<boolean> {
-		return this.trackerObject(tracker).wasHead(this.refOf(tracker), name, commit);
+		return this.trackerObject(tracker).wasHead(this.refOf(tracker), this.branchFor(tracker, name), commit);
 	}
 
 	/** Webhook pulls waiting or running, oldest first (src/webhook.ts). */

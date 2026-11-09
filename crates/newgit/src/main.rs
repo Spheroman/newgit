@@ -360,6 +360,16 @@ enum Command {
 
 #[derive(Debug, Subcommand)]
 enum TrackerCommand {
+    /// Bind a tracker that lives in another project into this one: one tracker in two roots, the second mount a symlink. Its history stays its home's
+    Link {
+        /// What this project calls it
+        name: String,
+        /// Its home: `<owner>/<project>` for a project's root, or `<owner>/<project>/<path>`
+        home: String,
+        /// Where it is mounted here: an empty directory its files appear under
+        #[arg(long)]
+        mount: Utf8PathBuf,
+    },
     /// Create a tracker: outside Git (captured, never committed) unless --git
     Create {
         name: String,
@@ -2083,6 +2093,28 @@ fn tracker(mut command: TrackerCommand) -> Result<()> {
         *tracker = tracker_id(tracker)?;
     }
     match command {
+        TrackerCommand::Link { name, home, mount } => {
+            let manager = manager_here()?;
+            let outcome = manager.link_git_tracker(&name, &mount, &home)?;
+            let root = manager.store().paths().project_root.clone();
+            println!(
+                "Linked `{name}` to `{home}`, at {}",
+                display_path(&root, &outcome.path)
+            );
+            println!(
+                "  history:   {}'s own; its `main` is {} ({}), and nothing is copied",
+                home,
+                short_rev(&outcome.main),
+                plural(outcome.commits, "commit")
+            );
+            println!(
+                "  mounted:   {}, joined as one commit ({}) on the project root",
+                outcome.mount,
+                short_rev(&outcome.view)
+            );
+            println!("  publish it with: newgit merge main");
+            Ok(())
+        }
         TrackerCommand::Create {
             name,
             audience,

@@ -224,6 +224,7 @@ mod tests {
             priority: 0,
             history: crate::tracker::History::Commits,
             pinned: false,
+            link: None,
             requires: Vec::new(),
             resources: Vec::new(),
             excluded: Vec::new(),

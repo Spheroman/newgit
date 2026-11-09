@@ -1795,13 +1795,70 @@ impl BranchManager {
         from: &str,
         branch: Option<&str>,
     ) -> Result<ImportGitTrackerOutcome> {
+        self.import_git_tracker_from(name, audience, mount, from, branch, None, None)
+    }
+
+    /// Bind tracker `home` (`owner/project[/path]`, in Git on the remote)
+    /// into this project at `mount`, as `name`: one tracker in two roots, the
+    /// second mount a symlink (docs/design/trackers.md, *One tracker, two
+    /// roots*). Its `main` comes from its home's repo with a read password
+    /// from its home project, and the definition says `link`, so its
+    /// history, heads, and repo stay its home's: nothing is copied anywhere
+    /// new. Then as for an import: one commit in the project root adds the
+    /// definition, the mount, and the pin.
+    pub fn link_git_tracker(
+        &self,
+        name: &str,
+        mount: &Utf8Path,
+        home: &str,
+    ) -> Result<ImportGitTrackerOutcome> {
+        let link = self.remote.as_ref().ok_or_else(|| {
+            NewgitError::Unsupported(
+                "a link names a tracker on the remote: this project has none (`newgit remote add`)"
+                    .to_owned(),
+            )
+        })?;
+        let parts: Vec<&str> = home.split('/').collect();
+        if parts.len() < 2 || parts.iter().any(|part| part.is_empty()) {
+            return Err(NewgitError::Unsupported(format!(
+                "`{home}` is not a tracker's home: `<owner>/<project>` or `<owner>/<project>/<path>`"
+            )));
+        }
+        let home_project = format!("{}/{}", parts[0], parts[1]);
+        let client = link.connect(Acting::Login)?;
+        let credential = client.credential(&home_project, &home_repo(home), Scope::Read)?;
+        let url = credential.remote.clone().unwrap_or_default();
+        let auth = basic_auth_header(&credential);
+        self.import_git_tracker_from(
+            name,
+            "project-devs",
+            mount,
+            &url,
+            Some("main"),
+            Some(&auth),
+            Some(home),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn import_git_tracker_from(
+        &self,
+        name: &str,
+        audience: &str,
+        mount: &Utf8Path,
+        from: &str,
+        branch: Option<&str>,
+        auth: Option<&str>,
+        home: Option<&str>,
+    ) -> Result<ImportGitTrackerOutcome> {
         validate_name(name)?;
         if !crate::tracker::name_fits_id(name) {
             return Err(NewgitError::InvalidName(name.to_owned()));
         }
         self.refuse_root(name, "it always exists")?;
         self.require_migrated()?;
-        let definition = TrackerDefinition::in_git(name, audience.to_owned(), mount)?;
+        let mut definition = TrackerDefinition::in_git(name, audience.to_owned(), mount)?;
+        definition.link = home.map(str::to_owned);
         let mount = definition.mount.clone();
         if mount.as_str() == "." {
             return Err(NewgitError::Unsupported(format!(
@@ -1891,7 +1948,7 @@ impl BranchManager {
                     from,
                     &format!("+{}:{fetched_ref}", branch.unwrap_or("HEAD")),
                 ],
-                &[],
+                &crate::source::auth_env(auth),
             )?;
             let imported = self
                 .source
@@ -1932,10 +1989,13 @@ impl BranchManager {
             .trim()
             .is_empty();
 
-            let message = format!(
-                "Import `{name}` at {mount} from {}\n",
-                recorded_source(from)
-            );
+            let message = match home {
+                Some(home) => format!("Link `{name}` at {mount} to `{home}`\n"),
+                None => format!(
+                    "Import `{name}` at {mount} from {}\n",
+                    recorded_source(from)
+                ),
+            };
             let text = toml::to_string_pretty(&definition.to_file()).map_err(|source| {
                 NewgitError::TomlWrite {
                     label: format!("tracker `{name}`"),
@@ -2362,7 +2422,7 @@ impl BranchManager {
         let store = self.store.paths().tracker_store.clone();
         crate::tracker_repo::ensure_store(&store)?;
         let client = link.connect(Acting::Login)?;
-        let repo = format!("{}.t.{tracker}", link.project.replace('/', "."));
+        let repo = self.git_repo(&link.project, tracker);
         let credential = client.credential(&link.project, &repo, Scope::Read)?;
         let host = link
             .url
@@ -2463,7 +2523,7 @@ impl BranchManager {
                 client = Some(link.connect(Acting::Login)?);
             }
             let client = client.as_ref().expect("connected just now");
-            let repo = format!("{}.t.{tracker}", link.project.replace('/', "."));
+            let repo = self.git_repo(&link.project, tracker);
             let credential = client.credential(&link.project, &repo, Scope::Read)?;
             Ok(Some(crate::snapshots::Source {
                 url: credential.remote.clone().unwrap_or_default(),
@@ -10222,7 +10282,7 @@ impl BranchManager {
         // Every tracker's read password in one request.
         let repos: Vec<String> = list
             .keys()
-            .map(|tracker| format!("{}.t.{tracker}", project.replace('/', ".")))
+            .map(|tracker| self.git_repo(project, tracker))
             .collect();
         let credentials = client.credentials(project, &repos, Scope::Read)?;
         for ((tracker, commit), credential) in list.iter().zip(credentials) {
@@ -10415,7 +10475,13 @@ impl BranchManager {
         // pins, and a child's own `main` is the one `main` follows.
         let mut mains: Vec<(String, Option<String>, String)> = Vec::new();
         for merge in &moved {
-            if merge.tracker == self.root.name || into != "main" {
+            // A link new to the branch: its commit is its home's `main`
+            // already, and nothing here may move that.
+            if merge.tracker == self.root.name
+                || into != "main"
+                || (merge.action == TrackerMergeAction::New
+                    && self.link_of(&merge.tracker).is_some())
+            {
                 continue;
             }
             let current = if client.is_some() {
@@ -10496,6 +10562,12 @@ impl BranchManager {
                 .iter()
                 .filter(|merge| merge.action == TrackerMergeAction::New)
             {
+                // A link has its home's repo, and its commit is there
+                // already: the remote is told where its home is.
+                if let Some(home) = self.link_of(&merge.tracker) {
+                    client.link_tracker(project_key, &merge.tracker, &home)?;
+                    continue;
+                }
                 let seed = client.create_tracker_repo(project_key, &merge.tracker)?;
                 push(&seed.credential, &merge.commit, "refs/heads/main", None)?;
             }
@@ -10681,6 +10753,24 @@ impl BranchManager {
             remote: client.map(|(_, project)| project),
             anchor,
         })
+    }
+
+    /// The repo holding tracker `tracker`'s history for `project`: its own,
+    /// or, for a tracker linked from elsewhere (`link`), its home's.
+    /// Where tracker in Git `tracker` lives when it is linked from another
+    /// project: its home, `<owner>/<project>[/<path>]`.
+    fn link_of(&self, tracker: &str) -> Option<String> {
+        self.carved
+            .iter()
+            .find(|definition| definition.name == tracker)
+            .and_then(|definition| definition.link.clone())
+    }
+
+    fn git_repo(&self, project: &str, tracker: &str) -> String {
+        match self.link_of(tracker) {
+            Some(home) => home_repo(&home),
+            None => format!("{}.t.{tracker}", project.replace('/', ".")),
+        }
     }
 
     /// Send each of `sends` (a tracker, and its commit this merge lands) to
@@ -11049,7 +11139,7 @@ impl BranchManager {
             let repo = if forked {
                 fork_repo(project, from_slug, tracker)
             } else {
-                format!("{}.t.{tracker}", project.replace('/', "."))
+                self.git_repo(project, tracker)
             };
             let credential = match remote.credential(project, &repo, Scope::Read) {
                 Ok(credential) => credential,
@@ -11083,7 +11173,7 @@ impl BranchManager {
                             Some(&auth),
                         );
                     }
-                    let repo = format!("{}.t.{tracker}", project.replace('/', "."));
+                    let repo = self.git_repo(project, tracker);
                     let credential = remote.credential(project, &repo, Scope::Read)?;
                     crate::snapshots::Source {
                         url: credential.remote.clone().unwrap_or_default(),
@@ -11482,7 +11572,7 @@ impl BranchManager {
         let project = self.store.paths().project_root.clone();
         if let Some(link) = &self.remote {
             let client = link.connect(Acting::Login)?;
-            let repo = format!("{}.t.{tracker}", link.project.replace('/', "."));
+            let repo = self.git_repo(&link.project, tracker);
             match client.credential(&link.project, &repo, Scope::Read) {
                 Ok(credential) => {
                     let target = format!("refs/newgit/remote/{tracker}/{branch}");
@@ -14052,6 +14142,23 @@ fn local_tracker_ref(tracker: &str, branch: &str) -> String {
 
 /// The repo a tracker's content lives in on the remote: one per user for a
 /// per-user (`audience = "user"`) tracker, one shared otherwise.
+/// The repo of `home`, a tracker by its home path (`owner/project` for a
+/// root, `owner/project/a/b` below it): `owner.project.t.<id>`, what every
+/// root that links it fetches and pushes.
+pub fn home_repo(home: &str) -> String {
+    let parts: Vec<&str> = home.split('/').collect();
+    let id = if parts.len() <= 2 {
+        "root".to_owned()
+    } else {
+        parts[2..].join(crate::tracker::ID_SEPARATOR)
+    };
+    format!(
+        "{}.{}.t.{id}",
+        parts[0].to_lowercase(),
+        parts.get(1).copied().unwrap_or_default()
+    )
+}
+
 pub fn tracker_repo(project: &str, definition: &TrackerDefinition, login: &str) -> String {
     let prefix = project.replace('/', ".");
     if definition.audience == "user" {

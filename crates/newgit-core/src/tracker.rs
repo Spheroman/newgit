@@ -60,6 +60,12 @@ pub struct TrackerDefinition {
     /// parent's pin is a change to the parent, its maintainers' to approve.
     /// For what must not move by itself: a private dependency, `/env/prod`.
     pub pinned: bool,
+    /// Where this tracker lives, when not here (`link = "spheroman/jack-env"`):
+    /// one tracker bound into several roots, a second mount being a symlink.
+    /// Its history, heads, and repo are its home's; each root that links it
+    /// pins its own commit of it, and its home's definition says who may read
+    /// and change it.
+    pub link: Option<String>,
     /// Trackers or roles it cannot do without: binding it binds them, and
     /// they cannot be dropped while it is bound.
     pub requires: Vec<String>,
@@ -165,6 +171,8 @@ pub struct TrackerDefinitionFile {
     history: History,
     #[serde(default, skip_serializing_if = "is_false")]
     pinned: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    link: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     requires: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -258,6 +266,7 @@ impl TrackerDefinition {
             priority: 0,
             history: History::Commits,
             pinned: false,
+            link: None,
             requires: Vec::new(),
             resources: Vec::new(),
             excluded: Vec::new(),
@@ -292,6 +301,7 @@ impl TrackerDefinition {
             priority: 0,
             history: History::Commits,
             pinned: false,
+            link: None,
             requires: Vec::new(),
             resources: Vec::new(),
             excluded: Vec::new(),
@@ -361,6 +371,7 @@ impl TrackerDefinition {
             priority: file.priority,
             history: file.history,
             pinned: file.pinned,
+            link: file.link,
             requires: file.requires,
             resources: file.resources,
             excluded: Vec::new(),
@@ -372,6 +383,15 @@ impl TrackerDefinition {
     }
 
     fn validate(&self) -> Result<()> {
+        if let Some(link) = &self.link {
+            let parts: Vec<&str> = link.split('/').collect();
+            if !self.git || parts.len() < 2 || parts.iter().any(|part| part.is_empty()) {
+                return Err(self.invalid(format!(
+                    "`link = \"{link}\"` must name a tracker in Git by its home, \
+                     `<owner>/<project>` or `<owner>/<project>/<path>`, and this tracker must be `git = true`"
+                )));
+            }
+        }
         if let Some(maintainers) = &self.maintainers {
             let ok = matches!(maintainers.as_str(), "owner" | "project-devs")
                 || (maintainers.starts_with("user:") && maintainers.len() > "user:".len());
@@ -503,6 +523,7 @@ impl TrackerDefinition {
             priority: self.priority,
             history: self.history,
             pinned: self.pinned,
+            link: self.link.clone(),
             requires: self.requires.clone(),
             resources: self.resources.clone(),
         }
@@ -528,6 +549,7 @@ impl TrackerDefinition {
             priority: 0,
             history: History::Commits,
             pinned: false,
+            link: None,
             requires: Vec::new(),
             resources: Vec::new(),
             excluded: Vec::new(),
@@ -561,6 +583,7 @@ impl TrackerDefinition {
             priority: 0,
             history: History::Commits,
             pinned: false,
+            link: None,
             requires: Vec::new(),
             resources: Vec::new(),
             excluded: Vec::new(),
@@ -1026,6 +1049,7 @@ mod tests {
             priority: 0,
             history: History::Commits,
             pinned: false,
+            link: None,
             requires: Vec::new(),
             resources: Vec::new(),
             excluded: Vec::new(),

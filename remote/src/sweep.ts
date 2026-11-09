@@ -27,10 +27,13 @@ export async function sweep(env: Env, deps: Deps, id: ProjectId): Promise<boolea
 		if (!(await settle(deps, project, id, branch))) left = true;
 
 	const trackers = new Set((await project.branches()).flatMap((branch) => Object.keys(branch.list)));
+	// A link's landing refs are in its home's repo, which its home sweeps.
+	const links = await project.links();
 	const seen = await project.landingSightings();
 	const next: Record<string, Record<string, number>> = {};
 	let cleared = 0;
 	for (const tracker of trackers) {
+		if (links[tracker] !== undefined) continue;
 		const name = repoName({ kind: "tracker", project: id, tracker });
 		const refs = await deps.repos.refs(name).catch(() => null);
 		if (refs === null) continue;
