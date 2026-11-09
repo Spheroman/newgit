@@ -245,26 +245,28 @@ impl Stores {
         Ok(())
     }
 
-    /// Fetch every commit `commits` (root's) pin, and every commit those
-    /// pin in turn, for the trackers in `repos`: a reader's others are not
-    /// theirs to expand. A pin must be here before its own pins can be read,
-    /// so this goes one level of mounts at a time.
+    /// Fetch every commit `commits` (the view root's) pin, and every commit
+    /// those pin in turn, for the trackers in `repos`: a reader's others are
+    /// not theirs to expand. A pin must be here before its own pins can be
+    /// read, so this goes one level of mounts at a time. Pins are named from
+    /// `root`, the tracker the view is rooted at: in a view rooted at
+    /// `t3code`, its pin `repos` is `t3code__repos`.
     fn snapshot_pins(
         &self,
         repos: &BTreeMap<String, Source>,
+        root: &str,
         commits: &[String],
         held: &mut Held,
     ) -> Result<()> {
         let mut seen: HashSet<(String, String)> = HashSet::new();
         let mut level: BTreeMap<String, BTreeSet<String>> =
-            BTreeMap::from([(ROOT_TRACKER.to_owned(), commits.iter().cloned().collect())]);
+            BTreeMap::from([(root.to_owned(), commits.iter().cloned().collect())]);
         loop {
             let mut next: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
             let mut objects = Objects::open(&self.composing)?;
             for (tracker, commits) in &level {
                 for commit in commits {
-                    if tracker != ROOT_TRACKER
-                        && !held.get(tracker).is_some_and(|set| set.contains(commit))
+                    if tracker != root && !held.get(tracker).is_some_and(|set| set.contains(commit))
                     {
                         continue;
                     }
@@ -321,12 +323,18 @@ pub fn compose_view(plan: &Plan) -> Result<Utf8PathBuf> {
     // tracker's repo has it: a commit being *somewhere* here proves nothing
     // — a branch could name another tracker's commit under this tracker's
     // name.
+    // Only the whole histories count here, never `snapshots.git`: a view
+    // rooted at a child (`/<owner>/<name>/t3code.git`) composed after root's
+    // view finds that child's pins there one commit deep, and walking its
+    // history from a snapshot ends at the cut.
     let roots = wanted.remove(root).unwrap_or_default();
-    let known = |held: &Held, commit: &String| {
-        held.get(root)
+    let whole = tracker_histories(&stores.whole, [root.to_owned()].iter());
+    let known = |commit: &String| {
+        whole
+            .get(root)
             .is_some_and(|history| history.contains(commit))
     };
-    if !roots.iter().all(|commit| known(&held, commit)) {
+    if !roots.iter().all(known) {
         let source = plan.repos.get(root).ok_or_else(|| {
             NewgitError::Unsupported(format!("the plan names `{root}` but not where it is"))
         })?;
@@ -405,7 +413,7 @@ pub fn compose_view(plan: &Plan) -> Result<Utf8PathBuf> {
         .lines()
         .map(ToOwned::to_owned)
         .collect();
-    stores.snapshot_pins(&plan.repos, &history, &mut held)?;
+    stores.snapshot_pins(&plan.repos, root, &history, &mut held)?;
 
     // One compose for every branch and tag that reads the same trackers:
     // they share most of their history, which composes once.
@@ -842,7 +850,12 @@ pub fn check_index(plan: &IndexPlan) -> Result<IndexAnswer> {
     }
     // An index is this one commit's pins, all the way down: no history.
     let mut held = stores.held(plan.repos.keys());
-    stores.snapshot_pins(&plan.repos, std::slice::from_ref(root), &mut held)?;
+    stores.snapshot_pins(
+        &plan.repos,
+        ROOT_TRACKER,
+        std::slice::from_ref(root),
+        &mut held,
+    )?;
     let actual = compose::index(&stores.composing, ROOT_TRACKER, root)?;
     Ok(IndexAnswer {
         matches: actual == plan.list,
