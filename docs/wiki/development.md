@@ -1,0 +1,31 @@
+# Development
+
+This repository uses [`mise`](https://mise.jdx.dev/) to pin Rust.
+
+```sh
+mise install
+mise run ci        # fmt-check + clippy -D warnings + test, exactly what CI runs
+mise run test
+mise run install   # build and install into ~/.cargo/bin
+```
+
+CI runs the suite on Linux and macOS, checks the declared MSRV, and smoke
+tests the release binary against a throwaway project — the tests here drive
+real `git`, real process groups, and real ports, so they are integration
+tests by nature.
+
+## Workspace layout
+
+- `crates/newgit-core` holds the domain model: branch instances, tracker
+  definitions and their histories, the compose/split engine that turns
+  tracker histories into one workspace history and back, resource
+  definitions and lifecycle hooks, metadata storage, real-directory
+  materialization, checkpoints and undo, export, cleanup, and the remote
+  client.
+- `crates/newgit` is the CLI, published as the `newgit` crate.
+- `remote/` is the hosted remote: a Cloudflare Worker with Durable Objects
+  over Artifacts repos, deployed at `https://newgit.dev`.
+- `.newgit/` is created by `newgit init`. Committed: `config.toml`,
+  `trackers/`, `resources/`, `scripts/`, `exports/`. Gitignored local state: `branches/`,
+  `checkpoints/`, `logs/`, `state/`, `installs/`, and `local/` — which holds
+  `trackers.git`, every tracker's history (bare repo).

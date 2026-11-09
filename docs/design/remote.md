@@ -82,14 +82,22 @@ this repository is `spheroman/newgit` on newgit.dev, and GitHub's
 - `newgit remote delete <owner>/<name>`: the owner deletes the project —
   every token pinned to it revoked first, then every repo under its prefix,
   then its record — so the name can be linked again from scratch.
-- The landing page at `/`: one file of one tracker, at its trunk, named by
-  `LANDING_PAGE` in `wrangler.jsonc`. newgit.dev's is
-  `remote/site/index.html` in `site`, a `project-devs` tracker outside Git, so
-  the page is never committed and naming it in the config is what
-  publishes it. A change goes live with `newgit tracker merge site`, within
+- The site: the landing page at `/` and the wiki under `/docs`, read from
+  trackers at their trunk and named by `SITE` in `wrangler.jsonc`
+  (`remote/src/site.ts`). The look is newgit.dev's `site`, a `project-devs`
+  tracker outside Git: `remote/site/index.html` is the landing page and
+  `remote/site/page.html` the template every wiki page is poured into, so
+  neither is ever committed and naming them in the config is what publishes
+  them. The words are root's Markdown in `docs/wiki/`, open source and
+  reviewed with the code: `<page>.md` is `/docs/<page>`, `README.md` is
+  `/docs`, and `_sidebar.md` is the sidebar. Links are written file to file
+  for GitHub, so the directory reads the same there; the Worker turns ones
+  between pages into `/docs/…` and the rest into GitHub links. A merged pull
+  request reaches root's `main` here through the webhook, and the wiki with
+  it. Nothing else in either tracker is served. A change goes live with `newgit tracker merge site`, within
   a minute (the edge caches it), with no deploy. A shared tracker outside Git
   stored on the remote (`storage = "remote"`) has its `main` there as the
-  repo's branch `main`, as a tracker in Git does, and `/` reads it.
+  repo's branch `main`, as a tracker in Git does, and the site reads it.
   `newgit tracker merge` pushes it before moving `main` here, and fails
   whole if the push does, so merging such a tracker needs a login and the
   network. A checkpoint's sync carries only pins and instance branches

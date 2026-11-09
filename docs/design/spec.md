@@ -6,7 +6,7 @@ what they cost.*
 This document describes newgit as it exists on `main`. It explains the
 design, not the commands. For those, and for the rest of the documentation:
 
-- [The guide](../guide.md) covers how to use newgit, command by command.
+- [The wiki](../wiki/README.md) covers how to use newgit, command by command.
 - [`definitions.md`](../../crates/newgit/reference/definitions.md), which
   `newgit reference` prints, lists every key in a tracker, resource, or
   export definition, with its default and the template variables each hook

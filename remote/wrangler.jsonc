@@ -49,10 +49,20 @@
     // The account the spend kill switch reads billing for; not a secret.
     "CLOUDFLARE_ACCOUNT_ID": "bce0b38de721f350c8d8a51d0520337d",
     "ARTIFACTS_GIT_BASE": "https://bce0b38de721f350c8d8a51d0520337d.artifacts.cloudflare.net/git/newgit",
-    // Served at /: this file of this tracker, at its trunk. The tracker is
-    // secret, so naming it here is what publishes the page (src/index.ts,
-    // `landingPage`).
-    "LANDING_PAGE": { "project": "spheroman/newgit", "tracker": "site", "path": "remote/site/index.html" }
+    // The site, read from trackers at their trunk (src/site.ts). `site` is
+    // secret, so naming its files here is what publishes them: the landing
+    // page at /, and the template every wiki page is poured into. The wiki's
+    // words are root's Markdown in docs/wiki, at /docs/<page>.
+    "SITE": {
+      "project": "spheroman/newgit",
+      "landing": { "tracker": "site", "path": "remote/site/index.html" },
+      "docs": {
+        "tracker": "root",
+        "dir": "docs/wiki",
+        "template": { "tracker": "site", "path": "remote/site/page.html" },
+        "source": "https://github.com/Spheroman/newgit/blob/main"
+      }
+    }
   },
   // A remote of its own for trying changes before they merge: its own
   // Worker, Artifacts namespace, Durable Objects, and container, on

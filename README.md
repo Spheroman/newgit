@@ -159,8 +159,8 @@ running.
 
 ## Learn more
 
-- **[The guide](https://github.com/Spheroman/newgit/blob/main/docs/guide.md)**
-  covers adopting newgit in an existing project, every command, the T3 Code
+- **[The wiki](https://newgit.dev/docs)** ([source](docs/wiki/)) covers
+  adopting newgit in an existing project, every command, the T3 Code
   integration in detail, exporting to GitHub, and the sharp edges worth
   knowing about.
 - **`newgit reference`** documents every tracker and resource key, its
