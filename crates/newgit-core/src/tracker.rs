@@ -50,6 +50,11 @@ pub struct TrackerDefinition {
     /// unless a person's own default says otherwise. Negative means only when
     /// asked for (`--use`), for a role-less tracker too.
     pub priority: i32,
+    /// How its parent records it rolling up (`history`, the parent's
+    /// choice, as the mount is): `commits`, one per change so the parent's
+    /// `git log` is complete, or `pins`, one snapshot of where it is now
+    /// (docs/design/anchoring.md, *How much history rolls up*).
+    pub history: History,
     /// Trackers or roles it cannot do without: binding it binds them, and
     /// they cannot be dropped while it is bound.
     pub requires: Vec<String>,
@@ -151,10 +156,26 @@ pub struct TrackerDefinitionFile {
     role: Option<String>,
     #[serde(default, skip_serializing_if = "is_zero")]
     priority: i32,
+    #[serde(default, skip_serializing_if = "is_default_history")]
+    history: History,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     requires: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     resources: Vec<String>,
+}
+
+/// How a parent records a child rolling up: every change (`commits`, the
+/// default), or where it is now (`pins`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum History {
+    #[default]
+    Commits,
+    Pins,
+}
+
+fn is_default_history(history: &History) -> bool {
+    *history == History::Commits
 }
 
 fn is_zero(value: &i32) -> bool {
@@ -228,6 +249,7 @@ impl TrackerDefinition {
             maintainers: None,
             role: None,
             priority: 0,
+            history: History::Commits,
             requires: Vec::new(),
             resources: Vec::new(),
             excluded: Vec::new(),
@@ -260,6 +282,7 @@ impl TrackerDefinition {
             maintainers: None,
             role: None,
             priority: 0,
+            history: History::Commits,
             requires: Vec::new(),
             resources: Vec::new(),
             excluded: Vec::new(),
@@ -327,6 +350,7 @@ impl TrackerDefinition {
             maintainers: file.maintainers,
             role: file.role,
             priority: file.priority,
+            history: file.history,
             requires: file.requires,
             resources: file.resources,
             excluded: Vec::new(),
@@ -467,6 +491,7 @@ impl TrackerDefinition {
             maintainers: self.maintainers.clone(),
             role: self.role.clone(),
             priority: self.priority,
+            history: self.history,
             requires: self.requires.clone(),
             resources: self.resources.clone(),
         }
@@ -490,6 +515,7 @@ impl TrackerDefinition {
             maintainers: None,
             role: None,
             priority: 0,
+            history: History::Commits,
             requires: Vec::new(),
             resources: Vec::new(),
             excluded: Vec::new(),
@@ -521,6 +547,7 @@ impl TrackerDefinition {
             maintainers: Some("owner".to_owned()),
             role: None,
             priority: 0,
+            history: History::Commits,
             requires: Vec::new(),
             resources: Vec::new(),
             excluded: Vec::new(),
@@ -984,6 +1011,7 @@ mod tests {
             maintainers: None,
             role: None,
             priority: 0,
+            history: History::Commits,
             requires: Vec::new(),
             resources: Vec::new(),
             excluded: Vec::new(),

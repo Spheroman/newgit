@@ -198,7 +198,20 @@ the source of truth, and a mirror may trail it.
      sweep's first form.
    - Subscriptions wait for exports to live on the remote: today the client
      exports.
-5. `history`, and the sweep.
+5. `history`, and the sweep. **Done.**
+   - A definition's `history` (`commits` by default, or `pins`) is how its
+     parent records it. A `pins` child rolls up as one snapshot of where it
+     is now, with none of its messages; `commits` children still get one
+     commit per change (`remote/src/rollup.ts`).
+   - The client merges tracker by tracker when the instance changed nothing
+     of root's own but pins (`merge_by_pins`). Under `pins`, root's history
+     never descends from the merger's, so a merge in the composed view met
+     an old base and conflicted on files only the instance had changed.
+   - The sweep (`remote/src/sweep.ts`) runs from `ProjectDO`'s alarm within
+     the hour of a landing or an upload, and again while anything is left.
+     It rolls up every pending branch. It deletes landing refs whose commit
+     is in history at once, and others on their third sighting (two hours
+     on, past any merge still pending).
 6. `status`, exports, and the webhook follow the log.
 7. `follow` says pinned.
 8. Replace `ProjectDO` and project-shaped repo names, as #201's remote redesign.

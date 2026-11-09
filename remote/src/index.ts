@@ -519,6 +519,8 @@ async function route(request: Request, env: Env, deps: Deps): Promise<Response> 
 			throw new HttpError(400, `${name} did not take the pack for ${commit}`);
 		if ((await deps.repos.readCommit(name, commit)) === null)
 			throw new HttpError(400, `the pack sent for ${commit} does not hold it`);
+		// A merge that never comes leaves this ref: the sweep clears it.
+		await project.sweepSoon();
 		return json({ tracker, commit, ref });
 	}
 
@@ -770,7 +772,16 @@ async function route(request: Request, env: Env, deps: Deps): Promise<Response> 
 			}
 			if (tracker === "root" || (!dropped && answer?.onMain !== true)) writes.push(tracker);
 		}
-		const started = await project.beginMerge(branch, base, login, MERGE_PENDING_SECONDS, list, writes, anchor);
+		const started = await project.beginMerge(
+			branch,
+			base,
+			login,
+			MERGE_PENDING_SECONDS,
+			list,
+			writes,
+			anchor,
+			uploaded === true,
+		);
 		if (!started.ok) {
 			if (started.reason === "missing") throw new HttpError(404, `no branch \`${branch}\` in ${key}`);
 			throw new HttpError(409, `\`${branch}\` moved since you looked: merge again onto what it is now`);
@@ -873,8 +884,12 @@ async function route(request: Request, env: Env, deps: Deps): Promise<Response> 
 				const moved = [...new Set([...Object.keys(base), ...Object.keys(list)])].filter(
 					(tracker) => base[tracker] !== list[tracker],
 				);
+				// Worked out from its own commits when it began: the same list,
+				// so the same answer.
 				const anchor =
-					pending?.landed === true ? began : await anchorFor(deps, id, base, list, moved, project, branch);
+					pending?.landed === true || pending?.read === true
+						? began
+						: await anchorFor(deps, id, base, list, moved, project, branch);
 				if (!within(anchor, began))
 					throw new HttpError(409, `this merge touches more than it did when it began: start the merge again`);
 				const landed = await landAndFollow(deps, project, id, branch, base, list, login, asked, true, anchor);
@@ -1378,6 +1393,11 @@ export interface TrackerFacts {
 	paths: string[];
 	/** The tracker whose history holds this definition's file. */
 	source: string;
+	/**
+	 * How its parent records it rolling up: one commit per change, or one
+	 * snapshot of where it is now (docs/design/anchoring.md).
+	 */
+	history?: "commits" | "pins";
 }
 
 /** Where `access` is mounted: every definition is `<name>.toml` at its root. */
@@ -1410,7 +1430,14 @@ function implicitFacts(tracker: string): TrackerFacts | undefined {
 }
 
 function parseFacts(text: string, source: string): TrackerFacts | undefined {
-	let definition: { audience?: unknown; git?: unknown; maintainers?: unknown; mount?: unknown; paths?: unknown };
+	let definition: {
+		audience?: unknown;
+		git?: unknown;
+		maintainers?: unknown;
+		mount?: unknown;
+		paths?: unknown;
+		history?: unknown;
+	};
 	try {
 		definition = parseToml(text) as typeof definition;
 	} catch {
@@ -1427,7 +1454,9 @@ function parseFacts(text: string, source: string): TrackerFacts | undefined {
 	const mount = normalizePath(typeof definition.mount === "string" ? definition.mount : ".");
 	const paths = Array.isArray(definition.paths) ? definition.paths.filter((path) => typeof path === "string") : [];
 	// `git` defaults to false, and is written only when true.
-	return { audience, git: definition.git === true, maintainers, mount, paths, source };
+	// `history` defaults to `commits`, and is written only when `pins`.
+	const history = definition.history === "pins" ? "pins" : "commits";
+	return { audience, git: definition.git === true, maintainers, mount, paths, source, history };
 }
 
 /** `./a/b/` → `a/b`; the empty path is `.`. */
@@ -1968,8 +1997,12 @@ async function makeFork(
 }
 
 /** What rolling up needs of a project's `ProjectDO`. */
-function rollupStore(project: DurableObjectStub<ProjectDO>): RollupStore {
+function rollupStore(project: DurableObjectStub<ProjectDO>, deps: Deps, id: ProjectId): RollupStore {
 	return {
+		// Its definition's `history`: the parent's choice, read as policy is,
+		// from each holder's `main`.
+		historyOf: async (tracker) =>
+			(await definitionFacts(deps.repos, id, tracker, await listedTrackers(project)))?.history ?? "commits",
 		head: (branch, tracker) => project.head(branch, tracker),
 		trackers: async (branch) => Object.keys((await project.branch(branch))?.list ?? {}),
 		pending: (branch, parent) => project.pending(branch, parent),
@@ -1991,7 +2024,7 @@ export async function settle(
 ): Promise<boolean> {
 	const repoOf = (tracker: string) => repoName({ kind: "tracker", project: id, tracker });
 	try {
-		const rolled = await rollUp(deps.repos, rollupStore(project), repoOf, branch, "root");
+		const rolled = await rollUp(deps.repos, rollupStore(project, deps, id), repoOf, branch, "root");
 		if (rolled.written > 0 || rolled.head !== null) {
 			const heads = {
 				head: (name: string, tracker: string) => project.head(name, tracker),
@@ -2111,6 +2144,8 @@ export async function landAndFollow(
 	const landed = await project.land(branch, base, list, by, anchor);
 	if (!landed.ok) return { ok: false, reason: landed.reason };
 	await revokeRepoTokens(deps, landed.tokens);
+	// What rolls up later, and the landing refs left behind: the sweep's.
+	await project.sweepSoon();
 	// The landing is the truth from here; the branches follow after the
 	// answer, so the merger does not wait on them. What cannot follow is
 	// logged, and the next landing (or a finish asked again) brings root's

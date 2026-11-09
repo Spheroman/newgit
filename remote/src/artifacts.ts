@@ -144,16 +144,20 @@ export class ArtifactsRepos implements Repos {
 	}
 
 	async readCommit(name: string, hash: string) {
+		const known = readCommits.get(`${name} ${hash}`);
+		if (known !== undefined) return known;
 		try {
 			using repo = await this.artifacts.get(name);
 			const commit = await repo.readCommit(hash);
 			if (commit === null) return null;
-			return {
+			const read = {
 				hash: commit.hash,
 				tree: commit.treeHash,
 				parents: commit.parents,
 				committedAt: commit.committedAt,
 			};
+			remember(readCommits, `${name} ${hash}`, read);
+			return read;
 		} catch (error) {
 			if (isNotFound(error)) return null;
 			throw error;
@@ -162,9 +166,14 @@ export class ArtifactsRepos implements Repos {
 
 	async readTree(name: string, hash: string) {
 		try {
+			const known = readTrees.get(`${name} ${hash}`);
+			if (known !== undefined) return known;
 			using repo = await this.artifacts.get(name);
 			const entries = await repo.readTree(hash);
-			return entries === null ? null : entries.map(({ name, hash, type }) => ({ name, hash, type }));
+			if (entries === null) return null;
+			const read = entries.map(({ name, hash, type }) => ({ name, hash, type }));
+			remember(readTrees, `${name} ${hash}`, read);
+			return read;
 		} catch (error) {
 			if (isNotFound(error)) return null;
 			throw error;
@@ -246,6 +255,20 @@ export class ArtifactsRepos implements Repos {
 			await this.revokeToken(name, token.id).catch(() => false);
 		}
 	}
+}
+
+/**
+ * Commits and trees read before, by repo and hash. An object never changes,
+ * so what was read stays true; only an absence is asked again (it may have
+ * been pushed since). Bounded: past this many, forgotten and read again.
+ */
+const readCommits = new Map<string, CommitFacts>();
+const readTrees = new Map<string, TreeEntry[]>();
+const OBJECTS_KEPT = 20_000;
+
+function remember<T>(cache: Map<string, T>, key: string, value: T): void {
+	if (cache.size >= OBJECTS_KEPT) cache.clear();
+	cache.set(key, value);
 }
 
 /** Named, as Git names itself: a bare client can be turned away at the door. */

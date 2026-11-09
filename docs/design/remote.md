@@ -603,7 +603,14 @@ answers `writes` (the trackers whose refs the merge may ask to move), and
 mints no write password: the Worker moves every ref. A pack too large, or a
 remote from before uploads, takes the old way: `begin` hands passwords, and
 asks as for a landing at root since it cannot read the commits. A finish
-that finds the merge touching more than `begin` saw is refused. `begin` compares the base only for the trackers the merge
+that finds the merge touching more than `begin` saw is refused.
+
+A child's definition says how its parent records it (`history`): every
+change (`commits`, the default), or one snapshot of where it is now
+(`pins`), which carries none of the child's messages. A sweep from
+`ProjectDO`'s alarm, within the hour of a landing or an upload, rolls up
+what nobody has read and clears the landing refs merges leave
+(`remote/src/sweep.ts`). A merge's uploads are sent at once, one thread each. `begin` compares the base only for the trackers the merge
 moves; root is the finish's to compare. A pin that only follows its tracker's own `main` is the parent's
 choice, so its parent's maintainers are asked for that, as root's were
 before. A tracker above the anchor counts as touched if any commit the merge adds

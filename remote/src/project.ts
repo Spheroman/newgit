@@ -11,6 +11,7 @@ import { DurableObject } from "cloudflare:workers";
 import { within } from "./anchor";
 import { liveDeps } from "./index";
 import type { MirrorInstance } from "./endpoint";
+import { SWEEP_EVERY_MS, sweep } from "./sweep";
 import { type MirrorPull, PULL_BRANCH, PULL_POLL_MS, PULL_START_MS, advancePulls } from "./webhook";
 
 export interface ProjectInfo {
@@ -42,6 +43,11 @@ interface PendingMerge {
 	 * Only that tracker and those inside it move; the trackers above roll up.
 	 */
 	anchor?: string;
+	/**
+	 * The anchor was worked out from the merge's own commits (sent before
+	 * it began): the landing need not work it out again.
+	 */
+	read?: boolean;
 	tokens: HandedToken[];
 	/** Past this it is forgotten and its passwords cancelled. */
 	until: string;
@@ -451,6 +457,7 @@ export class ProjectDO extends DurableObject<Env> {
 		target: TrackerList,
 		writes: string[] = [],
 		anchor = "root",
+		read = false,
 	): MergeStart {
 		const branch = this.branch(name);
 		if (branch === null) return { ok: false, reason: "missing" };
@@ -474,7 +481,7 @@ export class ProjectDO extends DurableObject<Env> {
 		// The same merge begun again (a run that stopped): its passwords from
 		// before are cancelled, and it starts over.
 		stale.push(...(this.pendingMerge(name, target)?.tokens ?? []));
-		const merge: PendingMerge = { by, target, writes, tokens: [], until, anchor };
+		const merge: PendingMerge = { by, target, writes, tokens: [], until, anchor, read };
 		this.sql.exec("INSERT OR REPLACE INTO meta VALUES (?, ?)", key, JSON.stringify(merge));
 		return { ok: true, until, stale };
 	}
@@ -718,10 +725,78 @@ export class ProjectDO extends DurableObject<Env> {
 	 */
 	async alarm(): Promise<void> {
 		const info = this.info();
-		if (info === null || this.pulls().length === 0) return;
+		if (info === null) return;
+		const id = { owner: info.owner, name: info.name };
 		const deps = liveDeps(this.env, (promise) => this.ctx.waitUntil(promise));
-		if (await advancePulls(this.env, deps, { owner: info.owner, name: info.name }))
-			await this.ctx.storage.setAlarm(Date.now() + PULL_POLL_MS);
+		const now = Date.now();
+		let next = Number.POSITIVE_INFINITY;
+		if (this.pulls().length > 0 && (await advancePulls(this.env, deps, id))) next = now + PULL_POLL_MS;
+		const due = this.sweepAt();
+		if (due !== null && due <= now) {
+			this.sql.exec("DELETE FROM meta WHERE key = 'sweep_at'");
+			// Still something to do (landing refs not yet old enough, a roll-up
+			// that failed): again later.
+			if (await sweep(this.env, deps, id)) this.writeSweepAt(now + SWEEP_EVERY_MS);
+		}
+		const sweepAt = this.sweepAt();
+		if (sweepAt !== null) next = Math.min(next, sweepAt);
+		if (Number.isFinite(next)) await this.ctx.storage.setAlarm(next);
+	}
+
+	/**
+	 * Sweep within the hour, unless one is due sooner: after a landing or an
+	 * upload, something may be left to roll up or to clear.
+	 */
+	async sweepSoon(): Promise<void> {
+		if (this.sweepAt() === null) this.writeSweepAt(Date.now() + SWEEP_EVERY_MS);
+		const at = this.sweepAt()!;
+		const alarm = await this.ctx.storage.getAlarm();
+		if (alarm === null || alarm > at) await this.ctx.storage.setAlarm(at);
+	}
+
+	private sweepAt(): number | null {
+		const row = this.sql.exec<{ value: string }>("SELECT value FROM meta WHERE key = 'sweep_at'").toArray()[0];
+		return row ? Number(row.value) : null;
+	}
+
+	private writeSweepAt(at: number): void {
+		this.sql.exec("INSERT OR REPLACE INTO meta VALUES ('sweep_at', ?)", String(at));
+	}
+
+	/**
+	 * Whether `commit` is in `tracker`'s history as the remote knows it, on
+	 * any branch: a head it has been, or a change's own commit a roll-up
+	 * kept. A landing ref at one is spent.
+	 */
+	knownCommit(tracker: string, commit: string): boolean {
+		return (
+			this.sql
+				.exec(
+					"SELECT 1 FROM head_log WHERE tracker = ? AND (old = ? OR new = ?) LIMIT 1",
+					tracker,
+					commit,
+					commit,
+				)
+				.toArray().length > 0 ||
+			// A change's own commit is logged on the child's move, and sits in
+			// the parent's repo: this one's, when `tracker` is the parent.
+			this.sql
+				.exec<{ tracker: string }>("SELECT tracker FROM head_log WHERE via = ?", commit)
+				.toArray()
+				.some((row) => parentOf(row.tracker) === tracker) ||
+			this.sql.exec("SELECT 1 FROM heads WHERE tracker = ? AND commit_id = ? LIMIT 1", tracker, commit).toArray()
+				.length > 0
+		);
+	}
+
+	/** How many sweeps have seen each landing ref no head explains, by repo. */
+	landingSightings(): Record<string, Record<string, number>> {
+		const row = this.sql.exec<{ value: string }>("SELECT value FROM meta WHERE key = 'landing_sightings'").toArray()[0];
+		return row ? (JSON.parse(row.value) as Record<string, Record<string, number>>) : {};
+	}
+
+	setLandingSightings(sightings: Record<string, Record<string, number>>): void {
+		this.sql.exec("INSERT OR REPLACE INTO meta VALUES ('landing_sightings', ?)", JSON.stringify(sightings));
 	}
 
 	isMember(login: string): boolean {

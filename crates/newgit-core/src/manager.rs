@@ -10080,38 +10080,51 @@ impl BranchManager {
             }
             Some(ours) if self.source.is_ancestor(ours, &theirs)? => theirs.clone(),
             Some(ours) => {
-                // Both moved: the merge commit, made in this view and split.
-                let ours_view = self
-                    .compose_here(&format!("refs/newgit/views/branches/{into}"), ours)?
-                    .ok_or_else(|| {
-                        NewgitError::Unsupported(format!("`{into}` composes to nothing"))
-                    })?;
-                let view_merge = match self.merge_commits(
-                    &ours_view,
-                    &head,
-                    &format!("Merge `{name}` into {into}"),
-                )? {
-                    Ok(merged) => merged,
-                    Err(files) => {
-                        let all = self.all_definitions();
-                        let mut by_tracker: BTreeMap<String, Vec<String>> = BTreeMap::new();
-                        for file in files {
-                            let owner = crate::tracker::owner_of(&all, Utf8Path::new(&file))
-                                .map_or_else(|| self.root.name.clone(), |owner| owner.name.clone());
-                            by_tracker.entry(owner).or_default().push(file);
-                        }
-                        let listed: Vec<String> = by_tracker
-                            .iter()
-                            .map(|(tracker, files)| format!("`{tracker}`: {}", files.join(", ")))
-                            .collect();
-                        return Err(NewgitError::Unsupported(format!(
-                            "`{instance}` conflicts with `{into}`, so nothing moved — {}. Bring \
+                match self.merge_by_pins(ours, &theirs, &format!("Merge `{name}` into {into}"))? {
+                    // Root's own files untouched by the instance: each tracker merged
+                    // in its own history, root only moving pins.
+                    Some(merged) => merged,
+                    None => {
+                        // Both moved: the merge commit, made in this view and split.
+                        let ours_view = self
+                            .compose_here(&format!("refs/newgit/views/branches/{into}"), ours)?
+                            .ok_or_else(|| {
+                                NewgitError::Unsupported(format!("`{into}` composes to nothing"))
+                            })?;
+                        let view_merge = match self.merge_commits(
+                            &ours_view,
+                            &head,
+                            &format!("Merge `{name}` into {into}"),
+                        )? {
+                            Ok(merged) => merged,
+                            Err(files) => {
+                                let all = self.all_definitions();
+                                let mut by_tracker: BTreeMap<String, Vec<String>> = BTreeMap::new();
+                                for file in files {
+                                    let owner =
+                                        crate::tracker::owner_of(&all, Utf8Path::new(&file))
+                                            .map_or_else(
+                                                || self.root.name.clone(),
+                                                |owner| owner.name.clone(),
+                                            );
+                                    by_tracker.entry(owner).or_default().push(file);
+                                }
+                                let listed: Vec<String> = by_tracker
+                                    .iter()
+                                    .map(|(tracker, files)| {
+                                        format!("`{tracker}`: {}", files.join(", "))
+                                    })
+                                    .collect();
+                                return Err(NewgitError::Unsupported(format!(
+                                    "`{instance}` conflicts with `{into}`, so nothing moved — {}. Bring \
                              `{into}` into the instance's workspace, resolve there, and merge again",
-                            listed.join("; ")
-                        )));
+                                    listed.join("; ")
+                                )));
+                            }
+                        };
+                        self.split_view(&view_merge, &dropped)?.root
                     }
-                };
-                self.split_view(&view_merge, &dropped)?.root
+                }
             }
         };
         let list = crate::compose::index(&project, &self.root.name, &merged_root)?;
@@ -10430,6 +10443,9 @@ impl BranchManager {
         sends: &[(&str, &str)],
     ) -> Result<bool> {
         let repo = self.store.paths().project_root.clone();
+        // Each pack made here, then all sent at once: each upload is a
+        // round trip to Artifacts through the Worker, a second or more.
+        let mut packs = Vec::new();
         for (tracker, commit) in sends {
             let mut wants = format!("{commit}\n");
             for have in crate::source::run_git_env(
@@ -10457,13 +10473,29 @@ impl BranchManager {
             if pack.len() > MERGE_UPLOAD_MAX_BYTES {
                 return Ok(false);
             }
-            match client.upload_objects(project, tracker, commit, &pack) {
+            packs.push((*tracker, *commit, pack));
+        }
+        let sent: Vec<Result<()>> = std::thread::scope(|scope| {
+            let running: Vec<_> = packs
+                .iter()
+                .map(|(tracker, commit, pack)| {
+                    scope.spawn(move || client.upload_objects(project, tracker, commit, pack))
+                })
+                .collect();
+            running
+                .into_iter()
+                .map(|thread| thread.join().expect("an upload does not panic"))
+                .collect()
+        });
+        let mut all = true;
+        for result in sent {
+            match result {
                 Ok(()) => {}
-                Err(NewgitError::UploadRefused(_)) => return Ok(false),
+                Err(NewgitError::UploadRefused(_)) => all = false,
                 Err(error) => return Err(error),
             }
         }
-        Ok(true)
+        Ok(all)
     }
 
     /// After a merge into `main`, bring the project root along when it can be
@@ -10520,6 +10552,95 @@ impl BranchManager {
     /// A real merge of two commits — two views, or two commits of one
     /// tracker: the merge commit, by whoever runs this (signed when they
     /// sign), or the files that conflict.
+    /// Merge root commit `theirs` into `ours` tracker by tracker, when that
+    /// is all it takes: since they parted, `theirs` changed nothing of root's
+    /// own but pins, and each pin it moved either `ours` left alone or one
+    /// side's commit descends from the other's in that tracker's own history.
+    /// Root is then `ours` with those pins, a merge of the two. None when it
+    /// takes more (root's own files, or a tracker both sides moved apart):
+    /// the merge is made in the composed view.
+    ///
+    /// The view merge is three-way over composed history, which holds a
+    /// tracker's commits only where root kept them. A parent that rolls a
+    /// child up as `pins` keeps none, so the instance's last merge was never
+    /// `main`'s view's ancestor, and its next one met an old base and
+    /// "conflicted" on files only it had changed (seen on the dev remote).
+    fn merge_by_pins(&self, ours: &str, theirs: &str, message: &str) -> Result<Option<String>> {
+        let repo = self.store.paths().project_root.clone();
+        let git = |args: &[&str]| -> Result<String> {
+            let mut full = vec!["-C", repo.as_str()];
+            full.extend_from_slice(args);
+            Ok(crate::source::run_git_env(&full, &[])?.trim().to_owned())
+        };
+        let Ok(base) = git(&["merge-base", ours, theirs]) else {
+            return Ok(None);
+        };
+        let changed = git(&["diff-tree", "-r", "--name-only", &base, theirs])?;
+        if changed.is_empty() {
+            return Ok(Some(ours.to_owned()));
+        }
+        let pins_dir = format!("{}/", crate::compose::PINS_DIR);
+        if !changed.lines().all(|path| path.starts_with(&pins_dir)) {
+            return Ok(None);
+        }
+        let pin_at = |commit: &str, path: &str| -> Result<Option<String>> {
+            let line = git(&["ls-tree", commit, "--", path])?;
+            Ok(line
+                .split_whitespace()
+                .nth(2)
+                .filter(|_| line.starts_with("160000"))
+                .map(str::to_owned))
+        };
+        let mut pins = Vec::new();
+        for path in changed.lines() {
+            let Some(their_pin) = pin_at(theirs, path)? else {
+                return Ok(None);
+            };
+            let base_pin = pin_at(&base, path)?;
+            let our_pin = pin_at(ours, path)?;
+            let pin = match &our_pin {
+                None => return Ok(None),
+                Some(our_pin) if base_pin.as_deref() == Some(our_pin.as_str()) => their_pin,
+                Some(our_pin) if our_pin == &their_pin => continue,
+                Some(our_pin) if self.source.is_ancestor(our_pin, &their_pin)? => their_pin,
+                Some(our_pin) if self.source.is_ancestor(&their_pin, our_pin)? => continue,
+                Some(_) => return Ok(None),
+            };
+            pins.push((path.to_owned(), pin));
+        }
+        // `ours` with those pins: a tree of its own, in a scratch index.
+        let index =
+            tempfile::NamedTempFile::new().map_err(|source| NewgitError::io(&repo, source))?;
+        let index_path = index.path().to_string_lossy().into_owned();
+        let env = [("GIT_INDEX_FILE".to_owned(), index_path)];
+        let with_index = |args: &[&str]| -> Result<String> {
+            let mut full = vec!["-C", repo.as_str()];
+            full.extend_from_slice(args);
+            Ok(crate::source::run_git_env(&full, &env)?.trim().to_owned())
+        };
+        with_index(&["read-tree", ours])?;
+        for (path, pin) in &pins {
+            with_index(&[
+                "update-index",
+                "--add",
+                "--cacheinfo",
+                &format!("160000,{pin},{path}"),
+            ])?;
+        }
+        let tree = with_index(&["write-tree"])?;
+        let merged = git(&[
+            "commit-tree",
+            &tree,
+            "-p",
+            ours,
+            "-p",
+            theirs,
+            "-m",
+            message,
+        ])?;
+        Ok(Some(merged))
+    }
+
     fn merge_commits(
         &self,
         ours: &str,

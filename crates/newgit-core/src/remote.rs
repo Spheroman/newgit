@@ -183,7 +183,7 @@ impl Scope {
 
 /// Everything newgit asks of a remote. Methods take the project by name;
 /// the token is the implementation's.
-pub trait Remote {
+pub trait Remote: Send + Sync {
     fn url(&self) -> &str;
     fn me(&self) -> Result<Me>;
     /// Create `<you>/<name>` with one repo per tracker in Git in `trackers`.

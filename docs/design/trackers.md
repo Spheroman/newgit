@@ -107,6 +107,7 @@ authoritative list; in short:
 | `paths` | Its claims, relative to the mount. `!` excludes: `[".", "!dist/"]`. The most specific owner of a path wins (see *Ownership*). |
 | `role` | Trackers with the same role are mutually exclusive alternatives: an instance binds exactly one per role. A tracker without a role is its own slot. |
 | `priority` | Which alternative is picked by default: highest readable wins. **Negative: never picked automatically** — only by `--use` or a personal setting. |
+| `history` | How its parent records it rolling up (docs/design/anchoring.md): `commits` (the default), one commit per change so the parent's `git log` is complete; or `pins`, one snapshot of where it is now, carrying none of its messages. The parent's choice, as the mount is. Written only when `pins`. |
 | `resources` | Resources this tracker brings. A resource is bound iff a bound tracker brings it. |
 | `requires` | Trackers or roles this one needs: bound with it, and not droppable while it is bound. |
 | `git` | Whether its content is committed with Git. `false` (the default): never in the workspace's Git, excluded, never committed, captured by newgit from the files at checkpoint. `true`: a tracker in Git, committed with Git and split into its own history. Written only when `true`. |
