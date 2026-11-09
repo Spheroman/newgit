@@ -1549,6 +1549,10 @@ impl GitSource {
         let mut pushed = 0;
         let mut split_files = false;
         let mut split_merge = false;
+        // A one-commit step the remote drops is tried again a few times: a
+        // drop can be the remote's, not the step's, and giving up throws the
+        // whole copy away.
+        let mut retries = 0;
         while pushed < chain.len() {
             let upto = (pushed + step).min(chain.len());
             let target = &chain[upto - 1];
@@ -1560,6 +1564,7 @@ impl GitSource {
                     pushed = upto;
                     split_files = false;
                     split_merge = false;
+                    retries = 0;
                     step = (step * 2).min(start);
                 }
                 // One merge the remote will not take: stage what its other
@@ -1578,6 +1583,10 @@ impl GitSource {
                                 .or(bases.first().copied());
                             Self::push_large_files(location, url, target, since, auth)?;
                             split_files = true;
+                            continue;
+                        }
+                        if dropped(&error) && retries < DROPPED_RETRIES {
+                            retries += 1;
                             continue;
                         }
                         return Err(error);
@@ -1925,6 +1934,10 @@ const SNAPSHOT_BATCH: usize = 256;
 /// once the real push lands.
 const STAGING_REF: &str = "refs/heads/newgit-staging";
 
+/// How many times one commit the remote keeps dropping is pushed again, after
+/// its large files went ahead, before the push gives up.
+const DROPPED_RETRIES: usize = 3;
+
 /// Where large files are sent ahead of the commit that brings them.
 const FILES_REF: &str = "refs/heads/newgit-staging-files";
 
@@ -1940,6 +1953,11 @@ fn dropped(error: &NewgitError) -> bool {
     };
     [
         "HTTP 500",
+        // Git over HTTP says it this way: `fatal: unable to access '…': The
+        // requested URL returned error: 500`, with `remote: Internal Server
+        // Error` before it. Artifacts answers a push it drops so.
+        "returned error: 50",
+        "Internal Server Error",
         "unexpected disconnect",
         "remote end hung up",
         "receive_pack_failed",
@@ -2236,6 +2254,30 @@ fn spawn_error(args: &[&str], source: &std::io::Error) -> NewgitError {
 #[cfg(test)]
 mod tests {
     use super::RefUpdate;
+
+    fn git_failed(stderr: &str) -> crate::NewgitError {
+        crate::NewgitError::SourceCommand {
+            command: "git push".to_owned(),
+            stderr: stderr.to_owned(),
+        }
+    }
+
+    /// What Git printed when Artifacts dropped a step of the `t3code` copy,
+    /// 43 minutes in: a drop, so a smaller step, not the end of the copy.
+    #[test]
+    fn a_500_over_http_is_a_drop() {
+        assert!(super::dropped(&git_failed(
+            "remote: Internal Server Error\nfatal: unable to access \
+             'https://example.artifacts.cloudflare.net/git/x.git/': The requested URL \
+             returned error: 500"
+        )));
+        assert!(super::dropped(&git_failed(
+            "fatal: unable to access 'https://x/': The requested URL returned error: 503"
+        )));
+        assert!(!super::dropped(&git_failed(
+            "fatal: unable to access 'https://x/': The requested URL returned error: 403"
+        )));
+    }
 
     #[test]
     fn ref_update_reads_zero_ids_as_absent() {
