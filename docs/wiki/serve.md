@@ -103,6 +103,9 @@ What differs is the machinery, and it is the reason to run it:
   different anchors, and the second merges again. A merge in flight is kept in
   memory, so restarting the server tells its merger to start the merge over.
 
+Only here so far: pull requests (`newgit pr create`, `pr checkout`, `pr
+list`). newgit.dev answers that it has none yet.
+
 What it does not do yet:
 
 - GitHub webhooks and mirror pulls: a pull request merged on a GitHub mirror

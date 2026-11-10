@@ -51,6 +51,9 @@ pub struct Pending {
     anchor: String,
     /// The anchor was read from the merge's own commits.
     read: bool,
+    /// The instance whose work this is, as the merger said: its pull
+    /// request against the branch is marked merged when this lands.
+    instance: Option<String>,
     until: Instant,
 }
 
@@ -389,6 +392,9 @@ pub struct Begin {
     list: Option<List>,
     #[serde(default)]
     uploaded: bool,
+    /// The instance being merged, from a newgit that knows to say.
+    #[serde(default)]
+    instance: Option<String>,
 }
 
 /// `POST /branches/<branch>/merge`: check everything, and remember what was
@@ -570,6 +576,7 @@ pub fn begin(
             writes: writes.clone(),
             anchor: anchor.clone(),
             read,
+            instance: begin.instance.clone(),
             until,
         },
     );
@@ -744,10 +751,20 @@ pub fn finish(
         "DELETE FROM grants WHERE token_id = ? AND refs = 'refs/newgit/landing/'",
         [&caller.token_id],
     )?;
+    // In the landing's own transaction: never a moment where the branch has
+    // the work and its pull request still says open.
+    let pull = match &pending.instance {
+        Some(instance) => {
+            db::merge_pull(&transaction, &project.key, instance, branch, &caller.login)?
+        }
+        None => None,
+    };
     transaction.commit()?;
     let behind = follow(project, branch, list, &asked)?;
     project.app.trackers_moved();
-    answer(db, project, branch, behind, anchor)
+    let mut landed = answer(db, project, branch, behind, anchor)?;
+    landed.body["pull"] = json!(pull);
+    Ok(landed)
 }
 
 fn answer(

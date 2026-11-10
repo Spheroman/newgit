@@ -48,7 +48,7 @@ invited, through `POST /v1/dev/login` with `x-dev-login: <secret>`.
 ```
 <data>/
   server.sqlite          tokens, projects, members, branches (heads), instances,
-                         forks, checkpoints, tags, links, grants
+                         forks, checkpoints, tags, links, grants, items
   token.key              the HMAC key tokens are signed with
   hooks/pre-receive      refuses refs outside a grant's prefix
   homes/<owner>/<project>/
@@ -119,6 +119,26 @@ Resolved loudly; each is reversible.
 7. **Merges in flight are kept in memory.** A restart forgets them, and
    their finish is told to start the merge again, which is safe: nothing
    moved yet.
+
+8. **Pull requests are here, not on the Worker** (#167, #170). newgit.dev
+   is moving to `serve` ([landing.md](landing.md)), so a second copy in
+   ProjectDO would be thrown away. The Worker answers 404 `no route`, and
+   the CLI says the remote has no pull requests yet. They live in `items`,
+   one number sequence per project for pull requests and, later, issues
+   (#161). **A pull request names an instance and a base branch, never a
+   commit:** its head is the instance's latest checkpoint, read when asked,
+   so a push moves it, each checkpoint is a revision, and the push path did
+   not change. One may be open per instance and branch. Opening one is
+   refused while the workspace's HEAD is not the instance's head on the
+   remote (unpushed commits) and for a private instance, which it would
+   reveal. `pr checkout` is `spawn --from-checkpoint` on the head. A merge
+   says which instance it lands (`instance` in the begin body), and the
+   landing's own transaction marks that instance's pull request against the
+   branch merged, so no moment shows the branch moved and the pull request
+   open. Removing the instance closes its pull requests. The merger's word
+   on which instance it is merging is taken as it is: merging needs the same
+   approvals whatever it says, and the worst a false name does is mark that
+   instance's pull request merged.
 
 ## Not yet
 

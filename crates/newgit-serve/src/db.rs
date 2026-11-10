@@ -1,6 +1,7 @@
 //! Everything *about* history, in one SQLite database: what the Worker kept
 //! in its Durable Objects (users' tokens, each project's members, branches,
-//! instances, forks, checkpoints, tags, links).
+//! instances, forks, checkpoints, tags, links), and the forge's items: pull
+//! requests today, issues later, one number sequence per project.
 //!
 //! Every project-scoped table is keyed by `home` first (`<owner>/<project>`),
 //! so moving a set of homes to another node is a `WHERE home ...` away. One
@@ -63,6 +64,15 @@ CREATE TABLE IF NOT EXISTS tags (
 CREATE TABLE IF NOT EXISTS links (
     home TEXT NOT NULL REFERENCES projects ON DELETE CASCADE, tracker TEXT NOT NULL,
     home_project TEXT NOT NULL, home_tracker TEXT NOT NULL, PRIMARY KEY (home, tracker));
+CREATE TABLE IF NOT EXISTS items (
+    home TEXT NOT NULL REFERENCES projects ON DELETE CASCADE, number INTEGER NOT NULL,
+    kind TEXT NOT NULL, title TEXT NOT NULL, body TEXT NOT NULL DEFAULT '',
+    author TEXT NOT NULL, agent TEXT, state TEXT NOT NULL, draft INTEGER NOT NULL DEFAULT 0,
+    instance TEXT, base TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+    closed_at TEXT, merged_by TEXT, PRIMARY KEY (home, number));
+CREATE INDEX IF NOT EXISTS items_by_state ON items (home, kind, state, updated_at DESC, number DESC);
+CREATE UNIQUE INDEX IF NOT EXISTS items_open_pull ON items (home, instance, base)
+    WHERE kind = 'pr' AND state = 'open';
 CREATE TABLE IF NOT EXISTS grants (
     repo TEXT NOT NULL, token_id TEXT NOT NULL, refs TEXT NOT NULL, expires_at INTEGER NOT NULL,
     PRIMARY KEY (repo, token_id, refs));
@@ -632,6 +642,192 @@ pub fn checkpoints(
     )?;
     let rows = statement.query_map(params![home, instance, viewer], checkpoint_row)?;
     Ok(rows.collect::<Result<_, _>>()?)
+}
+
+// ── Pull requests ─────────────────────────────────────────────────────────
+
+/// A pull request: an instance's work proposed for `base`. Its head is not
+/// stored; it is the instance's latest checkpoint, read when asked, so a push
+/// moves it and each checkpoint is a revision.
+#[derive(Debug, Clone)]
+pub struct Pull {
+    pub number: i64,
+    pub title: String,
+    pub body: String,
+    pub author: String,
+    pub agent: Option<String>,
+    pub state: String,
+    pub draft: bool,
+    pub instance: String,
+    pub base: String,
+    pub created_at: String,
+    pub updated_at: String,
+    pub closed_at: Option<String>,
+    pub merged_by: Option<String>,
+}
+
+impl Pull {
+    /// What a list shows: everything but the body. Field names follow `gh`'s
+    /// where the concept is the same.
+    pub fn summary(&self) -> Value {
+        json!({
+            "number": self.number, "title": self.title, "state": self.state,
+            "isDraft": self.draft, "author": self.author, "agent": self.agent,
+            "instance": self.instance, "baseRefName": self.base,
+            "createdAt": self.created_at, "updatedAt": self.updated_at,
+            "closedAt": self.closed_at, "mergedBy": self.merged_by,
+        })
+    }
+}
+
+fn pull_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Pull> {
+    Ok(Pull {
+        number: row.get("number")?,
+        title: row.get("title")?,
+        body: row.get("body")?,
+        author: row.get("author")?,
+        agent: row.get("agent")?,
+        state: row.get("state")?,
+        draft: row.get::<_, i64>("draft")? != 0,
+        instance: row
+            .get::<_, Option<String>>("instance")?
+            .unwrap_or_default(),
+        base: row.get::<_, Option<String>>("base")?.unwrap_or_default(),
+        created_at: row.get("created_at")?,
+        updated_at: row.get("updated_at")?,
+        closed_at: row.get("closed_at")?,
+        merged_by: row.get("merged_by")?,
+    })
+}
+
+/// What a new pull request says.
+pub struct NewPull<'a> {
+    pub title: &'a str,
+    pub body: &'a str,
+    pub author: &'a str,
+    pub agent: Option<&'a str>,
+    pub draft: bool,
+    pub instance: &'a str,
+    pub base: &'a str,
+}
+
+/// Open a pull request with the project's next number. `Err(number)` when
+/// `instance` already has one open against `base`.
+pub fn create_pull(db: &Connection, home: &str, new: &NewPull<'_>) -> ApiResult<Result<Pull, i64>> {
+    let open: Option<i64> = db
+        .query_row(
+            "SELECT number FROM items
+             WHERE home = ? AND kind = 'pr' AND state = 'open' AND instance = ? AND base = ?",
+            [home, new.instance, new.base],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if let Some(number) = open {
+        return Ok(Err(number));
+    }
+    let number: i64 = db.query_row(
+        "SELECT COALESCE(MAX(number), 0) + 1 FROM items WHERE home = ?",
+        [home],
+        |row| row.get(0),
+    )?;
+    let now = now_iso();
+    db.execute(
+        "INSERT INTO items (home, number, kind, title, body, author, agent, state, draft,
+                            instance, base, created_at, updated_at)
+         VALUES (?, ?, 'pr', ?, ?, ?, ?, 'open', ?, ?, ?, ?, ?)",
+        params![
+            home,
+            number,
+            new.title,
+            new.body,
+            new.author,
+            new.agent,
+            i64::from(new.draft),
+            new.instance,
+            new.base,
+            now,
+            now
+        ],
+    )?;
+    pull(db, home, number)?.map(Ok).ok_or_else(|| {
+        crate::error::HttpError::internal(format!(
+            "pull request #{number} was written and is not there"
+        ))
+    })
+}
+
+pub fn pull(db: &Connection, home: &str, number: i64) -> ApiResult<Option<Pull>> {
+    Ok(db
+        .query_row(
+            "SELECT * FROM items WHERE home = ? AND kind = 'pr' AND number = ?",
+            params![home, number],
+            pull_row,
+        )
+        .optional()?)
+}
+
+/// Pull requests in `state` (`None`: every state), most recently updated
+/// first, none on another user's private instance.
+pub fn pulls(
+    db: &Connection,
+    home: &str,
+    state: Option<&str>,
+    viewer: &str,
+    limit: usize,
+) -> ApiResult<Vec<Pull>> {
+    let mut statement = db.prepare(
+        "SELECT p.* FROM items p LEFT JOIN instances i ON i.home = p.home AND i.name = p.instance
+         WHERE p.home = ?1 AND p.kind = 'pr' AND (?2 IS NULL OR p.state = ?2)
+           AND (i.private IS NULL OR i.private = 0 OR i.owner = ?3)
+         ORDER BY p.updated_at DESC, p.number DESC LIMIT ?4",
+    )?;
+    let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+    let rows = statement.query_map(params![home, state, viewer, limit], pull_row)?;
+    Ok(rows.collect::<Result<_, _>>()?)
+}
+
+/// Mark the pull request `instance` has open against `base` merged; its
+/// number, if there was one. Called inside the landing's transaction.
+pub fn merge_pull(
+    db: &Connection,
+    home: &str,
+    instance: &str,
+    base: &str,
+    by: &str,
+) -> ApiResult<Option<i64>> {
+    let now = now_iso();
+    Ok(db
+        .query_row(
+            "UPDATE items SET state = 'merged', merged_by = ?, closed_at = ?, updated_at = ?
+             WHERE home = ? AND kind = 'pr' AND state = 'open' AND instance = ? AND base = ?
+             RETURNING number",
+            params![by, now, now, home, instance, base],
+            |row| row.get(0),
+        )
+        .optional()?)
+}
+
+/// Close every pull request `instance` has open: it is gone, so they have
+/// no head.
+pub fn close_pulls_of(db: &Connection, home: &str, instance: &str) -> ApiResult<usize> {
+    let now = now_iso();
+    Ok(db.execute(
+        "UPDATE items SET state = 'closed', closed_at = ?, updated_at = ?
+         WHERE home = ? AND kind = 'pr' AND state = 'open' AND instance = ?",
+        params![now, now, home, instance],
+    )?)
+}
+
+/// `instance`'s latest checkpoint: a pull request's head.
+pub fn latest_checkpoint(db: &Connection, home: &str, instance: &str) -> ApiResult<Option<Value>> {
+    Ok(db
+        .query_row(
+            "SELECT * FROM checkpoints WHERE home = ? AND instance = ?
+             ORDER BY created_at DESC, id DESC LIMIT 1",
+            [home, instance],
+            checkpoint_row,
+        )
+        .optional()?)
 }
 
 // ── Tags ──────────────────────────────────────────────────────────────────

@@ -155,6 +155,70 @@ pub struct RemoteCheckpoint {
     pub record: serde_json::Value,
 }
 
+/// A pull request: an instance's work proposed for a branch.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemotePull {
+    pub number: u64,
+    pub title: String,
+    /// Left out of lists; only one pull request's own answer has it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body: Option<String>,
+    /// `open`, `closed`, or `merged`.
+    pub state: String,
+    #[serde(default)]
+    pub is_draft: bool,
+    pub author: String,
+    #[serde(default)]
+    pub agent: Option<String>,
+    /// The instance whose work it proposes; its latest checkpoint is the head.
+    pub instance: String,
+    /// The branch it proposes the work for.
+    pub base_ref_name: String,
+    pub created_at: String,
+    pub updated_at: String,
+    #[serde(default)]
+    pub closed_at: Option<String>,
+    #[serde(default)]
+    pub merged_by: Option<String>,
+    /// The instance's latest checkpoint. Left out of lists; `None` once the
+    /// instance is gone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub head: Option<PullHead>,
+}
+
+/// Where a pull request's head is: a checkpoint, `spawn --from-checkpoint`'s
+/// `<instance>/<checkpoint>`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PullHead {
+    pub checkpoint: String,
+    pub instance: String,
+    pub id: String,
+    pub created_by: String,
+    #[serde(default)]
+    pub agent: Option<String>,
+    pub created_at: String,
+    /// The commit the instance's workspace was at when it pushed.
+    #[serde(default)]
+    pub commit: Option<String>,
+}
+
+/// What `pr create` asks the remote for.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NewPullRequest<'a> {
+    pub instance: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub base: Option<&'a str>,
+    pub title: &'a str,
+    pub body: &'a str,
+    pub draft: bool,
+    /// The commit the workspace is at: refused unless the remote has it as
+    /// the instance's head, so nothing unpushed is proposed.
+    pub head_rev: &'a str,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct DeviceCode {
     pub device_code: String,
@@ -229,6 +293,7 @@ pub trait Remote: Send + Sync {
         base: &std::collections::BTreeMap<String, String>,
         list: &std::collections::BTreeMap<String, String>,
         uploaded: bool,
+        instance: Option<&str>,
     ) -> Result<BegunMerge>;
     /// Send `pack`, holding `commit` and what `tracker`'s repo lacks of it,
     /// before a merge begins: the remote pushes it to `commit`'s landing ref
@@ -304,6 +369,13 @@ pub trait Remote: Send + Sync {
     fn revoke_token(&self, id: &str) -> Result<()>;
     /// An agent or instance token replaces itself; the old one is revoked.
     fn renew(&self) -> Result<(String, String)>;
+    /// Open a pull request for an instance's pushed work.
+    fn create_pull(&self, project: &str, new: &NewPullRequest<'_>) -> Result<RemotePull>;
+    /// One pull request, its body and head included.
+    fn pull(&self, project: &str, number: u64) -> Result<RemotePull>;
+    /// Pull requests in `state` (`open`, `closed`, `merged`, `all`), most
+    /// recently updated first.
+    fn pulls(&self, project: &str, state: &str, limit: usize) -> Result<Vec<RemotePull>>;
 }
 
 type Cache<T> = std::sync::LazyLock<std::sync::RwLock<std::collections::HashMap<String, T>>>;
@@ -638,6 +710,21 @@ fn remote_error(status: u16, text: &str) -> NewgitError {
     NewgitError::Remote { status, message }
 }
 
+/// A remote with no pull request routes (newgit.dev's Worker, or a `newgit
+/// serve` from before them) answers 404 "no route": said as that, not as a
+/// missing pull request.
+fn no_pulls_here(error: NewgitError) -> NewgitError {
+    match error {
+        NewgitError::Remote {
+            status: 404,
+            message,
+        } if message.contains("no route for") => NewgitError::Unsupported(
+            "this remote has no pull requests yet: they are on `newgit serve`, not newgit.dev's Worker".to_owned(),
+        ),
+        error => error,
+    }
+}
+
 /// A project's path: `<owner>/<name>`, each part encoded.
 fn project_path(project: &str) -> String {
     project
@@ -743,7 +830,13 @@ impl Remote for HttpRemote {
         base: &std::collections::BTreeMap<String, String>,
         list: &std::collections::BTreeMap<String, String>,
         uploaded: bool,
+        instance: Option<&str>,
     ) -> Result<BegunMerge> {
+        let mut body = serde_json::json!({ "base": base, "list": list, "uploaded": uploaded });
+        // So the landing marks the instance's pull request merged.
+        if let Some(instance) = instance {
+            body["instance"] = serde_json::json!(instance);
+        }
         let started: BegunMerge = self.send_checked(
             "POST",
             &format!(
@@ -751,7 +844,7 @@ impl Remote for HttpRemote {
                 project_path(project),
                 segment(branch)
             ),
-            serde_json::json!({ "base": base, "list": list, "uploaded": uploaded }),
+            body,
         )?;
         Ok(started)
     }
@@ -1112,6 +1205,47 @@ impl Remote for HttpRemote {
         Ok(())
     }
 
+    fn create_pull(&self, project: &str, new: &NewPullRequest<'_>) -> Result<RemotePull> {
+        let body = serde_json::to_value(new).map_err(|error| NewgitError::Remote {
+            status: 0,
+            message: format!("could not encode the pull request: {error}"),
+        })?;
+        self.send(
+            "POST",
+            &format!("/v1/projects/{}/pulls", project_path(project)),
+            Some(body),
+        )
+        .map_err(no_pulls_here)
+    }
+
+    fn pull(&self, project: &str, number: u64) -> Result<RemotePull> {
+        self.send(
+            "GET",
+            &format!("/v1/projects/{}/pulls/{number}", project_path(project)),
+            None,
+        )
+        .map_err(no_pulls_here)
+    }
+
+    fn pulls(&self, project: &str, state: &str, limit: usize) -> Result<Vec<RemotePull>> {
+        #[derive(Deserialize)]
+        struct List {
+            pulls: Vec<RemotePull>,
+        }
+        let list: List = self
+            .send(
+                "GET",
+                &format!(
+                    "/v1/projects/{}/pulls?state={}&limit={limit}",
+                    project_path(project),
+                    segment(state)
+                ),
+                None,
+            )
+            .map_err(no_pulls_here)?;
+        Ok(list.pulls)
+    }
+
     fn renew(&self) -> Result<(String, String)> {
         #[derive(Deserialize)]
         struct Renewed {
@@ -1438,6 +1572,10 @@ pub struct LandedMerge {
     /// None from a remote that does not say.
     #[serde(default)]
     pub anchor: Option<String>,
+    /// The pull request the landing marked merged, from a remote that has
+    /// them.
+    #[serde(default)]
+    pub pull: Option<u64>,
 }
 
 /// Where a merge's commit waits in a tracker's repo until the remote lands

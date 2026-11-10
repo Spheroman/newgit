@@ -48,6 +48,8 @@ use crate::tracker_repo::{
     pinned_revs, prune_unreferenced,
 };
 
+mod pull_request;
+pub use pull_request::PullRequestSpec;
 mod stale_render;
 pub use stale_render::{PossiblyStale, StaleRender};
 
@@ -10636,6 +10638,7 @@ impl BranchManager {
         }
 
         let mut anchor = None;
+        let mut pull = None;
         // What root is once this merge is in: its own commit, unless it
         // landed below root and root rolled up to something more.
         let mut landed_root = merged_root.clone();
@@ -10719,7 +10722,16 @@ impl BranchManager {
             // The remote asks Git how each pin moves; whether this merge may
             // make each move is its call, not ours. Without the upload it
             // hands a write password for each tracker it may move.
-            let begun = client.begin_merge(project_key, into, &base, &list, uploaded)?;
+            // Named so the landing marks the instance's pull request merged.
+            let instance = (name != PROJECT_ROOT_INSTANCE).then(|| branch_slug(&name));
+            let begun = client.begin_merge(
+                project_key,
+                into,
+                &base,
+                &list,
+                uploaded,
+                instance.as_deref(),
+            )?;
             anchor = begun.anchor.clone();
             let credentials = begun.credentials;
             let writes = begun.writes;
@@ -10787,6 +10799,7 @@ impl BranchManager {
             // The commit point, and the only one: the remote moves the list
             // by compare-and-swap, then root's branch and each move follow.
             let landed = client.finish_merge(project_key, into, &base, &list, &ref_moves)?;
+            pull = landed.pull;
             warnings.extend(landed.behind);
             // Where it landed is the finish's to say: `begin` cannot read
             // the merge's commits yet, which arrive after it.
@@ -10883,6 +10896,7 @@ impl BranchManager {
             trackers,
             remote: client.map(|(_, project)| project),
             anchor,
+            pull,
         })
     }
 
@@ -13959,6 +13973,8 @@ pub struct MergeOutcome {
     /// Where it landed on the remote: the lowest tracker covering everything
     /// it touched. Root, or a tracker the trackers above roll up to.
     pub anchor: Option<String>,
+    /// The pull request the landing marked merged.
+    pub pull: Option<u64>,
 }
 
 /// What a person asks of a spawn beyond the defaults: `--use`, `--drop`,

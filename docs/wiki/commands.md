@@ -98,6 +98,17 @@ Remote:
   pin to its `follow` ref; spawn says when a tracker is behind
 - `newgit members add|remove <github-login>` / `members list [--json]`
 - `newgit spawn <name> --from-checkpoint <instance>/<checkpoint>`
+- `newgit pr create [instance] [--base <branch>] [-t <title>] [-b <body> |
+  -F <file>] [--draft] [--json]` — propose an instance's pushed work for a
+  branch. Its head is the instance's latest checkpoint, so it moves when the
+  instance pushes again. Title and body default to the last commit's message.
+  Refused while the workspace has unpushed commits, and for a private
+  instance. `newgit merge` marks it merged as it lands. On `newgit serve` only
+  for now
+- `newgit pr checkout <number> [--name <instance>] [--json]` — `spawn
+  --from-checkpoint` on a pull request's head: its code, uncommitted work, the
+  trackers you may read, and its resources, as instance `pr-<number>`
+- `newgit pr list [--state open|closed|merged|all] [-L <n>] [--json]`
 
 Resource templates: `process`, `pnpm`, `install`, `command-snapshot`,
 `command-snapshot-migrations`, `supabase`, `external`. `newgit resource

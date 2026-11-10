@@ -32,6 +32,8 @@ newgit login                      # GitHub device flow
 newgit remote add                 # create <you>/<project>: a repo per tracker in Git
 newgit members add octocat
 newgit spawn --from-checkpoint auth-refactor/ckpt_003
+newgit pr create auth-refactor    # or propose it, and a reviewer runs it by number:
+newgit pr checkout 12             # code, database, and ports, as instance pr-12
 newgit merge auth-refactor        # into main: one merge commit, every tracker at once
 
 # a teammate

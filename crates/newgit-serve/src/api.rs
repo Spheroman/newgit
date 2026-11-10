@@ -845,9 +845,27 @@ fn project_route(
             require_owner(&instance.owner, &login, &format!("remove `{name}`"))?;
             caller.require_not_instance("remove instances")?;
             remove_forks(&project, &instance)?;
+            db::close_pulls_of(&db, &key, name)?;
             db::delete_instance(&db, &key, name)?;
             db::revoke_pinned(&db, &key, Some(name))?;
             ok(json!({ "name": name, "removed": true }))
+        }
+        ("POST", ["pulls"]) => create_pull(&project, &db, caller, request),
+        ("GET", ["pulls"]) => list_pulls(&project, &db, &login, request),
+        ("GET", ["pulls", number]) => {
+            let found = number
+                .parse::<i64>()
+                .ok()
+                .map(|number| db::pull(&db, &key, number))
+                .transpose()?
+                .flatten();
+            match found {
+                Some(pull) => match pull_json(&db, &project, &login, &pull)? {
+                    Some(answer) => ok(answer),
+                    None => fail(404, format!("no pull request #{number} in {key}")),
+                },
+                None => fail(404, format!("no pull request #{number} in {key}")),
+            }
         }
         ("GET", ["tags"]) => ok(json!({ "tags": db::tags(&db, &key)? })),
         (_, ["tags", ..]) => {
@@ -900,6 +918,210 @@ fn project_route(
         }
         _ => fail(404, format!("no route for {method} {}", request.path)),
     }
+}
+
+/// The longest title a pull request may have, in characters.
+const PULL_TITLE_MAX: usize = 256;
+/// The longest body, in bytes.
+const PULL_BODY_MAX: usize = 64 * 1024;
+/// How many pull requests a list returns unless asked, and at most.
+const PULLS_DEFAULT: usize = 30;
+const PULLS_MAX: usize = 100;
+
+/// `POST /pulls`: propose an instance's pushed work for a branch. The head
+/// is the instance's latest checkpoint; `headRev`, the commit the caller's
+/// workspace is at, must be what the remote has, so nothing unpushed is
+/// proposed by mistake.
+fn create_pull(
+    project: &ProjectContext<'_>,
+    db: &Connection,
+    caller: &Caller,
+    request: &ApiRequest,
+) -> ApiResult<ApiResponse> {
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Spec {
+        instance: Option<String>,
+        base: Option<String>,
+        title: Option<String>,
+        #[serde(default)]
+        body: String,
+        #[serde(default)]
+        draft: bool,
+        head_rev: Option<String>,
+    }
+    let spec: Spec = body(request)?;
+    let Some(name) = spec.instance else {
+        return fail(400, "instance is required");
+    };
+    let title = spec.title.as_deref().map(str::trim).unwrap_or_default();
+    if title.is_empty() {
+        return fail(400, "a pull request needs a title");
+    }
+    if title.chars().count() > PULL_TITLE_MAX {
+        return fail(
+            400,
+            format!("a title is at most {PULL_TITLE_MAX} characters"),
+        );
+    }
+    if spec.body.len() > PULL_BODY_MAX {
+        return fail(
+            400,
+            format!("a body is at most {} KiB", PULL_BODY_MAX / 1024),
+        );
+    }
+    let key = &project.key;
+    let Some(instance) =
+        db::instance(db, key, &name)?.filter(|found| found.visible_to(&caller.login))
+    else {
+        return fail(
+            409,
+            format!("`{name}` is not on {key} yet: push it first (`git push` in its workspace)"),
+        );
+    };
+    require_owner(
+        &instance.owner,
+        &caller.login,
+        &format!("open a pull request for `{name}`"),
+    )?;
+    caller.require_this_instance(&name)?;
+    if instance.private {
+        return fail(
+            409,
+            format!(
+                "`{name}` is private: a pull request would show it to the project. Merge it, or spawn the work again without --private"
+            ),
+        );
+    }
+    let base = spec
+        .base
+        .unwrap_or_else(|| project.info.default_branch.clone());
+    if db::list_of(db, key, &base)?.is_none() {
+        return fail(404, format!("no branch `{base}` in {key}"));
+    }
+    let Some(head) = db::latest_checkpoint(db, key, &name)? else {
+        return fail(
+            409,
+            format!(
+                "`{name}` has no checkpoint on {key} yet: push it first (`git push` in its workspace)"
+            ),
+        );
+    };
+    if let (Some(mine), Some(theirs)) = (spec.head_rev.as_deref(), instance.head_rev.as_deref())
+        && mine != theirs
+    {
+        return fail(
+            409,
+            format!(
+                "`{name}` is at {} here and {} on {key}: push it first (`git push` in its workspace)",
+                short(mine),
+                short(theirs)
+            ),
+        );
+    }
+    let opened = db::create_pull(
+        db,
+        key,
+        &db::NewPull {
+            title,
+            body: &spec.body,
+            author: &caller.login,
+            agent: caller.agent.as_deref(),
+            draft: spec.draft,
+            instance: &name,
+            base: &base,
+        },
+    )?;
+    let pull = match opened {
+        Ok(pull) => pull,
+        Err(number) => {
+            return fail(
+                409,
+                format!("`{name}` already has pull request #{number} open against `{base}`"),
+            );
+        }
+    };
+    let mut answer = pull.summary();
+    answer["body"] = json!(pull.body);
+    answer["head"] = head_json(&head, instance.head_rev.as_deref());
+    created(answer)
+}
+
+fn short(commit: &str) -> &str {
+    &commit[..commit.len().min(12)]
+}
+
+/// A checkpoint as a pull request's head.
+fn head_json(checkpoint: &Value, commit: Option<&str>) -> Value {
+    json!({
+        "checkpoint": format!(
+            "{}/{}",
+            checkpoint["instance"].as_str().unwrap_or_default(),
+            checkpoint["id"].as_str().unwrap_or_default()
+        ),
+        "instance": checkpoint["instance"], "id": checkpoint["id"],
+        "createdBy": checkpoint["createdBy"], "agent": checkpoint["agent"],
+        "createdAt": checkpoint["createdAt"], "commit": commit,
+    })
+}
+
+/// One pull request as `login` may see it, head and body included; `None`
+/// when it is on another user's private instance.
+fn pull_json(
+    db: &Connection,
+    project: &ProjectContext<'_>,
+    login: &str,
+    pull: &db::Pull,
+) -> ApiResult<Option<Value>> {
+    let instance = db::instance(db, &project.key, &pull.instance)?;
+    if instance
+        .as_ref()
+        .is_some_and(|instance| !instance.visible_to(login))
+    {
+        return Ok(None);
+    }
+    let head = match &instance {
+        Some(instance) => db::latest_checkpoint(db, &project.key, &pull.instance)?
+            .map(|head| head_json(&head, instance.head_rev.as_deref())),
+        None => None,
+    };
+    let mut answer = pull.summary();
+    answer["body"] = json!(pull.body);
+    answer["head"] = head.unwrap_or(Value::Null);
+    Ok(Some(answer))
+}
+
+/// `GET /pulls?state=open|closed|merged|all&limit=n`: newest activity first,
+/// bodies left out.
+fn list_pulls(
+    project: &ProjectContext<'_>,
+    db: &Connection,
+    login: &str,
+    request: &ApiRequest,
+) -> ApiResult<ApiResponse> {
+    let state = match request.query.get("state").map(String::as_str) {
+        None | Some("open") => Some("open"),
+        Some("all") => None,
+        Some(state @ ("closed" | "merged")) => Some(state),
+        Some(other) => {
+            return fail(
+                400,
+                format!("state is open, closed, merged, or all, not `{other}`"),
+            );
+        }
+    };
+    let limit = match request.query.get("limit") {
+        None => PULLS_DEFAULT,
+        Some(limit) => match limit.parse::<usize>() {
+            Ok(limit) if (1..=PULLS_MAX).contains(&limit) => limit,
+            _ => return fail(400, format!("limit is 1 to {PULLS_MAX}")),
+        },
+    };
+    let pulls: Vec<Value> = db::pulls(db, &project.key, state, login, limit)?
+        .iter()
+        .map(db::Pull::summary)
+        .collect();
+    ok(json!({ "pulls": pulls }))
 }
 
 fn visible_instance(

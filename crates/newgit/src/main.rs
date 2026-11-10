@@ -24,6 +24,7 @@ use newgit_core::tracker::{ID_SEPARATOR, ROOT_TRACKER, Storage, TrackerDefinitio
 use newgit_core::{MetadataStore, ProjectConfig};
 
 mod claude_code;
+mod pr_cmd;
 mod remote_cmd;
 
 /// `0.1.0 (a1b2c3d4e5f6)` — the release plus the commit it was built from.
@@ -267,6 +268,12 @@ enum Command {
         /// The branch to merge into
         #[arg(long, default_value = "main")]
         into: String,
+    },
+    /// Pull requests: propose an instance's pushed work for a branch, and
+    /// spawn one to review it, environment and all
+    Pr {
+        #[command(subcommand)]
+        command: pr_cmd::PrCommand,
     },
     /// Move a mounted tracker's pin to its `follow` ref (default `main`): one
     /// commit, `Pull <tracker>: N commits from <ref>`, holding its files at
@@ -719,6 +726,7 @@ fn main() -> Result<()> {
             full,
         } => remote_cmd::clone(&project, dir, url, full),
         Command::Merge { instance, into } => merge(instance, &into),
+        Command::Pr { command } => pr_cmd::pr_command(command),
         Command::Pull {
             remote: Some(target),
             ..
@@ -1157,6 +1165,18 @@ fn spawn_from_checkpoint(
         format!("`{spec}` is not `<instance>/<checkpoint>`, e.g. `fix-login/ckpt_003`")
     })?;
     let outcome = manager.spawn_from_checkpoint(name, instance, checkpoint)?;
+    report_spawned_checkpoint(manager, &outcome, spec, json, None)
+}
+
+/// What `spawn --from-checkpoint` and `pr checkout` print: `spec` is the
+/// checkpoint spawned, `pull` the pull request it is the head of.
+fn report_spawned_checkpoint(
+    manager: &BranchManager,
+    outcome: &newgit_core::manager::SpawnFromCheckpointOutcome,
+    spec: &str,
+    json: bool,
+    pull: Option<u64>,
+) -> Result<()> {
     let by = match &outcome.agent {
         Some(agent) => format!("{} (agent {agent})", outcome.author),
         None => outcome.author.clone(),
@@ -1186,9 +1206,7 @@ fn spawn_from_checkpoint(
                 resource
             })
             .collect::<Vec<_>>();
-        println!(
-            "{}",
-            serde_json::json!({
+        let mut report = serde_json::json!({
                 "name": outcome.branch.name,
                 "workspace": outcome.branch.workspace_path,
                 "from": spec,
@@ -1201,8 +1219,11 @@ fn spawn_from_checkpoint(
                 "started": stop_start_resources_json(&outcome.started),
                 "recovery_record": outcome.undo.recovery_record,
                 "warnings": outcome.warnings,
-            })
-        );
+        });
+        if let Some(pull) = pull {
+            report["pull"] = serde_json::json!(pull);
+        }
+        println!("{report}");
         // Exits 1 for the reason `spawn --json` below does, and the same way:
         // after printing, leaving the instance and its record in place.
         if !outcome.is_complete() {
@@ -4491,6 +4512,9 @@ fn merge(instance: Option<String>, into: &str) -> Result<()> {
     }
     if let Some(note) = &outcome.project_root {
         println!("  {note}");
+    }
+    if let Some(pull) = outcome.pull {
+        println!("  pull request #{pull}: merged");
     }
     Ok(())
 }
