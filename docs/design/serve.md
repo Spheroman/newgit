@@ -333,8 +333,12 @@ Resolved loudly; each is reversible.
   landing and every one stuck after it on the same projects: their
   projects are set back to what SQLite has, which they never changed;
   refs they moved are moved back; a tracker they were copying toward
-  another store is removed from it (the objects copied stay in that store,
-  unreachable, until its garbage collection, which does not exist yet).
+  another store is removed from it. **The objects copied stay in that
+  store until its garbage collection, which does not exist yet ([#434]),
+  and under protocol v2 its readers can fetch one by id: voiding a stuck
+  widening leaves its history readable by the wider audience.** Voiding
+  says which stamps it gave up; fixing the cause and retrying leaves
+  nothing behind.
 - **`?at=<stamp>`** answers the stamp's own landing, read from one
   resolved log commit. It refuses a stamp not yet in place (409, every
   landing up to the applied mark is), a project state that shows a landing
