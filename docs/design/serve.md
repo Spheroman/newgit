@@ -206,7 +206,7 @@ Resolved loudly; each is reversible.
    moved yet. One whose landing was written down before the restart is in
    place when the server is back, and its finish asked again says so.
 8. **The landing log is the commit point** ([landing.md](landing.md),
-   *Landing*, items 3 and 4; `crates/newgit-serve/src/landing.rs`).
+   *Landing*, items 3 and 4; `crates/newgit-serve/src/landing/`).
    - **One hidden Git repository per server**, `<data>/landing.git`: this
      server is one shard. Each landing (a project made or deleted, a
      merge's finish, a branch made, a tracker made or moved between stores)

@@ -63,7 +63,7 @@ pub struct App {
     generation: std::sync::atomic::AtomicU64,
     /// Merges begun and not landed.
     pub merges: merge::Merges,
-    /// Every landing's commit point (`landing.rs`).
+    /// Every landing's commit point (`landing/`).
     pub log: landing::Log,
     /// Pushes running, which a tracker moving between stores waits out.
     pub pushes: landing::Pushes,
