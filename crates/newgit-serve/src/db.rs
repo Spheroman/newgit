@@ -615,6 +615,15 @@ pub fn keep_only(db: &Connection, home: &str, state: &HomeState) -> ApiResult<()
     Ok(())
 }
 
+/// Every project's home, in order.
+pub fn project_keys(db: &Connection) -> ApiResult<Vec<String>> {
+    let mut statement = db.prepare("SELECT home FROM projects ORDER BY home")?;
+    let homes = statement
+        .query_map([], |row| row.get(0))?
+        .collect::<Result<_, _>>()?;
+    Ok(homes)
+}
+
 /// One home's branches' lists, and the store each of its trackers is in.
 pub type HomeState = (BTreeMap<String, List>, BTreeMap<String, String>);
 

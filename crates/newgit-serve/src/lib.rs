@@ -16,6 +16,7 @@ pub mod names;
 pub mod policy;
 pub mod reparent;
 pub mod repos;
+pub mod rooted;
 pub mod server_merge;
 pub mod tokens;
 
@@ -69,6 +70,8 @@ pub struct App {
     pub log: landing::Log,
     /// Pushes running, which a tracker moving between stores waits out.
     pub pushes: landing::Pushes,
+    /// Stored rooted histories, extended in the background (`rooted`).
+    pub rooted: rooted::Worker,
     /// `<data>/serve.lock`, locked while this runs: one process per data
     /// directory, since the landing log has one writer.
     _lock: std::fs::File,
@@ -127,6 +130,7 @@ impl App {
             merges: merge::Merges::default(),
             log,
             pushes: landing::Pushes::default(),
+            rooted: rooted::Worker::default(),
             _lock: lock,
         };
         // Landings written down and not yet in place, before anything is
@@ -205,7 +209,7 @@ impl App {
         answer
     }
 
-    fn compose_lock(&self, project: &str) -> Arc<tokio::sync::Mutex<()>> {
+    pub(crate) fn compose_lock(&self, project: &str) -> Arc<tokio::sync::Mutex<()>> {
         let mut locks = self
             .compose_locks
             .lock()
@@ -313,6 +317,7 @@ pub fn serve_on(listener: std::net::TcpListener, config: Config) -> anyhow::Resu
             listen: address,
             ..config
         })?);
+        rooted::start(&app);
         println!("newgit serve: listening on http://{address}");
         use std::io::Write as _;
         std::io::stdout().flush()?;
