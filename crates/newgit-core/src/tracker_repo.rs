@@ -1070,9 +1070,39 @@ impl TrackerRepo {
         if !definition.git {
             crate::materializer::exclude_tracker_paths(workspace, &definition.paths)?;
         }
+        // Git keeps the executable bit and nothing else of a mode, so the
+        // rest (a `0600` key) is taken from what was there before the clear
+        // and put back on the file the rev writes at the same path: an
+        // undo never makes a file more readable than it was. Never wider
+        // than the rev writes it either, for a decrypted secret.
+        let sealed = matches!(planned, Planned::Sealed(_));
+        let before = modes_of(workspace, &files);
         clear_owned_paths(workspace, definition)?;
         self.apply_checkout(&commit, workspace, &files, planned)?;
+        keep_modes(workspace, &before, sealed);
         Ok(files.len())
+    }
+
+    /// Whether every object `rev` reaches is in this store: checked past
+    /// what the store's other refs reach, which Git already holds whole.
+    pub fn holds_whole(&self, rev: &str) -> bool {
+        let Ok(commit) = self.commit_for(rev) else {
+            return false;
+        };
+        let exclude = format!("--exclude={}", self.pin_ref(rev));
+        git(
+            &self.git_dir,
+            &[
+                "rev-list",
+                "--objects",
+                "--missing=print",
+                &commit,
+                "--not",
+                &exclude,
+                "--all",
+            ],
+        )
+        .is_ok_and(|listed| !listed.lines().any(|line| line.starts_with('?')))
     }
 
     /// Refuse a rev holding a link whose target leaves the directory it is
@@ -1718,6 +1748,58 @@ fn write_entry(path: &Utf8Path, mode: &str, bytes: &[u8]) -> Result<()> {
             .map_err(|source| NewgitError::io(path, source))?;
     }
     Ok(())
+}
+
+/// The permission bits of each of `files` in `workspace` that is a regular
+/// file now.
+fn modes_of(workspace: &Utf8Path, files: &[String]) -> Vec<(String, u32)> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        files
+            .iter()
+            .filter_map(|file| {
+                let metadata = std::fs::symlink_metadata(workspace.join(file)).ok()?;
+                metadata
+                    .is_file()
+                    .then(|| (file.clone(), metadata.permissions().mode() & 0o7777))
+            })
+            .collect()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (workspace, files);
+        Vec::new()
+    }
+}
+
+/// Put `before`'s bits other than the executable ones back on the files
+/// written at the same paths; the executable bits are the rev's. For a
+/// sealed tracker, only ever narrower than it wrote them.
+fn keep_modes(workspace: &Utf8Path, before: &[(String, u32)], sealed: bool) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        for (file, old) in before {
+            let path = workspace.join(file);
+            let Ok(metadata) = std::fs::symlink_metadata(&path) else {
+                continue;
+            };
+            if !metadata.is_file() {
+                continue;
+            }
+            let written = metadata.permissions().mode() & 0o7777;
+            let mut mode = (old & 0o7666) | (written & 0o111 & ((old & 0o444) >> 2));
+            if sealed {
+                mode &= written;
+            }
+            if mode != written {
+                let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode));
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = (workspace, before, sealed);
 }
 
 /// What one captured path is, decided from `symlink_metadata` alone.

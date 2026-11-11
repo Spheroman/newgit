@@ -352,6 +352,12 @@ fn an_interrupted_restore_or_eviction_finishes_on_the_next_command() {
     newgit_ok(&repo, &["start", "x"]);
     assert_eq!(read(&ws.join("untracked.txt")), "u\n");
     assert!(!ws.join("half.txt").exists());
+    // What a cut-short restore left is never deleted: anyone may have
+    // written there since.
+    assert_eq!(
+        read(&temp.join("workspaces/.x.interrupted-restore/half.txt")),
+        "half a clone\n"
+    );
     assert!(!restoring.exists());
     assert!(!newgit_ok(&repo, &["status"]).contains("evicted"));
 

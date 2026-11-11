@@ -24,12 +24,19 @@ inside a workspace):
   nothing to do and 1 if any resource failed
 - `newgit stop --evict [--discard-ignored]` — stop, checkpoint, and delete
   the workspace, leaving its marker; `newgit start` brings it back from that
-  checkpoint, with uncommitted and staged work, other branches, the stash,
-  tracker content, and rebuilt installs. It refuses, deleting nothing, when
-  something would not come back: ignored files no tracker owns and nothing
-  rebuilds (listed; `--discard-ignored` lets them go), a merge or rebase in
-  the middle, hand edits to a rendered file, an untracked repository, or a
-  process still working in the directory
+  checkpoint into the same directory, with uncommitted and staged work,
+  other branches, the stash, notes, other remotes' refs, local Git config,
+  hooks, file modes, empty directories, tracker content, and rebuilt
+  installs. It refuses, deleting nothing, when something would not come
+  back: ignored files no tracker owns and nothing rebuilds (listed, a
+  directory with its file count; declare build output as a resource, see
+  `newgit reference definitions`, or `--discard-ignored` lets them go), a
+  merge or rebase in the middle, hand edits to a rendered file, an untracked
+  repository, an initialized submodule, a linked worktree, or a process
+  still in the directory (run it from outside the workspace). Not kept, and
+  said first: reflogs other than the stash's, intent-to-add entries, and
+  hand-set assume-unchanged/skip-worktree flags. Evicting does not free an
+  untracked file's blob, and evict checkpoints are not pruned yet (#446)
 - `newgit checkpoint [instance] [-m <msg>] [--verify]` / `undo [instance]
   [--to <id>] [--only <resource>] [--force-recompute]` / `checkpoints
   [instance]` — `--verify` proves the restore works by running a real undo;

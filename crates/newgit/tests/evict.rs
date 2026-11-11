@@ -179,7 +179,11 @@ fn evict_then_start_brings_the_workspace_back_as_it_was() {
     // and deletes nothing.
     let refused = newgit(&repo, &["stop", "x", "--evict"]);
     assert!(!refused.status.success());
-    assert!(refused.stderr.contains("`target`"), "{}", refused.stderr);
+    assert!(
+        refused.stderr.contains("`target/ (1 file)`"),
+        "{}",
+        refused.stderr
+    );
     assert!(
         refused.stderr.contains("--discard-ignored"),
         "{}",
@@ -203,7 +207,7 @@ fn evict_then_start_brings_the_workspace_back_as_it_was() {
         .to_owned();
     assert_eq!(
         evicted["evicted"]["discarded"],
-        serde_json::json!(["target"])
+        serde_json::json!([{"path": "target", "directory": true, "files": 1}])
     );
     assert!(!running(&store, "db"));
     // Only the marker stays, so commands run there still find the instance.
@@ -231,9 +235,13 @@ fn evict_then_start_brings_the_workspace_back_as_it_was() {
     newgit_ok(&repo, &["cleanup"]);
     assert!(store.paths().branches.join("x.toml").is_file());
 
-    // A second evict has nothing left to do.
+    // A second evict has nothing left to do, and says it is evicted.
     let again = json(&repo, &["stop", "x", "--evict", "--json"]);
-    assert!(again.get("evicted").is_none(), "{again}");
+    assert_eq!(
+        again["evicted"],
+        serde_json::json!({"checkpoint": checkpoint, "already": true}),
+        "{again}"
+    );
 
     let started = json(&repo, &["start", "x", "--json"]);
     assert_eq!(

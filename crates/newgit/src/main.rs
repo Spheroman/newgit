@@ -133,9 +133,11 @@ enum Command {
         /// its disk; `newgit start` brings it back from that checkpoint.
         /// Refuses, deleting nothing, when the workspace holds what would
         /// not come back: ignored files no tracker owns and no resource
-        /// rebuilds (such as `target/`, listed), a merge or rebase in the
-        /// middle, hand edits to a rendered file, an untracked repository,
-        /// or a process still working in it
+        /// rebuilds (such as `target/`, listed; declare build output as a
+        /// resource), a merge or rebase in the middle, hand edits to a
+        /// rendered file, an untracked repository, an initialized
+        /// submodule, a linked worktree, or a process still working in it
+        /// (the shell it was run from included: run it from outside)
         #[arg(long)]
         evict: bool,
         /// With `--evict`: evict even though the ignored files it lists
@@ -1983,10 +1985,25 @@ fn stop_start_json(outcome: &StopStartOutcome) -> serde_json::Value {
         Some(WorkspaceChange::Evicted {
             checkpoint,
             discarded,
+            not_kept,
         }) => {
             json["evicted"] = serde_json::json!({
                 "checkpoint": checkpoint,
-                "discarded": discarded,
+                "discarded": discarded
+                    .iter()
+                    .map(|discarded| serde_json::json!({
+                        "path": discarded.path,
+                        "directory": discarded.dir,
+                        "files": discarded.files,
+                    }))
+                    .collect::<Vec<_>>(),
+                "not_kept": not_kept,
+            });
+        }
+        Some(WorkspaceChange::AlreadyEvicted { checkpoint }) => {
+            json["evicted"] = serde_json::json!({
+                "checkpoint": checkpoint,
+                "already": true,
             });
         }
         Some(WorkspaceChange::Restored { checkpoint }) => {
@@ -2090,12 +2107,23 @@ fn print_stop_start(outcome: &StopStartOutcome, which: StopStart) {
     if let Some(WorkspaceChange::Restored { checkpoint }) = &outcome.workspace {
         println!("Restored the workspace for `{instance}` from {checkpoint}");
     }
+    if let Some(WorkspaceChange::AlreadyEvicted { checkpoint }) = &outcome.workspace {
+        println!(
+            "`{instance}` is already evicted to {checkpoint}; `newgit start {instance}` brings it \
+             back"
+        );
+        return;
+    }
     print_stopped_or_started(outcome, which);
     if let Some(WorkspaceChange::Evicted {
         checkpoint,
         discarded,
+        not_kept,
     }) = &outcome.workspace
     {
+        for what in not_kept {
+            eprintln!("[newgit] not kept by the eviction: {what}");
+        }
         println!(
             "Evicted the workspace for `{instance}` to {checkpoint}; `newgit start {instance}` \
              brings it back"

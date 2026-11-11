@@ -140,7 +140,10 @@ fn a_checkpoint_the_remote_did_not_take_is_still_restored_here() {
     let evicted = fixture.newgit(&fixture.store, &["stop", "a", "--evict"]);
     assert!(evicted.status.success());
     let said = String::from_utf8_lossy(&evicted.stderr);
-    assert!(said.contains("not on the remote"), "{said}");
+    assert!(
+        said.contains("the only copy of `a`'s work is now in the project store on this machine"),
+        "{said}"
+    );
 
     fixture.ok(&fixture.store, &["start", "a"]);
     assert_eq!(read(&ws.join(".env.shared")), SECRET);

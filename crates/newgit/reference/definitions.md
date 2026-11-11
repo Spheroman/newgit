@@ -864,10 +864,46 @@ instance comes back on the same ports with its rendered config still valid.
 `newgit stop --evict` also frees the workspace's disk: it checkpoints the
 instance and deletes the workspace, leaving its marker, and `newgit start`
 brings it back from that checkpoint at the same path before starting
-anything. A `recompute` resource's `[identity] produces` comes back from
-the install store; any other ignored file that no tracker outside Git owns
-does not, so the eviction refuses and lists it unless `--discard-ignored`
-is given.
+anything. File modes, empty directories, the local Git config, hooks,
+notes, and other remotes' refs come back too. A `recompute` resource's
+`[identity] produces` comes back from the install store; any other ignored
+file that no tracker outside Git owns does not, so the eviction refuses and
+lists it (a wholly ignored directory as one entry, with its file count)
+unless `--discard-ignored` is given. It also refuses an initialized
+submodule, a linked worktree, and a process with its working directory in
+the workspace, the shell it was run from included: run it from outside.
+
+To say build output may go, declare it as the path-dependent artifact it
+is, rather than passing `--discard-ignored` every time. A tree the build
+tool fills again by itself needs a `prepare` that only makes the
+directory:
+
+```toml
+# .newgit/resources/rust-target.toml
+ownership = "workspace"
+
+[identity]
+paths = ["Cargo.lock"]
+produces = ["target"]
+
+[actions.prepare]
+command = "rm -rf target && mkdir target"   # the store only ever holds an empty tree
+
+[checkpoint]
+mode = "hash"
+
+[restore]
+mode = "recompute"
+```
+
+After the restore, `target/` is empty and the next build fills it. An
+`undo` across a change to `Cargo.lock` empties it too.
+
+Not kept, and named before anything is deleted: reflogs other than the
+stash's, intent-to-add entries, and assume-unchanged or skip-worktree flags
+set by hand (the files' content is kept). An untracked file's blob stays in
+the store with the checkpoint, so evicting does not free that disk, and
+evict checkpoints are not pruned yet (#446).
 
 `suspend` / `resume` are for a resource that keeps running without a
 process newgit supervises: a `prepare` that starts a Supabase stack, a
