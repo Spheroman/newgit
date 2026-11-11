@@ -1478,7 +1478,7 @@ fn ensure_repo(git_dir: &Utf8Path) -> Result<()> {
     }
     create_dir_all(git_dir)?;
     run(
-        Command::new("git").args(["init", "-q", "--bare", git_dir.as_str()]),
+        crate::git::command().args(["init", "-q", "--bare", git_dir.as_str()]),
         &format!("git init --bare {git_dir}"),
         None,
     )
@@ -1796,7 +1796,7 @@ fn trimmed(output: &[u8]) -> String {
 }
 
 fn command(git_dir: &Utf8Path, args: &[&str], env: &[(String, String)]) -> Command {
-    let mut command = Command::new("git");
+    let mut command = crate::git::command();
     command
         .arg(format!("--git-dir={git_dir}"))
         .args(args)

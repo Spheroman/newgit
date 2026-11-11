@@ -25,7 +25,6 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io::Write as _;
-use std::process::Command;
 
 use camino::{Utf8Path, Utf8PathBuf};
 
@@ -730,7 +729,7 @@ fn one_side_changed(
     there: &Option<String>,
     other_there: &Option<String>,
 ) -> Result<Option<Side>> {
-    let output = Command::new("git")
+    let output = crate::git::command()
         .arg("-C")
         .arg(repo.as_str())
         .args(["merge-base", ahead, other])
@@ -756,7 +755,7 @@ fn one_side_changed(
 
 /// Whether commit `ancestor` is behind commit `descendant`.
 fn is_ancestor(repo: &Utf8Path, ancestor: &str, descendant: &str) -> Result<bool> {
-    Ok(Command::new("git")
+    Ok(crate::git::command()
         .arg("-C")
         .arg(repo.as_str())
         .args(["merge-base", "--is-ancestor", ancestor, descendant])
@@ -910,7 +909,7 @@ pub(crate) fn index_with(objects: &mut Objects, root: &str, commit: &str) -> Res
 /// The root commit view commit `view` stands for, by the note composing or
 /// splitting left on it.
 pub fn read_root(repo: &Utf8Path, view: &str) -> Result<Option<(String, String)>> {
-    let note = Command::new("git")
+    let note = crate::git::command()
         .arg("-C")
         .arg(repo.as_str())
         .args(["notes", "--ref", NOTES_REF, "show", view])
@@ -2055,7 +2054,7 @@ impl<'a> Splitter<'a> {
         }
         // Git answers for what it has: commits made in this split first.
         self.objects.flush()?;
-        let output = Command::new("git")
+        let output = crate::git::command()
             .arg("-C")
             .arg(self.objects.repo().as_str())
             .args(["merge-base", "--is-ancestor", ancestor, descendant])
@@ -2203,7 +2202,7 @@ fn sign_commit(
         }
     }
     let out = run(
-        Command::new("git")
+        crate::git::command()
             .arg("-C")
             .arg(repo.as_str())
             .args(&args)
@@ -2276,7 +2275,7 @@ pub fn find_held_sealed(
     ];
     args.extend_from_slice(rev_list);
     let output = run(
-        Command::new("git")
+        crate::git::command()
             .arg("-C")
             .arg(repo.as_str())
             .args(&args)
@@ -2329,7 +2328,7 @@ pub fn find_outside_git_under(
     ];
     args.extend_from_slice(rev_list);
     let output = run(
-        Command::new("git")
+        crate::git::command()
             .arg("-C")
             .arg(repo.as_str())
             .args(&args)
@@ -2428,7 +2427,7 @@ fn write_notes_once(
     }
     stream.push(b'\n');
     run(
-        Command::new("git").arg("-C").arg(repo.as_str()).args([
+        crate::git::command().arg("-C").arg(repo.as_str()).args([
             "fast-import",
             "--quiet",
             "--date-format=raw",
@@ -2452,7 +2451,10 @@ fn missing(id: &str) -> NewgitError {
 
 fn git(repo: &Utf8Path, args: &[&str]) -> Result<String> {
     let out = run(
-        Command::new("git").arg("-C").arg(repo.as_str()).args(args),
+        crate::git::command()
+            .arg("-C")
+            .arg(repo.as_str())
+            .args(args),
         &format!("git {}", args.join(" ")),
         None,
     )?;

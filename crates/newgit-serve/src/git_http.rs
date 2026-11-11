@@ -534,7 +534,7 @@ async fn run_git(app: Arc<App>, run: Run, ask: Ask, request: Request<Body>) -> R
     let Ok(permit) = app.git_slots.clone().acquire_owned().await else {
         return text(503, "the remote is shutting down");
     };
-    let mut command = tokio::process::Command::new("git");
+    let mut command = tokio::process::Command::from(newgit_core::git::command());
     command
         .arg("-c")
         .arg(format!("core.hooksPath={}", app.hooks_dir()));

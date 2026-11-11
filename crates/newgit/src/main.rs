@@ -3361,6 +3361,10 @@ fn push_receive_pack(store: &Utf8Path, instance: &str, repository: &Utf8Path) ->
         bail!("asked to receive into {repository}, but this workspace's outbox is {outbox}");
     }
     let hooks = outbox.join("hooks");
+    // git-locale: the pusher reads this Git's messages, so it keeps the
+    // pusher's locale: a developer's `git push` gets their language, and a
+    // push newgit makes already carries `LC_ALL=C` from `git::command()`.
+    // newgit reads nothing of it here (it replaces this process).
     let error = std::process::Command::new("git")
         .args(["-c", &format!("core.hooksPath={hooks}"), "receive-pack"])
         .arg(outbox.as_str())
@@ -4913,6 +4917,8 @@ fn tracker_log(tracker: &str, instance: Option<String>, git_args: &[String]) -> 
     let instance = instance.or_else(|| context.current_branch.clone());
     let manager = BranchManager::open(context.store)?;
     let (store, reference) = manager.tracker_log_target(tracker, instance.as_deref())?;
+    // git-locale: `newgit log` is Git's log for the developer to read, in
+    // their language; newgit reads nothing of it.
     let status = std::process::Command::new("git")
         .arg(format!("--git-dir={store}"))
         .args(["log", &reference])

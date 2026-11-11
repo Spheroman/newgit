@@ -1,5 +1,4 @@
 use std::collections::BTreeSet;
-use std::process::Command;
 
 use camino::{Utf8Path, Utf8PathBuf};
 
@@ -38,7 +37,7 @@ impl GitSource {
     /// exist yet) — used to enforce the tracker-path invariant.
     pub fn is_ignored(&self, path: &str) -> Result<bool> {
         let args = ["-C", self.root.as_str(), "check-ignore", "-q", "--", path];
-        let output = Command::new("git")
+        let output = crate::git::command()
             .args(args)
             .output()
             .map_err(|source| spawn_error(&args, &source))?;
@@ -55,7 +54,7 @@ impl GitSource {
         // and come back the same way, each as it was given.
         use std::io::Write as _;
         let args = ["-C", self.root.as_str(), "check-ignore", "-z", "--stdin"];
-        let mut child = Command::new("git")
+        let mut child = crate::git::command()
             .args(args)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
@@ -124,7 +123,7 @@ impl GitSource {
             "--quiet",
             &format!("refs/heads/{name}"),
         ];
-        let output = Command::new("git")
+        let output = crate::git::command()
             .args(args)
             .output()
             .map_err(|source| spawn_error(&args, &source))?;
@@ -151,7 +150,7 @@ impl GitSource {
                 "-q",
                 "HEAD",
             ];
-            let output = Command::new("git")
+            let output = crate::git::command()
                 .args(args)
                 .output()
                 .map_err(|source| spawn_error(&args, &source))?;
@@ -520,7 +519,7 @@ impl GitSource {
             ancestor,
             descendant,
         ];
-        let output = Command::new("git")
+        let output = crate::git::command()
             .args(args)
             .output()
             .map_err(|source| spawn_error(&args, &source))?;
@@ -537,7 +536,7 @@ impl GitSource {
             args.push("--push");
         }
         args.extend(["--", remote]);
-        let output = Command::new("git")
+        let output = crate::git::command()
             .args(&args)
             .output()
             .map_err(|source| spawn_error(&args, &source))?;
@@ -659,7 +658,7 @@ impl GitSource {
         args.extend(["--".to_owned(), url.to_owned()]);
         args.extend(refspecs);
 
-        let status = Command::new("git")
+        let status = crate::git::command()
             .args(&args)
             .envs(admitting.map(|dir| ("GIT_ALTERNATE_OBJECT_DIRECTORIES", dir.as_str())))
             .envs(auth_env(auth))
@@ -823,7 +822,7 @@ impl GitSource {
     /// file's trailing newline on every render.
     pub fn workspace_show_head(workspace: &Utf8Path, path: &Utf8Path) -> Result<Option<String>> {
         let args = ["-C", workspace.as_str(), "show", &format!("HEAD:{path}")];
-        let output = Command::new("git")
+        let output = crate::git::command()
             .args(args)
             .output()
             .map_err(|source| spawn_error(&args, &source))?;
@@ -2263,7 +2262,7 @@ fn run_git_input(args: &[&str], input: &str) -> Result<String> {
 /// [`run_git_input`], with `env` set for it.
 fn run_git_input_env(args: &[&str], input: &str, env: &[(String, String)]) -> Result<String> {
     use std::io::Write as _;
-    let mut child = Command::new("git")
+    let mut child = crate::git::command()
         .args(args)
         .envs(env.iter().map(|(key, value)| (key, value)))
         .stdin(std::process::Stdio::piped())
@@ -2298,7 +2297,7 @@ pub fn merge_commits(
     message: &str,
     env: &[(String, String)],
 ) -> Result<std::result::Result<String, Vec<String>>> {
-    let output = Command::new("git")
+    let output = crate::git::command()
         .arg("-C")
         .arg(repo.as_str())
         .args([
@@ -2306,21 +2305,26 @@ pub fn merge_commits(
             "--write-tree",
             "--name-only",
             "--no-messages",
+            // NUL-separated, so a conflicted name comes back as it is called
+            // rather than as Git quotes it (`"r\303\251sum\303\251"`).
+            "-z",
             ours,
             theirs,
         ])
         .output()
         .map_err(|source| NewgitError::io(repo, source))?;
-    let text = String::from_utf8_lossy(&output.stdout).into_owned();
-    let mut lines = text.lines();
-    let tree = lines.next().unwrap_or_default().to_owned();
+    let mut fields = output
+        .stdout
+        .split(|&byte| byte == 0)
+        .filter(|field| !field.is_empty())
+        .map(|field| String::from_utf8_lossy(field).into_owned());
+    let tree = fields.next().unwrap_or_default();
     match output.status.code() {
         Some(0) => {}
         Some(1) => {
-            return Ok(Err(lines
-                .take_while(|line| !line.is_empty())
-                .map(ToOwned::to_owned)
-                .collect()));
+            let mut files: Vec<String> = fields.collect();
+            files.dedup();
+            return Ok(Err(files));
         }
         _ => {
             return Err(NewgitError::SourceCommand {
@@ -2348,7 +2352,7 @@ pub fn merge_commits(
 }
 
 pub fn run_git_env(args: &[&str], env: &[(String, String)]) -> Result<String> {
-    let output = Command::new("git")
+    let output = crate::git::command()
         .args(args)
         .envs(env.iter().map(|(key, value)| (key, value)))
         .output()
@@ -2367,7 +2371,7 @@ pub fn run_git_env(args: &[&str], env: &[(String, String)]) -> Result<String> {
 /// `git <args>` with `input` on its standard input; its output, trimmed.
 pub fn run_git_stdin(args: &[&str], input: &[u8]) -> Result<String> {
     use std::io::Write as _;
-    let mut child = Command::new("git")
+    let mut child = crate::git::command()
         .args(args)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())

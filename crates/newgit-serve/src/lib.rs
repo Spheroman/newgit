@@ -231,7 +231,7 @@ const GIT_REQUIRED: (u32, u32) = (2, 45);
 
 /// Refuse to start on a Git too old to make a store, saying which was found.
 fn require_git() -> anyhow::Result<()> {
-    let output = std::process::Command::new("git")
+    let output = newgit_core::git::command()
         .arg("--version")
         .output()
         .context("running `git --version`: newgit serve needs Git on its PATH")?;

@@ -129,7 +129,7 @@ pub const DURABLE_FSYNC: &str = "committed,reference";
 /// Git run against the repository at `dir`, syncing what it writes
 /// ([`DURABLE_FSYNC`]) whatever the repository's own config says.
 pub fn git_command(dir: &Utf8Path) -> Command {
-    let mut command = Command::new("git");
+    let mut command = newgit_core::git::command();
     command
         .args(["-c", &format!("core.fsync={DURABLE_FSYNC}")])
         .args(["-c", "core.fsyncMethod=fsync"])
@@ -299,7 +299,7 @@ pub fn create_store(dir: &Utf8Path, store: &Store) -> ApiResult<()> {
     if let Some(parent) = dir.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let output = Command::new("git")
+    let output = newgit_core::git::command()
         .args([
             "init",
             "-q",
@@ -974,7 +974,7 @@ impl Repo {
             if let Some(parent) = dir.parent() {
                 std::fs::create_dir_all(parent)?;
             }
-            let output = Command::new("git")
+            let output = newgit_core::git::command()
                 .args(["init", "-q", "--bare", "-b", "main"])
                 .arg(dir.as_str())
                 .output()?;
