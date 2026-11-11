@@ -110,6 +110,7 @@ authoritative list; in short:
 | `pinned` | Whether its parent holds it where it is (docs/design/anchoring.md, *Follow and pinned*): a change landing at it never rolls up into the parent, and moving the parent's pin is a change to the parent, approved by the parent's maintainers; rollback is a revert. For what must not move by itself: a private dependency, `/env/prod`. Default `false`. |
 | `link` | Where it lives when it lives in another project: `"<owner>/<project>[/<path>]"` (see *Links*). Its history, heads, repo, and policy are its home's; only where it is mounted is this project's. Only a tracker in Git. Written by `newgit tracker link`. |
 | `resources` | Resources this tracker brings. A resource is bound iff a bound tracker brings it. |
+| `from` | The tracker whose history this one started at: a fork, whose audience may not be wider than its upstream's. Written by `newgit tracker create --from`. See *Binding*. |
 | `requires` | Trackers or roles this one needs: bound with it, and not droppable while it is bound. |
 | `git` | Whether its content is committed with Git. `false` (the default): never in the workspace's Git, excluded, never committed, captured by newgit from the files at checkpoint. `true`: a tracker in Git, committed with Git and split into its own history. Written only when `true`. |
 | `maintainers` | Who may merge changes to it: `owner`, `project-devs`, or `user:<login>`; by default its audience. See *Who may change what*. |
@@ -207,7 +208,7 @@ deep inside another is not its child, and stays when what surrounds it goes.
 
 **The definition is the `.gitignore`.** Generating the view's `.gitignore`
 from claims, and turning an agent's edit of it into a definition change, is
-planned (step 6). Compose doesn't depend on it.
+planned (step 7). Compose doesn't depend on it.
 
 ## Shape and policy
 
@@ -294,6 +295,55 @@ tracker in a role.
 
 `{{bound.trackers}}` and `{{bound.paths}}` give a resource's commands what the
 instance binds, so a shared install builds only the bound members.
+
+**Members of a role are forks (decided 2026-11-08, #201; built for trackers
+outside Git, #415).** Project branches own the branch axis, so a variant
+cannot be a branch of a tracker (`db@staging/feature-x` would stop the names
+lining up); it is a member of a role. What members lacked was a shared
+history to merge along, and a fork gives them one:
+
+```
+newgit tracker create staging-db --role db --from local-db
+```
+
+- **Its `main` is `local-db`'s very commit.** Locally that is two refs in the
+  one store (`main` and a pin), so nothing is copied. Its definition says
+  `from = "local-db"`, claims what `local-db` claims at its mount, and fills
+  its role (`--role` names one when `local-db` has none, and is written to
+  `local-db` too). It brings no resources and requires nothing, and its
+  `priority` is below `local-db`'s and negative: making a fork never changes
+  what anything binds by default.
+- **A fork can't be wider than its upstream (decided).** Its history holds
+  everything its upstream had, so it may be read by no one the upstream's
+  audience does not include: the same audience, or one inside it (`public`
+  holds every audience, `project-devs` holds `user` and `user:<login>`, which
+  the remote serves to members only; any other two are not ordered). Refused
+  at creation, naming both audiences, and after it wherever definitions are
+  checked: every load of the definitions, and split, which refuses a commit
+  changing definitions into a fork wider than its upstream. The upstream
+  cannot be removed while a fork names it. On `newgit serve` the definitions
+  read are whatever commits their governors landed, so the server holds every
+  fork to its upstream's audience as it reads them (and says so when it
+  refuses one): every rule and every store then sees it no wider. A fork
+  whose upstream is not defined is read as undefined.
+- **A narrower fork lives in the narrower store.** On `serve` a fork's repo
+  is made on its first sync, starting at its upstream's branches. With the
+  same audience that is a namespace in the upstream's store, refs alone. A
+  narrower one is made in its own audience's store, which fetches only what
+  the upstream's `main` reaches: all of it readable by that audience already,
+  so nothing is written into a store whose readers could not read it. What
+  the fork gains after that stays in its own store. newgit.dev's Worker
+  takes the history as the sync uploads it (a copy), and only the client
+  checks the ceiling there.
+- **Only a tracker outside Git can be forked yet.** Every instance's view
+  holds every tracker in Git its user may read, so two members in Git at one
+  mount would collide; `--git --from <tracker>` says so. Forking one in Git
+  at another mount, and `tracker mount <owner>/<tracker>`, build on the same
+  `from` later.
+- **Next (#201, step 2):** `tracker merge` / `rebase` / `cherry-pick` between
+  members, on the current project branch, with `--disclose` to merge into a
+  member with a wider audience. Unrelated histories are refused as Git
+  refuses them, which is why `--from` is the way to add a member.
 
 **Dependencies (decided; roles not wired yet).** A resource's `depends_on`
 names resources or trackers today. Naming a role is the planned addition: a
@@ -828,7 +878,7 @@ key would replace it, and `explicit` trackers would never be carried by
 
 ## Rooting at any tracker
 
-**Spawning at a tracker** (`newgit spawn --root electron`, planned, step 6)
+**Spawning at a tracker** (`newgit spawn --root electron`, planned, step 7)
 composes the view rooted there. Resources come from the trackers in that
 view. A tracker that mounts nothing in Git composes to its own history
 unchanged. One that does composes like any root (its pin-only commits
@@ -1213,7 +1263,7 @@ named and skipped.
 
 ## Build order
 
-Status as of 2026-11-05. Each step lands alone and keeps the suite green.
+Status as of 2026-11-11. Each step lands alone and keeps the suite green.
 
 **Before roots (done, 2026-10):** tracker repos with real history (`main`,
 `instances/<instance>`) in the shared store; the `root` tracker, ownership by
@@ -1244,7 +1294,10 @@ headers were recorded — is replaced by the steps below and deleted.
    are done. For #144, a mounted tracker joins as one commit, a mirror holds
    only what it ships, the project root fetches from the endpoint, and a
    webhook brings GitHub's merges in; bringing the real t3code in is next.
-6. **Later:** spawning at a tracker (`spawn --root`), `.gitignore` as
+6. **Roles are forks** (#201's *Roles are forks* build order): step 1,
+   `tracker create --from` for trackers outside Git, is *done* (#415; see
+   *Binding*). Merging between members with `--disclose` is next.
+7. **Later:** spawning at a tracker (`spawn --root`), `.gitignore` as
    definition, moving `role`/`priority`/`requires` to the mounting parent,
    `spawn --from <instance>` with `requires` checked between instances,
    profiles, the per-remote redesign, the `newgit branch` CLI.
@@ -1532,6 +1585,11 @@ CLI, the narrow-audience warning, `.gitignore` as definition, and
   needing supabase running) cannot be expressed (#54). Reviewing a change
   places each tracker it touched locally or in the preview; settled in
   [remote.md](remote.md), *Reviewing a change* (#229).
+- **Forks.** The ceiling lives in the fork's definition (`from`), so a
+  definition change that drops `from` lifts it; whoever governs the fork's
+  definition (by default the owner, who governs the upstream's too) can do
+  that. Recording forks on the server, so dropping `from` is refused too,
+  is open (#415).
 - **The model itself.** The rest of #201: every tracker the same kind of
-  thing, rooted at the user. The engine is built; what remains is step 6
+  thing, rooted at the user. The engine is built; what remains is step 7
   above, and the per-remote redesign under *Users, remotes, and trust*.

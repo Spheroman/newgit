@@ -67,6 +67,12 @@ pub struct Facts {
     pub pinned: bool,
     /// Another project is its home: `<owner>/<project>[/<path>]`.
     pub link: Option<String>,
+    /// The tracker whose history it started at (`from`): a fork, never
+    /// readable by anyone its upstream is not.
+    pub from: Option<String>,
+    /// Why it is served with its upstream's audience rather than its own: its
+    /// definition makes it wider than its upstream's ([`cap_forks`]).
+    pub capped: Option<String>,
 }
 
 /// Where `access` is mounted: every definition is `<name>.toml` at its root.
@@ -84,6 +90,8 @@ pub fn implicit_facts(tracker: &str) -> Option<Facts> {
         source: "access".to_owned(),
         pinned: false,
         link: None,
+        from: None,
+        capped: None,
     };
     match tracker {
         "root" => Some(base(Maintainers::ProjectDevs, ".")),
@@ -118,7 +126,73 @@ pub fn parse_facts(text: &str, source: &str) -> Option<Facts> {
         source: source.to_owned(),
         pinned: table.get("pinned").and_then(toml::Value::as_bool) == Some(true),
         link: string("link").map(str::to_owned),
+        from: string("from").map(str::to_owned),
+        capped: None,
     })
+}
+
+/// Whether a fork with audience `fork` is readable by no one `upstream` does
+/// not include: the same audience, or one inside it. `public` holds every
+/// audience; `project-devs` holds `user` and `user:<login>`, which are served
+/// to members only ([`decide`]). Any other two are not ordered.
+pub fn audience_within(fork: &Audience, upstream: &Audience) -> bool {
+    fork == upstream
+        || *upstream == Audience::Public
+        || (*upstream == Audience::ProjectDevs
+            && matches!(fork, Audience::User | Audience::Named(_)))
+}
+
+fn audience_name(audience: &Audience) -> String {
+    match audience {
+        Audience::Public => "public".to_owned(),
+        Audience::ProjectDevs => "project-devs".to_owned(),
+        Audience::User => "user".to_owned(),
+        Audience::Named(login) => format!("user:{login}"),
+    }
+}
+
+/// Hold every fork to its upstream's audience, whatever its definition
+/// says. The client refuses a definition that widens a fork, but the
+/// definitions the server reads are commits anyone governing them made, so
+/// here a fork wider than its upstream is read with its upstream's audience
+/// (and says why, in `capped`): every rule, every store, and every read then
+/// treats it as no wider than the history it holds. A fork whose upstream is
+/// not defined has no ceiling to be held to, and is left out, as an undefined
+/// tracker is. Forks of forks are held in turn, until nothing changes.
+pub fn cap_forks(facts: &mut BTreeMap<String, Facts>) {
+    for _round in 0..8 {
+        let mut changed = false;
+        let names: Vec<String> = facts.keys().cloned().collect();
+        for name in names {
+            let Some(fork) = facts.get(&name) else {
+                continue;
+            };
+            let Some(from) = fork.from.clone().filter(|_| fork.link.is_none()) else {
+                continue;
+            };
+            let Some(upstream) = facts.get(&from).map(|up| up.audience.clone()) else {
+                facts.remove(&name);
+                changed = true;
+                continue;
+            };
+            if audience_within(&fork.audience, &upstream) {
+                continue;
+            }
+            let fork = facts.get_mut(&name).unwrap_or_else(|| unreachable!());
+            fork.capped = Some(format!(
+                "`{name}`'s definition makes it `{}`, wider than `{from}`'s `{}`, which it is a fork \
+                 of: it is served as `{}` until its definition is no wider",
+                audience_name(&fork.audience),
+                audience_name(&upstream),
+                audience_name(&upstream),
+            ));
+            fork.audience = upstream;
+            changed = true;
+        }
+        if !changed {
+            return;
+        }
+    }
 }
 
 /// `./a/b/` → `a/b`; the empty path is `.`.
@@ -302,6 +376,21 @@ pub fn load_definitions_at<'n>(
     let mut all: BTreeSet<String> = ["root".to_owned(), "access".to_owned()].into();
     all.extend(names.into_iter().map(str::to_owned));
     let mut facts = read_definitions(&reader, project, &all);
+    // A fork is held to its upstream, so its upstream is read with it, and
+    // that one's, in turn.
+    for _round in 0..8 {
+        let upstreams: Vec<String> = facts
+            .values()
+            .filter_map(|fact| fact.from.clone())
+            .filter(|from| !all.contains(from))
+            .collect();
+        if upstreams.is_empty() {
+            break;
+        }
+        all.extend(upstreams);
+        facts = read_definitions(&reader, project, &all);
+    }
+    cap_forks(&mut facts);
     let linked: Vec<(String, Facts)> = facts
         .iter()
         .filter(|(_, fact)| fact.link.is_some())

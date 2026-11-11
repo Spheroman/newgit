@@ -81,7 +81,11 @@ newgit status                          # ready / starting / not ready, and why
 
 Trackers sharing a `role` are alternatives (`dev-db`, `staging-db`); a spawn
 picks one by `--use`, then your own default in `~/.newgit/config.toml`, then
-`priority`. A tracker can bring resources (they run only while it is bound) and
+`priority`. Add a variant as a fork, so the two share history: `newgit tracker
+create staging-db --role db --from local-db` starts at `local-db`'s `main`
+(nothing is copied), claims its paths, and is bound only when asked for. A
+fork is never readable by anyone its upstream is not: a wider `--audience` is
+refused, and so is a later definition change that widens it. A tracker can bring resources (they run only while it is bound) and
 `require` others.
 
 `pinned = true` holds a tracker where its parent has it: a change to it never

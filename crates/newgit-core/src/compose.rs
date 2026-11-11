@@ -1069,6 +1069,9 @@ pub enum Refusal {
         /// Each tracker carrying it, with its audience.
         trackers: Vec<(String, String)>,
     },
+    /// The definitions it leaves would make a fork readable by someone its
+    /// upstream is not, or name an upstream that is not defined.
+    Fork { commit: String, reason: String },
 }
 
 impl std::fmt::Display for Refusal {
@@ -1125,6 +1128,12 @@ impl std::fmt::Display for Refusal {
                     short(commit)
                 )
             }
+            Refusal::Fork { commit, reason } => write!(
+                f,
+                "commit {} changes tracker definitions, and then {reason}. Fix the definition \
+                 in that commit and try again",
+                short(commit)
+            ),
         }
     }
 }
@@ -1521,6 +1530,25 @@ impl<'a> Splitter<'a> {
         let changed = changed.unwrap_or_default();
         if changed.is_empty() {
             return Ok(());
+        }
+        // A definition change that widens a fork past its upstream is refused
+        // where it becomes a commit, as creating one that wide is.
+        let defines = changed.iter().any(|path| {
+            Utf8Path::new(path)
+                .parent()
+                .is_some_and(|dir| dir.ends_with(DEFINITIONS_DIR))
+        });
+        if defines && let Err(error) = crate::tracker::check_forks(definitions) {
+            let reason = match error {
+                NewgitError::InvalidDefinition { name, reason, .. } => {
+                    format!("`{}` is refused: {reason}", tracker_path(&name))
+                }
+                other => other.to_string(),
+            };
+            return Err(SplitError::Refused(Refusal::Fork {
+                commit: commit.id.clone(),
+                reason,
+            }));
         }
         for path in changed {
             if path == PINS_DIR || path.starts_with(&format!("{PINS_DIR}/")) {

@@ -1412,8 +1412,15 @@ pub fn authorize(
             ),
         );
     };
-    policy::decide(repo, write, &who, Some(&facts), &context)
-        .map_err(|why| HttpError::new(403, why))?;
+    policy::decide(repo, write, &who, Some(&facts), &context).map_err(|why| {
+        HttpError::new(
+            403,
+            match &facts.capped {
+                Some(capped) => format!("{why} ({capped})"),
+                None => why,
+            },
+        )
+    })?;
     let name = repo.name();
     if let RepoRef::Fork {
         instance, tracker, ..
@@ -1461,12 +1468,68 @@ pub fn authorize(
             };
             Ok(Authorized::Make(made, landing))
         }
-        RepoRef::Tracker { login: Some(_), .. } if !facts.git && write => {
+        RepoRef::Tracker {
+            tracker,
+            login: Some(login),
+            ..
+        } if !facts.git && write => {
             location.create()?;
             Ok(Authorized::Here(location))
         }
         _ => fail(404, format!("{name} does not exist yet")),
     }
+}
+
+/// A fork's repo, just made on its first write, starts at its upstream's
+/// (`from`): the upstream's branches, and for a per-user tracker the
+/// caller's own `main` of it, as the fork's. Its definition was held to its
+/// upstream's audience when it was read ([`policy`]'s `cap_forks`), so the
+/// store it was made in is the upstream's (same audience: refs alone,
+/// nothing copied) or a narrower one, which takes only what those refs reach,
+/// all of it readable there already. An upstream with nothing to start from
+/// leaves it empty, as any new tracker is.
+fn start_fork(
+    project: &ProjectContext<'_>,
+    db: &Connection,
+    fork: &Repo,
+    tracker: &str,
+    facts: &Facts,
+    login: Option<&str>,
+) -> ApiResult<()> {
+    let Some(upstream) = &facts.from else {
+        return Ok(());
+    };
+    let Some(upstream_facts) = project.facts(db, upstream)? else {
+        return Ok(());
+    };
+    if upstream_facts.git || project.links.contains_key(upstream) {
+        return Ok(());
+    }
+    // A per-user upstream is each user's own: the caller's starts their fork.
+    let source_login = match (&upstream_facts.audience, login) {
+        (policy::Audience::User, Some(login)) => Some(login.to_owned()),
+        (policy::Audience::User, None) => return Ok(()),
+        _ => None,
+    };
+    let source = RepoRef::Tracker {
+        project: project.id.clone(),
+        tracker: upstream.clone(),
+        login: source_login,
+    };
+    let source = project.served(db, &source, Some(&upstream_facts), false)?;
+    if !source.exists() {
+        return Ok(());
+    }
+    let mut refs: Vec<(String, String)> = source
+        .list_refs("refs/heads/")?
+        .into_iter()
+        .map(|(reference, _)| (reference.clone(), reference))
+        .collect();
+    refs.push((
+        format!("refs/trackers/{upstream}/main"),
+        format!("refs/trackers/{tracker}/main"),
+    ));
+    fork.take_refs(&source, &refs)
 }
 
 fn credential(

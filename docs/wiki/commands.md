@@ -43,7 +43,11 @@ tracker, it takes a path, read from where it runs: `t3code/repos` at the top
 of the project, `repos` inside `apps/t3code`, `..` to go up:
 
 - `newgit tracker create <name> [--audience <a>] [--storage <s>]
-  [--merge-with-source]`
+  [--role <r>] [--merge-with-source]`
+- `newgit tracker create <name> --from <tracker> [--role <r>] [--audience
+  <a>]` — a fork of a tracker outside Git: its history starts at that
+  tracker's `main` (nothing is copied), it claims the same paths and fills the
+  same role, and its audience may be narrower than its upstream's, never wider
 - `newgit tracker create <name> --git --path <path>` — a tracker in Git,
   mounted at that path by one commit; history before it stays in whichever
   tracker held the files. Inside another tracker's mount it is that

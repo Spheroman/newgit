@@ -41,7 +41,7 @@ use crate::supervisor::{ProcessState, StopOutcome, Supervisor, run_captured, run
 use crate::templates::{instantiate, resource_template};
 use crate::tracker::{
     Storage, TrackerDefinition, collect_files, collect_owned_files, content_rev, normalize_path,
-    symlinked_parent,
+    symlinked_parent, tracker_path,
 };
 use crate::tracker_repo::{
     Branch, CaptureAt, TrackerRepo, clear_owned_paths, copy_file, parse_tracker_state_ref,
@@ -1388,6 +1388,23 @@ pub struct MergeTrackerOutcome {
 pub struct AddTrackerOutcome {
     pub path: Utf8PathBuf,
     pub ignored_patterns: Vec<String>,
+}
+
+/// What `newgit tracker create <name> --from <upstream>` made.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForkTrackerOutcome {
+    pub path: Utf8PathBuf,
+    pub upstream: String,
+    pub audience: String,
+    pub storage: Storage,
+    pub role: String,
+    /// The upstream had no role, and now fills this one too.
+    pub upstream_role_added: bool,
+    pub priority: i32,
+    /// The commit both `main`s are at.
+    pub main: String,
+    pub commits: usize,
+    pub paths: Vec<Utf8PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -7473,6 +7490,18 @@ impl BranchManager {
         storage: Storage,
         merge_with_source: bool,
     ) -> Result<AddTrackerOutcome> {
+        self.create_tracker_in_role(name, audience, storage, merge_with_source, None)
+    }
+
+    /// [`Self::create_tracker`], filling `role` when one is given.
+    pub fn create_tracker_in_role(
+        &self,
+        name: &str,
+        audience: &str,
+        storage: Storage,
+        merge_with_source: bool,
+        role: Option<&str>,
+    ) -> Result<AddTrackerOutcome> {
         validate_name(name)?;
         if !crate::tracker::name_fits_id(name) {
             return Err(NewgitError::InvalidName(name.to_owned()));
@@ -7495,10 +7524,140 @@ impl BranchManager {
             merge_with_source,
             Vec::new(),
         )?;
+        let definition = match role {
+            Some(role) => definition.with_role(role)?,
+            None => definition,
+        };
         let path = self.store.create_tracker_definition(&definition)?;
         Ok(AddTrackerOutcome {
             path,
             ignored_patterns: Vec::new(),
+        })
+    }
+
+    /// A tracker outside Git whose history starts at `upstream`'s: a fork,
+    /// so the members of a role share history and can merge with each other
+    /// (docs/design/trackers.md, *Roles are forks*). It claims what
+    /// `upstream` claims and fills its role, and its definition says `from`.
+    /// Locally every tracker is in one store, so its `main` and a pin are
+    /// two refs at `upstream`'s `main`: nothing is copied.
+    ///
+    /// Its audience defaults to `upstream`'s and may be narrower, never
+    /// wider: refused, naming both. Its storage defaults to `upstream`'s.
+    /// With no role on `upstream`, `role` is required and is written to
+    /// `upstream` as well, so the two are alternatives.
+    pub fn fork_tracker(
+        &self,
+        name: &str,
+        upstream: &str,
+        audience: Option<&str>,
+        storage: Option<Storage>,
+        role: Option<&str>,
+        merge_with_source: bool,
+    ) -> Result<ForkTrackerOutcome> {
+        validate_name(name)?;
+        if !crate::tracker::name_fits_id(name) {
+            return Err(NewgitError::InvalidName(name.to_owned()));
+        }
+        self.refuse_root(name, "it always exists")?;
+        let path = self.store.paths().trackers.join(format!("{name}.toml"));
+        if path.exists() || self.all_definitions().iter().any(|d| d.name == name) {
+            return Err(NewgitError::AlreadyExists(path));
+        }
+        let from = match self
+            .all_definitions()
+            .into_iter()
+            .find(|d| d.name == upstream)
+        {
+            Some(from) => from,
+            None => return Err(NewgitError::UnknownTracker(upstream.to_owned())),
+        };
+        let shown = tracker_path(&from.name);
+        if from.git {
+            return Err(NewgitError::Unsupported(format!(
+                "`{shown}` is a tracker in Git, and only a tracker outside Git can be forked yet: \
+                 members of a role are alternatives, and every instance holds every tracker in \
+                 Git, so two at one mount would both be in its view"
+            )));
+        }
+        let audience = audience.unwrap_or(&from.audience).to_owned();
+        if !crate::tracker::audience_within(&audience, &from.audience) {
+            return Err(NewgitError::Unsupported(format!(
+                "a fork can't be readable by anyone its upstream isn't: `{name}` would be \
+                 `{audience}`, wider than `{shown}`'s `{}`, and its history would hold all of \
+                 `{shown}`'s. Give it `--audience {}` or a narrower one",
+                from.audience, from.audience
+            )));
+        }
+        let storage = storage.unwrap_or(from.storage);
+        if storage == Storage::Remote && self.config.remote.is_none() {
+            return Err(NewgitError::Unsupported(format!(
+                "tracker `{name}` would use `storage = \"remote\"`, but .newgit/config.toml has \
+                 no [remote] to sync it to; add one, or fork with `--storage local`"
+            )));
+        }
+        let role = match (role, from.role.as_deref()) {
+            (Some(asked), Some(theirs)) if asked != theirs => {
+                return Err(NewgitError::Unsupported(format!(
+                    "`{shown}` fills role `{theirs}`, and a fork fills its upstream's role (it \
+                     claims the same paths): `--role {theirs}`, or leave `--role` out"
+                )));
+            }
+            (_, Some(theirs)) => theirs.to_owned(),
+            (Some(asked), None) => asked.to_owned(),
+            (None, None) => {
+                return Err(NewgitError::Unsupported(format!(
+                    "`{shown}` fills no role, and a fork claims the same paths as its upstream, \
+                     which only members of one role may: name the role they both fill, \
+                     `newgit tracker create {name} --from {shown} --role <role>`"
+                )));
+            }
+        };
+        let lane = self.lane(&from.name);
+        if lane.main().is_none() {
+            return Err(NewgitError::Unsupported(format!(
+                "`{shown}` has no history yet (nothing merged to its `main`), so a fork would \
+                 share nothing with it: capture and merge it first (`newgit tracker capture \
+                 {shown}`, then `newgit tracker merge {shown}`)"
+            )));
+        }
+        let fork = from.fork_as(name, audience, storage, merge_with_source, role.clone())?;
+        let upstream_role_added = from.role.is_none();
+        let upstream_updated = if upstream_role_added {
+            Some(from.with_role(&role)?)
+        } else {
+            None
+        };
+        let mut all: Vec<TrackerDefinition> = self
+            .all_definitions()
+            .into_iter()
+            .map(|existing| match &upstream_updated {
+                Some(updated) if updated.name == existing.name => updated.clone(),
+                _ => existing,
+            })
+            .collect();
+        all.push(fork.clone());
+        crate::tracker::resolve_ownership(&mut all)?;
+
+        let path = self.store.create_tracker_definition(&fork)?;
+        if let Some(updated) = &upstream_updated {
+            self.store.save_tracker_definition(updated)?;
+        }
+        let forked = self.lane(name);
+        let main = forked.fork_from(&lane)?.ok_or_else(|| {
+            NewgitError::Unsupported(format!("`{shown}`'s `main` went away while forking it"))
+        })?;
+        Ok(ForkTrackerOutcome {
+            path,
+            upstream: from.name.clone(),
+            audience: fork.audience.clone(),
+            storage,
+            role,
+            upstream_role_added,
+            priority: fork.priority,
+            main,
+            commits: forked.main_commits(),
+            paths: fork.paths.clone(),
         })
     }
 
@@ -7561,6 +7720,22 @@ impl BranchManager {
                     }
                 ))
             })?;
+
+        let forks: Vec<String> = self
+            .all_definitions()
+            .iter()
+            .filter(|other| other.from.as_deref() == Some(name))
+            .map(|other| format!("`{}`", tracker_path(&other.name)))
+            .collect();
+        if !forks.is_empty() {
+            return Err(NewgitError::Unsupported(format!(
+                "{} {} a fork of `{name}`, whose audience is the ceiling on {}: remove {} first",
+                forks.join(", "),
+                if forks.len() == 1 { "is" } else { "are" },
+                if forks.len() == 1 { "its" } else { "theirs" },
+                if forks.len() == 1 { "it" } else { "them" },
+            )));
+        }
 
         let branches = self.store.load_branches()?;
         let bound: Vec<&str> = branches

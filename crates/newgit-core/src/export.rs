@@ -224,6 +224,7 @@ mod tests {
             priority: 0,
             pinned: false,
             link: None,
+            from: None,
             requires: Vec::new(),
             resources: Vec::new(),
             export: Vec::new(),

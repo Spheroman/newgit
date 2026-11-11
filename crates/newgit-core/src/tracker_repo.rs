@@ -706,6 +706,27 @@ impl TrackerRepo {
         git(&self.git_dir, &["update-ref", &self.main_ref(), &commit]).map(drop)
     }
 
+    /// Start this tracker's history at `upstream`'s `main`: its `main` and a
+    /// pin at that very commit, in the one shared store, so nothing is
+    /// copied. Returns the rev, or `None` when `upstream` has no `main`.
+    pub fn fork_from(&self, upstream: &TrackerRepo) -> Result<Option<String>> {
+        let Some(commit) = upstream.resolve(&upstream.main_ref()) else {
+            return Ok(None);
+        };
+        let rev = short(&commit);
+        git(&self.git_dir, &["update-ref", &self.pin_ref(&rev), &commit])?;
+        git(&self.git_dir, &["update-ref", &self.main_ref(), &commit])?;
+        Ok(Some(rev))
+    }
+
+    /// How many commits `main` holds.
+    pub fn main_commits(&self) -> usize {
+        git(&self.git_dir, &["rev-list", "--count", &self.main_ref()])
+            .ok()
+            .and_then(|count| count.trim().parse().ok())
+            .unwrap_or(0)
+    }
+
     pub fn has_rev(&self, rev: &str) -> bool {
         self.resolve(&self.pin_ref(rev)).is_some()
     }

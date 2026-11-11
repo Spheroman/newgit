@@ -62,6 +62,11 @@ pub struct TrackerDefinition {
     /// pins its own commit of it, and its home's definition says who may read
     /// and change it.
     pub link: Option<String>,
+    /// The tracker whose history this one started at (`from = "local-db"`,
+    /// written by `newgit tracker create --from`): a fork, so the two share
+    /// history and can merge. Its audience is a ceiling: a fork is never
+    /// readable by anyone its upstream is not ([`check_forks`]).
+    pub from: Option<String>,
     /// Trackers or roles it cannot do without: binding it binds them, and
     /// they cannot be dropped while it is bound.
     pub requires: Vec<String>,
@@ -171,6 +176,8 @@ pub struct TrackerDefinitionFile {
     pinned: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     link: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    from: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     requires: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -252,6 +259,7 @@ impl TrackerDefinition {
             priority: 0,
             pinned: false,
             link: None,
+            from: None,
             requires: Vec::new(),
             resources: Vec::new(),
             export: Vec::new(),
@@ -287,6 +295,7 @@ impl TrackerDefinition {
             priority: 0,
             pinned: false,
             link: None,
+            from: None,
             requires: Vec::new(),
             resources: Vec::new(),
             export: Vec::new(),
@@ -367,6 +376,7 @@ impl TrackerDefinition {
             priority: file.priority,
             pinned: file.pinned,
             link: file.link,
+            from: file.from,
             requires: file.requires,
             resources: file.resources,
             export,
@@ -394,6 +404,14 @@ impl TrackerDefinition {
                      `<owner>/<project>` or `<owner>/<project>/<path>`, and this tracker must be `git = true`"
                 )));
             }
+        }
+        if let Some(from) = &self.from
+            && (from == &self.name || from.is_empty())
+        {
+            return Err(self.invalid(format!(
+                "`from = \"{from}\"` names the tracker whose history this one started at, \
+                 which must be another tracker"
+            )));
         }
         if let Some(maintainers) = &self.maintainers {
             let ok = matches!(maintainers.as_str(), "owner" | "project-devs")
@@ -505,6 +523,50 @@ impl TrackerDefinition {
         Ok(updated)
     }
 
+    /// A fork of this tracker, as `newgit tracker create <name> --from
+    /// <this>` writes it: the same claims at the same mount, filling `role`,
+    /// and `from` naming this one. It brings no resources and requires
+    /// nothing: those are what make members of a role differ. Bound only
+    /// when asked for (`priority` below this one's, and negative), so making
+    /// a fork never changes what anything binds by default.
+    pub fn fork_as(
+        &self,
+        name: &str,
+        audience: String,
+        storage: Storage,
+        merge_with_source: bool,
+        role: String,
+    ) -> Result<Self> {
+        let mut fork = self.clone();
+        fork.name = name.to_owned();
+        fork.audience = audience;
+        fork.storage = storage;
+        fork.merge_with_source = merge_with_source;
+        fork.maintainers = None;
+        fork.role = Some(role);
+        fork.priority = self.priority.min(0) - 1;
+        fork.pinned = false;
+        fork.link = None;
+        fork.from = Some(self.name.clone());
+        fork.requires = Vec::new();
+        fork.resources = Vec::new();
+        fork.export = Vec::new();
+        fork.excluded = Vec::new();
+        fork.parent = None;
+        fork.validate()?;
+        fork.definition_rev = fork.compute_definition_rev()?;
+        Ok(fork)
+    }
+
+    /// This definition filling `role`.
+    pub fn with_role(&self, role: &str) -> Result<Self> {
+        let mut updated = self.clone();
+        updated.role = Some(role.to_owned());
+        updated.validate()?;
+        updated.definition_rev = updated.compute_definition_rev()?;
+        Ok(updated)
+    }
+
     pub fn with_added_paths(&self, paths: &[Utf8PathBuf]) -> Result<Self> {
         let mut updated = self.clone();
         for path in paths {
@@ -535,6 +597,7 @@ impl TrackerDefinition {
             priority: self.priority,
             pinned: self.pinned,
             link: self.link.clone(),
+            from: self.from.clone(),
             requires: self.requires.clone(),
             resources: self.resources.clone(),
             export: export_value(&self.export),
@@ -561,6 +624,7 @@ impl TrackerDefinition {
             priority: 0,
             pinned: false,
             link: None,
+            from: None,
             requires: Vec::new(),
             resources: Vec::new(),
             export: Vec::new(),
@@ -595,6 +659,7 @@ impl TrackerDefinition {
             priority: 0,
             pinned: false,
             link: None,
+            from: None,
             requires: Vec::new(),
             resources: Vec::new(),
             export: Vec::new(),
@@ -780,12 +845,68 @@ pub fn owner_of<'a>(
         .map(|(_, definition)| definition)
 }
 
+/// Whether a fork with audience `fork` is readable by no one its upstream's
+/// audience `upstream` does not include: the same audience, or one inside
+/// it. `public` holds every audience, and `project-devs` holds `user` (each
+/// member their own) and `user:<login>` (the remote serves those to members
+/// only). Any other two are not ordered, and are not within each other.
+pub fn audience_within(fork: &str, upstream: &str) -> bool {
+    fork == upstream
+        || upstream == "public"
+        || (upstream == "project-devs" && (fork == "user" || fork.starts_with("user:")))
+}
+
+/// Refuse a fork (`from`) whose upstream is not defined, or whose audience
+/// is wider than its upstream's: everything the upstream held when the fork
+/// was made is in the fork's history, so a fork readable by more people
+/// discloses it. Checked wherever definitions are read together, so a
+/// definition change that widens a fork later is refused as creating one
+/// would be.
+pub fn check_forks(definitions: &[TrackerDefinition]) -> Result<()> {
+    for fork in definitions {
+        let Some(from) = &fork.from else {
+            continue;
+        };
+        let Some(upstream) = definitions.iter().find(|other| other.name == *from) else {
+            return Err(NewgitError::InvalidDefinition {
+                kind: "tracker",
+                name: fork.name.clone(),
+                reason: format!(
+                    "it is a fork of `{}` (`from`), which is not defined: its audience is a \
+                     ceiling on the fork's, so the fork cannot be checked without it",
+                    tracker_path(from)
+                ),
+            });
+        };
+        if !audience_within(&fork.audience, &upstream.audience) {
+            return Err(NewgitError::InvalidDefinition {
+                kind: "tracker",
+                name: fork.name.clone(),
+                reason: format!(
+                    "its audience `{}` is wider than `{}`'s, `{}`, which it is a fork of \
+                     (`from`): its history holds `{}`'s, so it may be read by no one `{}` \
+                     is not. Give it `{}`'s audience or a narrower one",
+                    fork.audience,
+                    tracker_path(from),
+                    upstream.audience,
+                    tracker_path(from),
+                    tracker_path(from),
+                    tracker_path(from),
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
 /// Settle who owns what across every tracker. A path's owner is its most
 /// specific claimant, so trackers may nest — `apps` can hold `apps/electron`
 /// for another tracker — but no two may claim the identical path, and only
-/// one may own `.`. Fills in each definition's `excluded` (paths inside its
+/// one may own `.`, and no fork may be wider than its upstream
+/// ([`check_forks`]). Fills in each definition's `excluded` (paths inside its
 /// own that a more specific tracker owns).
 pub fn resolve_ownership(definitions: &mut [TrackerDefinition]) -> Result<()> {
+    check_forks(definitions)?;
     let roots: Vec<&str> = definitions
         .iter()
         .filter(|definition| definition.owns_everything())
@@ -1083,6 +1204,7 @@ mod tests {
             priority: 0,
             pinned: false,
             link: None,
+            from: None,
             requires: Vec::new(),
             resources: Vec::new(),
             export: Vec::new(),

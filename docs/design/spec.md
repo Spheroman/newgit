@@ -275,6 +275,14 @@ The full model is in [`trackers.md`](trackers.md). The short version:
   A negative priority is never bound unless asked. `newgit tracker use` and
   `drop` change a live instance's binding. A tracker brings resources, and
   they run only while it is bound.
+- **Members of a role are forks of each other.** `newgit tracker create
+  staging-db --role db --from local-db` starts a tracker outside Git at
+  `local-db`'s `main` (two refs in the one local store, nothing copied) and
+  records `from = "local-db"`, so the two share history and can merge
+  (merging between members is next). A fork's audience is a ceiling: never
+  wider than its upstream's, refused at creation, on every load, and in any
+  commit changing definitions; `newgit serve` reads a wider one with its
+  upstream's audience. A tracker in Git cannot be forked yet.
 
 ### Trackers outside Git
 

@@ -401,23 +401,31 @@ enum TrackerCommand {
         #[arg(long)]
         mount: Utf8PathBuf,
     },
-    /// Create a tracker: outside Git (captured, never committed) unless --git
+    /// Create a tracker: outside Git (captured, never committed) unless --git.
+    /// With --from <tracker>, a fork: its history starts at that tracker's `main`
     Create {
         /// Its name. A tracker in Git carved inside another one's mount is
         /// that tracker's child (`t3code/repos`), placed by --path
         name: String,
         /// Who may read this tracker's content: `public`, `project-devs`,
-        /// `user` (each user their own copy), or `user:<login>`
-        #[arg(long, default_value = "project-devs")]
-        audience: String,
+        /// `user` (each user their own copy), or `user:<login>`. Default
+        /// `project-devs`; for a fork, its upstream's, and never wider
+        #[arg(long)]
+        audience: Option<String>,
         /// Write `merge_with_source = true`. Nothing reads it yet: `newgit
         /// merge` merges every tracker the instance changed
         #[arg(long)]
         merge_with_source: bool,
         /// Where synced state lives: `local`, or `remote` (needs a `[remote]`
-        /// in .newgit/config.toml)
-        #[arg(long, default_value = "local")]
-        storage: String,
+        /// in .newgit/config.toml). Default `local`; for a fork, its
+        /// upstream's
+        #[arg(long)]
+        storage: Option<String>,
+        /// The role it fills: trackers sharing one are alternatives, and an
+        /// instance binds one of them. A fork fills its upstream's; name it
+        /// when the upstream has none yet, and both fill it
+        #[arg(long, conflicts_with = "git")]
+        role: Option<String>,
         /// A tracker in Git: committed content with its own history, carved out
         /// of whichever tracker owns its paths now (usually root), or with
         /// --from, brought in from another repository
@@ -427,16 +435,19 @@ enum TrackerCommand {
         /// at. Paths of a tracker outside Git are added with `tracker track`
         #[arg(long = "path", value_name = "PATH", group = "place")]
         path: Vec<Utf8PathBuf>,
-        /// Where an imported tracker is mounted (with --from): an empty
+        /// Where an imported tracker is mounted (with --git --from): an empty
         /// directory its files appear under
         #[arg(long, value_name = "DIR", requires = "from", group = "place")]
         mount: Option<Utf8PathBuf>,
-        /// Import another repository's history, unchanged, as this tracker's
-        /// `main`: a URL, or a path (relative to here)
-        #[arg(long, value_name = "REPOSITORY", requires = "git")]
+        /// What its history starts at. Without --git, another tracker outside
+        /// Git: a fork, claiming the same paths and filling the same role, so
+        /// the two can merge; nothing is copied. With --git, another
+        /// repository (a URL, or a path relative to here), imported unchanged
+        /// as this tracker's `main`
+        #[arg(long, value_name = "TRACKER|REPOSITORY")]
         from: Option<String>,
         /// The branch of --from to import (default: its HEAD)
-        #[arg(long, value_name = "BRANCH", requires = "from")]
+        #[arg(long, value_name = "BRANCH", requires = "from", requires = "git")]
         from_branch: Option<String>,
     },
     /// Add workspace paths to a tracker outside Git
@@ -2218,6 +2229,21 @@ fn tracker(mut command: TrackerCommand) -> Result<()> {
                 Err(_) => from,
             };
             let manager = manager_here()?;
+            let audience = audience.unwrap_or_else(|| "project-devs".to_owned());
+            if !std::path::Path::new(&from).exists()
+                && manager
+                    .resolve_tracker(&current_dir()?, &from)
+                    .is_ok_and(|id| {
+                        manager.tracker_definitions().iter().any(|d| d.name == id)
+                            || manager.carved_trackers().iter().any(|d| d.name == id)
+                    })
+            {
+                bail!(
+                    "`{from}` is a tracker here, and only a tracker outside Git can be forked yet \
+                     (`newgit tracker create {name} --from {from}`, without --git). --git --from \
+                     imports another repository"
+                );
+            }
             let outcome = manager.import_git_tracker(
                 &name,
                 &audience,
@@ -2257,6 +2283,7 @@ fn tracker(mut command: TrackerCommand) -> Result<()> {
             ..
         } => {
             let manager = manager_here()?;
+            let audience = audience.unwrap_or_else(|| "project-devs".to_owned());
             let outcome = manager.create_git_tracker(&name, &audience, &path)?;
             let root = manager.store().paths().project_root.clone();
             println!(
@@ -2290,13 +2317,98 @@ fn tracker(mut command: TrackerCommand) -> Result<()> {
             audience,
             merge_with_source,
             storage,
+            role,
+            git: false,
+            path,
+            mount,
+            from: Some(from),
+            ..
+        } => {
+            if !path.is_empty() || mount.is_some() {
+                bail!(
+                    "a fork claims what its upstream claims, at its mount: leave out --path and \
+                     --mount (`newgit tracker create {name} --from {from}`)"
+                );
+            }
+            let upstream = tracker_id(&from)?;
+            let manager = manager_here()?;
+            let root = manager.store().paths().project_root.clone();
+            let storage = storage.as_deref().map(parse_storage).transpose()?;
+            let outcome = manager.fork_tracker(
+                &name,
+                &upstream,
+                audience.as_deref(),
+                storage,
+                role.as_deref(),
+                merge_with_source,
+            )?;
+            let upstream = tracker_path(&outcome.upstream);
+            println!(
+                "Forked `{upstream}` as `{name}`, a tracker outside Git, at {}",
+                display_path(&root, &outcome.path)
+            );
+            println!(
+                "  history:   starts at `{upstream}`'s `main`, {} ({}); nothing is copied",
+                short_rev(&outcome.main),
+                plural(outcome.commits, "commit")
+            );
+            println!(
+                "  claims:    {}, as `{upstream}` does",
+                outcome
+                    .paths
+                    .iter()
+                    .map(|path| path.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+            if outcome.upstream_role_added {
+                println!(
+                    "  role:      `{}`, which `{upstream}` now fills too, so an instance binds one of them",
+                    outcome.role
+                );
+            } else {
+                println!("  role:      `{}`, beside `{upstream}`", outcome.role);
+            }
+            println!(
+                "  audience:  {} (a fork is never readable by anyone `{upstream}` is not)",
+                outcome.audience
+            );
+            println!(
+                "  binding:   priority {}, so new instances keep binding what they did; \
+                 bind it with `newgit tracker use {name}` or `spawn --use {name}`",
+                outcome.priority
+            );
+            if outcome.storage == Storage::Remote {
+                println!(
+                    "  remote:    `newgit serve` starts its repo at `{upstream}`'s on its first \
+                     sync; newgit.dev's Worker takes its history as uploaded, and only this \
+                     client checks its audience there"
+                );
+            }
+            println!("  commit the definition with Git; it is `access`'s, so an owner merges it");
+            warn_graph(&manager_here()?);
+            Ok(())
+        }
+        TrackerCommand::Create {
+            name,
+            audience,
+            merge_with_source,
+            storage,
+            role,
+            git: false,
             ..
         } => {
             let manager = manager_here()?;
             let root = manager.store().paths().project_root.clone();
-            let storage = parse_storage(&storage)?;
-            let outcome = match manager.create_tracker(&name, &audience, storage, merge_with_source)
-            {
+            let storage = parse_storage(storage.as_deref().unwrap_or("local"))?;
+            let audience = audience.unwrap_or_else(|| "project-devs".to_owned());
+            let outcome = match manager.create_tracker_in_role(
+                &name,
+                &audience,
+                storage,
+                merge_with_source,
+                role.as_deref(),
+            ) {
                 Ok(outcome) => outcome,
                 Err(newgit_core::NewgitError::AlreadyExists(path)) => {
                     bail!(

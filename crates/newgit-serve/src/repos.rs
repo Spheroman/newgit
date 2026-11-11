@@ -725,6 +725,57 @@ impl Repo {
         Ok(())
     }
 
+    /// Point each of `refs` (`(theirs, ours)`, both as readers name them) at
+    /// what `from`'s `theirs` is, skipping one `from` lacks: refs alone when
+    /// the two are one store, so nothing is copied, or else fetched in, which
+    /// copies only what those refs reach. This repo must be made already.
+    pub fn take_refs(&self, from: &Repo, refs: &[(String, String)]) -> ApiResult<()> {
+        let mut found = Vec::new();
+        for (theirs, ours) in refs {
+            if let Some((_, commit)) = from
+                .list_refs(theirs)?
+                .into_iter()
+                .find(|(reference, _)| reference == theirs)
+            {
+                found.push((theirs, ours.clone(), commit));
+            }
+        }
+        if found.is_empty() {
+            return Ok(());
+        }
+        if from.dir() == self.dir() {
+            let set: Vec<(String, String)> = found
+                .into_iter()
+                .map(|(_, ours, commit)| (ours, commit))
+                .collect();
+            return self.set_refs(&set);
+        }
+        let source = from.dir();
+        let refspecs: Vec<String> = found
+            .iter()
+            .map(|(theirs, ours, _)| format!("+{}:{}", from.full(theirs), self.full(ours)))
+            .collect();
+        let mut args = vec![
+            "fetch",
+            "--quiet",
+            "--no-tags",
+            "--no-write-fetch-head",
+            source.as_str(),
+        ];
+        args.extend(refspecs.iter().map(String::as_str));
+        let output = git(&self.dir(), &args)?;
+        if !output.status.success() {
+            return Err(HttpError::internal(format!(
+                "fork {source} ({}) into {} ({}): {}",
+                from.namespace,
+                self.dir(),
+                self.namespace,
+                String::from_utf8_lossy(&output.stderr).trim()
+            )));
+        }
+        Ok(())
+    }
+
     // ── A merge's landing ─────────────────────────────────────────────────
 
     /// Where `login`'s merge objects for this repo wait until the merge lands:

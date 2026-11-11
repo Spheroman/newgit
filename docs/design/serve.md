@@ -126,6 +126,15 @@ Resolved loudly; each is reversible.
    - **A fork is a namespace inside its tracker's**, made by copying the
      tracker's branch refs in: nothing to wait for or garbage-collect around,
      and it moves with the tracker. Its readers are exactly its tracker's.
+   - **A fork of a tracker outside Git** (`tracker create --from`, #415) is
+     made on its first write, starting at its upstream's branches: a
+     namespace in the upstream's store, refs alone, when their audiences
+     match, or else in the fork's own audience's store, fetching only what
+     the upstream's `main` reaches. That store is never wider, because the
+     definitions are read with every fork held to its upstream's audience
+     (`policy::cap_forks`): a fork whose definition says wider is served as
+     its upstream's audience, and one whose upstream is not defined is not
+     defined either.
    - **A private instance, an embargo, has a store of its own**, as does
      each user's content: its shape is the secret.
    - **A new tracker's seed is alone** in `tracker/<name>` until it joins a
