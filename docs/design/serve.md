@@ -3,11 +3,14 @@
 *The newgit remote as one binary: Git stores on local disk, one per audience,
 every landing committed to a landing log, project state in SQLite, and the
 same API as the Worker (`remote/`), so the CLI talks to either. Tracked in
-[#344]; the stores are [#409], the landing log [#410].*
+[#344]; the stores are [#409], the landing log [#410], the server's own
+merge [#411].*
 
 [#344]: https://github.com/Spheroman/newgit/issues/344
 [#409]: https://github.com/Spheroman/newgit/issues/409
 [#410]: https://github.com/Spheroman/newgit/issues/410
+[#411]: https://github.com/Spheroman/newgit/issues/411
+[#440]: https://github.com/Spheroman/newgit/issues/440
 
 ---
 
@@ -71,6 +74,9 @@ invited, through `POST /v1/dev/login` with `x-dev-login: <secret>`.
     tracker/<name>.git   a new tracker's seed, alone until it joins a branch
   homes/<owner>/<project>/landing/<login>/<namespace>.git
                          a merge's objects until it lands, never served
+  homes/<owner>/<project>/scratch/<random>.git
+                         the server's merge's composed objects while it
+                         runs, never served, removed after it (and at start)
   endpoint/<owner>/<project>/   the composer's stores and cached views
 ```
 
@@ -223,11 +229,11 @@ Resolved loudly; each is reversible.
    only the trackers at and under the anchor and rolled the parents up
    later, so merges at different anchors did not wait on each other across
    Durable Objects. Here a landing is one entry in the landing log over the
-   whole index, checked against the merge's `base` under the lock, and in
-   place before answering. The merger's own commits are the branch's
-   history, ids and signatures kept, and nothing rolls up. Two merges begun
-   from one index at different anchors now conflict, and the second merges
-   again. Who must approve is decided by the anchor exactly as before.
+   whole index, checked under the lock, and in place before answering, and
+   nothing rolls up. Two merges begun from one index at different anchors
+   both land: the second is merged onto the first (decision 9). Who must
+   approve is decided by the anchor exactly as before, read again at the
+   head the merge lands on.
 5. **Checks run here, at once.** Ancestry, "only pins moved", the history
    walk, and what root's commit pins are local `git` reads. Nothing answers
    202.
@@ -254,8 +260,8 @@ Resolved loudly; each is reversible.
      commit T (`GET …/branches/<branch>?at=<stamp>`), never a commit date.
      Its message holds the entry: a format version, lists, every ref move
      with its old value, store moves, and the commits a move takes from a
-     merger's landing. Fields added later (#411's epochs and merge commit,
-     #412's rooted tips) are defaulted when an older entry is read; an
+     merger's landing. Fields added later (#411's `epoch`, #412's rooted
+     tips) are defaulted when an older entry is read; an
      entry of a newer format than the server reads stops it, in place or
      not (the newest entry is checked at every start). Gitlinks name
      commits without holding them, so the log holds no content and is
@@ -327,14 +333,127 @@ Resolved loudly; each is reversible.
    - **One server per data directory.** `serve.lock` is held while one
      runs; a second refuses to start.
 
-## Known limits
+9. **The server merges** ([landing.md](landing.md), *What a user sees* 1–3,
+   *Landing* 1–3, 5, 6, 8; `crates/newgit-serve/src/server_merge.rs`,
+   `reparent.rs`, `merge.rs` `finish`). `merge` lands or it doesn't.
+   - **The base is the server's.** `begin` reads the index root's base
+     commit pins (`index_of`) and refuses a `base` that is not exactly that,
+     and `finish` uses the base `begin` read. Every rule compares the base
+     with the list, so a base the client wrote could hide a tracker the
+     merge moves; nothing a decision rests on is taken from the client
+     unread (the list is read from root's commit too, the moves are checked
+     against what the rules hand out, the anchor is the server's).
+   - **A fast-forward when Git would make one.** A branch still at the
+     merge's `base` moves to the merger's own commits, ids and signatures
+     kept.
+   - **Re-made on the head when the changes are apart** (`reparent.rs`).
+     What each side changed is a *touch*: for each tracker whose commit
+     moved, the paths of its own tree that changed (pins aside) and the
+     directories that went, read in process skipping equal subtrees, as
+     the bytes Git stores (a name need not be UTF-8). Two touches overlap
+     when, in a tracker both moved, one changed a path the other changed or
+     one inside it, or one under a directory the other deleted or renamed
+     away. A touch that reshapes the composed tree overlaps every other: a
+     tracker added or dropped, a tracker whose own content went entirely
+     (its directory in the view is gone, and Git may follow it, and the
+     directories above it, as a rename), a definition changed (`access`, or
+     any tracker's own `.newgit/trackers/`: a mount may have moved), or pins
+     the re-make cannot write back exactly. For these only Git's merge of
+     the composed trees is right. The re-make stands in for that merge, so
+     `crates/newgit-serve/tests/reparent_differential.rs` holds it to Git's: generated
+     cases across several trackers, each re-made tree compared with what
+     `git merge-tree` makes of the same composed trees.
+     When the merger's touch (base to its list) and what landed since (base
+     to head) do not overlap, no merge runs: each tracker only the merger
+     moved lands at the merger's own commit, each only the head moved stays,
+     and each both moved (root, and the parents along the mount chain) gets
+     one new commit on the head's, its tree the head's with the merger's own
+     paths and pins laid on, the merger's commit its second parent, by the
+     merger, with the stock message. O(depth) objects, no `merge-tree`.
+   - **Otherwise one merge, composed.** The base, the head, and the
+     merger's index are each composed into one view tree (every tracker at
+     its mount, `newgit_core::compose::view_tree`), `git merge-tree`
+     merges them (`merge.directoryRenames=true`, so a file added under a
+     directory another landing renamed follows it), and the result is
+     split by tracker (`newgit_core::compose::split`). A tracker both moved
+     gets one merge commit, the head's commit first and the merger's
+     second, as GitHub's merge button does, holding only that tracker's
+     tree and pins and the stock message ``Merge `<login>` into
+     <branch>``, by the merger. Refused (409) only for a real conflict,
+     naming each file in trackers the merger may read and saying only
+     that there are others, not how many ("one or more files in trackers
+     you cannot read"); the client then merges
+     `<branch>` into its work. A tracker's `main` the merger asked to move
+     to its own commit moves to the commit that lands in its place, from
+     where it is now, when that comes after it.
+   - **One commit, one audience: the rule for content a merge carries.**
+     Following a move, Git's merge can put one side's change into the
+     tracker the other side moved the file to. The rule: *a server merge is
+     refused (409) when following a move the other side made would put
+     content into a tracker whose store does not include the store of the
+     tracker the content was in*, where a store includes another only when
+     it is the same or the public one (decision 1). Concretely, with Git's
+     own rename detection (50% similar) on each side against the base: a
+     change one side made to a file the other side moved into such a
+     tracker, or a file one side added under a directory the other side
+     moved there. Moves the merger made in their own commits land as they
+     made them: that is their choice, made from content they could read.
+     What the merge would carry along with someone's move, which nobody
+     chose to widen, is refused, naming where it would have gone; bringing
+     the branch in and making the move one's own is the way through.
+     Re-making on a new head moves nothing between trackers (each path is
+     set from the same tracker's commit), so it never needs the rule.
+   - **What lands is authorized, at the head it lands on.** Each attempt
+     reads the rules (maintainers, audiences, definitions on each tracker's
+     `main`, membership) and checks the merger's own change against them,
+     and then checks what would land (head to result) the same way: a
+     tracker the merge changes that the merger may not (a file someone
+     moved into it carrying the merger's edit) is refused (403), naming it.
+     The rules are read under the db lock and decided without it. After a
+     re-make on a new head they are read and decided again against what
+     finally lands.
+   - **Rechecked by path, under the roots' hold.** The merge runs with
+     nothing held; then its roots are held (decision 8; a busy hold is
+     waited for, within the turn budget, rather than throwing the merge
+     away) and the branch, the project's epoch, and the merger's membership
+     are read again. If the branch moved and what landed in between
+     overlaps this merge's touch, the attempt starts again (merging onto
+     the new head); if not, the merge is re-made on it as above, without
+     Git's merge. The membership read here, under the recheck's db lock, is
+     what the landing goes ahead on.
+   - **Barriers and epochs, on `main`.** Definitions are read from `main`,
+     so only there is a change to `.newgit/trackers/` (`access`'s own
+     files, or any tracker's own `.newgit/trackers/`) a barrier: it holds
+     its roots before it merges, so it lands on the head it merged onto, by
+     itself, and its entry sets the project's epoch one higher (`epoch`,
+     defaulted in older entries; `projects.epoch` in SQLite, written with
+     the landing's rows). Every merge's landing names the epoch it was
+     prepared under, and `check` refuses one prepared under another, so it
+     starts again. A result that changes the definitions though the
+     merger's own change did not (a move followed into
+     `.newgit/trackers/`) starts again as a barrier.
+   - **Fairness is a turn on paths, not on the project.** After three lost
+     rechecks a merge takes a turn on its touch: until it lands, no other
+     merge lands over those paths (one that would waits for the turn to be
+     given up), and merges on other paths land beside it. A turn waits only
+     for older turns on the same paths. A merge still waiting after 40 s in
+     all (the client gives a request a minute) is answered 503.
+   - **Nothing composed reaches a store, and nothing is left behind.**
+     Composed trees cross every audience, so they are made in a scratch
+     repository of the merge's own, `scratch/<random>.git` in the home,
+     which borrows every store's objects (alternates), is served to no one
+     (no repo name reaches it), and is removed when the merge is done, and
+     at start. Only each tracker's new commit and the objects it adds over
+     its parents leave it, into the merger's landing for that tracker, and
+     from there into a store exactly as the merger's own commits do
+     (decision 1). Commits re-made on a new head are written straight into
+     the merger's landing for their tracker. An attempt that lost removes
+     the landing refs of every commit it made. Each `git` process the
+     server merge starts for one step (`merge-tree`, `diff-tree`, `notes`,
+     the pack it copies out, `update-ref`) is stopped after 60 s (503,
+     nothing landed); see *Known limits* for the reads that are not.
 
-- **Fast-forward only.** A merge lands only onto the `base` it began from,
-  so it always fast-forwards; one whose branch moved meanwhile is told to
-  merge again. Writing a merge commit with the merger's commits as its
-  second parent when the branch moved needs the server to merge
-  (`merge-tree`), which is [#411]: it writes that commit before the
-  landing, and the log takes it like any other.
+## Known limits
 - **Raw Git reads are atomic per repo, not across repos.** Each store's
   refs move in one transaction and the rows that say where everything is
   move under the same lock, but a client fetching two trackers' repos one
@@ -400,6 +519,55 @@ Resolved loudly; each is reversible.
   does every start. Until then those landings are refused with a 503 that
   says it is in place and what failed. `--void-landing` refuses it: moving
   its refs back while its rows stay would split the API from Git.
+- **Concurrent merges onto one branch take turns at the hold.** Each
+  attempt merges outside the lock, but landings on one project are held one
+  at a time, and what each does while held (the recheck, re-making the
+  merge on a head that moved, reading the rules again, placing its commits,
+  writing the landing) is a few hundred milliseconds of `git` in a debug
+  build. Measured with `serve_server_merge_bench.rs` (ignored by default;
+  `BENCH_MODE=<mode>`): 24 merges begun from one base, finished at once
+  from 24 threads, debug build, one M5 Pro Mac, landed per second (all 24
+  land in every mode):
+
+  | mode | what each merge changes | before | after | Git merges run |
+  |------|-------------------------|--------|-------|----------------|
+  | `mixed` | a new file in `blog` or in root, alternately | 1.0 | 2.8 | 0 |
+  | `same` | a new file in `blog` | 0.9 | 2.1 | 0 |
+  | `spread` | a new file in its own tracker (27 in all) | 0.25, 8–9 answered 503 | 2.1 | 0 |
+  | `overlap` | its own line of one file in root | — | 1.0 | 185 |
+
+  "Before" is the whole-branch recheck this replaced, as measured in the
+  review of #436. The three modes whose changes are apart now cost the same
+  per landing whatever the number of trackers (`mixed` is quicker because
+  half its merges move one tracker, not two). Merges whose changes overlap
+  run Git's merge again each time something lands on their paths first,
+  and composing their views is O(trackers) (#440).
+- **A member removed after the recheck** (between the recheck's db lock,
+  where membership is read for the last time, and the landing's commit,
+  which spans placing the merge's commits) is not caught: membership is a
+  row, not a landing, so it moves no epoch. A maintainer removed is: that
+  is a change to the definitions.
+- **A linked tracker both sides moved is refused** (409), naming it: its
+  history is at its home, which this merge does not land in. Land it there
+  first.
+- **A tracker that gains content only by a merge** (a file the other side
+  moved into it while this side edited it) gets a merge commit whose
+  second parent may be behind its first: split makes one commit per
+  tracker whose merged tree is neither side's, on both sides' commits.
+- **Not every `git` a merge waits on is timed.** The long-lived
+  `cat-file --batch` that reads objects in process (`Objects`: touches,
+  the re-make, composing), and the authorization's ancestry checks
+  (`merge-base --is-ancestor`), `cat-file -e`, and `diff-tree` reads run
+  without the 60 s limit. Each is a bounded read of objects the server
+  holds, so a hang means a broken repository rather than a slow merge, but
+  one would hold the merge's turn, or its roots, until it ends.
+- **Merges land at about two a second** (a debug build), though a merge
+  apart from what landed runs no Git merge: each spawns about 55 `git`
+  processes, and the re-make, the rules check, placement, and the landing
+  run one after another while the roots are held, about 400 ms a landing.
+  Issue #445 has the counts and the way to milliseconds (objects written
+  in process, the object format cached, re-made objects written straight
+  into the store).
 - **A merge's finish holds its projects while it places its commits.**
   From deciding which store each new commit goes into until it has
   landed, a merge's finish holds its projects' locks, and that includes

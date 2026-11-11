@@ -817,7 +817,7 @@ impl BranchManager {
         )?;
         tree = objects.set_path(
             &tree,
-            &format!("{DEFINITIONS_DIR}/migrate-gate"),
+            format!("{DEFINITIONS_DIR}/migrate-gate"),
             Some((b"100644".to_vec(), access_file)),
         )?;
         objects.flush()?;

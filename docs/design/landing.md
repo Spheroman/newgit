@@ -1,6 +1,6 @@
 # Landing
 
-**Status: decided; steps 1 and 2 of the build order are built.** How changes land in a tree of trackers on
+**Status: decided; steps 1, 2 and 3 of the build order are built.** How changes land in a tree of trackers on
 `newgit serve`. It replaces [anchoring.md](anchoring.md), which describes how
 the Worker on newgit.dev lands merges today and goes when newgit.dev moves to
 `serve`. Settled with Jack on 2026-11-10 after two adversarial reviews and a
@@ -123,6 +123,19 @@ On one server:
 8. A directory renamed by a landing reruns the merge of any landing prepared
    before it, so a file added under the old name follows the rename.
 
+Items 1–3, 5, 6 and 8 are built (#411): [serve.md](serve.md), decision 9.
+The recheck is by path, as item 3 says: a landing in between that changed
+other paths costs only re-making the commits that record pins (root, and
+each tracker both moved along the mount chain) on the new head, in
+process, with no `merge-tree`; the same holds for a merge's first attempt
+when what landed since its base changed other paths. A directory another
+landing deleted or renamed overlaps every path under it (item 8), and a
+landing that empties a tracker, adds or drops one, or changes a definition
+reruns every merge prepared before it, since its whole directory in the
+view may have moved. Composing
+views is still O(trackers) per Git merge (#440). Item 7's strict merge queue
+is not built.
+
 Across servers there is no transaction: two landings, in order (rule 5).
 
 ## Secrets and trackers outside Git
@@ -192,10 +205,15 @@ Anchors as a concept, deferred roll-ups, inboxes and outboxes, reservations,
    reftable, one audience per store enforced at creation.
 2. **Done (#410).** The landing log and one-transaction landings with group
    commit; readers resolve heads through it; startup repair; store moves
-   as landing steps. A landing fast-forwards only: the merge commit when
-   the branch moved is step 3's, since it needs `merge-tree`.
-3. Server-side merge (compose, `merge-tree`, split) in place of "merge
-   again", with barriers, epochs, and fairness.
+   as landing steps.
+3. **Done (#411).** Server-side merge in place of "merge again": a
+   fast-forward when the branch did not move; the merger's work re-made on
+   the head, without Git's merge, when what landed since changed other
+   paths; otherwise compose, `merge-tree`, and split, with one merge commit
+   per tracker both sides moved and the merger's commit second. The recheck
+   by path; policy, membership, and the audience rule read against what
+   lands; barriers and epochs on `main`; fairness as a turn on the paths a
+   merge changes. Composing views from cached subtrees is #440.
 4. Stored rooted histories, extended at landing.
 5. Dependencies across servers: ordered two-step landings, proposals, resume.
 6. ~~Encryption of trackers outside Git (#338).~~ Done on the client; the

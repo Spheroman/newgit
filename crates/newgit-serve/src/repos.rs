@@ -146,6 +146,80 @@ pub fn git(dir: &Utf8Path, args: &[&str]) -> std::io::Result<Output> {
         .output()
 }
 
+/// [`git`] with `input` on its stdin, stopped after `limit`: answered 503,
+/// naming the command, when it runs longer. Its output whether or not it
+/// succeeded.
+pub fn git_timed(
+    dir: &Utf8Path,
+    args: &[&str],
+    input: Option<&[u8]>,
+    limit: std::time::Duration,
+) -> ApiResult<Output> {
+    use std::io::Read as _;
+    let mut child = git_command(dir)
+        .args(args)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .stdin(if input.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    // Each pipe drained (and fed) on a thread of its own, so a full pipe
+    // never stalls the child while the clock runs.
+    let feeding = match (input, child.stdin.take()) {
+        (Some(input), Some(mut stdin)) => {
+            let input = input.to_vec();
+            Some(std::thread::spawn(move || {
+                let _ = stdin.write_all(&input);
+            }))
+        }
+        _ => None,
+    };
+    let drain = |pipe: Option<Box<dyn std::io::Read + Send>>| {
+        std::thread::spawn(move || {
+            let mut out = Vec::new();
+            if let Some(mut pipe) = pipe {
+                let _ = pipe.read_to_end(&mut out);
+            }
+            out
+        })
+    };
+    let stdout = drain(child.stdout.take().map(|pipe| Box::new(pipe) as _));
+    let stderr = drain(child.stderr.take().map(|pipe| Box::new(pipe) as _));
+    let deadline = std::time::Instant::now() + limit;
+    let mut pause = std::time::Duration::from_millis(1);
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(HttpError::new(
+                503,
+                format!(
+                    "`git {}` ran longer than {} s and was stopped; nothing landed: try again",
+                    args.first().copied().unwrap_or_default(),
+                    limit.as_secs()
+                ),
+            ));
+        }
+        std::thread::sleep(pause);
+        pause = (pause * 2).min(std::time::Duration::from_millis(20));
+    };
+    if let Some(feeding) = feeding {
+        let _ = feeding.join();
+    }
+    Ok(Output {
+        status,
+        stdout: stdout.join().unwrap_or_default(),
+        stderr: stderr.join().unwrap_or_default(),
+    })
+}
+
 fn checked(dir: &Utf8Path, args: &[&str]) -> ApiResult<String> {
     let output = git(dir, args)?;
     if !output.status.success() {
@@ -169,6 +243,21 @@ fn run_stdin(dir: &Utf8Path, args: &[&str], input: &str) -> ApiResult<bool> {
     }
     let output = child.wait_with_output()?;
     Ok(output.status.success())
+}
+
+/// The lock that opening the landing at `dir` takes, one per landing,
+/// holding the alternate refs prefix this process last set there.
+type LandingLock = std::sync::Arc<std::sync::Mutex<Option<String>>>;
+
+fn landing_lock(dir: &Utf8Path) -> LandingLock {
+    static LOCKS: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<Utf8PathBuf, LandingLock>>,
+    > = std::sync::OnceLock::new();
+    let mut locks = LOCKS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    locks.entry(dir.to_owned()).or_default().clone()
 }
 
 pub fn store_exists(dir: &Utf8Path) -> bool {
@@ -874,6 +963,13 @@ impl Repo {
 
     fn open_landing_from(&self, login: &str, borrow: &Repo) -> ApiResult<Utf8PathBuf> {
         let dir = self.landing_dir(login)?;
+        // One at a time per landing: concurrent merges by one login open the
+        // same landing, and Git's config lock refuses a second writer. Other
+        // landings, and other projects, do not wait.
+        let lock = landing_lock(&dir);
+        let mut known = lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if !store_exists(&dir) {
             if let Some(parent) = dir.parent() {
                 std::fs::create_dir_all(parent)?;
@@ -890,18 +986,32 @@ impl Repo {
             }
             checked(&dir, &["config", "receive.fsckObjects", "true"])?;
         }
-        std::fs::write(
-            dir.join("objects/info/alternates"),
-            format!("{}\n", borrow.dir().join("objects")),
-        )?;
-        checked(
-            &dir,
-            &[
-                "config",
-                "core.alternateRefsPrefixes",
-                &borrow.full("refs/heads/"),
-            ],
-        )?;
+        let alternates = dir.join("objects/info/alternates");
+        let borrowed = format!("{}\n", borrow.dir().join("objects"));
+        if std::fs::read_to_string(&alternates).ok().as_deref() != Some(borrowed.as_str()) {
+            // Written beside it and renamed over it: a Git reading the
+            // landing meanwhile (an `index-pack` by the same login) sees the
+            // old file or the new one, never half of one.
+            let fresh = dir.join(format!(
+                "objects/info/alternates.{}",
+                crate::tokens::random_hex(6)
+            ));
+            std::fs::write(&fresh, &borrowed)?;
+            std::fs::rename(&fresh, &alternates)?;
+        }
+        // What this process set last is what the config says: only this
+        // process writes it.
+        let prefixes = borrow.full("refs/heads/");
+        if known.as_deref() != Some(prefixes.as_str()) {
+            let set = git(&dir, &["config", "--get", "core.alternateRefsPrefixes"])
+                .ok()
+                .filter(|output| output.status.success())
+                .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned());
+            if set.as_deref() != Some(prefixes.as_str()) {
+                checked(&dir, &["config", "core.alternateRefsPrefixes", &prefixes])?;
+            }
+            *known = Some(prefixes);
+        }
         Ok(dir)
     }
 

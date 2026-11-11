@@ -368,6 +368,9 @@ pub(super) fn write_rows(
             for (tracker, step) in &change.stores {
                 db::set_tracker_store(&transaction, home, tracker, &step.to)?;
             }
+            if let Some(epoch) = change.epoch {
+                db::set_epoch(&transaction, home, epoch)?;
+            }
             if change.whole {
                 // Its whole state: rows it does not name go (a void's, of
                 // anything a voided landing could have left).
