@@ -2,10 +2,11 @@
 //!
 //! Two kinds of URL:
 //!
-//! - `/_git/<repo>.git/…`: one tracker's repo (or an instance's fork of it, a
-//!   namespace inside it), as `remote`s in credentials name it. The password
-//!   is the caller's newgit token; every request is checked against the rules
-//!   when it arrives.
+//! - `/_git/<repo>.git/…`: one tracker's repo (or an instance's fork of it),
+//!   as `remote`s in credentials name it: a Git namespace in its audience's
+//!   store, served with `git --namespace`. The password is the caller's
+//!   newgit token; every request is checked against the rules when it
+//!   arrives.
 //! - `/<owner>/<name>[/<path>].git/…`: the project's Git endpoint. Each
 //!   reader's view is composed from the trackers they may read
 //!   (`newgit_core::endpoint::compose_view`), then served. Read-only.
@@ -30,7 +31,7 @@ use crate::App;
 use crate::api::{self, Caller, ProjectContext};
 use crate::db;
 use crate::error::{ApiResult, HttpError, fail};
-use crate::names::{self, ProjectId, RepoRef, parse_project_key, parse_repo_name, within};
+use crate::names::{ProjectId, RepoRef, parse_project_key, parse_repo_name, within};
 use crate::policy::{self, Context};
 
 /// The most a gzipped request body may inflate to. Git gzips only
@@ -122,8 +123,21 @@ struct Run {
     namespace: Option<String>,
     /// Ref prefixes a push may touch; empty for any the namespace allows.
     allowed: Vec<String>,
-    /// Hide other instances' namespaces from a tracker's own readers.
-    hide_namespaces: bool,
+    /// A tracker's own refs, not a fork's: instances' namespaces inside it
+    /// are hidden from its readers, and a push to it may move a `main`.
+    tracker: bool,
+}
+
+impl Run {
+    /// `repo`, the API's `named`, as its namespace in its store.
+    fn repo(named: &RepoRef, repo: &crate::repos::Repo, allowed: Vec<String>) -> Self {
+        Self {
+            git_dir: repo.dir(),
+            namespace: Some(repo.namespace.clone()),
+            allowed,
+            tracker: !matches!(named, RepoRef::Fork { .. }),
+        }
+    }
 }
 
 // ── A tracker's repo ──────────────────────────────────────────────────────
@@ -178,8 +192,9 @@ fn authorize_repo(app: &App, token: &str, name: &str, write: bool) -> ApiResult<
     {
         let granted = db::granted(&db, &repo.name(), &caller.token_id)?;
         if !granted.is_empty() {
-            let location = names::locate(&app.config.data, &repo, false);
-            if !crate::repos::exists(&location.git_dir) {
+            // A seed: alone in its own store, so nothing else is reachable.
+            let location = project.locate(&repo, false);
+            if !location.exists() {
                 return fail(404, format!("{} does not exist", repo.name()));
             }
             let allowed = if granted.iter().any(|refs| refs == "*") {
@@ -187,21 +202,11 @@ fn authorize_repo(app: &App, token: &str, name: &str, write: bool) -> ApiResult<
             } else {
                 granted
             };
-            return Ok(Run {
-                git_dir: location.git_dir,
-                hide_namespaces: location.namespace.is_none(),
-                namespace: location.namespace,
-                allowed,
-            });
+            return Ok(Run::repo(&repo, &location, allowed));
         }
     }
     let location = api::authorize(&project, &db, &caller, &repo, write)?;
-    Ok(Run {
-        git_dir: location.git_dir,
-        hide_namespaces: location.namespace.is_none(),
-        namespace: location.namespace,
-        allowed: Vec::new(),
-    })
+    Ok(Run::repo(&repo, &location, Vec::new()))
 }
 
 // ── The Git endpoint ──────────────────────────────────────────────────────
@@ -257,7 +262,7 @@ pub async fn endpoint(app: Arc<App>, request: Request<Body>) -> Response<Body> {
         git_dir: view,
         namespace: None,
         allowed: Vec::new(),
-        hide_namespaces: false,
+        tracker: false,
     };
     run_git(app, run, ask, request).await
 }
@@ -390,12 +395,14 @@ fn view_plan(
     let repos = needed
         .iter()
         .map(|tracker| {
+            let repo = project.tracker(tracker);
             (
                 tracker.clone(),
                 newgit_core::endpoint::Source {
-                    url: project.tracker_dir(tracker).to_string(),
+                    url: repo.dir().to_string(),
                     // Local repos: Git sends no header to a path.
                     auth: "Authorization: Basic eDp4".to_owned(),
+                    namespace: Some(repo.namespace),
                 },
             )
         })
@@ -468,7 +475,8 @@ async fn run_git(app: Arc<App>, run: Run, ask: Ask, request: Request<Body>) -> R
     command
         .arg("-c")
         .arg(format!("core.hooksPath={}", app.hooks_dir()));
-    if run.hide_namespaces {
+    if run.tracker {
+        // Matched with the namespace stripped: the forks inside this one.
         command.arg("-c").arg("transfer.hideRefs=refs/namespaces/");
     }
     if let Some(namespace) = &run.namespace {
@@ -488,10 +496,9 @@ async fn run_git(app: Arc<App>, run: Run, ask: Ask, request: Request<Body>) -> R
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
-    // A push to a repo's own refs (not a fork's namespace) may move a `main`
-    // that definitions are read from.
-    let moves_trackers =
-        ask.service == Service::Receive && !ask.advertise && run.namespace.is_none();
+    // A push to a tracker's own refs (not a fork's) may move a `main` that
+    // definitions are read from.
+    let moves_trackers = ask.service == Service::Receive && !ask.advertise && run.tracker;
     let mut child = match command.spawn() {
         Ok(child) => child,
         Err(error) => return refused(&HttpError::internal(error)),

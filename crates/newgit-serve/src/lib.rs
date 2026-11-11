@@ -1,6 +1,7 @@
 //! `newgit serve`: the newgit remote as one binary.
 //!
-//! Git repositories on local disk, served by real Git; project state in one
+//! Git stores on local disk, one per audience, served by real Git; project
+//! state in one
 //! SQLite database; the checks and composition the Worker sent to a container
 //! run in-process. It answers the same API the Worker on Cloudflare does
 //! (`remote/`), so the CLI talks to either (docs/design/serve.md).
@@ -10,6 +11,7 @@ pub mod db;
 pub mod error;
 pub mod git_http;
 pub mod merge;
+pub mod migrate;
 pub mod names;
 pub mod policy;
 pub mod repos;
@@ -84,7 +86,7 @@ impl App {
             use std::os::unix::fs::PermissionsExt as _;
             std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755))?;
         }
-        Ok(Self {
+        let app = Self {
             git_slots: Arc::new(tokio::sync::Semaphore::new(config.git_slots.max(1))),
             config,
             db,
@@ -93,14 +95,16 @@ impl App {
             definitions: Mutex::default(),
             generation: std::sync::atomic::AtomicU64::new(0),
             merges: merge::Merges::default(),
-        })
+        };
+        migrate::per_tracker_repos(&app)?;
+        Ok(app)
     }
 
     pub fn hooks_dir(&self) -> Utf8PathBuf {
         self.config.data.join("hooks")
     }
 
-    /// Something moved a tracker repo's own refs (a push to it, a branch made,
+    /// Something moved a tracker's own refs (a push to it, a branch made,
     /// a project made or deleted): every definition read before may be stale.
     /// Definitions are read from trackers' `main`, which moves only through
     /// this server, so this is exact rather than a time to live. Pushes into
@@ -111,7 +115,12 @@ impl App {
     }
 
     /// `project`'s definitions of `names`, read once per generation.
-    pub fn definitions(&self, project: &names::ProjectId, mut names: Vec<String>) -> Definitions {
+    pub fn definitions(
+        &self,
+        db: &rusqlite::Connection,
+        project: &names::ProjectId,
+        mut names: Vec<String>,
+    ) -> Definitions {
         names.sort();
         names.dedup();
         let key = (project.key(), names);
@@ -127,8 +136,12 @@ impl App {
                 return facts.clone();
             }
         }
-        let facts =
-            policy::load_definitions(&self.config.data, project, key.1.iter().map(String::as_str));
+        let facts = policy::load_definitions(
+            &self.config.data,
+            db,
+            project,
+            key.1.iter().map(String::as_str),
+        );
         let mut cache = self
             .definitions
             .lock()

@@ -1,10 +1,11 @@
 # `newgit serve`
 
-*The newgit remote as one binary: Git repositories on local disk, project
-state in SQLite, and the same API as the Worker (`remote/`), so the CLI talks
-to either. Tracked in [#344].*
+*The newgit remote as one binary: Git stores on local disk, one per audience,
+project state in SQLite, and the same API as the Worker (`remote/`), so the
+CLI talks to either. Tracked in [#344]; the stores are [#409].*
 
 [#344]: https://github.com/Spheroman/newgit/issues/344
+[#409]: https://github.com/Spheroman/newgit/issues/409
 
 ---
 
@@ -48,15 +49,32 @@ invited, through `POST /v1/dev/login` with `x-dev-login: <secret>`.
 ```
 <data>/
   server.sqlite          tokens, projects, members, branches (heads), instances,
-                         forks, checkpoints, tags, links, grants
+                         forks, checkpoints, tags, links, grants, and which
+                         store each tracker is in (tracker_stores)
   token.key              the HMAC key tokens are signed with
   hooks/pre-receive      refuses refs outside a grant's prefix
-  homes/<owner>/<project>/
-    t/<tracker>.git      a tracker's history; its instances' forks as namespaces
-    u/<tracker>/<login>.git   one user's per-user tracker
-    i/<instance>/<tracker>.git  a private instance's fork
+  homes/<owner>/<project>/stores/   one bare repository per audience, refs in reftable
+    project-devs.git     trackers the members read (root and access by default)
+    public.git           trackers anyone reads
+    user/<login>.git     trackers for user:<login>, and <login>'s content of
+                         every per-user tracker
+    instance/<name>.git  a private instance's forks
+    tracker/<name>.git   a new tracker's seed, alone until it joins a branch
   endpoint/<owner>/<project>/   the composer's stores and cached views
 ```
+
+Every repo the API names is a Git namespace in one store, served with
+`git --namespace`, so its readers see `refs/heads/main` and nothing else:
+
+| Repo (API name) | Store | Namespace |
+|---|---|---|
+| `<o>.<p>.t.<tracker>` | its audience's | `t/<tracker>` |
+| `<o>.<p>.i.<instance>.<tracker>` | the tracker's | `t/<tracker>/i/<instance>`, inside the tracker's |
+| the same, private instance | `instance/<instance>` | `t/<tracker>/i/<instance>` |
+| `<o>.<p>.t.<tracker>.<login>` | `user/<login>` | `u/<tracker>` |
+
+So root's `main` is `refs/namespaces/t/refs/namespaces/root/refs/heads/main`
+in `project-devs.git`. Stores need Git 2.45 or newer, for reftable.
 
 - **One SQLite database, every project table keyed by `home` first.** The home
   (`<owner>/<project>` today) is the shard unit: moving a set of homes to
@@ -73,23 +91,41 @@ invited, through `POST /v1/dev/login` with `x-dev-login: <secret>`.
 
 Resolved loudly; each is reversible.
 
-1. **A fork is a Git namespace in the tracker's repo**
-   (`refs/namespaces/i/refs/namespaces/<instance>/`), made by copying the
-   tracker's branch refs in. Nothing is copied, so there is nothing to wait
-   for, nothing to garbage-collect around, and no deletion order to keep.
-   The tracker's own readers are served with `transfer.hideRefs` over
-   `refs/namespaces/`, and a push to the tracker cannot reach a namespace.
-   **A private instance's forks are repos of their own:** objects sharing a
-   store answer "do you have this?" for everyone in it, and an embargo's
-   shape is the secret.
-   **`hideRefs` only tidies the listing; it is not access control.** Under
-   protocol v2 a reader can fetch any object in a repo by id ("wants can be
-   anything", `gitprotocol-v2(5)`), a `have` line is an existence oracle,
-   and a crafted push can point a ref at any object in the store, which a
-   reachability check then allows. So a repo is safe only when everyone who
-   can reach it may read all of it: **one audience per repo, always.** The
-   namespaces here are safe because a fork's readers are exactly its
-   tracker's. Reproduced in `docs/research/nixpkgs-bench.md`, *Review*.
+1. **One object store per audience, every tracker a Git namespace in it**
+   ([landing.md](landing.md), *Trackers, storage, and mounts*). Never a repo
+   per tracker (22k repos: 424k files, 143 s gc), and **never a store shared
+   across audiences.** Under protocol v2 a reader can fetch any object in a
+   repository by id ("wants can be anything", `gitprotocol-v2(5)`), a `have`
+   line is an existence oracle, and a crafted push can point a ref at any
+   object in the store, which a reachability check then allows. So a store
+   is safe only when everyone who can reach it may read all of it, and
+   nothing here filters in front of `upload-pack` pretending otherwise.
+   Reproduced in `docs/research/nixpkgs-bench.md`, *Review*.
+   - **A store is made for one audience and never takes a second.** Its
+     audience is written in its config (`newgit.audience`) when it is made,
+     and making it again for another is refused. Which store a tracker is in
+     is a row in SQLite, not something worked out from its definition: the
+     definitions are read from the stores.
+   - **`transfer.hideRefs` only tidies a listing.** A tracker's readers do
+     not see its instances' forks inside it, and a push cannot reach outside
+     its namespace; neither is access control, and neither needs to be.
+   - **A fork is a namespace inside its tracker's**, made by copying the
+     tracker's branch refs in: nothing to wait for or garbage-collect around,
+     and it moves with the tracker. Its readers are exactly its tracker's.
+   - **A private instance, an embargo, has a store of its own**, as does
+     each user's content: its shape is the secret.
+   - **A new tracker's seed is alone** in `tracker/<name>` until it joins a
+     branch. Whoever seeds it may not read every audience, and their push
+     could name any object in a store it landed in.
+   - **A tracker settles in its audience's store** when it joins a branch,
+     after every landing (a definition may have changed its audience), and
+     before any Git request reaches it, which is refused if it cannot move.
+     The first tracker of an audience is its seed's store renamed; the rest
+     are fetched in, and leave their old store. Objects left behind there
+     stay until gc, readable only by the audience that could read them
+     already.
+   - **`has_commit` asks the store, not the namespace.** Within one audience
+     that is no leak, only a looser check than a repo per tracker gave.
 2. **The Git password is the caller's own newgit token.** No repo passwords
    are minted, stored, or revoked. Each Git request is checked against the
    rules when it arrives, so a revocation or a removed member bites on the
@@ -121,6 +157,10 @@ Resolved loudly; each is reversible.
    moved yet.
 
 ## Not yet
+
+- Garbage collection of the stores, and a move between stores that is safe
+  against a push to the same tracker in flight. A move happens only when a
+  tracker joins a branch or its audience changes.
 
 - The GitHub webhook (`POST /v1/webhooks/github`) and mirror pulls.
 - The landing page and `/install.sh`.

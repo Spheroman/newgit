@@ -214,7 +214,7 @@ fn anchor_for(
     let mut touched = Vec::new();
     let mut read = true;
     for tracker in moved {
-        let dir = project.tracker_dir(tracker);
+        let dir = project.tracker(tracker).dir();
         let (old, new) = (&base[tracker], &list[tracker]);
         let only = only_pins_moved(&dir, old, new);
         let history = match only {
@@ -266,9 +266,9 @@ pub fn index_of(project: &ProjectContext<'_>, root: &str) -> List {
         if index.contains_key(&tracker) {
             continue;
         }
-        let dir = project.tracker_dir(&tracker);
+        let repo = project.tracker(&tracker);
         index.insert(tracker.clone(), commit.clone());
-        for (name, pin) in repos::pins_of(&dir, &commit) {
+        for (name, pin) in repo.pins_of(&commit) {
             let child = if tracker == "root" {
                 name
             } else {
@@ -343,8 +343,8 @@ pub fn receive_objects(
         &policy::Context::default(),
     )
     .map_err(|why| HttpError::new(403, why))?;
-    let dir = project.tracker_dir(tracker);
-    if !repos::exists(&dir) {
+    let repo = project.tracker(tracker);
+    if !repo.exists() {
         return fail(
             404,
             format!("{} does not exist", project.repo_of(tracker).name()),
@@ -352,7 +352,7 @@ pub fn receive_objects(
     }
     let mut index = std::process::Command::new("git")
         .arg("--git-dir")
-        .arg(dir.as_str())
+        .arg(repo.dir().as_str())
         .args(["index-pack", "--stdin", "--fix-thin", "--strict"])
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::null())
@@ -372,11 +372,11 @@ pub fn receive_objects(
             ),
         );
     }
-    if !repos::has_commit(&dir, commit) {
+    if !repo.has_commit(commit) {
         return fail(400, format!("the pack sent for {commit} does not hold it"));
     }
     let reference = landing_ref(commit);
-    repos::set_refs(&dir, &[(reference.clone(), commit.to_owned())])?;
+    repo.set_refs(&[(reference.clone(), commit.to_owned())])?;
     Ok(ApiResponse {
         status: 200,
         body: json!({ "tracker": tracker, "commit": commit, "ref": reference }),
@@ -462,7 +462,7 @@ pub fn begin(
                     format!("`{tracker}` is not in Git; `newgit merge` never carries it"),
                 );
             }
-            if !repos::exists(&project.tracker_dir(tracker)) {
+            if !project.tracker(tracker).exists() {
                 return fail(
                     400,
                     format!(
@@ -514,13 +514,13 @@ pub fn begin(
             &policy::Context::default(),
         )
         .map_err(|why| HttpError::new(403, why))?;
-        let dir = project.tracker_dir(tracker);
+        let repo = project.tracker(tracker);
         let (forward, on_main) = match (tracker.as_str(), list.get(tracker)) {
             ("root", _) | (_, None) => (false, false),
             (_, Some(new)) => (
-                repos::has_commit(&dir, new) && repos::is_ancestor(&dir, &base[tracker], new),
-                repos::branch_head(&dir, None, "main")
-                    .is_some_and(|main| repos::is_ancestor(&dir, new, &main)),
+                repo.has_commit(new) && repo.is_ancestor(&base[tracker], new),
+                repo.branch_head("main")
+                    .is_some_and(|main| repo.is_ancestor(new, &main)),
             ),
         };
         // Above the anchor nothing is touched, only moved along: approved
@@ -675,7 +675,7 @@ pub fn finish(
         );
     };
     for (tracker, commit) in list {
-        if !repos::has_commit(&project.tracker_dir(tracker), commit) {
+        if !project.tracker(tracker).has_commit(commit) {
             return fail(
                 400,
                 format!(
@@ -747,6 +747,8 @@ pub fn finish(
     transaction.commit()?;
     let behind = follow(project, branch, list, &asked)?;
     project.app.trackers_moved();
+    // A landing may have changed definitions, and so audiences.
+    project.settle_after_landing(db);
     answer(db, project, branch, behind, anchor)
 }
 
@@ -836,25 +838,18 @@ fn follow(
     moves: &[RefMove],
 ) -> ApiResult<Vec<String>> {
     let mut behind = Vec::new();
-    let root = project.tracker_dir("root");
-    repos::set_refs(
-        &root,
-        &[(format!("refs/heads/{branch}"), list["root"].clone())],
-    )?;
+    project
+        .tracker("root")
+        .set_refs(&[(format!("refs/heads/{branch}"), list["root"].clone())])?;
     for step in moves {
-        let dir = project.tracker_dir(&step.tracker);
+        let repo = project.tracker(&step.tracker);
         let reference = format!("refs/heads/{}", step.branch);
-        let moved = repos::update_refs(
-            &dir,
-            &[RefUpdate {
-                reference: &reference,
-                new: &step.new,
-                old: step.old.as_deref(),
-            }],
-        )?;
-        if !moved
-            && repos::branch_head(&dir, None, &step.branch).as_deref() != Some(step.new.as_str())
-        {
+        let moved = repo.update_refs(&[RefUpdate {
+            reference: &reference,
+            new: &step.new,
+            old: step.old.as_deref(),
+        }])?;
+        if !moved && repo.branch_head(&step.branch).as_deref() != Some(step.new.as_str()) {
             behind.push(format!(
                 "`{}`'s `{}` moved while this merge ran",
                 step.tracker, step.branch
@@ -862,8 +857,7 @@ fn follow(
         }
     }
     for (tracker, commit) in list {
-        let dir = project.tracker_dir(tracker);
-        let _ = repos::git(&dir, &["update-ref", "-d", &landing_ref(commit)]);
+        let _ = project.tracker(tracker).delete_ref(&landing_ref(commit));
     }
     Ok(behind)
 }

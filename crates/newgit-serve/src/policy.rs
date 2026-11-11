@@ -8,7 +8,9 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use camino::Utf8Path;
 
-use crate::names::{ProjectId, RepoRef, tracker_dir};
+use rusqlite::Connection;
+
+use crate::names::{ProjectId, RepoRef};
 use crate::repos;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -255,14 +257,17 @@ fn next_holders(
     next
 }
 
-/// Reads files at a tracker's `main` in one project.
+/// Reads files at a tracker's `main`, wherever its store is.
 pub struct Reader<'a> {
     pub data: &'a Utf8Path,
+    pub db: &'a Connection,
 }
 
 impl Reader<'_> {
     fn read(&self, project: &ProjectId, tracker: &str, path: &str) -> Option<String> {
-        repos::read_file(&tracker_dir(self.data, project, tracker), "main", path)
+        repos::tracker(self.data, self.db, project, tracker)
+            .ok()?
+            .read_file("main", path)
     }
 }
 
@@ -271,10 +276,11 @@ impl Reader<'_> {
 /// mounted is this project's.
 pub fn load_definitions<'n>(
     data: &Utf8Path,
+    db: &Connection,
     project: &ProjectId,
     names: impl IntoIterator<Item = &'n str>,
 ) -> BTreeMap<String, Facts> {
-    let reader = Reader { data };
+    let reader = Reader { data, db };
     let mut all: BTreeSet<String> = ["root".to_owned(), "access".to_owned()].into();
     all.extend(names.into_iter().map(str::to_owned));
     let mut facts = read_definitions(&reader, project, &all);
@@ -287,7 +293,8 @@ pub fn load_definitions<'n>(
         let Some((home, tracker)) = home_of(&fact) else {
             continue;
         };
-        if let Some(there) = load_definitions(data, &home, [tracker.as_str()]).remove(&tracker) {
+        if let Some(there) = load_definitions(data, db, &home, [tracker.as_str()]).remove(&tracker)
+        {
             facts.insert(
                 name,
                 Facts {

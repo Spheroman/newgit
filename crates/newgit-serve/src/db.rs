@@ -1,6 +1,7 @@
 //! Everything *about* history, in one SQLite database: what the Worker kept
 //! in its Durable Objects (users' tokens, each project's members, branches,
-//! instances, forks, checkpoints, tags, links).
+//! instances, forks, checkpoints, tags, links), and which store each
+//! tracker's history is in.
 //!
 //! Every project-scoped table is keyed by `home` first (`<owner>/<project>`),
 //! so moving a set of homes to another node is a `WHERE home ...` away. One
@@ -63,6 +64,9 @@ CREATE TABLE IF NOT EXISTS tags (
 CREATE TABLE IF NOT EXISTS links (
     home TEXT NOT NULL REFERENCES projects ON DELETE CASCADE, tracker TEXT NOT NULL,
     home_project TEXT NOT NULL, home_tracker TEXT NOT NULL, PRIMARY KEY (home, tracker));
+CREATE TABLE IF NOT EXISTS tracker_stores (
+    home TEXT NOT NULL REFERENCES projects ON DELETE CASCADE, tracker TEXT NOT NULL,
+    store TEXT NOT NULL, PRIMARY KEY (home, tracker));
 CREATE TABLE IF NOT EXISTS grants (
     repo TEXT NOT NULL, token_id TEXT NOT NULL, refs TEXT NOT NULL, expires_at INTEGER NOT NULL,
     PRIMARY KEY (repo, token_id, refs));
@@ -462,6 +466,34 @@ pub fn add_link(
     db.execute(
         "INSERT OR REPLACE INTO links VALUES (?, ?, ?, ?)",
         params![home, tracker, project, there],
+    )?;
+    Ok(())
+}
+
+// ── Stores ────────────────────────────────────────────────────────────────
+
+/// Tracker → the store its history is in (`crate::repos::Store::name`), for
+/// each tracker of `home` that has one.
+pub fn tracker_stores(db: &Connection, home: &str) -> ApiResult<BTreeMap<String, String>> {
+    let mut statement = db.prepare("SELECT tracker, store FROM tracker_stores WHERE home = ?")?;
+    let rows = statement.query_map([home], |row| Ok((row.get(0)?, row.get(1)?)))?;
+    Ok(rows.collect::<Result<_, _>>()?)
+}
+
+pub fn tracker_store(db: &Connection, home: &str, tracker: &str) -> ApiResult<Option<String>> {
+    Ok(db
+        .query_row(
+            "SELECT store FROM tracker_stores WHERE home = ? AND tracker = ?",
+            [home, tracker],
+            |row| row.get(0),
+        )
+        .optional()?)
+}
+
+pub fn set_tracker_store(db: &Connection, home: &str, tracker: &str, store: &str) -> ApiResult<()> {
+    db.execute(
+        "INSERT OR REPLACE INTO tracker_stores VALUES (?, ?, ?)",
+        params![home, tracker, store],
     )?;
     Ok(())
 }

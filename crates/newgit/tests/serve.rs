@@ -166,6 +166,11 @@ fn an_attempt_travels_and_lands_through_newgit_serve() {
     // A tracker's own readers never see the instances inside it.
     let advertised = git_as(&jack_token, &temp, &["ls-remote", &root_repo]);
     assert!(!String::from_utf8_lossy(&advertised.stdout).contains("namespaces"));
-    // A fork is refs in the tracker's repo, not a copy.
-    assert!(!server.data.join("homes/jack/store/i").exists());
+    // A fork is refs inside the tracker's namespace, not a copy.
+    assert!(
+        !server
+            .data
+            .join("homes/jack/store/stores/instance")
+            .exists()
+    );
 }

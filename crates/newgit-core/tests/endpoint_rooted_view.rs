@@ -130,6 +130,7 @@ fn plan(
                     Source {
                         url: repo.to_string(),
                         auth: "Basic eDpwdw==".to_owned(),
+                        namespace: None,
                     },
                 )
             })
