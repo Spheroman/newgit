@@ -873,35 +873,23 @@ unless `--discard-ignored` is given. It also refuses an initialized
 submodule, a linked worktree, and a process with its working directory in
 the workspace, the shell it was run from included: run it from outside.
 
-To say build output may go, declare it as the path-dependent artifact it
-is, rather than passing `--discard-ignored` every time. A tree the build
-tool fills again by itself needs a `prepare` that only makes the
-directory:
+Declaring disposable build output (such as `target/`) so that a plain
+`--evict` frees it is not possible yet; `--discard-ignored` is the manual
+override (#447).
 
-```toml
-# .newgit/resources/rust-target.toml
-ownership = "workspace"
-
-[identity]
-paths = ["Cargo.lock"]
-produces = ["target"]
-
-[actions.prepare]
-command = "rm -rf target && mkdir target"   # the store only ever holds an empty tree
-
-[checkpoint]
-mode = "hash"
-
-[restore]
-mode = "recompute"
-```
-
-After the restore, `target/` is empty and the next build fills it. An
-`undo` across a change to `Cargo.lock` empties it too.
+A restore that fails or is cut short never deletes what is at the path:
+it moves it aside, whole, to `.<name>.restore-failed` or
+`.<name>.interrupted-restore` beside the workspace, says so the moment it
+does, and `start`, `status`, `stop --evict`, and `cleanup` name each such
+saved copy until `newgit cleanup --discard-saved <path>` deletes it. newgit
+never deletes one on its own. A read-only directory in the workspace is
+made writable to delete it.
 
 Not kept, and named before anything is deleted: reflogs other than the
-stash's, intent-to-add entries, and assume-unchanged or skip-worktree flags
-set by hand (the files' content is kept). An untracked file's blob stays in
+stash's, intent-to-add entries, assume-unchanged or skip-worktree flags
+set by hand (the files' content is kept), setuid, setgid, and sticky bits,
+and a value set by hand on a config key newgit sets itself
+(`remote.origin.url`, `credential.*`, its export remotes). An untracked file's blob stays in
 the store with the checkpoint, so evicting does not free that disk, and
 evict checkpoints are not pruned yet (#446).
 

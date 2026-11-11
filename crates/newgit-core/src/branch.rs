@@ -74,6 +74,13 @@ pub struct BranchInstance {
     /// while the workspace is there.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub evicted: Option<String>,
+    /// Directories beside the workspace holding what was at its path when a
+    /// restore of it was cut short or failed (`.<name>.interrupted-restore`,
+    /// `.<name>.restore-failed`): work no checkpoint holds. newgit never
+    /// deletes one on its own; `newgit cleanup --discard-saved <path>` does,
+    /// when asked.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub saved_copies: Vec<Utf8PathBuf>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -219,6 +226,7 @@ impl BranchInstance {
             parked: BTreeMap::new(),
             private: false,
             evicted: None,
+            saved_copies: Vec::new(),
             created_at: now,
             remote: None,
             updated_at: now,

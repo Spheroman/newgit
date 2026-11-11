@@ -35,6 +35,33 @@ impl EvictPlan {
     }
 }
 
+/// What newgit says of a saved copy `copy` of `branch`: where it is, that
+/// no checkpoint holds it, and how to be rid of it once looked through.
+pub(crate) fn saved_copy_notice(branch: &BranchInstance, copy: &Utf8Path) -> String {
+    format!(
+        "{copy} holds what was at `{}`'s workspace path when a restore of it {}, untouched, \
+         and no checkpoint holds it. Look through it and copy out what you need; then `newgit \
+         cleanup --discard-saved {copy}` deletes it. newgit never deletes it on its own",
+        branch.name,
+        if copy.as_str().contains(".restore-failed") {
+            "failed"
+        } else {
+            "was cut short"
+        }
+    )
+}
+
+/// The warning when the workspace an eviction moved aside could not all be
+/// deleted.
+fn trash_left_warning(name: &str, trash: &Utf8Path, id: &str, error: &std::io::Error) -> String {
+    format!(
+        "the evicted workspace was moved to {trash}, but not all of it could be deleted \
+         ({error}). Nothing in it is lost: checkpoint {id} holds it. The next `newgit start \
+         {name}` or `newgit stop --evict {name}` tries again; or delete it yourself (`chmod -R \
+         u+w {trash} && rm -rf {trash}`)"
+    )
+}
+
 /// `a`, `` `a` and `b` ``, or `` `a`, `b`, and 3 more ``: paths in a refusal.
 fn list_paths(paths: &[Utf8PathBuf]) -> String {
     const SHOWN: usize = 8;
@@ -107,9 +134,14 @@ impl BranchManager {
             }
             let mut outcome = self.stop_instance(&branch.name)?;
             outcome.workspace = Some(WorkspaceChange::AlreadyEvicted { checkpoint });
+            outcome.warnings.extend(self.saved_copy_notices(&branch));
             return Ok(outcome);
         }
         self.require_workspace(&branch)?;
+        // A workspace an earlier eviction moved aside and could not delete
+        // goes first, before anything is stopped or recorded: the move below
+        // needs its place.
+        self.clear_trash(&branch)?;
         // Before anything is stopped: what would refuse anyway.
         self.evict_plan(&branch, discard_ignored)?;
         // Only the shell this was run from: the instance's own processes are
@@ -125,8 +157,10 @@ impl BranchManager {
         // Again, now that nothing of the instance runs: whatever stopping
         // wrote is judged too, and this is the list the outcome names.
         let plan = self.evict_plan(&branch, discard_ignored)?;
-        let not_kept = crate::evict::not_kept(&workspace, &plan.rendered)?;
-        let files = crate::evict::record_files(&workspace, &|path| plan.skips(path))?;
+        let mut not_kept = crate::evict::not_kept(&workspace, &plan.rendered)?;
+        let (files, special) = crate::evict::record_files(&workspace, &|path| plan.skips(path))?;
+        not_kept.extend(crate::evict::special_bits_not_kept(&special));
+        not_kept.extend(self.config_not_kept(&branch));
         let checkpoint = self.checkpoint_branch(
             &mut branch,
             Some("evicted by `newgit stop --evict`"),
@@ -229,20 +263,16 @@ impl BranchManager {
         // restores, and a directory beside it with a marker, which `start`
         // deletes.
         let trash = self.evict_trash(&branch);
-        if trash.exists() {
-            std::fs::remove_dir_all(&trash).map_err(|source| NewgitError::io(&trash, source))?;
-        }
         std::fs::rename(&workspace, &trash)
             .map_err(|source| NewgitError::io(&workspace, source))?;
         crate::evict::kill_point("evict-after-rename");
         crate::materializer::write_workspace_marker(self.source.root(), &branch)?;
-        if let Err(error) = std::fs::remove_dir_all(&trash) {
-            outcome.warnings.push(format!(
-                "the evicted workspace was moved to {trash} but not all of it could be deleted \
-                 ({error}); `newgit start {}` deletes the rest",
-                branch.name
-            ));
+        if let Err(error) = crate::evict::delete_tree(&trash) {
+            outcome
+                .warnings
+                .push(trash_left_warning(&branch.name, &trash, &id, &error));
         }
+        outcome.warnings.extend(self.saved_copy_notices(&branch));
         outcome.workspace = Some(WorkspaceChange::Evicted {
             checkpoint: id,
             discarded: plan.discarded,
@@ -271,9 +301,9 @@ impl BranchManager {
         if ancestors_only {
             others.clear();
         }
-        let listed = |list: &[(u32, String)]| {
+        let listed = |list: &[crate::evict::Process]| {
             list.iter()
-                .map(|(pid, command)| format!("{pid} {command}"))
+                .map(|(pid, command, cwd)| format!("pid {pid} `{command}` in {cwd}"))
                 .collect::<Vec<_>>()
                 .join(", ")
         };
@@ -381,9 +411,9 @@ impl BranchManager {
             return Err(NewgitError::Unsupported(format!(
                 "not evicting `{name}`: {} {} ignored, owned by no tracker outside Git, and \
                  rebuilt by no resource, so no checkpoint holds {} and it would not come back. \
-                 Declare build output a resource rebuilds (`[identity] produces`), keep what \
-                 should come back in a tracker (`newgit tracker track`), or `newgit stop --evict \
-                 --discard-ignored` evicts anyway and loses {}",
+                 Keep what should come back in a tracker (`newgit tracker track`), or `newgit \
+                 stop --evict --discard-ignored` evicts anyway and loses {}. Build output such \
+                 as `target/` cannot be declared disposable yet (#447)",
                 list_paths(&named),
                 if named.len() == 1 { "is" } else { "are" },
                 if named.len() == 1 { "it" } else { "them" },
@@ -554,6 +584,190 @@ impl BranchManager {
         self.beside_workspace(branch, "evicting")
     }
 
+    /// Delete what an earlier eviction of `branch` moved aside and could not
+    /// delete: only an evicted workspace, which its checkpoint holds. An
+    /// error, naming what to do, when it cannot be deleted.
+    pub(super) fn clear_trash(&self, branch: &BranchInstance) -> Result<()> {
+        let trash = self.evict_trash(branch);
+        if std::fs::symlink_metadata(&trash).is_err() {
+            return Ok(());
+        }
+        crate::evict::delete_tree(&trash).map_err(|error| {
+            NewgitError::Unsupported(format!(
+                "{trash}, a workspace an earlier eviction of `{}` moved aside, could not be \
+                 deleted ({error}). It holds only what that eviction's checkpoint holds. \
+                 Nothing was changed; delete it yourself (`chmod -R u+w {trash} && rm -rf \
+                 {trash}`), then run this again",
+                branch.name
+            ))
+        })
+    }
+
+    /// What `start`, `status`, and `stop --evict` say of each saved copy of
+    /// `branch` still on disk ([`BranchInstance::saved_copies`]).
+    pub fn saved_copy_notices(&self, branch: &BranchInstance) -> Vec<String> {
+        branch
+            .saved_copies
+            .iter()
+            .filter(|copy| std::fs::symlink_metadata(copy).is_ok())
+            .map(|copy| saved_copy_notice(branch, copy))
+            .collect()
+    }
+
+    /// What `cleanup` says of every saved copy under the workspace root:
+    /// it never deletes one on its own. A copy no record lists (its
+    /// instance was removed since) is named all the same.
+    pub(super) fn saved_copy_warnings(
+        &self,
+        workspace_root: &Utf8Path,
+        branches: &[BranchInstance],
+    ) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut named = BTreeSet::new();
+        for branch in branches {
+            for copy in &branch.saved_copies {
+                if std::fs::symlink_metadata(copy).is_ok() {
+                    named.insert(copy.clone());
+                    out.push(saved_copy_notice(branch, copy));
+                }
+            }
+        }
+        let Ok(entries) = std::fs::read_dir(workspace_root) else {
+            return out;
+        };
+        let mut unlisted: Vec<Utf8PathBuf> = entries
+            .flatten()
+            .filter_map(|entry| Utf8PathBuf::from_path_buf(entry.path()).ok())
+            .filter(|path| {
+                path.file_name()
+                    .is_some_and(crate::cleanup::is_saved_copy_name)
+                    && !named.contains(path)
+            })
+            .collect();
+        unlisted.sort();
+        for copy in unlisted {
+            out.push(format!(
+                "{copy} holds what was at a workspace path when a restore of it was cut short or \
+                 failed, and no checkpoint holds it. Look through it and copy out what you need; \
+                 then `newgit cleanup --discard-saved {copy}` deletes it. newgit never deletes \
+                 it on its own"
+            ));
+        }
+        out
+    }
+
+    /// Delete the saved copy at `path` (`newgit cleanup --discard-saved`),
+    /// which no checkpoint holds: only when asked, by its path, and only a
+    /// directory a restore made (a record lists it, or it is under the
+    /// workspace root with a saved copy's name). Returns what was deleted.
+    pub fn discard_saved_copy(&self, path: &Utf8Path) -> Result<Utf8PathBuf> {
+        let absolute = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            Utf8PathBuf::from_path_buf(
+                std::env::current_dir().map_err(|source| NewgitError::io(".", source))?,
+            )
+            .map_err(|_| NewgitError::Unsupported("the current directory is not UTF-8".into()))?
+            .join(path)
+        };
+        let same = |a: &Utf8Path, b: &Utf8Path| {
+            a == b
+                || matches!(
+                    (a.canonicalize_utf8(), b.canonicalize_utf8()),
+                    (Ok(a), Ok(b)) if a == b
+                )
+        };
+        let owner = self
+            .store
+            .load_branches()?
+            .into_iter()
+            .find(|branch| branch.saved_copies.iter().any(|copy| same(copy, &absolute)));
+        let workspace_root = self.config.workspace_root(&self.store.paths().project_root);
+        let unlisted = absolute
+            .parent()
+            .is_some_and(|parent| same(parent, &workspace_root))
+            && absolute
+                .file_name()
+                .is_some_and(crate::cleanup::is_saved_copy_name);
+        let Some(copy) = owner
+            .as_ref()
+            .and_then(|branch| {
+                branch
+                    .saved_copies
+                    .iter()
+                    .find(|copy| same(copy, &absolute))
+                    .cloned()
+            })
+            .or_else(|| unlisted.then(|| absolute.clone()))
+        else {
+            return Err(NewgitError::Unsupported(format!(
+                "{path} is not a saved copy newgit made (`.<name>.interrupted-restore` or \
+                 `.<name>.restore-failed` beside a workspace), so nothing was deleted"
+            )));
+        };
+        let _lock = match &owner {
+            Some(branch) => Some(self.lock_instance(&branch.slug, &branch.name)?),
+            None => None,
+        };
+        crate::evict::delete_tree(&copy).map_err(|source| NewgitError::io(&copy, source))?;
+        if let Some(branch) = owner {
+            let mut record = self.store.find_branch(&branch.slug)?;
+            record.saved_copies.retain(|have| !same(have, &copy));
+            record.updated_at = Utc::now();
+            self.store.save_branch_record(&record)?;
+        }
+        Ok(copy)
+    }
+
+    /// What newgit would drop of the workspace's own config when a restore
+    /// replays it ([`crate::evict::plan_config`]), worked out before the
+    /// eviction deletes anything: the config newgit writes is made in a
+    /// scratch repository by the same steps the restore takes.
+    fn config_not_kept(&self, branch: &BranchInstance) -> Vec<String> {
+        let predicted = (|| -> Result<Vec<(String, Vec<String>)>> {
+            let scratch = self
+                .store
+                .instance_state_dir(&branch.slug)
+                .join("evict-config-scratch");
+            let _ = crate::evict::delete_tree(&scratch);
+            crate::materializer::create_dir_all(&scratch)?;
+            let made = (|| {
+                crate::source::run_git_env(&["init", "-q", scratch.as_str()], &[])?;
+                crate::source::run_git_env(
+                    &[
+                        "-C",
+                        scratch.as_str(),
+                        "config",
+                        "remote.origin.fetch",
+                        "+refs/heads/*:refs/remotes/origin/*",
+                    ],
+                    &[],
+                )?;
+                let mut scratched = branch.clone();
+                scratched.workspace_path = scratch.clone();
+                self.ensure_workspace_push(&scratched)?;
+                if let Some(remote) = &branch.remote {
+                    GitSource::workspace_use_credential_helper(
+                        &scratch,
+                        &[&remote.endpoint],
+                        &format!("!{} credential", sh_quote(&newgit_program())),
+                    )?;
+                }
+                crate::evict::workspace_config(&scratch)
+            })();
+            let _ = crate::evict::delete_tree(&scratch);
+            made
+        })();
+        let old = crate::evict::workspace_config(&branch.workspace_path);
+        match (old, predicted) {
+            (Ok(old), Ok(new)) => crate::evict::plan_config(&old, &new).dropped,
+            (_, Err(error)) | (Err(error), _) => vec![format!(
+                "any value set by hand on newgit's own config keys (`remote.origin.*`, \
+                 `credential.*`), which newgit sets again; it could not work out which: {error}"
+            )],
+        }
+    }
+
     /// The record says `evicted`, but the eviction stopped between saving
     /// it and moving the workspace: the workspace at the path is the
     /// original, never moved, and its `.git/` still says so. Clear
@@ -582,15 +796,24 @@ impl BranchManager {
     }
 
     /// Move everything at `branch`'s workspace path into a new directory
-    /// beside it, leaving the directory itself (a shell may be in it)
-    /// empty. Returns where it went.
-    fn move_contents_aside(&self, branch: &BranchInstance, what: &str) -> Result<Utf8PathBuf> {
+    /// beside it, `.<name>.<what>`, leaving the directory itself (a shell
+    /// may be in it) empty, and keep it: recorded in the instance's record
+    /// first, so a kill part way leaves no copy nobody knows of, said on
+    /// stderr the moment it is made, and never deleted by newgit unless
+    /// asked (`newgit cleanup --discard-saved`). The copy carries no
+    /// instance marker, so nothing takes it for a workspace. Returns where
+    /// it went.
+    fn save_aside(&self, branch: &BranchInstance, what: &str, why: &str) -> Result<Utf8PathBuf> {
+        let mut record = self.store.find_branch(&branch.slug)?;
         let mut aside = self.beside_workspace(branch, what);
         let mut n = 1;
-        while aside.exists() {
+        while std::fs::symlink_metadata(&aside).is_ok() || record.saved_copies.contains(&aside) {
             n += 1;
             aside = self.beside_workspace(branch, &format!("{what}-{n}"));
         }
+        record.saved_copies.push(aside.clone());
+        record.updated_at = Utc::now();
+        self.store.save_branch_record(&record)?;
         crate::materializer::create_dir_all(&aside)?;
         let workspace = &branch.workspace_path;
         let entries =
@@ -600,6 +823,15 @@ impl BranchManager {
             let to = aside.join(entry.file_name().to_string_lossy().as_ref());
             std::fs::rename(entry.path(), &to).map_err(|source| NewgitError::io(&to, source))?;
         }
+        // newgit's own marker, which would make the copy look like an
+        // instance's workspace; nothing of the user's.
+        let _ = std::fs::remove_file(aside.join(".newgit/local/instance.toml"));
+        let mut copy = branch.clone();
+        copy.saved_copies = vec![aside.clone()];
+        eprintln!(
+            "[newgit] warning: {why}. {}",
+            saved_copy_notice(&copy, &aside)
+        );
         Ok(aside)
     }
 
@@ -632,9 +864,8 @@ impl BranchManager {
         let mut warnings = Vec::new();
         // An eviction cut short after its move aside: checkpointed, and
         // never at the path since.
-        let trash = self.evict_trash(&branch);
-        if trash.exists() {
-            let _ = std::fs::remove_dir_all(&trash);
+        if let Err(error) = self.clear_trash(&branch) {
+            warnings.push(format!("{error}; the restore goes on beside it"));
         }
         if workspace.exists() && !crate::materializer::is_evicted_stub(&workspace) {
             if !restoring.exists() {
@@ -645,34 +876,71 @@ impl BranchManager {
                     branch.name, branch.name
                 )));
             }
-            let aside = self.move_contents_aside(&branch, "interrupted-restore")?;
-            warnings.push(format!(
-                "a restore of `{}` was cut short, and what it left at {workspace} is now at \
-                 {aside}, untouched: newgit cannot tell whether anything was written there \
-                 since. Delete it once you have looked",
-                branch.name
-            ));
+            self.save_aside(
+                &branch,
+                "interrupted-restore",
+                &format!(
+                    "a restore of `{}` was cut short, and newgit cannot tell whether anything \
+                     was written at {workspace} since, so what is there is kept",
+                    branch.name
+                ),
+            )?;
         }
         self.require_resolvable_graph()?;
         let record = self.checkpoint_log(&branch).load(checkpoint)?;
         crate::remote::write_private(&restoring, checkpoint)?;
+        let log = self.checkpoint_log(&branch);
+        let taken_before: BTreeSet<String> = log
+            .list()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|record| record.id)
+            .collect();
         match self.restore_into(&branch, checkpoint, &record) {
             Ok(more) => warnings.extend(more),
             Err(error) => {
-                // Only this restore has written there since it began.
+                // The restore's undo checkpoints what is at the path before
+                // it replaces it: anything written there before then is in
+                // that checkpoint, not lost.
+                let safety: Vec<String> = log
+                    .list()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|record| record.id)
+                    .filter(|id| !taken_before.contains(id))
+                    .collect();
+                if !safety.is_empty() {
+                    eprintln!(
+                        "[newgit] warning: what was at {workspace} before the restore's undo \
+                         replaced it is in checkpoint {}: once `newgit start {}` has brought \
+                         the workspace back, `newgit undo {} --to {}` brings that instead",
+                        safety.join(", "),
+                        branch.name,
+                        branch.name,
+                        safety[0]
+                    );
+                }
+                // The clone beside the path is this restore's own, and
+                // nothing else's.
                 let staging = self.beside_workspace(&branch, "restoring");
-                let _ = std::fs::remove_dir_all(&staging);
-                let back = workspace
-                    .exists()
-                    .then(|| self.move_contents_aside(&branch, "restore-failed"))
-                    .transpose()
-                    .and_then(|aside| {
-                        crate::materializer::write_workspace_marker(self.source.root(), &branch)?;
-                        if let Some(aside) = aside {
-                            let _ = std::fs::remove_dir_all(aside);
-                        }
-                        Ok(())
-                    });
+                let _ = crate::evict::delete_tree(&staging);
+                // What is at the path is kept whole: something other than
+                // this restore (an editor, a language server, a shell in the
+                // marker's directory) may have written there while it ran.
+                let back = (|| -> Result<()> {
+                    if workspace.exists() && !crate::materializer::is_evicted_stub(&workspace) {
+                        self.save_aside(
+                            &branch,
+                            "restore-failed",
+                            &format!(
+                                "restoring `{}` failed ({error}), and anything may have been \
+                                 written at {workspace} while it ran, so what is there is kept",
+                                branch.name
+                            ),
+                        )?;
+                    }
+                    crate::materializer::write_workspace_marker(self.source.root(), &branch)
+                })();
                 return match back {
                     Ok(()) => {
                         let _ = std::fs::remove_file(&restoring);
@@ -714,8 +982,8 @@ impl BranchManager {
         let workspace = branch.workspace_path.clone();
         let mut warnings = Vec::new();
         let staging = self.beside_workspace(branch, "restoring");
-        if staging.exists() {
-            std::fs::remove_dir_all(&staging)
+        if std::fs::symlink_metadata(&staging).is_ok() {
+            crate::evict::delete_tree(&staging)
                 .map_err(|source| NewgitError::io(&staging, source))?;
         }
         let mut staged = branch.clone();
@@ -733,6 +1001,14 @@ impl BranchManager {
         // marker goes (the clone has its own), then the clone's entries move
         // in.
         crate::materializer::create_dir_all(&workspace)?;
+        // Judged again: something may have been written there while the
+        // clone was made, and a rename would replace it.
+        let empty = std::fs::read_dir(&workspace).is_ok_and(|mut entries| entries.next().is_none());
+        if !empty && !crate::materializer::is_evicted_stub(&workspace) {
+            return Err(NewgitError::Unsupported(format!(
+                "something was written at {workspace} while the restore made its clone"
+            )));
+        }
         for marker in [".newgit/local/instance.toml", ".newgit/local/.gitignore"] {
             let _ = std::fs::remove_file(workspace.join(marker));
         }
@@ -743,6 +1019,11 @@ impl BranchManager {
         for entry in entries {
             let entry = entry.map_err(|source| NewgitError::io(&staging, source))?;
             let to = workspace.join(entry.file_name().to_string_lossy().as_ref());
+            if std::fs::symlink_metadata(&to).is_ok() {
+                return Err(NewgitError::Unsupported(format!(
+                    "{to} was written while the restore ran, so it was not replaced"
+                )));
+            }
             std::fs::rename(entry.path(), &to).map_err(|source| NewgitError::io(&to, source))?;
         }
         std::fs::remove_dir(&staging).map_err(|source| NewgitError::io(&staging, source))?;
@@ -803,6 +1084,7 @@ impl BranchManager {
             &saved.git,
             &state,
         )?);
+        crate::evict::pause_point("restore-after-git");
         crate::evict::fail_point("restore-after-git")?;
         warnings.extend(crate::evict::reapply_files(&workspace, &saved.files));
         Ok(warnings)

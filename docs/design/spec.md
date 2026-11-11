@@ -1301,15 +1301,19 @@ linked to the workspace (`git worktree add`), whose Git is in
 and no bound `recompute` resource rebuilds, such as `target/` or a stray
 `.env.local`. It names those, a wholly ignored directory as one entry with
 its file count, and `--discard-ignored` evicts anyway, naming them again
-(`discarded` in `--json`). The way to say a build directory may go is to
-declare it as what it is, a path-dependent artifact: a resource whose
-`[identity] produces` names it, with a `recompute` restore (this
-repository's `.newgit/resources/rust-target.toml` does that for
-`target/`). `--discard-ignored` stays the manual override. It also refuses
+(`discarded` in `--json`). There is no way yet to declare build output
+such as `target/` disposable, so a plain `--evict` refuses in a Rust
+workspace and `--discard-ignored` is the manual override
+([#447](https://github.com/Spheroman/newgit/issues/447)): a resource
+cannot say it without a destructive `prepare` or an identity that refills
+the tree on `undo`. It also refuses
 while a process other than itself has its working directory in the
 workspace, judged again right before the move: the shell or agent it was
 run from included, since the directory would be deleted under it, so it
-has to run from outside the workspace. And it refuses when a resource
+has to run from outside the workspace. `lsof` (on macOS) runs with `-b`,
+so it does not block on a dead network mount, and under a timeout: when it
+does not answer, the eviction refuses, deleting nothing. A refusal names
+each process by pid, command, and directory. And it refuses when a resource
 would not stop, when the checkpoint is degraded, and when the checkpoint
 is not whole in the store: every object its source commit and tracker
 revs reach, checked object by object past what the store's other refs
@@ -1319,9 +1323,16 @@ remote did not take it, the eviction says so plainly: the only copy of the
 instance's work is then in the project store on this machine.
 
 Not kept, and said before anything is deleted (`not_kept` in `--json`):
-reflogs other than the stash's, intent-to-add (`git add -N`) entries, and
-assume-unchanged or skip-worktree flags set by hand. The content of those
-files is kept; only the flag is lost. Evicting does not free the disk an
+reflogs other than the stash's, intent-to-add (`git add -N`) entries,
+assume-unchanged or skip-worktree flags set by hand (the content of those
+files is kept; only the flag is lost), setuid, setgid, and sticky bits
+(the mode's permission bits are kept, and a mode is put back with `lstat`,
+never through a symlink), and a value set by hand on a config key newgit
+sets itself on restore (`origin`'s URLs and receive-pack, `credential.*`,
+its export remotes), worked out by making newgit's own config in a scratch
+repository. Of every other config key the clone already has, a
+single value comes back as it was and a multi-valued key (an added
+`remote.origin.fetch`) gets the saved values added beside newgit's. Evicting does not free the disk an
 untracked file's content takes, since its blob is in the store with the
 checkpoint, and each cycle adds an evict checkpoint and one or two
 before-undo checkpoints with no retention yet
@@ -1331,17 +1342,34 @@ A crash or a failure part way loses nothing. A crash after the record says
 `evicted` and before the move leaves the original workspace at the path,
 with `.git/newgit-evicting` naming the checkpoint: `start` recognises it
 and clears `evicted`, and `stop --evict` then evicts again. The move aside
-is one rename, so otherwise the path holds its marker or nothing, and the
-next `start` deletes a moved-aside workspace left behind. A restore writes
-`.newgit/state/<slug>/evict-restoring` and keeps `evicted` until it is
-done. One that fails puts the path back to its marker, deleting only what
-it wrote itself, under the instance's lock, so the next `start` runs it
-again. One that is killed part way leaves half a workspace that anyone may
-have worked in since: the next `start` moves it aside whole, to
-`.<name>.interrupted-restore` beside the path, says where, and restores;
-it is never deleted. A restore refuses when something other than the
-marker was written at the path since an eviction or a failed restore, and
-so does `stop --evict`, rather than report nothing to do. While an
+is one rename, so otherwise the path holds its marker or nothing. The
+moved-aside workspace (`.<name>.evicting`) holds only what the checkpoint
+holds; it is deleted right away, a read-only directory in it made
+writable first. If it cannot be, the eviction says so and how, and the next
+`start` or `stop --evict` tries again: `stop --evict` before it stops or
+records anything, refusing with what to do when it still cannot.
+
+A restore writes `.newgit/state/<slug>/evict-restoring` and keeps
+`evicted` until it is done. A restore never deletes what is at the path,
+since an editor, a language server, or a shell sitting in the marker's
+directory may have written there while it ran. One that fails moves what
+is at the path, whole, to `.<name>.restore-failed` beside it, puts the
+marker back, and keeps `evicted`, so the next `start` runs it again. One
+that is killed part way leaves half a workspace that anyone may have
+worked in since: the next `start` moves it, whole, to
+`.<name>.interrupted-restore`, and then restores. A second one gets `-2`,
+and so on. These are *saved copies*: each carries no instance marker, is recorded in
+the instance's binding record (`saved_copies`) before anything moves into
+it, and is named, with what to do, on stderr the moment it is made and by
+every `start`, `status`, `stop --evict`, and `cleanup` after. `cleanup`
+never takes one for an orphan workspace, and `remove` keeps them and names
+them. Only `newgit cleanup --discard-saved <path>` deletes one. A restore
+refuses when something other than the marker was written at the path since
+an eviction or a failed restore, and so does `stop --evict`, rather than
+report nothing to do. `remove` refuses too, naming what is there, unless
+`--force`. (A `remove` of an instance that is not evicted deletes its
+workspace however dirty it is, as it always has:
+[#448](https://github.com/Spheroman/newgit/issues/448).) While an
 instance is evicted, commands that need its workspace (`checkpoint`,
 `undo`, `run`, `merge`, ...) say it was evicted and to run `newgit start`.
 A second `stop --evict` says it is already evicted to its checkpoint.

@@ -82,6 +82,11 @@ enum Command {
         /// branch; removal prints the tip to recover it from
         #[arg(long)]
         delete_branch: bool,
+        /// Remove an evicted instance even though its workspace path holds
+        /// more than its marker (work written there after a restore failed
+        /// or was cut short), deleting that work, which no checkpoint holds
+        #[arg(long)]
+        force: bool,
     },
     /// Manage tracker definitions and content
     Tracker {
@@ -219,6 +224,13 @@ enum Command {
         /// archived, releasing the snapshot revs they pin
         #[arg(long)]
         purge_archived: bool,
+        /// Delete only this saved copy, which a restore that was cut short
+        /// or failed kept of what was at a workspace path
+        /// (`.<name>.interrupted-restore`, `.<name>.restore-failed`), and
+        /// nothing else. No checkpoint holds it: look through it first.
+        /// newgit never deletes one otherwise
+        #[arg(long, value_name = "PATH", conflicts_with_all = ["dry_run", "purge_archived"])]
+        discard_saved: Option<Utf8PathBuf>,
     },
     /// Resolve every `[[render]]` and report the result
     Render {
@@ -731,6 +743,7 @@ fn main() -> Result<()> {
             purge,
             keep_branch,
             delete_branch,
+            force,
         } => {
             let source_branch = if keep_branch {
                 SourceBranchPolicy::Keep
@@ -739,7 +752,7 @@ fn main() -> Result<()> {
             } else {
                 SourceBranchPolicy::Auto
             };
-            remove(&name, purge, source_branch)
+            remove(&name, purge, source_branch, force)
         }
         Command::Tracker { command } => tracker(command),
         Command::Resource { command } => resource(command),
@@ -802,8 +815,17 @@ fn main() -> Result<()> {
         Command::Checkpoints { instance } => checkpoints(instance),
         Command::Export(args) => export(args),
         Command::Cleanup {
+            discard_saved: Some(path),
+            ..
+        } => {
+            let deleted = manager_here()?.discard_saved_copy(&path)?;
+            println!("Deleted saved copy {deleted}");
+            Ok(())
+        }
+        Command::Cleanup {
             dry_run,
             purge_archived,
+            discard_saved: None,
         } => cleanup(dry_run, purge_archived),
         Command::Render { check } => render_command(check),
         Command::Ports { check } => ports_command(check),
@@ -3250,6 +3272,18 @@ fn status_table(
             println!("  - {problem}");
         }
     }
+    for report in &reports {
+        let notices = manager.saved_copy_notices(&report.branch);
+        if !notices.is_empty() {
+            println!(
+                "\n`{}` has work kept aside, in no checkpoint:",
+                report.branch.name
+            );
+            for notice in notices {
+                println!("  - {notice}");
+            }
+        }
+    }
     for report in reports
         .iter()
         .filter(|report| report.workspace_exists && report.readiness.is_starting())
@@ -4542,20 +4576,28 @@ fn print_warnings(warnings: &[String]) {
     }
 }
 
-fn remove(name: &str, purge: bool, source_branch: SourceBranchPolicy) -> Result<()> {
+fn remove(name: &str, purge: bool, source_branch: SourceBranchPolicy, force: bool) -> Result<()> {
     let manager = manager_here()?;
     let checkpoints = if purge {
         ArchivedCheckpoints::Purge
     } else {
         ArchivedCheckpoints::Keep
     };
-    let outcome = manager.remove(name, &current_dir()?, checkpoints, source_branch)?;
+    let outcome =
+        manager.remove_forced(name, &current_dir()?, checkpoints, source_branch, force)?;
 
     println!("Removed branch instance `{}`", outcome.branch.name);
     for hook in &outcome.hooks {
         print_hook(hook);
     }
     println!("  workspace: {} (deleted)", outcome.branch.workspace_path);
+    for copy in &outcome.saved_copies {
+        println!(
+            "  kept:      {copy}, what was at the workspace path when a restore failed or was \
+             cut short; no checkpoint holds it. `newgit cleanup --discard-saved {copy}` deletes \
+             it once you have looked"
+        );
+    }
     if let Some(head) = &outcome.unsaved_workspace_head {
         // Whatever the branch line says next is about the store's branch;
         // this is the work that never reached it.

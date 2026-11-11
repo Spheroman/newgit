@@ -308,6 +308,11 @@ pub fn orphan_workspaces(
             }
             continue;
         }
+        // What a restore that was cut short or failed kept of the user's
+        // work: never an orphan, whatever is in it.
+        if dir.file_name().is_some_and(is_saved_copy_name) {
+            continue;
+        }
         if workspace_marker_path(&dir).is_file() || is_empty_dir(&dir)? {
             orphans.push(dir);
         } else {
@@ -318,6 +323,25 @@ pub fn orphan_workspaces(
         }
     }
     Ok((orphans, warnings))
+}
+
+/// Whether a directory name under the workspace root is a saved copy a
+/// restore made (`.<name>.interrupted-restore`, `.<name>.restore-failed`,
+/// with `-2`, `-3`, … after a second one).
+pub fn is_saved_copy_name(name: &str) -> bool {
+    name.starts_with('.')
+        && [".interrupted-restore", ".restore-failed"]
+            .iter()
+            .any(|what| match name.find(what) {
+                Some(at) => {
+                    let rest = &name[at + what.len()..];
+                    rest.is_empty()
+                        || rest
+                            .strip_prefix('-')
+                            .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+                }
+                None => false,
+            })
 }
 
 fn is_empty_dir(path: &Utf8Path) -> Result<bool> {

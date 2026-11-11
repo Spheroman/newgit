@@ -237,11 +237,18 @@ pub struct FileModes {
 
 /// [`FileModes`] for `workspace`, leaving out `.git` and every path
 /// `skip` says the eviction does not keep (a tree a resource rebuilds,
-/// newgit's marker, a rendered file, a discarded ignored file).
+/// newgit's marker, a rendered file, a discarded ignored file). Only the
+/// permission bits are kept: setuid, setgid, and sticky bits are not put
+/// back by a restore, and the second value names the paths that had one,
+/// for the not-kept list.
 #[cfg(unix)]
-pub fn record_files(workspace: &Utf8Path, skip: &dyn Fn(&Utf8Path) -> bool) -> Result<FileModes> {
+pub fn record_files(
+    workspace: &Utf8Path,
+    skip: &dyn Fn(&Utf8Path) -> bool,
+) -> Result<(FileModes, Vec<String>)> {
     use std::os::unix::fs::PermissionsExt as _;
     let mut out = FileModes::default();
+    let mut special = Vec::new();
     let mut pending = vec![Utf8PathBuf::new()];
     while let Some(relative) = pending.pop() {
         let dir = if relative.as_str().is_empty() {
@@ -268,10 +275,14 @@ pub fn record_files(workspace: &Utf8Path, skip: &dyn Fn(&Utf8Path) -> bool) -> R
             let metadata = entry
                 .metadata()
                 .map_err(|source| NewgitError::io(workspace.join(&path), source))?;
-            let mode = metadata.permissions().mode() & 0o7777;
             if metadata.file_type().is_symlink() {
                 continue;
             }
+            let all = metadata.permissions().mode() & 0o7777;
+            if all & 0o7000 != 0 {
+                special.push(path.to_string());
+            }
+            let mode = all & 0o777;
             let default = if metadata.is_dir() || mode & 0o100 != 0 {
                 0o755
             } else {
@@ -289,12 +300,101 @@ pub fn record_files(workspace: &Utf8Path, skip: &dyn Fn(&Utf8Path) -> bool) -> R
         }
     }
     out.empty_dirs.sort();
-    Ok(out)
+    special.sort();
+    Ok((out, special))
 }
 
 #[cfg(not(unix))]
-pub fn record_files(_: &Utf8Path, _: &dyn Fn(&Utf8Path) -> bool) -> Result<FileModes> {
-    Ok(FileModes::default())
+pub fn record_files(
+    _: &Utf8Path,
+    _: &dyn Fn(&Utf8Path) -> bool,
+) -> Result<(FileModes, Vec<String>)> {
+    Ok((FileModes::default(), Vec::new()))
+}
+
+/// The not-kept entry for the paths [`record_files`] found with a setuid,
+/// setgid, or sticky bit, if any.
+pub fn special_bits_not_kept(paths: &[String]) -> Option<String> {
+    (!paths.is_empty()).then(|| {
+        format!(
+            "setuid, setgid, and sticky bits on {} (the files and their other mode bits are \
+             kept)",
+            list_strings(paths)
+        )
+    })
+}
+
+/// `` `a`, `b`, `c`, … `` (at most eight named).
+fn list_strings(items: &[String]) -> String {
+    const SHOWN: usize = 8;
+    let mut out = items
+        .iter()
+        .take(SHOWN)
+        .map(|item| format!("`{item}`"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    if items.len() > SHOWN {
+        out.push_str(&format!(", and {} more", items.len() - SHOWN));
+    }
+    out
+}
+
+/// Whether `relative` names something inside `workspace` reached without
+/// following a symlink: no component on the way is one. What is at the
+/// end may be anything, or nothing.
+fn no_symlink_on_the_way(workspace: &Utf8Path, relative: &Utf8Path) -> bool {
+    let mut at = workspace.to_path_buf();
+    let mut components = relative.components().peekable();
+    while let Some(component) = components.next() {
+        if !matches!(component, camino::Utf8Component::Normal(_)) {
+            return false;
+        }
+        at.push(component);
+        if components.peek().is_some()
+            && std::fs::symlink_metadata(&at).is_ok_and(|meta| meta.file_type().is_symlink())
+        {
+            return false;
+        }
+    }
+    true
+}
+
+/// Delete the directory `path` and everything in it, as `rm -rf` would
+/// after `chmod -R u+w`: a directory without its owner's write (or search)
+/// permission is given it first, so a read-only tree in the workspace
+/// (`chmod 555`) does not stop the delete half way. Never follows a
+/// symlink.
+pub fn delete_tree(path: &Utf8Path) -> std::io::Result<()> {
+    match std::fs::remove_dir_all(path) {
+        Ok(()) => return Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(_) => {}
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mut pending = vec![path.as_std_path().to_path_buf()];
+        while let Some(dir) = pending.pop() {
+            let Ok(meta) = std::fs::symlink_metadata(&dir) else {
+                continue;
+            };
+            if !meta.is_dir() {
+                continue;
+            }
+            let mode = meta.permissions().mode();
+            if mode & 0o700 != 0o700 {
+                std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(mode | 0o700))?;
+            }
+            if let Ok(entries) = std::fs::read_dir(&dir) {
+                for entry in entries.flatten() {
+                    if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                        pending.push(entry.path());
+                    }
+                }
+            }
+        }
+    }
+    std::fs::remove_dir_all(path)
 }
 
 /// Put back what [`record_files`] saved: the empty directories, then each
@@ -305,6 +405,12 @@ pub fn reapply_files(workspace: &Utf8Path, saved: &FileModes) -> Vec<String> {
     let mut warnings = Vec::new();
     for dir in &saved.empty_dirs {
         let path = workspace.join(dir);
+        if !no_symlink_on_the_way(workspace, Utf8Path::new(dir)) {
+            warnings.push(format!(
+                "empty directory `{dir}` was not made again: a symlink is on the way to it"
+            ));
+            continue;
+        }
         if let Err(error) = std::fs::create_dir_all(&path) {
             warnings.push(format!(
                 "empty directory `{dir}` could not be made again: {error}"
@@ -314,10 +420,28 @@ pub fn reapply_files(workspace: &Utf8Path, saved: &FileModes) -> Vec<String> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;
-        let mut ordered: Vec<(&String, &u32, bool)> = saved
+        // Looked at with `lstat`, never through a symlink: a mode is put on
+        // the file or directory the eviction saw, not on what a link points
+        // at. Only the permission bits, whatever an older record says.
+        let mut ordered: Vec<(&String, u32, bool)> = saved
             .modes
             .iter()
-            .map(|(path, mode)| (path, mode, workspace.join(path).is_dir()))
+            .filter_map(|(path, mode)| {
+                let full = workspace.join(path);
+                let meta = std::fs::symlink_metadata(&full).ok();
+                let usable = no_symlink_on_the_way(workspace, Utf8Path::new(path))
+                    && meta
+                        .as_ref()
+                        .is_some_and(|meta| !meta.file_type().is_symlink());
+                if !usable {
+                    warnings.push(format!(
+                        "`{path}` is not there as a file or directory to get its mode {:o} back",
+                        mode & 0o777
+                    ));
+                    return None;
+                }
+                Some((path, mode & 0o777, meta.is_some_and(|meta| meta.is_dir())))
+            })
             .collect();
         ordered.sort_by(|a, b| {
             a.2.cmp(&b.2)
@@ -325,14 +449,8 @@ pub fn reapply_files(workspace: &Utf8Path, saved: &FileModes) -> Vec<String> {
         });
         for (path, mode, _) in ordered {
             let full = workspace.join(path);
-            if std::fs::symlink_metadata(&full).is_err() {
-                warnings.push(format!(
-                    "`{path}` is not there to get its mode {mode:o} back"
-                ));
-                continue;
-            }
             if let Err(error) =
-                std::fs::set_permissions(&full, std::fs::Permissions::from_mode(*mode))
+                std::fs::set_permissions(&full, std::fs::Permissions::from_mode(mode))
             {
                 warnings.push(format!(
                     "`{path}` could not get its mode {mode:o} back: {error}"
@@ -451,6 +569,26 @@ pub fn kill_point(point: &str) {
     #[cfg(debug_assertions)]
     if std::env::var("NEWGIT_TEST_KILL_AT").is_ok_and(|at| at == point) {
         std::process::exit(137);
+    }
+    let _ = point;
+}
+
+/// Wait here when a debug build's `NEWGIT_TEST_PAUSE_AT` names `point`:
+/// write `<NEWGIT_TEST_PAUSE_DIR>/<point>.paused`, then go on once
+/// `<point>.go` is there (or after a minute). How the tests write into a
+/// workspace at an exact moment of a restore. Nothing in a release build.
+pub fn pause_point(point: &str) {
+    #[cfg(debug_assertions)]
+    if std::env::var("NEWGIT_TEST_PAUSE_AT").is_ok_and(|at| at == point)
+        && let Ok(dir) = std::env::var("NEWGIT_TEST_PAUSE_DIR")
+    {
+        let dir = Utf8PathBuf::from(dir);
+        let _ = std::fs::write(dir.join(format!("{point}.paused")), "");
+        let go = dir.join(format!("{point}.go"));
+        let started = std::time::Instant::now();
+        while !go.exists() && started.elapsed().as_secs() < 60 {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
     }
     let _ = point;
 }
@@ -709,13 +847,110 @@ fn config_entries(listing: &str) -> Vec<(String, Vec<String>)> {
     out
 }
 
+/// Whether newgit owns config `key` in a workspace, setting it again on
+/// every restore: `origin`'s URLs and receive-pack, the credential helper,
+/// and the remotes newgit makes for export targets (their `receivepack`
+/// runs `newgit push-receive-pack`). `new` is the config newgit wrote.
+fn newgit_owns(key: &str, new: &[(String, Vec<String>)]) -> bool {
+    if key.starts_with("credential.") {
+        return true;
+    }
+    let Some(rest) = key.strip_prefix("remote.") else {
+        return false;
+    };
+    let Some((remote, name)) = rest.rsplit_once('.') else {
+        return false;
+    };
+    if !["url", "pushurl", "receivepack", "gh-resolved"].contains(&name) {
+        return false;
+    }
+    remote == "origin"
+        || new.iter().any(|(have, values)| {
+            *have == format!("remote.{remote}.receivepack")
+                && values
+                    .iter()
+                    .any(|value| value.contains("push-receive-pack"))
+        })
+}
+
+/// How a saved config goes back over the one a restore's new clone has.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct ConfigPlan {
+    /// Keys set to exactly the saved values, replacing the new clone's.
+    pub replace: Vec<(String, Vec<String>)>,
+    /// Values added to a key, beside the new clone's.
+    pub add: Vec<(String, Vec<String>)>,
+    /// What does not come back, for the not-kept list.
+    pub dropped: Vec<String>,
+}
+
+/// [`ConfigPlan`] for the saved config `old` over the new clone's `new`.
+///
+/// A key the new clone lacks comes back as it was. One newgit owns
+/// ([`newgit_owns`]) keeps newgit's values, and a value set by hand on it
+/// is dropped and named. `branch.*` is the user's (upstreams,
+/// descriptions) and comes back as it was. Any other key the new clone
+/// has with one value, saved with one value, takes the saved one
+/// (`core.autocrlf`); otherwise it is multi-valued (`remote.origin.fetch`),
+/// and the saved values the new clone lacks are added, and a value the user
+/// had removed, which comes back, is named.
+pub fn plan_config(old: &[(String, Vec<String>)], new: &[(String, Vec<String>)]) -> ConfigPlan {
+    let mut plan = ConfigPlan::default();
+    for (key, values) in old {
+        let Some(have) = new.iter().find(|(name, _)| name == key).map(|(_, v)| v) else {
+            plan.add.push((key.clone(), values.clone()));
+            continue;
+        };
+        if have == values {
+            continue;
+        }
+        if key.starts_with("branch.") {
+            plan.replace.push((key.clone(), values.clone()));
+        } else if newgit_owns(key, new) {
+            if values.iter().any(|value| !have.contains(value)) {
+                plan.dropped.push(format!(
+                    "a value set by hand on config `{key}`, which newgit sets again"
+                ));
+            }
+        } else if values.len() == 1 && have.len() == 1 {
+            plan.replace.push((key.clone(), values.clone()));
+        } else {
+            let extra: Vec<String> = values
+                .iter()
+                .filter(|value| !have.contains(value))
+                .cloned()
+                .collect();
+            if !extra.is_empty() {
+                plan.add.push((key.clone(), extra));
+            }
+            if have.iter().any(|value| !values.contains(value)) {
+                plan.dropped.push(format!(
+                    "the removal of a value of config `{key}`: newgit's default value comes back \
+                     beside yours"
+                ));
+            }
+        }
+    }
+    plan
+}
+
+/// `key → values` of a config listing (`git config -z --list`), in order.
+pub fn parse_config(listing: &str) -> Vec<(String, Vec<String>)> {
+    config_entries(listing)
+}
+
+/// The workspace's own config (`.git/config`), listed.
+pub fn workspace_config(workspace: &Utf8Path) -> Result<Vec<(String, Vec<String>)>> {
+    Ok(config_entries(&git(
+        workspace,
+        &["config", "-z", "--local", "--list"],
+    )?))
+}
+
 /// Put back what [`save_config_and_hooks`] kept, into the workspace the
-/// restore just made. A config key the new workspace already has is
-/// newgit's own (its remote, push routing, sparse checkout) and keeps
-/// newgit's value, except `branch.*`, which is the user's (upstreams,
-/// descriptions); every other key comes back as it was (`user.*`, other
-/// remotes). A saved hook replaces what the new workspace has under its
-/// name. What could not be replayed, as warnings.
+/// restore just made, as [`plan_config`] says. A saved hook replaces what
+/// the new workspace has under its name. What could not be replayed, and
+/// what did not come back, as warnings.
 fn replay_config_and_hooks(workspace: &Utf8Path, state: &Utf8Path) -> Result<Vec<String>> {
     let mut warnings = Vec::new();
     let saved = state.join("config");
@@ -724,21 +959,28 @@ fn replay_config_and_hooks(workspace: &Utf8Path, state: &Utf8Path) -> Result<Vec
             workspace,
             &["config", "-z", "--file", saved.as_str(), "--list"],
         )?);
-        let new = config_entries(&git(workspace, &["config", "-z", "--local", "--list"])?);
-        for (key, values) in old {
-            let have = new.iter().find(|(name, _)| *name == key).map(|(_, v)| v);
-            if have == Some(&values) || (have.is_some() && !key.starts_with("branch.")) {
-                continue;
-            }
-            if have.is_some() {
-                let _ = git(workspace, &["config", "--local", "--unset-all", &key]);
-            }
-            for value in &values {
-                if let Err(error) = git(workspace, &["config", "--local", "--add", &key, value]) {
+        let new = workspace_config(workspace)?;
+        let plan = plan_config(&old, &new);
+        for (key, values) in &plan.replace {
+            let _ = git(workspace, &["config", "--local", "--unset-all", key]);
+            for value in values {
+                if let Err(error) = git(workspace, &["config", "--local", "--add", key, value]) {
                     warnings.push(format!("config `{key}` could not be set again: {error}"));
                 }
             }
         }
+        for (key, values) in &plan.add {
+            for value in values {
+                if let Err(error) = git(workspace, &["config", "--local", "--add", key, value]) {
+                    warnings.push(format!("config `{key}` could not be set again: {error}"));
+                }
+            }
+        }
+        warnings.extend(
+            plan.dropped
+                .into_iter()
+                .map(|what| format!("not kept by the eviction: {what}")),
+        );
     }
     let hooks = state.join("hooks");
     if let Ok(entries) = std::fs::read_dir(&hooks) {
@@ -776,8 +1018,8 @@ pub fn clear_saved(store: &Utf8Path, slug: &str) -> Result<()> {
     Ok(())
 }
 
-/// A process, as `(pid, command)`.
-pub type Process = (u32, String);
+/// A process, as `(pid, command, working directory)`.
+pub type Process = (u32, String, Utf8PathBuf);
 
 /// The processes whose working directory is `dir` or under it, apart from
 /// this one: `(others, ancestors)`, each `(pid, command)`. `others` are a
@@ -797,9 +1039,9 @@ pub fn processes_in(dir: &Utf8Path) -> Result<(Vec<Process>, Vec<Process>)> {
             continue;
         }
         if chain.contains(&pid) {
-            above.push((pid, command));
+            above.push((pid, command, cwd));
         } else {
-            others.push((pid, command));
+            others.push((pid, command, cwd));
         }
     }
     for list in [&mut others, &mut above] {
@@ -866,18 +1108,81 @@ fn cwds() -> Result<Vec<(u32, String, Utf8PathBuf)>> {
     Ok(out)
 }
 
+/// How long `lsof` may take before the eviction gives up on it.
+#[cfg(not(target_os = "linux"))]
+fn lsof_timeout() -> std::time::Duration {
+    #[cfg(debug_assertions)]
+    if let Some(ms) = std::env::var("NEWGIT_TEST_LSOF_TIMEOUT_MS")
+        .ok()
+        .and_then(|ms| ms.parse().ok())
+    {
+        return std::time::Duration::from_millis(ms);
+    }
+    std::time::Duration::from_secs(20)
+}
+
 #[cfg(not(target_os = "linux"))]
 fn cwds() -> Result<Vec<(u32, String, Utf8PathBuf)>> {
+    use std::io::Read as _;
     // Run from `/`: started in the workspace, `lsof` would list itself.
-    let output = std::process::Command::new("lsof")
-        .args(["-nPw", "-d", "cwd", "-F", "pcn"])
+    // `-b` avoids the kernel calls that can block (`stat` and friends on a
+    // dead network mount); the timeout covers whatever still does, since
+    // this runs under the instance's lock.
+    let mut child = std::process::Command::new("lsof")
+        .args(["-bnPw", "-d", "cwd", "-F", "pcn"])
         .current_dir("/")
-        .output()
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
         .map_err(|error| {
             NewgitError::Unsupported(format!(
                 "could not run `lsof` to find the processes still in the workspace: {error}"
             ))
         })?;
+    let mut stdout = child.stdout.take().expect("piped");
+    let mut stderr = child.stderr.take().expect("piped");
+    let reading = std::thread::spawn(move || {
+        let mut out = Vec::new();
+        let _ = stdout.read_to_end(&mut out);
+        out
+    });
+    let reading_err = std::thread::spawn(move || {
+        let mut out = Vec::new();
+        let _ = stderr.read_to_end(&mut out);
+        out
+    });
+    let limit = lsof_timeout();
+    let started = std::time::Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if started.elapsed() < limit => {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(NewgitError::Unsupported(format!(
+                    "not evicting: `lsof`, which finds the processes still in the workspace, \
+                     did not answer within {} s (a network mount that does not respond can \
+                     do that), so newgit cannot tell whether anything is still there. \
+                     Nothing was deleted; unmount what hangs, or try again",
+                    limit.as_secs_f32()
+                )));
+            }
+            Err(error) => {
+                return Err(NewgitError::Unsupported(format!(
+                    "could not wait for `lsof`: {error}"
+                )));
+            }
+        }
+    };
+    let output = std::process::Output {
+        status,
+        stdout: reading.join().unwrap_or_default(),
+        stderr: reading_err.join().unwrap_or_default(),
+    };
     // lsof exits 1 when some process could not be read, which is not this
     // user's; what it did list is still right.
     if !output.status.success() && output.stdout.is_empty() {

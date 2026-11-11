@@ -38,10 +38,9 @@ An eviction that would lose something (ignored build output nobody
 declared, a rebase in the middle, a shell still in the directory) refuses
 and leaves the thread stopped, on disk. The server has to run it with its
 working directory outside the workspace: run from inside, it refuses, since
-the directory would be deleted under the caller. Build output such as
-`target/` is declared as a resource (this repository's
-`.newgit/resources/rust-target.toml`), so a plain `--evict` frees it;
-`--discard-ignored` is the manual override.
+the directory would be deleted under the caller. Declaring disposable
+build output such as `target/` is not possible yet, so a Rust workspace
+is not freed: `--discard-ignored` is the manual override (#447).
 
 On macOS it installs as "T3 Code (newgit)", beside upstream T3 Code: its
 own app ID, state in `~/.t3-newgit`, and no auto-update.

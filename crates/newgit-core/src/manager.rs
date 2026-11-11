@@ -988,6 +988,10 @@ pub struct RemoveOutcome {
     /// say so, rather than let "nothing unique" on the branch read as
     /// "nothing lost".
     pub unsaved_workspace_head: Option<String>,
+    /// Saved copies of what was at the workspace path when a restore was
+    /// cut short or failed ([`BranchInstance::saved_copies`]): kept, since
+    /// no checkpoint holds them.
+    pub saved_copies: Vec<Utf8PathBuf>,
 }
 
 /// What `remove` should do with the instance's source branch.
@@ -8094,12 +8098,62 @@ impl BranchManager {
         checkpoints: ArchivedCheckpoints,
         source_branch: SourceBranchPolicy,
     ) -> Result<RemoveOutcome> {
+        self.remove_forced(name, cwd, checkpoints, source_branch, false)
+    }
+
+    /// [`Self::remove`]; `force` also deletes what was written at an
+    /// evicted instance's workspace path since, which no checkpoint holds
+    /// and which `remove` otherwise refuses to delete.
+    pub fn remove_forced(
+        &self,
+        name: &str,
+        cwd: &Utf8Path,
+        checkpoints: ArchivedCheckpoints,
+        source_branch: SourceBranchPolicy,
+        force: bool,
+    ) -> Result<RemoveOutcome> {
         let (_lock, branch) = self.locked_branch(name)?;
 
         if cwd.starts_with(&branch.workspace_path) {
             return Err(NewgitError::Unsupported(format!(
                 "the current directory is inside the workspace of `{}`; step out of it before \
                  removing",
+                branch.name
+            )));
+        }
+        // An evicted instance's workspace path holds only its marker, unless
+        // something was written there after a restore failed or was cut
+        // short; no checkpoint holds that.
+        if branch.evicted.is_some()
+            && branch.workspace_path.exists()
+            && !crate::materializer::is_evicted_stub(&branch.workspace_path)
+            && !force
+        {
+            let mut held: Vec<String> = std::fs::read_dir(&branch.workspace_path)
+                .map(|entries| {
+                    entries
+                        .flatten()
+                        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                        .filter(|name| name != ".newgit")
+                        .collect()
+                })
+                .unwrap_or_default();
+            held.sort();
+            return Err(NewgitError::Unsupported(format!(
+                "not removing `{}`: it is evicted, and {} holds more than its marker ({}), \
+                 written since and in no checkpoint, which `remove` would delete. Move what you \
+                 want to keep out of it, or `newgit remove {} --force` deletes it",
+                branch.name,
+                branch.workspace_path,
+                if held.is_empty() {
+                    "under `.newgit/`".to_owned()
+                } else {
+                    held.iter()
+                        .take(8)
+                        .map(|name| format!("`{name}`"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                },
                 branch.name
             )));
         }
@@ -8143,9 +8197,17 @@ impl BranchManager {
         // deleted.
         crate::evict::clear_saved(self.source.root(), &branch.slug)?;
         let trash = self.evict_trash(&branch);
-        if trash.exists() {
-            std::fs::remove_dir_all(&trash).map_err(|source| NewgitError::io(trash, source))?;
+        if std::fs::symlink_metadata(&trash).is_ok() {
+            crate::evict::delete_tree(&trash).map_err(|source| NewgitError::io(trash, source))?;
         }
+        // Saved copies are the user's work, in no checkpoint: kept, and
+        // named, since the record that listed them is archived.
+        let saved_copies: Vec<Utf8PathBuf> = branch
+            .saved_copies
+            .iter()
+            .filter(|copy| std::fs::symlink_metadata(copy).is_ok())
+            .cloned()
+            .collect();
         // Its branches go with it; pins keep whatever its archived
         // checkpoints still name.
         for definition in &self.trackers {
@@ -8190,6 +8252,7 @@ impl BranchManager {
             remote_warning,
             source_branch,
             unsaved_workspace_head,
+            saved_copies,
         })
     }
 
@@ -8695,6 +8758,9 @@ impl BranchManager {
         };
         let (orphans, unrecognized) = orphan_workspaces(&workspace_root, &claimed, &in_use)?;
         outcome.warnings.extend(unrecognized);
+        outcome
+            .warnings
+            .extend(self.saved_copy_warnings(&workspace_root, &branches));
         for orphan in orphans {
             if !dry_run {
                 std::fs::remove_dir_all(&orphan)
@@ -14030,14 +14096,24 @@ impl BranchManager {
     pub fn start_instance(&self, instance: &str) -> Result<StopStartOutcome> {
         let (lock, branch) = self.locked_branch(instance)?;
         let branch = self.recover_unmoved(branch)?;
+        // Saved copies from before this `start`; one it makes itself is
+        // said the moment it is made.
+        let mut earlier = branch.clone();
+        earlier
+            .saved_copies
+            .retain(|copy| std::fs::symlink_metadata(copy).is_ok());
+        let notices = self.saved_copy_notices(&earlier);
         let Some(checkpoint) = branch.evicted.clone() else {
-            return self.start_resources(lock, branch);
+            let mut outcome = self.start_resources(lock, branch)?;
+            outcome.warnings.extend(notices);
+            return Ok(outcome);
         };
         let warnings = self.restore_evicted(branch, &checkpoint)?;
         let branch = self.store.find_branch(instance)?;
         let mut outcome = self.start_resources(lock, branch)?;
         outcome.workspace = Some(WorkspaceChange::Restored { checkpoint });
         outcome.warnings.splice(0..0, warnings);
+        outcome.warnings.extend(notices);
         Ok(outcome)
     }
 
