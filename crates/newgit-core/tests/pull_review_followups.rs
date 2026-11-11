@@ -317,6 +317,19 @@ fn two_instances_pulling_the_same_tips_make_one_merge() {
         "a real merge"
     );
     assert_eq!(one, two, "the same merge commit in both");
+    // newgit's, not whoever merged the pull request on GitHub (#426
+    // review): dated as the later parent.
+    assert_eq!(
+        in_store(&["log", "-1", "--format=%an <%ae>|%cn <%ce>", &one]),
+        "newgit <newgit@localhost>|newgit <newgit@localhost>"
+    );
+    let later = in_store(&["log", "-1", "--format=%ct", &theirs]).max(in_store(&[
+        "log",
+        "-1",
+        "--format=%ct",
+        &ours,
+    ]));
+    assert_eq!(in_store(&["log", "-1", "--format=%ct", &one]), later);
 
     manager(&store).merge("one", "main").expect("merge one");
     manager(&store).merge("two", "main").expect("merge two");

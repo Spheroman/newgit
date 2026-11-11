@@ -2529,7 +2529,7 @@ impl BranchManager {
 
     /// Every definition, trackers outside Git included: what names the owner of
     /// a path nothing bound owns.
-    fn all_definitions(&self) -> Vec<TrackerDefinition> {
+    pub fn all_definitions(&self) -> Vec<TrackerDefinition> {
         self.carved_definitions()
             .into_iter()
             .chain(self.trackers.iter().cloned())
@@ -11776,11 +11776,13 @@ impl BranchManager {
     }
 
     /// [`Self::merge_commits`] for a pull: the merge of `ours` with an export
-    /// target's `theirs` is the same commit wherever it is made. Its author
-    /// and committer, and their dates, are those of the parent committed
-    /// last (`theirs` on a tie), and it is never signed, being nobody's own
-    /// work. So two instances pulling the same two tips make one commit, and
-    /// merging both lands one merge, not three.
+    /// target's `theirs` is the same commit wherever it is made. It is
+    /// newgit's, made on nobody's behalf ([`crate::source::NEWGIT_NAME`], as
+    /// an endpoint's `Merge main from github` is), dated as the parent
+    /// committed last (`theirs` on a tie), and never signed. So two
+    /// instances pulling the same two tips make one commit, and merging both
+    /// lands one merge, not three. Unsigned, it is refused by a target that
+    /// requires signed commits (docs/design/trackers.md).
     fn merge_pulled(
         &self,
         ours: &str,
@@ -11788,45 +11790,41 @@ impl BranchManager {
         message: &str,
     ) -> Result<std::result::Result<String, Vec<String>>> {
         let project = self.store.paths().project_root.clone();
-        let committer = |commit: &str| -> Result<(i64, String, String, String)> {
+        let dated = |commit: &str| -> Result<(i64, String)> {
             let line = crate::source::run_git_env(
                 &[
                     "-C",
                     project.as_str(),
                     "log",
                     "-1",
-                    "--format=%ct%x00%cn%x00%ce%x00%cd",
+                    "--format=%ct%x00%cd",
                     "--date=raw",
                     commit,
                 ],
                 &[],
             )?;
-            let mut fields = line.trim().split('\0').map(ToOwned::to_owned);
-            let mut next = || fields.next().unwrap_or_default();
-            let time = next().parse().unwrap_or(0);
-            Ok((time, next(), next(), next()))
+            let (time, date) = line.trim().split_once('\0').unwrap_or_default();
+            Ok((time.parse().unwrap_or(0), date.to_owned()))
         };
-        let ours_by = committer(ours)?;
-        let theirs_by = committer(theirs)?;
-        let (_, name, email, date) = if ours_by.0 > theirs_by.0 {
-            ours_by
+        let ours_at = dated(ours)?;
+        let theirs_at = dated(theirs)?;
+        let (_, date) = if ours_at.0 > theirs_at.0 {
+            ours_at
         } else {
-            theirs_by
+            theirs_at
         };
-        let env: Vec<(String, String)> = [
-            ("GIT_AUTHOR_NAME", name.clone()),
-            ("GIT_AUTHOR_EMAIL", email.clone()),
-            ("GIT_AUTHOR_DATE", date.clone()),
-            ("GIT_COMMITTER_NAME", name),
-            ("GIT_COMMITTER_EMAIL", email),
-            ("GIT_COMMITTER_DATE", date),
-            ("GIT_CONFIG_COUNT", "1".to_owned()),
-            ("GIT_CONFIG_KEY_0", "commit.gpgSign".to_owned()),
-            ("GIT_CONFIG_VALUE_0", "false".to_owned()),
+        let mut env: Vec<(String, String)> = [
+            ("GIT_AUTHOR_NAME", crate::source::NEWGIT_NAME),
+            ("GIT_AUTHOR_EMAIL", crate::source::NEWGIT_EMAIL),
+            ("GIT_AUTHOR_DATE", date.as_str()),
+            ("GIT_COMMITTER_NAME", crate::source::NEWGIT_NAME),
+            ("GIT_COMMITTER_EMAIL", crate::source::NEWGIT_EMAIL),
+            ("GIT_COMMITTER_DATE", date.as_str()),
         ]
         .into_iter()
-        .map(|(key, value)| (key.to_owned(), value))
+        .map(|(key, value)| (key.to_owned(), value.to_owned()))
         .collect();
+        env.extend(crate::source::config_env(&[("commit.gpgSign", "false")]));
         crate::source::merge_commits(&project, ours, theirs, message, &env)
     }
 

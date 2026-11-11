@@ -2712,6 +2712,12 @@ fn tracker(mut command: TrackerCommand) -> Result<()> {
                     *depth -= top;
                 }
             }
+            // Whom each claim of a tracker in Git inside a deeper mount
+            // loses to: it owns nothing there, and the list says so.
+            let every: Vec<TrackerDefinition> = definitions
+                .iter()
+                .map(|definition| (*definition).clone())
+                .collect();
             let rows: Vec<_> = ordered
                 .iter()
                 .map(|(depth, definition)| {
@@ -2743,10 +2749,19 @@ fn tracker(mut command: TrackerCommand) -> Result<()> {
                     } else if definition.paths.is_empty() {
                         pathless_summary(&manager, definition)
                     } else {
+                        let unreached = newgit_core::tracker::unreached_claims(&every, definition);
                         definition
                             .paths
                             .iter()
-                            .map(|path| path.as_str())
+                            .map(
+                                |path| match unreached.iter().find(|(claim, _)| *claim == path) {
+                                    Some((_, mount)) => format!(
+                                        "{path} (inside `{}`'s mount: not this tracker's)",
+                                        newgit_core::tracker::tracker_path(&mount.name)
+                                    ),
+                                    None => path.to_string(),
+                                },
+                            )
                             .collect::<Vec<_>>()
                             .join(", ")
                     };

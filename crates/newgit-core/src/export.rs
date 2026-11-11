@@ -229,6 +229,7 @@ mod tests {
             resources: Vec::new(),
             export: Vec::new(),
             excluded: Vec::new(),
+            ownership: Vec::new(),
             parent: None,
         }
     }

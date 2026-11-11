@@ -143,28 +143,59 @@ is one commit; see *Carving is a commit*.
 
 Every path in a view has at most one owner. Ownership comes from claims,
 never from which tracker currently has the file, and it is the same whichever
-tracker you root at. Split assigns paths by this rule **(decided)**:
+tracker you root at. **(decided; rule 1 as of the #426 review, 2026-11-11)**
 
-1. **The deepest mount wins.** A path under `apps/electron/` is decided among
-   the trackers mounted at `apps/electron` or deeper. A parent's claim of `.`,
-   or of a directory around the mount, does not reach into it. A claim
-   *inside* the mount does (decided 2026-11-11, #426 review): `env` mounted at
-   `.` claiming `apps/electron/.env` owns that file exactly as a definition
-   mounted at `apps/electron` claiming `.env` would, and the longest claim
-   wins as in rule 2. `newgit tracker track` writes the first form, so
-   judging the two differently let a target's commit adding `.env` past the
-   check for files of a tracker outside Git.
-2. **Among trackers mounted at the same path, the longest claim wins.**
-   `local-db` mounted at `.` claiming `.env.db` beats root's `.`. Trackers
-   sharing a mount split by their claims: a tracker mounted beside `access`
-   at `.newgit/trackers` and claiming `web.toml` owns that file; `access`
-   keeps the rest.
-3. **Identical claims at the same mount are an error, except within a role.**
-4. **Claims can exclude**, `.gitignore`-style: `paths = [".", "!.env",
-   "!node_modules/"]`. An excluded path is owned only by a tracker that
-   explicitly claims it at that mount, or filled by a resource. Otherwise it
-   is unowned, which is all "ignored" ever meant, and split refuses a commit
-   that changes it.
+1. **The longest claim that reaches a path owns it.** A claim reaches a path
+   under it unless a tracker mounted deeper holds the path and the claim is
+   `.`, or a directory around that mount, or the claiming tracker is in Git.
+   So only a tracker outside Git reaches into another's mount, with a claim
+   inside it: `paths = ["apps/t3code/.env"]` owns that file just as `mount =
+   "apps/t3code"`, `paths = [".env"]` would.
+2. **A tracker's own `!` exclusions take it out of the running** for what
+   they exclude: `paths = [".", "!.env", "!node_modules/"]`. A path no
+   reaching claim takes is owned by nothing, which is all "ignored" ever
+   meant, and a commit changing it is refused; a resource may fill it.
+3. **Identical claims are an error, except between role alternatives**, of
+   which a workspace binds one.
+
+What follows from rule 1: a path under `apps/electron/` is decided among
+the trackers mounted at `apps/electron` or deeper, and trackers outside Git
+with a claim inside it. Trackers sharing a mount split by their claims:
+`local-db` mounted at `.` claiming `.env.db` beats root's `.`, and a tracker
+mounted beside `access` at `.newgit/trackers` claiming `web.toml` owns that
+file while `access` keeps the rest. A claim of a tracker in Git inside a
+deeper mount owns nothing (`newgit tracker list` says so): `pub`, in Git,
+claiming `apps/t3code/secrets/pub.txt` while `t3code` is mounted at
+`apps/t3code` does not take that file from `t3code`, nor from `sec`, outside
+Git with audience `user`, mounted there claiming `secrets`. A tracker in Git
+that should own something inside another's mount is carved there, as a
+child.
+
+Why trackers in Git and outside it differ. Split puts a tracker in Git's
+files in its own commits by mount: a deeper mount is cut out of the trees of
+the trackers around it. A claim of a tracker in Git reaching into one would
+be a promise split cannot keep: the file would land in the tracker mounted
+there, or in its parent. A tracker outside Git's files are never split: a
+commit adding one is refused, and claiming inside a mount is exactly how
+`newgit tracker track` writes a `.env` (`paths = ["apps/electron/.env"]`).
+Judging that claim by mount (before the #426 review) let a target's commit
+adding the file through the check; letting a claim of a tracker in Git
+reach in too (the first #426 review fix) let a commit move a file of `sec`
+into root's `main`.
+
+**One function decides.** `owners_of` (`crates/newgit-core/src/tracker.rs`)
+is this rule. The commit and push gate, split's check, export, import,
+pull, and the workspace (capture, checkout, clear: what
+`resolve_ownership` settles for each tracker) all ask it. Split assigns a
+path a commit adds to the tracker in Git it names, or refuses the commit
+when it names a tracker outside Git, or nothing; a generated test
+(`tests/ownership_agrees.rs`) holds all three to agreeing. Of role
+alternatives tied on one claim, the gate names one outside Git first, so
+the file is refused whichever one a workspace binds. The server's
+copies (`newgit-serve`'s `policy.rs`, the Worker's `ownerOf`) decide among
+trackers in Git only, for definition files under `.newgit/trackers/`, where
+no tracker outside Git may be mounted: there the deepest mount holding the
+path decides, then the longest claim, which is this rule.
 
 A tracker carved inside another tracker's mount (`apps/electron/native`
 while `electron` is mounted at `apps/electron`) is a child of `electron`
@@ -937,15 +968,25 @@ pull. A child named beside a parent whose target fails is listed as
 skipped with it.
 
 **The merge with a target is the same commit everywhere (decided, #426
-review).** Its author and committer, and their dates, are the parent
-committed last's (the target's tip on a tie), with the same message, and
-it is never signed: it is nobody's own work. Two instances pulling the same
-two diverged tips make one commit, so merging both lands one merge on the
-tracker's `main`, not three. A force-pushed target is merged with the line
-the tracker already has, as `git pull` would: what the force-push removed
-comes back, and the next export pushes it again. To keep it out, revert it
-in an instance and merge that before pulling; nothing resets a tracker's
-branch to a target yet.
+review).** It is newgit's, made on nobody's behalf: author and committer
+`newgit <newgit@localhost>` (the identity of an endpoint's `Merge main from
+github`), not whoever merged the pull request on GitHub, dated as the parent
+committed last (the target's tip on a tie), with the same message, and never
+signed. Two instances pulling the same two diverged tips make one commit,
+so merging both lands one merge on the tracker's `main`, not three.
+Unsigned, it is rejected by an export target that requires signed commits:
+an export carrying it fails there
+([#443](https://github.com/Spheroman/newgit/issues/443)).
+
+A force-pushed target is merged with the line the tracker already has, as
+`git pull` would: the commits the force-push removed stay in the tracker's
+history, and the next export pushes them to the target again. Reverting the
+change in an instance and merging it keeps it out of the tip only: the
+removed commits are still in the history, and the next export still
+publishes them. When the force-push was to purge a secret, that publishes
+it again, and nothing in newgit can purge it yet
+([#442](https://github.com/Spheroman/newgit/issues/442): a way to reset a
+tracker's line to its target). Until then, do not export that tracker.
 
 Five kinds of tracker stay put, and it says which: a pin holding commits
 its `follow` ref lacks (the instance's own work on it; moving the pin would
@@ -1135,7 +1176,7 @@ audience, maintainers) is then just who may change the tracker that owns its
 definition file. That is `access` — which `newgit init` creates with
 `maintainers = "owner"`, mounted at `.newgit/trackers` claiming `.` — unless
 a tracker in Git mounted beside it at `.newgit/trackers` claims the file
-(ownership rule 2). So governance layers with no special case: project
+(ownership rule 1: trackers sharing a mount split by their claims). So governance layers with no special case: project
 trackers; an admin tracker mounted at `.newgit/trackers` claiming the
 definitions it governs (readable by everyone who uses them, since newgit
 needs their paths, but maintained by admins); and a tracker of yours

@@ -1940,6 +1940,40 @@ impl GitSource {
     }
 }
 
+/// Who a commit newgit makes on nobody's behalf says made it: the merge of
+/// a pull with an export target, or an endpoint's `Merge main from github`.
+pub const NEWGIT_NAME: &str = "newgit";
+pub const NEWGIT_EMAIL: &str = "newgit@localhost";
+
+/// Environment setting Git `config` for one command, after whatever
+/// `GIT_CONFIG_COUNT` entries the caller's environment already sets, so
+/// those still apply.
+pub fn config_env(config: &[(&str, &str)]) -> Vec<(String, String)> {
+    config_env_after(std::env::var("GIT_CONFIG_COUNT").ok().as_deref(), config)
+}
+
+/// [`config_env`] after `count`, the caller's `GIT_CONFIG_COUNT`.
+fn config_env_after(count: Option<&str>, config: &[(&str, &str)]) -> Vec<(String, String)> {
+    let first: usize = count
+        .and_then(|count| count.trim().parse().ok())
+        .unwrap_or(0);
+    let mut env = vec![(
+        "GIT_CONFIG_COUNT".to_owned(),
+        (first + config.len()).to_string(),
+    )];
+    for (index, (key, value)) in config.iter().enumerate() {
+        env.push((
+            format!("GIT_CONFIG_KEY_{}", first + index),
+            (*key).to_owned(),
+        ));
+        env.push((
+            format!("GIT_CONFIG_VALUE_{}", first + index),
+            (*value).to_owned(),
+        ));
+    }
+    env
+}
+
 /// Git config for one command, carrying an `Authorization` header. Passed in
 /// the environment rather than as `-c` so the password never appears in the
 /// process list; the credential helper is cleared so nothing caches it.
@@ -1947,16 +1981,7 @@ pub fn auth_env(auth: Option<&str>) -> Vec<(String, String)> {
     let Some(header) = auth else {
         return Vec::new();
     };
-    vec![
-        ("GIT_CONFIG_COUNT".to_owned(), "2".to_owned()),
-        ("GIT_CONFIG_KEY_0".to_owned(), "http.extraHeader".to_owned()),
-        ("GIT_CONFIG_VALUE_0".to_owned(), header.to_owned()),
-        (
-            "GIT_CONFIG_KEY_1".to_owned(),
-            "credential.helper".to_owned(),
-        ),
-        ("GIT_CONFIG_VALUE_1".to_owned(), String::new()),
-    ]
+    config_env(&[("http.extraHeader", header), ("credential.helper", "")])
 }
 
 fn run_git(args: &[&str]) -> Result<String> {
@@ -2340,6 +2365,37 @@ fn spawn_error(args: &[&str], source: &std::io::Error) -> NewgitError {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn config_env_extends_the_callers_git_config_count() {
+        let pairs = |env: Vec<(String, String)>| {
+            env.into_iter()
+                .map(|(key, value)| format!("{key}={value}"))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            pairs(super::config_env_after(
+                None,
+                &[("commit.gpgSign", "false")]
+            )),
+            [
+                "GIT_CONFIG_COUNT=1",
+                "GIT_CONFIG_KEY_0=commit.gpgSign",
+                "GIT_CONFIG_VALUE_0=false"
+            ]
+        );
+        assert_eq!(
+            pairs(super::config_env_after(
+                Some("2"),
+                &[("commit.gpgSign", "false")]
+            )),
+            [
+                "GIT_CONFIG_COUNT=3",
+                "GIT_CONFIG_KEY_2=commit.gpgSign",
+                "GIT_CONFIG_VALUE_2=false"
+            ]
+        );
+    }
+
     use super::RefUpdate;
 
     fn git_failed(stderr: &str) -> crate::NewgitError {

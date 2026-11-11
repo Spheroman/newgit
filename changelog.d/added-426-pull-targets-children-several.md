@@ -18,8 +18,9 @@
     a workspace); naming an instance where a tracker goes says so and gives
     the `--instance` form. A named tracker that stays exits non-zero.
   - Two instances pulling the same two diverged tips make the same merge
-    commit (author, committer, and dates from its parents), so merging both
-    lands one merge, not three.
+    commit (newgit's identity, dates from its parents), so merging both
+    lands one merge, not three. It is unsigned, so a target requiring
+    signed commits rejects an export carrying it (#443).
   - `newgit pull <tracker>` writes `Update trackers: <tracker> (N
     commits)`, like plain `newgit pull`, and no longer moves a pin holding
     the instance's own commits back to its `follow` ref: that pin stays

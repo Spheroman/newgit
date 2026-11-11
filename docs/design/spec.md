@@ -243,8 +243,14 @@ The full model is in [`trackers.md`](trackers.md). The short version:
 
 - **Every path has at most one owner.** A tracker is *mounted* at a path
   inside its parent, and claims paths relative to its mount (`!` excludes).
-  The deepest mount wins (a claim inside a deeper mount still reaches it),
-  then the longest claim. `root` owns `.`,
+  The longest claim that reaches a path owns it. A claim reaches a path
+  under it unless a tracker mounted deeper holds the path and the claim is
+  `.`, or a directory around that mount, or the claiming tracker is in Git.
+  So only a tracker outside Git reaches into another's mount, with a claim
+  inside it: `paths = ["apps/t3code/.env"]` owns that file just as `mount =
+  "apps/t3code"`, `paths = [".env"]` would. A tracker's own `!`
+  exclusions take it out of the running; identical claims are an error,
+  except between role alternatives. `root` owns `.`,
   everything nothing else claims, `.newgit/` included. `access` is mounted
   at `.newgit/trackers/` and holds every tracker's definition, which decides
   who may read what; by default only the project's owner may change it

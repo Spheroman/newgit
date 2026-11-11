@@ -15,6 +15,16 @@ project, `repos` from inside `apps/t3code`, `..` to go up, and a leading `/` for
 the full path, such as `/remote/<owner>/<project>/t3code/repos`. Without `--git` a tracker stays outside Git: captured, never
 committed.
 
+Who owns a path: the longest claim that reaches a path owns it. A claim reaches a path
+under it unless a tracker mounted deeper holds the path and the claim is
+`.`, or a directory around that mount, or the claiming tracker is in Git.
+So only a tracker outside Git reaches into another's mount, with a claim
+inside it: `paths = ["apps/t3code/.env"]` owns that file just as `mount =
+"apps/t3code"`, `paths = [".env"]` would. A tracker's own `!`
+exclusions take it out of the running, and a path no reaching claim takes
+is owned by nothing. A tracker in Git that should own something inside
+another's mount is carved there, as its child.
+
 A tracker outside Git that syncs (`--storage remote`) and is not `public` is
 encrypted to its audience before anything leaves your machine: each file with
 [age](https://age-encryption.org), to the SSH keys GitHub publishes for each

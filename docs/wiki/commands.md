@@ -128,15 +128,20 @@ Remote:
   tracker pull`). A named tracker that stays exits non-zero. Every argument
   is a tracker: `--instance` names another instance. Spawn says when a
   tracker is behind. Two instances pulling the same two diverged tips make
-  the same merge commit, so merging both lands one merge
+  the same merge commit (newgit's, dated from its parents), so merging both
+  lands one merge. It is unsigned, so a target that requires signed commits
+  rejects an export carrying it
+  ([#443](https://github.com/Spheroman/newgit/issues/443))
 - `newgit pull --remote <target>` — bring back what was merged on an export
   target (a pull request on GitHub); `newgit merge main` publishes it. A
   force-pushed target is merged with the line the tracker already has, as
-  `git pull` would: commits the force-push removed come back, and the next
-  export pushes them to the target again. When the force-push was to remove
-  something, take it out of the tracker here before you pull: revert it in
-  an instance and `newgit merge` that, so the merge keeps it out (newgit
-  has no command yet that resets a tracker's branch to a target)
+  `git pull` would: the commits the force-push removed stay in the
+  tracker's history, and the next export pushes them to the target again.
+  Reverting the change in an instance keeps it out of the tip only: the
+  next export still publishes those commits, so a secret the force-push
+  purged is published again. Nothing in newgit can purge it yet
+  ([#442](https://github.com/Spheroman/newgit/issues/442)); until then,
+  do not export that tracker
 - `newgit tracker allow-plaintext <path>...` — release workspace paths this
   machine has held encrypted content at, so whatever tracker claims them now
   (a `public` one, or one in Git) may capture, commit, and send them
