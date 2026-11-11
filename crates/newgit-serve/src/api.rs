@@ -1361,22 +1361,61 @@ fn credentials(
 }
 
 /// Where a repo authorized is: there, or to be made there by its first
-/// write, which lands (its row is the log's) once the db lock is let go of.
+/// write once the db lock is let go of.
 pub enum Authorized {
     Here(Repo),
-    Make(Repo, Landing),
+    /// Made by its first write: by its landing (a tracker's repo, whose row
+    /// is the log's), or with none for one user's own repo; and a fork
+    /// started at its upstream's as it is made ([`ForkStart`]).
+    Make {
+        repo: Repo,
+        landing: Option<Landing>,
+        fork: Option<Box<ForkStart>>,
+    },
 }
 
 impl Authorized {
-    /// Where it is, made if it is to be: landed with the db lock let go of
-    /// (`db` is taken, and handed back).
+    /// Where it is, made if it is to be, with the db lock let go of (`db`
+    /// is taken, and handed back): a fork's commits copied into a narrower
+    /// store first, then its starting refs and its record moved by the
+    /// landing that makes it, so it exists whole or not at all.
     pub fn made<'a>(self, app: &'a App, db: DbGuard<'a>) -> ApiResult<(Repo, DbGuard<'a>)> {
         match self {
             Self::Here(repo) => Ok((repo, db)),
-            Self::Make(repo, landing) => {
+            Self::Make {
+                repo,
+                landing,
+                fork,
+            } => {
                 drop(db);
                 repo.create()?;
-                app.log.land(app, landing)?;
+                let starts = match &fork {
+                    Some(fork) => fork.place(&repo)?,
+                    None => Vec::new(),
+                };
+                match (landing, &fork) {
+                    (Some(mut landing), fork) => {
+                        if let Some(fork) = fork {
+                            landing
+                                .asked
+                                .extend(starts.into_iter().map(|(reference, commit)| {
+                                    landing::Asked {
+                                        home: fork.home.clone(),
+                                        tracker: fork.tracker.clone(),
+                                        reference,
+                                        old: None,
+                                        new: commit,
+                                    }
+                                }));
+                        }
+                        app.log.land(app, landing)?;
+                    }
+                    (None, Some(_)) => {
+                        repo.start_refs(&starts)?;
+                        app.trackers_moved();
+                    }
+                    (None, None) => {}
+                }
                 Ok((repo, app.db.lock()))
             }
         }
@@ -1412,8 +1451,15 @@ pub fn authorize(
             ),
         );
     };
-    policy::decide(repo, write, &who, Some(&facts), &context)
-        .map_err(|why| HttpError::new(403, why))?;
+    policy::decide(repo, write, &who, Some(&facts), &context).map_err(|why| {
+        HttpError::new(
+            403,
+            match &facts.capped {
+                Some(capped) => format!("{why} ({capped})"),
+                None => why,
+            },
+        )
+    })?;
     let name = repo.name();
     if let RepoRef::Fork {
         instance, tracker, ..
@@ -1424,49 +1470,184 @@ pub fn authorize(
     }
     // Never served from a store its readers are not exactly the audience of.
     let location = project.served(db, repo, Some(&facts), private)?;
-    if matches!(repo, RepoRef::Fork { .. }) || location.exists() {
+    let RepoRef::Tracker { tracker, login, .. } = repo else {
+        return Ok(Authorized::Here(location));
+    };
+    let fork = !facts.git && write && facts.from.is_some();
+    if location.exists() {
+        // One user's own fork, made and never started (stopped before its
+        // refs moved): started now. A tracker's is made by its landing, refs
+        // and record with it, so it never is.
+        if fork
+            && login.is_some()
+            && location.recorded_from().is_none()
+            && location.list_refs("refs/heads/")?.is_empty()
+        {
+            return Ok(Authorized::Make {
+                fork: fork_start(project, db, &who, &facts, tracker, login.as_deref())?
+                    .map(Box::new),
+                repo: location,
+                landing: None,
+            });
+        }
         return Ok(Authorized::Here(location));
     }
-    match repo {
-        // A tracker outside Git gets its repo on its first write.
-        RepoRef::Tracker {
-            tracker,
-            login: None,
-            ..
-        } if !facts.git && write => {
-            let made = Repo::tracker(
-                &project.home(),
-                Some(Store::for_tracker(Some(&facts), tracker)),
-                tracker,
-            );
-            let step = Move {
-                from: None,
-                to: made.store.name(),
-            };
-            let landing = Landing {
-                entry: Entry {
-                    by: caller.login.clone(),
-                    homes: [(
-                        project.key.clone(),
-                        Change {
-                            incarnation: project.info.incarnation.clone(),
-                            stores: [(tracker.clone(), step)].into(),
-                            ..Change::default()
-                        },
-                    )]
-                    .into(),
-                    ..Entry::default()
-                },
-                ..Landing::default()
-            };
-            Ok(Authorized::Make(made, landing))
-        }
-        RepoRef::Tracker { login: Some(_), .. } if !facts.git && write => {
-            location.create()?;
-            Ok(Authorized::Here(location))
-        }
-        _ => fail(404, format!("{name} does not exist yet")),
+    if facts.git || !write {
+        return fail(404, format!("{name} does not exist yet"));
     }
+    // A tracker outside Git gets its repo on its first write. A fork's is
+    // checked before anything is made or copied, and starts at its
+    // upstream's before anyone may push to it.
+    let fork = if fork {
+        fork_start(project, db, &who, &facts, tracker, login.as_deref())?.map(Box::new)
+    } else {
+        None
+    };
+    if login.is_some() {
+        if fork.is_none() {
+            location.create()?;
+            return Ok(Authorized::Here(location));
+        }
+        return Ok(Authorized::Make {
+            repo: location,
+            landing: None,
+            fork,
+        });
+    }
+    let made = Repo::tracker(
+        &project.home(),
+        Some(Store::for_tracker(Some(&facts), tracker)),
+        tracker,
+    );
+    let step = Move {
+        from: None,
+        to: made.store.name(),
+    };
+    let landing = Landing {
+        entry: Entry {
+            by: caller.login.clone(),
+            homes: [(
+                project.key.clone(),
+                Change {
+                    incarnation: project.info.incarnation.clone(),
+                    stores: [(tracker.clone(), step)].into(),
+                    ..Change::default()
+                },
+            )]
+            .into(),
+            ..Entry::default()
+        },
+        ..Landing::default()
+    };
+    Ok(Authorized::Make {
+        repo: made,
+        landing: Some(landing),
+        fork,
+    })
+}
+
+/// What a fork's repo starts with, read under the db lock and put in place
+/// once it is let go of ([`Authorized::made`]).
+pub struct ForkStart {
+    home: String,
+    tracker: String,
+    upstream: String,
+    /// The upstream's repo, when there is anything to start from.
+    source: Option<Repo>,
+    /// Each ref it starts with, as its readers name it, at its upstream's
+    /// commit: the upstream's branches, and its pin as the fork's.
+    refs: Vec<(String, String)>,
+}
+
+impl ForkStart {
+    /// Put what the fork starts with into `fork`'s store, before anything
+    /// says it is there: the upstream's commits (in its own store already
+    /// when the two are one: same audience, refs alone, nothing copied; or
+    /// else fetched into the narrower one, which takes only what those refs
+    /// reach, all of it readable there already), and the record of what it
+    /// was made from ([`repos::FORK_RECORD`]). Returns every ref to move.
+    fn place(&self, fork: &Repo) -> ApiResult<Vec<(String, String)>> {
+        if let Some(source) = &self.source
+            && source.dir() != fork.dir()
+        {
+            let commits: Vec<String> = self.refs.iter().map(|(_, commit)| commit.clone()).collect();
+            fork.fetch_commits(&source.dir(), &commits)?;
+        }
+        let mut refs = self.refs.clone();
+        refs.push((
+            format!("{}{}", repos::FORK_RECORD, self.upstream),
+            fork.record_commit(&self.upstream)?,
+        ));
+        Ok(refs)
+    }
+}
+
+/// What fork `tracker` (its definition's `facts`) starts with: its
+/// upstream's (`from`) branches, for a per-user upstream the caller's own,
+/// or nothing to start from (an upstream in Git, linked, or not made yet)
+/// but its record. Its definition was held to its upstream's audience when
+/// it was read ([`policy`]'s `cap_forks`), so it is made in the upstream's
+/// store or a narrower one. Refused before anything is made or copied when
+/// the fork's audience isn't within its upstream's, or when the caller may
+/// not read the upstream: starting the fork would hand them what they can't
+/// read. `None` for a tracker that is not a fork.
+fn fork_start(
+    project: &ProjectContext<'_>,
+    db: &Connection,
+    who: &policy::Requester,
+    facts: &Facts,
+    tracker: &str,
+    login: Option<&str>,
+) -> ApiResult<Option<ForkStart>> {
+    let Some(upstream) = &facts.from else {
+        return Ok(None);
+    };
+    let Some(upstream_facts) = project.facts(db, upstream)? else {
+        return fail(
+            404,
+            format!("`{upstream}`, which this tracker is a fork of (`from`), is not defined"),
+        );
+    };
+    policy::may_start_fork(&project.id, upstream, facts, &upstream_facts, who)
+        .map_err(|why| HttpError::new(403, why))?;
+    let mut start = ForkStart {
+        home: project.key.clone(),
+        tracker: tracker.to_owned(),
+        upstream: upstream.clone(),
+        source: None,
+        refs: Vec::new(),
+    };
+    if upstream_facts.git || project.links.contains_key(upstream) {
+        return Ok(Some(start));
+    }
+    // A per-user upstream is each user's own: the caller's starts their fork.
+    let source_login = match (&upstream_facts.audience, login) {
+        (policy::Audience::User, Some(login)) => Some(login.to_owned()),
+        (policy::Audience::User, None) => return Ok(Some(start)),
+        _ => None,
+    };
+    let source = RepoRef::Tracker {
+        project: project.id.clone(),
+        tracker: upstream.clone(),
+        login: source_login,
+    };
+    let source = project.served(db, &source, Some(&upstream_facts), false)?;
+    if !source.exists() {
+        return Ok(Some(start));
+    }
+    start.refs = source.list_refs("refs/heads/")?;
+    let pin = format!("refs/trackers/{upstream}/main");
+    if let Some((_, commit)) = source
+        .list_refs(&pin)?
+        .into_iter()
+        .find(|(reference, _)| *reference == pin)
+    {
+        start
+            .refs
+            .push((format!("refs/trackers/{tracker}/main"), commit));
+    }
+    start.source = Some(source);
+    Ok(Some(start))
 }
 
 fn credential(

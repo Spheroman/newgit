@@ -910,6 +910,7 @@ pub fn view_definitions(repo: &Utf8Path, root: &str, tree: &str) -> Result<Vec<T
         audience: &audience,
         newgit_made: None,
         need_history: &|_| Ok(()),
+        forks_before: &[],
     };
     Splitter::new(Objects::open(repo)?, &options).flattened(tree, Utf8Path::new("."))
 }
@@ -1069,6 +1070,9 @@ pub enum Refusal {
         /// Each tracker carrying it, with its audience.
         trackers: Vec<(String, String)>,
     },
+    /// The definitions it leaves would make a fork readable by someone its
+    /// upstream is not, or name an upstream that is not defined.
+    Fork { commit: String, reason: String },
 }
 
 impl std::fmt::Display for Refusal {
@@ -1125,6 +1129,12 @@ impl std::fmt::Display for Refusal {
                     short(commit)
                 )
             }
+            Refusal::Fork { commit, reason } => write!(
+                f,
+                "commit {} changes tracker definitions, and then {reason}. Fix the definition \
+                 in that commit and try again",
+                short(commit)
+            ),
         }
     }
 }
@@ -1176,6 +1186,10 @@ pub struct SplitOptions<'a> {
     /// Called before a question about a tracker's ancestry: its history
     /// must be here for the answer to mean anything.
     pub need_history: &'a dyn Fn(&str) -> Result<()>,
+    /// Fork relations known from before what is split (this machine's
+    /// records of what each fork started at): a commit that drops or changes
+    /// `from` is held to them as to its parents' (`fork_problems`).
+    pub forks_before: &'a [crate::tracker::EarlierFork],
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1203,6 +1217,10 @@ struct Splitter<'a> {
     made: Vec<(String, String)>,
     noted: Vec<(String, String)>,
     sign: HashMap<Vec<u8>, bool>,
+    /// View commit → every fork relation it or a commit behind it states,
+    /// as far back as this split (or the first commit before it) reaches:
+    /// a fork stays held to an upstream after a commit drops `from`.
+    forks: HashMap<String, Vec<crate::tracker::EarlierFork>>,
 }
 
 /// One tracker's part of a view commit, split.
@@ -1277,6 +1295,7 @@ impl<'a> Splitter<'a> {
             made: Vec::new(),
             noted: Vec::new(),
             sign: HashMap::new(),
+            forks: HashMap::new(),
         }
     }
 
@@ -1421,7 +1440,18 @@ impl<'a> Splitter<'a> {
             }
         }
         let definitions = self.flattened(&commit.tree, Utf8Path::new("."))?;
-        self.refuse(&commit, &definitions)?;
+        let mut earlier = self.options.forks_before.to_vec();
+        for parent in &commit.parents {
+            earlier.extend(self.forks_at(parent)?);
+        }
+        earlier.sort();
+        earlier.dedup();
+        self.refuse(&commit, &definitions, &earlier)?;
+        let mut forks = earlier;
+        forks.extend(crate::tracker::forks_in(&definitions));
+        forks.sort();
+        forks.dedup();
+        self.forks.insert(view.to_owned(), forks);
 
         let mut made_here: Vec<(String, String)> = Vec::new();
         let root = self.options.root.to_owned();
@@ -1501,10 +1531,16 @@ impl<'a> Splitter<'a> {
         &mut self,
         commit: &Commit,
         definitions: &[TrackerDefinition],
+        earlier: &[crate::tracker::EarlierFork],
     ) -> std::result::Result<(), SplitError> {
         let mut changed: Option<BTreeSet<String>> = None;
+        // What differs from any parent: a merge's result can break a fork
+        // that neither side broke alone (one adds it, the other narrows its
+        // upstream), so its definitions are checked whole.
+        let mut changed_any: BTreeSet<String> = BTreeSet::new();
         if commit.parents.is_empty() {
             changed = Some(self.objects.files(&commit.tree)?.into_keys().collect());
+            changed_any.extend(changed.iter().flatten().cloned());
         }
         for parent in &commit.parents {
             let parent_tree = self.objects.commit(parent)?.tree;
@@ -1513,12 +1549,33 @@ impl<'a> Splitter<'a> {
                 .changed_paths(Some(&parent_tree), Some(&commit.tree))?
                 .into_iter()
                 .collect();
+            changed_any.extend(paths.iter().cloned());
             changed = Some(match changed {
                 None => paths,
                 Some(before) => before.intersection(&paths).cloned().collect(),
             });
         }
         let changed = changed.unwrap_or_default();
+        // A definition change that widens a fork past its upstream, or drops
+        // or changes `from` to get past it, is refused where it becomes a
+        // commit, as creating a fork that wide is.
+        let defines = changed_any.iter().any(|path| {
+            Utf8Path::new(path)
+                .parent()
+                .is_some_and(|dir| dir.ends_with(DEFINITIONS_DIR))
+        });
+        if defines && let Err(error) = crate::tracker::check_forks(definitions, earlier) {
+            let reason = match error {
+                NewgitError::InvalidDefinition { name, reason, .. } => {
+                    format!("`{}` is refused: {reason}", tracker_path(&name))
+                }
+                other => other.to_string(),
+            };
+            return Err(SplitError::Refused(Refusal::Fork {
+                commit: commit.id.clone(),
+                reason,
+            }));
+        }
         if changed.is_empty() {
             return Ok(());
         }
@@ -1551,6 +1608,19 @@ impl<'a> Splitter<'a> {
             }
         }
         Ok(())
+    }
+
+    /// Every fork relation view commit `view` or a commit behind it states:
+    /// what this split recorded for a commit it split, or else what the
+    /// commit's own definitions say.
+    fn forks_at(&mut self, view: &str) -> Result<Vec<crate::tracker::EarlierFork>> {
+        if let Some(forks) = self.forks.get(view) {
+            return Ok(forks.clone());
+        }
+        let tree = self.objects.commit(view)?.tree;
+        let forks = crate::tracker::forks_in(&self.flattened(&tree, Utf8Path::new("."))?);
+        self.forks.insert(view.to_owned(), forks.clone());
+        Ok(forks)
     }
 
     /// Every definition in the view `tree` (the root's), with each mounted
