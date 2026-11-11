@@ -234,7 +234,7 @@ impl Objects {
     /// An object's type and body, or `None` when the repository lacks it.
     fn read_raw(&mut self, id: &str) -> Result<Option<(String, Vec<u8>)>> {
         if self.batch.is_none() {
-            let mut child = Command::new("git")
+            let mut child = crate::git::command()
                 .arg("-C")
                 .arg(self.repo.as_str())
                 .args(["cat-file", "--batch"])
@@ -651,15 +651,18 @@ impl Objects {
                 paths.push_str(&format!("{}\n", path.display()));
             }
             let out = run(
-                Command::new("git").arg("-C").arg(self.repo.as_str()).args([
-                    "hash-object",
-                    "--literally",
-                    "-t",
-                    kind,
-                    "-w",
-                    "--no-filters",
-                    "--stdin-paths",
-                ]),
+                crate::git::command()
+                    .arg("-C")
+                    .arg(self.repo.as_str())
+                    .args([
+                        "hash-object",
+                        "--literally",
+                        "-t",
+                        kind,
+                        "-w",
+                        "--no-filters",
+                        "--stdin-paths",
+                    ]),
                 "git hash-object",
                 Some(paths.as_bytes()),
             )?;
@@ -710,7 +713,10 @@ pub fn join_path(prefix: &[u8], name: &[u8]) -> Vec<u8> {
 
 fn git_output(repo: &Utf8Path, args: &[&str]) -> Result<String> {
     let out = run(
-        Command::new("git").arg("-C").arg(repo.as_str()).args(args),
+        crate::git::command()
+            .arg("-C")
+            .arg(repo.as_str())
+            .args(args),
         &format!("git {}", args.join(" ")),
         None,
     )?;

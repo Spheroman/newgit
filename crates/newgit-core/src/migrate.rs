@@ -467,7 +467,7 @@ impl BranchManager {
             stdin.push_str(&format!("update refs/newgit/migrate/{name} {commit}\n"));
         }
         crate::objects::run(
-            std::process::Command::new("git")
+            crate::git::command()
                 .arg("-C")
                 .arg(project.as_str())
                 .args(["update-ref", "--stdin"]),
@@ -603,7 +603,7 @@ impl BranchManager {
             transaction.push_str(&format!("delete {name} {commit}\n"));
         }
         crate::objects::run(
-            std::process::Command::new("git")
+            crate::git::command()
                 .arg(&store_dir)
                 .args(["update-ref", "--stdin"]),
             "git update-ref --stdin (tracker store)",
@@ -681,7 +681,7 @@ impl BranchManager {
             stdin.push_str(&format!("update {SAVED}/index/{tracker} {commit}\n"));
         }
         crate::objects::run(
-            std::process::Command::new("git")
+            crate::git::command()
                 .arg("-C")
                 .arg(project.as_str())
                 .args(["update-ref", "--stdin"]),
@@ -870,7 +870,7 @@ impl BranchManager {
                 ));
             }
             crate::objects::run(
-                std::process::Command::new("git")
+                crate::git::command()
                     .arg("-C")
                     .arg(project.as_str())
                     .args(["update-ref", "--stdin"]),
@@ -1256,7 +1256,7 @@ fn old_notes(project: &Utf8Path) -> Result<Vec<(String, BTreeMap<String, String>
     }
     let input: String = pairs.iter().map(|(blob, _)| format!("{blob}\n")).collect();
     let out = crate::objects::run(
-        std::process::Command::new("git")
+        crate::git::command()
             .arg("-C")
             .arg(project.as_str())
             .args(["cat-file", "--batch"]),
@@ -1291,7 +1291,7 @@ fn old_notes(project: &Utf8Path) -> Result<Vec<(String, BTreeMap<String, String>
 
 fn write_blob(repo: &Utf8Path, text: &str) -> Result<String> {
     let out = crate::objects::run(
-        std::process::Command::new("git")
+        crate::git::command()
             .arg("-C")
             .arg(repo.as_str())
             .args(["hash-object", "-w", "--stdin"]),
@@ -1318,7 +1318,7 @@ fn delete_refs_with(location: &[&str], prefix: &str) -> Result<()> {
         return Ok(());
     }
     let listing = format!("{}\n", listing.trim_end());
-    let mut command = std::process::Command::new("git");
+    let mut command = crate::git::command();
     command.args(location).args(["update-ref", "--stdin"]);
     crate::objects::run(
         &mut command,

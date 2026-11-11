@@ -7,7 +7,7 @@ use super::write_notes;
 use camino::Utf8PathBuf;
 
 fn git(dir: &Utf8PathBuf, args: &[&str]) -> String {
-    let output = std::process::Command::new("git")
+    let output = crate::git::command()
         .arg("-C")
         .arg(dir.as_str())
         .args(args)

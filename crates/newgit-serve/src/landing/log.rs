@@ -3,7 +3,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io::Write as _;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::sync::atomic::AtomicU64;
 use std::sync::{Condvar, Mutex};
 
@@ -21,7 +21,7 @@ use super::{Log, anyhow_of};
 pub(super) const COMMITTER: &str = "newgit serve <serve@newgit.invalid>";
 
 pub(super) fn init_log(dir: &Utf8Path) -> anyhow::Result<()> {
-    let output = Command::new("git")
+    let output = newgit_core::git::command()
         .args([
             "init",
             "-q",

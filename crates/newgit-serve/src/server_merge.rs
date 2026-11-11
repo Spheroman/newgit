@@ -37,7 +37,6 @@
 //!   commits.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::process::Command;
 
 use camino::{Utf8Path, Utf8PathBuf};
 use newgit_core::compose::{self, NOTES_REF, SplitError, SplitOptions};
@@ -123,7 +122,7 @@ impl Scratch {
         let dir = scratch_dir(&home).join(format!("{}.git", crate::tokens::random_hex(12)));
         std::fs::create_dir_all(scratch_dir(&home))?;
         let scratch = Self { dir };
-        let output = Command::new("git")
+        let output = newgit_core::git::command()
             .args(["init", "-q", "--bare"])
             .arg(scratch.dir.as_str())
             .output()?;

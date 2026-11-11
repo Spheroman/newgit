@@ -2219,7 +2219,7 @@ impl BranchManager {
         let committer = ident("GIT_COMMITTER_IDENT")?;
         let blob = {
             use std::io::Write as _;
-            let mut child = std::process::Command::new("git")
+            let mut child = crate::git::command()
                 .arg("-C")
                 .arg(root.as_str())
                 .args(["hash-object", "-w", "--stdin"])
@@ -11655,10 +11655,13 @@ impl BranchManager {
                 wants.push_str(&format!("^{have}\n"));
             }
             let pack = crate::objects::run(
-                std::process::Command::new("git")
-                    .arg("-C")
-                    .arg(repo.as_str())
-                    .args(["pack-objects", "--revs", "--thin", "--stdout", "-q"]),
+                crate::git::command().arg("-C").arg(repo.as_str()).args([
+                    "pack-objects",
+                    "--revs",
+                    "--thin",
+                    "--stdout",
+                    "-q",
+                ]),
                 "git pack-objects",
                 Some(wants.as_bytes()),
             )?;
