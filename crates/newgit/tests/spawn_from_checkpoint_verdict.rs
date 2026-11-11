@@ -27,6 +27,7 @@ struct Spawned {
 
 /// `review`, spawned from `feature-a/ckpt_001` without `--json`.
 fn spawn_review(fixture: &Fixture) -> Spawned {
+    only_on_the_remote(fixture, "feature-a");
     let output = fixture.newgit(
         &fixture.store,
         &["spawn", "review", "--from-checkpoint", "feature-a/ckpt_001"],
@@ -207,6 +208,7 @@ command = "{restore}"
         checkpointed(&fixture);
 
         let human = spawn_review(&fixture);
+        only_on_the_remote(&fixture, "feature-a");
         let json = fixture.newgit(
             &fixture.store,
             &[

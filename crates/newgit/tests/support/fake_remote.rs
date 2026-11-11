@@ -1053,3 +1053,10 @@ fn export_to(url: &Utf8Path, name: &str, extra: &str) -> String {
         format!("{{ url = \"{url}\", name = \"{name}\", {extra} }}")
     }
 }
+
+/// Forget `instance`'s checkpoints on this machine, keeping the remote's:
+/// `spawn --from-checkpoint` uses a checkpoint this machine has as it is, so
+/// a test of bringing one in from the remote has to be without it.
+fn only_on_the_remote(fixture: &Fixture, instance: &str) {
+    let _ = std::fs::remove_dir_all(fixture.store.join(".newgit/checkpoints").join(instance));
+}

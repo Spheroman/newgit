@@ -1039,12 +1039,15 @@ reported per resource, and a dependent of a resource that did not start is
 not started against it. Starting is not waiting: the dependent starts once
 its dependency's process exists, not once that process answers (#54).
 
-`spawn --from-checkpoint <instance>/<checkpoint>` brings up someone else's
-checkpoint, from the remote: their source and uncommitted work, the
-trackers you may read (your own copy of per-user ones), and resources
-restored from the checkpoint, such as a database loaded from its dump. It
-is built from parts that already exist: fetch, spawn at the checkpoint's
-head, then undo to the checkpoint. Its `autostart` actions start after the
+`spawn --from-checkpoint <instance>/<checkpoint>` brings up a checkpoint
+as a new instance: its source and uncommitted work, its trackers, and
+resources restored from the checkpoint, such as a database loaded from its
+dump. Like a bare branch name in Git, the name means this machine's first:
+a checkpoint taken here (even of an instance since removed) is used as it
+is, with no remote involved. Only one this machine does not have comes from
+the remote, which gives the trackers you may read and your own copy of
+per-user ones. It is built from parts that already exist: (fetch,) spawn at
+the checkpoint's head, then undo to the checkpoint. Its `autostart` actions start after the
 undo, since the restore stops and restarts processes to match the
 checkpoint. The new instance's workspace comes up on its own branch, made
 at the checkpoint's commit, even when the author's was on another branch

@@ -110,7 +110,8 @@ Remote:
 - `newgit pull --remote <target>` — bring back what was merged on an export
   target (a pull request on GitHub); `newgit merge main` publishes it
 - `newgit members add|remove <github-login>` / `members list [--json]`
-- `newgit spawn <name> --from-checkpoint <instance>/<checkpoint>`
+- `newgit spawn <name> --from-checkpoint <instance>/<checkpoint>` — one
+  taken on this machine is used as it is; any other comes from the remote
 
 Resource templates: `process`, `pnpm`, `install`, `command-snapshot`,
 `command-snapshot-migrations`, `supabase`, `external`. `newgit resource

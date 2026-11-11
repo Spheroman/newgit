@@ -390,6 +390,7 @@ fn a_checkpoint_after_a_merge_spawns_elsewhere() {
     fixture.ok(&fixture.store, &["merge", "feature-a"]);
     // Nothing changed since the merge: the fork has no commit for this one.
     fixture.ok(&workspace, &["checkpoint"]);
+    only_on_the_remote(&fixture, "feature-a");
     let spawned = fixture.ok(
         &fixture.store,
         &["spawn", "review", "--from-checkpoint", "feature-a/ckpt_002"],

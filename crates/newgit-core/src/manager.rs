@@ -288,8 +288,9 @@ pub struct SpawnFromCheckpointOutcome {
     /// after it rather than at the spawn, so the restore does not stop a
     /// process the checkpoint never had running.
     pub started: Vec<StopStartResource>,
-    /// Who took the checkpoint, and the agent that did, if one did.
-    pub author: String,
+    /// Who took the checkpoint, and the agent that did, if one did; `None`
+    /// for a checkpoint taken on this machine, which records neither.
+    pub author: Option<String>,
     pub agent: Option<String>,
     /// Trackers that did not come across, and why; plus the restore's own.
     pub warnings: Vec<String>,
@@ -3508,32 +3509,100 @@ impl BranchManager {
         )
     }
 
-    /// Spawn someone's checkpoint here: a new instance named `name` that comes
-    /// up as the checkpoint was — source (uncommitted work included), tracker
+    /// Spawn a checkpoint here: a new instance named `name` that comes up as
+    /// the checkpoint was — source (uncommitted work included), tracker
     /// content, and resource state such as a database restored from its dump.
     ///
-    /// Trackers resolve for the person spawning, not the author: a per-user
+    /// A checkpoint this machine has (`newgit checkpoints` lists it, even of
+    /// an instance since removed) is spawned from here, as it is, with no
+    /// remote involved. Any other comes from the project's remote, where
+    /// trackers resolve for the person spawning, not the author: a per-user
     /// tracker gets *their own* content, a shared one the checkpoint's exact
     /// rev, and one they may not read nothing — each said in `warnings`.
     ///
-    /// Built from parts that already exist: fetch, `spawn` at the checkpoint's
-    /// head, import the record into the new instance's own history, `undo`
-    /// to it.
+    /// Built from parts that already exist: (fetch,) `spawn` at the
+    /// checkpoint's head, copy the record into the new instance's own
+    /// history, `undo` to it.
     pub fn spawn_from_checkpoint(
         &self,
         name: &str,
         from_instance: &str,
         checkpoint_id: &str,
     ) -> Result<SpawnFromCheckpointOutcome> {
-        let link = self.remote.as_ref().ok_or(NewgitError::NoRemote)?;
         validate_name(name)?;
+        let from_slug = branch_slug(from_instance);
+        let local = CheckpointLog::new(self.store.checkpoint_dir(&from_slug), from_instance);
+        if local
+            .list()?
+            .iter()
+            .any(|record| record.id == checkpoint_id)
+        {
+            return self.spawn_from_local_checkpoint(name, &from_slug, local.load(checkpoint_id)?);
+        }
+        if self.remote.is_none() {
+            return Err(NewgitError::UnknownCheckpoint {
+                instance: from_instance.to_owned(),
+                id: checkpoint_id.to_owned(),
+            });
+        }
+        self.spawn_from_remote_checkpoint(name, &from_slug, checkpoint_id)
+    }
+
+    /// [`Self::spawn_from_checkpoint`] of a checkpoint on this machine: its
+    /// commits are in the store under its own ref, and its tracker revs in
+    /// the lanes, so the record is used as it stands.
+    fn spawn_from_local_checkpoint(
+        &self,
+        name: &str,
+        from_slug: &str,
+        mut record: CheckpointRecord,
+    ) -> Result<SpawnFromCheckpointOutcome> {
+        let _lock = self.lock_instance(&branch_slug(name), name)?;
+        let checkpoint_id = record.id.clone();
+        let tip = self.source.rev_parse(&record.source.store_ref)?;
+        // The tracker branches start where the checkpoint's committed work
+        // split, as they did for the instance that took it.
+        self.prepare_projection()?;
+        let trackers: Vec<(String, String)> = self
+            .split_view(&record.source.head_rev, &record.dropped)?
+            .index
+            .into_iter()
+            .collect();
+        let mut warnings = Vec::new();
+        for state in &mut record.tracker_states {
+            if let Some(rev) = &state.content_rev
+                && self
+                    .trackers
+                    .iter()
+                    .any(|definition| definition.name == state.name)
+                && !self.lane(&state.name).has_rev(rev)
+            {
+                warnings.push(format!(
+                    "tracker `{}`: its rev {rev} is no longer on this machine",
+                    state.name
+                ));
+                state.content_rev = None;
+            }
+        }
+        record.message = Some(format!("spawned from {from_slug}/{checkpoint_id}"));
+        self.finish_spawn_from_checkpoint(name, record, &tip, &trackers, None, None, warnings)
+    }
+
+    /// [`Self::spawn_from_checkpoint`] of a checkpoint on the project's
+    /// remote.
+    fn spawn_from_remote_checkpoint(
+        &self,
+        name: &str,
+        from_slug: &str,
+        checkpoint_id: &str,
+    ) -> Result<SpawnFromCheckpointOutcome> {
+        let link = self.remote.as_ref().ok_or(NewgitError::NoRemote)?;
         // Held across the spawn and the undo that finishes it: nothing else
         // gets to see the instance half-built.
         let _lock = self.lock_instance(&branch_slug(name), name)?;
         let remote = link.connect(Acting::Login)?;
         let project = link.project.clone();
-        let from_slug = branch_slug(from_instance);
-        let found = remote.checkpoint(&project, &from_slug, checkpoint_id)?;
+        let found = remote.checkpoint(&project, from_slug, checkpoint_id)?;
         let mut record: CheckpointRecord =
             serde_json::from_value(found.record.clone()).map_err(|error| NewgitError::Remote {
                 status: 0,
@@ -3547,15 +3616,13 @@ impl BranchManager {
         let imported = self.import_code(
             remote.as_ref(),
             &project,
-            &from_slug,
+            from_slug,
             checkpoint_id,
             &record.code,
             &mut warnings,
         )?;
         record.source.head_rev = imported.head.clone();
         record.source.dirty_rev = (imported.tip != imported.head).then(|| imported.tip.clone());
-        let imported_ref = format!("refs/newgit/imported/{from_slug}/{checkpoint_id}");
-        self.source.update_ref(&imported_ref, &imported.tip)?;
 
         // Trackers, resolved for whoever is spawning.
         let me = remote.me()?.login;
@@ -3583,33 +3650,6 @@ impl BranchManager {
             }
         }
 
-        let spawned = self.spawn_inner(
-            name,
-            Some(&record.source.head_rev),
-            &BindingChoice::default(),
-            false,
-        )?;
-        let mut branch = spawned.branch.clone();
-        // Its tracker branches start where the checkpoint's committed work is.
-        self.land_tracker_branches(
-            imported
-                .trackers
-                .iter()
-                .map(|(tracker, commit)| (tracker.as_str(), commit.as_str())),
-            &format!("instances/{}", branch.slug),
-        )?;
-
-        // The record joins the new instance's own history, rewritten to
-        // point at what is on this machine.
-        let log = self.checkpoint_log(&branch);
-        record.id = log.next_id()?;
-        record.branch = branch.name.clone();
-        // Taken on the new instance's own branch, which `spawn_inner` made at
-        // the checkpoint's head. The branch the author's workspace was on, or
-        // its detached HEAD, is the author's: the undo below would put this
-        // workspace there (#315).
-        record.source.checked_out = Some(branch.source_ref.clone());
-        record.source.detached = false;
         record.message = Some(format!(
             "spawned from {from_slug}/{checkpoint_id} (by {}{})",
             found.created_by,
@@ -3619,11 +3659,6 @@ impl BranchManager {
                 .map(|agent| format!(", agent {agent}"))
                 .unwrap_or_default()
         ));
-        let store_ref = format!("refs/newgit/checkpoints/{}/{}", branch.slug, record.id);
-        self.source
-            .update_ref(&store_ref, &self.source.rev_parse(&imported_ref)?)?;
-        self.source.delete_ref(&imported_ref)?;
-        record.source.store_ref = store_ref;
         for state in &mut record.resource_states {
             // A deposit's recorded path was on the author's machine; it is the
             // same rev's file here, in this machine's lane checkout cache.
@@ -3645,6 +3680,61 @@ impl BranchManager {
                 });
             }
         }
+        self.finish_spawn_from_checkpoint(
+            name,
+            record,
+            &imported.tip,
+            &imported.trackers,
+            Some(found.created_by),
+            found.agent,
+            warnings,
+        )
+    }
+
+    /// What both spawns from a checkpoint end in, once `record` names
+    /// commits and revs that are on this machine: spawn at its head, land
+    /// its tracker branches, copy it into the new instance's history (`tip`
+    /// kept alive by its ref), undo to it, then autostart.
+    #[allow(clippy::too_many_arguments)]
+    fn finish_spawn_from_checkpoint(
+        &self,
+        name: &str,
+        mut record: CheckpointRecord,
+        tip: &str,
+        trackers: &[(String, String)],
+        author: Option<String>,
+        agent: Option<String>,
+        mut warnings: Vec<String>,
+    ) -> Result<SpawnFromCheckpointOutcome> {
+        let spawned = self.spawn_inner(
+            name,
+            Some(&record.source.head_rev),
+            &BindingChoice::default(),
+            false,
+        )?;
+        let mut branch = spawned.branch.clone();
+        // Its tracker branches start where the checkpoint's committed work is.
+        self.land_tracker_branches(
+            trackers
+                .iter()
+                .map(|(tracker, commit)| (tracker.as_str(), commit.as_str())),
+            &format!("instances/{}", branch.slug),
+        )?;
+
+        // The record joins the new instance's own history, rewritten to
+        // point at what is on this machine.
+        let log = self.checkpoint_log(&branch);
+        record.id = log.next_id()?;
+        record.branch = branch.name.clone();
+        // Taken on the new instance's own branch, which `spawn_inner` made at
+        // the checkpoint's head. The branch the author's workspace was on, or
+        // its detached HEAD, is the author's: the undo below would put this
+        // workspace there (#315).
+        record.source.checked_out = Some(branch.source_ref.clone());
+        record.source.detached = false;
+        let store_ref = format!("refs/newgit/checkpoints/{}/{}", branch.slug, record.id);
+        self.source.update_ref(&store_ref, tip)?;
+        record.source.store_ref = store_ref;
         log.save(&record)?;
 
         let undo = self.undo(
@@ -3665,8 +3755,8 @@ impl BranchManager {
             spawned,
             undo,
             started,
-            author: found.created_by,
-            agent: found.agent,
+            author,
+            agent,
             warnings,
         })
     }

@@ -532,9 +532,11 @@ struct SpawnArgs {
     /// Base revision when creating a new source branch (defaults to HEAD)
     #[arg(long, conflicts_with = "from_checkpoint")]
     from: Option<String>,
-    /// Spawn a checkpoint from the project's remote, `<instance>/<checkpoint>`
-    /// (the id `newgit checkpoints` shows where it was made): source, trackers
-    /// you may read, and resource state, with your own per-user tracker content
+    /// Spawn a checkpoint, `<instance>/<checkpoint>` (the id `newgit
+    /// checkpoints` shows where it was made): source, trackers, and resource
+    /// state. One on this machine is used as it is; any other comes from the
+    /// project's remote, with the trackers you may read and your own per-user
+    /// tracker content
     #[arg(long, value_name = "INSTANCE/CHECKPOINT")]
     from_checkpoint: Option<String>,
     /// Bind this tracker (repeatable): over its role's default, or one that
@@ -1189,9 +1191,12 @@ fn spawn_from_checkpoint(
         format!("`{spec}` is not `<instance>/<checkpoint>`, e.g. `fix-login/ckpt_003`")
     })?;
     let outcome = manager.spawn_from_checkpoint(name, instance, checkpoint)?;
-    let by = match &outcome.agent {
-        Some(agent) => format!("{} (agent {agent})", outcome.author),
-        None => outcome.author.clone(),
+    // A checkpoint from the remote says who took it; one from this machine
+    // was taken here.
+    let by = match (&outcome.author, &outcome.agent) {
+        (Some(author), Some(agent)) => format!("taken by {author} (agent {agent})"),
+        (Some(author), None) => format!("taken by {author}"),
+        (None, _) => "taken on this machine".to_owned(),
     };
     if json {
         // Each resource the instance ended up with, as `spawn --json` reports
@@ -1261,13 +1266,10 @@ fn spawn_from_checkpoint(
     // alone reads as a clean spawn, and the lines below only say otherwise
     // if each carries its own verdict.
     if outcome.is_complete() {
-        println!(
-            "Spawned `{}` from {spec}, taken by {by}",
-            outcome.branch.name
-        );
+        println!("Spawned `{}` from {spec}, {by}", outcome.branch.name);
     } else {
         println!(
-            "Spawned `{}` from {spec}, taken by {by} — but {} did not come up (see below)",
+            "Spawned `{}` from {spec}, {by} — but {} did not come up (see below)",
             outcome.branch.name,
             not_ready
                 .iter()

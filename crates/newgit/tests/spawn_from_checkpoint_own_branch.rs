@@ -17,6 +17,7 @@ include!("support/fake_remote.rs");
 /// without moving the workspace off the branch it was made on. Returns
 /// `review`'s workspace.
 fn spawn_review(fixture: &Fixture) -> Utf8PathBuf {
+    only_on_the_remote(fixture, "feature-a");
     let output = fixture.newgit(
         &fixture.store,
         &["spawn", "review", "--from-checkpoint", "feature-a/ckpt_001"],

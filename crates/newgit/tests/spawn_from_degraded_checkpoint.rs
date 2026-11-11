@@ -46,6 +46,7 @@ command = "echo state_ref={{{{state_ref}}}} >> {restored}"
         "{checkpoint}"
     );
 
+    only_on_the_remote(&fixture, "feature-a");
     let output = fixture.newgit(
         &fixture.store,
         &[
