@@ -30,12 +30,16 @@ fn a_store_holds_the_audience_it_was_made_for_and_no_other() {
     // first, and by copying when the audience has one already.
     let site = Repo::new(&home, Store::Tracker("site".into()), "t/site".into());
     site.create().expect("site");
-    let moved = site.move_to(&Store::Public, |_| Ok(())).expect("moved");
+    let copied = site.copy_to(&Store::Public).expect("copied");
+    site.finish_move(&copied).expect("moved");
+    let moved = copied.to;
     assert!(moved.exists() && !site.dir().exists());
     assert_eq!(repos::audience_of(&moved.dir()).as_deref(), Some("public"));
     let lib = Repo::new(&home, Store::Tracker("lib".into()), "t/lib".into());
     lib.create().expect("lib");
-    let moved = lib.move_to(&Store::ProjectDevs, |_| Ok(())).expect("moved");
+    let copied = lib.copy_to(&Store::ProjectDevs).expect("copied");
+    lib.finish_move(&copied).expect("moved");
+    let moved = copied.to;
     assert!(moved.exists() && root.exists() && !lib.dir().exists());
     assert!(!home.join("stores/tracker").exists());
 
