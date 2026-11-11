@@ -62,6 +62,7 @@ impl Remote {
                         Source {
                             url: repo.to_string(),
                             auth: "Authorization: Basic eDpwYXNz".to_owned(),
+                            namespace: None,
                         },
                     )
                 })

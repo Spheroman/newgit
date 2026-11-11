@@ -1,6 +1,6 @@
 # Landing
 
-**Status: decided, not built.** How changes land in a tree of trackers on
+**Status: decided; step 1 of the build order is built.** How changes land in a tree of trackers on
 `newgit serve`. It replaces [anchoring.md](anchoring.md), which describes how
 the Worker on newgit.dev lands merges today and goes when newgit.dev moves to
 `serve`. Settled with Jack on 2026-11-10 after two adversarial reviews and a
@@ -80,7 +80,8 @@ state.
   reveals that a hidden commit exists, and a crafted push can point a ref at
   any object in the store. A check in front of upload-pack can't close all
   three without reimplementing Git's authorization, which would be
-  simulating security. An embargoed branch gets a store of its own.
+  simulating security. An embargoed branch gets a store of its own. Built
+  (#409): [serve.md](serve.md), *The shape* and decision 1.
 - **Mounts** say how a tracker sits in its parent, the same for every tracker:
 
   | Mount | The child's head | The parent records | Example |
@@ -175,8 +176,8 @@ Anchors as a concept, deferred roll-ups, inboxes and outboxes, reservations,
 
 ## Build order on `newgit serve`
 
-1. Pool per audience: trackers as ref namespaces, refs in reftable, one
-   audience per store enforced at creation.
+1. **Done (#409).** Pool per audience: trackers as ref namespaces, refs in
+   reftable, one audience per store enforced at creation.
 2. The landing log and one-transaction landings with group commit; readers
    resolve heads through it; startup repair.
 3. Server-side merge (compose, `merge-tree`, split) in place of "merge

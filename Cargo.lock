@@ -924,6 +924,7 @@ dependencies = [
  "clap",
  "newgit-core",
  "newgit-serve",
+ "rusqlite",
  "serde_json",
 ]
 

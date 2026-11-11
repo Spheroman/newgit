@@ -115,6 +115,7 @@ fn repos(trackers: &BTreeMap<String, (Utf8PathBuf, String)>) -> BTreeMap<String,
                 Source {
                     url: repo.to_string(),
                     auth: "Basic eDpwdw==".to_owned(),
+                    namespace: None,
                 },
             )
         })

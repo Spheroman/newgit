@@ -1,8 +1,8 @@
 //! `newgit serve`: the newgit remote as one binary.
 //!
-//! Git repositories on local disk, served by real Git; project state in one
-//! SQLite database; the checks and composition the Worker sent to a container
-//! run in-process. It answers the same API the Worker on Cloudflare does
+//! Git stores on local disk, one per audience, served by real Git; project
+//! state in one SQLite database; the checks and composition the Worker sent
+//! to a container run in-process. It answers the same API the Worker on Cloudflare does
 //! (`remote/`), so the CLI talks to either (docs/design/serve.md).
 
 pub mod api;
@@ -10,6 +10,7 @@ pub mod db;
 pub mod error;
 pub mod git_http;
 pub mod merge;
+pub mod migrate;
 pub mod names;
 pub mod policy;
 pub mod repos;
@@ -72,6 +73,7 @@ const DEFINITIONS_KEPT: usize = 1024;
 
 impl App {
     pub fn open(config: Config) -> anyhow::Result<Self> {
+        require_git()?;
         std::fs::create_dir_all(&config.data)
             .with_context(|| format!("creating {}", config.data))?;
         let db = db::Db::open(&config.data.join("server.sqlite"))?;
@@ -84,7 +86,7 @@ impl App {
             use std::os::unix::fs::PermissionsExt as _;
             std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755))?;
         }
-        Ok(Self {
+        let app = Self {
             git_slots: Arc::new(tokio::sync::Semaphore::new(config.git_slots.max(1))),
             config,
             db,
@@ -93,14 +95,16 @@ impl App {
             definitions: Mutex::default(),
             generation: std::sync::atomic::AtomicU64::new(0),
             merges: merge::Merges::default(),
-        })
+        };
+        migrate::per_tracker_repos(&app)?;
+        Ok(app)
     }
 
     pub fn hooks_dir(&self) -> Utf8PathBuf {
         self.config.data.join("hooks")
     }
 
-    /// Something moved a tracker repo's own refs (a push to it, a branch made,
+    /// Something moved a tracker's own refs (a push to it, a branch made,
     /// a project made or deleted): every definition read before may be stale.
     /// Definitions are read from trackers' `main`, which moves only through
     /// this server, so this is exact rather than a time to live. Pushes into
@@ -111,7 +115,12 @@ impl App {
     }
 
     /// `project`'s definitions of `names`, read once per generation.
-    pub fn definitions(&self, project: &names::ProjectId, mut names: Vec<String>) -> Definitions {
+    pub fn definitions(
+        &self,
+        db: &rusqlite::Connection,
+        project: &names::ProjectId,
+        mut names: Vec<String>,
+    ) -> Definitions {
         names.sort();
         names.dedup();
         let key = (project.key(), names);
@@ -127,8 +136,12 @@ impl App {
                 return facts.clone();
             }
         }
-        let facts =
-            policy::load_definitions(&self.config.data, project, key.1.iter().map(String::as_str));
+        let facts = policy::load_definitions(
+            &self.config.data,
+            db,
+            project,
+            key.1.iter().map(String::as_str),
+        );
         let mut cache = self
             .definitions
             .lock()
@@ -159,6 +172,38 @@ impl App {
             .map_or_else(|| self.config.listen.to_string(), str::to_owned);
         format!("http://{host}")
     }
+}
+
+/// The oldest Git whose stores serve can make: reftable.
+const GIT_REQUIRED: (u32, u32) = (2, 45);
+
+/// Refuse to start on a Git too old to make a store, saying which was found.
+fn require_git() -> anyhow::Result<()> {
+    let output = std::process::Command::new("git")
+        .arg("--version")
+        .output()
+        .context("running `git --version`: newgit serve needs Git on its PATH")?;
+    let found = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    let (major, minor) = GIT_REQUIRED;
+    match git_version(&found) {
+        Some(version) if version >= GIT_REQUIRED => Ok(()),
+        _ => anyhow::bail!(
+            "newgit serve needs Git {major}.{minor} or newer (its stores keep refs in reftable); found `{found}`"
+        ),
+    }
+}
+
+/// `(major, minor)` of `git --version`'s answer (`git version 2.45.1`,
+/// `git version 2.39.5 (Apple Git-154)`).
+pub fn git_version(answer: &str) -> Option<(u32, u32)> {
+    let version = answer
+        .strip_prefix("git version ")?
+        .split_whitespace()
+        .next()?;
+    let mut parts = version.split('.');
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next()?.parse().ok()?;
+    Some((major, minor))
 }
 
 /// The key tokens are signed with: made once, kept in the data directory.
@@ -289,4 +334,19 @@ fn json_response(status: u16, body: &serde_json::Value) -> Response<Body> {
         HeaderValue::from_static("application/json"),
     );
     response
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn git_versions_are_read() {
+        assert_eq!(super::git_version("git version 2.45.1"), Some((2, 45)));
+        assert_eq!(
+            super::git_version("git version 2.39.5 (Apple Git-154)"),
+            Some((2, 39))
+        );
+        assert_eq!(super::git_version("git version 3.0"), Some((3, 0)));
+        assert_eq!(super::git_version("not git"), None);
+        assert!(super::git_version("git version 2.9.0") < Some(super::GIT_REQUIRED));
+    }
 }
