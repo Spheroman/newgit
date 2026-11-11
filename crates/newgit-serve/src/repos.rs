@@ -151,18 +151,28 @@ pub fn audience_of(dir: &Utf8Path) -> Option<String> {
         .then(|| String::from_utf8_lossy(&output.stdout).trim().to_owned())
 }
 
+/// Whether `store` may be made, or is, at `dir`: nothing there yet, or a
+/// store made for that same audience.
+pub fn check_store(dir: &Utf8Path, store: &Store) -> ApiResult<()> {
+    let name = store.name();
+    if !store_exists(dir) {
+        return Ok(());
+    }
+    match audience_of(dir) {
+        Some(made_for) if made_for == name => Ok(()),
+        made_for => Err(HttpError::internal(format!(
+            "{dir} was made for {}, so it never holds {name}'s",
+            made_for.as_deref().unwrap_or("no audience")
+        ))),
+    }
+}
+
 /// Make the store `store` at `dir`, refs in reftable. One that exists already
 /// must have been made for the same audience: a store never takes a second.
 pub fn create_store(dir: &Utf8Path, store: &Store) -> ApiResult<()> {
     let name = store.name();
     if store_exists(dir) {
-        return match audience_of(dir) {
-            Some(made_for) if made_for == name => Ok(()),
-            made_for => Err(HttpError::internal(format!(
-                "{dir} was made for {}, so it never holds {name}'s",
-                made_for.as_deref().unwrap_or("no audience")
-            ))),
-        };
+        return check_store(dir, store);
     }
     if let Some(parent) = dir.parent() {
         std::fs::create_dir_all(parent)?;
@@ -299,21 +309,12 @@ impl Repo {
     /// Whether the store holds `commit`. The store, not the namespace: what
     /// its audience may read, which is all that matters here.
     pub fn has_commit(&self, commit: &str) -> bool {
-        store_exists(&self.dir())
-            && git(
-                &self.dir(),
-                &["cat-file", "-e", &format!("{commit}^{{commit}}")],
-            )
-            .is_ok_and(|output| output.status.success())
+        has_commit(&self.dir(), commit)
     }
 
     /// Whether `ancestor` is `descendant` or behind it.
     pub fn is_ancestor(&self, ancestor: &str, descendant: &str) -> bool {
-        git(
-            &self.dir(),
-            &["merge-base", "--is-ancestor", ancestor, descendant],
-        )
-        .is_ok_and(|output| output.status.success())
+        is_ancestor(&self.dir(), ancestor, descendant)
     }
 
     /// Move refs all together or not at all (`git update-ref --stdin`, in one
@@ -392,50 +393,55 @@ impl Repo {
             .collect())
     }
 
-    /// The repo gone: its refs (and any fork's inside it), and its `HEAD`.
-    pub fn remove(&self) -> ApiResult<()> {
-        self.delete_refs_under("refs/")?;
-        git(
-            &self.dir(),
-            &["symbolic-ref", "--delete", "--quiet", &self.full("HEAD")],
-        )?;
-        Ok(())
-    }
-
     /// A commit's pins: `.newgit/pins/<name>` gitlinks, by child name.
     pub fn pins_of(&self, commit: &str) -> Vec<(String, String)> {
-        let Ok(output) = git(&self.dir(), &["ls-tree", &format!("{commit}:.newgit/pins")]) else {
-            return Vec::new();
-        };
-        String::from_utf8_lossy(&output.stdout)
-            .lines()
-            .filter_map(|line| {
-                let (meta, name) = line.split_once('\t')?;
-                let mut fields = meta.split_whitespace();
-                (fields.next()? == "160000").then_some(())?;
-                fields.next()?;
-                Some((name.to_owned(), fields.next()?.to_owned()))
-            })
-            .collect()
+        pins_of(&self.dir(), commit)
     }
 
     /// Bring this repo's refs into `to`, a store of `to`'s own, under the same
-    /// namespace, then remove them here. A store of one tracker alone moving
-    /// to an audience no store holds yet is that store, renamed.
-    pub fn move_to(&self, to: &Store) -> ApiResult<Self> {
+    /// namespace: copied, then `place`d (the row saying where it is now
+    /// follows it), then removed here. A store of one tracker alone moving to
+    /// an audience no store holds yet is that store, labelled for `to` and
+    /// renamed. So a move that stops part way leaves the repo whole where the
+    /// row says, or whole where it was going with the row behind it, which
+    /// `ProjectContext::settle` repairs; never a row naming a store without
+    /// it, nor a store at `to`'s path labelled for another audience.
+    ///
+    /// A ref removed here must still be what was copied: a push that moved
+    /// one meanwhile fails the move (the row goes back), rather than being
+    /// dropped while its pusher was told it landed.
+    pub fn move_to(&self, to: &Store, place: impl Fn(&Store) -> ApiResult<()>) -> ApiResult<Self> {
         let moved = Self::new(&self.home, to.clone(), self.namespace.clone());
-        if matches!(self.store, Store::Tracker(_)) && !store_exists(&moved.dir()) {
+        let alone = matches!(self.store, Store::Tracker(_));
+        if alone && !store_exists(&moved.dir()) {
+            checked(&self.dir(), &["config", AUDIENCE_KEY, &to.name()])?;
             if let Some(parent) = moved.dir().parent() {
                 std::fs::create_dir_all(parent)?;
             }
             std::fs::rename(self.dir(), moved.dir())?;
-            checked(&moved.dir(), &["config", AUDIENCE_KEY, &to.name()])?;
+            place(to)?;
         } else {
-            moved.copy_from(&self.dir(), &self.prefix())?;
-            if matches!(self.store, Store::Tracker(_)) {
+            let copied = list_refs(&self.dir(), &self.full("refs/"))?;
+            moved.copy_from(&self.dir(), &self.prefix(), "refs/")?;
+            place(to)?;
+            if let Err(error) = self.remove_exactly(&copied) {
+                place(&self.store)?;
+                return Err(error);
+            }
+            let left = list_refs(&self.dir(), &self.full("refs/"))?;
+            if !left.is_empty() {
+                // Made after the copy (a push in flight): kept, not lost, and
+                // said. The store is the old audience's, which could read it.
+                eprintln!(
+                    "newgit serve: {} ({}) gained {} refs while it moved to {}; they stay in {}",
+                    self.namespace,
+                    self.store.name(),
+                    left.len(),
+                    to.name(),
+                    self.dir()
+                );
+            } else if alone {
                 delete(&self.dir())?;
-            } else {
-                self.remove()?;
             }
         }
         // `stores/tracker/`, once the last seed in it is gone.
@@ -445,12 +451,35 @@ impl Repo {
         Ok(moved)
     }
 
-    /// Make this repo, with every ref under `from_prefix` in the repository at
-    /// `from` as its own: a namespace's prefix, or empty for a repository's
-    /// own refs.
-    pub fn copy_from(&self, from: &Utf8Path, from_prefix: &str) -> ApiResult<()> {
+    /// Delete exactly `refs` (full names, as listed) at the objects they were
+    /// listed at, all or none, then this repo's `HEAD`.
+    fn remove_exactly(&self, refs: &[(String, String)]) -> ApiResult<()> {
+        let mut script = String::from("start\n");
+        for (reference, old) in refs {
+            script.push_str(&format!("delete {reference} {old}\n"));
+        }
+        script.push_str("prepare\ncommit\n");
+        if !refs.is_empty() && !run_stdin(&self.dir(), &["update-ref", "--stdin"], &script)? {
+            return Err(HttpError::internal(format!(
+                "a ref of {} in {} moved while it was copied; it stays here",
+                self.namespace,
+                self.dir()
+            )));
+        }
+        git(
+            &self.dir(),
+            &["symbolic-ref", "--delete", "--quiet", &self.full("HEAD")],
+        )?;
+        Ok(())
+    }
+
+    /// Make this repo, with every ref under `<from_prefix><under>` in the
+    /// repository at `from` as its own: `from_prefix` a namespace's prefix, or
+    /// empty for a repository's own refs; `under` `refs/` for all of them, or
+    /// `refs/heads/` for branches alone.
+    pub fn copy_from(&self, from: &Utf8Path, from_prefix: &str, under: &str) -> ApiResult<()> {
         self.create()?;
-        let refspec = format!("+{from_prefix}refs/*:{}refs/*", self.prefix());
+        let refspec = format!("+{from_prefix}{under}*:{}{under}*", self.prefix());
         let output = git(
             &self.dir(),
             &[
@@ -472,24 +501,245 @@ impl Repo {
         }
         Ok(())
     }
+
+    // ── A merge's landing ─────────────────────────────────────────────────
+
+    /// Where `login`'s merge objects for this repo wait until the merge lands:
+    /// a bare repository of its own, `landing/<login>/<namespace>.git` in the
+    /// home, beside the stores and never one of them. Nothing serves it to
+    /// anyone; only the merger writes to it, and the server reads it.
+    ///
+    /// Which store a merge's commits belong in is only known once it lands
+    /// (it may change the definitions that say so), so they are never written
+    /// into a store before then: a landing that narrows a tracker's audience
+    /// would otherwise leave its new content in the wider store, where under
+    /// protocol v2 anyone reaching any repo in it can fetch it by id.
+    pub fn landing_dir(&self, login: &str) -> ApiResult<Utf8PathBuf> {
+        if !is_part(login) {
+            return Err(HttpError::new(
+                403,
+                format!("`{login}` cannot name a merge's landing"),
+            ));
+        }
+        Ok(self
+            .home
+            .join("landing")
+            .join(login)
+            .join(format!("{}.git", self.namespace)))
+    }
+
+    /// [`Self::landing_dir`], made if it is not yet, borrowing the store's
+    /// objects (its alternates, rewritten each time so they follow the store
+    /// when it moves) so a thin pack resolves against them. A push into it
+    /// is told of this repo's own branches as what the server has, and no
+    /// other ref in the store.
+    pub fn open_landing(&self, login: &str) -> ApiResult<Utf8PathBuf> {
+        let dir = self.landing_dir(login)?;
+        if !store_exists(&dir) {
+            if let Some(parent) = dir.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            let output = Command::new("git")
+                .args(["init", "-q", "--bare", "-b", "main"])
+                .arg(dir.as_str())
+                .output()?;
+            if !output.status.success() {
+                return Err(HttpError::internal(format!(
+                    "git init {dir}: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                )));
+            }
+            checked(&dir, &["config", "receive.fsckObjects", "true"])?;
+        }
+        std::fs::write(
+            dir.join("objects/info/alternates"),
+            format!("{}\n", self.dir().join("objects")),
+        )?;
+        checked(
+            &dir,
+            &[
+                "config",
+                "core.alternateRefsPrefixes",
+                &self.full("refs/heads/"),
+            ],
+        )?;
+        Ok(dir)
+    }
+
+    /// What a merge by `login` reads this repo's objects from: its landing,
+    /// which sees the store's objects too, or the store when it has none.
+    pub fn view(&self, login: &str) -> ApiResult<Utf8PathBuf> {
+        if store_exists(&self.landing_dir(login)?) {
+            self.open_landing(login)
+        } else {
+            Ok(self.dir())
+        }
+    }
+
+    /// `commit`, waiting in `login`'s landing, brought into this repo at its
+    /// landing ref, once the repo is in the store the landing left it in.
+    /// One already in the store, or never sent, is left alone.
+    pub fn take_landing(&self, login: &str, commit: &str) -> ApiResult<()> {
+        let landing = self.landing_dir(login)?;
+        let reference = format!("refs/newgit/landing/{commit}");
+        if !store_exists(&landing)
+            || !git(&landing, &["rev-parse", "--verify", "--quiet", &reference])
+                .is_ok_and(|output| output.status.success())
+        {
+            return Ok(());
+        }
+        if !self.has_commit(commit) {
+            self.open_landing(login)?;
+            let refspec = format!("+{reference}:{}", self.full(&reference));
+            let output = git(
+                &self.dir(),
+                &[
+                    "fetch",
+                    "--quiet",
+                    "--no-tags",
+                    "--no-write-fetch-head",
+                    landing.as_str(),
+                    &refspec,
+                ],
+            )?;
+            if !output.status.success() {
+                return Err(HttpError::internal(format!(
+                    "bring {commit} from {landing} into {} ({}): {}",
+                    self.dir(),
+                    self.namespace,
+                    String::from_utf8_lossy(&output.stderr).trim()
+                )));
+            }
+        }
+        git(&landing, &["update-ref", "-d", &reference])?;
+        Ok(())
+    }
 }
 
-/// `project`'s own tracker `tracker`: in the store its row names, or alone in
-/// a store of its own when it has none yet (where a new one is made).
+/// Whether the repository at `dir` holds `commit`.
+pub fn has_commit(dir: &Utf8Path, commit: &str) -> bool {
+    store_exists(dir)
+        && git(dir, &["cat-file", "-e", &format!("{commit}^{{commit}}")])
+            .is_ok_and(|output| output.status.success())
+}
+
+/// Whether, in the repository at `dir`, `ancestor` is `descendant` or
+/// behind it.
+pub fn is_ancestor(dir: &Utf8Path, ancestor: &str, descendant: &str) -> bool {
+    git(dir, &["merge-base", "--is-ancestor", ancestor, descendant])
+        .is_ok_and(|output| output.status.success())
+}
+
+/// `path`'s text at `commit` in the repository at `dir`.
+pub fn read_blob(dir: &Utf8Path, commit: &str, path: &str) -> Option<String> {
+    let output = git(dir, &["cat-file", "blob", &format!("{commit}:{path}")]).ok()?;
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+/// A commit's pins in the repository at `dir`: `.newgit/pins/<name>`
+/// gitlinks, by child name.
+pub fn pins_of(dir: &Utf8Path, commit: &str) -> Vec<(String, String)> {
+    let Ok(output) = git(dir, &["ls-tree", &format!("{commit}:.newgit/pins")]) else {
+        return Vec::new();
+    };
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| {
+            let (meta, name) = line.split_once('\t')?;
+            let mut fields = meta.split_whitespace();
+            (fields.next()? == "160000").then_some(())?;
+            fields.next()?;
+            Some((name.to_owned(), fields.next()?.to_owned()))
+        })
+        .collect()
+}
+
+/// How many repos, as the API names them (trackers, forks, users' content),
+/// the stores in the home at `home` hold: one per namespace with any ref.
+pub fn count_repos(home: &Utf8Path) -> usize {
+    let mut found = std::collections::BTreeSet::new();
+    let mut stack = vec![home.join("stores")];
+    while let Some(dir) = stack.pop() {
+        let Ok(read) = dir.read_dir_utf8() else {
+            continue;
+        };
+        for entry in read.flatten() {
+            let path = entry.path().to_owned();
+            if !path.is_dir() {
+                continue;
+            }
+            if !store_exists(&path) {
+                stack.push(path);
+                continue;
+            }
+            for (reference, _) in list_refs(&path, "refs/namespaces/").unwrap_or_default() {
+                // `refs/namespaces/<t|u>/refs/namespaces/<name>/`, then for a
+                // fork `refs/namespaces/i/refs/namespaces/<instance>/`.
+                let parts: Vec<&str> = reference.split('/').collect();
+                let repo = match parts.as_slice() {
+                    [
+                        "refs",
+                        "namespaces",
+                        kind,
+                        "refs",
+                        "namespaces",
+                        name,
+                        "refs",
+                        "namespaces",
+                        "i",
+                        "refs",
+                        "namespaces",
+                        instance,
+                        ..,
+                    ] => {
+                        format!("{kind}/{name}/i/{instance}")
+                    }
+                    ["refs", "namespaces", kind, "refs", "namespaces", name, ..] => {
+                        format!("{kind}/{name}")
+                    }
+                    _ => continue,
+                };
+                // Per-user content is one repo per user's store.
+                found.insert(format!(
+                    "{}:{repo}",
+                    if repo.starts_with("u/") {
+                        path.as_str()
+                    } else {
+                        ""
+                    }
+                ));
+            }
+        }
+    }
+    found.len()
+}
+
+impl Repo {
+    /// Tracker `tracker`'s repo in the home at `home`: in `store`, or alone in
+    /// a store of its own when it has none yet (where a new one is made).
+    pub fn tracker(home: &Utf8Path, store: Option<Store>, tracker: &str) -> Self {
+        Self::new(
+            home,
+            store.unwrap_or_else(|| Store::Tracker(tracker.to_owned())),
+            crate::names::tracker_namespace(tracker),
+        )
+    }
+}
+
+/// `project`'s own tracker `tracker`, in the store its row names
+/// ([`Repo::tracker`]).
 pub fn tracker(
     data: &Utf8Path,
     db: &rusqlite::Connection,
     project: &crate::names::ProjectId,
     tracker: &str,
 ) -> ApiResult<Repo> {
-    let store = crate::db::tracker_store(db, &project.key(), tracker)?
-        .and_then(|name| Store::parse(&name))
-        .unwrap_or_else(|| Store::Tracker(tracker.to_owned()));
-    Ok(Repo::new(
-        &project.dir(data),
-        store,
-        crate::names::tracker_namespace(tracker),
-    ))
+    let store =
+        crate::db::tracker_store(db, &project.key(), tracker)?.and_then(|name| Store::parse(&name));
+    Ok(Repo::tracker(&project.dir(data), store, tracker))
 }
 
 /// Every ref under `prefix` in the store at `dir`, with its object.

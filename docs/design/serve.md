@@ -60,6 +60,8 @@ invited, through `POST /v1/dev/login` with `x-dev-login: <secret>`.
                          every per-user tracker
     instance/<name>.git  a private instance's forks
     tracker/<name>.git   a new tracker's seed, alone until it joins a branch
+  homes/<owner>/<project>/landing/<login>/<namespace>.git
+                         a merge's objects until it lands, never served
   endpoint/<owner>/<project>/   the composer's stores and cached views
 ```
 
@@ -74,7 +76,8 @@ Every repo the API names is a Git namespace in one store, served with
 | `<o>.<p>.t.<tracker>.<login>` | `user/<login>` | `u/<tracker>` |
 
 So root's `main` is `refs/namespaces/t/refs/namespaces/root/refs/heads/main`
-in `project-devs.git`. Stores need Git 2.45 or newer, for reftable.
+in `project-devs.git`. Stores need Git 2.45 or newer, for reftable; serve
+refuses to start on an older one.
 
 - **One SQLite database, every project table keyed by `home` first.** The home
   (`<owner>/<project>` today) is the shard unit: moving a set of homes to
@@ -117,13 +120,40 @@ Resolved loudly; each is reversible.
    - **A new tracker's seed is alone** in `tracker/<name>` until it joins a
      branch. Whoever seeds it may not read every audience, and their push
      could name any object in a store it landed in.
+   - **Every repo is served only from the store its tracker's current facts
+     call for**: its audience's, its user's, or a private instance's own. A
+     tracker, a fork of it, a user's content, and a merge's objects all pass
+     one check (`ProjectContext::served`), which settles the tracker first
+     and refuses anything else, including a store at the right path whose
+     label names another audience.
    - **A tracker settles in its audience's store** when it joins a branch,
-     after every landing (a definition may have changed its audience), and
-     before any Git request reaches it, which is refused if it cannot move.
-     The first tracker of an audience is its seed's store renamed; the rest
-     are fetched in, and leave their old store. Objects left behind there
-     stay until gc, readable only by the audience that could read them
-     already.
+     when a landing changes its definition, and before any Git request
+     reaches it, which is refused if it cannot move. The first tracker of an
+     audience is its seed's store, labelled and then renamed; the rest are
+     copied in, their row moved, and only then removed from their old store,
+     each ref at exactly the object copied, so a push that moved one
+     meanwhile fails the move (the row goes back) instead of being dropped.
+     A move that stopped after the copy is finished by the next settle.
+   - **A merge's objects wait in a landing of the merger's own**, never in a
+     store, until the merge lands. Which store they belong in is the
+     landing's to say: one that narrows a tracker's audience and adds to it
+     in the same merge must not leave the addition in the wider store, where
+     anyone reaching any repo in it could fetch it by id, with nothing to
+     remove it. Uploaded packs and pushes with a merge's password both go
+     into `landing/<login>/<namespace>.git`, which borrows the store's
+     objects (alternates) so thin packs resolve, and is served to no one.
+     When the merge finishes, its definitions are read from the commits it
+     lands, each tracker moves to the store they call for, and only then do
+     its new commits follow it there, all before the landing is written
+     down: under the db lock nothing lands beside it, and a landing whose
+     objects have nowhere safe to go (a store in the way made for another
+     audience) does not land.
+   - **What a tracker held before its audience narrowed stays where it
+     was.** Its refs leave the wider store, but its objects remain there
+     until gc, and under protocol v2 any reader of that store can still
+     fetch them by id through any repo in it. That content was readable by
+     that audience already, so this keeps nothing new from anyone; to take
+     back something that was public, rewrite it, do not narrow it.
    - **`has_commit` asks the store, not the namespace.** Within one audience
      that is no leak, only a looser check than a repo per tracker gave.
 2. **The Git password is the caller's own newgit token.** No repo passwords
@@ -156,11 +186,30 @@ Resolved loudly; each is reversible.
    their finish is told to start the merge again, which is safe: nothing
    moved yet.
 
+## Known limits
+
+For the landing log (#410), which makes each of these a step of a landing
+rather than a side effect:
+
+- **Moves run under the global db mutex**, inside `authorize` (any Git
+  request or credential) and inside a merge's `finish`. A large tracker's
+  first copy into a store blocks every other request while it runs.
+- **Moves are a side effect of reads and of landings' hooks**
+  (`settle_after_landing`, the settle before serving). They should be a
+  landing-log step, retried until done, not attempted by whichever request
+  arrives first. A move that fails part way through a landing that moves
+  several trackers can leave a copy of one already moved in its new store
+  though the landing did not happen; for a widening, that is history in the
+  wider store before its definition says so.
+- **`Repo::update_refs` is one namespace per transaction**, so a landing's
+  branch moves across trackers are not one ref transaction.
+- **A push already running when a move starts is not stopped.** A ref it
+  moves is caught (the move fails and goes back); a ref it creates after
+  the copy is kept in the old store and logged, not carried along.
+
 ## Not yet
 
-- Garbage collection of the stores, and a move between stores that is safe
-  against a push to the same tracker in flight. A move happens only when a
-  tracker joins a branch or its audience changes.
+- Garbage collection of the stores and of merge landings.
 
 - The GitHub webhook (`POST /v1/webhooks/github`) and mirror pulls.
 - The landing page and `/install.sh`.

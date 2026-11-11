@@ -8,6 +8,10 @@
   never safe, since Git serves any object in a repository by id to anyone
   who can reach it, so a store is made for one audience and never takes a
   second; a private instance and each user's content keep stores of their
-  own, and a new tracker's seed stays alone until it joins a branch. An
+  own, and a new tracker's seed stays alone until it joins a branch. A
+  merge's objects wait in a landing of the merger's own until it lands, then
+  go to the store its definitions call for, so a merge that narrows a
+  tracker never leaves what it adds readable by the wider audience. An
   existing data directory is moved over the first time the server starts
-  on it. The server now needs Git 2.45 or newer.
+  on it. The server now needs Git 2.45 or newer, and says so if it finds
+  an older one.

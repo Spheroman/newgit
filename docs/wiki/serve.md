@@ -4,8 +4,8 @@
 binary: each tracker's Git history on the machine's own disk, project state in
 one SQLite database, and the same API newgit.dev answers. A project points at
 it the way it points at newgit.dev, and nothing else about using newgit
-changes. It needs `git` 2.45 or newer on the `PATH`, and runs on Linux and
-macOS.
+changes. It needs `git` 2.45 or newer on the `PATH` (it refuses to start
+on an older one), and runs on Linux and macOS.
 
 ```sh
 newgit serve --data /var/lib/newgit --listen 0.0.0.0:8484 \
@@ -21,7 +21,8 @@ it was.
   `token.key` tokens are signed with, and under
   `homes/<owner>/<project>/stores/` one Git repository per audience (the
   members', the public's, each user's, each private instance's), every
-  tracker a namespace in its audience's. Back it up as a directory, with the
+  tracker a namespace in its audience's, and under `landing/` each merge's
+  objects until it lands. Back it up as a directory, with the
   server stopped. There is no online backup yet. A data directory from
   before stores, with a repository per tracker, is moved over the first time
   the server starts on it.

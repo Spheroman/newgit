@@ -193,7 +193,8 @@ fn authorize_repo(app: &App, token: &str, name: &str, write: bool) -> ApiResult<
         let granted = db::granted(&db, &repo.name(), &caller.token_id)?;
         if !granted.is_empty() {
             // A seed: alone in its own store, so nothing else is reachable.
-            let location = project.locate(&repo, false);
+            let facts = project.facts(&db, repo.tracker_name())?;
+            let location = project.served(&db, &repo, facts.as_ref(), false)?;
             if !location.exists() {
                 return fail(404, format!("{} does not exist", repo.name()));
             }
@@ -205,9 +206,29 @@ fn authorize_repo(app: &App, token: &str, name: &str, write: bool) -> ApiResult<
             return Ok(Run::repo(&repo, &location, allowed));
         }
     }
+    // A merge's commits, pushed with the password `begin` handed out: into
+    // the merger's landing for this repo, never the store, until the merge
+    // lands and says which store they belong in (`Repo::landing_dir`).
+    if write
+        && matches!(&repo, RepoRef::Tracker { tracker, login: None, .. } if listed.contains(tracker))
+        && db::granted(&db, &repo.name(), &caller.token_id)?
+            .iter()
+            .any(|refs| refs == LANDING)
+    {
+        let location = api::authorize(&project, &db, &caller, &repo, false)?;
+        return Ok(Run {
+            git_dir: location.open_landing(&caller.login)?,
+            namespace: None,
+            allowed: vec![LANDING.to_owned()],
+            tracker: false,
+        });
+    }
     let location = api::authorize(&project, &db, &caller, &repo, write)?;
     Ok(Run::repo(&repo, &location, Vec::new()))
 }
+
+/// The refs a merge's landing password may push.
+pub const LANDING: &str = "refs/newgit/landing/";
 
 // ── The Git endpoint ──────────────────────────────────────────────────────
 
