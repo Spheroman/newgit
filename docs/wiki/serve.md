@@ -23,8 +23,9 @@ it was.
   the `token.key` tokens are signed with, and under
   `homes/<owner>/<project>/stores/` one Git repository per audience (the
   members', the public's, each user's, each private instance's), every
-  tracker a namespace in its audience's, and under `landing/` each merge's
-  objects until it lands. Back it up as a directory, with the
+  tracker a namespace in its audience's, under `landing/` each merge's
+  objects until it lands, and under `scratch/` the server's own merges
+  while they run. Back it up as a directory, with the
   server stopped. There is no online backup yet. A data directory from
   before stores, with a repository per tracker, is moved over the first time
   the server starts on it, and one from before the landing log gets a log
@@ -116,9 +117,21 @@ What differs is the machinery, and it is the reason to run it:
   answer says the stamp of the landing that last moved it.
   `GET /v1/projects/<owner>/<project>/branches/<branch>?at=<stamp>` gives
   the branch's list as that landing left it.
-- Two merges begun from the same state conflict even when they are at
-  different anchors, and the second merges again. A merge in flight is kept in
-  memory, so restarting the server tells its merger to start the merge over.
+- `newgit merge` lands or it doesn't. When nothing landed since your merge
+  began, the branch fast-forwards to your own commits. When something did,
+  the server merges your work onto it, as GitHub's merge button does: one
+  merge commit in each tracker both of you changed, your commit its second
+  parent, and your commits as you made them everywhere else; `newgit merge`
+  says so, with the commit. You are told to merge again only for a real
+  conflict, and the answer names each file you may read. What lands is
+  checked against the rules at the state it lands on, so someone removed
+  as a maintainer or member while your merge ran does not land it, and a
+  merge that would put your edit in a tracker you may not change (because
+  someone moved the file there) is refused, naming the tracker. A merge
+  never carries content into a tracker more people may read: if someone
+  moved a file into one while you edited it, bring `main` in and make the
+  move yours. A merge in flight is kept in memory, so restarting the server
+  tells its merger to start the merge over.
 
 What it does not do yet:
 

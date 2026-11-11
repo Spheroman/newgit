@@ -194,7 +194,7 @@ fn definitions_tree(
         let Some(commit) = objects.try_commit(pin)? else {
             continue;
         };
-        if let Some(entry) = objects.entry_at(&commit.tree, &format!("{name}.toml"))?
+        if let Some(entry) = objects.entry_at(&commit.tree, format!("{name}.toml"))?
             && mount_in(&read_blob_text(objects, &entry.id)?).as_deref() == Some(DEFINITIONS_DIR)
         {
             return Ok(Some(commit.tree));
@@ -204,15 +204,7 @@ fn definitions_tree(
 }
 
 fn read_blob_text(objects: &mut Objects, id: &str) -> Result<String> {
-    let out = run(
-        Command::new("git")
-            .arg("-C")
-            .arg(objects.repo().as_str())
-            .args(["cat-file", "blob", id]),
-        "git cat-file blob",
-        None,
-    )?;
-    Ok(String::from_utf8_lossy(&out).into_owned())
+    Ok(String::from_utf8_lossy(&objects.blob(id)?).into_owned())
 }
 
 /// A definition's `mount`, read loosely: compose needs where, not what.
@@ -241,7 +233,7 @@ fn mounts_of(
     let definitions = definitions_tree(objects, tree, all_pins)?;
     for name in wanted.keys() {
         let entry = match &definitions {
-            Some(definitions) => objects.entry_at(definitions, &format!("{name}.toml"))?,
+            Some(definitions) => objects.entry_at(definitions, format!("{name}.toml"))?,
             None => None,
         };
         let Some(entry) = entry else {
@@ -817,6 +809,42 @@ fn view_tree_cached(
     }
     cache.insert(commit.to_owned(), tree.clone());
     Ok(tree)
+}
+
+/// Where each tracker present sits in [`view_tree`]`(commit)`: the chain of
+/// pin names from `commit` down to it (empty for `commit` itself), and the
+/// directory its tree is grafted at (`.` for the top). Two trackers can share
+/// a directory: each claims its own files there.
+pub fn view_mounts(objects: &mut Objects, commit: &str) -> Result<Vec<(Vec<String>, String)>> {
+    let mut out = vec![(Vec::new(), ".".to_owned())];
+    let mut stack = vec![(commit.to_owned(), Vec::<String>::new(), ".".to_owned(), 0)];
+    while let Some((commit, chain, at, nesting)) = stack.pop() {
+        if nesting > 32 {
+            return Err(NewgitError::Unsupported(format!(
+                "commit {} mounts trackers more than 32 deep: a tracker mounted inside itself?",
+                short(&commit)
+            )));
+        }
+        let found = objects.commit(&commit)?;
+        let pins = pins_in(objects, &found.tree)?;
+        let present: BTreeMap<String, String> = pins
+            .iter()
+            .filter(|(_, pin)| objects.has_commit(pin).unwrap_or(false))
+            .map(|(name, pin)| (name.clone(), pin.clone()))
+            .collect();
+        for (name, mount) in mounts_of(objects, &commit, &found.tree, &pins, &present)? {
+            let full = match (at.as_str(), mount.as_str()) {
+                (".", mount) => mount.to_owned(),
+                (at, ".") => at.to_owned(),
+                (at, mount) => format!("{at}/{mount}"),
+            };
+            let mut below = chain.clone();
+            below.push(name.clone());
+            out.push((below.clone(), full.clone()));
+            stack.push((present[&name].clone(), below, full, nesting + 1));
+        }
+    }
+    Ok(out)
 }
 
 /// Whether commit `commit`'s own definitions mount a tracker in Git that it
@@ -1533,18 +1561,20 @@ impl<'a> Splitter<'a> {
         definitions: &[TrackerDefinition],
         earlier: &[crate::tracker::EarlierFork],
     ) -> std::result::Result<(), SplitError> {
-        let mut changed: Option<BTreeSet<String>> = None;
+        // Paths as the bytes Git stores: a name that is not UTF-8, looked
+        // up again by its lossy text, would seem deleted and pass unjudged.
+        let mut changed: Option<BTreeSet<Vec<u8>>> = None;
         // What differs from any parent: a merge's result can break a fork
         // that neither side broke alone (one adds it, the other narrows its
         // upstream), so its definitions are checked whole.
-        let mut changed_any: BTreeSet<String> = BTreeSet::new();
+        let mut changed_any: BTreeSet<Vec<u8>> = BTreeSet::new();
         if commit.parents.is_empty() {
             changed = Some(self.objects.files(&commit.tree)?.into_keys().collect());
             changed_any.extend(changed.iter().flatten().cloned());
         }
         for parent in &commit.parents {
             let parent_tree = self.objects.commit(parent)?.tree;
-            let paths: BTreeSet<String> = self
+            let paths: BTreeSet<Vec<u8>> = self
                 .objects
                 .changed_paths(Some(&parent_tree), Some(&commit.tree))?
                 .into_iter()
@@ -1560,7 +1590,7 @@ impl<'a> Splitter<'a> {
         // or changes `from` to get past it, is refused where it becomes a
         // commit, as creating a fork that wide is.
         let defines = changed_any.iter().any(|path| {
-            Utf8Path::new(path)
+            Utf8Path::new(&*String::from_utf8_lossy(path))
                 .parent()
                 .is_some_and(|dir| dir.ends_with(DEFINITIONS_DIR))
         });
@@ -1579,15 +1609,18 @@ impl<'a> Splitter<'a> {
         if changed.is_empty() {
             return Ok(());
         }
-        for path in changed {
-            if path == PINS_DIR || path.starts_with(&format!("{PINS_DIR}/")) {
+        for raw in changed {
+            // Shown, and judged by owner, as text: a claim is UTF-8, so a
+            // name that is not matches only by the directories above it.
+            let path = String::from_utf8_lossy(&raw).into_owned();
+            if raw == PINS_DIR.as_bytes() || raw.starts_with(format!("{PINS_DIR}/").as_bytes()) {
                 return Err(SplitError::Refused(Refusal::Reserved {
                     commit: commit.id.clone(),
                     path,
                 }));
             }
             // Deleting a file is how it comes out: never refused.
-            if self.objects.entry_at(&commit.tree, &path)?.is_none() {
+            if self.objects.entry_at(&commit.tree, &raw)?.is_none() {
                 continue;
             }
             match owner_of(definitions, Utf8Path::new(&path)) {
@@ -1873,7 +1906,7 @@ impl<'a> Splitter<'a> {
                     let at = if mount == "." {
                         file
                     } else {
-                        format!("{mount}/{file}")
+                        crate::objects::join_path(mount.as_bytes(), &file)
                     };
                     own = self.objects.set_path(&own, &at, None)?;
                 }
@@ -1975,7 +2008,7 @@ impl<'a> Splitter<'a> {
         for (child, pin) in pins {
             tree = self.objects.set_path(
                 &tree,
-                &format!("{PINS_DIR}/{child}"),
+                format!("{PINS_DIR}/{child}"),
                 Some((GITLINK_MODE.to_vec(), pin.clone())),
             )?;
         }
@@ -2074,6 +2107,7 @@ impl<'a> Splitter<'a> {
         };
         let changed = self.objects.changed_paths(base.as_deref(), Some(part))?;
         Ok(changed.into_iter().next().map(|path| {
+            let path = String::from_utf8_lossy(&path).into_owned();
             if mount == "." {
                 path
             } else {

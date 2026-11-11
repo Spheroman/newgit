@@ -2266,19 +2266,19 @@ impl BranchManager {
                 moved.push((access.to_owned(), made.clone()));
                 objects.set_path(
                     &commit.tree,
-                    &format!("{}/{access}", crate::compose::PINS_DIR),
+                    format!("{}/{access}", crate::compose::PINS_DIR),
                     Some((crate::objects::GITLINK_MODE.to_vec(), made)),
                 )?
             }
             None => objects.set_path(
                 &commit.tree,
-                &format!("{}/{name}.toml", crate::tracker::DEFINITIONS_DIR),
+                format!("{}/{name}.toml", crate::tracker::DEFINITIONS_DIR),
                 Some(file),
             )?,
         };
         let tree = objects.set_path(
             &tree,
-            &format!("{}/{}", crate::compose::PINS_DIR, pin.0),
+            format!("{}/{}", crate::compose::PINS_DIR, pin.0),
             Some((crate::objects::GITLINK_MODE.to_vec(), pin.1.clone())),
         )?;
         moved.push(pin.clone());
@@ -11319,6 +11319,8 @@ impl BranchManager {
         // What root is once this merge is in: its own commit, unless it
         // landed below root and root rolled up to something more.
         let mut landed_root = merged_root.clone();
+        // What landed in each tracker, when the remote merged it.
+        let mut landed_list: Option<BTreeMap<String, String>> = None;
         if !moved.is_empty()
             && let Some((client, project_key)) = &client
         {
@@ -11471,21 +11473,26 @@ impl BranchManager {
             // Where it landed is the finish's to say: `begin` cannot read
             // the merge's commits yet, which arrive after it.
             anchor = landed.anchor.or(anchor);
-            // Landed below root: root rolled up to it on the remote, perhaps
-            // with other landings beside it, so root is now the remote's,
-            // not this merge's own commit. Bring that here, and everything
-            // it pins, so the next spawn starts from what landed: two merges
-            // at once would otherwise each leave only their own.
+            // Merged on the remote onto what landed since this merge's base,
+            // or landed below root and rolled up to (the Worker): root is
+            // now the remote's, not this merge's own commit. Bring that
+            // here, and everything it pins, so the next spawn starts from
+            // what landed: two merges at once would otherwise each leave
+            // only their own.
             // The merge has landed whatever happens here, so a failure is
             // said, not taken for the merge failing.
-            if anchor
-                .as_deref()
-                .is_some_and(|anchor| anchor != self.root.name)
+            if landed.merged
+                || anchor
+                    .as_deref()
+                    .is_some_and(|anchor| anchor != self.root.name)
             {
                 match self.branch_list(Some((client.as_ref(), project_key.as_str())), into) {
                     Ok(after) => {
                         if let Some(root) = after.get(&self.root.name) {
                             landed_root = root.clone();
+                        }
+                        if landed.merged {
+                            landed_list = Some(after);
                         }
                     }
                     Err(error) => warnings.push(format!(
@@ -11534,7 +11541,13 @@ impl BranchManager {
         }
         let updates: Vec<(String, String)> = children
             .iter()
-            .map(|(tracker, commit)| (local_tracker_ref(tracker, into), (*commit).to_owned()))
+            .map(|(tracker, commit)| {
+                let commit = landed_list
+                    .as_ref()
+                    .and_then(|landed| landed.get(*tracker))
+                    .map_or(*commit, String::as_str);
+                (local_tracker_ref(tracker, into), commit.to_owned())
+            })
             .collect();
         self.source.update_refs(&updates)?;
         let published: Vec<(&str, &str)> = std::iter::once(self.root.name.as_str())
@@ -11554,6 +11567,30 @@ impl BranchManager {
         } else {
             None
         };
+        // Merged on the remote: what landed in each tracker is the remote's
+        // to say, not this merge's own commits.
+        let server_merged = landed_list.is_some();
+        if let Some(landed) = &landed_list {
+            trackers = landed
+                .iter()
+                .filter(|(tracker, commit)| {
+                    base.get(*tracker) != Some(*commit)
+                        && (list.get(*tracker) == Some(*commit)
+                            || list.get(*tracker) != base.get(*tracker))
+                })
+                .map(|(tracker, commit)| TrackerMerge {
+                    tracker: tracker.clone(),
+                    action: if !base.contains_key(tracker) {
+                        TrackerMergeAction::New
+                    } else if list.get(tracker) == Some(commit) {
+                        TrackerMergeAction::FastForward
+                    } else {
+                        TrackerMergeAction::Merged
+                    },
+                    commit: commit.clone(),
+                })
+                .collect();
+        }
         Ok(MergeOutcome {
             instance: name,
             into: into.to_owned(),
@@ -11563,6 +11600,7 @@ impl BranchManager {
             trackers,
             remote: client.map(|(_, project)| project),
             anchor,
+            server_merged,
         })
     }
 
@@ -12392,7 +12430,7 @@ impl BranchManager {
             for (name, new) in moved {
                 tree = objects.set_path(
                     &tree,
-                    &format!("{}/{name}", crate::compose::PINS_DIR),
+                    format!("{}/{name}", crate::compose::PINS_DIR),
                     Some((crate::objects::GITLINK_MODE.to_vec(), new.clone())),
                 )?;
             }
@@ -14821,6 +14859,9 @@ pub struct MergeOutcome {
     /// Where it landed on the remote: the lowest tracker covering everything
     /// it touched. Root, or a tracker the trackers above roll up to.
     pub anchor: Option<String>,
+    /// The branch moved on the remote since this merge's base, and the
+    /// remote merged onto what it is now: `trackers` says what landed.
+    pub server_merged: bool,
 }
 
 /// What a person asks of a spawn beyond the defaults: `--use`, `--drop`,

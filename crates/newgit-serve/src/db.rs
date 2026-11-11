@@ -98,6 +98,7 @@ const ADDED: &[(&str, &str, &str)] = &[
     ("branches", "stamp", "INTEGER"),
     ("head_log", "stamp", "INTEGER"),
     ("projects", "incarnation", "TEXT"),
+    ("projects", "epoch", "INTEGER"),
 ];
 
 pub struct Db {
@@ -372,6 +373,30 @@ pub fn project(db: &Connection, home: &str) -> ApiResult<Option<ProjectInfo>> {
             },
         )
         .optional()?)
+}
+
+/// How many landings have changed the project's definitions
+/// (`.newgit/trackers/`): a merge prepared under an older epoch starts again
+/// (docs/design/landing.md, *Landing* 5). Only applying a landing moves it.
+pub fn epoch(db: &Connection, home: &str) -> ApiResult<u64> {
+    let epoch: Option<i64> = db
+        .query_row("SELECT epoch FROM projects WHERE home = ?", [home], |row| {
+            row.get(0)
+        })
+        .optional()?
+        .flatten();
+    Ok(epoch
+        .and_then(|epoch| u64::try_from(epoch).ok())
+        .unwrap_or(0))
+}
+
+/// The project's epoch set to `epoch`, by the landing that bumps it.
+pub fn set_epoch(db: &Connection, home: &str, epoch: u64) -> ApiResult<()> {
+    db.execute(
+        "UPDATE projects SET epoch = ? WHERE home = ?",
+        params![i64::try_from(epoch).unwrap_or(i64::MAX), home],
+    )?;
+    Ok(())
 }
 
 pub fn owned_count(db: &Connection, login: &str) -> ApiResult<usize> {

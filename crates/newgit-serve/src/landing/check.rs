@@ -25,6 +25,9 @@ pub(super) struct Seen {
     /// is theirs.
     pub(super) fresh: BTreeSet<String>,
     pub(super) refs: BTreeMap<(String, String, String), Option<String>>,
+    /// Each home's epoch as the landings before this one in the batch leave
+    /// it.
+    pub(super) epochs: BTreeMap<String, u64>,
     /// What each store answered for each name asked of it this batch
     /// (`None`: missing), so each store is read once per batch, not once per
     /// landing.
@@ -125,6 +128,14 @@ impl Seen {
         }
     }
 
+    pub(super) fn epoch(&self, db: &Connection, home: &str) -> ApiResult<u64> {
+        match self.epochs.get(home) {
+            Some(epoch) => Ok(*epoch),
+            None if self.fresh.contains(home) => Ok(0),
+            None => db::epoch(db, home),
+        }
+    }
+
     pub(super) fn list(
         &self,
         db: &Connection,
@@ -189,6 +200,7 @@ pub(super) fn check(
         expect,
         placed,
         asked,
+        epochs,
     } = landing;
     entry.format = FORMAT;
     for (home, change) in &entry.homes {
@@ -238,6 +250,28 @@ pub(super) fn check(
                     ),
                 ),
             });
+        }
+    }
+    for (home, epoch) in &epochs {
+        if seen.epoch(db, home)? != *epoch {
+            return Err(HttpError::new(
+                409,
+                format!(
+                    "the definitions of `{home}` changed since this merge was prepared: start again"
+                ),
+            ));
+        }
+    }
+    for (home, change) in &entry.homes {
+        if let Some(epoch) = change.epoch
+            && epoch != seen.epoch(db, home)? + 1
+        {
+            return Err(HttpError::new(
+                409,
+                format!(
+                    "the definitions of `{home}` changed since this merge was prepared: start again"
+                ),
+            ));
         }
     }
     for want in &placed {
@@ -394,6 +428,9 @@ pub(super) fn check(
         for (tracker, step) in &change.stores {
             seen.stores
                 .insert((home.clone(), tracker.clone()), Some(step.to.clone()));
+        }
+        if let Some(epoch) = change.epoch {
+            seen.epochs.insert(home.clone(), epoch);
         }
         for (tracker, moved) in &change.refs {
             for (reference, step) in moved {

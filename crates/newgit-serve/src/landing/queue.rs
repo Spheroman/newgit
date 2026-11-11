@@ -280,14 +280,30 @@ pub(super) struct Processed {
     pub(super) marks: Vec<Mark>,
 }
 
+/// How a landing that waited too long for a root is answered.
+const BUSY: &str = "this project is busy";
+
+/// Whether `error` is a root another landing held too long ([`busy`]), not a
+/// stuck landing: waiting again is all it needs.
+pub fn is_busy(error: &HttpError) -> bool {
+    error.status == 503 && error.message.starts_with(BUSY)
+}
+
 pub(super) fn busy(blocker: Option<String>) -> HttpError {
     HttpError::new(
         503,
         format!(
-            "this project is busy ({}): try again in a moment",
+            "{BUSY} ({}): try again in a moment",
             blocker.unwrap_or_else(|| "another landing holds it".to_owned())
         ),
     )
+}
+
+/// How a merge into `branch` that waited its whole turn budget is answered.
+pub fn busy_merging(branch: &str) -> HttpError {
+    busy(Some(format!(
+        "merges into `{branch}` changing the same paths as this one kept landing first"
+    )))
 }
 
 pub(super) fn answered(outcome: Option<ApiResult<Outcome>>) -> ApiResult<Outcome> {
@@ -338,6 +354,31 @@ impl Log {
             std::fs::read_to_string(path)
                 .is_ok_and(|faults| faults.lines().any(|fault| fault.trim() == at))
         })
+    }
+
+    /// Wait a moment here if the fault file says to: for the tests that
+    /// land something between a merge and its recheck
+    /// (`delay-merge-by-<login>`).
+    pub fn pause(&self, at: &str) {
+        if self.armed(at) {
+            std::thread::sleep(Duration::from_millis(1500));
+        }
+    }
+
+    /// Wait here while the fault file says to (at most a minute), with
+    /// `<fault file>.at` naming where, for the tests that land something
+    /// before a finish reads the branch (`hold-finish-by-<login>`).
+    pub fn wait_while(&self, at: &str) {
+        let Some(path) = self.faults.as_ref().filter(|_| self.armed(at)) else {
+            return;
+        };
+        let marker = format!("{path}.at");
+        let _ = std::fs::write(&marker, at);
+        let until = std::time::Instant::now() + Duration::from_secs(60);
+        while self.armed(at) && std::time::Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let _ = std::fs::remove_file(&marker);
     }
 
     /// Stop the process here if the fault file says to.

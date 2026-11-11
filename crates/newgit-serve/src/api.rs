@@ -1034,6 +1034,7 @@ fn project_route(
                 "createdAt": project.info.created_at, "defaultBranch": project.info.default_branch,
                 "key": key, "endpoint": endpoint_url(&request.origin, &project.id),
                 "members": db::members(&db, &key)?, "branches": db::branches(&db, &key)?,
+                "epoch": db::epoch(&db, &key)?,
             });
             answer["name"] = json!(project.info.name);
             ok(answer)
@@ -1927,7 +1928,7 @@ fn create_branch(
             list: None,
         }],
         placed,
-        asked: Vec::new(),
+        ..Landing::default()
     };
     drop(db);
     project.app.log.land(project.app, landing)?;

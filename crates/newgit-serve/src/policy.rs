@@ -458,23 +458,63 @@ fn next_holders(
     next
 }
 
-/// Reads files at a tracker's `main`, wherever its store is.
+/// Reads files at a tracker's `main`, wherever its store is: through one
+/// `git cat-file --batch` per repository, each file once per load.
 pub struct Reader<'a> {
     pub data: &'a Utf8Path,
     pub db: &'a Connection,
     /// Trackers read at a commit, from a repository, rather than at `main`:
     /// what a landing's definitions will be before it lands.
     pub at: &'a BTreeMap<String, (Utf8PathBuf, String)>,
+    read: std::cell::RefCell<BTreeMap<(String, String, String), Option<String>>>,
+    batches: std::cell::RefCell<BTreeMap<Utf8PathBuf, newgit_core::objects::Objects>>,
 }
 
-impl Reader<'_> {
-    fn read(&self, project: &ProjectId, tracker: &str, path: &str) -> Option<String> {
-        if let Some((dir, commit)) = self.at.get(tracker) {
-            return repos::read_blob(dir, commit, path);
+impl<'a> Reader<'a> {
+    pub fn new(
+        data: &'a Utf8Path,
+        db: &'a Connection,
+        at: &'a BTreeMap<String, (Utf8PathBuf, String)>,
+    ) -> Self {
+        Self {
+            data,
+            db,
+            at,
+            read: std::cell::RefCell::default(),
+            batches: std::cell::RefCell::default(),
         }
-        repos::tracker(self.data, self.db, project, tracker)
-            .ok()?
-            .read_file("main", path)
+    }
+
+    fn read(&self, project: &ProjectId, tracker: &str, path: &str) -> Option<String> {
+        let key = (project.key(), tracker.to_owned(), path.to_owned());
+        if let Some(found) = self.read.borrow().get(&key) {
+            return found.clone();
+        }
+        let (dir, rev) = match self.at.get(tracker) {
+            Some((dir, commit)) => (dir.clone(), commit.clone()),
+            None => {
+                let repo = repos::tracker(self.data, self.db, project, tracker).ok()?;
+                if !repos::store_exists(&repo.dir()) {
+                    return None;
+                }
+                (repo.dir(), repo.full("refs/heads/main"))
+            }
+        };
+        let found = {
+            let mut batches = self.batches.borrow_mut();
+            let batch = match batches.entry(dir.clone()) {
+                std::collections::btree_map::Entry::Occupied(found) => found.into_mut(),
+                std::collections::btree_map::Entry::Vacant(empty) => {
+                    empty.insert(newgit_core::objects::Objects::open(&dir).ok()?)
+                }
+            };
+            batch
+                .blob(&format!("{rev}:{path}"))
+                .ok()
+                .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+        };
+        self.read.borrow_mut().insert(key, found.clone());
+        found
     }
 }
 
@@ -499,7 +539,7 @@ pub fn load_definitions_at<'n>(
     names: impl IntoIterator<Item = &'n str>,
     at: &BTreeMap<String, (Utf8PathBuf, String)>,
 ) -> BTreeMap<String, Facts> {
-    let reader = Reader { data, db, at };
+    let reader = Reader::new(data, db, at);
     let mut all: BTreeSet<String> = ["root".to_owned(), "access".to_owned()].into();
     all.extend(names.into_iter().map(str::to_owned));
     let mut facts = read_definitions(&reader, project, &all);
