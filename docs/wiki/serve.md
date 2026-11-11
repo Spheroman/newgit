@@ -17,15 +17,18 @@ It prints `newgit serve: listening on <url>` and stays in the foreground;
 Ctrl-C stops it, and starting it again on the same `--data` carries on where
 it was.
 
-- `--data <dir>` is everything the remote keeps: `server.sqlite`, the
-  `token.key` tokens are signed with, and under
+- `--data <dir>` is everything the remote keeps: `landing.git`, the log
+  every landing is committed to first (if the server stops mid-landing, it
+  finishes it, or never shows it, when it starts again), `server.sqlite`,
+  the `token.key` tokens are signed with, and under
   `homes/<owner>/<project>/stores/` one Git repository per audience (the
   members', the public's, each user's, each private instance's), every
   tracker a namespace in its audience's, and under `landing/` each merge's
   objects until it lands. Back it up as a directory, with the
   server stopped. There is no online backup yet. A data directory from
   before stores, with a repository per tracker, is moved over the first time
-  the server starts on it.
+  the server starts on it, and one from before the landing log gets a log
+  that starts from what its database says.
 - `--listen` is `127.0.0.1:8484` unless you say otherwise, and `127.0.0.1:0`
   picks a free port and prints it.
 - `--url` is the address clients reach it at, when that is not the one they
@@ -109,6 +112,10 @@ What differs is the machinery, and it is the reason to run it:
   anyone who can reach a repository fetch any object in it by id, so the
   server never puts two audiences' objects in one, rather than pretending to
   filter what Git serves.
+- Every landing has a stamp, its place in the landing log, and a branch's
+  answer says the stamp of the landing that last moved it.
+  `GET /v1/projects/<owner>/<project>/branches/<branch>?at=<stamp>` gives
+  the branch's list as that landing left it.
 - Two merges begun from the same state conflict even when they are at
   different anchors, and the second merges again. A merge in flight is kept in
   memory, so restarting the server tells its merger to start the merge over.

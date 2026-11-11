@@ -6,11 +6,11 @@
 //! - **Checks read the repos here.** Whether a pin moves forward along its
 //!   tracker's `main`, whether a commit changes only pins, and what root's
 //!   commit pins are local `git` reads, answered at once. Nothing answers 202.
-//! - **A landing is one SQLite transaction** over the whole index, compared
-//!   with the `base` the merge began from, then each repo's branch moved by
-//!   `git update-ref` before answering. Nothing follows later, and nothing is
-//!   rolled up: the merger's own commits are the branch's history, ids and
-//!   signatures kept.
+//! - **A landing is one entry in the landing log** (`crate::landing`) over
+//!   the whole index, compared under the lock with the `base` the merge began
+//!   from, and in place (refs, rows, stores) before answering. Nothing
+//!   follows later, and nothing is rolled up: the merger's own commits are
+//!   the branch's history, ids and signatures kept.
 //!
 //! > **Decision (loud): the anchor decides approval, not what lands.** The
 //! > Worker landed only the trackers at and under the anchor and rolled the
@@ -23,16 +23,17 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
 
-use rusqlite::{Connection, params};
+use rusqlite::Connection;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::api::{ApiResponse, Caller, ProjectContext};
-use crate::db::{self, List};
+use crate::db::{self, DbGuard, List};
 use crate::error::{ApiResult, HttpError, fail};
+use crate::landing::{self, Asked, Change, Entry, Landing};
 use crate::names::{lineage, parent_of, within};
 use crate::policy::{self, Facts};
-use crate::repos::{self, RefUpdate};
+use crate::repos::{self, Repo};
 
 /// How long a merge begun may take to finish.
 const PENDING: Duration = Duration::from_secs(70 * 60);
@@ -637,10 +638,11 @@ struct RefMove {
 }
 
 /// `PUT /branches/<branch>` with a `base`: land the index the merge began
-/// with, all at once, then move every repo's branch before answering.
+/// with, all at once, as one entry in the landing log, in place before
+/// answering.
 pub fn finish(
     project: &ProjectContext<'_>,
-    db: &mut Connection,
+    db: DbGuard<'_>,
     caller: &Caller,
     branch: &str,
     base: &List,
@@ -658,7 +660,7 @@ pub fn finish(
     }
     let pending_key = key(&project.key, branch, list);
     let pending = project.app.merges.lock().get(&pending_key).cloned();
-    let current = db::list_of(db, &project.key, branch)?;
+    let current = db::list_of(&db, &project.key, branch)?;
     let landed_already = current.as_ref() == Some(list);
     if pending.is_none() && !landed_already {
         return fail(
@@ -686,15 +688,13 @@ pub fn finish(
         .unwrap_or_default();
     let asked = check_moves(moves, &writes, branch, list)?;
     if landed_already {
-        // A finish asked again, its answer lost (or its objects not yet in
-        // place): it landed, and lands and follows again.
-        land(project, db, &caller.login, branch, list)?;
-        let behind = follow(project, branch, list, &asked)?;
+        // A finish asked again, its answer lost: it landed, and is in place
+        // (the list says so only once it is).
         return answer(
-            db,
+            &db,
             project,
             branch,
-            behind,
+            Vec::new(),
             pending.map_or_else(|| "root".to_owned(), |p| p.anchor),
         );
     }
@@ -731,10 +731,10 @@ pub fn finish(
     let anchor = if pending.read {
         pending.anchor.clone()
     } else {
-        let facts = project.definitions(db, moved.iter().map(String::as_str))?;
+        let facts = project.definitions(&db, moved.iter().map(String::as_str))?;
         anchor_for(
             project,
-            db,
+            &db,
             &caller.login,
             branch,
             base,
@@ -756,50 +756,195 @@ pub fn finish(
             format!("`{branch}` moved since you looked: merge again onto what it is now"),
         );
     }
-    // Its objects into the stores the landing calls for, before it is
-    // written down: under the db lock nothing lands beside it, and a landing
-    // whose objects have nowhere safe to go does not land.
-    land(project, db, &caller.login, branch, list)?;
-    // The commit point.
-    let transaction = db.transaction()?;
-    if db::list_of(&transaction, &project.key, branch)?.as_ref() != Some(base) {
-        return fail(
-            409,
-            format!("`{branch}` moved since you looked: merge again onto what it is now"),
-        );
+    let prepared = prepare(project, &db, &caller.login, branch, base, list, &asked)?;
+    drop(db);
+    // Each tracker's new commits into a store that may hold them whether or
+    // not this lands, outside any lock.
+    for (target, borrow, commit) in &prepared.placements {
+        target.take_landing(&caller.login, commit, borrow)?;
     }
-    let now = db::now_iso();
-    for tracker in &moved {
-        let (old, new) = (base.get(tracker), list.get(tracker));
-        match new {
-            Some(new) => transaction.execute(
-                "INSERT OR REPLACE INTO heads VALUES (?, ?, ?, ?)",
-                params![project.key, branch, tracker, new],
-            )?,
-            None => transaction.execute(
-                "DELETE FROM heads WHERE home = ? AND branch = ? AND tracker = ?",
-                params![project.key, branch, tracker],
-            )?,
-        };
-        transaction.execute(
-            "INSERT INTO head_log (home, branch, tracker, old, new, moved_by, moved_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-            params![project.key, branch, tracker, old, new, caller.login, now],
-        )?;
-    }
-    transaction.execute(
-        "UPDATE branches SET updated_at = ? WHERE home = ? AND name = ?",
-        params![now, project.key, branch],
-    )?;
-    transaction.execute(
+    let landed = project.app.log.land(project.app, prepared.landing);
+    let db = project.app.db.lock();
+    let behind = match landed {
+        Ok(landed) => landed
+            .behind
+            .iter()
+            .map(|step| {
+                format!(
+                    "`{}`'s `{}` moved while this merge ran",
+                    step.tracker,
+                    step.reference.trim_start_matches("refs/heads/")
+                )
+            })
+            .collect(),
+        // Landed by an earlier ask whose answer was lost.
+        Err(error)
+            if error.status == 409
+                && db::list_of(&db, &project.key, branch)?.as_ref() == Some(list) =>
+        {
+            Vec::new()
+        }
+        Err(error) => return Err(error),
+    };
+    db.execute(
         "DELETE FROM grants WHERE token_id = ? AND refs = 'refs/newgit/landing/'",
         [&caller.token_id],
     )?;
-    transaction.commit()?;
-    let behind = follow(project, branch, list, &asked)?;
-    project.app.trackers_moved();
-    // A landing may have changed definitions, and so audiences.
-    project.settle_after_landing(db);
-    answer(db, project, branch, behind, anchor)
+    answer(&db, project, branch, behind, anchor)
+}
+
+/// A merge's landing, ready to be checked under the lock and written down,
+/// and the commits to bring into stores before it is.
+struct Prepared {
+    landing: Landing,
+    /// Each commit waiting in the merger's landing, the repo it goes into
+    /// before the landing is written down, and the repo it resolves
+    /// against: where its tracker is.
+    placements: Vec<(Repo, Repo, String)>,
+}
+
+/// What landing `list` onto `base` writes down, and where its new commits
+/// go. Definitions are read from each tracker's `main`, so only a landing on
+/// `main` changes them; for one, they are read from the commits it lands,
+/// and every tracker whose audience that changes moves store in the same
+/// landing (`ProjectContext::moves`).
+///
+/// A tracker's new commits wait in the merger's landing until they go into a
+/// store whose readers may see them whether or not the landing happens:
+///
+/// - a tracker staying where it is, or widening, takes them into the store it
+///   is in now, before the landing is written down (a widening copies them on
+///   once it is, with the rest of its history);
+/// - a narrowing takes them into its new, narrower store before, too;
+/// - a move between audiences not ordered by inclusion (`user:a` to
+///   `user:b`, a private instance's to the members') takes them into neither
+///   before: they go straight into the new store after the landing is
+///   written down (`Change::takes`).
+///
+/// So a landing that is refused, or never written down, has made nothing
+/// more readable than it was, and one that is has made all of it.
+fn prepare(
+    project: &ProjectContext<'_>,
+    db: &Connection,
+    by: &str,
+    branch: &str,
+    base: &List,
+    list: &List,
+    asked: &[RefMove],
+) -> ApiResult<Prepared> {
+    let mut names = project.placed();
+    names.extend(list.keys().cloned());
+    let after = if branch == "main" {
+        let mut at = BTreeMap::new();
+        for (tracker, commit) in list {
+            if !project.links.contains_key(tracker) {
+                let view = project.tracker(tracker).view(by)?;
+                at.insert(tracker.clone(), (view, commit.clone()));
+            }
+        }
+        policy::load_definitions_at(
+            &project.app.config.data,
+            db,
+            &project.id,
+            names.iter().map(String::as_str),
+            &at,
+        )
+    } else {
+        project.definitions(db, names.iter().map(String::as_str))?
+    };
+    let mut listed: BTreeSet<String> = db::listed_trackers(db, &project.key)?.into_iter().collect();
+    listed.extend(list.keys().cloned());
+    let stores = project.moves(&after, &listed)?;
+    let mut change = Change {
+        branches: [(branch.to_owned(), list.clone())].into(),
+        ..Change::default()
+    };
+    let mut placements = Vec::new();
+    let mut placed = Vec::new();
+    for (tracker, commit) in list {
+        if project.links.contains_key(tracker) {
+            continue;
+        }
+        let here = project.own(tracker);
+        placed.push(landing::Placed {
+            home: project.key.clone(),
+            tracker: tracker.clone(),
+            store: db::tracker_store(db, &project.key, tracker)?,
+        });
+        // Its landing ref goes once the commit is on the branch.
+        change
+            .refs
+            .entry(tracker.clone())
+            .or_default()
+            .insert(landing_ref(commit), None);
+        let to = stores
+            .get(tracker)
+            .and_then(|step| repos::Store::parse(&step.to));
+        match to {
+            None => placements.push((here.clone(), here, commit.clone())),
+            Some(to) if to.includes(&here.store) => {
+                placements.push((here.clone(), here, commit.clone()));
+            }
+            Some(to) if here.store.includes(&to) => {
+                let there = Repo {
+                    store: to,
+                    ..here.clone()
+                };
+                placements.push((there, here, commit.clone()));
+            }
+            Some(_) => {
+                if here.waits_in_landing(by, commit) {
+                    change
+                        .takes
+                        .entry(tracker.clone())
+                        .or_default()
+                        .push(commit.clone());
+                }
+            }
+        }
+    }
+    change
+        .refs
+        .entry("root".to_owned())
+        .or_default()
+        .insert(format!("refs/heads/{branch}"), Some(list["root"].clone()));
+    change.stores = stores;
+    let mut asked_refs = Vec::new();
+    for step in asked {
+        let (home, there) = match project.links.get(&step.tracker) {
+            Some((home, there)) => (home.clone(), there.clone()),
+            None => (project.key.clone(), step.tracker.clone()),
+        };
+        placed.push(landing::Placed {
+            home: home.clone(),
+            tracker: there.clone(),
+            store: db::tracker_store(db, &home, &there)?,
+        });
+        asked_refs.push(Asked {
+            home,
+            tracker: there,
+            reference: format!("refs/heads/{}", step.branch),
+            old: step.old.clone(),
+            new: step.new.clone(),
+            repo: project.tracker(&step.tracker),
+        });
+    }
+    Ok(Prepared {
+        landing: Landing {
+            entry: Entry {
+                by: by.to_owned(),
+                homes: [(project.key.clone(), change)].into(),
+            },
+            expect: vec![landing::Expect {
+                home: project.key.clone(),
+                branch: branch.to_owned(),
+                list: Some(base.clone()),
+            }],
+            placed,
+            asked: asked_refs,
+        },
+        placements,
+    })
 }
 
 fn answer(
@@ -876,117 +1021,6 @@ fn check_moves(
         }
     }
     Ok(moves)
-}
-
-/// Every commit of `list` waiting in `by`'s landings, brought into the store
-/// its tracker's definition calls for as this landing leaves it. Each
-/// tracker's new commits go first into the narrower of its old store and its
-/// new one, so a landing that fails part way has made nothing more readable
-/// than it was:
-///
-/// - a narrowing moves the tracker first, then its commits follow it into the
-///   narrower store, never written into the wider one;
-/// - a widening brings its commits into the old, narrower store first, and
-///   moves only once every tracker's commits are in place, so a commit that
-///   cannot be brought in (an object missing) leaves it where it was;
-/// - a move between stores whose audiences are not ordered by inclusion
-///   (`user:a` to `user:b`) is taken as a narrowing: moved, then filled.
-///
-/// The quarantine borrows whichever store the tracker is in when its commits
-/// are brought in (`Repo::open_landing` rewrites its alternates), so it never
-/// resolves an object from a store the commits are not going into.
-///
-/// Definitions are read from each tracker's `main`, so only a landing on
-/// `main` changes them; for one, they are read from the commits it lands.
-/// Every store a tracker moves to is checked before anything moves, so a
-/// store in the way made for another audience refuses the landing whole.
-/// Run again by a finish asked again: what is in place already is left.
-fn land(
-    project: &ProjectContext<'_>,
-    db: &Connection,
-    by: &str,
-    branch: &str,
-    list: &List,
-) -> ApiResult<()> {
-    let names = list.keys().map(String::as_str);
-    let after = if branch == "main" {
-        let mut at = BTreeMap::new();
-        for (tracker, commit) in list {
-            if !project.links.contains_key(tracker) {
-                let view = project.tracker(tracker).view(by)?;
-                at.insert(tracker.clone(), (view, commit.clone()));
-            }
-        }
-        policy::load_definitions_at(&project.app.config.data, db, &project.id, names, &at)
-    } else {
-        project.definitions(db, names)?
-    };
-    let mut widening = BTreeSet::new();
-    for tracker in list.keys() {
-        let Some(fact) = after.get(tracker) else {
-            continue;
-        };
-        if project.links.contains_key(tracker) {
-            continue;
-        }
-        let to = repos::Store::for_tracker(Some(fact), tracker);
-        let own = project.own(tracker);
-        if own.store != to {
-            repos::check_store(&to.dir(&project.home()), &to)?;
-            if own.exists() && own.store.widens_to(&to) {
-                widening.insert(tracker.as_str());
-            }
-        }
-    }
-    for (tracker, commit) in list {
-        if widening.contains(tracker.as_str()) {
-            project.tracker(tracker).take_landing(by, commit)?;
-        }
-    }
-    for (tracker, commit) in list {
-        if !widening.contains(tracker.as_str()) {
-            project.settle(db, tracker, after.get(tracker))?;
-            project.tracker(tracker).take_landing(by, commit)?;
-        }
-    }
-    for tracker in &widening {
-        project.settle(db, tracker, after.get(*tracker))?;
-    }
-    Ok(())
-}
-
-/// Each repo's branch after a landing: root's to the list, each asked-for
-/// move by compare-and-swap, and the landing refs gone. What could not move
-/// (a child's `main` moved meanwhile) is said, and the landing stands.
-fn follow(
-    project: &ProjectContext<'_>,
-    branch: &str,
-    list: &List,
-    moves: &[RefMove],
-) -> ApiResult<Vec<String>> {
-    let mut behind = Vec::new();
-    project
-        .tracker("root")
-        .set_refs(&[(format!("refs/heads/{branch}"), list["root"].clone())])?;
-    for step in moves {
-        let repo = project.tracker(&step.tracker);
-        let reference = format!("refs/heads/{}", step.branch);
-        let moved = repo.update_refs(&[RefUpdate {
-            reference: &reference,
-            new: &step.new,
-            old: step.old.as_deref(),
-        }])?;
-        if !moved && repo.branch_head(&step.branch).as_deref() != Some(step.new.as_str()) {
-            behind.push(format!(
-                "`{}`'s `{}` moved while this merge ran",
-                step.tracker, step.branch
-            ));
-        }
-    }
-    for (tracker, commit) in list {
-        let _ = project.tracker(tracker).delete_ref(&landing_ref(commit));
-    }
-    Ok(behind)
 }
 
 #[cfg(test)]

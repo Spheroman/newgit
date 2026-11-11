@@ -1,6 +1,6 @@
 # Landing
 
-**Status: decided; step 1 of the build order is built.** How changes land in a tree of trackers on
+**Status: decided; steps 1 and 2 of the build order are built.** How changes land in a tree of trackers on
 `newgit serve`. It replaces [anchoring.md](anchoring.md), which describes how
 the Worker on newgit.dev lands merges today and goes when newgit.dev moves to
 `serve`. Settled with Jack on 2026-11-10 after two adversarial reviews and a
@@ -109,7 +109,9 @@ On one server:
    server shard; its sequence number is the landing stamp. Repo refs and
    SQLite follow it and are repaired from it at startup, and readers resolve
    heads through it, so no reader sees half a landing. "State at T" reads
-   the stamps, never commit dates.
+   the stamps, never commit dates. A tracker moving between stores is part
+   of its landing's entry, put in place after the commit point. Built
+   (#410): [serve.md](serve.md), decision 8.
 5. **Barriers:** a change under `.newgit/trackers/` (definitions, audiences,
    mounts) lands only on the current head, by itself, and bumps an epoch. A
    landing prepared under an older epoch starts again.
@@ -188,8 +190,10 @@ Anchors as a concept, deferred roll-ups, inboxes and outboxes, reservations,
 
 1. **Done (#409).** Pool per audience: trackers as ref namespaces, refs in
    reftable, one audience per store enforced at creation.
-2. The landing log and one-transaction landings with group commit; readers
-   resolve heads through it; startup repair.
+2. **Done (#410).** The landing log and one-transaction landings with group
+   commit; readers resolve heads through it; startup repair; store moves
+   as landing steps. A landing fast-forwards only: the merge commit when
+   the branch moved is step 3's, since it needs `merge-tree`.
 3. Server-side merge (compose, `merge-tree`, split) in place of "merge
    again", with barriers, epochs, and fairness.
 4. Stored rooted histories, extended at landing.

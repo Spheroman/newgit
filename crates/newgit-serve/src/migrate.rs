@@ -18,11 +18,13 @@
 //! exactly as a seed does when it joins a branch, so the first tracker of an
 //! audience is renamed into place rather than copied twice.
 //!
-//! It runs at every start, and does nothing once nothing old is left (and no
-//! tracker is alone that a stopped run may have left unsettled). A run that
-//! stopped part way is finished by the next: copying is idempotent, an old
-//! repository is deleted only once it is copied and its row written, and
-//! settling finishes a move the way it finishes any other.
+//! It runs at every start, after the landing log is repaired, and does
+//! nothing once nothing old is left (and no tracker is alone that a stopped
+//! run may have left unsettled). Rows and moves are landings like any other
+//! (`crate::landing`). A run that stopped part way is finished by the next:
+//! copying is idempotent, an old repository is deleted only once it is copied
+//! and its row landed, and a move that stopped is put in place by the log's
+//! repair, or landed again here.
 
 use anyhow::{Context as _, anyhow};
 use camino::{Utf8Path, Utf8PathBuf};
@@ -31,6 +33,7 @@ use crate::App;
 use crate::api::ProjectContext;
 use crate::db;
 use crate::error::HttpError;
+use crate::landing::{Change, Entry, Landing, Move};
 use crate::names::{ProjectId, fork_namespace, is_part, parse_project_key, user_namespace};
 use crate::repos::{self, Repo, Store};
 
@@ -59,23 +62,38 @@ pub fn per_tracker_repos(app: &App) -> anyhow::Result<()> {
 }
 
 fn migrate_home(app: &App, id: &ProjectId, home: &Utf8Path) -> anyhow::Result<()> {
-    let db = app.db.lock();
     let key = id.key();
-    if db::project(&db, &key).map_err(message)?.is_none() {
-        eprintln!("newgit serve: {home} is no project's; left as it is");
-        return Ok(());
+    {
+        let db = app.db.lock();
+        if db::project(&db, &key).map_err(message)?.is_none() {
+            eprintln!("newgit serve: {home} is no project's; left as it is");
+            return Ok(());
+        }
     }
     let had_old = OLD.iter().any(|old| home.join(old).is_dir());
     let copy = |repo: &Repo, old: &Utf8Path| -> anyhow::Result<()> {
         repo.copy_from(old, "", "refs/").map_err(message)?;
         Ok(())
     };
-    // Copied, then its row, then the old one deleted: a run stopped anywhere
-    // between leaves the old repository for the next run to copy again.
+    // Copied, then its row landed, then the old one deleted: a run stopped
+    // anywhere between leaves the old repository for the next run to copy
+    // again.
+    let mut made = Change::default();
+    let mut copied = Vec::new();
     for (tracker, old) in entries(&home.join("t"), true) {
         let repo = Repo::tracker(home, Some(Store::Tracker(tracker.clone())), &tracker);
         copy(&repo, &old)?;
-        db::set_tracker_store(&db, &key, &tracker, &repo.store.name()).map_err(message)?;
+        made.stores.insert(
+            tracker,
+            Move {
+                from: None,
+                to: repo.store.name(),
+            },
+        );
+        copied.push(old);
+    }
+    land(app, &key, made)?;
+    for old in copied {
         repos::delete(&old).map_err(message)?;
     }
     for (tracker, dir) in entries(&home.join("u"), false) {
@@ -103,13 +121,60 @@ fn migrate_home(app: &App, id: &ProjectId, home: &Utf8Path) -> anyhow::Result<()
     for old in OLD {
         remove_empty(&home.join(old));
     }
-    // What fails to settle here is said, and settled (or refused) by the
-    // first request that reaches it, as after a landing.
-    let project = ProjectContext::open(app, &db, id).map_err(message)?;
-    project.settle_after_landing(&db);
+    // Each tracker on a branch into its audience's store, as when a seed
+    // joins a branch: one landing. One that cannot move is said, and the
+    // server starts; it is refused until a landing moves it.
+    let moves = {
+        let db = app.db.lock();
+        let project = ProjectContext::open(app, &db, id).map_err(message)?;
+        let listed = db::listed_trackers(&db, &key)
+            .map_err(message)?
+            .into_iter()
+            .collect();
+        let placed = project.placed();
+        let after = project
+            .definitions(&db, placed.iter().map(String::as_str))
+            .map_err(message)?;
+        project.moves(&after, &listed)
+    };
+    match moves {
+        Ok(stores) => {
+            if let Err(error) = land(
+                app,
+                &key,
+                Change {
+                    stores,
+                    ..Change::default()
+                },
+            ) {
+                eprintln!("newgit serve: settling {key}'s stores: {error:#}");
+            }
+        }
+        Err(error) => eprintln!("newgit serve: settling {key}'s stores: {}", error.message),
+    }
     if had_old {
         eprintln!("newgit serve: moved {key} to one store per audience");
     }
+    Ok(())
+}
+
+/// Land `change` to `key`, by the server, if it changes anything.
+fn land(app: &App, key: &str, change: Change) -> anyhow::Result<()> {
+    if change == Change::default() {
+        return Ok(());
+    }
+    app.log
+        .land(
+            app,
+            Landing {
+                entry: Entry {
+                    by: "newgit serve".to_owned(),
+                    homes: [(key.to_owned(), change)].into(),
+                },
+                ..Landing::default()
+            },
+        )
+        .map_err(message)?;
     Ok(())
 }
 

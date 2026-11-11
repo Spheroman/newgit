@@ -3,6 +3,11 @@
 //! instances, forks, checkpoints, tags, links), and which store each
 //! tracker's history is in.
 //!
+//! Branches' lists (`heads`, `head_log`) and which store each tracker is in
+//! (`tracker_stores`) follow the landing log (`crate::landing`): they are
+//! written only by applying a landing, each landing in one transaction, and
+//! repaired from the log at startup. `landing_applied` says how far.
+//!
 //! Every project-scoped table is keyed by `home` first (`<owner>/<project>`),
 //! so moving a set of homes to another node is a `WHERE home ...` away. One
 //! connection behind one lock: SQLite serializes writers anyway, and a write
@@ -67,13 +72,54 @@ CREATE TABLE IF NOT EXISTS links (
 CREATE TABLE IF NOT EXISTS tracker_stores (
     home TEXT NOT NULL REFERENCES projects ON DELETE CASCADE, tracker TEXT NOT NULL,
     store TEXT NOT NULL, PRIMARY KEY (home, tracker));
+CREATE TABLE IF NOT EXISTS landing_applied (
+    id INTEGER PRIMARY KEY CHECK (id = 1), stamp INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS grants (
     repo TEXT NOT NULL, token_id TEXT NOT NULL, refs TEXT NOT NULL, expires_at INTEGER NOT NULL,
     PRIMARY KEY (repo, token_id, refs));
 ";
 
+/// Columns added since a table was first made: added to a database made
+/// before them.
+const ADDED: &[(&str, &str, &str)] = &[
+    ("branches", "stamp", "INTEGER"),
+    ("head_log", "stamp", "INTEGER"),
+];
+
 pub struct Db {
     connection: Mutex<Connection>,
+}
+
+thread_local! {
+    static HELD: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// The one connection, locked. While a thread holds it, that thread may not
+/// wait on a landing ([`held_here`]): applying one takes this lock.
+pub struct DbGuard<'a>(MutexGuard<'a, Connection>);
+
+impl std::ops::Deref for DbGuard<'_> {
+    type Target = Connection;
+    fn deref(&self) -> &Connection {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for DbGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Connection {
+        &mut self.0
+    }
+}
+
+impl Drop for DbGuard<'_> {
+    fn drop(&mut self) {
+        HELD.with(|held| held.set(held.get().saturating_sub(1)));
+    }
+}
+
+/// Whether this thread holds the db lock.
+pub fn held_here() -> bool {
+    HELD.with(|held| held.get() > 0)
 }
 
 pub fn now_iso() -> String {
@@ -159,15 +205,33 @@ impl Db {
         let connection = Connection::open(path.as_std_path())?;
         connection.busy_timeout(std::time::Duration::from_secs(5))?;
         connection.execute_batch(SCHEMA)?;
+        for (table, column, kind) in ADDED {
+            let has: bool = connection
+                .prepare(&format!(
+                    "SELECT 1 FROM pragma_table_info('{table}') WHERE name = ?"
+                ))?
+                .exists([column])?;
+            if !has {
+                connection
+                    .execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {kind}"))?;
+            }
+        }
+        // A landing applied again (replayed at startup) logs nothing twice.
+        connection.execute_batch(
+            "CREATE UNIQUE INDEX IF NOT EXISTS head_log_by_stamp ON head_log (stamp, home, branch, tracker)",
+        )?;
         Ok(Self {
             connection: Mutex::new(connection),
         })
     }
 
-    pub fn lock(&self) -> MutexGuard<'_, Connection> {
-        self.connection
+    pub fn lock(&self) -> DbGuard<'_> {
+        let guard = self
+            .connection
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        HELD.with(|held| held.set(held.get() + 1));
+        DbGuard(guard)
     }
 }
 
@@ -377,17 +441,26 @@ pub fn list_of(db: &Connection, home: &str, branch: &str) -> ApiResult<Option<Li
 
 pub fn branches(db: &Connection, home: &str) -> ApiResult<Vec<Value>> {
     let mut statement = db.prepare(
-        "SELECT name, created_by, created_at, updated_at FROM branches WHERE home = ? ORDER BY name",
+        "SELECT name, created_by, created_at, updated_at, stamp FROM branches WHERE home = ? ORDER BY name",
     )?;
-    let rows: Vec<(String, String, String, String)> = statement
+    let rows: Vec<(String, String, String, String, Option<i64>)> = statement
         .query_map([home], |row| {
-            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+            ))
         })?
         .collect::<Result<_, _>>()?;
     let mut out = Vec::new();
-    for (name, by, created, updated) in rows {
+    for (name, by, created, updated, stamp) in rows {
         let list = list_of(db, home, &name)?.unwrap_or_default();
-        out.push(json!({ "name": name, "list": list, "createdBy": by, "createdAt": created, "updatedAt": updated }));
+        out.push(json!({
+            "name": name, "list": list, "createdBy": by, "createdAt": created,
+            "updatedAt": updated, "stamp": stamp,
+        }));
     }
     Ok(out)
 }
@@ -400,39 +473,117 @@ pub fn listed_trackers(db: &Connection, home: &str) -> ApiResult<Vec<String>> {
     Ok(rows.collect::<Result<_, _>>()?)
 }
 
-/// Create a branch from a list; `false` when it exists.
-pub fn create_branch(
+/// Branch `branch` of `home` set to `list` by `by`, as landing `stamp` left
+/// it: made if it is not yet, and each tracker it moves logged. Only applying
+/// a landing calls this (`crate::landing`); run again for the same stamp, it
+/// changes nothing.
+pub fn set_branch(
     db: &Connection,
     home: &str,
     branch: &str,
     list: &List,
     by: &str,
-) -> ApiResult<bool> {
+    stamp: u64,
+) -> ApiResult<()> {
     let now = now_iso();
-    let inserted = db.execute(
-        "INSERT OR IGNORE INTO branches VALUES (?, ?, ?, ?, ?)",
-        params![home, branch, by, now, now],
-    )?;
-    if inserted == 0 {
-        return Ok(false);
+    let stamp = i64::try_from(stamp).unwrap_or(i64::MAX);
+    let before = list_of(db, home, branch)?;
+    if before.is_none() {
+        db.execute(
+            "INSERT INTO branches (home, name, created_by, created_at, updated_at, stamp) VALUES (?, ?, ?, ?, ?, ?)",
+            params![home, branch, by, now, now, stamp],
+        )?;
+    } else {
+        db.execute(
+            "UPDATE branches SET updated_at = ?, stamp = ? WHERE home = ? AND name = ?",
+            params![now, stamp, home, branch],
+        )?;
     }
-    for (tracker, commit) in list {
-        // A seed's grant ends once its tracker is on a branch: from then on
-        // its history moves only by merging.
+    let before = before.unwrap_or_default();
+    let trackers: std::collections::BTreeSet<&String> = before.keys().chain(list.keys()).collect();
+    for tracker in trackers {
+        let (old, new) = (before.get(tracker), list.get(tracker));
+        if old == new {
+            continue;
+        }
+        match new {
+            Some(new) => db.execute(
+                "INSERT OR REPLACE INTO heads VALUES (?, ?, ?, ?)",
+                params![home, branch, tracker, new],
+            )?,
+            None => db.execute(
+                "DELETE FROM heads WHERE home = ? AND branch = ? AND tracker = ?",
+                params![home, branch, tracker],
+            )?,
+        };
+        db.execute(
+            "INSERT OR IGNORE INTO head_log (home, branch, tracker, old, new, moved_by, moved_at, stamp) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            params![home, branch, tracker, old, new, by, now, stamp],
+        )?;
+    }
+    Ok(())
+}
+
+/// One home's branches' lists, and the store each of its trackers is in.
+pub type HomeState = (BTreeMap<String, List>, BTreeMap<String, String>);
+
+/// Every project's branches' lists and trackers' stores, as SQLite has them:
+/// what the landing log starts from when it is made for a data directory
+/// from before it.
+pub fn everything(db: &Connection) -> ApiResult<BTreeMap<String, HomeState>> {
+    let mut out = BTreeMap::new();
+    let mut statement = db.prepare("SELECT home FROM projects ORDER BY home")?;
+    let homes: Vec<String> = statement
+        .query_map([], |row| row.get(0))?
+        .collect::<Result<_, _>>()?;
+    for home in homes {
+        let mut lists = BTreeMap::new();
+        let mut statement = db.prepare("SELECT name FROM branches WHERE home = ?")?;
+        let names: Vec<String> = statement
+            .query_map([&home], |row| row.get(0))?
+            .collect::<Result<_, _>>()?;
+        for name in names {
+            lists.insert(name.clone(), list_of(db, &home, &name)?.unwrap_or_default());
+        }
+        out.insert(home.clone(), (lists, tracker_stores(db, &home)?));
+    }
+    Ok(out)
+}
+
+/// The stamp of the last landing applied, and every one before it.
+pub fn applied(db: &Connection) -> ApiResult<Option<u64>> {
+    let stamp: Option<i64> = db
+        .query_row(
+            "SELECT stamp FROM landing_applied WHERE id = 1",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(stamp.and_then(|stamp| u64::try_from(stamp).ok()))
+}
+
+pub fn set_applied(db: &Connection, stamp: u64) -> ApiResult<()> {
+    db.execute(
+        "INSERT OR REPLACE INTO landing_applied VALUES (1, ?)",
+        [i64::try_from(stamp).unwrap_or(i64::MAX)],
+    )?;
+    Ok(())
+}
+
+/// A seed's grant ends once its tracker is on a branch: from then on its
+/// history moves only by merging.
+pub fn end_seed_grants<'t>(
+    db: &Connection,
+    home: &str,
+    trackers: impl IntoIterator<Item = &'t String>,
+) -> ApiResult<()> {
+    for tracker in trackers {
         db.execute(
             "DELETE FROM grants WHERE repo = ?",
             [format!("{}.t.{tracker}", home.replace('/', "."))],
         )?;
-        db.execute(
-            "INSERT INTO heads VALUES (?, ?, ?, ?)",
-            params![home, branch, tracker, commit],
-        )?;
-        db.execute(
-            "INSERT INTO head_log (home, branch, tracker, old, new, moved_by, moved_at) VALUES (?, ?, ?, NULL, ?, ?, ?)",
-            params![home, branch, tracker, commit, by, now],
-        )?;
     }
-    Ok(true)
+    Ok(())
 }
 
 pub fn set_default_branch(db: &Connection, home: &str, branch: &str) -> ApiResult<bool> {
@@ -490,6 +641,7 @@ pub fn tracker_store(db: &Connection, home: &str, tracker: &str) -> ApiResult<Op
         .optional()?)
 }
 
+/// Where `tracker`'s history is: written only by applying a landing.
 pub fn set_tracker_store(db: &Connection, home: &str, tracker: &str, store: &str) -> ApiResult<()> {
     db.execute(
         "INSERT OR REPLACE INTO tracker_stores VALUES (?, ?, ?)",

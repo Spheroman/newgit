@@ -130,10 +130,12 @@ fn a_data_directory_of_per_tracker_repos_moves_to_stores_per_audience() {
             ("site".to_owned(), site.clone()),
         ]
         .into();
-        db::create_branch(&db, "jack/p", "main", &list, "jack").expect("main");
+        db::set_branch(&db, "jack/p", "main", &list, "jack", 0).expect("main");
         db::create_instance(&db, "jack/p", "feat", "jack", &root, None, false).expect("feat");
         db::add_fork(&db, "jack/p", "feat", "root").expect("fork");
     }
+    // From before the landing log, too: its first entry is what SQLite says.
+    std::fs::remove_dir_all(data.join("landing.git")).expect("no log");
 
     // Opened again: moved.
     let app = App::open(config(&data, unused)).expect("migrates");

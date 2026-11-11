@@ -9,6 +9,7 @@ pub mod api;
 pub mod db;
 pub mod error;
 pub mod git_http;
+pub mod landing;
 pub mod merge;
 pub mod migrate;
 pub mod names;
@@ -62,6 +63,10 @@ pub struct App {
     generation: std::sync::atomic::AtomicU64,
     /// Merges begun and not landed.
     pub merges: merge::Merges,
+    /// Every landing's commit point (`landing.rs`).
+    pub log: landing::Log,
+    /// Pushes running, which a tracker moving between stores waits out.
+    pub pushes: landing::Pushes,
 }
 
 pub type Definitions = BTreeMap<String, policy::Facts>;
@@ -77,6 +82,7 @@ impl App {
         std::fs::create_dir_all(&config.data)
             .with_context(|| format!("creating {}", config.data))?;
         let db = db::Db::open(&config.data.join("server.sqlite"))?;
+        let log = landing::Log::open(&config.data, &db)?;
         let token_key = token_key(&config.data)?;
         let hooks = config.data.join("hooks");
         std::fs::create_dir_all(&hooks)?;
@@ -95,7 +101,14 @@ impl App {
             definitions: Mutex::default(),
             generation: std::sync::atomic::AtomicU64::new(0),
             merges: merge::Merges::default(),
+            log,
+            pushes: landing::Pushes::default(),
         };
+        // Landings written down and not yet in place, before anything is
+        // served.
+        app.log.replay(&app).map_err(|error| {
+            anyhow::anyhow!("repairing from the landing log: {}", error.message)
+        })?;
         migrate::per_tracker_repos(&app)?;
         Ok(app)
     }
