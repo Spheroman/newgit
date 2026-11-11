@@ -23,7 +23,9 @@
 //! that waits for `newgit tracker allow-plaintext <path>` on this machine.
 //! It is a confirmation, not a boundary: anything that can run commands in
 //! the workspace can run that one too. A machine that has never held the
-//! content has nothing to hold back.
+//! content has nothing to hold back. It knows paths (compared case-folded),
+//! not content: the same content copied or moved to another path is not
+//! held back.
 
 use std::collections::BTreeMap;
 
@@ -408,11 +410,11 @@ impl BranchManager {
         if !Self::stores_unencrypted(definition) || paths.is_empty() {
             return Ok(());
         }
-        let held = crate::tracker_repo::held_sealed(&self.store.paths().tracker_store);
+        let held = self.held_sealed_paths()?;
         let mut found: Vec<&str> = paths
             .iter()
             .map(String::as_str)
-            .filter(|path| held.contains(*path))
+            .filter(|path| held.holds(path))
             .collect();
         if found.is_empty() {
             return Ok(());
@@ -436,7 +438,9 @@ impl BranchManager {
     }
 
     /// Every path this machine holds back from being stored unencrypted.
-    pub fn held_sealed_paths(&self) -> std::collections::BTreeSet<String> {
+    /// Compared case-folded ([`crate::tracker_repo::fold_path`]); an error
+    /// when the file is there but does not parse.
+    pub fn held_sealed_paths(&self) -> Result<crate::tracker_repo::HeldSealed> {
         crate::tracker_repo::held_sealed(&self.store.paths().tracker_store)
     }
 
@@ -830,8 +834,9 @@ impl BranchManager {
                 "the remote's `main` of `{name}` has changes {rev} does not include (merged \
                  from somewhere else since this machine last saw it), so nothing was \
                  published: that would overwrite them. In the instance, `newgit tracker pull \
-                 {name} --keep-mine` pulls them and puts your files back on top (each file you \
-                 have REPLACES theirs; files only they have stay; there is no content merge), \
+                 {name} --keep-mine` pulls them and puts your version back on top (each file \
+                 you have REPLACES theirs, a file you deleted since the rev you started from is \
+                 deleted again, files only they added stay; there is no content merge), \
                  then `newgit tracker merge {name}` publishes it. To take theirs instead, \
                  `newgit tracker pull {name}` (your version stays at {rev})",
                 name = definition.name,
@@ -917,7 +922,7 @@ impl BranchManager {
         let known = self.remote_has(&definition.name);
         let lane = self.lane(&definition.name);
         if !definition.encrypted_to_audience() {
-            if !Self::stores_unencrypted(definition) || self.held_sealed_paths().is_empty() {
+            if !Self::stores_unencrypted(definition) || self.held_sealed_paths()?.is_empty() {
                 return Ok(());
             }
             // Everything the remote would receive, not only the tip: an
@@ -1083,7 +1088,9 @@ fn refusal_text(name: &str, definition: &TrackerDefinition, found: &[&str]) -> S
          here, or decrypted into a workspace here), and {goes}. Definitions arrive through \
          `access`, `newgit merge main`, and `pull`, so nothing at {} is captured or sent \
          unencrypted until you release it on this machine: `newgit tracker allow-plaintext \
-         {command}`. Who changed the definitions: `git log -p -- .newgit/trackers/`",
+         {command}`. (The guard knows paths, not content: the same content copied or moved \
+         to another path is not held back.) Who changed the definitions: `git log -p -- \
+         .newgit/trackers/`",
         if found.len() == 1 {
             "that path"
         } else {
@@ -1093,7 +1100,7 @@ fn refusal_text(name: &str, definition: &TrackerDefinition, found: &[&str]) -> S
 }
 
 /// `value` as a shell reads it back: bare when it is plain.
-fn shell_quote(value: &str) -> String {
+pub(super) fn shell_quote(value: &str) -> String {
     let plain = !value.is_empty()
         && value
             .chars()

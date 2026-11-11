@@ -446,8 +446,14 @@ putting it in a workspace decrypts, and the workspace always holds plaintext
   --keep-mine` in the instance takes yours on top of theirs: it captures the
   instance's files, pulls `main`, puts those files back over it, and
   captures that, so the next `tracker merge` publishes it with theirs
-  underneath. There is no content merge: every file you have REPLACES
-  theirs, and files only they have stay. A plain `newgit tracker pull
+  underneath. There is no content merge: "yours" is your whole version of
+  the tracker's files. Every file you have REPLACES theirs, a file you
+  deleted since the rev you started from (the newest rev your capture and
+  theirs share) is deleted again even if they changed it, and files only
+  they added stay. When the two share no rev, newgit cannot tell a file you
+  deleted from one they added, so a file you deleted comes back from theirs;
+  the command says so. If a step fails after the pull, the error names the
+  rev that holds your version. A plain `newgit tracker pull
   <tracker>` takes theirs instead, replacing the instance's files of the
   tracker (yours stay at the rev the refusal names). `tracker pull`, and a
   spawn in a fresh `newgit clone`, fetch the remote's `main` first. A `main` that
@@ -486,8 +492,10 @@ putting it in a workspace decrypts, and the workspace always holds plaintext
   (`.newgit/trackers/*.toml`) arrive through `access`, `newgit merge main`,
   and `pull`. This machine remembers every workspace path at which it has
   held encrypted content, captured encrypted here or decrypted into a
-  workspace here (`.newgit/local/sealed-paths.json`). The guard is keyed by
-  path, not by tracker: whatever tracker claims such a path now, under
+  workspace here (`.newgit/local/sealed-paths.json`; a file there that does
+  not parse stops every capture and send that consults it, rather than
+  being read as empty). The guard is keyed by path, not by tracker:
+  whatever tracker claims such a path now, under
   whatever name (a definition renamed, deleted and replaced, or a narrower
   one claiming one of its files), a capture or send that would store its
   content unencrypted is refused as an error. That is a `public` tracker
@@ -495,8 +503,13 @@ putting it in a workspace decrypts, and the workspace always holds plaintext
   true`; the path stays ignored in existing workspaces, but a commit with
   it is refused at the push gate all the same). The refusal names the
   paths and prints the command that releases them on this machine:
-  `newgit tracker allow-plaintext <path>...`. A path captured encrypted
-  again is held back again. `newgit checkpoint` keeps the checkpoint on
+  `newgit tracker allow-plaintext <path>...` (a directory releases every
+  held file under it, and the command lists what it released). A path
+  captured encrypted again is held back again. The guard knows paths, not
+  content: the same content copied or moved to another path is not held
+  back. Paths are compared ignoring case, so a
+  claim spelled differently on a case-insensitive filesystem (macOS) is
+  the same path. `newgit checkpoint` keeps the checkpoint on
   this machine and exits non-zero when its sync is refused for this or any
   other security reason (plaintext, a stale set of recipients, a merge
   commit); a remote it cannot reach is a warning, as before.

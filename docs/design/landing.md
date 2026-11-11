@@ -135,7 +135,8 @@ member list, so it could add a login whose keys then become recipients
 definitions, which decide whether a path is encrypted at all (a machine that
 has held a path's encrypted content refuses to store it unencrypted until
 `newgit tracker allow-plaintext <path>` there, a confirmation rather than a
-boundary; a machine that never held it has nothing to compare against);
+boundary that knows paths, not content; a machine that never held it has
+nothing to compare against);
 nothing is signed, so it could substitute content that decrypts cleanly
 (#431); and names, sizes, and commit metadata stay readable to it. They merge on the client, which can
 decrypt; the server still checks ancestry and moves refs in the same landing

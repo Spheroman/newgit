@@ -1112,10 +1112,16 @@ pub struct KeptMine {
     pub mine: String,
     /// The `main` pulled.
     pub main: Option<String>,
+    /// The rev mine and `main` share, against which mine's deletions are
+    /// judged. `None` when they share none: then nothing was deleted, and a
+    /// file mine deleted came back from `main`.
+    pub base: Option<String>,
     /// Mine on top of it: what the instance is bound to now.
     pub rev: String,
     /// Files of `main` that mine replaced.
     pub files: usize,
+    /// Files mine deleted since `base` that `main` still had: deleted again.
+    pub deleted: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2757,7 +2763,7 @@ impl BranchManager {
         env: &[(String, String)],
         mount: Option<&Utf8Path>,
     ) -> Result<()> {
-        let held = self.held_sealed_paths();
+        let held = self.held_sealed_paths()?;
         let Some((commit, path)) =
             crate::compose::find_held_sealed(repo, rev_list, env, &held, mount)?
         else {
@@ -2765,14 +2771,16 @@ impl BranchManager {
         };
         let owner = crate::tracker::owner_of(&self.all_definitions(), Utf8Path::new(&path))
             .map_or_else(|| "root".to_owned(), |owner| owner.name.clone());
+        let quoted = encryption::shell_quote(&path);
         Err(NewgitError::PlaintextRefused(format!(
             "commit {} changes `{path}`, which held content encrypted to its audience on this \
              machine (captured encrypted here, or decrypted into a workspace here). It belongs \
              to `{owner}` now, a tracker in Git, so it would be pushed as it is. Definitions \
              arrive through `access`, `newgit merge main`, and `pull`, so it is not pushed until \
-             you release the path on this machine: `newgit tracker allow-plaintext {path}`. Or \
-             take it out of that commit (`git rm --cached {path}`, then `git commit --amend`) \
-             and try again. Who changed the definitions: `git log -p -- .newgit/trackers/`",
+             you release the path on this machine: `newgit tracker allow-plaintext {quoted}`. \
+             Or take it out of that commit (`git rm --cached {quoted}` then `git commit \
+             --amend`, or an interactive rebase if the commit is older) and try again. Who \
+             changed the definitions: `git log -p -- .newgit/trackers/`",
             &commit[..commit.len().min(12)]
         )))
     }
@@ -7321,24 +7329,51 @@ impl BranchManager {
     /// Take mine, on top of theirs: what `newgit tracker pull --keep-mine`
     /// does when a merge was refused because the remote's `main` moved on.
     /// This instance's files are captured, `main` (the remote's, when it
-    /// keeps one) is pulled, and the captured files are put back over it and
-    /// captured again, on top of `main`, so `newgit tracker merge` is a fast
-    /// forward of it. There is no content merge: every file this instance
-    /// has replaces `main`'s, and files only `main` has stay.
+    /// keeps one) is pulled, and the captured version is put back over it
+    /// and captured again, on top of `main`, so `newgit tracker merge` is a
+    /// fast forward of it. There is no content merge: "mine" is this
+    /// instance's whole version of the tracker's files. Every file it has
+    /// replaces `main`'s, and a file it deleted since the rev it started
+    /// from (the newest rev its capture and `main` share) is deleted again,
+    /// even where `main` changed it. Files only `main` added stay. When the
+    /// two share no rev, deletions cannot be told apart from files `main`
+    /// added, so every file only `main` has stays, and [`KeptMine::base`]
+    /// is `None` to say so.
     pub fn pull_tracker_keep_mine(&self, instance: &str, tracker: &str) -> Result<KeptMine> {
         let mine = self.capture_tracker(instance, tracker)?.rev;
-        self.pull_tracker(instance, tracker)?;
         let definition = self.definition(tracker)?;
+        let name = definition.name.clone();
+        let mine_kept = |error: NewgitError| {
+            NewgitError::Unsupported(format!(
+                "{error}. Your version of `{name}` is captured at {mine}: `newgit tracker \
+                 checkout {name} --rev {mine}` puts it back in the workspace"
+            ))
+        };
+        self.pull_tracker(instance, tracker).map_err(mine_kept)?;
+        self.keep_mine_over_main(instance, definition, &mine)
+            .map_err(mine_kept)
+    }
+
+    fn keep_mine_over_main(
+        &self,
+        instance: &str,
+        definition: &TrackerDefinition,
+        mine: &str,
+    ) -> Result<KeptMine> {
         let lane = self.lane(&definition.name);
         let main = lane.main();
+        let base = main.as_deref().and_then(|main| lane.merge_base(mine, main));
         let mut replaced = 0;
+        let mut deleted = Vec::new();
         {
             let (_lock, mut branch) = self.locked_branch(instance)?;
-            let dir = lane.checkout_dir(&mine)?;
+            let dir = lane.checkout_dir(mine)?;
+            let mut have = BTreeSet::new();
             for (relative, absolute) in crate::tracker::collect_all_files(&dir)? {
                 if !definition.owns(&relative) {
                     continue;
                 }
+                have.insert(relative.to_string());
                 let target = branch.workspace_path.join(&relative);
                 let same = match (std::fs::read(&absolute), std::fs::read(&target)) {
                     (Ok(ours), Ok(theirs)) => ours == theirs,
@@ -7354,17 +7389,34 @@ impl BranchManager {
                 crate::tracker_repo::copy_file(&absolute, &target)?;
                 replaced += 1;
             }
+            // What this instance deleted since the rev it started from is
+            // part of its version: deleted again, whatever `main` did to it.
+            if let Some(base) = &base {
+                for relative in lane.files_at(base)? {
+                    if have.contains(&relative) || !definition.owns(Utf8Path::new(&relative)) {
+                        continue;
+                    }
+                    let target = branch.workspace_path.join(&relative);
+                    if std::fs::symlink_metadata(&target).is_ok() {
+                        std::fs::remove_file(&target)
+                            .map_err(|source| NewgitError::io(&target, source))?;
+                        deleted.push(relative);
+                    }
+                }
+            }
             // Committed content again; this instance's values go back on
             // top, and the capture below takes them off.
             self.rerender_all(&mut branch);
             self.store.save_branch_record(&branch)?;
         }
-        let rev = self.capture_tracker(instance, tracker)?.rev;
+        let rev = self.capture_tracker(instance, &definition.name)?.rev;
         Ok(KeptMine {
-            mine,
+            mine: mine.to_owned(),
             main,
+            base,
             rev,
             files: replaced,
+            deleted,
         })
     }
 

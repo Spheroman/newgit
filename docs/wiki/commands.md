@@ -120,12 +120,17 @@ Remote:
   machine has held encrypted content at, so whatever tracker claims them now
   (a `public` one, or one in Git) may capture, commit, and send them
   unencrypted. Until then every such capture and send fails: definitions
-  arrive from elsewhere. A confirmation, not a boundary: anything that can
-  run commands here can run it
+  arrive from elsewhere. A directory releases every held file under it, and
+  case does not matter. The guard knows paths, not content: the same
+  content copied or moved to another path is not held back. A
+  confirmation, not a boundary: anything that can run commands here can
+  run it
 - `newgit tracker pull <tracker> --keep-mine` — after a `tracker merge` was
   refused because the remote's `main` moved: pull it and put this
-  instance's files back on top as a new capture (each file you have
-  replaces theirs; files only they have stay), so merging again publishes it
+  instance's version back on top as a new capture (each file you have
+  replaces theirs, a file you deleted since the rev you started from is
+  deleted again, files only they added stay; with no shared rev, a file you
+  deleted comes back, and it says so), so merging again publishes it
 - `newgit members add|remove <github-login>` / `members list [--json]` — add
   and remove re-encrypt each shared encrypted tracker's `main` for the new
   members, list every recipient by key fingerprint (saying `CHANGED` when

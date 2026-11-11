@@ -677,6 +677,29 @@ impl TrackerRepo {
         Ok(rev)
     }
 
+    /// The newest rev both `a` and `b` descend from, if they share one:
+    /// what `newgit tracker pull --keep-mine` takes as the rev the
+    /// developer started from.
+    pub fn merge_base(&self, a: &str, b: &str) -> Option<String> {
+        let a = self.commit_any(a).ok()?;
+        let b = self.commit_any(b).ok()?;
+        git(&self.git_dir, &["merge-base", &a, &b])
+            .ok()
+            .map(|commit| commit.trim().to_owned())
+            .filter(|commit| !commit.is_empty())
+            .map(|commit| short(&commit))
+    }
+
+    /// The tracker's files a rev holds (never the recipients record).
+    pub fn files_at(&self, rev: &str) -> Result<Vec<String>> {
+        let commit = self.commit_any(rev)?;
+        Ok(self
+            .tree_files(&commit, &[])?
+            .into_iter()
+            .filter(|path| path != RECIPIENTS_PATH)
+            .collect())
+    }
+
     /// Move `main` to `rev` — what merging a tracker does for now.
     pub fn set_main(&self, rev: &str) -> Result<()> {
         let commit = self.commit_for(rev)?;
@@ -930,14 +953,16 @@ impl TrackerRepo {
                 git_env(&self.git_dir, &args, &identity(&self.git_dir))?
             }
         };
-        let rev = short(&commit);
-        git(&self.git_dir, &["update-ref", &self.pin_ref(&rev), &commit])?;
+        // Recorded before anything names the commit: a failure here leaves
+        // no pin and no branch moved, only an unreferenced commit.
         if at.seal.is_some() {
             note_held_sealed(
                 &self.git_dir,
                 files.iter().map(|(relative, _)| relative.as_str()),
             )?;
         }
+        let rev = short(&commit);
+        git(&self.git_dir, &["update-ref", &self.pin_ref(&rev), &commit])?;
         let branch = match at.branch {
             Branch::Main => self.main_ref(),
             Branch::Instance(slug) => self.instance_ref(slug),
@@ -1397,26 +1422,105 @@ fn sealed_paths_file(git_dir: &Utf8Path) -> Utf8PathBuf {
         .join("sealed-paths.json")
 }
 
+/// The path compared when judging whether a path is held: case-folded, so
+/// a claim spelled `.ENV.SHARED` on a case-insensitive filesystem (macOS)
+/// is the `.env.shared` it opens. Folding only ever makes more paths match,
+/// so it errs toward refusing.
+pub fn fold_path(path: &str) -> String {
+    path.to_lowercase()
+}
+
+/// Every workspace path this machine holds back from being stored
+/// unencrypted, as first recorded; compared case-folded ([`fold_path`]).
+#[derive(Debug, Clone, Default)]
+pub struct HeldSealed {
+    paths: std::collections::BTreeSet<String>,
+    folded: std::collections::BTreeSet<String>,
+}
+
+impl HeldSealed {
+    fn from_paths(paths: std::collections::BTreeSet<String>) -> Self {
+        let folded = paths.iter().map(|path| fold_path(path)).collect();
+        Self { paths, folded }
+    }
+
+    /// Whether `path`, however it is cased, is held.
+    pub fn holds(&self, path: &str) -> bool {
+        self.folded.contains(&fold_path(path))
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.paths.is_empty()
+    }
+
+    /// The held paths, as recorded.
+    pub fn paths(&self) -> &std::collections::BTreeSet<String> {
+        &self.paths
+    }
+}
+
 /// Every workspace path at which this machine has held content of a sealed
 /// rev, whatever tracker it was (captured encrypted here, or decrypted into
 /// a workspace or cache here), less what `newgit tracker allow-plaintext`
 /// released. Keyed by path, not tracker: a definition renamed, replaced, or
-/// narrowed still claims the same file. Written only by this machine.
-pub fn held_sealed(git_dir: &Utf8Path) -> std::collections::BTreeSet<String> {
-    std::fs::read_to_string(sealed_paths_file(git_dir))
-        .ok()
-        .and_then(|text| serde_json::from_str(&text).ok())
-        .unwrap_or_default()
+/// narrowed still claims the same file. Written only by this machine. The
+/// guard knows paths, not content: the same content copied or moved to
+/// another path is not held back.
+///
+/// No file is nothing held. A file that is there but does not parse is an
+/// error: reading it as empty would turn the guard off without a word.
+pub fn held_sealed(git_dir: &Utf8Path) -> Result<HeldSealed> {
+    read_held_sealed(&sealed_paths_file(git_dir)).map(HeldSealed::from_paths)
 }
 
-fn save_held_sealed(git_dir: &Utf8Path, paths: &std::collections::BTreeSet<String>) -> Result<()> {
-    let text = serde_json::to_string_pretty(paths).map_err(|error| {
-        NewgitError::io(
-            sealed_paths_file(git_dir),
-            std::io::Error::other(error.to_string()),
-        )
-    })?;
-    crate::remote::write_private(&sealed_paths_file(git_dir), &text)
+fn read_held_sealed(file: &Utf8Path) -> Result<std::collections::BTreeSet<String>> {
+    let text = match std::fs::read_to_string(file) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(std::collections::BTreeSet::new());
+        }
+        Err(source) => return Err(NewgitError::io(file, source)),
+    };
+    serde_json::from_str(&text).map_err(|error| {
+        NewgitError::PlaintextRefused(format!(
+            "`{file}` (the paths this machine has held encrypted content at) does not parse \
+             ({error}), so nothing that could store a path unencrypted goes ahead. Restore it, \
+             or delete it to start over: every path is held again the next time this machine \
+             captures or decrypts it encrypted"
+        ))
+    })
+}
+
+/// Read, change, and write the held paths under `sealed-paths.lock`
+/// (`flock`, as the store's other shared files under `.newgit/local/` are),
+/// so two instances noting paths at once both land. `change` returns
+/// whether it changed anything; nothing is written when it did not.
+fn update_held_sealed<T>(
+    git_dir: &Utf8Path,
+    change: impl FnOnce(&mut std::collections::BTreeSet<String>) -> (bool, T),
+) -> Result<T> {
+    let file = sealed_paths_file(git_dir);
+    let lock_path = file.with_extension("lock");
+    if let Some(parent) = lock_path.parent() {
+        crate::materializer::create_dir_all(parent)?;
+    }
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&lock_path)
+        .map_err(|source| NewgitError::io(&lock_path, source))?;
+    lock.lock()
+        .map_err(|source| NewgitError::io(&lock_path, source))?;
+    let mut held = read_held_sealed(&file)?;
+    let (changed, out) = change(&mut held);
+    if changed {
+        let text = serde_json::to_string_pretty(&held)
+            .map_err(|error| NewgitError::io(&file, std::io::Error::other(error.to_string())))?;
+        crate::remote::write_private(&file, &text)?;
+    }
+    drop(lock);
+    Ok(out)
 }
 
 /// Remember that this machine holds sealed content at `paths`.
@@ -1424,33 +1528,51 @@ pub fn note_held_sealed<'a>(
     git_dir: &Utf8Path,
     paths: impl IntoIterator<Item = &'a str>,
 ) -> Result<()> {
-    let mut held = held_sealed(git_dir);
-    let before = held.len();
-    held.extend(
-        paths
-            .into_iter()
-            .filter(|path| *path != RECIPIENTS_PATH)
-            .map(ToOwned::to_owned),
-    );
-    if held.len() == before {
+    let new: Vec<&str> = paths
+        .into_iter()
+        .filter(|path| *path != RECIPIENTS_PATH)
+        .collect();
+    if new.is_empty() {
         return Ok(());
     }
-    save_held_sealed(git_dir, &held)
+    update_held_sealed(git_dir, |held| {
+        let before = held.len();
+        held.extend(new.iter().map(|path| (*path).to_owned()));
+        (held.len() != before, ())
+    })
 }
 
 /// Forget `paths` (`newgit tracker allow-plaintext`): their content may be
-/// stored unencrypted from now on. Returns the ones that were held.
+/// stored unencrypted from now on. Compared case-folded; a directory
+/// releases every held path under it. Returns the held paths released.
 pub fn release_sealed(git_dir: &Utf8Path, paths: &[String]) -> Result<Vec<String>> {
-    let mut held = held_sealed(git_dir);
-    let released: Vec<String> = paths
+    let wanted: Vec<String> = paths
         .iter()
-        .filter(|path| held.remove(path.as_str()))
-        .cloned()
+        .map(|path| {
+            let path = path.trim_start_matches("./").trim_end_matches('/');
+            fold_path(if path.is_empty() { "." } else { path })
+        })
         .collect();
-    if !released.is_empty() {
-        save_held_sealed(git_dir, &held)?;
-    }
-    Ok(released)
+    update_held_sealed(git_dir, |held| {
+        let released: Vec<String> = held
+            .iter()
+            .filter(|path| {
+                let folded = fold_path(path);
+                wanted.iter().any(|want| {
+                    want == "."
+                        || folded == *want
+                        || folded
+                            .strip_prefix(want.as_str())
+                            .is_some_and(|rest| rest.starts_with('/'))
+                })
+            })
+            .cloned()
+            .collect();
+        for path in &released {
+            held.remove(path);
+        }
+        (!released.is_empty(), released)
+    })
 }
 
 /// What sending a rev would carry: see [`TrackerRepo::unsent`].

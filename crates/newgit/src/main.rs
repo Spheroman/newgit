@@ -487,10 +487,13 @@ enum TrackerCommand {
         /// Instance (inferred when run inside a workspace)
         instance: Option<String>,
         /// Take mine, on top of theirs: capture this instance's files first,
-        /// pull `main`, then put those files back over it and capture that,
+        /// pull `main`, then put your version back over it and capture that,
         /// so `newgit tracker merge` publishes it. Every file this instance
-        /// has REPLACES `main`'s; files only `main` has stay. There is no
-        /// content merge
+        /// has REPLACES `main`'s, and a file you deleted since the rev you
+        /// started from is deleted again; files only `main` added stay.
+        /// When your version and `main` share no rev, a file you deleted
+        /// comes back from `main` (the output says so). There is no content
+        /// merge
         #[arg(long)]
         keep_mine: bool,
     },
@@ -501,7 +504,8 @@ enum TrackerCommand {
     /// (`access`, `newgit merge main`, `pull`). A confirmation, not a
     /// boundary: anything that can run commands here can run this
     AllowPlaintext {
-        /// Workspace-relative paths, as the refusal names them
+        /// Workspace-relative paths, as the refusal names them. A directory
+        /// releases every held file under it; case does not matter
         #[arg(required = true)]
         paths: Vec<String>,
     },
@@ -2779,12 +2783,25 @@ fn tracker(mut command: TrackerCommand) -> Result<()> {
                     );
                 } else {
                     println!(
-                        "  put your files ({}) back on top as {}: {} REPLACED `main`'s, and \
-                         files only `main` has stay",
+                        "  put your version ({}) back on top as {}: {} REPLACED `main`'s, and \
+                         files only `main` added stay",
                         kept.mine,
                         kept.rev,
                         plural(kept.files, "file")
                     );
+                    for path in &kept.deleted {
+                        println!(
+                            "  deleted `{path}` again: you deleted it since {}",
+                            kept.mine
+                        );
+                    }
+                    if kept.base.is_none() && kept.main.is_some() {
+                        println!(
+                            "  your version and `main` share no rev, so newgit cannot tell a \
+                             file you deleted from one `main` added: any file you deleted is \
+                             BACK from `main`. Delete it again and capture before merging"
+                        );
+                    }
                     println!("  `newgit tracker merge {tracker}` publishes it");
                 }
                 return Ok(());
@@ -2799,22 +2816,27 @@ fn tracker(mut command: TrackerCommand) -> Result<()> {
         }
         TrackerCommand::AllowPlaintext { paths } => {
             let manager = manager_here()?;
-            let paths: Vec<String> = paths
-                .iter()
-                .map(|path| {
-                    path.trim_start_matches("./")
-                        .trim_end_matches('/')
-                        .to_owned()
-                })
-                .collect();
             let released = manager.allow_plaintext(&paths)?;
+            for path in &released {
+                println!("Released `{path}` on this machine");
+            }
             for path in &paths {
-                if released.contains(path) {
-                    println!("Released `{path}` on this machine");
-                } else {
+                let folded = newgit_core::tracker_repo::fold_path(
+                    path.trim_start_matches("./").trim_end_matches('/'),
+                );
+                let matched = released.iter().any(|held| {
+                    let held = newgit_core::tracker_repo::fold_path(held);
+                    folded.is_empty()
+                        || folded == "."
+                        || held == folded
+                        || held
+                            .strip_prefix(folded.as_str())
+                            .is_some_and(|rest| rest.starts_with('/'))
+                });
+                if !matched {
                     println!(
-                        "`{path}` was not held back on this machine (it never held encrypted \
-                         content here, or was released already)"
+                        "`{path}` was not held back on this machine, nor any file under it (it \
+                         never held encrypted content here, or was released already)"
                     );
                 }
             }

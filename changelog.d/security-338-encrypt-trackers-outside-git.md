@@ -20,13 +20,15 @@
   a member's removal (or captured before it and not yet sent) reaches the
   remote encrypted to them. Publishing a tracker's `main` no longer forces
   over a `main` merged elsewhere: it is refused, and `newgit tracker pull
-  <tracker> --keep-mine` puts your files on top of theirs (file by file, no
-  content merge) so merging again publishes them. A workspace path this
+  <tracker> --keep-mine` puts your version on top of theirs (file by file,
+  your deletions included, no content merge) so merging again publishes it. A workspace path this
   machine has held encrypted content at is never captured or sent
   unencrypted because a definition now puts it in a `public` tracker or a
   tracker in Git, under any name, until `newgit tracker allow-plaintext
-  <path>` on this machine (a confirmation, not a boundary; a machine that
-  never held the content has nothing to compare against). `newgit
+  <path>` on this machine (a confirmation, not a boundary; it knows paths,
+  compared ignoring case, not content, so the same content copied or moved
+  to another path is not held back; a machine that never held the content
+  has nothing to compare against). `newgit
   checkpoint` exits non-zero when its sync is refused for a security reason,
   keeping the checkpoint locally. A per-user tracker is encrypted to the login `newgit login` saved,
   never to whoever the remote says you are. There is no opt-out:

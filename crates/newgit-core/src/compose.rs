@@ -2121,20 +2121,23 @@ pub fn find_outside_git(
 
 /// The first `(commit, path)` among `rev_list`'s commits that adds or
 /// changes a path in `held` (each judged where the view has it, under
-/// `mount`): content this machine has held encrypted, about to be pushed
+/// `mount`, and compared case-folded): content this machine has held encrypted, about to be pushed
 /// through Git as it is (#338). Nothing to walk when `held` is empty.
 pub fn find_held_sealed(
     repo: &Utf8Path,
     rev_list: &[&str],
     env: &[(String, String)],
-    held: &std::collections::BTreeSet<String>,
+    held: &crate::tracker_repo::HeldSealed,
     mount: Option<&Utf8Path>,
 ) -> Result<Option<(String, String)>> {
     if held.is_empty() {
         return Ok(None);
     }
+    // `--root`: a root commit's paths are listed whatever `log.showRoot`
+    // the developer's config sets.
     let mut args = vec![
         "log",
+        "--root",
         "-m",
         "--no-renames",
         "--name-only",
@@ -2167,7 +2170,7 @@ pub fn find_held_sealed(
             Some(mount) if mount.as_str() != "." => format!("{mount}/{field}"),
             _ => field.to_owned(),
         };
-        if held.contains(&field) {
+        if held.holds(&field) {
             return Ok(Some((commit, field)));
         }
     }

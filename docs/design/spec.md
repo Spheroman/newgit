@@ -386,7 +386,8 @@ checks that every file those commits carry is age ciphertext. A workspace
 path this machine has held encrypted content at is never captured or sent
 unencrypted because a definition (any definition, by any name) now puts it in
 a `public` tracker or a tracker in Git, until `newgit tracker allow-plaintext
-<path>` on this machine: a confirmation, keyed by path, not a boundary. What
+<path>` on this machine: a confirmation, keyed by path, not a boundary (the
+same content copied or moved to another path is not held back). What
 counts as already on the remote is kept per remote and project, and
 forgotten when the project is linked again. `user` is the login `newgit login` saved, never the remote's say. Publishing `main` fetches the
 remote's first and never forces over changes it lacks. Every change to the
@@ -415,6 +416,8 @@ What it guarantees, and its limits:
   that has never held the content has nothing to compare against and
   captures as the definition says. It is a confirmation step, not a
   boundary: an agent in the workspace can run `allow-plaintext` itself.
+  It knows paths, not content: the same content copied or moved to
+  another path is not held back.
 - GitHub accounts are the key authority.
 - There is no integrity: recipients' keys are public, so the remote can
   replace a file with content of its choosing that decrypts cleanly (signed

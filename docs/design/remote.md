@@ -304,7 +304,9 @@ in plaintext. Clients hold that back only where they can tell: a machine
 that has held a path's encrypted content refuses to capture or send it
 unencrypted until `newgit tracker allow-plaintext <path>` is run there (a
 confirmation, which an agent in the workspace can give too, not a
-boundary), and a machine that never held it has nothing to compare against.
+boundary; it knows paths, so the same content copied or moved to another
+path is not held back), and a machine that never held it has nothing to
+compare against.
 
 **Who may use it (decided).** Who may use a remote at all is the Worker's
 `ALLOWED_LOGINS` secret: GitHub logins separated by commas or whitespace, or
