@@ -14096,6 +14096,7 @@ impl BranchManager {
             &self.source,
             &branch,
             &self.sparse_patterns(&branch.dropped),
+            &self.export_mains_to_carry(&branch.dropped),
         )? {
             warnings.push(warning);
         }
