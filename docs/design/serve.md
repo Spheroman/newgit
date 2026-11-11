@@ -143,11 +143,19 @@ Resolved loudly; each is reversible.
      into `landing/<login>/<namespace>.git`, which borrows the store's
      objects (alternates) so thin packs resolve, and is served to no one.
      When the merge finishes, its definitions are read from the commits it
-     lands, each tracker moves to the store they call for, and only then do
-     its new commits follow it there, all before the landing is written
-     down: under the db lock nothing lands beside it, and a landing whose
-     objects have nowhere safe to go (a store in the way made for another
-     audience) does not land.
+     lands, and each tracker's new commits go first into the narrower of
+     its old store and the one they call for, so a step that fails has made
+     nothing more readable. A narrowing moves the tracker, then its commits
+     follow it into the narrower store. A widening brings its commits into
+     its old, narrower store first, and moves only once every tracker's
+     commits are in place, so one that cannot be brought in (an object
+     missing) leaves it where it was. A move between audiences not ordered
+     by inclusion (`user:a` to `user:b`) is taken as a narrowing. The
+     landing borrows whichever store its tracker is in at that moment. All
+     of it happens before the landing is written down: under the db lock
+     nothing lands beside it, and a landing whose objects have nowhere safe
+     to go (a store in the way made for another audience, an object
+     missing) does not land.
    - **What a tracker held before its audience narrowed stays where it
      was.** Its refs leave the wider store, but its objects remain there
      until gc, and under protocol v2 any reader of that store can still
@@ -197,10 +205,14 @@ rather than a side effect:
 - **Moves are a side effect of reads and of landings' hooks**
   (`settle_after_landing`, the settle before serving). They should be a
   landing-log step, retried until done, not attempted by whichever request
-  arrives first. A move that fails part way through a landing that moves
-  several trackers can leave a copy of one already moved in its new store
-  though the landing did not happen; for a widening, that is history in the
-  wider store before its definition says so.
+  arrives first. Every new commit of a landing is in place before any
+  widening moves, but the moves themselves are not one step: in a landing
+  that widens several trackers (or moves one between audiences not ordered
+  by inclusion), a move that fails after another has finished leaves the
+  finished one's history in its new store though the landing did not
+  happen. For a widening, that is history in the wider store before its
+  definition says so; the next settle moves its refs back, and its objects
+  stay there until gc.
 - **`Repo::update_refs` is one namespace per transaction**, so a landing's
   branch moves across trackers are not one ref transaction.
 - **A push already running when a move starts is not stopped.** A ref it

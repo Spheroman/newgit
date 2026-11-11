@@ -95,6 +95,16 @@ impl Store {
         }
     }
 
+    /// Whether a tracker moving from this store to `to` widens who reads it:
+    /// everyone who reads this store reads `to`, and more. Only `public` is
+    /// known to hold every other audience. Any other two (`user:a` and
+    /// `user:b`, or `user:a` and `project-devs`, whose login need not be a
+    /// member) are not ordered by inclusion, and a move between them is not a
+    /// widening.
+    pub fn widens_to(&self, to: &Store) -> bool {
+        *to == Self::Public && *self != Self::Public
+    }
+
     /// The store's directory in the home at `home`.
     pub fn dir(&self, home: &Utf8Path) -> Utf8PathBuf {
         home.join("stores").join(format!("{}.git", self.name()))

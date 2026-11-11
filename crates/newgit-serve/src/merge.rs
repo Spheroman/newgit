@@ -879,11 +879,25 @@ fn check_moves(
 }
 
 /// Every commit of `list` waiting in `by`'s landings, brought into the store
-/// its tracker's definition calls for as this landing leaves it: the tracker
-/// moves there first, then its new commits follow it. So a landing that
-/// narrows a tracker's audience never writes what it lands into the wider
-/// store. Definitions are read from each tracker's `main`, so only a landing
-/// on `main` changes them; for one, they are read from the commits it lands.
+/// its tracker's definition calls for as this landing leaves it. Each
+/// tracker's new commits go first into the narrower of its old store and its
+/// new one, so a landing that fails part way has made nothing more readable
+/// than it was:
+///
+/// - a narrowing moves the tracker first, then its commits follow it into the
+///   narrower store, never written into the wider one;
+/// - a widening brings its commits into the old, narrower store first, and
+///   moves only once every tracker's commits are in place, so a commit that
+///   cannot be brought in (an object missing) leaves it where it was;
+/// - a move between stores whose audiences are not ordered by inclusion
+///   (`user:a` to `user:b`) is taken as a narrowing: moved, then filled.
+///
+/// The quarantine borrows whichever store the tracker is in when its commits
+/// are brought in (`Repo::open_landing` rewrites its alternates), so it never
+/// resolves an object from a store the commits are not going into.
+///
+/// Definitions are read from each tracker's `main`, so only a landing on
+/// `main` changes them; for one, they are read from the commits it lands.
 /// Every store a tracker moves to is checked before anything moves, so a
 /// store in the way made for another audience refuses the landing whole.
 /// Run again by a finish asked again: what is in place already is left.
@@ -907,18 +921,36 @@ fn land(
     } else {
         project.definitions(db, names)?
     };
+    let mut widening = BTreeSet::new();
     for tracker in list.keys() {
         let Some(fact) = after.get(tracker) else {
             continue;
         };
+        if project.links.contains_key(tracker) {
+            continue;
+        }
         let to = repos::Store::for_tracker(Some(fact), tracker);
-        if !project.links.contains_key(tracker) && project.own(tracker).store != to {
+        let own = project.own(tracker);
+        if own.store != to {
             repos::check_store(&to.dir(&project.home()), &to)?;
+            if own.exists() && own.store.widens_to(&to) {
+                widening.insert(tracker.as_str());
+            }
         }
     }
     for (tracker, commit) in list {
-        project.settle(db, tracker, after.get(tracker))?;
-        project.tracker(tracker).take_landing(by, commit)?;
+        if widening.contains(tracker.as_str()) {
+            project.tracker(tracker).take_landing(by, commit)?;
+        }
+    }
+    for (tracker, commit) in list {
+        if !widening.contains(tracker.as_str()) {
+            project.settle(db, tracker, after.get(tracker))?;
+            project.tracker(tracker).take_landing(by, commit)?;
+        }
+    }
+    for tracker in &widening {
+        project.settle(db, tracker, after.get(*tracker))?;
     }
     Ok(())
 }
