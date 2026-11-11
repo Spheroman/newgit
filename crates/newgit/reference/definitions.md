@@ -434,15 +434,23 @@ putting it in a workspace decrypts, and the workspace always holds plaintext
   machine never gets anything captured after their removal, nor anything
   captured before it that this machine had not sent yet (a capture while
   offline included). What the remote already held while they were a member,
-  they keep.
+  they keep. What this machine counts as on the remote is kept per remote
+  URL and project, and forgotten by `newgit remote add` and `remote delete`,
+  so a project linked again (elsewhere, or deleted and made again under the
+  same name) gets every stale commit made again too. newgit never makes a
+  merge commit in a tracker outside Git; an unsent one (made by hand in the
+  store) is refused rather than sent.
 - **`main` is never forced over.** Publishing `main` fetches the remote's
   first and refuses when it has changes the rev does not contain (merged
-  elsewhere since this machine last saw it): `newgit tracker pull <tracker>`
-  in the instance brings them, and replaces that instance's files of the
-  tracker with the remote's `main`. The refusal names the rev that keeps
-  your version and the `newgit tracker checkout <tracker> --rev <rev>` that
-  puts it back. `tracker pull`, and a spawn in a fresh `newgit clone`, fetch
-  the remote's `main` first. A `main` that
+  elsewhere since this machine last saw it). `newgit tracker pull <tracker>
+  --keep-mine` in the instance takes yours on top of theirs: it captures the
+  instance's files, pulls `main`, puts those files back over it, and
+  captures that, so the next `tracker merge` publishes it with theirs
+  underneath. There is no content merge: every file you have REPLACES
+  theirs, and files only they have stay. A plain `newgit tracker pull
+  <tracker>` takes theirs instead, replacing the instance's files of the
+  tracker (yours stay at the rev the refusal names). `tracker pull`, and a
+  spawn in a fresh `newgit clone`, fetch the remote's `main` first. A `main` that
   only re-encrypts the one this rev contains (what `members add` and `remove`
   publish) counts as contained. The push is leased, so a merge landing in
   between is not overwritten either.
@@ -473,14 +481,25 @@ putting it in a workspace decrypts, and the workspace always holds plaintext
   there is. Every send (checkpoint sync, `tracker merge`, a per-user `main`)
   checks every file the commits the remote does not have yet would carry
   and refuses anything that is not age ciphertext.
-- **A definition that stops encrypting is not taken on its word.** The
-  definition (`.newgit/trackers/<tracker>.toml`) arrives through `access`,
-  `newgit merge main`, and `pull`. A tracker this machine has encrypted
-  (its history holds an encrypted rev, or `.newgit/local/audience.json`
-  remembers a set for it) whose definition now says `public` is refused at
-  every capture and send, as an error, until you run `newgit tracker
-  allow-plaintext <tracker>` on this machine (remembered under
-  `.newgit/local/`, and forgotten once it is encrypted again).
+- **A definition that stops encrypting is not taken on its word, on a
+  machine that has held the content.** Definitions
+  (`.newgit/trackers/*.toml`) arrive through `access`, `newgit merge main`,
+  and `pull`. This machine remembers every workspace path at which it has
+  held encrypted content, captured encrypted here or decrypted into a
+  workspace here (`.newgit/local/sealed-paths.json`). The guard is keyed by
+  path, not by tracker: whatever tracker claims such a path now, under
+  whatever name (a definition renamed, deleted and replaced, or a narrower
+  one claiming one of its files), a capture or send that would store its
+  content unencrypted is refused as an error. That is a `public` tracker
+  outside Git, or a commit pushed through Git (a definition turned `git =
+  true`; the path stays ignored in existing workspaces, but a commit with
+  it is refused at the push gate all the same). The refusal names the
+  paths and prints the command that releases them on this machine:
+  `newgit tracker allow-plaintext <path>...`. A path captured encrypted
+  again is held back again. `newgit checkpoint` keeps the checkpoint on
+  this machine and exits non-zero when its sync is refused for this or any
+  other security reason (plaintext, a stale set of recipients, a merge
+  commit); a remote it cannot reach is a warning, as before.
 - **`user` is you:** a per-user tracker is encrypted to the login `newgit
   login` saved, and a remote that answers with another login is refused.
 
@@ -495,12 +514,17 @@ putting it in a workspace decrypts, and the workspace always holds plaintext
   fingerprints newgit prints (`CHANGED`, `+ <login>`), so read them. On a
   machine encrypting a tracker for the first time there is no earlier set
   to compare with, and the listing is all there is.
-- The remote also serves tracker definitions (through `access`). A
-  definition changed to `public` is refused until confirmed on each machine
-  that has encrypted that tracker (above); a machine that never has, a fresh
-  clone, takes it as it is. A definition that names another audience
-  (`user:<login>`) is not held back: it is a change of recipients, printed
-  as one.
+- The remote also serves tracker definitions (through `access`), and a
+  definition decides whether a path is encrypted at all. The guard above
+  covers machines that have held the encrypted content, by path: a fresh
+  clone that spawns with the encrypted `main` has (its spawn decrypts it),
+  and is refused like any other. A machine that has never held the content
+  has nothing to compare against, and captures what it has as the
+  definition says. The guard is a confirmation step, not a boundary:
+  anything that can run commands in the workspace, an agent included, can
+  run `newgit tracker allow-plaintext` itself. A definition that names
+  another audience (`user:<login>`) is not held back: it is a change of
+  recipients, printed as one.
 - GitHub accounts are the key authority: whoever controls `<login>`'s GitHub
   account decides which keys read that login's trackers.
 - There is no integrity. Recipients' keys are public, so the remote can

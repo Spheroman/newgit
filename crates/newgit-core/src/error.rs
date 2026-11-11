@@ -121,6 +121,12 @@ pub enum NewgitError {
     #[error("tracker `{tracker}` is encrypted to its audience: {message}")]
     Encryption { tracker: String, message: String },
 
+    /// Content this machine has held encrypted would be stored or sent
+    /// unencrypted, and nobody released it here with `newgit tracker
+    /// allow-plaintext` (#338).
+    #[error("{0}")]
+    PlaintextRefused(String),
+
     #[error("tracker `{0}` owns no paths; there is nothing to capture from a workspace")]
     TrackerHasNoPaths(String),
 

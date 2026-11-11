@@ -16,10 +16,14 @@
 //! and nothing captured after their removal reaches the remote encrypted to
 //! them.
 //!
-//! A tracker this machine has encrypted is never captured or sent in
-//! plaintext just because its definition (which arrives through `access`,
-//! `newgit merge main`, and `pull`) now says `public`: that waits for
-//! `newgit tracker allow-plaintext <tracker>` on this machine.
+//! A workspace path at which this machine has held encrypted content is
+//! never captured or sent unencrypted just because a definition (which
+//! arrives through `access`, `newgit merge main`, and `pull`) now puts it in
+//! a `public` tracker or a tracker in Git, whatever that tracker is called:
+//! that waits for `newgit tracker allow-plaintext <path>` on this machine.
+//! It is a confirmation, not a boundary: anything that can run commands in
+//! the workspace can run that one too. A machine that has never held the
+//! content has nothing to hold back.
 
 use std::collections::BTreeMap;
 
@@ -87,11 +91,6 @@ struct AudienceCache {
     /// [`Recipients::to_text`] writes them.
     #[serde(default)]
     used: BTreeMap<String, String>,
-    /// Trackers this machine encrypted whose definition now stores them in
-    /// plaintext, which the developer confirmed here with `newgit tracker
-    /// allow-plaintext`. Forgotten when the tracker is encrypted again.
-    #[serde(default)]
-    plaintext_allowed: std::collections::BTreeSet<String>,
 }
 
 /// Who `recipients` are, each login with its keys' fingerprints, and loudly
@@ -348,109 +347,199 @@ impl BranchManager {
     /// What a capture of `definition` is encrypted to, or `None` when it is
     /// stored as plaintext (see
     /// [`TrackerDefinition::encrypted_to_audience`]; a project with no
-    /// remote has nowhere for it to go, so nothing to encrypt for).
+    /// remote has nowhere for it to go, so nothing to encrypt for). A
+    /// capture in plaintext of a path this machine has held encrypted is
+    /// refused ([`Self::refuse_releasing`]).
     pub(super) fn seal_for(
         &self,
         definition: &TrackerDefinition,
         branch: Option<&BranchInstance>,
     ) -> Result<Option<Recipients>> {
-        if self.remote.is_none() {
+        // A tracker in Git is committed, not captured: what it would push
+        // is judged at the push gate.
+        if definition.git {
             return Ok(None);
         }
         if !definition.encrypted_to_audience() {
-            self.refuse_unsealing(definition)?;
+            let root = branch.map_or_else(
+                || self.store.paths().project_root.clone(),
+                |branch| branch.workspace_path.clone(),
+            );
+            let paths: Vec<String> = if definition.paths.is_empty() {
+                Vec::new()
+            } else {
+                crate::tracker::collect_owned_files(&root, definition)?
+                    .into_iter()
+                    .map(|(relative, _)| relative.into_string())
+                    .collect()
+            };
+            self.refuse_releasing(definition, &paths)?;
+            return Ok(None);
+        }
+        if self.remote.is_none() {
             return Ok(None);
         }
         let audience = self.audience_of(definition, branch, Fresh::Preferred)?;
         self.announce(&definition.name, &audience);
-        self.forget_plaintext_allowed(&definition.name);
         Ok(Some(audience.recipients))
     }
 
-    /// Refuse to capture or send `definition` in plaintext when this
-    /// machine has encrypted it before and the developer has not confirmed
-    /// here that it is meant to be plaintext now. The definition arrives
-    /// from elsewhere (`access`, `newgit merge main`, `pull`), so a change
-    /// to `public` alone is not enough to stop encrypting a secret.
-    pub(super) fn refuse_unsealing(&self, definition: &TrackerDefinition) -> Result<()> {
-        if definition.encrypted_to_audience()
-            || definition.git
-            || definition.storage != Storage::Remote
-            || self.remote.is_none()
-        {
+    /// Whether `definition`'s content leaves this machine unencrypted: a
+    /// tracker in Git (committed and pushed as it is), or one outside Git
+    /// that syncs and is `public`.
+    fn stores_unencrypted(definition: &TrackerDefinition) -> bool {
+        definition.git || (definition.storage == Storage::Remote && definition.audience == "public")
+    }
+
+    /// Refuse to put `paths` of `definition` anywhere unencrypted when this
+    /// machine has held encrypted content at any of them
+    /// ([`crate::tracker_repo::held_sealed`]) and the developer has not released
+    /// them here with `newgit tracker allow-plaintext`. Keyed by path:
+    /// whatever the tracker claiming them is called now, a definition
+    /// renamed, replaced, or narrowed claims the same files. Definitions
+    /// arrive from elsewhere (`access`, `newgit merge main`, `pull`), so a
+    /// definition alone does not turn encryption off. A confirmation, not a
+    /// boundary: anything that can run commands here can run that one.
+    pub(super) fn refuse_releasing(
+        &self,
+        definition: &TrackerDefinition,
+        paths: &[String],
+    ) -> Result<()> {
+        if !Self::stores_unencrypted(definition) || paths.is_empty() {
             return Ok(());
         }
-        let cache = self.load_audience_cache();
-        if cache.plaintext_allowed.contains(&definition.name) {
+        let held = crate::tracker_repo::held_sealed(&self.store.paths().tracker_store);
+        let mut found: Vec<&str> = paths
+            .iter()
+            .map(String::as_str)
+            .filter(|path| held.contains(*path))
+            .collect();
+        if found.is_empty() {
             return Ok(());
         }
-        let sealed_before = cache.used.contains_key(&definition.name)
-            || self.lane(&definition.name).ever_sealed().unwrap_or(true);
-        if !sealed_before {
-            return Ok(());
-        }
-        Err(NewgitError::Unsupported(format!(
-            "tracker `{name}` was encrypted on this machine, but its definition \
-             (`.newgit/trackers/{path}.toml`) now says `audience = \"{audience}\"`, which \
-             stores it in plaintext on the remote. Definitions arrive through `access`, `newgit \
-             merge main`, and `pull`, so nothing of `{name}` is captured or sent in plaintext \
-             until you confirm the change on this machine: `newgit tracker allow-plaintext \
-             {name}`. Who changed it: `git log -p -- .newgit/trackers/{path}.toml`",
-            path = crate::tracker::tracker_path(&definition.name),
-            audience = definition.audience,
-            name = definition.name,
+        found.sort_unstable();
+        found.dedup();
+        Err(NewgitError::PlaintextRefused(refusal_text(
+            &definition.name,
+            definition,
+            &found,
         )))
     }
 
-    /// Confirm on this machine that `definition`, which this machine has
-    /// encrypted, is captured and sent in plaintext from now on, as its
-    /// definition says. `false` when its definition still encrypts it.
-    pub fn allow_plaintext(&self, tracker: &str) -> Result<bool> {
-        let definition = self.definition(tracker)?;
-        if definition.encrypted_to_audience() {
-            return Ok(false);
-        }
-        let mut cache = self.load_audience_cache();
-        cache.plaintext_allowed.insert(definition.name.clone());
-        self.save_audience_cache(&cache)?;
-        Ok(true)
+    /// Release `paths` on this machine (`newgit tracker allow-plaintext`):
+    /// their content may be captured, committed, and sent unencrypted from
+    /// now on, as whatever definition claims them says. The ones that were
+    /// held back; a path held again (captured encrypted again) is held back
+    /// again.
+    pub fn allow_plaintext(&self, paths: &[String]) -> Result<Vec<String>> {
+        crate::tracker_repo::release_sealed(&self.store.paths().tracker_store, paths)
     }
 
-    fn forget_plaintext_allowed(&self, tracker: &str) {
-        let mut cache = self.load_audience_cache();
-        if cache.plaintext_allowed.remove(tracker) {
-            let _ = self.save_audience_cache(&cache);
-        }
+    /// Every path this machine holds back from being stored unencrypted.
+    pub fn held_sealed_paths(&self) -> std::collections::BTreeSet<String> {
+        crate::tracker_repo::held_sealed(&self.store.paths().tracker_store)
     }
 
-    /// Every ref in this store naming a commit of `tracker` the remote
-    /// has: what this machine sent there, its `main` as last fetched, and
-    /// revs fetched from it.
+    /// Where this store keeps what it knows the linked remote has: under a
+    /// key for the remote's URL and project, so a store linked to another
+    /// remote, or to a project made again under the same name, starts with
+    /// nothing counted as already there. `None` with no remote.
+    fn remote_refs(&self) -> Option<String> {
+        use sha2::Digest as _;
+        let link = self.remote.as_ref()?;
+        let digest = sha2::Sha256::digest(format!("{}\n{}", link.url, link.project).as_bytes());
+        let key: String = digest[..8]
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        Some(format!("refs/newgit/remote/{key}"))
+    }
+
+    /// Forget everything this store counts as already on a remote: what
+    /// `newgit remote add` and `remote delete` do, since a project linked
+    /// again (another remote, or one deleted and made again under the same
+    /// name, which [`Self::remote_refs`] cannot tell apart) has none of it.
+    /// Commits encrypted to a set that is no longer the audience are then
+    /// made again before anything is sent there.
+    pub fn forget_what_the_remote_has(&self) -> Result<()> {
+        let store = &self.store.paths().tracker_store;
+        if !store.join("HEAD").is_file() {
+            return Ok(());
+        }
+        let location = format!("--git-dir={store}");
+        let refs = crate::source::run_git_env(
+            &[
+                &location,
+                "for-each-ref",
+                "--format=delete %(refname)",
+                "refs/newgit/remote/",
+            ],
+            &[],
+        )?;
+        if !refs.trim().is_empty() {
+            crate::source::run_git_stdin(
+                &[&location, "update-ref", "--stdin"],
+                format!("{}\n", refs.trim()).as_bytes(),
+            )?;
+        }
+        self.forget_unsent();
+        Ok(())
+    }
+
+    /// Where the tracker store remembers what it last sent to `repo`'s
+    /// `destination` on the linked remote: a ref, so Git keeps the commit
+    /// it names.
+    pub(super) fn sent_ref(&self, repo: &str, destination: &str) -> String {
+        format!(
+            "{}/sent/{repo}/{}",
+            self.remote_refs()
+                .unwrap_or_else(|| "refs/newgit/unlinked".to_owned()),
+            destination.trim_start_matches("refs/")
+        )
+    }
+
+    /// Where the linked remote's `main` of `tracker`, as last fetched, is
+    /// kept (its other branches beside it).
+    fn remote_main_refs(&self, tracker: &str) -> Option<String> {
+        Some(format!("{}/main/{tracker}", self.remote_refs()?))
+    }
+
+    /// Every ref in this store naming a commit of `tracker` the linked
+    /// remote has: what this machine sent there, its `main` as last
+    /// fetched, and revs fetched from it.
     pub(super) fn remote_has(&self, tracker: &str) -> Vec<String> {
+        let Some(base) = self.remote_refs() else {
+            return Vec::new();
+        };
         let store = format!("--git-dir={}", self.store.paths().tracker_store);
         let Ok(refs) = crate::source::run_git_env(
             &[
                 &store,
                 "for-each-ref",
                 "--format=%(refname)",
-                "refs/newgit/sent/",
-                &format!("refs/newgit/remote-main/{tracker}/"),
-                &format!("refs/newgit/remote-has/{tracker}/"),
+                &format!("{base}/sent/"),
+                &format!("{base}/main/{tracker}/"),
+                &format!("{base}/has/{tracker}/"),
             ],
             &[],
         ) else {
             return Vec::new();
         };
+        let sent_prefix = format!("{base}/sent/");
         let sent = format!("/trackers/{tracker}/");
         refs.lines()
             .map(str::trim)
-            .filter(|name| !name.starts_with("refs/newgit/sent/") || name.contains(&sent))
+            .filter(|name| !name.starts_with(&sent_prefix) || name.contains(&sent))
             .map(ToOwned::to_owned)
             .collect()
     }
 
-    /// Remember that the remote has `commit` of `tracker` (fetched from it).
+    /// Remember that the linked remote has `commit` of `tracker` (fetched
+    /// from it).
     pub(super) fn note_remote_has(&self, tracker: &str, commit: &str) {
+        let Some(base) = self.remote_refs() else {
+            return;
+        };
         let store = format!("--git-dir={}", self.store.paths().tracker_store);
         let Ok(full) = crate::source::run_git_env(
             &[
@@ -469,11 +558,12 @@ impl BranchManager {
             &[
                 &store,
                 "update-ref",
-                &format!("refs/newgit/remote-has/{tracker}/{full}"),
+                &format!("{base}/has/{tracker}/{full}"),
                 full,
             ],
             &[],
         );
+        self.forget_unsent();
     }
 
     /// `rev`, or `rev` made safe to publish and encrypted to exactly the
@@ -501,8 +591,9 @@ impl BranchManager {
         self.announce(&definition.name, &audience);
         let lane = self.lane(&definition.name);
         let known = self.remote_has(&definition.name);
+        let unsent = self.unsent(definition, rev, &known, Some(&audience.recipients))?;
         let rev = lane
-            .rebuild_unsent(rev, &known, &audience.recipients, on)?
+            .rebuild_unsent(&unsent, &audience.recipients, on)?
             .unwrap_or_else(|| rev.to_owned());
         if lane.sealed_to(&rev, &audience.recipients)? {
             return Ok(rev);
@@ -569,7 +660,8 @@ impl BranchManager {
         // A `main` never published may have commits under it encrypted to
         // someone removed since: made again first, as any send does.
         let known = self.remote_has(&definition.name);
-        let rebuilt = lane.rebuild_unsent(&main, &known, &audience.recipients, Branch::Main)?;
+        let unsent = self.unsent(definition, &main, &known, Some(&audience.recipients))?;
+        let rebuilt = lane.rebuild_unsent(&unsent, &audience.recipients, Branch::Main)?;
         let current = rebuilt.clone().unwrap_or_else(|| main.clone());
         let rev = if lane.sealed_to(&current, &audience.recipients)? {
             match rebuilt {
@@ -627,15 +719,13 @@ impl BranchManager {
         };
         let remote = link.connect(acting)?;
         let repo = tracker_repo(&link.project, definition, "");
-        let credential = match remote.credential(&link.project, &repo, Scope::Read) {
-            Ok(credential) => credential,
-            // Never published: there is nothing there to bring.
-            Err(NewgitError::Remote { status: 404, .. }) => return Ok(None),
-            Err(error) => return Err(error),
-        };
         let store = self.store.paths().tracker_store.clone();
         crate::tracker_repo::ensure_store(&store)?;
-        let landing = format!("refs/newgit/remote-main/{}", definition.name);
+        let landing = self
+            .remote_main_refs(&definition.name)
+            .expect("a linked remote has refs");
+        // Whatever was fetched before stops counting as the remote's
+        // before it is asked again: gone when the remote has none now.
         let _ = crate::source::run_git_env(
             &[
                 &format!("--git-dir={store}"),
@@ -645,6 +735,13 @@ impl BranchManager {
             ],
             &[],
         );
+        self.forget_unsent();
+        let credential = match remote.credential(&link.project, &repo, Scope::Read) {
+            Ok(credential) => credential,
+            // Never published: there is nothing there to bring.
+            Err(NewgitError::Remote { status: 404, .. }) => return Ok(None),
+            Err(error) => return Err(error),
+        };
         GitSource::fetch_refs(
             &[&format!("--git-dir={store}")],
             credential.remote.as_deref().unwrap_or_default(),
@@ -732,11 +829,11 @@ impl BranchManager {
             return Err(NewgitError::Unsupported(format!(
                 "the remote's `main` of `{name}` has changes {rev} does not include (merged \
                  from somewhere else since this machine last saw it), so nothing was \
-                 published: that would overwrite them. `newgit tracker pull {name}` in the \
-                 instance brings them in, and REPLACES this instance's `{name}` files with \
-                 the remote's `main`. Your version stays at {rev}: `newgit tracker checkout \
-                 {name} --rev {rev}` puts it back in the workspace, to copy what you need \
-                 before you capture and merge again",
+                 published: that would overwrite them. In the instance, `newgit tracker pull \
+                 {name} --keep-mine` pulls them and puts your files back on top (each file you \
+                 have REPLACES theirs; files only they have stay; there is no content merge), \
+                 then `newgit tracker merge {name}` publishes it. To take theirs instead, \
+                 `newgit tracker pull {name}` (your version stays at {rev})",
                 name = definition.name,
             )));
         }
@@ -747,9 +844,10 @@ impl BranchManager {
         let auth = basic_auth_header(&credential);
         let location = format!("--git-dir={}", self.store.paths().tracker_store);
         let pin = format!("refs/trackers/{}/pins/{rev}", definition.name);
-        GitSource::push_refs(&[&location], &url, &[format!("{pin}:{pin}")], Some(&auth))?;
+        let pushing = super::tracker_push_location(&location, definition);
+        GitSource::push_refs(&pushing, &url, &[format!("{pin}:{pin}")], Some(&auth))?;
         GitSource::push_leased(
-            &[&location],
+            &pushing,
             &url,
             &lane.full(rev)?,
             "refs/heads/main",
@@ -757,15 +855,18 @@ impl BranchManager {
             Some(&auth),
         )?;
         // The remote has it now.
-        let _ = crate::source::run_git_env(
-            &[
-                &location,
-                "update-ref",
-                &format!("refs/newgit/remote-main/{}/main", definition.name),
-                &lane.full(rev)?,
-            ],
-            &[],
-        );
+        if let Some(landing) = self.remote_main_refs(&definition.name) {
+            let _ = crate::source::run_git_env(
+                &[
+                    &location,
+                    "update-ref",
+                    &format!("{landing}/main"),
+                    &lane.full(rev)?,
+                ],
+                &[],
+            );
+            self.forget_unsent();
+        }
         Ok(Some(link.project.clone()))
     }
 
@@ -813,15 +914,20 @@ impl BranchManager {
     /// tracker this machine encrypted whose definition now says otherwise
     /// is refused outright ([`Self::refuse_unsealing`]).
     pub(super) fn refuse_plaintext(&self, definition: &TrackerDefinition, rev: &str) -> Result<()> {
-        if !definition.encrypted_to_audience() {
-            return self.refuse_unsealing(definition);
-        }
         let known = self.remote_has(&definition.name);
-        let Some(found) = self
-            .lane(&definition.name)
-            .unsent(rev, &known, None)?
-            .plaintext
-        else {
+        let lane = self.lane(&definition.name);
+        if !definition.encrypted_to_audience() {
+            if !Self::stores_unencrypted(definition) || self.held_sealed_paths().is_empty() {
+                return Ok(());
+            }
+            // Everything the remote would receive, not only the tip: an
+            // earlier unsent commit may hold a path the tip does not.
+            let paths = lane.unsent_paths(rev, &known)?;
+            return self.refuse_releasing(definition, &paths);
+        }
+        let unsent = self.unsent(definition, rev, &known, None)?;
+        lane.refuse_merge(&unsent)?;
+        let Some(found) = unsent.plaintext else {
             return Ok(());
         };
         Err(NewgitError::Encryption {
@@ -852,7 +958,9 @@ impl BranchManager {
         self.announce(&definition.name, &audience);
         let lane = self.lane(&definition.name);
         let known = self.remote_has(&definition.name);
-        let stale = lane.unsent(rev, &known, Some(&audience.recipients))?.stale;
+        let stale = self
+            .unsent(definition, rev, &known, Some(&audience.recipients))?
+            .stale;
         let found = match stale {
             Some(found) => found,
             None if lane.sealed_to(rev, &audience.recipients)? => return Ok(()),
@@ -880,6 +988,61 @@ impl BranchManager {
         })
     }
 
+    /// [`crate::tracker_repo::TrackerRepo::unsent`], once per command for
+    /// the same question: a send asks it to rebuild, then again to check
+    /// for plaintext and for a stale set, and reading every unsent blob's
+    /// header three times is what made a large send slow. An answer for
+    /// any recipients answers `None` (plaintext is judged either way).
+    /// Forgotten whenever what the remote has changes
+    /// ([`Self::forget_unsent`]).
+    pub(super) fn unsent(
+        &self,
+        definition: &TrackerDefinition,
+        rev: &str,
+        known: &[String],
+        recipients: Option<&Recipients>,
+    ) -> Result<crate::tracker_repo::Unsent> {
+        let lane = self.lane(&definition.name);
+        let key = format!(
+            "{}\n{}\n{}",
+            definition.name,
+            lane.full(rev)?,
+            known.join(" ")
+        );
+        let asked = recipients.map(Recipients::to_text);
+        {
+            let memo = self
+                .unsent
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(answers) = memo.get(&key) {
+                let found = match &asked {
+                    Some(asked) => answers.get(asked),
+                    None => answers.values().next(),
+                };
+                if let Some(found) = found {
+                    return Ok(found.clone());
+                }
+            }
+        }
+        let unsent = lane.unsent(rev, known, recipients)?;
+        self.unsent
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(key)
+            .or_default()
+            .insert(asked.unwrap_or_default(), unsent.clone());
+        Ok(unsent)
+    }
+
+    /// Forget every [`Self::unsent`] answer: what the remote has changed.
+    pub(super) fn forget_unsent(&self) {
+        self.unsent
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+    }
+
     /// Remember why `tracker` could not be encrypted again in this
     /// command, for the refusal that follows.
     pub(super) fn note_reseal_failure(&self, tracker: &str, why: String) {
@@ -887,6 +1050,58 @@ impl BranchManager {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(tracker.to_owned(), why);
+    }
+}
+
+/// What [`BranchManager::refuse_releasing`] says: the paths, where they
+/// would go, and the exact command that releases them.
+fn refusal_text(name: &str, definition: &TrackerDefinition, found: &[&str]) -> String {
+    let path = crate::tracker::tracker_path(name);
+    let listed = found
+        .iter()
+        .map(|path| format!("`{path}`"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let goes = if definition.git {
+        format!(
+            "`{name}` is a tracker in Git (`.newgit/trackers/{path}.toml`), so it would be \
+             committed and pushed as it is"
+        )
+    } else {
+        format!(
+            "`{name}`'s definition (`.newgit/trackers/{path}.toml`) says `audience = \
+             \"public\"`, so it would be stored in plaintext on the remote"
+        )
+    };
+    let command = found
+        .iter()
+        .map(|path| shell_quote(path))
+        .collect::<Vec<_>>()
+        .join(" ");
+    format!(
+        "{listed} held content encrypted to its audience on this machine (captured encrypted \
+         here, or decrypted into a workspace here), and {goes}. Definitions arrive through \
+         `access`, `newgit merge main`, and `pull`, so nothing at {} is captured or sent \
+         unencrypted until you release it on this machine: `newgit tracker allow-plaintext \
+         {command}`. Who changed the definitions: `git log -p -- .newgit/trackers/`",
+        if found.len() == 1 {
+            "that path"
+        } else {
+            "those paths"
+        },
+    )
+}
+
+/// `value` as a shell reads it back: bare when it is plain.
+fn shell_quote(value: &str) -> String {
+    let plain = !value.is_empty()
+        && value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "_@%+=:,./-".contains(c));
+    if plain {
+        value.to_owned()
+    } else {
+        format!("'{}'", value.replace('\'', r"'\''"))
     }
 }
 

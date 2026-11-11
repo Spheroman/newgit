@@ -76,7 +76,7 @@ fn in_plaintext(repo: &Utf8Path, needle: &str) -> bool {
 
 /// The definition of `env` changed to `public` (as it would arrive through
 /// `access` or `merge main`): nothing is captured or sent in plaintext
-/// until `newgit tracker allow-plaintext env` on this machine.
+/// until `newgit tracker allow-plaintext .env.shared` on this machine.
 #[test]
 fn a_definition_turned_public_is_refused_until_confirmed_here() {
     let (_guard, temp) = tempdir();
@@ -107,7 +107,7 @@ fn a_definition_turned_public_is_refused_until_confirmed_here() {
     assert!(said.contains("`env`"), "{said}");
     assert!(said.contains("audience = \"public\""), "{said}");
     assert!(
-        said.contains("newgit tracker allow-plaintext env"),
+        said.contains("newgit tracker allow-plaintext .env.shared"),
         "{said}"
     );
     let capture = fixture.newgit(&workspace, &["tracker", "capture", "env"]);
@@ -117,8 +117,8 @@ fn a_definition_turned_public_is_refused_until_confirmed_here() {
         "nothing of it in plaintext on the remote"
     );
 
-    let allowed = fixture.ok(&workspace, &["tracker", "allow-plaintext", "env"]);
-    assert!(allowed.contains("plaintext"), "{allowed}");
+    let allowed = fixture.ok(&workspace, &["tracker", "allow-plaintext", ".env.shared"]);
+    assert!(allowed.contains("Released `.env.shared`"), "{allowed}");
     let checkpoint = fixture.newgit(&workspace, &["checkpoint"]);
     assert!(checkpoint.status.success(), "{}", all(&checkpoint));
     assert!(
@@ -152,10 +152,8 @@ fn a_public_tracker_never_encrypted_needs_no_confirmation() {
     let workspace = workspace_of(&fixture, "web");
     std::fs::write(workspace.join("index.html"), "<h1>hi</h1>\n").expect("write");
     fixture.ok(&workspace, &["checkpoint"]);
-    let said = fixture.ok(&workspace, &["tracker", "allow-plaintext", "site"]);
-    assert!(said.contains("plaintext"), "{said}");
-    let env = fixture.newgit(&fixture.store, &["tracker", "allow-plaintext", "README"]);
-    assert!(!env.status.success(), "no such tracker: {}", all(&env));
+    let said = fixture.ok(&workspace, &["tracker", "allow-plaintext", "index.html"]);
+    assert!(said.contains("was not held back"), "{said}");
 }
 
 /// A remote that answers `GET /v1/me` with another login does not get a
@@ -228,11 +226,11 @@ fn a_fresh_clone_spawns_with_main_and_pulls_first() {
     );
 }
 
-/// A merge refused because the remote's `main` moved says that pulling
-/// replaces this instance's files, and which rev keeps its version and how
-/// to get it back; that command does get it back.
+/// A merge refused because the remote's `main` moved names both ways out:
+/// `pull --keep-mine` (tested whole in `encrypted_trackers_keep_mine.rs`),
+/// and a plain pull, which takes theirs, with the rev that keeps yours.
 #[test]
-fn a_refused_merge_says_what_the_pull_replaces_and_how_to_get_it_back() {
+fn a_refused_merge_names_keep_mine_and_the_rev_a_plain_pull_leaves() {
     let (_guard, temp) = tempdir();
     let fixture = setup(&temp);
     let workspace = checkpointed(&fixture);
@@ -251,18 +249,17 @@ fn a_refused_merge_says_what_the_pull_replaces_and_how_to_get_it_back() {
     let merge = fixture.newgit(&b, &["tracker", "merge", "env"]);
     assert!(!merge.status.success(), "{}", all(&merge));
     let said = String::from_utf8_lossy(&merge.stderr).into_owned();
-    assert!(said.contains("newgit tracker pull env"), "{said}");
-    assert!(said.contains("REPLACES"), "{said}");
-    let rev = said
-        .split("Your version stays at ")
-        .nth(1)
-        .and_then(|rest| rest.split(':').next())
-        .expect("names the rev")
-        .to_owned();
     assert!(
-        said.contains(&format!("newgit tracker checkout env --rev {rev}")),
+        said.contains("newgit tracker pull env --keep-mine"),
         "{said}"
     );
+    assert!(said.contains("REPLACES theirs"), "{said}");
+    let rev = said
+        .split("your version stays at ")
+        .nth(1)
+        .and_then(|rest| rest.split(')').next())
+        .expect("names the rev")
+        .to_owned();
 
     fixture.ok(&b, &["tracker", "pull", "env"]);
     assert_eq!(

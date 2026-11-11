@@ -27,9 +27,14 @@ first time and whenever that changes. `newgit members add` and `remove`
 re-encrypt `main` for the new set of members, and nothing this machine had
 not sent yet reaches the remote encrypted to someone removed since; someone
 removed can still read what the remote held while they were a member, so
-rotate those secrets. If a definition you pull turns an encrypted tracker
-`public`, newgit refuses to capture or send it until you run `newgit tracker
-allow-plaintext <tracker>`. There is no opt-out:
+rotate those secrets. If a definition you pull would store a file this
+machine has held encrypted without encryption (the tracker turned `public`
+or into a tracker in Git, or a new `public` tracker claiming its path),
+newgit refuses to capture or send it until you run `newgit tracker
+allow-plaintext <path>`. If `newgit tracker merge` is refused because
+someone merged since, `newgit tracker pull <tracker> --keep-mine` puts your
+files on top of theirs (yours replace theirs file by file; no content
+merge), and merging again publishes it. There is no opt-out:
 a tracker a server must read (a page the remote serves) is `public`.
 
 What that guarantees, and what it does not:
@@ -42,10 +47,15 @@ What that guarantees, and what it does not:
   recipients, and the only signal is the fingerprints newgit prints
   (`CHANGED`, `+ <login>`). A machine encrypting a tracker for the first
   time has nothing to compare with.
-- The remote also serves tracker definitions. A definition changed to
-  `public` is refused, as an error, on every machine that has encrypted that
-  tracker until `newgit tracker allow-plaintext <tracker>` is run there; a
-  machine that never encrypted it takes the definition as it is.
+- The remote also serves tracker definitions, and a definition decides
+  whether a path is encrypted at all. A machine that has held a path's
+  encrypted content (captured it encrypted, or decrypted it into a
+  workspace, as a fresh clone's spawn does) refuses, as an error, to
+  capture or send that path unencrypted, whatever tracker claims it now,
+  until `newgit tracker allow-plaintext <path>` is run there. A machine
+  that has never held the content has nothing to compare against and
+  captures as the definition says. It is a confirmation step, not a
+  boundary: an agent in the workspace can run `allow-plaintext` itself.
 - GitHub accounts are the key authority.
 - There is no integrity: recipients' keys are public, so the remote can
   replace a file with content of its choosing that decrypts cleanly (signed

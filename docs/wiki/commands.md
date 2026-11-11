@@ -116,10 +116,16 @@ Remote:
   left alone (`newgit tracker pull`)
 - `newgit pull --remote <target>` — bring back what was merged on an export
   target (a pull request on GitHub); `newgit merge main` publishes it
-- `newgit tracker allow-plaintext <tracker>` — confirm on this machine that
-  a tracker it encrypted is captured and sent in plaintext from now on,
-  because its definition now says `audience = "public"`. Until then every
-  capture and send of it fails: definitions arrive from elsewhere
+- `newgit tracker allow-plaintext <path>...` — release workspace paths this
+  machine has held encrypted content at, so whatever tracker claims them now
+  (a `public` one, or one in Git) may capture, commit, and send them
+  unencrypted. Until then every such capture and send fails: definitions
+  arrive from elsewhere. A confirmation, not a boundary: anything that can
+  run commands here can run it
+- `newgit tracker pull <tracker> --keep-mine` — after a `tracker merge` was
+  refused because the remote's `main` moved: pull it and put this
+  instance's files back on top as a new capture (each file you have
+  replaces theirs; files only they have stay), so merging again publishes it
 - `newgit members add|remove <github-login>` / `members list [--json]` — add
   and remove re-encrypt each shared encrypted tracker's `main` for the new
   members, list every recipient by key fingerprint (saying `CHANGED` when

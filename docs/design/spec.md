@@ -382,10 +382,13 @@ and the workspace holds plaintext, owner-only. Before a checkpoint syncs or
 again and every commit the remote does not have yet is checked against it:
 those encrypted to anyone else are made again, on the last commit the remote
 has, so nothing encrypted to a member removed since is ever sent. Every send
-checks that every file those commits carry is age ciphertext. A tracker this
-machine has encrypted is never captured or sent in plaintext because its
-definition now says `public`, until `newgit tracker allow-plaintext` on this
-machine. `user` is the login `newgit login` saved, never the remote's say. Publishing `main` fetches the
+checks that every file those commits carry is age ciphertext. A workspace
+path this machine has held encrypted content at is never captured or sent
+unencrypted because a definition (any definition, by any name) now puts it in
+a `public` tracker or a tracker in Git, until `newgit tracker allow-plaintext
+<path>` on this machine: a confirmation, keyed by path, not a boundary. What
+counts as already on the remote is kept per remote and project, and
+forgotten when the project is linked again. `user` is the login `newgit login` saved, never the remote's say. Publishing `main` fetches the
 remote's first and never forces over changes it lacks. Every change to the
 recipient set is printed by fingerprint. A tracker that was plaintext is
 encrypted on its next capture as a new history whose first commit names the
@@ -403,10 +406,15 @@ What it guarantees, and its limits:
   recipients, and the only signal is the fingerprints newgit prints
   (`CHANGED`, `+ <login>`). A machine encrypting a tracker for the first
   time has nothing to compare with.
-- The remote also serves tracker definitions. A definition changed to
-  `public` is refused, as an error, on every machine that has encrypted that
-  tracker until `newgit tracker allow-plaintext <tracker>` is run there; a
-  machine that never encrypted it takes the definition as it is.
+- The remote also serves tracker definitions, and a definition decides
+  whether a path is encrypted at all. A machine that has held a path's
+  encrypted content (captured it encrypted, or decrypted it into a
+  workspace, as a fresh clone's spawn does) refuses, as an error, to
+  capture or send that path unencrypted, whatever tracker claims it now,
+  until `newgit tracker allow-plaintext <path>` is run there. A machine
+  that has never held the content has nothing to compare against and
+  captures as the definition says. It is a confirmation step, not a
+  boundary: an agent in the workspace can run `allow-plaintext` itself.
 - GitHub accounts are the key authority.
 - There is no integrity: recipients' keys are public, so the remote can
   replace a file with content of its choosing that decrypts cleanly (signed

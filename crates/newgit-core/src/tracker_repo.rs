@@ -15,6 +15,10 @@ use crate::tracker::{
 /// commit id, the way Git abbreviates.
 const REV_LEN: usize = 12;
 
+/// How much of a blob a send reads to judge it: an age header is the age
+/// line and one stanza per recipient, a few hundred bytes each.
+const HEADER_BYTES: u64 = 1 << 20;
+
 /// The trailer on a sealed rev that starts a new history in place of a
 /// plaintext one: the full commit id of the plaintext rev it replaces.
 pub const REPLACES_TRAILER: &str = "newgit-replaces:";
@@ -119,15 +123,28 @@ impl TrackerRepo {
     /// record, which anyone holding the history could have written.
     pub fn sealed_to(&self, rev: &str, recipients: &Recipients) -> Result<bool> {
         let commit = self.commit_any(rev)?;
-        for (path, (mode, oid)) in self.listing(&commit)? {
-            if path == RECIPIENTS_PATH || mode == "120000" {
-                continue;
-            }
-            if !recipients.sealed(&self.blob(&oid)?) {
-                return Ok(false);
-            }
-        }
-        Ok(true)
+        let oids: Vec<String> = self
+            .listing(&commit)?
+            .into_iter()
+            .filter(|(path, (mode, _))| path != RECIPIENTS_PATH && mode != "120000")
+            .map(|(_, (_, oid))| oid)
+            .collect();
+        let headers = self.headers(&oids)?;
+        Ok(oids.iter().all(|oid| {
+            headers
+                .get(oid)
+                .is_some_and(|header| recipients.sealed(header))
+        }))
+    }
+
+    /// The workspace paths `rev` holds (its record left out): what a send
+    /// of a tracker stored in plaintext is judged by against the paths this
+    /// machine has held encrypted content at ([`held_sealed`]).
+    pub fn paths(&self, rev: &str) -> Result<Vec<String>> {
+        let commit = self.commit_any(rev)?;
+        let mut files = self.tree_files(&commit, &[])?;
+        files.retain(|file| file != RECIPIENTS_PATH);
+        Ok(files)
     }
 
     /// The first file in `rev` or any rev behind it that is not an age file
@@ -138,6 +155,50 @@ impl TrackerRepo {
     /// encrypted history replaces).
     pub fn plaintext_in_history(&self, rev: &str) -> Result<Option<String>> {
         Ok(self.unsent(rev, &[], None)?.plaintext)
+    }
+
+    /// `rev --not known…`, for `git log --stdin`: `known` grows with every
+    /// checkpoint sent, so it goes on stdin rather than the command line.
+    fn unsent_revs(&self, rev: &str, known: &[String]) -> Result<String> {
+        let commit = self.commit_any(rev)?;
+        let mut revs = format!("{commit}\n");
+        if !known.is_empty() {
+            revs.push_str("--not\n");
+            for reference in known {
+                revs.push_str(reference);
+                revs.push('\n');
+            }
+        }
+        Ok(revs)
+    }
+
+    /// Every path the commits of `rev` a remote with everything behind
+    /// `known` lacks add or change: where a send of a tracker stored in
+    /// plaintext puts content. One `git log`, no blob read.
+    pub fn unsent_paths(&self, rev: &str, known: &[String]) -> Result<Vec<String>> {
+        let revs = self.unsent_revs(rev, known)?;
+        let log = git_stdin(
+            &self.git_dir,
+            &[
+                "log",
+                "--format=",
+                "--name-only",
+                "-z",
+                "--no-renames",
+                "--diff-filter=d",
+                "-m",
+                "--root",
+                "--stdin",
+            ],
+            &[],
+            revs.as_bytes(),
+        )?;
+        let paths: std::collections::BTreeSet<&str> = log
+            .split('\0')
+            .map(|path| path.trim_start_matches('\n'))
+            .filter(|path| !path.is_empty() && *path != RECIPIENTS_PATH)
+            .collect();
+        Ok(paths.into_iter().map(ToOwned::to_owned).collect())
     }
 
     /// What sending `rev` to a remote that already has every commit behind
@@ -154,21 +215,12 @@ impl TrackerRepo {
         known: &[String],
         recipients: Option<&Recipients>,
     ) -> Result<Unsent> {
-        let commit = self.commit_any(rev)?;
-        // The revs on stdin: `known` grows with every checkpoint sent.
-        let mut revs = format!("{commit}\n");
-        if !known.is_empty() {
-            revs.push_str("--not\n");
-            for reference in known {
-                revs.push_str(reference);
-                revs.push('\n');
-            }
-        }
+        let revs = self.unsent_revs(rev, known)?;
         let log = git_stdin(
             &self.git_dir,
             &[
                 "log",
-                "--format=commit %H",
+                "--format=commit %H %P",
                 "--raw",
                 "--no-abbrev",
                 "--no-renames",
@@ -179,14 +231,19 @@ impl TrackerRepo {
             &[],
             revs.as_bytes(),
         )?;
+        let mut out = Unsent::default();
         // Every blob a missing commit introduced, with the commit and path.
         let mut commits = std::collections::BTreeSet::new();
         let mut introduced: Vec<(String, String, String)> = Vec::new();
         let mut seen = std::collections::BTreeSet::new();
         let mut current = String::new();
         for line in log.lines() {
-            if let Some(commit) = line.strip_prefix("commit ") {
-                current = commit.to_owned();
+            if let Some(header) = line.strip_prefix("commit ") {
+                let mut fields = header.split(' ');
+                current = fields.next().unwrap_or_default().to_owned();
+                if fields.filter(|parent| !parent.is_empty()).count() > 1 {
+                    out.merge.get_or_insert_with(|| current.clone());
+                }
                 commits.insert(current.clone());
                 continue;
             }
@@ -211,10 +268,9 @@ impl TrackerRepo {
             introduced.push((current.clone(), path.to_owned(), (*oid).to_owned()));
         }
         let oids: Vec<String> = introduced.iter().map(|(_, _, oid)| oid.clone()).collect();
-        let blobs = self.blobs(&oids)?;
-        let mut out = Unsent::default();
+        let headers = self.headers(&oids)?;
         for (commit, path, oid) in &introduced {
-            let Some(bytes) = blobs.get(oid) else {
+            let Some(bytes) = headers.get(oid) else {
                 continue;
             };
             let at = format!("`{path}` at {}", short(commit));
@@ -243,36 +299,34 @@ impl TrackerRepo {
         Ok(out)
     }
 
-    /// `rev` again with nothing under it that a remote with everything
-    /// behind `known` lacks and that is not encrypted to exactly `seal`
-    /// ([`Self::unsent`]): the commits from the oldest such one up are made
+    /// A rev again with nothing under it that the remote lacks and that is
+    /// not encrypted to exactly `seal`, given what [`Self::unsent`] said
+    /// sending it would carry (asked with `seal`): the commits from the oldest such one up are made
     /// again, each one's content encrypted to `seal`, on the commit below
     /// it (one the remote has, or one already encrypted to `seal`), and
     /// `branch` is moved to the last. `None` when nothing needed it. The
     /// commits it replaces stay here, unsent.
+    ///
+    /// newgit makes no merge commits in a tracker outside Git, so the
+    /// commits the remote lacks are one line of first parents. One that is
+    /// not (a merge made by hand in the store) is refused rather than
+    /// rebuilt: remaking only its first-parent line would still send
+    /// whatever its other parents hold.
     pub fn rebuild_unsent(
         &self,
-        rev: &str,
-        known: &[String],
+        unsent: &Unsent,
         seal: &Recipients,
         branch: Branch<'_>,
     ) -> Result<Option<String>> {
-        let unsent = self.unsent(rev, known, Some(seal))?;
-        if unsent.bad.is_empty() {
-            return Ok(None);
-        }
-        // The oldest bad one along first parents. A bad commit off them
-        // (behind a merge) is not under what the rebuild makes at all.
+        self.refuse_merge(unsent)?;
+        // The oldest bad one along first parents, which with no merges are
+        // every commit the remote lacks.
         let Some(oldest) = unsent
             .commits
             .iter()
             .rposition(|commit| unsent.bad.contains(commit))
         else {
-            // Every bad commit is off the first-parent line: the tip made
-            // again on its first parent leaves them all behind.
-            let tip = self.commit_any(rev)?;
-            let parent = self.resolve(&format!("{tip}^"));
-            return self.remake(&tip, parent.as_deref(), seal, branch).map(Some);
+            return Ok(None);
         };
         let mut parent = self.resolve(&format!("{}^", unsent.commits[oldest]));
         let mut rebuilt = None;
@@ -282,6 +336,23 @@ impl TrackerRepo {
             rebuilt = Some(made);
         }
         Ok(rebuilt)
+    }
+
+    /// Refuse to send commits that include a merge: see
+    /// [`Self::rebuild_unsent`].
+    pub fn refuse_merge(&self, unsent: &Unsent) -> Result<()> {
+        match &unsent.merge {
+            None => Ok(()),
+            Some(merge) => Err(self.encryption(format!(
+                "commit {} is a merge, and newgit does not send merge commits of a tracker \
+                 outside Git (it never makes them; it cannot tell what each parent would \
+                 carry to the remote). Nothing is sent. Capture the tracker again on a rev \
+                 without one (`newgit tracker checkout {} --rev <rev>`, then `newgit \
+                 checkpoint`)",
+                short(merge),
+                self.tracker
+            ))),
+        }
     }
 
     /// `commit`'s content, encrypted to `seal`, as a commit on `parent`
@@ -304,8 +375,13 @@ impl TrackerRepo {
             .rev)
     }
 
-    /// Every one of `oids`' contents, by oid, in one `git cat-file --batch`.
-    fn blobs(&self, oids: &[String]) -> Result<std::collections::BTreeMap<String, Vec<u8>>> {
+    /// The start of each of `oids`' contents, by oid, in one `git cat-file
+    /// --batch`: at most [`HEADER_BYTES`] of each, the rest read and
+    /// dropped. Enough for an age header (the age line and one stanza per
+    /// recipient), which is all a send judges a blob by; a blob of any size
+    /// costs no more memory than that.
+    fn headers(&self, oids: &[String]) -> Result<std::collections::BTreeMap<String, Vec<u8>>> {
+        use std::io::{BufRead as _, Read as _};
         let mut out = std::collections::BTreeMap::new();
         if oids.is_empty() {
             return Ok(out);
@@ -316,18 +392,31 @@ impl TrackerRepo {
             input.push('\n');
         }
         let args = ["cat-file", "--batch"];
-        let output = run(
-            &mut command(&self.git_dir, &args, &[]),
-            &describe(&args),
-            Some(input.as_bytes()),
-        )?;
-        let mut rest = output.as_slice();
-        while !rest.is_empty() {
-            let Some(end) = rest.iter().position(|byte| *byte == b'\n') else {
+        let failed = |message: String| NewgitError::SourceCommand {
+            command: describe(&args),
+            stderr: message,
+        };
+        let mut child = command(&self.git_dir, &args, &[])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|error| failed(error.to_string()))?;
+        let mut pipe = child.stdin.take().expect("stdin was piped");
+        let writer = std::thread::spawn(move || pipe.write_all(input.as_bytes()));
+        let stdout = child.stdout.take().expect("stdout was piped");
+        let mut reader = std::io::BufReader::new(stdout);
+        let mut line = Vec::new();
+        loop {
+            line.clear();
+            if reader
+                .read_until(b'\n', &mut line)
+                .map_err(|error| failed(error.to_string()))?
+                == 0
+            {
                 break;
-            };
-            let header = String::from_utf8_lossy(&rest[..end]).into_owned();
-            rest = &rest[end + 1..];
+            }
+            let header = String::from_utf8_lossy(&line).trim_end().to_owned();
             let mut fields = header.split(' ');
             let (Some(oid), Some(_kind), Some(size)) =
                 (fields.next(), fields.next(), fields.next())
@@ -335,49 +424,29 @@ impl TrackerRepo {
                 // `<oid> missing`
                 continue;
             };
-            let size: usize = size.parse().map_err(|_| {
-                self.encryption(format!("could not read `git cat-file --batch`: {header}"))
-            })?;
-            if rest.len() < size {
-                break;
-            }
-            out.insert(oid.to_owned(), rest[..size].to_vec());
-            rest = rest.get(size + 1..).unwrap_or_default();
+            let size: u64 = size
+                .parse()
+                .map_err(|_| failed(format!("could not read its answer: {header}")))?;
+            let kept = size.min(HEADER_BYTES);
+            let mut start = Vec::with_capacity(usize::try_from(kept).unwrap_or(0));
+            (&mut reader)
+                .take(kept)
+                .read_to_end(&mut start)
+                .map_err(|error| failed(error.to_string()))?;
+            // The rest of the body and its trailing newline, dropped.
+            std::io::copy(
+                &mut (&mut reader).take(size - kept + 1),
+                &mut std::io::sink(),
+            )
+            .map_err(|error| failed(error.to_string()))?;
+            out.insert(oid.to_owned(), start);
+        }
+        let _ = writer.join();
+        let status = child.wait().map_err(|error| failed(error.to_string()))?;
+        if !status.success() {
+            return Err(failed(format!("exited with {status}")));
         }
         Ok(out)
-    }
-
-    /// Whether any rev of this tracker this store holds a branch or pin of
-    /// is a sealed one: whether this machine ever encrypted it (or was
-    /// handed encrypted content of it).
-    pub fn ever_sealed(&self) -> Result<bool> {
-        if !self.git_dir.join("HEAD").is_file() {
-            return Ok(false);
-        }
-        let tips = git(
-            &self.git_dir,
-            &[
-                "for-each-ref",
-                "--format=%(objectname)",
-                &format!("refs/trackers/{}/", self.tracker),
-            ],
-        )?;
-        let mut input = String::new();
-        for tip in tips.lines().collect::<std::collections::BTreeSet<_>>() {
-            input.push_str(&format!("{tip}:{RECIPIENTS_PATH}\n"));
-        }
-        if input.is_empty() {
-            return Ok(false);
-        }
-        let args = ["cat-file", "--batch-check"];
-        let output = run(
-            &mut command(&self.git_dir, &args, &[]),
-            &describe(&args),
-            Some(input.as_bytes()),
-        )?;
-        Ok(String::from_utf8_lossy(&output)
-            .lines()
-            .any(|line| !line.ends_with(" missing")))
     }
 
     /// The plaintext rev `rev` replaced as the start of a new, sealed
@@ -863,6 +932,12 @@ impl TrackerRepo {
         };
         let rev = short(&commit);
         git(&self.git_dir, &["update-ref", &self.pin_ref(&rev), &commit])?;
+        if at.seal.is_some() {
+            note_held_sealed(
+                &self.git_dir,
+                files.iter().map(|(relative, _)| relative.as_str()),
+            )?;
+        }
         let branch = match at.branch {
             Branch::Main => self.main_ref(),
             Branch::Instance(slug) => self.instance_ref(slug),
@@ -1024,6 +1099,8 @@ impl TrackerRepo {
             let bytes = self.plaintext(rev, file, mode, oid, true)?;
             out.push((file.clone(), mode.clone(), bytes));
         }
+        // Its plaintext is about to be on this machine, at these paths.
+        note_held_sealed(&self.git_dir, files.iter().map(String::as_str))?;
         Ok(Planned::Sealed(out))
     }
 
@@ -1311,9 +1388,77 @@ fn short(commit: &str) -> String {
     commit[..REV_LEN.min(commit.len())].to_owned()
 }
 
+/// Where this machine keeps every workspace path at which it has held a
+/// sealed rev's content: beside the tracker store, in `.newgit/local/`.
+fn sealed_paths_file(git_dir: &Utf8Path) -> Utf8PathBuf {
+    git_dir
+        .parent()
+        .map_or_else(|| git_dir.to_path_buf(), Utf8Path::to_path_buf)
+        .join("sealed-paths.json")
+}
+
+/// Every workspace path at which this machine has held content of a sealed
+/// rev, whatever tracker it was (captured encrypted here, or decrypted into
+/// a workspace or cache here), less what `newgit tracker allow-plaintext`
+/// released. Keyed by path, not tracker: a definition renamed, replaced, or
+/// narrowed still claims the same file. Written only by this machine.
+pub fn held_sealed(git_dir: &Utf8Path) -> std::collections::BTreeSet<String> {
+    std::fs::read_to_string(sealed_paths_file(git_dir))
+        .ok()
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .unwrap_or_default()
+}
+
+fn save_held_sealed(git_dir: &Utf8Path, paths: &std::collections::BTreeSet<String>) -> Result<()> {
+    let text = serde_json::to_string_pretty(paths).map_err(|error| {
+        NewgitError::io(
+            sealed_paths_file(git_dir),
+            std::io::Error::other(error.to_string()),
+        )
+    })?;
+    crate::remote::write_private(&sealed_paths_file(git_dir), &text)
+}
+
+/// Remember that this machine holds sealed content at `paths`.
+pub fn note_held_sealed<'a>(
+    git_dir: &Utf8Path,
+    paths: impl IntoIterator<Item = &'a str>,
+) -> Result<()> {
+    let mut held = held_sealed(git_dir);
+    let before = held.len();
+    held.extend(
+        paths
+            .into_iter()
+            .filter(|path| *path != RECIPIENTS_PATH)
+            .map(ToOwned::to_owned),
+    );
+    if held.len() == before {
+        return Ok(());
+    }
+    save_held_sealed(git_dir, &held)
+}
+
+/// Forget `paths` (`newgit tracker allow-plaintext`): their content may be
+/// stored unencrypted from now on. Returns the ones that were held.
+pub fn release_sealed(git_dir: &Utf8Path, paths: &[String]) -> Result<Vec<String>> {
+    let mut held = held_sealed(git_dir);
+    let released: Vec<String> = paths
+        .iter()
+        .filter(|path| held.remove(path.as_str()))
+        .cloned()
+        .collect();
+    if !released.is_empty() {
+        save_held_sealed(git_dir, &held)?;
+    }
+    Ok(released)
+}
+
 /// What sending a rev would carry: see [`TrackerRepo::unsent`].
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct Unsent {
+    /// A merge commit among them, if any: refused, see
+    /// [`TrackerRepo::rebuild_unsent`].
+    pub merge: Option<String>,
     /// The commits the remote lacks along the rev's first parents, newest
     /// first.
     pub commits: Vec<String>,

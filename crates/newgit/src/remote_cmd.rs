@@ -221,7 +221,11 @@ fn add(url: Option<String>, project: Option<String>, json: bool) -> Result<()> {
         project: Some(key.clone()),
     });
     store.write_config(&config)?;
-    BranchManager::open(store.clone())?.route_project_root()?;
+    let manager = BranchManager::open(store.clone())?;
+    // A project linked again (another remote, or one made again under the
+    // same name) has none of what this machine sent before.
+    manager.forget_what_the_remote_has()?;
+    manager.route_project_root()?;
 
     if json {
         println!(
@@ -974,6 +978,7 @@ fn delete(confirm: &str, json: bool) -> Result<()> {
     }
     let repos = client.delete_project(&name)?;
     let store = context.store;
+    BranchManager::open(store.clone())?.forget_what_the_remote_has()?;
     let mut config = store.load_config()?;
     config.remote = None;
     store.write_config(&config)?;

@@ -19,11 +19,16 @@
   encrypted to anyone else is made again first, so nothing captured after
   a member's removal (or captured before it and not yet sent) reaches the
   remote encrypted to them. Publishing a tracker's `main` no longer forces
-  over a `main` merged elsewhere: it is refused until `newgit tracker pull`,
-  which (like a spawn in a fresh clone) fetches the remote's `main` first.
-  A tracker this machine encrypted whose definition turns `public` is
-  refused until `newgit tracker allow-plaintext <tracker>` on this machine,
-  and a per-user tracker is encrypted to the login `newgit login` saved,
+  over a `main` merged elsewhere: it is refused, and `newgit tracker pull
+  <tracker> --keep-mine` puts your files on top of theirs (file by file, no
+  content merge) so merging again publishes them. A workspace path this
+  machine has held encrypted content at is never captured or sent
+  unencrypted because a definition now puts it in a `public` tracker or a
+  tracker in Git, under any name, until `newgit tracker allow-plaintext
+  <path>` on this machine (a confirmation, not a boundary; a machine that
+  never held the content has nothing to compare against). `newgit
+  checkpoint` exits non-zero when its sync is refused for a security reason,
+  keeping the checkpoint locally. A per-user tracker is encrypted to the login `newgit login` saved,
   never to whoever the remote says you are. There is no opt-out:
   newgit.dev's `site` is now `public`. An existing tracker is encrypted on
   its next capture, as a new history.
@@ -31,7 +36,9 @@
   What it does not do: the remote cannot read what was encrypted before it
   acts, but a remote that acts can read what is captured afterwards. It
   decides membership, so it can add a login whose keys then become
-  recipients, and the printed fingerprints are the only signal; GitHub
+  recipients, and the printed fingerprints are the only signal; it serves
+  the definitions, which a machine that never held a path's content takes
+  as they are; GitHub
   accounts are the key authority; nothing is signed, so the remote can
   replace a file with content that decrypts cleanly
   ([#431](https://github.com/Spheroman/newgit/issues/431)); file names,

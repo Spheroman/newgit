@@ -296,7 +296,15 @@ encrypt to the members it names, by the keys GitHub publishes for them. So
 the remote is the membership authority for encryption too. It cannot read
 encrypted content, but it could add a login whose keys would then become
 recipients of the next capture, which is why clients print every recipient
-by key fingerprint whenever the set changes.
+by key fingerprint whenever the set changes. It also serves the tracker
+definitions (through `access`), and a definition decides whether a path is
+encrypted at all: one turned `public`, or into a tracker in Git, or a new
+`public` tracker over an encrypted path, would have the next capture stored
+in plaintext. Clients hold that back only where they can tell: a machine
+that has held a path's encrypted content refuses to capture or send it
+unencrypted until `newgit tracker allow-plaintext <path>` is run there (a
+confirmation, which an agent in the workspace can give too, not a
+boundary), and a machine that never held it has nothing to compare against.
 
 **Who may use it (decided).** Who may use a remote at all is the Worker's
 `ALLOWED_LOGINS` secret: GitHub logins separated by commas or whitespace, or
