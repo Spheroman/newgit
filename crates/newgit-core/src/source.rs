@@ -45,11 +45,74 @@ impl GitSource {
         Ok(output.status.success())
     }
 
-    /// Whether `path` is tracked by the store repo — a tracker path that is
-    /// also in Git history is dual-tracked, deliberately or not.
-    pub fn is_tracked(&self, path: &str) -> Result<bool> {
-        self.git(&["ls-files", "--", path])
-            .map(|stdout| !stdout.is_empty())
+    /// Which of `paths` the store repo ignores: one `git check-ignore` for
+    /// all of them, rather than one each.
+    pub fn ignored_among<'p>(&self, paths: &[&'p str]) -> Result<BTreeSet<&'p str>> {
+        if paths.is_empty() {
+            return Ok(BTreeSet::new());
+        }
+        // `-z` is only accepted with `--stdin`: the paths go in NUL-separated
+        // and come back the same way, each as it was given.
+        use std::io::Write as _;
+        let args = ["-C", self.root.as_str(), "check-ignore", "-z", "--stdin"];
+        let mut child = Command::new("git")
+            .args(args)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|source| spawn_error(&args, &source))?;
+        let input: Vec<u8> = paths
+            .iter()
+            .flat_map(|path| path.bytes().chain([0]))
+            .collect();
+        child
+            .stdin
+            .take()
+            .expect("piped stdin")
+            .write_all(&input)
+            .map_err(|source| spawn_error(&args, &source))?;
+        let output = child
+            .wait_with_output()
+            .map_err(|source| spawn_error(&args, &source))?;
+        // 1 is "none of them": only 0 and 1 are answers.
+        if !matches!(output.status.code(), Some(0 | 1)) {
+            return Err(NewgitError::SourceCommand {
+                command: format!("git {}", args.join(" ")),
+                stderr: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+            });
+        }
+        let listed = String::from_utf8_lossy(&output.stdout);
+        let listed: BTreeSet<&str> = listed.split('\0').collect();
+        Ok(paths
+            .iter()
+            .copied()
+            .filter(|path| listed.contains(path))
+            .collect())
+    }
+
+    /// Which of `paths` the store repo tracks, itself or anything under it —
+    /// a tracker path that is also in Git history is dual-tracked,
+    /// deliberately or not. One `git ls-files` for all of them.
+    pub fn tracked_among<'p>(&self, paths: &[&'p str]) -> Result<BTreeSet<&'p str>> {
+        if paths.is_empty() {
+            return Ok(BTreeSet::new());
+        }
+        let mut args = vec!["ls-files", "-z", "--"];
+        args.extend_from_slice(paths);
+        let listed = self.git(&args)?;
+        let files: Vec<&str> = listed.split('\0').filter(|file| !file.is_empty()).collect();
+        Ok(paths
+            .iter()
+            .copied()
+            .filter(|path| {
+                let path = path.trim_end_matches('/');
+                files.iter().any(|file| {
+                    file.strip_prefix(path)
+                        .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
+                })
+            })
+            .collect())
     }
 
     pub fn branch_exists(&self, name: &str) -> Result<bool> {
@@ -1925,6 +1988,40 @@ impl GitSource {
     }
 }
 
+/// Who a commit newgit makes on nobody's behalf says made it: the merge of
+/// a pull with an export target, or an endpoint's `Merge main from github`.
+pub const NEWGIT_NAME: &str = "newgit";
+pub const NEWGIT_EMAIL: &str = "newgit@localhost";
+
+/// Environment setting Git `config` for one command, after whatever
+/// `GIT_CONFIG_COUNT` entries the caller's environment already sets, so
+/// those still apply.
+pub fn config_env(config: &[(&str, &str)]) -> Vec<(String, String)> {
+    config_env_after(std::env::var("GIT_CONFIG_COUNT").ok().as_deref(), config)
+}
+
+/// [`config_env`] after `count`, the caller's `GIT_CONFIG_COUNT`.
+fn config_env_after(count: Option<&str>, config: &[(&str, &str)]) -> Vec<(String, String)> {
+    let first: usize = count
+        .and_then(|count| count.trim().parse().ok())
+        .unwrap_or(0);
+    let mut env = vec![(
+        "GIT_CONFIG_COUNT".to_owned(),
+        (first + config.len()).to_string(),
+    )];
+    for (index, (key, value)) in config.iter().enumerate() {
+        env.push((
+            format!("GIT_CONFIG_KEY_{}", first + index),
+            (*key).to_owned(),
+        ));
+        env.push((
+            format!("GIT_CONFIG_VALUE_{}", first + index),
+            (*value).to_owned(),
+        ));
+    }
+    env
+}
+
 /// Git config for one command, carrying an `Authorization` header. Passed in
 /// the environment rather than as `-c` so the password never appears in the
 /// process list; the credential helper is cleared so nothing caches it.
@@ -1932,16 +2029,7 @@ pub fn auth_env(auth: Option<&str>) -> Vec<(String, String)> {
     let Some(header) = auth else {
         return Vec::new();
     };
-    vec![
-        ("GIT_CONFIG_COUNT".to_owned(), "2".to_owned()),
-        ("GIT_CONFIG_KEY_0".to_owned(), "http.extraHeader".to_owned()),
-        ("GIT_CONFIG_VALUE_0".to_owned(), header.to_owned()),
-        (
-            "GIT_CONFIG_KEY_1".to_owned(),
-            "credential.helper".to_owned(),
-        ),
-        ("GIT_CONFIG_VALUE_1".to_owned(), String::new()),
-    ]
+    config_env(&[("http.extraHeader", header), ("credential.helper", "")])
 }
 
 fn run_git(args: &[&str]) -> Result<String> {
@@ -2372,6 +2460,37 @@ fn spawn_error(args: &[&str], source: &std::io::Error) -> NewgitError {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn config_env_extends_the_callers_git_config_count() {
+        let pairs = |env: Vec<(String, String)>| {
+            env.into_iter()
+                .map(|(key, value)| format!("{key}={value}"))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            pairs(super::config_env_after(
+                None,
+                &[("commit.gpgSign", "false")]
+            )),
+            [
+                "GIT_CONFIG_COUNT=1",
+                "GIT_CONFIG_KEY_0=commit.gpgSign",
+                "GIT_CONFIG_VALUE_0=false"
+            ]
+        );
+        assert_eq!(
+            pairs(super::config_env_after(
+                Some("2"),
+                &[("commit.gpgSign", "false")]
+            )),
+            [
+                "GIT_CONFIG_COUNT=3",
+                "GIT_CONFIG_KEY_2=commit.gpgSign",
+                "GIT_CONFIG_VALUE_2=false"
+            ]
+        );
+    }
+
     use super::RefUpdate;
 
     fn git_failed(stderr: &str) -> crate::NewgitError {

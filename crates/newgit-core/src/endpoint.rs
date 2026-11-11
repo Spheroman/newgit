@@ -1298,10 +1298,10 @@ fn land(plan: &PullPlan, store: &Utf8Path) -> Result<PullAnswer> {
     };
     let date = git(&["log", "-1", "--format=%ct +0000", commit])?;
     let identity: Vec<(String, String)> = [
-        ("GIT_AUTHOR_NAME", "newgit"),
-        ("GIT_AUTHOR_EMAIL", "newgit@localhost"),
-        ("GIT_COMMITTER_NAME", "newgit"),
-        ("GIT_COMMITTER_EMAIL", "newgit@localhost"),
+        ("GIT_AUTHOR_NAME", crate::source::NEWGIT_NAME),
+        ("GIT_AUTHOR_EMAIL", crate::source::NEWGIT_EMAIL),
+        ("GIT_COMMITTER_NAME", crate::source::NEWGIT_NAME),
+        ("GIT_COMMITTER_EMAIL", crate::source::NEWGIT_EMAIL),
         ("GIT_AUTHOR_DATE", date.as_str()),
         ("GIT_COMMITTER_DATE", date.as_str()),
     ]

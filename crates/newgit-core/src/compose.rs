@@ -1807,11 +1807,43 @@ impl<'a> Splitter<'a> {
                 } else {
                     self.objects.subtree(tree, mount)?
                 };
+                // Its claims go in, and the claims beside it that beat it
+                // come out, shortest first, so each path ends up as its
+                // longest claim says: `x/sec` of its own stays inside
+                // another's `x`.
+                let length = |claim: &Utf8Path| {
+                    if claim.as_str() == "." {
+                        0
+                    } else {
+                        claim.as_str().len()
+                    }
+                };
+                let mut steps: Vec<(usize, bool, &Utf8Path)> = child
+                    .paths
+                    .iter()
+                    .map(|claim| (length(claim), false, claim.as_path()))
+                    .collect();
+                for other in definitions.iter().filter(|other| {
+                    other.name != child.name && other.name != own_name && other.mount == child.mount
+                }) {
+                    for claim in &other.paths {
+                        if other.claim_on(claim) > child.claim_on(claim) {
+                            steps.push((length(claim), true, claim.as_path()));
+                        }
+                    }
+                }
+                steps.sort();
                 let mut part = EMPTY_TREE.to_owned();
                 if let Some(base) = &base {
-                    for claim in &child.paths {
+                    for (_, beaten, claim) in steps {
                         let at = relative(claim);
-                        if at == "." {
+                        if beaten {
+                            part = if at == "." {
+                                EMPTY_TREE.to_owned()
+                            } else {
+                                self.objects.set_path(&part, &at, None)?
+                            };
+                        } else if at == "." {
                             part = self.objects.overlay(&part, base)?;
                         } else if let Some(entry) = self.objects.entry_at(base, &at)? {
                             part =
@@ -1820,17 +1852,10 @@ impl<'a> Splitter<'a> {
                         }
                     }
                 }
+                // Its own exclusions, and what is mounted deeper, are never
+                // its: removed last.
                 let mut out: Vec<String> =
                     child.exclusions.iter().map(|path| relative(path)).collect();
-                for other in definitions.iter().filter(|other| {
-                    other.name != child.name && other.name != own_name && other.mount == child.mount
-                }) {
-                    for claim in &other.paths {
-                        if other.claim_on(claim) > child.claim_on(claim) {
-                            out.push(relative(claim));
-                        }
-                    }
-                }
                 for other in &children {
                     if other.name != child.name
                         && other.mount != child.mount

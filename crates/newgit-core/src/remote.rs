@@ -1615,7 +1615,7 @@ pub enum Acting<'a> {
     Workspace(&'a Utf8Path),
 }
 
-type Connect = dyn Fn(Acting<'_>) -> Result<Box<dyn Remote>>;
+type Connect = dyn Fn(Acting<'_>) -> Result<Box<dyn Remote>> + Send + Sync;
 
 /// A project's link to its remote: which project, where, and how to get a
 /// client acting as someone. Tests build one over a fake [`Remote`].
@@ -1638,7 +1638,7 @@ impl RemoteLink {
     pub fn new(
         project: impl Into<String>,
         url: impl Into<String>,
-        connect: impl Fn(Acting<'_>) -> Result<Box<dyn Remote>> + 'static,
+        connect: impl Fn(Acting<'_>) -> Result<Box<dyn Remote>> + Send + Sync + 'static,
     ) -> Self {
         Self {
             project: project.into(),

@@ -291,12 +291,22 @@ history starts as the project's Git history; `access` is mounted at
 `.newgit/trackers` with `paths = ["."]`, so it holds every tracker's
 definition but a child's (see below), with `maintainers = "owner"`. A
 tracker is *mounted* at a path inside its parent and claims paths relative
-to its mount. Ownership nests:
-the deepest mount wins, then the longest claim, so `root` owning `.` and
-`runtime-env` owning `.env.local` do not conflict. Two trackers claiming the
-identical path at the same mount is an error. A claim starting with `!`
-excludes: a path every claim excludes is owned by nothing, and a commit
-changing it is refused when it leaves the machine.
+to its mount. Ownership nests, so `root` owning `.` and `runtime-env` owning
+`.env.local` do not conflict:
+
+The longest claim that reaches a path owns it. A claim reaches a path
+under it unless a tracker mounted deeper holds the path and the claim is
+`.`, or a directory around that mount, or the claiming tracker is in Git.
+So only a tracker outside Git reaches into another's mount, with a claim
+inside it: `paths = ["apps/t3code/.env"]` owns that file just as `mount =
+"apps/t3code"`, `paths = [".env"]` would.
+
+A claim starting with `!` takes its own tracker out of the running for what
+it excludes; a path no reaching claim takes is owned by nothing, and a
+commit changing it is refused when it leaves the machine. Two trackers
+claiming the identical path is an error, except between role alternatives.
+`newgit tracker list` marks a claim of a tracker in Git inside a deeper
+mount, which owns nothing.
 
 Every tracker has a history, and `git` says where it lives. By default
 (`git = false`) a tracker is outside Git: its files are never committed, and
@@ -317,10 +327,12 @@ history instead: the branch (its `HEAD` by default) becomes the tracker's
 `<dir>`, an empty directory: one ordinary commit holding its files. Its
 history stays in its own repository and never enters this project's, so
 `git log` under the mount starts there. A `--from` path is relative to where you
-run it. `newgit pull <tracker>` moves its pin to its `follow` ref in one
-commit, and `newgit pull` alone does it for every tracker in Git root mounts,
-still one commit, on the branch it runs on; nothing else moves a pin on your
-behalf. `newgit clone` fetches only
+run it. `newgit pull <tracker>...` moves its pin to its `follow` ref in one
+commit, after taking what is new on an export target rooted at it, and
+`newgit pull` alone does it for every tracker in Git mounted here, at any
+depth, still one commit on the branch it runs on (a child's pin moves by a
+commit in the tracker that mounts it first). No tracker's `main` moves until
+`newgit merge`, and nothing else moves a pin on your behalf. `newgit clone` fetches only
 the commits root pins of a mounted tracker, and its history the first time
 something needs it, once; `newgit clone --full` fetches every history up
 front. How sensitive a tracker's content is has nothing to do with this; that
@@ -370,7 +382,7 @@ resources = ["staging-tunnel"]
 | `merge_with_source` | bool | no | `false` | meant to say whether a source merge carries this tracker's state with it. Accepted and stored, but nothing reads it yet: `newgit merge` merges every tracker the instance changed. |
 | `mount` | string | no | `.` | where the tracker's own root sits inside the parent that defines it (`apps/electron`). `.` is an overlay beside the parent's files. A tracker in Git may be mounted at `.newgit/trackers`, beside `access`, to govern the definitions it claims (see `maintainers`); no other mount may reach into `.git` or `.newgit`. A tracker outside Git may have a mount too; it is never pinned. |
 | `follow` | string | no | `main` | the ref of the tracker's own history that `newgit pull <tracker>` (or `newgit pull`, for every one) brings in. Trackers outside Git ignore it. |
-| `paths` | array of strings | no | `[]` | its claims, relative to the mount, normalized first (`./.env.local` is `.env.local`). `!` excludes (`[".", "!dist/"]`): an excluded path is owned by a tracker that claims it at the same mount, or by nothing. Must not be absolute, contain `..`, or reach into `.git` or `.newgit` in any case (`.GIT` too). `.` must be a tracker's only claim. May be empty for a tracker that only receives resource deposits (`into_tracker`) or only brings `resources`: such a tracker has nothing in the workspace, so `tracker drop` (and `tracker use` swapping it out of its role) skips the capture, and `tracker list` shows it after the ownership tree with what deposits into it and what it brings. |
+| `paths` | array of strings | no | `[]` | its claims, relative to the mount, normalized first (`./.env.local` is `.env.local`). `!` excludes (`[".", "!dist/"]`): an excluded path is owned by the longest other claim that reaches it, or by nothing. Must not be absolute, contain `..`, or reach into `.git` or `.newgit` in any case (`.GIT` too). `.` must be a tracker's only claim. May be empty for a tracker that only receives resource deposits (`into_tracker`) or only brings `resources`: such a tracker has nothing in the workspace, so `tracker drop` (and `tracker use` swapping it out of its role) skips the capture, and `tracker list` shows it after the ownership tree with what deposits into it and what it brings. |
 | `git` | bool | no | `false` | `true` makes a tracker in Git: committed with Git rather than captured by newgit. The default keeps its files out of Git, so a new tracker fails closed. Written only when `true`. |
 | `role` | string | no | — | the slot it fills: trackers sharing a role are alternatives (`dev-db`, `staging-db`) and may claim the same paths; an instance binds one of them. |
 | `priority` | integer | no | `0` | which tracker of a role an instance binds by default (the highest), unless your own default says otherwise (`[projects.<project>.roles]` in `~/.newgit/config.toml`). Negative means only when asked for (`--use`), for a role-less tracker too. |
@@ -1979,9 +1991,34 @@ when the instance's work touched that tracker.
 A pull request merged there comes back with `newgit pull --remote <target>`:
 the tracker's `main` fast-forwards to it (or really merges it, when `main`
 moved here too), then its pin in the project root moves, in one commit on
-top, whatever the new commits' dates. Instances pick it up with `newgit pull <tracker>` once `newgit merge
-main` has published it. An export finding the target ahead says to run
-that rather than pulling by itself.
+top, whatever the new commits' dates. Plain `newgit pull` (and `newgit
+pull <tracker>`) takes it too, anywhere, as the first step of updating that
+tracker, one more fetch per tracker with a rooted target: the pin moves on
+the branch it ran on, and the tracker's `main` only when that merges. A
+target that can't be reached, conflicts, or adds a file of a tracker
+outside Git leaves that tracker and the trackers below it where they were,
+and the rest still move. A pin holding commits of this instance's own is
+listed as diverged and does not take its target either, until `newgit
+merge` lands that work. An export finding the target ahead says to pull
+rather than pulling by itself, or, after a plain pull in the project root,
+to `newgit merge main`.
+
+The merge is newgit's (`newgit <newgit@localhost>`, as is an endpoint's
+`Merge main from github`), dated as the parent committed last, and never
+signed, so two instances pulling the same two diverged tips make the same
+commit and merging both lands one merge. Unsigned, it is rejected by an
+export target that requires signed commits: an export carrying it fails
+there ([#443](https://github.com/Spheroman/newgit/issues/443)).
+
+A force-pushed target is merged with the line the tracker already has, as
+`git pull` would: the commits the force-push removed stay in the tracker's
+history, and the next export pushes them to the target again. Reverting the
+change in an instance and merging it keeps it out of the tip only: the
+removed commits are still in the history, and the next export still
+publishes them. When the force-push was to purge a secret, that publishes
+it again, and nothing in newgit can purge it yet
+([#442](https://github.com/Spheroman/newgit/issues/442): a way to reset a
+tracker's line to its target). Until then, do not export that tracker.
 
 ### Pull requests from a workspace: `branches = true`
 

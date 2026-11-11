@@ -383,8 +383,12 @@ fn depth(mount: &str) -> usize {
     }
 }
 
-/// The tracker in Git owning workspace `path`, by the ownership rules: the
-/// deepest mount holding it, then the longest claim, ties to the lesser name.
+/// The tracker in Git owning workspace `path`, as the client's `owners_of`
+/// decides it (docs/design/trackers.md, *Ownership*) among trackers in Git:
+/// a claim of a tracker in Git never reaches into a deeper mount, so the
+/// deepest mount holding the path decides, then the longest claim, ties to
+/// the lesser name. Asked only of definition files under
+/// `.newgit/trackers/`, where no tracker outside Git may be mounted.
 fn owner_of(facts: &BTreeMap<String, Facts>, path: &str) -> Option<String> {
     let in_git: Vec<(&String, &Facts)> = facts
         .iter()

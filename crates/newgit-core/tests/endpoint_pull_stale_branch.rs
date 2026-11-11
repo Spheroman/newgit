@@ -63,7 +63,7 @@ fn a_branch_from_before_a_withheld_tracker_moved_merges_with_mains_pin() {
         ],
     );
     manager(&remote.store)
-        .pull(None, "t3code")
+        .pull(None, &["t3code".to_owned()])
         .expect("pull t3code");
     // ... alongside work the mirror does see, so its `main` moves too.
     let repo = remote.store.paths().project_root.clone();

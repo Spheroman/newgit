@@ -155,7 +155,7 @@ fn every_tracker_behind_moves_in_one_commit_that_lists_each() {
     let before = git(&repo, &["rev-parse", "HEAD"]);
     let manager = BranchManager::open(store.clone()).expect("manager");
 
-    let pulled = manager.pull_all(None).expect("pull");
+    let pulled = manager.pull(None, &[]).expect("pull");
     let moved: Vec<(&str, usize)> = pulled
         .pulled
         .iter()
@@ -185,7 +185,7 @@ fn every_tracker_behind_moves_in_one_commit_that_lists_each() {
     assert_eq!(pin(&store, "instances/main", "ui"), ui);
 
     // A second pull has nothing to do, and writes nothing.
-    let again = manager.pull_all(None).expect("again");
+    let again = manager.pull(None, &[]).expect("again");
     assert_eq!(again.view, None);
     assert!(again.pulled.is_empty(), "{again:?}");
     assert_eq!(
@@ -208,7 +208,7 @@ fn nothing_behind_makes_no_commit() {
     let before = git(&repo, &["rev-parse", "HEAD"]);
     let manager = BranchManager::open(store.clone()).expect("manager");
 
-    let pulled = manager.pull_all(None).expect("pull");
+    let pulled = manager.pull(None, &[]).expect("pull");
     assert_eq!(pulled.view, None);
     assert!(pulled.pulled.is_empty(), "{pulled:?}");
     // `access`, which holds the definitions, is a mounted tracker in Git too.
@@ -236,7 +236,7 @@ fn in_an_instance_the_commit_lands_on_its_branch_and_main_keeps_its_pins() {
     let ui = advance(&temp, &store, "ui", &["c.js", "d.js"]);
     let project_head = git(&repo, &["rev-parse", "HEAD"]);
 
-    let pulled = manager.pull_all(Some("feature")).expect("pull");
+    let pulled = manager.pull(Some("feature"), &[]).expect("pull");
     let view = pulled.view.expect("a view commit");
     assert_eq!(
         git(&workspace, &["rev-parse", "HEAD"]),
@@ -277,7 +277,7 @@ fn a_pin_holding_its_own_commits_stays_and_the_rest_move() {
     advance(&temp, &store, "lib", &["a.js"]);
     let ui = advance(&temp, &store, "ui", &["c.js"]);
 
-    let pulled = manager.pull_all(Some("feature")).expect("pull");
+    let pulled = manager.pull(Some("feature"), &[]).expect("pull");
     assert_eq!(
         pulled.diverged,
         vec![("lib".to_owned(), "main".to_owned())],
@@ -318,7 +318,7 @@ fn trackers_outside_git_are_left_alone() {
     let env_before = std::fs::read_to_string(workspace.join(".env.local")).expect("read env");
     advance(&temp, &store, "lib", &["a.js"]);
 
-    let pulled = manager.pull_all(Some("feature")).expect("pull");
+    let pulled = manager.pull(Some("feature"), &[]).expect("pull");
     assert_eq!(pulled.outside_git, vec!["env".to_owned()]);
     assert!(
         pulled.pulled.iter().all(|pulled| pulled.tracker != "env"),
