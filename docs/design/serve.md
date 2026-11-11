@@ -93,8 +93,9 @@ Every repo the API names is a Git namespace in one store, served with
 | `/<o>/<p>[/<path>].git`, its stored view | the tracker's | `r/<tracker>` (decision 10) |
 
 So root's `main` is `refs/namespaces/t/refs/namespaces/root/refs/heads/main`
-in `project-devs.git`. Stores need Git 2.45 or newer, for reftable; serve
-refuses to start on an older one.
+in `project-devs.git`. Stores need Git 2.46 or newer, for reftable (2.45)
+and symbolic refs moved in a ref transaction (`symref-update`, 2.46);
+serve refuses to start on an older one.
 
 - **One SQLite database, every project table keyed by `home` first.** The home
   (`<owner>/<project>` today) is the shard unit: moving a set of homes to
@@ -486,8 +487,33 @@ Resolved loudly; each is reversible.
       and tag was composed from (`T`'s commit, the readable set, the view),
       and per readable set what every commit of `T` composed to
       (`lines/<set>/map/ab/cd/<rest>`, a blob: the view commit, the children
-      expanded, its canonical id) and the canonical notes. The state ref and
-      every served ref move in one compare-and-swap transaction.
+      expanded, its canonical id) and the canonical notes. The state ref,
+      every served ref, and `HEAD` move in one transaction, a
+      compare-and-swap on the state ref against the state its writer read
+      when it started, which also checks the tracker's own `HEAD` is still
+      in `S` (`update-ref --stdin`'s `symref-verify`; `HEAD` itself by
+      `symref-update`, hence Git 2.46). A writer that loses reads the state
+      again: a tracker that left `S` meanwhile (its move landed) gets
+      nothing written back there.
+    - **Never moves back.** The state records when its lists were read: the
+      project's incarnation, its *revision* (`projects.revision`, which
+      SQLite triggers move with every change to a list, tag, link, store
+      row, or the default branch, in that change's transaction), and the
+      stamp of the last landing there. A refresh from lists read at an
+      older revision than the stored state's leaves it as it is, and the
+      same history read again later records the later revision, so a
+      writer that read the lists in between cannot put its view back. A
+      fetch brings the history up to the lists it read before upload-pack
+      starts; from then on its refs only move forward, so upload-pack never
+      advertises a view behind those lists
+      (`crates/newgit-serve/tests/rooted_monotonic.rs`,
+      `rooted_fetch_race.rs`).
+    - **As of a landing.** "Tracker `T`'s rooted history as of landing
+      stamp `N`" is `rooted::as_of(app, project, T, N)`: refused until `N`
+      is in place, it brings the stored history up to the lists (which
+      then hold `N` and all before it) and answers its refs and the `At` it
+      was composed at. Since it never moves back, what it answers stays at
+      least that new. A mirror export or a webhook (#414) asks it.
     - **Extending is composing only the new commits**
       (`newgit_core::compose::extend`): `rev-list` from what is wanted, not
       from what was composed last, each new commit composed onto its
@@ -505,8 +531,25 @@ Resolved loudly; each is reversible.
       audience changed) is another set: composed whole, once.
     - **Derived data, outside the landing.** Nothing about stored histories
       is in a landing's entry, and nothing is composed while a landing holds
-      anything: `land` returns, then the projects it touched are extended by
-      one background thread, each tracker under its project's compose lock.
+      anything: `land` works out from the landing alone which trackers it
+      touched (pins that differ from the lists it expects, store and ref
+      moves; everything, for a definitions change, a project made, or a
+      void), then returns, and one background thread extends those
+      trackers and the trackers they are mounted within. Entries for one
+      project coalesce in its queue. A pass reads the project's lists,
+      tags, definitions, and rows once, under the db lock, and lets go of
+      it; every Git process (whether the store is the tracker's, the
+      composing, the ref transaction) runs after, each tracker under its
+      project's compose lock, let go of between chunks of a long history.
+      A request right after a landing waits for that read at most
+      (`rooted_lock_wait.rs`: 300 trackers, debug build, the longest of 84
+      requests made while the extension ran waited 159 ms, against 3.5 s
+      before). A pass that fails or panics is logged, kept in
+      `Worker::failing`, and tried again with backoff (1 s, doubling, at
+      most 5 minutes) without waiting for another landing; the thread goes
+      on (`rooted_worker_panic.rs`). A tracker that has left every list (or
+      the default branch, or its store) has its stored history removed by
+      the next pass that reaches it.
       Every fetch of a rooted view compares the stored state with the lists
       it read under the db lock and composes what is missing first, so no
       reader sees a view behind what landed, whether or not the background
@@ -519,6 +562,8 @@ Resolved loudly; each is reversible.
       tracker composes that one itself. Long histories are recorded every
       5,000 commits (`NEWGIT_SERVE_ROOTED_CHUNK`), so a pass stopped part
       way resumes where it was (`serve_rooted_stored.rs`).
+      Backfilling holds a project's compose lock one chunk at a time, so a
+      fetch of another view there waits for at most one chunk.
       `NEWGIT_SERVE_ROOTED=off` composes every view per fetch as before, and
       `NEWGIT_SERVE_ROOTED_BACKGROUND=off` leaves extending to fetches;
       both are for the tests.
@@ -558,16 +603,20 @@ Resolved loudly; each is reversible.
 - **Extending a parent of many trackers is O(trackers) per commit.**
   Composing one commit grafts every child at its mount, so root's
   extension at each landing costs what composing one commit of root's view
-  costs (decision 10, *What it costs*), in the background and outside the
-  landing, but a fetch of root's view right after a landing waits for it.
-  #440 is the fix (graft only what moved).
+  costs (decision 10, *What it costs*: p50 755 ms at 2,000 trackers), in
+  the background and outside the landing, but a fetch of root's view right
+  after a landing waits for it. The queue is deduplicated, but at a landing
+  rate above one per extension the backlog in time grows without limit.
+  The nixpkgs prototype's pooled mixed-reader layout was 23–32 ms a
+  landing, flat, because it memoized by subtree and redid only the paths
+  that changed; reusing the previous commit's subtrees for the children a
+  landing did not touch is the fix, recorded on #440 with these numbers.
 - **What stored histories leave behind stays until gc ([#434]).** Each
   extension writes a new state commit and map trees, and canonical notes
-  are kept for view commits a branch no longer reaches. A tracker moving
+  are kept for view commits a branch no longer reaches. (A tracker moving
   to another store has its `r/<T>` and state ref removed from the old one
-  with its namespace; an extension already running in the old store when
-  the move lands can write them back there (content that store's readers
-  had already), and they stay until gc.
+  with its namespace, and an extension still running there when the move
+  lands writes nothing back: decision 10, *Layout*.)
 - **Raw Git reads are atomic per repo, not across repos.** Each store's
   refs move in one transaction and the rows that say where everything is
   move under the same lock, but a client fetching two trackers' repos one

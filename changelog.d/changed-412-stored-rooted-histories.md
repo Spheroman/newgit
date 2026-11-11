@@ -13,3 +13,8 @@
   is still composed for per fetch. A data directory from before this gets
   its stored histories at start, in the background and resumably, and any
   fetch before that composes what it needs itself.
+
+  A stored view never moves back to older lists, and its refs move in one
+  compare-and-swap with its state, so a tracker moving to another store
+  never gets its view written back into the one it left. `newgit serve`
+  now needs Git 2.46 or newer.

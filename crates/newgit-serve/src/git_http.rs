@@ -307,14 +307,23 @@ pub async fn endpoint(app: Arc<App>, request: Request<Body>) -> Response<Body> {
     let lock = app.compose_lock(&id.key());
     let _held = lock.lock().await;
     if let Some(want) = stored {
-        // The stored rooted history, brought up to the lists just read
-        // before it is served: never behind what has landed.
+        // The stored rooted history, checked where it is and brought up to
+        // the lists just read, all after the db lock is let go of. A stored
+        // history never moves back to older lists (`rooted::refresh`), so
+        // once this returns its refs are at least as new as the lists this
+        // read, whatever writes it after: upload-pack reads no older view.
         let refreshed = {
-            let want = want.clone();
-            tokio::task::spawn_blocking(move || crate::rooted::refresh(&want)).await
+            let (mut want, id) = (want.clone(), id.clone());
+            tokio::task::spawn_blocking(move || {
+                if !crate::rooted::located(&mut want, &id)? {
+                    return Ok(None);
+                }
+                crate::rooted::refresh(&want).map(|done| (!done.gone).then_some(want))
+            })
+            .await
         };
         match refreshed {
-            Ok(Ok(_)) => {
+            Ok(Ok(Some(want))) => {
                 drop(_held);
                 let run = Run {
                     git_dir: want.dir(),
@@ -325,6 +334,9 @@ pub async fn endpoint(app: Arc<App>, request: Request<Body>) -> Response<Body> {
                 };
                 return run_git(app, run, ask, request).await;
             }
+            // Not where its lists said by the time it was checked (a move
+            // landed meanwhile): composed for this fetch, as before.
+            Ok(Ok(None)) => {}
             Ok(Err(error)) => eprintln!(
                 "newgit serve: `{}`'s rooted history in {}: {}; composing it for this fetch",
                 want.tracker,

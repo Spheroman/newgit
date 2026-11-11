@@ -269,17 +269,66 @@ fn graft(objects: &mut Objects, tree: &str, mount: &str, child: &str) -> Result<
     objects.set_path(tree, mount, entry)
 }
 
-/// Whether no mount in `ordered` is `.`, the same as another, or inside
-/// another: then grafting them in any order makes one tree.
-fn apart(ordered: &[(&String, &String)]) -> bool {
-    let mounts: HashSet<&str> = ordered.iter().map(|(_, mount)| mount.as_str()).collect();
-    mounts.len() == ordered.len()
-        && !mounts.contains(".")
-        && mounts.iter().all(|mount| {
-            mount
-                .match_indices('/')
-                .all(|(at, _)| !mounts.contains(&mount[..at]))
-        })
+/// A mount as the path components grafting it reads, when it is canonical:
+/// what `normalize_path` makes of a workspace-relative path (not empty, not
+/// `.`, no `..`, not absolute, no doubled or trailing `/`). `None` for any
+/// other: such a mount is grafted one at a time, as it always was.
+fn canonical_parts(mount: &str) -> Option<Vec<&[u8]>> {
+    let parts = crate::objects::split_path(mount.as_bytes());
+    let canonical = !parts.is_empty()
+        && parts.iter().all(|part| *part != b"..")
+        && parts.join(&b'/') == mount.as_bytes();
+    canonical.then_some(parts)
+}
+
+/// Whether every mount in `mounts` is canonical and none is the same as
+/// another or inside another, compared by path component: then grafting
+/// them in any order makes one tree. Anything not provably so (`.`, an
+/// absolute or `..` mount, `pkgs/a` beside `/pkgs/a/b`) is not apart.
+fn apart(mounts: &[&str]) -> bool {
+    let mut paths = Vec::with_capacity(mounts.len());
+    for mount in mounts {
+        let Some(parts) = canonical_parts(mount) else {
+            return false;
+        };
+        paths.push(parts);
+    }
+    // Sorted by component, a path inside another (or equal to it) comes
+    // right after it or after another path inside it.
+    paths.sort();
+    paths.windows(2).all(|pair| !pair[1].starts_with(&pair[0]))
+}
+
+/// `own` with each `(mount, view)` of `children` grafted in, in that order:
+/// one at a time, each graft reading the tree the one before made.
+pub fn graft_each(objects: &mut Objects, own: &str, children: &[(&str, &str)]) -> Result<String> {
+    let mut tree = own.to_owned();
+    for (mount, view) in children {
+        tree = graft(objects, &tree, mount, view)?;
+    }
+    Ok(tree)
+}
+
+/// [`graft_each`], in one pass when the mounts are [`apart`]: each graft
+/// then reads only its own mount of `own`, so all of them at once make the
+/// same tree with each directory written once (a parent of thousands of
+/// trackers rewrites `pkgs/` once, not once per tracker). Otherwise, one at
+/// a time.
+pub fn graft_all(objects: &mut Objects, own: &str, children: &[(&str, &str)]) -> Result<String> {
+    let mounts: Vec<&str> = children.iter().map(|(mount, _)| *mount).collect();
+    if !apart(&mounts) {
+        return graft_each(objects, own, children);
+    }
+    let mut edits = Vec::with_capacity(children.len());
+    for (mount, view) in children {
+        let merged = match objects.subtree(own, mount)? {
+            Some(existing) => objects.overlay(&existing, view)?,
+            None => (*view).to_owned(),
+        };
+        let entry = (merged != EMPTY_TREE).then(|| (TREE_MODE.to_vec(), merged));
+        edits.push((mount.as_bytes().to_vec(), entry));
+    }
+    objects.set_paths(own, edits)
 }
 
 fn depth(mount: &str) -> usize {
@@ -616,27 +665,11 @@ impl Composer<'_> {
                 .ok_or_else(|| missing(pin))?;
             views.push((mount.as_str(), view));
         }
-        if apart(ordered) {
-            // Each graft reads only its own mount of `own`, so all of them
-            // at once make the same tree, each directory written once: a
-            // parent of thousands of trackers rewrites `pkgs/` once, not
-            // once per tracker.
-            let mut edits = Vec::with_capacity(views.len());
-            for (mount, view) in views {
-                let merged = match self.objects.subtree(own, mount)? {
-                    Some(existing) => self.objects.overlay(&existing, &view)?,
-                    None => view,
-                };
-                let entry = (merged != EMPTY_TREE).then(|| (TREE_MODE.to_vec(), merged));
-                edits.push((mount.as_bytes().to_vec(), entry));
-            }
-            return self.objects.set_paths(own, edits);
-        }
-        let mut tree = own.to_owned();
-        for (mount, view) in views {
-            tree = graft(&mut self.objects, &tree, mount, &view)?;
-        }
-        Ok(tree)
+        let children: Vec<(&str, &str)> = views
+            .iter()
+            .map(|(mount, view)| (*mount, view.as_str()))
+            .collect();
+        graft_all(&mut self.objects, own, &children)
     }
 
     fn own_tree(&mut self, commit: &Commit, cache: &mut HashMap<String, String>) -> Result<String> {
@@ -2628,22 +2661,19 @@ mod tests {
 
     #[test]
     fn mounts_are_apart_only_when_none_is_inside_another() {
-        let check = |mounts: &[&str]| {
-            let named: Vec<(String, String)> = mounts
-                .iter()
-                .enumerate()
-                .map(|(index, mount)| (format!("t{index}"), (*mount).to_owned()))
-                .collect();
-            let ordered: Vec<(&String, &String)> =
-                named.iter().map(|(name, mount)| (name, mount)).collect();
-            apart(&ordered)
-        };
-        assert!(check(&[]));
-        assert!(check(&["pkgs/a", "pkgs/b", "pkgs/a-b", "lib"]));
-        assert!(!check(&["."]));
-        assert!(!check(&["pkgs/a", "pkgs/a/vendor"]));
-        assert!(!check(&["a", "a-b", "a/c"]));
-        assert!(!check(&["lib", "lib"]));
+        assert!(apart(&[]));
+        assert!(apart(&["pkgs/a", "pkgs/b", "pkgs/a-b", "lib"]));
+        assert!(!apart(&["."]));
+        assert!(!apart(&[""]));
+        assert!(!apart(&["pkgs/a", "pkgs/a/vendor"]));
+        assert!(!apart(&["a", "a-b", "a/c"]));
+        assert!(!apart(&["lib", "lib"]));
+        // Equal or nested by path, not by string: never apart.
+        assert!(!apart(&["pkgs/a", "/pkgs/a/b"]));
+        assert!(!apart(&["pkgs/a", "/pkgs/a"]));
+        assert!(!apart(&["pkgs/a", "pkgs//a"]));
+        assert!(!apart(&["pkgs/a/", "pkgs/b"]));
+        assert!(!apart(&["pkgs/../a", "b"]));
     }
 
     #[test]

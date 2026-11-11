@@ -99,6 +99,29 @@ const ADDED: &[(&str, &str, &str)] = &[
     ("head_log", "stamp", "INTEGER"),
     ("projects", "incarnation", "TEXT"),
     ("projects", "epoch", "INTEGER"),
+    ("projects", "revision", "INTEGER"),
+    ("projects", "landed", "INTEGER"),
+];
+
+/// `projects.revision` counts every change to what a project's views are
+/// made of: its branches' lists, its tags, its links, where its trackers
+/// are, its default branch. Kept by SQLite itself, in the transaction of the
+/// change, so nothing that writes one of those rows can forget it. Stored
+/// rooted histories record the revision they were composed at, and a
+/// refresh never replaces a newer one with an older (`crate::rooted`).
+const REVISION_TRIGGERS: &[(&str, &str)] = &[
+    ("heads", "INSERT"),
+    ("heads", "UPDATE"),
+    ("heads", "DELETE"),
+    ("tags", "INSERT"),
+    ("tags", "UPDATE"),
+    ("tags", "DELETE"),
+    ("links", "INSERT"),
+    ("links", "UPDATE"),
+    ("links", "DELETE"),
+    ("tracker_stores", "INSERT"),
+    ("tracker_stores", "UPDATE"),
+    ("tracker_stores", "DELETE"),
 ];
 
 pub struct Db {
@@ -235,6 +258,18 @@ impl Db {
                     .execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {kind}"))?;
             }
         }
+        for (table, event) in REVISION_TRIGGERS {
+            let row = if *event == "DELETE" { "OLD" } else { "NEW" };
+            connection.execute_batch(&format!(
+                "CREATE TRIGGER IF NOT EXISTS revision_{table}_{event} AFTER {event} ON {table} \
+                 BEGIN UPDATE projects SET revision = COALESCE(revision, 0) + 1 WHERE home = {row}.home; END",
+                event = event.to_lowercase(),
+            ))?;
+        }
+        connection.execute_batch(
+            "CREATE TRIGGER IF NOT EXISTS revision_projects_default AFTER UPDATE OF default_branch ON projects \
+             BEGIN UPDATE projects SET revision = COALESCE(revision, 0) + 1 WHERE home = NEW.home; END",
+        )?;
         // A landing applied again (replayed at startup) logs nothing twice.
         connection.execute_batch(
             "CREATE UNIQUE INDEX IF NOT EXISTS head_log_by_stamp ON head_log (stamp, home, branch, tracker)",
@@ -612,6 +647,31 @@ pub fn keep_only(db: &Connection, home: &str, state: &HomeState) -> ApiResult<()
             [home, tracker],
         )?;
     }
+    Ok(())
+}
+
+/// Where project `home`'s views are: its [`REVISION_TRIGGERS`] revision, and
+/// the stamp of the last landing whose rows it has (`0` for none since).
+pub fn views_at(db: &Connection, home: &str) -> ApiResult<(u64, u64)> {
+    let found: Option<(Option<i64>, Option<i64>)> = db
+        .query_row(
+            "SELECT revision, landed FROM projects WHERE home = ?",
+            [home],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let (revision, landed) = found.unwrap_or_default();
+    let count = |value: Option<i64>| u64::try_from(value.unwrap_or(0)).unwrap_or(0);
+    Ok((count(revision), count(landed)))
+}
+
+/// Landing `stamp` wrote `home`'s rows.
+pub fn set_landed(db: &Connection, home: &str, stamp: u64) -> ApiResult<()> {
+    let stamp = i64::try_from(stamp).unwrap_or(i64::MAX);
+    db.execute(
+        "UPDATE projects SET landed = MAX(COALESCE(landed, 0), ?) WHERE home = ?",
+        params![stamp, home],
+    )?;
     Ok(())
 }
 

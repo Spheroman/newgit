@@ -539,8 +539,10 @@ impl Objects {
 
     /// `tree` with each of `edits` (a path, and what to set there: `None`
     /// removes it) made, as [`Self::set_path`] one after another would make
-    /// them, each touched directory written once. The paths must be apart:
-    /// none equal to another or inside it, so their order does not matter.
+    /// them, each touched directory written once. The paths must be apart,
+    /// as [`split_path`] reads them: none equal to another or inside it, so
+    /// their order does not matter. Paths that are not, or the root, are an
+    /// error, never a panic.
     pub fn set_paths(
         &mut self,
         tree: &str,
@@ -563,19 +565,31 @@ impl Objects {
                 "set_paths takes paths below the root".to_owned(),
             ));
         }
+        // Refused (never indexed past) when two paths are equal or one is
+        // inside the other.
         let updated = self.set_many(Some(tree), &parts)?;
         Ok(updated.unwrap_or_else(|| self.make_tree(Vec::new())))
     }
 
     fn set_many(&mut self, tree: Option<&str>, edits: &[PartsEdit]) -> Result<Option<String>> {
+        let mut by_name: BTreeMap<&Vec<u8>, Vec<usize>> = BTreeMap::new();
+        for (index, (parts, _)) in edits.iter().enumerate() {
+            let Some(first) = parts.first() else {
+                return Err(not_apart());
+            };
+            by_name.entry(first).or_default().push(index);
+        }
+        // A path set here and also edited below (or set twice) is not apart
+        // from the other: its order would matter, so it is refused.
+        if by_name.values().any(|indexes| {
+            indexes.len() > 1 && indexes.iter().any(|index| edits[*index].0.len() == 1)
+        }) {
+            return Err(not_apart());
+        }
         let mut entries = match tree {
             Some(tree) => self.tree(tree)?,
             None => Vec::new(),
         };
-        let mut by_name: BTreeMap<&Vec<u8>, Vec<usize>> = BTreeMap::new();
-        for (index, (parts, _)) in edits.iter().enumerate() {
-            by_name.entry(&parts[0]).or_default().push(index);
-        }
         for (name, indexes) in by_name {
             let position = entries.iter().position(|existing| &existing.name == name);
             let replacement = if let [only] = indexes.as_slice()
@@ -819,6 +833,12 @@ pub fn join_path(prefix: &[u8], name: &[u8]) -> Vec<u8> {
     path.push(b'/');
     path.extend_from_slice(name);
     path
+}
+
+fn not_apart() -> NewgitError {
+    NewgitError::Unsupported(
+        "set_paths takes paths apart: none equal to another or inside it".to_owned(),
+    )
 }
 
 fn git_output(repo: &Utf8Path, args: &[&str]) -> Result<String> {

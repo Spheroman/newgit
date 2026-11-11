@@ -29,16 +29,26 @@
 //! composed from, the readable set's key, and the view commit) and, for each
 //! readable set, `lines/<key>/map/<ab>/<cd>/<rest>` (what each commit of `T`
 //! composed to: [`Composition`]) and `lines/<key>/notes/…` (the canonical
-//! notes, in Git's own notes layout). The state ref and every served ref
-//! move in one ref transaction.
+//! notes, in Git's own notes layout). The state ref, every served ref, and
+//! `HEAD` move in one ref transaction: a compare-and-swap against the state
+//! its writer read, which also checks the tracker's own `HEAD` is still in
+//! `S`, so a tracker that moved out meanwhile gets nothing written back.
+//!
+//! **Never back.** The state records when its lists were read ([`At`]: the
+//! project's revision, which SQLite moves with every change to what views
+//! are made of). A refresh from older lists than what is stored leaves it
+//! alone, so once a fetch has brought it up to the lists it read, its refs
+//! only move forward. "Tracker `T`'s rooted history as of landing `N`" is
+//! [`as_of`].
 //!
 //! **When.** Derived data, never a state anyone sees (landing.md, *How we got
 //! here*): nothing about it is in a landing's entry. Every read of a rooted
 //! view compares what is stored with the lists it reads under the db lock,
 //! and composes what is missing before it serves, so no reader ever sees a
-//! rooted view behind what has landed. After each landing the touched
-//! trackers are extended in the background ([`Worker`]), outside every lock a
-//! landing holds, so the read usually finds it done. A landing voided or
+//! rooted view behind what has landed. After each landing the trackers it
+//! touched, and those they are mounted within, are extended in the
+//! background ([`Worker`]), outside every lock a landing holds and with no
+//! Git process under the db lock, so the read usually finds it done. A landing voided or
 //! never put in place changed no list, so nothing was composed for it; a
 //! crash mid-extension leaves objects nothing names and a state ref where it
 //! was.
@@ -63,7 +73,9 @@ use crate::App;
 use crate::api::ProjectContext;
 use crate::db;
 use crate::error::{ApiResult, HttpError};
+use crate::landing::Stamp;
 use crate::names::{ProjectId, RepoRef, namespace_prefix, parse_project_key, within};
+use crate::policy::Facts;
 use crate::repos::{self, Repo, Store};
 
 /// Where a tracker's stored rooted history is served from, in its store.
@@ -99,6 +111,57 @@ pub struct Part {
     pub annotation: Option<TagAnnotation>,
 }
 
+/// When the lists a stored rooted history was composed from were read: which
+/// project of its name (`db::ProjectInfo::incarnation`), the revision of
+/// what its views are made of (`db::views_at`: every list, tag, link, store
+/// row, and default branch change moves it), and the stamp of the last
+/// landing in it. Within one incarnation a higher revision is newer; another
+/// incarnation is another project. A refresh never replaces a stored history
+/// with one read at an older revision.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct At {
+    pub incarnation: String,
+    pub revision: u64,
+    pub landed: Stamp,
+}
+
+impl At {
+    fn line(&self) -> String {
+        let incarnation = if self.incarnation.is_empty() {
+            "-"
+        } else {
+            &self.incarnation
+        };
+        format!("at {incarnation} {} {}\n", self.revision, self.landed)
+    }
+
+    /// What a state's `served` says it was read at (nothing, for a state
+    /// from before this was recorded: older than anything).
+    fn of(served: &str) -> Self {
+        served
+            .lines()
+            .find_map(|line| {
+                let mut fields = line.strip_prefix("at ")?.split(' ');
+                let incarnation = fields.next()?;
+                Some(Self {
+                    incarnation: if incarnation == "-" {
+                        String::new()
+                    } else {
+                        incarnation.to_owned()
+                    },
+                    revision: fields.next()?.parse().ok()?,
+                    landed: fields.next()?.parse().ok()?,
+                })
+            })
+            .unwrap_or_default()
+    }
+
+    /// Whether lists read at `self` are older than ones read at `stored`.
+    pub fn behind(&self, stored: &Self) -> bool {
+        self.incarnation == stored.incarnation && self.revision < stored.revision
+    }
+}
+
 /// A tracker's stored rooted history as the lists have it now.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Want {
@@ -110,6 +173,14 @@ pub struct Want {
     pub tags: BTreeMap<String, Part>,
     /// The store of each tracker composed into it: its own, or `public`.
     pub stores: BTreeMap<String, Store>,
+    /// When the lists it was read from were read.
+    pub at: At,
+    /// What the tracker's own `HEAD` in `store` names, as [`located`] found
+    /// it: every write of the stored history checks it is still there in the
+    /// same transaction, so a tracker whose move to another store lands
+    /// meanwhile gets nothing written back into the store it left. `None`
+    /// writes without that check (the tests that make a store by hand).
+    pub own_head: Option<String>,
 }
 
 impl Want {
@@ -122,9 +193,26 @@ impl Want {
         Repo::new(&self.home, self.store.clone(), namespace(&self.tracker))
     }
 
+    /// The tracker's own repo, in the same store.
+    fn own(&self) -> Repo {
+        Repo::tracker(&self.home, Some(self.store.clone()), &self.tracker)
+    }
+
+    /// Whether `other` is the same history, whenever its lists were read.
+    fn same_as(&self, other: &Self) -> bool {
+        self.home == other.home
+            && self.tracker == other.tracker
+            && self.store == other.store
+            && self.default_branch == other.default_branch
+            && self.heads == other.heads
+            && self.tags == other.tags
+            && self.stores == other.stores
+    }
+
     /// What the state ref's `served` says when the history is this.
     fn served_text(&self, views: &BTreeMap<String, String>) -> String {
         let mut text = format!("default {}\n", self.default_branch);
+        text.push_str(&self.at.line());
         for (kind, parts) in [("head", &self.heads), ("tag", &self.tags)] {
             for (name, part) in parts {
                 let key = format!("{kind} {name}");
@@ -160,119 +248,230 @@ fn annotation_key(annotation: Option<&TagAnnotation>) -> String {
     )
 }
 
+/// What one project's stored rooted histories are made of, read once under
+/// the db lock and nothing else: its lists, tags, definitions, and rows.
+/// Every [`Want`] is made from it with no process and no lock, and every Git
+/// check ([`located`]) and composition runs after the lock is let go of.
+pub struct Snapshot {
+    pub id: ProjectId,
+    pub home: Utf8PathBuf,
+    pub at: At,
+    default_branch: String,
+    lists: Vec<(String, db::List)>,
+    tags: Vec<(String, db::List, Option<TagAnnotation>)>,
+    facts: BTreeMap<String, Facts>,
+    links: BTreeSet<String>,
+    /// The store each named tracker's row puts it in.
+    rows: BTreeMap<String, Store>,
+    /// For each tracker on the default branch: where it is, and the store
+    /// its facts call for (`ProjectContext::placed_for`).
+    places: BTreeMap<String, (Repo, Store)>,
+}
+
+impl Snapshot {
+    /// Read under the db lock `db`, which `project` was opened under.
+    pub fn read(project: &ProjectContext<'_>, db: &Connection) -> ApiResult<Self> {
+        let lists: Vec<(String, db::List)> = db::branches(db, &project.key)?
+            .iter()
+            .map(|branch| {
+                (
+                    branch["name"].as_str().unwrap_or_default().to_owned(),
+                    serde_json::from_value(branch["list"].clone()).unwrap_or_default(),
+                )
+            })
+            .collect();
+        let tags: Vec<(String, db::List, Option<TagAnnotation>)> = db::tags(db, &project.key)?
+            .iter()
+            .map(|tag| {
+                (
+                    tag["name"].as_str().unwrap_or_default().to_owned(),
+                    serde_json::from_value(tag["list"].clone()).unwrap_or_default(),
+                    serde_json::from_value(tag["annotation"].clone())
+                        .ok()
+                        .flatten(),
+                )
+            })
+            .collect();
+        let named: BTreeSet<String> = lists
+            .iter()
+            .flat_map(|(_, list)| list.keys())
+            .chain(tags.iter().flat_map(|(_, list, _)| list.keys()))
+            .cloned()
+            .collect();
+        let facts = project.definitions(db, named.iter().map(String::as_str))?;
+        let rows = named
+            .iter()
+            .map(|name| (name.clone(), project.own(name).store))
+            .collect();
+        let default_branch = project.info.default_branch.clone();
+        let mut places = BTreeMap::new();
+        if let Some((_, list)) = lists.iter().find(|(name, _)| *name == default_branch) {
+            for tracker in list.keys() {
+                // On a branch, so decided when it has facts at all.
+                let decided = facts.contains_key(tracker);
+                places.insert(
+                    tracker.clone(),
+                    project.placed_for(
+                        &RepoRef::tracker(&project.id, tracker),
+                        facts.get(tracker),
+                        false,
+                        decided,
+                    ),
+                );
+            }
+        }
+        let (revision, landed) = db::views_at(db, &project.key)?;
+        Ok(Self {
+            id: project.id.clone(),
+            home: project.home(),
+            at: At {
+                incarnation: project.info.incarnation.clone(),
+                revision,
+                landed,
+            },
+            default_branch,
+            lists,
+            tags,
+            facts,
+            links: project.links.keys().cloned().collect(),
+            rows,
+            places,
+        })
+    }
+
+    /// Every tracker that may have a stored rooted history: those on the
+    /// default branch.
+    pub fn trackers(&self) -> impl Iterator<Item = &String> {
+        self.places.keys()
+    }
+
+    /// The store tracker `name`'s row puts it in, for a tracker named on a
+    /// list or tag.
+    pub fn row(&self, name: &str) -> Option<&Store> {
+        self.rows.get(name)
+    }
+
+    /// Tracker `tracker`'s stored rooted history as these lists, tags,
+    /// definitions, and rows have it. `None` when it has none: a link (its
+    /// home is elsewhere), a tracker outside Git, one not on the default
+    /// branch, or one not in the store its audience calls for (refused by
+    /// `served`, whose row half this is; [`located`] is the rest).
+    pub fn want(&self, tracker: &str) -> Option<Want> {
+        if self.links.contains(tracker) {
+            return None;
+        }
+        // A view's `HEAD` is the default branch, so one not on it is not
+        // served (the composer refuses it too).
+        let (location, expected) = self.places.get(tracker)?;
+        if !self.facts.get(tracker).is_some_and(|fact| fact.git) || location.store != *expected {
+            return None;
+        }
+        let store = location.store.clone();
+        let mut stores = BTreeMap::new();
+        let mut member = |name: &str| -> bool {
+            if !within(name, tracker)
+                || self.links.contains(name)
+                || !self.facts.get(name).is_some_and(|fact| fact.git)
+            {
+                return false;
+            }
+            let there = self
+                .rows
+                .get(name)
+                .cloned()
+                .unwrap_or_else(|| Store::Tracker(name.to_owned()));
+            if there == store || there == Store::Public {
+                stores.insert(name.to_owned(), there);
+                true
+            } else {
+                false
+            }
+        };
+        let mut cut = |list: &db::List| -> BTreeSet<String> {
+            list.keys()
+                .filter(|name| member(name))
+                .cloned()
+                .collect::<BTreeSet<_>>()
+        };
+        let mut heads = BTreeMap::new();
+        for (name, list) in &self.lists {
+            if let Some(source) = list.get(tracker) {
+                heads.insert(
+                    name.clone(),
+                    Part {
+                        source: source.clone(),
+                        set: cut(list),
+                        annotation: None,
+                    },
+                );
+            }
+        }
+        let mut tags = BTreeMap::new();
+        for (name, list, annotation) in &self.tags {
+            let Some(source) = list.get(tracker) else {
+                continue;
+            };
+            tags.insert(
+                name.clone(),
+                Part {
+                    source: source.clone(),
+                    set: cut(list),
+                    annotation: annotation.clone(),
+                },
+            );
+        }
+        Some(Want {
+            home: self.home.clone(),
+            tracker: tracker.to_owned(),
+            store,
+            default_branch: self.default_branch.clone(),
+            heads,
+            tags,
+            stores,
+            at: self.at.clone(),
+            own_head: None,
+        })
+    }
+}
+
 /// Tracker `tracker` of `project`'s stored rooted history, as its lists,
-/// tags, definitions, and store rows have it under the db lock. `None` when
-/// it has none: a link (its home is elsewhere), a tracker outside Git, one
-/// not on the default branch, or one not in the store its audience calls for (refused by
-/// `served`, as every repo handed out is).
+/// tags, definitions, and store rows have it under the db lock `db`: no
+/// process runs. [`located`] then checks it, outside the lock.
 pub fn wanted(
     project: &ProjectContext<'_>,
     db: &Connection,
     tracker: &str,
 ) -> ApiResult<Option<Want>> {
-    if project.links.contains_key(tracker) {
-        return Ok(None);
-    }
-    let branches = db::branches(db, &project.key)?;
-    let lists: Vec<(String, db::List)> = branches
-        .iter()
-        .map(|branch| {
-            (
-                branch["name"].as_str().unwrap_or_default().to_owned(),
-                serde_json::from_value(branch["list"].clone()).unwrap_or_default(),
-            )
-        })
-        .collect();
-    // A view's `HEAD` is the default branch, so one not on it is not served
-    // (the composer refuses it too).
-    let default = &project.info.default_branch;
-    if !lists
-        .iter()
-        .any(|(name, list)| name == default && list.contains_key(tracker))
-    {
-        return Ok(None);
-    }
-    let named: Vec<&str> = lists
-        .iter()
-        .flat_map(|(_, list)| list.keys().map(String::as_str))
-        .collect();
-    let facts = project.definitions(db, named)?;
-    if !facts.get(tracker).is_some_and(|fact| fact.git) {
-        return Ok(None);
-    }
-    let Ok(location) = project.served(
-        db,
-        &RepoRef::tracker(&project.id, tracker),
-        facts.get(tracker),
-        false,
-    ) else {
-        return Ok(None);
+    Ok(Snapshot::read(project, db)?.want(tracker))
+}
+
+/// `served`'s Git half for `want`'s tracker, run outside the db lock: its
+/// store is made, for its audience, and the tracker's repo is there. Records
+/// what the tracker's `HEAD` there names ([`Want::own_head`]). `false` when
+/// it is not: nothing is served from it.
+pub fn located(want: &mut Want, id: &ProjectId) -> ApiResult<bool> {
+    let own = want.own();
+    let Some(head) = symbolic(&want.dir(), &own.full("HEAD"))? else {
+        return Ok(false);
     };
-    if !location.exists() {
+    let repo = RepoRef::tracker(id, &want.tracker);
+    if crate::api::served_from(&repo, own, &want.store, true).is_err() {
+        return Ok(false);
+    }
+    want.own_head = Some(head);
+    Ok(true)
+}
+
+/// What symbolic ref `name` in the store at `dir` names, if it is one.
+fn symbolic(dir: &Utf8Path, name: &str) -> ApiResult<Option<String>> {
+    if !repos::store_exists(dir) {
         return Ok(None);
     }
-    let store = location.store.clone();
-    let mut stores = BTreeMap::new();
-    let mut member = |name: &str| -> bool {
-        if !within(name, tracker)
-            || project.links.contains_key(name)
-            || !facts.get(name).is_some_and(|fact| fact.git)
-        {
-            return false;
-        }
-        let there = project.own(name).store;
-        if there == store || there == Store::Public {
-            stores.insert(name.to_owned(), there);
-            true
-        } else {
-            false
-        }
-    };
-    let mut cut = |list: &db::List| -> BTreeSet<String> {
-        list.keys()
-            .filter(|name| member(name))
-            .cloned()
-            .collect::<BTreeSet<_>>()
-    };
-    let mut heads = BTreeMap::new();
-    for (name, list) in &lists {
-        if let Some(source) = list.get(tracker) {
-            heads.insert(
-                name.clone(),
-                Part {
-                    source: source.clone(),
-                    set: cut(list),
-                    annotation: None,
-                },
-            );
-        }
-    }
-    let mut tags = BTreeMap::new();
-    for tag in db::tags(db, &project.key)? {
-        let list: db::List = serde_json::from_value(tag["list"].clone()).unwrap_or_default();
-        let Some(source) = list.get(tracker) else {
-            continue;
-        };
-        tags.insert(
-            tag["name"].as_str().unwrap_or_default().to_owned(),
-            Part {
-                source: source.clone(),
-                set: cut(&list),
-                annotation: serde_json::from_value(tag["annotation"].clone())
-                    .ok()
-                    .flatten(),
-            },
-        );
-    }
-    Ok(Some(Want {
-        home: project.home(),
-        tracker: tracker.to_owned(),
-        store,
-        default_branch: project.info.default_branch.clone(),
-        heads,
-        tags,
-        stores,
-    }))
+    let output = repos::git(dir, &["symbolic-ref", "--quiet", name])?;
+    Ok(output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).trim().to_owned()))
 }
 
 /// What [`refresh`] did.
@@ -282,6 +481,13 @@ pub struct Refreshed {
     pub fresh: bool,
     /// Commits of the tracker composed now.
     pub composed: usize,
+    /// What is stored was composed from lists read after these, and differs:
+    /// left as it is, never moved back to them. What it serves is at least
+    /// as new as what was asked.
+    pub newer: bool,
+    /// The tracker is no longer in this store (its move landed meanwhile):
+    /// nothing was written here.
+    pub gone: bool,
 }
 
 /// The state ref's commit, its `served` text, and the tree of each line.
@@ -331,6 +537,7 @@ fn core(error: newgit_core::error::NewgitError) -> HttpError {
 fn sources_of(served: &str) -> Vec<String> {
     served
         .lines()
+        .filter(|line| !line.starts_with("at "))
         .map(|line| {
             let mut fields: Vec<&str> = line.split(' ').collect();
             if fields.first().is_some_and(|kind| *kind != "default") {
@@ -555,52 +762,155 @@ fn state_commit(objects: &mut Objects, served: &str, lines: &BTreeMap<String, St
     objects.make_commit(&tree, &[], NOBODY, NOBODY, b"", b"rooted history\n")
 }
 
-/// Move the state ref from `old` to `new`, and every served ref of `want`'s
-/// namespace in `refs` (a full name → its object, `None` deleted), in one
-/// transaction.
+/// Move the state ref from `old` (the state this writer read: `None`, none)
+/// to `new`, and every served ref of `want`'s namespace in `refs` (a full
+/// name → its object, `None` deleted), and point the namespace's `HEAD` at
+/// the default branch, in one transaction: a compare-and-swap on the state
+/// ref, which also checks the tracker's own `HEAD` is still in this store
+/// ([`Want::own_head`]). `false` when another writer moved the state first,
+/// or the tracker left: nothing moved.
 fn write_refs(
     want: &Want,
     old: Option<&str>,
     new: &str,
     refs: &BTreeMap<String, Option<String>>,
-) -> ApiResult<()> {
+) -> ApiResult<bool> {
     let zero = "0".repeat(40);
-    let mut lines = vec![format!(
-        "update {} {new} {}",
+    let repo = want.repo();
+    let mut script = String::from("start\n");
+    script.push_str(&format!(
+        "update {} {new} {}\n",
         state_ref(&want.tracker),
         old.unwrap_or(&zero)
-    )];
+    ));
+    if let Some(head) = &want.own_head {
+        script.push_str(&format!(
+            "symref-verify {} {head}\n",
+            want.own().full("HEAD")
+        ));
+    }
     for (name, object) in refs {
         match object {
-            Some(object) => lines.push(format!("update {name} {object}")),
-            None => lines.push(format!("delete {name}")),
+            Some(object) => script.push_str(&format!("update {name} {object}\n")),
+            None => script.push_str(&format!("delete {name}\n")),
         }
     }
-    repos::Prepared::new(&want.dir(), &lines)?.commit()
+    script.push_str(&format!(
+        "symref-update {} {}\n",
+        repo.full("HEAD"),
+        repo.full(&format!("refs/heads/{}", want.default_branch))
+    ));
+    script.push_str("prepare\ncommit\n");
+    let dir = want.dir();
+    if repos::run_stdin(&dir, &["update-ref", "--no-deref", "--stdin"], &script)? {
+        return Ok(true);
+    }
+    // Lost to another writer, or the tracker left: either way the state or
+    // the tracker's `HEAD` is not what this read. Anything else is a fault.
+    let mut objects = Objects::open(&dir).map_err(core)?;
+    let now = read_state(&mut objects, &dir, &want.tracker)?.commit;
+    let moved = match &want.own_head {
+        Some(head) => symbolic(&dir, &want.own().full("HEAD"))?.as_deref() != Some(head.as_str()),
+        None => false,
+    };
+    if now.as_deref() != old || moved {
+        return Ok(false);
+    }
+    Err(HttpError::internal(format!(
+        "moving `{}`'s stored rooted history in {dir}",
+        want.tracker
+    )))
 }
 
+/// After a lost [`write_refs`]: the tracker left (gone), or another writer
+/// moved the state first (try again: [`refresh_with`] reads it anew).
+fn lost(want: &Want) -> ApiResult<Option<Refreshed>> {
+    let gone = match &want.own_head {
+        Some(head) => {
+            symbolic(&want.dir(), &want.own().full("HEAD"))?.as_deref() != Some(head.as_str())
+        }
+        None => false,
+    };
+    Ok(gone.then(|| Refreshed {
+        gone: true,
+        ..Refreshed::default()
+    }))
+}
+
+/// How many times a refresh that lost its swap to another writer reads the
+/// state again and tries again.
+const ATTEMPTS: usize = 4;
+
 /// Bring `want`'s stored rooted history up to the lists: compose only the
-/// commits not composed yet, and move its refs. Run holding the project's
-/// compose lock, never the db lock or a landing's.
+/// commits not composed yet, and move its refs. Never moves it back: when
+/// what is stored was composed from newer lists, it is left as it is. Run
+/// holding the project's compose lock, never the db lock or a landing's.
 pub fn refresh(want: &Want) -> ApiResult<Refreshed> {
-    refresh_with(want, chunk(), &|| {})
+    refresh_with(want, chunk(), &|| {}, &|| {})
 }
 
 /// [`refresh`], recording what is composed every `chunk` commits and
-/// calling `checkpoint` after each (the crash test stops there).
-pub fn refresh_with(want: &Want, chunk: usize, checkpoint: &dyn Fn()) -> ApiResult<Refreshed> {
+/// calling `checkpoint` after each (the crash test stops there) and
+/// `between` (the worker lets go of the compose lock there, and takes it
+/// again).
+pub fn refresh_with(
+    want: &Want,
+    chunk: usize,
+    checkpoint: &dyn Fn(),
+    between: &dyn Fn(),
+) -> ApiResult<Refreshed> {
+    for _ in 0..ATTEMPTS {
+        if let Some(done) = refresh_once(want, chunk, checkpoint, between)? {
+            return Ok(done);
+        }
+    }
+    Err(HttpError::internal(format!(
+        "`{}`'s stored rooted history kept moving while it was extended",
+        want.tracker
+    )))
+}
+
+/// One try of [`refresh_with`]: `None` when another writer moved the state
+/// first.
+fn refresh_once(
+    want: &Want,
+    chunk: usize,
+    checkpoint: &dyn Fn(),
+    between: &dyn Fn(),
+) -> ApiResult<Option<Refreshed>> {
     let chunk = chunk.max(1);
     let dir = want.dir();
     let mut objects = Objects::open(&dir).map_err(core)?;
     let state = read_state(&mut objects, &dir, &want.tracker)?;
-    if !state.served.is_empty()
-        && sources_of(&state.served) == sources_of(&want.served_text(&BTreeMap::new()))
-    {
-        return Ok(Refreshed {
-            fresh: true,
-            composed: 0,
-        });
+    let stored_at = At::of(&state.served);
+    let same = !state.served.is_empty()
+        && sources_of(&state.served) == sources_of(&want.served_text(&BTreeMap::new()));
+    if state.commit.is_some() && want.at.behind(&stored_at) {
+        // Composed from newer lists than these: never moved back.
+        return Ok(Some(Refreshed {
+            fresh: same,
+            newer: !same,
+            ..Refreshed::default()
+        }));
     }
+    if same {
+        if stored_at != want.at {
+            // The same history, read later: say so, so that a writer that
+            // read the lists between the two cannot move it back.
+            let served = replace_at(&state.served, &want.at);
+            let commit = state_commit(&mut objects, &served, &state.lines);
+            objects.flush().map_err(core)?;
+            if !write_refs(want, state.commit.as_deref(), &commit, &BTreeMap::new())? {
+                return lost(want);
+            }
+        }
+        return Ok(Some(Refreshed {
+            fresh: true,
+            ..Refreshed::default()
+        }));
+    }
+    let mut current = state.commit.clone();
+    let mut recorded = state.lines.clone();
     if !want.heads.contains_key(&want.default_branch) {
         return Err(HttpError::internal(format!(
             "`{}` is not on the default branch `{}`",
@@ -722,13 +1032,20 @@ pub fn refresh_with(want: &Want, chunk: usize, checkpoint: &dyn Fn()) -> ApiResu
             if part.len() == chunk {
                 // A long history: record this chunk, so a stop resumes here.
                 line.record(&mut objects)?;
-                let mut lines = state.lines.clone();
+                let mut lines = recorded.clone();
                 lines.insert(key.clone(), line.tree(&mut objects));
+                recorded = lines.clone();
                 let commit = state_commit(&mut objects, &state.served, &lines);
                 objects.flush().map_err(core)?;
-                let current = read_state(&mut objects, &dir, &want.tracker)?.commit;
-                write_refs(want, current.as_deref(), &commit, &BTreeMap::new())?;
+                if !write_refs(want, current.as_deref(), &commit, &BTreeMap::new())? {
+                    return lost(want);
+                }
+                current = Some(commit);
                 checkpoint();
+                // The project's compose lock is let go of between chunks,
+                // so a fetch of another view there waits for one chunk, not
+                // for the whole of a long history.
+                between();
             }
         }
     }
@@ -816,24 +1133,34 @@ pub fn refresh_with(want: &Want, chunk: usize, checkpoint: &dyn Fn()) -> ApiResu
         .map(|(reference, _)| repo.full(&reference))
         .collect();
     refs.retain(|reference, object| object.is_some() || present.contains(reference));
-    let current = read_state(&mut objects, &dir, &want.tracker)?.commit;
-    write_refs(want, current.as_deref(), &commit, &refs)?;
-    let head = repo.full("HEAD");
-    let target = repo.full(&format!("refs/heads/{}", want.default_branch));
-    let pointed = repos::git(&dir, &["symbolic-ref", "--quiet", &head])?;
-    if String::from_utf8_lossy(&pointed.stdout).trim() != target {
-        let output = repos::git(&dir, &["symbolic-ref", &head, &target])?;
-        if !output.status.success() {
-            return Err(HttpError::internal(format!(
-                "pointing {head} at {target}: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
-            )));
+    if !write_refs(want, current.as_deref(), &commit, &refs)? {
+        return lost(want);
+    }
+    Ok(Some(Refreshed {
+        composed,
+        ..Refreshed::default()
+    }))
+}
+
+/// `served` with its `at` line saying `at`.
+fn replace_at(served: &str, at: &At) -> String {
+    let mut text = String::new();
+    let mut placed = false;
+    for line in served.lines() {
+        if line.starts_with("at ") {
+            continue;
+        }
+        text.push_str(line);
+        text.push('\n');
+        if !placed && line.starts_with("default ") {
+            text.push_str(&at.line());
+            placed = true;
         }
     }
-    Ok(Refreshed {
-        fresh: false,
-        composed,
-    })
+    if !placed {
+        text.insert_str(0, &at.line());
+    }
+    text
 }
 
 /// Fetch into the store at `dir`, from `public`, every commit of a public
@@ -932,75 +1259,287 @@ pub fn stored_composition(
 
 // ── Keeping them up to date ───────────────────────────────────────────────
 
+/// What a landing touched in one project: the trackers whose stored rooted
+/// histories it may change are these and every tracker they are mounted
+/// within.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Touched {
+    /// Anything: definitions changed (every readable set may have), the
+    /// project was made, a branch's old list is not known, or a pass over
+    /// everything (the backfill).
+    All,
+    Some(BTreeSet<String>),
+}
+
+impl Touched {
+    /// Whether tracker `tracker`'s stored rooted history may have changed.
+    pub fn reaches(&self, tracker: &str) -> bool {
+        match self {
+            Self::All => true,
+            Self::Some(names) => names.iter().any(|name| within(name, tracker)),
+        }
+    }
+
+    /// Both: what two queued entries for one project coalesce to.
+    pub fn and(&mut self, other: Self) {
+        match (&mut *self, other) {
+            (Self::All, _) => {}
+            (_, Self::All) => *self = Self::All,
+            (Self::Some(mine), Self::Some(theirs)) => mine.extend(theirs),
+        }
+    }
+}
+
+/// What `landing` touches, by project, worked out from the landing alone
+/// (no process, no lock): for each branch it sets, the trackers whose pins
+/// differ from the list it expects there; every tracker it moves between
+/// stores or whose refs it moves. Anything it cannot say that of (the
+/// project made or removed, definitions changed, a void, a branch whose old
+/// list it does not name) touches everything there.
+pub fn touched_by(landing: &crate::landing::Landing) -> BTreeMap<String, Touched> {
+    let entry = &landing.entry;
+    let mut out = BTreeMap::new();
+    for (home, change) in &entry.homes {
+        let all = !entry.voids.is_empty()
+            || change.made.is_some()
+            || change.removed
+            || change.whole
+            || change.epoch.is_some()
+            || !change.unmoves.is_empty();
+        if all {
+            out.insert(home.clone(), Touched::All);
+            continue;
+        }
+        let mut names: BTreeSet<String> = change
+            .stores
+            .keys()
+            .chain(change.refs.keys())
+            .chain(change.takes.keys())
+            .cloned()
+            .collect();
+        let mut known = true;
+        for (branch, list) in &change.branches {
+            let Some(expect) = landing
+                .expect
+                .iter()
+                .find(|expect| expect.home == *home && expect.branch == *branch)
+            else {
+                known = false;
+                break;
+            };
+            let before = expect.list.clone().unwrap_or_default();
+            for (name, pin) in list {
+                if before.get(name) != Some(pin) {
+                    names.insert(name.clone());
+                }
+            }
+            names.extend(
+                before
+                    .keys()
+                    .filter(|name| !list.contains_key(*name))
+                    .cloned(),
+            );
+        }
+        out.insert(
+            home.clone(),
+            if known {
+                Touched::Some(names)
+            } else {
+                Touched::All
+            },
+        );
+    }
+    out
+}
+
+/// A refresh that failed, waiting to be tried again.
+#[derive(Debug, Clone)]
+pub struct Failing {
+    pub home: String,
+    /// What is tried again.
+    pub touched: Touched,
+    /// Why it failed last, as the server's log says it.
+    pub error: String,
+    pub attempts: u32,
+    due: std::time::Instant,
+}
+
+#[derive(Default)]
+struct Queue {
+    /// Projects to refresh, in the order they were touched, each once.
+    order: VecDeque<String>,
+    /// What each queued project's landings touched, coalesced.
+    touched: HashMap<String, Touched>,
+    /// Projects whose last refresh failed, tried again when due.
+    failing: BTreeMap<String, Failing>,
+}
+
+/// The longest a failed refresh waits to be tried again.
+const MOST_BACKOFF: std::time::Duration = std::time::Duration::from_secs(300);
+
+fn first_backoff() -> std::time::Duration {
+    std::env::var("NEWGIT_SERVE_ROOTED_RETRY_MS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .map_or(
+            std::time::Duration::from_secs(1),
+            std::time::Duration::from_millis,
+        )
+}
+
 /// Extends stored rooted histories in the background: after each landing,
-/// for the projects it touched, and once at start for every project (the
-/// backfill of a data directory from before them). One thread; each
-/// tracker is refreshed under its project's compose lock, so a read that
-/// needs it waits for at most that tracker.
+/// for the trackers it touched and those they are mounted within, and once
+/// at start for every project (the backfill of a data directory from before
+/// them). One thread. Each project's lists are read once per pass, under the
+/// db lock and with no process; every Git process runs after it is let go
+/// of, each tracker under its project's compose lock, let go of between
+/// chunks of a long history, so a fetch that needs it waits for at most one
+/// chunk. A refresh that fails (or panics) is logged, kept in
+/// [`Worker::failing`], and tried again with backoff without waiting for
+/// another landing; the thread keeps going.
 #[derive(Default)]
 pub struct Worker {
-    queue: Mutex<VecDeque<String>>,
+    queue: Mutex<Queue>,
     wake: Condvar,
     /// What each tracker was last brought up to here, by `(home, tracker)`:
-    /// one unchanged since is not read again.
+    /// one unchanged since is not refreshed again.
     done: Mutex<HashMap<(String, String), Want>>,
-    /// Trackers refreshed, for the tests that wait on the backfill.
+    /// Trackers refreshed (failures not counted), for the tests that wait
+    /// on the backfill.
     pub refreshed: std::sync::atomic::AtomicU64,
+    /// Refreshes that failed or panicked.
+    pub failed: std::sync::atomic::AtomicU64,
+    /// Passes over a project done, failed or not.
+    pub passes: std::sync::atomic::AtomicU64,
     /// The background pass at start has looked at every project.
     pub backfilled: std::sync::atomic::AtomicBool,
 }
 
 impl Worker {
-    /// Something landed in `homes`: their trackers may need extending.
-    pub fn touched<'h>(&self, homes: impl IntoIterator<Item = &'h String>) {
-        let mut queue = self
-            .queue
+    fn queue(&self) -> std::sync::MutexGuard<'_, Queue> {
+        self.queue
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        for home in homes {
-            if !queue.contains(home) {
-                queue.push_back(home.clone());
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Landings touched `touched`, by project: their stored rooted histories
+    /// may need extending. Entries for a project already queued coalesce.
+    pub fn touched(&self, touched: BTreeMap<String, Touched>) {
+        let mut queue = self.queue();
+        for (home, what) in touched {
+            match queue.touched.get_mut(&home) {
+                Some(queued) => queued.and(what),
+                None => {
+                    queue.order.push_back(home.clone());
+                    queue.touched.insert(home, what);
+                }
             }
         }
         self.wake.notify_all();
     }
 
-    fn next(&self) -> String {
-        let mut queue = self
-            .queue
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+    /// The next project to refresh and what to refresh there: a queued one,
+    /// or a failing one whose retry is due, waiting until there is one.
+    fn next(&self) -> (String, Touched) {
+        let mut queue = self.queue();
         loop {
-            if let Some(home) = queue.pop_front() {
-                return home;
+            if let Some(home) = queue.order.pop_front() {
+                let mut what = queue.touched.remove(&home).unwrap_or(Touched::All);
+                // A failing retry there rides along.
+                if let Some(failing) = queue.failing.get(&home) {
+                    what.and(failing.touched.clone());
+                }
+                return (home, what);
             }
-            queue = self
-                .wake
-                .wait(queue)
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let now = std::time::Instant::now();
+            let due = queue
+                .failing
+                .values()
+                .min_by_key(|failing| failing.due)
+                .map(|failing| (failing.home.clone(), failing.due));
+            match due {
+                Some((home, at)) if at <= now => {
+                    let what = queue.failing[&home].touched.clone();
+                    return (home, what);
+                }
+                Some((_, at)) => {
+                    queue = self
+                        .wake
+                        .wait_timeout(queue, at - now)
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .0;
+                }
+                None => {
+                    queue = self
+                        .wake
+                        .wait(queue)
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                }
+            }
         }
     }
 
-    pub fn forget(&self, home: &str, tracker: &str) {
-        self.done
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(&(home.to_owned(), tracker.to_owned()));
+    /// A pass over `home` ended: `failed` is what failed there, and why.
+    fn ended(&self, home: &str, failed: Option<(Touched, String)>) {
+        self.passes
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let mut queue = self.queue();
+        let Some((touched, error)) = failed else {
+            queue.failing.remove(home);
+            return;
+        };
+        let attempts = queue
+            .failing
+            .get(home)
+            .map_or(0, |failing| failing.attempts)
+            + 1;
+        let backoff = first_backoff()
+            .saturating_mul(1 << (attempts - 1).min(16))
+            .min(MOST_BACKOFF);
+        eprintln!(
+            "newgit serve: stored rooted histories of {home} failed ({attempts} in a row; trying again in {} s): {error}",
+            backoff.as_secs_f64()
+        );
+        queue.failing.insert(
+            home.to_owned(),
+            Failing {
+                home: home.to_owned(),
+                touched,
+                error,
+                attempts,
+                due: std::time::Instant::now() + backoff,
+            },
+        );
     }
 
-    fn is_done(&self, want: &Want, home: &str) -> bool {
-        self.done
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(&(home.to_owned(), want.tracker.clone()))
-            == Some(want)
+    /// Every project whose stored rooted histories failed to refresh last
+    /// time, and why: what an operator looks at when a view is composed per
+    /// fetch for longer than it should be.
+    pub fn failing(&self) -> Vec<Failing> {
+        self.queue().failing.values().cloned().collect()
     }
 
-    fn did(&self, want: &Want, home: &str) {
+    fn is_done(&self, want: &Want) -> bool {
         self.done
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert((home.to_owned(), want.tracker.clone()), want.clone());
+            .get(&(want.home.to_string(), want.tracker.clone()))
+            .is_some_and(|done| done.same_as(want))
+    }
+
+    fn did(&self, want: &Want) {
+        self.done
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert((want.home.to_string(), want.tracker.clone()), want.clone());
+    }
+
+    /// `tracker` of `home` has no stored rooted history any more.
+    fn forget(&self, home: &Utf8Path, tracker: &str) {
+        self.done
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&(home.to_string(), tracker.to_owned()));
     }
 }
 
@@ -1021,69 +1560,277 @@ pub fn start(app: &std::sync::Arc<App>) {
                 db::project_keys(&db).unwrap_or_default()
             };
             for home in &homes {
-                refresh_home(&app, home);
+                pass(&app, home, &Touched::All);
             }
             app.rooted
                 .backfilled
                 .store(true, std::sync::atomic::Ordering::SeqCst);
             loop {
-                let home = app.rooted.next();
-                refresh_home(&app, &home);
+                let (home, touched) = app.rooted.next();
+                pass(&app, &home, &touched);
             }
         })
         .expect("the rooted thread starts");
 }
 
-/// Bring every stored rooted history of project `home` up to its lists.
-fn refresh_home(app: &App, home: &str) {
-    let Some(id) = parse_project_key(home) else {
-        return;
+/// One pass over `home`, a panic in it caught: said, counted, and tried
+/// again like any failure, and the thread goes on.
+fn pass(app: &App, home: &str, touched: &Touched) {
+    let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        refresh_home(app, home, touched)
+    }));
+    let failed = match ran {
+        Ok(failed) => failed,
+        Err(panic) => {
+            app.rooted
+                .failed
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let why = panic
+                .downcast_ref::<&str>()
+                .map(|text| (*text).to_owned())
+                .or_else(|| panic.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "a panic".to_owned());
+            Some((touched.clone(), format!("panicked: {why}")))
+        }
     };
-    let wants = {
+    app.rooted.ended(home, failed);
+}
+
+/// Bring the stored rooted histories of project `home` that `touched`
+/// reaches up to its lists, and remove those of trackers it no longer has.
+/// Returns what failed, and why.
+fn refresh_home(app: &App, home: &str, touched: &Touched) -> Option<(Touched, String)> {
+    let id = parse_project_key(home)?;
+    // Everything that must be consistent, once, under the db lock; nothing
+    // else is done holding it.
+    let snapshot = {
         let db = app.db.lock();
-        match wants_of(app, &db, &id) {
-            Ok(wants) => wants,
+        match ProjectContext::open(app, &db, &id).and_then(|project| Snapshot::read(&project, &db))
+        {
+            Ok(snapshot) => snapshot,
+            // Removed since: nothing to keep up.
+            Err(error) if error.status == 404 => return None,
             Err(error) => {
-                eprintln!(
-                    "newgit serve: rooted histories of {home}: {}",
-                    error.cause()
-                );
-                return;
+                app.rooted
+                    .failed
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                return Some((touched.clone(), error.cause().to_owned()));
             }
         }
     };
-    for want in wants {
-        if app.rooted.is_done(&want, home) {
+    app.log.panic_at("rooted-panic");
+    // A worker whose lists are stale by the time it writes (the race test).
+    app.log.pause("rooted-after-snapshot");
+    let mut failed = BTreeSet::new();
+    let mut why = String::new();
+    let candidates: Vec<String> = snapshot
+        .trackers()
+        .filter(|tracker| touched.reaches(tracker))
+        .cloned()
+        .collect();
+    let lock = app.compose_lock(home);
+    for tracker in candidates {
+        let Some(mut want) = snapshot.want(&tracker) else {
+            continue;
+        };
+        if app.rooted.is_done(&want) {
             continue;
         }
-        let lock = app.compose_lock(home);
-        let held = lock.blocking_lock();
         let checkpoint = || app.log.stop_at("rooted-checkpoint");
-        match refresh_with(&want, chunk(), &checkpoint) {
-            Ok(_) => app.rooted.did(&want, home),
-            Err(error) => eprintln!(
-                "newgit serve: extending `{}`'s rooted history in {home}: {}",
-                want.tracker,
-                error.cause()
-            ),
+        let held = std::cell::RefCell::new(Some(lock.blocking_lock()));
+        let between = || {
+            drop(held.borrow_mut().take());
+            *held.borrow_mut() = Some(lock.blocking_lock());
+        };
+        let result = located(&mut want, &id).and_then(|here| {
+            if here {
+                refresh_with(&want, chunk(), &checkpoint, &between).map(Some)
+            } else {
+                Ok(None)
+            }
+        });
+        drop(held.borrow_mut().take());
+        match result {
+            Ok(Some(done)) => {
+                if !done.gone && !done.newer {
+                    app.rooted.did(&want);
+                }
+                app.rooted
+                    .refreshed
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+            Ok(None) => {}
+            Err(error) => {
+                app.rooted
+                    .failed
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                why = format!("`{tracker}`: {}", error.cause());
+                failed.insert(tracker);
+            }
         }
-        drop(held);
-        app.rooted
-            .refreshed
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     }
+    if let Err(error) = remove_unwanted(app, &snapshot, touched) {
+        app.rooted
+            .failed
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        why = format!("removing stored rooted histories: {}", error.cause());
+        return Some((touched.clone(), why));
+    }
+    (!failed.is_empty()).then_some((Touched::Some(failed), why))
 }
 
-/// Every tracker of `id` with a stored rooted history, as wanted now.
-fn wants_of(app: &App, db: &Connection, id: &ProjectId) -> ApiResult<Vec<Want>> {
-    let project = ProjectContext::open(app, db, id)?;
-    let mut wants = Vec::new();
-    for tracker in db::listed_trackers(db, &project.key)? {
-        if let Some(want) = wanted(&project, db, &tracker)? {
-            wants.push(want);
+/// Remove the stored rooted history of every tracker `touched` reaches that
+/// `snapshot` gives none (it left every list or the default branch, or it is
+/// not where its audience says): derived data nobody is served. One composed
+/// from newer lists than `snapshot`'s is left alone.
+fn remove_unwanted(app: &App, snapshot: &Snapshot, touched: &Touched) -> ApiResult<()> {
+    // Where a stored history that should not be could be: for everything,
+    // every store's; for some trackers, the stores their rows name.
+    let mut found: Vec<(Store, String)> = Vec::new();
+    match touched {
+        Touched::All => {
+            let mut stores: BTreeSet<Store> = snapshot.rows.values().cloned().collect();
+            stores.extend([Store::Public, Store::ProjectDevs]);
+            for store in stores {
+                let dir = store.dir(&snapshot.home);
+                if !repos::store_exists(&dir) {
+                    continue;
+                }
+                let listed = repos::git(
+                    &dir,
+                    &["for-each-ref", "--format=%(refname)", "refs/newgit/rooted/"],
+                )?;
+                for line in String::from_utf8_lossy(&listed.stdout).lines() {
+                    if let Some(tracker) = line.strip_prefix("refs/newgit/rooted/") {
+                        found.push((store.clone(), tracker.to_owned()));
+                    }
+                }
+            }
+        }
+        Touched::Some(names) => {
+            for name in names {
+                if snapshot.want(name).is_none()
+                    && let Some(store) = snapshot.row(name)
+                {
+                    found.push((store.clone(), name.clone()));
+                }
+            }
         }
     }
-    Ok(wants)
+    let lock = app.compose_lock(&snapshot.id.key());
+    for (store, tracker) in found {
+        if snapshot
+            .want(&tracker)
+            .is_some_and(|want| want.store == store)
+        {
+            continue;
+        }
+        let _held = lock.blocking_lock();
+        if remove(&store.dir(&snapshot.home), &tracker, &snapshot.at)? {
+            app.rooted.forget(&snapshot.home, &tracker);
+        }
+    }
+    Ok(())
+}
+
+/// Remove `tracker`'s stored rooted history from the store at `dir` (its
+/// served namespace and its state ref, in one transaction, swapped against
+/// the state read here), unless it was composed from lists newer than `at`.
+/// Whether it was removed.
+fn remove(dir: &Utf8Path, tracker: &str, at: &At) -> ApiResult<bool> {
+    if !repos::store_exists(dir) {
+        return Ok(false);
+    }
+    let mut objects = Objects::open(dir).map_err(core)?;
+    let state = read_state(&mut objects, dir, tracker)?;
+    let Some(commit) = state.commit else {
+        return Ok(false);
+    };
+    if at.behind(&At::of(&state.served)) {
+        return Ok(false);
+    }
+    let listed = repos::git(
+        dir,
+        &[
+            "for-each-ref",
+            "--format=%(refname) %(objectname)",
+            &prefix(tracker),
+        ],
+    )?;
+    let mut script = format!("start\ndelete {} {commit}\n", state_ref(tracker));
+    for line in String::from_utf8_lossy(&listed.stdout).lines() {
+        let Some((reference, object)) = line.split_once(' ') else {
+            continue;
+        };
+        // `HEAD` there is symbolic: removed itself, not what it names.
+        if reference.ends_with("/HEAD") {
+            script.push_str(&format!("delete {reference}\n"));
+        } else {
+            script.push_str(&format!("delete {reference} {object}\n"));
+        }
+    }
+    let head = format!("{}HEAD", prefix(tracker));
+    if symbolic(dir, &head)?.is_some() && !script.contains(&format!("delete {head}\n")) {
+        script.push_str(&format!("delete {head}\n"));
+    }
+    script.push_str("prepare\ncommit\n");
+    repos::run_stdin(dir, &["update-ref", "--no-deref", "--stdin"], &script)
+}
+
+/// Tracker `tracker` of project `id`'s stored rooted history as of landing
+/// `stamp`: what the module answers for anything outside it that must name
+/// a tracker's rooted history at a point in the log (a mirror export, a
+/// webhook). The lists are read under the db lock; once landing `stamp` is
+/// in place they hold it and everything before it, so the history is
+/// brought up to them (composing what is missing, under the project's
+/// compose lock) and its refs are read. Since a stored history never moves
+/// back, they stay at least as new as `stamp` from then on. `Ok(None)` when
+/// the tracker has no stored rooted history (a link, outside Git, not on the
+/// default branch, not where its audience says). Refused (409) when `stamp`
+/// is not in place yet. Blocking: never called from an async task, nor with
+/// the db lock held.
+pub fn as_of(app: &App, id: &ProjectId, tracker: &str, stamp: Stamp) -> ApiResult<Option<History>> {
+    let snapshot = {
+        let db = app.db.lock();
+        let project = ProjectContext::open(app, &db, id)?;
+        Snapshot::read(&project, &db)?
+    };
+    if snapshot.at.landed < stamp && app.log.applied() < stamp {
+        return Err(HttpError::new(
+            409,
+            format!("landing {stamp} is not in place in {} yet", id.key()),
+        ));
+    }
+    let Some(mut want) = snapshot.want(tracker) else {
+        return Ok(None);
+    };
+    let lock = app.compose_lock(&id.key());
+    let _held = lock.blocking_lock();
+    if !located(&mut want, id)? {
+        return Ok(None);
+    }
+    let done = refresh(&want)?;
+    if done.gone {
+        return Ok(None);
+    }
+    let dir = want.dir();
+    let mut objects = Objects::open(&dir).map_err(core)?;
+    let at = At::of(&read_state(&mut objects, &dir, tracker)?.served);
+    let repo = want.repo();
+    let refs = repo.list_refs("refs/")?;
+    Ok(Some(History { at, repo, refs }))
+}
+
+/// A stored rooted history as [`as_of`] answers it.
+#[derive(Debug, Clone)]
+pub struct History {
+    /// When the lists it was composed from were read: at or after the
+    /// stamp asked for.
+    pub at: At,
+    /// Where it is served from: the namespace `r/<tracker>` in its store.
+    pub repo: Repo,
+    /// Its refs, as its readers name them (`refs/heads/main`), with objects.
+    pub refs: Vec<(String, String)>,
 }
 
 /// Whether `prefix` is the namespace prefix of a stored rooted history (the

@@ -230,8 +230,10 @@ impl App {
     }
 }
 
-/// The oldest Git whose stores serve can make: reftable.
-const GIT_REQUIRED: (u32, u32) = (2, 45);
+/// The oldest Git whose stores serve can make: reftable (2.45), and a
+/// symbolic ref moved in the same transaction as the refs beside it
+/// (`symref-update`, 2.46: a stored rooted history's `HEAD`, `rooted`).
+const GIT_REQUIRED: (u32, u32) = (2, 46);
 
 /// Refuse to start on a Git too old to make a store, saying which was found.
 fn require_git() -> anyhow::Result<()> {
@@ -244,7 +246,7 @@ fn require_git() -> anyhow::Result<()> {
     match git_version(&found) {
         Some(version) if version >= GIT_REQUIRED => Ok(()),
         _ => anyhow::bail!(
-            "newgit serve needs Git {major}.{minor} or newer (its stores keep refs in reftable); found `{found}`"
+            "newgit serve needs Git {major}.{minor} or newer (its stores keep refs in reftable, and move symbolic refs in a transaction); found `{found}`"
         ),
     }
 }

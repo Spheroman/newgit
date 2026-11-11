@@ -231,7 +231,7 @@ fn checked(dir: &Utf8Path, args: &[&str]) -> ApiResult<String> {
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
 }
 
-fn run_stdin(dir: &Utf8Path, args: &[&str], input: &str) -> ApiResult<bool> {
+pub(crate) fn run_stdin(dir: &Utf8Path, args: &[&str], input: &str) -> ApiResult<bool> {
     let mut child = git_command(dir)
         .args(args)
         .stdin(Stdio::piped())

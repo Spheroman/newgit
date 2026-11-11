@@ -289,6 +289,8 @@ fn want_of(world: &World, home: &Utf8Path, root: &str) -> Want {
         heads,
         tags,
         stores,
+        at: rooted::At::default(),
+        own_head: None,
     }
 }
 
@@ -346,7 +348,7 @@ fn compare(
     step: usize,
 ) -> (usize, usize) {
     let want = want_of(world, home, root);
-    let refreshed = rooted::refresh_with(&want, 3, &|| {}).expect("refresh");
+    let refreshed = rooted::refresh_with(&want, 3, &|| {}, &|| {}).expect("refresh");
     let set = set_of(world, root);
     let public = world.public.clone();
     let public_objects = std::cell::RefCell::new(Objects::open(&public).expect("objects"));

@@ -114,6 +114,8 @@ impl Project {
                 .iter()
                 .map(|name| (name.clone(), Store::ProjectDevs))
                 .collect(),
+            at: rooted::At::default(),
+            own_head: None,
         }
     }
 }
