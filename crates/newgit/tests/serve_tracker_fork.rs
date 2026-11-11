@@ -5,6 +5,7 @@
 // that audience's store, which takes only what the upstream's `main` reaches.
 
 include!("support/serve.rs");
+include!("support/serve_keys.rs");
 
 fn project(temp: &Utf8Path, home: &Utf8Path, server: &Server) -> Utf8PathBuf {
     let store = temp.join("store");
@@ -68,6 +69,7 @@ fn a_fork_starts_at_its_upstream_in_the_store_its_audience_calls_for() {
     let home = temp.join("jack");
     login(&server, &home, "jack");
     let eve = login(&server, &temp.join("eve"), "eve");
+    publish_keys(&[("jack", &home)]);
     let store = project(&temp, &home, &server);
     let stores = server.data.join("homes/jack/store/stores");
     let devs = stores.join("project-devs.git");

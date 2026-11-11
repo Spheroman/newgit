@@ -13,6 +13,8 @@
   show and fix it), and in any commit that changes definitions, merges
   included. `serve` records what each fork's repo was made from and serves
   the fork with that upstream's audience, whatever its definition says.
-  Against newgit.dev's Worker only the client checks. `tracker list` shows
-  what each fork came from. Only trackers outside Git can be forked yet. `tracker create`
-  also takes `--role` for a plain tracker outside Git.
+  Against newgit.dev's Worker only the client checks. A fork of an
+  encrypted tracker is encrypted to its own audience: a narrower one's first
+  sync encrypts it again to its own recipients. `tracker list` shows what
+  each fork came from. Only trackers outside Git can be forked yet.
+  `tracker create` also takes `--role` for a plain tracker outside Git.

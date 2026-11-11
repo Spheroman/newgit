@@ -127,23 +127,32 @@ Resolved loudly; each is reversible.
      tracker's branch refs in: nothing to wait for or garbage-collect around,
      and it moves with the tracker. Its readers are exactly its tracker's.
    - **A fork of a tracker outside Git** (`tracker create --from`, #415) is
-     made on its first write, starting at its upstream's branches: a
-     namespace in the upstream's store, refs alone, when their audiences
-     match, or else in the fork's own audience's store, fetching only what
-     the upstream's branches reach (only `main` today). Before anything is
-     made or copied it is refused when the fork is wider than its upstream or
-     the caller may not read the upstream (`policy::may_start_fork`). Last it
-     records the upstream as `refs/newgit/from/<upstream>` in the fork's
-     namespace (`repos::FORK_RECORD`), hidden from every Git request
-     (`transfer.hideRefs`) so no push moves or deletes it; a repo with no
-     branch and no record is started again on the next write. Its store is
-     never wider, because the definitions are read with every fork held to
-     the upstream its definition names and to the recorded one
-     (`policy::cap_forks`, run until nothing changes): a fork whose
-     definition says wider, or drops `from`, is served as its upstream's
-     audience, and one whose ceiling can't be settled (an upstream not
-     defined, a cycle, a linked fork whose home can't be read) is not
-     defined.
+     made on its first write, starting at its upstream's branches, by the
+     same landing that makes any tracker's repo (`api::Authorized::made`).
+     Before anything is made or copied it is refused when the fork is wider
+     than its upstream or the caller may not read the upstream
+     (`policy::may_start_fork`), and what it starts at is read, all under
+     the db lock. Then, with the lock let go of: with the same audience its
+     repo is a namespace in the upstream's store and nothing is copied;
+     with a narrower one its store fetches, by id, only the commits the
+     upstream's branches reach (only `main` today), all readable there
+     already. The landing that makes it then writes its row, its starting
+     refs, and its record of the upstream, `refs/newgit/from/<upstream>` in
+     its namespace (`repos::FORK_RECORD`, at an empty commit naming the
+     upstream), as one entry: the fork exists whole or not at all, across a
+     crash too. The refs are asked with nothing as their old value, so a
+     second first write never moves what the first one started. The record
+     is hidden from every Git request (`transfer.hideRefs`), so no push
+     moves or deletes it. One user's own fork (`audience = "user"`) has no
+     row and no landing: its starting refs and record are one ref
+     transaction, and a repo with neither is started again on the next
+     write. Its store is never wider, because the definitions are read with
+     every fork held to the upstream its definition names and to the
+     recorded one (`policy::cap_forks`, run until nothing changes, wherever
+     definitions are read, a landing's included): a fork whose definition
+     says wider, or drops `from`, is served as its upstream's audience, and
+     one whose ceiling can't be settled (an upstream not defined, a cycle, a
+     linked fork whose home can't be read) is not defined.
    - **A private instance, an embargo, has a store of its own**, as does
      each user's content: its shape is the secret.
    - **A new tracker's seed is alone** in `tracker/<name>` until it joins a

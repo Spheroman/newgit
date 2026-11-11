@@ -5,6 +5,7 @@
 // outside a narrower fork's audience reads none of it.
 
 include!("support/serve.rs");
+include!("support/serve_keys.rs");
 
 fn project(temp: &Utf8Path, home: &Utf8Path, server: &Server) -> Utf8PathBuf {
     let store = temp.join("store");
@@ -94,6 +95,7 @@ fn a_fork_stays_held_to_the_upstream_it_was_made_from() {
     let jack = login(&server, &home, "jack");
     let bob = login(&server, &temp.join("bob"), "bob");
     let eve = login(&server, &temp.join("eve"), "eve");
+    publish_keys(&[("jack", &home), ("bob", &temp.join("bob"))]);
     let store = project(&temp, &home, &server);
     newgit(&home, &store, &["members", "add", "bob"]);
     let stores = server.data.join("homes/jack/store/stores");
@@ -183,6 +185,10 @@ fn a_fork_stays_held_to_the_upstream_it_was_made_from() {
         &["commit", "-q", "-am", "Publish staging-db"],
     );
     newgit(&home, &store, &["merge", "main"]);
+    // `public` is never encrypted, and `.env.db` held ciphertext here: the
+    // client holds it back (#338) until it is released, which is part of
+    // going past the client too.
+    newgit(&home, &store, &["tracker", "allow-plaintext", ".env.db"]);
     newgit(&home, &store, &["checkpoint", "b"]);
 
     // The server still holds it to `local-db`'s audience: it stays in the

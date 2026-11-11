@@ -510,8 +510,42 @@ impl BranchManager {
 
     /// Every ref in this store naming a commit of `tracker` the linked
     /// remote has: what this machine sent there, its `main` as last
-    /// fetched, and revs fetched from it.
+    /// fetched, and revs fetched from it. A fork's repo on the remote starts
+    /// at its upstream's branches (#415), so what the remote has of its
+    /// upstreams (what `from` names, and what this machine recorded it
+    /// started at) counts too: the history a fork starts with is never made
+    /// again, and a narrower fork's first send encrypts its content to its
+    /// own audience in a commit on top of it, which every reader of the
+    /// fork could read already.
     pub(super) fn remote_has(&self, tracker: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut seen = std::collections::BTreeSet::new();
+        let mut next = vec![tracker.to_owned()];
+        let records = crate::tracker_repo::fork_records(&self.store.paths().tracker_store)
+            .unwrap_or_default();
+        while let Some(at) = next.pop() {
+            if !seen.insert(at.clone()) {
+                continue;
+            }
+            out.extend(self.remote_has_own(&at));
+            let from = self
+                .trackers
+                .iter()
+                .find(|definition| definition.name == at)
+                .and_then(|definition| definition.from.clone());
+            next.extend(from);
+            next.extend(
+                records
+                    .iter()
+                    .filter(|(fork, _)| *fork == at)
+                    .map(|(_, upstream)| upstream.clone()),
+            );
+        }
+        out
+    }
+
+    /// [`Self::remote_has`] for `tracker`'s own repo alone.
+    fn remote_has_own(&self, tracker: &str) -> Vec<String> {
         let Some(base) = self.remote_refs() else {
             return Vec::new();
         };

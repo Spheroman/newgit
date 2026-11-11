@@ -36,9 +36,10 @@ const STORE_CONFIG: &[(&str, &str)] = &[
 ];
 
 /// Where a fork's repo records the tracker it was made from:
-/// `refs/newgit/from/<upstream>`, in its namespace. Written by the server
-/// alone (`api::start_fork`), never by a push: Git requests hide it
-/// (`transfer.hideRefs`), so no push can move or delete it.
+/// `refs/newgit/from/<upstream>`, in its namespace, at
+/// [`Repo::record_commit`]. Written by the server alone, by the landing that
+/// makes the fork's repo (`api::Authorized::made`), never by a push: Git
+/// requests hide it (`transfer.hideRefs`), so no push can move or delete it.
 pub const FORK_RECORD: &str = "refs/newgit/from/";
 
 /// The config key a store's audience is written under when it is made.
@@ -742,21 +743,24 @@ impl Repo {
         reference.strip_prefix(FORK_RECORD).map(str::to_owned)
     }
 
-    /// Record that this repo was made from `upstream`'s: a ref naming a blob
-    /// that holds the upstream's name, so it keeps nothing else alive.
-    pub fn record_from(&self, upstream: &str) -> ApiResult<()> {
-        let mut child = Command::new("git")
-            .arg("--git-dir")
-            .arg(self.dir().as_str())
-            .args(["hash-object", "-w", "--stdin"])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()?;
-        if let Some(mut stdin) = child.stdin.take() {
-            stdin.write_all(format!("{upstream}\n").as_bytes())?;
-        }
-        let output = child.wait_with_output()?;
+    /// The commit this repo's record of being made from `upstream`'s points
+    /// at ([`FORK_RECORD`]), written into its store: an empty tree, its
+    /// message the upstream's name, its author and date fixed, so it keeps
+    /// nothing else alive and writing it again is the same commit. A ref
+    /// moved by a landing names a commit its store holds, so the record is
+    /// one.
+    pub fn record_commit(&self, upstream: &str) -> ApiResult<String> {
+        let tree = checked(&self.dir(), &["hash-object", "-w", "-t", "tree", "--stdin"])?;
+        let output = git_command(&self.dir())
+            .args(["commit-tree", &tree, "-m", &format!("from {upstream}")])
+            .env("GIT_AUTHOR_NAME", "newgit")
+            .env("GIT_AUTHOR_EMAIL", "newgit@localhost")
+            .env("GIT_AUTHOR_DATE", "1970-01-01T00:00:00Z")
+            .env("GIT_COMMITTER_NAME", "newgit")
+            .env("GIT_COMMITTER_EMAIL", "newgit@localhost")
+            .env("GIT_COMMITTER_DATE", "1970-01-01T00:00:00Z")
+            .stdin(Stdio::null())
+            .output()?;
         if !output.status.success() {
             return Err(HttpError::internal(format!(
                 "recording {}'s upstream in {}: {}",
@@ -765,59 +769,72 @@ impl Repo {
                 String::from_utf8_lossy(&output.stderr).trim()
             )));
         }
-        let blob = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-        self.set_refs(&[(format!("{FORK_RECORD}{upstream}"), blob)])
+        Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
     }
 
-    /// Point each of `refs` (`(theirs, ours)`, both as readers name them) at
-    /// what `from`'s `theirs` is, skipping one `from` lacks: refs alone when
-    /// the two are one store, so nothing is copied, or else fetched in, which
-    /// copies only what those refs reach. This repo must be made already.
-    pub fn take_refs(&self, from: &Repo, refs: &[(String, String)]) -> ApiResult<()> {
-        let mut found = Vec::new();
-        for (theirs, ours) in refs {
-            if let Some((_, commit)) = from
-                .list_refs(theirs)?
-                .into_iter()
-                .find(|(reference, _)| reference == theirs)
-            {
-                found.push((theirs, ours.clone(), commit));
-            }
-        }
-        if found.is_empty() {
+    /// Bring `commits`, and everything they reach, into this repo's store
+    /// from the store at `from`, by id, with no ref: only what they reach is
+    /// copied. A ref is pointed at them afterwards, by whoever says it moves.
+    pub fn fetch_commits(&self, from: &Utf8Path, commits: &[String]) -> ApiResult<()> {
+        let missing: Vec<&str> = commits
+            .iter()
+            .filter(|commit| !self.has_commit(commit))
+            .map(String::as_str)
+            .collect();
+        if missing.is_empty() {
             return Ok(());
         }
-        if from.dir() == self.dir() {
-            let set: Vec<(String, String)> = found
-                .into_iter()
-                .map(|(_, ours, commit)| (ours, commit))
-                .collect();
-            return self.set_refs(&set);
-        }
-        let source = from.dir();
-        let refspecs: Vec<String> = found
-            .iter()
-            .map(|(theirs, ours, _)| format!("+{}:{}", from.full(theirs), self.full(ours)))
-            .collect();
         let mut args = vec![
+            "-c",
+            "protocol.version=2",
             "fetch",
             "--quiet",
             "--no-tags",
             "--no-write-fetch-head",
-            source.as_str(),
+            from.as_str(),
         ];
-        args.extend(refspecs.iter().map(String::as_str));
+        args.extend(missing);
         let output = git(&self.dir(), &args)?;
         if !output.status.success() {
             return Err(HttpError::internal(format!(
-                "fork {source} ({}) into {} ({}): {}",
-                from.namespace,
+                "copying {from} into {} ({}): {}",
                 self.dir(),
                 self.namespace,
                 String::from_utf8_lossy(&output.stderr).trim()
             )));
         }
         Ok(())
+    }
+
+    /// Point each of `refs` (as readers name them) that does not exist yet at
+    /// its commit, all in one ref transaction or none: a ref that exists
+    /// already is left as it is.
+    pub fn start_refs(&self, refs: &[(String, String)]) -> ApiResult<()> {
+        let names: Vec<String> = refs
+            .iter()
+            .map(|(reference, _)| self.full(reference))
+            .collect();
+        let now = resolve(&self.dir(), &names)?;
+        let script: String = refs
+            .iter()
+            .filter(|(reference, _)| !now.contains_key(&self.full(reference)))
+            .map(|(reference, commit)| format!("create {} {commit}\n", self.full(reference)))
+            .collect();
+        if script.is_empty() {
+            return Ok(());
+        }
+        if run_stdin(&self.dir(), &["update-ref", "--stdin"], &script)? {
+            Ok(())
+        } else {
+            Err(HttpError::new(
+                409,
+                format!(
+                    "{} ({}) moved while it was being started: try again",
+                    self.dir(),
+                    self.namespace
+                ),
+            ))
+        }
     }
 
     // ── A merge's landing ─────────────────────────────────────────────────

@@ -361,13 +361,21 @@ newgit tracker create staging-db --role db --from local-db
   the upstream's `main` reaches (the upstream's branches are copied, and a
   tracker outside Git has only `main` today): all of it readable by that
   audience already, so nothing is written into a store whose readers could
-  not read it. A copy that fails leaves the repo unstarted (no branch, no
-  record), and the next write starts it again. What the fork gains after
-  that stays in its own store. newgit.dev's Worker takes the history as the
+  not read it. The copy runs before the landing that makes the fork, which
+  writes its starting refs and its record of the upstream with its row, so
+  a fork is there whole or not at all, and the next write makes one that
+  isn't. What the fork gains after that stays in its own store. newgit.dev's Worker takes the history as the
   sync uploads it (a copy).
-- **An encrypted upstream (#429).** A fork of an encrypted tracker with a
-  narrower audience has its content re-encrypted to its own recipients on
-  its first sync, so it shares no ciphertext history with its upstream.
+- **An encrypted upstream (#429).** A fork is encrypted to its own
+  audience. One with its upstream's audience starts at its upstream's
+  commits as they are. A narrower one starts at them too (its readers could
+  read all of it already), and its first sync encrypts its content again to
+  its own recipients, in a commit on top: everything it gains is readable
+  by its audience alone. The client counts what the remote has of a fork's
+  upstream as what it has of the fork, since the fork's repo starts there,
+  so that history is never made again. Both encrypt the upstream's paths,
+  so the guard on paths that held encrypted content never holds a fork
+  back.
 - **Only a tracker outside Git can be forked yet.** Every instance's view
   holds every tracker in Git its user may read, so two members in Git at one
   mount would collide; `--git --from <tracker>` says so. Forking one in Git
