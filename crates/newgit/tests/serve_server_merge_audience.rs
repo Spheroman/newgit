@@ -1,8 +1,9 @@
 // The server's merge composes trees across trackers with different
 // audiences, and nothing composed reaches a store (#411). Root is the
-// members', `blog` is public. Two merges from one base both move `blog`, and
-// one also moves root's README, so the server composes root's private files
-// with blog's, merges, and splits.
+// members', `blog` is public. Two merges from one base both move `blog` (each
+// adding the same `shared.md`, so their changes meet), and one also moves
+// root's README, so the server composes root's private files with blog's,
+// merges, and splits.
 //
 // - The composed view commit (named by root's merge commit's
 //   `Newgit-Split` trailer) is in no store, and the scratch repository it
@@ -55,7 +56,9 @@ fn nothing_composed_reaches_a_store_and_a_non_member_fetches_nothing_of_it() {
             &home,
             &blog,
             &base["blog"],
-            &[(file, Some("words\n"))],
+            // Both add `shared.md` too: the same path, so the second is
+            // merged by Git over the composed tree, not re-made.
+            &[(file, Some("words\n")), ("shared.md", Some("shared\n"))],
             &[],
             &format!("add {file}"),
         );
@@ -132,7 +135,7 @@ fn nothing_composed_reaches_a_store_and_a_non_member_fetches_nothing_of_it() {
     );
     assert_eq!(
         files.lines().collect::<Vec<_>>(),
-        vec!["a.md", "b.md", "post.md"]
+        vec!["a.md", "b.md", "post.md", "shared.md"]
     );
     assert_eq!(
         in_store(&home, &public, &["log", "-1", "--format=%B", blog_merge]),

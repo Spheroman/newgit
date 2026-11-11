@@ -4843,15 +4843,21 @@ fn merge(instance: Option<String>, into: &str) -> Result<()> {
         "Merged `{}` into `{into}`{place}{checkpoint}",
         outcome.instance
     );
+    if outcome.server_merged {
+        println!(
+            "  `{into}` had moved since this work began: the remote merged it onto what `{into}` is now"
+        );
+    }
     for merge in &outcome.trackers {
         let what = match merge.action {
             TrackerMergeAction::Unchanged => "unchanged",
             TrackerMergeAction::FastForward => "fast-forward",
+            TrackerMergeAction::Merged if outcome.server_merged => "merged by the remote",
             TrackerMergeAction::Merged => "merged",
             TrackerMergeAction::New => "new",
         };
         println!(
-            "  {:<12} {what:<12} {}",
+            "  {:<12} {what:<20} {}",
             tracker_path(&merge.tracker),
             &merge.commit[..merge.commit.len().min(12)]
         );

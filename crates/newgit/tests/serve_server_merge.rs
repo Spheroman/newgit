@@ -291,6 +291,9 @@ fn the_same_lines_changed_on_both_sides_are_refused_naming_the_file() {
     );
 }
 
+/// Followed into a tracker no more people read: `blog` is public, root the
+/// members', so carrying B's edit from one to the other widens nothing.
+/// (The other way round is refused: `serve_merge_audience_rule.rs`.)
 #[test]
 fn a_file_moved_between_trackers_is_followed() {
     let (_guard, temp) = tempdir();
@@ -300,26 +303,73 @@ fn a_file_moved_between_trackers_is_followed() {
     let _store = merge_project(&temp, &home, &server);
     let (devs, public) = stores(&server);
     let base = list_of(&server, &token, "main");
-    let notes = "first line\nsecond line\nthird line\nfourth line\nfifth line\n";
+    let post = "a first line\na second line\na third line\na fourth line\n";
 
-    // A moves notes.md from root into blog.
+    // The post, longer, so a move and an edit are each still "similar".
+    let blog_0 = clone_tracker(&server, &token, &temp, "blog", "blog-0");
+    let root_0 = clone_tracker(&server, &token, &temp, "root", "root-0");
+    let blog_c = commit_on(
+        &home,
+        &blog_0,
+        &base["blog"],
+        &[("post.md", Some(post))],
+        &[],
+        "a post",
+    );
+    let root_c = commit_on(
+        &home,
+        &root_0,
+        &base["root"],
+        &[],
+        &[("blog", &blog_c)],
+        "Update blog",
+    );
+    let mut first = base.clone();
+    first.insert("blog".into(), blog_c.clone());
+    first.insert("root".into(), root_c.clone());
+    let (status, answer) = merge_by_hand(
+        &server,
+        &token,
+        "main",
+        &base,
+        &first,
+        &[
+            Sent {
+                tracker: "blog",
+                dir: &blog_0,
+                commit: blog_c.clone(),
+            },
+            Sent {
+                tracker: "root",
+                dir: &root_0,
+                commit: root_c,
+            },
+        ],
+        serde_json::json!([
+            { "tracker": "blog", "branch": "main", "old": base["blog"], "new": blog_c },
+        ]),
+    );
+    assert_eq!(status, 200, "{answer}");
+    let base = list_of(&server, &token, "main");
+
+    // A moves blog's post.md into root.
     let blog_a = clone_tracker(&server, &token, &temp, "blog", "blog-a");
     let root_a = clone_tracker(&server, &token, &temp, "root", "root-a");
     let a_blog = commit_on(
         &home,
         &blog_a,
         &base["blog"],
-        &[("notes.md", Some(notes))],
+        &[("post.md", None)],
         &[],
-        "notes move to the blog",
+        "the post moves to root",
     );
     let a_root = commit_on(
         &home,
         &root_a,
         &base["root"],
-        &[("notes.md", None)],
+        &[("post.md", Some(post))],
         &[("blog", &a_blog)],
-        "notes move to the blog",
+        "the post moves to root",
     );
     let mut a_list = base.clone();
     a_list.insert("root".into(), a_root.clone());
@@ -346,42 +396,55 @@ fn a_file_moved_between_trackers_is_followed() {
     );
     assert_eq!(status, 200, "{answer}");
 
-    // B, from the same base, edits notes.md where it was.
+    // B, from the same base, edits the post where it was.
+    let blog_b = clone_tracker(&server, &token, &temp, "blog", "blog-b");
     let root_b = clone_tracker(&server, &token, &temp, "root", "root-b");
-    let edited = notes.replace("fifth line", "fifth line, edited");
+    let edited = post.replace("a fourth line", "a fourth line, edited");
+    let b_blog = commit_on(
+        &home,
+        &blog_b,
+        &base["blog"],
+        &[("post.md", Some(&edited))],
+        &[],
+        "post: the last line",
+    );
     let b_root = commit_on(
         &home,
         &root_b,
         &base["root"],
-        &[("notes.md", Some(&edited))],
         &[],
-        "notes: the last line",
+        &[("blog", &b_blog)],
+        "Update blog",
     );
     let mut b_list = base.clone();
     b_list.insert("root".into(), b_root.clone());
+    b_list.insert("blog".into(), b_blog.clone());
     let (status, answer) = merge_by_hand(
         &server,
         &token,
         "main",
         &base,
         &b_list,
-        &[Sent {
-            tracker: "root",
-            dir: &root_b,
-            commit: b_root,
-        }],
+        &[
+            Sent {
+                tracker: "blog",
+                dir: &blog_b,
+                commit: b_blog,
+            },
+            Sent {
+                tracker: "root",
+                dir: &root_b,
+                commit: b_root,
+            },
+        ],
         serde_json::json!([]),
     );
     assert_eq!(status, 200, "{answer}");
     let landed = list_of(&server, &token, "main");
     assert_eq!(
-        file_at(&home, &public, &landed["blog"], "notes.md").as_deref(),
+        file_at(&home, &devs, &landed["root"], "post.md").as_deref(),
         Some(edited.as_str()),
-        "B's edit followed the file into blog"
+        "B's edit followed the post into root"
     );
-    assert_eq!(file_at(&home, &devs, &landed["root"], "notes.md"), None);
-    assert_ne!(
-        landed["blog"], a_blog,
-        "blog got B's edit in a commit of its own"
-    );
+    assert_eq!(file_at(&home, &public, &landed["blog"], "post.md"), None);
 }

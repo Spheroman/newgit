@@ -204,15 +204,7 @@ fn definitions_tree(
 }
 
 fn read_blob_text(objects: &mut Objects, id: &str) -> Result<String> {
-    let out = run(
-        Command::new("git")
-            .arg("-C")
-            .arg(objects.repo().as_str())
-            .args(["cat-file", "blob", id]),
-        "git cat-file blob",
-        None,
-    )?;
-    Ok(String::from_utf8_lossy(&out).into_owned())
+    Ok(String::from_utf8_lossy(&objects.blob(id)?).into_owned())
 }
 
 /// A definition's `mount`, read loosely: compose needs where, not what.
@@ -817,6 +809,42 @@ fn view_tree_cached(
     }
     cache.insert(commit.to_owned(), tree.clone());
     Ok(tree)
+}
+
+/// Where each tracker present sits in [`view_tree`]`(commit)`: the chain of
+/// pin names from `commit` down to it (empty for `commit` itself), and the
+/// directory its tree is grafted at (`.` for the top). Two trackers can share
+/// a directory: each claims its own files there.
+pub fn view_mounts(objects: &mut Objects, commit: &str) -> Result<Vec<(Vec<String>, String)>> {
+    let mut out = vec![(Vec::new(), ".".to_owned())];
+    let mut stack = vec![(commit.to_owned(), Vec::<String>::new(), ".".to_owned(), 0)];
+    while let Some((commit, chain, at, nesting)) = stack.pop() {
+        if nesting > 32 {
+            return Err(NewgitError::Unsupported(format!(
+                "commit {} mounts trackers more than 32 deep: a tracker mounted inside itself?",
+                short(&commit)
+            )));
+        }
+        let found = objects.commit(&commit)?;
+        let pins = pins_in(objects, &found.tree)?;
+        let present: BTreeMap<String, String> = pins
+            .iter()
+            .filter(|(_, pin)| objects.has_commit(pin).unwrap_or(false))
+            .map(|(name, pin)| (name.clone(), pin.clone()))
+            .collect();
+        for (name, mount) in mounts_of(objects, &commit, &found.tree, &pins, &present)? {
+            let full = match (at.as_str(), mount.as_str()) {
+                (".", mount) => mount.to_owned(),
+                (at, ".") => at.to_owned(),
+                (at, mount) => format!("{at}/{mount}"),
+            };
+            let mut below = chain.clone();
+            below.push(name.clone());
+            out.push((below.clone(), full.clone()));
+            stack.push((present[&name].clone(), below, full, nesting + 1));
+        }
+    }
+    Ok(out)
 }
 
 /// Whether commit `commit`'s own definitions mount a tracker in Git that it

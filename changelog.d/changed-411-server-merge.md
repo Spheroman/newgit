@@ -4,18 +4,24 @@
   Before, a merge landed only onto the exact state it began from, so two
   merges begun from one base conflicted even at different trackers, and
   the second was told to merge again. Now a branch that did not move
-  fast-forwards to the merger's own commits, ids and signatures kept, and
-  one that moved is merged onto by the server: Git's merge (`merge-tree`)
-  over the composed tree, split back into each tracker's history, with one
-  merge commit in each tracker both sides moved (the merger's commit its
-  second parent, as GitHub's merge button writes it). A file moved between
-  trackers, or added under a directory another landing renamed, is
-  followed. Only a real conflict is refused, naming each file.
+  fast-forwards to the merger's own commits, ids and signatures kept. One
+  that moved since, on other paths, gets the merger's work laid onto it
+  without running Git's merge: a new commit in each tracker both sides
+  moved (root, and the parents along the mount chain), the merger's commit
+  its second parent. One that moved on the same paths is merged by Git
+  (`merge-tree`) over the composed tree and split back into each tracker's
+  history. A file moved between trackers, or added under a directory
+  another landing renamed, is followed. Only a real conflict is refused,
+  naming each file the merger may read.
 
-  The rules are read at the state the merge lands on, so a maintainer
-  removed while a merge ran does not land it. A change to the definitions
-  is a barrier that bumps the project's epoch, and a merge prepared under
-  another epoch starts again; a merge that loses the race three times gets
-  a turn to itself. Composed objects live only in a scratch repository no
-  one is served from; each tracker's store receives only that tracker's
-  own commits. The CLI brings the landed state back when the server merged.
+  What lands is authorized at the state it lands on, membership read again
+  at the last moment, so a merge that would carry the merger's edit into a
+  tracker they may not change is refused, naming it. Nothing is carried
+  into a tracker more people may read than chose to widen it. The base is
+  what the server reads from root's commit, never a list the client sent.
+  A change to the definitions on `main` is a barrier that bumps the
+  project's epoch; a merge that loses its recheck three times takes a turn
+  on the paths it changes, and merges on other paths land beside it.
+  Composed objects live only in a scratch repository no one is served
+  from, and an attempt that lost leaves nothing waiting. `newgit merge`
+  says when the server merged, and with which commit.

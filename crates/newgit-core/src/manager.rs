@@ -11546,6 +11546,30 @@ impl BranchManager {
         } else {
             None
         };
+        // Merged on the remote: what landed in each tracker is the remote's
+        // to say, not this merge's own commits.
+        let server_merged = landed_list.is_some();
+        if let Some(landed) = &landed_list {
+            trackers = landed
+                .iter()
+                .filter(|(tracker, commit)| {
+                    base.get(*tracker) != Some(*commit)
+                        && (list.get(*tracker) == Some(*commit)
+                            || list.get(*tracker) != base.get(*tracker))
+                })
+                .map(|(tracker, commit)| TrackerMerge {
+                    tracker: tracker.clone(),
+                    action: if !base.contains_key(tracker) {
+                        TrackerMergeAction::New
+                    } else if list.get(tracker) == Some(commit) {
+                        TrackerMergeAction::FastForward
+                    } else {
+                        TrackerMergeAction::Merged
+                    },
+                    commit: commit.clone(),
+                })
+                .collect();
+        }
         Ok(MergeOutcome {
             instance: name,
             into: into.to_owned(),
@@ -11555,6 +11579,7 @@ impl BranchManager {
             trackers,
             remote: client.map(|(_, project)| project),
             anchor,
+            server_merged,
         })
     }
 
@@ -14813,6 +14838,9 @@ pub struct MergeOutcome {
     /// Where it landed on the remote: the lowest tracker covering everything
     /// it touched. Root, or a tracker the trackers above roll up to.
     pub anchor: Option<String>,
+    /// The branch moved on the remote since this merge's base, and the
+    /// remote merged onto what it is now: `trackers` says what landed.
+    pub server_merged: bool,
 }
 
 /// What a person asks of a spawn beyond the defaults: `--use`, `--drop`,

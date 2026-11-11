@@ -14,11 +14,12 @@ pub mod merge;
 pub mod migrate;
 pub mod names;
 pub mod policy;
+pub mod reparent;
 pub mod repos;
 pub mod server_merge;
 pub mod tokens;
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
@@ -60,7 +61,7 @@ pub struct App {
     compose_locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     /// Definitions read before, by project and names, with the generation
     /// they were read at (see [`App::trackers_moved`]).
-    definitions: Mutex<HashMap<DefinitionsKey, (u64, Definitions)>>,
+    definitions: Mutex<HashMap<String, DefinitionsRead>>,
     generation: std::sync::atomic::AtomicU64,
     /// Merges begun and not landed.
     pub merges: merge::Merges,
@@ -74,10 +75,10 @@ pub struct App {
 }
 
 pub type Definitions = BTreeMap<String, policy::Facts>;
-/// A project's key and the tracker names asked for.
-type DefinitionsKey = (String, Vec<String>);
+/// One project's definitions as read: at which generation, for which names.
+type DefinitionsRead = (u64, BTreeSet<String>, Definitions);
 
-/// How many definition reads are kept before the cache starts over.
+/// How many projects' definitions are kept before the cache starts over.
 const DEFINITIONS_KEPT: usize = 1024;
 
 impl App {
@@ -151,34 +152,48 @@ impl App {
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     }
 
-    /// `project`'s definitions of `names`, read once per generation.
+    /// `project`'s definitions of `names` (and of `root` and `access`), read
+    /// once per generation: what one read found serves every later ask for
+    /// names it covered, until something moves a tracker's refs.
     pub fn definitions(
         &self,
         db: &rusqlite::Connection,
         project: &names::ProjectId,
-        mut names: Vec<String>,
+        names: Vec<String>,
     ) -> Definitions {
-        names.sort();
-        names.dedup();
-        let key = (project.key(), names);
+        let mut asked: BTreeSet<String> = names.into_iter().collect();
+        asked.extend(["root".to_owned(), "access".to_owned()]);
+        let key = project.key();
         let generation = self.generation.load(std::sync::atomic::Ordering::SeqCst);
+        let only = |facts: &Definitions| -> Definitions {
+            facts
+                .iter()
+                .filter(|(name, _)| asked.contains(*name))
+                .map(|(name, fact)| (name.clone(), fact.clone()))
+                .collect()
+        };
+        let mut wanted = asked.clone();
         {
             let cache = self
                 .definitions
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if let Some((at, facts)) = cache.get(&key)
+            if let Some((at, read, facts)) = cache.get(&key)
                 && *at == generation
             {
-                return facts.clone();
+                if asked.is_subset(read) {
+                    return only(facts);
+                }
+                wanted.extend(read.iter().cloned());
             }
         }
         let facts = policy::load_definitions(
             &self.config.data,
             db,
             project,
-            key.1.iter().map(String::as_str),
+            wanted.iter().map(String::as_str),
         );
+        let answer = only(&facts);
         let mut cache = self
             .definitions
             .lock()
@@ -186,8 +201,8 @@ impl App {
         if cache.len() >= DEFINITIONS_KEPT {
             cache.clear();
         }
-        cache.insert(key, (generation, facts.clone()));
-        facts
+        cache.insert(key, (generation, wanted, facts));
+        answer
     }
 
     fn compose_lock(&self, project: &str) -> Arc<tokio::sync::Mutex<()>> {

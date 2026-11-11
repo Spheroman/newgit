@@ -266,6 +266,17 @@ impl Objects {
         Ok(Some((fields[1].to_owned(), body)))
     }
 
+    /// Blob `id`'s bytes, read through the batch (no process of its own).
+    pub fn blob(&mut self, id: &str) -> Result<Vec<u8>> {
+        match self.read_raw(id)? {
+            Some((kind, body)) if kind == "blob" => Ok(body),
+            _ => Err(NewgitError::SourceCommand {
+                command: format!("git cat-file blob {id}"),
+                stderr: format!("no blob {id}"),
+            }),
+        }
+    }
+
     /// Whether the repository (or this batch) has commit `id`.
     pub fn has_commit(&mut self, id: &str) -> Result<bool> {
         Ok(self.try_commit(id)?.is_some())

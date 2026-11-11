@@ -299,6 +299,13 @@ pub(super) fn busy(blocker: Option<String>) -> HttpError {
     )
 }
 
+/// How a merge into `branch` that waited its whole turn budget is answered.
+pub fn busy_merging(branch: &str) -> HttpError {
+    busy(Some(format!(
+        "merges into `{branch}` changing the same paths as this one kept landing first"
+    )))
+}
+
 pub(super) fn answered(outcome: Option<ApiResult<Outcome>>) -> ApiResult<Outcome> {
     outcome.unwrap_or_else(|| Err(HttpError::internal("a landing left unanswered")))
 }
@@ -356,6 +363,22 @@ impl Log {
         if self.armed(at) {
             std::thread::sleep(Duration::from_millis(1500));
         }
+    }
+
+    /// Wait here while the fault file says to (at most a minute), with
+    /// `<fault file>.at` naming where, for the tests that land something
+    /// before a finish reads the branch (`hold-finish-by-<login>`).
+    pub fn wait_while(&self, at: &str) {
+        let Some(path) = self.faults.as_ref().filter(|_| self.armed(at)) else {
+            return;
+        };
+        let marker = format!("{path}.at");
+        let _ = std::fs::write(&marker, at);
+        let until = std::time::Instant::now() + Duration::from_secs(60);
+        while self.armed(at) && std::time::Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let _ = std::fs::remove_file(&marker);
     }
 
     /// Stop the process here if the fault file says to.

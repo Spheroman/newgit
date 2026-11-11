@@ -18,7 +18,13 @@
 //!   the merger's second, as GitHub's merge button writes it.
 //! - **One commit, one audience.** Each merge commit holds its own tracker's
 //!   tree and pins, and the stock message `Merge `<login>` into <branch>`,
-//!   which says nothing about anyone's content.
+//!   which says nothing about anyone's content. A merge that would follow a
+//!   move into a tracker more people may read, carrying the other side's
+//!   change along, is refused ([`carried`]); a conflict names only files in
+//!   trackers the merger may read.
+//! - **Only when the changes meet.** A merge whose changes are apart from
+//!   what landed since its base never gets here: `crate::reparent` re-makes
+//!   it on the head without Git's merge.
 //! - **Composed objects never reach a store.** The composed trees cross
 //!   every audience, so they are made in a scratch repository of the merge's
 //!   own (`<home>/scratch/<random>.git`), which borrows every store's objects
@@ -29,8 +35,8 @@
 //!   there into a store only as `merge::finish` places any of a merge's
 //!   commits.
 
-use std::io::Write as _;
-use std::process::{Command, Stdio};
+use std::collections::{BTreeMap, BTreeSet};
+use std::process::Command;
 
 use camino::{Utf8Path, Utf8PathBuf};
 use newgit_core::compose::{self, NOTES_REF, SplitError, SplitOptions};
@@ -50,9 +56,9 @@ const NOBODY: &[u8] = b"newgit <newgit@localhost> 0 +0000";
 pub struct Merged {
     /// The index that lands: each tracker's commit.
     pub list: List,
-    /// The commits the server wrote, as `(tracker, commit)`: each waits at
-    /// its landing ref in the merger's landing for that tracker.
-    pub made: Vec<(String, String)>,
+    /// The commits the server wrote: each waits at its landing ref in the
+    /// merger's landing for its tracker until it lands or is given up.
+    pub made: Made,
 }
 
 /// A repository of one merge's own, removed when dropped.
@@ -169,26 +175,210 @@ fn run(dir: &Utf8Path, args: &[&str], input: Option<&[u8]>) -> ApiResult<Vec<u8>
     Ok(output.stdout)
 }
 
+/// How long any one `git` the merge runs may take before it is stopped. A
+/// hung `merge-tree` would otherwise hold its turn, or its roots, for ever.
+pub const GIT_LIMIT: std::time::Duration = std::time::Duration::from_secs(60);
+
 fn output(dir: &Utf8Path, args: &[&str], input: Option<&[u8]>) -> ApiResult<std::process::Output> {
-    let mut child = repos::git_command(dir)
-        .args(args)
-        .stdin(if input.is_some() {
-            Stdio::piped()
-        } else {
-            Stdio::null()
-        })
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
-    if let (Some(input), Some(mut stdin)) = (input, child.stdin.take()) {
-        stdin.write_all(input)?;
+    repos::git_timed(dir, args, input, GIT_LIMIT)
+}
+
+/// What the merger may see, and who may read each tracker: read under the
+/// db lock before the merge runs, at the head it merges onto.
+#[derive(Debug, Default, Clone)]
+pub struct Seen {
+    /// The trackers the merger may read.
+    pub readable: BTreeSet<String>,
+    /// The store each tracker is in, which says who may read it.
+    pub stores: BTreeMap<String, repos::Store>,
+}
+
+impl Seen {
+    /// Whether content of tracker `from` may be carried into `to` without
+    /// anyone choosing to: every reader of `to` may read `from` already.
+    fn may_carry(&self, from: &str, to: &str) -> bool {
+        from == to
+            || matches!(
+                (self.stores.get(from), self.stores.get(to)),
+                (Some(from), Some(to)) if from.includes(to)
+            )
     }
-    Ok(child.wait_with_output()?)
+}
+
+/// Each tracker's directory in a composed view, by its name here.
+struct Mounts(Vec<(String, String)>);
+
+fn depth(at: &str) -> usize {
+    if at == "." { 0 } else { at.split('/').count() }
+}
+
+fn holds(at: &str, path: &str) -> bool {
+    at == "."
+        || path == at
+        || path
+            .strip_prefix(at)
+            .is_some_and(|rest| rest.starts_with('/'))
+}
+
+impl Mounts {
+    fn read(objects: &mut Objects, roots: &[&str]) -> ApiResult<Self> {
+        let mut all = BTreeSet::new();
+        for root in roots {
+            for (chain, at) in compose::view_mounts(objects, root)? {
+                let name = if chain.is_empty() {
+                    "root".to_owned()
+                } else {
+                    chain.join("__")
+                };
+                all.insert((name, at));
+            }
+        }
+        Ok(Self(all.into_iter().collect()))
+    }
+
+    /// Every tracker whose directory holds `path`, at any depth.
+    fn holding(&self, path: &str) -> Vec<&str> {
+        self.0
+            .iter()
+            .filter(|(_, at)| holds(at, path))
+            .map(|(tracker, _)| tracker.as_str())
+            .collect()
+    }
+
+    /// The trackers `path` is in: those holding it at the deepest directory
+    /// (more than one where trackers share a directory).
+    fn owners(&self, path: &str) -> Vec<&str> {
+        let deepest = self
+            .0
+            .iter()
+            .filter(|(_, at)| holds(at, path))
+            .map(|(_, at)| depth(at))
+            .max()
+            .unwrap_or(0);
+        self.0
+            .iter()
+            .filter(|(_, at)| holds(at, path) && depth(at) == deepest)
+            .map(|(tracker, _)| tracker.as_str())
+            .collect()
+    }
+
+    /// `paths` as the merger may be told of them: each one in trackers it
+    /// may read by name, the rest only counted.
+    fn name(&self, paths: &[String], seen: &Seen) -> String {
+        let mut named = Vec::new();
+        let mut hidden = 0;
+        for path in paths {
+            if self
+                .holding(path)
+                .iter()
+                .all(|tracker| seen.readable.contains(*tracker))
+            {
+                named.push(format!("`{path}`"));
+            } else {
+                hidden += 1;
+            }
+        }
+        match hidden {
+            0 => {}
+            1 => named.push("a file in a tracker you cannot read".to_owned()),
+            hidden => named.push(format!("{hidden} files in trackers you cannot read")),
+        }
+        named.join(", ")
+    }
+}
+
+/// What one side changed from the base, as Git's rename detection (the
+/// merge's own, 50% similar) sees it.
+#[derive(Default)]
+struct Side {
+    renames: Vec<(String, String)>,
+    modified: BTreeSet<String>,
+    added: BTreeSet<String>,
+}
+
+impl Side {
+    fn read(dir: &Utf8Path, base: &str, view: &str) -> ApiResult<Self> {
+        let out = run(
+            dir,
+            &["diff-tree", "-r", "-M", "-z", "--name-status", base, view],
+            None,
+        )?;
+        let text = String::from_utf8_lossy(&out).into_owned();
+        let mut fields = text.split('\0').filter(|field| !field.is_empty());
+        let mut side = Self::default();
+        while let Some(status) = fields.next() {
+            let Some(path) = fields.next() else { break };
+            match status.as_bytes().first() {
+                Some(b'R' | b'C') => {
+                    let Some(to) = fields.next() else { break };
+                    if status.starts_with('R') {
+                        side.renames.push((path.to_owned(), to.to_owned()));
+                    }
+                }
+                Some(b'M' | b'T') => {
+                    side.modified.insert(path.to_owned());
+                }
+                Some(b'A') => {
+                    side.added.insert(path.to_owned());
+                }
+                _ => {}
+            }
+        }
+        Ok(side)
+    }
+}
+
+/// What the merge would carry across trackers into one more people may
+/// read, by following a move the *other* side made: `(path, from, to)`.
+/// A change one side made to a file the other side moved into a wider
+/// tracker, or a file one side added under a directory the other side
+/// moved there (Git's directory renames).
+fn carried(
+    objects: &mut Objects,
+    merged: &str,
+    sides: [&Side; 2],
+    mounts: &Mounts,
+    seen: &Seen,
+) -> ApiResult<Vec<(String, String, String)>> {
+    let mut out = Vec::new();
+    for (moved, other) in [(sides[0], sides[1]), (sides[1], sides[0])] {
+        for (from_path, to_path) in &moved.renames {
+            let Some((from, to)) = mounts.owners(from_path).into_iter().find_map(|from| {
+                mounts
+                    .owners(to_path)
+                    .into_iter()
+                    .find(|to| !seen.may_carry(from, to))
+                    .map(|to| (from.to_owned(), to.to_owned()))
+            }) else {
+                continue;
+            };
+            if other.modified.contains(from_path) {
+                out.push((from_path.clone(), from.clone(), to.clone()));
+            }
+            if let Some((dir, _)) = from_path.rsplit_once('/') {
+                for added in &other.added {
+                    if added
+                        .strip_prefix(dir)
+                        .is_some_and(|rest| rest.starts_with('/'))
+                        && objects.entry_at(merged, added)?.is_none()
+                    {
+                        out.push((added.clone(), from.clone(), to.clone()));
+                    }
+                }
+            }
+        }
+    }
+    out.sort();
+    out.dedup();
+    Ok(out)
 }
 
 /// Merge `list` (the merger's index, made on `base`) onto `head` (the
-/// branch now), for `login` landing into `branch`. Refused (409) only for a
-/// real conflict, naming each file, or for what cannot be split.
+/// branch now), for `login` landing into `branch`. Refused (409) for a real
+/// conflict, naming each file the merger may read; for content it would
+/// carry into a tracker more people may read (see [`carried`]); and for
+/// what cannot be split.
+#[allow(clippy::too_many_arguments, reason = "each is one thing a merge is")]
 pub fn merge(
     project: &ProjectContext<'_>,
     login: &str,
@@ -196,6 +386,7 @@ pub fn merge(
     base: &List,
     head: &List,
     list: &List,
+    seen: &Seen,
 ) -> ApiResult<Merged> {
     let root_of = |index: &List| {
         index
@@ -214,6 +405,7 @@ pub fn merge(
     let head_view = view(&mut objects, &head_root)?;
     let list_view = view(&mut objects, &list_root)?;
     objects.flush()?;
+    let mounts = Mounts::read(&mut objects, &[&base_root, &head_root, &list_root])?;
     // Which root commit each side's view stands for, as split reads it.
     for (view, root) in [(&head_view, &head_root), (&list_view, &list_root)] {
         run(
@@ -254,16 +446,13 @@ pub fn merge(
         Some(0) => {}
         Some(1) => {
             let mut files: Vec<String> = fields.map(str::to_owned).collect();
+            files.sort();
             files.dedup();
-            let named = files
-                .iter()
-                .map(|file| format!("`{file}`"))
-                .collect::<Vec<_>>()
-                .join(", ");
             return Err(HttpError::new(
                 409,
                 format!(
-                    "this merge conflicts with what landed on `{branch}` since your base, in {named}: bring `{branch}` into your work, resolve, and merge again"
+                    "this merge conflicts with what landed on `{branch}` since your base, in {}: bring `{branch}` into your work, resolve, and merge again",
+                    mounts.name(&files, seen)
                 ),
             ));
         }
@@ -274,6 +463,23 @@ pub fn merge(
                 String::from_utf8_lossy(&merged.stderr).trim()
             )));
         }
+    }
+    // One commit, one audience: nothing crosses into a tracker more people
+    // may read unless someone chose to move it there from what they read.
+    let sides = [
+        Side::read(&scratch.dir, &base_view, &head_view)?,
+        Side::read(&scratch.dir, &base_view, &list_view)?,
+    ];
+    let crossing = carried(&mut objects, &tree, [&sides[0], &sides[1]], &mounts, seen)?;
+    if let Some((_, from, to)) = crossing.first() {
+        let paths: Vec<String> = crossing.iter().map(|(path, _, _)| path.clone()).collect();
+        return Err(HttpError::new(
+            409,
+            format!(
+                "this merge would carry {} from `{from}` into `{to}`, which more people may read, by following a move made on the other side, and nobody chose to widen that: bring `{branch}` into your work and merge again, so any such move is one you make",
+                mounts.name(&paths, seen)
+            ),
+        ));
     }
     let now = chrono::Utc::now().timestamp();
     let by = format!("{login} <{login}@users.noreply.github.com> {now} +0000");
@@ -295,6 +501,9 @@ pub fn merge(
         audience: &audience,
         newgit_made: None,
         need_history: &|_| Ok(()),
+        // Each side's forks are read from its own commits, the merge's
+        // parents.
+        forks_before: &[],
     };
     let split =
         compose::split(&scratch.dir, &merge_view, &options).map_err(|error| match error {
@@ -304,17 +513,23 @@ pub fn merge(
             ),
             SplitError::Git(error) => HttpError::internal(error),
         })?;
+    if let Some((tracker, _)) = split
+        .made
+        .iter()
+        .find(|(tracker, _)| project.links.contains_key(tracker))
+    {
+        let home = &project.links[tracker].0;
+        return Err(HttpError::new(
+            409,
+            format!(
+                "`{tracker}` is linked from `{home}`, and both this merge and what landed on `{branch}` since your base moved it: land it at its home first"
+            ),
+        ));
+    }
     // Each tracker's new commit, and what it adds over its parents (its own
     // tree), into the merger's landing for it: nothing composed leaves.
+    let mut made = Made::default();
     for (tracker, commit) in &split.made {
-        if let Some((home, _)) = project.links.get(tracker) {
-            return Err(HttpError::new(
-                409,
-                format!(
-                    "`{tracker}` is linked from `{home}`, and both this merge and what landed on `{branch}` since your base moved it: land it at its home first"
-                ),
-            ));
-        }
         let parents = objects.commit(commit)?.parents;
         let mut revs = format!("{commit}\n");
         for parent in &parents {
@@ -327,14 +542,76 @@ pub fn merge(
         )?;
         let landing = project.tracker(tracker).open_landing(login)?;
         run(&landing, &["index-pack", "--stdin"], Some(&pack))?;
-        run(
-            &landing,
-            &["update-ref", &crate::merge::landing_ref(commit), commit],
-            None,
-        )?;
+        made.wait(&landing, tracker, commit)?;
     }
     Ok(Merged {
         list: split.index,
-        made: split.made,
+        made,
     })
+}
+
+/// The commits the server made for one merge, each waiting at its landing
+/// ref in the merger's landing for its tracker. Dropped without
+/// [`Made::landed`], they are given up: their refs go, so an attempt that
+/// lost leaves nothing behind that names them.
+#[derive(Default)]
+pub struct Made {
+    commits: Vec<(String, String, Utf8PathBuf)>,
+}
+
+impl std::fmt::Debug for Made {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_list()
+            .entries(self.commits.iter().map(|(t, c, _)| (t, c)))
+            .finish()
+    }
+}
+
+impl Made {
+    /// `commit`, in `landing` (tracker `tracker`'s for this merger), set at
+    /// its landing ref.
+    pub fn wait(&mut self, landing: &Utf8Path, tracker: &str, commit: &str) -> ApiResult<()> {
+        run(
+            landing,
+            &["update-ref", &crate::merge::landing_ref(commit), commit],
+            None,
+        )?;
+        self.commits
+            .push((tracker.to_owned(), commit.to_owned(), landing.to_owned()));
+        Ok(())
+    }
+
+    /// Whether the server made `commit` for `tracker` here.
+    pub fn has(&self, tracker: &str, commit: &str) -> bool {
+        self.commits
+            .iter()
+            .any(|(made, id, _)| made == tracker && id == commit)
+    }
+
+    /// Those made, and kept: `commit`s still named by what lands.
+    pub fn keep(&mut self, landing: &List) {
+        self.commits
+            .retain(|(tracker, commit, _)| landing.get(tracker) != Some(commit));
+    }
+
+    /// Everything here landed (or is named by an entry written down): its
+    /// refs are the landing's to remove.
+    pub fn landed(mut self) {
+        self.commits.clear();
+    }
+
+    pub fn absorb(&mut self, mut other: Made) {
+        self.commits.append(&mut other.commits);
+    }
+}
+
+impl Drop for Made {
+    fn drop(&mut self) {
+        for (_, commit, landing) in self.commits.drain(..) {
+            let _ = repos::git(
+                &landing,
+                &["update-ref", "-d", &crate::merge::landing_ref(&commit)],
+            );
+        }
+    }
 }

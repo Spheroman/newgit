@@ -11,13 +11,17 @@
 //!   Nothing follows later, and nothing is rolled up.
 //! - **`merge` lands or it doesn't.** A branch still at the merge's `base`
 //!   fast-forwards to the merger's own commits, ids and signatures kept. One
-//!   that moved is merged onto by the server (`crate::server_merge`): Git's
-//!   merge over the composed tree, split back by tracker, one merge commit
-//!   in each tracker both sides moved with the merger's commit as its second
-//!   parent. Only a real conflict is refused, naming each file.
-//! - **The rules are read at the head it lands on**, on every attempt, never
-//!   at the merge's base; a change to the definitions bumps the project's
-//!   epoch, and an attempt prepared under another starts again.
+//!   that moved on other paths gets the merger's work re-made on it
+//!   (`crate::reparent`), with no Git merge; one that moved on the same
+//!   paths is merged onto by the server (`crate::server_merge`): Git's merge
+//!   over the composed tree, split back by tracker, one merge commit in each
+//!   tracker both sides moved with the merger's commit as its second parent.
+//!   Only a real conflict is refused, naming each file the merger may read.
+//! - **The base is read here**, from root's commit, never taken from the
+//!   merger; **the rules are read at the head it lands on**, on every
+//!   attempt, and checked against what lands, not only the merger's change;
+//!   a change to the definitions on `main` bumps the project's epoch, and an
+//!   attempt prepared under another starts again.
 //!
 //! > **Decision (loud): the anchor decides approval, not what lands.** The
 //! > Worker landed only the trackers at and under the anchor and rolled the
@@ -40,7 +44,9 @@ use crate::error::{ApiResult, HttpError, fail};
 use crate::landing::{self, Asked, Change, Entry, Hold, Landing};
 use crate::names::{lineage, parent_of, within};
 use crate::policy::{self, Facts};
+use crate::reparent::{self, Touch};
 use crate::repos::{self, Repo};
+use crate::server_merge::{Made, Seen};
 
 /// How long a merge begun may take to finish.
 const PENDING: Duration = Duration::from_secs(70 * 60);
@@ -53,6 +59,9 @@ pub const OBJECTS_MAX_BYTES: usize = 90 * 1024 * 1024;
 #[derive(Debug, Clone)]
 pub struct Pending {
     by: String,
+    /// The index it was made on, as root's commit there pins it: read by
+    /// the server, never taken from the merger.
+    base: List,
     target: List,
     /// The trackers whose branches the finish may ask to move.
     writes: Vec<String>,
@@ -60,19 +69,135 @@ pub struct Pending {
     until: Instant,
 }
 
-/// Merges in flight, by project, branch, and the root commit they land.
+/// Merges in flight, by project, branch, and the root commit they land, and
+/// the turns merges that lost too often hold.
 #[derive(Default)]
-pub struct Merges(std::sync::Mutex<BTreeMap<(String, String, String), Pending>>);
+pub struct Merges {
+    pending: std::sync::Mutex<BTreeMap<(String, String, String), Pending>>,
+    turns: std::sync::Mutex<Vec<TurnHeld>>,
+    turned: std::sync::Condvar,
+    next_turn: std::sync::atomic::AtomicU64,
+}
+
+/// A turn: what one merge changes on one branch, which no other merge
+/// lands over until it has landed (landing.md, *Landing* 6). Merges that
+/// change other paths land beside it.
+#[derive(Debug)]
+struct TurnHeld {
+    id: u64,
+    home: String,
+    branch: String,
+    touch: Touch,
+}
+
+/// A turn held, given up when dropped.
+pub struct Turn<'m> {
+    merges: &'m Merges,
+    id: u64,
+}
+
+impl Drop for Turn<'_> {
+    fn drop(&mut self) {
+        let mut turns = self.merges.turns();
+        turns.retain(|turn| turn.id != self.id);
+        self.merges.turned.notify_all();
+    }
+}
 
 impl Merges {
     fn lock(&self) -> std::sync::MutexGuard<'_, BTreeMap<(String, String, String), Pending>> {
         let mut merges = self
-            .0
+            .pending
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let now = Instant::now();
         merges.retain(|_, pending| pending.until > now);
         merges
+    }
+
+    fn turns(&self) -> std::sync::MutexGuard<'_, Vec<TurnHeld>> {
+        self.turns
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Whether a turn other than `mine`, and taken before it, holds paths
+    /// `touch` changes on `branch`.
+    fn blocked(&self, home: &str, branch: &str, mine: Option<u64>, touch: &Touch) -> bool {
+        self.turns().iter().any(|turn| {
+            turn.home == home
+                && turn.branch == branch
+                && mine.is_none_or(|mine| turn.id < mine)
+                && turn.touch.overlap(touch).is_some()
+        })
+    }
+
+    /// A turn on what `touch` changes, once no turn taken before holds any
+    /// of it; `None` when that is not by `until`.
+    fn take_turn(
+        &self,
+        home: &str,
+        branch: &str,
+        touch: Touch,
+        until: Instant,
+    ) -> Option<Turn<'_>> {
+        let mut turns = self.turns();
+        loop {
+            if !turns.iter().any(|turn| {
+                turn.home == home && turn.branch == branch && turn.touch.overlap(&touch).is_some()
+            }) {
+                let id = self
+                    .next_turn
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                turns.push(TurnHeld {
+                    id,
+                    home: home.to_owned(),
+                    branch: branch.to_owned(),
+                    touch,
+                });
+                return Some(Turn { merges: self, id });
+            }
+            let left = until.checked_duration_since(Instant::now())?;
+            turns = self
+                .turned
+                .wait_timeout(turns, left)
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .0;
+        }
+    }
+
+    /// Turn `turn` widened to what `touch` changes too: a rerun may change
+    /// more than the attempt it took its turn after.
+    fn widen(&self, turn: &Turn<'_>, touch: &Touch) {
+        let mut turns = self.turns();
+        if let Some(held) = turns.iter_mut().find(|held| held.id == turn.id) {
+            for (tracker, own) in &touch.0 {
+                let entry = held
+                    .touch
+                    .0
+                    .entry(tracker.clone())
+                    .or_insert_with(|| own.clone());
+                if let (
+                    reparent::Own::Paths { paths, gone },
+                    reparent::Own::Paths {
+                        paths: more,
+                        gone: more_gone,
+                    },
+                ) = (entry, own)
+                {
+                    paths.extend(more.iter().cloned());
+                    gone.extend(more_gone.iter().cloned());
+                }
+            }
+        }
+    }
+
+    /// Wait until a turn is given up, or `until`.
+    fn wait_turns(&self, until: Instant) {
+        let turns = self.turns();
+        if let Some(left) = until.checked_duration_since(Instant::now()) {
+            let _ = self.turned.wait_timeout(turns, left);
+        }
     }
 }
 
@@ -205,9 +330,8 @@ fn anchor_of(ids: &[String]) -> String {
 #[allow(clippy::too_many_arguments, reason = "each is one thing a landing is")]
 fn anchor_for(
     project: &ProjectContext<'_>,
-    db: &Connection,
+    past: &BTreeMap<String, Vec<String>>,
     by: &str,
-    branch: &str,
     base: &List,
     list: &List,
     moved: &[String],
@@ -229,7 +353,7 @@ fn anchor_for(
                 &dir,
                 old,
                 new,
-                &past_heads(db, &project.key, branch, tracker)?,
+                past.get(tracker).map_or(&[][..], Vec::as_slice),
             ),
             _ => Some(true),
         };
@@ -259,6 +383,49 @@ fn anchor_for(
         }
     }
     Ok(anchor)
+}
+
+/// [`index_of`], reading a tracker's pins only where its commit is not the
+/// one `known` (an index read before, by the server) has for it: there they
+/// are what `known` says.
+fn index_from(
+    project: &ProjectContext<'_>,
+    root: &str,
+    by: Option<&str>,
+    known: &List,
+) -> ApiResult<List> {
+    let mut index = List::new();
+    let mut stack = vec![("root".to_owned(), root.to_owned())];
+    while let Some((tracker, commit)) = stack.pop() {
+        if index.contains_key(&tracker) {
+            continue;
+        }
+        index.insert(tracker.clone(), commit.clone());
+        if tracker != "root" && known.get(&tracker) == Some(&commit) {
+            let below = format!("{tracker}__");
+            for (name, pin) in known.range(below.clone()..) {
+                if !name.starts_with(&below) {
+                    break;
+                }
+                index.insert(name.clone(), pin.clone());
+            }
+            continue;
+        }
+        let repo = project.tracker(&tracker);
+        let dir = match by {
+            Some(by) => repo.view(by)?,
+            None => repo.dir(),
+        };
+        for (name, pin) in repos::pins_of(&dir, &commit) {
+            let child = if tracker == "root" {
+                name
+            } else {
+                format!("{tracker}__{name}")
+            };
+            stack.push((child, pin));
+        }
+    }
+    Ok(index)
 }
 
 /// The index root's commit pins, all the way down: each tracker's
@@ -414,14 +581,29 @@ struct Authorized {
     anchor: String,
 }
 
-fn authorize_merge(
+/// What deciding a merge reads from the db: read under its lock
+/// ([`gather`]), decided without it ([`authorize_merge`]), so the db is not
+/// held while Git answers.
+struct Reads {
+    moved: Vec<String>,
+    facts: BTreeMap<String, Facts>,
+    /// Every commit each moved tracker was ever the head of on the branch.
+    past: BTreeMap<String, Vec<String>>,
+    /// Who the merger is to each moved tracker's policy, and its owner.
+    who: BTreeMap<String, (policy::Requester, Option<String>)>,
+    /// Whether the merger was a member of each home whose membership the
+    /// decision read: checked again under the recheck's lock.
+    members: BTreeMap<String, bool>,
+}
+
+fn gather(
     project: &ProjectContext<'_>,
     db: &Connection,
     caller: &Caller,
     branch: &str,
     base: &List,
     list: &List,
-) -> ApiResult<Authorized> {
+) -> ApiResult<Reads> {
     let moved: Vec<String> = base
         .keys()
         .chain(list.keys())
@@ -437,129 +619,188 @@ fn authorize_merge(
             db::add_link(db, &project.key, tracker, &home.key(), &there)?;
         }
     }
-    let anchor = anchor_for(
-        project,
-        db,
-        &caller.login,
-        branch,
-        base,
-        list,
-        &moved,
-        &facts,
-    )?;
+    let mut past = BTreeMap::new();
+    for tracker in &moved {
+        past.insert(
+            tracker.clone(),
+            past_heads(db, &project.key, branch, tracker)?,
+        );
+    }
+    let me = project.who(caller);
+    let mut members = BTreeMap::from([(project.key.clone(), me.member)]);
+    let mut who = BTreeMap::new();
+    for (tracker, fact) in &facts {
+        let found = project.who_for(db, fact, &me)?;
+        if let Some((home, _)) = policy::home_of(fact) {
+            members.insert(home.key(), found.0.member);
+        }
+        who.insert(tracker.clone(), found);
+    }
+    Ok(Reads {
+        moved,
+        facts,
+        past,
+        who,
+        members,
+    })
+}
+
+/// Whether `login` is still a member of each home `reads` read.
+fn members_held(db: &Connection, login: &str, reads: &Reads) -> ApiResult<bool> {
+    for (home, member) in &reads.members {
+        if db::is_member(db, home, login)? != *member {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn authorize_merge(
+    project: &ProjectContext<'_>,
+    caller: &Caller,
+    base: &List,
+    list: &List,
+    lands: Option<&str>,
+    reads: &Reads,
+) -> ApiResult<Authorized> {
+    let Reads {
+        moved, facts, past, ..
+    } = reads;
+    let anchor = anchor_for(project, past, &caller.login, base, list, moved, facts)?;
     let who = project.who(caller);
     let mut writes = Vec::new();
-    for tracker in &moved {
-        let fact = facts.get(tracker);
-        let dropped = !list.contains_key(tracker);
-        if !base.contains_key(tracker) {
-            // New to the branch: it joins through its own seeded repo, added
-            // by whoever governs its definition.
-            if fact.is_some_and(|fact| !fact.git) {
+    for tracker in moved {
+        let mut one = || -> ApiResult<()> {
+            let fact = facts.get(tracker);
+            let dropped = !list.contains_key(tracker);
+            if !base.contains_key(tracker) {
+                // New to the branch: it joins through its own seeded repo, added
+                // by whoever governs its definition.
+                if fact.is_some_and(|fact| !fact.git) {
+                    return fail(
+                        400,
+                        format!("`{tracker}` is not in Git; `newgit merge` never carries it"),
+                    );
+                }
+                if !project.tracker(tracker).exists() {
+                    return fail(
+                        400,
+                        format!(
+                            "`{tracker}` has no repo: a new tracker in Git joins by its own seeded repo"
+                        ),
+                    );
+                }
+                let governor = fact.map_or("access", |fact| fact.source.as_str());
+                let governing = facts
+                    .get(governor)
+                    .cloned()
+                    .or_else(|| policy::implicit_facts("access"))
+                    .unwrap_or_else(|| unreachable!());
+                if policy::may_maintain(&governing.maintainers, &who, &project.info.owner, governor)
+                    .is_err()
+                {
+                    return fail(
+                        403,
+                        format!(
+                            "only the maintainers of the tracker holding `{tracker}`'s definition may add it"
+                        ),
+                    );
+                }
+                return Ok(());
+            }
+            let Some(fact) = fact else {
+                if dropped {
+                    return Ok(());
+                }
+                return fail(
+                    400,
+                    format!(
+                        "`{tracker}` is not defined on `access`'s `main`: a new tracker in Git joins by its own seeded repo"
+                    ),
+                );
+            };
+            if !fact.git {
                 return fail(
                     400,
                     format!("`{tracker}` is not in Git; `newgit merge` never carries it"),
                 );
             }
-            if !project.tracker(tracker).exists() {
-                return fail(
-                    400,
-                    format!(
-                        "`{tracker}` has no repo: a new tracker in Git joins by its own seeded repo"
-                    ),
-                );
-            }
-            let governor = fact.map_or("access", |fact| fact.source.as_str());
-            let governing = facts
-                .get(governor)
+            let (policy_who, owner) = reads
+                .who
+                .get(tracker)
                 .cloned()
-                .or_else(|| policy::implicit_facts("access"))
-                .unwrap_or_else(|| unreachable!());
-            if policy::may_maintain(&governing.maintainers, &who, &project.info.owner, governor)
-                .is_err()
-            {
-                return fail(
-                    403,
-                    format!(
-                        "only the maintainers of the tracker holding `{tracker}`'s definition may add it"
-                    ),
-                );
-            }
-            continue;
-        }
-        let Some(fact) = fact else {
-            if dropped {
-                continue;
-            }
-            return fail(
-                400,
-                format!(
-                    "`{tracker}` is not defined on `access`'s `main`: a new tracker in Git joins by its own seeded repo"
+                .unwrap_or((who.clone(), None));
+            policy::decide(
+                &project.repo_of(tracker),
+                false,
+                &policy_who,
+                Some(fact),
+                &policy::Context::default(),
+            )
+            .map_err(|why| HttpError::new(403, why))?;
+            let repo = project.tracker(tracker);
+            let view = repo.view(&caller.login)?;
+            let (forward, on_main) = match (tracker.as_str(), list.get(tracker)) {
+                ("root", _) | (_, None) => (false, false),
+                (_, Some(new)) => (
+                    repos::has_commit(&view, new) && repos::is_ancestor(&view, &base[tracker], new),
+                    repo.branch_head("main")
+                        .is_some_and(|main| repos::is_ancestor(&view, new, &main)),
                 ),
-            );
-        };
-        if !fact.git {
-            return fail(
-                400,
-                format!("`{tracker}` is not in Git; `newgit merge` never carries it"),
-            );
-        }
-        let (policy_who, owner) = project.who_for(db, fact, &who)?;
-        policy::decide(
-            &project.repo_of(tracker),
-            false,
-            &policy_who,
-            Some(fact),
-            &policy::Context::default(),
-        )
-        .map_err(|why| HttpError::new(403, why))?;
-        let repo = project.tracker(tracker);
-        let view = repo.view(&caller.login)?;
-        let (forward, on_main) = match (tracker.as_str(), list.get(tracker)) {
-            ("root", _) | (_, None) => (false, false),
-            (_, Some(new)) => (
-                repos::has_commit(&view, new) && repos::is_ancestor(&view, &base[tracker], new),
-                repo.branch_head("main")
-                    .is_some_and(|main| repos::is_ancestor(&view, new, &main)),
-            ),
-        };
-        // Above the anchor nothing is touched, only moved along: approved
-        // where it lands.
-        if anchor != *tracker && within(&anchor, tracker) {
-            if tracker == "root" || !on_main {
+            };
+            // Above the anchor nothing is touched, only moved along: approved
+            // where it lands.
+            if anchor != *tracker && within(&anchor, tracker) {
+                if tracker == "root" || !on_main {
+                    writes.push(tracker.clone());
+                }
+                return Ok(());
+            }
+            if tracker != "root" && !dropped && forward && on_main {
+                // A pin following its tracker's own `main` is the parent's choice.
+                if anchor != "root" {
+                    let parent = parent_of(tracker).unwrap_or("root");
+                    let parent_facts = facts
+                        .get(parent)
+                        .cloned()
+                        .or_else(|| policy::implicit_facts("root"))
+                        .unwrap_or_else(|| unreachable!());
+                    policy::may_maintain(&parent_facts.maintainers, &who, &project.info.owner, parent).map_err(|why| {
+                        HttpError::new(403, format!("{why} (`{tracker}`'s pin follows its `main`, which is `{parent}`'s to choose)"))
+                    })?;
+                }
+                return Ok(());
+            }
+            let owner = owner.unwrap_or_else(|| project.info.owner.clone());
+            if let Err(why) = policy::may_maintain(&fact.maintainers, &policy_who, &owner, tracker)
+            {
+                let why = if tracker == "root" || dropped {
+                    why
+                } else if forward {
+                    format!("{why} (its pin moves to a commit not on its `main`)")
+                } else {
+                    format!("{why} (its pin moves back or sideways along its history)")
+                };
+                return fail(403, why);
+            }
+            if tracker == "root" || (!dropped && !on_main) {
                 writes.push(tracker.clone());
             }
-            continue;
-        }
-        if tracker != "root" && !dropped && forward && on_main {
-            // A pin following its tracker's own `main` is the parent's choice.
-            if anchor != "root" {
-                let parent = parent_of(tracker).unwrap_or("root");
-                let parent_facts = facts
-                    .get(parent)
-                    .cloned()
-                    .or_else(|| policy::implicit_facts("root"))
-                    .unwrap_or_else(|| unreachable!());
-                policy::may_maintain(&parent_facts.maintainers, &who, &project.info.owner, parent).map_err(|why| {
-                    HttpError::new(403, format!("{why} (`{tracker}`'s pin follows its `main`, which is `{parent}`'s to choose)"))
-                })?;
-            }
-            continue;
-        }
-        let owner = owner.unwrap_or_else(|| project.info.owner.clone());
-        if let Err(why) = policy::may_maintain(&fact.maintainers, &policy_who, &owner, tracker) {
-            let why = if tracker == "root" || dropped {
-                why
-            } else if forward {
-                format!("{why} (its pin moves to a commit not on its `main`)")
+            Ok(())
+        };
+        one().map_err(|error| {
+            if let Some(branch) = lands.filter(|_| error.status == 403) {
+                HttpError::new(
+                    403,
+                    format!(
+                        "merged onto what landed on `{branch}` since your base, this merge would change `{tracker}`, and {}",
+                        error.message
+                    ),
+                )
             } else {
-                format!("{why} (its pin moves back or sideways along its history)")
-            };
-            return fail(403, why);
-        }
-        if tracker == "root" || (!dropped && !on_main) {
-            writes.push(tracker.clone());
-        }
+                error
+            }
+        })?;
     }
     Ok(Authorized { writes, anchor })
 }
@@ -614,6 +855,9 @@ pub fn begin(
     }
     require_list(&list)?;
     require_list(&base)?;
+    if !base.contains_key("root") {
+        return fail(400, "a base names root's commit");
+    }
     let Some(current) = db::list_of(db, &project.key, branch)? else {
         return fail(404, format!("no branch `{branch}` in {}", project.key));
     };
@@ -625,12 +869,33 @@ pub fn begin(
             format!("the base this merge names was never `{branch}`: merge onto what it is now"),
         );
     }
-    let Authorized { writes, anchor } = authorize_merge(project, db, caller, branch, &base, &list)?;
+    // The base is what its root commit pins, read here: every rule below
+    // compares it with the list, so a base the merger wrote cannot hide a
+    // tracker the merge moves.
+    let pinned = index_of(project, &base["root"], None).map_err(|_| {
+        HttpError::new(
+            409,
+            format!("the base this merge names was never `{branch}`: merge onto what it is now"),
+        )
+    })?;
+    if pinned != base {
+        return fail(
+            409,
+            format!(
+                "the base this merge names is not what root's commit {} pinned on `{branch}`: merge onto what `{branch}` is now",
+                base["root"]
+            ),
+        );
+    }
+    let reads = gather(project, db, caller, branch, &base, &list)?;
+    let Authorized { writes, anchor } =
+        authorize_merge(project, caller, &base, &list, None, &reads)?;
     let until = Instant::now() + PENDING;
     project.app.merges.lock().insert(
         key(&project.key, branch, &list),
         Pending {
             by: caller.login.clone(),
+            base,
             target: list,
             writes: writes.clone(),
             anchor: anchor.clone(),
@@ -678,12 +943,15 @@ struct RefMove {
 /// commits; when it moved, the server merges onto what it is now
 /// ([`crate::server_merge`]) and lands that.
 ///
-/// Each attempt reads the rules at the head it lands on, merges outside any
-/// lock, then holds the project, rechecks that the branch and its epoch are
-/// still what it merged onto and read the rules at, and lands. An attempt
-/// that loses the recheck starts again; after [`FAIR`] such losses, or for a
-/// change to the definitions (a barrier), the project is held before the
-/// merge, so it lands on the head it merged onto, by itself.
+/// Each attempt reads the rules at the head it merges onto, merges outside
+/// any lock, then holds the project and rechecks. If the branch moved again
+/// meanwhile and the landing in between changed other paths, the merge is
+/// re-made on the new head without merging again ([`reparent::onto`]); if it
+/// changed the same paths, the attempt starts again. What lands is
+/// authorized at the head it lands on, under the recheck's lock. After
+/// [`FAIR`] lost attempts a merge takes a turn on the paths it changes; a
+/// change to the definitions on `main` (a barrier) holds the project before
+/// it merges, so it lands on the head it merged onto, by itself.
 pub fn finish(
     project: &ProjectContext<'_>,
     db: DbGuard<'_>,
@@ -705,6 +973,13 @@ pub fn finish(
     let pending_key = key(&project.key, branch, list);
     let pending = project.app.merges.lock().get(&pending_key).cloned();
     let current = db::list_of(&db, &project.key, branch)?;
+    // Everything below until it lands reads Git, which the db lock is not
+    // held for: every other request on the server waits on it.
+    drop(db);
+    project
+        .app
+        .log
+        .wait_while(&format!("hold-finish-by-{}", caller.login));
     let landed_already = current
         .as_ref()
         .is_some_and(|current| landed_in(project, list, current));
@@ -721,10 +996,10 @@ pub fn finish(
                 format!("{} began this merge; only they may land it", pending.by),
             );
         }
-        if pending.target != *list {
+        if pending.target != *list || pending.base != *base {
             return fail(
                 400,
-                "this is not the index the merge began with: start the merge again",
+                "this is not the index the merge began with, on the base it began on: start the merge again",
             );
         }
     }
@@ -737,12 +1012,13 @@ pub fn finish(
         // A finish asked again, its answer lost: it landed, and is in place
         // (the list says so only once it is).
         return answer(
-            &db,
+            &project.app.db.lock(),
             project,
             branch,
             Vec::new(),
             pending.map_or_else(|| "root".to_owned(), |p| p.anchor),
             false,
+            0,
         );
     }
     let Some(pending) = pending else {
@@ -752,6 +1028,9 @@ pub fn finish(
         );
     };
     for (tracker, commit) in list {
+        if pending.base.get(tracker) == Some(commit) {
+            continue;
+        }
         if !repos::has_commit(&project.tracker(tracker).view(&caller.login)?, commit) {
             return fail(
                 400,
@@ -761,7 +1040,7 @@ pub fn finish(
             );
         }
     }
-    if index_of(project, &list["root"], Some(&caller.login))? != *list {
+    if index_from(project, &list["root"], Some(&caller.login), &pending.base)? != *list {
         return fail(
             400,
             "root's commit does not pin what this index says: push the root commit the merge made to its landing ref, then finish",
@@ -769,7 +1048,7 @@ pub fn finish(
     }
     if !repos::is_ancestor(
         &project.tracker("root").view(&caller.login)?,
-        &base["root"],
+        &pending.base["root"],
         &list["root"],
     ) {
         return fail(
@@ -789,42 +1068,77 @@ pub fn finish(
             roots.insert(home.clone());
         }
     }
-    let barrier = changes_definitions(project, &caller.login, base, list);
-    drop(db);
+    // Definitions are read from `main`: only there is a change to them a
+    // barrier.
+    let mut barrier =
+        branch == "main" && changes_definitions(project, &caller.login, &pending.base, list);
     let started = Instant::now();
+    let until = started + TURN_WAIT;
     // Another merge holding the roots longer than a landing waits is not a
     // refusal: this one waits for its turn, up to `TURN_WAIT` in all.
-    let waits = |error: &HttpError| landing::is_busy(error) && started.elapsed() < TURN_WAIT;
+    let waits = |error: &HttpError| landing::is_busy(error) && Instant::now() < until;
+    let merges = &project.app.merges;
     let mut lost = 0;
+    let mut runs = 0;
+    let mut touched: Option<Touch> = None;
+    let mut turn: Option<Turn<'_>> = None;
     loop {
-        // A barrier, or a merge that lost too often, holds its roots before
-        // it merges: it lands on the head it merged onto.
-        let turn = if barrier || lost >= FAIR {
+        if Instant::now() >= until {
+            return Err(landing::busy_merging(branch));
+        }
+        // A barrier holds its roots before it merges: it lands on the head
+        // it merged onto, by itself.
+        let held = if barrier {
             match project.app.log.hold(
                 project.app,
                 roots.clone(),
-                &format!("a merge into `{branch}` has a turn to itself"),
+                &format!("a change to the definitions is merging into `{branch}`"),
             ) {
-                Ok(turn) => Some(turn),
+                Ok(held) => Some(held),
                 Err(error) if waits(&error) => continue,
                 Err(error) => return Err(error),
             }
         } else {
             None
         };
+        // A merge that lost too often takes a turn on what it changes: no
+        // merge lands over those paths until it has. Others land beside it.
+        if !barrier
+            && lost >= FAIR
+            && turn.is_none()
+            && let Some(touch) = &touched
+        {
+            match merges.take_turn(&project.key, branch, touch.clone(), until) {
+                Some(taken) => turn = Some(taken),
+                None => return Err(landing::busy_merging(branch)),
+            }
+        }
         let attempt = Attempt {
             caller,
             branch,
-            base,
+            base: &pending.base,
             list,
             moves,
             pending: &pending,
             roots: &roots,
             barrier,
         };
-        match attempt.run(project, turn.as_ref()) {
-            Ok(Some(answered)) => return Ok(answered),
-            Ok(None) => lost += 1,
+        let outcome = attempt.run(project, held.as_ref(), turn.as_ref(), &mut runs, until);
+        drop(held);
+        match outcome {
+            Ok(Outcome::Landed(answered)) => return Ok(answered),
+            Ok(Outcome::Lost(touch)) => {
+                lost += 1;
+                if let (Some(turn), Some(touch)) = (&turn, &touch) {
+                    merges.widen(turn, touch);
+                }
+                touched = touch.or(touched);
+            }
+            Ok(Outcome::Yield(touch)) => {
+                touched = Some(touch);
+                merges.wait_turns(until);
+            }
+            Ok(Outcome::Barrier) => barrier = true,
             Err(error) if waits(&error) => lost += 1,
             Err(error) => return Err(error),
         }
@@ -835,8 +1149,8 @@ pub fn finish(
 /// answered busy (503): under the client's own minute.
 const TURN_WAIT: Duration = Duration::from_secs(40);
 
-/// How many times a merge loses the recheck before it holds its roots
-/// first (landing.md, *Landing* 6).
+/// How many times a merge loses the recheck before it takes a turn on what
+/// it changes (landing.md, *Landing* 6).
 const FAIR: usize = 3;
 
 /// Whether index `list` has landed on a branch now at `current`: it is the
@@ -888,6 +1202,41 @@ fn changes_definitions(project: &ProjectContext<'_>, by: &str, base: &List, list
     false
 }
 
+/// Who `caller` is to each of `names`, and where each is: read under the db
+/// lock for the merge to name only what the merger may read, and to keep
+/// content in its audience.
+fn seen_by<'n>(
+    project: &ProjectContext<'_>,
+    db: &Connection,
+    caller: &Caller,
+    names: impl IntoIterator<Item = &'n String>,
+) -> ApiResult<Seen> {
+    let names: BTreeSet<&String> = names.into_iter().collect();
+    let facts = project.definitions(db, names.iter().map(|name| name.as_str()))?;
+    let who = project.who(caller);
+    let mut seen = Seen::default();
+    for name in names {
+        seen.stores
+            .insert(name.clone(), project.tracker(name).store.clone());
+        let Some(fact) = facts.get(name.as_str()) else {
+            continue;
+        };
+        let (who, _) = project.who_for(db, fact, &who)?;
+        if policy::decide(
+            &project.repo_of(name),
+            false,
+            &who,
+            Some(fact),
+            &policy::Context::default(),
+        )
+        .is_ok()
+        {
+            seen.readable.insert(name.clone());
+        }
+    }
+    Ok(seen)
+}
+
 /// One attempt to finish a merge.
 struct Attempt<'a> {
     caller: &'a Caller,
@@ -900,14 +1249,29 @@ struct Attempt<'a> {
     barrier: bool,
 }
 
+/// How an attempt ended.
+enum Outcome {
+    /// Landed: its answer.
+    Landed(ApiResponse),
+    /// What landed meanwhile changed what it changes, or the definitions:
+    /// merge again. What it changed, when it got that far.
+    Lost(Option<Touch>),
+    /// A turn holds what it changes: wait for that, then merge again.
+    Yield(Touch),
+    /// What it would land changes the definitions on `main`: merge again,
+    /// holding the project first.
+    Barrier,
+}
+
 impl Attempt<'_> {
-    /// Landed (its answer), or `None`: something landed on the branch, or
-    /// changed the definitions, between its merge and its recheck.
     fn run(
         &self,
         at: &ProjectContext<'_>,
-        turn: Option<&Hold<'_>>,
-    ) -> ApiResult<Option<ApiResponse>> {
+        held: Option<&Hold<'_>>,
+        turn: Option<&Turn<'_>>,
+        runs: &mut usize,
+        until: Instant,
+    ) -> ApiResult<Outcome> {
         let app = at.app;
         let login = &self.caller.login;
         let branch = self.branch;
@@ -926,12 +1290,22 @@ impl Attempt<'_> {
                 Vec::new(),
                 self.pending.anchor.clone(),
                 false,
+                *runs,
             )
-            .map(Some);
+            .map(Outcome::Landed);
         }
         let epoch = db::epoch(&db, &project.key)?;
-        // The rules at the head it lands on, never at its base.
-        let authorized = authorize_merge(&project, &db, self.caller, branch, self.base, self.list)?;
+        let reads = gather(&project, &db, self.caller, branch, self.base, self.list)?;
+        let seen = seen_by(
+            &project,
+            &db,
+            self.caller,
+            head.keys().chain(self.list.keys()).chain(self.base.keys()),
+        )?;
+        drop(db);
+        // The rules at the head it merges onto, never at its base.
+        let authorized =
+            authorize_merge(&project, self.caller, self.base, self.list, None, &reads)?;
         if !within(&authorized.anchor, &self.pending.anchor) {
             return fail(
                 409,
@@ -939,42 +1313,101 @@ impl Attempt<'_> {
             );
         }
         let asked = check_moves(self.moves, &authorized.writes, branch, self.list)?;
-        drop(db);
-        // Merged outside any lock, unless it has its turn.
-        let merged = if head == *self.base {
-            None
+        // Merged outside any lock, unless it holds its roots: a fast-forward
+        // when the branch did not move; re-made on the head when what landed
+        // since changed other paths; Git's merge otherwise.
+        let mut made = Made::default();
+        let (target, ours) = if head == *self.base {
+            let ours = Touch::between(&project, login, &head, self.list)?;
+            (self.list.clone(), ours)
         } else {
-            Some(crate::server_merge::merge(
-                &project, login, branch, self.base, &head, self.list,
-            )?)
+            let mine = Touch::between(&project, login, self.base, self.list)?;
+            let theirs = Touch::meeting(&project, login, self.base, &head, &mine)?;
+            if mine.overlap(&theirs).is_none() {
+                let target = reparent::onto(
+                    &project, login, branch, self.base, self.list, &head, &mine, &theirs, &mut made,
+                )?;
+                (target, mine)
+            } else {
+                *runs += 1;
+                let merged = crate::server_merge::merge(
+                    &project, login, branch, self.base, &head, self.list, &seen,
+                )?;
+                made = merged.made;
+                let ours = Touch::between(&project, login, &head, &merged.list)?;
+                (merged.list, ours)
+            }
         };
-        let target = merged
-            .as_ref()
-            .map_or_else(|| self.list.clone(), |merged| merged.list.clone());
+        // What lands, authorized at the head it lands on: what the merge
+        // made (a file another landing moved into a tracker, carrying the
+        // merger's edit) is the merger's change too.
+        let landing = self.lands(&project, &head, &target)?;
         app.log.pause(&format!("delay-merge-by-{login}"));
-        let own = match turn {
+        // Its roots, waited for as long as its turn allows: the merge it
+        // made stays good while it waits.
+        let own = match held {
             Some(_) => None,
-            None => Some(app.log.hold(
-                app,
-                self.roots.clone(),
-                &format!("a merge into `{branch}` is placing its commits"),
-            )?),
+            None => loop {
+                match app.log.hold(
+                    app,
+                    self.roots.clone(),
+                    &format!("a merge into `{branch}` is placing its commits"),
+                ) {
+                    Ok(hold) => break Some(hold),
+                    Err(error) if landing::is_busy(&error) && Instant::now() < until => {}
+                    Err(error) => return Err(error),
+                }
+            },
         };
-        let Some(hold) = turn.or(own.as_ref()) else {
+        let Some(hold) = held.or(own.as_ref()) else {
             return Err(HttpError::internal("a merge landed without its roots held"));
         };
+        // The recheck. The roots are held, so nothing lands on the branch
+        // until this does or gives up.
         let db = app.db.lock();
-        // The recheck: nothing landed on the branch, and the definitions did
-        // not change, since it merged and read the rules.
-        if db::list_of(&db, &project.key, branch)?.as_ref() != Some(&head)
-            || db::epoch(&db, &project.key)? != epoch
+        let now = db::list_of(&db, &project.key, branch)?;
+        let same =
+            db::epoch(&db, &project.key)? == epoch && members_held(&db, login, &landing.reads)?;
+        drop(db);
+        let Some(now) = now.filter(|_| same) else {
+            return Ok(Outcome::Lost(Some(ours)));
+        };
+        if app
+            .merges
+            .blocked(&project.key, branch, turn.map(|turn| turn.id), &ours)
         {
-            return Ok(None);
+            return Ok(Outcome::Yield(ours));
         }
+        let (target, landing) = if now == head {
+            (target, landing)
+        } else {
+            // Something landed since it merged: re-made on it when that
+            // changed other paths, merged again when it changed these.
+            let theirs = Touch::meeting(&project, login, &head, &now, &ours)?;
+            if theirs.overlap(&ours).is_some() {
+                return Ok(Outcome::Lost(Some(ours)));
+            }
+            let target = reparent::onto(
+                &project, login, branch, &head, &target, &now, &ours, &theirs, &mut made,
+            )?;
+            let landing = self.lands(&project, &now, &target)?;
+            (target, landing)
+        };
+        if landing.bumps && !self.barrier {
+            return Ok(Outcome::Barrier);
+        }
+        let db = app.db.lock();
+        if db::list_of(&db, &project.key, branch)?.as_ref() != Some(&now)
+            || db::epoch(&db, &project.key)? != epoch
+            || !members_held(&db, login, &landing.reads)?
+        {
+            return Ok(Outcome::Lost(Some(ours)));
+        }
+        let project = ProjectContext::load(app, &db, self.caller, &at.id)?;
         let asked = follow(&project, login, asked, self.list, &target);
-        let mut prepared = prepare(&project, &db, login, branch, &head, &target, &asked)?;
-        if let Some(change) = prepared.landing.entry.homes.get_mut(&project.key)
-            && self.barrier
+        let mut prepared = prepare(&project, &db, login, branch, &now, &target, &asked)?;
+        if landing.bumps
+            && let Some(change) = prepared.landing.entry.homes.get_mut(&project.key)
         {
             change.epoch = Some(epoch + 1);
         }
@@ -1004,18 +1437,20 @@ impl Attempt<'_> {
                 landed.pending,
             ),
             Err(error) if error.status == 409 => {
-                let now = db::list_of(&db, &project.key, branch)?;
-                if now.as_ref() == Some(&target) {
+                let after = db::list_of(&db, &project.key, branch)?;
+                if after.as_ref() == Some(&target) {
                     // Landed by an earlier ask whose answer was lost.
                     (Vec::new(), None)
-                } else if now.as_ref() != Some(&head) || db::epoch(&db, &project.key)? != epoch {
-                    return Ok(None);
+                } else if after.as_ref() != Some(&now) || db::epoch(&db, &project.key)? != epoch {
+                    return Ok(Outcome::Lost(Some(ours)));
                 } else {
                     return Err(error);
                 }
             }
             Err(error) => return Err(error),
         };
+        // The entry names what the server made: the landing moves its refs.
+        made.landed();
         db.execute(
             "DELETE FROM grants WHERE token_id = ? AND refs = 'refs/newgit/landing/'",
             [&self.caller.token_id],
@@ -1035,8 +1470,9 @@ impl Attempt<'_> {
             &project,
             branch,
             behind,
-            authorized.anchor,
-            merged.is_some(),
+            landing.rules.anchor,
+            target != *self.list,
+            *runs,
         )?;
         if let Some(pending) = pending {
             // It landed: readers see it. Only removing what it moved from
@@ -1045,8 +1481,39 @@ impl Attempt<'_> {
                 "landed; removing what it moved from where it was failed ({pending}) and is tried again at each landing on this project and when the server starts"
             ));
         }
-        Ok(Some(answered))
+        Ok(Outcome::Landed(answered))
     }
+
+    /// The rules for landing `target` on `head`: read under the db lock,
+    /// decided without it. A 403 names the tracker the merge would change.
+    fn lands(&self, project: &ProjectContext<'_>, head: &List, target: &List) -> ApiResult<Lands> {
+        let db = project.app.db.lock();
+        let reads = gather(project, &db, self.caller, self.branch, head, target)?;
+        drop(db);
+        let rules = authorize_merge(
+            project,
+            self.caller,
+            head,
+            target,
+            Some(self.branch),
+            &reads,
+        )?;
+        let bumps =
+            self.branch == "main" && changes_definitions(project, &self.caller.login, head, target);
+        Ok(Lands {
+            rules,
+            reads,
+            bumps,
+        })
+    }
+}
+
+/// What landing a merge's result on a head may do.
+struct Lands {
+    rules: Authorized,
+    reads: Reads,
+    /// It changes the definitions on `main`: a barrier, bumping the epoch.
+    bumps: bool,
 }
 
 /// The asked moves of a merge the server merged: a tracker branch asked to
@@ -1166,6 +1633,10 @@ fn prepare(
             tracker: tracker.clone(),
             store: db::tracker_store(db, &project.key, tracker)?,
         });
+        // A commit already on the branch waits nowhere and goes nowhere.
+        if base.get(tracker) == Some(commit) {
+            continue;
+        }
         // Its landing ref goes once the commit is on the branch.
         change
             .refs
@@ -1273,6 +1744,7 @@ fn answer(
     behind: Vec<String>,
     anchor: String,
     merged: bool,
+    server_merges: usize,
 ) -> ApiResult<ApiResponse> {
     let mut found = db::branches(db, &project.key)?
         .into_iter()
@@ -1281,6 +1753,9 @@ fn answer(
     found["behind"] = json!(behind);
     found["anchor"] = json!(anchor);
     found["merged"] = json!(merged);
+    // How many times the server ran Git's merge for this finish: 0 for a
+    // fast-forward, or a merge re-made on a head that moved without one.
+    found["server_merges"] = json!(server_merges);
     Ok(ApiResponse {
         status: 200,
         body: found,
@@ -1347,6 +1822,48 @@ fn check_moves(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn root_paths(paths: &[&str]) -> Touch {
+        Touch(
+            [(
+                "root".to_owned(),
+                reparent::Own::Paths {
+                    paths: paths.iter().map(|path| (*path).to_owned()).collect(),
+                    gone: BTreeSet::new(),
+                },
+            )]
+            .into(),
+        )
+    }
+
+    #[test]
+    fn a_turn_holds_only_the_paths_its_merge_changes() {
+        let merges = Merges::default();
+        let soon = Instant::now() + Duration::from_secs(1);
+        let turn = merges
+            .take_turn("jack/store", "main", root_paths(&["a.md"]), soon)
+            .expect("a turn");
+        assert!(merges.blocked("jack/store", "main", None, &root_paths(&["a.md"])));
+        assert!(!merges.blocked("jack/store", "main", None, &root_paths(&["b.md"])));
+        assert!(!merges.blocked("jack/store", "dev", None, &root_paths(&["a.md"])));
+        assert!(!merges.blocked("other/project", "main", None, &root_paths(&["a.md"])));
+        // Its own turn, and a turn taken after it, never hold it back.
+        assert!(!merges.blocked("jack/store", "main", Some(turn.id), &root_paths(&["a.md"])));
+        // Another merge on other paths takes its own turn at once; one on
+        // the same paths waits for the first to be given up.
+        assert!(
+            merges
+                .take_turn("jack/store", "main", root_paths(&["b.md"]), soon)
+                .is_some()
+        );
+        assert!(
+            merges
+                .take_turn("jack/store", "main", root_paths(&["a.md"]), Instant::now())
+                .is_none()
+        );
+        drop(turn);
+        assert!(!merges.blocked("jack/store", "main", None, &root_paths(&["a.md"])));
+    }
 
     #[test]
     fn anchors_are_the_lowest_common_tracker() {

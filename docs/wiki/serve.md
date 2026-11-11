@@ -121,12 +121,17 @@ What differs is the machinery, and it is the reason to run it:
   began, the branch fast-forwards to your own commits. When something did,
   the server merges your work onto it, as GitHub's merge button does: one
   merge commit in each tracker both of you changed, your commit its second
-  parent, and your commits as you made them everywhere else. You are told
-  to merge again only for a real conflict, and the answer names each file.
-  Who may merge what is read at the state your merge lands on, so someone
-  removed as a maintainer while your merge ran does not land it. A merge in
-  flight is kept in memory, so restarting the server tells its merger to
-  start the merge over.
+  parent, and your commits as you made them everywhere else; `newgit merge`
+  says so, with the commit. You are told to merge again only for a real
+  conflict, and the answer names each file you may read. What lands is
+  checked against the rules at the state it lands on, so someone removed
+  as a maintainer or member while your merge ran does not land it, and a
+  merge that would put your edit in a tracker you may not change (because
+  someone moved the file there) is refused, naming the tracker. A merge
+  never carries content into a tracker more people may read: if someone
+  moved a file into one while you edited it, bring `main` in and make the
+  move yours. A merge in flight is kept in memory, so restarting the server
+  tells its merger to start the merge over.
 
 What it does not do yet:
 
