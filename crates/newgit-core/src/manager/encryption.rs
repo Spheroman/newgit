@@ -516,7 +516,11 @@ impl BranchManager {
     /// started at) counts too: the history a fork starts with is never made
     /// again, and a narrower fork's first send encrypts its content to its
     /// own audience in a commit on top of it, which every reader of the
-    /// fork could read already.
+    /// fork could read already. That is safe only because a fork's audience
+    /// is never wider than its upstream's (the client's ceiling, held on
+    /// `serve` by `cap_forks`): were it wider, what this counts as present
+    /// would be history the fork's readers could not read, never sent to
+    /// them in a form they could.
     pub(super) fn remote_has(&self, tracker: &str) -> Vec<String> {
         let mut out = Vec::new();
         let mut seen = std::collections::BTreeSet::new();

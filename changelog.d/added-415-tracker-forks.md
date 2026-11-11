@@ -11,8 +11,11 @@
   and dropping or changing `from` doesn't lift that. The client refuses it at
   creation, in every command but `tracker list` and `tracker remove` (which
   show and fix it), and in any commit that changes definitions, merges
-  included. `serve` records what each fork's repo was made from and serves
-  the fork with that upstream's audience, whatever its definition says.
+  included. `serve` records what each fork's repo was made from and never serves
+  the fork wider than that upstream, whatever its definition says: a wider
+  fork is served with the upstream's audience, and one the upstream isn't
+  ordered with (`user:jack` under `user:bob`) isn't defined, so nothing
+  moves to readers who never had it.
   Against newgit.dev's Worker only the client checks. A fork of an
   encrypted tracker is encrypted to its own audience: a narrower one's first
   sync encrypts it again to its own recipients. `tracker list` shows what

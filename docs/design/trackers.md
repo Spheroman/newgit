@@ -341,10 +341,15 @@ newgit tracker create staging-db --role db --from local-db
     hidden from every Git request so no push moves or deletes it. As it reads
     definitions it holds every fork to both the upstream `from` names and the
     recorded one, until nothing changes, and says so when it refuses a read:
-    every rule and every store then sees it no wider. A fork whose ceiling
-    can't be settled is not defined (readers are told so): an upstream that
-    isn't defined, a cycle, a chain more than 64 forks long, a linked fork
-    whose home can't be read, or two upstreams no one audience fits under.
+    every rule and every store then sees it no wider. Against each upstream
+    a fork within it is left alone, and one the upstream is within is
+    narrowed to the upstream's audience; capping only ever narrows. A fork
+    whose ceiling can't be settled is not defined (readers are told so): an
+    upstream that isn't defined, an upstream it is not ordered with
+    (`user:jack` under an upstream narrowed to `user:bob`: moving it would
+    hand jack's own commits to bob), a cycle, a chain more than 64 forks
+    long, a linked fork whose home can't be read, or two upstreams no one
+    audience fits under. Each holds down a chain of forks too.
   - *newgit.dev's Worker* has no record and no cap: only the client checks
     the ceiling there, and a definition landed past it is served as written.
 - **A fork is never detached (decided).** Its history stays its upstream's,
@@ -360,8 +365,12 @@ newgit tracker create staging-db --role db --from local-db
   narrower one is made in its own audience's store, which fetches only what
   the upstream's `main` reaches (the upstream's branches are copied, and a
   tracker outside Git has only `main` today): all of it readable by that
-  audience already, so nothing is written into a store whose readers could
-  not read it. The copy runs before the landing that makes the fork, which
+  audience when the fork was checked, so nothing is written into a store
+  whose readers could not read it then. The check and the copy are not one
+  step: the copy runs after the db lock is let go of, so an upstream
+  narrowed, or a caller who loses access, in between leaves those commits
+  in the narrower store (`serve.md`, *Known limits*). The copy runs before
+  the landing that makes the fork, which
   writes its starting refs and its record of the upstream with its row, so
   a fork is there whole or not at all, and the next write makes one that
   isn't. What the fork gains after that stays in its own store. newgit.dev's Worker takes the history as the
@@ -373,7 +382,9 @@ newgit tracker create staging-db --role db --from local-db
   its own recipients, in a commit on top: everything it gains is readable
   by its audience alone. The client counts what the remote has of a fork's
   upstream as what it has of the fork, since the fork's repo starts there,
-  so that history is never made again. Both encrypt the upstream's paths,
+  so that history is never made again. That is safe only because a fork is
+  never wider than its upstream: counting a wider fork's upstream history
+  as sent would leave readers of the fork history they cannot read. Both encrypt the upstream's paths,
   so the guard on paths that held encrypted content never holds a fork
   back.
 - **Only a tracker outside Git can be forked yet.** Every instance's view
@@ -1615,6 +1626,16 @@ CLI, the narrow-audience warning, `.gitignore` as definition, and
 - **Imported histories.** Import (#140), export as a root (#141), and pull
   back (#142) are built; bringing the real t3code in, and measuring its
   cold start, is #144.
+- **A fork removed and made again under the same name.** `tracker remove`
+  deletes this machine's record of what a fork started at, but `serve`'s
+  record (`refs/newgit/from/<upstream>`) lives as long as the repo does, so
+  a tracker re-added under that name (say `public`) is still capped to the
+  old upstream's audience while the client believes it is what its
+  definition says. It fails closed, but silently: nothing tells the client
+  the server capped it. The server says so only when it refuses a read.
+  Telling the client in its sync and merge output, naming the upstream on
+  record, needs the server to hand the capped facts back on a write, which
+  nothing does yet.
 - **Per-user trackers.** A per-user tracker's `main` reaches the remote only
   as a side effect of some instance's checkpoint (#224).
 - **Sparse checkouts.** Restoring a dirty checkpoint writes files into a

@@ -164,18 +164,25 @@ fn audience_name(audience: &Audience) -> String {
 /// Hold every fork to its upstream's audience, whatever its definition
 /// says. The client refuses a definition that widens a fork, but the
 /// definitions the server reads are commits anyone governing them made, so
-/// here a fork wider than an upstream is read with that upstream's audience
-/// (and says why, in `capped`): every rule, every store, and every read then
-/// treats it as no wider than the history it holds. Its upstreams are the
-/// one `from` names and the one its repo was made from ([`Facts::recorded_from`]),
-/// so dropping or changing `from` lifts nothing.
+/// here every fork is checked against each of its upstreams: the one `from`
+/// names and the one its repo was made from ([`Facts::recorded_from`]), so
+/// dropping or changing `from` lifts nothing. Against each, one of three:
 ///
-/// Capping only ever narrows, so this runs until nothing changes, bounded by
-/// how many times every audience can narrow. A fork that is undefined
-/// afterwards is left out, as an undefined tracker is, so readers are told
-/// it is not defined: one whose upstream is not defined, one in a cycle of
-/// forks, and one held to two upstreams no one audience fits under. A
-/// linked fork's policy is its home's, capped there.
+/// - the fork is within the upstream ([`audience_within`]): left as it is;
+/// - the upstream is within the fork: the fork is read with the upstream's
+///   audience (and says why, in `capped`), so every rule, every store, and
+///   every read treats it as no wider than the history it holds;
+/// - the two are not ordered (`user:bob` and `user:jack`, or `user` and
+///   `user:bob`): the fork is left out, as an undefined tracker is. Moving
+///   it to the upstream's audience would hand its own commits to readers
+///   who never had them.
+///
+/// So capping only ever narrows, and this runs until nothing changes. A fork
+/// that is undefined afterwards is left out too, so readers are told it is
+/// not defined: one whose upstream is not defined (or was itself left out,
+/// down a chain of forks), one in a cycle of forks, and one held to two
+/// upstreams no one audience fits under. A linked fork's policy is its
+/// home's, capped there.
 pub fn cap_forks(facts: &mut BTreeMap<String, Facts>) {
     let upstreams = |fork: &Facts| -> Vec<String> {
         let mut all: Vec<String> = fork
@@ -209,10 +216,9 @@ pub fn cap_forks(facts: &mut BTreeMap<String, Facts>) {
     for name in cyclic {
         facts.remove(&name);
     }
-    // An audience narrows at most twice (`public`, `project-devs`, then a
-    // user); a fork capped more often than that is held to two upstreams
-    // no one audience fits under, and is left out.
-    let mut narrowed: BTreeMap<String, usize> = BTreeMap::new();
+    // Every change either removes a fork or strictly narrows one (an
+    // audience narrows at most twice: `public`, `project-devs`, then a
+    // user), so this settles within the bound.
     let rounds = 3 * facts.len() + 2;
     for _round in 0..rounds {
         let mut changed = false;
@@ -231,6 +237,11 @@ pub fn cap_forks(facts: &mut BTreeMap<String, Facts>) {
                 if audience_within(&fork.audience, &upstream) {
                     continue;
                 }
+                if !audience_within(&upstream, &fork.audience) {
+                    facts.remove(&name);
+                    changed = true;
+                    break;
+                }
                 fork.capped = Some(format!(
                     "`{name}` is a fork of `{from}`, and its definition makes it `{}`, wider \
                      than `{from}`'s `{}`: it is served as `{}`, since its history holds \
@@ -241,12 +252,6 @@ pub fn cap_forks(facts: &mut BTreeMap<String, Facts>) {
                 ));
                 fork.audience = upstream;
                 changed = true;
-                let times = narrowed.entry(name.clone()).or_default();
-                *times += 1;
-                if *times > 2 {
-                    facts.remove(&name);
-                    break;
-                }
             }
         }
         if !changed {

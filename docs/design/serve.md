@@ -144,15 +144,23 @@ Resolved loudly; each is reversible.
      second first write never moves what the first one started. The record
      is hidden from every Git request (`transfer.hideRefs`), so no push
      moves or deletes it. One user's own fork (`audience = "user"`) has no
-     row and no landing: its starting refs and record are one ref
-     transaction, and a repo with neither is started again on the next
-     write. Its store is never wider, because the definitions are read with
-     every fork held to the upstream its definition names and to the
-     recorded one (`policy::cap_forks`, run until nothing changes, wherever
-     definitions are read, a landing's included): a fork whose definition
-     says wider, or drops `from`, is served as its upstream's audience, and
-     one whose ceiling can't be settled (an upstream not defined, a cycle, a
-     linked fork whose home can't be read) is not defined.
+     row and no landing: per-user repos have neither a row nor a landing on
+     `main` for anything, so its fork is made outside the landing log too,
+     and what makes it crash-safe is that its starting refs and record are
+     one create-only ref transaction (nothing as their old value), so a
+     repo with neither is started again on the next write and one with
+     both is never started twice. Its store is never wider, because the
+     definitions are read with every fork held to the upstream its
+     definition names and to the recorded one (`policy::cap_forks`, run
+     until nothing changes, wherever definitions are read, a landing's
+     included). Against each upstream: a fork within it is left alone; one
+     the upstream is within (its definition says wider, or drops `from`)
+     is served as the upstream's audience; one not ordered with it
+     (`user:jack` under `user:bob`) is not defined, since moving it would
+     hand its own commits to readers who never had them. Capping only ever
+     narrows. One whose ceiling can't be settled otherwise (an upstream not
+     defined, a cycle, a linked fork whose home can't be read) is not
+     defined either.
    - **A private instance, an embargo, has a store of its own**, as does
      each user's content: its shape is the secret.
    - **A new tracker's seed is alone** in `tracker/<name>` until it joins a
@@ -338,6 +346,15 @@ Resolved loudly; each is reversible.
   would be readable by the wider audience before it was allowed to be), so
   its first copy into the wider store holds that project's landings (not
   reads, not other projects) while it runs.
+- **A narrower fork's start is checked, then copied.** Whether the fork
+  is within its upstream and whether the caller may read the upstream are
+  checked under the db lock, and the upstream's commits are fetched into
+  the narrower store by id after it is let go of (`ForkStart::place`). An
+  upstream narrowed, or a caller who loses access, in between (or a
+  landing that then fails) leaves those commits in the narrower store,
+  whose readers could read them at check time. Re-checking under the
+  landing needs the landing to take a precondition on another tracker's
+  facts, which it does not yet.
 - **One log per server.** Moving a set of homes to another node means
   splitting the log, which nothing does yet. A landing that touches a
   linked tracker on another server is two landings (landing.md), each in
