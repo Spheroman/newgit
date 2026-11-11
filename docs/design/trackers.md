@@ -317,24 +317,57 @@ newgit tracker create staging-db --role db --from local-db
   everything its upstream had, so it may be read by no one the upstream's
   audience does not include: the same audience, or one inside it (`public`
   holds every audience, `project-devs` holds `user` and `user:<login>`, which
-  the remote serves to members only; any other two are not ordered). Refused
-  at creation, naming both audiences, and after it wherever definitions are
-  checked: every load of the definitions, and split, which refuses a commit
-  changing definitions into a fork wider than its upstream. The upstream
-  cannot be removed while a fork names it. On `newgit serve` the definitions
-  read are whatever commits their governors landed, so the server holds every
-  fork to its upstream's audience as it reads them (and says so when it
-  refuses one): every rule and every store then sees it no wider. A fork
-  whose upstream is not defined is read as undefined.
+  the remote serves to members only; any other two are not ordered). The
+  ceiling belongs to the history, not to the definition's `from` line, so
+  dropping or changing `from` lifts nothing. Where it is held:
+  - *The client* refuses it at creation, naming both audiences. After that,
+    every command but `tracker list` and `tracker remove` (which can fix it)
+    refuses while a fork's definition breaks it, and says what to type: a
+    fork wider than its upstream, one whose upstream is not defined, forks in
+    a cycle, or one whose `from` was dropped or changed while its audience is
+    wider than what it started at. What it started at is this machine's
+    record, `refs/newgit/forks/<fork>/<upstream>` in
+    `.newgit/local/trackers.git`, written when the fork is made and whenever
+    a definition saying `from` is read. Split refuses any commit whose
+    definitions differ from any parent's and break the ceiling, held to its
+    parents' forks, every earlier commit's in the same push, and those
+    records; a merge's result is checked whole, since one side adding a fork
+    and the other narrowing its upstream are each fine alone. The upstream
+    can't be removed while a fork names it or is recorded as started at it.
+    This is a convenience for the developer, not a boundary: a client can be
+    bypassed.
+  - *`newgit serve`* is the boundary. When it makes a fork's repo it records
+    the upstream as `refs/newgit/from/<upstream>` in the fork's namespace,
+    hidden from every Git request so no push moves or deletes it. As it reads
+    definitions it holds every fork to both the upstream `from` names and the
+    recorded one, until nothing changes, and says so when it refuses a read:
+    every rule and every store then sees it no wider. A fork whose ceiling
+    can't be settled is not defined (readers are told so): an upstream that
+    isn't defined, a cycle, a chain more than 64 forks long, a linked fork
+    whose home can't be read, or two upstreams no one audience fits under.
+  - *newgit.dev's Worker* has no record and no cap: only the client checks
+    the ceiling there, and a definition landed past it is served as written.
+- **A fork is never detached (decided).** Its history stays its upstream's,
+  so nothing makes it stop being a fork: to share something more widely,
+  make a new tracker (`newgit tracker create <name>`) and capture into it
+  only what may be shared. The server's record lives as long as the fork's
+  repo does.
 - **A narrower fork lives in the narrower store.** On `serve` a fork's repo
-  is made on its first sync, starting at its upstream's branches. With the
+  is made on its first sync, starting at its upstream's branches, and is
+  checked first: refused, before anything is made or copied, when the fork is
+  wider than its upstream or the caller may not read the upstream. With the
   same audience that is a namespace in the upstream's store, refs alone. A
   narrower one is made in its own audience's store, which fetches only what
-  the upstream's `main` reaches: all of it readable by that audience already,
-  so nothing is written into a store whose readers could not read it. What
-  the fork gains after that stays in its own store. newgit.dev's Worker
-  takes the history as the sync uploads it (a copy), and only the client
-  checks the ceiling there.
+  the upstream's `main` reaches (the upstream's branches are copied, and a
+  tracker outside Git has only `main` today): all of it readable by that
+  audience already, so nothing is written into a store whose readers could
+  not read it. A copy that fails leaves the repo unstarted (no branch, no
+  record), and the next write starts it again. What the fork gains after
+  that stays in its own store. newgit.dev's Worker takes the history as the
+  sync uploads it (a copy).
+- **An encrypted upstream (#429).** A fork of an encrypted tracker with a
+  narrower audience has its content re-encrypted to its own recipients on
+  its first sync, so it shares no ciphertext history with its upstream.
 - **Only a tracker outside Git can be forked yet.** Every instance's view
   holds every tracker in Git its user may read, so two members in Git at one
   mount would collide; `--git --from <tracker>` says so. Forking one in Git
@@ -1585,11 +1618,9 @@ CLI, the narrow-audience warning, `.gitignore` as definition, and
   needing supabase running) cannot be expressed (#54). Reviewing a change
   places each tracker it touched locally or in the preview; settled in
   [remote.md](remote.md), *Reviewing a change* (#229).
-- **Forks.** The ceiling lives in the fork's definition (`from`), so a
-  definition change that drops `from` lifts it; whoever governs the fork's
-  definition (by default the owner, who governs the upstream's too) can do
-  that. Recording forks on the server, so dropping `from` is refused too,
-  is open (#415).
+- **Forks on newgit.dev.** The Worker keeps no record of what a fork was
+  made from and doesn't cap it, so there only the client holds the ceiling
+  (#415). `newgit serve` does both (*Binding*).
 - **The model itself.** The rest of #201: every tracker the same kind of
   thing, rooted at the user. The engine is built; what remains is step 7
   above, and the per-remote redesign under *Users, remotes, and trust*.

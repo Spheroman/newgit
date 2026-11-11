@@ -429,7 +429,7 @@ enum TrackerCommand {
         /// A tracker in Git: committed content with its own history, carved out
         /// of whichever tracker owns its paths now (usually root), or with
         /// --from, brought in from another repository
-        #[arg(long, requires = "place")]
+        #[arg(long)]
         git: bool,
         /// With --git: the one directory to carve out and mount the new tracker
         /// at. Paths of a tracker outside Git are added with `tracker track`
@@ -2165,9 +2165,19 @@ fn shell_quote(value: &str) -> String {
     }
 }
 
+/// Whether `--from` names a repository (a URL, `host:path`, or a directory
+/// here) rather than a tracker.
+fn looks_like_repository(from: &str) -> bool {
+    from.contains("://")
+        || from.ends_with(".git")
+        || from.starts_with("git@")
+        || std::path::Path::new(from).is_dir()
+}
+
 /// `given`, a tracker as typed here, as its id: a path from where this runs.
 fn tracker_id(given: &str) -> Result<String> {
-    let manager = BranchManager::open(context_here()?.store)?;
+    // Opened to repair: naming a tracker is how `tracker remove` starts.
+    let manager = BranchManager::open_to_repair(context_here()?.store)?;
     Ok(manager.resolve_tracker(&current_dir()?, given)?)
 }
 
@@ -2216,6 +2226,30 @@ fn tracker(mut command: TrackerCommand) -> Result<()> {
             from_branch,
             ..
         } => {
+            let manager = manager_here()?;
+            // Said first: a tracker named here is a fork, whatever else the
+            // command lacks for an import.
+            if !std::path::Path::new(&from).exists()
+                && let Ok(id) = manager.resolve_tracker(&current_dir()?, &from)
+                && let Some(named) = manager
+                    .tracker_definitions()
+                    .iter()
+                    .chain(manager.carved_trackers())
+                    .find(|d| d.name == id)
+            {
+                if named.git {
+                    bail!(
+                        "`{from}` is a tracker here, not a repository: --git --from imports \
+                         another repository. `{from}` is a tracker in Git, and only a tracker \
+                         outside Git can be forked yet"
+                    );
+                }
+                bail!(
+                    "`{from}` is a tracker here, not a repository: --git --from imports another \
+                     repository. To fork it, leave out --git: `newgit tracker create {name} \
+                     --from {from}`"
+                );
+            }
             let Some(mount) = mount.filter(|_| path.is_empty()) else {
                 bail!(
                     "an imported tracker is placed with --mount, not --path (its files keep their \
@@ -2228,22 +2262,7 @@ fn tracker(mut command: TrackerCommand) -> Result<()> {
                 Ok(local) => local.to_string_lossy().into_owned(),
                 Err(_) => from,
             };
-            let manager = manager_here()?;
             let audience = audience.unwrap_or_else(|| "project-devs".to_owned());
-            if !std::path::Path::new(&from).exists()
-                && manager
-                    .resolve_tracker(&current_dir()?, &from)
-                    .is_ok_and(|id| {
-                        manager.tracker_definitions().iter().any(|d| d.name == id)
-                            || manager.carved_trackers().iter().any(|d| d.name == id)
-                    })
-            {
-                bail!(
-                    "`{from}` is a tracker here, and only a tracker outside Git can be forked yet \
-                     (`newgit tracker create {name} --from {from}`, without --git). --git --from \
-                     imports another repository"
-                );
-            }
             let outcome = manager.import_git_tracker(
                 &name,
                 &audience,
@@ -2282,6 +2301,15 @@ fn tracker(mut command: TrackerCommand) -> Result<()> {
             path,
             ..
         } => {
+            // Checked here rather than by the parser, so that `--git --from
+            // <tracker>` is told about the tracker first.
+            if path.is_empty() {
+                bail!(
+                    "a tracker in Git is carved out of a directory: `newgit tracker create {name} \
+                     --git --path <dir>`, or imported with `--git --mount <dir> --from \
+                     <repository>`"
+                );
+            }
             let manager = manager_here()?;
             let audience = audience.unwrap_or_else(|| "project-devs".to_owned());
             let outcome = manager.create_git_tracker(&name, &audience, &path)?;
@@ -2330,8 +2358,25 @@ fn tracker(mut command: TrackerCommand) -> Result<()> {
                      --mount (`newgit tracker create {name} --from {from}`)"
                 );
             }
-            let upstream = tracker_id(&from)?;
             let manager = manager_here()?;
+            let defined = |id: &str| {
+                manager
+                    .tracker_definitions()
+                    .iter()
+                    .chain(manager.carved_trackers())
+                    .any(|d| d.name == id)
+            };
+            let upstream = match manager.resolve_tracker(&current_dir()?, &from) {
+                Ok(upstream) if defined(&upstream) || !looks_like_repository(&from) => upstream,
+                // A repository, not a tracker: that is an import.
+                Ok(_) | Err(_) if looks_like_repository(&from) => bail!(
+                    "`{from}` is a repository, not a tracker here: without --git, --from names a \
+                     tracker to fork. To import a repository, add --git and --mount <dir> \
+                     (`newgit tracker create {name} --git --mount <dir> --from {from}`)"
+                ),
+                Ok(upstream) => upstream,
+                Err(error) => return Err(error.into()),
+            };
             let root = manager.store().paths().project_root.clone();
             let storage = storage.as_deref().map(parse_storage).transpose()?;
             let outcome = manager.fork_tracker(
@@ -2370,7 +2415,9 @@ fn tracker(mut command: TrackerCommand) -> Result<()> {
                 println!("  role:      `{}`, beside `{upstream}`", outcome.role);
             }
             println!(
-                "  audience:  {} (a fork is never readable by anyone `{upstream}` is not)",
+                "  audience:  {}, and never wider than `{upstream}`'s, even if `from` is later \
+                 dropped or changed: this client refuses it on every command and push, and \
+                 `newgit serve` holds the fork to `{upstream}`'s audience",
                 outcome.audience
             );
             println!(
@@ -2469,7 +2516,8 @@ fn tracker(mut command: TrackerCommand) -> Result<()> {
             Ok(())
         }
         TrackerCommand::Remove { name } => {
-            let manager = manager_here()?;
+            // Removing a fork is one way to fix one that needs it.
+            let manager = BranchManager::open_to_repair(context_here()?.store)?;
             let outcome = manager.remove_tracker(&name)?;
             println!(
                 "Removed tracker `{name}`: {} deleted",
@@ -2504,7 +2552,8 @@ fn tracker(mut command: TrackerCommand) -> Result<()> {
         TrackerCommand::List { json } => {
             let context = context_here()?;
             let current = context.current_branch.clone();
-            let manager = BranchManager::open(context.store)?;
+            // Opened to repair: what needs fixing is listed, not refused.
+            let manager = BranchManager::open_to_repair(context.store)?;
             if !json {
                 warn_gitignore(&manager);
                 warn_graph(&manager);
@@ -2546,6 +2595,7 @@ fn tracker(mut command: TrackerCommand) -> Result<()> {
                             "encrypted": definition.encrypted_to_audience(),
                             "role": definition.role,
                             "priority": definition.priority,
+                            "from": definition.from.as_deref().map(path),
                             "requires": definition
                                 .requires
                                 .iter()
@@ -2564,6 +2614,14 @@ fn tracker(mut command: TrackerCommand) -> Result<()> {
                     serde_json::to_string_pretty(&serde_json::json!({
                         "instance": current,
                         "trackers": trackers,
+                        "problems": manager
+                            .fork_problems()
+                            .iter()
+                            .map(|(name, why)| serde_json::json!({
+                                "tracker": newgit_core::tracker::tracker_path(name),
+                                "problem": why,
+                            }))
+                            .collect::<Vec<_>>(),
                     }))?
                 );
                 return Ok(());
@@ -2676,7 +2734,7 @@ fn tracker(mut command: TrackerCommand) -> Result<()> {
                     if definition.encrypted_to_audience() {
                         audience.push_str(", encrypted");
                     }
-                    let paths = if definition.owns_everything() {
+                    let mut paths = if definition.owns_everything() {
                         "(everything no other tracker claims)".to_owned()
                     } else if definition.paths.is_empty() {
                         pathless_summary(&manager, definition)
@@ -2688,6 +2746,12 @@ fn tracker(mut command: TrackerCommand) -> Result<()> {
                             .collect::<Vec<_>>()
                             .join(", ")
                     };
+                    if let Some(from) = &definition.from {
+                        paths.push_str(&format!(
+                            " (a fork of `{}`)",
+                            newgit_core::tracker::tracker_path(from)
+                        ));
+                    }
                     (
                         name,
                         in_git.to_owned(),
@@ -2715,6 +2779,13 @@ fn tracker(mut command: TrackerCommand) -> Result<()> {
             if let Some(current) = &current {
                 println!(
                     "\n* = bound in `{current}`, - = dropped (`newgit tracker use|drop <tracker>`)"
+                );
+            }
+            // What stops every other command until it is fixed.
+            for (name, why) in manager.fork_problems() {
+                eprintln!(
+                    "\nnewgit: `{}` needs fixing: {why}",
+                    newgit_core::tracker::tracker_path(name)
                 );
             }
             Ok(())

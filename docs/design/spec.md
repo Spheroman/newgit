@@ -280,9 +280,12 @@ The full model is in [`trackers.md`](trackers.md). The short version:
   `local-db`'s `main` (two refs in the one local store, nothing copied) and
   records `from = "local-db"`, so the two share history and can merge
   (merging between members is next). A fork's audience is a ceiling: never
-  wider than its upstream's, refused at creation, on every load, and in any
-  commit changing definitions; `newgit serve` reads a wider one with its
-  upstream's audience. A tracker in Git cannot be forked yet.
+  wider than its upstream's, even after `from` is dropped or changed. The
+  client refuses a wider one at creation, on every load, and in any commit
+  changing definitions; `newgit serve` records what each fork's repo was made
+  from and serves a wider one with its upstream's audience. Against
+  newgit.dev's Worker only the client checks it. A fork is never detached. A
+  tracker in Git cannot be forked yet.
 
 ### Trackers outside Git
 

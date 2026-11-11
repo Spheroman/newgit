@@ -130,11 +130,20 @@ Resolved loudly; each is reversible.
      made on its first write, starting at its upstream's branches: a
      namespace in the upstream's store, refs alone, when their audiences
      match, or else in the fork's own audience's store, fetching only what
-     the upstream's `main` reaches. That store is never wider, because the
-     definitions are read with every fork held to its upstream's audience
-     (`policy::cap_forks`): a fork whose definition says wider is served as
-     its upstream's audience, and one whose upstream is not defined is not
-     defined either.
+     the upstream's branches reach (only `main` today). Before anything is
+     made or copied it is refused when the fork is wider than its upstream or
+     the caller may not read the upstream (`policy::may_start_fork`). Last it
+     records the upstream as `refs/newgit/from/<upstream>` in the fork's
+     namespace (`repos::FORK_RECORD`), hidden from every Git request
+     (`transfer.hideRefs`) so no push moves or deletes it; a repo with no
+     branch and no record is started again on the next write. Its store is
+     never wider, because the definitions are read with every fork held to
+     the upstream its definition names and to the recorded one
+     (`policy::cap_forks`, run until nothing changes): a fork whose
+     definition says wider, or drops `from`, is served as its upstream's
+     audience, and one whose ceiling can't be settled (an upstream not
+     defined, a cycle, a linked fork whose home can't be read) is not
+     defined.
    - **A private instance, an embargo, has a store of its own**, as does
      each user's content: its shape is the secret.
    - **A new tracker's seed is alone** in `tracker/<name>` until it joins a

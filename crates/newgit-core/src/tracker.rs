@@ -65,7 +65,7 @@ pub struct TrackerDefinition {
     /// The tracker whose history this one started at (`from = "local-db"`,
     /// written by `newgit tracker create --from`): a fork, so the two share
     /// history and can merge. Its audience is a ceiling: a fork is never
-    /// readable by anyone its upstream is not ([`check_forks`]).
+    /// readable by anyone its upstream is not ([`fork_problems`]).
     pub from: Option<String>,
     /// Trackers or roles it cannot do without: binding it binds them, and
     /// they cannot be dropped while it is bound.
@@ -856,57 +856,169 @@ pub fn audience_within(fork: &str, upstream: &str) -> bool {
         || (upstream == "project-devs" && (fork == "user" || fork.starts_with("user:")))
 }
 
-/// Refuse a fork (`from`) whose upstream is not defined, or whose audience
-/// is wider than its upstream's: everything the upstream held when the fork
-/// was made is in the fork's history, so a fork readable by more people
-/// discloses it. Checked wherever definitions are read together, so a
-/// definition change that widens a fork later is refused as creating one
-/// would be.
-pub fn check_forks(definitions: &[TrackerDefinition]) -> Result<()> {
+/// A fork relation a definition may no longer state but that still binds
+/// it: `fork` was a fork of `upstream` (in a parent commit's definitions, or
+/// by this machine's record of it), and `audience` is what `upstream`'s was
+/// then, when known. Dropping or changing `from` does not take the
+/// upstream's history out of the fork's, so the ceiling stays.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct EarlierFork {
+    pub fork: String,
+    pub upstream: String,
+    pub audience: Option<String>,
+}
+
+/// Every fork relation `definitions` state, as [`EarlierFork`]s for the
+/// definitions that come after them.
+pub fn forks_in(definitions: &[TrackerDefinition]) -> Vec<EarlierFork> {
+    definitions
+        .iter()
+        .filter_map(|fork| {
+            let upstream = fork.from.clone()?;
+            let audience = definitions
+                .iter()
+                .find(|other| other.name == upstream)
+                .map(|other| other.audience.clone());
+            Some(EarlierFork {
+                fork: fork.name.clone(),
+                upstream,
+                audience,
+            })
+        })
+        .collect()
+}
+
+/// What is wrong with each fork in `definitions`, as `(tracker, why)`, each
+/// `why` saying what to type: an upstream (`from`) that is not defined, an
+/// audience wider than an upstream's, forks of each other in a cycle, or a
+/// fork whose `from` was dropped or changed since `earlier` while its
+/// audience is wider than the upstream it was a fork of. Everything the
+/// upstream held when the fork was made is in the fork's history, so a fork
+/// readable by more people discloses it, whatever its definition says now.
+pub fn fork_problems(
+    definitions: &[TrackerDefinition],
+    earlier: &[EarlierFork],
+) -> Vec<(String, String)> {
+    let mut problems: Vec<(String, String)> = Vec::new();
+    let find = |name: &str| definitions.iter().find(|other| other.name == name);
+    let remove = |name: &str| format!("`newgit tracker remove {}`", tracker_path(name));
     for fork in definitions {
-        let Some(from) = &fork.from else {
-            continue;
-        };
-        let Some(upstream) = definitions.iter().find(|other| other.name == *from) else {
-            return Err(NewgitError::InvalidDefinition {
-                kind: "tracker",
-                name: fork.name.clone(),
-                reason: format!(
-                    "it is a fork of `{}` (`from`), which is not defined: its audience is a \
-                     ceiling on the fork's, so the fork cannot be checked without it",
-                    tracker_path(from)
+        let name = tracker_path(&fork.name);
+        if let Some(from) = &fork.from {
+            let up = tracker_path(from);
+            // Follow `from` up: a chain that comes back to this fork never
+            // reaches a history of its own.
+            let mut at = from.clone();
+            let mut cycle = false;
+            for _ in 0..=definitions.len() {
+                if at == fork.name {
+                    cycle = true;
+                    break;
+                }
+                match find(&at).and_then(|next| next.from.clone()) {
+                    Some(next) => at = next,
+                    None => break,
+                }
+            }
+            if cycle {
+                problems.push((
+                    fork.name.clone(),
+                    format!(
+                        "it is a fork of `{up}` (`from`), and following `from` comes back to \
+                         `{name}`: a fork starts at another tracker's history, so two can't be \
+                         forks of each other. Fix `from` in `{name}`'s definition, or {}",
+                        remove(&fork.name)
+                    ),
+                ));
+                continue;
+            }
+            match find(from) {
+                None => problems.push((
+                    fork.name.clone(),
+                    format!(
+                        "it is a fork of `{up}` (`from`), which is not defined, and `{up}`'s \
+                         audience is the ceiling on `{name}`'s. Restore `{up}`'s definition \
+                         (`git checkout -- .newgit/trackers/{up}.toml` if it was deleted), or {}",
+                        remove(&fork.name)
+                    ),
+                )),
+                Some(upstream) if !audience_within(&fork.audience, &upstream.audience) => {
+                    problems.push((
+                        fork.name.clone(),
+                        format!(
+                            "its audience `{}` is wider than `{up}`'s `{}`, and it is a fork of \
+                             `{up}` (`from`): its history holds `{up}`'s, so it may be read by \
+                             no one `{up}` is not. Set `audience = \"{}\"` (or a narrower one) \
+                             in `{name}`'s definition, or {}",
+                            fork.audience,
+                            upstream.audience,
+                            upstream.audience,
+                            remove(&fork.name)
+                        ),
+                    ));
+                }
+                Some(_) => {}
+            }
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        for was in earlier.iter().filter(|was| was.fork == fork.name) {
+            if fork.from.as_deref() == Some(was.upstream.as_str())
+                || !seen.insert(was.upstream.clone())
+            {
+                continue;
+            }
+            let up = tracker_path(&was.upstream);
+            let ceiling = find(&was.upstream)
+                .map(|upstream| upstream.audience.clone())
+                .or_else(|| was.audience.clone());
+            let now = match &fork.from {
+                Some(from) => format!("now says `from = \"{}\"`", tracker_path(from)),
+                None => "no longer says `from`".to_owned(),
+            };
+            let why = match ceiling {
+                Some(ceiling) if audience_within(&fork.audience, &ceiling) => continue,
+                Some(ceiling) => format!(
+                    "it was a fork of `{up}` and its definition {now}, but its history still \
+                     holds `{up}`'s, so its audience can't be wider than `{up}`'s `{ceiling}`, \
+                     and `{}` is. Put back `from = \"{up}\"` with an audience of `{ceiling}` or \
+                     narrower. A fork is never detached: to share something more widely, make a \
+                     new tracker (`newgit tracker create <name>`) and capture into it only what \
+                     may be shared",
+                    fork.audience
                 ),
-            });
-        };
-        if !audience_within(&fork.audience, &upstream.audience) {
-            return Err(NewgitError::InvalidDefinition {
-                kind: "tracker",
-                name: fork.name.clone(),
-                reason: format!(
-                    "its audience `{}` is wider than `{}`'s, `{}`, which it is a fork of \
-                     (`from`): its history holds `{}`'s, so it may be read by no one `{}` \
-                     is not. Give it `{}`'s audience or a narrower one",
-                    fork.audience,
-                    tracker_path(from),
-                    upstream.audience,
-                    tracker_path(from),
-                    tracker_path(from),
-                    tracker_path(from),
+                None => format!(
+                    "it was a fork of `{up}` and its definition {now}, but its history still \
+                     holds `{up}`'s, and `{up}` is not defined, so its ceiling can't be checked. \
+                     Restore `{up}`'s definition and put back `from = \"{up}\"`, or {}",
+                    remove(&fork.name)
                 ),
-            });
+            };
+            problems.push((fork.name.clone(), why));
         }
     }
-    Ok(())
+    problems
+}
+
+/// [`fork_problems`], refusing the first.
+pub fn check_forks(definitions: &[TrackerDefinition], earlier: &[EarlierFork]) -> Result<()> {
+    match fork_problems(definitions, earlier).into_iter().next() {
+        None => Ok(()),
+        Some((name, reason)) => Err(NewgitError::InvalidDefinition {
+            kind: "tracker",
+            name: tracker_path(&name),
+            reason,
+        }),
+    }
 }
 
 /// Settle who owns what across every tracker. A path's owner is its most
 /// specific claimant, so trackers may nest — `apps` can hold `apps/electron`
 /// for another tracker — but no two may claim the identical path, and only
-/// one may own `.`, and no fork may be wider than its upstream
-/// ([`check_forks`]). Fills in each definition's `excluded` (paths inside its
-/// own that a more specific tracker owns).
+/// one may own `.`. Fills in each definition's `excluded` (paths inside its
+/// own that a more specific tracker owns). Forks are checked apart
+/// ([`fork_problems`]): a fork that needs fixing must not stop the commands
+/// that fix it.
 pub fn resolve_ownership(definitions: &mut [TrackerDefinition]) -> Result<()> {
-    check_forks(definitions)?;
     let roots: Vec<&str> = definitions
         .iter()
         .filter(|definition| definition.owns_everything())

@@ -35,6 +35,12 @@ const STORE_CONFIG: &[(&str, &str)] = &[
     ("core.logAllRefUpdates", "always"),
 ];
 
+/// Where a fork's repo records the tracker it was made from:
+/// `refs/newgit/from/<upstream>`, in its namespace. Written by the server
+/// alone (`api::start_fork`), never by a push: Git requests hide it
+/// (`transfer.hideRefs`), so no push can move or delete it.
+pub const FORK_RECORD: &str = "refs/newgit/from/";
+
 /// The config key a store's audience is written under when it is made.
 const AUDIENCE_KEY: &str = "newgit.audience";
 
@@ -723,6 +729,44 @@ impl Repo {
             )));
         }
         Ok(())
+    }
+
+    /// The tracker this repo was made from, when it is a fork this server
+    /// started ([`FORK_RECORD`]).
+    pub fn recorded_from(&self) -> Option<String> {
+        if !store_exists(&self.dir()) {
+            return None;
+        }
+        let mut found = self.list_refs(FORK_RECORD).ok()?.into_iter();
+        let (reference, _) = found.next()?;
+        reference.strip_prefix(FORK_RECORD).map(str::to_owned)
+    }
+
+    /// Record that this repo was made from `upstream`'s: a ref naming a blob
+    /// that holds the upstream's name, so it keeps nothing else alive.
+    pub fn record_from(&self, upstream: &str) -> ApiResult<()> {
+        let mut child = Command::new("git")
+            .arg("--git-dir")
+            .arg(self.dir().as_str())
+            .args(["hash-object", "-w", "--stdin"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        if let Some(mut stdin) = child.stdin.take() {
+            stdin.write_all(format!("{upstream}\n").as_bytes())?;
+        }
+        let output = child.wait_with_output()?;
+        if !output.status.success() {
+            return Err(HttpError::internal(format!(
+                "recording {}'s upstream in {}: {}",
+                self.namespace,
+                self.dir(),
+                String::from_utf8_lossy(&output.stderr).trim()
+            )));
+        }
+        let blob = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+        self.set_refs(&[(format!("{FORK_RECORD}{upstream}"), blob)])
     }
 
     /// Point each of `refs` (`(theirs, ours)`, both as readers name them) at

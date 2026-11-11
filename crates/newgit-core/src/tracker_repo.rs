@@ -1375,6 +1375,73 @@ fn tracker_refs(git_dir: &Utf8Path) -> Result<Vec<(String, String)>> {
     Ok(refs)
 }
 
+/// Where this machine records which tracker each fork started at:
+/// `refs/newgit/forks/<fork>/<upstream>`, in the store. Written when a fork
+/// is made and whenever a definition saying `from` is read, and never by a
+/// definition edit, so a later edit that drops or changes `from` is still
+/// held to the upstream (`fork_problems`).
+const FORK_RECORDS: &str = "refs/newgit/forks/";
+
+/// Every `(fork, upstream)` this machine has recorded, sorted.
+pub fn fork_records(git_dir: &Utf8Path) -> Result<Vec<(String, String)>> {
+    if !git_dir.join("HEAD").is_file() {
+        return Ok(Vec::new());
+    }
+    let listing = git(
+        git_dir,
+        &["for-each-ref", "--format=%(refname)", FORK_RECORDS],
+    )?;
+    let mut records: Vec<(String, String)> = listing
+        .lines()
+        .filter_map(|name| {
+            let (fork, upstream) = name.strip_prefix(FORK_RECORDS)?.split_once('/')?;
+            Some((fork.to_owned(), upstream.to_owned()))
+        })
+        .collect();
+    records.sort();
+    Ok(records)
+}
+
+/// Record that `fork` started at `upstream`'s history. The ref names a blob
+/// holding the upstream's name, so it keeps nothing else alive.
+pub fn record_fork(git_dir: &Utf8Path, fork: &str, upstream: &str) -> Result<()> {
+    if !git_dir.join("HEAD").is_file() {
+        return Ok(());
+    }
+    let blob = git_stdin(
+        git_dir,
+        &["hash-object", "-w", "--stdin"],
+        &[],
+        format!("{upstream}\n").as_bytes(),
+    )?;
+    git(
+        git_dir,
+        &[
+            "update-ref",
+            &format!("{FORK_RECORDS}{fork}/{upstream}"),
+            &blob,
+        ],
+    )
+    .map(drop)
+}
+
+/// Forget what was recorded about `fork`: it is being removed.
+pub fn forget_fork(git_dir: &Utf8Path, fork: &str) -> Result<()> {
+    for (recorded, upstream) in fork_records(git_dir)? {
+        if recorded == fork {
+            git(
+                git_dir,
+                &[
+                    "update-ref",
+                    "-d",
+                    &format!("{FORK_RECORDS}{fork}/{upstream}"),
+                ],
+            )?;
+        }
+    }
+    Ok(())
+}
+
 /// Give a tracker a history from another repository: fetch `source_ref`
 /// from `source` into the tracker's `main`. A real copy, never borrowed
 /// objects: Git's own cleanup in either repository deletes what *that*

@@ -108,6 +108,9 @@ pub struct BranchManager {
     /// tracker, rev, what the remote has, and recipients: worked out once
     /// per command, though a send checks it more than once.
     unsent: Mutex<BTreeMap<String, BTreeMap<String, crate::tracker_repo::Unsent>>>,
+    /// Forks whose definitions need fixing, as `(tracker, why)`: only a
+    /// manager opened with [`BranchManager::open_to_repair`] has any.
+    fork_problems: Vec<(String, String)>,
 }
 
 /// An instance's lock as a command holds it; dropping the last guard for an
@@ -1448,7 +1451,34 @@ mod migrate;
 pub use migrate::MigrateOutcome;
 
 impl BranchManager {
+    /// Open the project. A fork whose definition needs fixing
+    /// ([`crate::tracker::fork_problems`]) refuses, saying what to type;
+    /// [`Self::open_to_repair`] opens anyway, for the commands that fix it.
     pub fn open(store: MetadataStore) -> Result<Self> {
+        let manager = Self::open_to_repair(store)?;
+        if manager.fork_problems.is_empty() {
+            return Ok(manager);
+        }
+        let list: Vec<String> = manager
+            .fork_problems
+            .iter()
+            .map(|(name, why)| format!("  `{}`: {why}", tracker_path(name)))
+            .collect();
+        Err(NewgitError::Unsupported(format!(
+            "{} needs fixing first:\n{}\n(`newgit tracker list` and `newgit tracker remove` \
+             still work meanwhile)",
+            if list.len() == 1 {
+                "a fork's definition"
+            } else {
+                "forks' definitions"
+            },
+            list.join("\n")
+        )))
+    }
+
+    /// [`Self::open`], with what is wrong with forks' definitions kept in
+    /// [`Self::fork_problems`] rather than refused.
+    pub fn open_to_repair(store: MetadataStore) -> Result<Self> {
         store.ensure_initialized()?;
         let config = store.load_config()?;
         let source = GitSource::open(&store.paths().project_root, config.project.source)?;
@@ -1466,6 +1496,7 @@ impl BranchManager {
             trackers.push(TrackerDefinition::access());
         }
         crate::tracker::resolve_ownership(&mut trackers)?;
+        let fork_problems = check_fork_records(&store, &trackers);
         let root = trackers.remove(
             trackers
                 .iter()
@@ -1516,6 +1547,7 @@ impl BranchManager {
             audiences: Mutex::new(BTreeMap::new()),
             reseal_failures: Mutex::new(BTreeMap::new()),
             unsent: Mutex::new(BTreeMap::new()),
+            fork_problems,
         })
     }
 
@@ -1523,6 +1555,30 @@ impl BranchManager {
     pub fn with_key_source(mut self, keys: Arc<dyn crate::crypt::KeySource>) -> Self {
         self.keys = keys;
         self
+    }
+
+    /// What this machine recorded each fork started at, for split: a commit
+    /// that drops or changes `from` is still held to it.
+    fn fork_records(&self) -> Vec<crate::tracker::EarlierFork> {
+        crate::tracker_repo::fork_records(&self.store.paths().tracker_store)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(fork, upstream)| crate::tracker::EarlierFork {
+                audience: self
+                    .all_definitions()
+                    .into_iter()
+                    .find(|definition| definition.name == upstream)
+                    .map(|definition| definition.audience),
+                fork,
+                upstream,
+            })
+            .collect()
+    }
+
+    /// Forks whose definitions need fixing, as `(tracker, why)`, when this
+    /// manager was opened with [`Self::open_to_repair`].
+    pub fn fork_problems(&self) -> &[(String, String)] {
+        &self.fork_problems
     }
 
     /// Hold `slug`'s lock for the rest of the command: every command that
@@ -2701,6 +2757,7 @@ impl BranchManager {
                 audience: &audience,
                 newgit_made,
                 need_history: &|tracker| self.need_history(tracker),
+                forks_before: &self.fork_records(),
             },
         )?)
     }
@@ -7643,6 +7700,7 @@ impl BranchManager {
         if let Some(updated) = &upstream_updated {
             self.store.save_tracker_definition(updated)?;
         }
+        crate::tracker_repo::record_fork(&self.store.paths().tracker_store, name, &from.name)?;
         let forked = self.lane(name);
         let main = forked.fork_from(&lane)?.ok_or_else(|| {
             NewgitError::Unsupported(format!("`{shown}`'s `main` went away while forking it"))
@@ -7721,10 +7779,19 @@ impl BranchManager {
                 ))
             })?;
 
+        // Named by `from`, or recorded as having started at it: either way
+        // its audience is a ceiling on theirs.
+        let records = crate::tracker_repo::fork_records(&self.store.paths().tracker_store)
+            .unwrap_or_default();
         let forks: Vec<String> = self
             .all_definitions()
             .iter()
-            .filter(|other| other.from.as_deref() == Some(name))
+            .filter(|other| {
+                other.from.as_deref() == Some(name)
+                    || records
+                        .iter()
+                        .any(|(fork, upstream)| fork == &other.name && upstream == name)
+            })
             .map(|other| format!("`{}`", tracker_path(&other.name)))
             .collect();
         if !forks.is_empty() {
@@ -7768,6 +7835,7 @@ impl BranchManager {
         let gitignore_removed = self.store.remove_gitignore_block(name)?;
 
         let path = self.store.delete_tracker_definition(name)?;
+        crate::tracker_repo::forget_fork(&self.store.paths().tracker_store, name)?;
         Ok(RemoveTrackerOutcome {
             path,
             gitignore_removed,
@@ -9185,6 +9253,7 @@ impl BranchManager {
                 audience: &audience,
                 newgit_made: None,
                 need_history: &|tracker| self.need_history(tracker),
+                forks_before: &self.fork_records(),
             },
         )?)
     }
@@ -14628,6 +14697,38 @@ fn rebind_hint(changes: &BTreeMap<String, Vec<Utf8PathBuf>>) -> String {
         [tracker] => format!("bind it again with `newgit tracker use {tracker}`"),
         _ => "bind them again with `newgit tracker use <tracker>`".to_owned(),
     }
+}
+
+/// What is wrong with the forks in `definitions`, held to this machine's
+/// records of what each fork started at as well as to what the definitions
+/// say now. Every fork relation a definition states is recorded as it is
+/// read, so dropping or changing `from` later doesn't lift the ceiling here.
+/// A record that can't be read or written leaves only the definitions to go
+/// by; split and the remote check again.
+fn check_fork_records(
+    store: &MetadataStore,
+    definitions: &[TrackerDefinition],
+) -> Vec<(String, String)> {
+    let git_dir = &store.paths().tracker_store;
+    let records = crate::tracker_repo::fork_records(git_dir).unwrap_or_default();
+    for definition in definitions {
+        if let Some(from) = &definition.from
+            && !records
+                .iter()
+                .any(|(fork, upstream)| fork == &definition.name && upstream == from)
+        {
+            let _ = crate::tracker_repo::record_fork(git_dir, &definition.name, from);
+        }
+    }
+    let earlier: Vec<crate::tracker::EarlierFork> = records
+        .into_iter()
+        .map(|(fork, upstream)| crate::tracker::EarlierFork {
+            fork,
+            upstream,
+            audience: None,
+        })
+        .collect();
+    crate::tracker::fork_problems(definitions, &earlier)
 }
 
 fn validate_ownership_with_replacement(

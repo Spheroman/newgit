@@ -126,6 +126,7 @@ impl Repo {
                 audience: &audience,
                 newgit_made: None,
                 need_history: &|_| Ok(()),
+                forks_before: &[],
             },
         )
         .unwrap_or_else(|error| panic!("split {tip}: {error}"))

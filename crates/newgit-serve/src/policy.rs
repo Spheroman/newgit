@@ -70,6 +70,11 @@ pub struct Facts {
     /// The tracker whose history it started at (`from`): a fork, never
     /// readable by anyone its upstream is not.
     pub from: Option<String>,
+    /// The tracker this server made its repo from, recorded then
+    /// (`refs/newgit/from/<upstream>` in its namespace, [`repos::Repo::recorded_from`]),
+    /// when that differs from what `from` says now: a fork stays held to
+    /// the upstream it was made from, whatever its definition later says.
+    pub recorded_from: Option<String>,
     /// Why it is served with its upstream's audience rather than its own: its
     /// definition makes it wider than its upstream's ([`cap_forks`]).
     pub capped: Option<String>,
@@ -78,6 +83,9 @@ pub struct Facts {
 /// Where `access` is mounted: every definition is `<name>.toml` at its root.
 pub const ACCESS_MOUNT: &str = ".newgit/trackers";
 const ID_SEPARATOR: &str = "__";
+/// The longest chain of forks (a fork of a fork of …) definitions are read
+/// along; a fork further from a history of its own is not defined.
+const MAX_FORK_CHAIN: usize = 64;
 
 /// Trackers that always exist, file or not.
 pub fn implicit_facts(tracker: &str) -> Option<Facts> {
@@ -91,6 +99,7 @@ pub fn implicit_facts(tracker: &str) -> Option<Facts> {
         pinned: false,
         link: None,
         from: None,
+        recorded_from: None,
         capped: None,
     };
     match tracker {
@@ -127,6 +136,7 @@ pub fn parse_facts(text: &str, source: &str) -> Option<Facts> {
         pinned: table.get("pinned").and_then(toml::Value::as_bool) == Some(true),
         link: string("link").map(str::to_owned),
         from: string("from").map(str::to_owned),
+        recorded_from: None,
         capped: None,
     })
 }
@@ -154,45 +164,153 @@ fn audience_name(audience: &Audience) -> String {
 /// Hold every fork to its upstream's audience, whatever its definition
 /// says. The client refuses a definition that widens a fork, but the
 /// definitions the server reads are commits anyone governing them made, so
-/// here a fork wider than its upstream is read with its upstream's audience
+/// here a fork wider than an upstream is read with that upstream's audience
 /// (and says why, in `capped`): every rule, every store, and every read then
-/// treats it as no wider than the history it holds. A fork whose upstream is
-/// not defined has no ceiling to be held to, and is left out, as an undefined
-/// tracker is. Forks of forks are held in turn, until nothing changes.
+/// treats it as no wider than the history it holds. Its upstreams are the
+/// one `from` names and the one its repo was made from ([`Facts::recorded_from`]),
+/// so dropping or changing `from` lifts nothing.
+///
+/// Capping only ever narrows, so this runs until nothing changes, bounded by
+/// how many times every audience can narrow. A fork that is undefined
+/// afterwards is left out, as an undefined tracker is, so readers are told
+/// it is not defined: one whose upstream is not defined, one in a cycle of
+/// forks, and one held to two upstreams no one audience fits under. A
+/// linked fork's policy is its home's, capped there.
 pub fn cap_forks(facts: &mut BTreeMap<String, Facts>) {
-    for _round in 0..8 {
+    let upstreams = |fork: &Facts| -> Vec<String> {
+        let mut all: Vec<String> = fork
+            .from
+            .iter()
+            .chain(fork.recorded_from.iter())
+            .cloned()
+            .collect();
+        all.dedup();
+        all
+    };
+    // A cycle never reaches a history of its own.
+    let names: Vec<String> = facts.keys().cloned().collect();
+    let mut cyclic = BTreeSet::new();
+    for name in &names {
+        let mut seen = BTreeSet::new();
+        let mut stack = vec![name.clone()];
+        while let Some(at) = stack.pop() {
+            let Some(fact) = facts.get(&at).filter(|fact| fact.link.is_none()) else {
+                continue;
+            };
+            for up in upstreams(fact) {
+                if up == *name {
+                    cyclic.insert(name.clone());
+                } else if seen.insert(up.clone()) {
+                    stack.push(up);
+                }
+            }
+        }
+    }
+    for name in cyclic {
+        facts.remove(&name);
+    }
+    // An audience narrows at most twice (`public`, `project-devs`, then a
+    // user); a fork capped more often than that is held to two upstreams
+    // no one audience fits under, and is left out.
+    let mut narrowed: BTreeMap<String, usize> = BTreeMap::new();
+    let rounds = 3 * facts.len() + 2;
+    for _round in 0..rounds {
         let mut changed = false;
         let names: Vec<String> = facts.keys().cloned().collect();
         for name in names {
-            let Some(fork) = facts.get(&name) else {
+            let Some(fork) = facts.get(&name).filter(|fork| fork.link.is_none()) else {
                 continue;
             };
-            let Some(from) = fork.from.clone().filter(|_| fork.link.is_none()) else {
-                continue;
-            };
-            let Some(upstream) = facts.get(&from).map(|up| up.audience.clone()) else {
-                facts.remove(&name);
+            for from in upstreams(fork) {
+                let Some(upstream) = facts.get(&from).map(|up| up.audience.clone()) else {
+                    facts.remove(&name);
+                    changed = true;
+                    break;
+                };
+                let fork = facts.get_mut(&name).unwrap_or_else(|| unreachable!());
+                if audience_within(&fork.audience, &upstream) {
+                    continue;
+                }
+                fork.capped = Some(format!(
+                    "`{name}` is a fork of `{from}`, and its definition makes it `{}`, wider \
+                     than `{from}`'s `{}`: it is served as `{}`, since its history holds \
+                     `{from}`'s",
+                    audience_name(&fork.audience),
+                    audience_name(&upstream),
+                    audience_name(&upstream),
+                ));
+                fork.audience = upstream;
                 changed = true;
-                continue;
-            };
-            if audience_within(&fork.audience, &upstream) {
-                continue;
+                let times = narrowed.entry(name.clone()).or_default();
+                *times += 1;
+                if *times > 2 {
+                    facts.remove(&name);
+                    break;
+                }
             }
-            let fork = facts.get_mut(&name).unwrap_or_else(|| unreachable!());
-            fork.capped = Some(format!(
-                "`{name}`'s definition makes it `{}`, wider than `{from}`'s `{}`, which it is a fork \
-                 of: it is served as `{}` until its definition is no wider",
-                audience_name(&fork.audience),
-                audience_name(&upstream),
-                audience_name(&upstream),
-            ));
-            fork.audience = upstream;
-            changed = true;
         }
         if !changed {
-            return;
+            break;
         }
     }
+    // Whatever still doesn't fit under every upstream never will.
+    loop {
+        let unfit: Vec<String> = facts
+            .iter()
+            .filter(|(_, fork)| fork.link.is_none())
+            .filter(|(_, fork)| {
+                upstreams(fork).iter().any(|from| {
+                    !facts
+                        .get(from)
+                        .is_some_and(|up| audience_within(&fork.audience, &up.audience))
+                })
+            })
+            .map(|(name, _)| name.clone())
+            .collect();
+        if unfit.is_empty() {
+            return;
+        }
+        for name in unfit {
+            facts.remove(&name);
+        }
+    }
+}
+
+/// Whether `who` may start fork `fork` (its definition's facts) from
+/// `upstream`'s history, before anything is made or copied: the fork must
+/// be no wider than `upstream` (`audience_within`), and `who` must be able
+/// to read `upstream` (for a per-user one, their own), since starting the
+/// fork hands them its history.
+pub fn may_start_fork(
+    project: &ProjectId,
+    upstream: &str,
+    fork: &Facts,
+    upstream_facts: &Facts,
+    who: &Requester,
+) -> Decision {
+    if !audience_within(&fork.audience, &upstream_facts.audience) {
+        return Err(format!(
+            "a fork can't be readable by anyone its upstream isn't: this one is `{}`, wider than \
+             `{upstream}`'s `{}`",
+            audience_name(&fork.audience),
+            audience_name(&upstream_facts.audience)
+        ));
+    }
+    let source = RepoRef::Tracker {
+        project: project.clone(),
+        tracker: upstream.to_owned(),
+        login: (upstream_facts.audience == Audience::User).then(|| who.login.clone()),
+    };
+    decide(
+        &source,
+        false,
+        who,
+        Some(upstream_facts),
+        &Context::default(),
+    )
+    .map_err(|why| {
+        format!("this tracker is a fork of `{upstream}`, and starting it reads `{upstream}`: {why}")
+    })
 }
 
 /// `./a/b/` → `a/b`; the empty path is `.`.
@@ -376,12 +494,29 @@ pub fn load_definitions_at<'n>(
     let mut all: BTreeSet<String> = ["root".to_owned(), "access".to_owned()].into();
     all.extend(names.into_iter().map(str::to_owned));
     let mut facts = read_definitions(&reader, project, &all);
-    // A fork is held to its upstream, so its upstream is read with it, and
-    // that one's, in turn.
-    for _round in 0..8 {
-        let upstreams: Vec<String> = facts
-            .values()
-            .filter_map(|fact| fact.from.clone())
+    // A fork is held to its upstreams (what `from` names, and what its repo
+    // was made from), so they are read with it, and theirs in turn, until no
+    // new one is named. Each round names at least one new tracker; a chain
+    // longer than this many is left unread, so its forks have no upstream
+    // and are left out (`cap_forks`).
+    let mut records: BTreeMap<String, Option<String>> = BTreeMap::new();
+    for _round in 0..=MAX_FORK_CHAIN {
+        for (name, fact) in &facts {
+            if !fact.git && fact.link.is_none() && !records.contains_key(name) {
+                let recorded = repos::tracker(data, db, project, name)
+                    .ok()
+                    .and_then(|repo| repo.recorded_from());
+                records.insert(name.clone(), recorded);
+            }
+        }
+        let upstreams: BTreeSet<String> = facts
+            .iter()
+            .flat_map(|(name, fact)| {
+                fact.from
+                    .iter()
+                    .chain(records.get(name).into_iter().flatten())
+                    .cloned()
+            })
             .filter(|from| !all.contains(from))
             .collect();
         if upstreams.is_empty() {
@@ -390,29 +525,44 @@ pub fn load_definitions_at<'n>(
         all.extend(upstreams);
         facts = read_definitions(&reader, project, &all);
     }
-    cap_forks(&mut facts);
+    for (name, recorded) in records {
+        if let (Some(fact), Some(recorded)) = (facts.get_mut(&name), recorded)
+            && fact.from.as_deref() != Some(recorded.as_str())
+        {
+            fact.recorded_from = Some(recorded);
+        }
+    }
     let linked: Vec<(String, Facts)> = facts
         .iter()
         .filter(|(_, fact)| fact.link.is_some())
         .map(|(name, fact)| (name.clone(), fact.clone()))
         .collect();
     for (name, fact) in linked {
-        let Some((home, tracker)) = home_of(&fact) else {
-            continue;
-        };
-        if let Some(there) = load_definitions(data, db, &home, [tracker.as_str()]).remove(&tracker)
-        {
-            facts.insert(
-                name,
-                Facts {
-                    mount: fact.mount,
-                    source: fact.source,
-                    link: fact.link,
-                    ..there
-                },
-            );
+        let there = home_of(&fact).and_then(|(home, tracker)| {
+            load_definitions(data, db, &home, [tracker.as_str()]).remove(&tracker)
+        });
+        match there {
+            Some(there) => {
+                facts.insert(
+                    name,
+                    Facts {
+                        mount: fact.mount,
+                        source: fact.source,
+                        link: fact.link,
+                        ..there
+                    },
+                );
+            }
+            // A fork whose home can't be read has no ceiling to be held
+            // to: not defined, rather than its own definition's word.
+            None if fact.from.is_some() => {
+                facts.remove(&name);
+            }
+            None => {}
         }
     }
+    // After links: an upstream that is a link has its home's audience.
+    cap_forks(&mut facts);
     facts
 }
 

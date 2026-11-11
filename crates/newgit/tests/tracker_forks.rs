@@ -250,7 +250,7 @@ fn widening_a_fork_later_is_refused_on_load() {
         text.replace("audience = \"project-devs\"", "audience = \"public\""),
     )
     .expect("write");
-    let err = newgit_err(&repo, &["tracker", "list"]);
+    let err = newgit_err(&repo, &["status"]);
     assert!(
         err.contains("staging-db") && err.contains("wider than `local-db`'s"),
         "{err}"

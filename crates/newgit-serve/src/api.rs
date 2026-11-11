@@ -1480,35 +1480,37 @@ pub fn authorize(
     }
 }
 
-/// A fork's repo, just made on its first write, starts at its upstream's
-/// (`from`): the upstream's branches, and for a per-user tracker the
-/// caller's own `main` of it, as the fork's. Its definition was held to its
-/// upstream's audience when it was read ([`policy`]'s `cap_forks`), so the
-/// store it was made in is the upstream's (same audience: refs alone,
-/// nothing copied) or a narrower one, which takes only what those refs reach,
-/// all of it readable there already. An upstream with nothing to start from
-/// leaves it empty, as any new tracker is.
-fn start_fork(
+/// Where a fork's repo starts from: its upstream's (`from`) repo, for a
+/// per-user upstream the caller's own of it, or `None` when there is
+/// nothing to start from (an upstream in Git, linked, or not made yet).
+/// Refused before anything is made or copied when the fork's audience isn't
+/// within its upstream's, or when the caller may not read the upstream:
+/// starting the fork would hand them what they can't read.
+fn fork_source(
     project: &ProjectContext<'_>,
     db: &Connection,
-    fork: &Repo,
-    tracker: &str,
+    who: &policy::Requester,
     facts: &Facts,
     login: Option<&str>,
-) -> ApiResult<()> {
+) -> ApiResult<Option<Repo>> {
     let Some(upstream) = &facts.from else {
-        return Ok(());
+        return Ok(None);
     };
     let Some(upstream_facts) = project.facts(db, upstream)? else {
-        return Ok(());
+        return fail(
+            404,
+            format!("`{upstream}`, which this tracker is a fork of (`from`), is not defined"),
+        );
     };
+    policy::may_start_fork(&project.id, upstream, facts, &upstream_facts, who)
+        .map_err(|why| HttpError::new(403, why))?;
     if upstream_facts.git || project.links.contains_key(upstream) {
-        return Ok(());
+        return Ok(None);
     }
     // A per-user upstream is each user's own: the caller's starts their fork.
     let source_login = match (&upstream_facts.audience, login) {
         (policy::Audience::User, Some(login)) => Some(login.to_owned()),
-        (policy::Audience::User, None) => return Ok(()),
+        (policy::Audience::User, None) => return Ok(None),
         _ => None,
     };
     let source = RepoRef::Tracker {
@@ -1517,19 +1519,44 @@ fn start_fork(
         login: source_login,
     };
     let source = project.served(db, &source, Some(&upstream_facts), false)?;
-    if !source.exists() {
+    Ok(source.exists().then_some(source))
+}
+
+/// Start a fork's repo, just made, at its upstream's ([`fork_source`]): the
+/// upstream's branches, and its `main` as the fork's. Its definition was
+/// held to its upstream's audience when it was read ([`policy`]'s
+/// `cap_forks`), so the store it was made in is the upstream's (same
+/// audience: refs alone, nothing copied) or a narrower one, which takes only
+/// what those refs reach, all of it readable there already. Then it records
+/// what it was made from ([`repos::FORK_RECORD`]), so the fork stays held to
+/// that upstream whatever its definition later says. The record is written
+/// last: a copy that fails leaves the repo without one, to start again on
+/// the next write.
+fn start_fork(
+    project: &ProjectContext<'_>,
+    fork: &Repo,
+    tracker: &str,
+    facts: &Facts,
+    source: Option<Repo>,
+) -> ApiResult<()> {
+    let Some(upstream) = &facts.from else {
         return Ok(());
+    };
+    if let Some(source) = source {
+        let mut refs: Vec<(String, String)> = source
+            .list_refs("refs/heads/")?
+            .into_iter()
+            .map(|(reference, _)| (reference.clone(), reference))
+            .collect();
+        refs.push((
+            format!("refs/trackers/{upstream}/main"),
+            format!("refs/trackers/{tracker}/main"),
+        ));
+        fork.take_refs(&source, &refs)?;
     }
-    let mut refs: Vec<(String, String)> = source
-        .list_refs("refs/heads/")?
-        .into_iter()
-        .map(|(reference, _)| (reference.clone(), reference))
-        .collect();
-    refs.push((
-        format!("refs/trackers/{upstream}/main"),
-        format!("refs/trackers/{tracker}/main"),
-    ));
-    fork.take_refs(&source, &refs)
+    fork.record_from(upstream)?;
+    project.app.trackers_moved();
+    Ok(())
 }
 
 fn credential(
