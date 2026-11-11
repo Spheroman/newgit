@@ -68,6 +68,12 @@ pub struct BranchInstance {
     /// embargo, for work the rest of the project must not see yet.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub private: bool,
+    /// The checkpoint this instance's workspace was evicted to (`newgit stop
+    /// --evict`): the workspace is gone, all but its marker, and `newgit
+    /// start` brings it back from this checkpoint at the same path. `None`
+    /// while the workspace is there.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evicted: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -212,6 +218,7 @@ impl BranchInstance {
             dropped: Default::default(),
             parked: BTreeMap::new(),
             private: false,
+            evicted: None,
             created_at: now,
             remote: None,
             updated_at: now,

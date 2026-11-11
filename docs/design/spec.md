@@ -1254,6 +1254,28 @@ comes back on the same ports. Both commands do nothing and exit 0 when
 there is nothing to do, so they can run on every settle and unsettle. Both
 exit 1 if any resource failed.
 
+`newgit stop --evict` also frees the instance's disk, for an instance
+nobody will touch for a while. After the stop, it checkpoints the instance
+(reason `evict`), then deletes the workspace, all but its marker, and
+records the checkpoint in the binding record as `evicted`. The marker
+stays so that commands run at the path still find the instance, and a
+tool holding the path still finds a directory. `newgit start` restores
+first. It materializes the workspace again at the same path, as `spawn`
+does, with the same remote token, and then undoes to that checkpoint. That
+brings back the source with its uncommitted work, tracker content, renders,
+and the trees resources build, filled from the install store. Then it
+starts what the stop stopped.
+
+An eviction loses what a checkpoint never carries. That means ignored
+files that no tracker owns and no resource rebuilds, such as `target/`.
+It names them (`discarded` in `--json`) rather than keeping quiet. It
+refuses when a dropped tracker's paths hold changes, as `undo` does, and
+it does nothing when a resource would not stop. A restore refuses when
+something other than the marker was written at the path since. While an
+instance is evicted, commands that need its workspace say to run
+`newgit start`. `status` shows it as `evicted`, and `cleanup` does not
+treat it as an instance whose workspace is gone.
+
 `suspend` never runs for a `project` or `user` resource, which other
 instances share, nor for one that never came up. The `supabase` template's
 pair is `supabase stop` / `supabase start`, which keeps the data.

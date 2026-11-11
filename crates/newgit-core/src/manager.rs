@@ -698,6 +698,26 @@ pub enum ActionOutcome {
 pub struct StopStartOutcome {
     pub instance: String,
     pub resources: Vec<StopStartResource>,
+    /// What happened to the workspace: evicted by `stop --evict`, or
+    /// brought back by the `start` after it. `None` when it stayed put.
+    pub workspace: Option<WorkspaceChange>,
+    /// Said along the way, as `undo` says them, by the restore.
+    pub warnings: Vec<String>,
+}
+
+/// What `newgit stop --evict`, or the `newgit start` after it, did to an
+/// instance's workspace.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorkspaceChange {
+    /// Checkpointed to `checkpoint`, then deleted. `discarded` is what went
+    /// with it that no checkpoint carries: ignored paths no tracker owns and
+    /// no resource rebuilds, such as `target/`.
+    Evicted {
+        checkpoint: String,
+        discarded: Vec<Utf8PathBuf>,
+    },
+    /// Materialized again and restored to `checkpoint`.
+    Restored { checkpoint: String },
 }
 
 impl StopStartOutcome {
@@ -7898,7 +7918,7 @@ impl BranchManager {
             .load_branches()?
             .into_par_iter()
             .map(|branch| {
-                let workspace_exists = branch.workspace_path.is_dir();
+                let workspace_exists = branch.workspace_path.is_dir() && branch.evicted.is_none();
                 let live_rev = workspace_exists
                     .then(|| GitSource::workspace_short_head(&branch.workspace_path).ok())
                     .flatten();
@@ -8573,7 +8593,7 @@ impl BranchManager {
         // that helps. Its binding record is archived, not deleted.
         let (live, stale): (Vec<_>, Vec<_>) = branches
             .iter()
-            .partition(|branch| branch.workspace_path.is_dir());
+            .partition(|branch| branch.workspace_path.is_dir() || branch.evicted.is_some());
 
         // Stale when listed, live again by the time this got its lock.
         let mut revived = Vec::new();
@@ -8583,7 +8603,7 @@ impl BranchManager {
             // waited has already torn it down and archived the record, and a
             // `spawn` may have brought the name back with a new workspace.
             let branch = match self.store.find_branch(&branch.slug) {
-                Ok(branch) if branch.workspace_path.is_dir() => {
+                Ok(branch) if branch.workspace_path.is_dir() || branch.evicted.is_some() => {
                     revived.push(branch);
                     continue;
                 }
@@ -13935,7 +13955,184 @@ impl BranchManager {
         Ok(StopStartOutcome {
             instance: branch.name,
             resources,
+            workspace: None,
+            warnings: Vec::new(),
         })
+    }
+
+    /// `newgit stop --evict`: [`Self::stop_instance`], then checkpoint the
+    /// instance and delete its workspace, all but its marker, so a settled
+    /// instance holds no disk beyond its checkpoint. [`Self::start_instance`]
+    /// brings the workspace back from that checkpoint, at the same path.
+    ///
+    /// Nothing is evicted when a resource would not stop: something would
+    /// still be running in the directory. Nor when a dropped tracker's paths
+    /// hold changes, which a checkpoint leaves out (as `undo` refuses). What
+    /// is ignored and no tracker owns or resource rebuilds goes with the
+    /// workspace, and is named in [`WorkspaceChange::Evicted`]. Evicting an
+    /// evicted instance only stops what is running.
+    pub fn evict_instance(&self, instance: &str) -> Result<StopStartOutcome> {
+        self.require_resolvable_graph()?;
+        let (_lock, branch) = self.locked_branch(instance)?;
+        let mut outcome = self.stop_instance(&branch.name)?;
+        let mut branch = self.store.find_branch(&branch.slug)?;
+        if branch.evicted.is_some() || !outcome.ok() {
+            return Ok(outcome);
+        }
+        self.require_workspace(&branch)?;
+        let outside = self.changes_left_out(&branch)?;
+        if !outside.is_empty() {
+            return Err(NewgitError::Unsupported(format!(
+                "{}: a checkpoint leaves them out, so evicting the workspace would lose them; \
+                 {} to keep them, or remove them",
+                describe_left_out(&branch.name, &outside),
+                rebind_hint(&outside)
+            )));
+        }
+        let discarded = self.evict_discards(&branch)?;
+        let checkpoint = self.checkpoint_branch(
+            &mut branch,
+            Some("evicted by `newgit stop --evict`"),
+            CheckpointReason::Evict,
+        )?;
+        outcome.warnings.extend(checkpoint.warnings.iter().cloned());
+        let id = checkpoint.record.id.clone();
+
+        // The workspace's own remote token lives in its `.git/`; kept beside
+        // the instance's state so the restored workspace pushes as this one.
+        let token = crate::remote::workspace_token(&branch.workspace_path)?;
+        if let Some(token) = &token {
+            crate::remote::write_private(&self.evicted_token_path(&branch), token)?;
+        }
+        // Recorded before the delete: a crash between the two leaves an
+        // instance `start` restores, not a half-deleted workspace `cleanup`
+        // would finalize.
+        branch.evicted = Some(id.clone());
+        branch.updated_at = Utc::now();
+        self.store.save_branch_record(&branch)?;
+        self.materializer().remove(&branch)?;
+        crate::materializer::write_workspace_marker(self.source.root(), &branch)?;
+        outcome.workspace = Some(WorkspaceChange::Evicted {
+            checkpoint: id,
+            discarded,
+        });
+        Ok(outcome)
+    }
+
+    /// The ignored paths in `branch`'s workspace that an eviction discards:
+    /// every one no tracker owns, no resource builds or renders, and that is
+    /// not newgit's own marker. Directories are named once, not walked.
+    fn evict_discards(&self, branch: &BranchInstance) -> Result<Vec<Utf8PathBuf>> {
+        let listed = crate::source::run_git_env(
+            &[
+                "-C",
+                branch.workspace_path.as_str(),
+                "ls-files",
+                "-z",
+                "--others",
+                "--ignored",
+                "--exclude-standard",
+                "--directory",
+            ],
+            &[],
+        )?;
+        let kept: Vec<Utf8PathBuf> =
+            self.trackers
+                .iter()
+                .filter(|definition| !branch.dropped.contains(&definition.name))
+                .flat_map(|definition| definition.paths.iter().cloned())
+                .chain(
+                    self.resources
+                        .iter()
+                        .flat_map(|definition| definition.identity_produces().iter().cloned()),
+                )
+                .chain(
+                    branch.resources.values().flat_map(|binding| {
+                        binding.rendered.iter().map(|render| render.path.clone())
+                    }),
+                )
+                .chain([Utf8PathBuf::from(".newgit/local")])
+                .collect();
+        Ok(listed
+            .split('\0')
+            .map(|path| path.trim_end_matches('/'))
+            .filter(|path| !path.is_empty())
+            .map(Utf8PathBuf::from)
+            .filter(|path| {
+                !kept
+                    .iter()
+                    .any(|keep| path.starts_with(keep) || keep.starts_with(path))
+            })
+            .collect())
+    }
+
+    fn evicted_token_path(&self, branch: &BranchInstance) -> Utf8PathBuf {
+        self.store
+            .instance_state_dir(&branch.slug)
+            .join("evicted-token")
+    }
+
+    /// Bring an evicted workspace back: materialize it again at its path,
+    /// as `spawn` does, then `undo` to the checkpoint the eviction took —
+    /// source with its uncommitted work, tracker content, renders, and the
+    /// trees resources rebuild, filled from the install store. Under the
+    /// instance's lock, which the caller holds.
+    fn restore_evicted(&self, mut branch: BranchInstance, checkpoint: &str) -> Result<Vec<String>> {
+        let workspace = branch.workspace_path.clone();
+        if workspace.exists() {
+            if !crate::materializer::is_evicted_stub(&workspace) {
+                return Err(NewgitError::Unsupported(format!(
+                    "`{}` was evicted, but {workspace} holds more than its marker now; move \
+                     that away, and `newgit start {}` brings the workspace back",
+                    branch.name, branch.name
+                )));
+            }
+            std::fs::remove_dir_all(&workspace)
+                .map_err(|source| NewgitError::io(workspace.clone(), source))?;
+        }
+        self.require_resolvable_graph()?;
+        let mut warnings = Vec::new();
+        if let Some(warning) = self.materializer().materialize_reporting(
+            &self.source,
+            &branch,
+            &self.sparse_patterns(&branch.dropped),
+        )? {
+            warnings.push(warning);
+        }
+        if !branch.dropped.is_empty() {
+            self.apply_sparse_to(&branch, true)?;
+        }
+        self.ensure_workspace_excludes(&branch)?;
+        let token_path = self.evicted_token_path(&branch);
+        if let Ok(token) = std::fs::read_to_string(&token_path) {
+            crate::remote::write_private(
+                &crate::remote::workspace_token_path(&workspace),
+                token.trim(),
+            )?;
+        }
+        self.ensure_workspace_push(&branch)?;
+        if let Some(remote) = &branch.remote {
+            GitSource::workspace_use_credential_helper(
+                &workspace,
+                &[&remote.endpoint],
+                &format!("!{} credential", sh_quote(&newgit_program())),
+            )?;
+        }
+        // The workspace is back, so the record says so before the undo, which
+        // needs one; an undo that fails part way says so as any undo does.
+        branch.evicted = None;
+        branch.updated_at = Utc::now();
+        self.store.save_branch_record(&branch)?;
+        let _ = std::fs::remove_file(&token_path);
+        let undo = self.undo(
+            &branch.name,
+            &UndoOptions {
+                to: Some(checkpoint.to_owned()),
+                ..UndoOptions::default()
+            },
+        )?;
+        warnings.extend(undo.warnings);
+        Ok(warnings)
     }
 
     /// `newgit start`: bring back what the instance's stopped record names,
@@ -13950,7 +14147,24 @@ impl BranchManager {
     /// already running — started by hand since — or no longer defined is
     /// dropped without being reported: there is nothing to do for it.
     pub fn start_instance(&self, instance: &str) -> Result<StopStartOutcome> {
-        let (_lock, mut branch) = self.locked_branch(instance)?;
+        let (lock, branch) = self.locked_branch(instance)?;
+        let Some(checkpoint) = branch.evicted.clone() else {
+            return self.start_resources(lock, branch);
+        };
+        let warnings = self.restore_evicted(branch, &checkpoint)?;
+        let branch = self.store.find_branch(instance)?;
+        let mut outcome = self.start_resources(lock, branch)?;
+        outcome.workspace = Some(WorkspaceChange::Restored { checkpoint });
+        outcome.warnings.splice(0..0, warnings);
+        Ok(outcome)
+    }
+
+    /// `start` proper, once the workspace is there.
+    fn start_resources(
+        &self,
+        _lock: HeldLock,
+        mut branch: BranchInstance,
+    ) -> Result<StopStartOutcome> {
         let mut record = self.load_stopped_record(&branch)?;
         // What spawn started and that has since died on its own is owed as
         // much as what `newgit stop` stopped (#261). Owed from here on like
@@ -13981,6 +14195,8 @@ impl BranchManager {
             return Ok(StopStartOutcome {
                 instance: branch.name,
                 resources: Vec::new(),
+                workspace: None,
+                warnings: Vec::new(),
             });
         }
         self.require_resolvable_graph()?;
@@ -14094,6 +14310,8 @@ impl BranchManager {
         Ok(StopStartOutcome {
             instance: branch.name,
             resources,
+            workspace: None,
+            warnings: Vec::new(),
         })
     }
 
@@ -14403,6 +14621,13 @@ impl BranchManager {
     }
 
     fn require_workspace(&self, branch: &BranchInstance) -> Result<()> {
+        if let Some(checkpoint) = &branch.evicted {
+            return Err(NewgitError::Unsupported(format!(
+                "the workspace for `{}` was evicted to {checkpoint}; `newgit start {}` brings \
+                 it back",
+                branch.name, branch.name
+            )));
+        }
         if branch.workspace_path.is_dir() {
             Ok(())
         } else {
