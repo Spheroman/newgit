@@ -55,6 +55,10 @@ pub enum MembersCommand {
     Add { login: String },
     /// Take a GitHub user's access away
     Remove { login: String },
+    /// Encrypt every shared tracker outside Git again, to the members as
+    /// they are now: what `add` and `remove` do, run again after one of
+    /// them could not (offline, or a member has since added a key)
+    Reencrypt,
     /// List the project's members
     List {
         /// Print them as JSON
@@ -998,21 +1002,58 @@ pub fn members(command: MembersCommand) -> Result<()> {
     match command {
         MembersCommand::Add { login } => {
             let login = login.to_lowercase();
+            let manager = manager_here()?;
             if client.add_member(&name, &login)? {
                 println!("{login} can now use `{name}`");
             } else {
                 println!("{login} was already a member of `{name}`");
             }
+            let encrypted = manager.encrypted_trackers();
+            if !encrypted.is_empty() {
+                match manager.usable_keys(&login) {
+                    Ok(keys) if keys.is_empty() => println!(
+                        "  WARNING: {login} has no ssh-ed25519 or ssh-rsa key at \
+                         https://github.com/{login}.keys, so they cannot decrypt {}, which {} \
+                         encrypted to the project's members. Once they add one, run `newgit \
+                         members reencrypt`",
+                        tracker_list(&encrypted),
+                        if encrypted.len() == 1 { "is" } else { "are" },
+                    ),
+                    Ok(_) => {}
+                    Err(error) => println!("  WARNING: could not read {login}'s keys: {error}"),
+                }
+                reencrypt(&manager)?;
+            }
         }
         MembersCommand::Remove { login } => {
             let login = login.to_lowercase();
+            let manager = manager_here()?;
             if client.remove_member(&name, &login)? {
                 println!("{login} no longer has access to `{name}`");
                 println!(
                     "  their newgit tokens stop working here at once; Git passwords they hold expire within 15 minutes"
                 );
+                let encrypted = manager.encrypted_trackers();
+                if !encrypted.is_empty() {
+                    // Said whatever the re-encryption does: it is true either way.
+                    println!(
+                        "  ROTATE: {login} can still read everything they could read before: every \
+                         rev of {} encrypted while they were a member, and whatever they copied. \
+                         Change those secrets wherever they are used",
+                        tracker_list(&encrypted),
+                    );
+                    reencrypt(&manager)?;
+                }
             } else {
                 println!("{login} was not a member of `{name}`");
+            }
+        }
+        MembersCommand::Reencrypt => {
+            let manager = manager_here()?;
+            if manager.encrypted_trackers().is_empty() {
+                println!("no tracker of `{name}` is encrypted to its audience");
+            } else {
+                reencrypt(&manager)?;
             }
         }
         MembersCommand::List { json } => {
@@ -1038,6 +1079,80 @@ pub fn members(command: MembersCommand) -> Result<()> {
                 }
             }
         }
+    }
+    Ok(())
+}
+
+fn manager_here() -> Result<BranchManager> {
+    let context = MetadataStore::discover(&crate::current_dir()?)?;
+    Ok(BranchManager::open(context.store)?)
+}
+
+fn tracker_list(trackers: &[String]) -> String {
+    trackers
+        .iter()
+        .map(|tracker| format!("`{}`", newgit_core::tracker::tracker_path(tracker)))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Encrypt each shared tracker's `main` again, and say what happened: who
+/// each is encrypted to, by key fingerprint, and loudly when that is not
+/// the set this machine last used. Fails, after saying which trackers were
+/// and were not re-encrypted, when any one was not: the membership change
+/// itself already happened, and `newgit members reencrypt` retries.
+fn reencrypt(manager: &BranchManager) -> Result<()> {
+    let mut failed = Vec::new();
+    let mut done = Vec::new();
+    for outcome in manager.reencrypt_for_audience() {
+        let tracker = newgit_core::tracker::tracker_path(&outcome.tracker);
+        if let Some(error) = &outcome.error {
+            println!("  `{tracker}`: NOT re-encrypted: {error}");
+            failed.push(format!("`{tracker}`"));
+            continue;
+        }
+        match &outcome.rev {
+            _ if !outcome.merged => {
+                println!("  `{tracker}`: nothing merged yet, so nothing to re-encrypt");
+            }
+            Some(rev) => println!(
+                "  `{tracker}`: main re-encrypted at {rev}{}",
+                if outcome.published {
+                    ""
+                } else {
+                    " (on this machine only: the remote has no `main` of it yet)"
+                }
+            ),
+            None => println!("  `{tracker}`: main is already encrypted to these keys"),
+        }
+        done.push(format!("`{tracker}`"));
+        println!(
+            "{}",
+            newgit_core::manager::describe_recipients(
+                &tracker,
+                &outcome.recipients,
+                outcome.previous.as_ref()
+            )
+        );
+        if !outcome.keyless.is_empty() {
+            println!(
+                "    WARNING: {} cannot decrypt it: no ssh-ed25519 or ssh-rsa key on GitHub",
+                outcome.keyless.join(", ")
+            );
+        }
+    }
+    if !failed.is_empty() {
+        bail!(
+            "not every encrypted tracker was re-encrypted. Re-encrypted: {}. NOT re-encrypted \
+             (their `main` on the remote is still encrypted to whoever it was before): {}. \
+             `newgit members reencrypt` retries",
+            if done.is_empty() {
+                "none".to_owned()
+            } else {
+                done.join(", ")
+            },
+            failed.join(", ")
+        );
     }
     Ok(())
 }

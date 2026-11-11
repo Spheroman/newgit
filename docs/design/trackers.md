@@ -937,7 +937,7 @@ and tag from the project root.
 |---|---|---|---|
 | `<owner>.<project>.t.<tracker>` | the history of a tracker in Git, at its own root | its audience | seeding, then merges |
 | `<owner>.<project>.i.<instance>.<tracker>` | an instance's branch of one tracker in Git, forked the first time the instance changes it | the tracker's audience; only the instance's owner when it is private | the instance |
-| `<owner>.<project>.t.<tracker>[.<login>]` | a tracker outside Git, as before | its audience | its audience |
+| `<owner>.<project>.t.<tracker>[.<login>]` | a tracker outside Git, as before: age ciphertext and a `.newgit/recipients` record unless `public` (#338) | its audience | its audience |
 
 No trunk repo, no composed repo, no whole-source fork per instance: spawning
 forks nothing.

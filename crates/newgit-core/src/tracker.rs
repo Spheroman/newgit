@@ -608,6 +608,15 @@ impl TrackerDefinition {
         definition
     }
 
+    /// Whether its content is encrypted to its audience before it leaves
+    /// this machine (#338): outside Git, synced (`storage = "remote"`), and
+    /// not `public`. There is no opt-out: content a server has to read is
+    /// `public`. A tracker in Git stays plaintext (Git composes it on the
+    /// server); so does one kept on this machine, which never leaves it.
+    pub fn encrypted_to_audience(&self) -> bool {
+        !self.git && self.storage == Storage::Remote && self.audience != "public"
+    }
+
     /// Committed content with its own history, composed into workspaces
     /// rather than captured from files — every tracker in Git but root.
     pub fn carved(&self) -> bool {

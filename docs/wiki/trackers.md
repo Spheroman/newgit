@@ -15,6 +15,37 @@ project, `repos` from inside `apps/t3code`, `..` to go up, and a leading `/` for
 the full path, such as `/remote/<owner>/<project>/t3code/repos`. Without `--git` a tracker stays outside Git: captured, never
 committed.
 
+A tracker outside Git that syncs (`--storage remote`) and is not `public` is
+encrypted to its audience before anything leaves your machine: each file with
+[age](https://age-encryption.org), to the SSH keys GitHub publishes for each
+member the remote lists (`https://github.com/<login>.keys`, `ssh-ed25519` or
+`ssh-rsa`). Your workspace holds plaintext, decrypted with
+`~/.ssh/id_ed25519` or `id_rsa`, or the key `$NEWGIT_IDENTITY` names (a key
+without a passphrase, added to your GitHub account, keeps agents from
+meeting a prompt). newgit prints who it encrypts to, by key fingerprint, the
+first time and whenever that changes. `newgit members add` and `remove`
+re-encrypt `main` for the new set of members; someone removed can still read
+what they could read before, so rotate those secrets. There is no opt-out:
+a tracker a server must read (a page the remote serves) is `public`.
+
+What that guarantees, and what it does not:
+
+- The remote, and anyone who controls its deployment, cannot read the
+  content.
+- The remote decides membership, so it could add a login whose GitHub keys
+  then become recipients; every change to the set is printed by key
+  fingerprint for that reason.
+- GitHub accounts are the key authority.
+- There is no integrity: recipients' keys are public, so the remote can
+  replace a file with content of its choosing that decrypts cleanly (signed
+  tracker commits are [#431](https://github.com/Spheroman/newgit/issues/431)).
+- File names, sizes, link targets, commit messages, authors, and dates are
+  visible.
+- Revs pushed before a tracker was encrypted stay on the remote in
+  plaintext: rotate what they held.
+- A teammate on an older newgit sees ciphertext, and a capture of theirs
+  would push plaintext.
+
 An instance works on what it binds:
 
 ```sh

@@ -2288,6 +2288,13 @@ fn tracker(mut command: TrackerCommand) -> Result<()> {
                 "Created tracker `{name}` at {}",
                 display_path(&root, &outcome.path)
             );
+            if storage == Storage::Remote && audience != "public" {
+                println!(
+                    "  encrypted: its content is encrypted to its audience's SSH keys on GitHub \
+                     before it leaves this machine, so the remote stores ciphertext (file names, \
+                     sizes and commit metadata stay readable)"
+                );
+            }
             println!("  add paths with: newgit tracker track {name} <path>...");
             println!("  {REFERENCE_POINTER}");
             warn_graph(&manager_here()?);
@@ -2402,6 +2409,7 @@ fn tracker(mut command: TrackerCommand) -> Result<()> {
                             "parent": definition.parent.as_deref().map(path),
                             "paths": definition.paths,
                             "git": definition.git,
+                            "encrypted": definition.encrypted_to_audience(),
                             "role": definition.role,
                             "priority": definition.priority,
                             "requires": definition
@@ -2523,12 +2531,17 @@ fn tracker(mut command: TrackerCommand) -> Result<()> {
                     if definition.priority != 0 {
                         role.push_str(&format!(" ({})", definition.priority));
                     }
-                    let audience = match &definition.maintainers {
+                    let mut audience = match &definition.maintainers {
                         Some(maintainers) if maintainers != &definition.audience => {
                             format!("{} (maintained by {maintainers})", definition.audience)
                         }
                         _ => definition.audience.clone(),
                     };
+                    // Said for every tracker whose content is encrypted
+                    // before it leaves this machine (#338).
+                    if definition.encrypted_to_audience() {
+                        audience.push_str(", encrypted");
+                    }
                     let paths = if definition.owns_everything() {
                         "(everything no other tracker claims)".to_owned()
                     } else if definition.paths.is_empty() {

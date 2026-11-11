@@ -116,7 +116,12 @@ Remote:
   left alone (`newgit tracker pull`)
 - `newgit pull --remote <target>` — bring back what was merged on an export
   target (a pull request on GitHub); `newgit merge main` publishes it
-- `newgit members add|remove <github-login>` / `members list [--json]`
+- `newgit members add|remove <github-login>` / `members list [--json]` — add
+  and remove re-encrypt each shared encrypted tracker's `main` for the new
+  members, list every recipient by key fingerprint (saying `CHANGED` when
+  the set is not the one this machine last used), and warn about a member
+  with no usable SSH key on GitHub; they fail, naming the trackers that were
+  not re-encrypted, when any was not. `members reencrypt` runs that again
 - `newgit spawn <name> --from-checkpoint <instance>/<checkpoint>` — one
   taken on this machine is used as it is; any other comes from the remote
 

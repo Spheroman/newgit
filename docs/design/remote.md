@@ -291,6 +291,13 @@ which only the project's owner may run, and only from their login (an
 agent's or instance's token is refused). The creator is the first member
 and cannot be removed.
 
+This list is also who an encrypted tracker is encrypted to (#338): clients
+encrypt to the members it names, by the keys GitHub publishes for them. So
+the remote is the membership authority for encryption too. It cannot read
+encrypted content, but it could add a login whose keys would then become
+recipients of the next capture, which is why clients print every recipient
+by key fingerprint whenever the set changes.
+
 **Who may use it (decided).** Who may use a remote at all is the Worker's
 `ALLOWED_LOGINS` secret: GitHub logins separated by commas or whitespace, or
 `*` for anyone. Unset admits no one, so a deployment that forgot it is

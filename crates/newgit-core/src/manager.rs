@@ -48,6 +48,8 @@ use crate::tracker_repo::{
     pinned_revs, prune_unreferenced,
 };
 
+mod encryption;
+pub use encryption::{Reencrypted, describe_recipients};
 mod stale_render;
 pub use stale_render::{PossiblyStale, StaleRender};
 
@@ -93,6 +95,12 @@ pub struct BranchManager {
     /// the held lock back instead of waiting on its own process; the entry
     /// dies with the last guard.
     locks: Mutex<BTreeMap<String, Weak<InstanceLock>>>,
+    /// Where members' public keys come from, to encrypt trackers outside
+    /// Git to their audience (#338): GitHub, unless replaced.
+    keys: Arc<dyn crate::crypt::KeySource>,
+    /// Each audience's recipients as read from the remote and GitHub in
+    /// this process, so a command reads them once.
+    audiences: Mutex<BTreeMap<String, encryption::Audience>>,
 }
 
 /// An instance's lock as a command holds it; dropping the last guard for an
@@ -865,6 +873,9 @@ pub struct TrackerReport {
     pub content_rev: Option<String>,
     /// The lane head/default, when one has been merged.
     pub lane_head: Option<String>,
+    /// The bound rev and the lane head are two revs holding the same
+    /// content: one is the other encrypted to other recipients (#338).
+    pub same_content: bool,
 }
 
 impl TrackerReport {
@@ -877,7 +888,10 @@ impl TrackerReport {
     /// direction is unknowable — this instance may be ahead, behind, or
     /// diverged — so callers must not advise one direction.
     pub fn diverged(&self) -> bool {
-        self.content_rev.is_some() && self.lane_head.is_some() && self.content_rev != self.lane_head
+        self.content_rev.is_some()
+            && self.lane_head.is_some()
+            && self.content_rev != self.lane_head
+            && !self.same_content
     }
 }
 
@@ -1448,7 +1462,15 @@ impl BranchManager {
             root,
             carved,
             locks: Mutex::new(BTreeMap::new()),
+            keys: Arc::new(crate::crypt::PublishedKeys::from_env()),
+            audiences: Mutex::new(BTreeMap::new()),
         })
+    }
+
+    /// Read members' public keys from `keys` instead of GitHub.
+    pub fn with_key_source(mut self, keys: Arc<dyn crate::crypt::KeySource>) -> Self {
+        self.keys = keys;
+        self
     }
 
     /// Hold `slug`'s lock for the rest of the command: every command that
@@ -6096,6 +6118,7 @@ impl BranchManager {
                     .get(&definition.name)
                     .and_then(|binding| binding.content_rev.clone());
                 let reversed = self.unrender_for_capture(branch, definition)?;
+                let seal = self.seal_for(definition, Some(branch))?;
                 let safety = lane.capture(
                     &workspace,
                     definition,
@@ -6106,6 +6129,7 @@ impl BranchManager {
                             "{} in `{}`, before re-binding",
                             definition.name, branch.name
                         ),
+                        seal: seal.as_ref(),
                     },
                 );
                 reversed.restore()?;
@@ -7010,6 +7034,13 @@ impl BranchManager {
             .get(&definition.name)
             .and_then(|binding| binding.content_rev.clone());
         let lane = self.lane(&definition.name);
+        let seal = match self.seal_for(definition, Some(&branch)) {
+            Ok(seal) => seal,
+            Err(error) => {
+                reversed.restore()?;
+                return Err(error);
+            }
+        };
         let capture = lane.capture(
             &branch.workspace_path,
             definition,
@@ -7017,6 +7048,7 @@ impl BranchManager {
                 parent: previous.as_deref(),
                 branch: Branch::Instance(&branch.slug),
                 message: &format!("{} in `{}`", definition.name, branch.name),
+                seal: seal.as_ref(),
             },
         );
         reversed.restore()?;
@@ -7077,6 +7109,7 @@ impl BranchManager {
 
         let lane = self.lane(&definition.name);
         let main = lane.main();
+        let seal = self.seal_for(definition, None)?;
         let capture = lane.capture(
             &root,
             definition,
@@ -7084,6 +7117,7 @@ impl BranchManager {
                 parent: main.as_deref(),
                 branch: Branch::Main,
                 message: &format!("{} seeded from the project", definition.name),
+                seal: seal.as_ref(),
             },
         )?;
         let changed = capture.committed;
@@ -7135,6 +7169,13 @@ impl BranchManager {
             .trackers
             .get(&definition.name)
             .and_then(|binding| binding.content_rev.clone());
+        let seal = match self.seal_for(definition, Some(&branch)) {
+            Ok(seal) => seal,
+            Err(error) => {
+                reversed.restore()?;
+                return Err(error);
+            }
+        };
         let safety = lane.capture(
             &branch.workspace_path,
             definition,
@@ -7145,6 +7186,7 @@ impl BranchManager {
                     "{} in `{}`, before checking out {target_rev}",
                     definition.name, branch.name
                 ),
+                seal: seal.as_ref(),
             },
         );
         reversed.restore()?;
@@ -7214,56 +7256,29 @@ impl BranchManager {
                 rev,
             });
         }
+        // Encrypted to its audience: `main` is encrypted to who reads it now,
+        // as the remote lists them, which may have changed since the
+        // capture (#338).
+        let rev = self.sealed_to_current(
+            definition,
+            &rev,
+            Some(&branch),
+            Branch::Instance(&branch.slug),
+            &format!(
+                "{} in `{}`, encrypted to its audience",
+                definition.name, branch.name
+            ),
+        )?;
         // The remote first: a merge that did not reach it fails whole,
         // rather than leaving `main` moved on this machine only.
-        let published = self.publish_tracker_main(&branch, definition, &rev)?;
+        let published =
+            self.publish_main(definition, &rev, Acting::Workspace(&branch.workspace_path))?;
         lane.set_main(&rev)?;
         Ok(MergeTrackerOutcome {
             tracker: definition.name.clone(),
             rev,
             published,
         })
-    }
-
-    /// Move the remote's `main` for a shared tracker whose synced state lives
-    /// there (`storage = "remote"`) to `rev`. A checkpoint's sync pushes only
-    /// such a tracker's pins and instance branches, never its `main`, so this
-    /// is the one way that `main` moves.
-    ///
-    /// On the remote a tracker repo's `main` is its branch `main`, as that of a
-    /// tracker in Git is: the repo's default branch, what the Worker's
-    /// `LANDING_PAGE` reads, and what anything reading a tracker by branch
-    /// gets. A per-user tracker's `main` already rides every checkpoint.
-    ///
-    /// Forced, so of two merges at once the last wins; the rev it replaces
-    /// stays on the remote under its pin and its instance branch. A lease
-    /// would refuse instead, but nothing fetches the remote's `main` back
-    /// into this machine's yet, so a refused merge would have no way to
-    /// catch up. The lease comes with that fetch.
-    fn publish_tracker_main(
-        &self,
-        branch: &BranchInstance,
-        definition: &TrackerDefinition,
-        rev: &str,
-    ) -> Result<Option<String>> {
-        if definition.storage != Storage::Remote || definition.audience == "user" {
-            return Ok(None);
-        }
-        let Some(link) = &self.remote else {
-            return Ok(None);
-        };
-        let remote = link.connect(Acting::Workspace(&branch.workspace_path))?;
-        let repo = tracker_repo(&link.project, definition, "");
-        let credential = remote.credential(&link.project, &repo, Scope::Write)?;
-        let url = credential.remote.clone().unwrap_or_default();
-        let pin = format!("refs/trackers/{}/pins/{rev}", definition.name);
-        GitSource::push_refs(
-            &[&format!("--git-dir={}", self.store.paths().tracker_store)],
-            &url,
-            &[format!("{pin}:{pin}"), format!("+{pin}:refs/heads/main")],
-            Some(&basic_auth_header(&credential)),
-        )?;
-        Ok(Some(link.project.clone()))
     }
 
     pub fn create_tracker(
@@ -7455,10 +7470,20 @@ impl BranchManager {
                             .iter()
                             .find(|(name, _)| name == &definition.name)
                             .and_then(|(_, head)| head.clone());
+                        // Re-encrypted to another set of recipients is still
+                        // the same content; not knowing (no key) is not.
+                        let same_content = match (&content_rev, &head) {
+                            (Some(bound), Some(head)) if bound != head => self
+                                .lane(&definition.name)
+                                .same_content(bound, head)
+                                .unwrap_or(false),
+                            _ => false,
+                        };
                         TrackerReport {
                             name: definition.name.clone(),
                             content_rev,
                             lane_head: head,
+                            same_content,
                         }
                     })
                     .collect();
@@ -7624,6 +7649,10 @@ impl BranchManager {
             (true, found) => (None, found.map_or(0, |plan| plan.checkpoints)),
             (false, purged) => (purged, 0),
         };
+        // And the plaintext this machine kept of what it decrypted for it
+        // (#338): only what a live instance or `main` holds stays cached.
+        // Its archived checkpoints still decrypt, with a key, if restored.
+        crate::tracker_repo::prune_plain_cache(&self.store.paths().tracker_store)?;
 
         // Last, so an error anywhere above leaves the branch untouched. By
         // now the record is archived and the removal has happened, so
@@ -10309,6 +10338,7 @@ impl BranchManager {
                     // shared, and the rev recorded here is what an undo
                     // re-renders on top of, so it has to hold the committed
                     // values a render's `find` matches.
+                    let seal = self.seal_for(definition, Some(branch))?;
                     let reversed = self.unrender_for_capture(branch, definition)?;
                     let capture = self.lane(&definition.name).capture(
                         &workspace,
@@ -10317,11 +10347,35 @@ impl BranchManager {
                             parent: bound.as_deref(),
                             branch: Branch::Instance(&branch.slug),
                             message: &format!("{} in `{}` at {id}", definition.name, branch.name),
+                            seal: seal.as_ref(),
                         },
                     );
                     reversed.restore()?;
                     Some(capture?.rev)
                 };
+            // About to be synced: a rev of an encrypted tracker this
+            // capture did not make (a dropped one, a deposit's), or made
+            // offline, is encrypted again if the audience changed since
+            // (#338). Without the remote it stays as it is, and the sync,
+            // which checks again, does not send it.
+            let content_rev = match content_rev {
+                Some(rev) if definition.encrypted_to_audience() && self.remote.is_some() => {
+                    match self.sealed_to_current(
+                        definition,
+                        &rev,
+                        Some(branch),
+                        Branch::Instance(&branch.slug),
+                        &format!(
+                            "{} in `{}` at {id}, encrypted to its audience",
+                            definition.name, branch.name
+                        ),
+                    ) {
+                        Ok(current) => Some(current),
+                        Err(_) => Some(rev),
+                    }
+                }
+                other => other,
+            };
             branch.trackers.insert(
                 definition.name.clone(),
                 TrackerBinding {
@@ -12228,6 +12282,9 @@ impl BranchManager {
             if definition.storage != Storage::Remote {
                 continue;
             }
+            // Nothing in plaintext, and nothing to a stale audience (#338).
+            self.refuse_plaintext(definition, rev)?;
+            self.refuse_stale(definition, rev, branch)?;
             if login.is_none() {
                 login = Some(remote.me()?.login);
             }
@@ -12240,7 +12297,12 @@ impl BranchManager {
             let pin = format!("{prefix}/pins/{rev}");
             let instance = format!("{prefix}/instances/{}", branch.slug);
             let mut refspecs = vec![format!("{pin}:{pin}"), format!("+{instance}:{instance}")];
-            if definition.audience == "user" && self.lane(&state.name).main().is_some() {
+            if definition.audience == "user"
+                && let Some(main) = self.lane(&state.name).main()
+            {
+                // A per-user `main` merged while no remote was linked is
+                // plaintext: checked like everything else sent.
+                self.refuse_plaintext(definition, &main)?;
                 let main = format!("{prefix}/main");
                 refspecs.push(format!("+{main}:{main}"));
             }
@@ -12394,6 +12456,7 @@ impl BranchManager {
                             .trackers
                             .get(tracker)
                             .and_then(|binding| binding.content_rev.clone());
+                        let seal = self.seal_for(self.definition(tracker)?, Some(branch))?;
                         let deposit = lane.deposit(
                             staging_path,
                             CaptureAt {
@@ -12403,6 +12466,7 @@ impl BranchManager {
                                     "{} checkpoint of `{}`",
                                     definition.name, branch.name
                                 ),
+                                seal: seal.as_ref(),
                             },
                         )?;
                         // A path the command echoed under {{snapshot.path}}

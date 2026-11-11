@@ -1,4 +1,4 @@
-audience = "project-devs"
+audience = "public"
 storage = "remote"
 merge_with_source = false
 paths = ["remote/site"]
