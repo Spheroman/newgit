@@ -2603,7 +2603,7 @@ impl BranchManager {
             &[format!("+refs/heads/*:refs/history/{tracker}/*")],
             Some(&basic_auth_header(&credential)),
         )?;
-        crate::source::run_git_env(
+        crate::source::run_fetch(
             &[
                 "-C",
                 project.as_str(),

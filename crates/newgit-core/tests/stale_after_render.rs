@@ -42,23 +42,29 @@ fn tempdir() -> (tempfile::TempDir, Utf8PathBuf) {
 
 const ENV: &str = "API_URL=http://127.0.0.1:54321\n";
 
-/// A port nothing holds, from the OS, for `db` to start probing at. A fixed
-/// one collided with whatever else was listening on the runner (or with the
-/// other test in this file), so `db` was given the next port and the
-/// assertion on the rendered file failed (#354).
-fn free_port() -> u16 {
-    std::net::TcpListener::bind(("127.0.0.1", 0))
-        .expect("bind an ephemeral port")
-        .local_addr()
-        .expect("local_addr")
-        .port()
+/// Where `db`'s port scan starts. Which port it gets is up to the
+/// allocator, which skips anything held, so the assertions read it back
+/// from the binding record ([`db_port`]) rather than predicting it: a port
+/// predicted with `bind(0)` and released was taken by something else on a
+/// loaded runner, `db` was given the next one, and the assertion on the
+/// rendered file failed (#354, #432).
+const DB_PORT_START: u16 = 47_300;
+
+/// The port `x`'s `db` was given.
+fn db_port(manager: &BranchManager) -> u16 {
+    manager
+        .store()
+        .find_branch("x")
+        .expect("instance")
+        .resources["db"]
+        .resolved_ports["api"]
 }
 
 /// `branch-db` brings `db`, which renders into `apps/admin/.env.local`.
 /// Three processes autostart regardless: `admin` declares it reads
 /// `apps/admin`, `quiet` declares it reads something else, and `worker`
 /// declares nothing.
-fn setup(temp: &Utf8Path, db_port: u16) -> BranchManager {
+fn setup(temp: &Utf8Path) -> BranchManager {
     let repo = temp.join("store");
     std::fs::create_dir_all(repo.join("apps/admin")).expect("mkdir");
     std::fs::create_dir_all(repo.join("apps/db")).expect("mkdir");
@@ -94,7 +100,7 @@ fn setup(temp: &Utf8Path, db_port: u16) -> BranchManager {
             r#"ownership = "branch"
 
 [ports.api]
-start = {db_port}
+start = {DB_PORT_START}
 
 [[render]]
 path = "apps/admin/.env.local"
@@ -155,8 +161,7 @@ impl Drop for Stop<'_> {
 #[test]
 fn a_use_that_rewrites_a_rendered_file_restarts_readers_and_names_the_rest() {
     let (_guard, temp) = tempdir();
-    let db_port = free_port();
-    let manager = setup(&temp, db_port);
+    let manager = setup(&temp);
     let spawned = manager
         .spawn_binding("x", None, &without_db())
         .expect("spawn x");
@@ -174,6 +179,7 @@ fn a_use_that_rewrites_a_rendered_file_restarts_readers_and_names_the_rest() {
     let change = manager
         .use_tracker("x", "branch-db")
         .expect("use branch-db");
+    let db_port = db_port(&manager);
 
     assert_eq!(
         std::fs::read_to_string(workspace.join("apps/admin/.env.local")).expect("env"),
@@ -231,8 +237,7 @@ fn a_use_that_rewrites_a_rendered_file_restarts_readers_and_names_the_rest() {
 #[test]
 fn a_drop_that_takes_a_rendered_value_out_restarts_its_readers() {
     let (_guard, temp) = tempdir();
-    let db_port = free_port();
-    let manager = setup(&temp, db_port);
+    let manager = setup(&temp);
     let spawned = manager.spawn("x", None).expect("spawn x");
     let _stop = Stop(&manager);
     let workspace = spawned.branch.workspace_path;
