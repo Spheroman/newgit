@@ -317,10 +317,12 @@ history instead: the branch (its `HEAD` by default) becomes the tracker's
 `<dir>`, an empty directory: one ordinary commit holding its files. Its
 history stays in its own repository and never enters this project's, so
 `git log` under the mount starts there. A `--from` path is relative to where you
-run it. `newgit pull <tracker>` moves its pin to its `follow` ref in one
-commit, and `newgit pull` alone does it for every tracker in Git root mounts,
-still one commit, on the branch it runs on; nothing else moves a pin on your
-behalf. `newgit clone` fetches only
+run it. `newgit pull <tracker>...` moves its pin to its `follow` ref in one
+commit, after taking what is new on an export target rooted at it, and
+`newgit pull` alone does it for every tracker in Git mounted here, at any
+depth, still one commit on the branch it runs on (a child's pin moves by a
+commit in the tracker that mounts it first). No tracker's `main` moves until
+`newgit merge`, and nothing else moves a pin on your behalf. `newgit clone` fetches only
 the commits root pins of a mounted tracker, and its history the first time
 something needs it, once; `newgit clone --full` fetches every history up
 front. How sensitive a tracker's content is has nothing to do with this; that
@@ -1979,9 +1981,13 @@ when the instance's work touched that tracker.
 A pull request merged there comes back with `newgit pull --remote <target>`:
 the tracker's `main` fast-forwards to it (or really merges it, when `main`
 moved here too), then its pin in the project root moves, in one commit on
-top, whatever the new commits' dates. Instances pick it up with `newgit pull <tracker>` once `newgit merge
-main` has published it. An export finding the target ahead says to run
-that rather than pulling by itself.
+top, whatever the new commits' dates. Plain `newgit pull` (and `newgit
+pull <tracker>`) takes it too, anywhere, as the first step of updating that
+tracker, one more fetch per tracker with a rooted target: the pin moves on
+the branch it ran on, and the tracker's `main` only when that merges. A
+target that can't be reached, or conflicts, leaves that tracker and the
+trackers below it where they were, and the rest still move. An export
+finding the target ahead says to pull rather than pulling by itself.
 
 ### Pull requests from a workspace: `branches = true`
 

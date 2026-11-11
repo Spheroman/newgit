@@ -261,10 +261,12 @@ The full model is in [`trackers.md`](trackers.md). The short version:
   so no id changes. You commit to a tracker in Git with Git. When work
   leaves the machine, newgit splits each commit into one root commit and a
   commit in each tracker it changed, and composing them back gives the same
-  commit, with the same id. `newgit pull <tracker>` moves a pin to the
-  tracker's `follow` ref, and `newgit pull` alone moves every pin root
-  mounts that is behind, in one commit on the branch it runs on; nothing
-  else moves one on your behalf.
+  commit, with the same id. `newgit pull` moves every pin that is
+  behind, at any depth, to the tracker's `follow` ref, after taking what is
+  new on its export target when it has one rooted at it, in one commit on
+  the branch it runs on (a child's moves by a commit in its parent first);
+  `newgit pull t3code ui-kit` only those. No tracker's `main` moves until
+  `newgit merge`, and nothing else moves a pin on your behalf.
 - **A tracker outside Git** (`git = false`, the default) owns files that
   never belong in Git: an `.env.local`, an agent's notes, a SQLite file, a
   public page. They are captured by newgit, never committed.

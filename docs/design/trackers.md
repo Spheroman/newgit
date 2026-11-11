@@ -500,7 +500,7 @@ split, checkpoint, push, and an ordinary merge fetch no history.
 |---|---|
 | A child's `main` moved past the pin, and the merge has to join them | Asks both ways round; neither → `need_history`, then `git merge-tree` |
 | A split where a view merge joins two lines of a child, with a tree equal to one of them | Asks whether that one descends from the other; "no" → `need_history` |
-| `newgit pull <tracker>`, `newgit pull` | Fast-forward: no history, `follow` lands on the pin and is counted. Otherwise `need_history`, so a pin is never moved backwards |
+| `newgit pull <tracker>`, `newgit pull` | Fast-forward: no history, `follow` lands on the pin and is counted. Otherwise `need_history`, so a pin is never moved backwards. A rooted target's tip the pin or `follow` already has needs none either; anything else is `need_history` first, as `--remote` is |
 | `newgit pull --remote` from a rooted target, a rooted export, `newgit log <tracker>`, `tracker migrate` | `need_history` first: each walks the history itself |
 | `spawn --from-checkpoint` | A plain fetch from the author's fork stops at the pin, so the checkpoint's commits are whole enough to push on; other pins come from the tracker's repo; no history unless root's walk reaches a snapshot |
 | A tracker's commits judged before a push | Stops at the pin, which is what the remote already holds |
@@ -880,7 +880,7 @@ sees it when someone runs:
 newgit pull electron
 ```
 
-That makes one view commit, `Pull electron: 14 commits from main`, which
+That makes one view commit, `Update trackers: electron (14 commits)`, which
 moves the pin and holds the child's files there, on one parent. It is authored
 by whoever ran it, needs the root's maintainers like any change, and merges
 into `main` like any instance commit; the workspace fast-forwards to it.
@@ -888,26 +888,58 @@ into `main` like any instance commit; the workspace fast-forwards to it.
 when a mounted tracker is behind its `follow` ref.
 
 `newgit pull` with no tracker (#345) is the same for every tracker in Git
-root mounts, in one commit: `Update trackers: t3code (14 commits), ui-kit
-(2 commits)`. A pin is part of a commit, so it lands on the branch it ran
-on, as `flake.lock` does: an instance's branch in an instance, and in the
-project root the project root's own instance branch, which `newgit merge
-main` publishes; `main` takes it only when that merges. It writes nothing
-when no pin is behind. Four kinds of tracker stay put, and it says which: a
-pin holding commits its `follow` ref lacks (the instance's own work on it;
-moving the pin would drop them, so merge first), a tracker mounted deeper
-than root (pulled in the tracker that mounts it), a tracker the remote will
-not let the caller read (a 403 on its repo; `newgit pull <tracker>` on it
-fails instead, and so does plain `newgit pull` when it can read none of
-them, since then nothing is known to be up to date), and a tracker outside
-Git, which has no pin (`newgit tracker pull` updates its files, and can
-overwrite an instance's). With a remote, it resolves each `follow` ref
-there, one fetch per tracker. It moves pins to
-the tracker's `follow` ref, not to what is newest on an export target:
-`newgit pull --remote <target>` stays a separate step. Updating from rooted
-export targets as part of it, pulling child trackers mounted deeper, and
-selecting several trackers (`newgit pull t3code ui-kit`) are tracked in
-[#426](https://github.com/Spheroman/newgit/issues/426).
+mounted here, at any depth, in one commit: `Update trackers: t3code (14
+commits), ui-kit (2 commits)`. `newgit pull t3code ui-kit` does it for
+those two only (#426): every argument is a tracker, and `--instance <name>`
+names an instance other than the one it runs in. A pin is part of a
+commit, so it lands on the branch it ran on, as `flake.lock` does: an
+instance's branch in an instance, and in the project root the project
+root's own instance branch, which `newgit merge main` publishes; `main`
+takes it only when that merges. It writes nothing when no pin is behind.
+
+**Update means upstream too (decided, #426).** For a tracker with an export
+target rooted at it (t3code → Spheroman/t3code), "update" means what is new
+*there*, as `nix flake update` would have it. So before moving pins, `newgit
+pull` does for each such tracker what `newgit pull --remote <target>` does
+to its `main`: fetches the target's branch, then fast-forwards the
+tracker's `follow` ref to it, or really merges the two (one merge commit,
+`Merge github.com/Spheroman/t3code newgit`, on that ref and the target's
+tip), and the pin moves to that. That is one more fetch per such tracker,
+on top of the one per tracker that resolves its `follow` ref with a remote.
+What it does *not* do is move the tracker's `main`, anywhere: `main` is
+shared, and landing commits there would change what every other instance
+pulls next. The target's commits ride on the tracker's branch for this
+instance (`instances/<slug>`) like any instance commit, the pin moves on
+this branch only, and `newgit merge` lands them on the tracker's `main`
+when the instance merges. That holds in the project root too: there, `newgit
+merge main` lands them. `newgit pull --remote` is unchanged, and still the
+one command that moves a tracker's `main` straight from a target.
+
+**A child moves in the tracker that mounts it (decided, #426).** A child's
+pin is part of its parent's commits, so moving it is a commit in the
+parent, whose own pin then moves in *its* parent, up to root: one commit per
+tracker whose pins moved, made bottom-up, each naming what moved below it
+from where it stands. Pulling `t3code/repos` makes `Update trackers: repos
+(1 commit)` in `t3code`, on t3code's pin, and root's view commit `Update
+trackers: t3code/repos (1 commit)` pins that. `newgit pull t3code/repos`
+does the same for that child alone; naming `t3code` moves only t3code's own
+pin. A child whose parent this instance does not bind stays, and is named:
+an instance commits only to trackers it binds (`newgit tracker use
+<parent>` binds it).
+
+Five kinds of tracker stay put, and it says which: a pin holding commits
+its `follow` ref lacks (the instance's own work on it; moving the pin would
+drop them, so merge first), a tracker the remote will not let the caller
+read (a 403 on its repo; plain `newgit pull` fails when it can read none of
+them, since then nothing is known to be up to date), a tracker whose export
+target cannot be pulled from (unreachable, a real conflict with its
+`follow` ref, a file of a tracker outside Git): it and every tracker below
+it stay, never half-moved, since the target ships them too, a child of a
+tracker this instance does not bind, and a tracker outside Git, which has
+no pin (`newgit tracker pull` updates its files, and can overwrite an
+instance's). The rest still move. A tracker named on the command line that
+stays for any of these reasons makes it exit non-zero, after the others
+moved.
 
 Parallel instances merge the way a monorepo does: two instances that each
 made a commit produce a merge commit in `main`'s view, even if they touched
@@ -1294,7 +1326,8 @@ named and skipped.
   files in place and ids of their own.
 - **#142 (pull from a target):** *done.* `newgit pull --remote t3code`
   fetches, fast-forwards or merges t3code's `main`, then moves its pin in
-  the project root as `newgit pull t3code` would. When t3code mounts
+  the project root as `newgit pull t3code` would (plain `newgit pull` does
+  the same fetch first, landing on the branch it runs on, #426). When t3code mounts
   trackers, what comes back is view commits, so it is split first: each file
   goes to the tracker that owns it, an upstream's plain commits and a merge
   of them included. For Spheroman/newgit, its
@@ -1308,7 +1341,7 @@ named and skipped.
   mirror, rooted at it, and importing t3code once put 8,164 of its commits
   into newgit's view and onto the public mirror. FORK.md: upstream comes in
   by merging pingdotgg/t3code into the fork's `newgit` branch, then `newgit
-  pull --remote t3code` and `newgit pull t3code`, one commit here. The
+  pull t3code` (or plain `newgit pull`), one commit here. The
   cold-start measurement doubles as the profile cost check.
 
 ---
@@ -1525,7 +1558,8 @@ this is the list.
   bringing those commits in moves a pin, which is a commit nobody asked for.
 - **`newgit pull --remote` lands in the project root only,** and publishes
   nothing; `newgit merge main` does. Instances pick a moved pin up with
-  `newgit pull <tracker>`. For a target without `root`, the files of each
+  `newgit pull <tracker>`, which also takes what is new on the target
+  itself, on the instance's branch, without moving the tracker's `main`. For a target without `root`, the files of each
   tracker it withholds are put back from the parent commit, and a commit
   touching a withheld tracker's mount is refused rather than guessed at.
 - **The import's commit is unsigned,** since newgit writes it and its
@@ -1609,11 +1643,13 @@ What was ugly, and is left that way for now:
 - **No CLI to unlink** other than dropping the definition by hand.
 
 Not found by this experiment, but found while running it: `newgit pull
-<tracker>` in an instance replaces the tracker's files with its `main`
-rather than merging the instance's own change into it. So the conflict
+<tracker>` in an instance replaced the tracker's files with its `main`
+rather than merging the instance's own change into it, so the conflict
 message's advice ("bring `main` into the instance's workspace, resolve
-there") loses the instance's change if followed with `pull`. This is true
-of every tracker in Git, not only links.
+there") lost the instance's change if followed with `pull`. Since #426 a
+pin holding the instance's own commits stays where it is, and `pull` says
+so (and exits non-zero when the tracker was named), rather than dropping
+them; bringing `main` in is still a merge, not a pull.
 
 ## Open questions and known gaps
 

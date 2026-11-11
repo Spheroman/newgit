@@ -9264,6 +9264,70 @@ impl BranchManager {
         tracker: &str,
         theirs: &str,
     ) -> Result<PullRemoteOutcome> {
+        let definition = self
+            .carved
+            .iter()
+            .find(|definition| definition.name == tracker)
+            .cloned()
+            .ok_or_else(|| {
+                NewgitError::Unsupported(format!("`{tracker}` is not a tracker in Git here"))
+            })?;
+        let ours = self.rooted_ours(tracker)?;
+        let rooted = self.rooted_merge(target, tracker, theirs, ours.as_deref())?;
+        // `main` moves with the pin, after the project root has taken it.
+        let mut mains: Vec<(String, String)> = if ours.as_deref() != Some(rooted.main.as_str()) {
+            vec![(tracker.to_owned(), rooted.main.clone())]
+        } else {
+            Vec::new()
+        };
+        mains.extend(rooted.children.iter().cloned());
+        let (pinned, view) =
+            self.move_pin(None, &definition, &rooted.main, &rooted.from, &mains)?;
+        Ok(PullRemoteOutcome {
+            target: target.name.clone(),
+            url: target.push_url(),
+            branch: target.branch.clone(),
+            root: Some(tracker.to_owned()),
+            commits: rooted.commits,
+            merged: rooted.merged,
+            pinned,
+            view,
+        })
+    }
+
+    /// Tracker `tracker`'s `main` as published, or as it is here when that
+    /// is ahead of it (pulled back before, not merged yet): what a pull from
+    /// its rooted target starts from, so a pull again finds nothing.
+    fn rooted_ours(&self, tracker: &str) -> Result<Option<String>> {
+        let published = self.tracker_branch_commit(tracker, "main")?;
+        let here = self
+            .source
+            .rev_parse(&local_tracker_ref(tracker, "main"))
+            .ok();
+        Ok(match (&published, &here) {
+            (Some(published), Some(here))
+                if published != here && self.source.is_ancestor(published, here)? =>
+            {
+                Some(here.clone())
+            }
+            (None, Some(here)) => Some(here.clone()),
+            _ => published,
+        })
+    }
+
+    /// What export target `target`, rooted at `tracker`, at `theirs`, makes
+    /// of `ours` (the tracker's commit it is pulled into): `ours` fast-
+    /// forwarded to the target's commits, or really merged with them as
+    /// `newgit merge` would. Moves nothing: the caller decides where the
+    /// result lands. Fails, moving nothing, on a real conflict and on a
+    /// history adding a file a tracker outside Git owns.
+    fn rooted_merge(
+        &self,
+        target: &ExportTarget,
+        tracker: &str,
+        theirs: &str,
+        ours: Option<&str>,
+    ) -> Result<RootedPull> {
         let project = self.store.paths().project_root.clone();
         let definition = self
             .carved
@@ -9273,22 +9337,6 @@ impl BranchManager {
             .ok_or_else(|| {
                 NewgitError::Unsupported(format!("`{tracker}` is not a tracker in Git here"))
             })?;
-        // `main` as published, or as it is here when that is ahead of it
-        // (pulled back before, not merged yet): a pull again finds nothing.
-        let published = self.tracker_branch_commit(tracker, "main")?;
-        let here = self
-            .source
-            .rev_parse(&local_tracker_ref(tracker, "main"))
-            .ok();
-        let ours = match (&published, &here) {
-            (Some(published), Some(here))
-                if published != here && self.source.is_ancestor(published, here)? =>
-            {
-                Some(here.clone())
-            }
-            (None, Some(here)) => Some(here.clone()),
-            _ => published,
-        };
         // A root that mounts trackers in Git is exported as a view, so what
         // comes back is view commits: split, each file goes to the tracker
         // that owns it. Adopted as they are, a change under a child's mount
@@ -9298,13 +9346,13 @@ impl BranchManager {
             .iter()
             .filter(|child| child.parent.as_deref() == Some(tracker))
             .collect();
-        let exported = match (&ours, children.is_empty()) {
+        let exported = match (ours, children.is_empty()) {
             (Some(ours), false) => Some(self.compose_rooted(target, tracker, ours)?),
             _ => None,
         };
         let mut new_args = vec![theirs];
-        if let Some(seen) = exported.as_ref().or(ours.as_ref()) {
-            new_args.extend(["--not", seen.as_str()]);
+        if let Some(seen) = exported.as_deref().or(ours) {
+            new_args.extend(["--not", seen]);
         }
         let all = self.all_definitions();
         if let Some((commit, path, owner)) = crate::compose::find_outside_git_under(
@@ -9344,10 +9392,10 @@ impl BranchManager {
             Some(outcome.root)
         };
         let theirs = split_tip.as_deref().unwrap_or(theirs);
-        let (main, merged) = match &ours {
+        let (main, merged) = match ours {
             None => (theirs.to_owned(), false),
             Some(ours) if ours == theirs || self.source.is_ancestor(theirs, ours)? => {
-                (ours.clone(), false)
+                (ours.to_owned(), false)
             }
             Some(ours) if self.source.is_ancestor(ours, theirs)? => (theirs.to_owned(), false),
             Some(ours) => match self.merge_commits(ours, theirs, &format!("Merge {from}"))? {
@@ -9364,23 +9412,13 @@ impl BranchManager {
                 }
             },
         };
-        // `main` moves with the pin, after the project root has taken it.
-        let mut mains: Vec<(String, String)> = if ours.as_deref() != Some(main.as_str()) {
-            vec![(tracker.to_owned(), main.clone())]
-        } else {
-            Vec::new()
-        };
-        mains.extend(moved_children);
-        let pulled = self.move_pin(None, &definition, &main, &from, &mains)?;
-        Ok(PullRemoteOutcome {
-            target: target.name.clone(),
-            url: target.push_url(),
-            branch: target.branch.clone(),
-            root: Some(tracker.to_owned()),
-            commits,
+        Ok(RootedPull {
+            tip: theirs.to_owned(),
+            main,
             merged,
-            pinned: pulled.commits,
-            view: pulled.view,
+            commits,
+            children: moved_children,
+            from,
         })
     }
 
@@ -12057,121 +12095,89 @@ impl BranchManager {
         })
     }
 
-    /// `newgit pull <tracker>`: one view commit in `instance` (the project
-    /// root when `None`) that moves `tracker`'s pin to its `follow` ref —
-    /// `Pull t3code: 14 commits from main` — authored by whoever runs it.
-    /// It holds the tracker's files at the new pin, and merges into
-    /// `main` like any instance commit. The workspace fast-forwards to it.
-    pub fn pull(&self, instance: Option<&str>, tracker: &str) -> Result<PullOutcome> {
-        self.require_migrated()?;
-        let definition = self
-            .carved
-            .iter()
-            .find(|definition| definition.name == tracker)
-            .cloned()
-            .ok_or_else(|| {
-                NewgitError::Unsupported(format!(
-                    "`{tracker}` is not a tracker in Git mounted here: `newgit pull` moves a \
-                     mounted tracker's pin"
-                ))
-            })?;
-        let new = self.follow_commit(&definition)?.ok_or_else(|| {
-            NewgitError::Unsupported(format!(
-                "`{tracker}` has no `{}` to pull here",
-                definition.follow
-            ))
-        })?;
-        self.move_pin(instance, &definition, &new, &definition.follow, &[])
-    }
-
-    /// `newgit pull` with no tracker (#345): every tracker in Git that root
-    /// mounts in `instance` (the project root when `None`) moves its pin to
-    /// its `follow` ref, in one view commit — `Update trackers: t3code (14
-    /// commits), ui-kit (2 commits)` — the way `newgit pull <tracker>` moves
-    /// one. Nothing is written when no pin moves.
+    /// `newgit pull [<tracker>...]` (#345, #426): bring the mounted trackers
+    /// in Git up to date in `instance` (the project root when `None`): every
+    /// one, at any depth, or only those `trackers` names (ids).
     ///
-    /// Only a pin its `follow` ref fast-forwards moves. One with commits
-    /// that ref lacks (the instance's own work on that tracker, say) stays
-    /// where it is, and is listed: moving it would drop them. One the
-    /// remote will not let the caller read (403) is listed and passed over,
-    /// unless every one tried was refused: then nothing is known to be up
-    /// to date, so it fails with the remote's reasons. Trackers outside Git
-    /// have no pins and are left alone, as are trackers mounted deeper than
-    /// root (pulled in the tracker that mounts them).
-    pub fn pull_all(&self, instance: Option<&str>) -> Result<PullAllOutcome> {
+    /// For each: a tracker with a rooted export target first takes what is
+    /// new there, as `newgit pull --remote <target>` would (a fast-forward,
+    /// or a real merge with its `follow` ref); then its pin moves to that,
+    /// or to its `follow` ref, when it fast-forwards the pin. The pin of a
+    /// tracker mounted below another lives in that tracker's commits, so
+    /// moving it is a commit in that tracker, whose own pin then moves in
+    /// its parent, up to root: one commit per tracker whose pins moved, made
+    /// bottom-up, each `Update trackers: t3code (14 commits), ui-kit (2
+    /// commits)` naming what moved below it. Root's is the view commit, on
+    /// this instance's branch. No tracker's `main` moves: every
+    /// commit lands on the trackers' branches for this instance, and `newgit
+    /// merge` lands them on `main`. Nothing is written when no pin moves.
+    ///
+    /// Each passed over and named, never half-moved, without stopping the
+    /// rest: a pin holding commits its ref lacks (moving it would drop them),
+    /// a tracker the remote will not let the caller read (403), one whose
+    /// export target cannot be pulled from (unreachable, a conflict, a file
+    /// of a tracker outside Git), and one mounted in a tracker this instance
+    /// does not bind. Every one read refused is an error: then nothing is
+    /// known to be up to date. Trackers outside Git have no pins and are
+    /// left alone.
+    pub fn pull(&self, instance: Option<&str>, trackers: &[String]) -> Result<PullOutcome> {
         self.require_migrated()?;
         let (slug, workspace, base) = self.pull_base(instance)?;
-        let (pins, index) = self.base_pins(&base)?;
-        let mut outcome = PullAllOutcome {
-            outside_git: self
-                .trackers
-                .iter()
-                .map(|definition| definition.name.clone())
-                .collect(),
-            ..PullAllOutcome::default()
-        };
-        let mut moved: Vec<(String, String)> = Vec::new();
-        let mut mounts: Vec<String> = Vec::new();
-        for (tracker, old) in &pins {
-            let Some(definition) = self
-                .carved
-                .iter()
-                .find(|definition| &definition.name == tracker)
-            else {
-                continue;
-            };
-            // A tracker the remote will not let this caller read is passed
-            // over, like a missing ref, so it does not stop the rest;
-            // `newgit pull <tracker>` still fails on it.
-            let new = match self.follow_commit(definition) {
-                Ok(Some(new)) => new,
-                Ok(None) => {
-                    outcome
-                        .no_follow
-                        .push((tracker.clone(), definition.follow.clone()));
-                    continue;
-                }
-                Err(NewgitError::Remote {
-                    status: 403,
-                    message,
-                }) => {
-                    outcome.unreadable.push((tracker.clone(), message));
-                    continue;
-                }
-                Err(error) => return Err(error),
-            };
-            match self.pin_move(tracker, old, &new)? {
-                PinMove::UpToDate => outcome.up_to_date.push(tracker.clone()),
-                PinMove::Diverged => outcome
-                    .diverged
-                    .push((tracker.clone(), definition.follow.clone())),
-                PinMove::Forward => {
-                    outcome.pulled.push(PullOutcome {
-                        tracker: tracker.clone(),
-                        follow: definition.follow.clone(),
-                        commits: self.commits_between(old, &new)?,
-                        view: None,
-                    });
-                    mounts.push(definition.mount.to_string());
-                    moved.push((tracker.clone(), new));
-                }
+        let (_, index) = self.base_pins(&base)?;
+        for tracker in trackers {
+            if !index.contains_key(tracker)
+                || !self
+                    .carved
+                    .iter()
+                    .any(|definition| &definition.name == tracker)
+            {
+                return Err(NewgitError::Unsupported(format!(
+                    "`{}` is not a tracker in Git mounted here: `newgit pull` moves a mounted \
+                     tracker's pin",
+                    crate::tracker::tracker_path(tracker)
+                )));
             }
         }
-        outcome.deeper = self
-            .carved
-            .iter()
-            .filter(|definition| {
-                !pins.contains_key(&definition.name) && index.contains_key(&definition.name)
-            })
-            .map(|definition| definition.name.clone())
-            .collect();
+        let dropped = if slug == PROJECT_ROOT_INSTANCE {
+            BTreeSet::new()
+        } else {
+            self.store
+                .find_branch(&slug)
+                .map(|branch| branch.dropped)
+                .unwrap_or_default()
+        };
+        let mut run = PullRun {
+            only: trackers.iter().cloned().collect(),
+            dropped,
+            targets: self
+                .export_targets()?
+                .into_iter()
+                .filter(|target| target.root.is_some())
+                .collect(),
+            land: Vec::new(),
+            outcome: PullOutcome {
+                outside_git: if trackers.is_empty() {
+                    self.trackers
+                        .iter()
+                        .map(|definition| definition.name.clone())
+                        .collect()
+                } else {
+                    Vec::new()
+                },
+                ..PullOutcome::default()
+            },
+        };
+        let root = self.root.name.clone();
+        let moved = self.pull_below(&mut run, &root, &base)?;
+        let mut outcome = run.outcome;
         // Every read refused (a token used in the wrong project, a member
         // removed): whether anything is behind is unknown, so say so
         // instead of reporting success.
         let read = outcome.pulled.len()
             + outcome.up_to_date.len()
             + outcome.diverged.len()
-            + outcome.no_follow.len();
+            + outcome.no_follow.len()
+            + outcome.target_failed.len();
         if read == 0 && !outcome.unreadable.is_empty() {
             return Err(NewgitError::Remote {
                 status: 403,
@@ -12189,20 +12195,17 @@ impl BranchManager {
         if moved.is_empty() {
             return Ok(outcome);
         }
-        let message = format!(
-            "Update trackers: {}",
-            outcome
-                .pulled
-                .iter()
-                .map(|pulled| format!(
-                    "{} ({} commit{})",
-                    pulled.tracker,
-                    pulled.commits,
-                    if pulled.commits == 1 { "" } else { "s" }
-                ))
-                .collect::<Vec<_>>()
-                .join(", ")
-        );
+        let message = pull_message(&outcome.pulled, None);
+        let mounts: Vec<String> = outcome
+            .pulled
+            .iter()
+            .filter_map(|pulled| {
+                self.carved
+                    .iter()
+                    .find(|definition| definition.name == pulled.tracker)
+                    .map(|definition| definition.mount.to_string())
+            })
+            .collect();
         let view = self.commit_pins(
             &slug,
             workspace.as_deref(),
@@ -12211,16 +12214,208 @@ impl BranchManager {
             &message,
             &mounts.join("`, `"),
             &[],
+            &run.land,
         )?;
         outcome.view = Some(view);
         Ok(outcome)
     }
 
+    /// Pull every tracker in Git that `tracker`'s commit `commit` pins, and
+    /// those below them: the pins that moved, `(name in commit, new)`.
+    fn pull_below(
+        &self,
+        run: &mut PullRun,
+        tracker: &str,
+        commit: &str,
+    ) -> Result<Vec<(String, String)>> {
+        let project = self.store.paths().project_root.clone();
+        let pins = {
+            let mut objects = crate::objects::Objects::open(&project)?;
+            match objects.try_commit(commit)? {
+                Some(found) => crate::compose::pins_in(&mut objects, &found.tree)?,
+                None => BTreeMap::new(),
+            }
+        };
+        let mut moved = Vec::new();
+        for (name, pin) in pins {
+            let id = crate::tracker::child_id(tracker, &name);
+            let Some(definition) = self
+                .carved
+                .iter()
+                .find(|definition| definition.name == id)
+                .cloned()
+            else {
+                continue;
+            };
+            let new = self.pull_pinned(run, &definition, &pin)?;
+            if new != pin {
+                run.land.push((id, new.clone()));
+                moved.push((name, new));
+            }
+        }
+        Ok(moved)
+    }
+
+    /// Pull `definition`'s tracker, pinned at `pin`, and the trackers below
+    /// it: its new commit, `pin` when nothing moved.
+    fn pull_pinned(
+        &self,
+        run: &mut PullRun,
+        definition: &TrackerDefinition,
+        pin: &str,
+    ) -> Result<String> {
+        let tracker = definition.name.as_str();
+        let mut start = pin.to_owned();
+        if run.only.is_empty() || run.only.contains(tracker) {
+            match self.pull_one(run, definition, pin)? {
+                PullStep::Move(new) => start = new,
+                PullStep::Stay => {}
+                // Its export target ships what is under it too: none of
+                // it moves, so nothing is half-moved.
+                PullStep::Skip => return Ok(start),
+            }
+        }
+        // Its children's pins are its commits, and an instance that does
+        // not bind it does not commit to it.
+        if run.dropped.contains(tracker) {
+            for child in self.carved.iter().filter(|child| {
+                child.name != tracker
+                    && descends_from(&child.name, tracker)
+                    && (run.only.is_empty() || run.only.contains(&child.name))
+            }) {
+                run.outcome
+                    .unbound
+                    .push((child.name.clone(), tracker.to_owned()));
+            }
+            return Ok(start);
+        }
+        let first = run.outcome.pulled.len();
+        let moved = self.pull_below(run, tracker, &start)?;
+        if moved.is_empty() {
+            return Ok(start);
+        }
+        let message = pull_message(&run.outcome.pulled[first..], Some(tracker));
+        let made = self.pin_commit(&start, &moved, &message)?;
+        run.outcome
+            .mounting
+            .push((tracker.to_owned(), made.clone()));
+        Ok(made)
+    }
+
+    /// Where `definition`'s own pin, now `pin`, moves: what its rooted export
+    /// targets add to its `follow` ref, when that fast-forwards the pin.
+    /// Why it stays, or is skipped, is in the outcome.
+    fn pull_one(
+        &self,
+        run: &mut PullRun,
+        definition: &TrackerDefinition,
+        pin: &str,
+    ) -> Result<PullStep> {
+        let tracker = definition.name.clone();
+        // A tracker the remote will not let this caller read is passed
+        // over, like a missing ref, so it does not stop the rest.
+        let mut new = match self.follow_commit(definition) {
+            Ok(Some(new)) => new,
+            Ok(None) => {
+                run.outcome
+                    .no_follow
+                    .push((tracker, definition.follow.clone()));
+                return Ok(PullStep::Stay);
+            }
+            Err(NewgitError::Remote {
+                status: 403,
+                message,
+            }) => {
+                run.outcome.unreadable.push((tracker, message));
+                return Ok(PullStep::Stay);
+            }
+            Err(error) => return Err(error),
+        };
+        let mut from = definition.follow.clone();
+        let mut children: Vec<(String, String)> = Vec::new();
+        let targets: Vec<ExportTarget> = run
+            .targets
+            .iter()
+            .filter(|target| target.root.as_deref() == Some(tracker.as_str()))
+            .cloned()
+            .collect();
+        for target in &targets {
+            match self.pull_target(target, &tracker, pin, &new) {
+                Ok(None) => {}
+                Ok(Some(rooted)) => {
+                    from = format!("{from} and {}", rooted.from);
+                    new = rooted.main;
+                    children.extend(rooted.children);
+                }
+                Err(error) => {
+                    run.outcome.target_failed.push((
+                        tracker,
+                        target.name.clone(),
+                        error.to_string(),
+                    ));
+                    return Ok(PullStep::Skip);
+                }
+            }
+        }
+        Ok(match self.pin_move(&tracker, pin, &new)? {
+            PinMove::UpToDate => {
+                run.outcome.up_to_date.push(tracker);
+                PullStep::Stay
+            }
+            PinMove::Diverged => {
+                run.outcome
+                    .diverged
+                    .push((tracker, definition.follow.clone()));
+                PullStep::Stay
+            }
+            PinMove::Forward => {
+                run.outcome.pulled.push(PulledTracker {
+                    commits: self.commits_between(pin, &new)?,
+                    tracker,
+                    from,
+                });
+                run.land.extend(children);
+                PullStep::Move(new)
+            }
+        })
+    }
+
+    /// What `tracker`'s rooted export target `target` adds to `ours` (its
+    /// `follow` ref here), as `newgit pull --remote` would bring it into
+    /// `main`: `None` when the target has nothing the pin or `ours` lack, or
+    /// no branch yet. One fetch from the target. Moves nothing.
+    fn pull_target(
+        &self,
+        target: &ExportTarget,
+        tracker: &str,
+        pin: &str,
+        ours: &str,
+    ) -> Result<Option<RootedPull>> {
+        let Some(theirs) = self.fetch_target(target)? else {
+            return Ok(None);
+        };
+        // Git answers "yes" truly even from a snapshot: only a "no" needs the
+        // history.
+        let has = |commit: &str, theirs: &str| -> Result<bool> {
+            Ok(commit == theirs || self.source.is_ancestor(theirs, commit)?)
+        };
+        if has(pin, &theirs)? || has(ours, &theirs)? {
+            return Ok(None);
+        }
+        self.need_history(tracker)?;
+        let rooted = self.rooted_merge(target, tracker, &theirs, Some(ours))?;
+        if rooted.main == ours || has(pin, &rooted.tip)? {
+            return Ok(None);
+        }
+        Ok(Some(rooted))
+    }
+
     /// Move `definition`'s pin in `instance` (the project root when `None`)
     /// to `new`, which came from `from` (a ref, or a target): one view
     /// commit, `Pull <tracker>: N commits from <from>`, authored by whoever
-    /// runs it, holding the tracker's files at `new`. Nothing
-    /// when the pin already has `new`.
+    /// runs it, holding the tracker's files at `new`, after which `mains`
+    /// land on the trackers' `main`. Nothing when the pin already has `new`.
+    /// How many commits came in, and the view commit.
     fn move_pin(
         &self,
         instance: Option<&str>,
@@ -12228,7 +12423,7 @@ impl BranchManager {
         new: &str,
         from: &str,
         mains: &[(String, String)],
-    ) -> Result<PullOutcome> {
+    ) -> Result<(usize, Option<String>)> {
         let tracker = definition.name.as_str();
         let (slug, workspace, base) = self.pull_base(instance)?;
         let (pins, index) = self.base_pins(&base)?;
@@ -12237,7 +12432,7 @@ impl BranchManager {
                 "root does not mount `{tracker}` at {}: {}",
                 &base[..12],
                 if index.contains_key(tracker) {
-                    "it is mounted deeper; pull it in the tracker that mounts it"
+                    "it is mounted deeper"
                 } else {
                     "commit its definition first"
                 }
@@ -12250,33 +12445,25 @@ impl BranchManager {
                     .map(|(tracker, main)| (tracker.as_str(), main.as_str())),
                 "main",
             )?;
-            return Ok(PullOutcome {
-                tracker: tracker.to_owned(),
-                follow: from.to_owned(),
-                commits: 0,
-                view: None,
-            });
+            return Ok((0, None));
         }
         let commits = self.commits_between(&old, new)?;
         let message = format!(
             "Pull {tracker}: {commits} commit{} from {from}",
             if commits == 1 { "" } else { "s" },
         );
+        let moved = [(tracker.to_owned(), new.to_owned())];
         let view = self.commit_pins(
             &slug,
             workspace.as_deref(),
             &base,
-            &[(tracker.to_owned(), new.to_owned())],
+            &moved,
             &message,
             definition.mount.as_str(),
             mains,
+            &moved,
         )?;
-        Ok(PullOutcome {
-            tracker: tracker.to_owned(),
-            follow: from.to_owned(),
-            commits,
-            view: Some(view),
-        })
+        Ok((commits, Some(view)))
     }
 
     /// Where a pull in `instance` (the project root when `None`) starts: the
@@ -12378,8 +12565,10 @@ impl BranchManager {
     /// each pin in `moved` (`(tracker, new)`), with `message`, authored by
     /// whoever runs it. The workspace (the project root when `None`) takes
     /// it before any branch moves, then `mains` land on the trackers'
-    /// `main`. `mounts` names where the moved trackers sit, for the error
-    /// when the workspace cannot take it. Returns the view commit.
+    /// `main`, and `land` (every tracker's new commit, at any depth) on
+    /// their branch for this instance. `mounts` names where the moved
+    /// trackers sit, for the error when the workspace cannot take it.
+    /// Returns the view commit.
     #[allow(clippy::too_many_arguments)]
     fn commit_pins(
         &self,
@@ -12390,37 +12579,9 @@ impl BranchManager {
         message: &str,
         mounts: &str,
         mains: &[(String, String)],
+        land: &[(String, String)],
     ) -> Result<String> {
-        let project = self.store.paths().project_root.clone();
-        let tree = {
-            let mut objects = crate::objects::Objects::open(&project)?;
-            let commit = objects.commit(base)?;
-            let mut tree = commit.tree.clone();
-            for (tracker, new) in moved {
-                tree = objects.set_path(
-                    &tree,
-                    &format!("{}/{tracker}", crate::compose::PINS_DIR),
-                    Some((crate::objects::GITLINK_MODE.to_vec(), new.clone())),
-                )?;
-            }
-            objects.flush()?;
-            tree
-        };
-        let pulled = crate::source::run_git_env(
-            &[
-                "-C",
-                project.as_str(),
-                "commit-tree",
-                &tree,
-                "-p",
-                base,
-                "-m",
-                message,
-            ],
-            &[],
-        )?
-        .trim()
-        .to_owned();
+        let pulled = self.pin_commit(base, moved, message)?;
         // Composed to a ref of its own, and taken by the workspace, before
         // any branch moves: a working tree that cannot take it leaves every
         // ref as it was, so the pull can simply run again.
@@ -12437,8 +12598,49 @@ impl BranchManager {
                 .map(|(tracker, main)| (tracker.as_str(), main.as_str())),
             "main",
         )?;
-        self.land_root_commit(slug, &pulled, moved, &view)?;
+        self.land_root_commit(slug, &pulled, land, &view)?;
         Ok(view)
+    }
+
+    /// A commit on `parent`, a commit of any tracker in Git, moving each of
+    /// its pins in `moved` (`(name in its tree, new)`), with `message`,
+    /// authored by whoever runs it.
+    fn pin_commit(
+        &self,
+        parent: &str,
+        moved: &[(String, String)],
+        message: &str,
+    ) -> Result<String> {
+        let project = self.store.paths().project_root.clone();
+        let tree = {
+            let mut objects = crate::objects::Objects::open(&project)?;
+            let commit = objects.commit(parent)?;
+            let mut tree = commit.tree.clone();
+            for (name, new) in moved {
+                tree = objects.set_path(
+                    &tree,
+                    &format!("{}/{name}", crate::compose::PINS_DIR),
+                    Some((crate::objects::GITLINK_MODE.to_vec(), new.clone())),
+                )?;
+            }
+            objects.flush()?;
+            tree
+        };
+        Ok(crate::source::run_git_env(
+            &[
+                "-C",
+                project.as_str(),
+                "commit-tree",
+                &tree,
+                "-p",
+                parent,
+                "-m",
+                message,
+            ],
+            &[],
+        )?
+        .trim()
+        .to_owned())
     }
 
     /// Fast-forward `workspace` (the project root when `None`) to the pull's
@@ -14789,44 +14991,117 @@ pub struct TrackerMerge {
     pub commit: String,
 }
 
-/// What `newgit pull <tracker>` did.
+/// A tracker whose pin `newgit pull` moved.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PullOutcome {
+pub struct PulledTracker {
     pub tracker: String,
-    /// The ref it pulled.
-    pub follow: String,
-    /// How many of the tracker's commits came in; none when up to date.
+    /// Where its commits came from: its `follow` ref, and its rooted
+    /// export targets that had something new (`main and github.com/acme/ui
+    /// main`).
+    pub from: String,
+    /// How many of the tracker's commits came in.
     pub commits: usize,
-    /// The view commit the pull made.
-    pub view: Option<String>,
 }
 
-/// What `newgit pull` with no tracker did (#345).
+/// What `newgit pull` did (#345, #426).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct PullAllOutcome {
-    /// The trackers whose pins moved, by name, each with the ref it pulled
-    /// and how many commits came in. Their `view` is `None`: the one view
-    /// commit is below.
-    pub pulled: Vec<PullOutcome>,
+pub struct PullOutcome {
+    /// The trackers whose pins moved, at any depth, by id, bottom-up.
+    pub pulled: Vec<PulledTracker>,
     /// The one view commit moving them all; none when no pin moved.
     pub view: Option<String>,
-    /// Mounted trackers whose pins already have their `follow` ref.
+    /// The commit made in each tracker that mounts one whose pin moved:
+    /// `(tracker, commit)`, bottom-up. Root's is `view`.
+    pub mounting: Vec<(String, String)>,
+    /// Trackers whose pins already have their `follow` ref.
     pub up_to_date: Vec<String>,
-    /// Mounted trackers whose pins hold commits their `follow` ref (the
-    /// second item) does not, left where they are: moving them would drop
-    /// those commits.
+    /// Trackers whose pins hold commits their `follow` ref (the second
+    /// item) does not, left where they are: moving them would drop those
+    /// commits.
     pub diverged: Vec<(String, String)>,
-    /// Mounted trackers with no `follow` ref (the second item) to pull.
+    /// Trackers with no `follow` ref (the second item) to pull.
     pub no_follow: Vec<(String, String)>,
-    /// Mounted trackers the remote refused to let this caller read (403),
-    /// with its reason: passed over, not pulled.
+    /// Trackers the remote refused to let this caller read (403), with its
+    /// reason: passed over, not pulled.
     pub unreadable: Vec<(String, String)>,
-    /// Trackers in Git mounted deeper than root, pulled in the tracker that
-    /// mounts them.
-    pub deeper: Vec<String>,
+    /// Trackers whose rooted export target (the second item) could not be
+    /// pulled from, with why (unreachable, a conflict): their pins stay.
+    pub target_failed: Vec<(String, String, String)>,
+    /// Trackers mounted in a tracker this instance does not bind (the second
+    /// item): their pins are its commits, so they stay.
+    pub unbound: Vec<(String, String)>,
     /// Trackers outside Git: they have no pins, so `newgit pull` leaves
-    /// them alone (`newgit tracker pull` updates one).
+    /// them alone (`newgit tracker pull` updates one). Listed only when no
+    /// tracker was named.
     pub outside_git: Vec<String>,
+}
+
+/// One `newgit pull` under way.
+struct PullRun {
+    /// The trackers named; every one when empty.
+    only: BTreeSet<String>,
+    /// The trackers this instance does not bind.
+    dropped: BTreeSet<String>,
+    /// Every export target rooted at a tracker.
+    targets: Vec<ExportTarget>,
+    /// Every tracker's new commit, at any depth: what lands on its branch
+    /// for this instance.
+    land: Vec<(String, String)>,
+    outcome: PullOutcome,
+}
+
+/// What a pull does with one tracker's own pin.
+enum PullStep {
+    /// It moves here.
+    Move(String),
+    /// It stays; what is under it may still move.
+    Stay,
+    /// It, and everything under it, stays.
+    Skip,
+}
+
+/// What a tracker's rooted export target makes of its `main`.
+struct RootedPull {
+    /// The target's tip, split into the tracker when it mounts trackers.
+    tip: String,
+    /// The tracker's commit with the target's commits in.
+    main: String,
+    /// They came in by a real merge.
+    merged: bool,
+    /// How many commits on the target were new.
+    commits: usize,
+    /// Trackers mounted in it whose commits a split made: `(tracker, commit)`.
+    children: Vec<(String, String)>,
+    /// The target, as a merge names it: `github.com/acme/ui main`.
+    from: String,
+}
+
+/// The message of a pull's commit in tracker `within` (root when `None`)
+/// moving `pulled`, each named from there: `Update trackers: lib (2
+/// commits), ui (1 commit)`.
+fn pull_message(pulled: &[PulledTracker], within: Option<&str>) -> String {
+    let name = |tracker: &str| {
+        let path = crate::tracker::tracker_path(tracker);
+        match within {
+            Some(within) => path
+                .strip_prefix(&format!("{}/", crate::tracker::tracker_path(within)))
+                .map_or_else(|| path.clone(), ToOwned::to_owned),
+            None => path,
+        }
+    };
+    format!(
+        "Update trackers: {}",
+        pulled
+            .iter()
+            .map(|pulled| format!(
+                "{} ({} commit{})",
+                name(&pulled.tracker),
+                pulled.commits,
+                if pulled.commits == 1 { "" } else { "s" }
+            ))
+            .collect::<Vec<_>>()
+            .join(", ")
+    )
 }
 
 /// How a pin would move to its `follow` ref.

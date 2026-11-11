@@ -109,15 +109,21 @@ Remote:
 - `newgit merge [instance] [--into <branch>]` — the merge commit is made in
   your view and committed at root's ref; `newgit merge main` merges the
   project root
-- `newgit pull <tracker> [instance]` — one commit moving a mounted tracker's
-  pin to its `follow` ref; spawn says when a tracker is behind
-- `newgit pull` — every tracker in Git root mounts, in one commit on the
+- `newgit pull [<tracker>...] [--instance <name>]` — every tracker in Git
+  mounted here, at any depth, or only those named, in one commit on the
   branch it runs on (`Update trackers: t3code (14 commits), ui-kit (2
   commits)`; in the project root, its own instance branch, which `newgit
-  merge main` publishes); no commit when none is behind. A pin holding
-  commits its ref lacks stays put, a tracker you can't read on the remote is
-  skipped (it fails when none can be read), and trackers outside Git are
-  left alone (`newgit tracker pull`)
+  merge main` publishes); no commit when none is behind. A tracker exported
+  to a target rooted at it first takes what is new there, as `--remote`
+  would (one more fetch each), without moving its `main` until `newgit
+  merge`. A child moves by a commit in the tracker that mounts it, whose pin
+  then moves, up to root. A pin holding commits its ref lacks stays put; a
+  tracker you can't read on the remote, or whose export target can't be
+  reached or conflicts, is skipped and named while the rest move (it fails
+  when none can be read); a child of a tracker the instance doesn't bind
+  stays; trackers outside Git are left alone (`newgit tracker pull`). A
+  named tracker that stays exits non-zero. Every argument is a tracker:
+  `--instance` names another instance. Spawn says when a tracker is behind
 - `newgit pull --remote <target>` — bring back what was merged on an export
   target (a pull request on GitHub); `newgit merge main` publishes it
 - `newgit tracker allow-plaintext <path>...` — release workspace paths this
