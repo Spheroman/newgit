@@ -6,7 +6,10 @@
 //! Branches' lists (`heads`, `head_log`) and which store each tracker is in
 //! (`tracker_stores`) follow the landing log (`crate::landing`): they are
 //! written only by applying a landing, each landing in one transaction, and
-//! repaired from the log at startup. `landing_applied` says how far.
+//! repaired from the log at startup. `landings_placed` says which landings
+//! are in place, written in the same transaction as the rows they make, and
+//! `landing_applied` is the stamp every landing up to is (the rows below it
+//! are folded into it).
 //!
 //! Every project-scoped table is keyed by `home` first (`<owner>/<project>`),
 //! so moving a set of homes to another node is a `WHERE home ...` away. One
@@ -74,6 +77,11 @@ CREATE TABLE IF NOT EXISTS tracker_stores (
     store TEXT NOT NULL, PRIMARY KEY (home, tracker));
 CREATE TABLE IF NOT EXISTS landing_applied (
     id INTEGER PRIMARY KEY CHECK (id = 1), stamp INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS landings_placed (
+    stamp INTEGER PRIMARY KEY, finished INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS landings_voided (
+    stamp INTEGER NOT NULL, by_stamp INTEGER NOT NULL, home TEXT NOT NULL,
+    PRIMARY KEY (stamp, home));
 CREATE TABLE IF NOT EXISTS grants (
     repo TEXT NOT NULL, token_id TEXT NOT NULL, refs TEXT NOT NULL, expires_at INTEGER NOT NULL,
     PRIMARY KEY (repo, token_id, refs));
@@ -84,6 +92,7 @@ CREATE TABLE IF NOT EXISTS grants (
 const ADDED: &[(&str, &str, &str)] = &[
     ("branches", "stamp", "INTEGER"),
     ("head_log", "stamp", "INTEGER"),
+    ("projects", "incarnation", "TEXT"),
 ];
 
 pub struct Db {
@@ -145,6 +154,10 @@ pub struct ProjectInfo {
     pub name: String,
     pub created_at: String,
     pub default_branch: String,
+    /// Which project of this name it is: made new each time a project is
+    /// made, so a landing written for a deleted one never acts on one made
+    /// again under its name (`crate::landing`).
+    pub incarnation: String,
 }
 
 #[derive(Debug, Clone)]
@@ -219,6 +232,11 @@ impl Db {
         // A landing applied again (replayed at startup) logs nothing twice.
         connection.execute_batch(
             "CREATE UNIQUE INDEX IF NOT EXISTS head_log_by_stamp ON head_log (stamp, home, branch, tracker)",
+        )?;
+        // A project from before incarnations is its first one.
+        connection.execute(
+            "UPDATE projects SET incarnation = lower(hex(randomblob(16))) WHERE incarnation IS NULL",
+            [],
         )?;
         Ok(Self {
             connection: Mutex::new(connection),
@@ -336,7 +354,7 @@ pub fn revoke_pinned(db: &Connection, project: &str, instance: Option<&str>) -> 
 pub fn project(db: &Connection, home: &str) -> ApiResult<Option<ProjectInfo>> {
     Ok(db
         .query_row(
-            "SELECT owner, name, created_at, default_branch FROM projects WHERE home = ?",
+            "SELECT owner, name, created_at, default_branch, incarnation FROM projects WHERE home = ?",
             [home],
             |row| {
                 Ok(ProjectInfo {
@@ -344,6 +362,7 @@ pub fn project(db: &Connection, home: &str) -> ApiResult<Option<ProjectInfo>> {
                     name: row.get(1)?,
                     created_at: row.get(2)?,
                     default_branch: row.get(3)?,
+                    incarnation: row.get::<_, Option<String>>(4)?.unwrap_or_default(),
                 })
             },
         )
@@ -359,12 +378,26 @@ pub fn owned_count(db: &Connection, login: &str) -> ApiResult<usize> {
     Ok(usize::try_from(count).unwrap_or(0))
 }
 
-/// Create a project with its owner as its first member; `false` when it exists.
+/// Create a project with its owner as its first member, as a new
+/// incarnation; `false` when it exists. Only a landing makes a project on a
+/// running server (`crate::landing`); this is also how a data directory from
+/// before the landing log got its projects.
 pub fn create_project(db: &Connection, home: &str, owner: &str, name: &str) -> ApiResult<bool> {
+    create_incarnation(db, home, owner, name, &crate::tokens::random_hex(16))
+}
+
+/// [`create_project`] as incarnation `incarnation`.
+pub fn create_incarnation(
+    db: &Connection,
+    home: &str,
+    owner: &str,
+    name: &str,
+    incarnation: &str,
+) -> ApiResult<bool> {
     let now = now_iso();
     let inserted = db.execute(
-        "INSERT OR IGNORE INTO projects (home, owner, name, created_at) VALUES (?, ?, ?, ?)",
-        params![home, owner, name, now],
+        "INSERT OR IGNORE INTO projects (home, owner, name, created_at, incarnation) VALUES (?, ?, ?, ?, ?)",
+        params![home, owner, name, now, incarnation],
     )?;
     if inserted == 0 {
         return Ok(false);
@@ -537,20 +570,25 @@ pub fn everything(db: &Connection) -> ApiResult<BTreeMap<String, HomeState>> {
         .query_map([], |row| row.get(0))?
         .collect::<Result<_, _>>()?;
     for home in homes {
-        let mut lists = BTreeMap::new();
-        let mut statement = db.prepare("SELECT name FROM branches WHERE home = ?")?;
-        let names: Vec<String> = statement
-            .query_map([&home], |row| row.get(0))?
-            .collect::<Result<_, _>>()?;
-        for name in names {
-            lists.insert(name.clone(), list_of(db, &home, &name)?.unwrap_or_default());
-        }
-        out.insert(home.clone(), (lists, tracker_stores(db, &home)?));
+        out.insert(home.clone(), home_state(db, &home)?);
     }
     Ok(out)
 }
 
-/// The stamp of the last landing applied, and every one before it.
+/// One home's branches' lists and trackers' stores, as SQLite has them.
+pub fn home_state(db: &Connection, home: &str) -> ApiResult<HomeState> {
+    let mut lists = BTreeMap::new();
+    let mut statement = db.prepare("SELECT name FROM branches WHERE home = ?")?;
+    let names: Vec<String> = statement
+        .query_map([home], |row| row.get(0))?
+        .collect::<Result<_, _>>()?;
+    for name in names {
+        lists.insert(name.clone(), list_of(db, home, &name)?.unwrap_or_default());
+    }
+    Ok((lists, tracker_stores(db, home)?))
+}
+
+/// The stamp every landing up to is in place, finished included.
 pub fn applied(db: &Connection) -> ApiResult<Option<u64>> {
     let stamp: Option<i64> = db
         .query_row(
@@ -568,6 +606,92 @@ pub fn set_applied(db: &Connection, stamp: u64) -> ApiResult<()> {
         [i64::try_from(stamp).unwrap_or(i64::MAX)],
     )?;
     Ok(())
+}
+
+fn sql_stamp(stamp: u64) -> i64 {
+    i64::try_from(stamp).unwrap_or(i64::MAX)
+}
+
+/// How far landing `stamp` got: `None`, not in place; `Some(false)`, in place
+/// with what it moved still to remove where it was; `Some(true)`, done.
+pub fn placed(db: &Connection, stamp: u64) -> ApiResult<Option<bool>> {
+    if applied(db)?.is_some_and(|floor| stamp <= floor) {
+        return Ok(Some(true));
+    }
+    let finished: Option<bool> = db
+        .query_row(
+            "SELECT finished FROM landings_placed WHERE stamp = ?",
+            [sql_stamp(stamp)],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(finished)
+}
+
+/// Landing `stamp` is in place (`finished`: and nothing of it is left to
+/// do). Written in the transaction that makes its rows, so whether a landing
+/// is in place and its rows can never disagree. Folds what is done into
+/// `landing_applied`.
+pub fn set_placed(db: &Connection, stamp: u64, finished: bool) -> ApiResult<()> {
+    db.execute(
+        "INSERT OR REPLACE INTO landings_placed VALUES (?, ?)",
+        params![sql_stamp(stamp), finished],
+    )?;
+    let mut floor = applied(db)?.unwrap_or(0);
+    loop {
+        let next = floor + 1;
+        let done: Option<bool> = db
+            .query_row(
+                "SELECT finished FROM landings_placed WHERE stamp = ?",
+                [sql_stamp(next)],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if done != Some(true) {
+            break;
+        }
+        db.execute(
+            "DELETE FROM landings_placed WHERE stamp = ?",
+            [sql_stamp(next)],
+        )?;
+        floor = next;
+    }
+    set_applied(db, floor)
+}
+
+/// Stamps after `landing_applied` that are in place, finished or not.
+pub fn placed_after(db: &Connection) -> ApiResult<BTreeMap<u64, bool>> {
+    let mut statement = db.prepare("SELECT stamp, finished FROM landings_placed")?;
+    let rows = statement.query_map([], |row| {
+        Ok((
+            u64::try_from(row.get::<_, i64>(0)?).unwrap_or(0),
+            row.get::<_, bool>(1)?,
+        ))
+    })?;
+    Ok(rows.collect::<Result<_, _>>()?)
+}
+
+/// Landing `stamp`, which touched `home`, was voided by landing `by`.
+pub fn set_voided(db: &Connection, stamp: u64, by: u64, home: &str) -> ApiResult<()> {
+    db.execute(
+        "INSERT OR REPLACE INTO landings_voided VALUES (?, ?, ?)",
+        params![sql_stamp(stamp), sql_stamp(by), home],
+    )?;
+    Ok(())
+}
+
+/// Whether `home`'s state at `stamp`, as the log's tree has it, shows a
+/// landing that was voided after it: one written down at or before `stamp`
+/// and voided after it.
+pub fn voided_at(db: &Connection, home: &str, stamp: u64) -> ApiResult<bool> {
+    Ok(db
+        .query_row(
+            "SELECT 1 FROM landings_voided WHERE home = ? AND stamp <= ? AND by_stamp > ?",
+            params![home, sql_stamp(stamp), sql_stamp(stamp)],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some())
 }
 
 /// A seed's grant ends once its tracker is on a branch: from then on its

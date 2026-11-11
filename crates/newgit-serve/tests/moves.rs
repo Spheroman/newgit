@@ -100,7 +100,23 @@ fn a_push_during_a_move_is_carried_to_the_new_store() {
     let pushed = with_main(&other, &home, "pushed meanwhile");
     let copied = site.copy_to(&Store::Public).expect("copied");
     // A push that began before readers moved lands on the old store between
-    // the copy and the remove.
+    // the copy and the remove, naming another tracker's commit (`other`'s),
+    // and the move carries that commit into the wider store. That is
+    // acceptable only because of who can make such a push: a push into the
+    // old store is authorized for its audience, so the pusher already reads
+    // every object there, `other`'s included, and pointing `site` at one is
+    // publishing what they could read, as pushing its content to `site`
+    // after the move would. Nothing is carried that its pusher could not
+    // read. The precondition, asserted: the commit was in the store the push
+    // went to before it, and that store is the narrower of the two.
+    assert!(
+        Store::Public.includes(&site.store) && !site.store.includes(&Store::Public),
+        "the move widens: the push went into the narrower store"
+    );
+    assert!(
+        repos::has_commit(&site.dir(), &pushed),
+        "the pusher could read the commit where they pushed it"
+    );
     site.set_refs(&[("refs/heads/main".to_owned(), pushed.clone())])
         .expect("pushed");
     site.set_refs(&[("refs/heads/topic".to_owned(), pushed.clone())])

@@ -548,6 +548,7 @@ fn land_made<'a>(
             entry: Entry {
                 by: by.to_owned(),
                 homes: [(key.to_owned(), made)].into(),
+                ..Entry::default()
             },
             ..Landing::default()
         },
@@ -599,15 +600,42 @@ fn create_project<'a>(
             ),
         );
     }
-    if !db::create_project(&db, &key, &id.owner, &name)? {
+    if db::project(&db, &key)?.is_some() {
         return fail(409, format!("project `{key}` already exists"));
     }
-    // A deleted project's name is free again: start from nothing on disk too.
-    let _ = repos::delete(&id.dir(&app.config.data));
-    app.trackers_moved();
+    // Made by a landing, as a new incarnation: a landing written for a
+    // project deleted under this name never acts on this one.
+    let incarnation = tokens::random_hex(16);
+    drop(db);
+    app.log.land(
+        app,
+        Landing {
+            entry: Entry {
+                by: caller.login.clone(),
+                homes: [(
+                    key.clone(),
+                    Change {
+                        incarnation: incarnation.clone(),
+                        made: Some(landing::Made {
+                            owner: id.owner.clone(),
+                            name: name.clone(),
+                        }),
+                        ..Change::default()
+                    },
+                )]
+                .into(),
+                ..Entry::default()
+            },
+            ..Landing::default()
+        },
+    )?;
+    let db = app.db.lock();
     let project = ProjectContext::open(app, &db, &id)?;
     let mut seeds = Vec::new();
-    let mut made = Change::default();
+    let mut made = Change {
+        incarnation: project.info.incarnation.clone(),
+        ..Change::default()
+    };
     for tracker in &spec.trackers {
         seeds.push(seed(
             &project,
@@ -1067,8 +1095,15 @@ fn project_route(
                 let Ok(stamp) = at.parse::<landing::Stamp>() else {
                     return fail(400, "at is a landing's stamp: a whole number");
                 };
+                let voided = db::voided_at(&db, &key, stamp)?;
                 drop(db);
-                return match app.log.list_at(&key, branch, stamp)? {
+                return match app.log.list_at(
+                    &key,
+                    &project.info.incarnation,
+                    branch,
+                    stamp,
+                    voided,
+                )? {
                     Some(list) => ok(json!({ "name": branch, "list": list, "stamp": stamp })),
                     None => fail(
                         404,
@@ -1229,11 +1264,13 @@ fn delete_project(
                 homes: [(
                     project.key.clone(),
                     Change {
+                        incarnation: project.info.incarnation.clone(),
                         removed: true,
                         ..Change::default()
                     },
                 )]
                 .into(),
+                ..Entry::default()
             },
             ..Landing::default()
         },
@@ -1412,11 +1449,13 @@ pub fn authorize(
                     homes: [(
                         project.key.clone(),
                         Change {
+                            incarnation: project.info.incarnation.clone(),
                             stores: [(tracker.clone(), step)].into(),
                             ..Change::default()
                         },
                     )]
                     .into(),
+                    ..Entry::default()
                 },
                 ..Landing::default()
             };
@@ -1489,7 +1528,10 @@ fn create_tracker(
             format!("{repo} exists already; its history moves only through `newgit merge`"),
         );
     }
-    let mut made = Change::default();
+    let mut made = Change {
+        incarnation: project.info.incarnation.clone(),
+        ..Change::default()
+    };
     let answer = seed(project, &db, &request.origin, caller, &tracker, &mut made)?;
     drop(land_made(
         project.app,
@@ -1671,6 +1713,7 @@ fn create_branch(
     names.extend(list.keys().cloned());
     let after = project.definitions(&db, names.iter().map(String::as_str))?;
     let mut change = Change {
+        incarnation: project.info.incarnation.clone(),
         branches: [(branch.to_owned(), list.clone())].into(),
         stores: project.moves(&after, &listed)?,
         ..Change::default()
@@ -1686,16 +1729,16 @@ fn create_branch(
             tracker: tracker.clone(),
             store: db::tracker_store(&db, &project.key, tracker)?,
         });
-        change
-            .refs
-            .entry(tracker.clone())
-            .or_default()
-            .insert(format!("refs/heads/{branch}"), Some(commit.clone()));
+        change.refs.entry(tracker.clone()).or_default().insert(
+            format!("refs/heads/{branch}"),
+            landing::RefMove::to(Some(commit.clone())),
+        );
     }
     let landing = Landing {
         entry: Entry {
             by: caller.login.clone(),
             homes: [(project.key.clone(), change)].into(),
+            ..Entry::default()
         },
         expect: vec![landing::Expect {
             home: project.key.clone(),

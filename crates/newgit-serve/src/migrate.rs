@@ -159,10 +159,14 @@ fn migrate_home(app: &App, id: &ProjectId, home: &Utf8Path) -> anyhow::Result<()
 }
 
 /// Land `change` to `key`, by the server, if it changes anything.
-fn land(app: &App, key: &str, change: Change) -> anyhow::Result<()> {
+fn land(app: &App, key: &str, mut change: Change) -> anyhow::Result<()> {
     if change == Change::default() {
         return Ok(());
     }
+    change.incarnation = crate::db::project(&app.db.lock(), key)
+        .map_err(message)?
+        .map(|info| info.incarnation)
+        .unwrap_or_default();
     app.log
         .land(
             app,
@@ -170,6 +174,7 @@ fn land(app: &App, key: &str, change: Change) -> anyhow::Result<()> {
                 entry: Entry {
                     by: "newgit serve".to_owned(),
                     homes: [(key.to_owned(), change)].into(),
+                    ..Entry::default()
                 },
                 ..Landing::default()
             },

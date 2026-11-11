@@ -67,6 +67,9 @@ pub struct App {
     pub log: landing::Log,
     /// Pushes running, which a tracker moving between stores waits out.
     pub pushes: landing::Pushes,
+    /// `<data>/serve.lock`, locked while this runs: one process per data
+    /// directory, since the landing log has one writer.
+    _lock: std::fs::File,
 }
 
 pub type Definitions = BTreeMap<String, policy::Facts>;
@@ -81,6 +84,19 @@ impl App {
         require_git()?;
         std::fs::create_dir_all(&config.data)
             .with_context(|| format!("creating {}", config.data))?;
+        let lock_path = config.data.join("serve.lock");
+        let lock = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&lock_path)
+            .with_context(|| format!("opening {lock_path}"))?;
+        if lock.try_lock().is_err() {
+            anyhow::bail!(
+                "another newgit serve is running on {} (it holds {lock_path}): stop it first",
+                config.data
+            );
+        }
         let db = db::Db::open(&config.data.join("server.sqlite"))?;
         let log = landing::Log::open(&config.data, &db)?;
         let token_key = token_key(&config.data)?;
@@ -103,6 +119,7 @@ impl App {
             merges: merge::Merges::default(),
             log,
             pushes: landing::Pushes::default(),
+            _lock: lock,
         };
         // Landings written down and not yet in place, before anything is
         // served.
@@ -232,6 +249,24 @@ fn token_key(data: &Utf8Path) -> anyhow::Result<Vec<u8>> {
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
     }
     Ok(key.into_bytes())
+}
+
+/// Void stuck landing `stamp` on the data directory `config` names, with no
+/// server running there: start as `serve` would (which tries every stuck
+/// landing again), then append the compensating entry ([`landing::Log::void`]).
+/// Returns what was done, to say.
+pub fn void_landing(config: Config, stamp: landing::Stamp) -> anyhow::Result<String> {
+    let app = App::open(config)?;
+    let (void, voided) = app
+        .log
+        .void(&app, stamp)
+        .map_err(|error| anyhow::anyhow!("{}", error.cause()))?;
+    let voided: Vec<String> = voided.iter().map(ToString::to_string).collect();
+    Ok(format!(
+        "voided landing{} {} with landing {void}: their projects are as SQLite had them, and land again",
+        if voided.len() == 1 { "" } else { "s" },
+        voided.join(", ")
+    ))
 }
 
 /// Run the remote until interrupted. Says where it listens on stdout, once

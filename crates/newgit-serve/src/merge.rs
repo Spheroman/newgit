@@ -756,14 +756,49 @@ pub fn finish(
             format!("`{branch}` moved since you looked: merge again onto what it is now"),
         );
     }
+    // Its roots held from here until it lands: this project, and the home of
+    // each linked tracker it asks to move. So which store each new commit
+    // goes into is decided, and the commits put there, with no landing
+    // moving those trackers between stores meanwhile: a merge's commits never
+    // reach a store whose readers the landing that is checked would not let
+    // read them.
+    let mut roots = BTreeSet::from([project.key.clone()]);
+    for step in &asked {
+        if let Some((home, _)) = project.links.get(&step.tracker) {
+            roots.insert(home.clone());
+        }
+    }
+    drop(db);
+    let hold = project.app.log.hold(
+        project.app,
+        roots,
+        &format!("a merge into `{branch}` is placing its commits"),
+    )?;
+    let db = project.app.db.lock();
+    let now = db::list_of(&db, &project.key, branch)?;
+    if now.as_ref() == Some(list) {
+        // Landed by an earlier ask whose answer was lost.
+        drop(hold);
+        return answer(&db, project, branch, Vec::new(), anchor);
+    }
+    if now.as_ref() != Some(base) {
+        return fail(
+            409,
+            format!("`{branch}` moved since you looked: merge again onto what it is now"),
+        );
+    }
     let prepared = prepare(project, &db, &caller.login, branch, base, list, &asked)?;
     drop(db);
     // Each tracker's new commits into a store that may hold them whether or
-    // not this lands, outside any lock.
+    // not this lands, outside the db lock and inside the roots' hold.
     for (target, borrow, commit) in &prepared.placements {
         target.take_landing(&caller.login, commit, borrow)?;
     }
-    let landed = project.app.log.land(project.app, prepared.landing);
+    let landed = project
+        .app
+        .log
+        .land_holding(project.app, prepared.landing, &hold);
+    drop(hold);
     let db = project.app.db.lock();
     let behind = match landed {
         Ok(landed) => landed
@@ -856,6 +891,7 @@ fn prepare(
     listed.extend(list.keys().cloned());
     let stores = project.moves(&after, &listed)?;
     let mut change = Change {
+        incarnation: project.info.incarnation.clone(),
         branches: [(branch.to_owned(), list.clone())].into(),
         ..Change::default()
     };
@@ -876,7 +912,7 @@ fn prepare(
             .refs
             .entry(tracker.clone())
             .or_default()
-            .insert(landing_ref(commit), None);
+            .insert(landing_ref(commit), landing::RefMove::to(None));
         let to = stores
             .get(tracker)
             .and_then(|step| repos::Store::parse(&step.to));
@@ -903,12 +939,12 @@ fn prepare(
             }
         }
     }
-    change
-        .refs
-        .entry("root".to_owned())
-        .or_default()
-        .insert(format!("refs/heads/{branch}"), Some(list["root"].clone()));
+    change.refs.entry("root".to_owned()).or_default().insert(
+        format!("refs/heads/{branch}"),
+        landing::RefMove::to(Some(list["root"].clone())),
+    );
     change.stores = stores;
+    let mut homes = BTreeMap::new();
     let mut asked_refs = Vec::new();
     for step in asked {
         let (home, there) = match project.links.get(&step.tracker) {
@@ -920,20 +956,41 @@ fn prepare(
             tracker: there.clone(),
             store: db::tracker_store(db, &home, &there)?,
         });
+        // Its home named in the entry before the landing waits, so its root
+        // is taken with the rest.
+        if home != project.key && !homes.contains_key(&home) {
+            let Some(info) = db::project(db, &home)? else {
+                return fail(
+                    409,
+                    format!(
+                        "`{}` links to `{home}`, which no longer exists",
+                        step.tracker
+                    ),
+                );
+            };
+            homes.insert(
+                home.clone(),
+                Change {
+                    incarnation: info.incarnation,
+                    ..Change::default()
+                },
+            );
+        }
         asked_refs.push(Asked {
             home,
             tracker: there,
             reference: format!("refs/heads/{}", step.branch),
             old: step.old.clone(),
             new: step.new.clone(),
-            repo: project.tracker(&step.tracker),
         });
     }
+    homes.insert(project.key.clone(), change);
     Ok(Prepared {
         landing: Landing {
             entry: Entry {
                 by: by.to_owned(),
-                homes: [(project.key.clone(), change)].into(),
+                homes,
+                ..Entry::default()
             },
             expect: vec![landing::Expect {
                 home: project.key.clone(),

@@ -51,12 +51,15 @@ invited, through `POST /v1/dev/login` with `x-dev-login: <secret>`.
 ```
 <data>/
   landing.git            the landing log: one commit per landing, the commit
-                         point; its tree is every branch's list and every
-                         tracker's store (refs in reftable, never served)
+                         point; its tree is every branch's list, every
+                         tracker's store, and each project's incarnation
+                         (refs in reftable, never served)
   server.sqlite          tokens, projects, members, branches (heads), instances,
                          forks, checkpoints, tags, links, grants, and which
                          store each tracker is in (tracker_stores); lists and
-                         stores follow the landing log (landing_applied)
+                         stores follow the landing log (landings_placed,
+                         landing_applied, landings_voided)
+  serve.lock             locked while a server runs: one per data directory
   token.key              the HMAC key tokens are signed with
   hooks/pre-receive      refuses refs outside a grant's prefix
   homes/<owner>/<project>/stores/   one bare repository per audience, refs in reftable
@@ -205,57 +208,88 @@ Resolved loudly; each is reversible.
 8. **The landing log is the commit point** ([landing.md](landing.md),
    *Landing*, items 3 and 4; `crates/newgit-serve/src/landing.rs`).
    - **One hidden Git repository per server**, `<data>/landing.git`: this
-     server is one shard. Each landing (a merge's finish, a branch made, a
-     tracker made or moved between stores, a project deleted) is one
-     commit, written with `git fast-import` with `core.fsync=committed`;
-     its stamp is its place in that history (1 for the first). The
+     server is one shard. Each landing (a project made or deleted, a
+     merge's finish, a branch made, a tracker made or moved between stores)
+     is one commit, written with `git fast-import`, objects and refs
+     fsynced; its stamp is its place in that history (1 for the first). The
      commit's tree is the whole state, every branch's list as gitlinks
-     under `<owner>/<project>/branches/<branch>/` and every tracker's store
-     under `<owner>/<project>/stores/`, so "state at stamp T" is the tree
-     of commit T (`GET …/branches/<branch>?at=<stamp>`), never a commit
-     date. Its message holds the entry: lists, ref moves, store moves, and
-     the commits a move takes from a merger's landing. Gitlinks name
+     under `<owner>/<project>/branches/<branch>/`, every tracker's store
+     under `<owner>/<project>/stores/`, and the project's incarnation at
+     `<owner>/<project>/incarnation`, so "state at stamp T" is the tree of
+     commit T (`GET …/branches/<branch>?at=<stamp>`), never a commit date.
+     Its message holds the entry: a format version, lists, every ref move
+     with its old value, store moves, and the commits a move takes from a
+     merger's landing. Fields added later (#411's epochs and merge commit,
+     #412's rooted tips) are defaulted when an older entry is read; an
+     entry of a newer format than the server reads stops it. Gitlinks name
      commits without holding them, so the log holds no content and is
      served to no one.
+   - **Nothing is written down that cannot be put in place.** The check
+     under the lock verifies everything putting it in place relies on: each
+     project is the incarnation the landing was written for, each branch
+     and store is as it expects, each ref it moves is where it says (its
+     old value is recorded), and each commit a ref moves to is in the store
+     it lands in. A merge naming a commit nobody sent is refused (400) and
+     the landings batched with it land.
+   - **A project is an incarnation.** Making a project is a landing that
+     gives it a new incarnation id, recorded in its creation and in every
+     entry that names it, deletion included. An entry acts only on the
+     incarnation it was written for, so nothing written for a deleted
+     project ever touches one made again under its name, and `?at=` on the
+     new one never shows the old one's lists.
    - **Everything else follows it.** After the commit, the landing is put
      in place: trackers it moves are copied into their new stores; then,
-     under the db lock, every ref it moves (one `update-ref --stdin`
-     transaction per store, full refnames across namespaces) and every row
-     (one SQLite transaction), so a reader holding the lock (every API
-     request, every Git request's authorization) sees all of it or none;
-     then what moved is removed where it was. `landing_applied` in SQLite
-     says how far that got. At startup, before anything is served, every
-     entry after it is put in place again (each step is safe twice), so a
-     crash between the log and the refs is repaired. Readers resolve heads
-     and stores from those rows, never from a move in progress.
+     under the db lock, every store's `update-ref --stdin` transaction is
+     prepared (every ref compare-and-swap against its recorded old value,
+     full refnames across namespaces) and only once all are prepared, each
+     is committed; then every row, with the stamp marked in place
+     (`landings_placed`), in one SQLite transaction; then what moved is
+     removed where it was, and the stamp marked finished. A reader holding
+     the lock (every API request, every Git request's authorization) sees
+     all of it or none. A ref someone else moved since the check (a push
+     racing the landing) is left as they left it and logged, never
+     overwritten; an asked ref found so is said back to the merger as
+     behind. At startup, before anything is served, every entry not marked
+     in place is put in place, and every one marked but not finished is
+     finished; one marked is never put in place again.
    - **Group commit.** The first landing to arrive leads: it takes
-     everything waiting, checks each in order (the branch still at its
-     `base`, each tracker still in the store it was prepared against, each
-     asked ref still at its old commit) against what is there and what the
-     batch lands before it, writes them with one `fast-import` (each its own
-     commit), and puts them in place together, while the next ones queue
-     behind it. 2,000 landings from 100 threads, each making a branch (one
-     entry, one ref move, one row): about 390 a second in batches of 50,
-     release build, one M5 Pro Mac (`landing_log.rs`, `landings_per_second`;
-     nixpkgs-bench.md measured 382 for its pooled layout).
-   - **Roots' locks.** A landing takes the lock of every project it touches
-     at once (so in a fixed order, and a tracker linked into several
-     projects stays atomic with all of them). Only one batch is checked
-     and written at a time; a landing whose roots are held waits.
+     everything waiting, checks each in order against what is there and
+     what the batch lands before it (lists, stores, projects, and refs),
+     writes them with one `fast-import` (each its own commit), and puts
+     them in place together, while the next ones queue behind it. When a
+     batch cannot be put in place together, its landings are put in place
+     one by one, so only the one at fault (and any after it on the same
+     projects) is stuck. 2,000 landings from 100 threads, each making a
+     branch (one entry, one ref move in one store, one row, no objects):
+     about 280 a second in batches of 50, release build, one M5 Pro Mac
+     (`landing_log.rs`, `landings_per_second`; 390 before refs and the
+     landing's SQLite transaction were fsynced and each store was read for
+     the compare-and-swap; nixpkgs-bench.md measured 382 for its pooled
+     layout). That is the log's own cost, not a merge's:
+     a real merge also places its commits, touches several refs and
+     stores, and is checked against each store, so merges land slower.
+   - **Roots' locks.** A landing names every project it touches in its
+     entry (a linked tracker's home among them) before it waits, and takes
+     all of them at once, so a tracker linked into several projects stays
+     atomic with all of them. Only one batch is checked and written at a
+     time. A merge's finish holds its projects from deciding which store
+     each new commit goes into until it has landed, so no store move can
+     land in between and leave a refused merge's commits in a store wider
+     than its tracker's. A landing that waits more than ten seconds for a
+     project another holds is answered 503, saying what holds it.
    - **A landing that moves storage holds its roots, not the log.** Copying
      a tracker into another store can be large, so it is put in place by
      its own request's thread after the batch is written, holding only its
      projects' locks, never the db lock or the log: other projects land
      meanwhile, and reads go on.
-   - **A landing written down and not in place blocks its roots, loudly.**
-     If putting one in place fails (a disk full, a store unwritable), its
-     merger is told it landed and is not yet in place, nothing shows it,
-     and every later landing on those projects first tries it again, and
-     is refused with 503 while it still fails. Startup tries it too.
+   - **A landing written down and not in place is stuck, loudly.** See
+     *Known limits*.
    - **A push into a store is counted while it runs.** A move waits for
      every push that began where the tracker was (before its row moved)
      before removing it there, so a ref a push in flight makes or moves is
      carried to the new store, not left behind in the old one.
+   - **One server per data directory.** `serve.lock` is held while one
+     runs; a second refuses to start.
 
 ## Known limits
 
@@ -281,7 +315,53 @@ Resolved loudly; each is reversible.
   linked tracker on another server is two landings (landing.md), each in
   its own server's log.
 - **A push that runs past ten minutes during a move** is no longer waited
-  for: what it leaves in the old store stays there, and is logged.
+  for: what it leaves in the old store stays there, and is logged. While
+  the move waits for it, the merger whose landing moves the tracker waits
+  too, and every other landing on that project is answered 503 after ten
+  seconds, naming the push it waits for.
+- **A stuck landing blocks its projects until it is put in place or
+  voided.** A landing written down that cannot be put in place (a store
+  unwritable, a disk full) is answered 503 with the real cause, which the
+  server's log says too. Every later landing on its projects is refused
+  with the same 503 after trying it again first, and so is every start of
+  the server. Other projects land as before. It also holds back the
+  applied mark, so `?at=` refuses every stamp after it until it is
+  resolved. The way out: fix the cause and restart (or land again there),
+  or, when the cause cannot be fixed, stop the server and run `newgit
+  serve --data <dir> --void-landing <stamp>`. That appends one
+  compensating landing (the log is never edited) which gives up that
+  landing and every one stuck after it on the same projects: their
+  projects are set back to what SQLite has, which they never changed;
+  refs they moved are moved back; a tracker they were copying toward
+  another store is removed from it (the objects copied stay in that store,
+  unreachable, until its garbage collection, which does not exist yet).
+- **`?at=<stamp>`** answers the stamp's own landing, read from one
+  resolved log commit. It refuses a stamp not yet in place (409, every
+  landing up to the applied mark is), a project state that shows a landing
+  voided after it (410), and answers nothing for a stamp from a deleted
+  project of the same name.
+- **What survives power loss.** The log's objects and refs, every store's
+  refs (`core.fsync=committed,reference` on the log, on every store, and
+  on every Git command the server runs), and SQLite's landing transaction
+  (`synchronous=FULL` for it) are synced, in that order: a landing's log
+  commit before anything follows it, its refs before its rows, its rows
+  (and its mark) before its answer. So a landing whose merger was answered
+  survives, a landing marked in place is in place, and one written down
+  and not marked is put in place at the next start. Other SQLite writes
+  (tokens, members, instances) run `synchronous=NORMAL` and may lose their
+  last moments; a push in flight may lose its ref update, as Git's own
+  would.
+- **A damaged log refuses to start.** The log is made only when
+  `landing.git` did not exist before (a data directory from before the
+  log, whose SQLite says no landing was put in place). A log that cannot
+  be read, one missing while SQLite says landings were put in place from
+  it, and one that ends before SQLite's applied mark all stop the server
+  with a message saying so, never a silent fresh start: restore
+  `landing.git` from a backup.
+- **`?at=` and startup cost grow with the log.** `?at=` resolves
+  `<tip>~<n>`, which walks back `n` commits, and the first start of a data
+  directory reads every entry after the applied mark; neither is indexed
+  yet, and the log is never compacted ([#434]).
 - **Pushes that move no tracker's branch are not landings**: a fork's, a
   seed's, a per-user repo's, a tracker outside Git's. They move their own
   refs, in their own store, as before.

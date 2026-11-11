@@ -13,6 +13,7 @@
 //! command: what the Worker read from Artifacts over its binding (a file at a
 //! branch, a branch's head, a commit's pins) is `git cat-file` here.
 
+use std::collections::BTreeMap;
 use std::io::Write as _;
 use std::process::{Command, Output, Stdio};
 
@@ -26,6 +27,10 @@ use crate::policy::{Audience, Facts};
 /// namespace or a landing might still name, and let `newgit clone` filter.
 const STORE_CONFIG: &[(&str, &str)] = &[
     ("receive.fsckObjects", "true"),
+    // A ref a push or a landing moved survives power loss once Git says it
+    // moved (`docs/design/serve.md`, *Known limits*).
+    ("core.fsync", DURABLE_FSYNC),
+    ("core.fsyncMethod", "fsync"),
     ("uploadpack.allowFilter", "true"),
     ("core.logAllRefUpdates", "always"),
 ];
@@ -110,10 +115,24 @@ impl Store {
     }
 }
 
-pub fn git(dir: &Utf8Path, args: &[&str]) -> std::io::Result<Output> {
-    Command::new("git")
+/// What every store and the landing log fsync: objects and refs, so what
+/// Git says it wrote survives power loss.
+pub const DURABLE_FSYNC: &str = "committed,reference";
+
+/// Git run against the repository at `dir`, syncing what it writes
+/// ([`DURABLE_FSYNC`]) whatever the repository's own config says.
+pub fn git_command(dir: &Utf8Path) -> Command {
+    let mut command = Command::new("git");
+    command
+        .args(["-c", &format!("core.fsync={DURABLE_FSYNC}")])
+        .args(["-c", "core.fsyncMethod=fsync"])
         .arg("--git-dir")
-        .arg(dir.as_str())
+        .arg(dir.as_str());
+    command
+}
+
+pub fn git(dir: &Utf8Path, args: &[&str]) -> std::io::Result<Output> {
+    git_command(dir)
         .args(args)
         .env("GIT_TERMINAL_PROMPT", "0")
         .stdin(Stdio::null())
@@ -132,9 +151,7 @@ fn checked(dir: &Utf8Path, args: &[&str]) -> ApiResult<String> {
 }
 
 fn run_stdin(dir: &Utf8Path, args: &[&str], input: &str) -> ApiResult<bool> {
-    let mut child = Command::new("git")
-        .arg("--git-dir")
-        .arg(dir.as_str())
+    let mut child = git_command(dir)
         .args(args)
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
@@ -503,6 +520,102 @@ impl Repo {
         Ok(())
     }
 
+    /// The second half of a move whose first half and whose rows flipping
+    /// happened before a restart, so what was copied is not known: every ref
+    /// still here is carried to `to` only where that moves it forward (absent
+    /// there, or there at an ancestor of it here), then removed here. A ref
+    /// pushed to `to` since the rows flipped is never moved back; one that
+    /// differs here and is not ahead is left there as it is, and said.
+    pub fn finish_move_after_restart(&self, to: &Repo) -> ApiResult<()> {
+        if !store_exists(&self.dir()) || self.dir() == to.dir() {
+            return Ok(());
+        }
+        let here = list_refs(&self.dir(), &self.full("refs/"))?;
+        let there: BTreeMap<String, String> = list_refs(&to.dir(), &to.full("refs/"))?
+            .into_iter()
+            .collect();
+        let zero = "0000000000000000000000000000000000000000";
+        for (reference, object) in &here {
+            let theirs = there.get(reference);
+            if theirs == Some(object) {
+                continue;
+            }
+            let staging = format!("refs/newgit/moving/{object}");
+            let fetched = git(
+                &to.dir(),
+                &[
+                    "fetch",
+                    "--quiet",
+                    "--no-tags",
+                    "--no-write-fetch-head",
+                    self.dir().as_str(),
+                    &format!("+{reference}:{staging}"),
+                ],
+            )?
+            .status
+            .success();
+            let forward = match theirs {
+                None => true,
+                Some(theirs) => fetched && is_ancestor(&to.dir(), theirs, object),
+            };
+            let carried = fetched
+                && forward
+                && run_stdin(
+                    &to.dir(),
+                    &["update-ref", "--stdin"],
+                    &format!(
+                        "update {reference} {object} {}\n",
+                        theirs.map_or(zero, String::as_str)
+                    ),
+                )?;
+            let _ = run_stdin(
+                &to.dir(),
+                &["update-ref", "--stdin"],
+                &format!("delete {staging}\n"),
+            );
+            if !carried {
+                eprintln!(
+                    "newgit serve: {reference} in {} is not ahead of {} in {}; the one in {} is kept",
+                    self.dir(),
+                    self.namespace,
+                    to.dir(),
+                    to.dir()
+                );
+            }
+        }
+        self.remove_exactly(&here)?;
+        if matches!(self.store, Store::Tracker(_)) && list_refs(&self.dir(), "refs/")?.is_empty() {
+            delete(&self.dir())?;
+            self.remove_empty_parent();
+        }
+        Ok(())
+    }
+
+    /// Undo [`Self::copy_to`] for a move voided before readers moved: a store
+    /// renamed into place is put back, labelled for this store again; refs
+    /// copied into `to` are removed there. Objects copied stay in `to`'s
+    /// store, unreachable, until it is garbage collected.
+    pub fn uncopy(&self, to: &Store) -> ApiResult<()> {
+        let moved = Self::new(&self.home, to.clone(), self.namespace.clone());
+        if moved.dir() == self.dir() || !store_exists(&moved.dir()) {
+            return Ok(());
+        }
+        if matches!(self.store, Store::Tracker(_)) && !store_exists(&self.dir()) {
+            checked(&moved.dir(), &["config", AUDIENCE_KEY, &self.store.name()])?;
+            if let Some(parent) = self.dir().parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::rename(moved.dir(), self.dir())?;
+            return Ok(());
+        }
+        moved.delete_refs_under("refs/")?;
+        git(
+            &moved.dir(),
+            &["symbolic-ref", "--delete", "--quiet", &moved.full("HEAD")],
+        )?;
+        Ok(())
+    }
+
     /// `stores/tracker/`, once the last seed in it is gone.
     fn remove_empty_parent(&self) {
         if let Some(parent) = self.dir().parent() {
@@ -711,38 +824,163 @@ pub struct Copied {
     pub refs: Vec<(String, String)>,
 }
 
-/// Run `script`'s ref updates in the store at `dir` as one transaction
-/// (`git update-ref --stdin`, `start` … `commit`): all of them or none.
-/// Each line is `update <full ref> <new> [<old>]` or `delete <full ref>`.
-pub fn transaction(dir: &Utf8Path, lines: &[String]) -> ApiResult<()> {
-    if lines.is_empty() {
-        return Ok(());
+/// One store's ref transaction, prepared (`git update-ref --stdin`, `start`
+/// … `prepare`): every ref in it locked and checked against its old value,
+/// nothing moved yet. [`Prepared::commit`] moves them all; dropping it
+/// without, or [`Prepared::abort`], moves none. A landing prepares every
+/// store's transaction before it commits any, so a store that refuses
+/// leaves every store as it was.
+pub struct Prepared {
+    dir: Utf8PathBuf,
+    child: std::process::Child,
+    stdin: Option<std::process::ChildStdin>,
+    /// What it answers: kept open until it is done, so it is never written
+    /// into a closed pipe.
+    answers: std::io::BufReader<std::process::ChildStdout>,
+}
+
+impl Prepared {
+    /// Prepare `lines` (`update <full ref> <new> <old>`, `delete <full ref>
+    /// <old>`) in the store at `dir`.
+    pub fn new(dir: &Utf8Path, lines: &[String]) -> ApiResult<Self> {
+        use std::io::BufRead as _;
+        let mut child = git_command(dir)
+            .args(["update-ref", "--stdin"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        let mut stdin = child.stdin.take();
+        let mut script = String::from("start\n");
+        for line in lines {
+            script.push_str(line);
+            script.push('\n');
+        }
+        script.push_str("prepare\n");
+        let written = stdin.as_mut().map(|stdin| {
+            stdin
+                .write_all(script.as_bytes())
+                .and_then(|()| stdin.flush())
+        });
+        let mut answers =
+            std::io::BufReader::new(child.stdout.take().ok_or_else(|| {
+                HttpError::internal(format!("update-ref in {dir} has no stdout"))
+            })?);
+        let mut prepared = false;
+        if matches!(written, Some(Ok(()))) {
+            let mut line = String::new();
+            while answers.read_line(&mut line).is_ok_and(|read| read > 0) {
+                if line.trim() == "prepare: ok" {
+                    prepared = true;
+                    break;
+                }
+                line.clear();
+            }
+        }
+        if !prepared {
+            drop(stdin);
+            let output = child.wait_with_output()?;
+            return Err(HttpError::internal(format!(
+                "moving refs in {dir}: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            )));
+        }
+        Ok(Self {
+            dir: dir.to_owned(),
+            child,
+            stdin,
+            answers,
+        })
     }
-    let mut script = String::from("start\n");
-    for line in lines {
-        script.push_str(line);
-        script.push('\n');
+
+    /// Move every ref prepared.
+    pub fn commit(mut self) -> ApiResult<()> {
+        use std::io::Read as _;
+        let mut stdin = self.stdin.take();
+        let sent = stdin
+            .as_mut()
+            .map(|stdin| stdin.write_all(b"commit\n").and_then(|()| stdin.flush()));
+        drop(stdin);
+        let mut rest = String::new();
+        let _ = self.answers.read_to_string(&mut rest);
+        let status = self.child.wait()?;
+        if !matches!(sent, Some(Ok(()))) || !status.success() || !rest.contains("commit: ok") {
+            let mut stderr = String::new();
+            if let Some(mut pipe) = self.child.stderr.take() {
+                let _ = pipe.read_to_string(&mut stderr);
+            }
+            return Err(HttpError::internal(format!(
+                "committing refs in {}: {}",
+                self.dir,
+                stderr.trim()
+            )));
+        }
+        Ok(())
     }
-    script.push_str("prepare\ncommit\n");
-    let mut child = Command::new("git")
-        .arg("--git-dir")
-        .arg(dir.as_str())
-        .args(["update-ref", "--stdin"])
+
+    /// Move none of them.
+    pub fn abort(mut self) {
+        if let Some(mut stdin) = self.stdin.take() {
+            let _ = stdin.write_all(b"abort\n");
+        }
+        let _ = std::io::copy(&mut self.answers, &mut std::io::sink());
+        let _ = self.child.wait();
+    }
+}
+
+impl Drop for Prepared {
+    fn drop(&mut self) {
+        // Closing stdin before `commit` aborts: nothing moved.
+        drop(self.stdin.take());
+        let _ = std::io::copy(&mut self.answers, &mut std::io::sink());
+        let _ = self.child.wait();
+    }
+}
+
+/// What each of `names` is in the repository at `dir`, by one `git cat-file
+/// --batch-check`: a full ref name answers the object it names, a commit id
+/// itself when the repository holds that commit. Anything missing (or not a
+/// commit, for an id) is left out.
+pub fn resolve(dir: &Utf8Path, names: &[String]) -> ApiResult<BTreeMap<String, String>> {
+    let mut found = BTreeMap::new();
+    if names.is_empty() || !store_exists(dir) {
+        return Ok(found);
+    }
+    let mut child = git_command(dir)
+        .args(["cat-file", "--batch-check=%(objectname) %(objecttype)"])
         .stdin(Stdio::piped())
-        .stdout(Stdio::null())
+        .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()?;
     if let Some(mut stdin) = child.stdin.take() {
-        stdin.write_all(script.as_bytes())?;
+        let mut input = String::new();
+        for name in names {
+            input.push_str(name);
+            input.push('\n');
+        }
+        stdin.write_all(input.as_bytes())?;
     }
     let output = child.wait_with_output()?;
     if !output.status.success() {
         return Err(HttpError::internal(format!(
-            "moving refs in {dir}: {}",
+            "reading refs in {dir}: {}",
             String::from_utf8_lossy(&output.stderr).trim()
         )));
     }
-    Ok(())
+    let answers = String::from_utf8_lossy(&output.stdout);
+    for (name, line) in names.iter().zip(answers.lines()) {
+        let mut parts = line.split_whitespace();
+        let (Some(object), Some(kind)) = (parts.next(), parts.next()) else {
+            continue;
+        };
+        if kind == "missing" || kind == "ambiguous" {
+            continue;
+        }
+        if name.starts_with("refs/") || kind == "commit" {
+            found.insert(name.clone(), object.to_owned());
+        }
+    }
+    Ok(found)
 }
 
 /// Whether the repository at `dir` holds `commit`.
