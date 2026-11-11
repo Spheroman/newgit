@@ -108,6 +108,7 @@ fn source(repo: &Utf8Path) -> Source {
     Source {
         url: repo.to_string(),
         auth: "Authorization: Basic eDpwdw==".to_owned(),
+        namespace: None,
     }
 }
 

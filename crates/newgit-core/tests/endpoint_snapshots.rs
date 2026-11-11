@@ -350,6 +350,7 @@ fn sources(project: &Published) -> BTreeMap<String, Source> {
                 Source {
                     url: repo.to_string(),
                     auth: "Authorization: Basic eDpwdw==".to_owned(),
+                    namespace: None,
                 },
             )
         })

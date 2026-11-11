@@ -4,7 +4,8 @@
 binary: each tracker's Git history on the machine's own disk, project state in
 one SQLite database, and the same API newgit.dev answers. A project points at
 it the way it points at newgit.dev, and nothing else about using newgit
-changes. It needs `git` on the `PATH`, and runs on Linux and macOS.
+changes. It needs `git` 2.45 or newer on the `PATH` (it refuses to start
+on an older one), and runs on Linux and macOS.
 
 ```sh
 newgit serve --data /var/lib/newgit --listen 0.0.0.0:8484 \
@@ -17,9 +18,14 @@ Ctrl-C stops it, and starting it again on the same `--data` carries on where
 it was.
 
 - `--data <dir>` is everything the remote keeps: `server.sqlite`, the
-  `token.key` tokens are signed with, and a repository per tracker under
-  `homes/<owner>/<project>/`. Back it up as a directory, with the server
-  stopped. There is no online backup yet.
+  `token.key` tokens are signed with, and under
+  `homes/<owner>/<project>/stores/` one Git repository per audience (the
+  members', the public's, each user's, each private instance's), every
+  tracker a namespace in its audience's, and under `landing/` each merge's
+  objects until it lands. Back it up as a directory, with the
+  server stopped. There is no online backup yet. A data directory from
+  before stores, with a repository per tracker, is moved over the first time
+  the server starts on it.
 - `--listen` is `127.0.0.1:8484` unless you say otherwise, and `127.0.0.1:0`
   picks a free port and prints it.
 - `--url` is the address clients reach it at, when that is not the one they
@@ -43,8 +49,8 @@ newgit login --url https://git.example.com
 newgit remote add --url https://git.example.com
 ```
 
-`remote add` creates `<you>/<project>` on the server, with a repository per
-tracker in Git, and writes `[remote]` to `.newgit/config.toml`. Commit that
+`remote add` creates `<you>/<project>` on the server, with each tracker in Git
+in its audience's store, and writes `[remote]` to `.newgit/config.toml`. Commit that
 file, and the project's other commands (`login`, `merge`, `members`, a
 workspace's `git push`) use this remote without being told. The owner adds a
 teammate with `newgit members add <login>`, and the teammate then:
@@ -97,8 +103,12 @@ What differs is the machinery, and it is the reason to run it:
   (9.4 s on newgit.dev), a plain `git clone` 0.4 s, a merge 1.2 s, and
   `spawn --from-checkpoint` 1.1 s. Those numbers have no internet round trips
   in them.
-- A fork costs nothing. It is a Git namespace inside the tracker's repo, not
-  a copy, except for a private instance's, which gets a repo of its own.
+- A fork costs nothing. It is a Git namespace inside the tracker's, not a
+  copy, except for a private instance's, which gets a store of its own.
+- Trackers share storage only with trackers of the same audience. Git lets
+  anyone who can reach a repository fetch any object in it by id, so the
+  server never puts two audiences' objects in one, rather than pretending to
+  filter what Git serves.
 - Two merges begun from the same state conflict even when they are at
   different anchors, and the second merges again. A merge in flight is kept in
   memory, so restarting the server tells its merger to start the merge over.

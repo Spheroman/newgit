@@ -196,9 +196,11 @@ fn anchor_of(ids: &[String]) -> String {
 /// Where a merge from `base` to `list` lands: the lowest tracker covering
 /// every one it touches (changes more than pins in), and every one it moves.
 /// `None` for the `read` flag when a commit could not be read: root, then.
+#[allow(clippy::too_many_arguments, reason = "each is one thing a landing is")]
 fn anchor_for(
     project: &ProjectContext<'_>,
     db: &Connection,
+    by: &str,
     branch: &str,
     base: &List,
     list: &List,
@@ -214,7 +216,7 @@ fn anchor_for(
     let mut touched = Vec::new();
     let mut read = true;
     for tracker in moved {
-        let dir = project.tracker_dir(tracker);
+        let dir = project.tracker(tracker).view(by)?;
         let (old, new) = (&base[tracker], &list[tracker]);
         let only = only_pins_moved(&dir, old, new);
         let history = match only {
@@ -258,15 +260,20 @@ fn anchor_for(
 }
 
 /// The index root's commit pins, all the way down: each tracker's
-/// `.newgit/pins/<name>`, read from that tracker's own repo.
-pub fn index_of(project: &ProjectContext<'_>, root: &str) -> List {
+/// `.newgit/pins/<name>`, read from that tracker's own repo, and for a merge
+/// by `by` from its landing too.
+pub fn index_of(project: &ProjectContext<'_>, root: &str, by: Option<&str>) -> ApiResult<List> {
     let mut index = List::new();
     let mut stack = vec![("root".to_owned(), root.to_owned())];
     while let Some((tracker, commit)) = stack.pop() {
         if index.contains_key(&tracker) {
             continue;
         }
-        let dir = project.tracker_dir(&tracker);
+        let repo = project.tracker(&tracker);
+        let dir = match by {
+            Some(by) => repo.view(by)?,
+            None => repo.dir(),
+        };
         index.insert(tracker.clone(), commit.clone());
         for (name, pin) in repos::pins_of(&dir, &commit) {
             let child = if tracker == "root" {
@@ -277,7 +284,7 @@ pub fn index_of(project: &ProjectContext<'_>, root: &str) -> List {
             stack.push((child, pin));
         }
     }
-    index
+    Ok(index)
 }
 
 // ── The routes ────────────────────────────────────────────────────────────
@@ -343,16 +350,21 @@ pub fn receive_objects(
         &policy::Context::default(),
     )
     .map_err(|why| HttpError::new(403, why))?;
-    let dir = project.tracker_dir(tracker);
-    if !repos::exists(&dir) {
+    // Checked to be in its audience's store, as any repo served is: the
+    // landing borrows that store's objects.
+    let repo = project.served_tracker(db, tracker)?;
+    if !repo.exists() {
         return fail(
             404,
             format!("{} does not exist", project.repo_of(tracker).name()),
         );
     }
+    // Into the merger's landing, not the store: which store the commit
+    // belongs in is the landing's to say (`Repo::landing_dir`).
+    let landing = repo.open_landing(&caller.login)?;
     let mut index = std::process::Command::new("git")
         .arg("--git-dir")
-        .arg(dir.as_str())
+        .arg(landing.as_str())
         .args(["index-pack", "--stdin", "--fix-thin", "--strict"])
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::null())
@@ -372,11 +384,17 @@ pub fn receive_objects(
             ),
         );
     }
-    if !repos::has_commit(&dir, commit) {
+    if !repos::has_commit(&landing, commit) {
         return fail(400, format!("the pack sent for {commit} does not hold it"));
     }
     let reference = landing_ref(commit);
-    repos::set_refs(&dir, &[(reference.clone(), commit.to_owned())])?;
+    let output = repos::git(&landing, &["update-ref", &reference, commit])?;
+    if !output.status.success() {
+        return Err(HttpError::internal(format!(
+            "could not set {reference} in {landing}: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
     Ok(ApiResponse {
         status: 200,
         body: json!({ "tracker": tracker, "commit": commit, "ref": reference }),
@@ -447,7 +465,16 @@ pub fn begin(
             db::add_link(db, &project.key, tracker, &home.key(), &there)?;
         }
     }
-    let (anchor, read) = anchor_for(project, db, branch, &base, &list, &moved, &facts)?;
+    let (anchor, read) = anchor_for(
+        project,
+        db,
+        &caller.login,
+        branch,
+        &base,
+        &list,
+        &moved,
+        &facts,
+    )?;
     let who = project.who(caller);
     let mut writes = Vec::new();
     for tracker in &moved {
@@ -462,7 +489,7 @@ pub fn begin(
                     format!("`{tracker}` is not in Git; `newgit merge` never carries it"),
                 );
             }
-            if !repos::exists(&project.tracker_dir(tracker)) {
+            if !project.tracker(tracker).exists() {
                 return fail(
                     400,
                     format!(
@@ -514,13 +541,14 @@ pub fn begin(
             &policy::Context::default(),
         )
         .map_err(|why| HttpError::new(403, why))?;
-        let dir = project.tracker_dir(tracker);
+        let repo = project.tracker(tracker);
+        let view = repo.view(&caller.login)?;
         let (forward, on_main) = match (tracker.as_str(), list.get(tracker)) {
             ("root", _) | (_, None) => (false, false),
             (_, Some(new)) => (
-                repos::has_commit(&dir, new) && repos::is_ancestor(&dir, &base[tracker], new),
-                repos::branch_head(&dir, None, "main")
-                    .is_some_and(|main| repos::is_ancestor(&dir, new, &main)),
+                repos::has_commit(&view, new) && repos::is_ancestor(&view, &base[tracker], new),
+                repo.branch_head("main")
+                    .is_some_and(|main| repos::is_ancestor(&view, new, &main)),
             ),
         };
         // Above the anchor nothing is touched, only moved along: approved
@@ -583,7 +611,7 @@ pub fn begin(
                 db,
                 &repo,
                 &caller.token_id,
-                "refs/newgit/landing/",
+                crate::git_http::LANDING,
                 db::now_seconds() + PUSH_SECONDS,
             )?;
             let expires = caller.expires.min(db::now_seconds() + PUSH_SECONDS);
@@ -658,7 +686,9 @@ pub fn finish(
         .unwrap_or_default();
     let asked = check_moves(moves, &writes, branch, list)?;
     if landed_already {
-        // A finish asked again, its answer lost: it landed, and follows again.
+        // A finish asked again, its answer lost (or its objects not yet in
+        // place): it landed, and lands and follows again.
+        land(project, db, &caller.login, branch, list)?;
         let behind = follow(project, branch, list, &asked)?;
         return answer(
             db,
@@ -675,7 +705,7 @@ pub fn finish(
         );
     };
     for (tracker, commit) in list {
-        if !repos::has_commit(&project.tracker_dir(tracker), commit) {
+        if !repos::has_commit(&project.tracker(tracker).view(&caller.login)?, commit) {
             return fail(
                 400,
                 format!(
@@ -684,7 +714,7 @@ pub fn finish(
             );
         }
     }
-    if index_of(project, &list["root"]) != *list {
+    if index_of(project, &list["root"], Some(&caller.login))? != *list {
         return fail(
             400,
             "root's commit does not pin what this index says: push the root commit the merge made to its landing ref, then finish",
@@ -702,7 +732,17 @@ pub fn finish(
         pending.anchor.clone()
     } else {
         let facts = project.definitions(db, moved.iter().map(String::as_str))?;
-        anchor_for(project, db, branch, base, list, &moved, &facts)?.0
+        anchor_for(
+            project,
+            db,
+            &caller.login,
+            branch,
+            base,
+            list,
+            &moved,
+            &facts,
+        )?
+        .0
     };
     if !within(&anchor, &pending.anchor) {
         return fail(
@@ -710,6 +750,16 @@ pub fn finish(
             "this merge touches more than it did when it began: start the merge again",
         );
     }
+    if current.as_ref() != Some(base) {
+        return fail(
+            409,
+            format!("`{branch}` moved since you looked: merge again onto what it is now"),
+        );
+    }
+    // Its objects into the stores the landing calls for, before it is
+    // written down: under the db lock nothing lands beside it, and a landing
+    // whose objects have nowhere safe to go does not land.
+    land(project, db, &caller.login, branch, list)?;
     // The commit point.
     let transaction = db.transaction()?;
     if db::list_of(&transaction, &project.key, branch)?.as_ref() != Some(base) {
@@ -747,6 +797,8 @@ pub fn finish(
     transaction.commit()?;
     let behind = follow(project, branch, list, &asked)?;
     project.app.trackers_moved();
+    // A landing may have changed definitions, and so audiences.
+    project.settle_after_landing(db);
     answer(db, project, branch, behind, anchor)
 }
 
@@ -826,6 +878,83 @@ fn check_moves(
     Ok(moves)
 }
 
+/// Every commit of `list` waiting in `by`'s landings, brought into the store
+/// its tracker's definition calls for as this landing leaves it. Each
+/// tracker's new commits go first into the narrower of its old store and its
+/// new one, so a landing that fails part way has made nothing more readable
+/// than it was:
+///
+/// - a narrowing moves the tracker first, then its commits follow it into the
+///   narrower store, never written into the wider one;
+/// - a widening brings its commits into the old, narrower store first, and
+///   moves only once every tracker's commits are in place, so a commit that
+///   cannot be brought in (an object missing) leaves it where it was;
+/// - a move between stores whose audiences are not ordered by inclusion
+///   (`user:a` to `user:b`) is taken as a narrowing: moved, then filled.
+///
+/// The quarantine borrows whichever store the tracker is in when its commits
+/// are brought in (`Repo::open_landing` rewrites its alternates), so it never
+/// resolves an object from a store the commits are not going into.
+///
+/// Definitions are read from each tracker's `main`, so only a landing on
+/// `main` changes them; for one, they are read from the commits it lands.
+/// Every store a tracker moves to is checked before anything moves, so a
+/// store in the way made for another audience refuses the landing whole.
+/// Run again by a finish asked again: what is in place already is left.
+fn land(
+    project: &ProjectContext<'_>,
+    db: &Connection,
+    by: &str,
+    branch: &str,
+    list: &List,
+) -> ApiResult<()> {
+    let names = list.keys().map(String::as_str);
+    let after = if branch == "main" {
+        let mut at = BTreeMap::new();
+        for (tracker, commit) in list {
+            if !project.links.contains_key(tracker) {
+                let view = project.tracker(tracker).view(by)?;
+                at.insert(tracker.clone(), (view, commit.clone()));
+            }
+        }
+        policy::load_definitions_at(&project.app.config.data, db, &project.id, names, &at)
+    } else {
+        project.definitions(db, names)?
+    };
+    let mut widening = BTreeSet::new();
+    for tracker in list.keys() {
+        let Some(fact) = after.get(tracker) else {
+            continue;
+        };
+        if project.links.contains_key(tracker) {
+            continue;
+        }
+        let to = repos::Store::for_tracker(Some(fact), tracker);
+        let own = project.own(tracker);
+        if own.store != to {
+            repos::check_store(&to.dir(&project.home()), &to)?;
+            if own.exists() && own.store.widens_to(&to) {
+                widening.insert(tracker.as_str());
+            }
+        }
+    }
+    for (tracker, commit) in list {
+        if widening.contains(tracker.as_str()) {
+            project.tracker(tracker).take_landing(by, commit)?;
+        }
+    }
+    for (tracker, commit) in list {
+        if !widening.contains(tracker.as_str()) {
+            project.settle(db, tracker, after.get(tracker))?;
+            project.tracker(tracker).take_landing(by, commit)?;
+        }
+    }
+    for tracker in &widening {
+        project.settle(db, tracker, after.get(*tracker))?;
+    }
+    Ok(())
+}
+
 /// Each repo's branch after a landing: root's to the list, each asked-for
 /// move by compare-and-swap, and the landing refs gone. What could not move
 /// (a child's `main` moved meanwhile) is said, and the landing stands.
@@ -836,25 +965,18 @@ fn follow(
     moves: &[RefMove],
 ) -> ApiResult<Vec<String>> {
     let mut behind = Vec::new();
-    let root = project.tracker_dir("root");
-    repos::set_refs(
-        &root,
-        &[(format!("refs/heads/{branch}"), list["root"].clone())],
-    )?;
+    project
+        .tracker("root")
+        .set_refs(&[(format!("refs/heads/{branch}"), list["root"].clone())])?;
     for step in moves {
-        let dir = project.tracker_dir(&step.tracker);
+        let repo = project.tracker(&step.tracker);
         let reference = format!("refs/heads/{}", step.branch);
-        let moved = repos::update_refs(
-            &dir,
-            &[RefUpdate {
-                reference: &reference,
-                new: &step.new,
-                old: step.old.as_deref(),
-            }],
-        )?;
-        if !moved
-            && repos::branch_head(&dir, None, &step.branch).as_deref() != Some(step.new.as_str())
-        {
+        let moved = repo.update_refs(&[RefUpdate {
+            reference: &reference,
+            new: &step.new,
+            old: step.old.as_deref(),
+        }])?;
+        if !moved && repo.branch_head(&step.branch).as_deref() != Some(step.new.as_str()) {
             behind.push(format!(
                 "`{}`'s `{}` moved while this merge ran",
                 step.tracker, step.branch
@@ -862,8 +984,7 @@ fn follow(
         }
     }
     for (tracker, commit) in list {
-        let dir = project.tracker_dir(tracker);
-        let _ = repos::git(&dir, &["update-ref", "-d", &landing_ref(commit)]);
+        let _ = project.tracker(tracker).delete_ref(&landing_ref(commit));
     }
     Ok(behind)
 }
