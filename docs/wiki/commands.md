@@ -22,6 +22,14 @@ inside a workspace):
   `autostart` action that died on its own); ports,
   workspace, trackers, and installs stay as they are. Both exit 0 with
   nothing to do and 1 if any resource failed
+- `newgit stop --evict [--discard-ignored]` — stop, checkpoint, and delete
+  the workspace, leaving its marker; `newgit start` brings it back from that
+  checkpoint, with uncommitted and staged work, other branches, the stash,
+  tracker content, and rebuilt installs. It refuses, deleting nothing, when
+  something would not come back: ignored files no tracker owns and nothing
+  rebuilds (listed; `--discard-ignored` lets them go), a merge or rebase in
+  the middle, hand edits to a rendered file, an untracked repository, or a
+  process still working in the directory
 - `newgit checkpoint [instance] [-m <msg>] [--verify]` / `undo [instance]
   [--to <id>] [--only <resource>] [--force-recompute]` / `checkpoints
   [instance]` — `--verify` proves the restore works by running a real undo;

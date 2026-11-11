@@ -113,6 +113,58 @@ pub struct BranchManager {
     /// Forks whose definitions need fixing, as `(tracker, why)`: only a
     /// manager opened with [`BranchManager::open_to_repair`] has any.
     fork_problems: Vec<(String, String)>,
+    /// Evicted instances this manager is bringing back right now, by slug:
+    /// the undo that does it needs the workspace every other command is
+    /// refused while the record says `evicted` (see
+    /// [`BranchManager::start_instance`]).
+    restoring: Mutex<BTreeSet<String>>,
+}
+
+/// An instance in [`BranchManager`]'s `restoring` for as long as this lives.
+struct Restoring<'a> {
+    set: &'a Mutex<BTreeSet<String>>,
+    slug: String,
+}
+
+impl<'a> Restoring<'a> {
+    fn new(set: &'a Mutex<BTreeSet<String>>, slug: &str) -> Self {
+        set.lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(slug.to_owned());
+        Self {
+            set,
+            slug: slug.to_owned(),
+        }
+    }
+}
+
+impl Drop for Restoring<'_> {
+    fn drop(&mut self) {
+        self.set
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&self.slug);
+    }
+}
+
+/// `a`, `` `a` and `b` ``, or `` `a`, `b`, and 3 more ``: paths in a refusal.
+fn list_paths(paths: &[Utf8PathBuf]) -> String {
+    const SHOWN: usize = 8;
+    let quoted: Vec<String> = paths
+        .iter()
+        .take(SHOWN)
+        .map(|path| format!("`{path}`"))
+        .collect();
+    let more = paths.len().saturating_sub(SHOWN);
+    match (quoted.as_slice(), more) {
+        ([one], 0) => one.clone(),
+        ([first, second], 0) => format!("{first} and {second}"),
+        (_, 0) => {
+            let (last, rest) = quoted.split_last().expect("more than two");
+            format!("{}, and {last}", rest.join(", "))
+        }
+        _ => format!("{}, and {more} more", quoted.join(", ")),
+    }
 }
 
 /// An instance's lock as a command holds it; dropping the last guard for an
@@ -1570,6 +1622,7 @@ impl BranchManager {
             reseal_failures: Mutex::new(BTreeMap::new()),
             unsent: Mutex::new(BTreeMap::new()),
             fork_problems,
+            restoring: Mutex::new(BTreeSet::new()),
         })
     }
 
@@ -8099,6 +8152,13 @@ impl BranchManager {
         };
 
         self.materializer().remove(&branch)?;
+        // What an eviction kept of its Git, and a workspace it left half
+        // deleted.
+        crate::evict::clear_saved(self.source.root(), &branch.slug)?;
+        let trash = self.evict_trash(&branch);
+        if trash.exists() {
+            std::fs::remove_dir_all(&trash).map_err(|source| NewgitError::io(trash, source))?;
+        }
         // Its branches go with it; pins keep whatever its archived
         // checkpoints still name.
         for definition in &self.trackers {
@@ -13965,31 +14025,71 @@ impl BranchManager {
     /// instance holds no disk beyond its checkpoint. [`Self::start_instance`]
     /// brings the workspace back from that checkpoint, at the same path.
     ///
-    /// Nothing is evicted when a resource would not stop: something would
-    /// still be running in the directory. Nor when a dropped tracker's paths
-    /// hold changes, which a checkpoint leaves out (as `undo` refuses). What
-    /// is ignored and no tracker owns or resource rebuilds goes with the
-    /// workspace, and is named in [`WorkspaceChange::Evicted`]. Evicting an
-    /// evicted instance only stops what is running.
-    pub fn evict_instance(&self, instance: &str) -> Result<StopStartOutcome> {
+    /// The promise is that the `start` after it gives back exactly what was
+    /// there, or that the eviction refuses and deletes nothing. So it
+    /// refuses, before anything is stopped, when the workspace holds what no
+    /// checkpoint carries: a Git operation in the middle (a merge, a
+    /// rebase), changes in a dropped tracker's paths, hand edits to a
+    /// rendered file, a repository of its own that is not ignored, or
+    /// ignored files no tracker owns and no resource rebuilds (`target/`),
+    /// unless `discard_ignored` says those may go; they are then named in
+    /// [`WorkspaceChange::Evicted`]. It also refuses when a resource would
+    /// not stop, when a process other than this one still has its working
+    /// directory in the workspace, and when the checkpoint is degraded or is
+    /// not whole in the store. What Git keeps only in the workspace's
+    /// `.git/` (other branches, tags, the stash, what is staged) goes into
+    /// the store first ([`crate::evict`]).
+    ///
+    /// The checkpoint has to be whole on this machine, not on the remote:
+    /// the store holds it, and only the workspace is deleted. A checkpoint
+    /// that did not sync says so in the warnings, and syncs at the next one.
+    ///
+    /// Evicting an evicted instance only stops what is running.
+    pub fn evict_instance(
+        &self,
+        instance: &str,
+        discard_ignored: bool,
+    ) -> Result<StopStartOutcome> {
         self.require_resolvable_graph()?;
         let (_lock, branch) = self.locked_branch(instance)?;
-        let mut outcome = self.stop_instance(&branch.name)?;
-        let mut branch = self.store.find_branch(&branch.slug)?;
-        if branch.evicted.is_some() || !outcome.ok() {
-            return Ok(outcome);
+        if branch.evicted.is_some() {
+            return self.stop_instance(&branch.name);
         }
         self.require_workspace(&branch)?;
-        let outside = self.changes_left_out(&branch)?;
-        if !outside.is_empty() {
+        // Before anything is stopped: what would refuse anyway.
+        self.evict_refusals(&branch, discard_ignored)?;
+        let mut outcome = self.stop_instance(&branch.name)?;
+        if !outcome.ok() {
+            return Ok(outcome);
+        }
+        let mut branch = self.store.find_branch(&branch.slug)?;
+        let workspace = branch.workspace_path.clone();
+        let inside = crate::evict::processes_in(&workspace)?;
+        if !inside.is_empty() {
             return Err(NewgitError::Unsupported(format!(
-                "{}: a checkpoint leaves them out, so evicting the workspace would lose them; \
-                 {} to keep them, or remove them",
-                describe_left_out(&branch.name, &outside),
-                rebind_hint(&outside)
+                "not evicting `{}`: {} still {} {workspace} as {} working directory ({}). Stop \
+                 {} or leave the directory, then evict again; `newgit start {}` brings back \
+                 what this stopped",
+                branch.name,
+                if inside.len() == 1 {
+                    "a process"
+                } else {
+                    "processes"
+                },
+                if inside.len() == 1 { "has" } else { "have" },
+                if inside.len() == 1 { "its" } else { "their" },
+                inside
+                    .iter()
+                    .map(|(pid, command)| format!("{pid} {command}"))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                if inside.len() == 1 { "it" } else { "them" },
+                branch.name
             )));
         }
-        let discarded = self.evict_discards(&branch)?;
+        // Again, now that nothing of the instance runs: whatever stopping
+        // wrote is judged too, and this is the list the outcome names.
+        let discarded = self.evict_refusals(&branch, discard_ignored)?;
         let checkpoint = self.checkpoint_branch(
             &mut branch,
             Some("evicted by `newgit stop --evict`"),
@@ -13997,21 +14097,58 @@ impl BranchManager {
         )?;
         outcome.warnings.extend(checkpoint.warnings.iter().cloned());
         let id = checkpoint.record.id.clone();
+        if !checkpoint.degraded.is_empty() {
+            return Err(NewgitError::Unsupported(format!(
+                "not evicting `{}`: checkpoint {id} could not capture {} (not up, and its \
+                 capture failed), so a restore would not bring {} back. The workspace is \
+                 untouched; fix the resource, or remove the instance instead",
+                branch.name,
+                checkpoint
+                    .degraded
+                    .iter()
+                    .map(|name| format!("`{name}`"))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                if checkpoint.degraded.len() == 1 {
+                    "it"
+                } else {
+                    "them"
+                }
+            )));
+        }
+        self.require_whole_here(&branch, &checkpoint.record)?;
 
+        let saved = crate::evict::save_git_state(&workspace, self.source.root(), &branch.slug)?;
+        let saved_text = serde_json::to_string(&saved)
+            .map_err(|error| NewgitError::io(&workspace, std::io::Error::other(error)))?;
+        crate::remote::write_private(&self.evicted_git_path(&branch), &saved_text)?;
         // The workspace's own remote token lives in its `.git/`; kept beside
         // the instance's state so the restored workspace pushes as this one.
-        let token = crate::remote::workspace_token(&branch.workspace_path)?;
-        if let Some(token) = &token {
-            crate::remote::write_private(&self.evicted_token_path(&branch), token)?;
+        if let Some(token) = crate::remote::workspace_token(&workspace)? {
+            crate::remote::write_private(&self.evicted_token_path(&branch), &token)?;
         }
-        // Recorded before the delete: a crash between the two leaves an
-        // instance `start` restores, not a half-deleted workspace `cleanup`
-        // would finalize.
+        // Recorded before the delete: from here on, whatever is at the path
+        // is what `start` restores over.
         branch.evicted = Some(id.clone());
         branch.updated_at = Utc::now();
         self.store.save_branch_record(&branch)?;
-        self.materializer().remove(&branch)?;
+        // Moved aside in one step, then deleted: a crash part way leaves the
+        // path with its marker or with nothing, both of which `start`
+        // restores, and a directory beside it with a marker, which `cleanup`
+        // collects.
+        let trash = self.evict_trash(&branch);
+        if trash.exists() {
+            std::fs::remove_dir_all(&trash).map_err(|source| NewgitError::io(&trash, source))?;
+        }
+        std::fs::rename(&workspace, &trash)
+            .map_err(|source| NewgitError::io(&workspace, source))?;
         crate::materializer::write_workspace_marker(self.source.root(), &branch)?;
+        if let Err(error) = std::fs::remove_dir_all(&trash) {
+            outcome.warnings.push(format!(
+                "the evicted workspace was moved to {trash} but not all of it could be deleted \
+                 ({error}); `newgit cleanup` deletes the rest"
+            ));
+        }
         outcome.workspace = Some(WorkspaceChange::Evicted {
             checkpoint: id,
             discarded,
@@ -14019,51 +14156,145 @@ impl BranchManager {
         Ok(outcome)
     }
 
-    /// The ignored paths in `branch`'s workspace that an eviction discards:
-    /// every one no tracker owns, no resource builds or renders, and that is
-    /// not newgit's own marker. Directories are named once, not walked.
+    /// Why `branch`'s workspace cannot be evicted without losing something,
+    /// as an error; otherwise the ignored paths that go with it (empty
+    /// unless `discard_ignored`).
+    fn evict_refusals(
+        &self,
+        branch: &BranchInstance,
+        discard_ignored: bool,
+    ) -> Result<Vec<Utf8PathBuf>> {
+        let workspace = &branch.workspace_path;
+        let name = &branch.name;
+        if let Some(what) = crate::evict::operation_in_progress(workspace)? {
+            return Err(NewgitError::Unsupported(format!(
+                "not evicting `{name}`: its workspace is in the middle of {what}, which lives in \
+                 its `.git/` and no checkpoint carries. Finish or abort it, then evict again"
+            )));
+        }
+        let outside = self.changes_left_out(branch)?;
+        if !outside.is_empty() {
+            return Err(NewgitError::Unsupported(format!(
+                "{}: a checkpoint leaves them out, so evicting the workspace would lose them; \
+                 {} to keep them, or remove them",
+                describe_left_out(name, &outside),
+                rebind_hint(&outside)
+            )));
+        }
+        let drift = self.render_drift(branch);
+        if !drift.is_empty() {
+            return Err(NewgitError::Unsupported(format!(
+                "not evicting `{name}`: a restore renders its files again, so {}",
+                drift.join("; ")
+            )));
+        }
+        let repositories = crate::evict::untracked_repositories(workspace)?;
+        if !repositories.is_empty() {
+            return Err(NewgitError::Unsupported(format!(
+                "not evicting `{name}`: {} {} a Git repository of its own, untracked, which a \
+                 checkpoint records as a commit id and not its files. Move it out, or commit \
+                 its work somewhere it is kept, then evict again",
+                list_paths(&repositories),
+                if repositories.len() == 1 {
+                    "is"
+                } else {
+                    "are each"
+                }
+            )));
+        }
+        let discarded = crate::evict::summarize(workspace, &self.evict_discards(branch)?)?;
+        if !discarded.is_empty() && !discard_ignored {
+            return Err(NewgitError::Unsupported(format!(
+                "not evicting `{name}`: {} {} ignored, owned by no tracker outside Git, and \
+                 rebuilt by no resource, so no checkpoint holds {} and it would not come back. \
+                 `newgit stop --evict --discard-ignored` evicts anyway and loses {}; a tracker \
+                 (`newgit tracker track`) keeps what should come back",
+                list_paths(&discarded),
+                if discarded.len() == 1 { "is" } else { "are" },
+                if discarded.len() == 1 { "it" } else { "them" },
+                if discarded.len() == 1 { "it" } else { "them" },
+            )));
+        }
+        Ok(discarded)
+    }
+
+    /// The ignored files in `branch`'s workspace an eviction loses: every
+    /// one that no bound tracker outside Git owns (a checkpoint captures
+    /// those), that no bound resource rebuilds on restore (a `recompute`
+    /// restore's `[identity] produces`, refilled from the install store),
+    /// that is not rendered, and that is not newgit's own marker. A tracker
+    /// in Git does not keep an ignored file: it is not committed.
     fn evict_discards(&self, branch: &BranchInstance) -> Result<Vec<Utf8PathBuf>> {
-        let listed = crate::source::run_git_env(
-            &[
-                "-C",
-                branch.workspace_path.as_str(),
-                "ls-files",
-                "-z",
-                "--others",
-                "--ignored",
-                "--exclude-standard",
-                "--directory",
-            ],
-            &[],
-        )?;
-        let kept: Vec<Utf8PathBuf> =
-            self.trackers
-                .iter()
-                .filter(|definition| !branch.dropped.contains(&definition.name))
-                .flat_map(|definition| definition.paths.iter().cloned())
-                .chain(
-                    self.resources
-                        .iter()
-                        .flat_map(|definition| definition.identity_produces().iter().cloned()),
-                )
-                .chain(
-                    branch.resources.values().flat_map(|binding| {
-                        binding.rendered.iter().map(|render| render.path.clone())
-                    }),
-                )
-                .chain([Utf8PathBuf::from(".newgit/local")])
-                .collect();
-        Ok(listed
-            .split('\0')
-            .map(|path| path.trim_end_matches('/'))
-            .filter(|path| !path.is_empty())
-            .map(Utf8PathBuf::from)
+        let bound: Vec<TrackerDefinition> = self
+            .all_definitions()
+            .into_iter()
+            .filter(|definition| !branch.dropped.contains(&definition.name))
+            .collect();
+        let rebuilt: Vec<Utf8PathBuf> = self
+            .resources
+            .iter()
+            .filter(|definition| {
+                branch.resources.contains_key(&definition.name)
+                    && self.resource_active(branch, &definition.name)
+                    && definition
+                        .restore
+                        .as_ref()
+                        .is_some_and(|spec| spec.mode == RestoreMode::Recompute)
+            })
+            .flat_map(|definition| definition.identity_produces().iter().cloned())
+            .collect();
+        let rendered: Vec<Utf8PathBuf> = branch
+            .resources
+            .values()
+            .flat_map(|binding| binding.rendered.iter().map(|render| render.path.clone()))
+            .collect();
+        let marker = [
+            Utf8Path::new(".newgit/local/instance.toml"),
+            Utf8Path::new(".newgit/local/.gitignore"),
+        ];
+        Ok(crate::evict::ignored_files(&branch.workspace_path)?
+            .into_iter()
             .filter(|path| {
-                !kept
-                    .iter()
-                    .any(|keep| path.starts_with(keep) || keep.starts_with(path))
+                !(marker.contains(&path.as_path())
+                    || rendered.contains(path)
+                    || rebuilt.iter().any(|tree| path.starts_with(tree))
+                    || crate::tracker::owner_of(&bound, path).is_some_and(|owner| !owner.git))
             })
             .collect())
+    }
+
+    /// Refuse unless `record`, just taken, is whole in this machine's store:
+    /// its source commit and all it reaches, and every tracker rev. The
+    /// eviction deletes the only other copy.
+    fn require_whole_here(&self, branch: &BranchInstance, record: &CheckpointRecord) -> Result<()> {
+        let tip = record
+            .source
+            .dirty_rev
+            .as_deref()
+            .unwrap_or(&record.source.head_rev);
+        let mut missing = Vec::new();
+        if self.source.ref_rev(&record.source.store_ref).is_none()
+            || !self.source.holds_complete(tip)
+        {
+            missing.push(format!("its source ({tip})"));
+        }
+        for state in &record.tracker_states {
+            if let Some(rev) = &state.content_rev
+                && !self.lane(&state.name).has_rev(rev)
+            {
+                missing.push(format!("tracker `{}` at {rev}", state.name));
+            }
+        }
+        if missing.is_empty() {
+            return Ok(());
+        }
+        Err(NewgitError::Unsupported(format!(
+            "not evicting `{}`: checkpoint {} is not whole in the store ({} missing), so the \
+             workspace is kept",
+            branch.name,
+            record.id,
+            missing.join(", ")
+        )))
     }
 
     fn evicted_token_path(&self, branch: &BranchInstance) -> Utf8PathBuf {
@@ -14072,25 +14303,67 @@ impl BranchManager {
             .join("evicted-token")
     }
 
+    /// What [`crate::evict::save_git_state`] saved, for the restore.
+    fn evicted_git_path(&self, branch: &BranchInstance) -> Utf8PathBuf {
+        self.store
+            .instance_state_dir(&branch.slug)
+            .join("evicted-git.json")
+    }
+
+    /// Written when a restore starts and deleted when it is done: while it
+    /// is there, what is at the workspace's path is that restore's own work,
+    /// and a `start` after a failed one deletes it and starts over.
+    fn evict_restoring_path(&self, branch: &BranchInstance) -> Utf8PathBuf {
+        self.store
+            .instance_state_dir(&branch.slug)
+            .join("evict-restoring")
+    }
+
+    /// Where an eviction moves the workspace just before deleting it.
+    fn evict_trash(&self, branch: &BranchInstance) -> Utf8PathBuf {
+        let workspace = &branch.workspace_path;
+        let name = format!(
+            ".{}.evicting",
+            workspace.file_name().unwrap_or(branch.slug.as_str())
+        );
+        workspace
+            .parent()
+            .map_or_else(|| Utf8PathBuf::from(&name), |parent| parent.join(&name))
+    }
+
     /// Bring an evicted workspace back: materialize it again at its path,
     /// as `spawn` does, then `undo` to the checkpoint the eviction took —
     /// source with its uncommitted work, tracker content, renders, and the
-    /// trees resources rebuild, filled from the install store. Under the
-    /// instance's lock, which the caller holds.
-    fn restore_evicted(&self, mut branch: BranchInstance, checkpoint: &str) -> Result<Vec<String>> {
+    /// trees resources rebuild, filled from the install store — and put back
+    /// what Git kept only in `.git/`. Under the instance's lock, which the
+    /// caller holds.
+    ///
+    /// The record says `evicted` until every step is done, so a restore that
+    /// fails part way is run again by the next `start`, from the start.
+    fn restore_evicted(&self, branch: BranchInstance, checkpoint: &str) -> Result<Vec<String>> {
         let workspace = branch.workspace_path.clone();
-        if workspace.exists() {
-            if !crate::materializer::is_evicted_stub(&workspace) {
-                return Err(NewgitError::Unsupported(format!(
-                    "`{}` was evicted, but {workspace} holds more than its marker now; move \
-                     that away, and `newgit start {}` brings the workspace back",
-                    branch.name, branch.name
-                )));
-            }
+        let restoring = self.evict_restoring_path(&branch);
+        let trash = self.evict_trash(&branch);
+        if trash.exists() {
+            let _ = std::fs::remove_dir_all(&trash);
+        }
+        if workspace.exists()
+            && !restoring.exists()
+            && !crate::materializer::is_evicted_stub(&workspace)
+        {
+            return Err(NewgitError::Unsupported(format!(
+                "`{}` was evicted, but {workspace} holds more than its marker now; move \
+                 that away, and `newgit start {}` brings the workspace back",
+                branch.name, branch.name
+            )));
+        }
+        self.require_resolvable_graph()?;
+        let record = self.checkpoint_log(&branch).load(checkpoint)?;
+        crate::remote::write_private(&restoring, checkpoint)?;
+        if std::fs::symlink_metadata(&workspace).is_ok() {
             std::fs::remove_dir_all(&workspace)
                 .map_err(|source| NewgitError::io(workspace.clone(), source))?;
         }
-        self.require_resolvable_graph()?;
         let mut warnings = Vec::new();
         if let Some(warning) = self.materializer().materialize_reporting(
             &self.source,
@@ -14119,20 +14392,58 @@ impl BranchManager {
                 &format!("!{} credential", sh_quote(&newgit_program())),
             )?;
         }
-        // The workspace is back, so the record says so before the undo, which
-        // needs one; an undo that fails part way says so as any undo does.
+        // Tracker content first, so the safety checkpoint the undo takes
+        // captures what the eviction left, not an empty workspace: an empty
+        // capture would be a rev on the instance's branch deleting it all.
+        for state in &record.tracker_states {
+            if branch.dropped.contains(&state.name) {
+                continue;
+            }
+            if let (Some(definition), Some(rev)) = (
+                self.trackers
+                    .iter()
+                    .find(|definition| definition.name == state.name),
+                &state.content_rev,
+            ) {
+                self.lane(&definition.name)
+                    .restore(&workspace, definition, rev)?;
+            }
+        }
+        let undo = {
+            let _restoring = Restoring::new(&self.restoring, &branch.slug);
+            self.undo(
+                &branch.name,
+                &UndoOptions {
+                    to: Some(checkpoint.to_owned()),
+                    ..UndoOptions::default()
+                },
+            )?
+        };
+        warnings.extend(undo.warnings);
+        let saved: crate::evict::SavedGit =
+            match std::fs::read_to_string(self.evicted_git_path(&branch)) {
+                Ok(text) => serde_json::from_str(&text).map_err(|error| {
+                    NewgitError::io(self.evicted_git_path(&branch), std::io::Error::other(error))
+                })?,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Default::default(),
+                Err(source) => return Err(NewgitError::io(self.evicted_git_path(&branch), source)),
+            };
+        crate::evict::restore_git_state(&workspace, self.source.root(), &branch.slug, &saved)?;
+
+        let mut branch = self.store.find_branch(&branch.slug)?;
         branch.evicted = None;
         branch.updated_at = Utc::now();
         self.store.save_branch_record(&branch)?;
-        let _ = std::fs::remove_file(&token_path);
-        let undo = self.undo(
-            &branch.name,
-            &UndoOptions {
-                to: Some(checkpoint.to_owned()),
-                ..UndoOptions::default()
-            },
-        )?;
-        warnings.extend(undo.warnings);
+        for done in [&token_path, &self.evicted_git_path(&branch), &restoring] {
+            let _ = std::fs::remove_file(done);
+        }
+        if let Err(error) = crate::evict::clear_saved(self.source.root(), &branch.slug) {
+            warnings.push(format!(
+                "the workspace is back, but what the eviction saved of its Git is still under \
+                 {} in the store: {error}",
+                crate::evict::saved_namespace(&branch.slug)
+            ));
+        }
         Ok(warnings)
     }
 
@@ -14622,7 +14933,13 @@ impl BranchManager {
     }
 
     fn require_workspace(&self, branch: &BranchInstance) -> Result<()> {
-        if let Some(checkpoint) = &branch.evicted {
+        if let Some(checkpoint) = &branch.evicted
+            && !self
+                .restoring
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .contains(&branch.slug)
+        {
             return Err(NewgitError::Unsupported(format!(
                 "the workspace for `{}` was evicted to {checkpoint}; `newgit start {}` brings \
                  it back",

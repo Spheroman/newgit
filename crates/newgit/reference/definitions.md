@@ -861,6 +861,14 @@ its own. A resource that was not running at the stop stays down, and one whose d
 The workspace, trackers, port claims and installs are left alone, so the
 instance comes back on the same ports with its rendered config still valid.
 
+`newgit stop --evict` also frees the workspace's disk: it checkpoints the
+instance and deletes the workspace, leaving its marker, and `newgit start`
+brings it back from that checkpoint at the same path before starting
+anything. A `recompute` resource's `[identity] produces` comes back from
+the install store; any other ignored file that no tracker outside Git owns
+does not, so the eviction refuses and lists it unless `--discard-ignored`
+is given.
+
 `suspend` / `resume` are for a resource that keeps running without a
 process newgit supervises: a `prepare` that starts a Supabase stack, a
 Compose project, a container, or a cloud machine that bills while it idles.

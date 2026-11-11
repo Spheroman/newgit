@@ -1256,25 +1256,52 @@ exit 1 if any resource failed.
 
 `newgit stop --evict` also frees the instance's disk, for an instance
 nobody will touch for a while. After the stop, it checkpoints the instance
-(reason `evict`), then deletes the workspace, all but its marker, and
-records the checkpoint in the binding record as `evicted`. The marker
-stays so that commands run at the path still find the instance, and a
-tool holding the path still finds a directory. `newgit start` restores
-first. It materializes the workspace again at the same path, as `spawn`
-does, with the same remote token, and then undoes to that checkpoint. That
-brings back the source with its uncommitted work, tracker content, renders,
-and the trees resources build, filled from the install store. Then it
-starts what the stop stopped.
+(reason `evict`), copies what Git keeps only in the workspace's `.git/`
+into the store (its local branches, tags, every stash entry, and what is
+staged, under `refs/newgit/evicted/<slug>/`), and records the checkpoint in
+the binding record as `evicted`. Then it moves the workspace aside, writes
+its marker back at the path, and deletes what it moved. The marker stays so
+that commands run at the path still find the instance, and a tool holding
+the path still finds a directory. `newgit start` restores first. It
+materializes the workspace again at the same path, as `spawn` does, with
+the same remote token, writes the checkpoint's tracker content, and then
+undoes to that checkpoint. That brings back the source with its
+uncommitted work, tracker content (an encrypted tracker decrypted from this
+machine's cache or key), renders, and the trees resources rebuild, filled
+from the install store. Then it puts back the branches, tags, stash, and
+staging, clears `evicted`, and starts what the stop stopped.
 
-An eviction loses what a checkpoint never carries. That means ignored
-files that no tracker owns and no resource rebuilds, such as `target/`.
-It names them (`discarded` in `--json`) rather than keeping quiet. It
-refuses when a dropped tracker's paths hold changes, as `undo` does, and
-it does nothing when a resource would not stop. A restore refuses when
-something other than the marker was written at the path since. While an
-instance is evicted, commands that need its workspace say to run
-`newgit start`. `status` shows it as `evicted`, and `cleanup` does not
-treat it as an instance whose workspace is gone.
+The promise is that the `start` gives back exactly what was there, or that
+the eviction refuses and deletes nothing. So it refuses, before anything is
+stopped, when the workspace holds what no checkpoint carries: a merge,
+rebase, cherry-pick, revert, or bisect in the middle, or unresolved
+conflicts; changes in a dropped tracker's paths (as `undo` refuses); hand
+edits to a rendered file; an untracked directory that is a repository of
+its own, which `git add -A` records as a commit id; and ignored files that
+no bound tracker outside Git owns and no bound `recompute` resource
+rebuilds, such as `target/` or a stray `.env.local`. It names those, and
+`--discard-ignored` evicts anyway, naming them again (`discarded` in
+`--json`). After the stop it also refuses while a process other than
+itself and its parents has its working directory in the workspace, when a
+resource would not stop, when the checkpoint is degraded, and when the
+checkpoint is not whole in the store. The checkpoint has to be whole on
+this machine, not on the remote: only the workspace is deleted, and the
+store keeps every commit and tracker rev the restore reads. A checkpoint
+the remote did not take is a warning, as for any checkpoint.
+
+A crash part way through loses nothing. The record says `evicted` before
+anything is deleted, and the move aside is one rename, so the path holds
+either the workspace, its marker, or nothing; a moved-aside workspace left
+behind has a marker, so `newgit cleanup` collects it, and the next `start`
+deletes it too. A restore writes `.newgit/state/<slug>/evict-restoring`
+before it touches the path and keeps `evicted` until it is done, so a
+`start` that fails part way is run again by the next one, over what it
+left. Otherwise a restore refuses when something other than the marker was
+written at the path since. While an instance is evicted, commands that need
+its workspace (`checkpoint`, `undo`, `run`, `merge`, ...) say it was
+evicted and to run `newgit start`. `status` shows it as `evicted`,
+`cleanup` does not treat it as an instance whose workspace is gone, and
+`remove` deletes what the eviction kept.
 
 `suspend` never runs for a `project` or `user` resource, which other
 instances share, nor for one that never came up. The `supabase` template's

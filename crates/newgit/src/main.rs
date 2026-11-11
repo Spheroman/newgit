@@ -131,10 +131,17 @@ enum Command {
         instance: Option<String>,
         /// Also checkpoint the instance and delete its workspace, to free
         /// its disk; `newgit start` brings it back from that checkpoint.
-        /// Ignored files no tracker owns and no resource rebuilds (such as
-        /// `target/`) are not kept, and are listed
+        /// Refuses, deleting nothing, when the workspace holds what would
+        /// not come back: ignored files no tracker owns and no resource
+        /// rebuilds (such as `target/`, listed), a merge or rebase in the
+        /// middle, hand edits to a rendered file, an untracked repository,
+        /// or a process still working in it
         #[arg(long)]
         evict: bool,
+        /// With `--evict`: evict even though the ignored files it lists
+        /// will not come back, and list them
+        #[arg(long, requires = "evict")]
+        discard_ignored: bool,
         /// Print one JSON document: each resource stopped, and its status
         #[arg(long)]
         json: bool,
@@ -749,12 +756,13 @@ fn main() -> Result<()> {
         Command::Stop {
             instance,
             evict,
+            discard_ignored,
             json,
         } => stop_start(
             instance,
             json,
             if evict {
-                StopStart::Evict
+                StopStart::Evict { discard_ignored }
             } else {
                 StopStart::Stop
             },
@@ -1937,7 +1945,7 @@ fn action(spec: &str, instance: Option<String>) -> Result<()> {
 #[derive(Debug, Clone, Copy)]
 enum StopStart {
     Stop,
-    Evict,
+    Evict { discard_ignored: bool },
     Start,
 }
 
@@ -1947,7 +1955,9 @@ fn stop_start(instance: Option<String>, json: bool, which: StopStart) -> Result<
     let (manager, instance) = manager_and_instance(instance)?;
     let outcome = match which {
         StopStart::Stop => manager.stop_instance(&instance)?,
-        StopStart::Evict => manager.evict_instance(&instance)?,
+        StopStart::Evict { discard_ignored } => {
+            manager.evict_instance(&instance, discard_ignored)?
+        }
         StopStart::Start => manager.start_instance(&instance)?,
     };
     if json {
@@ -2091,7 +2101,7 @@ fn print_stop_start(outcome: &StopStartOutcome, which: StopStart) {
              brings it back"
         );
         if !discarded.is_empty() {
-            println!("Not kept (ignored, and nothing rebuilds them):");
+            println!("Discarded (ignored, and nothing rebuilds them):");
             for path in discarded {
                 println!("  {path}");
             }
@@ -2103,7 +2113,9 @@ fn print_stopped_or_started(outcome: &StopStartOutcome, which: StopStart) {
     let instance = &outcome.instance;
     if outcome.resources.is_empty() {
         match which {
-            StopStart::Stop | StopStart::Evict => println!("Nothing running for `{instance}`"),
+            StopStart::Stop | StopStart::Evict { .. } => {
+                println!("Nothing running for `{instance}`")
+            }
             StopStart::Start => println!(
                 "Nothing stopped by `newgit stop`, and no `autostart` action down, for \
                  `{instance}`"
@@ -2117,14 +2129,14 @@ fn print_stopped_or_started(outcome: &StopStartOutcome, which: StopStart) {
             None => println!(
                 "{} `{spec}` for `{instance}`",
                 match which {
-                    StopStart::Stop | StopStart::Evict => "Stopped",
+                    StopStart::Stop | StopStart::Evict { .. } => "Stopped",
                     StopStart::Start => "Started",
                 }
             ),
             Some(error) => eprintln!(
                 "[newgit] could not {} `{spec}` for `{instance}`: {error}",
                 match which {
-                    StopStart::Stop | StopStart::Evict => "stop",
+                    StopStart::Stop | StopStart::Evict { .. } => "stop",
                     StopStart::Start => "start",
                 }
             ),

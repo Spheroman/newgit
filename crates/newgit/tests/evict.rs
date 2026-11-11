@@ -175,7 +175,23 @@ fn evict_then_start_brings_the_workspace_back_as_it_was() {
     std::fs::create_dir_all(workspace.join("target")).expect("mkdir");
     std::fs::write(workspace.join("target/build.o"), "o\n").expect("write");
 
-    let evicted = json(&repo, &["stop", "x", "--evict", "--json"]);
+    // `target/` would not come back, so a plain evict refuses, names it,
+    // and deletes nothing.
+    let refused = newgit(&repo, &["stop", "x", "--evict"]);
+    assert!(!refused.status.success());
+    assert!(refused.stderr.contains("`target`"), "{}", refused.stderr);
+    assert!(
+        refused.stderr.contains("--discard-ignored"),
+        "{}",
+        refused.stderr
+    );
+    assert!(workspace.join("target/build.o").is_file());
+    assert!(running(&store, "db"), "a refusal stops nothing");
+
+    let evicted = json(
+        &repo,
+        &["stop", "x", "--evict", "--discard-ignored", "--json"],
+    );
     assert_eq!(
         evicted["resources"],
         serde_json::json!([{"name": "db", "action": "start", "status": "stopped"}]),
