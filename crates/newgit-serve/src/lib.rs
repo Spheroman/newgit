@@ -15,6 +15,7 @@ pub mod migrate;
 pub mod names;
 pub mod policy;
 pub mod repos;
+pub mod server_merge;
 pub mod tokens;
 
 use std::collections::{BTreeMap, HashMap};
@@ -98,6 +99,9 @@ impl App {
             );
         }
         let db = db::Db::open(&config.data.join("server.sqlite"))?;
+        // Scratch repositories of merges the last run stopped in: never
+        // served, never named by anything.
+        server_merge::remove_scratch(&config.data);
         // Stores made before their config said to fsync get it now.
         repos::configure_stores(&config.data)
             .map_err(|error| anyhow::anyhow!("configuring stores: {}", error.cause()))?;

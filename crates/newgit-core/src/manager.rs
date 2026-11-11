@@ -11298,6 +11298,8 @@ impl BranchManager {
         // What root is once this merge is in: its own commit, unless it
         // landed below root and root rolled up to something more.
         let mut landed_root = merged_root.clone();
+        // What landed in each tracker, when the remote merged it.
+        let mut landed_list: Option<BTreeMap<String, String>> = None;
         if !moved.is_empty()
             && let Some((client, project_key)) = &client
         {
@@ -11450,21 +11452,26 @@ impl BranchManager {
             // Where it landed is the finish's to say: `begin` cannot read
             // the merge's commits yet, which arrive after it.
             anchor = landed.anchor.or(anchor);
-            // Landed below root: root rolled up to it on the remote, perhaps
-            // with other landings beside it, so root is now the remote's,
-            // not this merge's own commit. Bring that here, and everything
-            // it pins, so the next spawn starts from what landed: two merges
-            // at once would otherwise each leave only their own.
+            // Merged on the remote onto what landed since this merge's base,
+            // or landed below root and rolled up to (the Worker): root is
+            // now the remote's, not this merge's own commit. Bring that
+            // here, and everything it pins, so the next spawn starts from
+            // what landed: two merges at once would otherwise each leave
+            // only their own.
             // The merge has landed whatever happens here, so a failure is
             // said, not taken for the merge failing.
-            if anchor
-                .as_deref()
-                .is_some_and(|anchor| anchor != self.root.name)
+            if landed.merged
+                || anchor
+                    .as_deref()
+                    .is_some_and(|anchor| anchor != self.root.name)
             {
                 match self.branch_list(Some((client.as_ref(), project_key.as_str())), into) {
                     Ok(after) => {
                         if let Some(root) = after.get(&self.root.name) {
                             landed_root = root.clone();
+                        }
+                        if landed.merged {
+                            landed_list = Some(after);
                         }
                     }
                     Err(error) => warnings.push(format!(
@@ -11513,7 +11520,13 @@ impl BranchManager {
         }
         let updates: Vec<(String, String)> = children
             .iter()
-            .map(|(tracker, commit)| (local_tracker_ref(tracker, into), (*commit).to_owned()))
+            .map(|(tracker, commit)| {
+                let commit = landed_list
+                    .as_ref()
+                    .and_then(|landed| landed.get(*tracker))
+                    .map_or(*commit, String::as_str);
+                (local_tracker_ref(tracker, into), commit.to_owned())
+            })
             .collect();
         self.source.update_refs(&updates)?;
         let published: Vec<(&str, &str)> = std::iter::once(self.root.name.as_str())

@@ -83,7 +83,7 @@ pub use entry::{
     Asked, Change, Entry, Expect, FORMAT, Landed, Landing, Made, Move, Placed, RefMove, Stamp,
 };
 use queue::Queue;
-pub use queue::{Hold, Stuck};
+pub use queue::{Hold, Stuck, is_busy};
 
 pub struct Log {
     dir: Utf8PathBuf,

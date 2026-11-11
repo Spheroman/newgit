@@ -873,6 +873,12 @@ impl Repo {
     }
 
     fn open_landing_from(&self, login: &str, borrow: &Repo) -> ApiResult<Utf8PathBuf> {
+        // One at a time: concurrent merges by one login open the same
+        // landing, and Git's config lock refuses a second writer.
+        static OPENING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _opening = OPENING
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let dir = self.landing_dir(login)?;
         if !store_exists(&dir) {
             if let Some(parent) = dir.parent() {
@@ -890,18 +896,19 @@ impl Repo {
             }
             checked(&dir, &["config", "receive.fsckObjects", "true"])?;
         }
-        std::fs::write(
-            dir.join("objects/info/alternates"),
-            format!("{}\n", borrow.dir().join("objects")),
-        )?;
-        checked(
-            &dir,
-            &[
-                "config",
-                "core.alternateRefsPrefixes",
-                &borrow.full("refs/heads/"),
-            ],
-        )?;
+        let alternates = dir.join("objects/info/alternates");
+        let borrowed = format!("{}\n", borrow.dir().join("objects"));
+        if std::fs::read_to_string(&alternates).ok().as_deref() != Some(borrowed.as_str()) {
+            std::fs::write(&alternates, borrowed)?;
+        }
+        let prefixes = borrow.full("refs/heads/");
+        let set = git(&dir, &["config", "--get", "core.alternateRefsPrefixes"])
+            .ok()
+            .filter(|output| output.status.success())
+            .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned());
+        if set.as_deref() != Some(prefixes.as_str()) {
+            checked(&dir, &["config", "core.alternateRefsPrefixes", &prefixes])?;
+        }
         Ok(dir)
     }
 

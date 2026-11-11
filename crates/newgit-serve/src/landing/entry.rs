@@ -12,8 +12,7 @@ pub type Stamp = u64;
 
 /// The entry format this server writes and reads. An entry of a newer format
 /// is refused, never guessed at; a field added later is defaulted when an
-/// entry without it is read (#411's epochs and merge commit, #412's rooted
-/// tips).
+/// entry without it is read (#411's epoch, #412's rooted tips).
 pub const FORMAT: u32 = 1;
 
 /// One landing, as the log keeps it: everything to put in place.
@@ -83,6 +82,12 @@ pub struct Change {
     /// The project is deleted.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub removed: bool,
+    /// The project's epoch this landing sets: it changes the definitions
+    /// (`.newgit/trackers/`), so a merge prepared under the epoch before
+    /// starts again (#411). Absent from an entry that changes none, and from
+    /// every entry written before epochs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub epoch: Option<u64>,
 }
 
 /// A project made, by whom and under what name.
@@ -155,6 +160,9 @@ pub struct Landing {
     /// moved meanwhile is said ([`Landed::behind`]) and the landing stands.
     /// Each one's home is in the entry already, so its root is taken.
     pub asked: Vec<Asked>,
+    /// The epoch each home must still be at: what its merge was prepared,
+    /// and its policy read, under.
+    pub epochs: Vec<(String, u64)>,
 }
 
 #[derive(Debug, Clone)]

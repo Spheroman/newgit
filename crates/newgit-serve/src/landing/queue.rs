@@ -280,11 +280,20 @@ pub(super) struct Processed {
     pub(super) marks: Vec<Mark>,
 }
 
+/// How a landing that waited too long for a root is answered.
+const BUSY: &str = "this project is busy";
+
+/// Whether `error` is a root another landing held too long ([`busy`]), not a
+/// stuck landing: waiting again is all it needs.
+pub fn is_busy(error: &HttpError) -> bool {
+    error.status == 503 && error.message.starts_with(BUSY)
+}
+
 pub(super) fn busy(blocker: Option<String>) -> HttpError {
     HttpError::new(
         503,
         format!(
-            "this project is busy ({}): try again in a moment",
+            "{BUSY} ({}): try again in a moment",
             blocker.unwrap_or_else(|| "another landing holds it".to_owned())
         ),
     )
@@ -338,6 +347,15 @@ impl Log {
             std::fs::read_to_string(path)
                 .is_ok_and(|faults| faults.lines().any(|fault| fault.trim() == at))
         })
+    }
+
+    /// Wait a moment here if the fault file says to: for the tests that
+    /// land something between a merge and its recheck
+    /// (`delay-merge-by-<login>`).
+    pub fn pause(&self, at: &str) {
+        if self.armed(at) {
+            std::thread::sleep(Duration::from_millis(1500));
+        }
     }
 
     /// Stop the process here if the fault file says to.

@@ -1449,6 +1449,10 @@ pub struct LandedMerge {
     /// None from a remote that does not say.
     #[serde(default)]
     pub anchor: Option<String>,
+    /// The branch had moved since the merge's base, and the remote merged
+    /// onto what it is now: what landed is not the merge's own index.
+    #[serde(default)]
+    pub merged: bool,
 }
 
 /// Where a merge's commit waits in a tracker's repo until the remote lands
