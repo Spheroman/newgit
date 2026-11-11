@@ -3432,9 +3432,20 @@ impl BranchManager {
     /// must be gitignored unless deliberately dual-tracked with source.
     pub fn gitignore_warnings(&self) -> Vec<String> {
         let mut warnings = Vec::new();
+        let paths: Vec<&str> = self
+            .trackers
+            .iter()
+            .flat_map(|definition| definition.paths.iter().map(|path| path.as_str()))
+            .collect();
+        // Asked of Git once for every path, not once per path: this runs
+        // ahead of most commands. A question Git could not answer warns of
+        // nothing, as before.
+        let tracked = self.source.tracked_among(&paths).ok();
+        let ignored = self.source.ignored_among(&paths).ok();
         for definition in &self.trackers {
             for path in &definition.paths {
-                if let Ok(true) = self.source.is_tracked(path.as_str()) {
+                let path = path.as_str();
+                if tracked.as_ref().is_some_and(|tracked| tracked.contains(path)) {
                     warnings.push(format!(
                         "tracker `{}` owns `{path}`, which Git also tracks (dual-tracked): \
                          branch-local content will show as modifications and can be committed \
@@ -3442,7 +3453,7 @@ impl BranchManager {
                          this is deliberate",
                         definition.name
                     ));
-                } else if let Ok(false) = self.source.is_ignored(path.as_str()) {
+                } else if ignored.as_ref().is_some_and(|ignored| !ignored.contains(path)) {
                     warnings.push(format!(
                         "tracker `{}` owns `{path}` but the store repo does not gitignore it; \
                          agents may commit it into source history (fine only if deliberately \
@@ -7871,9 +7882,13 @@ impl BranchManager {
             .map(|definition| (definition.name.clone(), self.lane(&definition.name).main()))
             .collect();
 
+        // Each instance is a handful of `git` spawns and file reads, all
+        // independent of every other instance's: done side by side, a project
+        // with a hundred instances answers in the time of a few.
+        use rayon::prelude::*;
         self.store
             .load_branches()?
-            .into_iter()
+            .into_par_iter()
             .map(|branch| {
                 let workspace_exists = branch.workspace_path.is_dir();
                 let live_rev = workspace_exists
