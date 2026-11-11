@@ -800,24 +800,27 @@ pub fn finish(
         .land_holding(project.app, prepared.landing, &hold);
     drop(hold);
     let db = project.app.db.lock();
-    let behind = match landed {
-        Ok(landed) => landed
-            .behind
-            .iter()
-            .map(|step| {
-                format!(
-                    "`{}`'s `{}` moved while this merge ran",
-                    step.tracker,
-                    step.reference.trim_start_matches("refs/heads/")
-                )
-            })
-            .collect(),
+    let (behind, pending) = match landed {
+        Ok(landed) => (
+            landed
+                .behind
+                .iter()
+                .map(|step| {
+                    format!(
+                        "`{}`'s `{}` moved while this merge ran",
+                        step.tracker,
+                        step.reference.trim_start_matches("refs/heads/")
+                    )
+                })
+                .collect(),
+            landed.pending,
+        ),
         // Landed by an earlier ask whose answer was lost.
         Err(error)
             if error.status == 409
                 && db::list_of(&db, &project.key, branch)?.as_ref() == Some(list) =>
         {
-            Vec::new()
+            (Vec::new(), None)
         }
         Err(error) => return Err(error),
     };
@@ -825,7 +828,15 @@ pub fn finish(
         "DELETE FROM grants WHERE token_id = ? AND refs = 'refs/newgit/landing/'",
         [&caller.token_id],
     )?;
-    answer(&db, project, branch, behind, anchor)
+    let mut answered = answer(&db, project, branch, behind, anchor)?;
+    if let Some(pending) = pending {
+        // It landed: readers see it. Only removing what it moved from where
+        // it was is left, and is tried again.
+        answered.body["pending"] = json!(format!(
+            "landed; removing what it moved from where it was failed ({pending}) and is tried again at each landing on this project and when the server starts"
+        ));
+    }
+    Ok(answered)
 }
 
 /// A merge's landing, ready to be checked under the lock and written down,

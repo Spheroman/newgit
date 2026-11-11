@@ -98,6 +98,9 @@ impl App {
             );
         }
         let db = db::Db::open(&config.data.join("server.sqlite"))?;
+        // Stores made before their config said to fsync get it now.
+        repos::configure_stores(&config.data)
+            .map_err(|error| anyhow::anyhow!("configuring stores: {}", error.cause()))?;
         let log = landing::Log::open(&config.data, &db)?;
         let token_key = token_key(&config.data)?;
         let hooks = config.data.join("hooks");

@@ -51,7 +51,13 @@
 //!   Its roots refuse new landings with a 503 that says why, every landing
 //!   asking there tries it again first, and so does startup. An operator who
 //!   cannot fix the cause voids it ([`Log::void`], `newgit serve
-//!   --void-landing`): a compensating entry, appended, never an edit.
+//!   --void-landing`): a compensating entry, appended, never an edit. Once a
+//!   void is written down, the landings it names are never put in place:
+//!   every retry and replay reads ahead for voids first.
+//! - **A landing in place has landed.** One whose rows are written and whose
+//!   removal from the store it left failed is answered as landed (with the
+//!   removal pending), stays stuck until that is finished, and is never
+//!   voided.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io::Write as _;
@@ -260,6 +266,11 @@ pub struct Landed {
     pub stamp: Stamp,
     /// Asked refs that had moved meanwhile, and so were not moved.
     pub behind: Vec<Asked>,
+    /// In place, readers see it, and removing what it moved from where it
+    /// was failed, for this reason: that is tried again at each landing on
+    /// its projects and at each start, and they refuse new landings (503)
+    /// until it is done.
+    pub pending: Option<String>,
 }
 
 /// What a batch's leader decided for one landing.
@@ -282,29 +293,120 @@ struct Slot {
     outcome: Mutex<Option<ApiResult<Outcome>>>,
 }
 
-/// A landing written down that could not be put in place, and why.
+/// A landing written down that could not be put in place, or finished, and
+/// why.
 #[derive(Debug, Clone)]
 pub struct Stuck {
     pub stamp: Stamp,
     pub entry: Entry,
     pub cause: String,
+    /// In place (its rows are written, readers see it), and only removing
+    /// what it moved from where it was is left. Such a landing has landed:
+    /// it is finished, never voided.
+    pub placed: bool,
 }
 
 impl Stuck {
+    fn new(stamp: Stamp, entry: Entry) -> Self {
+        Self {
+            stamp,
+            entry,
+            cause: String::new(),
+            placed: false,
+        }
+    }
+
     /// What a landing refused because of it is told.
     fn refusal(&self) -> HttpError {
-        HttpError::new(
-            503,
+        let homes = homes_of(&self.entry);
+        let (stamp, by, cause) = (self.stamp, &self.entry.by, &self.cause);
+        let message = if self.placed {
             format!(
-                "landing {} (by {}, in {}) is written down but could not be put in place: {}. Nothing new lands in {} until it is; it is tried again at each landing there and when `newgit serve` starts, and an operator who cannot fix the cause voids it with `newgit serve --void-landing {}`",
-                self.stamp,
-                self.entry.by,
-                homes_of(&self.entry),
-                self.cause,
-                homes_of(&self.entry),
-                self.stamp
-            ),
-        )
+                "landing {stamp} (by {by}, in {homes}) is in place, and removing what it moved from where it was failed: {cause}. Nothing new lands in {homes} until that is done; it is tried again at each landing there and when `newgit serve` starts"
+            )
+        } else if !self.entry.voids.is_empty() {
+            format!(
+                "landing {stamp}, which voids {}, is written down but could not be put in place: {cause}. Nothing new lands in {homes} until it is; it is tried again at each landing there and when `newgit serve` starts",
+                stamps(&self.entry.voids)
+            )
+        } else {
+            format!(
+                "landing {stamp} (by {by}, in {homes}) is written down but could not be put in place: {cause}. Nothing new lands in {homes} until it is; it is tried again at each landing there and when `newgit serve` starts, and an operator who cannot fix the cause voids it with `newgit serve --void-landing {stamp}`"
+            )
+        };
+        HttpError::new(503, message)
+    }
+}
+
+fn stamps(stamps: &[Stamp]) -> String {
+    stamps
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// What putting one landing in place came to.
+enum Put {
+    /// In place and finished; the asked refs it found moved, and left.
+    Done(Vec<Skipped>),
+    /// In place (readers see it); removing what it moved from where it was
+    /// failed, for this reason.
+    Unfinished(Vec<Skipped>, String),
+    /// Not in place, for this reason.
+    Failed(String),
+    /// A later entry voids it: never put in place, whatever the void's own
+    /// fate.
+    Voided,
+}
+
+/// What the queue records for one landing put in place (or not).
+enum Mark {
+    /// In place and finished, with every landing it voids.
+    Done(Stamp, Vec<Stamp>),
+    Stuck(Stuck),
+    /// Nothing changes: a voided landing waits for its void.
+    Nothing,
+}
+
+/// A landing in place, as its lander is told: the asked refs it found
+/// moved, and why removing what it moved from where it was is pending.
+type Answered = (Vec<Skipped>, Option<String>);
+
+/// What a landing put in place (or not) answers its lander, and what the
+/// queue records for it. A landing in place has landed, finished or not.
+fn settle(stuck: Stuck, put: Put) -> (ApiResult<Answered>, Mark) {
+    match put {
+        Put::Done(skipped) => (
+            Ok((skipped, None)),
+            Mark::Done(stuck.stamp, stuck.entry.voids),
+        ),
+        Put::Unfinished(skipped, cause) => {
+            let stuck = Stuck {
+                cause: cause.clone(),
+                placed: true,
+                ..stuck
+            };
+            eprintln!("newgit serve: {}", stuck.refusal().message);
+            (Ok((skipped, Some(cause))), Mark::Stuck(stuck))
+        }
+        Put::Failed(cause) => {
+            let stuck = Stuck {
+                cause,
+                placed: false,
+                ..stuck
+            };
+            let refusal = stuck.refusal();
+            eprintln!("newgit serve: {}", refusal.message);
+            (Err(refusal), Mark::Stuck(stuck))
+        }
+        Put::Voided => (
+            Err(HttpError::new(
+                409,
+                format!("landing {} is voided", stuck.stamp),
+            )),
+            Mark::Nothing,
+        ),
     }
 }
 
@@ -388,9 +490,21 @@ impl Queue {
     }
 
     fn stick(&mut self, stuck: Stuck) {
-        if !self.stuck.iter().any(|known| known.stamp == stuck.stamp) {
-            self.stuck.push(stuck);
-            self.stuck.sort_by_key(|stuck| stuck.stamp);
+        self.stuck.retain(|known| known.stamp != stuck.stamp);
+        self.stuck.push(stuck);
+        self.stuck.sort_by_key(|stuck| stuck.stamp);
+    }
+
+    fn record(&mut self, mark: Mark) {
+        match mark {
+            Mark::Done(stamp, voids) => {
+                self.mark(stamp);
+                for voided in voids {
+                    self.mark(voided);
+                }
+            }
+            Mark::Stuck(stuck) => self.stick(stuck),
+            Mark::Nothing => {}
         }
     }
 }
@@ -481,6 +595,9 @@ impl Log {
             "the landing log {dir} has no landings: refusing to start (restore it from a backup)"
         );
         let tip_commit = head(&dir)?;
+        // The newest entry's format, whether or not it is in place: a
+        // newer server wrote it, and everything it wrote may rely on it.
+        newest_entry(&dir)?;
         let applied = db::applied(&connection).map_err(anyhow_of)?.unwrap_or(0);
         let placed = db::placed_after(&connection).map_err(anyhow_of)?;
         let latest = placed.keys().copied().max().unwrap_or(0).max(applied);
@@ -650,32 +767,20 @@ impl Log {
                                 }
                             }
                         };
-                        let applied = apply_entries(app, &[(stamp, &entry)], self, &note);
+                        let stuck = Stuck::new(stamp, entry.clone());
+                        let put = self
+                            .put_in_place(app, std::slice::from_ref(&stuck), &note)
+                            .pop()
+                            .unwrap_or(Put::Failed("nothing was put in place".to_owned()));
+                        let (answer, mark) = settle(stuck, put);
                         let mut queue = self.lock();
                         queue.release(&marked, token);
-                        let answer = match applied {
-                            Ok(skipped) => {
-                                queue.mark(stamp);
-                                landed.behind.extend(behind_of(&entry, stamp, &skipped));
-                                Ok(landed)
-                            }
-                            Err(error) => {
-                                let stuck = Stuck {
-                                    stamp,
-                                    entry,
-                                    cause: error.cause().to_owned(),
-                                };
-                                eprintln!(
-                                    "newgit serve: landing {stamp} is written down and could not be put in place: {}",
-                                    stuck.cause
-                                );
-                                let refusal = stuck.refusal();
-                                queue.stick(stuck);
-                                Err(refusal)
-                            }
-                        };
+                        queue.record(mark);
                         self.changed.notify_all();
-                        return answer;
+                        let (skipped, pending) = answer?;
+                        landed.behind.extend(behind_of(&entry, stamp, &skipped));
+                        landed.pending = pending;
+                        return Ok(landed);
                     }
                     Outcome::Stuck => {
                         self.retry(app, &slot.roots, token)?;
@@ -762,22 +867,19 @@ impl Log {
         );
         let taken = queue.take(&needed, token, &why);
         drop(queue);
-        let results = self.put_in_place(app, &entries, &|_| {});
+        let puts = self.put_in_place(app, &entries, &|_| {});
         let mut queue = self.lock();
         queue.release(&taken, token);
         let mut refusal = None;
-        for (stuck, result) in entries.into_iter().zip(results) {
-            match result {
-                Ok(()) => queue.mark(stuck.stamp),
-                Err(cause) => {
-                    let stuck = Stuck { cause, ..stuck };
-                    queue.stuck.retain(|known| known.stamp != stuck.stamp);
-                    if refusal.is_none() && !stuck.entry.roots().is_disjoint(roots) {
-                        refusal = Some(stuck.refusal());
-                    }
-                    queue.stick(stuck);
-                }
+        for (stuck, put) in entries.into_iter().zip(puts) {
+            let (_, mark) = settle(stuck, put);
+            if let Mark::Stuck(stuck) = &mark
+                && refusal.is_none()
+                && !stuck.entry.roots().is_disjoint(roots)
+            {
+                refusal = Some(stuck.refusal());
             }
+            queue.record(mark);
         }
         self.changed.notify_all();
         match refusal {
@@ -786,40 +888,57 @@ impl Log {
         }
     }
 
-    /// Put each of `entries` in place in stamp order, as far as SQLite says
-    /// it is not: one whose roots an earlier one left stuck is not tried.
-    fn put_in_place(
-        &self,
-        app: &App,
-        entries: &[Stuck],
-        note: &dyn Fn(String),
-    ) -> Vec<Result<(), String>> {
+    /// Put each of `entries` in place, one by one in stamp order, as far as
+    /// SQLite says it is not: one in place and not finished is finished,
+    /// one whose roots an earlier one left stuck is not tried, and one that
+    /// a later entry among them voids is never put in place (the void puts
+    /// back whatever of it is there).
+    fn put_in_place(&self, app: &App, entries: &[Stuck], note: &dyn Fn(String)) -> Vec<Put> {
+        let voided: BTreeSet<Stamp> = entries
+            .iter()
+            .flat_map(|stuck| stuck.entry.voids.iter().copied())
+            .collect();
         let mut failed: BTreeMap<String, Stamp> = BTreeMap::new();
-        let mut results = Vec::new();
+        let mut puts = Vec::new();
         for stuck in entries {
+            if voided.contains(&stuck.stamp) {
+                puts.push(Put::Voided);
+                continue;
+            }
             if let Some(before) = stuck.entry.roots().iter().find_map(|root| failed.get(root)) {
-                results.push(Err(format!(
-                    "landing {before}, before it in {}, is not in place",
+                puts.push(Put::Failed(format!(
+                    "landing {before}, before it in {}, is stuck",
                     homes_of(&stuck.entry)
                 )));
                 continue;
             }
-            let result = match placed_of(app, stuck.stamp) {
-                Ok(Some(true)) => Ok(()),
-                Ok(Some(false)) => finish(app, stuck.stamp, &stuck.entry, note),
-                Ok(None) => {
-                    apply_entries(app, &[(stuck.stamp, &stuck.entry)], self, note).map(drop)
-                }
-                Err(error) => Err(error),
+            let put = match placed_of(app, stuck.stamp) {
+                Ok(Some(true)) => Put::Done(Vec::new()),
+                Ok(Some(false)) => match finish(app, stuck.stamp, &stuck.entry, note) {
+                    Ok(()) => Put::Done(Vec::new()),
+                    Err(error) => Put::Unfinished(Vec::new(), error.cause().to_owned()),
+                },
+                Ok(None) => match apply_entries(app, &[(stuck.stamp, &stuck.entry)], self, note) {
+                    Ok(Applied {
+                        skipped,
+                        unfinished: None,
+                    }) => Put::Done(skipped),
+                    Ok(Applied {
+                        skipped,
+                        unfinished: Some(error),
+                    }) => Put::Unfinished(skipped, error.cause().to_owned()),
+                    Err(error) => Put::Failed(error.cause().to_owned()),
+                },
+                Err(error) => Put::Failed(error.cause().to_owned()),
             };
-            if result.is_err() {
+            if !matches!(put, Put::Done(_)) {
                 for root in stuck.entry.roots() {
                     failed.insert(root, stuck.stamp);
                 }
             }
-            results.push(result.map_err(|error| error.cause().to_owned()));
+            puts.push(put);
         }
-        results
+        puts
     }
 
     /// Take everything waiting that may land now, and land it as one batch.
@@ -864,11 +983,8 @@ impl Log {
         if let Some(commit) = processed.tip_commit {
             queue.tip_commit = commit;
         }
-        for (stamp, result) in processed.marks {
-            match result {
-                Ok(()) => queue.mark(stamp),
-                Err(stuck) => queue.stick(stuck),
-            }
+        for mark in processed.marks {
+            queue.record(mark);
         }
         for (slot, outcome) in batch.iter().zip(processed.outcomes) {
             let outcome = match outcome {
@@ -958,7 +1074,11 @@ impl Log {
         let mut here = Vec::new();
         for (offset, (index, entry, behind)) in accepted.into_iter().enumerate() {
             let stamp = tip + 1 + offset as Stamp;
-            let landed = Landed { stamp, behind };
+            let landed = Landed {
+                stamp,
+                behind,
+                pending: None,
+            };
             if batch[index].moves_storage {
                 outcomes[index] = Some(Ok(Outcome::Apply(stamp, entry, landed, BTreeSet::new())));
             } else {
@@ -969,13 +1089,17 @@ impl Log {
             .iter()
             .map(|(_, stamp, entry, _)| (*stamp, entry))
             .collect();
-        let results: Vec<ApiResult<Vec<Skipped>>> = match apply_entries(
-            app,
-            &together,
-            self,
-            &|_| {},
-        ) {
-            Ok(skipped) => together.iter().map(|_| Ok(skipped.clone())).collect(),
+        let puts: Vec<Put> = match apply_entries(app, &together, self, &|_| {}) {
+            Ok(Applied {
+                skipped,
+                unfinished,
+            }) => together
+                .iter()
+                .map(|_| match &unfinished {
+                    None => Put::Done(skipped.clone()),
+                    Some(error) => Put::Unfinished(skipped.clone(), error.cause().to_owned()),
+                })
+                .collect(),
             // One by one, so only the one at fault (and any after it in
             // its roots) is stuck.
             Err(error) => {
@@ -984,52 +1108,21 @@ impl Log {
                     together.len(),
                     error.cause()
                 );
-                let mut failed: BTreeMap<String, Stamp> = BTreeMap::new();
-                together
+                let one_by_one: Vec<Stuck> = here
                     .iter()
-                    .map(|(stamp, entry)| {
-                        if let Some(before) = entry.roots().iter().find_map(|root| failed.get(root))
-                        {
-                            return Err(HttpError::new(
-                                500,
-                                format!(
-                                    "landing {before}, before it in {}, is not in place",
-                                    homes_of(entry)
-                                ),
-                            ));
-                        }
-                        let result = apply_entries(app, &[(*stamp, entry)], self, &|_| {});
-                        if result.is_err() {
-                            for root in entry.roots() {
-                                failed.insert(root, *stamp);
-                            }
-                        }
-                        result
-                    })
-                    .collect()
+                    .map(|(_, stamp, entry, _)| Stuck::new(*stamp, entry.clone()))
+                    .collect();
+                self.put_in_place(app, &one_by_one, &|_| {})
             }
         };
-        for ((index, stamp, entry, mut landed), result) in here.into_iter().zip(results) {
-            match result {
-                Ok(skipped) => {
-                    landed.behind.extend(behind_of(&entry, stamp, &skipped));
-                    processed.marks.push((stamp, Ok(())));
-                    outcomes[index] = Some(Ok(Outcome::Landed(landed)));
-                }
-                Err(error) => {
-                    let stuck = Stuck {
-                        stamp,
-                        entry,
-                        cause: error.cause().to_owned(),
-                    };
-                    eprintln!(
-                        "newgit serve: landing {stamp} is written down and could not be put in place: {}",
-                        stuck.cause
-                    );
-                    outcomes[index] = Some(Err(stuck.refusal()));
-                    processed.marks.push((stamp, Err(stuck)));
-                }
-            }
+        for ((index, stamp, entry, mut landed), put) in here.into_iter().zip(puts) {
+            let (answer, mark) = settle(Stuck::new(stamp, entry.clone()), put);
+            outcomes[index] = Some(answer.map(|(skipped, pending)| {
+                landed.behind.extend(behind_of(&entry, stamp, &skipped));
+                landed.pending = pending;
+                Outcome::Landed(landed)
+            }));
+            processed.marks.push(mark);
         }
         processed.outcomes = outcomes.into_iter().map(answered).collect();
         processed
@@ -1092,40 +1185,124 @@ impl Log {
         let entries: Vec<Stuck> = self
             .entries_after(applied, tip)?
             .into_iter()
-            .map(|(stamp, entry)| Stuck {
-                stamp,
-                entry,
-                cause: String::new(),
-            })
+            .map(|(stamp, entry)| Stuck::new(stamp, entry))
             .collect();
-        let results = self.put_in_place(app, &entries, &|_| {});
+        // Every entry read, so a landing a later entry voids is known to be
+        // voided before it would be put in place.
+        let puts = self.put_in_place(app, &entries, &|_| {});
         let mut queue = self.lock();
-        for (stuck, result) in entries.into_iter().zip(results) {
-            match result {
-                Ok(()) => queue.mark(stuck.stamp),
-                Err(cause) => {
-                    eprintln!(
-                        "newgit serve: landing {} (by {}, in {}) is written down and could not be put in place: {cause}. Its projects refuse new landings until it is; restart to try again, or void it with `newgit serve --void-landing {}`",
-                        stuck.stamp,
-                        stuck.entry.by,
-                        homes_of(&stuck.entry),
-                        stuck.stamp
-                    );
-                    queue.stick(Stuck { cause, ..stuck });
-                }
-            }
+        for (stuck, put) in entries.into_iter().zip(puts) {
+            queue.record(settle(stuck, put).1);
         }
         Ok(())
     }
 
-    /// Give up landing `stamp`, which is stuck, and every landing stuck after
-    /// it in the projects it touches: one compensating entry, appended,
-    /// whose homes are set back to what SQLite has (which those landings
-    /// never changed), whose refs they moved are moved back, and whose
-    /// copies toward a store they never reached are removed. Returns the
-    /// compensating entry's stamp and the stamps it voids.
+    /// Give up landing `stamp`, which is stuck and not in place, and every
+    /// landing stuck after it in the projects it touches: one compensating
+    /// entry, appended, whose homes are set to what SQLite has (which those
+    /// landings never changed), whose refs they moved are moved back, and
+    /// whose copies toward a store they never reached are removed. Returns
+    /// the compensating entry's stamp and the stamps it voids.
+    ///
+    /// A landing in place (its rows written; only removing what it moved
+    /// from where it was is left) has landed, and is refused: it is
+    /// finished by trying it again. Once the void is written down, the
+    /// landings it names are never put in place, even if putting the void
+    /// itself in place fails or is interrupted: it is tried again, like any
+    /// stuck landing, and it removes whatever of them is there.
     pub fn void(&self, app: &App, stamp: Stamp) -> ApiResult<(Stamp, Vec<Stamp>)> {
+        let (roots, voided) = self.to_void(stamp)?;
+        // Whether any of them is in place is SQLite's to say, read without
+        // the queue's lock.
+        for stuck in &voided {
+            if placed_of(app, stuck.stamp)?.is_some() {
+                return Err(HttpError::new(
+                    409,
+                    format!(
+                        "landing {} (by {}, in {}) is in place: readers see it, and only removing what it moved from where it was is left ({}). It has landed, so it cannot be voided; it is finished by trying it again, which every landing there and every start of `newgit serve` does: fix the cause and restart",
+                        stuck.stamp,
+                        stuck.entry.by,
+                        homes_of(&stuck.entry),
+                        if stuck.cause.is_empty() {
+                            "no cause recorded"
+                        } else {
+                            stuck.cause.as_str()
+                        }
+                    ),
+                ));
+            }
+        }
         let mut queue = self.lock();
+        while queue.leading || queue.blocker(&roots, 0).is_some() {
+            queue = self
+                .changed
+                .wait(queue)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+        drop(queue);
+        let (again, still) = self.to_void(stamp)?;
+        let mut queue = self.lock();
+        let same = again == roots
+            && still
+                .iter()
+                .map(|stuck| stuck.stamp)
+                .eq(voided.iter().map(|stuck| stuck.stamp));
+        if !same || queue.leading || queue.blocker(&roots, 0).is_some() {
+            return Err(HttpError::new(
+                409,
+                format!(
+                    "the landings stuck in {} changed meanwhile: void again",
+                    roots.iter().cloned().collect::<Vec<_>>().join(", ")
+                ),
+            ));
+        }
+        queue.leading = true;
+        let tip = queue.tip;
+        drop(queue);
+        let written = self.write_void(app, tip, &roots, &voided);
+        let mut queue = self.lock();
+        let answer = match written {
+            Ok((void_stamp, commit, entry)) => {
+                queue.tip = void_stamp;
+                queue.tip_commit = commit;
+                drop(queue);
+                // Put in place with the landings it voids, so they are known
+                // to be voided whatever happens to it.
+                let mut entries = voided.clone();
+                entries.push(Stuck::new(void_stamp, entry));
+                let mut puts = self.put_in_place(app, &entries, &|_| {});
+                let put = puts
+                    .pop()
+                    .unwrap_or(Put::Failed("nothing was put in place".to_owned()));
+                let void = entries
+                    .pop()
+                    .unwrap_or_else(|| Stuck::new(void_stamp, Entry::default()));
+                let (answer, mark) = settle(void, put);
+                queue = self.lock();
+                queue.record(mark);
+                match answer {
+                    Ok(_) => Ok((void_stamp, voided.iter().map(|stuck| stuck.stamp).collect())),
+                    Err(error) => Err(HttpError::new(
+                        500,
+                        format!(
+                            "the void was written down as landing {void_stamp} and could not be put in place: {}. The landings it voids are never put in place; it is tried again at each landing on their projects and when `newgit serve` starts",
+                            error.cause()
+                        ),
+                    )),
+                }
+            }
+            Err(error) => Err(error),
+        };
+        queue.leading = false;
+        self.changed.notify_all();
+        answer
+    }
+
+    /// What voiding `stamp` gives up: it, and every landing stuck after it
+    /// in the projects they touch, with those projects. Refused for a
+    /// landing not stuck, a void, or one a void already gives up.
+    fn to_void(&self, stamp: Stamp) -> ApiResult<(BTreeSet<String>, Vec<Stuck>)> {
+        let queue = self.lock();
         if !queue.stuck.iter().any(|stuck| stuck.stamp == stamp) {
             return Err(HttpError::new(
                 409,
@@ -1146,65 +1323,42 @@ impl Log {
                 voided.push(stuck.clone());
             }
         }
-        while queue.leading || queue.blocker(&roots, 0).is_some() {
-            queue = self
-                .changed
-                .wait(queue)
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-        }
-        queue.leading = true;
-        let tip = queue.tip;
-        drop(queue);
-        let result = self.write_void(app, tip, &roots, &voided);
-        let mut queue = self.lock();
-        queue.leading = false;
-        let answer = match result {
-            Ok((void_stamp, commit, entry, applied)) => {
-                queue.tip = void_stamp;
-                queue.tip_commit = commit;
-                match applied {
-                    Ok(()) => {
-                        for stuck in &voided {
-                            queue.mark(stuck.stamp);
-                        }
-                        queue.mark(void_stamp);
-                        Ok((void_stamp, voided.iter().map(|stuck| stuck.stamp).collect()))
-                    }
-                    Err(error) => {
-                        let stuck = Stuck {
-                            stamp: void_stamp,
-                            entry,
-                            cause: error.cause().to_owned(),
-                        };
-                        let refusal = HttpError::new(
-                            500,
-                            format!(
-                                "the void was written down as landing {void_stamp} and could not be put in place: {}; it is tried again when `newgit serve` starts",
-                                stuck.cause
-                            ),
-                        );
-                        queue.stick(stuck);
-                        Err(refusal)
-                    }
-                }
+        for stuck in &voided {
+            if !stuck.entry.voids.is_empty() {
+                return Err(HttpError::new(
+                    409,
+                    format!(
+                        "landing {} is a void (of {}) that could not be put in place: {}. It is tried again at each landing there and when `newgit serve` starts; fix the cause and restart",
+                        stuck.stamp,
+                        stamps(&stuck.entry.voids),
+                        stuck.cause
+                    ),
+                ));
             }
-            Err(error) => Err(error),
-        };
-        self.changed.notify_all();
-        answer
+            if let Some(by) = queue
+                .stuck
+                .iter()
+                .find(|void| void.entry.voids.contains(&stuck.stamp))
+            {
+                return Err(HttpError::new(
+                    409,
+                    format!(
+                        "landing {} is voided already, by landing {}, which could not be put in place yet: {}. It is tried again at each landing there and when `newgit serve` starts",
+                        stuck.stamp, by.stamp, by.cause
+                    ),
+                ));
+            }
+        }
+        Ok((roots, voided))
     }
 
-    #[allow(
-        clippy::type_complexity,
-        reason = "the void's stamp, commit, entry, and result"
-    )]
     fn write_void(
         &self,
         app: &App,
         tip: Stamp,
         roots: &BTreeSet<String>,
         voided: &[Stuck],
-    ) -> ApiResult<(Stamp, String, Entry, ApiResult<()>)> {
+    ) -> ApiResult<(Stamp, String, Entry)> {
         let mut entry = Entry {
             by: "newgit serve (void)".to_owned(),
             voids: voided.iter().map(|stuck| stuck.stamp).collect(),
@@ -1269,10 +1423,7 @@ impl Log {
             }
         }
         write_entries(&self.dir, tip, &[&entry])?;
-        let stamp = tip + 1;
-        let commit = head(&self.dir)?;
-        let applied = apply_entries(app, &[(stamp, &entry)], self, &|_| {}).map(drop);
-        Ok((stamp, commit, entry, applied))
+        Ok((tip + 1, head(&self.dir)?, entry))
     }
 
     /// Branch `branch` of `home` (incarnation `incarnation`) as landing
@@ -1354,7 +1505,7 @@ struct Processed {
     /// The log's commit after them.
     tip_commit: Option<String>,
     /// Each written one put in place here, or stuck.
-    marks: Vec<(Stamp, Result<(), Stuck>)>,
+    marks: Vec<Mark>,
 }
 
 fn busy(blocker: Option<String>) -> HttpError {
@@ -1415,6 +1566,23 @@ fn head(dir: &Utf8Path) -> anyhow::Result<String> {
         String::from_utf8_lossy(&output.stderr).trim()
     );
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+}
+
+/// The log's last entry, read and checked: one of a format newer than this
+/// server reads refuses the start.
+fn newest_entry(dir: &Utf8Path) -> anyhow::Result<(Stamp, Entry)> {
+    let output = repos::git(dir, &["log", "-1", "--format=%B", "refs/heads/main"])?;
+    anyhow::ensure!(
+        output.status.success(),
+        "the landing log {dir} cannot be read ({}): refusing to start (restore it from a backup)",
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+    parse_entry(String::from_utf8_lossy(&output.stdout).trim()).map_err(|error| {
+        anyhow::anyhow!(
+            "the landing log {dir}: {}: refusing to start",
+            error.cause()
+        )
+    })
 }
 
 fn parse_entry(message: &str) -> ApiResult<(Stamp, Entry)> {
@@ -1976,11 +2144,6 @@ fn placed_of(app: &App, stamp: Stamp) -> ApiResult<Option<bool>> {
     db::placed(&db, stamp)
 }
 
-/// Put landing `stamp` in place, from the start: see [`apply_entries`].
-pub fn apply(app: &App, stamp: Stamp, entry: &Entry) -> ApiResult<()> {
-    apply_entries(app, &[(stamp, entry)], &app.log, &|_| {}).map(drop)
-}
-
 /// Whether `change` acts on the project there now: the incarnation it was
 /// written for (or, when it makes one, no project yet).
 fn acts(current: Option<&String>, change: &Change) -> bool {
@@ -2007,15 +2170,17 @@ fn acts(current: Option<&String>, change: &Change) -> bool {
 ///    finished.
 ///
 /// A change written for another incarnation of its project than the one
-/// there now does nothing. Returns the asked refs found moved and left.
+/// there now does nothing. An error means the rows were not written: the
+/// entries are not in place. Once they are, they have landed, and a failure
+/// of step 3 is said in [`Applied::unfinished`].
 fn apply_entries(
     app: &App,
     entries: &[(Stamp, &Entry)],
     log: &Log,
     note: &dyn Fn(String),
-) -> ApiResult<Vec<Skipped>> {
+) -> ApiResult<Applied> {
     if entries.is_empty() {
-        return Ok(Vec::new());
+        return Ok(Applied::default());
     }
     let data = &app.config.data;
     // Which changes act: the project there is the one each was written for,
@@ -2047,7 +2212,7 @@ fn apply_entries(
         }
     }
     // 1. Copies, before anything says they are there.
-    let mut moving = Vec::new();
+    let mut moving: Vec<Moving> = Vec::new();
     for ((stamp, entry), here) in entries.iter().zip(&acting) {
         for (home, change) in &entry.homes {
             if !here.contains(home) || change.removed {
@@ -2177,13 +2342,47 @@ fn apply_entries(
         log.fault("before-rows");
         db.execute_batch("PRAGMA synchronous = FULL")?;
         let written = write_rows(&mut db, entries, &acting);
-        db.execute_batch("PRAGMA synchronous = NORMAL")?;
+        if let Err(error) = db.execute_batch("PRAGMA synchronous = NORMAL") {
+            eprintln!("newgit serve: setting SQLite back to synchronous=NORMAL: {error}");
+        }
         written?;
         app.trackers_moved();
     }
-    // 3. What moved, removed where it was.
+    // 3. What moved, removed where it was: the entries are in place, so
+    // whatever fails here leaves them landed and not finished.
+    let unfinished = remove_moved(app, entries, &acting, &moving, note).err();
+    Ok(Applied {
+        skipped,
+        unfinished,
+    })
+}
+
+/// What [`apply_entries`] put in place.
+#[derive(Default)]
+struct Applied {
+    /// Asked refs found moved, and left.
+    skipped: Vec<Skipped>,
+    /// Why removing what moved from where it was failed: the entries are in
+    /// place, and not finished.
+    unfinished: Option<HttpError>,
+}
+
+/// A tracker being moved by landing `stamp`: home, tracker, where it was,
+/// and what was copied.
+type Moving = (Stamp, String, String, Repo, repos::Copied);
+
+/// Step 3 of [`apply_entries`]: what moved, removed where it was, once
+/// every push that began there is done; a deleted project's home removed;
+/// the stamps marked finished.
+fn remove_moved(
+    app: &App,
+    entries: &[(Stamp, &Entry)],
+    acting: &[BTreeSet<String>],
+    moving: &[Moving],
+    note: &dyn Fn(String),
+) -> ApiResult<()> {
     let mut done = BTreeSet::new();
-    for (stamp, home, tracker, repo, copied) in &moving {
+    for (stamp, home, tracker, repo, copied) in moving {
         note(format!(
             "landing {stamp} is waiting for pushes into {tracker} in the {} store to end before removing it there",
             repo.store.name()
@@ -2193,7 +2392,7 @@ fn apply_entries(
         repo.finish_move(copied)?;
         done.insert(*stamp);
     }
-    for ((stamp, entry), here) in entries.iter().zip(&acting) {
+    for ((stamp, entry), here) in entries.iter().zip(acting) {
         for (home, change) in &entry.homes {
             if here.contains(home) && change.removed {
                 remove_home(app, home)?;
@@ -2209,7 +2408,7 @@ fn apply_entries(
             db::set_placed(&db, stamp, true)?;
         }
     }
-    Ok(skipped)
+    Ok(())
 }
 
 /// One ref's moves in a batch.
@@ -2256,6 +2455,16 @@ fn write_rows(
             }
             for (tracker, step) in &change.stores {
                 db::set_tracker_store(&transaction, home, tracker, &step.to)?;
+            }
+            if change.whole {
+                // Its whole state: rows it does not name go (a void's, of
+                // anything a voided landing could have left).
+                let stores = change
+                    .stores
+                    .iter()
+                    .map(|(tracker, step)| (tracker.clone(), step.to.clone()))
+                    .collect();
+                db::keep_only(&transaction, home, &(change.branches.clone(), stores))?;
             }
         }
         db::set_placed(&transaction, *stamp, !entry.moves_storage())?;

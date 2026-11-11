@@ -227,6 +227,57 @@ pub fn create_store(dir: &Utf8Path, store: &Store) -> ApiResult<()> {
     Ok(())
 }
 
+/// Give every store in `data`'s homes [`STORE_CONFIG`], as a store made
+/// now gets it: one made before a key was added (`core.fsync`, by this
+/// server's first landings) gets it when the server starts, so a push into
+/// it, which runs with the store's own config, is as durable as a landing.
+/// Writes only what differs; returns how many stores it changed.
+pub fn configure_stores(data: &Utf8Path) -> ApiResult<usize> {
+    let mut changed = 0;
+    let Ok(owners) = data.join("homes").read_dir_utf8() else {
+        return Ok(0);
+    };
+    for owner in owners.flatten() {
+        let Ok(projects) = owner.path().read_dir_utf8() else {
+            continue;
+        };
+        for project in projects.flatten() {
+            let mut stack = vec![project.path().join("stores")];
+            while let Some(dir) = stack.pop() {
+                if store_exists(&dir) {
+                    if configure_store(&dir)? {
+                        changed += 1;
+                    }
+                    continue;
+                }
+                let Ok(read) = dir.read_dir_utf8() else {
+                    continue;
+                };
+                for entry in read.flatten() {
+                    if entry.path().is_dir() {
+                        stack.push(entry.path().to_owned());
+                    }
+                }
+            }
+        }
+    }
+    Ok(changed)
+}
+
+/// [`STORE_CONFIG`] for the store at `dir`, written where it differs.
+fn configure_store(dir: &Utf8Path) -> ApiResult<bool> {
+    let listed = checked(dir, &["config", "--local", "--list"])?;
+    let have: std::collections::BTreeSet<&str> = listed.lines().collect();
+    let mut changed = false;
+    for (key, value) in STORE_CONFIG {
+        if !have.contains(format!("{}={value}", key.to_lowercase()).as_str()) {
+            checked(dir, &["config", key, value])?;
+            changed = true;
+        }
+    }
+    Ok(changed)
+}
+
 pub fn delete(dir: &Utf8Path) -> ApiResult<bool> {
     if !dir.exists() {
         return Ok(false);
@@ -827,7 +878,7 @@ pub struct Copied {
 /// One store's ref transaction, prepared (`git update-ref --stdin`, `start`
 /// … `prepare`): every ref in it locked and checked against its old value,
 /// nothing moved yet. [`Prepared::commit`] moves them all; dropping it
-/// without, or [`Prepared::abort`], moves none. A landing prepares every
+/// without committing moves none. A landing prepares every
 /// store's transaction before it commits any, so a store that refuses
 /// leaves every store as it was.
 pub struct Prepared {
@@ -916,15 +967,6 @@ impl Prepared {
             )));
         }
         Ok(())
-    }
-
-    /// Move none of them.
-    pub fn abort(mut self) {
-        if let Some(mut stdin) = self.stdin.take() {
-            let _ = stdin.write_all(b"abort\n");
-        }
-        let _ = std::io::copy(&mut self.answers, &mut std::io::sink());
-        let _ = self.child.wait();
     }
 }
 

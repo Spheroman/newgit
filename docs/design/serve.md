@@ -221,7 +221,8 @@ Resolved loudly; each is reversible.
      with its old value, store moves, and the commits a move takes from a
      merger's landing. Fields added later (#411's epochs and merge commit,
      #412's rooted tips) are defaulted when an older entry is read; an
-     entry of a newer format than the server reads stops it. Gitlinks name
+     entry of a newer format than the server reads stops it, in place or
+     not (the newest entry is checked at every start). Gitlinks name
      commits without holding them, so the log holds no content and is
      served to no one.
    - **Nothing is written down that cannot be put in place.** The check
@@ -331,25 +332,54 @@ Resolved loudly; each is reversible.
   serve --data <dir> --void-landing <stamp>`. That appends one
   compensating landing (the log is never edited) which gives up that
   landing and every one stuck after it on the same projects: their
-  projects are set back to what SQLite has, which they never changed;
-  refs they moved are moved back; a tracker they were copying toward
-  another store is removed from it. **The objects copied stay in that
+  projects are set to what SQLite has, which they never changed (rows
+  SQLite has that the void does not name are removed); refs they moved
+  are moved back; a tracker they were copying toward another store is
+  removed from it. Once the void is written down, the landings it names
+  are never put in place: a restart or a retry reads every entry first,
+  and a landing a later entry voids is skipped, even when putting the
+  void itself in place failed or was interrupted. The void is then stuck
+  like any landing, tried again at each landing on its projects and at
+  each start, and putting it in place again is safe. A void and a landing
+  already voided cannot be voided. **The objects copied stay in that
   store until its garbage collection, which does not exist yet ([#434]),
   and under protocol v2 its readers can fetch one by id: voiding a stuck
   widening leaves its history readable by the wider audience.** Voiding
   says which stamps it gave up; fixing the cause and retrying leaves
   nothing behind.
+- **A landing in place and not finished has landed, and is never
+  voided.** A store move whose rows are written is in place: readers see
+  it, through the API and through Git. If removing the tracker from the
+  store it left then fails, its merger is answered 200 with `pending`
+  saying so, not 503, and the landing is finished (never voided) by
+  trying again, which every later landing on its projects does first, as
+  does every start. Until then those landings are refused with a 503 that
+  says it is in place and what failed. `--void-landing` refuses it: moving
+  its refs back while its rows stay would split the API from Git.
+- **A merge's finish holds its projects while it places its commits.**
+  From deciding which store each new commit goes into until it has
+  landed, a merge's finish holds its projects' locks, and that includes
+  copying its commits from the merger's landing into those stores. A
+  large placement therefore answers every other landing on those projects
+  503 after ten seconds, saying a merge is placing its commits. Other
+  projects, and reads, are not held.
 - **`?at=<stamp>`** answers the stamp's own landing, read from one
   resolved log commit. It refuses a stamp not yet in place (409, every
   landing up to the applied mark is), a project state that shows a landing
   voided after it (410), and answers nothing for a stamp from a deleted
   project of the same name.
 - **What survives power loss.** The log's objects and refs, every store's
-  refs (`core.fsync=committed,reference` on the log, on every store, and
-  on every Git command the server runs), and SQLite's landing transaction
-  (`synchronous=FULL` for it) are synced, in that order: a landing's log
-  commit before anything follows it, its refs before its rows, its rows
-  (and its mark) before its answer. So a landing whose merger was answered
+  objects and refs (`core.fsync=committed,reference` and
+  `core.fsyncMethod=fsync` on the log and on every store, written into a
+  store made before this when the server starts, so a push, which runs
+  with the store's config, gets them too; and passed on every Git command
+  the server runs), and SQLite's landing transaction (`synchronous=FULL`
+  for it) are synced, in that order. On macOS a plain `fsync` leaves
+  writes in the drive's cache; Git's `fsync` method flushes it
+  (`F_FULLFSYNC`), and SQLite does too (`PRAGMA fullfsync`,
+  `checkpoint_fullfsync`). The order: a landing's log commit before
+  anything follows it, its refs before its rows, its rows (and its mark)
+  before its answer. So a landing whose merger was answered
   survives, a landing marked in place is in place, and one written down
   and not marked is put in place at the next start. Other SQLite writes
   (tokens, members, instances) run `synchronous=NORMAL` and may lose their

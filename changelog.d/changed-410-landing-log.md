@@ -27,4 +27,9 @@
   503 with its real cause on its projects only, is tried again at each
   landing there and at each start, and can be given up with
   `newgit serve --void-landing <stamp>`, which appends a compensating
-  landing.
+  landing. Once a void is written down, the landings it gives up are never
+  put in place, even if the void itself is interrupted. A store move whose
+  rows are in place has landed: its merger is told so, with the removal
+  from the old store pending, and it is finished by trying again, never
+  voided. Stores made before this get their fsync config when the server
+  starts.

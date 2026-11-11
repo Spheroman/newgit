@@ -28,6 +28,11 @@ use crate::error::ApiResult;
 const SCHEMA: &str = r"
 PRAGMA journal_mode = WAL;
 PRAGMA synchronous = NORMAL;
+-- On macOS a plain fsync leaves writes in the drive's cache; Git's
+-- core.fsyncMethod=fsync flushes it (F_FULLFSYNC), and so does SQLite with
+-- these. Elsewhere they do nothing.
+PRAGMA fullfsync = ON;
+PRAGMA checkpoint_fullfsync = ON;
 PRAGMA foreign_keys = ON;
 CREATE TABLE IF NOT EXISTS tokens (
     id TEXT PRIMARY KEY, login TEXT NOT NULL, kind TEXT NOT NULL, agent TEXT,
@@ -552,6 +557,34 @@ pub fn set_branch(
         db.execute(
             "INSERT OR IGNORE INTO head_log (home, branch, tracker, old, new, moved_by, moved_at, stamp) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             params![home, branch, tracker, old, new, by, now, stamp],
+        )?;
+    }
+    Ok(())
+}
+
+/// Make `home`'s branches and trackers' stores exactly `state`: rows it does
+/// not name are removed. Only applying a landing that sets a home's whole
+/// state calls this (a void, `crate::landing`), after it sets each row it
+/// names; run again, it changes nothing.
+pub fn keep_only(db: &Connection, home: &str, state: &HomeState) -> ApiResult<()> {
+    let (lists, stores) = home_state(db, home)?;
+    for branch in lists.keys().filter(|branch| !state.0.contains_key(*branch)) {
+        db.execute(
+            "DELETE FROM heads WHERE home = ? AND branch = ?",
+            [home, branch],
+        )?;
+        db.execute(
+            "DELETE FROM branches WHERE home = ? AND name = ?",
+            [home, branch],
+        )?;
+    }
+    for tracker in stores
+        .keys()
+        .filter(|tracker| !state.1.contains_key(*tracker))
+    {
+        db.execute(
+            "DELETE FROM tracker_stores WHERE home = ? AND tracker = ?",
+            [home, tracker],
         )?;
     }
     Ok(())
