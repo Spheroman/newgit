@@ -682,23 +682,23 @@ async function route(request: Request, env: Env, deps: Deps): Promise<Response> 
 	// What is not written down yet, read without rolling it up: what
 	// `newgit status` says.
 	if (method === "GET" && rest === "/state") {
-		const report = await project.report();
 		// A pinned tracker's own `main` moved on past the pin its parent
 		// holds: said, so held still never reads as forgotten. (On a branch
-		// its head is the pin: moving it is a change to the parent.)
-		const listed = await listedTrackers(project);
-		const pinned: string[] = [];
-		for (const tracker of listed)
-			if ((await definitionFacts(deps.repos, id, tracker, listed))?.pinned === true) pinned.push(tracker);
-		const mains = new Map<string, string | null>();
-		for (const tracker of pinned)
-			mains.set(
-				tracker,
-				await deps.repos
-					.branchHead(namer(tracker), "main")
-					.catch(() => null),
-			);
-		const branches = await project.branches();
+		// its head is the pin: moving it is a change to the parent.) Asked
+		// together, not one round trip after another, and every tracker's
+		// definition read in one go rather than once per tracker.
+		const [report, branches] = await Promise.all([project.report(), project.branches()]);
+		const listed = [...new Set(branches.flatMap((branch) => Object.keys(branch.list)))];
+		const facts = await loadDefinitions(deps.repos, id, listed);
+		const pinned = listed.filter((tracker) => facts.get(tracker)?.pinned === true);
+		const mains = new Map<string, string | null>(
+			await Promise.all(
+				pinned.map(
+					async (tracker) =>
+						[tracker, await deps.repos.branchHead(namer(tracker), "main").catch(() => null)] as const,
+				),
+			),
+		);
 		return json({
 			...report,
 			branches: report.branches.map((state) => {

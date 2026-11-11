@@ -3061,8 +3061,31 @@ fn status(name: Option<&str>, path_only: bool) -> Result<()> {
         return workspace_path(context, name);
     }
     let manager = BranchManager::open(context.store)?;
-    warn_gitignore(&manager);
-    warn_graph(&manager);
+    let current_branch = context.current_branch.as_deref();
+    // The remote is asked first and answered last: its round trip runs
+    // alongside the local work instead of after it.
+    std::thread::scope(|scope| {
+        let asked = scope.spawn(|| ask_remote_state(&manager));
+        let shown = status_table(&manager, name, current_branch)?;
+        let asked = asked
+            .join()
+            .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+        if shown {
+            remote_state_notes(asked);
+        }
+        Ok(())
+    })
+}
+
+/// `status`'s table and what follows it. Whether it showed any instance:
+/// with none, nothing more is said.
+fn status_table(
+    manager: &BranchManager,
+    name: Option<&str>,
+    current_branch: Option<&str>,
+) -> Result<bool> {
+    warn_gitignore(manager);
+    warn_graph(manager);
     let mut reports = manager.statuses()?;
 
     if let Some(name) = name {
@@ -3074,7 +3097,7 @@ fn status(name: Option<&str>, path_only: bool) -> Result<()> {
 
     if reports.is_empty() {
         println!("No branch instances yet. Create one with `newgit spawn <name>`.");
-        return Ok(());
+        return Ok(false);
     }
 
     let name_width = column_width(reports.iter().map(|r| r.branch.name.len() + 2), "NAME");
@@ -3093,7 +3116,7 @@ fn status(name: Option<&str>, path_only: bool) -> Result<()> {
     );
     let (mut any_never_pulled, mut any_diverged, mut any_base_drift) = (false, false, false);
     for (report, workspace_status) in reports.iter().zip(&statuses_col) {
-        let marker = if context.current_branch.as_deref() == Some(report.branch.name.as_str()) {
+        let marker = if current_branch == Some(report.branch.name.as_str()) {
             "* "
         } else {
             "  "
@@ -3147,26 +3170,38 @@ fn status(name: Option<&str>, path_only: bool) -> Result<()> {
             manager.store().paths().project_root
         );
     }
-    remote_state_notes(&manager);
-    Ok(())
+    Ok(true)
+}
+
+/// Which project was asked, and what it answered.
+type AskedState = Option<(
+    String,
+    newgit_core::Result<newgit_core::remote::RemoteState>,
+)>;
+
+/// What the project's remote has not written down yet, as `status` asks it:
+/// within seconds, and `None` with no remote to ask.
+fn ask_remote_state(manager: &BranchManager) -> AskedState {
+    let link = manager.remote_link()?;
+    let asked = link
+        .connect(newgit_core::remote::Acting::Login)
+        .and_then(|client| client.state(&link.project, true));
+    Some((link.project.clone(), asked))
 }
 
 /// What the project's remote has not written down yet, and webhook pulls
 /// waiting, failing, or refused: said only when there is something, so
 /// "not written yet" never reads as "out of date" (docs/design/anchoring.md).
-/// Asked within seconds; not logged in, it says nothing.
-fn remote_state_notes(manager: &BranchManager) {
-    let Some(link) = manager.remote_link() else {
+/// Not logged in, it says nothing.
+fn remote_state_notes(asked: AskedState) {
+    let Some((project, asked)) = asked else {
         return;
     };
-    let asked = link
-        .connect(newgit_core::remote::Acting::Login)
-        .and_then(|client| client.state(&link.project, true));
     match asked {
         Ok(state) => {
             let notes = state.notes();
             if !notes.is_empty() {
-                println!("\nOn {}:", link.project);
+                println!("\nOn {project}:");
                 for note in notes {
                     println!("  {note}");
                 }
@@ -3174,8 +3209,7 @@ fn remote_state_notes(manager: &BranchManager) {
         }
         Err(newgit_core::NewgitError::NotLoggedIn(_)) => {}
         Err(error) => println!(
-            "\nOn {}: the remote did not say what it has not written down yet ({error})",
-            link.project
+            "\nOn {project}: the remote did not say what it has not written down yet ({error})"
         ),
     }
 }

@@ -45,11 +45,74 @@ impl GitSource {
         Ok(output.status.success())
     }
 
-    /// Whether `path` is tracked by the store repo — a tracker path that is
-    /// also in Git history is dual-tracked, deliberately or not.
-    pub fn is_tracked(&self, path: &str) -> Result<bool> {
-        self.git(&["ls-files", "--", path])
-            .map(|stdout| !stdout.is_empty())
+    /// Which of `paths` the store repo ignores: one `git check-ignore` for
+    /// all of them, rather than one each.
+    pub fn ignored_among<'p>(&self, paths: &[&'p str]) -> Result<BTreeSet<&'p str>> {
+        if paths.is_empty() {
+            return Ok(BTreeSet::new());
+        }
+        // `-z` is only accepted with `--stdin`: the paths go in NUL-separated
+        // and come back the same way, each as it was given.
+        use std::io::Write as _;
+        let args = ["-C", self.root.as_str(), "check-ignore", "-z", "--stdin"];
+        let mut child = Command::new("git")
+            .args(args)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|source| spawn_error(&args, &source))?;
+        let input: Vec<u8> = paths
+            .iter()
+            .flat_map(|path| path.bytes().chain([0]))
+            .collect();
+        child
+            .stdin
+            .take()
+            .expect("piped stdin")
+            .write_all(&input)
+            .map_err(|source| spawn_error(&args, &source))?;
+        let output = child
+            .wait_with_output()
+            .map_err(|source| spawn_error(&args, &source))?;
+        // 1 is "none of them": only 0 and 1 are answers.
+        if !matches!(output.status.code(), Some(0 | 1)) {
+            return Err(NewgitError::SourceCommand {
+                command: format!("git {}", args.join(" ")),
+                stderr: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+            });
+        }
+        let listed = String::from_utf8_lossy(&output.stdout);
+        let listed: BTreeSet<&str> = listed.split('\0').collect();
+        Ok(paths
+            .iter()
+            .copied()
+            .filter(|path| listed.contains(path))
+            .collect())
+    }
+
+    /// Which of `paths` the store repo tracks, itself or anything under it —
+    /// a tracker path that is also in Git history is dual-tracked,
+    /// deliberately or not. One `git ls-files` for all of them.
+    pub fn tracked_among<'p>(&self, paths: &[&'p str]) -> Result<BTreeSet<&'p str>> {
+        if paths.is_empty() {
+            return Ok(BTreeSet::new());
+        }
+        let mut args = vec!["ls-files", "-z", "--"];
+        args.extend_from_slice(paths);
+        let listed = self.git(&args)?;
+        let files: Vec<&str> = listed.split('\0').filter(|file| !file.is_empty()).collect();
+        Ok(paths
+            .iter()
+            .copied()
+            .filter(|path| {
+                let path = path.trim_end_matches('/');
+                files.iter().any(|file| {
+                    file.strip_prefix(path)
+                        .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
+                })
+            })
+            .collect())
     }
 
     pub fn branch_exists(&self, name: &str) -> Result<bool> {
