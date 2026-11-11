@@ -107,6 +107,13 @@ Remote:
   project root
 - `newgit pull <tracker> [instance]` — one commit moving a mounted tracker's
   pin to its `follow` ref; spawn says when a tracker is behind
+- `newgit pull` — every tracker in Git root mounts, in one commit on the
+  branch it runs on (`Update trackers: t3code (14 commits), ui-kit (2
+  commits)`; in the project root, its own instance branch, which `newgit
+  merge main` publishes); no commit when none is behind. A pin holding
+  commits its ref lacks stays put, a tracker you can't read on the remote is
+  skipped (it fails when none can be read), and trackers outside Git are
+  left alone (`newgit tracker pull`)
 - `newgit pull --remote <target>` — bring back what was merged on an export
   target (a pull request on GitHub); `newgit merge main` publishes it
 - `newgit members add|remove <github-login>` / `members list [--json]`

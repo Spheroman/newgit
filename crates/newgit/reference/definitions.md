@@ -318,7 +318,9 @@ history instead: the branch (its `HEAD` by default) becomes the tracker's
 history stays in its own repository and never enters this project's, so
 `git log` under the mount starts there. A `--from` path is relative to where you
 run it. `newgit pull <tracker>` moves its pin to its `follow` ref in one
-commit; nothing else moves a pin on your behalf. `newgit clone` fetches only
+commit, and `newgit pull` alone does it for every tracker in Git root mounts,
+still one commit, on the branch it runs on; nothing else moves a pin on your
+behalf. `newgit clone` fetches only
 the commits root pins of a mounted tracker, and its history the first time
 something needs it, once; `newgit clone --full` fetches every history up
 front. How sensitive a tracker's content is has nothing to do with this; that
@@ -367,7 +369,7 @@ resources = ["staging-tunnel"]
 | `storage` | string | yes | — | `local` or `remote` — where synced state lives. `remote` needs a `[remote]` in `config.toml`; checkpoint sync then pushes the tracker there. |
 | `merge_with_source` | bool | no | `false` | meant to say whether a source merge carries this tracker's state with it. Accepted and stored, but nothing reads it yet: `newgit merge` merges every tracker the instance changed. |
 | `mount` | string | no | `.` | where the tracker's own root sits inside the parent that defines it (`apps/electron`). `.` is an overlay beside the parent's files. A tracker in Git may be mounted at `.newgit/trackers`, beside `access`, to govern the definitions it claims (see `maintainers`); no other mount may reach into `.git` or `.newgit`. A tracker outside Git may have a mount too; it is never pinned. |
-| `follow` | string | no | `main` | the ref of the tracker's own history that `newgit pull <tracker>` brings in. Trackers outside Git ignore it. |
+| `follow` | string | no | `main` | the ref of the tracker's own history that `newgit pull <tracker>` (or `newgit pull`, for every one) brings in. Trackers outside Git ignore it. |
 | `paths` | array of strings | no | `[]` | its claims, relative to the mount, normalized first (`./.env.local` is `.env.local`). `!` excludes (`[".", "!dist/"]`): an excluded path is owned by a tracker that claims it at the same mount, or by nothing. Must not be absolute, contain `..`, or reach into `.git` or `.newgit` in any case (`.GIT` too). `.` must be a tracker's only claim. May be empty for a tracker that only receives resource deposits (`into_tracker`) or only brings `resources`: such a tracker has nothing in the workspace, so `tracker drop` (and `tracker use` swapping it out of its role) skips the capture, and `tracker list` shows it after the ownership tree with what deposits into it and what it brings. |
 | `git` | bool | no | `false` | `true` makes a tracker in Git: committed with Git rather than captured by newgit. The default keeps its files out of Git, so a new tracker fails closed. Written only when `true`. |
 | `role` | string | no | — | the slot it fills: trackers sharing a role are alternatives (`dev-db`, `staging-db`) and may claim the same paths; an instance binds one of them. |

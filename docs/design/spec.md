@@ -262,7 +262,9 @@ The full model is in [`trackers.md`](trackers.md). The short version:
   leaves the machine, newgit splits each commit into one root commit and a
   commit in each tracker it changed, and composing them back gives the same
   commit, with the same id. `newgit pull <tracker>` moves a pin to the
-  tracker's `follow` ref; nothing else moves one on your behalf.
+  tracker's `follow` ref, and `newgit pull` alone moves every pin root
+  mounts that is behind, in one commit on the branch it runs on; nothing
+  else moves one on your behalf.
 - **A tracker outside Git** (`git = false`, the default) owns files that
   never belong in Git: an `.env.local`, an agent's notes, a SQLite file, a
   public page. They are captured by newgit, never committed.
