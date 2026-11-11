@@ -538,6 +538,12 @@ async fn run_git(app: Arc<App>, run: Run, ask: Ask, request: Request<Body>) -> R
     command
         .arg("-c")
         .arg(format!("core.hooksPath={}", app.hooks_dir()));
+    // A fork's record of what it was made from is the server's alone: hidden
+    // from every request, so no push can move or delete it (receive-pack
+    // refuses to update a hidden ref). Matched with the namespace stripped.
+    command
+        .arg("-c")
+        .arg(format!("transfer.hideRefs={}", crate::repos::FORK_RECORD));
     if run.tracker {
         // Matched with the namespace stripped: the forks inside this one.
         command.arg("-c").arg("transfer.hideRefs=refs/namespaces/");

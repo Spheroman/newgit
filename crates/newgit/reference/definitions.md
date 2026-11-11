@@ -376,6 +376,7 @@ resources = ["staging-tunnel"]
 | `priority` | integer | no | `0` | which tracker of a role an instance binds by default (the highest), unless your own default says otherwise (`[projects.<project>.roles]` in `~/.newgit/config.toml`). Negative means only when asked for (`--use`), for a role-less tracker too. |
 | `pinned` | boolean | no | `false` | whether the parent that mounts it holds it where it is on the remote: a change landing at it never rolls up into the parent, and moving the parent's pin is a change to the parent, its maintainers' to approve (rollback is a revert). For what must not move by itself: a private dependency, an environment. |
 | `link` | string | no | — | where it lives when it lives in another project on the remote: `"<owner>/<project>"` for that project's root, `"<owner>/<project>/<path>"` for a tracker there. Its history, heads, repo, and policy (audience, maintainers, judged by membership there) are its home's; each root that links it pins its own commit, and a change merged from any of them reaches all of them. Only with `git = true`. Written by `newgit tracker link <name> <home> --mount <dir>`, which needs a linked project and read access to the home; `newgit merge main` publishes the link. |
+| `from` | string | no | — | the tracker whose history this one started at: a *fork*. Written by `newgit tracker create <name> --from <tracker>`. Its audience is a ceiling: this tracker may be read by no one `from`'s audience does not include (the same audience, or a narrower one: `public` holds every audience, `project-devs` holds `user` and `user:<login>`). The ceiling stays if `from` is later dropped or changed. See *Forks*. |
 | `requires` | array of strings | no | `[]` | trackers or roles it cannot do without: binding it binds them, and they cannot be dropped while it is bound. In a child's definition, a tracker is a path from its parent (`vendor` is a sibling, `../site` goes up). |
 | `resources` | array of strings | no | `[]` | resources it brings: they bind only while it is bound. `newgit tracker use` binds and prepares them and starts their `autostart` action; `drop` stops them and releases their binding. |
 | `export` | string, table, or array of those | no | — | where a tracker in Git ships through `newgit export --remote`: a URL it declares (`"github.com/acme/widget"`, or `{ url = …, branch = …, branches = …, name = … }`), the target rooted at it; `"inherit"`, wherever its parent ships; or a list of those. Left out, it never ships. `tracker create --git --path` writes `"inherit"`. A tracker outside Git may not have one. See *Export*. |
@@ -384,6 +385,47 @@ resources = ["staging-tunnel"]
 The paths of a tracker outside Git stay out of Git: `newgit tracker track` adds them to
 the store's `.gitignore`, and each workspace's Git is told to ignore them too,
 so their content never lands in source history.
+
+### Forks
+
+Trackers sharing a role are variants of one thing (`local-db`,
+`staging-db`), and a fork is how a variant is added so the two share
+history:
+
+```
+newgit tracker create staging-db --role db --from local-db
+```
+
+`staging-db` claims what `local-db` claims, at its mount, and fills its
+role (`--role` names it when `local-db` has none yet, and both then fill
+it). Its `main` is `local-db`'s very commit, so nothing is copied, and its
+definition says `from = "local-db"`. It brings no resources and requires
+nothing, since those are what make the variants differ, and its `priority`
+is below `local-db`'s and negative, so new instances keep binding what they
+did until someone asks for it (`--use staging-db`, `tracker use`). Its
+audience and storage default to `local-db`'s; the audience may be narrower,
+never wider. Only a tracker outside Git can be forked yet: every instance
+holds every tracker in Git, so two at one mount would collide. The upstream
+must have something on its `main` (`tracker capture`, then `tracker merge`).
+
+On `newgit serve`, a fork's repo is made on its first sync, starting at its
+upstream's branches: a namespace in its upstream's store when their
+audiences match, or, for a narrower one, in that audience's store, which
+takes only what the upstream's `main` reaches.
+
+The audience ceiling belongs to the fork's history, not to its `from` line,
+so dropping or changing `from` doesn't lift it, and a fork is never
+detached: to share something more widely, make a new tracker and capture
+into it only what may be shared. This client refuses a fork that breaks the
+ceiling at creation, in every command but `tracker list` and `tracker
+remove` (which say what is wrong and fix it), and in any commit that changes
+definitions, checked against its parents and against what this machine
+recorded each fork started at. The upstream can't be removed while a fork
+names it. `newgit serve` records the upstream when it makes the fork's
+repo, and serves the fork with its upstream's audience whatever its
+definition says; a fork whose ceiling can't be settled (its upstream not
+defined, a cycle) isn't defined there. Against newgit.dev's Worker only this
+client checks the ceiling.
 
 `newgit tracker remove <name>` deletes the definition and reverses both of
 those: the `.gitignore` block and each live workspace's ignore entries. It
