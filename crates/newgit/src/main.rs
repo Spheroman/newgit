@@ -14,6 +14,7 @@ use newgit_core::manager::{
     ExportReason, InstanceReport, KeptBranch, MismatchCause, Readiness, RemoteExportOptions,
     RemoveOutcome, ResourceBindOutcome, SourceBranchOutcome, SourceBranchPolicy, StopStartOutcome,
     StopStartResource, StopStartStatus, TrackerBindOutcome, UndoOptions, VerifyResource,
+    WorkspaceChange,
 };
 use newgit_core::resource::{CheckpointMode, ResourceDefinition};
 use newgit_core::source::{RefUpdate, find_repo_root};
@@ -81,6 +82,11 @@ enum Command {
         /// branch; removal prints the tip to recover it from
         #[arg(long)]
         delete_branch: bool,
+        /// Remove an evicted instance even though its workspace path holds
+        /// more than its marker (work written there after a restore failed
+        /// or was cut short), deleting that work, which no checkpoint holds
+        #[arg(long)]
+        force: bool,
     },
     /// Manage tracker definitions and content
     Tracker {
@@ -128,12 +134,27 @@ enum Command {
     Stop {
         /// Instance (inferred when run inside a workspace)
         instance: Option<String>,
+        /// Also checkpoint the instance and delete its workspace, to free
+        /// its disk; `newgit start` brings it back from that checkpoint.
+        /// Refuses, deleting nothing, when the workspace holds what would
+        /// not come back: ignored files no tracker owns and no resource
+        /// rebuilds (such as `target/`, listed; declare build output as a
+        /// resource), a merge or rebase in the middle, hand edits to a
+        /// rendered file, an untracked repository, an initialized
+        /// submodule, a linked worktree, or a process still working in it
+        /// (the shell it was run from included: run it from outside)
+        #[arg(long)]
+        evict: bool,
+        /// With `--evict`: evict even though the ignored files it lists
+        /// will not come back, and list them
+        #[arg(long, requires = "evict")]
+        discard_ignored: bool,
         /// Print one JSON document: each resource stopped, and its status
         #[arg(long)]
         json: bool,
     },
     /// Start again what the last `newgit stop` stopped, and any `autostart`
-    /// action that died on its own
+    /// action that died on its own, bringing back an evicted workspace first
     ///
     /// A resource nobody had started stays stopped. Exits 0 when there is
     /// nothing to start, and 1 when anything failed to; a failed one is
@@ -203,6 +224,13 @@ enum Command {
         /// archived, releasing the snapshot revs they pin
         #[arg(long)]
         purge_archived: bool,
+        /// Delete only this saved copy, which a restore that was cut short
+        /// or failed kept of what was at a workspace path
+        /// (`.<name>.interrupted-restore`, `.<name>.restore-failed`), and
+        /// nothing else. No checkpoint holds it: look through it first.
+        /// newgit never deletes one otherwise
+        #[arg(long, value_name = "PATH", conflicts_with_all = ["dry_run", "purge_archived"])]
+        discard_saved: Option<Utf8PathBuf>,
     },
     /// Resolve every `[[render]]` and report the result
     Render {
@@ -715,6 +743,7 @@ fn main() -> Result<()> {
             purge,
             keep_branch,
             delete_branch,
+            force,
         } => {
             let source_branch = if keep_branch {
                 SourceBranchPolicy::Keep
@@ -723,7 +752,7 @@ fn main() -> Result<()> {
             } else {
                 SourceBranchPolicy::Auto
             };
-            remove(&name, purge, source_branch)
+            remove(&name, purge, source_branch, force)
         }
         Command::Tracker { command } => tracker(command),
         Command::Resource { command } => resource(command),
@@ -739,7 +768,20 @@ fn main() -> Result<()> {
             instance,
             dry_run: true,
         } => action_dry_run(&spec, instance),
-        Command::Stop { instance, json } => stop_start(instance, json, StopStart::Stop),
+        Command::Stop {
+            instance,
+            evict,
+            discard_ignored,
+            json,
+        } => stop_start(
+            instance,
+            json,
+            if evict {
+                StopStart::Evict { discard_ignored }
+            } else {
+                StopStart::Stop
+            },
+        ),
         Command::Start { instance, json } => stop_start(instance, json, StopStart::Start),
         Command::Checkpoint {
             instance,
@@ -773,8 +815,17 @@ fn main() -> Result<()> {
         Command::Checkpoints { instance } => checkpoints(instance),
         Command::Export(args) => export(args),
         Command::Cleanup {
+            discard_saved: Some(path),
+            ..
+        } => {
+            let deleted = manager_here()?.discard_saved_copy(&path)?;
+            println!("Deleted saved copy {deleted}");
+            Ok(())
+        }
+        Command::Cleanup {
             dry_run,
             purge_archived,
+            discard_saved: None,
         } => cleanup(dry_run, purge_archived),
         Command::Render { check } => render_command(check),
         Command::Ports { check } => ports_command(check),
@@ -1918,6 +1969,7 @@ fn action(spec: &str, instance: Option<String>) -> Result<()> {
 #[derive(Debug, Clone, Copy)]
 enum StopStart {
     Stop,
+    Evict { discard_ignored: bool },
     Start,
 }
 
@@ -1927,6 +1979,9 @@ fn stop_start(instance: Option<String>, json: bool, which: StopStart) -> Result<
     let (manager, instance) = manager_and_instance(instance)?;
     let outcome = match which {
         StopStart::Stop => manager.stop_instance(&instance)?,
+        StopStart::Evict { discard_ignored } => {
+            manager.evict_instance(&instance, discard_ignored)?
+        }
         StopStart::Start => manager.start_instance(&instance)?,
     };
     if json {
@@ -1941,10 +1996,44 @@ fn stop_start(instance: Option<String>, json: bool, which: StopStart) -> Result<
 }
 
 fn stop_start_json(outcome: &StopStartOutcome) -> serde_json::Value {
-    serde_json::json!({
+    let mut json = serde_json::json!({
         "instance": outcome.instance,
         "resources": stop_start_resources_json(&outcome.resources),
-    })
+    });
+    if !outcome.warnings.is_empty() {
+        json["warnings"] = serde_json::json!(outcome.warnings);
+    }
+    match &outcome.workspace {
+        Some(WorkspaceChange::Evicted {
+            checkpoint,
+            discarded,
+            not_kept,
+        }) => {
+            json["evicted"] = serde_json::json!({
+                "checkpoint": checkpoint,
+                "discarded": discarded
+                    .iter()
+                    .map(|discarded| serde_json::json!({
+                        "path": discarded.path,
+                        "directory": discarded.dir,
+                        "files": discarded.files,
+                    }))
+                    .collect::<Vec<_>>(),
+                "not_kept": not_kept,
+            });
+        }
+        Some(WorkspaceChange::AlreadyEvicted { checkpoint }) => {
+            json["evicted"] = serde_json::json!({
+                "checkpoint": checkpoint,
+                "already": true,
+            });
+        }
+        Some(WorkspaceChange::Restored { checkpoint }) => {
+            json["restored"] = serde_json::json!({ "checkpoint": checkpoint });
+        }
+        None => {}
+    }
+    json
 }
 
 /// `{"name", "action", "status", "error"}` per resource, as `stop`,
@@ -2034,9 +2123,49 @@ fn print_started(started: &[StopStartResource]) {
 
 fn print_stop_start(outcome: &StopStartOutcome, which: StopStart) {
     let instance = &outcome.instance;
+    for warning in &outcome.warnings {
+        eprintln!("[newgit] warning: {warning}");
+    }
+    if let Some(WorkspaceChange::Restored { checkpoint }) = &outcome.workspace {
+        println!("Restored the workspace for `{instance}` from {checkpoint}");
+    }
+    if let Some(WorkspaceChange::AlreadyEvicted { checkpoint }) = &outcome.workspace {
+        println!(
+            "`{instance}` is already evicted to {checkpoint}; `newgit start {instance}` brings it \
+             back"
+        );
+        return;
+    }
+    print_stopped_or_started(outcome, which);
+    if let Some(WorkspaceChange::Evicted {
+        checkpoint,
+        discarded,
+        not_kept,
+    }) = &outcome.workspace
+    {
+        for what in not_kept {
+            eprintln!("[newgit] not kept by the eviction: {what}");
+        }
+        println!(
+            "Evicted the workspace for `{instance}` to {checkpoint}; `newgit start {instance}` \
+             brings it back"
+        );
+        if !discarded.is_empty() {
+            println!("Discarded (ignored, and nothing rebuilds them):");
+            for path in discarded {
+                println!("  {path}");
+            }
+        }
+    }
+}
+
+fn print_stopped_or_started(outcome: &StopStartOutcome, which: StopStart) {
+    let instance = &outcome.instance;
     if outcome.resources.is_empty() {
         match which {
-            StopStart::Stop => println!("Nothing running for `{instance}`"),
+            StopStart::Stop | StopStart::Evict { .. } => {
+                println!("Nothing running for `{instance}`")
+            }
             StopStart::Start => println!(
                 "Nothing stopped by `newgit stop`, and no `autostart` action down, for \
                  `{instance}`"
@@ -2050,14 +2179,14 @@ fn print_stop_start(outcome: &StopStartOutcome, which: StopStart) {
             None => println!(
                 "{} `{spec}` for `{instance}`",
                 match which {
-                    StopStart::Stop => "Stopped",
+                    StopStart::Stop | StopStart::Evict { .. } => "Stopped",
                     StopStart::Start => "Started",
                 }
             ),
             Some(error) => eprintln!(
                 "[newgit] could not {} `{spec}` for `{instance}`: {error}",
                 match which {
-                    StopStart::Stop => "stop",
+                    StopStart::Stop | StopStart::Evict { .. } => "stop",
                     StopStart::Start => "start",
                 }
             ),
@@ -3143,6 +3272,18 @@ fn status_table(
             println!("  - {problem}");
         }
     }
+    for report in &reports {
+        let notices = manager.saved_copy_notices(&report.branch);
+        if !notices.is_empty() {
+            println!(
+                "\n`{}` has work kept aside, in no checkpoint:",
+                report.branch.name
+            );
+            for notice in notices {
+                println!("  - {notice}");
+            }
+        }
+    }
     for report in reports
         .iter()
         .filter(|report| report.workspace_exists && report.readiness.is_starting())
@@ -3215,6 +3356,9 @@ fn remote_state_notes(asked: AskedState) {
 }
 
 fn status_column(report: &InstanceReport) -> String {
+    if report.branch.evicted.is_some() {
+        return "evicted".to_owned();
+    }
     if !report.workspace_exists {
         return "ws-missing".to_owned();
     }
@@ -3838,6 +3982,7 @@ fn checkpoints(instance: Option<String>) -> Result<()> {
             (CheckpointReason::BeforeUndo, Some(false)) => "failed-undo",
             (CheckpointReason::BeforeUndo, _) => "before-undo",
             (CheckpointReason::Push, _) => "push",
+            (CheckpointReason::Evict, _) => "evict",
         };
         let source = format!(
             "{}{}",
@@ -4431,20 +4576,28 @@ fn print_warnings(warnings: &[String]) {
     }
 }
 
-fn remove(name: &str, purge: bool, source_branch: SourceBranchPolicy) -> Result<()> {
+fn remove(name: &str, purge: bool, source_branch: SourceBranchPolicy, force: bool) -> Result<()> {
     let manager = manager_here()?;
     let checkpoints = if purge {
         ArchivedCheckpoints::Purge
     } else {
         ArchivedCheckpoints::Keep
     };
-    let outcome = manager.remove(name, &current_dir()?, checkpoints, source_branch)?;
+    let outcome =
+        manager.remove_forced(name, &current_dir()?, checkpoints, source_branch, force)?;
 
     println!("Removed branch instance `{}`", outcome.branch.name);
     for hook in &outcome.hooks {
         print_hook(hook);
     }
     println!("  workspace: {} (deleted)", outcome.branch.workspace_path);
+    for copy in &outcome.saved_copies {
+        println!(
+            "  kept:      {copy}, what was at the workspace path when a restore failed or was \
+             cut short; no checkpoint holds it. `newgit cleanup --discard-saved {copy}` deletes \
+             it once you have looked"
+        );
+    }
     if let Some(head) = &outcome.unsaved_workspace_head {
         // Whatever the branch line says next is about the store's branch;
         // this is the work that never reached it.

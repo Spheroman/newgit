@@ -29,6 +29,19 @@ when you unsettle it or send it a message
 ([Spheroman/t3code#2](https://github.com/Spheroman/t3code/issues/2));
 `remove` stays for delete.
 
+To give a settled thread's disk back, `newgit stop --evict <instance>`
+checkpoints it and deletes its workspace, all but its marker, and the
+`start` on unsettle brings it back from that checkpoint at the same path.
+The fork evicts once the settle finishes and no terminal runs there, unless
+**Free disk when a newgit thread settles** is off in Settings → Threads.
+An eviction that would lose something (ignored build output nobody
+declared, a rebase in the middle, a shell still in the directory) refuses
+and leaves the thread stopped, on disk. The server has to run it with its
+working directory outside the workspace: run from inside, it refuses, since
+the directory would be deleted under the caller. Declaring disposable
+build output such as `target/` is not possible yet, so a Rust workspace
+is not freed: `--discard-ignored` is the manual override (#447).
+
 On macOS it installs as "T3 Code (newgit)", beside upstream T3 Code: its
 own app ID, state in `~/.t3-newgit`, and no auto-update.
 

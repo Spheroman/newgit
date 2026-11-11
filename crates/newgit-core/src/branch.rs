@@ -68,6 +68,19 @@ pub struct BranchInstance {
     /// embargo, for work the rest of the project must not see yet.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub private: bool,
+    /// The checkpoint this instance's workspace was evicted to (`newgit stop
+    /// --evict`): the workspace is gone, all but its marker, and `newgit
+    /// start` brings it back from this checkpoint at the same path. `None`
+    /// while the workspace is there.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evicted: Option<String>,
+    /// Directories beside the workspace holding what was at its path when a
+    /// restore of it was cut short or failed (`.<name>.interrupted-restore`,
+    /// `.<name>.restore-failed`): work no checkpoint holds. newgit never
+    /// deletes one on its own; `newgit cleanup --discard-saved <path>` does,
+    /// when asked.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub saved_copies: Vec<Utf8PathBuf>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -212,6 +225,8 @@ impl BranchInstance {
             dropped: Default::default(),
             parked: BTreeMap::new(),
             private: false,
+            evicted: None,
+            saved_copies: Vec::new(),
             created_at: now,
             remote: None,
             updated_at: now,

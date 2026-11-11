@@ -72,6 +72,9 @@ pub enum CheckpointReason {
     /// to the project's remote — a push `undo` cannot take back, so it is
     /// the one moment a checkpoint has to exist.
     Push,
+    /// Taken by `newgit stop --evict` just before the workspace is deleted:
+    /// the state `newgit start` brings the workspace back to.
+    Evict,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

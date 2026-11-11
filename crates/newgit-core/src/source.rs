@@ -456,6 +456,23 @@ impl GitSource {
 
     /// Whether the store holds `commit` and everything it reaches, so a ref
     /// to it needs no fetch ([`crate::local_refs::holds_complete`]).
+    /// Whether every object `tip` reaches is in the store, checked object
+    /// by object past what refs other than `own` reach (those Git already
+    /// holds whole).
+    pub fn holds_whole(&self, tip: &str, own: &str) -> bool {
+        let exclude = format!("--exclude={own}");
+        self.git(&[
+            "rev-list",
+            "--objects",
+            "--missing=print",
+            tip,
+            "--not",
+            &exclude,
+            "--all",
+        ])
+        .is_ok_and(|listed| !listed.lines().any(|line| line.starts_with('?')))
+    }
+
     pub fn holds_complete(&self, commit: &str) -> bool {
         crate::local_refs::git_dir_of(&self.root)
             .is_some_and(|git_dir| crate::local_refs::holds_complete(&git_dir, &[commit]))

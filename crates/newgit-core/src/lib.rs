@@ -7,6 +7,7 @@ pub mod crypt;
 pub mod deposit_diff;
 pub mod endpoint;
 pub mod error;
+pub mod evict;
 pub mod export;
 pub mod export_target;
 pub mod exports;
