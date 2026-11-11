@@ -171,24 +171,7 @@ impl Merges {
     fn widen(&self, turn: &Turn<'_>, touch: &Touch) {
         let mut turns = self.turns();
         if let Some(held) = turns.iter_mut().find(|held| held.id == turn.id) {
-            for (tracker, own) in &touch.0 {
-                let entry = held
-                    .touch
-                    .0
-                    .entry(tracker.clone())
-                    .or_insert_with(|| own.clone());
-                if let (
-                    reparent::Own::Paths { paths, gone },
-                    reparent::Own::Paths {
-                        paths: more,
-                        gone: more_gone,
-                    },
-                ) = (entry, own)
-                {
-                    paths.extend(more.iter().cloned());
-                    gone.extend(more_gone.iter().cloned());
-                }
-            }
+            held.touch.widen(touch);
         }
     }
 
@@ -241,6 +224,7 @@ fn only_pins_moved(dir: &camino::Utf8Path, old: &str, next: &str) -> Option<bool
         &[
             "diff-tree",
             "-r",
+            "-z",
             "--name-only",
             "--no-commit-id",
             old,
@@ -248,10 +232,13 @@ fn only_pins_moved(dir: &camino::Utf8Path, old: &str, next: &str) -> Option<bool
         ],
     )
     .ok()?;
+    // `-z`: names as stored, never quoted (a quoted name would start `"`).
     output.status.success().then(|| {
-        String::from_utf8_lossy(&output.stdout)
-            .lines()
-            .all(|path| path.starts_with(".newgit/pins/"))
+        output
+            .stdout
+            .split(|&byte| byte == 0)
+            .filter(|path| !path.is_empty())
+            .all(|path| path.starts_with(b".newgit/pins/"))
     })
 }
 
@@ -266,7 +253,8 @@ fn history_touches(
 ) -> Option<bool> {
     let mut args = vec![
         "log",
-        "--format=>%H %P",
+        "-z",
+        "--format=%x01%H %P",
         "--name-only",
         "--diff-merges=first-parent",
         next,
@@ -278,16 +266,19 @@ fn history_touches(
     if !output.status.success() {
         return None;
     }
-    for entry in String::from_utf8_lossy(&output.stdout).split('>').skip(1) {
-        let mut lines = entry.lines();
-        let header = lines.next()?;
-        if header.split_whitespace().count() < 2 {
-            return Some(true); // a root commit: everything in it is new
-        }
-        if lines
-            .filter(|line| !line.is_empty())
-            .any(|path| !path.starts_with(".newgit/pins/"))
-        {
+    // `-z`, and each commit's header marked by \x01, which no path holds:
+    // names as stored (never quoted), and a name that looks like a header
+    // cannot be read as one.
+    for field in output.stdout.split(|&byte| byte == 0) {
+        let field = field.strip_prefix(b"\n").unwrap_or(field);
+        if let Some(header) = field.strip_prefix(b"\x01") {
+            let ids = header
+                .split(|&byte| byte == b' ')
+                .filter(|id| !id.is_empty());
+            if ids.count() < 2 {
+                return Some(true); // a root commit: everything in it is new
+            }
+        } else if !field.is_empty() && !field.starts_with(b".newgit/pins/") {
             return Some(true);
         }
     }
@@ -1180,22 +1171,35 @@ fn changes_definitions(project: &ProjectContext<'_>, by: &str, base: &List, list
         let Ok(dir) = project.tracker(tracker).view(by) else {
             return true;
         };
+        // `-z`: names as stored. Without it Git quotes a name with bytes
+        // past ASCII, and `".newgit/trackers/caf\351.toml"` would not start
+        // with `.newgit/trackers/`.
         let Ok(output) = repos::git(
             &dir,
-            &["diff-tree", "-r", "--name-only", "--no-commit-id", old, new],
+            &[
+                "diff-tree",
+                "-r",
+                "-z",
+                "--name-only",
+                "--no-commit-id",
+                old,
+                new,
+            ],
         ) else {
             return true;
         };
         if !output.status.success() {
             return true;
         }
-        let paths = String::from_utf8_lossy(&output.stdout);
-        let mut paths = paths.lines();
+        let mut paths = output
+            .stdout
+            .split(|&byte| byte == 0)
+            .filter(|path| !path.is_empty());
         if tracker == "access" {
-            if paths.any(|path| !path.starts_with(".newgit/pins/")) {
+            if paths.any(|path| !path.starts_with(b".newgit/pins/")) {
                 return true;
             }
-        } else if paths.any(|path| path.starts_with(".newgit/trackers/")) {
+        } else if paths.any(|path| path.starts_with(b".newgit/trackers/")) {
             return true;
         }
     }
@@ -1824,16 +1828,17 @@ mod tests {
     use super::*;
 
     fn root_paths(paths: &[&str]) -> Touch {
-        Touch(
-            [(
+        Touch {
+            trackers: [(
                 "root".to_owned(),
-                reparent::Own::Paths {
-                    paths: paths.iter().map(|path| (*path).to_owned()).collect(),
+                reparent::Own {
+                    paths: paths.iter().map(|path| path.as_bytes().to_vec()).collect(),
                     gone: BTreeSet::new(),
                 },
             )]
             .into(),
-        )
+            whole: None,
+        }
     }
 
     #[test]

@@ -118,7 +118,7 @@ fn a_conflict_in_a_tracker_the_merger_cannot_read_is_not_named() {
     let error = answer["error"].as_str().unwrap_or_default();
     assert!(!error.contains("payroll"), "{error}");
     assert!(
-        error.contains("a file in a tracker you cannot read"),
+        error.contains("one or more files in trackers you cannot read"),
         "{error}"
     );
 }

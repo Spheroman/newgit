@@ -19,9 +19,10 @@
 //! - **One commit, one audience.** Each merge commit holds its own tracker's
 //!   tree and pins, and the stock message `Merge `<login>` into <branch>`,
 //!   which says nothing about anyone's content. A merge that would follow a
-//!   move into a tracker more people may read, carrying the other side's
-//!   change along, is refused ([`carried`]); a conflict names only files in
-//!   trackers the merger may read.
+//!   move into a tracker whose store does not include the one the content
+//!   was in (so someone who could not read it could), carrying the other
+//!   side's change along, is refused ([`carried`]); a conflict names only
+//!   files, and trackers, the merger may read.
 //! - **Only when the changes meet.** A merge whose changes are apart from
 //!   what landed since its base never gets here: `crate::reparent` re-makes
 //!   it on the head without Git's merge.
@@ -212,12 +213,13 @@ fn depth(at: &str) -> usize {
     if at == "." { 0 } else { at.split('/').count() }
 }
 
-fn holds(at: &str, path: &str) -> bool {
+/// Whether the directory `at` holds `path` (bytes, as Git stores names).
+fn holds(at: &str, path: &[u8]) -> bool {
     at == "."
-        || path == at
+        || path == at.as_bytes()
         || path
-            .strip_prefix(at)
-            .is_some_and(|rest| rest.starts_with('/'))
+            .strip_prefix(at.as_bytes())
+            .is_some_and(|rest| rest.starts_with(b"/"))
 }
 
 impl Mounts {
@@ -237,7 +239,7 @@ impl Mounts {
     }
 
     /// Every tracker whose directory holds `path`, at any depth.
-    fn holding(&self, path: &str) -> Vec<&str> {
+    fn holding(&self, path: &[u8]) -> Vec<&str> {
         self.0
             .iter()
             .filter(|(_, at)| holds(at, path))
@@ -247,7 +249,7 @@ impl Mounts {
 
     /// The trackers `path` is in: those holding it at the deepest directory
     /// (more than one where trackers share a directory).
-    fn owners(&self, path: &str) -> Vec<&str> {
+    fn owners(&self, path: &[u8]) -> Vec<&str> {
         let deepest = self
             .0
             .iter()
@@ -263,25 +265,23 @@ impl Mounts {
     }
 
     /// `paths` as the merger may be told of them: each one in trackers it
-    /// may read by name, the rest only counted.
-    fn name(&self, paths: &[String], seen: &Seen) -> String {
+    /// may read by name; of the rest, not even how many.
+    fn name(&self, paths: &[Vec<u8>], seen: &Seen) -> String {
         let mut named = Vec::new();
-        let mut hidden = 0;
+        let mut hidden = false;
         for path in paths {
             if self
                 .holding(path)
                 .iter()
                 .all(|tracker| seen.readable.contains(*tracker))
             {
-                named.push(format!("`{path}`"));
+                named.push(format!("`{}`", String::from_utf8_lossy(path)));
             } else {
-                hidden += 1;
+                hidden = true;
             }
         }
-        match hidden {
-            0 => {}
-            1 => named.push("a file in a tracker you cannot read".to_owned()),
-            hidden => named.push(format!("{hidden} files in trackers you cannot read")),
+        if hidden {
+            named.push("one or more files in trackers you cannot read".to_owned());
         }
         named.join(", ")
     }
@@ -289,11 +289,12 @@ impl Mounts {
 
 /// What one side changed from the base, as Git's rename detection (the
 /// merge's own, 50% similar) sees it.
+/// Paths are the bytes Git stores (`-z`: never quoted).
 #[derive(Default)]
 struct Side {
-    renames: Vec<(String, String)>,
-    modified: BTreeSet<String>,
-    added: BTreeSet<String>,
+    renames: Vec<(Vec<u8>, Vec<u8>)>,
+    modified: BTreeSet<Vec<u8>>,
+    added: BTreeSet<Vec<u8>>,
 }
 
 impl Side {
@@ -303,23 +304,24 @@ impl Side {
             &["diff-tree", "-r", "-M", "-z", "--name-status", base, view],
             None,
         )?;
-        let text = String::from_utf8_lossy(&out).into_owned();
-        let mut fields = text.split('\0').filter(|field| !field.is_empty());
+        let mut fields = out
+            .split(|&byte| byte == 0)
+            .filter(|field| !field.is_empty());
         let mut side = Self::default();
         while let Some(status) = fields.next() {
             let Some(path) = fields.next() else { break };
-            match status.as_bytes().first() {
+            match status.first() {
                 Some(b'R' | b'C') => {
                     let Some(to) = fields.next() else { break };
-                    if status.starts_with('R') {
-                        side.renames.push((path.to_owned(), to.to_owned()));
+                    if status.starts_with(b"R") {
+                        side.renames.push((path.to_vec(), to.to_vec()));
                     }
                 }
                 Some(b'M' | b'T') => {
-                    side.modified.insert(path.to_owned());
+                    side.modified.insert(path.to_vec());
                 }
                 Some(b'A') => {
-                    side.added.insert(path.to_owned());
+                    side.added.insert(path.to_vec());
                 }
                 _ => {}
             }
@@ -328,8 +330,10 @@ impl Side {
     }
 }
 
-/// What the merge would carry across trackers into one more people may
-/// read, by following a move the *other* side made: `(path, from, to)`.
+/// What the merge would carry across trackers into one whose store does not
+/// include the store of the tracker it was in (decision 1: only the same
+/// store, or the public one, includes another), by following a move the
+/// *other* side made: `(path, from, to)`.
 /// A change one side made to a file the other side moved into a wider
 /// tracker, or a file one side added under a directory the other side
 /// moved there (Git's directory renames).
@@ -339,7 +343,7 @@ fn carried(
     sides: [&Side; 2],
     mounts: &Mounts,
     seen: &Seen,
-) -> ApiResult<Vec<(String, String, String)>> {
+) -> ApiResult<Vec<(Vec<u8>, String, String)>> {
     let mut out = Vec::new();
     for (moved, other) in [(sides[0], sides[1]), (sides[1], sides[0])] {
         for (from_path, to_path) in &moved.renames {
@@ -355,11 +359,12 @@ fn carried(
             if other.modified.contains(from_path) {
                 out.push((from_path.clone(), from.clone(), to.clone()));
             }
-            if let Some((dir, _)) = from_path.rsplit_once('/') {
+            if let Some(slash) = from_path.iter().rposition(|&byte| byte == b'/') {
+                let dir = &from_path[..slash];
                 for added in &other.added {
                     if added
                         .strip_prefix(dir)
-                        .is_some_and(|rest| rest.starts_with('/'))
+                        .is_some_and(|rest| rest.starts_with(b"/"))
                         && objects.entry_at(merged, added)?.is_none()
                     {
                         out.push((added.clone(), from.clone(), to.clone()));
@@ -373,10 +378,36 @@ fn carried(
     Ok(out)
 }
 
+/// Why a merge that would carry `what` from tracker `from` into `to` is
+/// refused, naming only the trackers the merger may read. The stores are
+/// not ordered (a `user:` tracker's readers are not a subset of the
+/// project's, nor the other way), so this says some readers of `to` may
+/// not read `from`, never that more people may.
+fn refused_carry(what: &str, from: &str, to: &str, seen: &Seen, branch: &str) -> String {
+    let readable = |tracker: &str| seen.readable.contains(tracker);
+    let from_named = if readable(from) {
+        format!("`{from}`")
+    } else {
+        "a tracker you cannot read".to_owned()
+    };
+    let into = match (readable(to), readable(from)) {
+        (true, true) => format!("`{to}`, which some who may not read `{from}` may read"),
+        (true, false) => format!("`{to}`, which some who may not read that tracker may read"),
+        (false, _) => {
+            "a tracker you cannot read, which some who may not read where it was may read"
+                .to_owned()
+        }
+    };
+    format!(
+        "this merge would carry {what} from {from_named} into {into}, by following a move made on the other side, and nobody chose to widen who may read it: bring `{branch}` into your work and merge again, so any such move is one you make"
+    )
+}
+
 /// Merge `list` (the merger's index, made on `base`) onto `head` (the
 /// branch now), for `login` landing into `branch`. Refused (409) for a real
 /// conflict, naming each file the merger may read; for content it would
-/// carry into a tracker more people may read (see [`carried`]); and for
+/// carry into a tracker some who may not read it may read (see
+/// [`carried`]); and for
 /// what cannot be split.
 #[allow(clippy::too_many_arguments, reason = "each is one thing a merge is")]
 pub fn merge(
@@ -439,13 +470,17 @@ pub fn merge(
         ],
         None,
     )?;
-    let stdout = String::from_utf8_lossy(&merged.stdout).into_owned();
-    let mut fields = stdout.split('\0').filter(|field| !field.is_empty());
-    let tree = fields.next().unwrap_or_default().trim().to_owned();
+    let mut fields = merged
+        .stdout
+        .split(|&byte| byte == 0)
+        .filter(|field| !field.is_empty());
+    let tree = String::from_utf8_lossy(fields.next().unwrap_or_default())
+        .trim()
+        .to_owned();
     match merged.status.code() {
         Some(0) => {}
         Some(1) => {
-            let mut files: Vec<String> = fields.map(str::to_owned).collect();
+            let mut files: Vec<Vec<u8>> = fields.map(<[u8]>::to_vec).collect();
             files.sort();
             files.dedup();
             return Err(HttpError::new(
@@ -464,7 +499,7 @@ pub fn merge(
             )));
         }
     }
-    // One commit, one audience: nothing crosses into a tracker more people
+    // One commit, one audience: nothing crosses into a tracker others
     // may read unless someone chose to move it there from what they read.
     let sides = [
         Side::read(&scratch.dir, &base_view, &head_view)?,
@@ -472,13 +507,10 @@ pub fn merge(
     ];
     let crossing = carried(&mut objects, &tree, [&sides[0], &sides[1]], &mounts, seen)?;
     if let Some((_, from, to)) = crossing.first() {
-        let paths: Vec<String> = crossing.iter().map(|(path, _, _)| path.clone()).collect();
+        let paths: Vec<Vec<u8>> = crossing.iter().map(|(path, _, _)| path.clone()).collect();
         return Err(HttpError::new(
             409,
-            format!(
-                "this merge would carry {} from `{from}` into `{to}`, which more people may read, by following a move made on the other side, and nobody chose to widen that: bring `{branch}` into your work and merge again, so any such move is one you make",
-                mounts.name(&paths, seen)
-            ),
+            refused_carry(&mounts.name(&paths, seen), from, to, seen, branch),
         ));
     }
     let now = chrono::Utc::now().timestamp();

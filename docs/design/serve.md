@@ -349,10 +349,20 @@ Resolved loudly; each is reversible.
    - **Re-made on the head when the changes are apart** (`reparent.rs`).
      What each side changed is a *touch*: for each tracker whose commit
      moved, the paths of its own tree that changed (pins aside) and the
-     directories that went, read in process skipping equal subtrees. Two
-     touches overlap when, in a tracker both moved, one changed a path the
-     other changed or one inside it, or one under a directory the other
-     deleted or renamed away, or when either added or dropped the tracker.
+     directories that went, read in process skipping equal subtrees, as
+     the bytes Git stores (a name need not be UTF-8). Two touches overlap
+     when, in a tracker both moved, one changed a path the other changed or
+     one inside it, or one under a directory the other deleted or renamed
+     away. A touch that reshapes the composed tree overlaps every other: a
+     tracker added or dropped, a tracker whose own content went entirely
+     (its directory in the view is gone, and Git may follow it, and the
+     directories above it, as a rename), a definition changed (`access`, or
+     any tracker's own `.newgit/trackers/`: a mount may have moved), or pins
+     the re-make cannot write back exactly. For these only Git's merge of
+     the composed trees is right. The re-make stands in for that merge, so
+     `crates/newgit-serve/tests/reparent_differential.rs` holds it to Git's: generated
+     cases across several trackers, each re-made tree compared with what
+     `git merge-tree` makes of the same composed trees.
      When the merger's touch (base to its list) and what landed since (base
      to head) do not overlap, no merge runs: each tracker only the merger
      moved lands at the merger's own commit, each only the head moved stays,
@@ -370,8 +380,9 @@ Resolved loudly; each is reversible.
      second, as GitHub's merge button does, holding only that tracker's
      tree and pins and the stock message ``Merge `<login>` into
      <branch>``, by the merger. Refused (409) only for a real conflict,
-     naming each file in trackers the merger may read and counting the rest
-     ("a file in a tracker you cannot read"); the client then merges
+     naming each file in trackers the merger may read and saying only
+     that there are others, not how many ("one or more files in trackers
+     you cannot read"); the client then merges
      `<branch>` into its work. A tracker's `main` the merger asked to move
      to its own commit moves to the commit that lands in its place, from
      where it is now, when that comes after it.
@@ -437,8 +448,10 @@ Resolved loudly; each is reversible.
      from there into a store exactly as the merger's own commits do
      (decision 1). Commits re-made on a new head are written straight into
      the merger's landing for their tracker. An attempt that lost removes
-     the landing refs of every commit it made. Every `git` the merge runs
-     itself is stopped after 60 s (503, nothing landed).
+     the landing refs of every commit it made. Each `git` process the
+     server merge starts for one step (`merge-tree`, `diff-tree`, `notes`,
+     the pack it copies out, `update-ref`) is stopped after 60 s (503,
+     nothing landed); see *Known limits* for the reads that are not.
 
 ## Known limits
 - **Raw Git reads are atomic per repo, not across repos.** Each store's
@@ -541,6 +554,20 @@ Resolved loudly; each is reversible.
   moved into it while this side edited it) gets a merge commit whose
   second parent may be behind its first: split makes one commit per
   tracker whose merged tree is neither side's, on both sides' commits.
+- **Not every `git` a merge waits on is timed.** The long-lived
+  `cat-file --batch` that reads objects in process (`Objects`: touches,
+  the re-make, composing), and the authorization's ancestry checks
+  (`merge-base --is-ancestor`), `cat-file -e`, and `diff-tree` reads run
+  without the 60 s limit. Each is a bounded read of objects the server
+  holds, so a hang means a broken repository rather than a slow merge, but
+  one would hold the merge's turn, or its roots, until it ends.
+- **Merges land at about two a second** (a debug build), though a merge
+  apart from what landed runs no Git merge: each spawns about 55 `git`
+  processes, and the re-make, the rules check, placement, and the landing
+  run one after another while the roots are held, about 400 ms a landing.
+  Issue #445 has the counts and the way to milliseconds (objects written
+  in process, the object format cached, re-made objects written straight
+  into the store).
 - **A merge's finish holds its projects while it places its commits.**
   From deciding which store each new commit goes into until it has
   landed, a merge's finish holds its projects' locks, and that includes

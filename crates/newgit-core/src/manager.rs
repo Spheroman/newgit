@@ -2266,19 +2266,19 @@ impl BranchManager {
                 moved.push((access.to_owned(), made.clone()));
                 objects.set_path(
                     &commit.tree,
-                    &format!("{}/{access}", crate::compose::PINS_DIR),
+                    format!("{}/{access}", crate::compose::PINS_DIR),
                     Some((crate::objects::GITLINK_MODE.to_vec(), made)),
                 )?
             }
             None => objects.set_path(
                 &commit.tree,
-                &format!("{}/{name}.toml", crate::tracker::DEFINITIONS_DIR),
+                format!("{}/{name}.toml", crate::tracker::DEFINITIONS_DIR),
                 Some(file),
             )?,
         };
         let tree = objects.set_path(
             &tree,
-            &format!("{}/{}", crate::compose::PINS_DIR, pin.0),
+            format!("{}/{}", crate::compose::PINS_DIR, pin.0),
             Some((crate::objects::GITLINK_MODE.to_vec(), pin.1.clone())),
         )?;
         moved.push(pin.clone());
@@ -12409,7 +12409,7 @@ impl BranchManager {
             for (name, new) in moved {
                 tree = objects.set_path(
                     &tree,
-                    &format!("{}/{name}", crate::compose::PINS_DIR),
+                    format!("{}/{name}", crate::compose::PINS_DIR),
                     Some((crate::objects::GITLINK_MODE.to_vec(), new.clone())),
                 )?;
             }

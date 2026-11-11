@@ -129,7 +129,10 @@ other paths costs only re-making the commits that record pins (root, and
 each tracker both moved along the mount chain) on the new head, in
 process, with no `merge-tree`; the same holds for a merge's first attempt
 when what landed since its base changed other paths. A directory another
-landing deleted or renamed overlaps every path under it (item 8). Composing
+landing deleted or renamed overlaps every path under it (item 8), and a
+landing that empties a tracker, adds or drops one, or changes a definition
+reruns every merge prepared before it, since its whole directory in the
+view may have moved. Composing
 views is still O(trackers) per Git merge (#440). Item 7's strict merge queue
 is not built.
 
