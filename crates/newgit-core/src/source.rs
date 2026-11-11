@@ -51,11 +51,29 @@ impl GitSource {
         if paths.is_empty() {
             return Ok(BTreeSet::new());
         }
-        let mut args = vec!["-C", self.root.as_str(), "check-ignore", "-z", "--"];
-        args.extend_from_slice(paths);
-        let output = Command::new("git")
-            .args(&args)
-            .output()
+        // `-z` is only accepted with `--stdin`: the paths go in NUL-separated
+        // and come back the same way, each as it was given.
+        use std::io::Write as _;
+        let args = ["-C", self.root.as_str(), "check-ignore", "-z", "--stdin"];
+        let mut child = Command::new("git")
+            .args(args)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|source| spawn_error(&args, &source))?;
+        let input: Vec<u8> = paths
+            .iter()
+            .flat_map(|path| path.bytes().chain([0]))
+            .collect();
+        child
+            .stdin
+            .take()
+            .expect("piped stdin")
+            .write_all(&input)
+            .map_err(|source| spawn_error(&args, &source))?;
+        let output = child
+            .wait_with_output()
             .map_err(|source| spawn_error(&args, &source))?;
         // 1 is "none of them": only 0 and 1 are answers.
         if !matches!(output.status.code(), Some(0 | 1)) {

@@ -527,7 +527,17 @@ impl Reader {
             use std::os::unix::fs::PermissionsExt as _;
             let _ = std::fs::set_permissions(&self.cache, std::fs::Permissions::from_mode(0o700));
         }
-        let staging = self.cache.join(format!("{oid}.tmp"));
+        // A staging file of this writer's own: two writers of the same blob
+        // (`status` decrypts for every instance at once, and two commands can
+        // run together) would otherwise truncate each other's half-written
+        // file, or find it already renamed away. Each rename lands a whole
+        // file; the last one wins, and they hold the same plaintext.
+        static STAGED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let staging = self.cache.join(format!(
+            "{oid}.{}.{}.tmp",
+            std::process::id(),
+            STAGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
         let mut options = std::fs::OpenOptions::new();
         options.write(true).create(true).truncate(true);
         #[cfg(unix)]

@@ -3155,7 +3155,10 @@ fn status_table(
 }
 
 /// Which project was asked, and what it answered.
-type AskedState = Option<(String, newgit_core::Result<newgit_core::remote::RemoteState>)>;
+type AskedState = Option<(
+    String,
+    newgit_core::Result<newgit_core::remote::RemoteState>,
+)>;
 
 /// What the project's remote has not written down yet, as `status` asks it:
 /// within seconds, and `None` with no remote to ask.

@@ -3445,7 +3445,10 @@ impl BranchManager {
         for definition in &self.trackers {
             for path in &definition.paths {
                 let path = path.as_str();
-                if tracked.as_ref().is_some_and(|tracked| tracked.contains(path)) {
+                if tracked
+                    .as_ref()
+                    .is_some_and(|tracked| tracked.contains(path))
+                {
                     warnings.push(format!(
                         "tracker `{}` owns `{path}`, which Git also tracks (dual-tracked): \
                          branch-local content will show as modifications and can be committed \
@@ -3453,7 +3456,10 @@ impl BranchManager {
                          this is deliberate",
                         definition.name
                     ));
-                } else if ignored.as_ref().is_some_and(|ignored| !ignored.contains(path)) {
+                } else if ignored
+                    .as_ref()
+                    .is_some_and(|ignored| !ignored.contains(path))
+                {
                     warnings.push(format!(
                         "tracker `{}` owns `{path}` but the store repo does not gitignore it; \
                          agents may commit it into source history (fine only if deliberately \

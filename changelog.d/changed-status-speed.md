@@ -8,3 +8,8 @@
   per request instead of once per tracker. The tracker-path gitignore
   check that runs before most commands is also one `git` call per check
   instead of one per path.
+
+  Two commands decrypting the same tracker file at once no longer trip
+  over each other's half-written copy in the local plaintext cache;
+  before, the loser failed, and `status` could mark an instance `~`
+  (differs from `main`) when it did not.
