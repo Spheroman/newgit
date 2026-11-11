@@ -2189,13 +2189,16 @@ pub(crate) fn write_notes(
     // project root) may write notes between our reading the ref and moving
     // it: Git then refuses a ref that is not a fast-forward. Built again on
     // its notes, ours are added to theirs.
+    // Matched without case: some Git versions (2.45.2, for one) print
+    // "warning: Not updating", others "not updating".
+    let raced = |stderr: &str| {
+        let stderr = stderr.to_lowercase();
+        stderr.contains("not updating") || stderr.contains("cannot lock ref")
+    };
     let mut attempt = 0;
     loop {
         match write_notes_once(repo, notes_ref, label, notes) {
-            Err(NewgitError::SourceCommand { stderr, .. })
-                if attempt < 20
-                    && (stderr.contains("not updating") || stderr.contains("cannot lock ref")) =>
-            {
+            Err(NewgitError::SourceCommand { stderr, .. }) if attempt < 20 && raced(&stderr) => {
                 attempt += 1;
                 // Apart, so writers that met do not meet again.
                 let nanos = std::time::SystemTime::now()
