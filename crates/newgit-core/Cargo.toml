@@ -13,6 +13,11 @@ readme = "../../README.md"
 workspace = true
 
 [dependencies]
+# Encrypting trackers outside Git to their audience (#338): age, to the
+# members' GitHub SSH keys; base64 for key fingerprints and age's key tags;
+# rpassword to ask for an SSH key's passphrase.
+age = { version = "0.12", features = ["ssh"] }
+base64 = "0.22"
 camino = { version = "1.2", features = ["serde1"] }
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
 # Process-group signalling and reaping (see supervisor.rs), and low-level
@@ -25,6 +30,7 @@ nix = { version = "0.31", features = ["signal", "process", "net", "fs"] }
 # The path scan reads every produced tree in full; one thread over 3.8 GB
 # took longer than the install it was vetting.
 rayon = "1"
+rpassword = "7"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha1 = "0.11"

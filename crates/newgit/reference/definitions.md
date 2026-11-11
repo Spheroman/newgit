@@ -393,6 +393,167 @@ histories are Git's. Captured history in `.newgit/local/trackers.git` is left
 in place — it becomes unreferenced, and `newgit cleanup` reclaims it once
 nothing else (a checkpoint that captured it) still pins a rev.
 
+### Encrypted trackers
+
+A tracker outside Git with `storage = "remote"` and an audience other than
+`public` is encrypted on this machine before anything of it is sent. There is
+no opt-out: content a server has to read (a page the remote serves) is
+`public`. Each file is encrypted whole with [age](https://age-encryption.org)
+and committed as an ordinary blob in the tracker's history; capture encrypts,
+putting it in a workspace decrypts, and the workspace always holds plaintext
+(written owner-only, `0600`).
+
+- **Who it is encrypted to is computed, never read back:** the members its
+  audience names, as the remote lists them now (`project-devs`: every member;
+  `user`: you; `user:<login>`: that login), by the `ssh-ed25519` and `ssh-rsa`
+  keys GitHub publishes at `https://github.com/<login>.keys`. Nothing else.
+  Each encrypted rev records the list in its own tree at
+  `.newgit/recipients`, for people to read; newgit never takes a recipient
+  from it, from `main`, or from anything else the remote serves. Whether a
+  rev is encrypted to the current set is read from each file's own age
+  header, which names the current keys (by a public tag of each key; the
+  header is not authenticated, so it identifies the keys, it does not prove
+  them). A member with only `ecdsa` or security-key (`sk-*`) keys, or none,
+  is left out and warned about; nobody with a key at all refuses the capture.
+- **Said by fingerprint:** the first time a tracker is encrypted, whenever the
+  set differs from the one this machine last used (on every command that
+  captures or publishes), and on every `newgit members add`, `remove`, and
+  `reencrypt`, newgit lists each login with its
+  keys' `SHA256:` fingerprints (what `ssh-keygen -lf` prints), and says
+  `CHANGED` with who was added and removed. Read it: the remote decides who
+  is a member (below).
+- **Current before anything is published:** a capture reads the member list
+  from the remote (once per command), or, offline, what this machine last
+  read (`.newgit/local/audience.json`, written only from the remote and
+  GitHub). Before a checkpoint syncs and before `tracker merge` or a
+  re-encryption publishes `main`, the list is read again, and every commit
+  the remote does not have yet is checked against it, not only the last
+  one. Those encrypted to anyone else are made again, encrypted to the
+  members as they are now, on the last commit the remote has; the stale ones
+  stay on this machine and are never sent. So a member removed on another
+  machine never gets anything captured after their removal, nor anything
+  captured before it that this machine had not sent yet (a capture while
+  offline included). What the remote already held while they were a member,
+  they keep. What this machine counts as on the remote is kept per remote
+  URL and project, and forgotten by `newgit remote add` and `remote delete`,
+  so a project linked again (elsewhere, or deleted and made again under the
+  same name) gets every stale commit made again too. newgit never makes a
+  merge commit in a tracker outside Git; an unsent one (made by hand in the
+  store) is refused rather than sent.
+- **`main` is never forced over.** Publishing `main` fetches the remote's
+  first and refuses when it has changes the rev does not contain (merged
+  elsewhere since this machine last saw it). `newgit tracker pull <tracker>
+  --keep-mine` in the instance takes yours on top of theirs: it captures the
+  instance's files, pulls `main`, puts those files back over it, and
+  captures that, so the next `tracker merge` publishes it with theirs
+  underneath. There is no content merge: "yours" is your whole version of
+  the tracker's files. Every file you have REPLACES theirs, a file you
+  deleted since the rev you started from (the newest rev your capture and
+  theirs share) is deleted again even if they changed it, and files only
+  they added stay. When the two share no rev, newgit cannot tell a file you
+  deleted from one they added, so a file you deleted comes back from theirs;
+  the command says so. If a step fails after the pull, the error names the
+  rev that holds your version. A plain `newgit tracker pull
+  <tracker>` takes theirs instead, replacing the instance's files of the
+  tracker (yours stay at the rev the refusal names). `tracker pull`, and a
+  spawn in a fresh `newgit clone`, fetch the remote's `main` first. A `main` that
+  only re-encrypts the one this rev contains (what `members add` and `remove`
+  publish) counts as contained. The push is leased, so a merge landing in
+  between is not overwritten either.
+- **Decrypting** uses the keys in `$NEWGIT_IDENTITY` (`:`-separated paths of
+  SSH private keys or age identity files), then `~/.ssh/id_ed25519` and
+  `~/.ssh/id_rsa`. A passphrase is asked once, on a terminal; without one a
+  protected key is skipped. For agents, add a key without a passphrase to
+  your GitHub account and point `$NEWGIT_IDENTITY` at it, so no agent meets
+  a prompt. Instances on your machine decrypt with your key; identities for
+  sandboxes and cloud agents are
+  [#430](https://github.com/Spheroman/newgit/issues/430). This machine
+  keeps the plaintext of what it encrypted or decrypted under
+  `.newgit/local/tracker-plain/` (owner-only, never pushed), so it rarely
+  needs a key; `newgit remove` drops what only the removed instance held.
+- **Membership changes re-encrypt `main`:** `newgit members add` and
+  `members remove` fetch each shared encrypted tracker's `main`, encrypt it
+  to the members as they are now, and publish it. If any tracker could not
+  be, the command fails and names which were and were not re-encrypted;
+  `newgit members reencrypt` retries. Removing someone says loudly that they
+  can still read every rev they could read before: rotate those secrets.
+- **Keys come from GitHub**, or from `$NEWGIT_KEYS_URL` instead: an
+  `https://` base or a `file://` directory of `<login>.keys`, never
+  `http://`. A resource cannot export it, or any other `NEWGIT_` name.
+- **A tracker that was plaintext** is encrypted on its next capture, as a new
+  history with no parent, so pushing it carries none of the plaintext revs.
+  Its first commit names the plaintext rev it replaces, and merging it may
+  replace a plaintext `main` that rev contains: the one history replacement
+  there is. Every send (checkpoint sync, `tracker merge`, a per-user `main`)
+  checks every file the commits the remote does not have yet would carry
+  and refuses anything that is not age ciphertext.
+- **A definition that stops encrypting is not taken on its word, on a
+  machine that has held the content.** Definitions
+  (`.newgit/trackers/*.toml`) arrive through `access`, `newgit merge main`,
+  and `pull`. This machine remembers every workspace path at which it has
+  held encrypted content, captured encrypted here or decrypted into a
+  workspace here (`.newgit/local/sealed-paths.json`; a file there that does
+  not parse stops every capture and send that consults it, rather than
+  being read as empty). The guard is keyed by path, not by tracker:
+  whatever tracker claims such a path now, under
+  whatever name (a definition renamed, deleted and replaced, or a narrower
+  one claiming one of its files), a capture or send that would store its
+  content unencrypted is refused as an error. That is a `public` tracker
+  outside Git, or a commit pushed through Git (a definition turned `git =
+  true`; the path stays ignored in existing workspaces, but a commit with
+  it is refused at the push gate all the same). The refusal names the
+  paths and prints the command that releases them on this machine:
+  `newgit tracker allow-plaintext <path>...` (a directory releases every
+  held file under it, and the command lists what it released). A path
+  captured encrypted again is held back again. The guard knows paths, not
+  content: the same content copied or moved to another path is not held
+  back. Paths are compared ignoring case, so a
+  claim spelled differently on a case-insensitive filesystem (macOS) is
+  the same path. `newgit checkpoint` keeps the checkpoint on
+  this machine and exits non-zero when its sync is refused for this or any
+  other security reason (plaintext, a stale set of recipients, a merge
+  commit); a remote it cannot reach is a warning, as before.
+- **`user` is you:** a per-user tracker is encrypted to the login `newgit
+  login` saved, and a remote that answers with another login is refused.
+
+**What this guarantees, and what it does not:**
+
+- The remote, and anyone who controls its deployment (on newgit.dev:
+  Cloudflare, the account, its operators), cannot read what was encrypted
+  before it acts. This holds against a remote that only stores and serves.
+- A remote that acts can read what is captured afterwards. It decides
+  membership, so it can add a login, whose GitHub keys then become
+  recipients of the next capture or re-encryption; the only signal is the
+  fingerprints newgit prints (`CHANGED`, `+ <login>`), so read them. On a
+  machine encrypting a tracker for the first time there is no earlier set
+  to compare with, and the listing is all there is.
+- The remote also serves tracker definitions (through `access`), and a
+  definition decides whether a path is encrypted at all. The guard above
+  covers machines that have held the encrypted content, by path: a fresh
+  clone that spawns with the encrypted `main` has (its spawn decrypts it),
+  and is refused like any other. A machine that has never held the content
+  has nothing to compare against, and captures what it has as the
+  definition says. The guard is a confirmation step, not a boundary:
+  anything that can run commands in the workspace, an agent included, can
+  run `newgit tracker allow-plaintext` itself. A definition that names
+  another audience (`user:<login>`) is not held back: it is a change of
+  recipients, printed as one.
+- GitHub accounts are the key authority: whoever controls `<login>`'s GitHub
+  account decides which keys read that login's trackers.
+- There is no integrity. Recipients' keys are public, so the remote can
+  replace a file with content of its choosing that decrypts cleanly (a
+  `.env` pointing at its own server), or serve an old rev. Signed tracker
+  commits are [#431](https://github.com/Spheroman/newgit/issues/431).
+- File names, sizes (roughly), link targets, commit messages, authors, and
+  dates are visible to the remote. Only file contents are encrypted.
+- Revs pushed before a tracker was encrypted stay on the remote in plaintext
+  until its repo is deleted: rotate what they held.
+- A teammate on a newgit older than this release sees ciphertext in their
+  workspace, and a capture of theirs would push plaintext. Everyone sharing
+  an encrypted tracker has to upgrade.
+- Trackers in Git, `public` trackers, and trackers kept on this machine
+  (`storage = "local"`) are not encrypted.
+
 ---
 
 ## Resource — `.newgit/resources/<name>.toml`
@@ -1595,11 +1756,13 @@ one deliberate overlap is a `captures` entry naming its *own* resource's
 front, and the action overwrites it with the one that did not exist until it
 ran. The owner is the same resource either way.
 
-`NEWGIT_BRANCH`, `NEWGIT_WORKSPACE`, and `NEWGIT_LOCKED` are reserved, so
-a resource declaring one is reported too — a declaration that could never
-reach the process is a mistake worth naming, not a silent no-op. newgit sets
-the first two for every command it runs; `NEWGIT_LOCKED` it sets only for a
-hook run under an instance's lock.
+Every name starting with `NEWGIT_` is reserved, so a resource declaring one
+is reported too. newgit sets `NEWGIT_BRANCH` and `NEWGIT_WORKSPACE` for every
+command it runs, and `NEWGIT_LOCKED` for a hook run under an instance's lock:
+a declaration of one could never reach the process. Others it obeys, such as
+`NEWGIT_KEYS_URL` and `NEWGIT_IDENTITY` (see *Encrypted trackers*): an export
+of one would change whose keys a `newgit` run inside `newgit run` encrypts
+to.
 
 Every command that changes an instance (`spawn`, `action`, `stop`, `start`,
 `checkpoint`, `undo`, `merge`, every `tracker` command that changes an

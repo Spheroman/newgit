@@ -146,6 +146,10 @@ fn a_push_publishes_the_code_that_defines_a_new_tracker() {
     let output = Command::new("git")
         .args(["-C", workspace.as_str(), "push", "origin", "landing"])
         .env("HOME", fixture.temp.join("home").as_str())
+        .env(
+            "NEWGIT_KEYS_URL",
+            format!("file://{}", fixture.temp.join("published-keys")),
+        )
         .output()
         .expect("git runs");
     let stderr = String::from_utf8_lossy(&output.stderr);

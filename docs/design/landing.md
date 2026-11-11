@@ -127,9 +127,19 @@ Across servers there is no transaction: two landings, in order (rule 5).
 
 Unchanged in shape: their own history, never in the workspace's `.git`, never
 in a view, never exported. On `serve` they are **encrypted to their audience**
-(#338) with age and the members' GitHub SSH keys, so the server stores
-ciphertext and holds no key. They merge on the client, which can decrypt;
-the server still checks ancestry and moves refs in the same landing
+(#338) with age and the members' GitHub SSH keys, unless `public` (built: see
+the reference's *Encrypted trackers*). The server stores ciphertext and
+cannot read it, but it is still trusted for four things: it keeps the
+member list, so it could add a login whose keys then become recipients
+(every change to the set is printed by fingerprint); it serves the tracker
+definitions, which decide whether a path is encrypted at all (a machine that
+has held a path's encrypted content refuses to store it unencrypted until
+`newgit tracker allow-plaintext <path>` there, a confirmation rather than a
+boundary that knows paths, not content; a machine that never held it has
+nothing to compare against);
+nothing is signed, so it could substitute content that decrypts cleanly
+(#431); and names, sizes, and commit metadata stay readable to it. They merge on the client, which can
+decrypt; the server still checks ancestry and moves refs in the same landing
 transaction. A checkpoint records their revisions in the binding record, not
 as Git parents, so no shared store references a private commit.
 
@@ -184,7 +194,8 @@ Anchors as a concept, deferred roll-ups, inboxes and outboxes, reservations,
    again", with barriers, epochs, and fairness.
 4. Stored rooted histories, extended at landing.
 5. Dependencies across servers: ordered two-step landings, proposals, resume.
-6. Encryption of trackers outside Git (#338).
+6. ~~Encryption of trackers outside Git (#338).~~ Done on the client; the
+   Worker and `serve` move the ciphertext as opaque blobs.
 7. Move newgit.dev from the Worker to `serve`, and delete `anchoring.md`.
 
 ## Open

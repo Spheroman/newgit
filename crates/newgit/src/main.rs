@@ -486,6 +486,28 @@ enum TrackerCommand {
         tracker: String,
         /// Instance (inferred when run inside a workspace)
         instance: Option<String>,
+        /// Take mine, on top of theirs: capture this instance's files first,
+        /// pull `main`, then put your version back over it and capture that,
+        /// so `newgit tracker merge` publishes it. Every file this instance
+        /// has REPLACES `main`'s, and a file you deleted since the rev you
+        /// started from is deleted again; files only `main` added stay.
+        /// When your version and `main` share no rev, a file you deleted
+        /// comes back from `main` (the output says so). There is no content
+        /// merge
+        #[arg(long)]
+        keep_mine: bool,
+    },
+    /// Release workspace paths this machine has held encrypted content at,
+    /// so whatever tracker claims them now may store them unencrypted (a
+    /// `public` tracker, or a tracker in Git). Until then newgit refuses to
+    /// capture or send them unencrypted: definitions arrive from elsewhere
+    /// (`access`, `newgit merge main`, `pull`). A confirmation, not a
+    /// boundary: anything that can run commands here can run this
+    AllowPlaintext {
+        /// Workspace-relative paths, as the refusal names them. A directory
+        /// releases every held file under it; case does not matter
+        #[arg(required = true)]
+        paths: Vec<String>,
     },
     /// Bind a tracker in an instance again: its files come back (a tracker
     /// in Git's history never left), with any work a drop stashed
@@ -2288,6 +2310,13 @@ fn tracker(mut command: TrackerCommand) -> Result<()> {
                 "Created tracker `{name}` at {}",
                 display_path(&root, &outcome.path)
             );
+            if storage == Storage::Remote && audience != "public" {
+                println!(
+                    "  encrypted: its content is encrypted to its audience's SSH keys on GitHub \
+                     before it leaves this machine, so the remote stores ciphertext (file names, \
+                     sizes and commit metadata stay readable)"
+                );
+            }
             println!("  add paths with: newgit tracker track {name} <path>...");
             println!("  {REFERENCE_POINTER}");
             warn_graph(&manager_here()?);
@@ -2402,6 +2431,7 @@ fn tracker(mut command: TrackerCommand) -> Result<()> {
                             "parent": definition.parent.as_deref().map(path),
                             "paths": definition.paths,
                             "git": definition.git,
+                            "encrypted": definition.encrypted_to_audience(),
                             "role": definition.role,
                             "priority": definition.priority,
                             "requires": definition
@@ -2523,12 +2553,17 @@ fn tracker(mut command: TrackerCommand) -> Result<()> {
                     if definition.priority != 0 {
                         role.push_str(&format!(" ({})", definition.priority));
                     }
-                    let audience = match &definition.maintainers {
+                    let mut audience = match &definition.maintainers {
                         Some(maintainers) if maintainers != &definition.audience => {
                             format!("{} (maintained by {maintainers})", definition.audience)
                         }
                         _ => definition.audience.clone(),
                     };
+                    // Said for every tracker whose content is encrypted
+                    // before it leaves this machine (#338).
+                    if definition.encrypted_to_audience() {
+                        audience.push_str(", encrypted");
+                    }
                     let paths = if definition.owns_everything() {
                         "(everything no other tracker claims)".to_owned()
                     } else if definition.paths.is_empty() {
@@ -2729,14 +2764,90 @@ fn tracker(mut command: TrackerCommand) -> Result<()> {
             print_stale_render(&change.stale);
             Ok(())
         }
-        TrackerCommand::Pull { tracker, instance } => {
+        TrackerCommand::Pull {
+            tracker,
+            instance,
+            keep_mine,
+        } => {
             let (manager, instance) = manager_and_instance(instance)?;
+            if keep_mine {
+                let kept = manager.pull_tracker_keep_mine(&instance, &tracker)?;
+                match &kept.main {
+                    Some(main) => println!("Pulled `{tracker}`'s `main` ({main}) for `{instance}`"),
+                    None => println!("`{tracker}` has no `main` yet, so there was nothing to pull"),
+                }
+                if kept.rev == kept.main.clone().unwrap_or_default() {
+                    println!(
+                        "  your files ({}) were already what `main` has; nothing to put back",
+                        kept.mine
+                    );
+                } else {
+                    println!(
+                        "  put your version ({}) back on top as {}: {} REPLACED `main`'s, and \
+                         files only `main` added stay",
+                        kept.mine,
+                        kept.rev,
+                        plural(kept.files, "file")
+                    );
+                    for path in &kept.deleted {
+                        println!(
+                            "  deleted `{path}` again: you deleted it since {}",
+                            kept.mine
+                        );
+                    }
+                    if kept.base.is_none() && kept.main.is_some() {
+                        println!(
+                            "  your version and `main` share no rev, so newgit cannot tell a \
+                             file you deleted from one `main` added: any file you deleted is \
+                             BACK from `main`. Delete it again and capture before merging"
+                        );
+                    }
+                    println!("  `newgit tracker merge {tracker}` publishes it");
+                }
+                return Ok(());
+            }
             let outcome = manager.pull_tracker(&instance, &tracker)?;
             let deposit_only = tracker_is_deposit_only(&manager, &outcome.name);
             println!(
                 "Pulled {} for `{instance}`",
                 bind_line(&outcome, deposit_only)
             );
+            Ok(())
+        }
+        TrackerCommand::AllowPlaintext { paths } => {
+            let manager = manager_here()?;
+            let released = manager.allow_plaintext(&paths)?;
+            for path in &released {
+                println!("Released `{path}` on this machine");
+            }
+            for path in &paths {
+                let folded = newgit_core::tracker_repo::fold_path(
+                    path.trim_start_matches("./").trim_end_matches('/'),
+                );
+                let matched = released.iter().any(|held| {
+                    let held = newgit_core::tracker_repo::fold_path(held);
+                    folded.is_empty()
+                        || folded == "."
+                        || held == folded
+                        || held
+                            .strip_prefix(folded.as_str())
+                            .is_some_and(|rest| rest.starts_with('/'))
+                });
+                if !matched {
+                    println!(
+                        "`{path}` was not held back on this machine, nor any file under it (it \
+                         never held encrypted content here, or was released already)"
+                    );
+                }
+            }
+            if !released.is_empty() {
+                println!(
+                    "  Whatever tracker claims it now may capture, commit, and send it \
+                     unencrypted. What was encrypted before stays encrypted on the remote; what \
+                     goes there from now on, anyone who can read where it goes reads, and so does \
+                     whoever runs the remote. Capturing it encrypted again holds it back again"
+                );
+            }
             Ok(())
         }
     }
@@ -2983,10 +3094,23 @@ fn checkpoint(instance: Option<String>, message: Option<&str>) -> Result<()> {
                     .collect::<Vec<_>>()
                     .join(", ")
             ),
+            Some(_) if outcome.sync_refused => {
+                println!("  remote:   not synced: refused (the warning above says why)")
+            }
             Some(_) => println!("  remote:   not synced (the warning above says why)"),
         }
     }
     println!("  undo with: newgit undo {instance}");
+    // Saved here, and kept; but what was asked (a checkpoint the remote
+    // has) was refused for a reason only the developer can settle, and an
+    // agent reads the exit code, not the warning.
+    if outcome.sync_refused {
+        bail!(
+            "checkpoint {} is saved on this machine, but newgit refused to send it to the \
+             remote (the warning above says why)",
+            record.id
+        );
+    }
     Ok(())
 }
 

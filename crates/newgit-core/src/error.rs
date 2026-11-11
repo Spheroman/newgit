@@ -116,6 +116,17 @@ pub enum NewgitError {
     #[error("tracker `{tracker}` has no captured content at rev `{rev}`")]
     NoSnapshot { tracker: String, rev: String },
 
+    /// Encrypting a tracker outside Git to its audience, or reading one
+    /// back, could not be done (#338). Never answered with plaintext.
+    #[error("tracker `{tracker}` is encrypted to its audience: {message}")]
+    Encryption { tracker: String, message: String },
+
+    /// Content this machine has held encrypted would be stored or sent
+    /// unencrypted, and nobody released it here with `newgit tracker
+    /// allow-plaintext` (#338).
+    #[error("{0}")]
+    PlaintextRefused(String),
+
     #[error("tracker `{0}` owns no paths; there is nothing to capture from a workspace")]
     TrackerHasNoPaths(String),
 
@@ -206,8 +217,9 @@ pub enum NewgitError {
     },
 
     #[error(
-        "environment variable `{name}` is declared by {claimant}, but newgit sets `{name}` for \
-         every command it runs and would shadow it; rename it"
+        "environment variable `{name}` is declared by {claimant}, but names starting with \
+         `NEWGIT_` are newgit's own (it sets some for every command it runs, and obeys others, \
+         such as where members' keys come from); rename it"
     )]
     ReservedEnvName { name: String, claimant: String },
 
