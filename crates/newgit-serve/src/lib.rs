@@ -275,11 +275,20 @@ pub fn void_landing(config: Config, stamp: landing::Stamp) -> anyhow::Result<Str
 /// Run the remote until interrupted. Says where it listens on stdout, once
 /// it does.
 pub fn serve(config: Config) -> anyhow::Result<()> {
+    let listener = std::net::TcpListener::bind(config.listen)?;
+    serve_on(listener, config)
+}
+
+/// [`serve`], on a listener already bound, in place of `config.listen`. A
+/// caller in the same process binds port 0 and knows the port before it
+/// serves; one that picked a port and let go of it could find it taken.
+pub fn serve_on(listener: std::net::TcpListener, config: Config) -> anyhow::Result<()> {
+    listener.set_nonblocking(true)?;
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
     runtime.block_on(async move {
-        let listener = tokio::net::TcpListener::bind(config.listen).await?;
+        let listener = tokio::net::TcpListener::from_std(listener)?;
         let address = listener.local_addr()?;
         let app = Arc::new(App::open(Config {
             listen: address,

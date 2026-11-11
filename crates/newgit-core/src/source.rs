@@ -1762,34 +1762,14 @@ impl GitSource {
         auth: Option<&str>,
         flags: &[&str],
     ) -> Result<()> {
-        let fetch = |extra: Option<&str>| {
+        let fetch = |extra: &[&str]| {
             let mut args: Vec<&str> = location.to_vec();
             args.extend(["fetch", "--quiet", "--no-write-fetch-head"]);
             args.extend(flags);
             args.extend(extra);
             args.extend(["--", url]);
             args.extend(refspecs.iter().map(String::as_str));
-            // Another newgit in the same store (two merges at once, from one
-            // project root) may be moving the same tracking ref: fetching is
-            // idempotent, so wait a moment and fetch again.
-            let mut attempt = 0;
-            loop {
-                match run_git_env(&args, &auth_env(auth)) {
-                    Err(NewgitError::SourceCommand { stderr, .. })
-                        if attempt < 10 && stderr.contains("cannot lock ref") =>
-                    {
-                        attempt += 1;
-                        let nanos = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .map(|elapsed| elapsed.subsec_nanos())
-                            .unwrap_or_default();
-                        std::thread::sleep(std::time::Duration::from_millis(
-                            20 + u64::from(nanos % 80),
-                        ));
-                    }
-                    other => return other.map(|_| ()),
-                }
-            }
+            run_fetch(&args, &auth_env(auth))
         };
         // Snapshots are shallow on purpose (`crate::snapshots`): deepening
         // them here is how a snapshot clone would end up fetching every
@@ -1804,7 +1784,7 @@ impl GitSource {
         // carries on deepening, even when this fetch went through whole.
         let mut tries = WHOLE_FETCH_BACKOFF.iter();
         let mut started = loop {
-            match fetch(None) {
+            match fetch(&[]) {
                 Ok(()) if !left_shallow(location)? => return Ok(()),
                 Ok(()) => break true,
                 Err(error) if dropped(&error) => match tries.next() {
@@ -1825,7 +1805,12 @@ impl GitSource {
         // One stepped fetch in a store at a time: two deepening at once fail
         // with `shallow file has changed since we read it`. Released when
         // dropped, or when the process dies. Whoever held it may have
-        // finished the job.
+        // finished the job. A whole fetch above needs no lock: Git reads and
+        // rewrites `shallow` only for a fetch that deepens.
+        //
+        // Each band skips Git's auto-maintenance: its repack rewrites
+        // `shallow` in the background, under the next band. The next
+        // ordinary fetch into the store runs it.
         let _lock = steps_lock(location)?;
         if started && !left_shallow(location)? {
             return Ok(());
@@ -1837,7 +1822,7 @@ impl GitSource {
             } else {
                 format!("--depth={depth}")
             };
-            match fetch(Some(&flag)) {
+            match fetch(&[&flag, "--no-auto-maintenance"]) {
                 Ok(()) => {
                     started = true;
                     if !left_shallow(location)? {
@@ -1909,7 +1894,7 @@ impl GitSource {
                 url,
             ]);
             args.extend(refspecs.iter().map(String::as_str));
-            run_git_env(&args, &auth_env(auth)).map(|_| ())
+            run_fetch(&args, &auth_env(auth))
         };
         if let [commit] = commits {
             let mut tries = WHOLE_FETCH_BACKOFF.iter();
@@ -2054,6 +2039,53 @@ fn dropped(error: &NewgitError) -> bool {
     ]
     .iter()
     .any(|sign| stderr.contains(sign))
+}
+
+/// `git <args>`, a fetch, run again when it collided with another Git in
+/// the same repository, which is only ever a moment's work: fetching is
+/// idempotent.
+///
+/// - `cannot lock ref`: another newgit in the same store (two merges at
+///   once, from one project root) moving the same tracking ref.
+/// - `shallow file has changed since we read it`, or `shallow.lock` taken:
+///   another Git rewriting the store's `shallow` file while this fetch
+///   deepens it. Another stepped fetch waits on [`steps_lock`], but Git's
+///   own auto-maintenance does not: the `git repack` it detaches after
+///   every fetch rewrites `shallow` in a shallow repository. That can take a
+///   while in a large store, so these wait longer, up to about ten seconds.
+pub(crate) fn run_fetch(args: &[&str], env: &[(String, String)]) -> Result<()> {
+    let mut attempt: u32 = 0;
+    loop {
+        match run_git_env(args, env) {
+            Err(NewgitError::SourceCommand { ref stderr, .. })
+                if attempt < 10
+                    && (stderr.contains("cannot lock ref") || shallow_moved(stderr)) =>
+            {
+                let base = if shallow_moved(stderr) {
+                    50u64 << attempt.min(5)
+                } else {
+                    20
+                };
+                attempt += 1;
+                let nanos = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|elapsed| elapsed.subsec_nanos())
+                    .unwrap_or_default();
+                std::thread::sleep(std::time::Duration::from_millis(
+                    base + u64::from(nanos % 80),
+                ));
+            }
+            other => return other.map(|_| ()),
+        }
+    }
+}
+
+/// Whether Git failed because another Git was rewriting the repository's
+/// `shallow` file: in Git's words when it finds the file changed under it,
+/// or when it finds the file's lock taken.
+fn shallow_moved(stderr: &str) -> bool {
+    stderr.contains("shallow file has changed since we read it")
+        || stderr.contains("shallow.lock': File exists")
 }
 
 /// The lock on stepped fetches into the repository at `location`.

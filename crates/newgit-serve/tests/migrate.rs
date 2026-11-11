@@ -227,12 +227,13 @@ fn a_data_directory_of_per_tracker_repos_moves_to_stores_per_audience() {
     );
 
     // Served from the stores, as each tracker's own repo.
-    let port = std::net::TcpListener::bind("127.0.0.1:0")
-        .and_then(|listener| listener.local_addr())
-        .expect("a free port");
+    // Held from the moment the OS picks it: a port picked and let go of
+    // could be taken before serve binds it.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a free port");
+    let port = listener.local_addr().expect("its address");
     std::thread::spawn({
         let data = data.clone();
-        move || newgit_serve::serve(config(&data, port))
+        move || newgit_serve::serve_on(listener, config(&data, port))
     });
     let url = format!("http://{port}");
     let started = std::time::Instant::now();
