@@ -277,38 +277,45 @@ enum Command {
         #[arg(long, default_value = "main")]
         into: String,
     },
-    /// Move a mounted tracker's pin to its `follow` ref, or bring back what was
-    /// merged on an export target (--remote)
+    /// Bring mounted trackers up to date: move each pin to its `follow` ref,
+    /// after taking what is new on its rooted export target; or bring back
+    /// what was merged on an export target (--remote)
     ///
-    /// `newgit pull <tracker>` moves the pin to its `follow` ref (default
-    /// `main`): one commit, `Pull <tracker>: N commits from <ref>`, holding its
-    /// files at the new pin; its history stays in its own repo. Nothing else
-    /// moves a pin on anyone's behalf.
+    /// `newgit pull` updates every tracker in Git mounted here, at any depth;
+    /// `newgit pull t3code ui-kit` only those. A tracker exported to a
+    /// target rooted at it (`export = "github.com/acme/t3code"`) first takes
+    /// the commits that are new there, as `--remote` would: one more fetch
+    /// per such tracker. Then each pin moves to that, or to its `follow` ref
+    /// (default `main`), in one commit: `Update trackers: t3code (14
+    /// commits), ui-kit (2 commits)`. A tracker mounted inside another is pinned in that tracker's
+    /// commits, so its pull is a commit there too, whose pin moves in turn,
+    /// up to root.
     ///
-    /// With no tracker, every tracker in Git root mounts moves to its
-    /// `follow` ref, in one commit: `Update trackers: t3code (14 commits),
-    /// ui-kit (2 commits)`, on this instance's branch (the project root's
-    /// own instance branch outside one, which `newgit merge main`
-    /// publishes). A pin holding commits its ref does not stays where it
-    /// is, and a tracker the remote won't let you read is skipped (it fails
-    /// when it can read none of them). Trackers outside Git have no pins and
-    /// are left alone
-    /// (`newgit tracker pull`)
+    /// It lands on this instance's branch (the project root's own instance
+    /// branch outside one); no tracker's `main` moves until `newgit merge`.
+    /// Each of these is skipped and named, and the rest still move: a pin
+    /// holding commits its ref does not, a tracker the remote won't let you
+    /// read (it fails when it can read none), an export target that can't
+    /// be reached or conflicts, and a tracker mounted in one this instance
+    /// doesn't bind. Naming a tracker that is skipped exits non-zero.
+    /// Trackers outside Git have no pins and are left alone (`newgit
+    /// tracker pull`)
     ///
     /// With --remote <target>, bring the commits on an export target's branch
     /// (a pull request merged there) back instead: into the tracker a rooted
-    /// target is rooted at, then its pin in the project root; otherwise into
-    /// the project root as work. `newgit merge main` publishes either
+    /// target is rooted at, and its `main`, then its pin in the project root;
+    /// otherwise into the project root as work. `newgit merge main` publishes
+    /// either
     Pull {
-        /// The mounted tracker in Git to bring up to date (every one when
+        /// The mounted trackers in Git to bring up to date (every one when
         /// left out)
-        tracker: Option<String>,
-        /// Instance (inferred when run inside a workspace; the project root
-        /// otherwise)
-        #[arg(conflicts_with = "remote")]
+        trackers: Vec<String>,
+        /// The instance to pull in (default: the one whose workspace this
+        /// runs in; the project root otherwise)
+        #[arg(long, conflicts_with = "remote")]
         instance: Option<String>,
         /// The export target to pull from (declared by a tracker's `export`)
-        #[arg(long, value_name = "TARGET", conflicts_with = "tracker")]
+        #[arg(long, value_name = "TARGET", conflicts_with = "trackers")]
         remote: Option<String>,
     },
     /// Clone a project from a newgit remote: its default branch composed from
@@ -801,11 +808,8 @@ fn main() -> Result<()> {
             ..
         } => pull_remote(&target),
         Command::Pull {
-            tracker: Some(tracker),
-            instance,
-            ..
-        } => pull(instance, &tracker_id(&tracker)?),
-        Command::Pull { .. } => pull_all(),
+            trackers, instance, ..
+        } => pull(instance, &trackers),
         Command::EndpointCompose => {
             let plan: newgit_core::endpoint::Plan = serde_json::from_reader(std::io::stdin())
                 .context("the plan on stdin is not JSON newgit can read")?;
@@ -2708,6 +2712,12 @@ fn tracker(mut command: TrackerCommand) -> Result<()> {
                     *depth -= top;
                 }
             }
+            // Whom each claim of a tracker in Git inside a deeper mount
+            // loses to: it owns nothing there, and the list says so.
+            let every: Vec<TrackerDefinition> = definitions
+                .iter()
+                .map(|definition| (*definition).clone())
+                .collect();
             let rows: Vec<_> = ordered
                 .iter()
                 .map(|(depth, definition)| {
@@ -2739,10 +2749,19 @@ fn tracker(mut command: TrackerCommand) -> Result<()> {
                     } else if definition.paths.is_empty() {
                         pathless_summary(&manager, definition)
                     } else {
+                        let unreached = newgit_core::tracker::unreached_claims(&every, definition);
                         definition
                             .paths
                             .iter()
-                            .map(|path| path.as_str())
+                            .map(
+                                |path| match unreached.iter().find(|(claim, _)| *claim == path) {
+                                    Some((_, mount)) => format!(
+                                        "{path} (inside `{}`'s mount: not this tracker's)",
+                                        newgit_core::tracker::tracker_path(&mount.name)
+                                    ),
+                                    None => path.to_string(),
+                                },
+                            )
                             .collect::<Vec<_>>()
                             .join(", ")
                     };
@@ -4866,42 +4885,48 @@ fn tracker_log(tracker: &str, instance: Option<String>, git_args: &[String]) -> 
     Ok(())
 }
 
-fn pull(instance: Option<String>, tracker: &str) -> Result<()> {
+/// `newgit pull [<tracker>...]` (#345, #426): mounted trackers' pins to
+/// their `follow` refs, after their rooted export targets, in one commit on
+/// the branch this runs on.
+fn pull(instance: Option<String>, named: &[String]) -> Result<()> {
     let context = context_here()?;
     let instance = instance.or_else(|| context.current_branch.clone());
     let manager = BranchManager::open(context.store)?;
-    let outcome = manager.pull(instance.as_deref(), tracker)?;
-    match &outcome.view {
-        None => println!(
-            "`{}` is up to date with its `{}`",
-            outcome.tracker, outcome.follow
-        ),
-        Some(view) => println!(
-            "Pulled `{}`: {} commit{} from {} ({})",
-            outcome.tracker,
-            outcome.commits,
-            if outcome.commits == 1 { "" } else { "s" },
-            outcome.follow,
-            &view[..view.len().min(12)]
-        ),
-    }
-    Ok(())
-}
-
-/// `newgit pull` with no tracker (#345): every mounted tracker's pin to its
-/// `follow` ref, in one commit on the branch this runs on.
-fn pull_all() -> Result<()> {
-    let context = context_here()?;
-    let instance = context.current_branch.clone();
-    let manager = BranchManager::open(context.store)?;
-    let outcome = manager.pull_all(instance.as_deref())?;
+    // An instance named where a tracker goes passes through as it is, for
+    // the pull to say it is one and give the `--instance` form.
+    let trackers = named
+        .iter()
+        .map(|tracker| {
+            tracker_id(tracker).or_else(|error| {
+                if manager.store().find_branch(tracker).is_ok() {
+                    Ok(tracker.clone())
+                } else {
+                    Err(error)
+                }
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let outcome = manager.pull(instance.as_deref(), &trackers)?;
     let place = match instance.as_deref() {
         Some(instance) => format!("`{instance}`"),
         None => "the project root".to_owned(),
     };
     match &outcome.view {
-        None if outcome.unreadable.is_empty() => {
+        None if outcome.unreadable.is_empty() && trackers.is_empty() => {
             println!("Nothing to pull: no mounted tracker is behind its `follow` ref in {place}")
+        }
+        None if outcome.unreadable.is_empty() => {
+            if !outcome.up_to_date.is_empty() {
+                let names: Vec<String> = outcome
+                    .up_to_date
+                    .iter()
+                    .map(|tracker| format!("`{}`", tracker_path(tracker)))
+                    .collect();
+                println!(
+                    "Nothing to pull in {place}: {} up to date",
+                    names.join(", ")
+                );
+            }
         }
         None => println!(
             "The trackers you can read are up to date in {place}; {} could not be read on the \
@@ -4919,33 +4944,95 @@ fn pull_all() -> Result<()> {
                     "  {:<12} {} from {}",
                     tracker_path(&pulled.tracker),
                     plural(pulled.commits, "commit"),
-                    pulled.follow
+                    pulled.from
+                );
+            }
+            for (tracker, commit) in &outcome.mounting {
+                println!(
+                    "  `{}` mounts {}: its pins moved in commit {} of its own",
+                    tracker_path(tracker),
+                    if outcome
+                        .pulled
+                        .iter()
+                        .filter(|pulled| pulled.tracker.starts_with(&format!("{tracker}__")))
+                        .count()
+                        == 1
+                    {
+                        "one of them"
+                    } else {
+                        "some of them"
+                    },
+                    short_rev(commit)
                 );
             }
         }
     }
+    let mut skipped: Vec<String> = Vec::new();
+    let mut skip = |tracker: &str, line: String| {
+        println!("{line}");
+        if trackers.iter().any(|named| named == tracker) {
+            skipped.push(format!("`{}`", tracker_path(tracker)));
+        }
+    };
     for (tracker, follow) in &outcome.diverged {
-        println!(
-            "  `{}` stays: its pin has commits its `{follow}` does not (`newgit merge` them first)",
-            tracker_path(tracker)
+        skip(
+            tracker,
+            format!(
+                "  `{}` stays: its pin has commits its `{follow}` does not (`newgit merge` them \
+                 first)",
+                tracker_path(tracker)
+            ),
         );
     }
     for (tracker, follow) in &outcome.no_follow {
-        println!(
-            "  `{}` stays: it has no `{follow}` to pull here",
-            tracker_path(tracker)
+        skip(
+            tracker,
+            format!(
+                "  `{}` stays: it has no `{follow}` to pull here",
+                tracker_path(tracker)
+            ),
         );
     }
     for (tracker, reason) in &outcome.unreadable {
-        println!(
-            "  `{}` skipped: you can't read it on the remote ({reason})",
-            tracker_path(tracker)
+        skip(
+            tracker,
+            format!(
+                "  `{}` skipped: you can't read it on the remote ({reason})",
+                tracker_path(tracker)
+            ),
         );
     }
-    for tracker in &outcome.deeper {
-        println!(
-            "  `{}` stays: it is mounted deeper; pull it in the tracker that mounts it",
-            tracker_path(tracker)
+    for (tracker, target, reason) in &outcome.target_failed {
+        skip(
+            tracker,
+            format!(
+                "  `{}` skipped: its export target `{target}` could not be pulled from, so its \
+                 pin stays ({reason})",
+                tracker_path(tracker)
+            ),
+        );
+    }
+    for (tracker, parent) in &outcome.with_parent {
+        skip(
+            tracker,
+            format!(
+                "  `{}` skipped: `{}`, which mounts it, was skipped, and its export target \
+                 ships it too, so it stays with it",
+                tracker_path(tracker),
+                tracker_path(parent)
+            ),
+        );
+    }
+    for (tracker, parent) in &outcome.unbound {
+        skip(
+            tracker,
+            format!(
+                "  `{}` stays: `{}`, which mounts it, is not bound in {place} (`newgit tracker \
+                 use {}` binds it)",
+                tracker_path(tracker),
+                tracker_path(parent),
+                tracker_path(parent)
+            ),
         );
     }
     if !outcome.outside_git.is_empty() {
@@ -4959,6 +5046,9 @@ fn pull_all() -> Result<()> {
              <tracker>` updates one",
             names.join(", ")
         );
+    }
+    if !skipped.is_empty() {
+        bail!("not pulled: {}", skipped.join(", "));
     }
     Ok(())
 }

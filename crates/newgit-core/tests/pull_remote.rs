@@ -79,9 +79,9 @@ fn a_pr_merged_upstream_comes_back_with_pull_remote_and_newgit_pull() {
     // next export is a no-op.
     manager(&store).merge("main", "main").expect("merge");
     let caught = manager(&store)
-        .pull(Some("feature"), "t3code")
+        .pull(Some("feature"), &["t3code".to_owned()])
         .expect("pull t3code");
-    assert_eq!(caught.commits, 2);
+    assert_eq!(caught.pulled[0].commits, 2);
     assert!(feature.join("apps/t3code/src/pr.ts").is_file());
     manager(&store)
         .export_to_remote("t3code", RemoteExportOptions::default())

@@ -143,22 +143,59 @@ is one commit; see *Carving is a commit*.
 
 Every path in a view has at most one owner. Ownership comes from claims,
 never from which tracker currently has the file, and it is the same whichever
-tracker you root at. Split assigns paths by this rule **(decided)**:
+tracker you root at. **(decided; rule 1 as of the #426 review, 2026-11-11)**
 
-1. **The deepest mount wins.** A path under `apps/electron/` is decided among
-   the trackers mounted at `apps/electron` or deeper. A parent's claim of `.`
-   does not reach into a mount.
-2. **Among trackers mounted at the same path, the longest claim wins.**
-   `local-db` mounted at `.` claiming `.env.db` beats root's `.`. Trackers
-   sharing a mount split by their claims: a tracker mounted beside `access`
-   at `.newgit/trackers` and claiming `web.toml` owns that file; `access`
-   keeps the rest.
-3. **Identical claims at the same mount are an error, except within a role.**
-4. **Claims can exclude**, `.gitignore`-style: `paths = [".", "!.env",
-   "!node_modules/"]`. An excluded path is owned only by a tracker that
-   explicitly claims it at that mount, or filled by a resource. Otherwise it
-   is unowned, which is all "ignored" ever meant, and split refuses a commit
-   that changes it.
+1. **The longest claim that reaches a path owns it.** A claim reaches a path
+   under it unless a tracker mounted deeper holds the path and the claim is
+   `.`, or a directory around that mount, or the claiming tracker is in Git.
+   So only a tracker outside Git reaches into another's mount, with a claim
+   inside it: `paths = ["apps/t3code/.env"]` owns that file just as `mount =
+   "apps/t3code"`, `paths = [".env"]` would.
+2. **A tracker's own `!` exclusions take it out of the running** for what
+   they exclude: `paths = [".", "!.env", "!node_modules/"]`. A path no
+   reaching claim takes is owned by nothing, which is all "ignored" ever
+   meant, and a commit changing it is refused; a resource may fill it.
+3. **Identical claims are an error, except between role alternatives**, of
+   which a workspace binds one.
+
+What follows from rule 1: a path under `apps/electron/` is decided among
+the trackers mounted at `apps/electron` or deeper, and trackers outside Git
+with a claim inside it. Trackers sharing a mount split by their claims:
+`local-db` mounted at `.` claiming `.env.db` beats root's `.`, and a tracker
+mounted beside `access` at `.newgit/trackers` claiming `web.toml` owns that
+file while `access` keeps the rest. A claim of a tracker in Git inside a
+deeper mount owns nothing (`newgit tracker list` says so): `pub`, in Git,
+claiming `apps/t3code/secrets/pub.txt` while `t3code` is mounted at
+`apps/t3code` does not take that file from `t3code`, nor from `sec`, outside
+Git with audience `user`, mounted there claiming `secrets`. A tracker in Git
+that should own something inside another's mount is carved there, as a
+child.
+
+Why trackers in Git and outside it differ. Split puts a tracker in Git's
+files in its own commits by mount: a deeper mount is cut out of the trees of
+the trackers around it. A claim of a tracker in Git reaching into one would
+be a promise split cannot keep: the file would land in the tracker mounted
+there, or in its parent. A tracker outside Git's files are never split: a
+commit adding one is refused, and claiming inside a mount is exactly how
+`newgit tracker track` writes a `.env` (`paths = ["apps/electron/.env"]`).
+Judging that claim by mount (before the #426 review) let a target's commit
+adding the file through the check; letting a claim of a tracker in Git
+reach in too (the first #426 review fix) let a commit move a file of `sec`
+into root's `main`.
+
+**One function decides.** `owners_of` (`crates/newgit-core/src/tracker.rs`)
+is this rule. The commit and push gate, split's check, export, import,
+pull, and the workspace (capture, checkout, clear: what
+`resolve_ownership` settles for each tracker) all ask it. Split assigns a
+path a commit adds to the tracker in Git it names, or refuses the commit
+when it names a tracker outside Git, or nothing; a generated test
+(`tests/ownership_agrees.rs`) holds all three to agreeing. Of role
+alternatives tied on one claim, the gate names one outside Git first, so
+the file is refused whichever one a workspace binds. The server's
+copies (`newgit-serve`'s `policy.rs`, the Worker's `ownerOf`) decide among
+trackers in Git only, for definition files under `.newgit/trackers/`, where
+no tracker outside Git may be mounted: there the deepest mount holding the
+path decides, then the longest claim, which is this rule.
 
 A tracker carved inside another tracker's mount (`apps/electron/native`
 while `electron` is mounted at `apps/electron`) is a child of `electron`
@@ -500,7 +537,7 @@ split, checkpoint, push, and an ordinary merge fetch no history.
 |---|---|
 | A child's `main` moved past the pin, and the merge has to join them | Asks both ways round; neither → `need_history`, then `git merge-tree` |
 | A split where a view merge joins two lines of a child, with a tree equal to one of them | Asks whether that one descends from the other; "no" → `need_history` |
-| `newgit pull <tracker>`, `newgit pull` | Fast-forward: no history, `follow` lands on the pin and is counted. Otherwise `need_history`, so a pin is never moved backwards |
+| `newgit pull <tracker>`, `newgit pull` | Fast-forward: no history, `follow` lands on the pin and is counted. Otherwise `need_history`, so a pin is never moved backwards. A rooted target's tip the pin or `follow` already has needs none either; anything else is `need_history` first, as `--remote` is |
 | `newgit pull --remote` from a rooted target, a rooted export, `newgit log <tracker>`, `tracker migrate` | `need_history` first: each walks the history itself |
 | `spawn --from-checkpoint` | A plain fetch from the author's fork stops at the pin, so the checkpoint's commits are whole enough to push on; other pins come from the tracker's repo; no history unless root's walk reaches a snapshot |
 | A tracker's commits judged before a push | Stops at the pin, which is what the remote already holds |
@@ -880,7 +917,7 @@ sees it when someone runs:
 newgit pull electron
 ```
 
-That makes one view commit, `Pull electron: 14 commits from main`, which
+That makes one view commit, `Update trackers: electron (14 commits)`, which
 moves the pin and holds the child's files there, on one parent. It is authored
 by whoever ran it, needs the root's maintainers like any change, and merges
 into `main` like any instance commit; the workspace fast-forwards to it.
@@ -888,26 +925,83 @@ into `main` like any instance commit; the workspace fast-forwards to it.
 when a mounted tracker is behind its `follow` ref.
 
 `newgit pull` with no tracker (#345) is the same for every tracker in Git
-root mounts, in one commit: `Update trackers: t3code (14 commits), ui-kit
-(2 commits)`. A pin is part of a commit, so it lands on the branch it ran
-on, as `flake.lock` does: an instance's branch in an instance, and in the
-project root the project root's own instance branch, which `newgit merge
-main` publishes; `main` takes it only when that merges. It writes nothing
-when no pin is behind. Four kinds of tracker stay put, and it says which: a
-pin holding commits its `follow` ref lacks (the instance's own work on it;
-moving the pin would drop them, so merge first), a tracker mounted deeper
-than root (pulled in the tracker that mounts it), a tracker the remote will
-not let the caller read (a 403 on its repo; `newgit pull <tracker>` on it
-fails instead, and so does plain `newgit pull` when it can read none of
-them, since then nothing is known to be up to date), and a tracker outside
-Git, which has no pin (`newgit tracker pull` updates its files, and can
-overwrite an instance's). With a remote, it resolves each `follow` ref
-there, one fetch per tracker. It moves pins to
-the tracker's `follow` ref, not to what is newest on an export target:
-`newgit pull --remote <target>` stays a separate step. Updating from rooted
-export targets as part of it, pulling child trackers mounted deeper, and
-selecting several trackers (`newgit pull t3code ui-kit`) are tracked in
-[#426](https://github.com/Spheroman/newgit/issues/426).
+mounted here, at any depth, in one commit: `Update trackers: t3code (14
+commits), ui-kit (2 commits)`. `newgit pull t3code ui-kit` does it for
+those two only (#426): every argument is a tracker, and `--instance <name>`
+names an instance other than the one it runs in. A pin is part of a
+commit, so it lands on the branch it ran on, as `flake.lock` does: an
+instance's branch in an instance, and in the project root the project
+root's own instance branch, which `newgit merge main` publishes; `main`
+takes it only when that merges. It writes nothing when no pin is behind.
+
+**Update means upstream too (decided, #426).** For a tracker with an export
+target rooted at it (t3code → Spheroman/t3code), "update" means what is new
+*there*, as `nix flake update` would have it. So before moving pins, `newgit
+pull` does for each such tracker what `newgit pull --remote <target>` does
+to its `main`: fetches the target's branch, then fast-forwards the
+tracker's `follow` ref to it, or really merges the two (one merge commit,
+`Merge github.com/Spheroman/t3code newgit`, on that ref and the target's
+tip), and the pin moves to that. That is one more fetch per such tracker,
+on top of the one per tracker that resolves its `follow` ref with a remote.
+What it does *not* do is move the tracker's `main`, anywhere: `main` is
+shared, and landing commits there would change what every other instance
+pulls next. The target's commits ride on the tracker's branch for this
+instance (`instances/<slug>`) like any instance commit, the pin moves on
+this branch only, and `newgit merge` lands them on the tracker's `main`
+when the instance merges. That holds in the project root too: there, `newgit
+merge main` lands them. `newgit pull --remote` is unchanged, and still the
+one command that moves a tracker's `main` straight from a target.
+
+**A child moves in the tracker that mounts it (decided, #426).** A child's
+pin is part of its parent's commits, so moving it is a commit in the
+parent, whose own pin then moves in *its* parent, up to root: one commit per
+tracker whose pins moved, made bottom-up, each naming what moved below it
+from where it stands. Pulling `t3code/repos` makes `Update trackers: repos
+(1 commit)` in `t3code`, on t3code's pin, and root's view commit `Update
+trackers: t3code/repos (1 commit)` pins that. `newgit pull t3code/repos`
+does the same for that child alone; naming `t3code` moves only t3code's own
+pin. A child whose parent this instance does not bind stays: an instance
+commits only to trackers it binds (`newgit tracker use <parent>` binds it).
+It is named when it was asked for, or when its `follow` ref is ahead of its
+pin, so an instance that dropped the parent is not told about it on every
+pull. A child named beside a parent whose target fails is listed as
+skipped with it.
+
+**The merge with a target is the same commit everywhere (decided, #426
+review).** It is newgit's, made on nobody's behalf: author and committer
+`newgit <newgit@localhost>` (the identity of an endpoint's `Merge main from
+github`), not whoever merged the pull request on GitHub, dated as the parent
+committed last (the target's tip on a tie), with the same message, and never
+signed. Two instances pulling the same two diverged tips make one commit,
+so merging both lands one merge on the tracker's `main`, not three.
+Unsigned, it is rejected by an export target that requires signed commits:
+an export carrying it fails there
+([#443](https://github.com/Spheroman/newgit/issues/443)).
+
+A force-pushed target is merged with the line the tracker already has, as
+`git pull` would: the commits the force-push removed stay in the tracker's
+history, and the next export pushes them to the target again. Reverting the
+change in an instance and merging it keeps it out of the tip only: the
+removed commits are still in the history, and the next export still
+publishes them. When the force-push was to purge a secret, that publishes
+it again, and nothing in newgit can purge it yet
+([#442](https://github.com/Spheroman/newgit/issues/442): a way to reset a
+tracker's line to its target). Until then, do not export that tracker.
+
+Five kinds of tracker stay put, and it says which: a pin holding commits
+its `follow` ref lacks (the instance's own work on it; moving the pin would
+drop them, so merge first; such a tracker is listed as diverged and does
+not take its target either, until `newgit merge`), a tracker the remote will not let the caller
+read (a 403 on its repo; plain `newgit pull` fails when it can read none of
+them, since then nothing is known to be up to date), a tracker whose export
+target cannot be pulled from (unreachable, a real conflict with its
+`follow` ref, a file of a tracker outside Git): it and every tracker below
+it stay, never half-moved, since the target ships them too, a child of a
+tracker this instance does not bind, and a tracker outside Git, which has
+no pin (`newgit tracker pull` updates its files, and can overwrite an
+instance's). The rest still move. A tracker named on the command line that
+stays for any of these reasons makes it exit non-zero, after the others
+moved.
 
 Parallel instances merge the way a monorepo does: two instances that each
 made a commit produce a merge commit in `main`'s view, even if they touched
@@ -1082,7 +1176,7 @@ audience, maintainers) is then just who may change the tracker that owns its
 definition file. That is `access` — which `newgit init` creates with
 `maintainers = "owner"`, mounted at `.newgit/trackers` claiming `.` — unless
 a tracker in Git mounted beside it at `.newgit/trackers` claims the file
-(ownership rule 2). So governance layers with no special case: project
+(ownership rule 1: trackers sharing a mount split by their claims). So governance layers with no special case: project
 trackers; an admin tracker mounted at `.newgit/trackers` claiming the
 definitions it governs (readable by everyone who uses them, since newgit
 needs their paths, but maintained by admins); and a tracker of yours
@@ -1294,7 +1388,8 @@ named and skipped.
   files in place and ids of their own.
 - **#142 (pull from a target):** *done.* `newgit pull --remote t3code`
   fetches, fast-forwards or merges t3code's `main`, then moves its pin in
-  the project root as `newgit pull t3code` would. When t3code mounts
+  the project root as `newgit pull t3code` would (plain `newgit pull` does
+  the same fetch first, landing on the branch it runs on, #426). When t3code mounts
   trackers, what comes back is view commits, so it is split first: each file
   goes to the tracker that owns it, an upstream's plain commits and a merge
   of them included. For Spheroman/newgit, its
@@ -1308,7 +1403,7 @@ named and skipped.
   mirror, rooted at it, and importing t3code once put 8,164 of its commits
   into newgit's view and onto the public mirror. FORK.md: upstream comes in
   by merging pingdotgg/t3code into the fork's `newgit` branch, then `newgit
-  pull --remote t3code` and `newgit pull t3code`, one commit here. The
+  pull t3code` (or plain `newgit pull`), one commit here. The
   cold-start measurement doubles as the profile cost check.
 
 ---
@@ -1525,7 +1620,8 @@ this is the list.
   bringing those commits in moves a pin, which is a commit nobody asked for.
 - **`newgit pull --remote` lands in the project root only,** and publishes
   nothing; `newgit merge main` does. Instances pick a moved pin up with
-  `newgit pull <tracker>`. For a target without `root`, the files of each
+  `newgit pull <tracker>`, which also takes what is new on the target
+  itself, on the instance's branch, without moving the tracker's `main`. For a target without `root`, the files of each
   tracker it withholds are put back from the parent commit, and a commit
   touching a withheld tracker's mount is refused rather than guessed at.
 - **The import's commit is unsigned,** since newgit writes it and its
@@ -1609,11 +1705,13 @@ What was ugly, and is left that way for now:
 - **No CLI to unlink** other than dropping the definition by hand.
 
 Not found by this experiment, but found while running it: `newgit pull
-<tracker>` in an instance replaces the tracker's files with its `main`
-rather than merging the instance's own change into it. So the conflict
+<tracker>` in an instance replaced the tracker's files with its `main`
+rather than merging the instance's own change into it, so the conflict
 message's advice ("bring `main` into the instance's workspace, resolve
-there") loses the instance's change if followed with `pull`. This is true
-of every tracker in Git, not only links.
+there") lost the instance's change if followed with `pull`. Since #426 a
+pin holding the instance's own commits stays where it is, and `pull` says
+so (and exits non-zero when the tracker was named), rather than dropping
+them; bringing `main` in is still a merge, not a pull.
 
 ## Open questions and known gaps
 

@@ -1867,11 +1867,7 @@ pub fn clear_owned_paths(workspace: &Utf8Path, definition: &TrackerDefinition) -
             .any(|inner| inner.starts_with(owned))
         {
             for (relative, absolute) in collect_files(workspace, std::slice::from_ref(owned))? {
-                if definition
-                    .excluded
-                    .iter()
-                    .any(|inner| relative.starts_with(inner))
-                {
+                if !definition.owns(&relative) {
                     continue;
                 }
                 std::fs::remove_file(&absolute)

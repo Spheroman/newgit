@@ -109,17 +109,39 @@ Remote:
 - `newgit merge [instance] [--into <branch>]` — the merge commit is made in
   your view and committed at root's ref; `newgit merge main` merges the
   project root
-- `newgit pull <tracker> [instance]` — one commit moving a mounted tracker's
-  pin to its `follow` ref; spawn says when a tracker is behind
-- `newgit pull` — every tracker in Git root mounts, in one commit on the
+- `newgit pull [<tracker>...] [--instance <name>]` — every tracker in Git
+  mounted here, at any depth, or only those named, in one commit on the
   branch it runs on (`Update trackers: t3code (14 commits), ui-kit (2
   commits)`; in the project root, its own instance branch, which `newgit
-  merge main` publishes); no commit when none is behind. A pin holding
-  commits its ref lacks stays put, a tracker you can't read on the remote is
-  skipped (it fails when none can be read), and trackers outside Git are
-  left alone (`newgit tracker pull`)
+  merge main` publishes); no commit when none is behind. A tracker exported
+  to a target rooted at it first takes what is new there, as `--remote`
+  would (one more fetch each), without moving its `main` until `newgit
+  merge`. A child moves by a commit in the tracker that mounts it, whose pin
+  then moves, up to root. A pin holding commits its ref lacks stays put: an
+  instance with commits of its own on a tracker is listed as diverged and
+  does not take its target either, until `newgit merge` lands that work. A
+  tracker you can't read on the remote, or whose export target can't be
+  reached, conflicts, or adds a file of a tracker outside Git, is skipped
+  and named while the rest move (it fails when none can be read); a child
+  of a tracker the instance doesn't bind stays, and is named when it was
+  asked for or is behind; trackers outside Git are left alone (`newgit
+  tracker pull`). A named tracker that stays exits non-zero. Every argument
+  is a tracker: `--instance` names another instance. Spawn says when a
+  tracker is behind. Two instances pulling the same two diverged tips make
+  the same merge commit (newgit's, dated from its parents), so merging both
+  lands one merge. It is unsigned, so a target that requires signed commits
+  rejects an export carrying it
+  ([#443](https://github.com/Spheroman/newgit/issues/443))
 - `newgit pull --remote <target>` — bring back what was merged on an export
-  target (a pull request on GitHub); `newgit merge main` publishes it
+  target (a pull request on GitHub); `newgit merge main` publishes it. A
+  force-pushed target is merged with the line the tracker already has, as
+  `git pull` would: the commits the force-push removed stay in the
+  tracker's history, and the next export pushes them to the target again.
+  Reverting the change in an instance keeps it out of the tip only: the
+  next export still publishes those commits, so a secret the force-push
+  purged is published again. Nothing in newgit can purge it yet
+  ([#442](https://github.com/Spheroman/newgit/issues/442)); until then,
+  do not export that tracker
 - `newgit tracker allow-plaintext <path>...` — release workspace paths this
   machine has held encrypted content at, so whatever tracker claims them now
   (a `public` one, or one in Git) may capture, commit, and send them

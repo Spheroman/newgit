@@ -1674,10 +1674,13 @@ function claimOn(facts: TrackerFacts, path: string): number | undefined {
 
 /**
  * The tracker in Git owning workspace `path`, by the ownership rules
- * (docs/design/trackers.md, *Ownership*), as the client's `owner_of` decides it:
- * the deepest mount holding the path decides, a parent's claim not reaching
- * into it; among the trackers mounted there the longest claim wins, ties to
- * the lesser name; a path every claim there excludes is owned by nothing.
+ * (docs/design/trackers.md, *Ownership*), as the client's `owners_of` decides
+ * it among trackers in Git: a claim of a tracker in Git never reaches into a
+ * deeper mount, so the deepest mount holding the path decides; among the
+ * trackers mounted there the longest claim wins, ties to the lesser name; a
+ * path every claim there excludes is owned by nothing. Asked only of
+ * definition files under `.newgit/trackers/`, where no tracker outside Git
+ * may be mounted.
  */
 function ownerOf(facts: Map<string, TrackerFacts>, path: string): string | undefined {
 	const depth = (mount: string) => (mount === "." ? 0 : mount.split("/").length);

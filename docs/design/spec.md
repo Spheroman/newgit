@@ -243,7 +243,14 @@ The full model is in [`trackers.md`](trackers.md). The short version:
 
 - **Every path has at most one owner.** A tracker is *mounted* at a path
   inside its parent, and claims paths relative to its mount (`!` excludes).
-  The deepest mount wins, then the longest claim. `root` owns `.`,
+  The longest claim that reaches a path owns it. A claim reaches a path
+  under it unless a tracker mounted deeper holds the path and the claim is
+  `.`, or a directory around that mount, or the claiming tracker is in Git.
+  So only a tracker outside Git reaches into another's mount, with a claim
+  inside it: `paths = ["apps/t3code/.env"]` owns that file just as `mount =
+  "apps/t3code"`, `paths = [".env"]` would. A tracker's own `!`
+  exclusions take it out of the running; identical claims are an error,
+  except between role alternatives. `root` owns `.`,
   everything nothing else claims, `.newgit/` included. `access` is mounted
   at `.newgit/trackers/` and holds every tracker's definition, which decides
   who may read what; by default only the project's owner may change it
@@ -261,10 +268,12 @@ The full model is in [`trackers.md`](trackers.md). The short version:
   so no id changes. You commit to a tracker in Git with Git. When work
   leaves the machine, newgit splits each commit into one root commit and a
   commit in each tracker it changed, and composing them back gives the same
-  commit, with the same id. `newgit pull <tracker>` moves a pin to the
-  tracker's `follow` ref, and `newgit pull` alone moves every pin root
-  mounts that is behind, in one commit on the branch it runs on; nothing
-  else moves one on your behalf.
+  commit, with the same id. `newgit pull` moves every pin that is
+  behind, at any depth, to the tracker's `follow` ref, after taking what is
+  new on its export target when it has one rooted at it, in one commit on
+  the branch it runs on (a child's moves by a commit in its parent first);
+  `newgit pull t3code ui-kit` only those. No tracker's `main` moves until
+  `newgit merge`, and nothing else moves a pin on your behalf.
 - **A tracker outside Git** (`git = false`, the default) owns files that
   never belong in Git: an `.env.local`, an agent's notes, a SQLite file, a
   public page. They are captured by newgit, never committed.
