@@ -94,7 +94,7 @@ fn a_migration_that_stopped_part_way_is_finished_by_the_next_start() {
             ("site".to_owned(), site.clone()),
         ]
         .into();
-        db::create_branch(&db, "jack/p", "main", &list, "jack").expect("main");
+        db::set_branch(&db, "jack/p", "main", &list, "jack", 0).expect("main");
 
         // The run that stopped. root: copied alone, nothing recorded, the old
         // repository still there.
@@ -109,13 +109,19 @@ fn a_migration_that_stopped_part_way_is_finished_by_the_next_start() {
             .expect("site copied");
         db::set_tracker_store(&db, "jack/p", "site", "tracker/site").expect("row");
         std::fs::remove_dir_all(home.join("t/site.git")).expect("old site");
-        assert!(
-            alone
-                .move_to(&Store::Public, |_| Err(
-                    newgit_serve::error::HttpError::internal("stopped")
-                ))
-                .is_err()
+        // As a move does when its store is the audience's first: labelled,
+        // then renamed.
+        git(
+            &temp,
+            &[
+                "--git-dir",
+                alone.dir().as_str(),
+                "config",
+                "newgit.audience",
+                "public",
+            ],
         );
+        std::fs::rename(alone.dir(), Store::Public.dir(&home)).expect("renamed");
         // env: copied, the old one not yet deleted.
         Repo::new(&home, Store::User("ana".into()), "u/env".into())
             .copy_from(&home.join("u/env/ana.git"), "", "refs/")

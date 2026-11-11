@@ -24,6 +24,7 @@ impl Drop for Server {
     }
 }
 
+#[allow(dead_code, reason = "a binary that starts its own server does not use it")]
 fn start(temp: &Utf8Path) -> Server {
     let data = temp.join("serve");
     let mut child = Command::new(env!("CARGO_BIN_EXE_newgit"))

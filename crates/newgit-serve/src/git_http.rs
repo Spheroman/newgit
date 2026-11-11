@@ -126,6 +126,9 @@ struct Run {
     /// A tracker's own refs, not a fork's: instances' namespaces inside it
     /// are hidden from its readers, and a push to it may move a `main`.
     tracker: bool,
+    /// A push into a store, counted while it runs: a tracker moving out of
+    /// that store waits for it before removing what it had there.
+    pushing: Option<crate::landing::Pushing>,
 }
 
 impl Run {
@@ -136,6 +139,7 @@ impl Run {
             namespace: Some(repo.namespace.clone()),
             allowed,
             tracker: !matches!(named, RepoRef::Fork { .. }),
+            pushing: None,
         }
     }
 }
@@ -161,9 +165,11 @@ pub async fn repo(app: Arc<App>, request: Request<Body>) -> Response<Body> {
     };
     let name = name.to_owned();
     let write = ask.service == Service::Receive;
+    let pushes = write && !ask.advertise;
     let decided = {
         let app = app.clone();
-        tokio::task::spawn_blocking(move || authorize_repo(&app, &token, &name, write)).await
+        tokio::task::spawn_blocking(move || authorize_repo(&app, &token, &name, write, pushes))
+            .await
     };
     let run = match decided {
         Ok(Ok(run)) => run,
@@ -173,7 +179,16 @@ pub async fn repo(app: Arc<App>, request: Request<Body>) -> Response<Body> {
     run_git(app, run, ask, request).await
 }
 
-fn authorize_repo(app: &App, token: &str, name: &str, write: bool) -> ApiResult<Run> {
+/// What `name` is to the caller `token` names, and where Git runs for it.
+/// `pushes`: this is the push itself (not its advertisement), counted while
+/// it runs.
+fn authorize_repo(
+    app: &Arc<App>,
+    token: &str,
+    name: &str,
+    write: bool,
+    pushes: bool,
+) -> ApiResult<Run> {
     let db = app.db.lock();
     let caller = api::caller_for(app, &db, token)?;
     let Some(repo) = parse_repo_name(name) else {
@@ -203,7 +218,11 @@ fn authorize_repo(app: &App, token: &str, name: &str, write: bool) -> ApiResult<
             } else {
                 granted
             };
-            return Ok(Run::repo(&repo, &location, allowed));
+            let mut run = Run::repo(&repo, &location, allowed);
+            if pushes {
+                run.pushing = Some(counted(app, &repo, &location));
+            }
+            return Ok(run);
         }
     }
     // A merge's commits, pushed with the password `begin` handed out: into
@@ -215,16 +234,38 @@ fn authorize_repo(app: &App, token: &str, name: &str, write: bool) -> ApiResult<
             .iter()
             .any(|refs| refs == LANDING)
     {
-        let location = api::authorize(&project, &db, &caller, &repo, false)?;
+        let (location, _db) =
+            api::authorize(&project, &db, &caller, &repo, false)?.made(app, db)?;
         return Ok(Run {
             git_dir: location.open_landing(&caller.login)?,
             namespace: None,
             allowed: vec![LANDING.to_owned()],
             tracker: false,
+            pushing: None,
         });
     }
-    let location = api::authorize(&project, &db, &caller, &repo, write)?;
-    Ok(Run::repo(&repo, &location, Vec::new()))
+    let authorized = api::authorize(&project, &db, &caller, &repo, write)?;
+    let (location, _db) = authorized.made(app, db)?;
+    let mut run = Run::repo(&repo, &location, Vec::new());
+    if pushes {
+        // Under the db lock, where the store was decided.
+        run.pushing = Some(counted(app, &repo, &location));
+    }
+    Ok(run)
+}
+
+/// A push into `location`, which is `repo`, counted while it runs.
+fn counted(
+    app: &Arc<App>,
+    repo: &RepoRef,
+    location: &crate::repos::Repo,
+) -> crate::landing::Pushing {
+    crate::landing::Pushes::start(
+        app,
+        &repo.project().key(),
+        repo.tracker_name(),
+        &location.store.name(),
+    )
 }
 
 /// The refs a merge's landing password may push.
@@ -284,6 +325,7 @@ pub async fn endpoint(app: Arc<App>, request: Request<Body>) -> Response<Body> {
         namespace: None,
         allowed: Vec::new(),
         tracker: false,
+        pushing: None,
     };
     run_git(app, run, ask, request).await
 }
@@ -520,6 +562,7 @@ async fn run_git(app: Arc<App>, run: Run, ask: Ask, request: Request<Body>) -> R
     // A push to a tracker's own refs (not a fork's) may move a `main` that
     // definitions are read from.
     let moves_trackers = ask.service == Service::Receive && !ask.advertise && run.tracker;
+    let pushing = run.pushing;
     let mut child = match command.spawn() {
         Ok(child) => child,
         Err(error) => return refused(&HttpError::internal(error)),
@@ -549,6 +592,7 @@ async fn run_git(app: Arc<App>, run: Run, ask: Ask, request: Request<Body>) -> R
             let mut text = String::new();
             let _ = stderr.read_to_string(&mut text).await;
             let _ = child.wait().await;
+            drop(pushing);
             drop(permit);
             if moves_trackers {
                 app.trackers_moved();

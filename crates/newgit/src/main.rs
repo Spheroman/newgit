@@ -4974,10 +4974,18 @@ struct ServeArgs {
     /// How many Git processes may run at once
     #[arg(long, default_value_t = 16)]
     git_slots: usize,
+    /// Give up a stuck landing (one written down that could not be put in
+    /// place, which its projects' 503s and the server's log name), and every
+    /// landing stuck after it in its projects, then exit. Stop the server
+    /// first. Restarting the server tries every stuck landing again; this is
+    /// for one whose cause cannot be fixed. Appends a compensating landing;
+    /// the log is never edited
+    #[arg(long, value_name = "STAMP")]
+    void_landing: Option<u64>,
 }
 
 fn serve(args: ServeArgs) -> Result<()> {
-    newgit_serve::serve(newgit_serve::Config {
+    let config = newgit_serve::Config {
         data: args.data,
         listen: args.listen,
         url: args.url,
@@ -4988,5 +4996,10 @@ fn serve(args: ServeArgs) -> Result<()> {
         github_client_id: args.github_client_id,
         dev_login_secret: args.dev_login_secret,
         git_slots: args.git_slots,
-    })
+    };
+    if let Some(stamp) = args.void_landing {
+        println!("{}", newgit_serve::void_landing(config, stamp)?);
+        return Ok(());
+    }
+    newgit_serve::serve(config)
 }
