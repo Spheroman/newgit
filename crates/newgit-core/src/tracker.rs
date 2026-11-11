@@ -822,26 +822,60 @@ impl TrackerDefinition {
 }
 
 /// The owner of `path` among `definitions`, by the ownership rules
-/// (docs/design/trackers.md, *Ownership*): the deepest mount holding the path
-/// decides, a parent's claim of `.` not reaching into it; among the trackers
-/// mounted there, the longest claim wins; a path every claim there excludes
-/// is owned by nothing.
+/// (docs/design/trackers.md, *Ownership*): the longest claim holding the
+/// path wins, among the claims that reach it. A tracker mounted deeper takes
+/// its whole mount from a claim of `.` or of a directory around that mount,
+/// but not from a claim inside it: `env` mounted at `.` claiming
+/// `apps/t3code/.env` owns that file, as a definition mounted at
+/// `apps/t3code` claiming `.env` would. So a definition written with
+/// project-relative paths and one written with a mount are judged alike,
+/// and as [`resolve_ownership`] carves them out of the workspace. A path
+/// every reaching claim excludes is owned by nothing.
 pub fn owner_of<'a>(
     definitions: &'a [TrackerDefinition],
     path: &Utf8Path,
 ) -> Option<&'a TrackerDefinition> {
-    let deepest = definitions
-        .iter()
-        .filter(|definition| mount_holds(&definition.mount, path))
-        .map(|definition| mount_depth(&definition.mount))
-        .max()?;
+    // Whether `definition`'s claim `claim` reaches `path`, or a tracker
+    // mounted deeper, around the path and not inside the claim, takes it.
+    let reaches = |definition: &TrackerDefinition, claim: &Utf8Path| {
+        let depth = mount_depth(&definition.mount);
+        !definitions.iter().any(|other| {
+            other.mounted()
+                && mount_depth(&other.mount) > depth
+                && path.starts_with(&other.mount)
+                && (claim.as_str() == "." || other.mount.starts_with(claim))
+        })
+    };
     definitions
         .iter()
+        .filter(|definition| mount_holds(&definition.mount, path))
         .filter(|definition| {
-            mount_holds(&definition.mount, path) && mount_depth(&definition.mount) == deepest
+            !definition
+                .exclusions
+                .iter()
+                .any(|excluded| path.starts_with(excluded))
         })
-        .filter_map(|definition| definition.claim_on(path).map(|claim| (claim, definition)))
-        .max_by(|(left, a), (right, b)| left.cmp(right).then_with(|| b.name.cmp(&a.name)))
+        .filter_map(|definition| {
+            definition
+                .paths
+                .iter()
+                .filter(|claim| claim.as_str() == "." || path.starts_with(claim))
+                .filter(|claim| reaches(definition, claim))
+                .map(|claim| {
+                    if claim.as_str() == "." {
+                        0
+                    } else {
+                        claim.as_str().len()
+                    }
+                })
+                .max()
+                .map(|claim| (claim, definition))
+        })
+        .max_by(|(left, a), (right, b)| {
+            left.cmp(right)
+                .then_with(|| mount_depth(&a.mount).cmp(&mount_depth(&b.mount)))
+                .then_with(|| b.name.cmp(&a.name))
+        })
         .map(|(_, definition)| definition)
 }
 

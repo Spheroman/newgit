@@ -1985,9 +1985,22 @@ top, whatever the new commits' dates. Plain `newgit pull` (and `newgit
 pull <tracker>`) takes it too, anywhere, as the first step of updating that
 tracker, one more fetch per tracker with a rooted target: the pin moves on
 the branch it ran on, and the tracker's `main` only when that merges. A
-target that can't be reached, or conflicts, leaves that tracker and the
-trackers below it where they were, and the rest still move. An export
-finding the target ahead says to pull rather than pulling by itself.
+target that can't be reached, conflicts, or adds a file of a tracker
+outside Git leaves that tracker and the trackers below it where they were,
+and the rest still move. A pin holding commits of this instance's own is
+listed as diverged and does not take its target either, until `newgit
+merge` lands that work. Two instances pulling the same two diverged tips
+make the same merge commit (its author, committer, and dates are those of
+the parent committed last), so merging both lands one merge. An export
+finding the target ahead says to pull rather than pulling by itself, or,
+after a plain pull in the project root, to `newgit merge main`.
+
+A force-pushed target is merged with the line the tracker already has, as
+`git pull` would: the commits the force-push removed come back, and the
+next export pushes them to the target again. When the force-push was to
+remove something, take it out of the tracker here before you pull: revert
+it in an instance and `newgit merge` that, so the merge keeps it out.
+newgit has no command yet that resets a tracker's branch to a target.
 
 ### Pull requests from a workspace: `branches = true`
 

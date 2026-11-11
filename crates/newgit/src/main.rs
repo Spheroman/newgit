@@ -4876,11 +4876,21 @@ fn tracker_log(tracker: &str, instance: Option<String>, git_args: &[String]) -> 
 fn pull(instance: Option<String>, named: &[String]) -> Result<()> {
     let context = context_here()?;
     let instance = instance.or_else(|| context.current_branch.clone());
+    let manager = BranchManager::open(context.store)?;
+    // An instance named where a tracker goes passes through as it is, for
+    // the pull to say it is one and give the `--instance` form.
     let trackers = named
         .iter()
-        .map(|tracker| tracker_id(tracker))
+        .map(|tracker| {
+            tracker_id(tracker).or_else(|error| {
+                if manager.store().find_branch(tracker).is_ok() {
+                    Ok(tracker.clone())
+                } else {
+                    Err(error)
+                }
+            })
+        })
         .collect::<Result<Vec<_>>>()?;
-    let manager = BranchManager::open(context.store)?;
     let outcome = manager.pull(instance.as_deref(), &trackers)?;
     let place = match instance.as_deref() {
         Some(instance) => format!("`{instance}`"),
@@ -4984,6 +4994,17 @@ fn pull(instance: Option<String>, named: &[String]) -> Result<()> {
                 "  `{}` skipped: its export target `{target}` could not be pulled from, so its \
                  pin stays ({reason})",
                 tracker_path(tracker)
+            ),
+        );
+    }
+    for (tracker, parent) in &outcome.with_parent {
+        skip(
+            tracker,
+            format!(
+                "  `{}` skipped: `{}`, which mounts it, was skipped, and its export target \
+                 ships it too, so it stays with it",
+                tracker_path(tracker),
+                tracker_path(parent)
             ),
         );
     }

@@ -117,15 +117,26 @@ Remote:
   to a target rooted at it first takes what is new there, as `--remote`
   would (one more fetch each), without moving its `main` until `newgit
   merge`. A child moves by a commit in the tracker that mounts it, whose pin
-  then moves, up to root. A pin holding commits its ref lacks stays put; a
+  then moves, up to root. A pin holding commits its ref lacks stays put: an
+  instance with commits of its own on a tracker is listed as diverged and
+  does not take its target either, until `newgit merge` lands that work. A
   tracker you can't read on the remote, or whose export target can't be
-  reached or conflicts, is skipped and named while the rest move (it fails
-  when none can be read); a child of a tracker the instance doesn't bind
-  stays; trackers outside Git are left alone (`newgit tracker pull`). A
-  named tracker that stays exits non-zero. Every argument is a tracker:
-  `--instance` names another instance. Spawn says when a tracker is behind
+  reached, conflicts, or adds a file of a tracker outside Git, is skipped
+  and named while the rest move (it fails when none can be read); a child
+  of a tracker the instance doesn't bind stays, and is named when it was
+  asked for or is behind; trackers outside Git are left alone (`newgit
+  tracker pull`). A named tracker that stays exits non-zero. Every argument
+  is a tracker: `--instance` names another instance. Spawn says when a
+  tracker is behind. Two instances pulling the same two diverged tips make
+  the same merge commit, so merging both lands one merge
 - `newgit pull --remote <target>` — bring back what was merged on an export
-  target (a pull request on GitHub); `newgit merge main` publishes it
+  target (a pull request on GitHub); `newgit merge main` publishes it. A
+  force-pushed target is merged with the line the tracker already has, as
+  `git pull` would: commits the force-push removed come back, and the next
+  export pushes them to the target again. When the force-push was to remove
+  something, take it out of the tracker here before you pull: revert it in
+  an instance and `newgit merge` that, so the merge keeps it out (newgit
+  has no command yet that resets a tracker's branch to a target)
 - `newgit tracker allow-plaintext <path>...` — release workspace paths this
   machine has held encrypted content at, so whatever tracker claims them now
   (a `public` one, or one in Git) may capture, commit, and send them

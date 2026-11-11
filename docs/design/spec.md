@@ -243,7 +243,8 @@ The full model is in [`trackers.md`](trackers.md). The short version:
 
 - **Every path has at most one owner.** A tracker is *mounted* at a path
   inside its parent, and claims paths relative to its mount (`!` excludes).
-  The deepest mount wins, then the longest claim. `root` owns `.`,
+  The deepest mount wins (a claim inside a deeper mount still reaches it),
+  then the longest claim. `root` owns `.`,
   everything nothing else claims, `.newgit/` included. `access` is mounted
   at `.newgit/trackers/` and holds every tracker's definition, which decides
   who may read what; by default only the project's owner may change it

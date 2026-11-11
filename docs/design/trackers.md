@@ -146,8 +146,14 @@ never from which tracker currently has the file, and it is the same whichever
 tracker you root at. Split assigns paths by this rule **(decided)**:
 
 1. **The deepest mount wins.** A path under `apps/electron/` is decided among
-   the trackers mounted at `apps/electron` or deeper. A parent's claim of `.`
-   does not reach into a mount.
+   the trackers mounted at `apps/electron` or deeper. A parent's claim of `.`,
+   or of a directory around the mount, does not reach into it. A claim
+   *inside* the mount does (decided 2026-11-11, #426 review): `env` mounted at
+   `.` claiming `apps/electron/.env` owns that file exactly as a definition
+   mounted at `apps/electron` claiming `.env` would, and the longest claim
+   wins as in rule 2. `newgit tracker track` writes the first form, so
+   judging the two differently let a target's commit adding `.env` past the
+   check for files of a tracker outside Git.
 2. **Among trackers mounted at the same path, the longest claim wins.**
    `local-db` mounted at `.` claiming `.env.db` beats root's `.`. Trackers
    sharing a mount split by their claims: a tracker mounted beside `access`
@@ -923,13 +929,28 @@ from where it stands. Pulling `t3code/repos` makes `Update trackers: repos
 (1 commit)` in `t3code`, on t3code's pin, and root's view commit `Update
 trackers: t3code/repos (1 commit)` pins that. `newgit pull t3code/repos`
 does the same for that child alone; naming `t3code` moves only t3code's own
-pin. A child whose parent this instance does not bind stays, and is named:
-an instance commits only to trackers it binds (`newgit tracker use
-<parent>` binds it).
+pin. A child whose parent this instance does not bind stays: an instance
+commits only to trackers it binds (`newgit tracker use <parent>` binds it).
+It is named when it was asked for, or when its `follow` ref is ahead of its
+pin, so an instance that dropped the parent is not told about it on every
+pull. A child named beside a parent whose target fails is listed as
+skipped with it.
+
+**The merge with a target is the same commit everywhere (decided, #426
+review).** Its author and committer, and their dates, are the parent
+committed last's (the target's tip on a tie), with the same message, and
+it is never signed: it is nobody's own work. Two instances pulling the same
+two diverged tips make one commit, so merging both lands one merge on the
+tracker's `main`, not three. A force-pushed target is merged with the line
+the tracker already has, as `git pull` would: what the force-push removed
+comes back, and the next export pushes it again. To keep it out, revert it
+in an instance and merge that before pulling; nothing resets a tracker's
+branch to a target yet.
 
 Five kinds of tracker stay put, and it says which: a pin holding commits
 its `follow` ref lacks (the instance's own work on it; moving the pin would
-drop them, so merge first), a tracker the remote will not let the caller
+drop them, so merge first; such a tracker is listed as diverged and does
+not take its target either, until `newgit merge`), a tracker the remote will not let the caller
 read (a 403 on its repo; plain `newgit pull` fails when it can read none of
 them, since then nothing is known to be up to date), a tracker whose export
 target cannot be pulled from (unreachable, a real conflict with its
