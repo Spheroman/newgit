@@ -1282,9 +1282,13 @@ fn resolve_order(
     (walk.ordered, walk.problems)
 }
 
-/// Names newgit sets on every command it runs, after every resource's. A
-/// declaration claiming one of these is dead on arrival.
-const RESERVED_ENV_NAMES: [&str; 3] = ["NEWGIT_BRANCH", "NEWGIT_WORKSPACE", "NEWGIT_LOCKED"];
+/// Every name newgit sets or reads itself starts with this: the ones it
+/// sets on every command it runs, after every resource's (`NEWGIT_BRANCH`,
+/// `NEWGIT_WORKSPACE`, `NEWGIT_LOCKED`), and the ones a newgit run inside
+/// `newgit run` would obey (`NEWGIT_KEYS_URL`, where members' keys come
+/// from; `NEWGIT_IDENTITY`, which key decrypts). A resource export of any of
+/// them is refused: one could point key lookup at keys of its choosing.
+const RESERVED_ENV_PREFIX: &str = "NEWGIT_";
 
 /// Check that no environment variable name is claimed by two declarations.
 ///
@@ -1344,7 +1348,7 @@ pub fn check_env_names(resources: &[ResourceDefinition]) -> Vec<GraphProblem> {
     let mut problems = Vec::new();
     for (name, mut claimants) in claims {
         claimants.sort();
-        if RESERVED_ENV_NAMES.contains(&name) {
+        if name.starts_with(RESERVED_ENV_PREFIX) {
             // Reported per claimant: each one has to be renamed, and a
             // collision between two dead declarations is not the point.
             for claimant in claimants {

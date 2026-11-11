@@ -42,7 +42,9 @@ fn local_main(fixture: &Fixture, tracker: &str) -> String {
 fn merging_a_shared_remote_tracker_moves_its_main_on_the_remote() {
     let (_guard, temp) = tempdir();
     let fixture = setup(&temp);
-    let workspace = captured(&fixture, "site", "project-devs", "remote");
+    // A page the remote serves, so `public` and plaintext (#338); encrypted
+    // trackers' merges are in tests/encrypted_trackers.rs.
+    let workspace = captured(&fixture, "site", "public", "remote");
 
     let output = fixture.ok(&workspace, &["tracker", "merge", "site"]);
     assert!(

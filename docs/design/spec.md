@@ -364,6 +364,71 @@ your own `.env.local`, never theirs. `tracker create --storage remote`
 is refused until the project has a remote, rather than quietly behaving as
 local.
 
+**A synced tracker outside Git is encrypted to its audience (#338).** With
+`storage = "remote"` and an audience other than `public` (no opt-out: what a
+server must read, like newgit.dev's `site`, is `public`), each file is
+encrypted whole with age on this machine before anything is sent. The
+recipients are computed, never read back: the members the audience names, as
+the remote lists them now (the remote is the membership authority), by the
+`ssh-ed25519` and `ssh-rsa` keys GitHub publishes for each. The ciphertext is
+an ordinary blob in the tracker's history, so Git's object model is
+untouched; the list is written beside it at `.newgit/recipients` for people
+to read, and no code takes a recipient from it. Capture encrypts (reusing a
+parent's blob when its content is unchanged and its own age header names
+the current keys, exactly, so unchanged content is still no commit),
+projection decrypts with the developer's own SSH key (or `$NEWGIT_IDENTITY`),
+and the workspace holds plaintext, owner-only. Before a checkpoint syncs or
+`tracker merge` or `members add`/`remove` publishes, the member list is read
+again and every commit the remote does not have yet is checked against it:
+those encrypted to anyone else are made again, on the last commit the remote
+has, so nothing encrypted to a member removed since is ever sent. Every send
+checks that every file those commits carry is age ciphertext. A workspace
+path this machine has held encrypted content at is never captured or sent
+unencrypted because a definition (any definition, by any name) now puts it in
+a `public` tracker or a tracker in Git, until `newgit tracker allow-plaintext
+<path>` on this machine: a confirmation, keyed by path, not a boundary (the
+same content copied or moved to another path is not held back). What
+counts as already on the remote is kept per remote and project, and
+forgotten when the project is linked again. `user` is the login `newgit login` saved, never the remote's say. Publishing `main` fetches the
+remote's first and never forces over changes it lacks. Every change to the
+recipient set is printed by fingerprint. A tracker that was plaintext is
+encrypted on its next capture as a new history whose first commit names the
+plaintext rev it replaces; that is the one history replacement. Identities
+for sandboxes and cloud agents are #430. The reference's *Encrypted
+trackers* has the details.
+
+What it guarantees, and its limits:
+
+- The remote, and anyone who controls its deployment, cannot read what was
+  encrypted before it acts: this holds against a remote that only stores
+  and serves.
+- A remote that acts can read what is captured afterwards. It decides
+  membership, so it can add a login whose GitHub keys then become
+  recipients, and the only signal is the fingerprints newgit prints
+  (`CHANGED`, `+ <login>`). A machine encrypting a tracker for the first
+  time has nothing to compare with.
+- The remote also serves tracker definitions, and a definition decides
+  whether a path is encrypted at all. A machine that has held a path's
+  encrypted content (captured it encrypted, or decrypted it into a
+  workspace, as a fresh clone's spawn does) refuses, as an error, to
+  capture or send that path unencrypted, whatever tracker claims it now,
+  until `newgit tracker allow-plaintext <path>` is run there. A machine
+  that has never held the content has nothing to compare against and
+  captures as the definition says. It is a confirmation step, not a
+  boundary: an agent in the workspace can run `allow-plaintext` itself.
+  It knows paths, not content: the same content copied or moved to
+  another path is not held back.
+- GitHub accounts are the key authority.
+- There is no integrity: recipients' keys are public, so the remote can
+  replace a file with content of its choosing that decrypts cleanly (signed
+  tracker commits are [#431](https://github.com/Spheroman/newgit/issues/431)).
+- File names, sizes, link targets, commit messages, authors, and dates are
+  visible.
+- Revs pushed before a tracker was encrypted stay on the remote in
+  plaintext: rotate what they held.
+- A teammate on an older newgit sees ciphertext, and a capture of theirs
+  would push plaintext.
+
 `merge_with_source` is written to every definition but nothing reads it
 yet. `newgit merge` merges trackers in Git, and trackers outside Git move only
 through `tracker merge`. [`trackers.md`](trackers.md) plans to replace it

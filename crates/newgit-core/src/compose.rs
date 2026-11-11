@@ -2119,6 +2119,64 @@ pub fn find_outside_git(
     find_outside_git_under(repo, rev_list, env, all, None)
 }
 
+/// The first `(commit, path)` among `rev_list`'s commits that adds or
+/// changes a path in `held` (each judged where the view has it, under
+/// `mount`, and compared case-folded): content this machine has held encrypted, about to be pushed
+/// through Git as it is (#338). Nothing to walk when `held` is empty.
+pub fn find_held_sealed(
+    repo: &Utf8Path,
+    rev_list: &[&str],
+    env: &[(String, String)],
+    held: &crate::tracker_repo::HeldSealed,
+    mount: Option<&Utf8Path>,
+) -> Result<Option<(String, String)>> {
+    if held.is_empty() {
+        return Ok(None);
+    }
+    // `--root`: a root commit's paths are listed whatever `log.showRoot`
+    // the developer's config sets.
+    let mut args = vec![
+        "log",
+        "--root",
+        "-m",
+        "--no-renames",
+        "--name-only",
+        "--diff-filter=d",
+        "-z",
+        "--format=%x01%H",
+    ];
+    args.extend_from_slice(rev_list);
+    let output = run(
+        Command::new("git")
+            .arg("-C")
+            .arg(repo.as_str())
+            .args(&args)
+            .envs(env.iter().map(|(key, value)| (key, value))),
+        "git log",
+        None,
+    )?;
+    let output = String::from_utf8_lossy(&output);
+    let mut commit = String::new();
+    for field in output.split('\0') {
+        let field = field.trim_start_matches('\n');
+        if let Some(id) = field.strip_prefix('\x01') {
+            commit = id.to_owned();
+            continue;
+        }
+        if field.is_empty() {
+            continue;
+        }
+        let field = match mount {
+            Some(mount) if mount.as_str() != "." => format!("{mount}/{field}"),
+            _ => field.to_owned(),
+        };
+        if held.holds(&field) {
+            return Ok(Some((commit, field)));
+        }
+    }
+    Ok(None)
+}
+
 /// [`find_outside_git`] over a tracker's own history, whose files sit at
 /// `mount` in the view: each path is judged, and reported, where the view
 /// has it. What an import, a rooted export, and a pull from one check.

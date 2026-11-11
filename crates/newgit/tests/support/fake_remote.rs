@@ -65,6 +65,9 @@ struct State {
     remote_state: Value,
     /// Answer uploads 404, as a remote from before them does.
     refuse_uploads: bool,
+    /// The project's members, when `members add`/`remove` changed them;
+    /// ana and jack until then.
+    members: Option<Vec<String>>,
     /// Every commit sent before a merge began, by tracker.
     uploads: Vec<(String, String)>,
     /// Where the next merges land, as the real remote says it: unset, a
@@ -91,6 +94,9 @@ struct State {
     not_a_member: std::collections::BTreeSet<String>,
     /// Project key → tag name → the tag, as the remote answers it.
     tags: BTreeMap<String, BTreeMap<String, Value>>,
+    /// Answer `GET /v1/me` with this login instead of the caller's: a
+    /// remote lying about who you are.
+    me_as: Option<String>,
 }
 
 /// A tracker's definition as the remote reads it, from `access`'s `main`:
@@ -446,7 +452,11 @@ fn route(
     match (method, segments.as_slice()) {
         ("GET", ["v1", "me"]) => (
             200,
-            json!({ "login": caller, "kind": "login", "token_id": "tok" }),
+            json!({
+                "login": state.me_as.clone().unwrap_or_else(|| caller.clone()),
+                "kind": "login",
+                "token_id": "tok",
+            }),
         ),
         ("POST", ["v1", "projects"]) => {
             let name = body["name"].as_str().unwrap_or_default();
@@ -495,9 +505,36 @@ fn route(
                 json!({
                     "name": name, "owner": owner, "key": key, "defaultBranch": "main",
                     "endpoint": format!("{}/{key}.git", state.base),
-                    "members": [{ "login": "ana" }, { "login": "jack" }], "branches": branches,
+                    "members": state
+                        .members
+                        .clone()
+                        .unwrap_or_else(|| vec!["ana".to_owned(), "jack".to_owned()])
+                        .iter()
+                        .map(|login| json!({ "login": login }))
+                        .collect::<Vec<_>>(),
+                    "branches": branches,
                 }),
             )
+        }
+        ("POST", ["v1", "projects", _, _, "members"]) => {
+            let login = body["login"].as_str().unwrap_or_default().to_owned();
+            let members = state
+                .members
+                .get_or_insert_with(|| vec!["ana".to_owned(), "jack".to_owned()]);
+            let added = !members.contains(&login);
+            if added {
+                members.push(login);
+                members.sort();
+            }
+            (200, json!({ "added": added }))
+        }
+        ("DELETE", ["v1", "projects", _, _, "members", login]) => {
+            let members = state
+                .members
+                .get_or_insert_with(|| vec!["ana".to_owned(), "jack".to_owned()]);
+            let before = members.len();
+            members.retain(|member| member != login);
+            (200, json!({ "removed": members.len() != before }))
         }
         ("DELETE", ["v1", "projects", owner, name]) => {
             let key = format!("{owner}/{name}");
@@ -930,6 +967,11 @@ impl Fixture {
             .current_dir(dir.as_str())
             .args(args)
             .env("HOME", self.temp.join("home").as_str())
+            // Members' public keys from a directory, never github.com.
+            .env(
+                "NEWGIT_KEYS_URL",
+                format!("file://{}", self.temp.join("published-keys")),
+            )
             .env("GIT_AUTHOR_NAME", "test")
             .env("GIT_AUTHOR_EMAIL", "test@example.com")
             .env("GIT_COMMITTER_NAME", "test")
@@ -962,6 +1004,12 @@ fn setup(temp: &Utf8Path) -> Fixture {
     std::fs::write(store.join("README.md"), "hello\n").expect("write");
     git(&store, &["add", "."]);
     git(&store, &["commit", "-q", "-m", "initial"]);
+
+    // jack's SSH key, where newgit looks for one, and ana's elsewhere: both
+    // published, as GitHub publishes them, for encrypting trackers outside
+    // Git to the project's members.
+    publish_ssh_key(temp, "jack", &temp.join("home/.ssh/id_ed25519"));
+    publish_ssh_key(temp, "ana", &temp.join("ana/.ssh/id_ed25519"));
 
     // A saved login, as `newgit login` writes it.
     let home = temp.join("home/.newgit");
@@ -997,6 +1045,21 @@ fn setup(temp: &Utf8Path) -> Fixture {
         &["remote", "add", "--url", &fixture.remote.url],
     );
     fixture
+}
+
+/// Make an ed25519 key at `private` and publish its public half as
+/// `login`'s, as `https://github.com/<login>.keys` would.
+fn publish_ssh_key(temp: &Utf8Path, login: &str, private: &Utf8Path) {
+    std::fs::create_dir_all(private.parent().expect("parent")).expect("mkdir");
+    let status = Command::new("ssh-keygen")
+        .args(["-q", "-t", "ed25519", "-N", "", "-C", login, "-f", private.as_str()])
+        .status()
+        .expect("ssh-keygen runs");
+    assert!(status.success(), "ssh-keygen failed");
+    let public = std::fs::read_to_string(format!("{private}.pub")).expect("public key");
+    let dir = temp.join("published-keys");
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    std::fs::write(dir.join(format!("{login}.keys")), public).expect("publish");
 }
 
 /// A tracker repo's (or fork's) commit, and the files in its tree.

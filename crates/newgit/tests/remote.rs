@@ -464,6 +464,14 @@ fn newgit_as(home: &Utf8Path, dir: &Utf8Path, args: &[&str]) -> String {
         .current_dir(dir.as_str())
         .args(args)
         .env("HOME", home.as_str())
+        // Members' keys from beside the homes, never github.com.
+        .env(
+            "NEWGIT_KEYS_URL",
+            format!(
+                "file://{}",
+                home.parent().expect("home's parent").join("published-keys")
+            ),
+        )
         .env("GIT_AUTHOR_NAME", "test")
         .env("GIT_AUTHOR_EMAIL", "test@example.com")
         .env("GIT_COMMITTER_NAME", "test")
@@ -511,6 +519,10 @@ fn a_teammate_spawns_a_checkpoint_running_with_their_own_keys() {
     let (jack_home, ana_home) = (temp.join("home-jack"), temp.join("home-ana"));
     save_login(&jack_home, &remote.url, "jack", LOGIN_TOKEN_ID);
     save_login(&ana_home, &remote.url, "ana", ANA_TOKEN_ID);
+    // Each with their own SSH key, published: the shared trackers are
+    // encrypted to both of them.
+    publish_ssh_key(&temp, "jack", &jack_home.join(".ssh/id_ed25519"));
+    publish_ssh_key(&temp, "ana", &ana_home.join(".ssh/id_ed25519"));
 
     // Jack's machine: the project, its trackers and a database resource,
     // committed so a teammate's clone has the same definitions.

@@ -1188,11 +1188,19 @@ fn read_auth(path: &Utf8Path) -> Result<AuthFile> {
 }
 
 /// Write a secret: created owner-only, never readable by anyone else.
+/// Staged under a name no other writer uses (this process, and a counter
+/// within it) and renamed into place, so writers running at once never
+/// truncate or move each other's staging file: each rename lands whole.
 pub fn write_private(path: &Utf8Path, contents: &str) -> Result<()> {
+    static STAGED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     if let Some(parent) = path.parent() {
         create_dir_all(parent)?;
     }
-    let staging = path.with_extension("tmp");
+    let staging = Utf8PathBuf::from(format!(
+        "{path}.{}.{}.tmp",
+        std::process::id(),
+        STAGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
     {
         use std::io::Write as _;
         let mut options = std::fs::OpenOptions::new();
@@ -1208,7 +1216,10 @@ pub fn write_private(path: &Utf8Path, contents: &str) -> Result<()> {
         file.write_all(contents.as_bytes())
             .map_err(|source| NewgitError::io(&staging, source))?;
     }
-    std::fs::rename(&staging, path).map_err(|source| NewgitError::io(path, source))
+    std::fs::rename(&staging, path).map_err(|source| {
+        let _ = std::fs::remove_file(&staging);
+        NewgitError::io(path, source)
+    })
 }
 
 /// Where a workspace keeps its own token: inside `.git/`, so it is never

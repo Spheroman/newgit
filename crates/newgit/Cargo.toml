@@ -32,3 +32,6 @@ serde_json = "1.0.151"
 [dev-dependencies]
 # Serve's tests read and write a row of its database directly.
 rusqlite = { version = "0.41", features = ["bundled"] }
+# The encrypted-tracker tests decrypt with an attacker's key, to show they
+# cannot (#338).
+age = "0.12"
