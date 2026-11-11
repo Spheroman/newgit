@@ -58,12 +58,14 @@ impl RealDirMaterializer {
     /// its own rebuild on top of the clone, and should not do that silently.
     ///
     /// `sparse` is the binding's sparse-checkout patterns: what they leave
-    /// out is never written.
+    /// out is never written. `carry` is store refs whose objects the
+    /// workspace should start with (see [`GitSource::clone_via_template`]).
     pub fn materialize_reporting(
         &self,
         source: &GitSource,
         branch: &BranchInstance,
         sparse: &[String],
+        carry: &[String],
     ) -> Result<Option<String>> {
         if branch.workspace_path.exists() {
             return Err(NewgitError::WorkspaceExists(branch.workspace_path.clone()));
@@ -85,6 +87,7 @@ impl RealDirMaterializer {
                 &branch.source_rev,
                 &branch.workspace_path,
                 sparse,
+                carry,
             )
             .err()
             .map(|error| error.to_string());
@@ -98,7 +101,8 @@ impl RealDirMaterializer {
 
 impl Materializer for RealDirMaterializer {
     fn materialize(&self, source: &GitSource, branch: &BranchInstance) -> Result<()> {
-        self.materialize_reporting(source, branch, &[]).map(|_| ())
+        self.materialize_reporting(source, branch, &[], &[])
+            .map(|_| ())
     }
 
     fn remove(&self, branch: &BranchInstance) -> Result<()> {

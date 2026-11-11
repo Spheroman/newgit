@@ -3387,6 +3387,7 @@ impl BranchManager {
             &self.source,
             &branch,
             &self.sparse_patterns(&branch.dropped),
+            &self.export_mains_to_carry(&branch.dropped),
         )?;
         if !branch.dropped.is_empty() {
             self.apply_sparse_to(&branch, true)?;
@@ -4280,20 +4281,12 @@ impl BranchManager {
                 ),
             )?;
             // What the target's own branch holds, as of the last export from
-            // here, so `gh pr create --fill` can list the PR's commits. Not
-            // for a target rooted at a tracker this instance leaves out: no
-            // work of its can go there, and that branch is the tracker's whole
-            // history as exported, with ids of its own, so fetching it is
-            // most of a spawn (192,069 objects for t3code). A `tracker use`
-            // routes again, at the checkpoint that follows.
-            let main = export_ref(&target.name, PROJECT_ROOT_INSTANCE);
-            let left_out = target
-                .root
-                .as_ref()
-                .is_some_and(|root| dropped.contains(root));
+            // here, so `gh pr create --fill` can list the PR's commits. A
+            // spawn's workspace already has its objects, carried by the
+            // source template, so this fetch transfers nothing; elsewhere
+            // (a `tracker use`, a clone without the template) it does.
             if workspace != self.store.paths().project_root.as_str()
-                && !left_out
-                && self.source.rev_parse(&main).is_ok()
+                && let Some(main) = self.routed_export_main(target, dropped)
             {
                 crate::source::run_git_env(
                     &[
@@ -4310,6 +4303,40 @@ impl BranchManager {
             }
         }
         Ok(())
+    }
+
+    /// The store ref holding `target`'s own branch, when a workspace with
+    /// `dropped` left out gets it as `refs/remotes/<target>/<branch>`. Not
+    /// for a target that exports no instance branches, or one rooted at a
+    /// tracker the instance leaves out: no work of its can go there, and
+    /// that branch is the tracker's whole history as exported, with ids of
+    /// its own (236,000 objects for t3code). A `tracker use` routes again,
+    /// at the checkpoint that follows.
+    fn routed_export_main(
+        &self,
+        target: &ExportTarget,
+        dropped: &BTreeSet<String>,
+    ) -> Option<String> {
+        let left_out = target
+            .root
+            .as_ref()
+            .is_some_and(|root| dropped.contains(root));
+        let main = export_ref(&target.name, PROJECT_ROOT_INSTANCE);
+        (target.branches && !left_out && self.source.rev_parse(&main).is_ok()).then_some(main)
+    }
+
+    /// The export branches a new workspace's source template carries for
+    /// it: what [`Self::route_export_remotes`] will fetch once the instance
+    /// is on the remote. None without one, since nothing is routed then.
+    fn export_mains_to_carry(&self, dropped: &BTreeSet<String>) -> Vec<String> {
+        if self.remote.is_none() {
+            return Vec::new();
+        }
+        self.export_targets()
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|target| self.routed_export_main(target, dropped))
+            .collect()
     }
 
     /// The trackers in Git the instance's work touched: those whose

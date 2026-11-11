@@ -412,7 +412,13 @@ leaves trackers out is copied from a template of its own binding,
 `<workspace root>/.source-template-<key>`, sparse from before its first
 checkout: nothing it leaves out is written, so leaving files out makes a spawn
 faster, not slower. The same goes for a plain `git clone`, where there is no
-template. `newgit cleanup` removes a template no live binding uses. Then the copy
+template. On a remote, the template also fetches each export target's
+branch the workspace will get as `refs/remotes/<target>/<branch>` (a
+rooted target's is its tracker's whole history), under
+`refs/newgit-template/`. The copy drops those refs but keeps their
+objects, so the workspace's own fetch of that branch moves nothing; fetched
+into each workspace, t3code's was 17s of a 21s spawn.
+`newgit cleanup` removes a template no live binding uses. Then the copy
 gets its own branch, with the upstream `git clone --branch` would set, and
 `core.checkStat=minimal` plus `core.trustctime=false`. Without those two
 settings Git would re-hash every file on the first `git status`, because

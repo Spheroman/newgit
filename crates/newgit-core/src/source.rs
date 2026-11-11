@@ -211,6 +211,16 @@ impl GitSource {
     ///
     /// `sparse` is what `template` is checked out with, which the workspace
     /// inherits (see [`crate::materializer::template_for`]).
+    ///
+    /// `carry` is store refs whose history the workspace will want next to
+    /// its own, such as an export target's branch. The template fetches
+    /// them, which costs only what is new since the last spawn, so their
+    /// objects reach the workspace in the same `clonefile` as the rest.
+    /// The refs themselves are deleted from the workspace: they are the
+    /// template's, and whoever wants that history names it there. Fetched
+    /// into the workspace instead, t3code's exported history was 236,000
+    /// objects packed again for each spawn, 17s of a 21s spawn and 400 MB
+    /// of a workspace `.git` no clone shared.
     pub fn clone_via_template(
         &self,
         template: &Utf8Path,
@@ -218,6 +228,7 @@ impl GitSource {
         rev: &str,
         destination: &Utf8Path,
         sparse: &[String],
+        carry: &[String],
     ) -> Result<()> {
         if let (Some(from), Some(to)) = (template.parent(), destination.parent())
             && !same_device(from, to)?
@@ -237,7 +248,7 @@ impl GitSource {
         lock.lock()
             .map_err(|source| NewgitError::io(&lock_path, source))?;
 
-        if let Err(error) = self.prepare_template(template, rev, sparse) {
+        if let Err(error) = self.prepare_template(template, rev, sparse, carry) {
             let _ = std::fs::remove_dir_all(template);
             return Err(error);
         }
@@ -266,6 +277,23 @@ impl GitSource {
                     std::fs::remove_file(&path).map_err(|source| NewgitError::io(&path, source))?;
                 }
             }
+            // The carried refs: their objects stay, for the workspace's
+            // own fetch of them to find.
+            let carried = run_git(&[
+                "-C",
+                destination.as_str(),
+                "for-each-ref",
+                "--format=delete %(refname)",
+                TEMPLATE_CARRY_NAMESPACE,
+            ])?;
+            if !carried.trim().is_empty() {
+                let mut input = carried.trim().to_owned();
+                input.push('\n');
+                run_git_stdin(
+                    &["-C", destination.as_str(), "update-ref", "--stdin"],
+                    input.as_bytes(),
+                )?;
+            }
             let head = format!("refs/heads/{branch}");
             let message = format!("clone: from {}", self.root);
             git(&["update-ref", "-m", &message, &head, rev])?;
@@ -283,7 +311,13 @@ impl GitSource {
 
     /// Bring the template to `rev`, cloning it from the store first if it
     /// does not exist yet.
-    fn prepare_template(&self, template: &Utf8Path, rev: &str, sparse: &[String]) -> Result<()> {
+    fn prepare_template(
+        &self,
+        template: &Utf8Path,
+        rev: &str,
+        sparse: &[String],
+        carry: &[String],
+    ) -> Result<()> {
         let git = |args: &[&str]| {
             let mut full = vec!["-C", template.as_str()];
             full.extend_from_slice(args);
@@ -308,6 +342,22 @@ impl GitSource {
                 template.as_str(),
             ])?;
             set_sparse(template, sparse)?;
+        }
+        if !carry.is_empty() {
+            let mut args = vec![
+                "fetch".to_owned(),
+                "--quiet".to_owned(),
+                "--no-tags".to_owned(),
+                "--no-write-fetch-head".to_owned(),
+                "origin".to_owned(),
+            ];
+            args.extend(
+                carry
+                    .iter()
+                    .map(|name| format!("+{name}:{TEMPLATE_CARRY_NAMESPACE}/{name}")),
+            );
+            let args: Vec<&str> = args.iter().map(String::as_str).collect();
+            git(&args)?;
         }
         git(&["checkout", "--quiet", "--force", "--detach", rev])?;
         if fresh {
@@ -1966,6 +2016,10 @@ const SNAPSHOT_BATCH: usize = 256;
 /// Where a push too big for the remote is staged step by step, deleted
 /// once the real push lands.
 const STAGING_REF: &str = "refs/heads/newgit-staging";
+
+/// Where a source template keeps the refs it carries for workspaces (see
+/// [`GitSource::clone_via_template`]), each under its store name.
+const TEMPLATE_CARRY_NAMESPACE: &str = "refs/newgit-template";
 
 /// How many times one commit the remote keeps dropping is pushed again, after
 /// its large files went ahead, before the push gives up.
