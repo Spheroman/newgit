@@ -487,6 +487,11 @@ enum TrackerCommand {
         /// Instance (inferred when run inside a workspace)
         instance: Option<String>,
     },
+    /// Confirm, on this machine, that a tracker it encrypted is captured
+    /// and sent in plaintext from now on, as its definition now says
+    /// (`audience = "public"`). Until then, newgit refuses to: a definition
+    /// arrives from elsewhere (`access`, `newgit merge main`, `pull`)
+    AllowPlaintext { tracker: String },
     /// Bind a tracker in an instance again: its files come back (a tracker
     /// in Git's history never left), with any work a drop stashed
     Use {
@@ -2144,6 +2149,7 @@ fn tracker(mut command: TrackerCommand) -> Result<()> {
     | TrackerCommand::Merge { tracker, .. }
     | TrackerCommand::Checkout { tracker, .. }
     | TrackerCommand::Pull { tracker, .. }
+    | TrackerCommand::AllowPlaintext { tracker }
     | TrackerCommand::Use { tracker, .. }
     | TrackerCommand::Drop { tracker, .. }
     | TrackerCommand::Remove { name: tracker } = &mut command
@@ -2750,6 +2756,23 @@ fn tracker(mut command: TrackerCommand) -> Result<()> {
                 "Pulled {} for `{instance}`",
                 bind_line(&outcome, deposit_only)
             );
+            Ok(())
+        }
+        TrackerCommand::AllowPlaintext { tracker } => {
+            let manager = manager_here()?;
+            if manager.allow_plaintext(&tracker)? {
+                println!(
+                    "`{tracker}` is captured and sent in plaintext from now on, on this machine, \
+                     as its definition says. What was encrypted before stays encrypted on the \
+                     remote; what is captured from now on, anyone who can read the tracker's \
+                     repo there reads, and so does whoever runs the remote"
+                );
+            } else {
+                println!(
+                    "`{tracker}` is encrypted to its audience by its definition, so there is \
+                     nothing to allow"
+                );
+            }
             Ok(())
         }
     }

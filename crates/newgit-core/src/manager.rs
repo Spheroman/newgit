@@ -101,6 +101,9 @@ pub struct BranchManager {
     /// Each audience's recipients as read from the remote and GitHub in
     /// this process, so a command reads them once.
     audiences: Mutex<BTreeMap<String, encryption::Audience>>,
+    /// Why a tracker's rev could not be encrypted again to its audience in
+    /// this command, by tracker: said when the sync then refuses it.
+    reseal_failures: Mutex<BTreeMap<String, String>>,
 }
 
 /// An instance's lock as a command holds it; dropping the last guard for an
@@ -1464,6 +1467,7 @@ impl BranchManager {
             locks: Mutex::new(BTreeMap::new()),
             keys: Arc::new(crate::crypt::PublishedKeys::from_env()),
             audiences: Mutex::new(BTreeMap::new()),
+            reseal_failures: Mutex::new(BTreeMap::new()),
         })
     }
 
@@ -3829,7 +3833,10 @@ impl BranchManager {
             )
             .map_err(|error| error.to_string())?;
             return match lane.main() {
-                Some(rev) => Ok(Some(rev)),
+                Some(rev) => {
+                    self.note_remote_has(&definition.name, &rev);
+                    Ok(Some(rev))
+                }
                 None => Err(no_own_content(&definition.name)),
             };
         }
@@ -3855,6 +3862,7 @@ impl BranchManager {
             Some(&basic_auth_header(&credential)),
         )
         .map_err(|error| error.to_string())?;
+        self.note_remote_has(&definition.name, &rev_ref);
         Ok(Some(rev.to_owned()))
     }
 
@@ -6137,6 +6145,19 @@ impl BranchManager {
             }
         }
 
+        // Nothing merged here yet (a clone): the remote's `main`, if it has
+        // one. A spawn with no network still binds, with nothing.
+        let mut warnings = Vec::new();
+        if !refresh
+            && lane.main().is_none()
+            && let Err(error) = self.bring_remote_main(definition, Acting::Workspace(&workspace))
+        {
+            warnings.push(format!(
+                "tracker `{}`: could not bring its `main` from the remote ({error}); `newgit \
+                 tracker pull {}` brings it later",
+                definition.name, definition.name
+            ));
+        }
         let (origin, content_rev, files) = match lane.main() {
             Some(rev) => {
                 let files = lane.restore(&workspace, definition, &rev)?;
@@ -6155,7 +6176,7 @@ impl BranchManager {
         branch.updated_at = Utc::now();
 
         Ok(TrackerBindOutcome {
-            warnings: Vec::new(),
+            warnings,
             name: definition.name.clone(),
             content_rev,
             files,
@@ -7222,6 +7243,9 @@ impl BranchManager {
         let definition = self.definition(tracker)?;
         self.require_workspace(&branch)?;
 
+        // The remote's `main` first, when it keeps one: a clone, or a
+        // machine that has not seen the latest merge, pulls what is there.
+        self.bring_remote_main(definition, Acting::Workspace(&branch.workspace_path))?;
         if self.lane(&definition.name).main().is_none() {
             return Err(NewgitError::Unsupported(format!(
                 "tracker `{}` has no merged content to pull",
@@ -10371,7 +10395,11 @@ impl BranchManager {
                         ),
                     ) {
                         Ok(current) => Some(current),
-                        Err(_) => Some(rev),
+                        // Kept for the sync's refusal to say.
+                        Err(error) => {
+                            self.note_reseal_failure(&definition.name, error.to_string());
+                            Some(rev)
+                        }
                     }
                 }
                 other => other,
@@ -12284,7 +12312,7 @@ impl BranchManager {
             }
             // Nothing in plaintext, and nothing to a stale audience (#338).
             self.refuse_plaintext(definition, rev)?;
-            self.refuse_stale(definition, rev, branch)?;
+            self.refuse_stale(definition, rev, Some(branch))?;
             if login.is_none() {
                 login = Some(remote.me()?.login);
             }

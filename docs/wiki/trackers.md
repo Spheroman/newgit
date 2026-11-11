@@ -24,17 +24,28 @@ member the remote lists (`https://github.com/<login>.keys`, `ssh-ed25519` or
 without a passphrase, added to your GitHub account, keeps agents from
 meeting a prompt). newgit prints who it encrypts to, by key fingerprint, the
 first time and whenever that changes. `newgit members add` and `remove`
-re-encrypt `main` for the new set of members; someone removed can still read
-what they could read before, so rotate those secrets. There is no opt-out:
+re-encrypt `main` for the new set of members, and nothing this machine had
+not sent yet reaches the remote encrypted to someone removed since; someone
+removed can still read what the remote held while they were a member, so
+rotate those secrets. If a definition you pull turns an encrypted tracker
+`public`, newgit refuses to capture or send it until you run `newgit tracker
+allow-plaintext <tracker>`. There is no opt-out:
 a tracker a server must read (a page the remote serves) is `public`.
 
 What that guarantees, and what it does not:
 
-- The remote, and anyone who controls its deployment, cannot read the
-  content.
-- The remote decides membership, so it could add a login whose GitHub keys
-  then become recipients; every change to the set is printed by key
-  fingerprint for that reason.
+- The remote, and anyone who controls its deployment, cannot read what was
+  encrypted before it acts: this holds against a remote that only stores
+  and serves.
+- A remote that acts can read what is captured afterwards. It decides
+  membership, so it can add a login whose GitHub keys then become
+  recipients, and the only signal is the fingerprints newgit prints
+  (`CHANGED`, `+ <login>`). A machine encrypting a tracker for the first
+  time has nothing to compare with.
+- The remote also serves tracker definitions. A definition changed to
+  `public` is refused, as an error, on every machine that has encrypted that
+  tracker until `newgit tracker allow-plaintext <tracker>` is run there; a
+  machine that never encrypted it takes the definition as it is.
 - GitHub accounts are the key authority.
 - There is no integrity: recipients' keys are public, so the remote can
   replace a file with content of its choosing that decrypts cleanly (signed

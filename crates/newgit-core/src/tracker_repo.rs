@@ -131,16 +131,40 @@ impl TrackerRepo {
     }
 
     /// The first file in `rev` or any rev behind it that is not an age file
-    /// (`<path> at <rev>`), or `None` when every one is: what pushing `rev`
-    /// could carry in plaintext. Links (stored as links) and each rev's
-    /// record are not content. Checked blob by blob, so a rev that only
-    /// looks sealed (one that tracks a file at the record's path) does not
-    /// pass.
+    /// (`<path> at <rev>`), or `None` when every one is. Links (stored as
+    /// links) and each rev's record are not content. What a send checks is
+    /// [`Self::unsent`]; this walks the whole history, for the one decision
+    /// that is about all of it (whether a `main` is the plaintext one an
+    /// encrypted history replaces).
     pub fn plaintext_in_history(&self, rev: &str) -> Result<Option<String>> {
+        Ok(self.unsent(rev, &[], None)?.plaintext)
+    }
+
+    /// What sending `rev` to a remote that already has every commit behind
+    /// `known` (refs or commits) would carry: the commits it lacks, newest
+    /// first along `rev`'s first parents, and of the files they introduce
+    /// the first one that is not age ciphertext and, given `recipients`,
+    /// the first that is not encrypted to exactly them. Only those commits
+    /// are read: one `git log`, and one `git cat-file --batch` for their
+    /// blobs. A file a commit keeps unchanged from one the remote has is
+    /// not sent again, so it is not judged here.
+    pub fn unsent(
+        &self,
+        rev: &str,
+        known: &[String],
+        recipients: Option<&Recipients>,
+    ) -> Result<Unsent> {
         let commit = self.commit_any(rev)?;
-        // Every blob each commit introduced, with its mode and path: one
-        // walk of the whole history.
-        let log = git(
+        // The revs on stdin: `known` grows with every checkpoint sent.
+        let mut revs = format!("{commit}\n");
+        if !known.is_empty() {
+            revs.push_str("--not\n");
+            for reference in known {
+                revs.push_str(reference);
+                revs.push('\n');
+            }
+        }
+        let log = git_stdin(
             &self.git_dir,
             &[
                 "log",
@@ -150,14 +174,20 @@ impl TrackerRepo {
                 "--no-renames",
                 "-m",
                 "--root",
-                &commit,
+                "--stdin",
             ],
+            &[],
+            revs.as_bytes(),
         )?;
-        let mut current = String::new();
+        // Every blob a missing commit introduced, with the commit and path.
+        let mut commits = std::collections::BTreeSet::new();
+        let mut introduced: Vec<(String, String, String)> = Vec::new();
         let mut seen = std::collections::BTreeSet::new();
+        let mut current = String::new();
         for line in log.lines() {
             if let Some(commit) = line.strip_prefix("commit ") {
-                current = short(commit);
+                current = commit.to_owned();
+                commits.insert(current.clone());
                 continue;
             }
             // `:<old mode> <new mode> <old oid> <new oid> <status>\t<path>`
@@ -174,15 +204,180 @@ impl TrackerRepo {
             if path == RECIPIENTS_PATH
                 || *mode == "120000"
                 || *mode == "000000"
-                || !seen.insert((*oid).to_owned())
+                || !seen.insert(((*oid).to_owned(), current.clone()))
             {
                 continue;
             }
-            if !crate::crypt::is_age(&self.blob(oid)?) {
-                return Ok(Some(format!("`{path}` at {current}")));
+            introduced.push((current.clone(), path.to_owned(), (*oid).to_owned()));
+        }
+        let oids: Vec<String> = introduced.iter().map(|(_, _, oid)| oid.clone()).collect();
+        let blobs = self.blobs(&oids)?;
+        let mut out = Unsent::default();
+        for (commit, path, oid) in &introduced {
+            let Some(bytes) = blobs.get(oid) else {
+                continue;
+            };
+            let at = format!("`{path}` at {}", short(commit));
+            if !crate::crypt::is_age(bytes) {
+                out.plaintext.get_or_insert_with(|| at.clone());
+                out.bad.insert(commit.clone());
+            } else if let Some(recipients) = recipients
+                && !recipients.sealed(bytes)
+            {
+                out.stale.get_or_insert(at);
+                out.bad.insert(commit.clone());
             }
         }
-        Ok(None)
+        // Newest first, along first parents: what a rebuild walks.
+        let first_parents = git_stdin(
+            &self.git_dir,
+            &["rev-list", "--first-parent", "--stdin"],
+            &[],
+            revs.as_bytes(),
+        )?;
+        out.commits = first_parents
+            .lines()
+            .map(ToOwned::to_owned)
+            .filter(|commit| commits.contains(commit))
+            .collect();
+        Ok(out)
+    }
+
+    /// `rev` again with nothing under it that a remote with everything
+    /// behind `known` lacks and that is not encrypted to exactly `seal`
+    /// ([`Self::unsent`]): the commits from the oldest such one up are made
+    /// again, each one's content encrypted to `seal`, on the commit below
+    /// it (one the remote has, or one already encrypted to `seal`), and
+    /// `branch` is moved to the last. `None` when nothing needed it. The
+    /// commits it replaces stay here, unsent.
+    pub fn rebuild_unsent(
+        &self,
+        rev: &str,
+        known: &[String],
+        seal: &Recipients,
+        branch: Branch<'_>,
+    ) -> Result<Option<String>> {
+        let unsent = self.unsent(rev, known, Some(seal))?;
+        if unsent.bad.is_empty() {
+            return Ok(None);
+        }
+        // The oldest bad one along first parents. A bad commit off them
+        // (behind a merge) is not under what the rebuild makes at all.
+        let Some(oldest) = unsent
+            .commits
+            .iter()
+            .rposition(|commit| unsent.bad.contains(commit))
+        else {
+            // Every bad commit is off the first-parent line: the tip made
+            // again on its first parent leaves them all behind.
+            let tip = self.commit_any(rev)?;
+            let parent = self.resolve(&format!("{tip}^"));
+            return self.remake(&tip, parent.as_deref(), seal, branch).map(Some);
+        };
+        let mut parent = self.resolve(&format!("{}^", unsent.commits[oldest]));
+        let mut rebuilt = None;
+        for commit in unsent.commits[..=oldest].iter().rev() {
+            let made = self.remake(commit, parent.as_deref(), seal, branch)?;
+            parent = Some(self.commit_for(&made)?);
+            rebuilt = Some(made);
+        }
+        Ok(rebuilt)
+    }
+
+    /// `commit`'s content, encrypted to `seal`, as a commit on `parent`
+    /// (none: a root) on `branch`, with `commit`'s message: its rev.
+    fn remake(
+        &self,
+        commit: &str,
+        parent: Option<&str>,
+        seal: &Recipients,
+        branch: Branch<'_>,
+    ) -> Result<String> {
+        let message = git(&self.git_dir, &["log", "-1", "--format=%B", commit])?;
+        let message: String = message
+            .lines()
+            .filter(|line| !line.starts_with(REPLACES_TRAILER))
+            .collect::<Vec<_>>()
+            .join("\n");
+        Ok(self
+            .reseal_onto(commit, parent, seal, branch, message.trim())?
+            .rev)
+    }
+
+    /// Every one of `oids`' contents, by oid, in one `git cat-file --batch`.
+    fn blobs(&self, oids: &[String]) -> Result<std::collections::BTreeMap<String, Vec<u8>>> {
+        let mut out = std::collections::BTreeMap::new();
+        if oids.is_empty() {
+            return Ok(out);
+        }
+        let mut input = String::new();
+        for oid in oids {
+            input.push_str(oid);
+            input.push('\n');
+        }
+        let args = ["cat-file", "--batch"];
+        let output = run(
+            &mut command(&self.git_dir, &args, &[]),
+            &describe(&args),
+            Some(input.as_bytes()),
+        )?;
+        let mut rest = output.as_slice();
+        while !rest.is_empty() {
+            let Some(end) = rest.iter().position(|byte| *byte == b'\n') else {
+                break;
+            };
+            let header = String::from_utf8_lossy(&rest[..end]).into_owned();
+            rest = &rest[end + 1..];
+            let mut fields = header.split(' ');
+            let (Some(oid), Some(_kind), Some(size)) =
+                (fields.next(), fields.next(), fields.next())
+            else {
+                // `<oid> missing`
+                continue;
+            };
+            let size: usize = size.parse().map_err(|_| {
+                self.encryption(format!("could not read `git cat-file --batch`: {header}"))
+            })?;
+            if rest.len() < size {
+                break;
+            }
+            out.insert(oid.to_owned(), rest[..size].to_vec());
+            rest = rest.get(size + 1..).unwrap_or_default();
+        }
+        Ok(out)
+    }
+
+    /// Whether any rev of this tracker this store holds a branch or pin of
+    /// is a sealed one: whether this machine ever encrypted it (or was
+    /// handed encrypted content of it).
+    pub fn ever_sealed(&self) -> Result<bool> {
+        if !self.git_dir.join("HEAD").is_file() {
+            return Ok(false);
+        }
+        let tips = git(
+            &self.git_dir,
+            &[
+                "for-each-ref",
+                "--format=%(objectname)",
+                &format!("refs/trackers/{}/", self.tracker),
+            ],
+        )?;
+        let mut input = String::new();
+        for tip in tips.lines().collect::<std::collections::BTreeSet<_>>() {
+            input.push_str(&format!("{tip}:{RECIPIENTS_PATH}\n"));
+        }
+        if input.is_empty() {
+            return Ok(false);
+        }
+        let args = ["cat-file", "--batch-check"];
+        let output = run(
+            &mut command(&self.git_dir, &args, &[]),
+            &describe(&args),
+            Some(input.as_bytes()),
+        )?;
+        Ok(String::from_utf8_lossy(&output)
+            .lines()
+            .any(|line| !line.ends_with(" missing")))
     }
 
     /// The plaintext rev `rev` replaced as the start of a new, sealed
@@ -329,10 +524,11 @@ impl TrackerRepo {
     }
 
     /// `rev`'s content again, encrypted to `seal`, as a commit on `branch`
-    /// on top of `rev`: how a membership change, or a new instance, is
-    /// given what is already there. `rev` itself when it is already sealed
-    /// to exactly `seal`. A plaintext `rev` is the start of a new history,
-    /// so nothing of the plaintext one rides along when it is pushed.
+    /// on top of `rev`: how a membership change gives a new member what is
+    /// already there. Only for a `rev` the remote has (or one already
+    /// encrypted to a set it may be sent to): `rev` itself rides along when
+    /// the result is pushed. A plaintext `rev` is the start of a new
+    /// history, so nothing of the plaintext one rides along.
     pub fn reseal(
         &self,
         rev: &str,
@@ -340,7 +536,20 @@ impl TrackerRepo {
         branch: Branch<'_>,
         message: &str,
     ) -> Result<CaptureOutcome> {
-        let commit = self.commit_for(rev)?;
+        self.reseal_onto(rev, Some(rev), seal, branch, message)
+    }
+
+    /// `rev`'s content, encrypted to `seal`, as a commit on `parent` (none:
+    /// a root).
+    fn reseal_onto(
+        &self,
+        rev: &str,
+        parent: Option<&str>,
+        seal: &Recipients,
+        branch: Branch<'_>,
+        message: &str,
+    ) -> Result<CaptureOutcome> {
+        let commit = self.commit_any(rev)?;
         let mut files = self.tree_files(&commit, &[])?;
         files.retain(|file| file != RECIPIENTS_PATH);
         self.refuse_escaping_links(rev, &commit, &files)?;
@@ -358,11 +567,22 @@ impl TrackerRepo {
         let planned = self.plan_checkout(rev, &commit, &files)?;
         self.apply_checkout(&commit, &dir, &files, planned)?;
         let collected = collect_all_files(&dir)?;
+        // A parent the remote has may have no pin here (its `main` as
+        // fetched): pinned, as every rev a capture parents onto is.
+        let parent = match parent {
+            Some(parent) => {
+                let full = self.commit_any(parent)?;
+                let rev = short(&full);
+                git(&self.git_dir, &["update-ref", &self.pin_ref(&rev), &full])?;
+                Some(rev)
+            }
+            None => None,
+        };
         self.commit_files(
             &dir,
             &collected,
             CaptureAt {
-                parent: Some(rev),
+                parent: parent.as_deref(),
                 branch,
                 message,
                 seal: Some(seal),
@@ -485,7 +705,11 @@ impl TrackerRepo {
         // the one history replacement there is.
         let mut replaces = None;
         let parent = match (at.seal, parent) {
-            (Some(_), Some(parent)) if self.plaintext_in_history(&parent)?.is_some() => {
+            // A sealed parent was made the same way, so its history is
+            // sealed already: only a plaintext one is walked.
+            (Some(_), Some(parent))
+                if !self.sealed(&parent) && self.plaintext_in_history(&parent)?.is_some() =>
+            {
                 replaces = Some(parent);
                 None
             }
@@ -1085,6 +1309,21 @@ fn identity(git_dir: &Utf8Path) -> Vec<(String, String)> {
 
 fn short(commit: &str) -> String {
     commit[..REV_LEN.min(commit.len())].to_owned()
+}
+
+/// What sending a rev would carry: see [`TrackerRepo::unsent`].
+#[derive(Debug, Default)]
+pub struct Unsent {
+    /// The commits the remote lacks along the rev's first parents, newest
+    /// first.
+    pub commits: Vec<String>,
+    /// Commits (any of those the remote lacks) that introduce a file that
+    /// is plaintext or not encrypted to the recipients asked about.
+    pub bad: std::collections::BTreeSet<String>,
+    /// The first file sent as plaintext, as `<path> at <rev>`.
+    pub plaintext: Option<String>,
+    /// The first file sent encrypted to another set of recipients.
+    pub stale: Option<String>,
 }
 
 /// A checkout, prepared: see [`TrackerRepo::plan_checkout`].

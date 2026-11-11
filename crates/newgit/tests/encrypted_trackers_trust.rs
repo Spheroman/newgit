@@ -374,14 +374,8 @@ fn a_merge_never_overwrites_a_main_merged_elsewhere_it_has_not_seen() {
     );
     let repo = env_repo(&fixture);
     let first = git(&repo, &["rev-parse", "refs/heads/main"]);
-    // A fresh clone has never seen `main` either: the same refusal, and
-    // `main` comes here for `tracker pull`.
-    std::fs::write(elsewhere.join(".env.shared"), "API_KEY=blind\n").expect("write");
-    fixture.ok(&elsewhere, &["checkpoint"]);
-    let blind = fixture.newgit(&elsewhere, &["tracker", "merge", "env"]);
-    assert!(!blind.status.success());
-    assert_eq!(git(&repo, &["rev-parse", "refs/heads/main"]), first);
-    fixture.ok(&elsewhere, &["tracker", "pull", "env"]);
+    // A fresh clone spawns with the remote's `main`, so its merge contains
+    // it and goes.
     assert_eq!(
         std::fs::read_to_string(elsewhere.join(".env.shared")).expect("read"),
         SECRET
@@ -391,6 +385,10 @@ fn a_merge_never_overwrites_a_main_merged_elsewhere_it_has_not_seen() {
     fixture.ok(&elsewhere, &["tracker", "merge", "env"]);
     let theirs = git(&repo, &["rev-parse", "refs/heads/main"]);
     assert_ne!(theirs, first);
+    assert_eq!(
+        git(&repo, &["merge-base", "--is-ancestor", &first, &theirs]),
+        ""
+    );
 
     // This one, from what it had, is refused, and the remote keeps theirs.
     std::fs::write(feature_b.join(".env.shared"), "API_KEY=mine\n").expect("write");

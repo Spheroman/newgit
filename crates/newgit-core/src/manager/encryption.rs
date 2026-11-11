@@ -7,8 +7,19 @@
 //! audience names, as the remote lists them (the remote is the membership
 //! authority), by the keys GitHub publishes for each. This machine keeps the
 //! last list it read in `.newgit/local/audience.json`, so a capture with no
-//! network still encrypts to someone; nothing is published until the list
-//! has been read again and the rev checked against it.
+//! network still encrypts to someone. Nothing is sent until the list has
+//! been read again and every commit the remote does not have yet has been
+//! checked against it: one encrypted to anyone else (a member removed since,
+//! for instance) is made again, encrypted to the members as they are now, on
+//! the last commit the remote has, and the stale one is never sent. A
+//! removed member keeps whatever the remote held while they were a member,
+//! and nothing captured after their removal reaches the remote encrypted to
+//! them.
+//!
+//! A tracker this machine has encrypted is never captured or sent in
+//! plaintext just because its definition (which arrives through `access`,
+//! `newgit merge main`, and `pull`) now says `public`: that waits for
+//! `newgit tracker allow-plaintext <tracker>` on this machine.
 
 use std::collections::BTreeMap;
 
@@ -39,8 +50,6 @@ pub struct Reencrypted {
     pub previous: Option<Recipients>,
     /// Members of its audience with no key age can encrypt to.
     pub keyless: Vec<String>,
-    /// Whether the new `main` reached the remote.
-    pub published: bool,
     /// Why it was not re-encrypted, when it was not.
     pub error: Option<String>,
 }
@@ -78,6 +87,11 @@ struct AudienceCache {
     /// [`Recipients::to_text`] writes them.
     #[serde(default)]
     used: BTreeMap<String, String>,
+    /// Trackers this machine encrypted whose definition now stores them in
+    /// plaintext, which the developer confirmed here with `newgit tracker
+    /// allow-plaintext`. Forgotten when the tracker is encrypted again.
+    #[serde(default)]
+    plaintext_allowed: std::collections::BTreeSet<String>,
 }
 
 /// Who `recipients` are, each login with its keys' fingerprints, and loudly
@@ -223,7 +237,7 @@ impl BranchManager {
                 members
             }
             "user" => {
-                let me = link.connect(acting)?.me()?.login.to_lowercase();
+                let me = self.pinned_me(link, acting, &cache, &definition.name)?;
                 cache.me = Some(me.clone());
                 vec![me]
             }
@@ -238,6 +252,41 @@ impl BranchManager {
         // being able to is no reason to fail this one.
         let _ = self.save_audience_cache(&cache);
         Ok(audience_from(&logins, &keys))
+    }
+
+    /// Who `user` is: the login saved by `newgit login` (else the one this
+    /// machine last encrypted a per-user tracker to), which the remote's
+    /// answer has to match. The remote does not get to decide whose keys a
+    /// per-user tracker is encrypted to.
+    fn pinned_me(
+        &self,
+        link: &crate::remote::RemoteLink,
+        acting: Acting<'_>,
+        cache: &AudienceCache,
+        tracker: &str,
+    ) -> Result<String> {
+        let answered = link.connect(acting)?.me()?.login.to_lowercase();
+        let pinned = crate::remote::saved_login(&link.url)?
+            .map(|saved| saved.login.to_lowercase())
+            .or_else(|| cache.me.clone());
+        match pinned {
+            Some(pinned) if pinned == answered => Ok(pinned),
+            Some(pinned) => Err(NewgitError::Encryption {
+                tracker: tracker.to_owned(),
+                message: format!(
+                    "the remote says you are `{answered}`, but this machine is logged in as \
+                     `{pinned}` (`newgit login`), so it is not encrypted to `{answered}`'s keys. \
+                     If you meant to switch accounts, run `newgit login` again"
+                ),
+            }),
+            None => Err(NewgitError::Encryption {
+                tracker: tracker.to_owned(),
+                message: format!(
+                    "this machine has no saved login to check the remote's answer (`{answered}`) \
+                     against, so it is not encrypted to it; run `newgit login`"
+                ),
+            }),
+        }
     }
 
     /// [`Self::audience_of`] from what this machine last read, if it read
@@ -305,18 +354,136 @@ impl BranchManager {
         definition: &TrackerDefinition,
         branch: Option<&BranchInstance>,
     ) -> Result<Option<Recipients>> {
-        if !definition.encrypted_to_audience() || self.remote.is_none() {
+        if self.remote.is_none() {
+            return Ok(None);
+        }
+        if !definition.encrypted_to_audience() {
+            self.refuse_unsealing(definition)?;
             return Ok(None);
         }
         let audience = self.audience_of(definition, branch, Fresh::Preferred)?;
         self.announce(&definition.name, &audience);
+        self.forget_plaintext_allowed(&definition.name);
         Ok(Some(audience.recipients))
     }
 
-    /// `rev`, or `rev` encrypted again (a commit on `on`) when its files
-    /// are not encrypted to exactly the audience as the remote has it now:
-    /// what every rev of an encrypted tracker goes through before it is
-    /// published.
+    /// Refuse to capture or send `definition` in plaintext when this
+    /// machine has encrypted it before and the developer has not confirmed
+    /// here that it is meant to be plaintext now. The definition arrives
+    /// from elsewhere (`access`, `newgit merge main`, `pull`), so a change
+    /// to `public` alone is not enough to stop encrypting a secret.
+    pub(super) fn refuse_unsealing(&self, definition: &TrackerDefinition) -> Result<()> {
+        if definition.encrypted_to_audience()
+            || definition.git
+            || definition.storage != Storage::Remote
+            || self.remote.is_none()
+        {
+            return Ok(());
+        }
+        let cache = self.load_audience_cache();
+        if cache.plaintext_allowed.contains(&definition.name) {
+            return Ok(());
+        }
+        let sealed_before = cache.used.contains_key(&definition.name)
+            || self.lane(&definition.name).ever_sealed().unwrap_or(true);
+        if !sealed_before {
+            return Ok(());
+        }
+        Err(NewgitError::Unsupported(format!(
+            "tracker `{name}` was encrypted on this machine, but its definition \
+             (`.newgit/trackers/{path}.toml`) now says `audience = \"{audience}\"`, which \
+             stores it in plaintext on the remote. Definitions arrive through `access`, `newgit \
+             merge main`, and `pull`, so nothing of `{name}` is captured or sent in plaintext \
+             until you confirm the change on this machine: `newgit tracker allow-plaintext \
+             {name}`. Who changed it: `git log -p -- .newgit/trackers/{path}.toml`",
+            path = crate::tracker::tracker_path(&definition.name),
+            audience = definition.audience,
+            name = definition.name,
+        )))
+    }
+
+    /// Confirm on this machine that `definition`, which this machine has
+    /// encrypted, is captured and sent in plaintext from now on, as its
+    /// definition says. `false` when its definition still encrypts it.
+    pub fn allow_plaintext(&self, tracker: &str) -> Result<bool> {
+        let definition = self.definition(tracker)?;
+        if definition.encrypted_to_audience() {
+            return Ok(false);
+        }
+        let mut cache = self.load_audience_cache();
+        cache.plaintext_allowed.insert(definition.name.clone());
+        self.save_audience_cache(&cache)?;
+        Ok(true)
+    }
+
+    fn forget_plaintext_allowed(&self, tracker: &str) {
+        let mut cache = self.load_audience_cache();
+        if cache.plaintext_allowed.remove(tracker) {
+            let _ = self.save_audience_cache(&cache);
+        }
+    }
+
+    /// Every ref in this store naming a commit of `tracker` the remote
+    /// has: what this machine sent there, its `main` as last fetched, and
+    /// revs fetched from it.
+    pub(super) fn remote_has(&self, tracker: &str) -> Vec<String> {
+        let store = format!("--git-dir={}", self.store.paths().tracker_store);
+        let Ok(refs) = crate::source::run_git_env(
+            &[
+                &store,
+                "for-each-ref",
+                "--format=%(refname)",
+                "refs/newgit/sent/",
+                &format!("refs/newgit/remote-main/{tracker}/"),
+                &format!("refs/newgit/remote-has/{tracker}/"),
+            ],
+            &[],
+        ) else {
+            return Vec::new();
+        };
+        let sent = format!("/trackers/{tracker}/");
+        refs.lines()
+            .map(str::trim)
+            .filter(|name| !name.starts_with("refs/newgit/sent/") || name.contains(&sent))
+            .map(ToOwned::to_owned)
+            .collect()
+    }
+
+    /// Remember that the remote has `commit` of `tracker` (fetched from it).
+    pub(super) fn note_remote_has(&self, tracker: &str, commit: &str) {
+        let store = format!("--git-dir={}", self.store.paths().tracker_store);
+        let Ok(full) = crate::source::run_git_env(
+            &[
+                &store,
+                "rev-parse",
+                "-q",
+                "--verify",
+                &format!("{commit}^{{commit}}"),
+            ],
+            &[],
+        ) else {
+            return;
+        };
+        let full = full.trim();
+        let _ = crate::source::run_git_env(
+            &[
+                &store,
+                "update-ref",
+                &format!("refs/newgit/remote-has/{tracker}/{full}"),
+                full,
+            ],
+            &[],
+        );
+    }
+
+    /// `rev`, or `rev` made safe to publish and encrypted to exactly the
+    /// audience as the remote has it now: what every rev of an encrypted
+    /// tracker goes through before it is published. Every commit under it
+    /// the remote does not have yet and that is encrypted to anyone else is
+    /// made again, on the last commit the remote has ([`Self::remote_has`]),
+    /// so nothing encrypted to a member removed since is ever sent; then,
+    /// when `rev` is one the remote has but encrypted to another set, its
+    /// content is encrypted again in a commit on top (on `on`).
     pub(super) fn sealed_to_current(
         &self,
         definition: &TrackerDefinition,
@@ -329,12 +496,18 @@ impl BranchManager {
             return Ok(rev.to_owned());
         }
         let audience = self.audience_of(definition, branch, Fresh::Required)?;
-        let lane = self.lane(&definition.name);
-        if lane.sealed_to(rev, &audience.recipients)? {
-            return Ok(rev.to_owned());
-        }
+        // Said whenever it is not the set this machine last used, whether
+        // or not anything has to be encrypted again.
         self.announce(&definition.name, &audience);
-        Ok(lane.reseal(rev, &audience.recipients, on, message)?.rev)
+        let lane = self.lane(&definition.name);
+        let known = self.remote_has(&definition.name);
+        let rev = lane
+            .rebuild_unsent(rev, &known, &audience.recipients, on)?
+            .unwrap_or_else(|| rev.to_owned());
+        if lane.sealed_to(&rev, &audience.recipients)? {
+            return Ok(rev);
+        }
+        Ok(lane.reseal(&rev, &audience.recipients, on, message)?.rev)
     }
 
     /// Encrypt every shared tracker's `main` again, to its audience's
@@ -362,7 +535,6 @@ impl BranchManager {
                 recipients: Recipients::default(),
                 previous: None,
                 keyless: Vec::new(),
-                published: false,
                 error: None,
             };
             if let Err(error) = self.reencrypt_main(definition, &mut entry) {
@@ -394,23 +566,31 @@ impl BranchManager {
             return Ok(());
         };
         entry.merged = true;
-        if lane.sealed_to(&main, &audience.recipients)? {
-            return Ok(());
-        }
-        let outcome = lane.reseal(
-            &main,
-            &audience.recipients,
-            Branch::Main,
-            &format!(
-                "{}: encrypted to its audience as it is now",
-                definition.name
-            ),
-        )?;
-        entry.published = self
-            .publish_main(definition, &outcome.rev, Acting::Login)?
-            .is_some();
-        lane.set_main(&outcome.rev)?;
-        entry.rev = Some(outcome.rev);
+        // A `main` never published may have commits under it encrypted to
+        // someone removed since: made again first, as any send does.
+        let known = self.remote_has(&definition.name);
+        let rebuilt = lane.rebuild_unsent(&main, &known, &audience.recipients, Branch::Main)?;
+        let current = rebuilt.clone().unwrap_or_else(|| main.clone());
+        let rev = if lane.sealed_to(&current, &audience.recipients)? {
+            match rebuilt {
+                Some(rev) => rev,
+                None => return Ok(()),
+            }
+        } else {
+            lane.reseal(
+                &current,
+                &audience.recipients,
+                Branch::Main,
+                &format!(
+                    "{}: encrypted to its audience as it is now",
+                    definition.name
+                ),
+            )?
+            .rev
+        };
+        self.publish_main(definition, &rev, Acting::Login)?;
+        lane.set_main(&rev)?;
+        entry.rev = Some(rev);
         Ok(())
     }
 
@@ -485,6 +665,32 @@ impl BranchManager {
         .map(|commit| commit.trim().to_owned()))
     }
 
+    /// Make the remote's `main` of `definition` this machine's, when this
+    /// machine has none or one behind it: what `newgit tracker pull`, and a
+    /// spawn in a fresh clone, start from. Only a shared tracker whose
+    /// `main` lives on the remote. Its `main` after, if any.
+    pub(super) fn bring_remote_main(
+        &self,
+        definition: &TrackerDefinition,
+        acting: Acting<'_>,
+    ) -> Result<Option<String>> {
+        let lane = self.lane(&definition.name);
+        if definition.git
+            || definition.storage != Storage::Remote
+            || definition.audience == "user"
+            || self.remote.is_none()
+        {
+            return Ok(lane.main());
+        }
+        let Some(theirs) = self.fetch_remote_main(definition, acting)? else {
+            return Ok(lane.main());
+        };
+        match lane.main() {
+            Some(main) if lane.contains(&main, &theirs)? => Ok(Some(main)),
+            _ => lane.adopt_main(&theirs).map(Some),
+        }
+    }
+
     /// Move the remote's `main` for a shared tracker whose synced state
     /// lives there (`storage = "remote"`) to `rev`. A checkpoint's sync
     /// pushes only such a tracker's pins and instance branches, never its
@@ -514,9 +720,11 @@ impl BranchManager {
         let Some(link) = &self.remote else {
             return Ok(None);
         };
-        self.refuse_plaintext(definition, rev)?;
         let lane = self.lane(&definition.name);
         let theirs = self.fetch_remote_main(definition, acting)?;
+        // Judged against what the remote has, `main` just fetched included.
+        self.refuse_plaintext(definition, rev)?;
+        self.refuse_stale(definition, rev, None)?;
         if let Some(theirs) = &theirs
             && !self.incorporates(definition, rev, theirs)?
         {
@@ -524,8 +732,11 @@ impl BranchManager {
             return Err(NewgitError::Unsupported(format!(
                 "the remote's `main` of `{name}` has changes {rev} does not include (merged \
                  from somewhere else since this machine last saw it), so nothing was \
-                 published: that would overwrite them. Bring them in with `newgit tracker pull \
-                 {name}` in the instance, then capture and merge again",
+                 published: that would overwrite them. `newgit tracker pull {name}` in the \
+                 instance brings them in, and REPLACES this instance's `{name}` files with \
+                 the remote's `main`. Your version stays at {rev}: `newgit tracker checkout \
+                 {name} --rev {rev}` puts it back in the workspace, to copy what you need \
+                 before you capture and merge again",
                 name = definition.name,
             )));
         }
@@ -545,6 +756,16 @@ impl BranchManager {
             theirs.as_deref(),
             Some(&auth),
         )?;
+        // The remote has it now.
+        let _ = crate::source::run_git_env(
+            &[
+                &location,
+                "update-ref",
+                &format!("refs/newgit/remote-main/{}/main", definition.name),
+                &lane.full(rev)?,
+            ],
+            &[],
+        );
         Ok(Some(link.project.clone()))
     }
 
@@ -585,15 +806,22 @@ impl BranchManager {
         Ok(false)
     }
 
-    /// Refuse to send a rev of an encrypted tracker whose history holds a
-    /// file that is not age ciphertext: the backstop on every path where
-    /// tracker content leaves this machine, whatever wrote the rev. Every
-    /// blob is checked, not the record.
+    /// Refuse to send a rev of an encrypted tracker that would carry a file
+    /// that is not age ciphertext: the backstop on every path where tracker
+    /// content leaves this machine, whatever wrote the rev. Every file the
+    /// commits the remote lacks introduce is checked, not the record. And a
+    /// tracker this machine encrypted whose definition now says otherwise
+    /// is refused outright ([`Self::refuse_unsealing`]).
     pub(super) fn refuse_plaintext(&self, definition: &TrackerDefinition, rev: &str) -> Result<()> {
         if !definition.encrypted_to_audience() {
-            return Ok(());
+            return self.refuse_unsealing(definition);
         }
-        let Some(found) = self.lane(&definition.name).plaintext_in_history(rev)? else {
+        let known = self.remote_has(&definition.name);
+        let Some(found) = self
+            .lane(&definition.name)
+            .unsent(rev, &known, None)?
+            .plaintext
+        else {
             return Ok(());
         };
         Err(NewgitError::Encryption {
@@ -607,33 +835,58 @@ impl BranchManager {
         })
     }
 
-    /// Refuse to send `rev` unless it is encrypted to exactly the audience
-    /// as the remote has it now: what checkpoint sync checks, after the
-    /// checkpoint encrypted anything stale again.
+    /// Refuse to send `rev` unless every commit of it the remote does not
+    /// have yet is encrypted to exactly the audience as the remote has it
+    /// now (and `rev` itself is): what checkpoint sync and publishing `main`
+    /// check, after anything stale was encrypted again.
     pub(super) fn refuse_stale(
         &self,
         definition: &TrackerDefinition,
         rev: &str,
-        branch: &BranchInstance,
+        branch: Option<&BranchInstance>,
     ) -> Result<()> {
         if !definition.encrypted_to_audience() {
             return Ok(());
         }
-        let audience = self.audience_of(definition, Some(branch), Fresh::Required)?;
-        if self
-            .lane(&definition.name)
-            .sealed_to(rev, &audience.recipients)?
-        {
-            return Ok(());
-        }
+        let audience = self.audience_of(definition, branch, Fresh::Required)?;
+        self.announce(&definition.name, &audience);
+        let lane = self.lane(&definition.name);
+        let known = self.remote_has(&definition.name);
+        let stale = lane.unsent(rev, &known, Some(&audience.recipients))?.stale;
+        let found = match stale {
+            Some(found) => found,
+            None if lane.sealed_to(rev, &audience.recipients)? => return Ok(()),
+            None => format!("rev {rev}"),
+        };
+        let why = self
+            .reseal_failures
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&definition.name)
+            .cloned();
         Err(NewgitError::Encryption {
             tracker: definition.name.clone(),
             message: format!(
-                "rev {rev} is not encrypted to the audience as it is now ({}), so it is not \
-                 sent; `newgit checkpoint` again encrypts it to them",
-                audience.recipients.logins()
+                "{found} is not encrypted to the audience as it is now ({}), so nothing of rev \
+                 {rev} is sent. {}",
+                audience.recipients.logins(),
+                match why {
+                    Some(why) => format!("It could not be encrypted again to them: {why}"),
+                    None => "`newgit checkpoint` encrypts it to them again, given a key on \
+                             this machine that opens it"
+                        .to_owned(),
+                }
             ),
         })
+    }
+
+    /// Remember why `tracker` could not be encrypted again in this
+    /// command, for the refusal that follows.
+    pub(super) fn note_reseal_failure(&self, tracker: &str, why: String) {
+        self.reseal_failures
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(tracker.to_owned(), why);
     }
 }
 

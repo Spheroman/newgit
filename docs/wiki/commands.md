@@ -116,6 +116,10 @@ Remote:
   left alone (`newgit tracker pull`)
 - `newgit pull --remote <target>` — bring back what was merged on an export
   target (a pull request on GitHub); `newgit merge main` publishes it
+- `newgit tracker allow-plaintext <tracker>` — confirm on this machine that
+  a tracker it encrypted is captured and sent in plaintext from now on,
+  because its definition now says `audience = "public"`. Until then every
+  capture and send of it fails: definitions arrive from elsewhere
 - `newgit members add|remove <github-login>` / `members list [--json]` — add
   and remove re-encrypt each shared encrypted tracker's `main` for the new
   members, list every recipient by key fingerprint (saying `CHANGED` when

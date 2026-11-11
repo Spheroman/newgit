@@ -15,13 +15,23 @@
   and `remove` re-encrypt `main` and fail when they could not (`members
   reencrypt` retries); removing someone does not take back what they could
   already read, and says so. Membership is read again before anything is
-  published, and publishing a tracker's `main` no longer forces over a
-  `main` merged elsewhere: it is refused until `newgit tracker pull`. There
-  is no opt-out: newgit.dev's `site` is now `public`. An existing tracker is
-  encrypted on its next capture, as a new history.
+  published, and every commit the remote does not have yet that is
+  encrypted to anyone else is made again first, so nothing captured after
+  a member's removal (or captured before it and not yet sent) reaches the
+  remote encrypted to them. Publishing a tracker's `main` no longer forces
+  over a `main` merged elsewhere: it is refused until `newgit tracker pull`,
+  which (like a spawn in a fresh clone) fetches the remote's `main` first.
+  A tracker this machine encrypted whose definition turns `public` is
+  refused until `newgit tracker allow-plaintext <tracker>` on this machine,
+  and a per-user tracker is encrypted to the login `newgit login` saved,
+  never to whoever the remote says you are. There is no opt-out:
+  newgit.dev's `site` is now `public`. An existing tracker is encrypted on
+  its next capture, as a new history.
 
-  What it does not do: the remote still decides membership, so it could add
-  a login whose keys then become recipients (hence the fingerprints); GitHub
+  What it does not do: the remote cannot read what was encrypted before it
+  acts, but a remote that acts can read what is captured afterwards. It
+  decides membership, so it can add a login whose keys then become
+  recipients, and the printed fingerprints are the only signal; GitHub
   accounts are the key authority; nothing is signed, so the remote can
   replace a file with content that decrypts cleanly
   ([#431](https://github.com/Spheroman/newgit/issues/431)); file names,

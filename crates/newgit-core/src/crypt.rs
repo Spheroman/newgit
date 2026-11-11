@@ -13,8 +13,11 @@
 //! rev, not `main`, not anything a remote serves. The list is written into
 //! each sealed rev at [`RECIPIENTS_PATH`] for people to read, and no code
 //! takes a recipient from it. Whether a rev is sealed to a set is decided by
-//! the ciphertext itself: each age file's header names a tag of every SSH
-//! key it is encrypted to ([`stanzas`]).
+//! the ciphertext itself: each age file's header names the current keys, by
+//! a tag of every SSH key it is encrypted to ([`stanzas`]). That identifies
+//! the keys; it does not prove them (the tag is public, and the header's MAC
+//! is not checked without a key), so it decides what to encrypt again, never
+//! who may read.
 //!
 //! What stays readable without a key: file names, approximate sizes, link
 //! targets (a link is stored as a link), commit messages, authors, and
@@ -217,9 +220,9 @@ impl Recipients {
         self.0.iter().filter_map(Recipient::stanza).collect()
     }
 
-    /// Whether `ciphertext` is an age file encrypted to exactly these keys:
-    /// every one of them, and nothing else (no X25519, no passphrase, no
-    /// SSH key not listed here).
+    /// Whether `ciphertext` is an age file whose header names exactly these
+    /// keys: every one of them, and nothing else (no X25519, no passphrase,
+    /// no SSH key not listed here). Names, not proves: see the module doc.
     pub fn sealed(&self, ciphertext: &[u8]) -> bool {
         stanzas(ciphertext).is_some_and(|found| found == self.stanzas())
     }

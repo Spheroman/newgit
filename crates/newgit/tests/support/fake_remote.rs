@@ -94,6 +94,9 @@ struct State {
     not_a_member: std::collections::BTreeSet<String>,
     /// Project key → tag name → the tag, as the remote answers it.
     tags: BTreeMap<String, BTreeMap<String, Value>>,
+    /// Answer `GET /v1/me` with this login instead of the caller's: a
+    /// remote lying about who you are.
+    me_as: Option<String>,
 }
 
 /// A tracker's definition as the remote reads it, from `access`'s `main`:
@@ -449,7 +452,11 @@ fn route(
     match (method, segments.as_slice()) {
         ("GET", ["v1", "me"]) => (
             200,
-            json!({ "login": caller, "kind": "login", "token_id": "tok" }),
+            json!({
+                "login": state.me_as.clone().unwrap_or_else(|| caller.clone()),
+                "kind": "login",
+                "token_id": "tok",
+            }),
         ),
         ("POST", ["v1", "projects"]) => {
             let name = body["name"].as_str().unwrap_or_default();

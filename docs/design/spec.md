@@ -375,12 +375,17 @@ an ordinary blob in the tracker's history, so Git's object model is
 untouched; the list is written beside it at `.newgit/recipients` for people
 to read, and no code takes a recipient from it. Capture encrypts (reusing a
 parent's blob when its content is unchanged and its own age header names
-exactly the current keys, so unchanged content is still no commit),
+the current keys, exactly, so unchanged content is still no commit),
 projection decrypts with the developer's own SSH key (or `$NEWGIT_IDENTITY`),
 and the workspace holds plaintext, owner-only. Before a checkpoint syncs or
 `tracker merge` or `members add`/`remove` publishes, the member list is read
-again and a rev not encrypted to it is encrypted again; every send checks
-every blob it would carry is age ciphertext. Publishing `main` fetches the
+again and every commit the remote does not have yet is checked against it:
+those encrypted to anyone else are made again, on the last commit the remote
+has, so nothing encrypted to a member removed since is ever sent. Every send
+checks that every file those commits carry is age ciphertext. A tracker this
+machine has encrypted is never captured or sent in plaintext because its
+definition now says `public`, until `newgit tracker allow-plaintext` on this
+machine. `user` is the login `newgit login` saved, never the remote's say. Publishing `main` fetches the
 remote's first and never forces over changes it lacks. Every change to the
 recipient set is printed by fingerprint. A tracker that was plaintext is
 encrypted on its next capture as a new history whose first commit names the
@@ -390,11 +395,18 @@ trackers* has the details.
 
 What it guarantees, and its limits:
 
-- The remote, and anyone who controls its deployment, cannot read the
-  content.
-- The remote decides membership, so it could add a login whose GitHub keys
-  then become recipients; every change to the set is printed by key
-  fingerprint for that reason.
+- The remote, and anyone who controls its deployment, cannot read what was
+  encrypted before it acts: this holds against a remote that only stores
+  and serves.
+- A remote that acts can read what is captured afterwards. It decides
+  membership, so it can add a login whose GitHub keys then become
+  recipients, and the only signal is the fingerprints newgit prints
+  (`CHANGED`, `+ <login>`). A machine encrypting a tracker for the first
+  time has nothing to compare with.
+- The remote also serves tracker definitions. A definition changed to
+  `public` is refused, as an error, on every machine that has encrypted that
+  tracker until `newgit tracker allow-plaintext <tracker>` is run there; a
+  machine that never encrypted it takes the definition as it is.
 - GitHub accounts are the key authority.
 - There is no integrity: recipients' keys are public, so the remote can
   replace a file with content of its choosing that decrypts cleanly (signed

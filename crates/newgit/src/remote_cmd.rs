@@ -1115,14 +1115,7 @@ fn reencrypt(manager: &BranchManager) -> Result<()> {
             _ if !outcome.merged => {
                 println!("  `{tracker}`: nothing merged yet, so nothing to re-encrypt");
             }
-            Some(rev) => println!(
-                "  `{tracker}`: main re-encrypted at {rev}{}",
-                if outcome.published {
-                    ""
-                } else {
-                    " (on this machine only: the remote has no `main` of it yet)"
-                }
-            ),
+            Some(rev) => println!("  `{tracker}`: main re-encrypted at {rev}"),
             None => println!("  `{tracker}`: main is already encrypted to these keys"),
         }
         done.push(format!("`{tracker}`"));
