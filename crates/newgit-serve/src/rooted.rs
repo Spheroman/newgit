@@ -1061,7 +1061,7 @@ fn refresh_once(
             let found = line.lookup(&mut objects, &part.source)?.ok_or_else(|| {
                 HttpError::internal(format!(
                     "{} of `{}` was not composed",
-                    &part.source, want.tracker
+                    part.source, want.tracker
                 ))
             })?;
             let label = format!("{kind} {name}");
