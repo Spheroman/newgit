@@ -298,7 +298,7 @@ pub async fn endpoint(app: Arc<App>, request: Request<Body>) -> Response<Body> {
         let app = app.clone();
         tokio::task::spawn_blocking(move || plan_view(&app, &token, &parts)).await
     };
-    let (id, plan) = match decided {
+    let (id, plan, stored) = match decided {
         Ok(Ok(planned)) => planned,
         Ok(Err(error)) => return refused(&error),
         Err(error) => return refused(&HttpError::internal(error)),
@@ -306,6 +306,46 @@ pub async fn endpoint(app: Arc<App>, request: Request<Body>) -> Response<Body> {
     // One composition at a time per project: they share its stores.
     let lock = app.compose_lock(&id.key());
     let _held = lock.lock().await;
+    if let Some(want) = stored {
+        // The stored rooted history, checked where it is and brought up to
+        // the lists just read, all after the db lock is let go of. A stored
+        // history never moves back to older lists (`rooted::refresh`), so
+        // once this returns its refs are at least as new as the lists this
+        // read, whatever writes it after: upload-pack reads no older view.
+        let refreshed = {
+            let (mut want, id) = (want.clone(), id.clone());
+            tokio::task::spawn_blocking(move || {
+                if !crate::rooted::located(&mut want, &id)? {
+                    return Ok(None);
+                }
+                crate::rooted::refresh(&want).map(|done| (!done.gone).then_some(want))
+            })
+            .await
+        };
+        match refreshed {
+            Ok(Ok(Some(want))) => {
+                drop(_held);
+                let run = Run {
+                    git_dir: want.dir(),
+                    namespace: Some(crate::rooted::namespace(&want.tracker)),
+                    allowed: Vec::new(),
+                    tracker: false,
+                    pushing: None,
+                };
+                return run_git(app, run, ask, request).await;
+            }
+            // Not where its lists said by the time it was checked (a move
+            // landed meanwhile): composed for this fetch, as before.
+            Ok(Ok(None)) => {}
+            Ok(Err(error)) => eprintln!(
+                "newgit serve: `{}`'s rooted history in {}: {}; composing it for this fetch",
+                want.tracker,
+                id.key(),
+                error.cause()
+            ),
+            Err(error) => eprintln!("newgit serve: rooted history: {error}"),
+        }
+    }
     let composed =
         tokio::task::spawn_blocking(move || newgit_core::endpoint::compose_view(&plan)).await;
     let view = match composed {
@@ -333,11 +373,15 @@ pub async fn endpoint(app: Arc<App>, request: Request<Body>) -> Response<Body> {
 /// The view `token`'s caller may read of the project `parts` names, as a plan
 /// for the composer: each branch and tag cut down to the trackers in Git
 /// they may read, rooted at the tracker the path names.
-fn plan_view(
-    app: &App,
-    token: &str,
-    parts: &[String],
-) -> ApiResult<(ProjectId, newgit_core::endpoint::Plan)> {
+/// A view as the composer would make it, and the stored rooted history that
+/// is exactly it, when there is one (`rooted`).
+type Planned = (
+    ProjectId,
+    newgit_core::endpoint::Plan,
+    Option<crate::rooted::Want>,
+);
+
+fn plan_view(app: &App, token: &str, parts: &[String]) -> ApiResult<Planned> {
     let db = app.db.lock();
     let caller = api::caller_for(app, &db, token)?;
     let (Some(owner), Some(name)) = (parts.first(), parts.get(1)) else {
@@ -348,7 +392,42 @@ fn plan_view(
     };
     let project = ProjectContext::load(app, &db, &caller, &id)?;
     let plan = view_plan(app, &db, &project, &caller, &parts[2..])?;
-    Ok((id, plan))
+    let stored = stored_view(&db, &project, &plan)?;
+    Ok((id, plan, stored))
+}
+
+/// The stored rooted history of `plan`'s root, when it is exactly the view
+/// `plan` asks for: every branch and tag, each composed from the same
+/// trackers. A reader who may read more than the root's store's audience
+/// (a private tracker mounted inside) is composed for, per fetch.
+/// `NEWGIT_SERVE_ROOTED=off` composes for everyone, as before stored
+/// histories: the tests compare the two.
+fn stored_view(
+    db: &Connection,
+    project: &ProjectContext<'_>,
+    plan: &newgit_core::endpoint::Plan,
+) -> ApiResult<Option<crate::rooted::Want>> {
+    if std::env::var("NEWGIT_SERVE_ROOTED").is_ok_and(|value| value == "off") {
+        return Ok(None);
+    }
+    let Some(want) = crate::rooted::wanted(project, db, &plan.root)? else {
+        return Ok(None);
+    };
+    let same = |cut: &BTreeMap<String, String>, part: &crate::rooted::Part| {
+        cut.get(&plan.root) == Some(&part.source) && cut.keys().eq(part.set.iter())
+    };
+    let heads = plan.branches.len() == want.heads.len()
+        && plan
+            .branches
+            .iter()
+            .all(|(name, cut)| want.heads.get(name).is_some_and(|part| same(cut, part)));
+    let tags = plan.tags.len() == want.tags.len()
+        && plan.tags.iter().all(|(name, tag)| {
+            want.tags
+                .get(name)
+                .is_some_and(|part| same(&tag.list, part) && part.annotation == tag.annotation)
+        });
+    Ok((heads && tags && plan.default_branch == want.default_branch).then_some(want))
 }
 
 fn view_plan(

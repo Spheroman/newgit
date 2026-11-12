@@ -1,6 +1,6 @@
 # Landing
 
-**Status: decided; steps 1, 2 and 3 of the build order are built.** How changes land in a tree of trackers on
+**Status: decided; steps 1 to 4 of the build order are built.** How changes land in a tree of trackers on
 `newgit serve`. It replaces [anchoring.md](anchoring.md), which describes how
 the Worker on newgit.dev lands merges today and goes when newgit.dev moves to
 `serve`. Settled with Jack on 2026-11-10 after two adversarial reviews and a
@@ -174,7 +174,8 @@ Mac, relative numbers):
 - Spawning one package rooted at it: 0.13 s and 22 KB from the pool, the
   same as a repo of its own. Without a stored rooted history, a partial
   clone of one package took 99 s and 1.6 GB, so **each tracker's rooted
-  history is always stored**, never computed per fetch.
+  history is always stored**, never computed per fetch. Built (#412):
+  [serve.md](serve.md), decision 10, with what it costs on `serve`.
 - Landings: about 380 per second batched, against about 290 for one repo
   with stored splits.
 - `git log` on one package: 6–17 ms.
@@ -214,7 +215,15 @@ Anchors as a concept, deferred roll-ups, inboxes and outboxes, reservations,
    by path; policy, membership, and the audience rule read against what
    lands; barriers and epochs on `main`; fairness as a turn on the paths a
    merge changes. Composing views from cached subtrees is #440.
-4. Stored rooted histories, extended at landing.
+4. **Done (#412).** Stored rooted histories: each tracker's view, composed
+   from the trackers its store's readers may all read (its own store's and
+   public ones), kept in its store and extended by composing only what is
+   new. Derived data, never in a landing's entry: extended after each
+   landing in the background, and caught up by any read that finds it
+   behind, so no reader sees one behind what landed. A reader who may read
+   more (a private tracker mounted inside) is still composed for per
+   fetch; caching those per subtree is #440. [serve.md](serve.md),
+   decision 10.
 5. Dependencies across servers: ordered two-step landings, proposals, resume.
 6. ~~Encryption of trackers outside Git (#338).~~ Done on the client; the
    Worker and `serve` move the ciphertext as opaque blobs.

@@ -1169,6 +1169,13 @@ through a newgit workspace, which splits locally.
 Why a sandbox and not the Worker: a Worker cannot run Git, and composing in
 JavaScript would mean writing Git's object model ourselves.
 
+On `newgit serve` (#412) the views are pre-built after all: each tracker's
+view, as everyone who reads its store may read it, is stored in that store
+and extended at each landing by composing only what is new, with the same
+ids composing from scratch gives. A reader who may read more than that (a
+private tracker mounted inside) is composed for per fetch, as above
+([serve.md](serve.md), decision 10).
+
 **Who may change what (decided).** A tracker's `maintainers` may merge
 changes to it; by default they are its audience — anyone who may read a
 tracker may change it. Who may change a tracker's *security* (its paths,

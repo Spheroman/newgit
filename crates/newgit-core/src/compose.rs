@@ -269,6 +269,68 @@ fn graft(objects: &mut Objects, tree: &str, mount: &str, child: &str) -> Result<
     objects.set_path(tree, mount, entry)
 }
 
+/// A mount as the path components grafting it reads, when it is canonical:
+/// what `normalize_path` makes of a workspace-relative path (not empty, not
+/// `.`, no `..`, not absolute, no doubled or trailing `/`). `None` for any
+/// other: such a mount is grafted one at a time, as it always was.
+fn canonical_parts(mount: &str) -> Option<Vec<&[u8]>> {
+    let parts = crate::objects::split_path(mount.as_bytes());
+    let canonical = !parts.is_empty()
+        && parts.iter().all(|part| *part != b"..")
+        && parts.join(&b'/') == mount.as_bytes();
+    canonical.then_some(parts)
+}
+
+/// Whether every mount in `mounts` is canonical and none is the same as
+/// another or inside another, compared by path component: then grafting
+/// them in any order makes one tree. Anything not provably so (`.`, an
+/// absolute or `..` mount, `pkgs/a` beside `/pkgs/a/b`) is not apart.
+fn apart(mounts: &[&str]) -> bool {
+    let mut paths = Vec::with_capacity(mounts.len());
+    for mount in mounts {
+        let Some(parts) = canonical_parts(mount) else {
+            return false;
+        };
+        paths.push(parts);
+    }
+    // Sorted by component, a path inside another (or equal to it) comes
+    // right after it or after another path inside it.
+    paths.sort();
+    paths.windows(2).all(|pair| !pair[1].starts_with(&pair[0]))
+}
+
+/// `own` with each `(mount, view)` of `children` grafted in, in that order:
+/// one at a time, each graft reading the tree the one before made.
+pub fn graft_each(objects: &mut Objects, own: &str, children: &[(&str, &str)]) -> Result<String> {
+    let mut tree = own.to_owned();
+    for (mount, view) in children {
+        tree = graft(objects, &tree, mount, view)?;
+    }
+    Ok(tree)
+}
+
+/// [`graft_each`], in one pass when the mounts are [`apart`]: each graft
+/// then reads only its own mount of `own`, so all of them at once make the
+/// same tree with each directory written once (a parent of thousands of
+/// trackers rewrites `pkgs/` once, not once per tracker). Otherwise, one at
+/// a time.
+pub fn graft_all(objects: &mut Objects, own: &str, children: &[(&str, &str)]) -> Result<String> {
+    let mounts: Vec<&str> = children.iter().map(|(mount, _)| *mount).collect();
+    if !apart(&mounts) {
+        return graft_each(objects, own, children);
+    }
+    let mut edits = Vec::with_capacity(children.len());
+    for (mount, view) in children {
+        let merged = match objects.subtree(own, mount)? {
+            Some(existing) => objects.overlay(&existing, view)?,
+            None => (*view).to_owned(),
+        };
+        let entry = (merged != EMPTY_TREE).then(|| (TREE_MODE.to_vec(), merged));
+        edits.push((mount.as_bytes().to_vec(), entry));
+    }
+    objects.set_paths(own, edits)
+}
+
 fn depth(mount: &str) -> usize {
     if mount == "." {
         0
@@ -325,16 +387,7 @@ pub fn compose(
     tips: &[(String, String)],
     options: &ComposeOptions<'_>,
 ) -> Result<Vec<View>> {
-    let mut composer = Composer {
-        objects: Objects::open(repo)?,
-        options,
-        views: HashMap::new(),
-        children: HashMap::new(),
-        expanded: HashMap::new(),
-        composing: Vec::new(),
-        notes: Vec::new(),
-        canonical: Vec::new(),
-    };
+    let mut composer = Composer::new(repo, options)?;
     if !(options.readable)(root) {
         return Ok(tips
             .iter()
@@ -345,8 +398,9 @@ pub fn compose(
             .collect());
     }
     let commits: Vec<String> = tips.iter().map(|(_, commit)| commit.clone()).collect();
+    let walk = walk_of(repo, &commits, &[])?;
     composer.composing.push(root.to_owned());
-    composer.compose_root(root, &commits)?;
+    composer.compose_walk(root, &walk)?;
     composer.objects.flush()?;
     let mut views = Vec::new();
     for (view_ref, commit) in tips {
@@ -373,24 +427,151 @@ pub fn compose(
     Ok(views)
 }
 
-impl Composer<'_> {
-    fn compose_root(&mut self, name: &str, tips: &[String]) -> Result<()> {
-        let mut args = vec![
-            "rev-list".to_owned(),
-            "--topo-order".to_owned(),
-            "--reverse".to_owned(),
-        ];
-        args.extend(tips.iter().cloned());
-        let args: Vec<&str> = args.iter().map(String::as_str).collect();
-        let walk: Vec<String> = git(self.objects.repo(), &args)?
-            .lines()
-            .map(ToOwned::to_owned)
-            .collect();
+/// What one root commit composed to, kept beside a stored rooted history so
+/// that extending it composes only what is new: a commit's parents are all a
+/// later commit needs of what came before.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Composition {
+    /// The view commit it stands for (its parent's, when it was dropped as
+    /// changing only what this reader may not read).
+    pub view: String,
+    /// The children its view expanded.
+    pub expanded: BTreeSet<String>,
+    /// The commit its view commit stands for when the two differ (a view
+    /// without every tracker cannot rebuild the original): its canonical
+    /// note.
+    pub canonical: Option<String>,
+}
 
+/// Root commits `tips` reach and `stops` do not, oldest first, parents
+/// before children: what [`extend`] composes.
+pub fn walk_of(repo: &Utf8Path, tips: &[String], stops: &[String]) -> Result<Vec<String>> {
+    if tips.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut args = vec![
+        "rev-list".to_owned(),
+        "--topo-order".to_owned(),
+        "--reverse".to_owned(),
+    ];
+    args.extend(tips.iter().cloned());
+    if !stops.is_empty() {
+        args.push("--not".to_owned());
+        args.extend(stops.iter().cloned());
+    }
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    Ok(git(repo, &args)?.lines().map(ToOwned::to_owned).collect())
+}
+
+/// Compose root commits `walk` (oldest first, as [`walk_of`] gives) of the
+/// view rooted at `root` into `repo`, as [`compose`] would compose them as
+/// part of the whole history: the same commits, byte for byte. Every parent
+/// of a commit in `walk` is in `walk` before it or answered by `known` (what
+/// an earlier extension composed it to). A commit `known` answers is not
+/// composed again. Nothing is written but objects: no refs, no notes.
+/// Returns what each commit of `walk` composed to, in `walk`'s order.
+pub fn extend(
+    repo: &Utf8Path,
+    root: &str,
+    walk: &[String],
+    known: &mut dyn FnMut(&str) -> Result<Option<Composition>>,
+    options: &ComposeOptions<'_>,
+) -> Result<Vec<(String, Composition)>> {
+    if !(options.readable)(root) {
+        return Err(NewgitError::Unsupported(format!(
+            "a view rooted at `{root}` cannot leave `{root}` out"
+        )));
+    }
+    let mut composer = Composer::new(repo, options)?;
+    composer.composing.push(root.to_owned());
+    let mut fresh = Vec::new();
+    let mut walked: HashSet<&String> = HashSet::new();
+    for id in walk {
+        if let Some(found) = known(id)? {
+            composer.preload(id, &found)?;
+        } else {
+            fresh.push(id.clone());
+        }
+        walked.insert(id);
+    }
+    for id in &fresh {
+        let commit = composer.objects.commit(id)?;
+        for parent in &commit.parents {
+            if walked.contains(parent) || composer.views.contains_key(parent) {
+                continue;
+            }
+            let found = known(parent)?.ok_or_else(|| {
+                NewgitError::Unsupported(format!(
+                    "{} is not composed yet, and {} is composed onto it",
+                    short(parent),
+                    short(id)
+                ))
+            })?;
+            composer.preload(parent, &found)?;
+        }
+    }
+    composer.compose_walk(root, &fresh)?;
+    composer.objects.flush()?;
+    let canonical: HashMap<&String, &String> = composer
+        .canonical
+        .iter()
+        .map(|(id, original)| (id, original))
+        .collect();
+    let mut out = Vec::with_capacity(walk.len());
+    for id in walk {
+        let view = composer.views.get(id).ok_or_else(|| missing(id))?;
+        out.push((
+            id.clone(),
+            Composition {
+                view: view.id.clone(),
+                expanded: composer.expanded.get(id).cloned().unwrap_or_default(),
+                canonical: canonical.get(&view.id).map(|original| (*original).clone()),
+            },
+        ));
+    }
+    Ok(out)
+}
+
+impl<'a> Composer<'a> {
+    fn new(repo: &Utf8Path, options: &'a ComposeOptions<'a>) -> Result<Self> {
+        Ok(Composer {
+            objects: Objects::open(repo)?,
+            options,
+            views: HashMap::new(),
+            children: HashMap::new(),
+            expanded: HashMap::new(),
+            composing: Vec::new(),
+            notes: Vec::new(),
+            canonical: Vec::new(),
+        })
+    }
+
+    /// What an earlier composition made of root commit `id`, taken as made.
+    fn preload(&mut self, id: &str, found: &Composition) -> Result<()> {
+        let tree = self.objects.commit(&found.view)?.tree;
+        self.views.insert(
+            id.to_owned(),
+            Composed {
+                id: found.view.clone(),
+                tree,
+            },
+        );
+        self.expanded.insert(id.to_owned(), found.expanded.clone());
+        if let Some(original) = &found.canonical {
+            self.canonical.push((found.view.clone(), original.clone()));
+        }
+        Ok(())
+    }
+}
+
+impl Composer<'_> {
+    /// Compose `walk`, root commits of `name` oldest first, each onto its
+    /// parents' views.
+    fn compose_walk(&mut self, name: &str, walk: &[String]) -> Result<()> {
         // First every child this history pins, so a commit always mounts a
         // tree that is already expanded.
         let mut shapes: Vec<Shape> = Vec::with_capacity(walk.len());
-        for id in &walk {
+        for id in walk {
             let commit = self.objects.commit(id)?;
             let all_pins = pins_in(&mut self.objects, &commit.tree)?;
             let mounts = self.expand_children(name, &commit, &all_pins)?;
@@ -474,7 +655,7 @@ impl Composer<'_> {
         ordered: &[(&String, &String)],
         all_pins: &BTreeMap<String, String>,
     ) -> Result<String> {
-        let mut tree = own.to_owned();
+        let mut views = Vec::with_capacity(ordered.len());
         for (child, mount) in ordered {
             let pin = &all_pins[*child];
             let view = self
@@ -482,9 +663,13 @@ impl Composer<'_> {
                 .get(pin)
                 .cloned()
                 .ok_or_else(|| missing(pin))?;
-            tree = graft(&mut self.objects, &tree, mount, &view)?;
+            views.push((mount.as_str(), view));
         }
-        Ok(tree)
+        let children: Vec<(&str, &str)> = views
+            .iter()
+            .map(|(mount, view)| (*mount, view.as_str()))
+            .collect();
+        graft_all(&mut self.objects, own, &children)
     }
 
     fn own_tree(&mut self, commit: &Commit, cache: &mut HashMap<String, String>) -> Result<String> {
@@ -2472,6 +2657,23 @@ mod tests {
         assert_eq!(back.source, source);
         assert_eq!(back.message, message, "message of {split:?}");
         assert_eq!(back.headers, headers, "headers of {split:?}");
+    }
+
+    #[test]
+    fn mounts_are_apart_only_when_none_is_inside_another() {
+        assert!(apart(&[]));
+        assert!(apart(&["pkgs/a", "pkgs/b", "pkgs/a-b", "lib"]));
+        assert!(!apart(&["."]));
+        assert!(!apart(&[""]));
+        assert!(!apart(&["pkgs/a", "pkgs/a/vendor"]));
+        assert!(!apart(&["a", "a-b", "a/c"]));
+        assert!(!apart(&["lib", "lib"]));
+        // Equal or nested by path, not by string: never apart.
+        assert!(!apart(&["pkgs/a", "/pkgs/a/b"]));
+        assert!(!apart(&["pkgs/a", "/pkgs/a"]));
+        assert!(!apart(&["pkgs/a", "pkgs//a"]));
+        assert!(!apart(&["pkgs/a/", "pkgs/b"]));
+        assert!(!apart(&["pkgs/../a", "b"]));
     }
 
     #[test]
