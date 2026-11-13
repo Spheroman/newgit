@@ -73,6 +73,7 @@ fn config(data: &Utf8Path, listen: std::net::SocketAddr) -> Config {
         github_client_id: None,
         dev_login_secret: Some(SECRET.to_owned()),
         git_slots: 4,
+        github: None,
     }
 }
 

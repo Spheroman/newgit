@@ -813,6 +813,18 @@ pub struct Begin {
     uploaded: bool,
 }
 
+impl Begin {
+    /// A merge begun by the server itself, its commits already in the
+    /// merger's landing: a mirror's pull.
+    pub fn new(base: List, list: List) -> Self {
+        Self {
+            base: Some(base),
+            list: Some(list),
+            uploaded: true,
+        }
+    }
+}
+
 /// `POST /branches/<branch>/merge`: check everything, and remember what was
 /// checked. A refused merge holds nothing.
 pub fn begin(

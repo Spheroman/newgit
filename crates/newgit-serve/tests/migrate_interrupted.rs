@@ -59,6 +59,7 @@ fn config(data: &Utf8Path) -> Config {
         github_client_id: None,
         dev_login_secret: None,
         git_slots: 4,
+        github: None,
     }
 }
 

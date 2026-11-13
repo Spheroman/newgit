@@ -62,7 +62,7 @@ pub struct Merged {
 }
 
 /// A repository of one merge's own, removed when dropped.
-struct Scratch {
+pub struct Scratch {
     dir: Utf8PathBuf,
 }
 
@@ -117,7 +117,7 @@ impl Scratch {
     /// A new scratch repository in `project`'s home, borrowing the objects
     /// of every store there and of `login`'s landings (where the merge's own
     /// commits wait), and of each linked tracker's home.
-    fn open(project: &ProjectContext<'_>, login: &str) -> ApiResult<Self> {
+    pub fn open(project: &ProjectContext<'_>, login: &str) -> ApiResult<Self> {
         let home = project.home();
         let dir = scratch_dir(&home).join(format!("{}.git", crate::tokens::random_hex(12)));
         std::fs::create_dir_all(scratch_dir(&home))?;
@@ -159,6 +159,12 @@ impl Scratch {
         }
         std::fs::write(scratch.dir.join("objects/info/alternates"), alternates)?;
         Ok(scratch)
+    }
+}
+
+impl Scratch {
+    pub fn dir(&self) -> &Utf8Path {
+        &self.dir
     }
 }
 
