@@ -4,7 +4,7 @@
 every landing committed to a landing log, project state in SQLite, and the
 same API as the Worker (`remote/`), so the CLI talks to either. Tracked in
 [#344]; the stores are [#409], the landing log [#410], the server's own
-merge [#411], stored rooted histories [#412].*
+merge [#411], stored rooted histories [#412], mirrors [#414].*
 
 [#344]: https://github.com/Spheroman/newgit/issues/344
 [#409]: https://github.com/Spheroman/newgit/issues/409
@@ -12,6 +12,7 @@ merge [#411], stored rooted histories [#412].*
 [#411]: https://github.com/Spheroman/newgit/issues/411
 [#412]: https://github.com/Spheroman/newgit/issues/412
 [#440]: https://github.com/Spheroman/newgit/issues/440
+[#414]: https://github.com/Spheroman/newgit/issues/414
 
 ---
 
@@ -43,6 +44,9 @@ newgit serve --data /var/lib/newgit --listen 0.0.0.0:8484 \
   --github-client-id <oauth app id>
 newgit remote add --url https://git.example.com
 ```
+
+`--github <file>` (or `NEWGIT_SERVE_GITHUB`) says what GitHub is to this
+server (decision 11); without it there are no webhooks and no exports.
 
 TLS is for a proxy in front (Caddy, nginx), not the binary. For tests and
 trying changes locally, `--dev-login-secret` (or
@@ -77,7 +81,8 @@ invited, through `POST /v1/dev/login` with `x-dev-login: <secret>`.
                          a merge's objects until it lands, never served
   homes/<owner>/<project>/scratch/<random>.git
                          the server's merge's composed objects while it
-                         runs, never served, removed after it (and at start)
+                         runs, never served, removed after it (and at start);
+                         a mirror pull's and an export's too
   endpoint/<owner>/<project>/   the composer's stores and cached views
 ```
 
@@ -593,6 +598,99 @@ Resolved loudly; each is reversible.
       128 ms each is about 47 minutes in the background, serving
       meanwhile.
 
+11. **Mirrors: the webhook lands, exports follow** ([#414];
+    `crates/newgit-serve/src/mirror/`). A mirror is a GitHub repository an
+    export target names, and an audience: whoever can read it.
+    - **Configuration, read at startup, never committed:** `--github
+      <file>` (refused unless only its owner may read it), a TOML file
+      with `api` (GitHub's REST API, `https://api.github.com` by default)
+      and per project `[projects."<owner>/<name>"]` a `webhook_secret` and
+      an optional `token`. The Worker has one `GITHUB_WEBHOOK_SECRET` for
+      the whole remote and no GitHub credential at all (it fetches public
+      mirrors anonymously, asks GitHub's API unauthenticated, and the
+      client exports); here the secret is per project, so one project's
+      secret cannot sign another's events, and the token (a fine-grained
+      personal access token, or a GitHub App's installation token, with
+      contents read and write on the mirrors) fetches, pushes, and asks
+      the API. It reaches Git only through its environment
+      (`GIT_CONFIG_*`, an `http.extraHeader`), never its arguments, and is
+      cut out of any message that might echo it. Minting short-lived
+      installation tokens from a GitHub App key is not built: an
+      installation token placed in the file works until it expires.
+    - **The webhook** (`POST /v1/webhooks/github?project=<owner>/<name>`)
+      verifies `X-Hub-Signature-256` under the project's secret in
+      constant time (503 with no secret, 401 unsigned or wrong), answers
+      `ping`, records a merged `pull_request`'s head under its merge
+      commit, and queues a `push` to an export target's branch (403 from a
+      repository no definition on `main` exports to, or pushed by someone
+      who is not a member able to merge root). A push already queued for
+      that commit, or that delivery, is not queued twice; a delivery whose
+      pull has ended is queued again, which is how a redelivery asks
+      again. The queue is rows in SQLite, so a restart resumes it (#353).
+      Tags pushed to a mirror are not brought in yet.
+    - **A pull lands as a merge.** The pull thread fetches the mirror into
+      a scratch repository, composes `main` as the target sees it, and
+      walks what the mirror has beyond it (nothing: our own export, ends
+      `nothing`). The commits are brought in with the withheld trackers'
+      files put back from their parents (`compose::bring_in`, #401's rule
+      included), split by tracker, their new objects put in the pusher's
+      landing, and landed by `merge::begin` and `merge::finish` as the
+      pusher, from the root commit on `main` the mirror's history left:
+      a fast-forward when nothing landed since, the work re-made on what
+      did when it changed other paths, Git's merge over the composed tree
+      otherwise. So #451's first case (a branch rebuilt from `main`
+      changing `crates/newgit-serve`, which is the `serve` tracker) is the
+      server's merge, not a merge of views, and is refused only for a real
+      conflict. Each child's `main` follows, as a member's merge asks. A
+      target rooted at a tracker lands in that tracker, from the root
+      commit that pinned it where the mirror's history left it, each
+      tracker above it given one commit moving its pin: one landing.
+    - **Whose work, by content (#404, #451).** For each instance with a
+      fork of a withheld tracker holding commits `main` does not have, its
+      fork of the target's tracker is composed as the target sees it, in
+      the same composition as `main`. A commit the pull would land that
+      *is* one of those (an exported instance branch merged with a merge
+      commit), or whose pull request's head is one (a squash or rebase:
+      read from the `pull_request` event, or asked of GitHub), is refused
+      when that instance commit pins a withheld tracker at work `main`
+      does not have, naming the instance, the tracker, and both ways on.
+      Nothing is read from a branch's name, so a branch named like an
+      instance whose commits are not its lands. Commits a merge commit in
+      the walk brought in need no question; only new ids on the line of
+      first parents are asked about, at most 20 a pull. While GitHub
+      cannot answer, or lists nothing for up to two minutes, the pull
+      waits, holding nothing and spending no attempt, and `newgit status`
+      says so (#398). An instance's work not yet pushed to this server
+      cannot be seen, and a commit carrying it lands as a commit of
+      nobody's: the check is what the server holds.
+    - **Ends, said where `newgit status` reads them.** `landed`,
+      `nothing`, `refused` (with why and what to do), `gave up` (after 10
+      failed attempts, 15 s doubling to 10 minutes, or two hours). A pull
+      refused only because it carries an earlier refused pull's commits is
+      refused with it and said once, on the first, with how many wait on
+      it (#451's third case). Trouble stays said until a pull of that
+      target lands or finds nothing.
+    - **Exports are derived data, the one thing that may be behind.** A
+      landing only counts itself for the export thread (no work in its
+      hold). The thread composes each GitHub target's view (the history
+      rooted at its declaring tracker, only the trackers it ships, a pin
+      expanded only when it is in that tracker's own history: the ids the
+      client's `newgit export` makes) and pushes it, never forced. Where
+      the target withholds nothing and ships exactly what the declaring
+      tracker's stored rooted history is composed from, that history's tip
+      is pushed (`rooted::as_of`); otherwise the view is composed per
+      export, O(history) (*Known limits*). Before every push, every commit
+      it adds is checked to hold nothing at the mount of a withheld tracker
+      while that tracker is pinned there, and nothing a tracker outside
+      Git owns; failing that, nothing is pushed. A mirror with commits
+      `main` lacks is left as it is: the export waits for the pull, or
+      says how to bring them in. Failures retry with backoff; `/state`
+      says per target `up to date`, `behind` (landings since), or
+      `failing` with the reason, and `newgit status` says the last two.
+      A pull's commits were split with their originals in their trailers,
+      so they compose back to themselves: a pull then an export is a
+      fast-forward on GitHub.
+
 ## Known limits
 - **A view for a reader who reads more than its store's audience is
   composed per fetch.** A member who may also read a private tracker
@@ -611,6 +709,13 @@ Resolved loudly; each is reversible.
   landing, flat, because it memoized by subtree and redid only the paths
   that changed; reusing the previous commit's subtrees for the children a
   landing did not touch is the fix, recorded on #440 with these numbers.
+- **A pull composes `main` as its target sees it, whole, and an export
+  that cannot use a stored history does too.** O(history × trackers) per
+  pull and per export of a target that withholds something (newgit's own
+  `github` target withholds `t3code`). In the background, outside every
+  hold, but a long history makes mirrors slow to follow. Keeping each
+  target's composition between runs (as decision 10 does for readable
+  sets) is the fix, with #440.
 - **What stored histories leave behind stays until gc ([#434]).** Each
   extension writes a new state commit and map trees, and canonical notes
   are kept for view commits a branch no longer reaches. (A tracker moving
@@ -783,7 +888,8 @@ Resolved loudly; each is reversible.
 - Garbage collection of the stores, of merge landings, and of the landing
   log ([#434]).
 
-- The GitHub webhook (`POST /v1/webhooks/github`) and mirror pulls.
+- Tags made on a mirror, brought in by the webhook (the Worker does).
+- Minting GitHub App installation tokens (decision 11).
 - The landing page and `/install.sh`.
 - Moving newgit.dev across: copying every Artifacts repo and the Durable
   Objects' state, with a dry run; backups (Litestream for SQLite, bundles

@@ -1262,6 +1262,28 @@ pub struct RemoteState {
     pub pulls: Vec<PullState>,
     #[serde(default)]
     pub ended: Vec<PullEnded>,
+    /// How each export target's mirror stands, from a remote that exports
+    /// (`newgit serve`); none from one that leaves exports to the client.
+    #[serde(default)]
+    pub exports: Vec<ExportState>,
+}
+
+/// One export target's mirror, as the remote that pushes it says.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExportState {
+    pub target: String,
+    /// `up to date`, `behind`, or `failing`.
+    pub state: String,
+    /// Landings on the project since its last export finished.
+    #[serde(default)]
+    pub behind: u64,
+    #[serde(default)]
+    pub failures: u32,
+    #[serde(default)]
+    pub last_error: Option<String>,
+    #[serde(default)]
+    pub retry_at: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1415,6 +1437,40 @@ impl RemoteState {
                 since.push(ended);
             } else {
                 since.clear();
+            }
+        }
+        for export in &self.exports {
+            let landings = if export.behind == 1 {
+                "landing"
+            } else {
+                "landings"
+            };
+            match export.state.as_str() {
+                "failing" => {
+                    let mut note = format!(
+                        "the export to `{}` is failing ({} {}): {}",
+                        export.target,
+                        export.failures,
+                        if export.failures == 1 {
+                            "attempt"
+                        } else {
+                            "attempts"
+                        },
+                        export.last_error.as_deref().unwrap_or("no reason given")
+                    );
+                    if export.behind > 0 {
+                        note.push_str(&format!("; it is {} {landings} behind", export.behind));
+                    }
+                    if let Some(at) = &export.retry_at {
+                        note.push_str(&format!("; tried again at {at}"));
+                    }
+                    notes.push(note);
+                }
+                "behind" => notes.push(format!(
+                    "the export to `{}` is {} {landings} behind (exporting)",
+                    export.target, export.behind
+                )),
+                _ => {}
             }
         }
         for ended in troubles.values().flatten() {

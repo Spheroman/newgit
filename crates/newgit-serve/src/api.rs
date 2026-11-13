@@ -34,9 +34,18 @@ pub struct ApiRequest {
     pub query: BTreeMap<String, String>,
     pub bearer: Option<String>,
     pub dev_login: Option<String>,
+    /// The few other headers a route reads (GitHub's webhook headers), by
+    /// lowercase name.
+    pub headers: BTreeMap<String, String>,
     /// `scheme://host`, for the URLs answers name.
     pub origin: String,
     pub body: Vec<u8>,
+}
+
+impl ApiRequest {
+    pub fn header(&self, name: &str) -> Option<&str> {
+        self.headers.get(name).map(String::as_str)
+    }
 }
 
 pub struct ApiResponse {
@@ -133,7 +142,7 @@ fn is_commit_id(value: &str) -> bool {
             .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
 }
 
-fn decode(segment: &str) -> String {
+pub fn decode(segment: &str) -> String {
     let bytes = segment.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut index = 0;
@@ -235,6 +244,7 @@ pub fn handle(app: &App, request: &ApiRequest) -> ApiResult<ApiResponse> {
         ("POST", "/v1/login/device") => return device_start(app),
         ("POST", "/v1/login/poll") => return device_poll(app, request),
         ("POST", "/v1/dev/login") => return dev_login(app, request),
+        ("POST", "/v1/webhooks/github") => return crate::mirror::webhook::receive(app, request),
         _ => {}
     }
 
@@ -1856,7 +1866,14 @@ fn state(project: &ProjectContext<'_>, db: &Connection) -> ApiResult<ApiResponse
         }
         branches.push(entry);
     }
-    ok(json!({ "branches": branches, "pulls": [], "ended": [] }))
+    let running = app_running(project.app);
+    let mut answer =
+        crate::mirror::store::state(db, &project.key, running, crate::db::now_seconds())?;
+    answer["branches"] = json!(branches);
+    if !running {
+        project.app.mirrors.wake_pulls();
+    }
+    ok(answer)
 }
 
 fn create_branch(
@@ -2245,4 +2262,13 @@ fn valid_tagger(tagger: &str) -> bool {
         && zone.len() == 5
         && matches!(zone.as_bytes()[0], b'+' | b'-')
         && zone.bytes().skip(1).all(|byte| byte.is_ascii_digit())
+}
+
+/// Whether the mirror threads run: `/state` says a pull is stalled when not.
+fn app_running(app: &App) -> bool {
+    let off = std::env::var("NEWGIT_SERVE_MIRRORS").is_ok_and(|value| value == "off");
+    off || app
+        .mirrors
+        .pulling
+        .load(std::sync::atomic::Ordering::SeqCst)
 }

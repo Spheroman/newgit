@@ -43,6 +43,7 @@ fn request(method: &str, path: &str, bearer: Option<&str>, body: &str) -> ApiReq
         query: BTreeMap::new(),
         bearer: bearer.map(str::to_owned),
         dev_login: Some(SECRET.to_owned()),
+        headers: Default::default(),
         origin: "http://localhost".to_owned(),
         body: body.as_bytes().to_vec(),
     }

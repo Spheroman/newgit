@@ -1,6 +1,7 @@
 # Landing
 
-**Status: decided; steps 1 to 4 of the build order are built.** How changes land in a tree of trackers on
+**Status: decided; steps 1 to 4 of the build order are built, and the
+mirrors (#414).** How changes land in a tree of trackers on
 `newgit serve`. It replaces [anchoring.md](anchoring.md), which describes how
 the Worker on newgit.dev lands merges today and goes when newgit.dev moves to
 `serve`. Settled with Jack on 2026-11-10 after two adversarial reviews and a
@@ -225,6 +226,10 @@ Anchors as a concept, deferred roll-ups, inboxes and outboxes, reservations,
    fetch; caching those per subtree is #440. [serve.md](serve.md),
    decision 10.
 5. Dependencies across servers: ordered two-step landings, proposals, resume.
+   (Not a dependency, and done: **mirrors (#414).** The GitHub webhook
+   lands a mirror's commits as a merge, one landing, and each target's
+   view is exported after landings as derived data that may be behind:
+   [serve.md](serve.md), decision 11.)
 6. ~~Encryption of trackers outside Git (#338).~~ Done on the client; the
    Worker and `serve` move the ciphertext as opaque blobs.
 7. Move newgit.dev from the Worker to `serve`, and delete `anchoring.md`.

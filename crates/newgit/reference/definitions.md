@@ -1975,7 +1975,8 @@ withheld tracker's mount, or adds a file a tracker outside Git owns, is
 refused. `newgit merge main` publishes what came in.
 
 On a linked project the same thing happens on the remote when the target's
-repository has the webhook (`docs/design/remote.md`, *The GitHub webhook*),
+repository has the webhook (`docs/design/remote.md`, *The GitHub webhook*; on
+`newgit serve`, `docs/design/serve.md`, decision 11, which also exports),
 and the project root takes it with `git pull`: its `origin` is the remote's
 Git endpoint, set by `newgit remote add` and, for a project linked earlier,
 the next time newgit syncs the project root.

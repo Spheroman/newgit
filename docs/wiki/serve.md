@@ -133,10 +133,26 @@ What differs is the machinery, and it is the reason to run it:
   move yours. A merge in flight is kept in memory, so restarting the server
   tells its merger to start the merge over.
 
+- GitHub mirrors, with `--github <file>` (only its owner may read it):
+
+  ```toml
+  [projects."jack/store"]
+  webhook_secret = "the secret you give the mirror's webhook"
+  token = "a token that can read and write the mirror's contents"
+  ```
+
+  Each export target on GitHub gets the project's view pushed to it after
+  every landing, without what the target withholds, and `newgit status`
+  says when one is behind or failing. Give the mirror a webhook at
+  `https://<your remote>/v1/webhooks/github?project=<owner>/<name>` with
+  that secret and the *push* and *pull request* events, and a pull request
+  merged there lands in `main` like anyone's merge, as whoever merged it
+  (who must be a member who may merge root). When one is refused,
+  `newgit status` says why and what to do.
+
 What it does not do yet:
 
-- GitHub webhooks and mirror pulls: a pull request merged on a GitHub mirror
-  does not land in `main` by itself.
+- Tags made on a GitHub mirror are not brought in.
 - The site: no landing page, no `/install.sh`, and no wiki at `/docs`.
 - The spend kill switch, backups, and replicas.
 - Taking over newgit.dev. That still runs on the Worker, until moving its
