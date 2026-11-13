@@ -397,12 +397,17 @@ impl Workbench {
             .map_err(|error| HttpError::new(409, error.to_string()))
     }
 
-    /// Whether `tracker` ships to `target`: it is in Git, and the target's.
+    /// Whether `tracker` ships to `target`: it is in Git, the target's, and
+    /// not one user's (a per-user tracker's content is never in a view of
+    /// `main`, so it is never handed to a mirror's readers, whatever its
+    /// `export` says: fail closed).
     pub fn ships(&self, target: &ExportTarget, tracker: &str) -> bool {
-        self.definitions
-            .iter()
-            .any(|definition| definition.git && definition.name == tracker)
-            && target.ships(tracker)
+        self.definitions.iter().any(|definition| {
+            definition.git
+                && definition.name == tracker
+                && definition.audience != "user"
+                && !definition.audience.starts_with("user:")
+        }) && target.ships(tracker)
     }
 
     /// The trackers in Git on `main` the target leaves out, within what it
@@ -415,7 +420,7 @@ impl Workbench {
                 definition.git
                     && self.list.contains_key(&definition.name)
                     && crate::names::within(&definition.name, at)
-                    && !target.ships(&definition.name)
+                    && !self.ships(target, &definition.name)
             })
             .cloned()
             .collect()

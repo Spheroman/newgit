@@ -300,7 +300,7 @@ impl Export<'_> {
         let shipped: BTreeSet<&String> = within_at
             .iter()
             .copied()
-            .filter(|name| self.target.ships(name))
+            .filter(|name| self.bench.ships(self.target, name))
             .collect();
         // Used only when nothing is withheld: what is pushed is checked
         // commit by commit against what the target leaves out, by the notes

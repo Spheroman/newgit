@@ -11,7 +11,7 @@ use crate::error::ApiResult;
 pub const SCHEMA: &str = r"
 CREATE TABLE IF NOT EXISTS mirror_pulls (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    home TEXT NOT NULL REFERENCES projects ON DELETE CASCADE,
+    home TEXT NOT NULL,
     target TEXT NOT NULL, repo TEXT NOT NULL, branch TEXT NOT NULL,
     commit_id TEXT NOT NULL, pusher TEXT NOT NULL, delivery TEXT,
     queued_at INTEGER NOT NULL, attempts INTEGER NOT NULL DEFAULT 0,
@@ -20,15 +20,16 @@ CREATE TABLE IF NOT EXISTS mirror_pulls (
 CREATE INDEX IF NOT EXISTS mirror_pulls_by_home ON mirror_pulls (home, id);
 CREATE TABLE IF NOT EXISTS mirror_ended (
     seq INTEGER PRIMARY KEY AUTOINCREMENT,
-    home TEXT NOT NULL REFERENCES projects ON DELETE CASCADE,
+    home TEXT NOT NULL,
     target TEXT NOT NULL, commit_id TEXT NOT NULL, outcome TEXT NOT NULL,
     why TEXT, at INTEGER NOT NULL, blocked_by TEXT);
+CREATE INDEX IF NOT EXISTS mirror_ended_by_home ON mirror_ended (home, seq);
 CREATE TABLE IF NOT EXISTS mirror_heads (
-    home TEXT NOT NULL REFERENCES projects ON DELETE CASCADE,
+    home TEXT NOT NULL,
     repo TEXT NOT NULL, merged TEXT NOT NULL, head TEXT NOT NULL, branch TEXT NOT NULL,
     at INTEGER NOT NULL, PRIMARY KEY (home, repo, merged, head));
 CREATE TABLE IF NOT EXISTS mirror_exports (
-    home TEXT NOT NULL REFERENCES projects ON DELETE CASCADE,
+    home TEXT NOT NULL,
     target TEXT NOT NULL, url TEXT NOT NULL,
     tip TEXT, exported_at INTEGER, behind INTEGER NOT NULL DEFAULT 0,
     failures INTEGER NOT NULL DEFAULT 0, last_error TEXT, retry_at INTEGER,
@@ -40,6 +41,22 @@ pub const ENDED_KEPT: i64 = 10;
 
 pub fn create(db: &Connection) -> rusqlite::Result<()> {
     db.execute_batch(SCHEMA)
+}
+
+/// A project deleted: its mirrors' rows go with it, so one made again under
+/// its name starts with none. Not foreign keys to `projects`: every landing
+/// updates that row, and the checks cost a landing's transaction more than
+/// a request waiting on the db lock can spare (`rooted_lock_wait.rs`).
+pub fn forget(db: &Connection, home: &str) -> ApiResult<()> {
+    for table in [
+        "mirror_pulls",
+        "mirror_ended",
+        "mirror_heads",
+        "mirror_exports",
+    ] {
+        db.execute(&format!("DELETE FROM {table} WHERE home = ?"), [home])?;
+    }
+    Ok(())
 }
 
 /// Asking GitHub which pull request a commit came from: since when it has
