@@ -12,6 +12,7 @@ pub mod git_http;
 pub mod landing;
 pub mod merge;
 pub mod migrate;
+pub mod mirror;
 pub mod names;
 pub mod policy;
 pub mod reparent;
@@ -52,6 +53,9 @@ pub struct Config {
     pub dev_login_secret: Option<String>,
     /// How many Git children may run at once.
     pub git_slots: usize,
+    /// The file saying what GitHub is to this server: each project's webhook
+    /// secret and token (`mirror::GithubConfig`). Read once, at startup.
+    pub github: Option<Utf8PathBuf>,
 }
 
 pub struct App {
@@ -72,6 +76,10 @@ pub struct App {
     pub pushes: landing::Pushes,
     /// Stored rooted histories, extended in the background (`rooted`).
     pub rooted: rooted::Worker,
+    /// What GitHub is to this server, from `--github`.
+    pub github: mirror::GithubConfig,
+    /// The mirror threads' wake-ups (`mirror`).
+    pub mirrors: mirror::Mirrors,
     /// `<data>/serve.lock`, locked while this runs: one process per data
     /// directory, since the landing log has one writer.
     _lock: std::fs::File,
@@ -102,7 +110,15 @@ impl App {
                 config.data
             );
         }
+        let github = match &config.github {
+            Some(path) => mirror::GithubConfig::read(path)?,
+            None => mirror::GithubConfig {
+                api: mirror::GITHUB_API.to_owned(),
+                ..mirror::GithubConfig::default()
+            },
+        };
         let db = db::Db::open(&config.data.join("server.sqlite"))?;
+        mirror::store::create(&db.lock()).context("making the mirrors' tables")?;
         // Scratch repositories of merges the last run stopped in: never
         // served, never named by anything.
         server_merge::remove_scratch(&config.data);
@@ -131,6 +147,8 @@ impl App {
             log,
             pushes: landing::Pushes::default(),
             rooted: rooted::Worker::default(),
+            github,
+            mirrors: mirror::Mirrors::default(),
             _lock: lock,
         };
         // Landings written down and not yet in place, before anything is
@@ -320,6 +338,7 @@ pub fn serve_on(listener: std::net::TcpListener, config: Config) -> anyhow::Resu
             ..config
         })?);
         rooted::start(&app);
+        mirror::start(&app);
         println!("newgit serve: listening on http://{address}");
         use std::io::Write as _;
         std::io::stdout().flush()?;
@@ -390,6 +409,10 @@ async fn api_request(
         bearer: header("authorization")
             .and_then(|value| value.strip_prefix("Bearer ").map(str::to_owned)),
         dev_login: header("x-dev-login"),
+        headers: ["x-github-event", "x-github-delivery", "x-hub-signature-256"]
+            .into_iter()
+            .filter_map(|name| Some((name.to_owned(), header(name)?)))
+            .collect(),
         origin: app.origin(&head),
         body: Vec::new(),
     };
