@@ -2866,6 +2866,9 @@ fn tracker(mut command: TrackerCommand) -> Result<()> {
             if let Some(project) = &outcome.published {
                 println!("  remote:   `main` moved on {project} too");
             }
+            if let Some(capped) = &outcome.capped {
+                println!("  served narrower than defined: {capped}");
+            }
             Ok(())
         }
         TrackerCommand::Checkout {

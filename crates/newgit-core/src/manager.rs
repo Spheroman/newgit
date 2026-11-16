@@ -1387,6 +1387,11 @@ pub struct MergeTrackerOutcome {
     /// The remote project whose copy of the tracker's `main` moved too, for
     /// a tracker stored there.
     pub published: Option<String>,
+    /// Why the remote serves the tracker narrower than its definition says,
+    /// when it does: a fork held to its upstream's audience, whatever its
+    /// definition says now (#437). Readers its definition names may be
+    /// refused there.
+    pub capped: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -7552,10 +7557,15 @@ impl BranchManager {
         let published =
             self.publish_main(definition, &rev, Acting::Workspace(&branch.workspace_path))?;
         lane.set_main(&rev)?;
+        let (published, capped) = match published {
+            Some((project, capped)) => (Some(project), capped),
+            None => (None, None),
+        };
         Ok(MergeTrackerOutcome {
             tracker: definition.name.clone(),
             rev,
             published,
+            capped,
         })
     }
 

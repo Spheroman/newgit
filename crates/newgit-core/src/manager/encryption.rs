@@ -847,12 +847,16 @@ impl BranchManager {
     /// is refused, and the remote's `main` is made this machine's so
     /// `newgit tracker pull` brings it. The push is leased on the `main` it
     /// checked, so a merge landing in between is not overwritten either.
+    ///
+    /// Returns the remote project, and why the remote serves the tracker
+    /// narrower than its definition says when it does (a fork held to its
+    /// upstream, #437).
     pub(super) fn publish_main(
         &self,
         definition: &TrackerDefinition,
         rev: &str,
         acting: Acting<'_>,
-    ) -> Result<Option<String>> {
+    ) -> Result<Option<(String, Option<String>)>> {
         if definition.storage != Storage::Remote || definition.audience == "user" {
             return Ok(None);
         }
@@ -860,15 +864,16 @@ impl BranchManager {
             return Ok(None);
         };
         let lane = self.lane(&definition.name);
-        let theirs = self.fetch_remote_main(definition, acting)?;
+        let mut theirs = self.fetch_remote_main(definition, acting)?;
         // Judged against what the remote has, `main` just fetched included.
         self.refuse_plaintext(definition, rev)?;
         self.refuse_stale(definition, rev, None)?;
-        if let Some(theirs) = &theirs
-            && !self.incorporates(definition, rev, theirs)?
-        {
+        let refuse_behind = |theirs: &str| -> Result<()> {
+            if self.incorporates(definition, rev, theirs)? {
+                return Ok(());
+            }
             lane.adopt_main(theirs)?;
-            return Err(NewgitError::Unsupported(format!(
+            Err(NewgitError::Unsupported(format!(
                 "the remote's `main` of `{name}` has changes {rev} does not include (merged \
                  from somewhere else since this machine last saw it), so nothing was \
                  published: that would overwrite them. In the instance, `newgit tracker pull \
@@ -878,17 +883,30 @@ impl BranchManager {
                  then `newgit tracker merge {name}` publishes it. To take theirs instead, \
                  `newgit tracker pull {name}` (your version stays at {rev})",
                 name = definition.name,
-            )));
+            )))
+        };
+        if let Some(theirs) = &theirs {
+            refuse_behind(theirs)?;
         }
         let remote = link.connect(acting)?;
         let repo = tracker_repo(&link.project, definition, "");
         let credential = remote.credential(&link.project, &repo, Scope::Write)?;
+        let capped = credential.capped.clone();
         let url = credential.remote.clone().unwrap_or_default();
         let auth = basic_auth_header(&credential);
         let location = format!("--git-dir={}", self.store.paths().tracker_store);
         let pin = format!("refs/trackers/{}/pins/{rev}", definition.name);
         let pushing = super::tracker_push_location(&location, definition);
         GitSource::push_refs(&pushing, &url, &[format!("{pin}:{pin}")], Some(&auth))?;
+        // A fork's repo is made by its first write, which the pin just was,
+        // and it starts at its upstream's `main` (#437): that is the `main`
+        // to lease on, and to hold `rev` to, not none.
+        if theirs.is_none() && definition.from.is_some() {
+            theirs = self.fetch_remote_main(definition, acting)?;
+            if let Some(theirs) = &theirs {
+                refuse_behind(theirs)?;
+            }
+        }
         GitSource::push_leased(
             &pushing,
             &url,
@@ -910,7 +928,7 @@ impl BranchManager {
             );
             self.forget_unsent();
         }
-        Ok(Some(link.project.clone()))
+        Ok(Some((link.project.clone(), capped)))
     }
 
     /// Whether publishing `rev` as `main` keeps everything in `theirs`.
