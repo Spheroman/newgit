@@ -16,13 +16,13 @@ CREATE TABLE IF NOT EXISTS mirror_pulls (
     commit_id TEXT NOT NULL, pusher TEXT NOT NULL, delivery TEXT,
     queued_at INTEGER NOT NULL, attempts INTEGER NOT NULL DEFAULT 0,
     last_error TEXT, retry_at INTEGER, step TEXT, lookup TEXT,
-    touched_at INTEGER NOT NULL);
+    touched_at INTEGER NOT NULL, tag TEXT);
 CREATE INDEX IF NOT EXISTS mirror_pulls_by_home ON mirror_pulls (home, id);
 CREATE TABLE IF NOT EXISTS mirror_ended (
     seq INTEGER PRIMARY KEY AUTOINCREMENT,
     home TEXT NOT NULL,
     target TEXT NOT NULL, commit_id TEXT NOT NULL, outcome TEXT NOT NULL,
-    why TEXT, at INTEGER NOT NULL, blocked_by TEXT);
+    why TEXT, at INTEGER NOT NULL, blocked_by TEXT, tag TEXT);
 CREATE INDEX IF NOT EXISTS mirror_ended_by_home ON mirror_ended (home, seq);
 CREATE TABLE IF NOT EXISTS mirror_heads (
     home TEXT NOT NULL,
@@ -42,6 +42,8 @@ pub const ENDED_KEPT: i64 = 10;
 /// How many pulls waiting on a refused one are kept per target: they are
 /// only counted, and never push out the refusal they wait on.
 pub const WAITING_KEPT: i64 = 100;
+/// How many tags' pulls are kept per target, each tag's latest.
+pub const TAGS_KEPT: i64 = 20;
 
 pub fn create(db: &Connection) -> rusqlite::Result<()> {
     db.execute_batch(SCHEMA)
@@ -86,7 +88,11 @@ pub struct Pull {
     /// `owner/name` on GitHub, as the signed event gives it.
     pub repo: String,
     pub branch: String,
+    /// What the event said moved there: the branch's commit, or for a tag
+    /// its object (the tag object of an annotated one).
     pub commit: String,
+    /// A tag made on the mirror, by name: nothing lands but the tag.
+    pub tag: Option<String>,
     /// Who pushed, by GitHub login: the login newgit knows them by.
     pub pusher: String,
     pub queued_at: i64,
@@ -106,6 +112,7 @@ fn pull_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Pull> {
         repo: row.get("repo")?,
         branch: row.get("branch")?,
         commit: row.get("commit_id")?,
+        tag: row.get("tag")?,
         pusher: row.get("pusher")?,
         queued_at: row.get("queued_at")?,
         attempts: row.get("attempts")?,
@@ -128,7 +135,10 @@ pub enum Queued {
 /// Queue a pull, unless one of the same commit for the same target is
 /// waiting already (a redelivery, or GitHub sending one event twice). A
 /// delivery whose pull has ended is queued again: redelivering is how a
-/// pull is asked again.
+/// pull is asked again. `tag`: a tag made on the mirror, `commit` its
+/// object; a tag's pull and its commit's branch pull are two pulls, and the
+/// tag's waits behind every pull queued before it, so a pull request merged
+/// and then tagged is on `main` when its tag is looked for.
 #[expect(clippy::too_many_arguments, reason = "one row's columns")]
 pub fn queue(
     db: &Connection,
@@ -137,14 +147,15 @@ pub fn queue(
     repo: &str,
     branch: &str,
     commit: &str,
+    tag: Option<&str>,
     pusher: &str,
     delivery: Option<&str>,
     now: i64,
 ) -> ApiResult<Queued> {
     let waiting: Option<i64> = db
         .query_row(
-            "SELECT id FROM mirror_pulls WHERE home = ?1 AND ((target = ?2 AND commit_id = ?3) OR (delivery IS NOT NULL AND delivery = ?4)) ORDER BY id LIMIT 1",
-            params![home, target, commit, delivery],
+            "SELECT id FROM mirror_pulls WHERE home = ?1 AND ((target = ?2 AND commit_id = ?3 AND tag IS ?5) OR (delivery IS NOT NULL AND delivery = ?4)) ORDER BY id LIMIT 1",
+            params![home, target, commit, delivery, tag],
             |row| row.get(0),
         )
         .optional()?;
@@ -152,8 +163,8 @@ pub fn queue(
         return Ok(Queued::Already(id));
     }
     db.execute(
-        "INSERT INTO mirror_pulls (home, target, repo, branch, commit_id, pusher, delivery, queued_at, touched_at, step) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8, 'queued')",
-        params![home, target, repo, branch, commit, pusher, delivery, now],
+        "INSERT INTO mirror_pulls (home, target, repo, branch, commit_id, pusher, delivery, queued_at, touched_at, step, tag) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8, 'queued', ?9)",
+        params![home, target, repo, branch, commit, pusher, delivery, now, tag],
     )?;
     Ok(Queued::New(db.last_insert_rowid()))
 }
@@ -207,7 +218,8 @@ pub fn failed(db: &Connection, id: i64, why: &str, retry_at: i64, now: i64) -> A
 /// How a pull ended, for [`end`].
 #[derive(Debug, Clone, Copy)]
 pub struct Ending<'a> {
-    /// `landed`, `nothing`, `refused`, or `gave up`.
+    /// `landed`, `nothing`, `refused`, or `gave up`; for a tag's pull,
+    /// `tagged` when it made the tag and `nothing` when it was there.
     pub outcome: &'a str,
     pub why: Option<&'a str>,
     /// The commit of the refused pull this one waits on.
@@ -232,22 +244,44 @@ impl Ending<'_> {
 /// the target had; a pull refused again (a redelivery) replaces its own; and
 /// one that settles nothing and is no trouble is kept only when there is no
 /// trouble for it to hide.
+///
+/// A tag's pull is kept beside those, as its tag's latest: it lands nothing,
+/// so it neither ends the branch's trouble nor is ended with it. A refused
+/// tag stays said until that tag is made (or found made).
 pub fn end(db: &Connection, pull: &Pull, ending: &Ending<'_>, now: i64) -> ApiResult<()> {
     db.execute("DELETE FROM mirror_pulls WHERE id = ?", [pull.id])?;
     let target = params![pull.home, pull.target];
+    let insert = |db: &Connection| {
+        db.execute(
+            "INSERT INTO mirror_ended (home, target, commit_id, outcome, why, at, blocked_by, tag) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![pull.home, pull.target, pull.commit, ending.outcome, ending.why, now, ending.blocked_by, pull.tag],
+        )
+    };
+    if let Some(tag) = &pull.tag {
+        db.execute(
+            "DELETE FROM mirror_ended WHERE home = ?1 AND target = ?2 AND tag = ?3",
+            params![pull.home, pull.target, tag],
+        )?;
+        insert(db)?;
+        db.execute(
+            "DELETE FROM mirror_ended WHERE home = ?1 AND target = ?2 AND tag IS NOT NULL AND seq NOT IN (SELECT seq FROM mirror_ended WHERE home = ?1 AND target = ?2 AND tag IS NOT NULL ORDER BY seq DESC LIMIT ?3)",
+            params![pull.home, pull.target, TAGS_KEPT],
+        )?;
+        return Ok(());
+    }
     if ending.settles {
         db.execute(
-            "DELETE FROM mirror_ended WHERE home = ?1 AND target = ?2",
+            "DELETE FROM mirror_ended WHERE home = ?1 AND target = ?2 AND tag IS NULL",
             target,
         )?;
     } else if ending.is_trouble() {
         db.execute(
-            "DELETE FROM mirror_ended WHERE home = ?1 AND target = ?2 AND commit_id = ?3 AND outcome IN ('refused', 'gave up')",
+            "DELETE FROM mirror_ended WHERE home = ?1 AND target = ?2 AND tag IS NULL AND commit_id = ?3 AND outcome IN ('refused', 'gave up')",
             params![pull.home, pull.target, pull.commit],
         )?;
     } else {
         let troubled: bool = db.query_row(
-            "SELECT EXISTS (SELECT 1 FROM mirror_ended WHERE home = ?1 AND target = ?2 AND outcome IN ('refused', 'gave up'))",
+            "SELECT EXISTS (SELECT 1 FROM mirror_ended WHERE home = ?1 AND target = ?2 AND tag IS NULL AND outcome IN ('refused', 'gave up'))",
             target,
             |row| row.get(0),
         )?;
@@ -255,27 +289,24 @@ pub fn end(db: &Connection, pull: &Pull, ending: &Ending<'_>, now: i64) -> ApiRe
             return Ok(());
         }
         db.execute(
-            "DELETE FROM mirror_ended WHERE home = ?1 AND target = ?2",
+            "DELETE FROM mirror_ended WHERE home = ?1 AND target = ?2 AND tag IS NULL",
             target,
         )?;
     }
-    db.execute(
-        "INSERT INTO mirror_ended (home, target, commit_id, outcome, why, at, blocked_by) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-        params![pull.home, pull.target, pull.commit, ending.outcome, ending.why, now, ending.blocked_by],
-    )?;
+    insert(db)?;
     // Those said one by one and those only counted are kept apart, so a run
     // of pulls waiting on a refusal never pushes that refusal out; and none
     // is kept waiting on one that is gone.
     for (waiting, kept) in [("IS NULL", ENDED_KEPT), ("IS NOT NULL", WAITING_KEPT)] {
         db.execute(
             &format!(
-                "DELETE FROM mirror_ended WHERE home = ?1 AND target = ?2 AND blocked_by {waiting} AND seq NOT IN (SELECT seq FROM mirror_ended WHERE home = ?1 AND target = ?2 AND blocked_by {waiting} ORDER BY seq DESC LIMIT ?3)"
+                "DELETE FROM mirror_ended WHERE home = ?1 AND target = ?2 AND tag IS NULL AND blocked_by {waiting} AND seq NOT IN (SELECT seq FROM mirror_ended WHERE home = ?1 AND target = ?2 AND tag IS NULL AND blocked_by {waiting} ORDER BY seq DESC LIMIT ?3)"
             ),
             params![pull.home, pull.target, kept],
         )?;
     }
     db.execute(
-        "DELETE FROM mirror_ended WHERE home = ?1 AND target = ?2 AND blocked_by IS NOT NULL AND blocked_by NOT IN (SELECT commit_id FROM mirror_ended WHERE home = ?1 AND target = ?2 AND blocked_by IS NULL AND outcome = 'refused')",
+        "DELETE FROM mirror_ended WHERE home = ?1 AND target = ?2 AND blocked_by IS NOT NULL AND blocked_by NOT IN (SELECT commit_id FROM mirror_ended WHERE home = ?1 AND target = ?2 AND tag IS NULL AND blocked_by IS NULL AND outcome = 'refused')",
         target,
     )?;
     Ok(())
@@ -288,11 +319,12 @@ pub fn end(db: &Connection, pull: &Pull, ending: &Ending<'_>, now: i64) -> ApiRe
 pub fn supersede(db: &Connection, home: &str, target: &str, walk: &[String]) -> ApiResult<()> {
     for ended in ended(db, home)? {
         if ended.target == target
+            && ended.tag.is_none()
             && matches!(ended.outcome.as_str(), "refused" | "gave up")
             && walk.contains(&ended.commit)
         {
             db.execute(
-                "DELETE FROM mirror_ended WHERE home = ?1 AND target = ?2 AND commit_id = ?3",
+                "DELETE FROM mirror_ended WHERE home = ?1 AND target = ?2 AND tag IS NULL AND commit_id = ?3",
                 params![home, target, ended.commit],
             )?;
         }
@@ -302,10 +334,10 @@ pub fn supersede(db: &Connection, home: &str, target: &str, walk: &[String]) -> 
 
 /// `target`'s mirror is where `main` is (an export just found or put it
 /// there): whatever was refused or given up from it is over, with or without
-/// an event to say so.
+/// an event to say so. Not a refused tag: an export makes none.
 pub fn over(db: &Connection, home: &str, target: &str) -> ApiResult<()> {
     db.execute(
-        "DELETE FROM mirror_ended WHERE home = ?1 AND target = ?2 AND outcome IN ('refused', 'gave up')",
+        "DELETE FROM mirror_ended WHERE home = ?1 AND target = ?2 AND tag IS NULL AND outcome IN ('refused', 'gave up')",
         params![home, target],
     )?;
     Ok(())
@@ -322,12 +354,14 @@ pub struct Ended {
     /// The commit of the refused pull this one waits on, when it was
     /// refused only for carrying that one's commits.
     pub blocked_by: Option<String>,
+    /// The tag it was the pull of.
+    pub tag: Option<String>,
 }
 
 /// Every pull kept that ended, oldest first.
 pub fn ended(db: &Connection, home: &str) -> ApiResult<Vec<Ended>> {
     let mut statement = db.prepare_cached(
-        "SELECT target, commit_id, outcome, why, at, blocked_by FROM mirror_ended WHERE home = ? ORDER BY seq",
+        "SELECT target, commit_id, outcome, why, at, blocked_by, tag FROM mirror_ended WHERE home = ? ORDER BY seq",
     )?;
     let rows = statement.query_map([home], |row| {
         Ok(Ended {
@@ -337,6 +371,7 @@ pub fn ended(db: &Connection, home: &str) -> ApiResult<Vec<Ended>> {
             why: row.get(3)?,
             at: row.get(4)?,
             blocked_by: row.get(5)?,
+            tag: row.get(6)?,
         })
     })?;
     Ok(rows.collect::<Result<_, _>>()?)
@@ -504,6 +539,9 @@ pub fn state(db: &Connection, home: &str, threads_running: bool, now: i64) -> Ap
             "lastError": pull.last_error,
             "step": step,
         });
+        if let Some(tag) = &pull.tag {
+            entry["tag"] = json!(tag);
+        }
         if let Some(at) = pull.retry_at.filter(|at| *at > now) {
             entry["retryAt"] = json!(iso(at));
         }
@@ -547,11 +585,20 @@ pub fn state(db: &Connection, home: &str, threads_running: bool, now: i64) -> Ap
                 if count == 1 { "s" } else { "" },
             ));
         }
-        ended_json.push(json!({
+        let mut entry = json!({
             "target": one.target, "commit": one.commit, "outcome": one.outcome,
             "why": why, "at": iso(one.at),
-        }));
+        });
+        if let Some(tag) = &one.tag {
+            entry["tag"] = json!(tag);
+        }
+        ended_json.push(entry);
     }
+    // What is kept is exactly what is to be said, so trouble comes last: a
+    // reader that takes a later `landed` or `tagged` for the end of an
+    // earlier refusal (as `newgit status` does, per target) is not told a
+    // tag made after a refusal ended it.
+    ended_json.sort_by_key(|one| matches!(one["outcome"].as_str(), Some("refused" | "gave up")));
     let exports_json: Vec<Value> = exports(db, home)?
         .into_iter()
         .map(|export| {

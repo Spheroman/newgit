@@ -147,7 +147,9 @@ What differs is the machinery, and it is the reason to run it:
   `https://<your remote>/v1/webhooks/github?project=<owner>/<name>` with
   that secret and the *push* and *pull request* events, and a pull request
   merged there lands in `main` like anyone's merge, as whoever merged it
-  (who must be a member who may merge root). When one is refused,
+  (who must be a member who may merge root). A tag made there (a release
+  cut on GitHub) is made on the remote too, on the commit it names, once
+  that commit is on `main`; a tag never moves. When one is refused,
   `newgit status` says why and what to do. The server only ever talks to
   `https://github.com/<owner>/<name>.git`, with that project's token: a
   target written as an SSH address or on another host is exported by
@@ -155,7 +157,6 @@ What differs is the machinery, and it is the reason to run it:
 
 What it does not do yet:
 
-- Tags made on a GitHub mirror are not brought in.
 - The site: no landing page, no `/install.sh`, and no wiki at `/docs`.
 - The spend kill switch, backups, and replicas.
 - Taking over newgit.dev. That still runs on the Worker, until moving its

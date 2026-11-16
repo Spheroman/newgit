@@ -2105,7 +2105,7 @@ fn remove_forks(project: &ProjectContext<'_>, instance: &db::Instance) -> ApiRes
 }
 
 /// Why `name` is not a tag name Git accepts, if it is not.
-fn tag_name_problem(name: &str) -> Option<String> {
+pub(crate) fn tag_name_problem(name: &str) -> Option<String> {
     let bad = name.is_empty()
         || name.len() > 200
         || name.starts_with('-')
@@ -2165,19 +2165,7 @@ fn tag_route(
             None => fail(404, format!("no tag `{name}` in {key}")),
         };
     }
-    caller.require_human("tag")?;
-    caller.require_not_instance("tag")?;
-    let root_facts = project
-        .facts(db, "root")?
-        .or_else(|| policy::implicit_facts("root"))
-        .unwrap_or_else(|| unreachable!());
-    policy::may_maintain(
-        &root_facts.maintainers,
-        &project.who(caller),
-        &project.info.owner,
-        "root",
-    )
-    .map_err(|why| HttpError::new(403, format!("{why}, so may not tag")))?;
+    may_tag(project, db, caller)?;
     match request.method.as_str() {
         "DELETE" => {
             if !db::delete_tag(db, key, name)? {
@@ -2191,57 +2179,94 @@ fn tag_route(
             let Some(root) = put.root.filter(|root| is_commit_id(root)) else {
                 return fail(400, "root must name root's commit by its full id");
             };
-            let annotation = put.annotation;
-            if !annotation.is_null() {
-                let tagger = annotation["tagger"].as_str();
-                if tagger.is_none() || !annotation["message"].is_string() {
-                    return fail(
-                        400,
-                        "annotation is { tagger, message }, or null for a lightweight tag",
-                    );
-                }
-                if tagger.is_some_and(|tagger| tagger.contains('\n') || !valid_tagger(tagger)) {
-                    return fail(
-                        400,
-                        "annotation.tagger is `Name <email> <seconds> <zone>`, as Git writes it",
-                    );
-                }
-            }
-            if let Some(existing) = db::tag(db, key, name)? {
-                if existing["list"]["root"] == root.as_str() && existing["annotation"] == annotation
-                {
-                    return ok(existing);
-                }
-                let at = existing["list"]["root"].as_str().unwrap_or_default();
-                return fail(
-                    409,
-                    format!(
-                        "tag `{name}` names root commit {} already, and a tag never moves: delete it first if it is wrong",
-                        &at[..at.len().min(12)]
-                    ),
-                );
-            }
-            let repo = project.tracker("root");
-            let on_main = repo
-                .branch_head("main")
-                .is_some_and(|main| repo.has_commit(&root) && repo.is_ancestor(&root, &main));
-            if !on_main {
-                return fail(
-                    400,
-                    format!(
-                        "root commit {} is not on root's `main`: a tag names the project's history, so push the commit to `main` first (`git push origin main {name}`, or `git push --follow-tags`)",
-                        &root[..12]
-                    ),
-                );
-            }
-            let list = crate::merge::index_of(project, &root, None)?;
-            db::create_tag(db, key, name, &list, &annotation, &caller.login)?;
-            tagged(project, &list);
-            let made = db::tag(db, key, name)?.unwrap_or(Value::Null);
-            created(made)
+            let (tag, made) = make_tag(project, db, &caller.login, name, &root, &put.annotation)?;
+            if made { created(tag) } else { ok(tag) }
         }
         method => fail(404, format!("no route for {method} {}", request.path)),
     }
+}
+
+/// Whether `caller` may make or delete a tag: a person, from their own
+/// login, who maintains root.
+pub(crate) fn may_tag(
+    project: &ProjectContext<'_>,
+    db: &Connection,
+    caller: &Caller,
+) -> ApiResult<()> {
+    caller.require_human("tag")?;
+    caller.require_not_instance("tag")?;
+    let root_facts = project
+        .facts(db, "root")?
+        .or_else(|| policy::implicit_facts("root"))
+        .unwrap_or_else(|| unreachable!());
+    policy::may_maintain(
+        &root_facts.maintainers,
+        &project.who(caller),
+        &project.info.owner,
+        "root",
+    )
+    .map_err(|why| HttpError::new(403, format!("{why}, so may not tag")))
+}
+
+/// Make tag `name` at root commit `root`, by `by`: the one way a tag is
+/// made, whether pushed from a project root or made on a mirror. The tag,
+/// and whether this made it (`false`: it was there, naming that commit with
+/// that annotation). One that exists naming anything else is refused, since
+/// a tag never moves, and so is a commit that is not on root's `main`.
+pub(crate) fn make_tag(
+    project: &ProjectContext<'_>,
+    db: &Connection,
+    by: &str,
+    name: &str,
+    root: &str,
+    annotation: &Value,
+) -> ApiResult<(Value, bool)> {
+    let key = &project.key;
+    if !annotation.is_null() {
+        let tagger = annotation["tagger"].as_str();
+        if tagger.is_none() || !annotation["message"].is_string() {
+            return fail(
+                400,
+                "annotation is { tagger, message }, or null for a lightweight tag",
+            );
+        }
+        if tagger.is_some_and(|tagger| tagger.contains('\n') || !valid_tagger(tagger)) {
+            return fail(
+                400,
+                "annotation.tagger is `Name <email> <seconds> <zone>`, as Git writes it",
+            );
+        }
+    }
+    if let Some(existing) = db::tag(db, key, name)? {
+        if existing["list"]["root"] == root && existing["annotation"] == *annotation {
+            return Ok((existing, false));
+        }
+        let at = existing["list"]["root"].as_str().unwrap_or_default();
+        return fail(
+            409,
+            format!(
+                "tag `{name}` names root commit {} already, and a tag never moves: delete it first if it is wrong",
+                &at[..at.len().min(12)]
+            ),
+        );
+    }
+    let repo = project.tracker("root");
+    let on_main = repo
+        .branch_head("main")
+        .is_some_and(|main| repo.has_commit(root) && repo.is_ancestor(root, &main));
+    if !on_main {
+        return fail(
+            400,
+            format!(
+                "root commit {} is not on root's `main`: a tag names the project's history, so push the commit to `main` first (`git push origin main {name}`, or `git push --follow-tags`)",
+                &root[..root.len().min(12)]
+            ),
+        );
+    }
+    let list = crate::merge::index_of(project, root, None)?;
+    db::create_tag(db, key, name, &list, annotation, by)?;
+    tagged(project, &list);
+    Ok((db::tag(db, key, name)?.unwrap_or(Value::Null), true))
 }
 
 /// `Name <email> <seconds> <zone>`, as Git's `tagger` line has it.

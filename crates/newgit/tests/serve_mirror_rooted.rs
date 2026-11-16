@@ -2,6 +2,7 @@
 // to `jack/t3code` with its own files at the top. The server exports its
 // view there; a commit merged there lands in `t3code` and moves its pin in
 // root in the same landing; the export then finds the mirror where it is.
+// A tag made there is its tracker's, and is not brought in (#453).
 
 include!("support/serve.rs");
 include!("support/serve_mirror.rs");
@@ -86,4 +87,21 @@ fn a_commit_on_a_rooted_targets_mirror_lands_in_its_tracker_and_moves_the_pin() 
         std::thread::sleep(std::time::Duration::from_millis(200));
     }
     assert_eq!(git(&home, &t3, &["rev-parse", "refs/heads/main"]), pushed);
+
+    // A tag made on a rooted target's mirror names that tracker's commits,
+    // not the project's: it is not brought in (#453).
+    let tagged = serde_json::json!({
+        "ref": "refs/tags/v1", "after": pushed, "deleted": false,
+        "repository": { "full_name": "jack/t3code" }, "pusher": { "name": "jack" },
+    })
+    .to_string();
+    let (status, answer) = deliver(&server, "push", "d-t3-tag", &tagged);
+    assert_eq!(status, 200, "{answer}");
+    assert!(
+        answer["ignored"]
+            .as_str()
+            .is_some_and(|why| why.contains("rooted at `t3code`")),
+        "{answer}"
+    );
+    assert_eq!(state(&server, &token)["pulls"], serde_json::json!([]));
 }

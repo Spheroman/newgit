@@ -1344,6 +1344,10 @@ pub struct PullEnded {
     pub outcome: String,
     pub why: Option<String>,
     pub at: String,
+    /// The tag it was the pull of, for a tag made on the mirror: a pull of
+    /// its own, beside the pull of the commit it names.
+    #[serde(default)]
+    pub tag: Option<String>,
 }
 
 impl RemoteState {
@@ -1433,7 +1437,7 @@ impl RemoteState {
         for ended in &self.ended {
             let since = troubles.entry(ended.target.as_str()).or_default();
             if ended.outcome == "refused" || ended.outcome == "gave up" {
-                since.retain(|earlier| earlier.commit != ended.commit);
+                since.retain(|earlier| earlier.commit != ended.commit || earlier.tag != ended.tag);
                 since.push(ended);
             } else {
                 since.clear();

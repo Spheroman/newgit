@@ -13,6 +13,7 @@ merge [#411], stored rooted histories [#412], mirrors [#414].*
 [#412]: https://github.com/Spheroman/newgit/issues/412
 [#440]: https://github.com/Spheroman/newgit/issues/440
 [#414]: https://github.com/Spheroman/newgit/issues/414
+[#453]: https://github.com/Spheroman/newgit/issues/453
 
 ---
 
@@ -644,8 +645,30 @@ Resolved loudly; each is reversible.
       The commit this server itself last exported to the target is answered
       200 before who pushed is asked, and not queued: it was composed from
       `main`, and GitHub names the token's owner as its pusher, which for an
-      App's token is no member's login. Tags pushed to a mirror are not
-      brought in yet.
+      App's token is no member's login.
+    - **A tag made on a mirror is made here** ([#453]), as the Worker does.
+      A push to `refs/tags/*` of a target rooted at root, by someone who
+      may tag (a member maintaining root, the same check as a merge), is
+      queued as a pull of its own, behind every pull queued before it: a
+      pull request merged and then tagged is on `main` when its tag is
+      looked for. A rooted target's tags name its tracker's commits, not
+      the project's, and are ignored; so is a tag deleted there, since tags
+      never move. The pull lands nothing. It fetches the tag, composes
+      `main` as the target sees it, and reads which root commit the tagged
+      commit is the view of (the note the composition writes); an annotated
+      tag keeps its tagger and message, without a signature. The tag is
+      then made by the function a tag pushed from a project root is made by
+      (`api::make_tag`), as whoever pushed it. So it ends `tagged`; or
+      `nothing` when it is there already naming that commit, which is how
+      the client's own export of a tag ends when it comes back as an event;
+      or `refused` (`tag <name>: …`) when it would move, or names a commit
+      that is not on `main` as the target sees it (it lands first, by its
+      own event; then this one is sent again). A tag's ending is kept per
+      tag, beside the branch's: it neither ends a refused pull's trouble
+      nor is ended by a pull that lands, and a refused tag stays said until
+      that tag is made. A view commit that stands for several root commits
+      (the later ones changed only what the target does not ship) names the
+      first of them.
     - **A pull lands as a merge.** The pull thread fetches the mirror into
       a scratch repository, composes `main` as the target sees it, and
       walks what the mirror has beyond it (nothing: our own export, ends
@@ -919,7 +942,6 @@ Resolved loudly; each is reversible.
 - Garbage collection of the stores, of merge landings, and of the landing
   log ([#434]).
 
-- Tags made on a mirror, brought in by the webhook (the Worker does).
 - Minting GitHub App installation tokens (decision 11).
 - The landing page and `/install.sh`.
 - Moving newgit.dev across: copying every Artifacts repo and the Durable

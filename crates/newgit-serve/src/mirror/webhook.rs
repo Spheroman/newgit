@@ -9,6 +9,8 @@
 //! squash's pull need not ask GitHub. A `push` must come from a repository
 //! one of `main`'s definitions exports to (else 403), to that target's
 //! branch; whoever pushed must be a member who may merge root (else 403).
+//! A tag pushed there (`refs/tags/*`) is queued the same way, as a pull of
+//! its own behind every pull queued before it, for a target rooted at root.
 //! It is then queued (202), unless a pull of that commit to that target is
 //! waiting already (200). The commit this server itself last exported there
 //! is answered 200 before any of that: it came from `main`.
@@ -171,8 +173,14 @@ pub fn receive(app: &App, request: &ApiRequest) -> ApiResult<ApiResponse> {
         .map_err(|_| HttpError::new(400, "the event is not JSON"))?;
     let repo = push.repository.full_name.clone().unwrap_or_default();
     let reference = push.reference.clone().unwrap_or_default();
-    if reference.starts_with("refs/tags/") {
-        return ignored("tags made on a mirror are not brought in by `newgit serve` yet");
+    // A tag made on the mirror: `after` is its object, and nothing lands
+    // but the tag.
+    let tag = reference.strip_prefix("refs/tags/").map(str::to_owned);
+    if tag.is_some() && push.deleted {
+        return ignored("a tag is deleted on the remote, not by a mirror: tags never move");
+    }
+    if let Some(problem) = tag.as_deref().and_then(crate::api::tag_name_problem) {
+        return ignored(problem);
     }
     let commit = push.after.clone().unwrap_or_default();
     if push.deleted || !is_commit(&commit) {
@@ -222,14 +230,21 @@ pub fn receive(app: &App, request: &ApiRequest) -> ApiResult<ApiResponse> {
             &repo,
         );
     }
-    if reference != format!("refs/heads/{}", target.branch) {
+    if tag.is_some() && target.root.is_some() {
+        return ignored(format!(
+            "`{}` is rooted at `{}`: its tags name that tracker's commits, not the project's",
+            target.name,
+            target.declared_by()
+        ));
+    }
+    if tag.is_none() && reference != format!("refs/heads/{}", target.branch) {
         return ignored(format!("not `{}`", target.branch));
     }
     // Our own export coming back: the commit this server last pushed there
     // was composed from `main`, so there is nothing to look for. Answered
     // before who pushed is asked, since that was this server's token (an
     // App's is no member's login) and nothing lands.
-    {
+    if tag.is_none() {
         let db = app.db.lock();
         let ours = store::exports(&db, &home)?
             .into_iter()
@@ -241,7 +256,8 @@ pub fn receive(app: &App, request: &ApiRequest) -> ApiResult<ApiResponse> {
             ));
         }
     }
-    // Landing here is a merge by whoever pushed there.
+    // Landing here is a merge by whoever pushed there, and a tag is theirs
+    // to make: both are root's maintainers' to do.
     let who = policy::Requester {
         login: pusher.clone(),
         member,
@@ -252,7 +268,10 @@ pub fn receive(app: &App, request: &ApiRequest) -> ApiResult<ApiResponse> {
     if pusher.is_empty() || may.is_err() {
         return refused(
             403,
-            format!("`{pusher}` pushed this, and may not merge into {home}"),
+            format!(
+                "`{pusher}` pushed this, and may not {} {home}",
+                if tag.is_some() { "tag" } else { "merge into" }
+            ),
             &home,
             &repo,
         );
@@ -265,6 +284,7 @@ pub fn receive(app: &App, request: &ApiRequest) -> ApiResult<ApiResponse> {
         &repo,
         &target.branch,
         &commit,
+        tag.as_deref(),
         &pusher,
         delivery,
         super::now(),
@@ -273,7 +293,7 @@ pub fn receive(app: &App, request: &ApiRequest) -> ApiResult<ApiResponse> {
     app.mirrors.wake_pulls();
     eprintln!(
         "{}",
-        json!({ "webhook": "queued", "project": home, "target": target.name, "commit": commit, "pusher": pusher, "delivery": delivery })
+        json!({ "webhook": "queued", "project": home, "target": target.name, "commit": commit, "tag": tag, "pusher": pusher, "delivery": delivery })
     );
     Ok(match queued {
         Queued::New(_) => ApiResponse {

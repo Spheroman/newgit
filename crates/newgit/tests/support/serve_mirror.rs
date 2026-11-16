@@ -202,6 +202,7 @@ fn pulls_done(server: &Server, token: &str) -> Value {
 }
 
 /// How the last pull ended, by `/state`.
+#[allow(dead_code, reason = "not every binary that includes this uses it")]
 fn last_ended(state: &Value) -> Value {
     state["ended"]
         .as_array()
@@ -246,6 +247,7 @@ fn ancestor(dir: &Utf8Path, older: &str, newer: &str) -> bool {
 }
 
 /// A file of `main` as the server's Git endpoint serves the whole view.
+#[allow(dead_code, reason = "not every binary that includes this uses it")]
 fn main_file(server: &Server, token: &str, temp: &Utf8Path, path: &str) -> String {
     let dir = temp.join(format!("view-{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).expect("time").as_nanos()));
     let url = format!("{}/jack/store.git", server.url);

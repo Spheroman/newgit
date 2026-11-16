@@ -97,6 +97,8 @@ pub fn scaled(seconds: i64) -> i64 {
 #[derive(Debug)]
 enum Step {
     Landed,
+    /// A tag's pull made the tag.
+    Tagged,
     /// Its commit is on `main` already. `settled`: so is everything else the
     /// mirror's branch has, so the target's trouble is over; not so for an
     /// old delivery sent again while the mirror holds commits `main` lacks.
@@ -147,7 +149,7 @@ pub fn step_all(app: &App) {
 fn log(pull: &Pull, what: &str, why: Option<&str>) {
     eprintln!(
         "{}",
-        json!({ "webhook": what, "project": pull.home, "target": pull.target, "commit": pull.commit, "pusher": pull.pusher, "why": why })
+        json!({ "webhook": what, "project": pull.home, "target": pull.target, "commit": pull.commit, "tag": pull.tag, "pusher": pull.pusher, "why": why })
     );
 }
 
@@ -160,6 +162,10 @@ fn settle(app: &App, pull: &Pull, outcome: ApiResult<Step>) -> ApiResult<()> {
         Ok(Step::Landed) => {
             log(pull, "landed", None);
             store::end(&db, pull, &ending("landed", None, true), now)?;
+        }
+        Ok(Step::Tagged) => {
+            log(pull, "tagged", None);
+            store::end(&db, pull, &ending("tagged", None, false), now)?;
         }
         Ok(Step::Nothing { settled }) => {
             log(pull, "nothing to bring in", None);
@@ -269,6 +275,7 @@ fn first_refusal(
         .into_iter()
         .find(|ended| {
             ended.target == pull.target
+                && ended.tag.is_none()
                 && ended.outcome == "refused"
                 && ended.blocked_by.is_none()
                 && ended.commit != pull.commit
@@ -340,6 +347,18 @@ fn step(app: &App, pull: &Pull) -> ApiResult<Step> {
             pull.target, pull.branch, pull.repo
         )));
     };
+    if let Some(tag) = &pull.tag {
+        return tag_pull(
+            app,
+            pull,
+            &caller,
+            &bench,
+            &target,
+            &url,
+            tag,
+            token.as_deref(),
+        );
+    }
     mirror_git_ok(
         &dir,
         token.as_deref(),
@@ -374,6 +393,145 @@ fn step(app: &App, pull: &Pull) -> ApiResult<Step> {
         token: token.as_deref(),
     }
     .run()
+}
+
+/// A tag made on the mirror: nothing lands. The root commit on `main` whose
+/// view, as the target sees it, is the commit the tag names is found, and
+/// the tag is made there as a tag pushed from a project root is
+/// (`api::make_tag`): never moved, and found made when it is our own export
+/// of a tag coming back as an event. An annotated tag keeps its tagger and
+/// its message.
+#[expect(clippy::too_many_arguments, reason = "one pull's context")]
+fn tag_pull(
+    app: &App,
+    pull: &Pull,
+    caller: &Caller,
+    bench: &Workbench,
+    target: &ExportTarget,
+    url: &str,
+    tag: &str,
+    token: Option<&str>,
+) -> ApiResult<Step> {
+    let dir = bench.dir();
+    let refused = |why: String| {
+        Ok(Step::Refused {
+            why: format!("tag `{tag}`: {why}"),
+            walk: Vec::new(),
+        })
+    };
+    {
+        let db = app.db.lock();
+        store::set_step(&db, pull.id, "tagging", now())?;
+    }
+    if let Some(root) = &target.root {
+        return refused(format!(
+            "`{}` is rooted at `{root}`: its tags name that tracker's commits, not the project's",
+            target.name
+        ));
+    }
+    let fetched = super::mirror_git(
+        dir,
+        token,
+        &[
+            "fetch",
+            "--quiet",
+            "--no-tags",
+            url,
+            &format!("+refs/tags/{tag}:refs/mirrors/tag"),
+        ],
+    )?;
+    if !fetched.status.success() {
+        let stderr = String::from_utf8_lossy(&fetched.stderr);
+        if stderr.contains("couldn't find remote ref") {
+            return refused(format!("`{}` no longer has it", target.name));
+        }
+        return Err(HttpError::new(
+            502,
+            format!("git fetch failed: {}", super::redact(stderr.trim(), token)),
+        ));
+    }
+    if git_ok(dir, &["rev-parse", "refs/mirrors/tag"])? != pull.commit {
+        return refused(format!(
+            "on `{}` it is no longer {}",
+            target.name,
+            short(&pull.commit)
+        ));
+    }
+    let Ok(commit) = git_ok(dir, &["rev-parse", "--verify", "refs/mirrors/tag^{commit}"]) else {
+        return refused(format!(
+            "on `{}` it names no commit: a tag names a point of the project's history",
+            target.name
+        ));
+    };
+    let annotation = if git_ok(dir, &["cat-file", "-t", "refs/mirrors/tag"])? == "tag" {
+        let text = crate::repos::git(dir, &["cat-file", "tag", "refs/mirrors/tag"])?;
+        match newgit_core::endpoint::parse_annotation(&String::from_utf8_lossy(&text.stdout), tag) {
+            Ok(annotation) => {
+                json!({ "tagger": annotation.tagger, "message": annotation.message })
+            }
+            Err(error) => return refused(error.to_string()),
+        }
+    } else {
+        serde_json::Value::Null
+    };
+
+    // `main` as the target sees it: the mirror's commits are in it under
+    // the very ids they have there, each noted with its root commit.
+    let pin = bench
+        .list
+        .get("root")
+        .cloned()
+        .ok_or_else(|| HttpError::new(409, "`main` names no root commit"))?;
+    let ships = |name: &str| bench.ships(target, name);
+    let exported = compose::compose(
+        dir,
+        "root",
+        &[("refs/mirrors/view/target".to_owned(), pin)],
+        &ComposeOptions {
+            readable: &ships,
+            admit: None,
+        },
+    )
+    .map_err(core)?
+    .into_iter()
+    .next()
+    .and_then(|view| view.tip)
+    .ok_or_else(|| HttpError::new(409, "`root` composes to nothing"))?;
+    let root = if is_ancestor(dir, &commit, &exported) {
+        compose::read_root(dir, &commit)
+            .map_err(core)?
+            .filter(|(tracker, _)| tracker == "root")
+            .map(|(_, root)| root)
+    } else {
+        None
+    };
+    let Some(root) = root else {
+        return refused(format!(
+            "on `{}` it names {}, which is not on `main` as `{}` sees it: a tag names the project's history, so the commit lands first (a pull request merged there comes in by its own event; redeliver this one after it has)",
+            target.name,
+            short(&commit),
+            target.name
+        ));
+    };
+
+    let db = app.db.lock();
+    let project = ProjectContext::load(app, &db, caller, &bench_project(pull)?)?;
+    let made = crate::api::may_tag(&project, &db, caller)
+        .and_then(|()| crate::api::make_tag(&project, &db, &pull.pusher, tag, &root, &annotation));
+    match made {
+        Ok((_, true)) => Ok(Step::Tagged),
+        // There already, naming this commit: our own export of it.
+        Ok((_, false)) => Ok(Step::Nothing { settled: false }),
+        // A refusal is an answer: a tag that would move, a commit not on
+        // `main`, a pusher who may not tag.
+        Err(error) if matches!(error.status, 400 | 403 | 409) => refused(error.message),
+        Err(error) => Err(error),
+    }
+}
+
+fn bench_project(pull: &Pull) -> ApiResult<crate::names::ProjectId> {
+    parse_project_key(&pull.home)
+        .ok_or_else(|| HttpError::internal(format!("`{}` is not a project", pull.home)))
 }
 
 /// One pull's look, check, and landing.
