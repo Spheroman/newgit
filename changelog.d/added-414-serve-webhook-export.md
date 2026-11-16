@@ -21,3 +21,15 @@
   commit to carry nothing of a withheld tracker or one outside Git, and
   say how they stand (up to date, behind, failing and why) in `newgit
   status`. Configure both with `newgit serve --github <file>`.
+
+  The server talks to a mirror only at
+  `https://github.com/<owner>/<name>.git`, and sends the project's token
+  to no other host: a definition's `url` as written is never handed to
+  Git there, and a pull whose target no longer names the repository its
+  event did fetches nothing. Its own export coming back as an event is
+  answered without a pull. A later pull refused for a reason of its own
+  says that reason instead of repeating the first refusal's; a refusal
+  is never pushed out of `newgit status` by the pulls waiting on it or
+  by another mirror's; and it ends when the export next reaches the
+  mirror, so `newgit pull --remote <target>` then `newgit merge main`
+  clears it without an event.

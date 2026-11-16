@@ -261,15 +261,49 @@ pub(crate) fn now() -> i64 {
 
 // ── Git against a mirror ──────────────────────────────────────────────────
 
+/// Where this server talks to a mirror: `https://github.com/<owner>/<name>.git`,
+/// made here from the repository's name and never taken from a definition as
+/// written. A definition's `url` is whatever a maintainer of `access` typed
+/// (an `scp`-style address, a path, text that starts with `-`), and handed to
+/// Git it would be fetched with this server's own SSH keys, read another
+/// project's store off this disk, or be taken for an option. `None` when
+/// `repo` is not `<owner>/<name>` in the letters GitHub allows.
+pub fn mirror_url(repo: &str) -> Option<String> {
+    let (owner, name) = repo.split_once('/')?;
+    // GitHub's own letters. Never a leading `-` (an option), never `.` or
+    // `..` (a path), and no `.git` to double.
+    let part = |text: &str| {
+        !text.is_empty()
+            && text.len() <= 100
+            && !text.starts_with('-')
+            && text != "."
+            && text != ".."
+            && !text.ends_with(".git")
+            && text
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+    };
+    (part(owner) && part(name)).then(|| format!("{GITHUB}{owner}/{name}.git"))
+}
+
+/// Every mirror is under here, and the token goes nowhere else.
+pub const GITHUB: &str = "https://github.com/";
+
+/// The mirror an export target names, as [`mirror_url`] makes it.
+pub fn url_of(target: &ExportTarget) -> Option<String> {
+    mirror_url(&target.github_repo()?)
+}
+
 /// Git in `dir` (a bare repository), talking to a mirror: the token, when
 /// there is one, is handed to Git in its environment (`GIT_CONFIG_*`), never
 /// in its arguments, so no error message or log line that names the command
-/// carries it.
-pub(crate) fn mirror_git(
+/// carries it. It is an `http.<url>.extraHeader` for [`GITHUB`] alone: Git
+/// sends it to no other host, whatever it is asked to fetch.
+pub(crate) fn mirror_command(
     dir: &Utf8Path,
     token: Option<&str>,
     args: &[&str],
-) -> ApiResult<std::process::Output> {
+) -> std::process::Command {
     let mut command = crate::repos::git_command(dir);
     command
         .args(args)
@@ -281,13 +315,21 @@ pub(crate) fn mirror_git(
             base64::engine::general_purpose::STANDARD.encode(format!("x-access-token:{token}"));
         command
             .env("GIT_CONFIG_COUNT", "1")
-            .env("GIT_CONFIG_KEY_0", "http.extraHeader")
+            .env("GIT_CONFIG_KEY_0", format!("http.{GITHUB}.extraHeader"))
             .env(
                 "GIT_CONFIG_VALUE_0",
                 format!("Authorization: Basic {basic}"),
             );
     }
-    Ok(command.output()?)
+    command
+}
+
+pub(crate) fn mirror_git(
+    dir: &Utf8Path,
+    token: Option<&str>,
+    args: &[&str],
+) -> ApiResult<std::process::Output> {
+    Ok(mirror_command(dir, token, args).output()?)
 }
 
 /// [`mirror_git`], failing with Git's message, which never holds the token.
@@ -352,7 +394,13 @@ pub struct Workbench {
 }
 
 impl Workbench {
-    pub fn open(project: &ProjectContext<'_>, login: &str, list: List) -> ApiResult<Self> {
+    /// `login`: whose landings it borrows too, for a pull that puts its
+    /// commits there; `None` borrows nobody's. `-` is no login's name, so
+    /// nothing is ever joined into a path from what an event says.
+    pub fn open(project: &ProjectContext<'_>, login: Option<&str>, list: List) -> ApiResult<Self> {
+        let login = login
+            .filter(|login| crate::names::is_part(login))
+            .unwrap_or("-");
         let scratch = crate::server_merge::Scratch::open(project, login)?;
         let dir = scratch.dir().to_owned();
         let mut script = String::from("start\n");
@@ -410,6 +458,16 @@ impl Workbench {
         }) && target.ships(tracker)
     }
 
+    /// Where `tracker`'s own files sit in the project's view: `None` for
+    /// root, whose view is the project's.
+    pub fn mount_of(&self, tracker: &str) -> Option<Utf8PathBuf> {
+        self.definitions
+            .iter()
+            .find(|definition| definition.name == tracker)
+            .map(|definition| definition.mount.clone())
+            .filter(|mount| mount.as_str() != ".")
+    }
+
     /// The trackers in Git on `main` the target leaves out, within what it
     /// is rooted at.
     pub fn withheld(&self, target: &ExportTarget) -> Vec<TrackerDefinition> {
@@ -456,12 +514,15 @@ pub(crate) fn core(error: newgit_core::error::NewgitError) -> HttpError {
 pub fn target_for_repo(targets: &[ExportTarget], repo: &str) -> Option<ExportTarget> {
     targets
         .iter()
-        .find(|target| {
-            target
-                .github_repo()
-                .is_some_and(|there| there.eq_ignore_ascii_case(repo))
-        })
+        .find(|target| names_repo(target, repo))
         .cloned()
+}
+
+/// Whether `target` is the GitHub repository `repo` (`owner/name`, any case).
+pub fn names_repo(target: &ExportTarget, repo: &str) -> bool {
+    target
+        .github_repo()
+        .is_some_and(|there| there.eq_ignore_ascii_case(repo))
 }
 
 /// What to do about a pull that ended without landing.
@@ -474,4 +535,67 @@ pub fn bring_it_in(target: &str) -> String {
 /// Where a project's export repositories are: never a store, never served.
 pub fn exports_dir(home: &Utf8Path) -> Utf8PathBuf {
     home.join("exports")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_mirror_is_only_ever_https_on_github() {
+        assert_eq!(
+            mirror_url("Spheroman/newgit").as_deref(),
+            Some("https://github.com/Spheroman/newgit.git")
+        );
+        assert_eq!(
+            mirror_url("a-b/c_d.e").as_deref(),
+            Some("https://github.com/a-b/c_d.e.git")
+        );
+        assert_eq!(
+            mirror_url("acme/.github").as_deref(),
+            Some("https://github.com/acme/.github.git")
+        );
+        for not_one in [
+            "", "newgit", "a/b/c", "-o/x", "a/-x", "a/..", "../x", "./x", "a/x y", "a/x.git",
+            "a/x?y", "a/x#y", "a/%2e%2e",
+        ] {
+            assert_eq!(mirror_url(not_one), None, "{not_one}");
+        }
+    }
+
+    #[test]
+    fn the_token_is_in_the_environment_and_for_github_alone() {
+        let command = mirror_command(
+            Utf8Path::new("/nowhere.git"),
+            Some("s3cr3t-token"),
+            &["fetch", "https://github.com/a/b.git"],
+        );
+        let said: Vec<String> = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            said.iter()
+                .all(|arg| !arg.contains("s3cr3t") && !arg.contains("extraHeader")),
+            "{said:?}"
+        );
+        let env: BTreeMap<String, String> = command
+            .get_envs()
+            .filter_map(|(key, value)| {
+                Some((
+                    key.to_string_lossy().into_owned(),
+                    value?.to_string_lossy().into_owned(),
+                ))
+            })
+            .collect();
+        assert_eq!(
+            env.get("GIT_CONFIG_KEY_0").map(String::as_str),
+            Some("http.https://github.com/.extraHeader"),
+            "scoped to GitHub, never a bare http.extraHeader"
+        );
+        assert_eq!(env.get("GIT_CONFIG_COUNT").map(String::as_str), Some("1"));
+        // No token: nothing is configured at all.
+        let bare = mirror_command(Utf8Path::new("/nowhere.git"), None, &["fetch"]);
+        assert!(bare.get_envs().all(|(key, _)| key != "GIT_CONFIG_COUNT"));
+    }
 }

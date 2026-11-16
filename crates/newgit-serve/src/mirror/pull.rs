@@ -97,8 +97,12 @@ pub fn scaled(seconds: i64) -> i64 {
 #[derive(Debug)]
 enum Step {
     Landed,
-    /// Its commit is on `main` already.
-    Nothing,
+    /// Its commit is on `main` already. `settled`: so is everything else the
+    /// mirror's branch has, so the target's trouble is over; not so for an
+    /// old delivery sent again while the mirror holds commits `main` lacks.
+    Nothing {
+        settled: bool,
+    },
     Refused {
         why: String,
         /// The commits it would have landed: a later pull carrying one of
@@ -155,14 +159,14 @@ fn settle(app: &App, pull: &Pull, outcome: ApiResult<Step>) -> ApiResult<()> {
     match outcome {
         Ok(Step::Landed) => {
             log(pull, "landed", None);
-            store::end(&db, pull, "landed", None, None, now)?;
+            store::end(&db, pull, &ending("landed", None, true), now)?;
         }
-        Ok(Step::Nothing) => {
+        Ok(Step::Nothing { settled }) => {
             log(pull, "nothing to bring in", None);
-            store::end(&db, pull, "nothing", None, None, now)?;
+            store::end(&db, pull, &ending("nothing", None, settled), now)?;
         }
         Ok(Step::Refused { why, walk }) => {
-            let blocked_by = first_refusal(&db, pull, &walk)?;
+            let blocked_by = first_refusal(&db, pull, &walk, &why)?;
             let why = match &blocked_by {
                 Some((commit, at)) => format!(
                     "it carries commit {}, whose pull was refused at {}, and is refused with it: {why}",
@@ -172,18 +176,29 @@ fn settle(app: &App, pull: &Pull, outcome: ApiResult<Step>) -> ApiResult<()> {
                 None => why,
             };
             log(pull, "refused", Some(&why));
+            if blocked_by.is_none() {
+                // Its own reason: it speaks for the pulls whose commits it
+                // carries, whatever they were refused for.
+                let carried: Vec<String> = walk
+                    .iter()
+                    .filter(|commit| **commit != pull.commit)
+                    .cloned()
+                    .collect();
+                store::supersede(&db, &pull.home, &pull.target, &carried)?;
+            }
             store::end(
                 &db,
                 pull,
-                "refused",
-                Some(&why),
-                blocked_by.as_ref().map(|(commit, _)| commit.as_str()),
+                &store::Ending {
+                    blocked_by: blocked_by.as_ref().map(|(commit, _)| commit.as_str()),
+                    ..ending("refused", Some(&why), false)
+                },
                 now,
             )?;
         }
         Ok(Step::GaveUp(why)) => {
             log(pull, "gave up", Some(&why));
-            store::end(&db, pull, "gave up", Some(&why), None, now)?;
+            store::end(&db, pull, &ending("gave up", Some(&why), false), now)?;
         }
         Ok(Step::Wait | Step::Again) if over_time => {
             let why = format!(
@@ -202,7 +217,7 @@ fn settle(app: &App, pull: &Pull, outcome: ApiResult<Step>) -> ApiResult<()> {
                 super::bring_it_in(&pull.target)
             );
             log(pull, "gave up", Some(&why));
-            store::end(&db, pull, "gave up", Some(&why), None, now)?;
+            store::end(&db, pull, &ending("gave up", Some(&why), false), now)?;
         }
         Ok(Step::Wait | Step::Again) => {}
         Err(error) => {
@@ -221,36 +236,46 @@ fn settle(app: &App, pull: &Pull, outcome: ApiResult<Step>) -> ApiResult<()> {
                     super::bring_it_in(&pull.target)
                 );
                 log(pull, "gave up", Some(&why));
-                store::end(&db, pull, "gave up", Some(&why), None, now)?;
+                store::end(&db, pull, &ending("gave up", Some(&why), false), now)?;
             }
         }
     }
     Ok(())
 }
 
-/// The first refusal still standing for this target whose commit this pull
-/// would also land: the one it waits on. Standing means no pull of the
-/// target landed or found nothing since.
+fn ending<'a>(outcome: &'a str, why: Option<&'a str>, settles: bool) -> store::Ending<'a> {
+    store::Ending {
+        outcome,
+        why,
+        blocked_by: None,
+        settles,
+    }
+}
+
+/// The refusal this pull only repeats: the first still standing for its
+/// target whose commit it would also land, refused for the very reason this
+/// one is (#451: said once, on the first). A pull that carries a refused
+/// one's commits and is refused for a reason of its own is not waiting on
+/// it, and says its own: after `newgit merge <instance>` ends the first
+/// refusal's cause, a later pull that then conflicts must say the conflict,
+/// not repeat advice already taken.
 fn first_refusal(
     db: &rusqlite::Connection,
     pull: &Pull,
     walk: &[String],
+    why: &str,
 ) -> ApiResult<Option<(String, i64)>> {
-    let mut standing: Vec<store::Ended> = Vec::new();
-    for ended in store::ended(db, &pull.home)? {
-        if ended.target != pull.target {
-            continue;
-        }
-        match ended.outcome.as_str() {
-            "landed" | "nothing" => standing.clear(),
-            "refused" if ended.commit != pull.commit => standing.push(ended),
-            _ => {}
-        }
-    }
-    let carried = standing
-        .iter()
-        .find(|ended| ended.blocked_by.is_none() && walk.contains(&ended.commit));
-    Ok(carried.map(|ended| (ended.commit.clone(), ended.at)))
+    Ok(store::ended(db, &pull.home)?
+        .into_iter()
+        .find(|ended| {
+            ended.target == pull.target
+                && ended.outcome == "refused"
+                && ended.blocked_by.is_none()
+                && ended.commit != pull.commit
+                && walk.contains(&ended.commit)
+                && ended.why.as_deref() == Some(why)
+        })
+        .map(|ended| (ended.commit, ended.at)))
 }
 
 /// Who a pull lands as: whoever pushed to the mirror, with no token of
@@ -297,16 +322,22 @@ fn step(app: &App, pull: &Pull) -> ApiResult<Step> {
         .github
         .project(&pull.home)
         .and_then(|github| github.token.clone());
-    let bench = Workbench::open(&project, &pull.pusher, list)?;
+    let bench = Workbench::open(&project, Some(&pull.pusher), list)?;
     let dir = bench.dir().to_owned();
-    let Some(target) = bench
+    // The target as `main` declares it now, which may not be what it was
+    // when the event was queued. It must still be the repository the signed
+    // event named, on the branch it named: the event vouches for that
+    // repository's commits and no other's, and this server fetches from
+    // nowhere else (`mirror_url`).
+    let target = bench
         .targets()?
         .into_iter()
         .find(|target| target.name == pull.target)
-    else {
+        .filter(|target| super::names_repo(target, &pull.repo) && target.branch == pull.branch);
+    let (Some(target), Some(url)) = (target, super::mirror_url(&pull.repo)) else {
         return Ok(Step::GaveUp(format!(
-            "`{}` is no longer an export target on `main`",
-            pull.target
+            "`{}` no longer exports to `{}` of {} on `main`: the event was for that, so nothing was fetched",
+            pull.target, pull.branch, pull.repo
         )));
     };
     mirror_git_ok(
@@ -316,7 +347,7 @@ fn step(app: &App, pull: &Pull) -> ApiResult<Step> {
             "fetch",
             "--quiet",
             "--no-tags",
-            &target.push_url(),
+            &url,
             &format!("+refs/heads/{}:refs/mirrors/tip", pull.branch),
         ],
     )?;
@@ -415,7 +446,23 @@ impl Landing<'_> {
             ],
         )?);
         if walk.is_empty() {
-            return Ok(Step::Nothing);
+            // Whether the mirror's branch holds anything else `main` lacks:
+            // an old delivery sent again finds its own commit landed long
+            // ago, which says nothing of a later one that was refused.
+            let beyond = git_ok(
+                dir,
+                &[
+                    "rev-list",
+                    "-n",
+                    "1",
+                    "refs/mirrors/tip",
+                    "--not",
+                    &exported,
+                ],
+            )?;
+            return Ok(Step::Nothing {
+                settled: beyond.is_empty(),
+            });
         }
         let refused = |why: String| Step::Refused {
             why,
@@ -588,7 +635,7 @@ impl Landing<'_> {
             let target = &self.target.name;
             let tracker = &definition.name;
             return Ok(Some(format!(
-                "commit {} on `{target}` {what}, and that commit holds work in `{tracker}` that `main` does not have, which `{target}` does not ship: landing it alone would leave that work out. Nothing moved. To land it with that work, run `newgit merge {instance}` from the project root, then redeliver this event (or push to `{target}` again); to land only what `{target}` has, run `newgit pull --remote {target}` from the project root, and `{instance}`'s work in `{tracker}` stays on its fork",
+                "commit {} on `{target}` {what}, and that commit holds work in `{tracker}` that `main` does not have, which `{target}` does not ship: landing it alone would leave that work out. Nothing moved. To land it with that work, run `newgit merge {instance}` from the project root, then redeliver this event (or push to `{target}` again); or bring `{target}` in by hand: `newgit pull --remote {target}` from the project root, then `newgit merge main`",
                 short(commit)
             )));
         }
@@ -775,11 +822,15 @@ impl Landing<'_> {
             .get(commit)
             .cloned()
             .ok_or_else(|| HttpError::internal(format!("commit {commit} did not come in")))?;
-        if let Some((found, path, owner)) = compose::find_outside_git(
+        // Judged where the view has each path: a rooted target's files sit
+        // at its tracker's mount, not at the top.
+        let mount = self.bench.mount_of(&self.at);
+        if let Some((found, path, owner)) = compose::find_outside_git_under(
             dir,
             &[&tip, "--not", &main_view],
             &[],
             &self.bench.definitions,
+            mount.as_deref(),
         )
         .map_err(core)?
         {
@@ -818,7 +869,7 @@ impl Landing<'_> {
             SplitError::Git(error) => LandError::Failed(core(error)),
         })?;
         if split.root == pin || is_ancestor(dir, &split.root, pin) {
-            return Ok(Step::Nothing);
+            return Ok(Step::Nothing { settled: true });
         }
         let Some(base_own) = git_ok(dir, &["merge-base", &split.root, pin])
             .ok()
@@ -1044,8 +1095,11 @@ impl Landing<'_> {
         let target = &self.target.name;
         let branch = &self.pull.branch;
         match error.status {
-            409 if error.message.contains("merge onto what it is now")
-                || error.message.contains("start the merge again") =>
+            // `merge` says both as 400s and as 409s: neither is about what
+            // the mirror has, only about when this attempt read `main`.
+            400 | 409
+                if error.message.contains("merge onto what it is now")
+                    || error.message.contains("start the merge again") =>
             {
                 LandError::Again
             }

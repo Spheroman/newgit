@@ -613,10 +613,24 @@ Resolved loudly; each is reversible.
       personal access token, or a GitHub App's installation token, with
       contents read and write on the mirrors) fetches, pushes, and asks
       the API. It reaches Git only through its environment
-      (`GIT_CONFIG_*`, an `http.extraHeader`), never its arguments, and is
-      cut out of any message that might echo it. Minting short-lived
+      (`GIT_CONFIG_*`), never its arguments, as an `http.<url>.extraHeader`
+      for `https://github.com/` alone, so Git sends it to no other host, and
+      is cut out of any message that might echo it. Minting short-lived
       installation tokens from a GitHub App key is not built: an
       installation token placed in the file works until it expires.
+    - **The server talks to a mirror at
+      `https://github.com/<owner>/<name>.git` and nowhere else**, the URL
+      made here from the repository's name. A definition's `url` is whatever
+      a maintainer of `access` wrote, and the client pushes to it as written
+      with the developer's own credentials; the server never hands it to
+      Git. As written it could be an `scp`-style address (fetched with the
+      server's own SSH keys, not the project's token), a path (another
+      project's store on the same disk), or text Git takes for an option. A
+      pull also checks, when it runs, that its target still names the
+      repository and branch its signed event did: `main`'s definitions can
+      change while a pull waits, and the event vouched for that
+      repository's commits only. If not, it gives up, having fetched
+      nothing.
     - **The webhook** (`POST /v1/webhooks/github?project=<owner>/<name>`)
       verifies `X-Hub-Signature-256` under the project's secret in
       constant time (503 with no secret, 401 unsigned or wrong), answers
@@ -627,7 +641,11 @@ Resolved loudly; each is reversible.
       that commit, or that delivery, is not queued twice; a delivery whose
       pull has ended is queued again, which is how a redelivery asks
       again. The queue is rows in SQLite, so a restart resumes it (#353).
-      Tags pushed to a mirror are not brought in yet.
+      The commit this server itself last exported to the target is answered
+      200 before who pushed is asked, and not queued: it was composed from
+      `main`, and GitHub names the token's owner as its pusher, which for an
+      App's token is no member's login. Tags pushed to a mirror are not
+      brought in yet.
     - **A pull lands as a merge.** The pull thread fetches the mirror into
       a scratch repository, composes `main` as the target sees it, and
       walks what the mirror has beyond it (nothing: our own export, ends
@@ -665,11 +683,22 @@ Resolved loudly; each is reversible.
       nobody's: the check is what the server holds.
     - **Ends, said where `newgit status` reads them.** `landed`,
       `nothing`, `refused` (with why and what to do), `gave up` (after 10
-      failed attempts, 15 s doubling to 10 minutes, or two hours). A pull
-      refused only because it carries an earlier refused pull's commits is
-      refused with it and said once, on the first, with how many wait on
-      it (#451's third case). Trouble stays said until a pull of that
-      target lands or finds nothing.
+      failed attempts, 15 s doubling to 10 minutes, or two hours). What is
+      kept is per target: the last pull that settled it, and the trouble
+      since (ten said one by one). A pull that carries an earlier refused
+      pull's commits and is refused for the very same reason is refused
+      with it and said once, on the first, with how many wait on it
+      (#451's third case); those are only counted, so they never push the
+      first out of what is kept, and neither does another target's pull.
+      Refused for a reason of its own (the first's cause is over, and now
+      it conflicts), it says that reason and takes the place of the
+      refusals whose commits it carries: advice already taken is not said
+      again. Trouble stays said until the target is settled: a pull of it
+      lands, or finds the mirror's branch with nothing `main` lacks, or an
+      export reaches the mirror (so `newgit pull --remote <target>` then
+      `newgit merge main` ends it with no event). An old delivery sent
+      again, whose own commit is long on `main` while the mirror holds a
+      refused one, ends `nothing` and settles nothing.
     - **Exports are derived data, the one thing that may be behind.** A
       landing only counts itself for the export thread (no work in its
       hold). The thread composes each GitHub target's view (the history
@@ -682,7 +711,9 @@ Resolved loudly; each is reversible.
       export, O(history) (*Known limits*). Before every push, every commit
       it adds is checked to hold nothing at the mount of a withheld tracker
       while that tracker is pinned there, and nothing a tracker outside
-      Git owns; failing that, nothing is pushed. A mirror with commits
+      Git owns (for a rooted target too, each path judged where the
+      project's view has it, under the tracker's mount; a pull from one is
+      checked the same way); failing that, nothing is pushed. A mirror with commits
       `main` lacks is left as it is: the export waits for the pull, or
       says how to bring them in. Failures retry with backoff; `/state`
       says per target `up to date`, `behind` (landings since), or

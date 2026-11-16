@@ -10,7 +10,8 @@
 //! one of `main`'s definitions exports to (else 403), to that target's
 //! branch; whoever pushed must be a member who may merge root (else 403).
 //! It is then queued (202), unless a pull of that commit to that target is
-//! waiting already (200).
+//! waiting already (200). The commit this server itself last exported there
+//! is answered 200 before any of that: it came from `main`.
 
 use hmac::{KeyInit as _, Mac as _};
 use serde::Deserialize;
@@ -31,7 +32,10 @@ pub fn verify(secret: &str, body: &[u8], header: Option<&str>) -> bool {
     let Some(hex) = header.and_then(|header| header.strip_prefix("sha256=")) else {
         return false;
     };
-    if hex.len() != 64 {
+    // Exactly 64 hex digits, as GitHub writes them: `from_str_radix` alone
+    // would also take a sign (`+f`), and so more than one spelling of a
+    // signature.
+    if hex.len() != 64 || !hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return false;
     }
     let Some(given) = (0..32)
@@ -195,7 +199,9 @@ pub fn receive(app: &App, request: &ApiRequest) -> ApiResult<ApiResponse> {
     drop(db);
 
     // Which target this repository is, as `main`'s definitions say.
-    let bench = super::Workbench::open(&project, &pusher_dir(&pusher), list)?;
+    // Nobody's landings are borrowed: the pusher's name is what an event
+    // says, and nothing here is theirs to read yet.
+    let bench = super::Workbench::open(&project, None, list)?;
     let targets = bench.targets()?;
     let Some(target) = super::target_for_repo(&targets, &repo) else {
         return refused(
@@ -205,8 +211,35 @@ pub fn receive(app: &App, request: &ApiRequest) -> ApiResult<ApiResponse> {
             &repo,
         );
     };
+    if super::url_of(&target).is_none() {
+        return refused(
+            403,
+            format!(
+                "`{}` names no repository on GitHub this remote can fetch: {}",
+                target.name, target.url
+            ),
+            &home,
+            &repo,
+        );
+    }
     if reference != format!("refs/heads/{}", target.branch) {
         return ignored(format!("not `{}`", target.branch));
+    }
+    // Our own export coming back: the commit this server last pushed there
+    // was composed from `main`, so there is nothing to look for. Answered
+    // before who pushed is asked, since that was this server's token (an
+    // App's is no member's login) and nothing lands.
+    {
+        let db = app.db.lock();
+        let ours = store::exports(&db, &home)?
+            .into_iter()
+            .any(|export| export.target == target.name && export.tip.as_deref() == Some(&commit));
+        if ours {
+            return ignored(format!(
+                "{commit} is what this remote exported to `{}`",
+                target.name
+            ));
+        }
     }
     // Landing here is a merge by whoever pushed there.
     let who = policy::Requester {
@@ -252,16 +285,6 @@ pub fn receive(app: &App, request: &ApiRequest) -> ApiResult<ApiResponse> {
             body: json!({ "queued": commit, "already": true }),
         },
     })
-}
-
-/// The login a workbench borrows landings of: a GitHub login is a newgit
-/// login, and an empty one borrows none.
-fn pusher_dir(pusher: &str) -> String {
-    if pusher.is_empty() {
-        "-".to_owned()
-    } else {
-        pusher.to_owned()
-    }
 }
 
 /// A merged pull request: which head its merge commit (a squash, a merge, or
@@ -318,5 +341,26 @@ mod tests {
             body,
             Some(&header.replace("sha256=", "sha1="))
         ));
+        assert!(!verify("s3cret", body, Some(&format!("{header}00"))));
+        assert!(!verify("s3cret", body, Some(&header[..header.len() - 2])));
+        let upper = header.to_uppercase().replace("SHA256=", "sha256=");
+        assert!(verify("s3cret", body, Some(&upper)));
+    }
+
+    #[test]
+    fn a_signature_has_one_spelling() {
+        // A body whose signature starts with a byte below 0x10, so `0f` could
+        // also be written `+f` for a parser that takes a sign.
+        let (body, header) = (0..)
+            .map(|n| format!("{{\"n\":{n}}}").into_bytes())
+            .map(|body| {
+                let header = sign("s3cret", &body);
+                (body, header)
+            })
+            .find(|(_, header)| header.starts_with("sha256=0"))
+            .expect("one in sixteen");
+        assert!(verify("s3cret", &body, Some(&header)));
+        let signed = header.replacen("sha256=0", "sha256=+", 1);
+        assert!(!verify("s3cret", &body, Some(&signed)));
     }
 }

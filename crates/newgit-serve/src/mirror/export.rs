@@ -129,7 +129,7 @@ fn export_home(app: &App, home: &str) -> ApiResult<()> {
         let pulls = store::pulls(&db, home)?;
         (project, list, stamp, seen, pulls)
     };
-    let bench = Workbench::open(&project, "-", list)?;
+    let bench = Workbench::open(&project, None, list)?;
     let targets: Vec<ExportTarget> = bench
         .targets()?
         .into_iter()
@@ -159,6 +159,10 @@ fn export_home(app: &App, home: &str) -> ApiResult<()> {
             Ok(tip) => {
                 let behind = seen.get(&target.name).copied().unwrap_or(1).max(1);
                 store::exported(&db, home, &target.name, &tip, behind, now())?;
+                // The mirror is where `main` is: whatever a pull from it was
+                // refused for is over, whether or not an event comes to say
+                // so (this push's own event is answered at the door).
+                store::over(&db, home, &target.name)?;
                 eprintln!(
                     "{}",
                     json!({ "export": "up to date", "project": home, "target": target.name, "tip": tip })
@@ -208,7 +212,17 @@ impl Export<'_> {
             Some(tip) => tip,
             None => self.composed(at, &pin)?,
         };
-        let url = self.target.push_url();
+        // Only ever GitHub over HTTPS, made from the repository's name: a
+        // definition's `url` as written is never handed to Git here.
+        let Some(url) = super::url_of(self.target) else {
+            return Err(HttpError::new(
+                409,
+                format!(
+                    "`{}` names no repository on GitHub this remote can push to: {}",
+                    self.target.name, self.target.url
+                ),
+            ));
+        };
         let branch = &self.target.branch;
         let fetched = mirror_git(
             dir,
@@ -432,11 +446,18 @@ impl Export<'_> {
                 }
             }
         }
+        // For a rooted target too, each path judged where the project's view
+        // has it: under the tracker's mount.
         let range: Vec<&str> = range.iter().map(String::as_str).collect();
-        if at == "root"
-            && let Some((found, path, owner)) =
-                compose::find_outside_git(dir, &range, &[], &self.bench.definitions)
-                    .map_err(core)?
+        let mount = self.bench.mount_of(at);
+        if let Some((found, path, owner)) = compose::find_outside_git_under(
+            dir,
+            &range,
+            &[],
+            &self.bench.definitions,
+            mount.as_deref(),
+        )
+        .map_err(core)?
         {
             return Err(HttpError::new(
                 409,

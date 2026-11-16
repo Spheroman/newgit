@@ -36,8 +36,12 @@ CREATE TABLE IF NOT EXISTS mirror_exports (
     PRIMARY KEY (home, target));
 ";
 
-/// How many ended pulls are kept per project: what `newgit status` reads.
+/// How many ended pulls are kept per target, of those said one by one: what
+/// `newgit status` reads.
 pub const ENDED_KEPT: i64 = 10;
+/// How many pulls waiting on a refused one are kept per target: they are
+/// only counted, and never push out the refusal they wait on.
+pub const WAITING_KEPT: i64 = 100;
 
 pub fn create(db: &Connection) -> rusqlite::Result<()> {
     db.execute_batch(SCHEMA)
@@ -200,23 +204,109 @@ pub fn failed(db: &Connection, id: i64, why: &str, retry_at: i64, now: i64) -> A
     )?)
 }
 
+/// How a pull ended, for [`end`].
+#[derive(Debug, Clone, Copy)]
+pub struct Ending<'a> {
+    /// `landed`, `nothing`, `refused`, or `gave up`.
+    pub outcome: &'a str,
+    pub why: Option<&'a str>,
+    /// The commit of the refused pull this one waits on.
+    pub blocked_by: Option<&'a str>,
+    /// Whether the target's trouble is over with it: it landed, or the mirror
+    /// has nothing `main` lacks. A pull that only found its own commit on
+    /// `main` (an old delivery sent again) while the mirror holds more says
+    /// nothing of that.
+    pub settles: bool,
+}
+
+impl Ending<'_> {
+    fn is_trouble(&self) -> bool {
+        matches!(self.outcome, "refused" | "gave up")
+    }
+}
+
 /// A pull ends: off the queue, and how it ended kept for `newgit status`.
-pub fn end(
-    db: &Connection,
-    pull: &Pull,
-    outcome: &str,
-    why: Option<&str>,
-    blocked_by: Option<&str>,
-    now: i64,
-) -> ApiResult<()> {
+///
+/// What is kept, per target: the last pull that settled it (landed, or found
+/// nothing), then the trouble since. So one that settles replaces every row
+/// the target had; a pull refused again (a redelivery) replaces its own; and
+/// one that settles nothing and is no trouble is kept only when there is no
+/// trouble for it to hide.
+pub fn end(db: &Connection, pull: &Pull, ending: &Ending<'_>, now: i64) -> ApiResult<()> {
     db.execute("DELETE FROM mirror_pulls WHERE id = ?", [pull.id])?;
+    let target = params![pull.home, pull.target];
+    if ending.settles {
+        db.execute(
+            "DELETE FROM mirror_ended WHERE home = ?1 AND target = ?2",
+            target,
+        )?;
+    } else if ending.is_trouble() {
+        db.execute(
+            "DELETE FROM mirror_ended WHERE home = ?1 AND target = ?2 AND commit_id = ?3 AND outcome IN ('refused', 'gave up')",
+            params![pull.home, pull.target, pull.commit],
+        )?;
+    } else {
+        let troubled: bool = db.query_row(
+            "SELECT EXISTS (SELECT 1 FROM mirror_ended WHERE home = ?1 AND target = ?2 AND outcome IN ('refused', 'gave up'))",
+            target,
+            |row| row.get(0),
+        )?;
+        if troubled {
+            return Ok(());
+        }
+        db.execute(
+            "DELETE FROM mirror_ended WHERE home = ?1 AND target = ?2",
+            target,
+        )?;
+    }
     db.execute(
         "INSERT INTO mirror_ended (home, target, commit_id, outcome, why, at, blocked_by) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-        params![pull.home, pull.target, pull.commit, outcome, why, now, blocked_by],
+        params![pull.home, pull.target, pull.commit, ending.outcome, ending.why, now, ending.blocked_by],
     )?;
+    // Those said one by one and those only counted are kept apart, so a run
+    // of pulls waiting on a refusal never pushes that refusal out; and none
+    // is kept waiting on one that is gone.
+    for (waiting, kept) in [("IS NULL", ENDED_KEPT), ("IS NOT NULL", WAITING_KEPT)] {
+        db.execute(
+            &format!(
+                "DELETE FROM mirror_ended WHERE home = ?1 AND target = ?2 AND blocked_by {waiting} AND seq NOT IN (SELECT seq FROM mirror_ended WHERE home = ?1 AND target = ?2 AND blocked_by {waiting} ORDER BY seq DESC LIMIT ?3)"
+            ),
+            params![pull.home, pull.target, kept],
+        )?;
+    }
     db.execute(
-        "DELETE FROM mirror_ended WHERE home = ?1 AND seq NOT IN (SELECT seq FROM mirror_ended WHERE home = ?1 ORDER BY seq DESC LIMIT ?2)",
-        params![pull.home, ENDED_KEPT],
+        "DELETE FROM mirror_ended WHERE home = ?1 AND target = ?2 AND blocked_by IS NOT NULL AND blocked_by NOT IN (SELECT commit_id FROM mirror_ended WHERE home = ?1 AND target = ?2 AND blocked_by IS NULL AND outcome = 'refused')",
+        target,
+    )?;
+    Ok(())
+}
+
+/// A pull of `target` was refused for a reason of its own, and would have
+/// landed `walk` too: the trouble kept for pulls of those commits is its
+/// trouble now. What stopped them may be over (the refused pull got past
+/// it), and said beside this refusal it would be advice already taken.
+pub fn supersede(db: &Connection, home: &str, target: &str, walk: &[String]) -> ApiResult<()> {
+    for ended in ended(db, home)? {
+        if ended.target == target
+            && matches!(ended.outcome.as_str(), "refused" | "gave up")
+            && walk.contains(&ended.commit)
+        {
+            db.execute(
+                "DELETE FROM mirror_ended WHERE home = ?1 AND target = ?2 AND commit_id = ?3",
+                params![home, target, ended.commit],
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// `target`'s mirror is where `main` is (an export just found or put it
+/// there): whatever was refused or given up from it is over, with or without
+/// an event to say so.
+pub fn over(db: &Connection, home: &str, target: &str) -> ApiResult<()> {
+    db.execute(
+        "DELETE FROM mirror_ended WHERE home = ?1 AND target = ?2 AND outcome IN ('refused', 'gave up')",
+        params![home, target],
     )?;
     Ok(())
 }
@@ -394,8 +484,9 @@ fn iso(seconds: i64) -> String {
 }
 
 /// What `GET …/state` says of the mirrors: pulls waiting, pulls that ended
-/// (a run of refusals that each only waited on the first said once, on the
-/// first), and every export.
+/// (per target, the last that settled it and the trouble since; a run of
+/// refusals that each only waited on the first said once, on the first), and
+/// every export.
 pub fn state(db: &Connection, home: &str, threads_running: bool, now: i64) -> ApiResult<Value> {
     let waiting = pulls(db, home)?;
     let mut pulls_json = Vec::new();
@@ -430,25 +521,28 @@ pub fn state(db: &Connection, home: &str, threads_running: bool, now: i64) -> Ap
     }
     let all = ended(db, home)?;
     let mut ended_json: Vec<Value> = Vec::new();
-    for (at, one) in all.iter().enumerate() {
+    for one in &all {
         if one.blocked_by.is_some() {
             continue;
         }
         let mut why = one.why.clone();
-        let waiting_on: Vec<&Ended> = all[at + 1..]
-            .iter()
-            .filter(|later| {
-                later.target == one.target
-                    && later.blocked_by.as_deref() == Some(one.commit.as_str())
-            })
-            .collect();
+        // Each pull waiting on this one, once, however often it was sent.
+        let mut waiting_on: Vec<&str> = Vec::new();
+        for other in &all {
+            if other.target == one.target
+                && other.blocked_by.as_deref() == Some(one.commit.as_str())
+                && !waiting_on.contains(&other.commit.as_str())
+            {
+                waiting_on.push(&other.commit);
+            }
+        }
         if let Some(last) = waiting_on.last() {
             let count = waiting_on.len();
             why = Some(format!(
                 "{}. {count} later pull{} (the latest at {}) carr{} this commit and wait{} on it",
                 why.unwrap_or_default().trim_end_matches('.'),
                 if count == 1 { "" } else { "s" },
-                &last.commit[..last.commit.len().min(12)],
+                &last[..last.len().min(12)],
                 if count == 1 { "ies" } else { "y" },
                 if count == 1 { "s" } else { "" },
             ));

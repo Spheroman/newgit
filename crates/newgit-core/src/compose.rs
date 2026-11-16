@@ -731,21 +731,6 @@ impl Composer<'_> {
             }
         }
 
-        // A merge left with nothing of its own by what this reader may not
-        // read: its sides differ in a withheld pin, and the side that only
-        // moved it was dropped, so what is left is one parent, or an
-        // ancestor of it, with this tree.
-        if commit.parents.len() > 1
-            && self.joins_withheld(all_pins, mounts, &parent_commits)?
-            && let Some(parent) = self.empty_merge(&commit.parents, &tree)?
-        {
-            let view = self.views[&parent].clone();
-            let expanded = self.expanded.get(&parent).cloned().unwrap_or_default();
-            self.expanded.insert(commit.id.clone(), expanded);
-            self.views.insert(commit.id.clone(), view);
-            return Ok(());
-        }
-
         let split = parse_split(&commit.message);
 
         // The metadata: the commit's own, or for one split from a view
@@ -794,6 +779,28 @@ impl Composer<'_> {
             ),
         };
         let whole = Objects::commit_id(&tree, &parents, &author, &committer, &headers, &message);
+
+        // A merge left with nothing of its own by what this reader may not
+        // read: its sides differ in a withheld pin, and the side that only
+        // moved it was dropped, so what is left is one parent, or an
+        // ancestor of it, with this tree. Not one that comes back as the
+        // very commit it was split from: that is a merge this reader's own
+        // history has (a pull request merged on a mirror, whose branch was
+        // an instance's with work the mirror does not ship), and dropping
+        // it would leave the mirror holding a commit `main` never shows it
+        // again, so no export could ever follow (#451).
+        if commit.parents.len() > 1
+            && !(split.is_some() && whole == expected)
+            && self.joins_withheld(all_pins, mounts, &parent_commits)?
+            && let Some(parent) = self.empty_merge(&commit.parents, &tree)?
+        {
+            let view = self.views[&parent].clone();
+            let expanded = self.expanded.get(&parent).cloned().unwrap_or_default();
+            self.expanded.insert(commit.id.clone(), expanded);
+            self.views.insert(commit.id.clone(), view);
+            return Ok(());
+        }
+
         let id = if whole == expected {
             self.objects
                 .make_commit(&tree, &parents, &author, &committer, &headers, &message)

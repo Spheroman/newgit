@@ -148,7 +148,10 @@ What differs is the machinery, and it is the reason to run it:
   that secret and the *push* and *pull request* events, and a pull request
   merged there lands in `main` like anyone's merge, as whoever merged it
   (who must be a member who may merge root). When one is refused,
-  `newgit status` says why and what to do.
+  `newgit status` says why and what to do. The server only ever talks to
+  `https://github.com/<owner>/<name>.git`, with that project's token: a
+  target written as an SSH address or on another host is exported by
+  `newgit export` from your machine, not by the server.
 
 What it does not do yet:
 

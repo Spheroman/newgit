@@ -46,8 +46,17 @@ fn the_export_withholds_what_it_does_not_ship_and_composes_the_clients_ids() {
     assert_eq!(export["state"], "up to date", "{now}");
     assert_eq!(export["tip"], tip.as_str(), "{now}");
 
-    // A push of what the mirror has already is our own export coming back.
-    let (status, answer) = deliver(&server, "push", "d-own", &push_event(&tip, "jack"));
+    // A commit that is on `main` already (an old delivery sent again, the
+    // mirror since moved on by our own export) is looked for, and ends
+    // `nothing`. Our own export's tip is not even queued
+    // (`serve_mirror_target.rs`).
+    let work = mirror_clone(&home, &temp, &mirror, "old");
+    let old = git(&home, &work, &["rev-parse", "HEAD"]);
+    std::fs::write(store.join("README.md"), "store, moved\n").expect("write");
+    git(&home, &store, &["commit", "-q", "-am", "here: readme"]);
+    newgit(&home, &store, &["merge", "main"]);
+    mirror_main_until(&mirror, |now| now != tip);
+    let (status, answer) = deliver(&server, "push", "d-old", &push_event(&old, "jack"));
     assert_eq!(status, 202, "{answer}");
     let done = pulls_done(&server, &token);
     assert_eq!(last_ended(&done)["outcome"], "nothing", "{done}");
