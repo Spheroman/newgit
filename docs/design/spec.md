@@ -1540,8 +1540,10 @@ inherits its export, so what leaves fails closed. A target declared by a
 tracker other than root is rooted at it, its files at the top. Definitions
 live in `access`, so widening where something ships takes an owner's merge.
 An inheriting tracker whose audience is narrower than the declaring one's
-is refused rather than sent past it, and a history that ever committed a
-file a tracker outside Git owns is refused. It
+is refused rather than sent past it, and a commit the target does not have
+yet that adds a file a tracker outside Git owns is refused: what the target
+has, asked of it each time, is published already and is not judged again
+(#444). It
 pushes with your own Git credentials, so GitHub Actions and `gh` keep
 working. When the target's branch has moved ahead (a pull request merged on
 GitHub), export brings that in first. With `branches = true`, every push

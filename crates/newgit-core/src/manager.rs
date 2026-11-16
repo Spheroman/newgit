@@ -50,6 +50,7 @@ use crate::tracker_repo::{
 
 mod encryption;
 pub use encryption::{Reencrypted, describe_recipients};
+mod export_check;
 mod pull;
 pub use pull::{PullOutcome, PulledTracker};
 mod stale_render;
@@ -2117,10 +2118,19 @@ impl BranchManager {
                 &all,
                 Some(&mount),
             )? {
+                // All of an import is new to this project, and would be sent
+                // to its remote and its targets, so all of it is judged.
+                let inside = path
+                    .strip_prefix(&format!("{mount}/"))
+                    .unwrap_or(path.as_str());
                 return Err(NewgitError::SplitRefused(format!(
                     "commit {} of {from} adds `{path}`, which belongs to `{tracker}`, a tracker \
                      outside Git: its files (secrets among them) never come in or leave through \
-                     Git, so nothing was imported",
+                     Git, so nothing was imported. Every commit of an import is new here, so \
+                     every one is checked. To import it, take `{inside}` out of that history \
+                     (in a clone, `git filter-repo --invert-paths --path {inside}`) and import \
+                     from the clone; if `{path}` is not a secret, take it out of `{tracker}`'s \
+                     paths instead",
                     short(&commit)
                 )));
             }
@@ -9016,6 +9026,8 @@ impl BranchManager {
         }
 
         let url = target.push_url();
+        // A dry run says what would be refused, too.
+        self.refuse_new_outside_git(&target, &view.tip, &target.branch)?;
         if !options.dry_run {
             self.push_export(&target, &view.tip, &target.branch, options.force)
                 .map_err(|error| match error {
@@ -9695,9 +9707,8 @@ impl BranchManager {
     }
 
     /// Compose `list` (tracker → commit) as `target` sees it — its trackers
-    /// only — at `refs/newgit/exports/<target>/<branch>`, and refuse a
-    /// history that ever adds a path a tracker outside Git owns: a path made
-    /// secret later stays in the commits that once held it.
+    /// only — at `refs/newgit/exports/<target>/<branch>`. Nothing is pushed:
+    /// [`Self::refuse_new_outside_git`] judges what a push would send.
     fn compose_export(
         &self,
         target: &ExportTarget,
@@ -9736,7 +9747,6 @@ impl BranchManager {
 
         self.bring_pins(&root_name, root_commit, &BTreeMap::new())?;
         let root = self.store.paths().project_root.clone();
-        let all = self.all_definitions();
         let may_ship = |tracker: &str| shipped.contains(tracker);
         let view = crate::compose::compose(
             &root,
@@ -9759,24 +9769,6 @@ impl BranchManager {
                 target.name
             ))
         })?;
-        // A rooted view holds the tracker's files at its own root: each is
-        // judged where the project's view has it, under the mount.
-        let mount = target
-            .root
-            .as_ref()
-            .and_then(|_| code.iter().find(|definition| definition.name == root_name))
-            .map(|definition| definition.mount.clone());
-        if let Some((commit, path, tracker)) =
-            crate::compose::find_outside_git_under(&root, &[&tip], &[], &all, mount.as_deref())?
-        {
-            return Err(NewgitError::SplitRefused(format!(
-                "the export to `{}` would carry commit {}, which adds `{path}`, and `{path}` \
-                 belongs to `{tracker}`, a tracker outside Git, whose files (secrets among them) \
-                 never leave this machine through Git, so this history cannot be exported as it is",
-                target.name,
-                &commit[..commit.len().min(12)]
-            )));
-        }
         Ok((
             trackers,
             ComposedExport {
@@ -9862,6 +9854,7 @@ impl BranchManager {
                 let result = (|| {
                     let (trackers, view) =
                         self.compose_export(target, &list, &format!("instances/{}", branch.slug))?;
+                    self.refuse_new_outside_git(target, &view.tip, &branch.source_ref)?;
                     self.push_export(target, &view.tip, &branch.source_ref, forced)?;
                     crate::source::run_git_env(
                         &[
@@ -10335,6 +10328,7 @@ impl BranchManager {
                 short(&view.tip)
             )));
         }
+        self.refuse_new_outside_git(target, &view.tip, &target.branch)?;
         let object = match annotation {
             Some(annotation) => crate::endpoint::make_tag_object(
                 &project.join(".git"),

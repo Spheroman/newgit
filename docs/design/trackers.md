@@ -1285,6 +1285,26 @@ export = "inherit"       # ships inside t3code's export, wherever that goes
 - **What this gives up:** a child inherits all of its parent's targets, so
   two targets declared by one tracker show the same trackers. A view that
   differs is declared by a different tracker.
+- **An export judges only what it would newly publish (decided, #444).**
+  Before a push (a branch, a tag, or `export --remote`, dry runs too), the
+  target is asked what it has at its branch and the one being pushed
+  (`ls-remote`, and a fetch only of what this store lacks), and only the
+  commits it lacks are checked for a file a tracker outside Git owns. What
+  the target holds is published already, so refusing it again would block
+  the export forever (a commit that added `.env` before a tracker outside
+  Git claimed it) and protect nothing. It is asked every time, never taken
+  from a record here: a target force-pushed to purge a secret no longer has
+  it, so a remembered tip would publish it again. A merge is judged against
+  all its parents at once (`git log -c`): a file it holds as one parent has
+  it is that parent's, which is either new (and judged itself) or
+  published, so a merge bringing published content beside new work passes,
+  and an evil merge whose file differs from every parent's does not. A
+  commit the target lacks still refuses the export, and the error says the
+  way out: rewrite the history the target should have without the file,
+  push it there yourself, and `newgit pull --remote <target> --force`
+  resets the tracker's line to it (*Following a force-push*); or, when the
+  file is no secret, take it out of the claim. An import is still judged
+  whole, since all of it is new to the project, and names the same way out.
 
 A tracker left out leaves no path, no pin, and no history there, and a
 commit that only moved its pin is not shown, so the target's ids differ from
