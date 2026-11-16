@@ -50,6 +50,12 @@ trying changes locally, `--dev-login-secret` (or
 invited, through `POST /v1/dev/login` with `x-dev-login: <secret>`.
 `crates/newgit/tests/serve.rs` runs the whole loop that way.
 
+`GET /v1/serve/status`, for an `--admin` login's token only, says what
+fails in the background rather than in a request: the landing log's tip
+and applied mark, every stuck landing and why, and every project whose
+stored rooted histories failed to extend, with the error and how many
+times in a row (`crates/newgit-serve/src/status.rs`).
+
 ## The shape
 
 ```
@@ -106,7 +112,15 @@ serve refuses to start on an older one.
 - **The API is the Worker's**, route for route, so the CLI does not change.
   `crates/newgit-serve/src/api.rs` mirrors `remote/src/index.ts`, and
   `policy.rs` ports `names.ts` `decide` and the definitions reader unchanged
-  in meaning.
+  in meaning. One rule is the client's own, not a port: a definition's
+  `mount` is read and checked with `newgit_core::tracker::mount_problem`,
+  which the client loads definitions with, and a landing that would leave
+  `main` defining a tracker at a mount the client refuses (absolute, `..`,
+  empty) is answered 400 with the client's own message
+  (`serve_mount_refused.rs`). What the client normalizes (`./a/`, `a//b`)
+  serve normalizes the same way. A definition on `main` from before this is
+  read as the client would (`/pkgs/a` owns nothing) and not held against a
+  landing that leaves it as it is.
 - **Real Git serves every byte.** `git upload-pack` / `receive-pack
   --stateless-rpc`, streamed; at most `--git-slots` at once.
 
@@ -545,7 +559,8 @@ Resolved loudly; each is reversible.
       (`rooted_lock_wait.rs`: 300 trackers, debug build, the longest of 84
       requests made while the extension ran waited 159 ms, against 3.5 s
       before). A pass that fails or panics is logged, kept in
-      `Worker::failing`, and tried again with backoff (1 s, doubling, at
+      `Worker::failing` (which `GET /v1/serve/status` answers an admin
+      with), and tried again with backoff (1 s, doubling, at
       most 5 minutes) without waiting for another landing; the thread goes
       on (`rooted_worker_panic.rs`). A tracker that has left every list (or
       the default branch, or its store) has its stored history removed by

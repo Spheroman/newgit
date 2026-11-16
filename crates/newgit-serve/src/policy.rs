@@ -78,6 +78,10 @@ pub struct Facts {
     /// Why it is served with its upstream's audience rather than its own: its
     /// definition makes it wider than its upstream's ([`cap_forks`]).
     pub capped: Option<String>,
+    /// Why the client refuses the `mount` this definition writes
+    /// (`newgit_core::tracker::mount_problem`): a landing that defines a
+    /// tracker so on `main` is refused ([`mount_refusal`]).
+    pub mount_refused: Option<String>,
 }
 
 /// Where `access` is mounted: every definition is `<name>.toml` at its root.
@@ -101,6 +105,7 @@ pub fn implicit_facts(tracker: &str) -> Option<Facts> {
         from: None,
         recorded_from: None,
         capped: None,
+        mount_refused: None,
     };
     match tracker {
         "root" => Some(base(Maintainers::ProjectDevs, ".")),
@@ -115,6 +120,7 @@ pub fn parse_facts(text: &str, source: &str) -> Option<Facts> {
     let audience_text = string("audience")?;
     let audience = parse_audience(audience_text)?;
     let maintainers = parse_maintainers(string("maintainers").unwrap_or(audience_text))?;
+    let mount = string("mount").unwrap_or(".");
     let paths = table
         .get("paths")
         .and_then(toml::Value::as_array)
@@ -130,7 +136,10 @@ pub fn parse_facts(text: &str, source: &str) -> Option<Facts> {
         audience,
         git: table.get("git").and_then(toml::Value::as_bool) == Some(true),
         maintainers,
-        mount: normalize_path(string("mount").unwrap_or(".")),
+        // As the client loads it: one it refuses keeps its meaning (`/pkgs/a`
+        // is not `pkgs/a`) and owns nothing here.
+        mount: newgit_core::tracker::normalize_path(Utf8Path::new(mount)).into_string(),
+        mount_refused: newgit_core::tracker::mount_problem(mount),
         paths,
         source: source.to_owned(),
         pinned: table.get("pinned").and_then(toml::Value::as_bool) == Some(true),
@@ -138,6 +147,29 @@ pub fn parse_facts(text: &str, source: &str) -> Option<Facts> {
         from: string("from").map(str::to_owned),
         recorded_from: None,
         capped: None,
+    })
+}
+
+/// Why a landing that leaves `after` as the definitions on `main` is
+/// refused for a mount, where `before` (what `main` defines now) does not
+/// define that tracker so already: the client's own message, so the two
+/// never disagree about where a tracker sits, and ownership, which follows
+/// the mount, means one thing. A definition already on `main` is not held
+/// against a landing that leaves it as it is.
+pub fn mount_refusal(
+    before: &BTreeMap<String, Facts>,
+    after: &BTreeMap<String, Facts>,
+) -> Option<String> {
+    after.iter().find_map(|(name, facts)| {
+        let reason = facts.mount_refused.clone()?;
+        (before.get(name) != Some(facts)).then(|| {
+            newgit_core::error::NewgitError::InvalidDefinition {
+                kind: "tracker",
+                name: name.clone(),
+                reason,
+            }
+            .to_string()
+        })
     })
 }
 
@@ -596,6 +628,7 @@ pub fn load_definitions_at<'n>(
                     name,
                     Facts {
                         mount: fact.mount,
+                        mount_refused: fact.mount_refused,
                         source: fact.source,
                         link: fact.link,
                         ..there
@@ -715,7 +748,12 @@ fn add_nested(
         }
         let text = reader.read(project, parent, &format!("{ACCESS_MOUNT}/{stem}.toml"));
         if let Some(read) = text.and_then(|text| parse_facts(&text, parent)) {
-            let mount = place_claim(&holder.mount, &read.mount);
+            // One the client refuses is not placed: `/x` is not `<mount>/x`.
+            let mount = if read.mount_refused.is_some() {
+                read.mount.clone()
+            } else {
+                place_claim(&holder.mount, &read.mount)
+            };
             facts.insert(name.clone(), Facts { mount, ..read });
         }
     }
