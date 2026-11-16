@@ -53,6 +53,8 @@ pub use encryption::{Reencrypted, describe_recipients};
 mod export_check;
 mod pull;
 pub use pull::{PullOutcome, PulledTracker};
+mod reset;
+pub use reset::{HeldBack, ResetLine, ResetOutcome};
 mod stale_render;
 pub use stale_render::{PossiblyStale, StaleRender};
 
@@ -2933,6 +2935,7 @@ impl BranchManager {
     /// `AGENTS.md` is `apps/t3code/AGENTS.md`, not the `AGENTS.md` a tracker
     /// outside Git owns at the top. Everything else is judged as it is.
     fn refuse_unpublished_trackers(&self, commits: &[(&str, &str)]) -> Result<()> {
+        self.refuse_dropped(commits, "sending them to the remote")?;
         let all = self.all_definitions();
         let root = self.store.paths().project_root.clone();
         let mut plain = Vec::new();
@@ -9365,7 +9368,9 @@ impl BranchManager {
             .ok();
         Ok(match (&published, &here) {
             (Some(published), Some(here))
-                if published != here && self.source.is_ancestor(published, here)? =>
+                if published != here
+                    && (self.source.is_ancestor(published, here)?
+                        || self.reset_replaces(tracker, published, here)?) =>
             {
                 Some(here.clone())
             }
@@ -9715,6 +9720,11 @@ impl BranchManager {
         list: &BTreeMap<String, String>,
         branch: &str,
     ) -> Result<(Vec<ExportedTracker>, ComposedExport)> {
+        let pairs: Vec<(&str, &str)> = list
+            .iter()
+            .map(|(tracker, commit)| (tracker.as_str(), commit.as_str()))
+            .collect();
+        self.refuse_dropped(&pairs, &format!("exporting to `{}`", target.name))?;
         let code = self.carved_definitions();
         let trackers: Vec<ExportedTracker> = code
             .iter()
@@ -11237,6 +11247,11 @@ impl BranchManager {
         };
         let list = crate::compose::index(&project, &self.root.name, &merged_root)?;
         let incoming = crate::compose::index(&project, &self.root.name, &theirs)?;
+        let pairs: Vec<(&str, &str)> = list
+            .iter()
+            .map(|(tracker, commit)| (tracker.as_str(), commit.as_str()))
+            .collect();
+        self.refuse_dropped(&pairs, &format!("merging `{name}` into `{into}`"))?;
 
         // Each tracker: what happened to it.
         let mut trackers = Vec::new();
@@ -11298,6 +11313,11 @@ impl BranchManager {
                 None => merge.commit.clone(),
                 Some(main) if self.source.is_ancestor(&merge.commit, main)? => continue,
                 Some(main) if self.source.is_ancestor(main, &merge.commit)? => merge.commit.clone(),
+                // Its line was reset here (`pull --remote --force`, #442):
+                // `main` is the old line, replaced, never merged back in.
+                Some(main) if self.reset_replaces(&merge.tracker, main, &merge.commit)? => {
+                    merge.commit.clone()
+                }
                 Some(main) => match self.merge_commits(
                     main,
                     &merge.commit,

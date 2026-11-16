@@ -1910,9 +1910,11 @@ is not exported at all. A tracker that inherits a target whose declaring
 tracker's audience is wider than its own (and it is not `public`) refuses
 the export, naming it, rather than send it past its audience; `tracker
 create --git --path` writes no `export` for such a tracker, and says so. A
-history that ever adds a path a tracker outside Git owns, such as a `.env`
-committed before it was tracked, refuses the whole export before anything
-is pushed.
+commit the target does not have yet that adds a path a tracker outside Git
+owns, such as a `.env` committed before it was tracked and never exported,
+refuses the whole export before anything is pushed, and says the way out.
+What the target already has (asked of it at each push, never remembered)
+is published, so it is not judged again.
 
 The export is composed from each tracker's `main`: on a newgit remote, the
 remote's; otherwise this project's. Work committed in the project root
@@ -1941,6 +1943,18 @@ the project root as ordinary work, with the files of every tracker the
 target withholds put back as their parent had them. A commit that touches a
 withheld tracker's mount, or adds a file a tracker outside Git owns, is
 refused. `newgit merge main` publishes what came in.
+
+A force-pushed target (a secret purged there) is merged with what the
+tracker has, as `git pull` would, which keeps the removed commits for the
+next export to push again. `newgit pull --remote <target> --force` follows
+it instead, for a target rooted at a tracker: the tracker's line is reset
+to the target's, as `git reset --hard` would, and the project root's pin
+moves to it; `newgit merge main` publishes it, replacing the old line on the
+remote. It lists every commit only the old line had, and each instance that
+still holds one, and this machine then refuses to merge, send, or export
+them again. An instance with nothing of its own on the old line follows on
+`newgit pull`. Copies others already fetched are not undone. `--dry-run`
+says all of it and moves nothing.
 
 On a linked project the same thing happens on the remote when the target's
 repository has the webhook (`docs/design/remote.md`, *The GitHub webhook*),

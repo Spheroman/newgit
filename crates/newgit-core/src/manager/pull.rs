@@ -319,6 +319,13 @@ impl BranchManager {
             }
             Err(error) => return Err(error),
         };
+        // A pin on a line a reset dropped (`pull --remote --force`, #442),
+        // with nothing of its own on it, follows the reset: it is behind, not
+        // diverged, and the target is judged from the new line.
+        let reset = self.only_dropped(&tracker, pin, &new)?;
+        let followed = new.clone();
+        let pinned = pin;
+        let pin = if reset { followed.as_str() } else { pin };
         let mut from = definition.follow.clone();
         let mut children: Vec<(String, String)> = Vec::new();
         let targets: Vec<ExportTarget> = run
@@ -345,7 +352,11 @@ impl BranchManager {
                 }
             }
         }
-        Ok(match self.pin_move(&tracker, pin, &new)? {
+        let moving = match self.pin_move(&tracker, pin, &new)? {
+            PinMove::UpToDate if reset => PinMove::Forward,
+            moving => moving,
+        };
+        Ok(match moving {
             PinMove::UpToDate => {
                 run.outcome.up_to_date.push(tracker);
                 PullStep::Stay
@@ -358,9 +369,13 @@ impl BranchManager {
             }
             PinMove::Forward => {
                 run.outcome.pulled.push(PulledTracker {
-                    commits: self.commits_between(pin, &new)?,
+                    commits: self.commits_between(pinned, &new)?,
                     tracker,
-                    from,
+                    from: if reset {
+                        format!("{from}, following the reset of its line")
+                    } else {
+                        from
+                    },
                 });
                 run.land.extend(children);
                 PullStep::Move(new)

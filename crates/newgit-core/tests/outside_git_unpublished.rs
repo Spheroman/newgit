@@ -77,7 +77,7 @@ fn only_what_the_target_lacks_is_judged() {
     let root = commit(&repo, ".env", "TOKEN=published\n", "root adds .env");
     let found = compose::find_outside_git_unpublished(&repo, &["HEAD"], &all, None).expect("scan");
     assert_eq!(
-        found.map(|(commit, path, owner)| (commit, path, owner)),
+        found,
         Some((root.clone(), ".env".to_owned(), "env".to_owned()))
     );
 
