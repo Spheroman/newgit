@@ -19,7 +19,7 @@ base64 = "0.22"
 camino = "1.2"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
-getrandom = "0.3"
+getrandom = "0.4"
 hmac = "0.13"
 newgit-core = { path = "../newgit-core", version = "0.10.1" }
 rusqlite = { version = "0.41", features = ["bundled"] }
