@@ -692,18 +692,20 @@ Resolved loudly; each is reversible.
   `serve_server_merge_bench.rs` (ignored by default; `BENCH_MODE=<mode>`,
   and `BENCH_TRACKERS=<n>` for that many more trackers nobody changes): 24
   merges begun from one base, finished at once from 24 threads, debug
-  build, one M5 Pro Mac shared with other builds (load average 30–70, so
+  build, one M5 Pro Mac shared with other builds (load average 10–30, so
   each pair was run back to back), landed per second:
 
-  | mode | what each merge changes | #436 | now | Git merges run |
-  |------|-------------------------|------|-----|----------------|
-  | `mixed` | a new file in `blog` or in root, alternately | 1.0–2.0 (median 1.4) | 1.5–3.8 (median 2.7) | 0 |
-  | `same` | a new file in `blog` | 1.3 | 1.8–2.1 | 0 |
-  | `spread` | a new file in its own tracker (27 in all) | 0.5–1.2, up to 1 answered 503 | 1.1–2.1 | 0 |
-  | `overlap` | its own line of one file in root | 0.45, 6 answered 503 | 1.1 | about 170 |
-  | `overlap`, `BENCH_TRACKERS=24` | the same, 27 trackers | 0.26, 13 answered 503 | 0.7–1.0 | about 175 |
+  | mode | what each merge changes | before | now | Git merges run |
+  |------|-------------------------|--------|-----|----------------|
+  | `mixed` | a new file in `blog` or in root, alternately | 1.24–1.42 | 2.9–3.9 | 0 |
+  | `same` | a new file in `blog` | 1.37 | 2.28 | 0 |
+  | `spread` | a new file in its own tracker (27 in all) | 1.03 | 2.73 | 0 |
+  | `overlap` | its own line of one file in root | 0.54, 2 answered 503 | 1.34 | about 175 |
+  | `overlap`, `BENCH_TRACKERS=24` | the same, 27 trackers | 0.32, 11 answered 503 | 0.76 | about 190 |
 
-  "#436" is the build before #445 and #440; "now" is after. A merge whose
+  "Before" is the build before #445 and #440 (with #449's stored rooted
+  histories), "now" is after; the median time a landing holds its project
+  went from 650–900 ms to 250–380 ms. A merge whose
   changes are apart from what landed runs no Git merge and spawns about 27
   `git` processes, down from 54: objects are written in process as loose
   objects, the object format is asked once per repository, one reader per
@@ -758,9 +760,11 @@ Resolved loudly; each is reversible.
   `core.fsyncMethod=fsync` on the log and on every store, written into a
   store made before this when the server starts, so a push, which runs
   with the store's config, gets them too; and passed on every Git command
-  the server runs; a merge's commits copied into a store in process are
-  synced as Git's `core.fsyncMethod=batch` syncs loose objects, each file
-  written out and one flush of the device before any is in place), and
+  the server runs; objects newgit writes into a store in process, a
+  merge's commits placed and a stored rooted history's, follow the store's
+  `core.fsync` and are synced as Git's `core.fsyncMethod=batch` syncs
+  loose objects, each file written out and one flush of the device before
+  any is in place), and
   SQLite's landing transaction (`synchronous=FULL`
   for it) are synced, in that order. On macOS a plain `fsync` leaves
   writes in the drive's cache; Git's `fsync` method flushes it

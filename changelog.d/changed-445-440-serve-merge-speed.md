@@ -1,4 +1,4 @@
-- `newgit serve` lands concurrent merges about twice as fast, and
+- `newgit serve` lands concurrent merges two to three times as fast, and
   overlapping merges in a project with many trackers no longer time out
   ([#445](https://github.com/Spheroman/newgit/issues/445),
   [#440](https://github.com/Spheroman/newgit/issues/440)).
@@ -23,9 +23,12 @@
 
   Measured with `serve_server_merge_bench.rs` (24 merges from one base,
   finished at once, debug build, on a shared and busy machine, before
-  and after run back to back), merges landed a second: `mixed` 1.4 to
-  2.7 (median of five pairs), `same` 1.3 to about 2, `spread` 0.5–1.2
-  to 1.1–2.1, and `overlap` 0.45 to 1.1. With 27 trackers, `overlap`
-  went from 0.26 with 13 of 24 merges answered busy to 0.7–1.0 with none.
-  The time a landing holds its project went from about 600–900 ms to
-  about 300–500 ms.
+  and after run back to back), merges landed a second: `mixed` 1.2–1.4
+  to 2.9–3.9, `same` 1.4 to 2.3, `spread` 1.0 to 2.7, and `overlap` 0.54
+  (2 of 24 answered busy) to 1.3. With 27 trackers, `overlap` went from
+  0.32 with 11 of 24 merges answered busy to 0.76 with none. The time a
+  landing holds its project went from about 650–900 ms to 250–380 ms.
+
+  Objects newgit writes in process into a repository follow that
+  repository's own `core.fsync`, as Git's `hash-object` did: a store's
+  (stored rooted histories included) are synced, a scratch one's are not.

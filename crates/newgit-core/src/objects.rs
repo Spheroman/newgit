@@ -229,20 +229,33 @@ pub struct Objects {
     durable: bool,
 }
 
-/// Where `repo` keeps its objects, once it is known to use SHA-1 ids: asked
-/// of Git once per repository a process opens (a repository's object format
-/// never changes), and again only if the directory is gone. A relative path
+/// Where `repo` keeps its objects, once it is known to use SHA-1 ids, and
+/// whether its config has Git sync each loose object it writes
+/// ([`syncs_loose_objects`]): asked of Git once per repository a process
+/// opens (a repository's object format never changes), and again only if
+/// the directory is gone or its config was written since. A relative path
 /// is asked each time: it names another repository once the process moves.
-fn objects_dir(repo: &Utf8Path) -> Result<Utf8PathBuf> {
-    static KNOWN: OnceLock<Mutex<HashMap<Utf8PathBuf, Utf8PathBuf>>> = OnceLock::new();
+fn objects_dir(repo: &Utf8Path) -> Result<(Utf8PathBuf, bool)> {
+    type Known = HashMap<Utf8PathBuf, (Utf8PathBuf, bool, Option<std::time::SystemTime>)>;
+    static KNOWN: OnceLock<Mutex<Known>> = OnceLock::new();
+    // The config beside the objects: a repository's own.
+    let written = |dir: &Utf8Path| {
+        dir.parent()
+            .and_then(|git_dir| std::fs::metadata(git_dir.join("config")).ok())
+            .and_then(|meta| meta.modified().ok())
+    };
     let known = KNOWN.get_or_init(Default::default);
     let cached = known
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .get(repo)
         .cloned();
-    if let Some(dir) = cached.filter(|dir| dir.is_dir()) {
-        return Ok(dir);
+    if let Some((dir, durable, stamp)) = cached
+        && dir.is_dir()
+        && stamp.is_some()
+        && written(&dir) == stamp
+    {
+        return Ok((dir, durable));
     }
     let out = git_output(
         repo,
@@ -261,13 +274,62 @@ fn objects_dir(repo: &Utf8Path) -> Result<Utf8PathBuf> {
     } else {
         repo.join(path)
     };
+    let config = crate::git::command()
+        .arg("-C")
+        .arg(repo.as_str())
+        .args(["config", "--get-regexp", r"^core\.fsync(objectfiles)?$"])
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|source| NewgitError::io(repo, source))?;
+    let durable = syncs_loose_objects(&String::from_utf8_lossy(&config.stdout));
     if repo.is_absolute() {
+        let stamp = written(&dir);
         known
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(repo.to_path_buf(), dir.clone());
+            .insert(repo.to_path_buf(), (dir.clone(), durable, stamp));
     }
-    Ok(dir)
+    Ok((dir, durable))
+}
+
+/// Whether config lines `core.fsync <components>` and
+/// `core.fsyncobjectfiles <bool>` (as `git config --get-regexp` prints
+/// them) have Git sync each loose object it writes: as Git reads
+/// `core.fsync`, starting from its default (which leaves them out), each
+/// component that covers them (`loose-object`, `objects`, `committed`,
+/// `added`, `all`) adds them, a `-` before one takes them away, and `none`
+/// clears; the older `core.fsyncObjectFiles` counts only without it.
+fn syncs_loose_objects(config: &str) -> bool {
+    let mut fsync = None;
+    let mut object_files = false;
+    for line in config.lines() {
+        match line.split_once(' ') {
+            Some(("core.fsync", value)) => fsync = Some(value.to_owned()),
+            Some(("core.fsyncobjectfiles", value)) => {
+                object_files = matches!(
+                    value.trim().to_ascii_lowercase().as_str(),
+                    "true" | "yes" | "on" | "1"
+                );
+            }
+            _ => {}
+        }
+    }
+    let Some(fsync) = fsync else {
+        return object_files;
+    };
+    let mut loose = false;
+    for part in fsync.split(',').map(str::trim) {
+        let (taken, name) = match part.strip_prefix('-') {
+            Some(name) => (true, name),
+            None => (false, part),
+        };
+        if name == "none" {
+            loose = false;
+        } else if ["loose-object", "objects", "committed", "added", "all"].contains(&name) {
+            loose = !taken;
+        }
+    }
+    loose
 }
 
 /// A `git cat-file` with `mode` (`--batch`, `--batch-check`) in `repo`.
@@ -324,7 +386,7 @@ pub const COPY_LIMIT: (usize, usize) = (256, 32 << 20);
 
 impl Objects {
     pub fn open(repo: &Utf8Path) -> Result<Self> {
-        let objects_dir = objects_dir(repo)?;
+        let (objects_dir, durable) = objects_dir(repo)?;
         Ok(Self {
             repo: repo.to_path_buf(),
             objects_dir,
@@ -335,7 +397,7 @@ impl Objects {
             blobs: HashMap::new(),
             pending: Vec::new(),
             pending_ids: HashSet::new(),
-            durable: false,
+            durable,
         })
     }
 
@@ -344,7 +406,8 @@ impl Objects {
     }
 
     /// Sync each object written from here on to disk before putting it in
-    /// place, as Git does under `core.fsync=loose-object`: for a
+    /// place, as Git does under `core.fsync=loose-object` (which a
+    /// repository's own config already asks for, and is followed): for a
     /// repository whose objects must survive power loss once a log says
     /// they are there.
     pub fn set_durable(&mut self, durable: bool) {
@@ -1134,6 +1197,20 @@ pub(crate) fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn loose_objects_are_synced_as_gits_config_says() {
+        assert!(!syncs_loose_objects(""));
+        assert!(syncs_loose_objects("core.fsync committed,reference\n"));
+        assert!(syncs_loose_objects("core.fsync all\n"));
+        assert!(!syncs_loose_objects("core.fsync reference\n"));
+        assert!(!syncs_loose_objects("core.fsync committed,-loose-object\n"));
+        assert!(!syncs_loose_objects("core.fsync objects,none,reference\n"));
+        assert!(syncs_loose_objects("core.fsyncobjectfiles true\n"));
+        assert!(!syncs_loose_objects(
+            "core.fsyncobjectfiles true\ncore.fsync reference\n"
+        ));
+    }
 
     #[test]
     fn a_commit_parses_and_serializes_back_to_its_own_bytes() {
