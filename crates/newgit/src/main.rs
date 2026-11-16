@@ -227,7 +227,14 @@ enum Command {
     /// project to an export target (`--remote`)
     Export(ExportArgs),
     /// Garbage-collect across everything: stale workspaces, dead process
-    /// state, and unreferenced tracker snapshots
+    /// state, unreferenced tracker snapshots, and the checkpoints eviction
+    /// leaves behind
+    ///
+    /// Of each instance's history it collects every `evict` checkpoint but
+    /// the latest, and the checkpoints a restore of an evicted workspace
+    /// took on its way once that restore succeeded, with the store objects
+    /// only they reach. `explicit`, `push`, and `remove` checkpoints are
+    /// never collected: `newgit checkpoint` keeps a state for good
     Cleanup {
         /// Report what would be removed without touching anything
         #[arg(long)]
@@ -4517,6 +4524,36 @@ fn cleanup(dry_run: bool, purge_archived: bool) -> Result<()> {
             plural(purged.source_refs, "store ref"),
         );
     }
+    if !outcome.collected_checkpoints.is_empty() {
+        let collect = if dry_run {
+            "Would collect"
+        } else {
+            "Collected"
+        };
+        println!(
+            "{collect} {}: superseded by a later eviction, or taken by a restore that finished \
+             (an `explicit` checkpoint is never collected)",
+            plural(outcome.collected_checkpoints.len(), "checkpoint")
+        );
+        for collected in &outcome.collected_checkpoints {
+            let why = match (&collected.reason, &collected.restore_of) {
+                (CheckpointReason::Evict, _) => "evict, superseded".to_owned(),
+                (_, Some(of)) => format!("before-undo of the restore from {of}"),
+                _ => "before-undo".to_owned(),
+            };
+            println!("  {} {} ({why})", collected.slug, collected.id);
+        }
+        println!(
+            "  {} of store objects only they reached {}; Git deletes them once they are an \
+             hour old",
+            human_bytes(outcome.collected_bytes),
+            if dry_run {
+                "would be released"
+            } else {
+                "released"
+            }
+        );
+    }
     for rev in &outcome.pruned {
         println!("Snapshot {verb}: {} @ {}", rev.tracker, rev.rev);
     }
@@ -4678,6 +4715,21 @@ fn remove(
     }
     println!("  branch:    {}", source_branch_line(&outcome));
     Ok(())
+}
+
+/// `1.2 MB`, `512 B`: a size for a reader.
+fn human_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 4] = ["KB", "MB", "GB", "TB"];
+    if bytes < 1024 {
+        return format!("{bytes} B");
+    }
+    let mut size = bytes as f64 / 1024.0;
+    let mut unit = 0;
+    while size >= 1024.0 && unit < UNITS.len() - 1 {
+        size /= 1024.0;
+        unit += 1;
+    }
+    format!("{size:.1} {}", UNITS[unit])
 }
 
 /// `newgit remove --json`: what was removed, the checkpoint that keeps it,

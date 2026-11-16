@@ -96,11 +96,15 @@ as it stands, and undo returns to it, but the instance's own branch stays
 where it was until you switch back and commit there. `status` shows
 `` feature-a@1a2b3c4d (workspace on `try-x`) `` while that is the case.
 
-**`cleanup` never breaks an undo.** It finalizes instances whose workspace is
-gone, deletes unclaimed workspaces and dead process state, and prunes tracker
-snapshot revs nothing references — but never a rev a checkpoint still points
-at, and never a checkpoint record. `project`- and `user`-owned resources are
-never torn down by per-branch cleanup.
+**`cleanup` never breaks an undo you could want.** It finalizes instances
+whose workspace is gone, deletes unclaimed workspaces and dead process state,
+and prunes tracker snapshot revs nothing references — but never a rev a
+checkpoint still points at. Of the checkpoints themselves it collects only
+what eviction leaves behind (#446): every `evict` checkpoint but an
+instance's latest, and what a restore that succeeded took on its way. An
+`explicit` checkpoint, a push's, a removal's, and the redo point of an
+`undo` you ran are never collected. `project`- and `user`-owned resources
+are never torn down by per-branch cleanup.
 
 **`remove` never deletes work no checkpoint holds.** It checkpoints the
 workspace first; `newgit spawn <name> --from-checkpoint <name>/<id>` brings

@@ -37,10 +37,10 @@ inside a workspace):
   still in the directory (run it from outside the workspace). Not kept, and
   said first: reflogs other than the stash's, intent-to-add entries,
   hand-set assume-unchanged/skip-worktree flags, setuid/setgid/sticky bits,
-  and hand-set values on config keys newgit sets itself. Evicting does not
-  free an untracked file's blob, and evict checkpoints are not pruned yet
-  (#446). A restore that fails or is cut short moves what is at the path
-  aside, whole, to `.<name>.restore-failed` or `.<name>.interrupted-restore`
+  and hand-set values on config keys newgit sets itself. Evicting frees an
+  untracked file's blob only once a later eviction supersedes the
+  checkpoint holding it and `newgit cleanup` collects it (#446). A restore
+  that fails or is cut short moves what is at the path aside, whole, to `.<name>.restore-failed` or `.<name>.interrupted-restore`
   and keeps it; `start`, `status`, `stop --evict`, and `cleanup` name each
   one until `newgit cleanup --discard-saved <path>` deletes it
 - `newgit remove <instance> [--force] [--purge] [--json]` — checkpoints the
@@ -62,7 +62,12 @@ inside a workspace):
   a tracker's `export` declares: that tracker and every tracker inheriting
   its export ship, nothing else. A target is named after its repository
   unless its `export` gives a `name`
-- `newgit cleanup [--dry-run] [--purge-archived]`
+- `newgit cleanup [--dry-run] [--purge-archived]` — also collects what
+  eviction leaves behind: every `evict` checkpoint but each instance's
+  latest, and the checkpoints a restore that succeeded took on its way,
+  with the store objects only they reach (and says how many bytes); never
+  an `explicit`, `push`, or `remove` checkpoint, and a collected one is
+  gone for `undo --to` too (#446)
 - `newgit ports [--check]` — claimed ports, or detect a listening one nothing
   claims
 - `newgit render [--check]` — resolve every `[[render]]`; `--check` tests

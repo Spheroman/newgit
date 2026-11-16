@@ -1334,9 +1334,10 @@ repository. Of every other config key the clone already has, a
 single value comes back as it was and a multi-valued key (an added
 `remote.origin.fetch`) gets the saved values added beside newgit's. Evicting does not free the disk an
 untracked file's content takes, since its blob is in the store with the
-checkpoint, and each cycle adds an evict checkpoint and one or two
-before-undo checkpoints with no retention yet
-([#446](https://github.com/Spheroman/newgit/issues/446)).
+checkpoint, until a later eviction supersedes that checkpoint and `newgit
+cleanup` collects it (see *Cleanup*). Each cycle adds an evict checkpoint
+and the one or two before-undo checkpoints its restore's undo takes; a
+restore that succeeds marks those (`restore_of`) for `cleanup`.
 
 A crash or a failure part way loses nothing. A crash after the record says
 `evicted` and before the move leaves the original workspace at the path,
@@ -1469,10 +1470,30 @@ reports exactly what a real run would do. It:
 - **clears dead process state** and lock files of instances with no record.
 - **prunes tracker revisions nothing references**, and garbage-collects at
   once, so pruned content (possibly a secret) is gone rather than merely
-  unreachable. It never deletes a checkpoint record or a revision a
-  checkpoint points at, and reports how many it kept for that reason, so
-  retained disk is explained.
+  unreachable. It never deletes a revision a checkpoint points at, nor a
+  checkpoint record beyond what retention collects (below), and reports how
+  many it kept for that reason, so retained disk is explained.
 - **prunes the install store** (see *Installs*).
+- **collects what eviction leaves behind**
+  ([#446](https://github.com/Spheroman/newgit/issues/446)): in each
+  instance's history, live or archived, every `evict` checkpoint but the
+  latest (an instance is evicted again only once a restore brought its
+  workspace back, so each earlier one was restored) and every checkpoint a
+  restore that succeeded took on its way (`restore_of`: the marker and a
+  clone, nobody's work). Never the checkpoint the instance is evicted to,
+  a before-undo that a person's own `undo` took (its redo point), one a
+  restore that failed took (it may hold what was written at the path
+  meanwhile), or an `explicit`, `push`, or `remove` checkpoint. It deletes
+  each record and the store ref of its source, so the tracker revisions
+  only they held are pruned in the same pass, reports the bytes of store
+  objects only they reached (`git rev-list --disk-usage`), and runs `git
+  gc --prune=1.hour.ago` on the store. The hour is the grace a concurrent
+  checkpoint needs between writing an object and the ref that holds it;
+  Git's own default is two weeks. **A collected checkpoint is gone for
+  `undo --to` too**: that is the decision, since each one is a state the
+  instance was only ever in on its way somewhere else. A state worth
+  keeping is kept with `newgit checkpoint`, which nothing collects. The
+  copies a checkpoint sync sent to the remote are not touched.
 
 That conservatism is a dead end for archived instances: `undo` needs a
 binding record, so their checkpoints can never be restored, yet they pin

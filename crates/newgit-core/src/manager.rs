@@ -51,6 +51,7 @@ use crate::tracker_repo::{
 mod encryption;
 mod evict;
 mod remove;
+mod retention;
 pub use encryption::{Reencrypted, describe_recipients};
 mod pull;
 pub use pull::{PullOutcome, PulledTracker};
@@ -8844,9 +8845,21 @@ impl BranchManager {
             }
         }
 
+        // Retention (#446): evict checkpoints a later eviction superseded,
+        // and what a restore that succeeded took on its way. Collected
+        // before the lane roots are read, so the revs only they held go too.
+        let (_locks, superseded) = self.superseded_checkpoints(&surviving, archived)?;
+        let skipped: BTreeSet<(String, String)> = superseded
+            .iter()
+            .map(|(record, slug)| (slug.clone(), record.id.clone()))
+            .collect();
+        let (collected, collected_bytes) = self.collect_checkpoints(&superseded, dry_run)?;
+        outcome.collected_checkpoints = collected;
+        outcome.collected_bytes = collected_bytes;
+
         // Lane pruning. Roots come from the records that survive this pass,
         // so a dry run reports exactly what a real run would remove.
-        let roots = SnapshotRoots::collect(&self.store, &surviving, archived)?;
+        let roots = SnapshotRoots::collect_except(&self.store, &surviving, archived, &skipped)?;
         let lanes = self.store.paths().tracker_store.clone();
         for lane_rev in pinned_revs(&lanes)? {
             if roots.contains(&lane_rev.tracker, &lane_rev.rev) {
@@ -11068,6 +11081,7 @@ impl BranchManager {
             message: message.map(ToOwned::to_owned),
             reason,
             undo_completed: None,
+            restore_of: None,
             source: SourceState {
                 head_rev,
                 dirty_rev,

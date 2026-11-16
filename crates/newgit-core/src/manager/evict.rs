@@ -956,6 +956,14 @@ impl BranchManager {
             }
         }
 
+        // What the restore's undo checkpointed on its way is the marker and
+        // a clone, now that it succeeded: `cleanup` collects it (#446).
+        if let Err(error) = self.mark_restore_checkpoints(&branch, checkpoint, &taken_before) {
+            warnings.push(format!(
+                "the workspace is back, but the checkpoints its restore took could not be \
+                 marked for `newgit cleanup` to collect: {error}"
+            ));
+        }
         let mut branch = self.store.find_branch(&branch.slug)?;
         branch.evicted = None;
         branch.updated_at = Utc::now();

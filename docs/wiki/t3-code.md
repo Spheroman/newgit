@@ -43,7 +43,9 @@ and leaves the thread stopped, on disk. The server has to run it with its
 working directory outside the workspace: run from inside, it refuses, since
 the directory would be deleted under the caller. Declaring disposable
 build output such as `target/` is not possible yet, so a Rust workspace
-is not freed: `--discard-ignored` is the manual override (#447).
+is not freed: `--discard-ignored` is the manual override (#447). Each settle/unsettle
+cycle leaves an evict checkpoint behind, which `newgit cleanup` collects
+once a later eviction supersedes it (#446).
 
 On macOS it installs as "T3 Code (newgit)", beside upstream T3 Code: its
 own app ID, state in `~/.t3-newgit`, and no auto-update.

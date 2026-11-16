@@ -30,6 +30,14 @@ pub struct CheckpointRecord {
     /// one thing checkpoints exist to prevent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub undo_completed: Option<bool>,
+    /// Set on a checkpoint a restore of an evicted workspace took on its way
+    /// (its undo's `before-undo`), once that restore succeeded: the evict
+    /// checkpoint it brought back. What it holds is the marker the eviction
+    /// left and a clone, not anyone's work, so `newgit cleanup` collects it
+    /// ([`superseded`]). A restore that failed never sets it: its
+    /// checkpoint may hold what was written at the path while it ran.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restore_of: Option<String>,
     pub source: SourceState,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tracker_states: Vec<TrackerState>,
@@ -325,9 +333,54 @@ impl CheckpointLog {
         Ok(path)
     }
 
+    /// Delete a record, and the recovery record beside it if there is one.
+    pub fn delete(&self, id: &str) -> Result<()> {
+        for path in [
+            self.record_path(id),
+            self.dir.join(format!("{id}.recovery.toml")),
+        ] {
+            match std::fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(source) => return Err(NewgitError::io(&path, source)),
+            }
+        }
+        Ok(())
+    }
+
     fn record_path(&self, id: &str) -> Utf8PathBuf {
         self.dir.join(format!("{id}.toml"))
     }
+}
+
+/// The checkpoints of one instance's history `newgit cleanup` collects
+/// (#446), in id order: every `evict` checkpoint but the latest (each one
+/// before it was brought back by a restore that succeeded, since an instance
+/// is evicted again only once its workspace is back) and every checkpoint a
+/// restore that succeeded took on its way ([`CheckpointRecord::restore_of`]).
+/// Never the one the instance is evicted to now (`evicted_to`), and never a
+/// checkpoint anyone asked for, a push's, or a removal's: an `explicit`
+/// checkpoint is how a state is kept for good.
+pub fn superseded<'a>(
+    records: &'a [CheckpointRecord],
+    evicted_to: Option<&str>,
+) -> Vec<&'a CheckpointRecord> {
+    let latest_evict = records
+        .iter()
+        .filter(|record| record.reason == CheckpointReason::Evict)
+        .max_by_key(|record| numeric_id(&record.id))
+        .map(|record| record.id.as_str());
+    let mut out: Vec<&CheckpointRecord> = records
+        .iter()
+        .filter(|record| Some(record.id.as_str()) != evicted_to)
+        .filter(|record| match record.reason {
+            CheckpointReason::Evict => Some(record.id.as_str()) != latest_evict,
+            CheckpointReason::BeforeUndo => record.restore_of.is_some(),
+            CheckpointReason::Explicit | CheckpointReason::Push | CheckpointReason::Remove => false,
+        })
+        .collect();
+    out.sort_by_key(|record| numeric_id(&record.id));
+    out
 }
 
 fn numeric_id(id: &str) -> u64 {
@@ -357,6 +410,7 @@ mod tests {
             message: Some("before auth refactor".to_owned()),
             reason: CheckpointReason::Explicit,
             undo_completed: None,
+            restore_of: None,
             source: SourceState {
                 head_rev: "abc".to_owned(),
                 dirty_rev: None,
@@ -379,6 +433,59 @@ mod tests {
             Err(NewgitError::UnknownCheckpoint { .. })
         ));
     }
+    #[test]
+    fn retention_keeps_the_latest_evict_and_what_was_asked_for() {
+        let record =
+            |n: u64, reason: CheckpointReason, restore_of: Option<&str>| CheckpointRecord {
+                id: format!("ckpt_{n:03}"),
+                branch: "x".to_owned(),
+                created_at: Utc::now(),
+                message: None,
+                reason,
+                undo_completed: None,
+                restore_of: restore_of.map(ToOwned::to_owned),
+                source: SourceState {
+                    head_rev: "abc".to_owned(),
+                    dirty_rev: None,
+                    store_ref: format!("refs/newgit/checkpoints/x/ckpt_{n:03}"),
+                    checked_out: None,
+                    detached: false,
+                },
+                tracker_states: vec![],
+                resource_states: vec![],
+                code: CodeState::default(),
+                dropped: Default::default(),
+            };
+        use CheckpointReason::*;
+        let records = vec![
+            record(1, Explicit, None),
+            record(2, Evict, None),
+            record(3, BeforeUndo, Some("ckpt_002")),
+            // An undo someone ran: its redo point stays.
+            record(4, BeforeUndo, None),
+            record(5, Evict, None),
+            // A restore that failed: no `restore_of`, so it stays.
+            record(6, BeforeUndo, None),
+            record(7, BeforeUndo, Some("ckpt_005")),
+            record(8, Push, None),
+            record(9, Evict, None),
+            record(10, Remove, None),
+        ];
+        let ids = |records: Vec<&CheckpointRecord>| -> Vec<String> {
+            records.iter().map(|record| record.id.clone()).collect()
+        };
+        assert_eq!(
+            ids(superseded(&records, None)),
+            ["ckpt_002", "ckpt_003", "ckpt_005", "ckpt_007"]
+        );
+        // The checkpoint the record says the instance is evicted to stays,
+        // whatever else the history says.
+        assert_eq!(
+            ids(superseded(&records, Some("ckpt_005"))),
+            ["ckpt_002", "ckpt_003", "ckpt_007"]
+        );
+    }
+
     /// What `{{state_ref}}` is allowed to become. A hash is the case worth
     /// pinning: it is a recorded ref, so "there is no ref" is not why it
     /// resolves to nothing — it is the wrong kind of thing to hand a command.
