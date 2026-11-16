@@ -1845,9 +1845,19 @@ impl GitSource {
         //
         // A store left shallow by a stepped fetch that stopped part way
         // carries on deepening, even when this fetch went through whole.
+        //
+        // In a store already shallow, this fetch deepens it, and Git's
+        // auto-maintenance, which it detaches afterwards, rewrites `shallow`
+        // in the background under whatever comes next: the likeliest place
+        // for the collision `--no-auto-maintenance` below avoids (#432).
+        let opening: &[&str] = if left_shallow(location)? {
+            &["--no-auto-maintenance"]
+        } else {
+            &[]
+        };
         let mut tries = WHOLE_FETCH_BACKOFF.iter();
         let mut started = loop {
-            match fetch(&[]) {
+            match fetch(opening) {
                 Ok(()) if !left_shallow(location)? => return Ok(()),
                 Ok(()) => break true,
                 Err(error) if dropped(&error) => match tries.next() {
@@ -2177,7 +2187,7 @@ fn shallow_moved(stderr: &str) -> bool {
 }
 
 /// The lock on stepped fetches into the repository at `location`.
-fn steps_lock(location: &[&str]) -> Result<std::fs::File> {
+pub(crate) fn steps_lock(location: &[&str]) -> Result<std::fs::File> {
     let mut args = location.to_vec();
     args.extend([
         "rev-parse",

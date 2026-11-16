@@ -1299,6 +1299,10 @@ pub fn prune_unreferenced(git_dir: &Utf8Path) -> Result<()> {
     if !git_dir.join("HEAD").is_file() {
         return Ok(());
     }
+    // A stepped fetch into the store holds `shallow.lock` for each band, and
+    // `gc`'s repack dies with "failed to run repack" on finding it taken.
+    // Waiting on the stepped fetch's own lock waits it out whole (#441).
+    let _steps = crate::source::steps_lock(&[&format!("--git-dir={git_dir}")])?;
     git(git_dir, &["reflog", "expire", "--expire=now", "--all"])?;
     git(git_dir, &["gc", "--quiet", "--prune=now"])?;
     // And the plaintext this machine kept of what is gone.

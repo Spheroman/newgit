@@ -1250,7 +1250,10 @@ is not started, and stays owed, so a dev server is not brought up against a
 database that is still down.
 
 The workspace, trackers, installs, and port claims stay, so the instance
-comes back on the same ports. Both commands do nothing and exit 0 when
+comes back on the same ports, unless another program took one meanwhile:
+`start` probes each port before it starts a resource, and for one that is
+held claims a free port in its place, renders the exports and files again,
+and reports it (`moved_ports` in `--json`) (#441). Both commands do nothing and exit 0 when
 there is nothing to do, so they can run on every settle and unsettle. Both
 exit 1 if any resource failed.
 

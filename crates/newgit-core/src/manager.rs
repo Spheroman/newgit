@@ -698,6 +698,20 @@ pub enum ActionOutcome {
 pub struct StopStartOutcome {
     pub instance: String,
     pub resources: Vec<StopStartResource>,
+    /// Ports `start` moved because another program holds the one the
+    /// binding named (#441).
+    pub moved_ports: Vec<MovedPort>,
+}
+
+/// A claimed port `newgit start` found held by a program that is not newgit
+/// and replaced with a free one, so the rendered files and the exports agree
+/// with where the service will actually listen.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MovedPort {
+    pub resource: String,
+    pub port: String,
+    pub from: u16,
+    pub to: u16,
 }
 
 impl StopStartOutcome {
@@ -13932,6 +13946,7 @@ impl BranchManager {
         Ok(StopStartOutcome {
             instance: branch.name,
             resources,
+            moved_ports: Vec::new(),
         })
     }
 
@@ -13978,6 +13993,7 @@ impl BranchManager {
             return Ok(StopStartOutcome {
                 instance: branch.name,
                 resources: Vec::new(),
+                moved_ports: Vec::new(),
             });
         }
         self.require_resolvable_graph()?;
@@ -13988,6 +14004,7 @@ impl BranchManager {
         let mut still_stopped = Vec::new();
         let mut failed_here = BTreeSet::new();
         let mut captured = false;
+        let mut moved_ports = Vec::new();
         for definition in self.lifecycle_definitions() {
             let name = &definition.name;
             let mut owed: Vec<&StoppedResource> = record
@@ -14056,6 +14073,11 @@ impl BranchManager {
                         )),
                         Some((action_name, action)) => blocked()
                             .and_then(|()| {
+                                // Nothing checked the ports since spawn
+                                // claimed them: another program may hold one
+                                // now (#441).
+                                moved_ports
+                                    .extend(self.reclaim_busy_ports(&mut branch, definition)?);
                                 self.start_supervised(&branch, definition, action, action_name)
                             })
                             .map(|_| ())
@@ -14091,7 +14113,109 @@ impl BranchManager {
         Ok(StopStartOutcome {
             instance: branch.name,
             resources,
+            moved_ports,
         })
+    }
+
+    /// Probe each port `definition`'s binding in `branch` claims, and for one
+    /// that something outside newgit holds, claim a free one in its place:
+    /// written to the binding record, with the exports that name it and the
+    /// files that render it made again, so none points at a port whose
+    /// service is somebody else's. Returns what moved. A resource whose
+    /// ports are all free is left alone.
+    ///
+    /// Only for a resource whose process is not running (the caller's
+    /// `start` has checked), so the port is not held by its own process.
+    /// The claim is written under the store's port lock like
+    /// [`Self::claim_ports`], and the re-render is not.
+    fn reclaim_busy_ports(
+        &self,
+        branch: &mut BranchInstance,
+        definition: &ResourceDefinition,
+    ) -> Result<Vec<MovedPort>> {
+        let busy: Vec<(String, u16)> = branch
+            .resources
+            .get(&definition.name)
+            .map(|binding| {
+                binding
+                    .resolved_ports
+                    .iter()
+                    .filter(|(_, port)| !ports::bindable(**port))
+                    .map(|(name, port)| (name.clone(), *port))
+                    .collect()
+            })
+            .unwrap_or_default();
+        if busy.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut moved = Vec::new();
+        {
+            let _lock = self.store.lock_ports()?;
+            let mut used = ports::used_ports(&self.store.load_branches()?);
+            for (port_name, from) in busy {
+                let start = definition
+                    .ports
+                    .get(&port_name)
+                    .map_or(from, |request| request.start);
+                let to = ports::allocate(start, &mut used).map_err(|error| {
+                    NewgitError::Unsupported(format!(
+                        "port {from} (`{port_name}` of resource `{}`) is held by another                          program, and no other could be claimed: {error}",
+                        definition.name
+                    ))
+                })?;
+                if let Some(binding) = branch.resources.get_mut(&definition.name) {
+                    binding.resolved_ports.insert(port_name.clone(), to);
+                }
+                moved.push(MovedPort {
+                    resource: definition.name.clone(),
+                    port: port_name,
+                    from,
+                    to,
+                });
+            }
+            branch.updated_at = Utc::now();
+            self.store.save_branch_record(branch)?;
+        }
+
+        // What the ports reach: every export and rendered file, this
+        // resource's and its dependents', in dependency order.
+        let mut problems = Vec::new();
+        for name in self.graph.bind_order.clone() {
+            let Ok(bound_definition) = self.resource_definition(&name) else {
+                continue;
+            };
+            let Some(ports) = branch
+                .resources
+                .get(&name)
+                .map(|binding| binding.resolved_ports.clone())
+            else {
+                continue;
+            };
+            let bound_definition = bound_definition.clone();
+            let bound = self.bound_exports(branch);
+            let (exports, unresolved) =
+                self.resolve_exports(branch, &bound_definition, &ports, &bound);
+            if unresolved.is_empty()
+                && let Some(binding) = branch.resources.get_mut(&name)
+            {
+                binding.resolved_exports.extend(exports);
+            }
+            if !bound_definition.render.is_empty()
+                && let Err(error) = self.render_resource(branch, &bound_definition)
+            {
+                problems.push(format!("re-render for resource `{name}` failed: {error}"));
+            }
+        }
+        branch.updated_at = Utc::now();
+        self.store.save_branch_record(branch)?;
+        if !problems.is_empty() {
+            return Err(NewgitError::Unsupported(format!(
+                "moved to free ports, but {}",
+                problems.join("; ")
+            )));
+        }
+        Ok(moved)
     }
 
     /// Run `suspend` or `resume` quietly, so `--json` keeps stdout to

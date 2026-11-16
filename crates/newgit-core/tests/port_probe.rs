@@ -50,10 +50,27 @@ fn port_held_on_ipv4_wildcard_is_not_bindable() {
     );
 
     drop(held);
-    assert!(
-        bindable(port),
-        "port {port} should be bindable again once the wildcard listener is dropped"
-    );
+}
+
+/// A listener dropped frees its port, so the probe reports it bindable
+/// again, for the wildcard and loopback holders alike. A port given back is
+/// free only until anything else takes it, so this holds a few in turn and
+/// needs one reported bindable after it is let go.
+#[test]
+fn a_port_is_bindable_again_once_its_listener_is_dropped() {
+    for address in ["0.0.0.0", "127.0.0.1"] {
+        let freed = (0..5).any(|_| {
+            let held = TcpListener::bind((address, 0)).expect("bind ephemeral port");
+            let port = held.local_addr().expect("local_addr").port();
+            assert!(!bindable(port), "port {port} is held on {address}");
+            drop(held);
+            bindable(port)
+        });
+        assert!(
+            freed,
+            "no port held on {address} was bindable once its listener was dropped"
+        );
+    }
 }
 
 /// Same conflict, but held on loopback specifically rather than the
@@ -69,9 +86,6 @@ fn port_held_on_ipv4_loopback_is_not_bindable() {
         !bindable(port),
         "port {port} is held on 127.0.0.1 and must not be reported bindable"
     );
-
-    drop(held);
-    assert!(bindable(port), "port {port} should free up again");
 }
 
 /// A UDP socket on the same port is a known, documented gap (see the doc
@@ -81,20 +95,19 @@ fn port_held_on_ipv4_loopback_is_not_bindable() {
 /// oversight a future change might "fix" without noticing the tradeoff.
 #[test]
 fn udp_only_conflict_is_not_detected_by_design() {
-    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind ephemeral port");
-    let port = listener.local_addr().expect("local_addr").port();
-    drop(listener);
-
-    let held = match UdpSocket::bind(("127.0.0.1", port)) {
-        Ok(socket) => socket,
-        // Another process grabbed the TCP port's number for UDP in the tiny
-        // gap between freeing and rebinding; nothing to assert here.
-        Err(_) => return,
-    };
-
+    // Each UDP socket is held from the moment the OS picks it. The TCP side
+    // of its port is free unless something else took it, so a few are held
+    // and one must be reported bindable: the probe does not see UDP.
+    let held: Vec<(UdpSocket, u16)> = (0..5)
+        .map(|_| {
+            let socket = UdpSocket::bind(("127.0.0.1", 0)).expect("bind UDP port");
+            let port = socket.local_addr().expect("local_addr").port();
+            (socket, port)
+        })
+        .collect();
     assert!(
-        bindable(port),
-        "TCP probe is not expected to see a UDP-only listener on port {port}"
+        held.iter().any(|(_, port)| bindable(*port)),
+        "TCP probe is not expected to see a UDP-only listener, on any of {:?}",
+        held.iter().map(|(_, port)| *port).collect::<Vec<_>>()
     );
-    drop(held);
 }
