@@ -1,4 +1,5 @@
-// `newgit serve` keeps refs in reftable, which Git has from 2.45 on: on an
+// `newgit serve` keeps refs in reftable, which Git has from 2.45 on, and
+// moves symbolic refs in a ref transaction, from 2.46 on: on an
 // older Git it refuses to start, naming the Git it found and the one it needs,
 // rather than failing later on the first store it makes.
 
@@ -33,7 +34,7 @@ fn serve_refuses_a_git_older_than_reftable() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(!output.status.success(), "it started: {stderr}");
     assert!(
-        stderr.contains("Git 2.45 or newer") && stderr.contains("git version 2.39.5"),
+        stderr.contains("Git 2.46 or newer") && stderr.contains("git version 2.39.5"),
         "{stderr}"
     );
     let _ = std::fs::remove_dir_all(&dir);

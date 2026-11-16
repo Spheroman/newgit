@@ -522,7 +522,7 @@ pub fn receive_objects(
     // Into the merger's landing, not the store: which store the commit
     // belongs in is the landing's to say (`Repo::landing_dir`).
     let landing = repo.open_landing(&caller.login)?;
-    let mut index = std::process::Command::new("git")
+    let mut index = newgit_core::git::command()
         .arg("--git-dir")
         .arg(landing.as_str())
         .args(["index-pack", "--stdin", "--fix-thin", "--strict"])
