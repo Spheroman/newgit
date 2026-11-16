@@ -523,25 +523,35 @@ Resolved loudly; each is reversible.
   attempt merges outside the lock, but landings on one project are held one
   at a time, and what each does while held (the recheck, re-making the
   merge on a head that moved, reading the rules again, placing its commits,
-  writing the landing) is a few hundred milliseconds of `git` in a debug
-  build. Measured with `serve_server_merge_bench.rs` (ignored by default;
-  `BENCH_MODE=<mode>`): 24 merges begun from one base, finished at once
-  from 24 threads, debug build, one M5 Pro Mac, landed per second (all 24
-  land in every mode):
+  writing the landing) is a couple of hundred milliseconds in a debug
+  build, most of it the landing's own writes (the log commit and each
+  store's ref transaction, each synced). Measured with
+  `serve_server_merge_bench.rs` (ignored by default; `BENCH_MODE=<mode>`,
+  and `BENCH_TRACKERS=<n>` for that many more trackers nobody changes): 24
+  merges begun from one base, finished at once from 24 threads, debug
+  build, one M5 Pro Mac shared with other builds (load average 30–70, so
+  each pair was run back to back), landed per second:
 
-  | mode | what each merge changes | before | after | Git merges run |
-  |------|-------------------------|--------|-------|----------------|
-  | `mixed` | a new file in `blog` or in root, alternately | 1.0 | 2.8 | 0 |
-  | `same` | a new file in `blog` | 0.9 | 2.1 | 0 |
-  | `spread` | a new file in its own tracker (27 in all) | 0.25, 8–9 answered 503 | 2.1 | 0 |
-  | `overlap` | its own line of one file in root | — | 1.0 | 185 |
+  | mode | what each merge changes | #436 | now | Git merges run |
+  |------|-------------------------|------|-----|----------------|
+  | `mixed` | a new file in `blog` or in root, alternately | 1.0–2.0 (median 1.4) | 1.5–3.8 (median 2.7) | 0 |
+  | `same` | a new file in `blog` | 1.3 | 1.8–2.1 | 0 |
+  | `spread` | a new file in its own tracker (27 in all) | 0.5–1.2, up to 1 answered 503 | 1.1–2.1 | 0 |
+  | `overlap` | its own line of one file in root | 0.45, 6 answered 503 | 1.1 | about 170 |
+  | `overlap`, `BENCH_TRACKERS=24` | the same, 27 trackers | 0.26, 13 answered 503 | 0.7–1.0 | about 175 |
 
-  "Before" is the whole-branch recheck this replaced, as measured in the
-  review of #436. The three modes whose changes are apart now cost the same
-  per landing whatever the number of trackers (`mixed` is quicker because
-  half its merges move one tracker, not two). Merges whose changes overlap
-  run Git's merge again each time something lands on their paths first,
-  and composing their views is O(trackers) (#440).
+  "#436" is the build before #445 and #440; "now" is after. A merge whose
+  changes are apart from what landed runs no Git merge and spawns about 27
+  `git` processes, down from 54: objects are written in process as loose
+  objects, the object format is asked once per repository, one reader per
+  repository serves a whole attempt (what changed, whether a commit is
+  there, ancestry, whether the definitions change), and its commits are
+  copied into their stores in process instead of fetched. Merges whose
+  changes overlap run Git's merge again each time something lands on their
+  paths first; each tracker commit's view is composed once per finish
+  (#440), so an attempt that runs again composes only what landed since.
+  What is left under the hold is mostly the landing's synced writes and a
+  `git update-ref` per store a merge places into.
 - **A member removed after the recheck** (between the recheck's db lock,
   where membership is read for the last time, and the landing's commit,
   which spans placing the merge's commits) is not caught: membership is a
@@ -555,26 +565,26 @@ Resolved loudly; each is reversible.
   second parent may be behind its first: split makes one commit per
   tracker whose merged tree is neither side's, on both sides' commits.
 - **Not every `git` a merge waits on is timed.** The long-lived
-  `cat-file --batch` that reads objects in process (`Objects`: touches,
-  the re-make, composing), and the authorization's ancestry checks
-  (`merge-base --is-ancestor`), `cat-file -e`, and `diff-tree` reads run
-  without the 60 s limit. Each is a bounded read of objects the server
-  holds, so a hang means a broken repository rather than a slow merge, but
-  one would hold the merge's turn, or its roots, until it ends.
-- **Merges land at about two a second** (a debug build), though a merge
-  apart from what landed runs no Git merge: each spawns about 55 `git`
-  processes, and the re-make, the rules check, placement, and the landing
-  run one after another while the roots are held, about 400 ms a landing.
-  Issue #445 has the counts and the way to milliseconds (objects written
-  in process, the object format cached, re-made objects written straight
-  into the store).
+  `cat-file --batch` and `--batch-check` that read objects in process
+  (`Objects`, through each attempt's `Readers`: touches, ancestry, the
+  re-make, composing, placement), and the `git log` the anchor reads for a
+  tracker whose pins alone moved, run without the 60 s limit. Each is a
+  bounded read of objects the server holds, so a hang means a broken
+  repository rather than a slow merge, but one would hold the merge's turn,
+  or its roots, until it ends. An ancestry walk that goes past 512 commits
+  asks `git merge-base --is-ancestor`, also untimed.
 - **A merge's finish holds its projects while it places its commits.**
   From deciding which store each new commit goes into until it has
   landed, a merge's finish holds its projects' locks, and that includes
-  copying its commits from the merger's landing into those stores. A
-  large placement therefore answers every other landing on those projects
-  503 after ten seconds, saying a merge is placing its commits. Other
-  projects, and reads, are not held.
+  copying its commits from the merger's landing into those stores. The
+  copy is in process (what the store lacks, from the commit down, synced
+  before its ref is set) up to 256 objects or 32 MiB, and a `git fetch`
+  past that. A large placement therefore answers every other landing on
+  those projects 503 after ten seconds, saying a merge is placing its
+  commits. Other projects, and reads, are not held. Placement stays under
+  the hold even for a merge's own commits: the store they go into is the
+  one the landing checked, and a barrier landing in between could narrow
+  it.
 - **`?at=<stamp>`** answers the stamp's own landing, read from one
   resolved log commit. It refuses a stamp not yet in place (409, every
   landing up to the applied mark is), a project state that shows a landing
@@ -585,7 +595,10 @@ Resolved loudly; each is reversible.
   `core.fsyncMethod=fsync` on the log and on every store, written into a
   store made before this when the server starts, so a push, which runs
   with the store's config, gets them too; and passed on every Git command
-  the server runs), and SQLite's landing transaction (`synchronous=FULL`
+  the server runs; a merge's commits copied into a store in process are
+  synced as Git's `core.fsyncMethod=batch` syncs loose objects, each file
+  written out and one flush of the device before any is in place), and
+  SQLite's landing transaction (`synchronous=FULL`
   for it) are synced, in that order. On macOS a plain `fsync` leaves
   writes in the drive's cache; Git's `fsync` method flushes it
   (`F_FULLFSYNC`), and SQLite does too (`PRAGMA fullfsync`,

@@ -3,16 +3,18 @@
 //! Composing a view and splitting it back are only exact if nothing in
 //! between reinterprets a commit: an author in Latin-1, a message without a
 //! final newline, a signature whose continuation lines hold a lone space.
-//! So commits and trees are handled here as the bytes Git stores. Git still
-//! does all the storing: objects are read through one `git cat-file --batch`
-//! and written through `git hash-object --literally`, which checks each id
-//! comes out as worked out here. The only Git format implemented here is the
-//! layout of a commit's headers and a tree's entries, which is what deciding
-//! "is this the same commit" needs; packing, compression, and refs stay Git's.
+//! So commits and trees are handled here as the bytes Git stores. Objects
+//! are read through one `git cat-file --batch` and written here as loose
+//! objects in Git's own format (a zlib stream of `<kind> <size>\0<body>` at
+//! `objects/<2 hex>/<38 hex>`), each id worked out from the bytes written.
+//! The only Git formats implemented here are that, the layout of a commit's
+//! headers, and a tree's entries, which is what deciding "is this the same
+//! commit" needs; packing and refs stay Git's.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{BufRead as _, BufReader, Read as _, Write as _};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::sync::{Mutex, OnceLock};
 
 use camino::{Utf8Path, Utf8PathBuf};
 
@@ -195,35 +197,133 @@ pub fn hash(kind: &str, body: &[u8]) -> String {
     hex(&hasher.finalize())
 }
 
+/// One `git cat-file` kept running: its stdin and its answers.
+type Batch = (Child, ChildStdin, BufReader<ChildStdout>);
+
 /// One repository's objects: read through a long-lived `git cat-file
 /// --batch`, written in batches. Objects made here are readable at once,
 /// before they are written.
 pub struct Objects {
     repo: Utf8PathBuf,
-    batch: Option<(Child, ChildStdin, BufReader<ChildStdout>)>,
+    /// Where its loose objects go.
+    objects_dir: Utf8PathBuf,
+    batch: Option<Batch>,
+    /// A `git cat-file --batch-check`, started when first asked: what a
+    /// name resolves to now, or whether an object is here, without reading
+    /// its body.
+    check: Option<Batch>,
     commits: HashMap<String, Commit>,
     trees: HashMap<String, Vec<Entry>>,
     /// Made here, not written yet: `(kind, id, body)`.
     pending: Vec<(&'static str, String, Vec<u8>)>,
-    pending_ids: std::collections::HashSet<String>,
+    pending_ids: HashSet<String>,
+    /// Each object written is synced to disk before it is in place.
+    durable: bool,
 }
+
+/// Where `repo` keeps its objects, once it is known to use SHA-1 ids: asked
+/// of Git once per repository a process opens (a repository's object format
+/// never changes), and again only if the directory is gone.
+fn objects_dir(repo: &Utf8Path) -> Result<Utf8PathBuf> {
+    static KNOWN: OnceLock<Mutex<HashMap<Utf8PathBuf, Utf8PathBuf>>> = OnceLock::new();
+    let known = KNOWN.get_or_init(Default::default);
+    let cached = known
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(repo)
+        .cloned();
+    if let Some(dir) = cached.filter(|dir| dir.is_dir()) {
+        return Ok(dir);
+    }
+    let out = git_output(
+        repo,
+        &["rev-parse", "--show-object-format", "--git-path", "objects"],
+    )?;
+    let mut lines = out.lines();
+    let format = lines.next().unwrap_or_default().trim();
+    if format != "sha1" {
+        return Err(NewgitError::Unsupported(format!(
+            "{repo} uses {format} object ids; newgit composes SHA-1 repositories only"
+        )));
+    }
+    let path = Utf8PathBuf::from(lines.next().unwrap_or("objects").trim());
+    let dir = if path.is_absolute() {
+        path
+    } else {
+        repo.join(path)
+    };
+    known
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(repo.to_path_buf(), dir.clone());
+    Ok(dir)
+}
+
+/// A `git cat-file` with `mode` (`--batch`, `--batch-check`) in `repo`.
+fn start_batch(repo: &Utf8Path, mode: &str) -> Result<Batch> {
+    let mut child = Command::new("git")
+        .arg("-C")
+        .arg(repo.as_str())
+        .args(["cat-file", mode])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|source| NewgitError::io(repo, source))?;
+    let stdin = child.stdin.take().expect("piped stdin");
+    let stdout = BufReader::new(child.stdout.take().expect("piped stdout"));
+    Ok((child, stdin, stdout))
+}
+
+/// The entries of a tree object's body.
+fn parse_tree(body: &[u8]) -> Vec<Entry> {
+    let mut entries = Vec::new();
+    let mut rest: &[u8] = body;
+    while !rest.is_empty() {
+        let Some(space) = rest.iter().position(|&byte| byte == b' ') else {
+            break;
+        };
+        let Some(nul) = rest.iter().position(|&byte| byte == 0) else {
+            break;
+        };
+        if nul + 21 > rest.len() {
+            break;
+        }
+        entries.push(Entry {
+            mode: rest[..space].to_vec(),
+            name: rest[space + 1..nul].to_vec(),
+            id: hex(&rest[nul + 1..nul + 21]),
+        });
+        rest = &rest[nul + 21..];
+    }
+    entries
+}
+
+/// The object kinds Git has, as the static names pending objects keep.
+fn kind_name(kind: &str) -> Option<&'static str> {
+    ["blob", "tree", "commit", "tag"]
+        .into_iter()
+        .find(|known| *known == kind)
+}
+
+/// How many objects, and how many bytes of them, [`Objects::copy_reachable`]
+/// copies itself before leaving the copy to Git: past this, a fetch (which
+/// keeps them as one pack) is the better copy.
+pub const COPY_LIMIT: (usize, usize) = (256, 32 << 20);
 
 impl Objects {
     pub fn open(repo: &Utf8Path) -> Result<Self> {
-        let format = git_output(repo, &["rev-parse", "--show-object-format"])?;
-        if format.trim() != "sha1" {
-            return Err(NewgitError::Unsupported(format!(
-                "{repo} uses {} object ids; newgit composes SHA-1 repositories only",
-                format.trim()
-            )));
-        }
+        let objects_dir = objects_dir(repo)?;
         Ok(Self {
             repo: repo.to_path_buf(),
+            objects_dir,
             batch: None,
+            check: None,
             commits: HashMap::new(),
             trees: HashMap::new(),
             pending: Vec::new(),
-            pending_ids: std::collections::HashSet::new(),
+            pending_ids: HashSet::new(),
+            durable: false,
         })
     }
 
@@ -231,21 +331,18 @@ impl Objects {
         &self.repo
     }
 
+    /// Sync each object written from here on to disk before putting it in
+    /// place, as Git does under `core.fsync=loose-object`: for a
+    /// repository whose objects must survive power loss once a log says
+    /// they are there.
+    pub fn set_durable(&mut self, durable: bool) {
+        self.durable = durable;
+    }
+
     /// An object's type and body, or `None` when the repository lacks it.
     fn read_raw(&mut self, id: &str) -> Result<Option<(String, Vec<u8>)>> {
         if self.batch.is_none() {
-            let mut child = Command::new("git")
-                .arg("-C")
-                .arg(self.repo.as_str())
-                .args(["cat-file", "--batch"])
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::null())
-                .spawn()
-                .map_err(|source| NewgitError::io(&self.repo, source))?;
-            let stdin = child.stdin.take().expect("piped stdin");
-            let stdout = BufReader::new(child.stdout.take().expect("piped stdout"));
-            self.batch = Some((child, stdin, stdout));
+            self.batch = Some(start_batch(&self.repo, "--batch")?);
         }
         let (_, stdin, stdout) = self.batch.as_mut().expect("started above");
         let io = |source| NewgitError::SourceCommand {
@@ -267,6 +364,46 @@ impl Objects {
         stdout.read_exact(&mut body).map_err(io)?;
         body.truncate(size);
         Ok(Some((fields[1].to_owned(), body)))
+    }
+
+    /// Object `id`'s kind and body as stored, or `None` when the
+    /// repository lacks it.
+    pub fn raw(&mut self, id: &str) -> Result<Option<(String, Vec<u8>)>> {
+        self.read_raw(id)
+    }
+
+    /// What `name` (an object id, or any name Git resolves, such as a ref)
+    /// is in the repository right now: `(id, kind)`, or `None`. Never
+    /// cached: a ref moves.
+    pub fn resolve(&mut self, name: &str) -> Result<Option<(String, String)>> {
+        if name.contains('\n') {
+            return Ok(None);
+        }
+        if self.check.is_none() {
+            self.check = Some(start_batch(&self.repo, "--batch-check")?);
+        }
+        let (_, stdin, stdout) = self.check.as_mut().expect("started above");
+        let io = |source| NewgitError::SourceCommand {
+            command: "git cat-file --batch-check".to_owned(),
+            stderr: format!("{source}"),
+        };
+        stdin
+            .write_all(format!("{name}\n").as_bytes())
+            .and_then(|()| stdin.flush())
+            .map_err(io)?;
+        let mut line = String::new();
+        stdout.read_line(&mut line).map_err(io)?;
+        let fields: Vec<&str> = line.trim_end().split(' ').collect();
+        if fields.len() < 3 {
+            return Ok(None);
+        }
+        Ok(Some((fields[0].to_owned(), fields[1].to_owned())))
+    }
+
+    /// Whether the repository has object `id` (of any kind), without
+    /// reading it.
+    pub fn contains(&mut self, id: &str) -> Result<bool> {
+        Ok(self.resolve(id)?.is_some())
     }
 
     /// Blob `id`'s bytes, read through the batch (no process of its own).
@@ -323,25 +460,7 @@ impl Objects {
         } else {
             body
         };
-        let mut entries = Vec::new();
-        let mut rest: &[u8] = &body;
-        while !rest.is_empty() {
-            let Some(space) = rest.iter().position(|&byte| byte == b' ') else {
-                break;
-            };
-            let Some(nul) = rest.iter().position(|&byte| byte == 0) else {
-                break;
-            };
-            if nul + 21 > rest.len() {
-                break;
-            }
-            entries.push(Entry {
-                mode: rest[..space].to_vec(),
-                name: rest[space + 1..nul].to_vec(),
-                id: hex(&rest[nul + 1..nul + 21]),
-            });
-            rest = &rest[nul + 21..];
-        }
+        let entries = parse_tree(&body);
         self.trees.insert(id.to_owned(), entries.clone());
         Ok(entries)
     }
@@ -615,77 +734,195 @@ impl Objects {
         Ok(())
     }
 
-    /// Write everything made since the last flush. Each object's id is
-    /// checked against the one worked out for it.
+    /// Write everything made since the last flush, as loose objects. One
+    /// the repository has already (loose, packed, or borrowed) is not
+    /// written again.
     pub fn flush(&mut self) -> Result<()> {
-        if self.pending.is_empty() {
-            return Ok(());
-        }
         let pending = std::mem::take(&mut self.pending);
         self.pending_ids.clear();
-        // Objects this repository already has need no writing.
         let mut needed = Vec::new();
         for (kind, id, body) in pending {
-            let present = matches!(self.read_raw(&id)?, Some((found, _)) if found == kind);
-            if !present {
-                needed.push((kind, id, body));
-            }
-        }
-        let dir = tempfile::Builder::new()
-            .prefix("newgit-objects-")
-            .tempdir()
-            .map_err(|source| NewgitError::io(&self.repo, source))?;
-        for kind in ["tree", "commit"] {
-            let batch: Vec<&(&str, String, Vec<u8>)> = needed
-                .iter()
-                .filter(|(found, _, _)| *found == kind)
-                .collect();
-            if batch.is_empty() {
+            if self.loose_path(&id).exists()
+                || matches!(self.read_raw(&id)?, Some((found, _)) if found == kind)
+            {
                 continue;
             }
-            let mut paths = String::new();
-            for (index, (_, _, body)) in batch.iter().enumerate() {
-                let path = dir.path().join(format!("{kind}-{index}"));
-                std::fs::write(&path, body)
-                    .map_err(|source| NewgitError::io(&self.repo, source))?;
-                paths.push_str(&format!("{}\n", path.display()));
-            }
-            let out = run(
-                Command::new("git").arg("-C").arg(self.repo.as_str()).args([
-                    "hash-object",
-                    "--literally",
-                    "-t",
-                    kind,
-                    "-w",
-                    "--no-filters",
-                    "--stdin-paths",
-                ]),
-                "git hash-object",
-                Some(paths.as_bytes()),
-            )?;
-            let written: Vec<String> = String::from_utf8_lossy(&out)
-                .lines()
-                .map(ToOwned::to_owned)
-                .collect();
-            let expected: Vec<&String> = batch.iter().map(|(_, id, _)| id).collect();
-            if written.iter().collect::<Vec<_>>() != expected {
+            needed.push((kind, id, body));
+        }
+        self.write_loose(&needed)
+    }
+
+    fn loose_path(&self, id: &str) -> Utf8PathBuf {
+        self.objects_dir.join(&id[..2]).join(&id[2..])
+    }
+
+    /// `objects` (each `(kind, id, body)`), written as Git writes loose
+    /// objects: each compressed into a temporary file in its fan-out
+    /// directory, and linked into place only if nothing is there yet (an
+    /// object's bytes are its id, so whatever is there is it). When this is
+    /// durable, every
+    /// file is on disk before any is in place, as Git's
+    /// `core.fsyncMethod=batch` has it: on macOS each is written out and one
+    /// full flush of the device covers them all (a full flush per object
+    /// costs as much again each time); elsewhere each is synced.
+    fn write_loose(&self, objects: &[(&'static str, String, Vec<u8>)]) -> Result<()> {
+        use std::os::unix::fs::PermissionsExt as _;
+        let io = |source| NewgitError::io(&self.objects_dir, source);
+        let mut staged = Vec::new();
+        for (kind, id, body) in objects {
+            if id.len() != 40 || hash(kind, body) != *id {
                 return Err(NewgitError::SourceCommand {
-                    command: format!("git hash-object -t {kind}"),
+                    command: format!("writing {kind} {id}"),
                     stderr: "an object did not hash to the id worked out for it".to_owned(),
                 });
             }
+            let path = self.loose_path(id);
+            if path.exists() || staged.iter().any(|(_, staged)| *staged == path) {
+                continue;
+            }
+            // Made inside its fan-out directory, as Git makes it, so the
+            // directory is never empty while it is written: Git's own
+            // `prune-packed` removes an empty one, and would take it away
+            // from under a file waiting beside it. Made again if it went.
+            let fan_out = path.parent().expect("a fan-out directory");
+            let fan_out_io = |source| NewgitError::io(fan_out, source);
+            let temp = || {
+                tempfile::Builder::new()
+                    .prefix("tmp_obj_")
+                    .tempfile_in(fan_out)
+            };
+            let mut file = match temp() {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    std::fs::create_dir_all(fan_out).map_err(fan_out_io)?;
+                    temp().map_err(fan_out_io)?
+                }
+                found => found.map_err(fan_out_io)?,
+            };
+            {
+                let mut zlib = flate2::write::ZlibEncoder::new(
+                    file.as_file_mut(),
+                    flate2::Compression::fast(),
+                );
+                zlib.write_all(format!("{kind} {}\0", body.len()).as_bytes())
+                    .and_then(|()| zlib.write_all(body))
+                    .and_then(|()| zlib.finish().map(drop))
+                    .map_err(io)?;
+            }
+            if self.durable {
+                written_out(file.as_file()).map_err(io)?;
+            }
+            file.as_file()
+                .set_permissions(std::fs::Permissions::from_mode(0o444))
+                .map_err(io)?;
+            staged.push((file, path));
+        }
+        if self.durable
+            && let Some((last, _)) = staged.last()
+        {
+            flushed(last.as_file()).map_err(io)?;
+        }
+        for (file, path) in staged {
+            match file.persist_noclobber(&path) {
+                Ok(_) => {}
+                Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(NewgitError::io(&path, error.error)),
+            }
         }
         Ok(())
+    }
+
+    /// Every object `tip` reaches in `from` that this repository lacks,
+    /// written here as `from` has it, stopping at each object this one has
+    /// (a repository holds everything its objects reach). Gitlinks are
+    /// pins, not content: never followed. How many were written; `None`,
+    /// with nothing written, when more are missing than [`COPY_LIMIT`]
+    /// allows, so many being Git's to copy.
+    pub fn copy_reachable(&mut self, from: &mut Objects, tip: &str) -> Result<Option<usize>> {
+        let (most, most_bytes) = COPY_LIMIT;
+        let mut stack = vec![tip.to_owned()];
+        let mut seen = HashSet::new();
+        let mut found: Vec<(&'static str, String, Vec<u8>)> = Vec::new();
+        let mut bytes = 0;
+        while let Some(id) = stack.pop() {
+            if !seen.insert(id.clone()) || self.contains(&id)? {
+                continue;
+            }
+            let Some((kind, body)) = from.raw(&id)? else {
+                return Err(NewgitError::SourceCommand {
+                    command: "git cat-file --batch".to_owned(),
+                    stderr: format!("object {id} is not in {}", from.repo),
+                });
+            };
+            let kind = kind_name(&kind).ok_or_else(|| NewgitError::SourceCommand {
+                command: "git cat-file --batch".to_owned(),
+                stderr: format!("object {id} in {} is a {kind}", from.repo),
+            })?;
+            match kind {
+                "commit" => {
+                    let commit = Commit::parse(&id, &body);
+                    stack.push(commit.tree);
+                    stack.extend(commit.parents);
+                }
+                "tree" => stack.extend(
+                    parse_tree(&body)
+                        .into_iter()
+                        .filter(|entry| entry.mode != GITLINK_MODE)
+                        .map(|entry| entry.id),
+                ),
+                "tag" => {
+                    if let Some(object) = body
+                        .split(|&byte| byte == b'\n')
+                        .next()
+                        .and_then(|line| line.strip_prefix(b"object "))
+                    {
+                        stack.push(String::from_utf8_lossy(object).into_owned());
+                    }
+                }
+                _ => {}
+            }
+            bytes += body.len();
+            found.push((kind, id, body));
+            if found.len() > most || bytes > most_bytes {
+                return Ok(None);
+            }
+        }
+        let count = found.len();
+        self.write_loose(&found)?;
+        Ok(Some(count))
     }
 }
 
 impl Drop for Objects {
     fn drop(&mut self) {
-        if let Some((mut child, stdin, _)) = self.batch.take() {
+        for (mut child, stdin, _) in [self.batch.take(), self.check.take()].into_iter().flatten() {
             drop(stdin);
             let _ = child.wait();
         }
     }
+}
+
+/// `file`'s data handed to the device: with [`flushed`] after, on disk.
+#[cfg(target_vendor = "apple")]
+fn written_out(file: &std::fs::File) -> std::io::Result<()> {
+    // `fsync(2)` on macOS writes out without flushing the device's cache;
+    // `File::sync_all` is the full flush.
+    nix::unistd::fsync(file).map_err(std::io::Error::from)
+}
+
+#[cfg(not(target_vendor = "apple"))]
+fn written_out(file: &std::fs::File) -> std::io::Result<()> {
+    file.sync_all()
+}
+
+/// Everything written out so far on `file`'s device, on disk.
+#[cfg(target_vendor = "apple")]
+fn flushed(file: &std::fs::File) -> std::io::Result<()> {
+    file.sync_all()
+}
+
+#[cfg(not(target_vendor = "apple"))]
+fn flushed(_: &std::fs::File) -> std::io::Result<()> {
+    Ok(())
 }
 
 /// `a/b/c` as its parts; `.` and the empty path have none. Bytes, as Git

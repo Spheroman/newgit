@@ -14,6 +14,7 @@ pub mod merge;
 pub mod migrate;
 pub mod names;
 pub mod policy;
+pub mod readers;
 pub mod reparent;
 pub mod repos;
 pub mod server_merge;

@@ -26,12 +26,21 @@
 //! - **Only when the changes meet.** A merge whose changes are apart from
 //!   what landed since its base never gets here: `crate::reparent` re-makes
 //!   it on the head without Git's merge.
+//! - **Composed once per finish.** Each tracker commit's view is kept by
+//!   commit for the whole finish ([`Composer`]), in one scratch repository
+//!   kept across its attempts: the base, the head, and the merger's index
+//!   share most of their trackers, and an attempt that runs again (the head
+//!   moved over these paths) composes only what landed since. Split takes
+//!   its views from the same cache, so a tracker whose part of the merge is
+//!   its view on either side reuses that side's commit without composing it
+//!   again (#440).
 //! - **Composed objects never reach a store.** The composed trees cross
 //!   every audience, so they are made in a scratch repository of the merge's
 //!   own (`<home>/scratch/<random>.git`), which borrows every store's objects
 //!   (alternates), is served to no one, and is removed when the merge is done.
 //!   Only each tracker's own new commit, and the objects it adds over its
-//!   parents, leave it: into the merger's landing for that tracker
+//!   parents, leave it (copied in process: nothing composed is reachable
+//!   from a tracker's commit): into the merger's landing for that tracker
 //!   (`Repo::open_landing`), where the merger's own commits wait, and from
 //!   there into a store only as `merge::finish` places any of a merge's
 //!   commits.
@@ -47,6 +56,7 @@ use crate::api::ProjectContext;
 use crate::db::List;
 use crate::error::{ApiResult, HttpError};
 use crate::names::parse_project_key;
+use crate::readers::Readers;
 use crate::repos;
 
 /// Who the view commits that exist only in the scratch repository are by.
@@ -114,14 +124,79 @@ fn object_dirs(dir: &Utf8Path, out: &mut Vec<Utf8PathBuf>) {
     }
 }
 
+/// What one finish composes, kept across its attempts: its scratch
+/// repository, the reader writing there, and each tracker commit's view
+/// tree in it (`compose::view_tree_in`).
+#[derive(Default)]
+pub struct Composer {
+    open: Option<Composing>,
+}
+
+struct Composing {
+    /// Dropped after `objects`, whose `cat-file` reads it.
+    objects: Objects,
+    views: std::collections::HashMap<String, String>,
+    borrowed: Vec<Utf8PathBuf>,
+    scratch: Scratch,
+}
+
+impl Composer {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The scratch repository for `login`'s merge in `project` now: the one
+    /// kept, while it borrows the same object directories (a store made
+    /// since is a new one), or a new one.
+    fn open(&mut self, project: &ProjectContext<'_>, login: &str) -> ApiResult<&mut Composing> {
+        let borrowed = Scratch::borrowed(project, login);
+        if self
+            .open
+            .as_ref()
+            .is_some_and(|open| open.borrowed != borrowed)
+        {
+            self.open = None;
+        }
+        if self.open.is_none() {
+            let scratch = Scratch::open(&project.home(), &borrowed)?;
+            let objects = Objects::open(&scratch.dir)?;
+            self.open = Some(Composing {
+                objects,
+                views: std::collections::HashMap::new(),
+                borrowed,
+                scratch,
+            });
+        }
+        Ok(self.open.as_mut().expect("opened above"))
+    }
+}
+
 impl Scratch {
-    /// A new scratch repository in `project`'s home, borrowing the objects
-    /// of every store there and of `login`'s landings (where the merge's own
-    /// commits wait), and of each linked tracker's home.
-    fn open(project: &ProjectContext<'_>, login: &str) -> ApiResult<Self> {
+    /// The object directories a scratch repository in `project`'s home
+    /// borrows: every store there and `login`'s landings (where the merge's
+    /// own commits wait), and each linked tracker's home's stores.
+    fn borrowed(project: &ProjectContext<'_>, login: &str) -> Vec<Utf8PathBuf> {
         let home = project.home();
-        let dir = scratch_dir(&home).join(format!("{}.git", crate::tokens::random_hex(12)));
-        std::fs::create_dir_all(scratch_dir(&home))?;
+        let mut borrowed = Vec::new();
+        object_dirs(&home.join("stores"), &mut borrowed);
+        object_dirs(&home.join("landing").join(login), &mut borrowed);
+        for (linked_home, _) in project.links.values() {
+            if let Some(id) = parse_project_key(linked_home) {
+                object_dirs(
+                    &id.dir(&project.app.config.data).join("stores"),
+                    &mut borrowed,
+                );
+            }
+        }
+        borrowed.sort();
+        borrowed
+    }
+
+    /// A new scratch repository in `home`, borrowing the objects of each of
+    /// `borrowed`.
+    fn open(home: &Utf8Path, borrowed: &[Utf8PathBuf]) -> ApiResult<Self> {
+        let dir = scratch_dir(home).join(format!("{}.git", crate::tokens::random_hex(12)));
+        std::fs::create_dir_all(scratch_dir(home))?;
         let scratch = Self { dir };
         let output = Command::new("git")
             .args(["init", "-q", "--bare"])
@@ -141,17 +216,6 @@ impl Scratch {
             ("user.email", "newgit@localhost"),
         ] {
             run(&scratch.dir, &["config", key, value], None)?;
-        }
-        let mut borrowed = Vec::new();
-        object_dirs(&home.join("stores"), &mut borrowed);
-        object_dirs(&home.join("landing").join(login), &mut borrowed);
-        for (linked_home, _) in project.links.values() {
-            if let Some(id) = parse_project_key(linked_home) {
-                object_dirs(
-                    &id.dir(&project.app.config.data).join("stores"),
-                    &mut borrowed,
-                );
-            }
         }
         let mut alternates = String::new();
         for dir in borrowed {
@@ -412,6 +476,8 @@ fn refused_carry(what: &str, from: &str, to: &str, seen: &Seen, branch: &str) ->
 #[allow(clippy::too_many_arguments, reason = "each is one thing a merge is")]
 pub fn merge(
     project: &ProjectContext<'_>,
+    readers: &mut Readers,
+    composer: &mut Composer,
     login: &str,
     branch: &str,
     base: &List,
@@ -426,17 +492,21 @@ pub fn merge(
             .ok_or_else(|| HttpError::new(400, "an index names root's commit"))
     };
     let (base_root, head_root, list_root) = (root_of(base)?, root_of(head)?, root_of(list)?);
-    let scratch = Scratch::open(project, login)?;
-    let mut objects = Objects::open(&scratch.dir)?;
-    let view = |objects: &mut Objects, root: &str| -> ApiResult<String> {
-        let tree = compose::view_tree(objects, root)?;
+    let Composing {
+        objects,
+        views,
+        scratch,
+        ..
+    } = composer.open(project, login)?;
+    let mut view = |objects: &mut Objects, root: &str| -> ApiResult<String> {
+        let tree = compose::view_tree_in(objects, root, views)?;
         Ok(objects.make_commit(&tree, &[], NOBODY, NOBODY, b"", b"view\n"))
     };
-    let base_view = view(&mut objects, &base_root)?;
-    let head_view = view(&mut objects, &head_root)?;
-    let list_view = view(&mut objects, &list_root)?;
+    let base_view = view(objects, &base_root)?;
+    let head_view = view(objects, &head_root)?;
+    let list_view = view(objects, &list_root)?;
     objects.flush()?;
-    let mounts = Mounts::read(&mut objects, &[&base_root, &head_root, &list_root])?;
+    let mounts = Mounts::read(objects, &[&base_root, &head_root, &list_root])?;
     // Which root commit each side's view stands for, as split reads it.
     for (view, root) in [(&head_view, &head_root), (&list_view, &list_root)] {
         run(
@@ -505,7 +575,7 @@ pub fn merge(
         Side::read(&scratch.dir, &base_view, &head_view)?,
         Side::read(&scratch.dir, &base_view, &list_view)?,
     ];
-    let crossing = carried(&mut objects, &tree, [&sides[0], &sides[1]], &mounts, seen)?;
+    let crossing = carried(objects, &tree, [&sides[0], &sides[1]], &mounts, seen)?;
     if let Some((_, from, to)) = crossing.first() {
         let paths: Vec<Vec<u8>> = crossing.iter().map(|(path, _, _)| path.clone()).collect();
         return Err(HttpError::new(
@@ -538,7 +608,7 @@ pub fn merge(
         forks_before: &[],
     };
     let split =
-        compose::split(&scratch.dir, &merge_view, &options).map_err(|error| match error {
+        compose::split_in(objects, views, &merge_view, &options).map_err(|error| match error {
             SplitError::Refused(refusal) => HttpError::new(
                 409,
                 format!("the merge of this onto `{branch}` cannot be split by tracker: {refusal}"),
@@ -561,19 +631,28 @@ pub fn merge(
     // Each tracker's new commit, and what it adds over its parents (its own
     // tree), into the merger's landing for it: nothing composed leaves.
     let mut made = Made::default();
+    // Copied in process, from the commit down to what the landing (and the
+    // store it borrows) has: its parents are there, so only its own new
+    // objects are; a copy too large for that is Git's pack.
     for (tracker, commit) in &split.made {
-        let parents = objects.commit(commit)?.parents;
-        let mut revs = format!("{commit}\n");
-        for parent in &parents {
-            revs.push_str(&format!("^{parent}\n"));
-        }
-        let pack = run(
-            &scratch.dir,
-            &["pack-objects", "--revs", "--stdout", "-q"],
-            Some(revs.as_bytes()),
-        )?;
         let landing = project.tracker(tracker).open_landing(login)?;
-        run(&landing, &["index-pack", "--stdin"], Some(&pack))?;
+        if readers
+            .at(&landing)?
+            .copy_reachable(objects, commit)?
+            .is_none()
+        {
+            let parents = objects.commit(commit)?.parents;
+            let mut revs = format!("{commit}\n");
+            for parent in &parents {
+                revs.push_str(&format!("^{parent}\n"));
+            }
+            let pack = run(
+                &scratch.dir,
+                &["pack-objects", "--revs", "--stdout", "-q"],
+                Some(revs.as_bytes()),
+            )?;
+            run(&landing, &["index-pack", "--stdin"], Some(&pack))?;
+        }
         made.wait(&landing, tracker, commit)?;
     }
     Ok(Merged {

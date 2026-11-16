@@ -132,9 +132,12 @@ when what landed since its base changed other paths. A directory another
 landing deleted or renamed overlaps every path under it (item 8), and a
 landing that empties a tracker, adds or drops one, or changes a definition
 reruns every merge prepared before it, since its whole directory in the
-view may have moved. Composing
-views is still O(trackers) per Git merge (#440). Item 7's strict merge queue
-is not built.
+view may have moved. A Git merge composes each tracker commit's view once
+per finish (#440): the base, the head, and the merger's index share most of
+their trackers, and an attempt that runs again composes only what landed
+since. Split reuses the same views, so a tracker whose part of the merge is
+its view on either side keeps that side's commit without composing it
+again. Item 7's strict merge queue is not built.
 
 Across servers there is no transaction: two landings, in order (rule 5).
 
@@ -213,7 +216,8 @@ Anchors as a concept, deferred roll-ups, inboxes and outboxes, reservations,
    per tracker both sides moved and the merger's commit second. The recheck
    by path; policy, membership, and the audience rule read against what
    lands; barriers and epochs on `main`; fairness as a turn on the paths a
-   merge changes. Composing views from cached subtrees is #440.
+   merge changes. Views composed from subtrees cached by tracker commit
+   (#440), and what a merge asks of Git answered in process (#445).
 4. Stored rooted histories, extended at landing.
 5. Dependencies across servers: ordered two-step landings, proposals, resume.
 6. ~~Encryption of trackers outside Git (#338).~~ Done on the client; the

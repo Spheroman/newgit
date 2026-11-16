@@ -26,8 +26,8 @@
 //!   other landing moved keeps that; each tracker both moved (root, and
 //!   parents along the mount chain) gets a new commit on the new head's,
 //!   its tree the new head's with the merge's own paths and pins laid on.
-//!   No `merge-tree`, no composing: O(depth) objects, written into the
-//!   merger's landing for each tracker. `crates/newgit-serve/tests/reparent_differential.rs`
+//!   No `merge-tree`, no composing: O(depth) objects, written in process
+//!   into the merger's landing for each tracker. `crates/newgit-serve/tests/reparent_differential.rs`
 //!   holds this to Git's merge of the composed trees.
 //! - **Nothing moves between trackers here**: each path is set from the
 //!   same tracker's commit, so the audience rule's answer for the merge
@@ -40,9 +40,12 @@ use newgit_core::compose::PINS_DIR;
 use newgit_core::objects::{Entry, GITLINK_MODE, Objects};
 use newgit_core::tracker::{ACCESS_TRACKER, DEFINITIONS_DIR};
 
+use camino::Utf8PathBuf;
+
 use crate::api::ProjectContext;
 use crate::db::List;
 use crate::error::{ApiResult, HttpError};
+use crate::readers::Readers;
 use crate::server_merge::Made;
 
 /// What happened to one tracker's own content: its commit moved, and these
@@ -116,11 +119,12 @@ impl Touch {
     /// landings see the stores).
     pub fn between(
         project: &ProjectContext<'_>,
+        readers: &mut Readers,
         login: &str,
         from: &List,
         to: &List,
     ) -> ApiResult<Self> {
-        Self::read(&mut viewer(project, login), from, to, None)
+        Self::read(readers, &mut viewer(project, login), from, to, None)
     }
 
     /// What moving `from` to `to` changes where it can meet `other`: its
@@ -129,19 +133,21 @@ impl Touch {
     /// composed tree is read for every tracker: that meets anything.
     pub fn meeting(
         project: &ProjectContext<'_>,
+        readers: &mut Readers,
         login: &str,
         from: &List,
         to: &List,
         other: &Touch,
     ) -> ApiResult<Self> {
-        Self::read(&mut viewer(project, login), from, to, Some(other))
+        Self::read(readers, &mut viewer(project, login), from, to, Some(other))
     }
 
-    /// What moving `from` to `to` changes, each tracker's objects read
-    /// through `open`; where it can meet `other`, when given (see
-    /// [`Touch::meeting`]).
+    /// What moving `from` to `to` changes, each tracker's objects read from
+    /// the repository `dir_of` names, through `readers`; where it can meet
+    /// `other`, when given (see [`Touch::meeting`]).
     pub fn read(
-        open: &mut dyn FnMut(&str) -> ApiResult<Objects>,
+        readers: &mut Readers,
+        dir_of: &mut dyn FnMut(&str) -> ApiResult<Utf8PathBuf>,
         from: &List,
         to: &List,
         other: Option<&Touch>,
@@ -164,12 +170,13 @@ impl Touch {
             if tracker == ACCESS_TRACKER {
                 touch.whole.get_or_insert_with(|| tracker.clone());
             }
-            let mut objects = open(tracker)?;
+            let dir = dir_of(tracker)?;
+            let objects = readers.at(&dir)?;
             let old = objects.commit(old)?.tree;
             let new = objects.commit(new)?.tree;
             let reshaped = objects.subtree(&old, DEFINITIONS_DIR)?
                 != objects.subtree(&new, DEFINITIONS_DIR)?
-                || (holds_own(&mut objects, &old)? && !holds_own(&mut objects, &new)?);
+                || (holds_own(objects, &old)? && !holds_own(objects, &new)?);
             if reshaped {
                 touch.whole.get_or_insert_with(|| tracker.clone());
             }
@@ -186,7 +193,7 @@ impl Touch {
                     own.paths.insert(path);
                 }
             }
-            if !pins_exact(&mut objects, tracker, &old, &new, to)? {
+            if !pins_exact(objects, tracker, &old, &new, to)? {
                 touch.whole.get_or_insert_with(|| tracker.clone());
             }
             let mut asked = BTreeSet::new();
@@ -284,22 +291,22 @@ fn depth(tracker: &str) -> usize {
     }
 }
 
-/// How `login` reads each tracker's objects: its landings see the stores.
+/// Where `login` reads each tracker's objects: its landings see the stores.
 fn viewer<'p>(
     project: &'p ProjectContext<'_>,
     login: &'p str,
-) -> impl FnMut(&str) -> ApiResult<Objects> + 'p {
-    move |tracker| Ok(Objects::open(&project.tracker(tracker).view(login)?)?)
+) -> impl FnMut(&str) -> ApiResult<Utf8PathBuf> + 'p {
+    move |tracker| project.tracker(tracker).view(login)
 }
 
 /// Where [`remake`] writes the commits it makes.
 pub trait Landings {
     /// The objects of the repository a commit re-made for `tracker` is
     /// written to; it reads every commit of that tracker's the merge names.
-    fn open(&mut self, tracker: &str) -> ApiResult<Objects>;
-    /// `commit`, flushed into `objects` (from [`Landings::open`]), kept
-    /// until it lands or is given up.
-    fn wait(&mut self, objects: &Objects, tracker: &str, commit: &str) -> ApiResult<()>;
+    fn open(&mut self, tracker: &str) -> ApiResult<&mut Objects>;
+    /// `commit`, flushed into the repository [`Landings::open`] gave for
+    /// `tracker`, kept until it lands or is given up.
+    fn wait(&mut self, tracker: &str, commit: &str) -> ApiResult<()>;
     /// Whether this merge made `commit` for `tracker` (a merge commit,
     /// whose second parent is the merger's).
     fn made(&self, tracker: &str, commit: &str) -> bool;
@@ -308,18 +315,20 @@ pub trait Landings {
 /// The merger's landings, each commit made kept in `made`.
 struct Merger<'p, 'm> {
     project: &'p ProjectContext<'p>,
+    readers: &'m mut Readers,
     login: &'p str,
     made: &'m mut Made,
 }
 
 impl Landings for Merger<'_, '_> {
-    fn open(&mut self, tracker: &str) -> ApiResult<Objects> {
+    fn open(&mut self, tracker: &str) -> ApiResult<&mut Objects> {
         let dir = self.project.tracker(tracker).open_landing(self.login)?;
-        Ok(Objects::open(&dir)?)
+        self.readers.at(&dir)
     }
 
-    fn wait(&mut self, objects: &Objects, tracker: &str, commit: &str) -> ApiResult<()> {
-        self.made.wait(objects.repo(), tracker, commit)
+    fn wait(&mut self, tracker: &str, commit: &str) -> ApiResult<()> {
+        let dir = self.project.tracker(tracker).landing_dir(self.login)?;
+        self.made.wait(&dir, tracker, commit)
     }
 
     fn made(&self, tracker: &str, commit: &str) -> bool {
@@ -331,6 +340,7 @@ impl Landings for Merger<'_, '_> {
 #[allow(clippy::too_many_arguments, reason = "each is one thing a merge is")]
 pub fn onto(
     project: &ProjectContext<'_>,
+    readers: &mut Readers,
     login: &str,
     branch: &str,
     head: &List,
@@ -344,6 +354,7 @@ pub fn onto(
     remake(
         &mut Merger {
             project,
+            readers,
             login,
             made,
         },
@@ -391,7 +402,8 @@ pub fn remake(
     let message = format!("Merge `{login}` into {branch}\n");
     for tracker in both {
         let paths = &ours.trackers[tracker].paths;
-        let mut objects = landings.open(tracker)?;
+        let made_it = landings.made(tracker, &target[tracker]);
+        let objects = landings.open(tracker)?;
         let at_now = objects.commit(&now[tracker])?;
         let at_head = objects.commit(&head[tracker])?;
         let at_target = objects.commit(&target[tracker])?;
@@ -406,8 +418,8 @@ pub fn remake(
         // Each pin the merge moved, to what lands for that child now. The
         // touch held each to a gitlink for a listed child (`pins_exact`).
         let (before, after) = (
-            pin_entries(&mut objects, &at_head.tree)?,
-            pin_entries(&mut objects, &at_target.tree)?,
+            pin_entries(objects, &at_head.tree)?,
+            pin_entries(objects, &at_target.tree)?,
         );
         for (name, entry) in &after {
             if before.get(name) == Some(entry) {
@@ -435,7 +447,7 @@ pub fn remake(
             )));
         }
         let mut parents = vec![now[tracker].clone()];
-        if landings.made(tracker, &target[tracker]) {
+        if made_it {
             parents.extend(at_target.parents.iter().skip(1).cloned());
         } else {
             parents.push(target[tracker].clone());
@@ -449,7 +461,7 @@ pub fn remake(
             message.as_bytes(),
         );
         objects.flush()?;
-        landings.wait(&objects, tracker, &commit)?;
+        landings.wait(tracker, &commit)?;
         landing.insert(tracker.clone(), commit);
     }
     Ok(landing)
