@@ -5,6 +5,8 @@
 // its copy (`hold-fork-start`) while a merge changes the definitions, and it
 // is refused, with no fork made. Written again, it starts as usual.
 
+#![allow(dead_code, reason = "the shared helpers are not all used here")]
+
 include!("support/serve.rs");
 include!("support/serve_keys.rs");
 

@@ -5,6 +5,8 @@
 // had made the repo first. And a fork re-added under its old name is still
 // held to the upstream its repo was made from: the writer is told.
 
+#![allow(dead_code, reason = "the shared helpers are not all used here")]
+
 include!("support/serve.rs");
 include!("support/serve_keys.rs");
 
