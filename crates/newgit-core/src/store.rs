@@ -153,7 +153,7 @@ impl MetadataStore {
                 done.push(format!("wrote .newgit/trackers/{}.toml", definition.name));
             }
         }
-        let seeded = std::process::Command::new("git")
+        let seeded = crate::git::command()
             .arg(format!("--git-dir={}", store.paths.tracker_store))
             .args([
                 "rev-parse",
@@ -194,7 +194,7 @@ impl MetadataStore {
         let root = TrackerDefinition::root();
         let project = self.paths.project_root.as_str();
         let git = |args: &[&str]| {
-            std::process::Command::new("git")
+            crate::git::command()
                 .arg("-C")
                 .arg(project)
                 .args(args)

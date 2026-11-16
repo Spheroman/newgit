@@ -861,6 +861,38 @@ its own. A resource that was not running at the stop stays down, and one whose d
 The workspace, trackers, port claims and installs are left alone, so the
 instance comes back on the same ports with its rendered config still valid.
 
+`newgit stop --evict` also frees the workspace's disk: it checkpoints the
+instance and deletes the workspace, leaving its marker, and `newgit start`
+brings it back from that checkpoint at the same path before starting
+anything. File modes, empty directories, the local Git config, hooks,
+notes, and other remotes' refs come back too. A `recompute` resource's
+`[identity] produces` comes back from the install store; any other ignored
+file that no tracker outside Git owns does not, so the eviction refuses and
+lists it (a wholly ignored directory as one entry, with its file count)
+unless `--discard-ignored` is given. It also refuses an initialized
+submodule, a linked worktree, and a process with its working directory in
+the workspace, the shell it was run from included: run it from outside.
+
+Declaring disposable build output (such as `target/`) so that a plain
+`--evict` frees it is not possible yet; `--discard-ignored` is the manual
+override (#447).
+
+A restore that fails or is cut short never deletes what is at the path:
+it moves it aside, whole, to `.<name>.restore-failed` or
+`.<name>.interrupted-restore` beside the workspace, says so the moment it
+does, and `start`, `status`, `stop --evict`, and `cleanup` name each such
+saved copy until `newgit cleanup --discard-saved <path>` deletes it. newgit
+never deletes one on its own. A read-only directory in the workspace is
+made writable to delete it.
+
+Not kept, and named before anything is deleted: reflogs other than the
+stash's, intent-to-add entries, assume-unchanged or skip-worktree flags
+set by hand (the files' content is kept), setuid, setgid, and sticky bits,
+and a value set by hand on a config key newgit sets itself
+(`remote.origin.url`, `credential.*`, its export remotes). An untracked file's blob stays in
+the store with the checkpoint, so evicting does not free that disk, and
+evict checkpoints are not pruned yet (#446).
+
 `suspend` / `resume` are for a resource that keeps running without a
 process newgit supervises: a `prepare` that starts a Supabase stack, a
 Compose project, a container, or a cloud machine that bills while it idles.

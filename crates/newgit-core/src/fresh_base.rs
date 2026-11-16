@@ -26,7 +26,7 @@
 //! whose hooks run at the same moment — see one fetch and one answer.
 
 use std::io::Read as _;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::time::{Duration, Instant, SystemTime};
 
 use camino::Utf8Path;
@@ -148,7 +148,7 @@ pub fn fresh_base(store: &MetadataStore) -> Result<FreshBase> {
         .map(|rev| (upstream.to_owned(), rev))
     });
     let is_ancestor = |ancestor: &str, descendant: &str| {
-        Command::new("git")
+        crate::git::command()
             .args(["-C", root.as_str(), "merge-base", "--is-ancestor"])
             .args([ancestor, descendant])
             .stdout(Stdio::null())
@@ -202,7 +202,7 @@ fn fetched_within(fetch_head: Option<&Utf8Path>, window: Duration) -> bool {
 /// [`FETCH_TIMEOUT`], and never waiting on a password, a passphrase, or a
 /// new host key: a hook has no terminal to ask on.
 fn fetch(root: &Utf8Path, remote: &str, refspec: &str) -> std::result::Result<(), String> {
-    let mut command = Command::new("git");
+    let mut command = crate::git::command();
     command
         .args(["-C", root.as_str(), "fetch", "--quiet", remote, refspec])
         .env("GIT_TERMINAL_PROMPT", "0")

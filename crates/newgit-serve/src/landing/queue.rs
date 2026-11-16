@@ -381,6 +381,18 @@ impl Log {
         let _ = std::fs::remove_file(&marker);
     }
 
+    /// Stop the process at `at` if the fault file says to: for crash tests
+    /// outside the landing log (`rooted-checkpoint`).
+    pub fn stop_at(&self, at: &str) {
+        self.fault(at);
+    }
+
+    /// Panic here if the fault file says to: for the test that a panic in
+    /// the background extension stops nothing (`rooted-panic`).
+    pub fn panic_at(&self, at: &str) {
+        assert!(!self.armed(at), "stopping at {at}");
+    }
+
     /// Stop the process here if the fault file says to.
     pub(super) fn fault(&self, at: &str) {
         if self.armed(at) {
@@ -447,6 +459,17 @@ impl Log {
         landing: Landing,
         token: Option<u64>,
     ) -> ApiResult<Landed> {
+        // What it touches, from the landing alone: no process, no lock.
+        let touched = crate::rooted::touched_by(&landing);
+        let landed = self.land_waiting(app, landing, token)?;
+        // Derived data, after the landing and outside every lock it held:
+        // the stored rooted histories it touched are extended in the
+        // background (a read before that composes what it needs itself).
+        app.rooted.touched(touched);
+        Ok(landed)
+    }
+
+    fn land_waiting(&self, app: &App, landing: Landing, token: Option<u64>) -> ApiResult<Landed> {
         if db::held_here() {
             return Err(HttpError::internal(
                 "a landing was waited on with the db lock held",

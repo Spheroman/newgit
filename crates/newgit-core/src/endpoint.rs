@@ -652,7 +652,7 @@ fn view_notes(store: &Utf8Path, key: &str, notes_ref: &str) -> Result<bool> {
         return Ok(false);
     }
     stream.push(b'\n');
-    let mut child = std::process::Command::new("git")
+    let mut child = crate::git::command()
         .args([git_dir.as_str(), "fast-import", "--quiet", "--force"])
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::null())
@@ -809,7 +809,7 @@ pub fn check_ancestry(plan: &AncestryPlan) -> Result<Vec<AncestryAnswer>> {
         )?;
         let in_repo = |commit: &str| in_tracker(&store, &check.tracker, commit);
         let ancestor = |old: &str, new: &str| {
-            std::process::Command::new("git")
+            crate::git::command()
                 .args([&git_dir, "merge-base", "--is-ancestor", old, new])
                 .output()
                 .is_ok_and(|output| output.status.success())
@@ -1093,7 +1093,7 @@ fn land(plan: &PullPlan, store: &Utf8Path) -> Result<PullAnswer> {
         Ok(run_git_env(&full, &[])?.trim().to_owned())
     };
     let is_ancestor = |older: &str, newer: &str| {
-        std::process::Command::new("git")
+        crate::git::command()
             .args([&git_dir, "merge-base", "--is-ancestor", older, newer])
             .output()
             .is_ok_and(|output| output.status.success())
@@ -1478,7 +1478,7 @@ fn find_tag(plan: &PullPlan, store: &Utf8Path, name: &str) -> Result<PullAnswer>
     .next()
     .and_then(|view| view.tip)
     .ok_or_else(|| NewgitError::Unsupported(format!("root commit {base} composes to nothing")))?;
-    let on_main = std::process::Command::new("git")
+    let on_main = crate::git::command()
         .args([&git_dir, "merge-base", "--is-ancestor", &commit, &exported])
         .output()
         .is_ok_and(|output| output.status.success());

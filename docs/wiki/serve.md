@@ -4,7 +4,7 @@
 binary: each tracker's Git history on the machine's own disk, project state in
 one SQLite database, and the same API newgit.dev answers. A project points at
 it the way it points at newgit.dev, and nothing else about using newgit
-changes. It needs `git` 2.45 or newer on the `PATH` (it refuses to start
+changes. It needs `git` 2.46 or newer on the `PATH` (it refuses to start
 on an older one), and runs on Linux and macOS.
 
 ```sh

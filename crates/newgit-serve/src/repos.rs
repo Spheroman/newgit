@@ -129,7 +129,7 @@ pub const DURABLE_FSYNC: &str = "committed,reference";
 /// Git run against the repository at `dir`, syncing what it writes
 /// ([`DURABLE_FSYNC`]) whatever the repository's own config says.
 pub fn git_command(dir: &Utf8Path) -> Command {
-    let mut command = Command::new("git");
+    let mut command = newgit_core::git::command();
     command
         .args(["-c", &format!("core.fsync={DURABLE_FSYNC}")])
         .args(["-c", "core.fsyncMethod=fsync"])
@@ -231,7 +231,7 @@ fn checked(dir: &Utf8Path, args: &[&str]) -> ApiResult<String> {
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
 }
 
-fn run_stdin(dir: &Utf8Path, args: &[&str], input: &str) -> ApiResult<bool> {
+pub(crate) fn run_stdin(dir: &Utf8Path, args: &[&str], input: &str) -> ApiResult<bool> {
     let mut child = git_command(dir)
         .args(args)
         .stdin(Stdio::piped())
@@ -299,7 +299,7 @@ pub fn create_store(dir: &Utf8Path, store: &Store) -> ApiResult<()> {
     if let Some(parent) = dir.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let output = Command::new("git")
+    let output = newgit_core::git::command()
         .args([
             "init",
             "-q",
@@ -660,6 +660,7 @@ impl Repo {
             }
         }
         self.remove_exactly(&now)?;
+        self.remove_rooted()?;
         if matches!(self.store, Store::Tracker(_)) && list_refs(&self.dir(), "refs/")?.is_empty() {
             delete(&self.dir())?;
             self.remove_empty_parent();
@@ -731,9 +732,44 @@ impl Repo {
             }
         }
         self.remove_exactly(&here)?;
+        self.remove_rooted()?;
         if matches!(self.store, Store::Tracker(_)) && list_refs(&self.dir(), "refs/")?.is_empty() {
             delete(&self.dir())?;
             self.remove_empty_parent();
+        }
+        Ok(())
+    }
+
+    /// Remove this tracker's stored rooted history from this store, which it
+    /// has left: its served namespace and its state ref (`rooted`). Composed
+    /// again where it is now, on the next read or in the background.
+    fn remove_rooted(&self) -> ApiResult<()> {
+        let Some(tracker) = self
+            .namespace
+            .strip_prefix("t/")
+            .filter(|rest| !rest.contains('/'))
+        else {
+            return Ok(());
+        };
+        let mut refs = list_refs(&self.dir(), &crate::rooted::prefix(tracker))?;
+        refs.extend(list_refs(&self.dir(), &crate::rooted::state_ref(tracker))?);
+        if refs.is_empty() {
+            return Ok(());
+        }
+        let script: String = refs
+            .iter()
+            .map(|(reference, _)| format!("delete {reference}\n"))
+            .collect();
+        // `HEAD` there is symbolic: removed itself, not what it names.
+        if !run_stdin(
+            &self.dir(),
+            &["update-ref", "--no-deref", "--stdin"],
+            &script,
+        )? {
+            eprintln!(
+                "newgit serve: could not remove `{tracker}`'s stored rooted history from {}",
+                self.dir()
+            );
         }
         Ok(())
     }
@@ -974,7 +1010,7 @@ impl Repo {
             if let Some(parent) = dir.parent() {
                 std::fs::create_dir_all(parent)?;
             }
-            let output = Command::new("git")
+            let output = newgit_core::git::command()
                 .args(["init", "-q", "--bare", "-b", "main"])
                 .arg(dir.as_str())
                 .output()?;
@@ -1310,6 +1346,13 @@ pub fn count_repos(home: &Utf8Path) -> usize {
                 // `refs/namespaces/<t|u>/refs/namespaces/<name>/`, then for a
                 // fork `refs/namespaces/i/refs/namespaces/<instance>/`.
                 let parts: Vec<&str> = reference.split('/').collect();
+                // A stored rooted history is a view, not a repo.
+                if parts
+                    .get(2)
+                    .is_some_and(|kind| crate::rooted::is_rooted_namespace(kind))
+                {
+                    continue;
+                }
                 let repo = match parts.as_slice() {
                     [
                         "refs",

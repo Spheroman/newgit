@@ -12,7 +12,8 @@ pub type Stamp = u64;
 
 /// The entry format this server writes and reads. An entry of a newer format
 /// is refused, never guessed at; a field added later is defaulted when an
-/// entry without it is read (#411's epoch, #412's rooted tips).
+/// entry without it is read (#411's epoch). Stored rooted histories (#412)
+/// are derived from what entries land, never part of one (`rooted`).
 pub const FORMAT: u32 = 1;
 
 /// One landing, as the log keeps it: everything to put in place.

@@ -901,6 +901,26 @@ impl ProjectContext<'_> {
     ) -> ApiResult<Repo> {
         let tracker = repo.tracker_name();
         let decided = self.decided(db, tracker, facts)?;
+        let (location, expected) = self.placed_for(repo, facts, private, decided);
+        let made = match repo {
+            RepoRef::Tracker { login: None, .. } => location.exists(),
+            _ => repos::store_exists(&location.dir()),
+        };
+        served_from(repo, location, &expected, made)
+    }
+
+    /// [`Self::served`]'s half that reads only rows: where `repo` is, and the
+    /// store its tracker's facts call for, given whether its audience is
+    /// `decided`. What is read under the db lock; [`served_from`] is the
+    /// rest, which runs Git, and may run after it is let go of.
+    pub fn placed_for(
+        &self,
+        repo: &RepoRef,
+        facts: Option<&Facts>,
+        private: bool,
+        decided: bool,
+    ) -> (Repo, Store) {
+        let tracker = repo.tracker_name();
         let location = self.locate(repo, private);
         let expected = match repo {
             RepoRef::Tracker {
@@ -911,27 +931,7 @@ impl ProjectContext<'_> {
             // Undecided: where its row says, alone.
             _ => self.own(tracker).store,
         };
-        let made = match repo {
-            RepoRef::Tracker { login: None, .. } => location.exists(),
-            _ => repos::store_exists(&location.dir()),
-        };
-        // Not made yet: made where it belongs, on its first write.
-        if !made {
-            return Ok(location);
-        }
-        let made_for = repos::audience_of(&location.dir());
-        if location.store != expected || made_for.as_deref() != Some(expected.name().as_str()) {
-            return fail(
-                500,
-                format!(
-                    "{} is not in the store its audience calls for ({}, not {}): refused until a landing puts it there",
-                    repo.name(),
-                    expected.name(),
-                    made_for.unwrap_or_else(|| location.store.name()),
-                ),
-            );
-        }
-        Ok(location)
+        (location, expected)
     }
 
     /// [`Self::served`] for tracker `tracker` named here: its own, or for a
@@ -987,6 +987,34 @@ impl ProjectContext<'_> {
             db::project(db, &key)?.map(|info| info.owner),
         ))
     }
+}
+
+/// [`ProjectContext::served`]'s half that runs Git: `location` (`made`, or
+/// not yet), refused unless it is in exactly the store `expected` and that
+/// store was made for that audience.
+pub fn served_from(
+    repo: &RepoRef,
+    location: Repo,
+    expected: &Store,
+    made: bool,
+) -> ApiResult<Repo> {
+    // Not made yet: made where it belongs, on its first write.
+    if !made {
+        return Ok(location);
+    }
+    let made_for = repos::audience_of(&location.dir());
+    if location.store != *expected || made_for.as_deref() != Some(expected.name().as_str()) {
+        return fail(
+            500,
+            format!(
+                "{} is not in the store its audience calls for ({}, not {}): refused until a landing puts it there",
+                repo.name(),
+                expected.name(),
+                made_for.unwrap_or_else(|| location.store.name()),
+            ),
+        );
+    }
+    Ok(location)
 }
 
 fn project_route(
@@ -2079,6 +2107,21 @@ fn tag_name_problem(name: &str) -> Option<String> {
     bad.then(|| format!("`{name}` is not a tag name Git accepts"))
 }
 
+/// A tag made or deleted, naming `list`: the stored rooted histories of the
+/// trackers on it (and those they are mounted within) are extended in the
+/// background. A deleted one touches everything (its list is gone).
+fn tagged(project: &ProjectContext<'_>, list: &db::List) {
+    let touched = if list.is_empty() {
+        crate::rooted::Touched::All
+    } else {
+        crate::rooted::Touched::Some(list.keys().cloned().collect())
+    };
+    project
+        .app
+        .rooted
+        .touched([(project.key.clone(), touched)].into());
+}
+
 /// A tag names one point of root's `main`, frozen with the index its root
 /// commit pins. It never moves: the same commit again is a retry, another
 /// is refused. Readers see it as `refs/tags/<name>`.
@@ -2123,6 +2166,7 @@ fn tag_route(
             if !db::delete_tag(db, key, name)? {
                 return fail(404, format!("no tag `{name}` in {key}"));
             }
+            tagged(project, &BTreeMap::new());
             ok(json!({ "name": name, "deleted": true }))
         }
         "PUT" => {
@@ -2175,6 +2219,7 @@ fn tag_route(
             }
             let list = crate::merge::index_of(project, &root, None)?;
             db::create_tag(db, key, name, &list, &annotation, &caller.login)?;
+            tagged(project, &list);
             let made = db::tag(db, key, name)?.unwrap_or(Value::Null);
             created(made)
         }
