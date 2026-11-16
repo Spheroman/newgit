@@ -43,8 +43,15 @@ inside a workspace):
   aside, whole, to `.<name>.restore-failed` or `.<name>.interrupted-restore`
   and keeps it; `start`, `status`, `stop --evict`, and `cleanup` name each
   one until `newgit cleanup --discard-saved <path>` deletes it
-- `newgit remove <instance> [--force]` — on an evicted instance whose path
-  holds work written after a failed restore, refuses unless `--force`
+- `newgit remove <instance> [--force] [--purge] [--json]` — checkpoints the
+  workspace first (reason `remove`), so uncommitted, untracked, and staged
+  work comes back with `newgit spawn <instance> --from-checkpoint
+  <instance>/<id>`, and names what no checkpoint holds (ignored files
+  nothing rebuilds, the stash, branches only the workspace has) as `lost`.
+  A checkpoint that fails refuses unless `--force`; `--purge` takes none.
+  On an evicted instance whose path holds work written after a failed
+  restore, refuses unless `--force`
+  ([#448](https://github.com/Spheroman/newgit/issues/448))
 - `newgit checkpoint [instance] [-m <msg>] [--verify]` / `undo [instance]
   [--to <id>] [--only <resource>] [--force-recompute]` / `checkpoints
   [instance]` — `--verify` proves the restore works by running a real undo;

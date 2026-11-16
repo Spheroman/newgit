@@ -62,7 +62,15 @@ enum Command {
         #[arg(long)]
         path: bool,
     },
-    /// Delete an instance's workspace and archive its binding record
+    /// Checkpoint an instance, then delete its workspace and archive its
+    /// binding record
+    ///
+    /// The checkpoint (reason `remove`) holds everything a checkpoint can,
+    /// uncommitted and untracked work included, so `newgit spawn <name>
+    /// --from-checkpoint <name>/<id>` brings the workspace back. What no
+    /// checkpoint holds (ignored files nothing rebuilds, the stash) is named
+    /// as lost. A checkpoint that fails refuses the removal unless
+    /// `--force`; `--purge` takes none.
     ///
     /// The source branch goes too when it holds nothing unique: spawn
     /// created it, nothing has it checked out, and its tip is already on
@@ -82,11 +90,15 @@ enum Command {
         /// branch; removal prints the tip to recover it from
         #[arg(long)]
         delete_branch: bool,
-        /// Remove an evicted instance even though its workspace path holds
-        /// more than its marker (work written there after a restore failed
-        /// or was cut short), deleting that work, which no checkpoint holds
+        /// Remove even when the checkpoint taken first fails, or when an
+        /// evicted instance's workspace path holds more than its marker
+        /// (work written there after a restore failed or was cut short),
+        /// deleting what no checkpoint holds
         #[arg(long)]
         force: bool,
+        /// Print what was removed, kept, and lost as JSON
+        #[arg(long)]
+        json: bool,
     },
     /// Manage tracker definitions and content
     Tracker {
@@ -744,6 +756,7 @@ fn main() -> Result<()> {
             keep_branch,
             delete_branch,
             force,
+            json,
         } => {
             let source_branch = if keep_branch {
                 SourceBranchPolicy::Keep
@@ -752,7 +765,7 @@ fn main() -> Result<()> {
             } else {
                 SourceBranchPolicy::Auto
             };
-            remove(&name, purge, source_branch, force)
+            remove(&name, purge, source_branch, force, json)
         }
         Command::Tracker { command } => tracker(command),
         Command::Resource { command } => resource(command),
@@ -3983,6 +3996,7 @@ fn checkpoints(instance: Option<String>) -> Result<()> {
             (CheckpointReason::BeforeUndo, _) => "before-undo",
             (CheckpointReason::Push, _) => "push",
             (CheckpointReason::Evict, _) => "evict",
+            (CheckpointReason::Remove, _) => "remove",
         };
         let source = format!(
             "{}{}",
@@ -4576,7 +4590,13 @@ fn print_warnings(warnings: &[String]) {
     }
 }
 
-fn remove(name: &str, purge: bool, source_branch: SourceBranchPolicy, force: bool) -> Result<()> {
+fn remove(
+    name: &str,
+    purge: bool,
+    source_branch: SourceBranchPolicy,
+    force: bool,
+    json: bool,
+) -> Result<()> {
     let manager = manager_here()?;
     let checkpoints = if purge {
         ArchivedCheckpoints::Purge
@@ -4585,12 +4605,29 @@ fn remove(name: &str, purge: bool, source_branch: SourceBranchPolicy, force: boo
     };
     let outcome =
         manager.remove_forced(name, &current_dir()?, checkpoints, source_branch, force)?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&remove_json(&outcome))?);
+        return Ok(());
+    }
 
+    for warning in &outcome.warnings {
+        eprintln!("[newgit] warning: {warning}");
+    }
     println!("Removed branch instance `{}`", outcome.branch.name);
     for hook in &outcome.hooks {
         print_hook(hook);
     }
     println!("  workspace: {} (deleted)", outcome.branch.workspace_path);
+    if let Some(id) = &outcome.checkpoint {
+        println!(
+            "  kept:      checkpoint {id} holds the workspace as it was, uncommitted work \
+             included; `newgit spawn {} --from-checkpoint {}/{id}` brings it back",
+            outcome.branch.name, outcome.branch.slug
+        );
+    }
+    for what in &outcome.lost {
+        println!("  lost:      {what}");
+    }
     for copy in &outcome.saved_copies {
         println!(
             "  kept:      {copy}, what was at the workspace path when a restore failed or was \
@@ -4633,7 +4670,7 @@ fn remove(name: &str, purge: bool, source_branch: SourceBranchPolicy, force: boo
         // instance you will never undo still pins every rev it captured, and
         // nothing reaches those checkpoints now that the record is archived.
         None if outcome.kept_checkpoints > 0 => println!(
-            "  kept:      {}, still pinning their snapshot revs; drop them with \
+            "  history:   {} kept, still pinning their snapshot revs; drop them with \
              `newgit cleanup --purge-archived`",
             plural(outcome.kept_checkpoints, "checkpoint")
         ),
@@ -4641,6 +4678,59 @@ fn remove(name: &str, purge: bool, source_branch: SourceBranchPolicy, force: boo
     }
     println!("  branch:    {}", source_branch_line(&outcome));
     Ok(())
+}
+
+/// `newgit remove --json`: what was removed, the checkpoint that keeps it,
+/// and what is gone that no checkpoint holds.
+fn remove_json(outcome: &RemoveOutcome) -> serde_json::Value {
+    let hooks: Vec<serde_json::Value> = outcome
+        .hooks
+        .iter()
+        .map(|hook| {
+            let (status, command, log) = match &hook.detail {
+                HookDetail::Ran { command, ok, log } => (
+                    if *ok { "ok" } else { "failed" },
+                    Some(command.clone()),
+                    Some(log.to_string()),
+                ),
+                HookDetail::WouldRun(command) => ("would-run", Some(command.clone()), None),
+                HookDetail::SkippedOwnership => ("skipped-ownership", None, None),
+                HookDetail::NoHook => ("no-hook", None, None),
+                HookDetail::SkippedUnresolved { command, .. } => {
+                    ("skipped-unresolved", Some(command.clone()), None)
+                }
+            };
+            serde_json::json!({
+                "resource": hook.resource,
+                "status": status,
+                "command": command,
+                "log": log,
+            })
+        })
+        .collect();
+    let source_branch_kept = !matches!(
+        outcome.source_branch,
+        SourceBranchOutcome::Deleted { .. } | SourceBranchOutcome::Missing
+    );
+    serde_json::json!({
+        "instance": outcome.branch.name,
+        "workspace": outcome.branch.workspace_path,
+        "archived_record": outcome.archived_record,
+        "checkpoint": outcome.checkpoint,
+        "lost": outcome.lost,
+        "unsaved_workspace_head": outcome.unsaved_workspace_head,
+        "saved_copies": outcome.saved_copies,
+        "kept_checkpoints": outcome.kept_checkpoints,
+        "purged_checkpoints": outcome.purged_checkpoints.as_ref().map(|purged| purged.checkpoints),
+        "source_branch": {
+            "name": outcome.branch.source_ref,
+            "kept": source_branch_kept,
+            "reason": source_branch_line(outcome),
+        },
+        "remote_warning": outcome.remote_warning,
+        "hooks": hooks,
+        "warnings": outcome.warnings,
+    })
 }
 
 /// One line on what happened to the source branch, and always the reason —

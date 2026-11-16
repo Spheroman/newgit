@@ -102,6 +102,10 @@ snapshot revs nothing references — but never a rev a checkpoint still points
 at, and never a checkpoint record. `project`- and `user`-owned resources are
 never torn down by per-branch cleanup.
 
+**`remove` never deletes work no checkpoint holds.** It checkpoints the
+workspace first; `newgit spawn <name> --from-checkpoint <name>/<id>` brings
+it back, and what no checkpoint can hold is named as lost (#448).
+
 The one exception is one you ask for. An archived instance's checkpoints are
 unreachable — `undo` needs a binding record — yet they go on pinning revs, so
 `newgit remove <name> --purge` and `newgit cleanup --purge-archived` discard

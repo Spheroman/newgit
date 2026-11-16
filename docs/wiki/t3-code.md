@@ -6,7 +6,10 @@ own Git worktree. A fork,
 newgit instance instead. In a project with `.newgit/config.toml` at its
 root, "New worktree" runs `newgit spawn <branch> --from <base> --json` and
 opens the thread in that workspace, with its trackers bound and its
-resources prepared. Deleting the thread runs `newgit remove`. Every other
+resources prepared. Deleting the thread runs `newgit remove`, which
+checkpoints the workspace before deleting it, so a thread deleted with
+work in it can be brought back (`newgit spawn <name> --from-checkpoint
+<name>/<id>`; the id is in the archived record, `removed_to`). Every other
 project gets plain worktrees, as before.
 
 `newgit stop <instance>` and `newgit start <instance>` are the pair for

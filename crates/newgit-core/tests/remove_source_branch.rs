@@ -371,7 +371,16 @@ fn commits_never_checkpointed_are_reported_lost() {
     git(&workspace, &["commit", "-q", "-m", "late"]);
     let head = git(&workspace, &["rev-parse", "HEAD"]);
 
-    let outcome = remove(&repo, "smoke", SourceBranchPolicy::Auto).expect("remove");
+    // `--purge` takes no checkpoint first; a plain remove would take the
+    // commit into the store (#448).
+    let outcome = manager(&repo)
+        .remove(
+            "smoke",
+            &repo,
+            ArchivedCheckpoints::Purge,
+            SourceBranchPolicy::Auto,
+        )
+        .expect("remove");
     assert_eq!(outcome.unsaved_workspace_head, Some(head));
     // The store's branch never had that commit, so it still looks deletable
     // — the lost line is what keeps the report honest.

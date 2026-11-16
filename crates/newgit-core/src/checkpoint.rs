@@ -75,6 +75,11 @@ pub enum CheckpointReason {
     /// Taken by `newgit stop --evict` just before the workspace is deleted:
     /// the state `newgit start` brings the workspace back to.
     Evict,
+    /// Taken by `newgit remove` just before the workspace is deleted, so
+    /// removing never deletes work no checkpoint holds: the archived record
+    /// names it (`removed_to`), and `newgit spawn --from-checkpoint
+    /// <instance>/<id>` brings the workspace back.
+    Remove,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

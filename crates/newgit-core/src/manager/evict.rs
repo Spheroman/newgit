@@ -19,10 +19,10 @@ struct EvictState {
 }
 
 /// What an eviction leaves behind, judged before it deletes anything.
-struct EvictPlan {
+pub(super) struct EvictPlan {
     /// Ignored paths that go with the workspace (only with
     /// `--discard-ignored`).
-    discarded: Vec<crate::evict::Discarded>,
+    pub(super) discarded: Vec<crate::evict::Discarded>,
     /// The files resources render, which the restore renders again.
     rendered: Vec<Utf8PathBuf>,
     /// Every path the restore does not bring back from what was saved.
@@ -63,7 +63,7 @@ fn trash_left_warning(name: &str, trash: &Utf8Path, id: &str, error: &std::io::E
 }
 
 /// `a`, `` `a` and `b` ``, or `` `a`, `b`, and 3 more ``: paths in a refusal.
-fn list_paths(paths: &[Utf8PathBuf]) -> String {
+pub(super) fn list_paths(paths: &[Utf8PathBuf]) -> String {
     const SHOWN: usize = 8;
     let quoted: Vec<String> = paths
         .iter()
@@ -430,7 +430,7 @@ impl BranchManager {
     /// that is not rendered, and that is not newgit's own marker. A tracker
     /// in Git does not keep an ignored file: it is not committed. A tree a
     /// resource rebuilds is never walked.
-    fn evict_discards(&self, branch: &BranchInstance) -> Result<EvictPlan> {
+    pub(super) fn evict_discards(&self, branch: &BranchInstance) -> Result<EvictPlan> {
         let bound: Vec<TrackerDefinition> = self
             .all_definitions()
             .into_iter()

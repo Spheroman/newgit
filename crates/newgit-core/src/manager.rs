@@ -50,6 +50,7 @@ use crate::tracker_repo::{
 
 mod encryption;
 mod evict;
+mod remove;
 pub use encryption::{Reencrypted, describe_recipients};
 mod pull;
 pub use pull::{PullOutcome, PulledTracker};
@@ -977,16 +978,27 @@ pub struct RemoveOutcome {
     /// How many checkpoints removal left behind instead — retained disk the
     /// caller should be told about, since nothing reaches them any more.
     pub kept_checkpoints: usize,
+    /// The checkpoint removal took of the workspace before deleting it
+    /// (reason `remove`), which the archived record names as `removed_to`:
+    /// `newgit spawn --from-checkpoint <instance>/<id>` brings it back.
+    /// `None` when there was no workspace to take, or with `--purge`.
+    pub checkpoint: Option<String>,
+    /// What the removal deleted that no checkpoint holds (ignored files
+    /// nothing rebuilds, Git-only state such as the stash, and with
+    /// `--purge` or a failed checkpoint under `--force`, uncommitted work),
+    /// each said for a reader.
+    pub lost: Vec<String>,
+    /// What the checkpoint said along the way.
+    pub warnings: Vec<String>,
     /// Why the instance could not be removed from the remote, when it was on
     /// one: its fork and token outlive it until removed there.
     pub remote_warning: Option<String>,
     /// What happened to the instance's source branch in the store, and why.
     pub source_branch: SourceBranchOutcome,
     /// The workspace's HEAD when no ref in the store contained it: commits
-    /// made after the last checkpoint, deleted with the workspace. `remove`
-    /// does not checkpoint first (the workspace is disposable), but it does
-    /// say so, rather than let "nothing unique" on the branch read as
-    /// "nothing lost".
+    /// made after the last checkpoint, deleted with the workspace. Only
+    /// when no checkpoint was taken first (`--purge`, or `--force` past a
+    /// failed one), since the checkpoint takes them into the store.
     pub unsaved_workspace_head: Option<String>,
     /// Saved copies of what was at the workspace path when a restore was
     /// cut short or failed ([`BranchInstance::saved_copies`]): kept, since
@@ -8103,7 +8115,8 @@ impl BranchManager {
 
     /// [`Self::remove`]; `force` also deletes what was written at an
     /// evicted instance's workspace path since, which no checkpoint holds
-    /// and which `remove` otherwise refuses to delete.
+    /// and which `remove` otherwise refuses to delete, and removes the
+    /// instance when the checkpoint taken first fails.
     pub fn remove_forced(
         &self,
         name: &str,
@@ -8112,7 +8125,7 @@ impl BranchManager {
         source_branch: SourceBranchPolicy,
         force: bool,
     ) -> Result<RemoveOutcome> {
-        let (_lock, branch) = self.locked_branch(name)?;
+        let (_lock, mut branch) = self.locked_branch(name)?;
 
         if cwd.starts_with(&branch.workspace_path) {
             return Err(NewgitError::Unsupported(format!(
@@ -8161,6 +8174,14 @@ impl BranchManager {
         // anything is stopped or deleted: a dry run checks each hook and runs
         // none.
         self.run_cleanup_hooks(&branch, true)?;
+
+        // Before anything is stopped: a checkpoint of everything a
+        // checkpoint holds, with what is running still running, so that
+        // removing never deletes work no checkpoint holds. It takes the
+        // workspace's commits into the store, so the branch decision below
+        // sees them.
+        let keeping = checkpoints == ArchivedCheckpoints::Keep;
+        let keep = self.checkpoint_before_remove(&mut branch, keeping, force)?;
 
         let policy = source_branch;
         let (mut source_branch, via_outbox) = self.decide_source_branch(&branch, policy)?;
@@ -8220,10 +8241,14 @@ impl BranchManager {
                 &format!("instances/{}", branch.slug),
             ));
         }
+        if let Some(id) = &keep.checkpoint {
+            branch.removed_to = Some(id.clone());
+            branch.updated_at = Utc::now();
+            self.store.save_branch_record(&branch)?;
+        }
         let archived_record = self.store.archive_branch_record(&branch)?;
         // Either way, count what the instance leaves behind: checkpoints kept
         // for an unreachable instance are disk nobody will reclaim by accident.
-        let keeping = checkpoints == ArchivedCheckpoints::Keep;
         let found = self.purge_checkpoints(&branch.slug, keeping)?;
         let (purged_checkpoints, kept_checkpoints) = match (keeping, found) {
             (true, found) => (None, found.map_or(0, |plan| plan.checkpoints)),
@@ -8249,6 +8274,9 @@ impl BranchManager {
             hooks,
             purged_checkpoints,
             kept_checkpoints,
+            checkpoint: keep.checkpoint,
+            lost: keep.lost,
+            warnings: keep.warnings,
             remote_warning,
             source_branch,
             unsaved_workspace_head,
@@ -11060,7 +11088,14 @@ impl BranchManager {
         // it is what lets another machine spawn it.
         let mut left_out = Vec::new();
         let mut sync_refused = false;
-        let sync_error = match self.sync_checkpoint(branch, &record) {
+        // Except the one `remove` takes: the instance leaves the remote
+        // right after, and a removal must not wait on the network.
+        let synced = if reason == CheckpointReason::Remove {
+            Ok(Vec::new())
+        } else {
+            self.sync_checkpoint(branch, &record)
+        };
+        let sync_error = match synced {
             Ok(refused) => {
                 for (tracker, reason) in refused {
                     warnings.push(format!(

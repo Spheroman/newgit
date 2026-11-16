@@ -1367,9 +1367,8 @@ them. Only `newgit cleanup --discard-saved <path>` deletes one. A restore
 refuses when something other than the marker was written at the path since
 an eviction or a failed restore, and so does `stop --evict`, rather than
 report nothing to do. `remove` refuses too, naming what is there, unless
-`--force`. (A `remove` of an instance that is not evicted deletes its
-workspace however dirty it is, as it always has:
-[#448](https://github.com/Spheroman/newgit/issues/448).) While an
+`--force`. (A `remove` of an instance that is not evicted checkpoints it
+first; see *Remove*.) While an
 instance is evicted, commands that need its workspace (`checkpoint`,
 `undo`, `run`, `merge`, ...) say it was evicted and to run `newgit start`.
 A second `stop --evict` says it is already evicted to its checkpoint.
@@ -1393,10 +1392,34 @@ a checkpoint that bound less parks the same way.
 
 ### Remove
 
-`newgit remove <name>` stops what is running (dependents first), runs
-`[cleanup]` hooks where ownership allows — for parked bindings too, unless
-their drop already ran it — deletes the workspace (`rm -rf`;
-clones have no registration), and archives the binding record.
+`newgit remove <name>` checkpoints the workspace (reason `remove`), stops
+what is running (dependents first), runs `[cleanup]` hooks where ownership
+allows — for parked bindings too, unless their drop already ran it —
+deletes the workspace (`rm -rf`; clones have no registration), and
+archives the binding record, which names the checkpoint (`removed_to`).
+
+**Remove never deletes work no checkpoint holds**
+([#448](https://github.com/Spheroman/newgit/issues/448)). Before anything
+is stopped, it takes a checkpoint as `stop --evict` does: uncommitted,
+untracked, and staged work, the workspace's commits (which the store then
+holds, so the branch rule below sees them), tracker content, and resource
+state, captured while the resources still run. `newgit spawn <name>
+--from-checkpoint <name>/<id>` brings the workspace back. "Remove, and I
+can undo it" is the obvious reading of a remove that keeps checkpoints,
+and refusing a dirty workspace instead would make every unattended caller
+(T3 Code deletes a thread with a plain `newgit remove`) either fail or
+learn `--force` and lose the work anyway. The checkpoint does not sync to
+the remote, which the instance leaves a moment later, so a removal never
+waits on the network. What a checkpoint cannot hold is named as lost
+(`lost` in `--json`), never deleted in silence: ignored files no tracker
+outside Git owns and no resource rebuilds (`target/`, with its file
+count), changes in a dropped tracker's paths, hand edits to rendered files,
+a merge or rebase in progress, the stash, branches and tags only the
+workspace has, and staged content the working tree has moved past. A
+checkpoint that fails refuses the removal, deleting nothing, unless
+`--force`, which removes anyway and names the uncommitted work it deleted.
+`--purge` takes no checkpoint (it discards them all) and names the
+uncommitted work it deletes.
 
 **The source branch** goes too, when it holds nothing unique, and otherwise
 stays with the reason printed. It is deleted only when all of these hold:
@@ -1421,9 +1444,10 @@ silently adopt it. A squash-merged branch whose remote branch was deleted
 looks unique and is kept: the safe miss, named with the command to finish
 the job. `--keep-branch` and `--delete-branch` override.
 
-What `remove` cannot protect is work done since the last checkpoint. When
-no ref holds the workspace's `HEAD`, it says that work is lost, so "nothing
-unique on the branch" never reads as "nothing lost".
+With no checkpoint first (`--purge`, or `--force` past a failed one),
+when no ref holds the workspace's `HEAD`, it says the commits since the
+last checkpoint are lost, so "nothing unique on the branch" never reads as
+"nothing lost".
 
 **Checkpoints outlive removal.** They pin what their undo would need, and
 newgit never breaks an undo on its own initiative. `remove` reports how
