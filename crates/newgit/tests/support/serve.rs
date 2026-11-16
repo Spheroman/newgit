@@ -24,6 +24,7 @@ impl Drop for Server {
     }
 }
 
+#[allow(dead_code, reason = "a binary that starts its own server does not use it")]
 fn start(temp: &Utf8Path) -> Server {
     let data = temp.join("serve");
     let mut child = Command::new(env!("CARGO_BIN_EXE_newgit"))
@@ -101,6 +102,8 @@ fn run(program: &str, home: &Utf8Path, dir: &Utf8Path, args: &[&str]) -> Output 
         .current_dir(dir.as_str())
         .args(args)
         .env("HOME", home.as_str())
+        // Members' public keys from a directory, never github.com.
+        .env("NEWGIT_KEYS_URL", format!("file://{home}/published-keys"))
         .env("GIT_AUTHOR_NAME", "test")
         .env("GIT_AUTHOR_EMAIL", "test@example.com")
         .env("GIT_COMMITTER_NAME", "test")

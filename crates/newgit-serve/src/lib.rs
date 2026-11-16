@@ -1,21 +1,26 @@
 //! `newgit serve`: the newgit remote as one binary.
 //!
-//! Git repositories on local disk, served by real Git; project state in one
-//! SQLite database; the checks and composition the Worker sent to a container
-//! run in-process. It answers the same API the Worker on Cloudflare does
+//! Git stores on local disk, one per audience, served by real Git; project
+//! state in one SQLite database; the checks and composition the Worker sent
+//! to a container run in-process. It answers the same API the Worker on Cloudflare does
 //! (`remote/`), so the CLI talks to either (docs/design/serve.md).
 
 pub mod api;
 pub mod db;
 pub mod error;
 pub mod git_http;
+pub mod landing;
 pub mod merge;
+pub mod migrate;
 pub mod names;
 pub mod policy;
+pub mod reparent;
 pub mod repos;
+pub mod rooted;
+pub mod server_merge;
 pub mod tokens;
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
@@ -57,24 +62,54 @@ pub struct App {
     compose_locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     /// Definitions read before, by project and names, with the generation
     /// they were read at (see [`App::trackers_moved`]).
-    definitions: Mutex<HashMap<DefinitionsKey, (u64, Definitions)>>,
+    definitions: Mutex<HashMap<String, DefinitionsRead>>,
     generation: std::sync::atomic::AtomicU64,
     /// Merges begun and not landed.
     pub merges: merge::Merges,
+    /// Every landing's commit point (`landing/`).
+    pub log: landing::Log,
+    /// Pushes running, which a tracker moving between stores waits out.
+    pub pushes: landing::Pushes,
+    /// Stored rooted histories, extended in the background (`rooted`).
+    pub rooted: rooted::Worker,
+    /// `<data>/serve.lock`, locked while this runs: one process per data
+    /// directory, since the landing log has one writer.
+    _lock: std::fs::File,
 }
 
 pub type Definitions = BTreeMap<String, policy::Facts>;
-/// A project's key and the tracker names asked for.
-type DefinitionsKey = (String, Vec<String>);
+/// One project's definitions as read: at which generation, for which names.
+type DefinitionsRead = (u64, BTreeSet<String>, Definitions);
 
-/// How many definition reads are kept before the cache starts over.
+/// How many projects' definitions are kept before the cache starts over.
 const DEFINITIONS_KEPT: usize = 1024;
 
 impl App {
     pub fn open(config: Config) -> anyhow::Result<Self> {
+        require_git()?;
         std::fs::create_dir_all(&config.data)
             .with_context(|| format!("creating {}", config.data))?;
+        let lock_path = config.data.join("serve.lock");
+        let lock = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&lock_path)
+            .with_context(|| format!("opening {lock_path}"))?;
+        if lock.try_lock().is_err() {
+            anyhow::bail!(
+                "another newgit serve is running on {} (it holds {lock_path}): stop it first",
+                config.data
+            );
+        }
         let db = db::Db::open(&config.data.join("server.sqlite"))?;
+        // Scratch repositories of merges the last run stopped in: never
+        // served, never named by anything.
+        server_merge::remove_scratch(&config.data);
+        // Stores made before their config said to fsync get it now.
+        repos::configure_stores(&config.data)
+            .map_err(|error| anyhow::anyhow!("configuring stores: {}", error.cause()))?;
+        let log = landing::Log::open(&config.data, &db)?;
         let token_key = token_key(&config.data)?;
         let hooks = config.data.join("hooks");
         std::fs::create_dir_all(&hooks)?;
@@ -84,7 +119,7 @@ impl App {
             use std::os::unix::fs::PermissionsExt as _;
             std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755))?;
         }
-        Ok(Self {
+        let app = Self {
             git_slots: Arc::new(tokio::sync::Semaphore::new(config.git_slots.max(1))),
             config,
             db,
@@ -93,14 +128,25 @@ impl App {
             definitions: Mutex::default(),
             generation: std::sync::atomic::AtomicU64::new(0),
             merges: merge::Merges::default(),
-        })
+            log,
+            pushes: landing::Pushes::default(),
+            rooted: rooted::Worker::default(),
+            _lock: lock,
+        };
+        // Landings written down and not yet in place, before anything is
+        // served.
+        app.log.replay(&app).map_err(|error| {
+            anyhow::anyhow!("repairing from the landing log: {}", error.message)
+        })?;
+        migrate::per_tracker_repos(&app)?;
+        Ok(app)
     }
 
     pub fn hooks_dir(&self) -> Utf8PathBuf {
         self.config.data.join("hooks")
     }
 
-    /// Something moved a tracker repo's own refs (a push to it, a branch made,
+    /// Something moved a tracker's own refs (a push to it, a branch made,
     /// a project made or deleted): every definition read before may be stale.
     /// Definitions are read from trackers' `main`, which moves only through
     /// this server, so this is exact rather than a time to live. Pushes into
@@ -110,25 +156,48 @@ impl App {
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     }
 
-    /// `project`'s definitions of `names`, read once per generation.
-    pub fn definitions(&self, project: &names::ProjectId, mut names: Vec<String>) -> Definitions {
-        names.sort();
-        names.dedup();
-        let key = (project.key(), names);
+    /// `project`'s definitions of `names` (and of `root` and `access`), read
+    /// once per generation: what one read found serves every later ask for
+    /// names it covered, until something moves a tracker's refs.
+    pub fn definitions(
+        &self,
+        db: &rusqlite::Connection,
+        project: &names::ProjectId,
+        names: Vec<String>,
+    ) -> Definitions {
+        let mut asked: BTreeSet<String> = names.into_iter().collect();
+        asked.extend(["root".to_owned(), "access".to_owned()]);
+        let key = project.key();
         let generation = self.generation.load(std::sync::atomic::Ordering::SeqCst);
+        let only = |facts: &Definitions| -> Definitions {
+            facts
+                .iter()
+                .filter(|(name, _)| asked.contains(*name))
+                .map(|(name, fact)| (name.clone(), fact.clone()))
+                .collect()
+        };
+        let mut wanted = asked.clone();
         {
             let cache = self
                 .definitions
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if let Some((at, facts)) = cache.get(&key)
+            if let Some((at, read, facts)) = cache.get(&key)
                 && *at == generation
             {
-                return facts.clone();
+                if asked.is_subset(read) {
+                    return only(facts);
+                }
+                wanted.extend(read.iter().cloned());
             }
         }
-        let facts =
-            policy::load_definitions(&self.config.data, project, key.1.iter().map(String::as_str));
+        let facts = policy::load_definitions(
+            &self.config.data,
+            db,
+            project,
+            wanted.iter().map(String::as_str),
+        );
+        let answer = only(&facts);
         let mut cache = self
             .definitions
             .lock()
@@ -136,11 +205,11 @@ impl App {
         if cache.len() >= DEFINITIONS_KEPT {
             cache.clear();
         }
-        cache.insert(key, (generation, facts.clone()));
-        facts
+        cache.insert(key, (generation, wanted, facts));
+        answer
     }
 
-    fn compose_lock(&self, project: &str) -> Arc<tokio::sync::Mutex<()>> {
+    pub(crate) fn compose_lock(&self, project: &str) -> Arc<tokio::sync::Mutex<()>> {
         let mut locks = self
             .compose_locks
             .lock()
@@ -161,6 +230,40 @@ impl App {
     }
 }
 
+/// The oldest Git whose stores serve can make: reftable (2.45), and a
+/// symbolic ref moved in the same transaction as the refs beside it
+/// (`symref-update`, 2.46: a stored rooted history's `HEAD`, `rooted`).
+const GIT_REQUIRED: (u32, u32) = (2, 46);
+
+/// Refuse to start on a Git too old to make a store, saying which was found.
+fn require_git() -> anyhow::Result<()> {
+    let output = newgit_core::git::command()
+        .arg("--version")
+        .output()
+        .context("running `git --version`: newgit serve needs Git on its PATH")?;
+    let found = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    let (major, minor) = GIT_REQUIRED;
+    match git_version(&found) {
+        Some(version) if version >= GIT_REQUIRED => Ok(()),
+        _ => anyhow::bail!(
+            "newgit serve needs Git {major}.{minor} or newer (its stores keep refs in reftable, and move symbolic refs in a transaction); found `{found}`"
+        ),
+    }
+}
+
+/// `(major, minor)` of `git --version`'s answer (`git version 2.45.1`,
+/// `git version 2.39.5 (Apple Git-154)`).
+pub fn git_version(answer: &str) -> Option<(u32, u32)> {
+    let version = answer
+        .strip_prefix("git version ")?
+        .split_whitespace()
+        .next()?;
+    let mut parts = version.split('.');
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next()?.parse().ok()?;
+    Some((major, minor))
+}
+
 /// The key tokens are signed with: made once, kept in the data directory.
 fn token_key(data: &Utf8Path) -> anyhow::Result<Vec<u8>> {
     let path = data.join("token.key");
@@ -176,19 +279,47 @@ fn token_key(data: &Utf8Path) -> anyhow::Result<Vec<u8>> {
     Ok(key.into_bytes())
 }
 
+/// Void stuck landing `stamp` on the data directory `config` names, with no
+/// server running there: start as `serve` would (which tries every stuck
+/// landing again), then append the compensating entry ([`landing::Log::void`]).
+/// Returns what was done, to say.
+pub fn void_landing(config: Config, stamp: landing::Stamp) -> anyhow::Result<String> {
+    let app = App::open(config)?;
+    let (void, voided) = app
+        .log
+        .void(&app, stamp)
+        .map_err(|error| anyhow::anyhow!("{}", error.cause()))?;
+    let voided: Vec<String> = voided.iter().map(ToString::to_string).collect();
+    Ok(format!(
+        "voided landing{} {} with landing {void}: their projects are as SQLite had them, and land again",
+        if voided.len() == 1 { "" } else { "s" },
+        voided.join(", ")
+    ))
+}
+
 /// Run the remote until interrupted. Says where it listens on stdout, once
 /// it does.
 pub fn serve(config: Config) -> anyhow::Result<()> {
+    let listener = std::net::TcpListener::bind(config.listen)?;
+    serve_on(listener, config)
+}
+
+/// [`serve`], on a listener already bound, in place of `config.listen`. A
+/// caller in the same process binds port 0 and knows the port before it
+/// serves; one that picked a port and let go of it could find it taken.
+pub fn serve_on(listener: std::net::TcpListener, config: Config) -> anyhow::Result<()> {
+    listener.set_nonblocking(true)?;
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
     runtime.block_on(async move {
-        let listener = tokio::net::TcpListener::bind(config.listen).await?;
+        let listener = tokio::net::TcpListener::from_std(listener)?;
         let address = listener.local_addr()?;
         let app = Arc::new(App::open(Config {
             listen: address,
             ..config
         })?);
+        rooted::start(&app);
         println!("newgit serve: listening on http://{address}");
         use std::io::Write as _;
         std::io::stdout().flush()?;
@@ -289,4 +420,19 @@ fn json_response(status: u16, body: &serde_json::Value) -> Response<Body> {
         HeaderValue::from_static("application/json"),
     );
     response
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn git_versions_are_read() {
+        assert_eq!(super::git_version("git version 2.45.1"), Some((2, 45)));
+        assert_eq!(
+            super::git_version("git version 2.39.5 (Apple Git-154)"),
+            Some((2, 39))
+        );
+        assert_eq!(super::git_version("git version 3.0"), Some((3, 0)));
+        assert_eq!(super::git_version("not git"), None);
+        assert!(super::git_version("git version 2.9.0") < Some(super::GIT_REQUIRED));
+    }
 }

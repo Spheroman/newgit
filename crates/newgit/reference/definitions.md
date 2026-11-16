@@ -291,12 +291,22 @@ history starts as the project's Git history; `access` is mounted at
 `.newgit/trackers` with `paths = ["."]`, so it holds every tracker's
 definition but a child's (see below), with `maintainers = "owner"`. A
 tracker is *mounted* at a path inside its parent and claims paths relative
-to its mount. Ownership nests:
-the deepest mount wins, then the longest claim, so `root` owning `.` and
-`runtime-env` owning `.env.local` do not conflict. Two trackers claiming the
-identical path at the same mount is an error. A claim starting with `!`
-excludes: a path every claim excludes is owned by nothing, and a commit
-changing it is refused when it leaves the machine.
+to its mount. Ownership nests, so `root` owning `.` and `runtime-env` owning
+`.env.local` do not conflict:
+
+The longest claim that reaches a path owns it. A claim reaches a path
+under it unless a tracker mounted deeper holds the path and the claim is
+`.`, or a directory around that mount, or the claiming tracker is in Git.
+So only a tracker outside Git reaches into another's mount, with a claim
+inside it: `paths = ["apps/t3code/.env"]` owns that file just as `mount =
+"apps/t3code"`, `paths = [".env"]` would.
+
+A claim starting with `!` takes its own tracker out of the running for what
+it excludes; a path no reaching claim takes is owned by nothing, and a
+commit changing it is refused when it leaves the machine. Two trackers
+claiming the identical path is an error, except between role alternatives.
+`newgit tracker list` marks a claim of a tracker in Git inside a deeper
+mount, which owns nothing.
 
 Every tracker has a history, and `git` says where it lives. By default
 (`git = false`) a tracker is outside Git: its files are never committed, and
@@ -317,8 +327,12 @@ history instead: the branch (its `HEAD` by default) becomes the tracker's
 `<dir>`, an empty directory: one ordinary commit holding its files. Its
 history stays in its own repository and never enters this project's, so
 `git log` under the mount starts there. A `--from` path is relative to where you
-run it. `newgit pull <tracker>` moves its pin to its `follow` ref in one
-commit; nothing else moves a pin on your behalf. `newgit clone` fetches only
+run it. `newgit pull <tracker>...` moves its pin to its `follow` ref in one
+commit, after taking what is new on an export target rooted at it, and
+`newgit pull` alone does it for every tracker in Git mounted here, at any
+depth, still one commit on the branch it runs on (a child's pin moves by a
+commit in the tracker that mounts it first). No tracker's `main` moves until
+`newgit merge`, and nothing else moves a pin on your behalf. `newgit clone` fetches only
 the commits root pins of a mounted tracker, and its history the first time
 something needs it, once; `newgit clone --full` fetches every history up
 front. How sensitive a tracker's content is has nothing to do with this; that
@@ -367,13 +381,14 @@ resources = ["staging-tunnel"]
 | `storage` | string | yes | — | `local` or `remote` — where synced state lives. `remote` needs a `[remote]` in `config.toml`; checkpoint sync then pushes the tracker there. |
 | `merge_with_source` | bool | no | `false` | meant to say whether a source merge carries this tracker's state with it. Accepted and stored, but nothing reads it yet: `newgit merge` merges every tracker the instance changed. |
 | `mount` | string | no | `.` | where the tracker's own root sits inside the parent that defines it (`apps/electron`). `.` is an overlay beside the parent's files. A tracker in Git may be mounted at `.newgit/trackers`, beside `access`, to govern the definitions it claims (see `maintainers`); no other mount may reach into `.git` or `.newgit`. A tracker outside Git may have a mount too; it is never pinned. |
-| `follow` | string | no | `main` | the ref of the tracker's own history that `newgit pull <tracker>` brings in. Trackers outside Git ignore it. |
-| `paths` | array of strings | no | `[]` | its claims, relative to the mount, normalized first (`./.env.local` is `.env.local`). `!` excludes (`[".", "!dist/"]`): an excluded path is owned by a tracker that claims it at the same mount, or by nothing. Must not be absolute, contain `..`, or reach into `.git` or `.newgit` in any case (`.GIT` too). `.` must be a tracker's only claim. May be empty for a tracker that only receives resource deposits (`into_tracker`) or only brings `resources`: such a tracker has nothing in the workspace, so `tracker drop` (and `tracker use` swapping it out of its role) skips the capture, and `tracker list` shows it after the ownership tree with what deposits into it and what it brings. |
+| `follow` | string | no | `main` | the ref of the tracker's own history that `newgit pull <tracker>` (or `newgit pull`, for every one) brings in. Trackers outside Git ignore it. |
+| `paths` | array of strings | no | `[]` | its claims, relative to the mount, normalized first (`./.env.local` is `.env.local`). `!` excludes (`[".", "!dist/"]`): an excluded path is owned by the longest other claim that reaches it, or by nothing. Must not be absolute, contain `..`, or reach into `.git` or `.newgit` in any case (`.GIT` too). `.` must be a tracker's only claim. May be empty for a tracker that only receives resource deposits (`into_tracker`) or only brings `resources`: such a tracker has nothing in the workspace, so `tracker drop` (and `tracker use` swapping it out of its role) skips the capture, and `tracker list` shows it after the ownership tree with what deposits into it and what it brings. |
 | `git` | bool | no | `false` | `true` makes a tracker in Git: committed with Git rather than captured by newgit. The default keeps its files out of Git, so a new tracker fails closed. Written only when `true`. |
 | `role` | string | no | — | the slot it fills: trackers sharing a role are alternatives (`dev-db`, `staging-db`) and may claim the same paths; an instance binds one of them. |
 | `priority` | integer | no | `0` | which tracker of a role an instance binds by default (the highest), unless your own default says otherwise (`[projects.<project>.roles]` in `~/.newgit/config.toml`). Negative means only when asked for (`--use`), for a role-less tracker too. |
 | `pinned` | boolean | no | `false` | whether the parent that mounts it holds it where it is on the remote: a change landing at it never rolls up into the parent, and moving the parent's pin is a change to the parent, its maintainers' to approve (rollback is a revert). For what must not move by itself: a private dependency, an environment. |
 | `link` | string | no | — | where it lives when it lives in another project on the remote: `"<owner>/<project>"` for that project's root, `"<owner>/<project>/<path>"` for a tracker there. Its history, heads, repo, and policy (audience, maintainers, judged by membership there) are its home's; each root that links it pins its own commit, and a change merged from any of them reaches all of them. Only with `git = true`. Written by `newgit tracker link <name> <home> --mount <dir>`, which needs a linked project and read access to the home; `newgit merge main` publishes the link. |
+| `from` | string | no | — | the tracker whose history this one started at: a *fork*. Written by `newgit tracker create <name> --from <tracker>`. Its audience is a ceiling: this tracker may be read by no one `from`'s audience does not include (the same audience, or a narrower one: `public` holds every audience, `project-devs` holds `user` and `user:<login>`). The ceiling stays if `from` is later dropped or changed. See *Forks*. |
 | `requires` | array of strings | no | `[]` | trackers or roles it cannot do without: binding it binds them, and they cannot be dropped while it is bound. In a child's definition, a tracker is a path from its parent (`vendor` is a sibling, `../site` goes up). |
 | `resources` | array of strings | no | `[]` | resources it brings: they bind only while it is bound. `newgit tracker use` binds and prepares them and starts their `autostart` action; `drop` stops them and releases their binding. |
 | `export` | string, table, or array of those | no | — | where a tracker in Git ships through `newgit export --remote`: a URL it declares (`"github.com/acme/widget"`, or `{ url = …, branch = …, branches = …, name = … }`), the target rooted at it; `"inherit"`, wherever its parent ships; or a list of those. Left out, it never ships. `tracker create --git --path` writes `"inherit"`. A tracker outside Git may not have one. See *Export*. |
@@ -383,6 +398,47 @@ The paths of a tracker outside Git stay out of Git: `newgit tracker track` adds 
 the store's `.gitignore`, and each workspace's Git is told to ignore them too,
 so their content never lands in source history.
 
+### Forks
+
+Trackers sharing a role are variants of one thing (`local-db`,
+`staging-db`), and a fork is how a variant is added so the two share
+history:
+
+```
+newgit tracker create staging-db --role db --from local-db
+```
+
+`staging-db` claims what `local-db` claims, at its mount, and fills its
+role (`--role` names it when `local-db` has none yet, and both then fill
+it). Its `main` is `local-db`'s very commit, so nothing is copied, and its
+definition says `from = "local-db"`. It brings no resources and requires
+nothing, since those are what make the variants differ, and its `priority`
+is below `local-db`'s and negative, so new instances keep binding what they
+did until someone asks for it (`--use staging-db`, `tracker use`). Its
+audience and storage default to `local-db`'s; the audience may be narrower,
+never wider. Only a tracker outside Git can be forked yet: every instance
+holds every tracker in Git, so two at one mount would collide. The upstream
+must have something on its `main` (`tracker capture`, then `tracker merge`).
+
+On `newgit serve`, a fork's repo is made on its first sync, starting at its
+upstream's branches: a namespace in its upstream's store when their
+audiences match, or, for a narrower one, in that audience's store, which
+takes only what the upstream's `main` reaches.
+
+The audience ceiling belongs to the fork's history, not to its `from` line,
+so dropping or changing `from` doesn't lift it, and a fork is never
+detached: to share something more widely, make a new tracker and capture
+into it only what may be shared. This client refuses a fork that breaks the
+ceiling at creation, in every command but `tracker list` and `tracker
+remove` (which say what is wrong and fix it), and in any commit that changes
+definitions, checked against its parents and against what this machine
+recorded each fork started at. The upstream can't be removed while a fork
+names it. `newgit serve` records the upstream when it makes the fork's
+repo, and serves the fork with its upstream's audience whatever its
+definition says; a fork whose ceiling can't be settled (its upstream not
+defined, a cycle) isn't defined there. Against newgit.dev's Worker only this
+client checks the ceiling.
+
 `newgit tracker remove <name>` deletes the definition and reverses both of
 those: the `.gitignore` block and each live workspace's ignore entries. It
 refuses while any live instance still has the tracker bound (`newgit remove
@@ -390,6 +446,167 @@ refuses while any live instance still has the tracker bound (`newgit remove
 histories are Git's. Captured history in `.newgit/local/trackers.git` is left
 in place — it becomes unreferenced, and `newgit cleanup` reclaims it once
 nothing else (a checkpoint that captured it) still pins a rev.
+
+### Encrypted trackers
+
+A tracker outside Git with `storage = "remote"` and an audience other than
+`public` is encrypted on this machine before anything of it is sent. There is
+no opt-out: content a server has to read (a page the remote serves) is
+`public`. Each file is encrypted whole with [age](https://age-encryption.org)
+and committed as an ordinary blob in the tracker's history; capture encrypts,
+putting it in a workspace decrypts, and the workspace always holds plaintext
+(written owner-only, `0600`).
+
+- **Who it is encrypted to is computed, never read back:** the members its
+  audience names, as the remote lists them now (`project-devs`: every member;
+  `user`: you; `user:<login>`: that login), by the `ssh-ed25519` and `ssh-rsa`
+  keys GitHub publishes at `https://github.com/<login>.keys`. Nothing else.
+  Each encrypted rev records the list in its own tree at
+  `.newgit/recipients`, for people to read; newgit never takes a recipient
+  from it, from `main`, or from anything else the remote serves. Whether a
+  rev is encrypted to the current set is read from each file's own age
+  header, which names the current keys (by a public tag of each key; the
+  header is not authenticated, so it identifies the keys, it does not prove
+  them). A member with only `ecdsa` or security-key (`sk-*`) keys, or none,
+  is left out and warned about; nobody with a key at all refuses the capture.
+- **Said by fingerprint:** the first time a tracker is encrypted, whenever the
+  set differs from the one this machine last used (on every command that
+  captures or publishes), and on every `newgit members add`, `remove`, and
+  `reencrypt`, newgit lists each login with its
+  keys' `SHA256:` fingerprints (what `ssh-keygen -lf` prints), and says
+  `CHANGED` with who was added and removed. Read it: the remote decides who
+  is a member (below).
+- **Current before anything is published:** a capture reads the member list
+  from the remote (once per command), or, offline, what this machine last
+  read (`.newgit/local/audience.json`, written only from the remote and
+  GitHub). Before a checkpoint syncs and before `tracker merge` or a
+  re-encryption publishes `main`, the list is read again, and every commit
+  the remote does not have yet is checked against it, not only the last
+  one. Those encrypted to anyone else are made again, encrypted to the
+  members as they are now, on the last commit the remote has; the stale ones
+  stay on this machine and are never sent. So a member removed on another
+  machine never gets anything captured after their removal, nor anything
+  captured before it that this machine had not sent yet (a capture while
+  offline included). What the remote already held while they were a member,
+  they keep. What this machine counts as on the remote is kept per remote
+  URL and project, and forgotten by `newgit remote add` and `remote delete`,
+  so a project linked again (elsewhere, or deleted and made again under the
+  same name) gets every stale commit made again too. newgit never makes a
+  merge commit in a tracker outside Git; an unsent one (made by hand in the
+  store) is refused rather than sent.
+- **`main` is never forced over.** Publishing `main` fetches the remote's
+  first and refuses when it has changes the rev does not contain (merged
+  elsewhere since this machine last saw it). `newgit tracker pull <tracker>
+  --keep-mine` in the instance takes yours on top of theirs: it captures the
+  instance's files, pulls `main`, puts those files back over it, and
+  captures that, so the next `tracker merge` publishes it with theirs
+  underneath. There is no content merge: "yours" is your whole version of
+  the tracker's files. Every file you have REPLACES theirs, a file you
+  deleted since the rev you started from (the newest rev your capture and
+  theirs share) is deleted again even if they changed it, and files only
+  they added stay. When the two share no rev, newgit cannot tell a file you
+  deleted from one they added, so a file you deleted comes back from theirs;
+  the command says so. If a step fails after the pull, the error names the
+  rev that holds your version. A plain `newgit tracker pull
+  <tracker>` takes theirs instead, replacing the instance's files of the
+  tracker (yours stay at the rev the refusal names). `tracker pull`, and a
+  spawn in a fresh `newgit clone`, fetch the remote's `main` first. A `main` that
+  only re-encrypts the one this rev contains (what `members add` and `remove`
+  publish) counts as contained. The push is leased, so a merge landing in
+  between is not overwritten either.
+- **Decrypting** uses the keys in `$NEWGIT_IDENTITY` (`:`-separated paths of
+  SSH private keys or age identity files), then `~/.ssh/id_ed25519` and
+  `~/.ssh/id_rsa`. A passphrase is asked once, on a terminal; without one a
+  protected key is skipped. For agents, add a key without a passphrase to
+  your GitHub account and point `$NEWGIT_IDENTITY` at it, so no agent meets
+  a prompt. Instances on your machine decrypt with your key; identities for
+  sandboxes and cloud agents are
+  [#430](https://github.com/Spheroman/newgit/issues/430). This machine
+  keeps the plaintext of what it encrypted or decrypted under
+  `.newgit/local/tracker-plain/` (owner-only, never pushed), so it rarely
+  needs a key; `newgit remove` drops what only the removed instance held.
+- **Membership changes re-encrypt `main`:** `newgit members add` and
+  `members remove` fetch each shared encrypted tracker's `main`, encrypt it
+  to the members as they are now, and publish it. If any tracker could not
+  be, the command fails and names which were and were not re-encrypted;
+  `newgit members reencrypt` retries. Removing someone says loudly that they
+  can still read every rev they could read before: rotate those secrets.
+- **Keys come from GitHub**, or from `$NEWGIT_KEYS_URL` instead: an
+  `https://` base or a `file://` directory of `<login>.keys`, never
+  `http://`. A resource cannot export it, or any other `NEWGIT_` name.
+- **A tracker that was plaintext** is encrypted on its next capture, as a new
+  history with no parent, so pushing it carries none of the plaintext revs.
+  Its first commit names the plaintext rev it replaces, and merging it may
+  replace a plaintext `main` that rev contains: the one history replacement
+  there is. Every send (checkpoint sync, `tracker merge`, a per-user `main`)
+  checks every file the commits the remote does not have yet would carry
+  and refuses anything that is not age ciphertext.
+- **A definition that stops encrypting is not taken on its word, on a
+  machine that has held the content.** Definitions
+  (`.newgit/trackers/*.toml`) arrive through `access`, `newgit merge main`,
+  and `pull`. This machine remembers every workspace path at which it has
+  held encrypted content, captured encrypted here or decrypted into a
+  workspace here (`.newgit/local/sealed-paths.json`; a file there that does
+  not parse stops every capture and send that consults it, rather than
+  being read as empty). The guard is keyed by path, not by tracker:
+  whatever tracker claims such a path now, under
+  whatever name (a definition renamed, deleted and replaced, or a narrower
+  one claiming one of its files), a capture or send that would store its
+  content unencrypted is refused as an error. That is a `public` tracker
+  outside Git, or a commit pushed through Git (a definition turned `git =
+  true`; the path stays ignored in existing workspaces, but a commit with
+  it is refused at the push gate all the same). The refusal names the
+  paths and prints the command that releases them on this machine:
+  `newgit tracker allow-plaintext <path>...` (a directory releases every
+  held file under it, and the command lists what it released). A path
+  captured encrypted again is held back again. The guard knows paths, not
+  content: the same content copied or moved to another path is not held
+  back. Paths are compared ignoring case, so a
+  claim spelled differently on a case-insensitive filesystem (macOS) is
+  the same path. `newgit checkpoint` keeps the checkpoint on
+  this machine and exits non-zero when its sync is refused for this or any
+  other security reason (plaintext, a stale set of recipients, a merge
+  commit); a remote it cannot reach is a warning, as before.
+- **`user` is you:** a per-user tracker is encrypted to the login `newgit
+  login` saved, and a remote that answers with another login is refused.
+
+**What this guarantees, and what it does not:**
+
+- The remote, and anyone who controls its deployment (on newgit.dev:
+  Cloudflare, the account, its operators), cannot read what was encrypted
+  before it acts. This holds against a remote that only stores and serves.
+- A remote that acts can read what is captured afterwards. It decides
+  membership, so it can add a login, whose GitHub keys then become
+  recipients of the next capture or re-encryption; the only signal is the
+  fingerprints newgit prints (`CHANGED`, `+ <login>`), so read them. On a
+  machine encrypting a tracker for the first time there is no earlier set
+  to compare with, and the listing is all there is.
+- The remote also serves tracker definitions (through `access`), and a
+  definition decides whether a path is encrypted at all. The guard above
+  covers machines that have held the encrypted content, by path: a fresh
+  clone that spawns with the encrypted `main` has (its spawn decrypts it),
+  and is refused like any other. A machine that has never held the content
+  has nothing to compare against, and captures what it has as the
+  definition says. The guard is a confirmation step, not a boundary:
+  anything that can run commands in the workspace, an agent included, can
+  run `newgit tracker allow-plaintext` itself. A definition that names
+  another audience (`user:<login>`) is not held back: it is a change of
+  recipients, printed as one.
+- GitHub accounts are the key authority: whoever controls `<login>`'s GitHub
+  account decides which keys read that login's trackers.
+- There is no integrity. Recipients' keys are public, so the remote can
+  replace a file with content of its choosing that decrypts cleanly (a
+  `.env` pointing at its own server), or serve an old rev. Signed tracker
+  commits are [#431](https://github.com/Spheroman/newgit/issues/431).
+- File names, sizes (roughly), link targets, commit messages, authors, and
+  dates are visible to the remote. Only file contents are encrypted.
+- Revs pushed before a tracker was encrypted stay on the remote in plaintext
+  until its repo is deleted: rotate what they held.
+- A teammate on a newgit older than this release sees ciphertext in their
+  workspace, and a capture of theirs would push plaintext. Everyone sharing
+  an encrypted tracker has to upgrade.
+- Trackers in Git, `public` trackers, and trackers kept on this machine
+  (`storage = "local"`) are not encrypted.
 
 ---
 
@@ -643,6 +860,38 @@ long-running action again, along with any `autostart` action that died on
 its own. A resource that was not running at the stop stays down, and one whose dependency did not come back is not started against it.
 The workspace, trackers, port claims and installs are left alone, so the
 instance comes back on the same ports with its rendered config still valid.
+
+`newgit stop --evict` also frees the workspace's disk: it checkpoints the
+instance and deletes the workspace, leaving its marker, and `newgit start`
+brings it back from that checkpoint at the same path before starting
+anything. File modes, empty directories, the local Git config, hooks,
+notes, and other remotes' refs come back too. A `recompute` resource's
+`[identity] produces` comes back from the install store; any other ignored
+file that no tracker outside Git owns does not, so the eviction refuses and
+lists it (a wholly ignored directory as one entry, with its file count)
+unless `--discard-ignored` is given. It also refuses an initialized
+submodule, a linked worktree, and a process with its working directory in
+the workspace, the shell it was run from included: run it from outside.
+
+Declaring disposable build output (such as `target/`) so that a plain
+`--evict` frees it is not possible yet; `--discard-ignored` is the manual
+override (#447).
+
+A restore that fails or is cut short never deletes what is at the path:
+it moves it aside, whole, to `.<name>.restore-failed` or
+`.<name>.interrupted-restore` beside the workspace, says so the moment it
+does, and `start`, `status`, `stop --evict`, and `cleanup` name each such
+saved copy until `newgit cleanup --discard-saved <path>` deletes it. newgit
+never deletes one on its own. A read-only directory in the workspace is
+made writable to delete it.
+
+Not kept, and named before anything is deleted: reflogs other than the
+stash's, intent-to-add entries, assume-unchanged or skip-worktree flags
+set by hand (the files' content is kept), setuid, setgid, and sticky bits,
+and a value set by hand on a config key newgit sets itself
+(`remote.origin.url`, `credential.*`, its export remotes). An untracked file's blob stays in
+the store with the checkpoint, so evicting does not free that disk, and
+evict checkpoints are not pruned yet (#446).
 
 `suspend` / `resume` are for a resource that keeps running without a
 process newgit supervises: a `prepare` that starts a Supabase stack, a
@@ -1593,11 +1842,13 @@ one deliberate overlap is a `captures` entry naming its *own* resource's
 front, and the action overwrites it with the one that did not exist until it
 ran. The owner is the same resource either way.
 
-`NEWGIT_BRANCH`, `NEWGIT_WORKSPACE`, and `NEWGIT_LOCKED` are reserved, so
-a resource declaring one is reported too — a declaration that could never
-reach the process is a mistake worth naming, not a silent no-op. newgit sets
-the first two for every command it runs; `NEWGIT_LOCKED` it sets only for a
-hook run under an instance's lock.
+Every name starting with `NEWGIT_` is reserved, so a resource declaring one
+is reported too. newgit sets `NEWGIT_BRANCH` and `NEWGIT_WORKSPACE` for every
+command it runs, and `NEWGIT_LOCKED` for a hook run under an instance's lock:
+a declaration of one could never reach the process. Others it obeys, such as
+`NEWGIT_KEYS_URL` and `NEWGIT_IDENTITY` (see *Encrypted trackers*): an export
+of one would change whose keys a `newgit` run inside `newgit run` encrypts
+to.
 
 Every command that changes an instance (`spawn`, `action`, `stop`, `start`,
 `checkpoint`, `undo`, `merge`, every `tracker` command that changes an
@@ -1772,9 +2023,34 @@ when the instance's work touched that tracker.
 A pull request merged there comes back with `newgit pull --remote <target>`:
 the tracker's `main` fast-forwards to it (or really merges it, when `main`
 moved here too), then its pin in the project root moves, in one commit on
-top, whatever the new commits' dates. Instances pick it up with `newgit pull <tracker>` once `newgit merge
-main` has published it. An export finding the target ahead says to run
-that rather than pulling by itself.
+top, whatever the new commits' dates. Plain `newgit pull` (and `newgit
+pull <tracker>`) takes it too, anywhere, as the first step of updating that
+tracker, one more fetch per tracker with a rooted target: the pin moves on
+the branch it ran on, and the tracker's `main` only when that merges. A
+target that can't be reached, conflicts, or adds a file of a tracker
+outside Git leaves that tracker and the trackers below it where they were,
+and the rest still move. A pin holding commits of this instance's own is
+listed as diverged and does not take its target either, until `newgit
+merge` lands that work. An export finding the target ahead says to pull
+rather than pulling by itself, or, after a plain pull in the project root,
+to `newgit merge main`.
+
+The merge is newgit's (`newgit <newgit@localhost>`, as is an endpoint's
+`Merge main from github`), dated as the parent committed last, and never
+signed, so two instances pulling the same two diverged tips make the same
+commit and merging both lands one merge. Unsigned, it is rejected by an
+export target that requires signed commits: an export carrying it fails
+there ([#443](https://github.com/Spheroman/newgit/issues/443)).
+
+A force-pushed target is merged with the line the tracker already has, as
+`git pull` would: the commits the force-push removed stay in the tracker's
+history, and the next export pushes them to the target again. Reverting the
+change in an instance and merging it keeps it out of the tip only: the
+removed commits are still in the history, and the next export still
+publishes them. When the force-push was to purge a secret, that publishes
+it again, and nothing in newgit can purge it yet
+([#442](https://github.com/Spheroman/newgit/issues/442): a way to reset a
+tracker's line to its target). Until then, do not export that tracker.
 
 ### Pull requests from a workspace: `branches = true`
 

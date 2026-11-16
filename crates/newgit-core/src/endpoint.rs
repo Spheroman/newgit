@@ -79,6 +79,30 @@ pub struct Source {
     pub url: String,
     /// The `Authorization` header Git sends.
     pub auth: String,
+    /// The Git namespace the tracker is in the repository at `url`, when it
+    /// is one (`newgit serve` keeps every tracker of one audience in one
+    /// store). Read and written with `git --namespace`, so the refs here are
+    /// the tracker's own either way.
+    #[serde(default)]
+    pub namespace: Option<String>,
+}
+
+impl Source {
+    /// `location` (Git's own arguments, before its command), in this source's
+    /// namespace when it has one.
+    fn at(&self, location: &[&str]) -> Vec<String> {
+        let mut args: Vec<String> = location.iter().map(|arg| (*arg).to_owned()).collect();
+        args.extend(
+            self.namespace
+                .as_ref()
+                .map(|namespace| format!("--namespace={namespace}")),
+        );
+        args
+    }
+}
+
+fn strs(args: &[String]) -> Vec<&str> {
+    args.iter().map(String::as_str).collect()
 }
 
 /// The container's repositories. Three, because a shallow commit must never
@@ -201,7 +225,7 @@ impl Stores {
                 continue;
             };
             let absent = GitSource::fetch_snapshots(
-                &[&git_dir],
+                &strs(&source.at(&[&git_dir])),
                 &source.url,
                 &format!("refs/snapshots/{tracker}/"),
                 &missing,
@@ -226,7 +250,7 @@ impl Stores {
             // A merge's commit waits at a landing ref until it lands, and an
             // index check pins it before then.
             GitSource::fetch_refs(
-                &[&format!("--git-dir={}", self.whole)],
+                &strs(&source.at(&[&format!("--git-dir={}", self.whole)])),
                 &source.url,
                 &[
                     format!("+refs/heads/*:refs/trackers/{tracker}/heads/*"),
@@ -339,7 +363,7 @@ pub fn compose_view(plan: &Plan) -> Result<Utf8PathBuf> {
             NewgitError::Unsupported(format!("the plan names `{root}` but not where it is"))
         })?;
         GitSource::fetch_refs(
-            &[&format!("--git-dir={}", stores.whole)],
+            &strs(&source.at(&[&format!("--git-dir={}", stores.whole)])),
             &source.url,
             &[format!("+refs/heads/*:refs/trackers/{root}/heads/*")],
             Some(&source.auth),
@@ -628,7 +652,7 @@ fn view_notes(store: &Utf8Path, key: &str, notes_ref: &str) -> Result<bool> {
         return Ok(false);
     }
     stream.push(b'\n');
-    let mut child = std::process::Command::new("git")
+    let mut child = crate::git::command()
         .args([git_dir.as_str(), "fast-import", "--quiet", "--force"])
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::null())
@@ -775,7 +799,7 @@ pub fn check_ancestry(plan: &AncestryPlan) -> Result<Vec<AncestryAnswer>> {
         })?;
         // Fresh and pruned: a head deleted since the last fetch is not `main`.
         GitSource::fetch_refs(
-            &[&git_dir, "-c", "fetch.prune=true"],
+            &strs(&source.at(&[&git_dir, "-c", "fetch.prune=true"])),
             &source.url,
             &[format!(
                 "+refs/heads/*:refs/trackers/{}/heads/*",
@@ -785,7 +809,7 @@ pub fn check_ancestry(plan: &AncestryPlan) -> Result<Vec<AncestryAnswer>> {
         )?;
         let in_repo = |commit: &str| in_tracker(&store, &check.tracker, commit);
         let ancestor = |old: &str, new: &str| {
-            std::process::Command::new("git")
+            crate::git::command()
                 .args([&git_dir, "merge-base", "--is-ancestor", old, new])
                 .output()
                 .is_ok_and(|output| output.status.success())
@@ -822,11 +846,11 @@ pub fn check_index(plan: &IndexPlan) -> Result<IndexAnswer> {
     let stores = Stores::open(&plan.dir)?;
     if let Some(source) = plan.repos.get(ROOT_TRACKER) {
         GitSource::fetch_refs(
-            &[
+            &strs(&source.at(&[
                 &format!("--git-dir={}", stores.whole),
                 "-c",
                 "fetch.prune=true",
-            ],
+            ])),
             &source.url,
             // A merge's root commit waits at its landing ref until it lands.
             &[
@@ -906,7 +930,7 @@ pub fn copy_repo(plan: &CopyPlan) -> Result<CopyAnswer> {
         .collect();
     let prefix = format!("refs/copies/{key}/heads/");
     GitSource::fetch_refs(
-        &[&git_dir, "-c", "fetch.prune=true"],
+        &strs(&plan.from.at(&[&git_dir, "-c", "fetch.prune=true"])),
         &plan.from.url,
         &[format!("+refs/heads/*:{prefix}*")],
         Some(&plan.from.auth),
@@ -936,7 +960,12 @@ pub fn copy_repo(plan: &CopyPlan) -> Result<CopyAnswer> {
         .keys()
         .map(|branch| format!("+{prefix}{branch}:refs/heads/{branch}"))
         .collect();
-    GitSource::push_refs(&[&git_dir], &plan.to.url, &refspecs, Some(&plan.to.auth))?;
+    GitSource::push_refs(
+        &strs(&plan.to.at(&[&git_dir])),
+        &plan.to.url,
+        &refspecs,
+        Some(&plan.to.auth),
+    )?;
     Ok(CopyAnswer { branches })
 }
 
@@ -1038,7 +1067,7 @@ pub fn pull_mirror(plan: &PullPlan) -> Result<PullAnswer> {
     let git_dir = format!("--git-dir={store}");
     for (tracker, source) in &plan.repos {
         GitSource::fetch_refs(
-            &[&git_dir, "-c", "fetch.prune=true"],
+            &strs(&source.at(&[&git_dir, "-c", "fetch.prune=true"])),
             &source.url,
             &[format!("+refs/heads/*:refs/trackers/{tracker}/heads/*")],
             Some(&source.auth),
@@ -1064,7 +1093,7 @@ fn land(plan: &PullPlan, store: &Utf8Path) -> Result<PullAnswer> {
         Ok(run_git_env(&full, &[])?.trim().to_owned())
     };
     let is_ancestor = |older: &str, newer: &str| {
-        std::process::Command::new("git")
+        crate::git::command()
             .args([&git_dir, "merge-base", "--is-ancestor", older, newer])
             .output()
             .is_ok_and(|output| output.status.success())
@@ -1262,16 +1291,17 @@ fn land(plan: &PullPlan, store: &Utf8Path) -> Result<PullAnswer> {
                 audience: &audience,
                 newgit_made: None,
                 need_history: &|_| Ok(()),
+                forks_before: &[],
             },
         )?
         .root)
     };
     let date = git(&["log", "-1", "--format=%ct +0000", commit])?;
     let identity: Vec<(String, String)> = [
-        ("GIT_AUTHOR_NAME", "newgit"),
-        ("GIT_AUTHOR_EMAIL", "newgit@localhost"),
-        ("GIT_COMMITTER_NAME", "newgit"),
-        ("GIT_COMMITTER_EMAIL", "newgit@localhost"),
+        ("GIT_AUTHOR_NAME", crate::source::NEWGIT_NAME),
+        ("GIT_AUTHOR_EMAIL", crate::source::NEWGIT_EMAIL),
+        ("GIT_COMMITTER_NAME", crate::source::NEWGIT_NAME),
+        ("GIT_COMMITTER_EMAIL", crate::source::NEWGIT_EMAIL),
         ("GIT_AUTHOR_DATE", date.as_str()),
         ("GIT_COMMITTER_DATE", date.as_str()),
     ]
@@ -1348,7 +1378,7 @@ fn land(plan: &PullPlan, store: &Utf8Path) -> Result<PullAnswer> {
     let land_at = |tracker: &str, commit: &str| -> Result<()> {
         let source = source_of(tracker)?;
         GitSource::push_leased(
-            &[&git_dir],
+            &strs(&source.at(&[&git_dir])),
             &source.url,
             commit,
             &crate::remote::landing_ref(commit),
@@ -1448,7 +1478,7 @@ fn find_tag(plan: &PullPlan, store: &Utf8Path, name: &str) -> Result<PullAnswer>
     .next()
     .and_then(|view| view.tip)
     .ok_or_else(|| NewgitError::Unsupported(format!("root commit {base} composes to nothing")))?;
-    let on_main = std::process::Command::new("git")
+    let on_main = crate::git::command()
         .args([&git_dir, "merge-base", "--is-ancestor", &commit, &exported])
         .output()
         .is_ok_and(|output| output.status.success());

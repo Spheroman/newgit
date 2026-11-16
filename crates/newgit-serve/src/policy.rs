@@ -6,9 +6,11 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use camino::Utf8Path;
+use camino::{Utf8Path, Utf8PathBuf};
 
-use crate::names::{ProjectId, RepoRef, tracker_dir};
+use rusqlite::Connection;
+
+use crate::names::{ProjectId, RepoRef};
 use crate::repos;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -65,11 +67,25 @@ pub struct Facts {
     pub pinned: bool,
     /// Another project is its home: `<owner>/<project>[/<path>]`.
     pub link: Option<String>,
+    /// The tracker whose history it started at (`from`): a fork, never
+    /// readable by anyone its upstream is not.
+    pub from: Option<String>,
+    /// The tracker this server made its repo from, recorded then
+    /// (`refs/newgit/from/<upstream>` in its namespace, [`repos::Repo::recorded_from`]),
+    /// when that differs from what `from` says now: a fork stays held to
+    /// the upstream it was made from, whatever its definition later says.
+    pub recorded_from: Option<String>,
+    /// Why it is served with its upstream's audience rather than its own: its
+    /// definition makes it wider than its upstream's ([`cap_forks`]).
+    pub capped: Option<String>,
 }
 
 /// Where `access` is mounted: every definition is `<name>.toml` at its root.
 pub const ACCESS_MOUNT: &str = ".newgit/trackers";
 const ID_SEPARATOR: &str = "__";
+/// The longest chain of forks (a fork of a fork of …) definitions are read
+/// along; a fork further from a history of its own is not defined.
+const MAX_FORK_CHAIN: usize = 64;
 
 /// Trackers that always exist, file or not.
 pub fn implicit_facts(tracker: &str) -> Option<Facts> {
@@ -82,6 +98,9 @@ pub fn implicit_facts(tracker: &str) -> Option<Facts> {
         source: "access".to_owned(),
         pinned: false,
         link: None,
+        from: None,
+        recorded_from: None,
+        capped: None,
     };
     match tracker {
         "root" => Some(base(Maintainers::ProjectDevs, ".")),
@@ -116,6 +135,186 @@ pub fn parse_facts(text: &str, source: &str) -> Option<Facts> {
         source: source.to_owned(),
         pinned: table.get("pinned").and_then(toml::Value::as_bool) == Some(true),
         link: string("link").map(str::to_owned),
+        from: string("from").map(str::to_owned),
+        recorded_from: None,
+        capped: None,
+    })
+}
+
+/// Whether a fork with audience `fork` is readable by no one `upstream` does
+/// not include: the same audience, or one inside it. `public` holds every
+/// audience; `project-devs` holds `user` and `user:<login>`, which are served
+/// to members only ([`decide`]). Any other two are not ordered.
+pub fn audience_within(fork: &Audience, upstream: &Audience) -> bool {
+    fork == upstream
+        || *upstream == Audience::Public
+        || (*upstream == Audience::ProjectDevs
+            && matches!(fork, Audience::User | Audience::Named(_)))
+}
+
+fn audience_name(audience: &Audience) -> String {
+    match audience {
+        Audience::Public => "public".to_owned(),
+        Audience::ProjectDevs => "project-devs".to_owned(),
+        Audience::User => "user".to_owned(),
+        Audience::Named(login) => format!("user:{login}"),
+    }
+}
+
+/// Hold every fork to its upstream's audience, whatever its definition
+/// says. The client refuses a definition that widens a fork, but the
+/// definitions the server reads are commits anyone governing them made, so
+/// here every fork is checked against each of its upstreams: the one `from`
+/// names and the one its repo was made from ([`Facts::recorded_from`]), so
+/// dropping or changing `from` lifts nothing. Against each, one of three:
+///
+/// - the fork is within the upstream ([`audience_within`]): left as it is;
+/// - the upstream is within the fork: the fork is read with the upstream's
+///   audience (and says why, in `capped`), so every rule, every store, and
+///   every read treats it as no wider than the history it holds;
+/// - the two are not ordered (`user:bob` and `user:jack`, or `user` and
+///   `user:bob`): the fork is left out, as an undefined tracker is. Moving
+///   it to the upstream's audience would hand its own commits to readers
+///   who never had them.
+///
+/// So capping only ever narrows, and this runs until nothing changes. A fork
+/// that is undefined afterwards is left out too, so readers are told it is
+/// not defined: one whose upstream is not defined (or was itself left out,
+/// down a chain of forks), one in a cycle of forks, and one held to two
+/// upstreams no one audience fits under. A linked fork's policy is its
+/// home's, capped there.
+pub fn cap_forks(facts: &mut BTreeMap<String, Facts>) {
+    let upstreams = |fork: &Facts| -> Vec<String> {
+        let mut all: Vec<String> = fork
+            .from
+            .iter()
+            .chain(fork.recorded_from.iter())
+            .cloned()
+            .collect();
+        all.dedup();
+        all
+    };
+    // A cycle never reaches a history of its own.
+    let names: Vec<String> = facts.keys().cloned().collect();
+    let mut cyclic = BTreeSet::new();
+    for name in &names {
+        let mut seen = BTreeSet::new();
+        let mut stack = vec![name.clone()];
+        while let Some(at) = stack.pop() {
+            let Some(fact) = facts.get(&at).filter(|fact| fact.link.is_none()) else {
+                continue;
+            };
+            for up in upstreams(fact) {
+                if up == *name {
+                    cyclic.insert(name.clone());
+                } else if seen.insert(up.clone()) {
+                    stack.push(up);
+                }
+            }
+        }
+    }
+    for name in cyclic {
+        facts.remove(&name);
+    }
+    // Every change either removes a fork or strictly narrows one (an
+    // audience narrows at most twice: `public`, `project-devs`, then a
+    // user), so this settles within the bound.
+    let rounds = 3 * facts.len() + 2;
+    for _round in 0..rounds {
+        let mut changed = false;
+        let names: Vec<String> = facts.keys().cloned().collect();
+        for name in names {
+            let Some(fork) = facts.get(&name).filter(|fork| fork.link.is_none()) else {
+                continue;
+            };
+            for from in upstreams(fork) {
+                let Some(upstream) = facts.get(&from).map(|up| up.audience.clone()) else {
+                    facts.remove(&name);
+                    changed = true;
+                    break;
+                };
+                let fork = facts.get_mut(&name).unwrap_or_else(|| unreachable!());
+                if audience_within(&fork.audience, &upstream) {
+                    continue;
+                }
+                if !audience_within(&upstream, &fork.audience) {
+                    facts.remove(&name);
+                    changed = true;
+                    break;
+                }
+                fork.capped = Some(format!(
+                    "`{name}` is a fork of `{from}`, and its definition makes it `{}`, wider \
+                     than `{from}`'s `{}`: it is served as `{}`, since its history holds \
+                     `{from}`'s",
+                    audience_name(&fork.audience),
+                    audience_name(&upstream),
+                    audience_name(&upstream),
+                ));
+                fork.audience = upstream;
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    // Whatever still doesn't fit under every upstream never will.
+    loop {
+        let unfit: Vec<String> = facts
+            .iter()
+            .filter(|(_, fork)| fork.link.is_none())
+            .filter(|(_, fork)| {
+                upstreams(fork).iter().any(|from| {
+                    !facts
+                        .get(from)
+                        .is_some_and(|up| audience_within(&fork.audience, &up.audience))
+                })
+            })
+            .map(|(name, _)| name.clone())
+            .collect();
+        if unfit.is_empty() {
+            return;
+        }
+        for name in unfit {
+            facts.remove(&name);
+        }
+    }
+}
+
+/// Whether `who` may start fork `fork` (its definition's facts) from
+/// `upstream`'s history, before anything is made or copied: the fork must
+/// be no wider than `upstream` (`audience_within`), and `who` must be able
+/// to read `upstream` (for a per-user one, their own), since starting the
+/// fork hands them its history.
+pub fn may_start_fork(
+    project: &ProjectId,
+    upstream: &str,
+    fork: &Facts,
+    upstream_facts: &Facts,
+    who: &Requester,
+) -> Decision {
+    if !audience_within(&fork.audience, &upstream_facts.audience) {
+        return Err(format!(
+            "a fork can't be readable by anyone its upstream isn't: this one is `{}`, wider than \
+             `{upstream}`'s `{}`",
+            audience_name(&fork.audience),
+            audience_name(&upstream_facts.audience)
+        ));
+    }
+    let source = RepoRef::Tracker {
+        project: project.clone(),
+        tracker: upstream.to_owned(),
+        login: (upstream_facts.audience == Audience::User).then(|| who.login.clone()),
+    };
+    decide(
+        &source,
+        false,
+        who,
+        Some(upstream_facts),
+        &Context::default(),
+    )
+    .map_err(|why| {
+        format!("this tracker is a fork of `{upstream}`, and starting it reads `{upstream}`: {why}")
     })
 }
 
@@ -184,8 +383,12 @@ fn depth(mount: &str) -> usize {
     }
 }
 
-/// The tracker in Git owning workspace `path`, by the ownership rules: the
-/// deepest mount holding it, then the longest claim, ties to the lesser name.
+/// The tracker in Git owning workspace `path`, as the client's `owners_of`
+/// decides it (docs/design/trackers.md, *Ownership*) among trackers in Git:
+/// a claim of a tracker in Git never reaches into a deeper mount, so the
+/// deepest mount holding the path decides, then the longest claim, ties to
+/// the lesser name. Asked only of definition files under
+/// `.newgit/trackers/`, where no tracker outside Git may be mounted.
 fn owner_of(facts: &BTreeMap<String, Facts>, path: &str) -> Option<String> {
     let in_git: Vec<(&String, &Facts)> = facts
         .iter()
@@ -255,14 +458,63 @@ fn next_holders(
     next
 }
 
-/// Reads files at a tracker's `main` in one project.
+/// Reads files at a tracker's `main`, wherever its store is: through one
+/// `git cat-file --batch` per repository, each file once per load.
 pub struct Reader<'a> {
     pub data: &'a Utf8Path,
+    pub db: &'a Connection,
+    /// Trackers read at a commit, from a repository, rather than at `main`:
+    /// what a landing's definitions will be before it lands.
+    pub at: &'a BTreeMap<String, (Utf8PathBuf, String)>,
+    read: std::cell::RefCell<BTreeMap<(String, String, String), Option<String>>>,
+    batches: std::cell::RefCell<BTreeMap<Utf8PathBuf, newgit_core::objects::Objects>>,
 }
 
-impl Reader<'_> {
+impl<'a> Reader<'a> {
+    pub fn new(
+        data: &'a Utf8Path,
+        db: &'a Connection,
+        at: &'a BTreeMap<String, (Utf8PathBuf, String)>,
+    ) -> Self {
+        Self {
+            data,
+            db,
+            at,
+            read: std::cell::RefCell::default(),
+            batches: std::cell::RefCell::default(),
+        }
+    }
+
     fn read(&self, project: &ProjectId, tracker: &str, path: &str) -> Option<String> {
-        repos::read_file(&tracker_dir(self.data, project, tracker), "main", path)
+        let key = (project.key(), tracker.to_owned(), path.to_owned());
+        if let Some(found) = self.read.borrow().get(&key) {
+            return found.clone();
+        }
+        let (dir, rev) = match self.at.get(tracker) {
+            Some((dir, commit)) => (dir.clone(), commit.clone()),
+            None => {
+                let repo = repos::tracker(self.data, self.db, project, tracker).ok()?;
+                if !repos::store_exists(&repo.dir()) {
+                    return None;
+                }
+                (repo.dir(), repo.full("refs/heads/main"))
+            }
+        };
+        let found = {
+            let mut batches = self.batches.borrow_mut();
+            let batch = match batches.entry(dir.clone()) {
+                std::collections::btree_map::Entry::Occupied(found) => found.into_mut(),
+                std::collections::btree_map::Entry::Vacant(empty) => {
+                    empty.insert(newgit_core::objects::Objects::open(&dir).ok()?)
+                }
+            };
+            batch
+                .blob(&format!("{rev}:{path}"))
+                .ok()
+                .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+        };
+        self.read.borrow_mut().insert(key, found.clone());
+        found
     }
 }
 
@@ -271,34 +523,95 @@ impl Reader<'_> {
 /// mounted is this project's.
 pub fn load_definitions<'n>(
     data: &Utf8Path,
+    db: &Connection,
     project: &ProjectId,
     names: impl IntoIterator<Item = &'n str>,
 ) -> BTreeMap<String, Facts> {
-    let reader = Reader { data };
+    load_definitions_at(data, db, project, names, &BTreeMap::new())
+}
+
+/// [`load_definitions`], with each tracker in `at` read at its commit, from
+/// its repository, instead of at its `main`.
+pub fn load_definitions_at<'n>(
+    data: &Utf8Path,
+    db: &Connection,
+    project: &ProjectId,
+    names: impl IntoIterator<Item = &'n str>,
+    at: &BTreeMap<String, (Utf8PathBuf, String)>,
+) -> BTreeMap<String, Facts> {
+    let reader = Reader::new(data, db, at);
     let mut all: BTreeSet<String> = ["root".to_owned(), "access".to_owned()].into();
     all.extend(names.into_iter().map(str::to_owned));
     let mut facts = read_definitions(&reader, project, &all);
+    // A fork is held to its upstreams (what `from` names, and what its repo
+    // was made from), so they are read with it, and theirs in turn, until no
+    // new one is named. Each round names at least one new tracker; a chain
+    // longer than this many is left unread, so its forks have no upstream
+    // and are left out (`cap_forks`).
+    let mut records: BTreeMap<String, Option<String>> = BTreeMap::new();
+    for _round in 0..=MAX_FORK_CHAIN {
+        for (name, fact) in &facts {
+            if !fact.git && fact.link.is_none() && !records.contains_key(name) {
+                let recorded = repos::tracker(data, db, project, name)
+                    .ok()
+                    .and_then(|repo| repo.recorded_from());
+                records.insert(name.clone(), recorded);
+            }
+        }
+        let upstreams: BTreeSet<String> = facts
+            .iter()
+            .flat_map(|(name, fact)| {
+                fact.from
+                    .iter()
+                    .chain(records.get(name).into_iter().flatten())
+                    .cloned()
+            })
+            .filter(|from| !all.contains(from))
+            .collect();
+        if upstreams.is_empty() {
+            break;
+        }
+        all.extend(upstreams);
+        facts = read_definitions(&reader, project, &all);
+    }
+    for (name, recorded) in records {
+        if let (Some(fact), Some(recorded)) = (facts.get_mut(&name), recorded)
+            && fact.from.as_deref() != Some(recorded.as_str())
+        {
+            fact.recorded_from = Some(recorded);
+        }
+    }
     let linked: Vec<(String, Facts)> = facts
         .iter()
         .filter(|(_, fact)| fact.link.is_some())
         .map(|(name, fact)| (name.clone(), fact.clone()))
         .collect();
     for (name, fact) in linked {
-        let Some((home, tracker)) = home_of(&fact) else {
-            continue;
-        };
-        if let Some(there) = load_definitions(data, &home, [tracker.as_str()]).remove(&tracker) {
-            facts.insert(
-                name,
-                Facts {
-                    mount: fact.mount,
-                    source: fact.source,
-                    link: fact.link,
-                    ..there
-                },
-            );
+        let there = home_of(&fact).and_then(|(home, tracker)| {
+            load_definitions(data, db, &home, [tracker.as_str()]).remove(&tracker)
+        });
+        match there {
+            Some(there) => {
+                facts.insert(
+                    name,
+                    Facts {
+                        mount: fact.mount,
+                        source: fact.source,
+                        link: fact.link,
+                        ..there
+                    },
+                );
+            }
+            // A fork whose home can't be read has no ceiling to be held
+            // to: not defined, rather than its own definition's word.
+            None if fact.from.is_some() => {
+                facts.remove(&name);
+            }
+            None => {}
         }
     }
+    // After links: an upstream that is a link has its home's audience.
+    cap_forks(&mut facts);
     facts
 }
 

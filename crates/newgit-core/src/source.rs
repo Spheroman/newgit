@@ -1,5 +1,4 @@
 use std::collections::BTreeSet;
-use std::process::Command;
 
 use camino::{Utf8Path, Utf8PathBuf};
 
@@ -38,18 +37,81 @@ impl GitSource {
     /// exist yet) — used to enforce the tracker-path invariant.
     pub fn is_ignored(&self, path: &str) -> Result<bool> {
         let args = ["-C", self.root.as_str(), "check-ignore", "-q", "--", path];
-        let output = Command::new("git")
+        let output = crate::git::command()
             .args(args)
             .output()
             .map_err(|source| spawn_error(&args, &source))?;
         Ok(output.status.success())
     }
 
-    /// Whether `path` is tracked by the store repo — a tracker path that is
-    /// also in Git history is dual-tracked, deliberately or not.
-    pub fn is_tracked(&self, path: &str) -> Result<bool> {
-        self.git(&["ls-files", "--", path])
-            .map(|stdout| !stdout.is_empty())
+    /// Which of `paths` the store repo ignores: one `git check-ignore` for
+    /// all of them, rather than one each.
+    pub fn ignored_among<'p>(&self, paths: &[&'p str]) -> Result<BTreeSet<&'p str>> {
+        if paths.is_empty() {
+            return Ok(BTreeSet::new());
+        }
+        // `-z` is only accepted with `--stdin`: the paths go in NUL-separated
+        // and come back the same way, each as it was given.
+        use std::io::Write as _;
+        let args = ["-C", self.root.as_str(), "check-ignore", "-z", "--stdin"];
+        let mut child = crate::git::command()
+            .args(args)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|source| spawn_error(&args, &source))?;
+        let input: Vec<u8> = paths
+            .iter()
+            .flat_map(|path| path.bytes().chain([0]))
+            .collect();
+        child
+            .stdin
+            .take()
+            .expect("piped stdin")
+            .write_all(&input)
+            .map_err(|source| spawn_error(&args, &source))?;
+        let output = child
+            .wait_with_output()
+            .map_err(|source| spawn_error(&args, &source))?;
+        // 1 is "none of them": only 0 and 1 are answers.
+        if !matches!(output.status.code(), Some(0 | 1)) {
+            return Err(NewgitError::SourceCommand {
+                command: format!("git {}", args.join(" ")),
+                stderr: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+            });
+        }
+        let listed = String::from_utf8_lossy(&output.stdout);
+        let listed: BTreeSet<&str> = listed.split('\0').collect();
+        Ok(paths
+            .iter()
+            .copied()
+            .filter(|path| listed.contains(path))
+            .collect())
+    }
+
+    /// Which of `paths` the store repo tracks, itself or anything under it —
+    /// a tracker path that is also in Git history is dual-tracked,
+    /// deliberately or not. One `git ls-files` for all of them.
+    pub fn tracked_among<'p>(&self, paths: &[&'p str]) -> Result<BTreeSet<&'p str>> {
+        if paths.is_empty() {
+            return Ok(BTreeSet::new());
+        }
+        let mut args = vec!["ls-files", "-z", "--"];
+        args.extend_from_slice(paths);
+        let listed = self.git(&args)?;
+        let files: Vec<&str> = listed.split('\0').filter(|file| !file.is_empty()).collect();
+        Ok(paths
+            .iter()
+            .copied()
+            .filter(|path| {
+                let path = path.trim_end_matches('/');
+                files.iter().any(|file| {
+                    file.strip_prefix(path)
+                        .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
+                })
+            })
+            .collect())
     }
 
     pub fn branch_exists(&self, name: &str) -> Result<bool> {
@@ -61,7 +123,7 @@ impl GitSource {
             "--quiet",
             &format!("refs/heads/{name}"),
         ];
-        let output = Command::new("git")
+        let output = crate::git::command()
             .args(args)
             .output()
             .map_err(|source| spawn_error(&args, &source))?;
@@ -88,7 +150,7 @@ impl GitSource {
                 "-q",
                 "HEAD",
             ];
-            let output = Command::new("git")
+            let output = crate::git::command()
                 .args(args)
                 .output()
                 .map_err(|source| spawn_error(&args, &source))?;
@@ -211,6 +273,16 @@ impl GitSource {
     ///
     /// `sparse` is what `template` is checked out with, which the workspace
     /// inherits (see [`crate::materializer::template_for`]).
+    ///
+    /// `carry` is store refs whose history the workspace will want next to
+    /// its own, such as an export target's branch. The template fetches
+    /// them, which costs only what is new since the last spawn, so their
+    /// objects reach the workspace in the same `clonefile` as the rest.
+    /// The refs themselves are deleted from the workspace: they are the
+    /// template's, and whoever wants that history names it there. Fetched
+    /// into the workspace instead, t3code's exported history was 236,000
+    /// objects packed again for each spawn, 17s of a 21s spawn and 400 MB
+    /// of a workspace `.git` no clone shared.
     pub fn clone_via_template(
         &self,
         template: &Utf8Path,
@@ -218,6 +290,7 @@ impl GitSource {
         rev: &str,
         destination: &Utf8Path,
         sparse: &[String],
+        carry: &[String],
     ) -> Result<()> {
         if let (Some(from), Some(to)) = (template.parent(), destination.parent())
             && !same_device(from, to)?
@@ -237,7 +310,7 @@ impl GitSource {
         lock.lock()
             .map_err(|source| NewgitError::io(&lock_path, source))?;
 
-        if let Err(error) = self.prepare_template(template, rev, sparse) {
+        if let Err(error) = self.prepare_template(template, rev, sparse, carry) {
             let _ = std::fs::remove_dir_all(template);
             return Err(error);
         }
@@ -266,6 +339,23 @@ impl GitSource {
                     std::fs::remove_file(&path).map_err(|source| NewgitError::io(&path, source))?;
                 }
             }
+            // The carried refs: their objects stay, for the workspace's
+            // own fetch of them to find.
+            let carried = run_git(&[
+                "-C",
+                destination.as_str(),
+                "for-each-ref",
+                "--format=delete %(refname)",
+                TEMPLATE_CARRY_NAMESPACE,
+            ])?;
+            if !carried.trim().is_empty() {
+                let mut input = carried.trim().to_owned();
+                input.push('\n');
+                run_git_stdin(
+                    &["-C", destination.as_str(), "update-ref", "--stdin"],
+                    input.as_bytes(),
+                )?;
+            }
             let head = format!("refs/heads/{branch}");
             let message = format!("clone: from {}", self.root);
             git(&["update-ref", "-m", &message, &head, rev])?;
@@ -283,7 +373,13 @@ impl GitSource {
 
     /// Bring the template to `rev`, cloning it from the store first if it
     /// does not exist yet.
-    fn prepare_template(&self, template: &Utf8Path, rev: &str, sparse: &[String]) -> Result<()> {
+    fn prepare_template(
+        &self,
+        template: &Utf8Path,
+        rev: &str,
+        sparse: &[String],
+        carry: &[String],
+    ) -> Result<()> {
         let git = |args: &[&str]| {
             let mut full = vec!["-C", template.as_str()];
             full.extend_from_slice(args);
@@ -308,6 +404,22 @@ impl GitSource {
                 template.as_str(),
             ])?;
             set_sparse(template, sparse)?;
+        }
+        if !carry.is_empty() {
+            let mut args = vec![
+                "fetch".to_owned(),
+                "--quiet".to_owned(),
+                "--no-tags".to_owned(),
+                "--no-write-fetch-head".to_owned(),
+                "origin".to_owned(),
+            ];
+            args.extend(
+                carry
+                    .iter()
+                    .map(|name| format!("+{name}:{TEMPLATE_CARRY_NAMESPACE}/{name}")),
+            );
+            let args: Vec<&str> = args.iter().map(String::as_str).collect();
+            git(&args)?;
         }
         git(&["checkout", "--quiet", "--force", "--detach", rev])?;
         if fresh {
@@ -344,6 +456,23 @@ impl GitSource {
 
     /// Whether the store holds `commit` and everything it reaches, so a ref
     /// to it needs no fetch ([`crate::local_refs::holds_complete`]).
+    /// Whether every object `tip` reaches is in the store, checked object
+    /// by object past what refs other than `own` reach (those Git already
+    /// holds whole).
+    pub fn holds_whole(&self, tip: &str, own: &str) -> bool {
+        let exclude = format!("--exclude={own}");
+        self.git(&[
+            "rev-list",
+            "--objects",
+            "--missing=print",
+            tip,
+            "--not",
+            &exclude,
+            "--all",
+        ])
+        .is_ok_and(|listed| !listed.lines().any(|line| line.starts_with('?')))
+    }
+
     pub fn holds_complete(&self, commit: &str) -> bool {
         crate::local_refs::git_dir_of(&self.root)
             .is_some_and(|git_dir| crate::local_refs::holds_complete(&git_dir, &[commit]))
@@ -407,7 +536,7 @@ impl GitSource {
             ancestor,
             descendant,
         ];
-        let output = Command::new("git")
+        let output = crate::git::command()
             .args(args)
             .output()
             .map_err(|source| spawn_error(&args, &source))?;
@@ -424,7 +553,7 @@ impl GitSource {
             args.push("--push");
         }
         args.extend(["--", remote]);
-        let output = Command::new("git")
+        let output = crate::git::command()
             .args(&args)
             .output()
             .map_err(|source| spawn_error(&args, &source))?;
@@ -546,7 +675,7 @@ impl GitSource {
         args.extend(["--".to_owned(), url.to_owned()]);
         args.extend(refspecs);
 
-        let status = Command::new("git")
+        let status = crate::git::command()
             .args(&args)
             .envs(admitting.map(|dir| ("GIT_ALTERNATE_OBJECT_DIRECTORIES", dir.as_str())))
             .envs(auth_env(auth))
@@ -710,7 +839,7 @@ impl GitSource {
     /// file's trailing newline on every render.
     pub fn workspace_show_head(workspace: &Utf8Path, path: &Utf8Path) -> Result<Option<String>> {
         let args = ["-C", workspace.as_str(), "show", &format!("HEAD:{path}")];
-        let output = Command::new("git")
+        let output = crate::git::command()
             .args(args)
             .output()
             .map_err(|source| spawn_error(&args, &source))?;
@@ -1712,34 +1841,14 @@ impl GitSource {
         auth: Option<&str>,
         flags: &[&str],
     ) -> Result<()> {
-        let fetch = |extra: Option<&str>| {
+        let fetch = |extra: &[&str]| {
             let mut args: Vec<&str> = location.to_vec();
             args.extend(["fetch", "--quiet", "--no-write-fetch-head"]);
             args.extend(flags);
             args.extend(extra);
             args.extend(["--", url]);
             args.extend(refspecs.iter().map(String::as_str));
-            // Another newgit in the same store (two merges at once, from one
-            // project root) may be moving the same tracking ref: fetching is
-            // idempotent, so wait a moment and fetch again.
-            let mut attempt = 0;
-            loop {
-                match run_git_env(&args, &auth_env(auth)) {
-                    Err(NewgitError::SourceCommand { stderr, .. })
-                        if attempt < 10 && stderr.contains("cannot lock ref") =>
-                    {
-                        attempt += 1;
-                        let nanos = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .map(|elapsed| elapsed.subsec_nanos())
-                            .unwrap_or_default();
-                        std::thread::sleep(std::time::Duration::from_millis(
-                            20 + u64::from(nanos % 80),
-                        ));
-                    }
-                    other => return other.map(|_| ()),
-                }
-            }
+            run_fetch(&args, &auth_env(auth))
         };
         // Snapshots are shallow on purpose (`crate::snapshots`): deepening
         // them here is how a snapshot clone would end up fetching every
@@ -1754,7 +1863,7 @@ impl GitSource {
         // carries on deepening, even when this fetch went through whole.
         let mut tries = WHOLE_FETCH_BACKOFF.iter();
         let mut started = loop {
-            match fetch(None) {
+            match fetch(&[]) {
                 Ok(()) if !left_shallow(location)? => return Ok(()),
                 Ok(()) => break true,
                 Err(error) if dropped(&error) => match tries.next() {
@@ -1775,7 +1884,12 @@ impl GitSource {
         // One stepped fetch in a store at a time: two deepening at once fail
         // with `shallow file has changed since we read it`. Released when
         // dropped, or when the process dies. Whoever held it may have
-        // finished the job.
+        // finished the job. A whole fetch above needs no lock: Git reads and
+        // rewrites `shallow` only for a fetch that deepens.
+        //
+        // Each band skips Git's auto-maintenance: its repack rewrites
+        // `shallow` in the background, under the next band. The next
+        // ordinary fetch into the store runs it.
         let _lock = steps_lock(location)?;
         if started && !left_shallow(location)? {
             return Ok(());
@@ -1787,7 +1901,7 @@ impl GitSource {
             } else {
                 format!("--depth={depth}")
             };
-            match fetch(Some(&flag)) {
+            match fetch(&[&flag, "--no-auto-maintenance"]) {
                 Ok(()) => {
                     started = true;
                     if !left_shallow(location)? {
@@ -1859,7 +1973,7 @@ impl GitSource {
                 url,
             ]);
             args.extend(refspecs.iter().map(String::as_str));
-            run_git_env(&args, &auth_env(auth)).map(|_| ())
+            run_fetch(&args, &auth_env(auth))
         };
         if let [commit] = commits {
             let mut tries = WHOLE_FETCH_BACKOFF.iter();
@@ -1890,6 +2004,40 @@ impl GitSource {
     }
 }
 
+/// Who a commit newgit makes on nobody's behalf says made it: the merge of
+/// a pull with an export target, or an endpoint's `Merge main from github`.
+pub const NEWGIT_NAME: &str = "newgit";
+pub const NEWGIT_EMAIL: &str = "newgit@localhost";
+
+/// Environment setting Git `config` for one command, after whatever
+/// `GIT_CONFIG_COUNT` entries the caller's environment already sets, so
+/// those still apply.
+pub fn config_env(config: &[(&str, &str)]) -> Vec<(String, String)> {
+    config_env_after(std::env::var("GIT_CONFIG_COUNT").ok().as_deref(), config)
+}
+
+/// [`config_env`] after `count`, the caller's `GIT_CONFIG_COUNT`.
+fn config_env_after(count: Option<&str>, config: &[(&str, &str)]) -> Vec<(String, String)> {
+    let first: usize = count
+        .and_then(|count| count.trim().parse().ok())
+        .unwrap_or(0);
+    let mut env = vec![(
+        "GIT_CONFIG_COUNT".to_owned(),
+        (first + config.len()).to_string(),
+    )];
+    for (index, (key, value)) in config.iter().enumerate() {
+        env.push((
+            format!("GIT_CONFIG_KEY_{}", first + index),
+            (*key).to_owned(),
+        ));
+        env.push((
+            format!("GIT_CONFIG_VALUE_{}", first + index),
+            (*value).to_owned(),
+        ));
+    }
+    env
+}
+
 /// Git config for one command, carrying an `Authorization` header. Passed in
 /// the environment rather than as `-c` so the password never appears in the
 /// process list; the credential helper is cleared so nothing caches it.
@@ -1897,16 +2045,7 @@ pub fn auth_env(auth: Option<&str>) -> Vec<(String, String)> {
     let Some(header) = auth else {
         return Vec::new();
     };
-    vec![
-        ("GIT_CONFIG_COUNT".to_owned(), "2".to_owned()),
-        ("GIT_CONFIG_KEY_0".to_owned(), "http.extraHeader".to_owned()),
-        ("GIT_CONFIG_VALUE_0".to_owned(), header.to_owned()),
-        (
-            "GIT_CONFIG_KEY_1".to_owned(),
-            "credential.helper".to_owned(),
-        ),
-        ("GIT_CONFIG_VALUE_1".to_owned(), String::new()),
-    ]
+    config_env(&[("http.extraHeader", header), ("credential.helper", "")])
 }
 
 fn run_git(args: &[&str]) -> Result<String> {
@@ -1967,6 +2106,10 @@ const SNAPSHOT_BATCH: usize = 256;
 /// once the real push lands.
 const STAGING_REF: &str = "refs/heads/newgit-staging";
 
+/// Where a source template keeps the refs it carries for workspaces (see
+/// [`GitSource::clone_via_template`]), each under its store name.
+const TEMPLATE_CARRY_NAMESPACE: &str = "refs/newgit-template";
+
 /// How many times one commit the remote keeps dropping is pushed again, after
 /// its large files went ahead, before the push gives up.
 const DROPPED_RETRIES: usize = 3;
@@ -2000,6 +2143,53 @@ fn dropped(error: &NewgitError) -> bool {
     ]
     .iter()
     .any(|sign| stderr.contains(sign))
+}
+
+/// `git <args>`, a fetch, run again when it collided with another Git in
+/// the same repository, which is only ever a moment's work: fetching is
+/// idempotent.
+///
+/// - `cannot lock ref`: another newgit in the same store (two merges at
+///   once, from one project root) moving the same tracking ref.
+/// - `shallow file has changed since we read it`, or `shallow.lock` taken:
+///   another Git rewriting the store's `shallow` file while this fetch
+///   deepens it. Another stepped fetch waits on [`steps_lock`], but Git's
+///   own auto-maintenance does not: the `git repack` it detaches after
+///   every fetch rewrites `shallow` in a shallow repository. That can take a
+///   while in a large store, so these wait longer, up to about ten seconds.
+pub(crate) fn run_fetch(args: &[&str], env: &[(String, String)]) -> Result<()> {
+    let mut attempt: u32 = 0;
+    loop {
+        match run_git_env(args, env) {
+            Err(NewgitError::SourceCommand { ref stderr, .. })
+                if attempt < 10
+                    && (stderr.contains("cannot lock ref") || shallow_moved(stderr)) =>
+            {
+                let base = if shallow_moved(stderr) {
+                    50u64 << attempt.min(5)
+                } else {
+                    20
+                };
+                attempt += 1;
+                let nanos = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|elapsed| elapsed.subsec_nanos())
+                    .unwrap_or_default();
+                std::thread::sleep(std::time::Duration::from_millis(
+                    base + u64::from(nanos % 80),
+                ));
+            }
+            other => return other.map(|_| ()),
+        }
+    }
+}
+
+/// Whether Git failed because another Git was rewriting the repository's
+/// `shallow` file: in Git's words when it finds the file changed under it,
+/// or when it finds the file's lock taken.
+fn shallow_moved(stderr: &str) -> bool {
+    stderr.contains("shallow file has changed since we read it")
+        || stderr.contains("shallow.lock': File exists")
 }
 
 /// The lock on stepped fetches into the repository at `location`.
@@ -2089,7 +2279,7 @@ fn run_git_input(args: &[&str], input: &str) -> Result<String> {
 /// [`run_git_input`], with `env` set for it.
 fn run_git_input_env(args: &[&str], input: &str, env: &[(String, String)]) -> Result<String> {
     use std::io::Write as _;
-    let mut child = Command::new("git")
+    let mut child = crate::git::command()
         .args(args)
         .envs(env.iter().map(|(key, value)| (key, value)))
         .stdin(std::process::Stdio::piped())
@@ -2124,7 +2314,7 @@ pub fn merge_commits(
     message: &str,
     env: &[(String, String)],
 ) -> Result<std::result::Result<String, Vec<String>>> {
-    let output = Command::new("git")
+    let output = crate::git::command()
         .arg("-C")
         .arg(repo.as_str())
         .args([
@@ -2132,21 +2322,26 @@ pub fn merge_commits(
             "--write-tree",
             "--name-only",
             "--no-messages",
+            // NUL-separated, so a conflicted name comes back as it is called
+            // rather than as Git quotes it (`"r\303\251sum\303\251"`).
+            "-z",
             ours,
             theirs,
         ])
         .output()
         .map_err(|source| NewgitError::io(repo, source))?;
-    let text = String::from_utf8_lossy(&output.stdout).into_owned();
-    let mut lines = text.lines();
-    let tree = lines.next().unwrap_or_default().to_owned();
+    let mut fields = output
+        .stdout
+        .split(|&byte| byte == 0)
+        .filter(|field| !field.is_empty())
+        .map(|field| String::from_utf8_lossy(field).into_owned());
+    let tree = fields.next().unwrap_or_default();
     match output.status.code() {
         Some(0) => {}
         Some(1) => {
-            return Ok(Err(lines
-                .take_while(|line| !line.is_empty())
-                .map(ToOwned::to_owned)
-                .collect()));
+            let mut files: Vec<String> = fields.collect();
+            files.dedup();
+            return Ok(Err(files));
         }
         _ => {
             return Err(NewgitError::SourceCommand {
@@ -2174,7 +2369,7 @@ pub fn merge_commits(
 }
 
 pub fn run_git_env(args: &[&str], env: &[(String, String)]) -> Result<String> {
-    let output = Command::new("git")
+    let output = crate::git::command()
         .args(args)
         .envs(env.iter().map(|(key, value)| (key, value)))
         .output()
@@ -2193,7 +2388,7 @@ pub fn run_git_env(args: &[&str], env: &[(String, String)]) -> Result<String> {
 /// `git <args>` with `input` on its standard input; its output, trimmed.
 pub fn run_git_stdin(args: &[&str], input: &[u8]) -> Result<String> {
     use std::io::Write as _;
-    let mut child = Command::new("git")
+    let mut child = crate::git::command()
         .args(args)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
@@ -2286,6 +2481,37 @@ fn spawn_error(args: &[&str], source: &std::io::Error) -> NewgitError {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn config_env_extends_the_callers_git_config_count() {
+        let pairs = |env: Vec<(String, String)>| {
+            env.into_iter()
+                .map(|(key, value)| format!("{key}={value}"))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            pairs(super::config_env_after(
+                None,
+                &[("commit.gpgSign", "false")]
+            )),
+            [
+                "GIT_CONFIG_COUNT=1",
+                "GIT_CONFIG_KEY_0=commit.gpgSign",
+                "GIT_CONFIG_VALUE_0=false"
+            ]
+        );
+        assert_eq!(
+            pairs(super::config_env_after(
+                Some("2"),
+                &[("commit.gpgSign", "false")]
+            )),
+            [
+                "GIT_CONFIG_COUNT=3",
+                "GIT_CONFIG_KEY_2=commit.gpgSign",
+                "GIT_CONFIG_VALUE_2=false"
+            ]
+        );
+    }
+
     use super::RefUpdate;
 
     fn git_failed(stderr: &str) -> crate::NewgitError {

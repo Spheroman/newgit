@@ -22,6 +22,29 @@ inside a workspace):
   `autostart` action that died on its own); ports,
   workspace, trackers, and installs stay as they are. Both exit 0 with
   nothing to do and 1 if any resource failed
+- `newgit stop --evict [--discard-ignored]` — stop, checkpoint, and delete
+  the workspace, leaving its marker; `newgit start` brings it back from that
+  checkpoint into the same directory, with uncommitted and staged work,
+  other branches, the stash, notes, other remotes' refs, local Git config,
+  hooks, file modes, empty directories, tracker content, and rebuilt
+  installs. It refuses, deleting nothing, when something would not come
+  back: ignored files no tracker owns and nothing rebuilds (listed, a
+  directory with its file count; `--discard-ignored` lets them go, and
+  declaring disposable build output such as `target/` is not possible yet,
+  #447), a
+  merge or rebase in the middle, hand edits to a rendered file, an untracked
+  repository, an initialized submodule, a linked worktree, or a process
+  still in the directory (run it from outside the workspace). Not kept, and
+  said first: reflogs other than the stash's, intent-to-add entries,
+  hand-set assume-unchanged/skip-worktree flags, setuid/setgid/sticky bits,
+  and hand-set values on config keys newgit sets itself. Evicting does not
+  free an untracked file's blob, and evict checkpoints are not pruned yet
+  (#446). A restore that fails or is cut short moves what is at the path
+  aside, whole, to `.<name>.restore-failed` or `.<name>.interrupted-restore`
+  and keeps it; `start`, `status`, `stop --evict`, and `cleanup` name each
+  one until `newgit cleanup --discard-saved <path>` deletes it
+- `newgit remove <instance> [--force]` — on an evicted instance whose path
+  holds work written after a failed restore, refuses unless `--force`
 - `newgit checkpoint [instance] [-m <msg>] [--verify]` / `undo [instance]
   [--to <id>] [--only <resource>] [--force-recompute]` / `checkpoints
   [instance]` — `--verify` proves the restore works by running a real undo;
@@ -43,7 +66,11 @@ tracker, it takes a path, read from where it runs: `t3code/repos` at the top
 of the project, `repos` inside `apps/t3code`, `..` to go up:
 
 - `newgit tracker create <name> [--audience <a>] [--storage <s>]
-  [--merge-with-source]`
+  [--role <r>] [--merge-with-source]`
+- `newgit tracker create <name> --from <tracker> [--role <r>] [--audience
+  <a>]` — a fork of a tracker outside Git: its history starts at that
+  tracker's `main` (nothing is copied), it claims the same paths and fills the
+  same role, and its audience may be narrower than its upstream's, never wider
 - `newgit tracker create <name> --git --path <path>` — a tracker in Git,
   mounted at that path by one commit; history before it stays in whichever
   tracker held the files. Inside another tracker's mount it is that
@@ -105,12 +132,62 @@ Remote:
 - `newgit merge [instance] [--into <branch>]` — the merge commit is made in
   your view and committed at root's ref; `newgit merge main` merges the
   project root
-- `newgit pull <tracker> [instance]` — one commit moving a mounted tracker's
-  pin to its `follow` ref; spawn says when a tracker is behind
+- `newgit pull [<tracker>...] [--instance <name>]` — every tracker in Git
+  mounted here, at any depth, or only those named, in one commit on the
+  branch it runs on (`Update trackers: t3code (14 commits), ui-kit (2
+  commits)`; in the project root, its own instance branch, which `newgit
+  merge main` publishes); no commit when none is behind. A tracker exported
+  to a target rooted at it first takes what is new there, as `--remote`
+  would (one more fetch each), without moving its `main` until `newgit
+  merge`. A child moves by a commit in the tracker that mounts it, whose pin
+  then moves, up to root. A pin holding commits its ref lacks stays put: an
+  instance with commits of its own on a tracker is listed as diverged and
+  does not take its target either, until `newgit merge` lands that work. A
+  tracker you can't read on the remote, or whose export target can't be
+  reached, conflicts, or adds a file of a tracker outside Git, is skipped
+  and named while the rest move (it fails when none can be read); a child
+  of a tracker the instance doesn't bind stays, and is named when it was
+  asked for or is behind; trackers outside Git are left alone (`newgit
+  tracker pull`). A named tracker that stays exits non-zero. Every argument
+  is a tracker: `--instance` names another instance. Spawn says when a
+  tracker is behind. Two instances pulling the same two diverged tips make
+  the same merge commit (newgit's, dated from its parents), so merging both
+  lands one merge. It is unsigned, so a target that requires signed commits
+  rejects an export carrying it
+  ([#443](https://github.com/Spheroman/newgit/issues/443))
 - `newgit pull --remote <target>` — bring back what was merged on an export
-  target (a pull request on GitHub); `newgit merge main` publishes it
-- `newgit members add|remove <github-login>` / `members list [--json]`
-- `newgit spawn <name> --from-checkpoint <instance>/<checkpoint>`
+  target (a pull request on GitHub); `newgit merge main` publishes it. A
+  force-pushed target is merged with the line the tracker already has, as
+  `git pull` would: the commits the force-push removed stay in the
+  tracker's history, and the next export pushes them to the target again.
+  Reverting the change in an instance keeps it out of the tip only: the
+  next export still publishes those commits, so a secret the force-push
+  purged is published again. Nothing in newgit can purge it yet
+  ([#442](https://github.com/Spheroman/newgit/issues/442)); until then,
+  do not export that tracker
+- `newgit tracker allow-plaintext <path>...` — release workspace paths this
+  machine has held encrypted content at, so whatever tracker claims them now
+  (a `public` one, or one in Git) may capture, commit, and send them
+  unencrypted. Until then every such capture and send fails: definitions
+  arrive from elsewhere. A directory releases every held file under it, and
+  case does not matter. The guard knows paths, not content: the same
+  content copied or moved to another path is not held back. A
+  confirmation, not a boundary: anything that can run commands here can
+  run it
+- `newgit tracker pull <tracker> --keep-mine` — after a `tracker merge` was
+  refused because the remote's `main` moved: pull it and put this
+  instance's version back on top as a new capture (each file you have
+  replaces theirs, a file you deleted since the rev you started from is
+  deleted again, files only they added stay; with no shared rev, a file you
+  deleted comes back, and it says so), so merging again publishes it
+- `newgit members add|remove <github-login>` / `members list [--json]` — add
+  and remove re-encrypt each shared encrypted tracker's `main` for the new
+  members, list every recipient by key fingerprint (saying `CHANGED` when
+  the set is not the one this machine last used), and warn about a member
+  with no usable SSH key on GitHub; they fail, naming the trackers that were
+  not re-encrypted, when any was not. `members reencrypt` runs that again
+- `newgit spawn <name> --from-checkpoint <instance>/<checkpoint>` — one
+  taken on this machine is used as it is; any other comes from the remote
 
 Resource templates: `process`, `pnpm`, `install`, `command-snapshot`,
 `command-snapshot-migrations`, `supabase`, `external`. `newgit resource

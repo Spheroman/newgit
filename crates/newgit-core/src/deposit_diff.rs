@@ -156,7 +156,7 @@ struct NumstatEntry {
 }
 
 fn git_diff_command(args: &[&str], before: &Utf8Path, after: &Utf8Path) -> Command {
-    let mut command = Command::new("git");
+    let mut command = crate::git::command();
     command
         .args([
             "diff",

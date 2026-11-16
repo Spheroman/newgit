@@ -40,6 +40,7 @@ long_running = true
     )
     .expect("resource");
 
+    only_on_the_remote(&fixture, "feature-a");
     let output = fixture.newgit(
         &fixture.store,
         &[

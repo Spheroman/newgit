@@ -123,8 +123,8 @@ fn a_spawn_says_a_mounted_tracker_is_behind_and_the_pull_brings_it_in_as_a_merge
         "and writes nothing"
     );
 
-    let pulled = manager.pull(None, "lib").expect("pull");
-    assert_eq!(pulled.commits, 2);
+    let pulled = manager.pull(None, &["lib".to_owned()]).expect("pull");
+    assert_eq!(pulled.pulled[0].commits, 2);
     let view = pulled.view.expect("a view commit");
     assert_eq!(
         git(&repo, &["rev-parse", "HEAD"]),
@@ -133,7 +133,7 @@ fn a_spawn_says_a_mounted_tracker_is_behind_and_the_pull_brings_it_in_as_a_merge
     );
     assert_eq!(
         git(&repo, &["log", "-1", "--format=%s"]),
-        "Pull lib: 2 commits from main"
+        "Update trackers: lib (2 commits)"
     );
     assert_eq!(
         git(&repo, &["rev-parse", "HEAD^@"]),
@@ -149,7 +149,7 @@ fn a_spawn_says_a_mounted_tracker_is_behind_and_the_pull_brings_it_in_as_a_merge
             &repo,
             &["log", "--format=%s", "HEAD", "--", "libs/lib/b.js"]
         ),
-        "Pull lib: 2 commits from main",
+        "Update trackers: lib (2 commits)",
         "`git log` shows each pull as one commit"
     );
     // Root pins what it pulled, and a second pull has nothing to do.
@@ -163,7 +163,13 @@ fn a_spawn_says_a_mounted_tracker_is_behind_and_the_pull_brings_it_in_as_a_merge
         ],
     );
     assert_eq!(pinned, tip);
-    assert_eq!(manager.pull(None, "lib").expect("again").commits, 0);
+    assert!(
+        manager
+            .pull(None, &["lib".to_owned()])
+            .expect("again")
+            .pulled
+            .is_empty()
+    );
 
     // It merges into `main` like any commit.
     manager.merge("main", "main").expect("merge");
@@ -190,7 +196,9 @@ fn a_pull_inside_an_instance_fast_forwards_its_workspace() {
         .expect("spawn")
         .branch
         .workspace_path;
-    let pulled = manager.pull(Some("feature"), "lib").expect("pull");
+    let pulled = manager
+        .pull(Some("feature"), &["lib".to_owned()])
+        .expect("pull");
     assert_eq!(
         git(&workspace, &["rev-parse", "HEAD"]),
         pulled.view.expect("view")

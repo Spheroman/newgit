@@ -14,6 +14,7 @@ use newgit_core::manager::{
     ExportReason, InstanceReport, KeptBranch, MismatchCause, Readiness, RemoteExportOptions,
     RemoveOutcome, ResourceBindOutcome, SourceBranchOutcome, SourceBranchPolicy, StopStartOutcome,
     StopStartResource, StopStartStatus, TrackerBindOutcome, UndoOptions, VerifyResource,
+    WorkspaceChange,
 };
 use newgit_core::resource::{CheckpointMode, ResourceDefinition};
 use newgit_core::source::{RefUpdate, find_repo_root};
@@ -81,6 +82,11 @@ enum Command {
         /// branch; removal prints the tip to recover it from
         #[arg(long)]
         delete_branch: bool,
+        /// Remove an evicted instance even though its workspace path holds
+        /// more than its marker (work written there after a restore failed
+        /// or was cut short), deleting that work, which no checkpoint holds
+        #[arg(long)]
+        force: bool,
     },
     /// Manage tracker definitions and content
     Tracker {
@@ -128,12 +134,27 @@ enum Command {
     Stop {
         /// Instance (inferred when run inside a workspace)
         instance: Option<String>,
+        /// Also checkpoint the instance and delete its workspace, to free
+        /// its disk; `newgit start` brings it back from that checkpoint.
+        /// Refuses, deleting nothing, when the workspace holds what would
+        /// not come back: ignored files no tracker owns and no resource
+        /// rebuilds (such as `target/`, listed; declare build output as a
+        /// resource), a merge or rebase in the middle, hand edits to a
+        /// rendered file, an untracked repository, an initialized
+        /// submodule, a linked worktree, or a process still working in it
+        /// (the shell it was run from included: run it from outside)
+        #[arg(long)]
+        evict: bool,
+        /// With `--evict`: evict even though the ignored files it lists
+        /// will not come back, and list them
+        #[arg(long, requires = "evict")]
+        discard_ignored: bool,
         /// Print one JSON document: each resource stopped, and its status
         #[arg(long)]
         json: bool,
     },
     /// Start again what the last `newgit stop` stopped, and any `autostart`
-    /// action that died on its own
+    /// action that died on its own, bringing back an evicted workspace first
     ///
     /// A resource nobody had started stays stopped. Exits 0 when there is
     /// nothing to start, and 1 when anything failed to; a failed one is
@@ -203,6 +224,13 @@ enum Command {
         /// archived, releasing the snapshot revs they pin
         #[arg(long)]
         purge_archived: bool,
+        /// Delete only this saved copy, which a restore that was cut short
+        /// or failed kept of what was at a workspace path
+        /// (`.<name>.interrupted-restore`, `.<name>.restore-failed`), and
+        /// nothing else. No checkpoint holds it: look through it first.
+        /// newgit never deletes one otherwise
+        #[arg(long, value_name = "PATH", conflicts_with_all = ["dry_run", "purge_archived"])]
+        discard_saved: Option<Utf8PathBuf>,
     },
     /// Resolve every `[[render]]` and report the result
     Render {
@@ -277,28 +305,45 @@ enum Command {
         #[arg(long, default_value = "main")]
         into: String,
     },
-    /// Move a mounted tracker's pin to its `follow` ref, or bring back what was
-    /// merged on an export target (--remote)
+    /// Bring mounted trackers up to date: move each pin to its `follow` ref,
+    /// after taking what is new on its rooted export target; or bring back
+    /// what was merged on an export target (--remote)
     ///
-    /// `newgit pull <tracker>` moves the pin to its `follow` ref (default
-    /// `main`): one commit, `Pull <tracker>: N commits from <ref>`, holding its
-    /// files at the new pin; its history stays in its own repo. Nothing else
-    /// moves a pin on anyone's behalf.
+    /// `newgit pull` updates every tracker in Git mounted here, at any depth;
+    /// `newgit pull t3code ui-kit` only those. A tracker exported to a
+    /// target rooted at it (`export = "github.com/acme/t3code"`) first takes
+    /// the commits that are new there, as `--remote` would: one more fetch
+    /// per such tracker. Then each pin moves to that, or to its `follow` ref
+    /// (default `main`), in one commit: `Update trackers: t3code (14
+    /// commits), ui-kit (2 commits)`. A tracker mounted inside another is pinned in that tracker's
+    /// commits, so its pull is a commit there too, whose pin moves in turn,
+    /// up to root.
+    ///
+    /// It lands on this instance's branch (the project root's own instance
+    /// branch outside one); no tracker's `main` moves until `newgit merge`.
+    /// Each of these is skipped and named, and the rest still move: a pin
+    /// holding commits its ref does not, a tracker the remote won't let you
+    /// read (it fails when it can read none), an export target that can't
+    /// be reached or conflicts, and a tracker mounted in one this instance
+    /// doesn't bind. Naming a tracker that is skipped exits non-zero.
+    /// Trackers outside Git have no pins and are left alone (`newgit
+    /// tracker pull`)
     ///
     /// With --remote <target>, bring the commits on an export target's branch
     /// (a pull request merged there) back instead: into the tracker a rooted
-    /// target is rooted at, then its pin in the project root; otherwise into
-    /// the project root as work. `newgit merge main` publishes either
-    #[command(group(clap::ArgGroup::new("what").args(["tracker", "remote"]).required(true)))]
+    /// target is rooted at, and its `main`, then its pin in the project root;
+    /// otherwise into the project root as work. `newgit merge main` publishes
+    /// either
     Pull {
-        /// The mounted tracker in Git to bring up to date
-        tracker: Option<String>,
-        /// Instance (inferred when run inside a workspace; the project root
-        /// otherwise)
-        #[arg(conflicts_with = "remote")]
+        /// The mounted trackers in Git to bring up to date (every one when
+        /// left out)
+        trackers: Vec<String>,
+        /// The instance to pull in (default: the one whose workspace this
+        /// runs in; the project root otherwise)
+        #[arg(long, conflicts_with = "remote")]
         instance: Option<String>,
         /// The export target to pull from (declared by a tracker's `export`)
-        #[arg(long, value_name = "TARGET", conflicts_with = "tracker")]
+        #[arg(long, value_name = "TARGET", conflicts_with = "trackers")]
         remote: Option<String>,
     },
     /// Clone a project from a newgit remote: its default branch composed from
@@ -391,42 +436,53 @@ enum TrackerCommand {
         #[arg(long)]
         mount: Utf8PathBuf,
     },
-    /// Create a tracker: outside Git (captured, never committed) unless --git
+    /// Create a tracker: outside Git (captured, never committed) unless --git.
+    /// With --from <tracker>, a fork: its history starts at that tracker's `main`
     Create {
         /// Its name. A tracker in Git carved inside another one's mount is
         /// that tracker's child (`t3code/repos`), placed by --path
         name: String,
         /// Who may read this tracker's content: `public`, `project-devs`,
-        /// `user` (each user their own copy), or `user:<login>`
-        #[arg(long, default_value = "project-devs")]
-        audience: String,
+        /// `user` (each user their own copy), or `user:<login>`. Default
+        /// `project-devs`; for a fork, its upstream's, and never wider
+        #[arg(long)]
+        audience: Option<String>,
         /// Write `merge_with_source = true`. Nothing reads it yet: `newgit
         /// merge` merges every tracker the instance changed
         #[arg(long)]
         merge_with_source: bool,
         /// Where synced state lives: `local`, or `remote` (needs a `[remote]`
-        /// in .newgit/config.toml)
-        #[arg(long, default_value = "local")]
-        storage: String,
+        /// in .newgit/config.toml). Default `local`; for a fork, its
+        /// upstream's
+        #[arg(long)]
+        storage: Option<String>,
+        /// The role it fills: trackers sharing one are alternatives, and an
+        /// instance binds one of them. A fork fills its upstream's; name it
+        /// when the upstream has none yet, and both fill it
+        #[arg(long, conflicts_with = "git")]
+        role: Option<String>,
         /// A tracker in Git: committed content with its own history, carved out
         /// of whichever tracker owns its paths now (usually root), or with
         /// --from, brought in from another repository
-        #[arg(long, requires = "place")]
+        #[arg(long)]
         git: bool,
         /// With --git: the one directory to carve out and mount the new tracker
         /// at. Paths of a tracker outside Git are added with `tracker track`
         #[arg(long = "path", value_name = "PATH", group = "place")]
         path: Vec<Utf8PathBuf>,
-        /// Where an imported tracker is mounted (with --from): an empty
+        /// Where an imported tracker is mounted (with --git --from): an empty
         /// directory its files appear under
         #[arg(long, value_name = "DIR", requires = "from", group = "place")]
         mount: Option<Utf8PathBuf>,
-        /// Import another repository's history, unchanged, as this tracker's
-        /// `main`: a URL, or a path (relative to here)
-        #[arg(long, value_name = "REPOSITORY", requires = "git")]
+        /// What its history starts at. Without --git, another tracker outside
+        /// Git: a fork, claiming the same paths and filling the same role, so
+        /// the two can merge; nothing is copied. With --git, another
+        /// repository (a URL, or a path relative to here), imported unchanged
+        /// as this tracker's `main`
+        #[arg(long, value_name = "TRACKER|REPOSITORY")]
         from: Option<String>,
         /// The branch of --from to import (default: its HEAD)
-        #[arg(long, value_name = "BRANCH", requires = "from")]
+        #[arg(long, value_name = "BRANCH", requires = "from", requires = "git")]
         from_branch: Option<String>,
     },
     /// Add workspace paths to a tracker outside Git
@@ -476,6 +532,28 @@ enum TrackerCommand {
         tracker: String,
         /// Instance (inferred when run inside a workspace)
         instance: Option<String>,
+        /// Take mine, on top of theirs: capture this instance's files first,
+        /// pull `main`, then put your version back over it and capture that,
+        /// so `newgit tracker merge` publishes it. Every file this instance
+        /// has REPLACES `main`'s, and a file you deleted since the rev you
+        /// started from is deleted again; files only `main` added stay.
+        /// When your version and `main` share no rev, a file you deleted
+        /// comes back from `main` (the output says so). There is no content
+        /// merge
+        #[arg(long)]
+        keep_mine: bool,
+    },
+    /// Release workspace paths this machine has held encrypted content at,
+    /// so whatever tracker claims them now may store them unencrypted (a
+    /// `public` tracker, or a tracker in Git). Until then newgit refuses to
+    /// capture or send them unencrypted: definitions arrive from elsewhere
+    /// (`access`, `newgit merge main`, `pull`). A confirmation, not a
+    /// boundary: anything that can run commands here can run this
+    AllowPlaintext {
+        /// Workspace-relative paths, as the refusal names them. A directory
+        /// releases every held file under it; case does not matter
+        #[arg(required = true)]
+        paths: Vec<String>,
     },
     /// Bind a tracker in an instance again: its files come back (a tracker
     /// in Git's history never left), with any work a drop stashed
@@ -532,9 +610,11 @@ struct SpawnArgs {
     /// Base revision when creating a new source branch (defaults to HEAD)
     #[arg(long, conflicts_with = "from_checkpoint")]
     from: Option<String>,
-    /// Spawn a checkpoint from the project's remote, `<instance>/<checkpoint>`
-    /// (the id `newgit checkpoints` shows where it was made): source, trackers
-    /// you may read, and resource state, with your own per-user tracker content
+    /// Spawn a checkpoint, `<instance>/<checkpoint>` (the id `newgit
+    /// checkpoints` shows where it was made): source, trackers, and resource
+    /// state. One on this machine is used as it is; any other comes from the
+    /// project's remote, with the trackers you may read and your own per-user
+    /// tracker content
     #[arg(long, value_name = "INSTANCE/CHECKPOINT")]
     from_checkpoint: Option<String>,
     /// Bind this tracker (repeatable): over its role's default, or one that
@@ -663,6 +743,7 @@ fn main() -> Result<()> {
             purge,
             keep_branch,
             delete_branch,
+            force,
         } => {
             let source_branch = if keep_branch {
                 SourceBranchPolicy::Keep
@@ -671,7 +752,7 @@ fn main() -> Result<()> {
             } else {
                 SourceBranchPolicy::Auto
             };
-            remove(&name, purge, source_branch)
+            remove(&name, purge, source_branch, force)
         }
         Command::Tracker { command } => tracker(command),
         Command::Resource { command } => resource(command),
@@ -687,7 +768,20 @@ fn main() -> Result<()> {
             instance,
             dry_run: true,
         } => action_dry_run(&spec, instance),
-        Command::Stop { instance, json } => stop_start(instance, json, StopStart::Stop),
+        Command::Stop {
+            instance,
+            evict,
+            discard_ignored,
+            json,
+        } => stop_start(
+            instance,
+            json,
+            if evict {
+                StopStart::Evict { discard_ignored }
+            } else {
+                StopStart::Stop
+            },
+        ),
         Command::Start { instance, json } => stop_start(instance, json, StopStart::Start),
         Command::Checkpoint {
             instance,
@@ -721,8 +815,17 @@ fn main() -> Result<()> {
         Command::Checkpoints { instance } => checkpoints(instance),
         Command::Export(args) => export(args),
         Command::Cleanup {
+            discard_saved: Some(path),
+            ..
+        } => {
+            let deleted = manager_here()?.discard_saved_copy(&path)?;
+            println!("Deleted saved copy {deleted}");
+            Ok(())
+        }
+        Command::Cleanup {
             dry_run,
             purge_archived,
+            discard_saved: None,
         } => cleanup(dry_run, purge_archived),
         Command::Render { check } => render_command(check),
         Command::Ports { check } => ports_command(check),
@@ -756,8 +859,8 @@ fn main() -> Result<()> {
             ..
         } => pull_remote(&target),
         Command::Pull {
-            tracker, instance, ..
-        } => pull(instance, &tracker_id(&tracker.unwrap_or_default())?),
+            trackers, instance, ..
+        } => pull(instance, &trackers),
         Command::EndpointCompose => {
             let plan: newgit_core::endpoint::Plan = serde_json::from_reader(std::io::stdin())
                 .context("the plan on stdin is not JSON newgit can read")?;
@@ -1189,9 +1292,12 @@ fn spawn_from_checkpoint(
         format!("`{spec}` is not `<instance>/<checkpoint>`, e.g. `fix-login/ckpt_003`")
     })?;
     let outcome = manager.spawn_from_checkpoint(name, instance, checkpoint)?;
-    let by = match &outcome.agent {
-        Some(agent) => format!("{} (agent {agent})", outcome.author),
-        None => outcome.author.clone(),
+    // A checkpoint from the remote says who took it; one from this machine
+    // was taken here.
+    let by = match (&outcome.author, &outcome.agent) {
+        (Some(author), Some(agent)) => format!("taken by {author} (agent {agent})"),
+        (Some(author), None) => format!("taken by {author}"),
+        (None, _) => "taken on this machine".to_owned(),
     };
     if json {
         // Each resource the instance ended up with, as `spawn --json` reports
@@ -1261,13 +1367,10 @@ fn spawn_from_checkpoint(
     // alone reads as a clean spawn, and the lines below only say otherwise
     // if each carries its own verdict.
     if outcome.is_complete() {
-        println!(
-            "Spawned `{}` from {spec}, taken by {by}",
-            outcome.branch.name
-        );
+        println!("Spawned `{}` from {spec}, {by}", outcome.branch.name);
     } else {
         println!(
-            "Spawned `{}` from {spec}, taken by {by} — but {} did not come up (see below)",
+            "Spawned `{}` from {spec}, {by} — but {} did not come up (see below)",
             outcome.branch.name,
             not_ready
                 .iter()
@@ -1866,6 +1969,7 @@ fn action(spec: &str, instance: Option<String>) -> Result<()> {
 #[derive(Debug, Clone, Copy)]
 enum StopStart {
     Stop,
+    Evict { discard_ignored: bool },
     Start,
 }
 
@@ -1875,6 +1979,9 @@ fn stop_start(instance: Option<String>, json: bool, which: StopStart) -> Result<
     let (manager, instance) = manager_and_instance(instance)?;
     let outcome = match which {
         StopStart::Stop => manager.stop_instance(&instance)?,
+        StopStart::Evict { discard_ignored } => {
+            manager.evict_instance(&instance, discard_ignored)?
+        }
         StopStart::Start => manager.start_instance(&instance)?,
     };
     if json {
@@ -1889,10 +1996,44 @@ fn stop_start(instance: Option<String>, json: bool, which: StopStart) -> Result<
 }
 
 fn stop_start_json(outcome: &StopStartOutcome) -> serde_json::Value {
-    serde_json::json!({
+    let mut json = serde_json::json!({
         "instance": outcome.instance,
         "resources": stop_start_resources_json(&outcome.resources),
-    })
+    });
+    if !outcome.warnings.is_empty() {
+        json["warnings"] = serde_json::json!(outcome.warnings);
+    }
+    match &outcome.workspace {
+        Some(WorkspaceChange::Evicted {
+            checkpoint,
+            discarded,
+            not_kept,
+        }) => {
+            json["evicted"] = serde_json::json!({
+                "checkpoint": checkpoint,
+                "discarded": discarded
+                    .iter()
+                    .map(|discarded| serde_json::json!({
+                        "path": discarded.path,
+                        "directory": discarded.dir,
+                        "files": discarded.files,
+                    }))
+                    .collect::<Vec<_>>(),
+                "not_kept": not_kept,
+            });
+        }
+        Some(WorkspaceChange::AlreadyEvicted { checkpoint }) => {
+            json["evicted"] = serde_json::json!({
+                "checkpoint": checkpoint,
+                "already": true,
+            });
+        }
+        Some(WorkspaceChange::Restored { checkpoint }) => {
+            json["restored"] = serde_json::json!({ "checkpoint": checkpoint });
+        }
+        None => {}
+    }
+    json
 }
 
 /// `{"name", "action", "status", "error"}` per resource, as `stop`,
@@ -1982,9 +2123,49 @@ fn print_started(started: &[StopStartResource]) {
 
 fn print_stop_start(outcome: &StopStartOutcome, which: StopStart) {
     let instance = &outcome.instance;
+    for warning in &outcome.warnings {
+        eprintln!("[newgit] warning: {warning}");
+    }
+    if let Some(WorkspaceChange::Restored { checkpoint }) = &outcome.workspace {
+        println!("Restored the workspace for `{instance}` from {checkpoint}");
+    }
+    if let Some(WorkspaceChange::AlreadyEvicted { checkpoint }) = &outcome.workspace {
+        println!(
+            "`{instance}` is already evicted to {checkpoint}; `newgit start {instance}` brings it \
+             back"
+        );
+        return;
+    }
+    print_stopped_or_started(outcome, which);
+    if let Some(WorkspaceChange::Evicted {
+        checkpoint,
+        discarded,
+        not_kept,
+    }) = &outcome.workspace
+    {
+        for what in not_kept {
+            eprintln!("[newgit] not kept by the eviction: {what}");
+        }
+        println!(
+            "Evicted the workspace for `{instance}` to {checkpoint}; `newgit start {instance}` \
+             brings it back"
+        );
+        if !discarded.is_empty() {
+            println!("Discarded (ignored, and nothing rebuilds them):");
+            for path in discarded {
+                println!("  {path}");
+            }
+        }
+    }
+}
+
+fn print_stopped_or_started(outcome: &StopStartOutcome, which: StopStart) {
+    let instance = &outcome.instance;
     if outcome.resources.is_empty() {
         match which {
-            StopStart::Stop => println!("Nothing running for `{instance}`"),
+            StopStart::Stop | StopStart::Evict { .. } => {
+                println!("Nothing running for `{instance}`")
+            }
             StopStart::Start => println!(
                 "Nothing stopped by `newgit stop`, and no `autostart` action down, for \
                  `{instance}`"
@@ -1998,14 +2179,14 @@ fn print_stop_start(outcome: &StopStartOutcome, which: StopStart) {
             None => println!(
                 "{} `{spec}` for `{instance}`",
                 match which {
-                    StopStart::Stop => "Stopped",
+                    StopStart::Stop | StopStart::Evict { .. } => "Stopped",
                     StopStart::Start => "Started",
                 }
             ),
             Some(error) => eprintln!(
                 "[newgit] could not {} `{spec}` for `{instance}`: {error}",
                 match which {
-                    StopStart::Stop => "stop",
+                    StopStart::Stop | StopStart::Evict { .. } => "stop",
                     StopStart::Start => "start",
                 }
             ),
@@ -2117,9 +2298,19 @@ fn shell_quote(value: &str) -> String {
     }
 }
 
+/// Whether `--from` names a repository (a URL, `host:path`, or a directory
+/// here) rather than a tracker.
+fn looks_like_repository(from: &str) -> bool {
+    from.contains("://")
+        || from.ends_with(".git")
+        || from.starts_with("git@")
+        || std::path::Path::new(from).is_dir()
+}
+
 /// `given`, a tracker as typed here, as its id: a path from where this runs.
 fn tracker_id(given: &str) -> Result<String> {
-    let manager = BranchManager::open(context_here()?.store)?;
+    // Opened to repair: naming a tracker is how `tracker remove` starts.
+    let manager = BranchManager::open_to_repair(context_here()?.store)?;
     Ok(manager.resolve_tracker(&current_dir()?, given)?)
 }
 
@@ -2168,6 +2359,30 @@ fn tracker(mut command: TrackerCommand) -> Result<()> {
             from_branch,
             ..
         } => {
+            let manager = manager_here()?;
+            // Said first: a tracker named here is a fork, whatever else the
+            // command lacks for an import.
+            if !std::path::Path::new(&from).exists()
+                && let Ok(id) = manager.resolve_tracker(&current_dir()?, &from)
+                && let Some(named) = manager
+                    .tracker_definitions()
+                    .iter()
+                    .chain(manager.carved_trackers())
+                    .find(|d| d.name == id)
+            {
+                if named.git {
+                    bail!(
+                        "`{from}` is a tracker here, not a repository: --git --from imports \
+                         another repository. `{from}` is a tracker in Git, and only a tracker \
+                         outside Git can be forked yet"
+                    );
+                }
+                bail!(
+                    "`{from}` is a tracker here, not a repository: --git --from imports another \
+                     repository. To fork it, leave out --git: `newgit tracker create {name} \
+                     --from {from}`"
+                );
+            }
             let Some(mount) = mount.filter(|_| path.is_empty()) else {
                 bail!(
                     "an imported tracker is placed with --mount, not --path (its files keep their \
@@ -2180,7 +2395,7 @@ fn tracker(mut command: TrackerCommand) -> Result<()> {
                 Ok(local) => local.to_string_lossy().into_owned(),
                 Err(_) => from,
             };
-            let manager = manager_here()?;
+            let audience = audience.unwrap_or_else(|| "project-devs".to_owned());
             let outcome = manager.import_git_tracker(
                 &name,
                 &audience,
@@ -2219,7 +2434,17 @@ fn tracker(mut command: TrackerCommand) -> Result<()> {
             path,
             ..
         } => {
+            // Checked here rather than by the parser, so that `--git --from
+            // <tracker>` is told about the tracker first.
+            if path.is_empty() {
+                bail!(
+                    "a tracker in Git is carved out of a directory: `newgit tracker create {name} \
+                     --git --path <dir>`, or imported with `--git --mount <dir> --from \
+                     <repository>`"
+                );
+            }
             let manager = manager_here()?;
+            let audience = audience.unwrap_or_else(|| "project-devs".to_owned());
             let outcome = manager.create_git_tracker(&name, &audience, &path)?;
             let root = manager.store().paths().project_root.clone();
             println!(
@@ -2253,13 +2478,117 @@ fn tracker(mut command: TrackerCommand) -> Result<()> {
             audience,
             merge_with_source,
             storage,
+            role,
+            git: false,
+            path,
+            mount,
+            from: Some(from),
+            ..
+        } => {
+            if !path.is_empty() || mount.is_some() {
+                bail!(
+                    "a fork claims what its upstream claims, at its mount: leave out --path and \
+                     --mount (`newgit tracker create {name} --from {from}`)"
+                );
+            }
+            let manager = manager_here()?;
+            let defined = |id: &str| {
+                manager
+                    .tracker_definitions()
+                    .iter()
+                    .chain(manager.carved_trackers())
+                    .any(|d| d.name == id)
+            };
+            let upstream = match manager.resolve_tracker(&current_dir()?, &from) {
+                Ok(upstream) if defined(&upstream) || !looks_like_repository(&from) => upstream,
+                // A repository, not a tracker: that is an import.
+                Ok(_) | Err(_) if looks_like_repository(&from) => bail!(
+                    "`{from}` is a repository, not a tracker here: without --git, --from names a \
+                     tracker to fork. To import a repository, add --git and --mount <dir> \
+                     (`newgit tracker create {name} --git --mount <dir> --from {from}`)"
+                ),
+                Ok(upstream) => upstream,
+                Err(error) => return Err(error.into()),
+            };
+            let root = manager.store().paths().project_root.clone();
+            let storage = storage.as_deref().map(parse_storage).transpose()?;
+            let outcome = manager.fork_tracker(
+                &name,
+                &upstream,
+                audience.as_deref(),
+                storage,
+                role.as_deref(),
+                merge_with_source,
+            )?;
+            let upstream = tracker_path(&outcome.upstream);
+            println!(
+                "Forked `{upstream}` as `{name}`, a tracker outside Git, at {}",
+                display_path(&root, &outcome.path)
+            );
+            println!(
+                "  history:   starts at `{upstream}`'s `main`, {} ({}); nothing is copied",
+                short_rev(&outcome.main),
+                plural(outcome.commits, "commit")
+            );
+            println!(
+                "  claims:    {}, as `{upstream}` does",
+                outcome
+                    .paths
+                    .iter()
+                    .map(|path| path.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+            if outcome.upstream_role_added {
+                println!(
+                    "  role:      `{}`, which `{upstream}` now fills too, so an instance binds one of them",
+                    outcome.role
+                );
+            } else {
+                println!("  role:      `{}`, beside `{upstream}`", outcome.role);
+            }
+            println!(
+                "  audience:  {}, and never wider than `{upstream}`'s, even if `from` is later \
+                 dropped or changed: this client refuses it on every command and push, and \
+                 `newgit serve` holds the fork to `{upstream}`'s audience",
+                outcome.audience
+            );
+            println!(
+                "  binding:   priority {}, so new instances keep binding what they did; \
+                 bind it with `newgit tracker use {name}` or `spawn --use {name}`",
+                outcome.priority
+            );
+            if outcome.storage == Storage::Remote {
+                println!(
+                    "  remote:    `newgit serve` starts its repo at `{upstream}`'s on its first \
+                     sync; newgit.dev's Worker takes its history as uploaded, and only this \
+                     client checks its audience there"
+                );
+            }
+            println!("  commit the definition with Git; it is `access`'s, so an owner merges it");
+            warn_graph(&manager_here()?);
+            Ok(())
+        }
+        TrackerCommand::Create {
+            name,
+            audience,
+            merge_with_source,
+            storage,
+            role,
+            git: false,
             ..
         } => {
             let manager = manager_here()?;
             let root = manager.store().paths().project_root.clone();
-            let storage = parse_storage(&storage)?;
-            let outcome = match manager.create_tracker(&name, &audience, storage, merge_with_source)
-            {
+            let storage = parse_storage(storage.as_deref().unwrap_or("local"))?;
+            let audience = audience.unwrap_or_else(|| "project-devs".to_owned());
+            let outcome = match manager.create_tracker_in_role(
+                &name,
+                &audience,
+                storage,
+                merge_with_source,
+                role.as_deref(),
+            ) {
                 Ok(outcome) => outcome,
                 Err(newgit_core::NewgitError::AlreadyExists(path)) => {
                     bail!(
@@ -2273,6 +2602,13 @@ fn tracker(mut command: TrackerCommand) -> Result<()> {
                 "Created tracker `{name}` at {}",
                 display_path(&root, &outcome.path)
             );
+            if storage == Storage::Remote && audience != "public" {
+                println!(
+                    "  encrypted: its content is encrypted to its audience's SSH keys on GitHub \
+                     before it leaves this machine, so the remote stores ciphertext (file names, \
+                     sizes and commit metadata stay readable)"
+                );
+            }
             println!("  add paths with: newgit tracker track {name} <path>...");
             println!("  {REFERENCE_POINTER}");
             warn_graph(&manager_here()?);
@@ -2313,7 +2649,8 @@ fn tracker(mut command: TrackerCommand) -> Result<()> {
             Ok(())
         }
         TrackerCommand::Remove { name } => {
-            let manager = manager_here()?;
+            // Removing a fork is one way to fix one that needs it.
+            let manager = BranchManager::open_to_repair(context_here()?.store)?;
             let outcome = manager.remove_tracker(&name)?;
             println!(
                 "Removed tracker `{name}`: {} deleted",
@@ -2348,7 +2685,8 @@ fn tracker(mut command: TrackerCommand) -> Result<()> {
         TrackerCommand::List { json } => {
             let context = context_here()?;
             let current = context.current_branch.clone();
-            let manager = BranchManager::open(context.store)?;
+            // Opened to repair: what needs fixing is listed, not refused.
+            let manager = BranchManager::open_to_repair(context.store)?;
             if !json {
                 warn_gitignore(&manager);
                 warn_graph(&manager);
@@ -2387,8 +2725,10 @@ fn tracker(mut command: TrackerCommand) -> Result<()> {
                             "parent": definition.parent.as_deref().map(path),
                             "paths": definition.paths,
                             "git": definition.git,
+                            "encrypted": definition.encrypted_to_audience(),
                             "role": definition.role,
                             "priority": definition.priority,
+                            "from": definition.from.as_deref().map(path),
                             "requires": definition
                                 .requires
                                 .iter()
@@ -2407,6 +2747,14 @@ fn tracker(mut command: TrackerCommand) -> Result<()> {
                     serde_json::to_string_pretty(&serde_json::json!({
                         "instance": current,
                         "trackers": trackers,
+                        "problems": manager
+                            .fork_problems()
+                            .iter()
+                            .map(|(name, why)| serde_json::json!({
+                                "tracker": newgit_core::tracker::tracker_path(name),
+                                "problem": why,
+                            }))
+                            .collect::<Vec<_>>(),
                     }))?
                 );
                 return Ok(());
@@ -2493,6 +2841,12 @@ fn tracker(mut command: TrackerCommand) -> Result<()> {
                     *depth -= top;
                 }
             }
+            // Whom each claim of a tracker in Git inside a deeper mount
+            // loses to: it owns nothing there, and the list says so.
+            let every: Vec<TrackerDefinition> = definitions
+                .iter()
+                .map(|definition| (*definition).clone())
+                .collect();
             let rows: Vec<_> = ordered
                 .iter()
                 .map(|(depth, definition)| {
@@ -2508,24 +2862,44 @@ fn tracker(mut command: TrackerCommand) -> Result<()> {
                     if definition.priority != 0 {
                         role.push_str(&format!(" ({})", definition.priority));
                     }
-                    let audience = match &definition.maintainers {
+                    let mut audience = match &definition.maintainers {
                         Some(maintainers) if maintainers != &definition.audience => {
                             format!("{} (maintained by {maintainers})", definition.audience)
                         }
                         _ => definition.audience.clone(),
                     };
-                    let paths = if definition.owns_everything() {
+                    // Said for every tracker whose content is encrypted
+                    // before it leaves this machine (#338).
+                    if definition.encrypted_to_audience() {
+                        audience.push_str(", encrypted");
+                    }
+                    let mut paths = if definition.owns_everything() {
                         "(everything no other tracker claims)".to_owned()
                     } else if definition.paths.is_empty() {
                         pathless_summary(&manager, definition)
                     } else {
+                        let unreached = newgit_core::tracker::unreached_claims(&every, definition);
                         definition
                             .paths
                             .iter()
-                            .map(|path| path.as_str())
+                            .map(
+                                |path| match unreached.iter().find(|(claim, _)| *claim == path) {
+                                    Some((_, mount)) => format!(
+                                        "{path} (inside `{}`'s mount: not this tracker's)",
+                                        newgit_core::tracker::tracker_path(&mount.name)
+                                    ),
+                                    None => path.to_string(),
+                                },
+                            )
                             .collect::<Vec<_>>()
                             .join(", ")
                     };
+                    if let Some(from) = &definition.from {
+                        paths.push_str(&format!(
+                            " (a fork of `{}`)",
+                            newgit_core::tracker::tracker_path(from)
+                        ));
+                    }
                     (
                         name,
                         in_git.to_owned(),
@@ -2553,6 +2927,13 @@ fn tracker(mut command: TrackerCommand) -> Result<()> {
             if let Some(current) = &current {
                 println!(
                     "\n* = bound in `{current}`, - = dropped (`newgit tracker use|drop <tracker>`)"
+                );
+            }
+            // What stops every other command until it is fixed.
+            for (name, why) in manager.fork_problems() {
+                eprintln!(
+                    "\nnewgit: `{}` needs fixing: {why}",
+                    newgit_core::tracker::tracker_path(name)
                 );
             }
             Ok(())
@@ -2714,14 +3095,90 @@ fn tracker(mut command: TrackerCommand) -> Result<()> {
             print_stale_render(&change.stale);
             Ok(())
         }
-        TrackerCommand::Pull { tracker, instance } => {
+        TrackerCommand::Pull {
+            tracker,
+            instance,
+            keep_mine,
+        } => {
             let (manager, instance) = manager_and_instance(instance)?;
+            if keep_mine {
+                let kept = manager.pull_tracker_keep_mine(&instance, &tracker)?;
+                match &kept.main {
+                    Some(main) => println!("Pulled `{tracker}`'s `main` ({main}) for `{instance}`"),
+                    None => println!("`{tracker}` has no `main` yet, so there was nothing to pull"),
+                }
+                if kept.rev == kept.main.clone().unwrap_or_default() {
+                    println!(
+                        "  your files ({}) were already what `main` has; nothing to put back",
+                        kept.mine
+                    );
+                } else {
+                    println!(
+                        "  put your version ({}) back on top as {}: {} REPLACED `main`'s, and \
+                         files only `main` added stay",
+                        kept.mine,
+                        kept.rev,
+                        plural(kept.files, "file")
+                    );
+                    for path in &kept.deleted {
+                        println!(
+                            "  deleted `{path}` again: you deleted it since {}",
+                            kept.mine
+                        );
+                    }
+                    if kept.base.is_none() && kept.main.is_some() {
+                        println!(
+                            "  your version and `main` share no rev, so newgit cannot tell a \
+                             file you deleted from one `main` added: any file you deleted is \
+                             BACK from `main`. Delete it again and capture before merging"
+                        );
+                    }
+                    println!("  `newgit tracker merge {tracker}` publishes it");
+                }
+                return Ok(());
+            }
             let outcome = manager.pull_tracker(&instance, &tracker)?;
             let deposit_only = tracker_is_deposit_only(&manager, &outcome.name);
             println!(
                 "Pulled {} for `{instance}`",
                 bind_line(&outcome, deposit_only)
             );
+            Ok(())
+        }
+        TrackerCommand::AllowPlaintext { paths } => {
+            let manager = manager_here()?;
+            let released = manager.allow_plaintext(&paths)?;
+            for path in &released {
+                println!("Released `{path}` on this machine");
+            }
+            for path in &paths {
+                let folded = newgit_core::tracker_repo::fold_path(
+                    path.trim_start_matches("./").trim_end_matches('/'),
+                );
+                let matched = released.iter().any(|held| {
+                    let held = newgit_core::tracker_repo::fold_path(held);
+                    folded.is_empty()
+                        || folded == "."
+                        || held == folded
+                        || held
+                            .strip_prefix(folded.as_str())
+                            .is_some_and(|rest| rest.starts_with('/'))
+                });
+                if !matched {
+                    println!(
+                        "`{path}` was not held back on this machine, nor any file under it (it \
+                         never held encrypted content here, or was released already)"
+                    );
+                }
+            }
+            if !released.is_empty() {
+                println!(
+                    "  Whatever tracker claims it now may capture, commit, and send it \
+                     unencrypted. What was encrypted before stays encrypted on the remote; what \
+                     goes there from now on, anyone who can read where it goes reads, and so does \
+                     whoever runs the remote. Capturing it encrypted again holds it back again"
+                );
+            }
             Ok(())
         }
     }
@@ -2733,8 +3190,31 @@ fn status(name: Option<&str>, path_only: bool) -> Result<()> {
         return workspace_path(context, name);
     }
     let manager = BranchManager::open(context.store)?;
-    warn_gitignore(&manager);
-    warn_graph(&manager);
+    let current_branch = context.current_branch.as_deref();
+    // The remote is asked first and answered last: its round trip runs
+    // alongside the local work instead of after it.
+    std::thread::scope(|scope| {
+        let asked = scope.spawn(|| ask_remote_state(&manager));
+        let shown = status_table(&manager, name, current_branch)?;
+        let asked = asked
+            .join()
+            .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+        if shown {
+            remote_state_notes(asked);
+        }
+        Ok(())
+    })
+}
+
+/// `status`'s table and what follows it. Whether it showed any instance:
+/// with none, nothing more is said.
+fn status_table(
+    manager: &BranchManager,
+    name: Option<&str>,
+    current_branch: Option<&str>,
+) -> Result<bool> {
+    warn_gitignore(manager);
+    warn_graph(manager);
     let mut reports = manager.statuses()?;
 
     if let Some(name) = name {
@@ -2746,7 +3226,7 @@ fn status(name: Option<&str>, path_only: bool) -> Result<()> {
 
     if reports.is_empty() {
         println!("No branch instances yet. Create one with `newgit spawn <name>`.");
-        return Ok(());
+        return Ok(false);
     }
 
     let name_width = column_width(reports.iter().map(|r| r.branch.name.len() + 2), "NAME");
@@ -2765,7 +3245,7 @@ fn status(name: Option<&str>, path_only: bool) -> Result<()> {
     );
     let (mut any_never_pulled, mut any_diverged, mut any_base_drift) = (false, false, false);
     for (report, workspace_status) in reports.iter().zip(&statuses_col) {
-        let marker = if context.current_branch.as_deref() == Some(report.branch.name.as_str()) {
+        let marker = if current_branch == Some(report.branch.name.as_str()) {
             "* "
         } else {
             "  "
@@ -2790,6 +3270,18 @@ fn status(name: Option<&str>, path_only: bool) -> Result<()> {
         println!("\n`{}` is not ready:", report.branch.name);
         for problem in &report.readiness.problems {
             println!("  - {problem}");
+        }
+    }
+    for report in &reports {
+        let notices = manager.saved_copy_notices(&report.branch);
+        if !notices.is_empty() {
+            println!(
+                "\n`{}` has work kept aside, in no checkpoint:",
+                report.branch.name
+            );
+            for notice in notices {
+                println!("  - {notice}");
+            }
         }
     }
     for report in reports
@@ -2819,26 +3311,38 @@ fn status(name: Option<&str>, path_only: bool) -> Result<()> {
             manager.store().paths().project_root
         );
     }
-    remote_state_notes(&manager);
-    Ok(())
+    Ok(true)
+}
+
+/// Which project was asked, and what it answered.
+type AskedState = Option<(
+    String,
+    newgit_core::Result<newgit_core::remote::RemoteState>,
+)>;
+
+/// What the project's remote has not written down yet, as `status` asks it:
+/// within seconds, and `None` with no remote to ask.
+fn ask_remote_state(manager: &BranchManager) -> AskedState {
+    let link = manager.remote_link()?;
+    let asked = link
+        .connect(newgit_core::remote::Acting::Login)
+        .and_then(|client| client.state(&link.project, true));
+    Some((link.project.clone(), asked))
 }
 
 /// What the project's remote has not written down yet, and webhook pulls
 /// waiting, failing, or refused: said only when there is something, so
 /// "not written yet" never reads as "out of date" (docs/design/anchoring.md).
-/// Asked within seconds; not logged in, it says nothing.
-fn remote_state_notes(manager: &BranchManager) {
-    let Some(link) = manager.remote_link() else {
+/// Not logged in, it says nothing.
+fn remote_state_notes(asked: AskedState) {
+    let Some((project, asked)) = asked else {
         return;
     };
-    let asked = link
-        .connect(newgit_core::remote::Acting::Login)
-        .and_then(|client| client.state(&link.project, true));
     match asked {
         Ok(state) => {
             let notes = state.notes();
             if !notes.is_empty() {
-                println!("\nOn {}:", link.project);
+                println!("\nOn {project}:");
                 for note in notes {
                     println!("  {note}");
                 }
@@ -2846,13 +3350,15 @@ fn remote_state_notes(manager: &BranchManager) {
         }
         Err(newgit_core::NewgitError::NotLoggedIn(_)) => {}
         Err(error) => println!(
-            "\nOn {}: the remote did not say what it has not written down yet ({error})",
-            link.project
+            "\nOn {project}: the remote did not say what it has not written down yet ({error})"
         ),
     }
 }
 
 fn status_column(report: &InstanceReport) -> String {
+    if report.branch.evicted.is_some() {
+        return "evicted".to_owned();
+    }
     if !report.workspace_exists {
         return "ws-missing".to_owned();
     }
@@ -2968,10 +3474,23 @@ fn checkpoint(instance: Option<String>, message: Option<&str>) -> Result<()> {
                     .collect::<Vec<_>>()
                     .join(", ")
             ),
+            Some(_) if outcome.sync_refused => {
+                println!("  remote:   not synced: refused (the warning above says why)")
+            }
             Some(_) => println!("  remote:   not synced (the warning above says why)"),
         }
     }
     println!("  undo with: newgit undo {instance}");
+    // Saved here, and kept; but what was asked (a checkpoint the remote
+    // has) was refused for a reason only the developer can settle, and an
+    // agent reads the exit code, not the warning.
+    if outcome.sync_refused {
+        bail!(
+            "checkpoint {} is saved on this machine, but newgit refused to send it to the \
+             remote (the warning above says why)",
+            record.id
+        );
+    }
     Ok(())
 }
 
@@ -2986,6 +3505,10 @@ fn push_receive_pack(store: &Utf8Path, instance: &str, repository: &Utf8Path) ->
         bail!("asked to receive into {repository}, but this workspace's outbox is {outbox}");
     }
     let hooks = outbox.join("hooks");
+    // git-locale: the pusher reads this Git's messages, so it keeps the
+    // pusher's locale: a developer's `git push` gets their language, and a
+    // push newgit makes already carries `LC_ALL=C` from `git::command()`.
+    // newgit reads nothing of it here (it replaces this process).
     let error = std::process::Command::new("git")
         .args(["-c", &format!("core.hooksPath={hooks}"), "receive-pack"])
         .arg(outbox.as_str())
@@ -3459,6 +3982,7 @@ fn checkpoints(instance: Option<String>) -> Result<()> {
             (CheckpointReason::BeforeUndo, Some(false)) => "failed-undo",
             (CheckpointReason::BeforeUndo, _) => "before-undo",
             (CheckpointReason::Push, _) => "push",
+            (CheckpointReason::Evict, _) => "evict",
         };
         let source = format!(
             "{}{}",
@@ -4052,20 +4576,28 @@ fn print_warnings(warnings: &[String]) {
     }
 }
 
-fn remove(name: &str, purge: bool, source_branch: SourceBranchPolicy) -> Result<()> {
+fn remove(name: &str, purge: bool, source_branch: SourceBranchPolicy, force: bool) -> Result<()> {
     let manager = manager_here()?;
     let checkpoints = if purge {
         ArchivedCheckpoints::Purge
     } else {
         ArchivedCheckpoints::Keep
     };
-    let outcome = manager.remove(name, &current_dir()?, checkpoints, source_branch)?;
+    let outcome =
+        manager.remove_forced(name, &current_dir()?, checkpoints, source_branch, force)?;
 
     println!("Removed branch instance `{}`", outcome.branch.name);
     for hook in &outcome.hooks {
         print_hook(hook);
     }
     println!("  workspace: {} (deleted)", outcome.branch.workspace_path);
+    for copy in &outcome.saved_copies {
+        println!(
+            "  kept:      {copy}, what was at the workspace path when a restore failed or was \
+             cut short; no checkpoint holds it. `newgit cleanup --discard-saved {copy}` deletes \
+             it once you have looked"
+        );
+    }
     if let Some(head) = &outcome.unsaved_workspace_head {
         // Whatever the branch line says next is about the store's branch;
         // this is the work that never reached it.
@@ -4502,15 +5034,21 @@ fn merge(instance: Option<String>, into: &str) -> Result<()> {
         "Merged `{}` into `{into}`{place}{checkpoint}",
         outcome.instance
     );
+    if outcome.server_merged {
+        println!(
+            "  `{into}` had moved since this work began: the remote merged it onto what `{into}` is now"
+        );
+    }
     for merge in &outcome.trackers {
         let what = match merge.action {
             TrackerMergeAction::Unchanged => "unchanged",
             TrackerMergeAction::FastForward => "fast-forward",
+            TrackerMergeAction::Merged if outcome.server_merged => "merged by the remote",
             TrackerMergeAction::Merged => "merged",
             TrackerMergeAction::New => "new",
         };
         println!(
-            "  {:<12} {what:<12} {}",
+            "  {:<12} {what:<20} {}",
             tracker_path(&merge.tracker),
             &merge.commit[..merge.commit.len().min(12)]
         );
@@ -4532,6 +5070,8 @@ fn tracker_log(tracker: &str, instance: Option<String>, git_args: &[String]) -> 
     let instance = instance.or_else(|| context.current_branch.clone());
     let manager = BranchManager::open(context.store)?;
     let (store, reference) = manager.tracker_log_target(tracker, instance.as_deref())?;
+    // git-locale: `newgit log` is Git's log for the developer to read, in
+    // their language; newgit reads nothing of it.
     let status = std::process::Command::new("git")
         .arg(format!("--git-dir={store}"))
         .args(["log", &reference])
@@ -4544,24 +5084,170 @@ fn tracker_log(tracker: &str, instance: Option<String>, git_args: &[String]) -> 
     Ok(())
 }
 
-fn pull(instance: Option<String>, tracker: &str) -> Result<()> {
+/// `newgit pull [<tracker>...]` (#345, #426): mounted trackers' pins to
+/// their `follow` refs, after their rooted export targets, in one commit on
+/// the branch this runs on.
+fn pull(instance: Option<String>, named: &[String]) -> Result<()> {
     let context = context_here()?;
     let instance = instance.or_else(|| context.current_branch.clone());
     let manager = BranchManager::open(context.store)?;
-    let outcome = manager.pull(instance.as_deref(), tracker)?;
+    // An instance named where a tracker goes passes through as it is, for
+    // the pull to say it is one and give the `--instance` form.
+    let trackers = named
+        .iter()
+        .map(|tracker| {
+            tracker_id(tracker).or_else(|error| {
+                if manager.store().find_branch(tracker).is_ok() {
+                    Ok(tracker.clone())
+                } else {
+                    Err(error)
+                }
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let outcome = manager.pull(instance.as_deref(), &trackers)?;
+    let place = match instance.as_deref() {
+        Some(instance) => format!("`{instance}`"),
+        None => "the project root".to_owned(),
+    };
     match &outcome.view {
+        None if outcome.unreadable.is_empty() && trackers.is_empty() => {
+            println!("Nothing to pull: no mounted tracker is behind its `follow` ref in {place}")
+        }
+        None if outcome.unreadable.is_empty() => {
+            if !outcome.up_to_date.is_empty() {
+                let names: Vec<String> = outcome
+                    .up_to_date
+                    .iter()
+                    .map(|tracker| format!("`{}`", tracker_path(tracker)))
+                    .collect();
+                println!(
+                    "Nothing to pull in {place}: {} up to date",
+                    names.join(", ")
+                );
+            }
+        }
         None => println!(
-            "`{}` is up to date with its `{}`",
-            outcome.tracker, outcome.follow
+            "The trackers you can read are up to date in {place}; {} could not be read on the \
+             remote:",
+            plural(outcome.unreadable.len(), "tracker")
         ),
-        Some(view) => println!(
-            "Pulled `{}`: {} commit{} from {} ({})",
-            outcome.tracker,
-            outcome.commits,
-            if outcome.commits == 1 { "" } else { "s" },
-            outcome.follow,
-            &view[..view.len().min(12)]
-        ),
+        Some(view) => {
+            println!(
+                "Updated {} in {place}, one commit ({}):",
+                plural(outcome.pulled.len(), "tracker"),
+                short_rev(view)
+            );
+            for pulled in &outcome.pulled {
+                println!(
+                    "  {:<12} {} from {}",
+                    tracker_path(&pulled.tracker),
+                    plural(pulled.commits, "commit"),
+                    pulled.from
+                );
+            }
+            for (tracker, commit) in &outcome.mounting {
+                println!(
+                    "  `{}` mounts {}: its pins moved in commit {} of its own",
+                    tracker_path(tracker),
+                    if outcome
+                        .pulled
+                        .iter()
+                        .filter(|pulled| pulled.tracker.starts_with(&format!("{tracker}__")))
+                        .count()
+                        == 1
+                    {
+                        "one of them"
+                    } else {
+                        "some of them"
+                    },
+                    short_rev(commit)
+                );
+            }
+        }
+    }
+    let mut skipped: Vec<String> = Vec::new();
+    let mut skip = |tracker: &str, line: String| {
+        println!("{line}");
+        if trackers.iter().any(|named| named == tracker) {
+            skipped.push(format!("`{}`", tracker_path(tracker)));
+        }
+    };
+    for (tracker, follow) in &outcome.diverged {
+        skip(
+            tracker,
+            format!(
+                "  `{}` stays: its pin has commits its `{follow}` does not (`newgit merge` them \
+                 first)",
+                tracker_path(tracker)
+            ),
+        );
+    }
+    for (tracker, follow) in &outcome.no_follow {
+        skip(
+            tracker,
+            format!(
+                "  `{}` stays: it has no `{follow}` to pull here",
+                tracker_path(tracker)
+            ),
+        );
+    }
+    for (tracker, reason) in &outcome.unreadable {
+        skip(
+            tracker,
+            format!(
+                "  `{}` skipped: you can't read it on the remote ({reason})",
+                tracker_path(tracker)
+            ),
+        );
+    }
+    for (tracker, target, reason) in &outcome.target_failed {
+        skip(
+            tracker,
+            format!(
+                "  `{}` skipped: its export target `{target}` could not be pulled from, so its \
+                 pin stays ({reason})",
+                tracker_path(tracker)
+            ),
+        );
+    }
+    for (tracker, parent) in &outcome.with_parent {
+        skip(
+            tracker,
+            format!(
+                "  `{}` skipped: `{}`, which mounts it, was skipped, and its export target \
+                 ships it too, so it stays with it",
+                tracker_path(tracker),
+                tracker_path(parent)
+            ),
+        );
+    }
+    for (tracker, parent) in &outcome.unbound {
+        skip(
+            tracker,
+            format!(
+                "  `{}` stays: `{}`, which mounts it, is not bound in {place} (`newgit tracker \
+                 use {}` binds it)",
+                tracker_path(tracker),
+                tracker_path(parent),
+                tracker_path(parent)
+            ),
+        );
+    }
+    if !outcome.outside_git.is_empty() {
+        let names: Vec<String> = outcome
+            .outside_git
+            .iter()
+            .map(|tracker| format!("`{}`", tracker_path(tracker)))
+            .collect();
+        println!(
+            "  trackers outside Git have no pins and were left alone ({}): `newgit tracker pull \
+             <tracker>` updates one",
+            names.join(", ")
+        );
+    }
+    if !skipped.is_empty() {
+        bail!("not pulled: {}", skipped.join(", "));
     }
     Ok(())
 }
@@ -4760,10 +5446,18 @@ struct ServeArgs {
     /// How many Git processes may run at once
     #[arg(long, default_value_t = 16)]
     git_slots: usize,
+    /// Give up a stuck landing (one written down that could not be put in
+    /// place, which its projects' 503s and the server's log name), and every
+    /// landing stuck after it in its projects, then exit. Stop the server
+    /// first. Restarting the server tries every stuck landing again; this is
+    /// for one whose cause cannot be fixed. Appends a compensating landing;
+    /// the log is never edited
+    #[arg(long, value_name = "STAMP")]
+    void_landing: Option<u64>,
 }
 
 fn serve(args: ServeArgs) -> Result<()> {
-    newgit_serve::serve(newgit_serve::Config {
+    let config = newgit_serve::Config {
         data: args.data,
         listen: args.listen,
         url: args.url,
@@ -4774,5 +5468,10 @@ fn serve(args: ServeArgs) -> Result<()> {
         github_client_id: args.github_client_id,
         dev_login_secret: args.dev_login_secret,
         git_slots: args.git_slots,
-    })
+    };
+    if let Some(stamp) = args.void_landing {
+        println!("{}", newgit_serve::void_landing(config, stamp)?);
+        return Ok(());
+    }
+    newgit_serve::serve(config)
 }

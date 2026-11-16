@@ -172,7 +172,7 @@ fn hooks_present(file: &Utf8Path) -> bool {
 /// through its `info/exclude` rather than a `.gitignore` someone would have
 /// to commit. Nothing to do when something already ignores it.
 fn exclude_local_settings(dir: &Utf8Path) -> Result<()> {
-    let ignored = Command::new("git")
+    let ignored = newgit_core::git::command()
         .args(["check-ignore", "-q", LOCAL_SETTINGS])
         .current_dir(dir)
         .status()
@@ -180,7 +180,7 @@ fn exclude_local_settings(dir: &Utf8Path) -> Result<()> {
     if ignored.success() {
         return Ok(());
     }
-    let output = Command::new("git")
+    let output = newgit_core::git::command()
         .args([
             "rev-parse",
             "--path-format=absolute",
@@ -287,7 +287,7 @@ fn worktree_create() -> Result<()> {
 }
 
 fn branch_exists(root: &Utf8Path, name: &str) -> Result<bool> {
-    Ok(Command::new("git")
+    Ok(newgit_core::git::command()
         .args(["-C", root.as_str(), "rev-parse", "--verify", "--quiet"])
         .arg(format!("refs/heads/{name}"))
         .stdout(Stdio::null())

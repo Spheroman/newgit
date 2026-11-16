@@ -104,6 +104,7 @@ fn plan(temp: &Utf8Path, from: &Utf8Path, to: &Utf8Path) -> CopyPlan {
     let source = |url: &Utf8Path| Source {
         url: url.to_string(),
         auth: "Authorization: Basic eDpwdw==".to_owned(),
+        namespace: None,
     };
     CopyPlan {
         dir: temp.join("container"),

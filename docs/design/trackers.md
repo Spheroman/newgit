@@ -110,6 +110,7 @@ authoritative list; in short:
 | `pinned` | Whether its parent holds it where it is (docs/design/anchoring.md, *Follow and pinned*): a change landing at it never rolls up into the parent, and moving the parent's pin is a change to the parent, approved by the parent's maintainers; rollback is a revert. For what must not move by itself: a private dependency, `/env/prod`. Default `false`. |
 | `link` | Where it lives when it lives in another project: `"<owner>/<project>[/<path>]"` (see *Links*). Its history, heads, repo, and policy are its home's; only where it is mounted is this project's. Only a tracker in Git. Written by `newgit tracker link`. |
 | `resources` | Resources this tracker brings. A resource is bound iff a bound tracker brings it. |
+| `from` | The tracker whose history this one started at: a fork, whose audience may not be wider than its upstream's. Written by `newgit tracker create --from`. See *Binding*. |
 | `requires` | Trackers or roles this one needs: bound with it, and not droppable while it is bound. |
 | `git` | Whether its content is committed with Git. `false` (the default): never in the workspace's Git, excluded, never committed, captured by newgit from the files at checkpoint. `true`: a tracker in Git, committed with Git and split into its own history. Written only when `true`. |
 | `maintainers` | Who may merge changes to it: `owner`, `project-devs`, or `user:<login>`; by default its audience. See *Who may change what*. |
@@ -142,22 +143,59 @@ is one commit; see *Carving is a commit*.
 
 Every path in a view has at most one owner. Ownership comes from claims,
 never from which tracker currently has the file, and it is the same whichever
-tracker you root at. Split assigns paths by this rule **(decided)**:
+tracker you root at. **(decided; rule 1 as of the #426 review, 2026-11-11)**
 
-1. **The deepest mount wins.** A path under `apps/electron/` is decided among
-   the trackers mounted at `apps/electron` or deeper. A parent's claim of `.`
-   does not reach into a mount.
-2. **Among trackers mounted at the same path, the longest claim wins.**
-   `local-db` mounted at `.` claiming `.env.db` beats root's `.`. Trackers
-   sharing a mount split by their claims: a tracker mounted beside `access`
-   at `.newgit/trackers` and claiming `web.toml` owns that file; `access`
-   keeps the rest.
-3. **Identical claims at the same mount are an error, except within a role.**
-4. **Claims can exclude**, `.gitignore`-style: `paths = [".", "!.env",
-   "!node_modules/"]`. An excluded path is owned only by a tracker that
-   explicitly claims it at that mount, or filled by a resource. Otherwise it
-   is unowned, which is all "ignored" ever meant, and split refuses a commit
-   that changes it.
+1. **The longest claim that reaches a path owns it.** A claim reaches a path
+   under it unless a tracker mounted deeper holds the path and the claim is
+   `.`, or a directory around that mount, or the claiming tracker is in Git.
+   So only a tracker outside Git reaches into another's mount, with a claim
+   inside it: `paths = ["apps/t3code/.env"]` owns that file just as `mount =
+   "apps/t3code"`, `paths = [".env"]` would.
+2. **A tracker's own `!` exclusions take it out of the running** for what
+   they exclude: `paths = [".", "!.env", "!node_modules/"]`. A path no
+   reaching claim takes is owned by nothing, which is all "ignored" ever
+   meant, and a commit changing it is refused; a resource may fill it.
+3. **Identical claims are an error, except between role alternatives**, of
+   which a workspace binds one.
+
+What follows from rule 1: a path under `apps/electron/` is decided among
+the trackers mounted at `apps/electron` or deeper, and trackers outside Git
+with a claim inside it. Trackers sharing a mount split by their claims:
+`local-db` mounted at `.` claiming `.env.db` beats root's `.`, and a tracker
+mounted beside `access` at `.newgit/trackers` claiming `web.toml` owns that
+file while `access` keeps the rest. A claim of a tracker in Git inside a
+deeper mount owns nothing (`newgit tracker list` says so): `pub`, in Git,
+claiming `apps/t3code/secrets/pub.txt` while `t3code` is mounted at
+`apps/t3code` does not take that file from `t3code`, nor from `sec`, outside
+Git with audience `user`, mounted there claiming `secrets`. A tracker in Git
+that should own something inside another's mount is carved there, as a
+child.
+
+Why trackers in Git and outside it differ. Split puts a tracker in Git's
+files in its own commits by mount: a deeper mount is cut out of the trees of
+the trackers around it. A claim of a tracker in Git reaching into one would
+be a promise split cannot keep: the file would land in the tracker mounted
+there, or in its parent. A tracker outside Git's files are never split: a
+commit adding one is refused, and claiming inside a mount is exactly how
+`newgit tracker track` writes a `.env` (`paths = ["apps/electron/.env"]`).
+Judging that claim by mount (before the #426 review) let a target's commit
+adding the file through the check; letting a claim of a tracker in Git
+reach in too (the first #426 review fix) let a commit move a file of `sec`
+into root's `main`.
+
+**One function decides.** `owners_of` (`crates/newgit-core/src/tracker.rs`)
+is this rule. The commit and push gate, split's check, export, import,
+pull, and the workspace (capture, checkout, clear: what
+`resolve_ownership` settles for each tracker) all ask it. Split assigns a
+path a commit adds to the tracker in Git it names, or refuses the commit
+when it names a tracker outside Git, or nothing; a generated test
+(`tests/ownership_agrees.rs`) holds all three to agreeing. Of role
+alternatives tied on one claim, the gate names one outside Git first, so
+the file is refused whichever one a workspace binds. The server's
+copies (`newgit-serve`'s `policy.rs`, the Worker's `ownerOf`) decide among
+trackers in Git only, for definition files under `.newgit/trackers/`, where
+no tracker outside Git may be mounted: there the deepest mount holding the
+path decides, then the longest claim, which is this rule.
 
 A tracker carved inside another tracker's mount (`apps/electron/native`
 while `electron` is mounted at `apps/electron`) is a child of `electron`
@@ -207,7 +245,7 @@ deep inside another is not its child, and stays when what surrounds it goes.
 
 **The definition is the `.gitignore`.** Generating the view's `.gitignore`
 from claims, and turning an agent's edit of it into a definition change, is
-planned (step 6). Compose doesn't depend on it.
+planned (step 7). Compose doesn't depend on it.
 
 ## Shape and policy
 
@@ -294,6 +332,107 @@ tracker in a role.
 
 `{{bound.trackers}}` and `{{bound.paths}}` give a resource's commands what the
 instance binds, so a shared install builds only the bound members.
+
+**Members of a role are forks (decided 2026-11-08, #201; built for trackers
+outside Git, #415).** Project branches own the branch axis, so a variant
+cannot be a branch of a tracker (`db@staging/feature-x` would stop the names
+lining up); it is a member of a role. What members lacked was a shared
+history to merge along, and a fork gives them one:
+
+```
+newgit tracker create staging-db --role db --from local-db
+```
+
+- **Its `main` is `local-db`'s very commit.** Locally that is two refs in the
+  one store (`main` and a pin), so nothing is copied. Its definition says
+  `from = "local-db"`, claims what `local-db` claims at its mount, and fills
+  its role (`--role` names one when `local-db` has none, and is written to
+  `local-db` too). It brings no resources and requires nothing, and its
+  `priority` is below `local-db`'s and negative: making a fork never changes
+  what anything binds by default.
+- **A fork can't be wider than its upstream (decided).** Its history holds
+  everything its upstream had, so it may be read by no one the upstream's
+  audience does not include: the same audience, or one inside it (`public`
+  holds every audience, `project-devs` holds `user` and `user:<login>`, which
+  the remote serves to members only; any other two are not ordered). The
+  ceiling belongs to the history, not to the definition's `from` line, so
+  dropping or changing `from` lifts nothing. Where it is held:
+  - *The client* refuses it at creation, naming both audiences. After that,
+    every command but `tracker list` and `tracker remove` (which can fix it)
+    refuses while a fork's definition breaks it, and says what to type: a
+    fork wider than its upstream, one whose upstream is not defined, forks in
+    a cycle, or one whose `from` was dropped or changed while its audience is
+    wider than what it started at. What it started at is this machine's
+    record, `refs/newgit/forks/<fork>/<upstream>` in
+    `.newgit/local/trackers.git`, written when the fork is made and whenever
+    a definition saying `from` is read. Split refuses any commit whose
+    definitions differ from any parent's and break the ceiling, held to its
+    parents' forks, every earlier commit's in the same push, and those
+    records; a merge's result is checked whole, since one side adding a fork
+    and the other narrowing its upstream are each fine alone. The upstream
+    can't be removed while a fork names it or is recorded as started at it.
+    This is a convenience for the developer, not a boundary: a client can be
+    bypassed.
+  - *`newgit serve`* is the boundary. When it makes a fork's repo it records
+    the upstream as `refs/newgit/from/<upstream>` in the fork's namespace,
+    hidden from every Git request so no push moves or deletes it. As it reads
+    definitions it holds every fork to both the upstream `from` names and the
+    recorded one, until nothing changes, and says so when it refuses a read:
+    every rule and every store then sees it no wider. Against each upstream
+    a fork within it is left alone, and one the upstream is within is
+    narrowed to the upstream's audience; capping only ever narrows. A fork
+    whose ceiling can't be settled is not defined (readers are told so): an
+    upstream that isn't defined, an upstream it is not ordered with
+    (`user:jack` under an upstream narrowed to `user:bob`: moving it would
+    hand jack's own commits to bob), a cycle, a chain more than 64 forks
+    long, a linked fork whose home can't be read, or two upstreams no one
+    audience fits under. Each holds down a chain of forks too.
+  - *newgit.dev's Worker* has no record and no cap: only the client checks
+    the ceiling there, and a definition landed past it is served as written.
+- **A fork is never detached (decided).** Its history stays its upstream's,
+  so nothing makes it stop being a fork: to share something more widely,
+  make a new tracker (`newgit tracker create <name>`) and capture into it
+  only what may be shared. The server's record lives as long as the fork's
+  repo does.
+- **A narrower fork lives in the narrower store.** On `serve` a fork's repo
+  is made on its first sync, starting at its upstream's branches, and is
+  checked first: refused, before anything is made or copied, when the fork is
+  wider than its upstream or the caller may not read the upstream. With the
+  same audience that is a namespace in the upstream's store, refs alone. A
+  narrower one is made in its own audience's store, which fetches only what
+  the upstream's `main` reaches (the upstream's branches are copied, and a
+  tracker outside Git has only `main` today): all of it readable by that
+  audience when the fork was checked, so nothing is written into a store
+  whose readers could not read it then. The check and the copy are not one
+  step: the copy runs after the db lock is let go of, so an upstream
+  narrowed, or a caller who loses access, in between leaves those commits
+  in the narrower store (`serve.md`, *Known limits*). The copy runs before
+  the landing that makes the fork, which
+  writes its starting refs and its record of the upstream with its row, so
+  a fork is there whole or not at all, and the next write makes one that
+  isn't. What the fork gains after that stays in its own store. newgit.dev's Worker takes the history as the
+  sync uploads it (a copy).
+- **An encrypted upstream (#429).** A fork is encrypted to its own
+  audience. One with its upstream's audience starts at its upstream's
+  commits as they are. A narrower one starts at them too (its readers could
+  read all of it already), and its first sync encrypts its content again to
+  its own recipients, in a commit on top: everything it gains is readable
+  by its audience alone. The client counts what the remote has of a fork's
+  upstream as what it has of the fork, since the fork's repo starts there,
+  so that history is never made again. That is safe only because a fork is
+  never wider than its upstream: counting a wider fork's upstream history
+  as sent would leave readers of the fork history they cannot read. Both encrypt the upstream's paths,
+  so the guard on paths that held encrypted content never holds a fork
+  back.
+- **Only a tracker outside Git can be forked yet.** Every instance's view
+  holds every tracker in Git its user may read, so two members in Git at one
+  mount would collide; `--git --from <tracker>` says so. Forking one in Git
+  at another mount, and `tracker mount <owner>/<tracker>`, build on the same
+  `from` later.
+- **Next (#201, step 2):** `tracker merge` / `rebase` / `cherry-pick` between
+  members, on the current project branch, with `--disclose` to merge into a
+  member with a wider audience. Unrelated histories are refused as Git
+  refuses them, which is why `--from` is the way to add a member.
 
 **Dependencies (decided; roles not wired yet).** A resource's `depends_on`
 names resources or trackers today. Naming a role is the planned addition: a
@@ -398,7 +537,7 @@ split, checkpoint, push, and an ordinary merge fetch no history.
 |---|---|
 | A child's `main` moved past the pin, and the merge has to join them | Asks both ways round; neither → `need_history`, then `git merge-tree` |
 | A split where a view merge joins two lines of a child, with a tree equal to one of them | Asks whether that one descends from the other; "no" → `need_history` |
-| `newgit pull <tracker>` | Fast-forward: no history, `follow` lands on the pin and is counted. Otherwise `need_history`, so a pin is never moved backwards |
+| `newgit pull <tracker>`, `newgit pull` | Fast-forward: no history, `follow` lands on the pin and is counted. Otherwise `need_history`, so a pin is never moved backwards. A rooted target's tip the pin or `follow` already has needs none either; anything else is `need_history` first, as `--remote` is |
 | `newgit pull --remote` from a rooted target, a rooted export, `newgit log <tracker>`, `tracker migrate` | `need_history` first: each walks the history itself |
 | `spawn --from-checkpoint` | A plain fetch from the author's fork stops at the pin, so the checkpoint's commits are whole enough to push on; other pins come from the tracker's repo; no history unless root's walk reaches a snapshot |
 | A tracker's commits judged before a push | Stops at the pin, which is what the remote already holds |
@@ -778,12 +917,91 @@ sees it when someone runs:
 newgit pull electron
 ```
 
-That makes one view commit, `Pull electron: 14 commits from main`, which
+That makes one view commit, `Update trackers: electron (14 commits)`, which
 moves the pin and holds the child's files there, on one parent. It is authored
 by whoever ran it, needs the root's maintainers like any change, and merges
 into `main` like any instance commit; the workspace fast-forwards to it.
 `follow` names the ref it pulls. Spawn never writes a commit, but it says
 when a mounted tracker is behind its `follow` ref.
+
+`newgit pull` with no tracker (#345) is the same for every tracker in Git
+mounted here, at any depth, in one commit: `Update trackers: t3code (14
+commits), ui-kit (2 commits)`. `newgit pull t3code ui-kit` does it for
+those two only (#426): every argument is a tracker, and `--instance <name>`
+names an instance other than the one it runs in. A pin is part of a
+commit, so it lands on the branch it ran on, as `flake.lock` does: an
+instance's branch in an instance, and in the project root the project
+root's own instance branch, which `newgit merge main` publishes; `main`
+takes it only when that merges. It writes nothing when no pin is behind.
+
+**Update means upstream too (decided, #426).** For a tracker with an export
+target rooted at it (t3code → Spheroman/t3code), "update" means what is new
+*there*, as `nix flake update` would have it. So before moving pins, `newgit
+pull` does for each such tracker what `newgit pull --remote <target>` does
+to its `main`: fetches the target's branch, then fast-forwards the
+tracker's `follow` ref to it, or really merges the two (one merge commit,
+`Merge github.com/Spheroman/t3code newgit`, on that ref and the target's
+tip), and the pin moves to that. That is one more fetch per such tracker,
+on top of the one per tracker that resolves its `follow` ref with a remote.
+What it does *not* do is move the tracker's `main`, anywhere: `main` is
+shared, and landing commits there would change what every other instance
+pulls next. The target's commits ride on the tracker's branch for this
+instance (`instances/<slug>`) like any instance commit, the pin moves on
+this branch only, and `newgit merge` lands them on the tracker's `main`
+when the instance merges. That holds in the project root too: there, `newgit
+merge main` lands them. `newgit pull --remote` is unchanged, and still the
+one command that moves a tracker's `main` straight from a target.
+
+**A child moves in the tracker that mounts it (decided, #426).** A child's
+pin is part of its parent's commits, so moving it is a commit in the
+parent, whose own pin then moves in *its* parent, up to root: one commit per
+tracker whose pins moved, made bottom-up, each naming what moved below it
+from where it stands. Pulling `t3code/repos` makes `Update trackers: repos
+(1 commit)` in `t3code`, on t3code's pin, and root's view commit `Update
+trackers: t3code/repos (1 commit)` pins that. `newgit pull t3code/repos`
+does the same for that child alone; naming `t3code` moves only t3code's own
+pin. A child whose parent this instance does not bind stays: an instance
+commits only to trackers it binds (`newgit tracker use <parent>` binds it).
+It is named when it was asked for, or when its `follow` ref is ahead of its
+pin, so an instance that dropped the parent is not told about it on every
+pull. A child named beside a parent whose target fails is listed as
+skipped with it.
+
+**The merge with a target is the same commit everywhere (decided, #426
+review).** It is newgit's, made on nobody's behalf: author and committer
+`newgit <newgit@localhost>` (the identity of an endpoint's `Merge main from
+github`), not whoever merged the pull request on GitHub, dated as the parent
+committed last (the target's tip on a tie), with the same message, and never
+signed. Two instances pulling the same two diverged tips make one commit,
+so merging both lands one merge on the tracker's `main`, not three.
+Unsigned, it is rejected by an export target that requires signed commits:
+an export carrying it fails there
+([#443](https://github.com/Spheroman/newgit/issues/443)).
+
+A force-pushed target is merged with the line the tracker already has, as
+`git pull` would: the commits the force-push removed stay in the tracker's
+history, and the next export pushes them to the target again. Reverting the
+change in an instance and merging it keeps it out of the tip only: the
+removed commits are still in the history, and the next export still
+publishes them. When the force-push was to purge a secret, that publishes
+it again, and nothing in newgit can purge it yet
+([#442](https://github.com/Spheroman/newgit/issues/442): a way to reset a
+tracker's line to its target). Until then, do not export that tracker.
+
+Five kinds of tracker stay put, and it says which: a pin holding commits
+its `follow` ref lacks (the instance's own work on it; moving the pin would
+drop them, so merge first; such a tracker is listed as diverged and does
+not take its target either, until `newgit merge`), a tracker the remote will not let the caller
+read (a 403 on its repo; plain `newgit pull` fails when it can read none of
+them, since then nothing is known to be up to date), a tracker whose export
+target cannot be pulled from (unreachable, a real conflict with its
+`follow` ref, a file of a tracker outside Git): it and every tracker below
+it stay, never half-moved, since the target ships them too, a child of a
+tracker this instance does not bind, and a tracker outside Git, which has
+no pin (`newgit tracker pull` updates its files, and can overwrite an
+instance's). The rest still move. A tracker named on the command line that
+stays for any of these reasons makes it exit non-zero, after the others
+moved.
 
 Parallel instances merge the way a monorepo does: two instances that each
 made a commit produce a merge commit in `main`'s view, even if they touched
@@ -806,7 +1024,7 @@ key would replace it, and `explicit` trackers would never be carried by
 
 ## Rooting at any tracker
 
-**Spawning at a tracker** (`newgit spawn --root electron`, planned, step 6)
+**Spawning at a tracker** (`newgit spawn --root electron`, planned, step 7)
 composes the view rooted there. Resources come from the trackers in that
 view. A tracker that mounts nothing in Git composes to its own history
 unchanged. One that does composes like any root (its pin-only commits
@@ -915,7 +1133,7 @@ and tag from the project root.
 |---|---|---|---|
 | `<owner>.<project>.t.<tracker>` | the history of a tracker in Git, at its own root | its audience | seeding, then merges |
 | `<owner>.<project>.i.<instance>.<tracker>` | an instance's branch of one tracker in Git, forked the first time the instance changes it | the tracker's audience; only the instance's owner when it is private | the instance |
-| `<owner>.<project>.t.<tracker>[.<login>]` | a tracker outside Git, as before | its audience | its audience |
+| `<owner>.<project>.t.<tracker>[.<login>]` | a tracker outside Git, as before: age ciphertext and a `.newgit/recipients` record unless `public` (#338) | its audience | its audience |
 
 No trunk repo, no composed repo, no whole-source fork per instance: spawning
 forks nothing.
@@ -951,6 +1169,13 @@ through a newgit workspace, which splits locally.
 Why a sandbox and not the Worker: a Worker cannot run Git, and composing in
 JavaScript would mean writing Git's object model ourselves.
 
+On `newgit serve` (#412) the views are pre-built after all: each tracker's
+view, as everyone who reads its store may read it, is stored in that store
+and extended at each landing by composing only what is new, with the same
+ids composing from scratch gives. A reader who may read more than that (a
+private tracker mounted inside) is composed for per fetch, as above
+([serve.md](serve.md), decision 10).
+
 **Who may change what (decided).** A tracker's `maintainers` may merge
 changes to it; by default they are its audience — anyone who may read a
 tracker may change it. Who may change a tracker's *security* (its paths,
@@ -958,7 +1183,7 @@ audience, maintainers) is then just who may change the tracker that owns its
 definition file. That is `access` — which `newgit init` creates with
 `maintainers = "owner"`, mounted at `.newgit/trackers` claiming `.` — unless
 a tracker in Git mounted beside it at `.newgit/trackers` claims the file
-(ownership rule 2). So governance layers with no special case: project
+(ownership rule 1: trackers sharing a mount split by their claims). So governance layers with no special case: project
 trackers; an admin tracker mounted at `.newgit/trackers` claiming the
 definitions it governs (readable by everyone who uses them, since newgit
 needs their paths, but maintained by admins); and a tracker of yours
@@ -1170,7 +1395,8 @@ named and skipped.
   files in place and ids of their own.
 - **#142 (pull from a target):** *done.* `newgit pull --remote t3code`
   fetches, fast-forwards or merges t3code's `main`, then moves its pin in
-  the project root as `newgit pull t3code` would. When t3code mounts
+  the project root as `newgit pull t3code` would (plain `newgit pull` does
+  the same fetch first, landing on the branch it runs on, #426). When t3code mounts
   trackers, what comes back is view commits, so it is split first: each file
   goes to the tracker that owns it, an upstream's plain commits and a merge
   of them included. For Spheroman/newgit, its
@@ -1184,14 +1410,14 @@ named and skipped.
   mirror, rooted at it, and importing t3code once put 8,164 of its commits
   into newgit's view and onto the public mirror. FORK.md: upstream comes in
   by merging pingdotgg/t3code into the fork's `newgit` branch, then `newgit
-  pull --remote t3code` and `newgit pull t3code`, one commit here. The
+  pull t3code` (or plain `newgit pull`), one commit here. The
   cold-start measurement doubles as the profile cost check.
 
 ---
 
 ## Build order
 
-Status as of 2026-11-05. Each step lands alone and keeps the suite green.
+Status as of 2026-11-11. Each step lands alone and keeps the suite green.
 
 **Before roots (done, 2026-10):** tracker repos with real history (`main`,
 `instances/<instance>`) in the shared store; the `root` tracker, ownership by
@@ -1222,7 +1448,10 @@ headers were recorded — is replaced by the steps below and deleted.
    are done. For #144, a mounted tracker joins as one commit, a mirror holds
    only what it ships, the project root fetches from the endpoint, and a
    webhook brings GitHub's merges in; bringing the real t3code in is next.
-6. **Later:** spawning at a tracker (`spawn --root`), `.gitignore` as
+6. **Roles are forks** (#201's *Roles are forks* build order): step 1,
+   `tracker create --from` for trackers outside Git, is *done* (#415; see
+   *Binding*). Merging between members with `--disclose` is next.
+7. **Later:** spawning at a tracker (`spawn --root`), `.gitignore` as
    definition, moving `role`/`priority`/`requires` to the mounting parent,
    `spawn --from <instance>` with `requires` checked between instances,
    profiles, the per-remote redesign, the `newgit branch` CLI.
@@ -1398,7 +1627,8 @@ this is the list.
   bringing those commits in moves a pin, which is a commit nobody asked for.
 - **`newgit pull --remote` lands in the project root only,** and publishes
   nothing; `newgit merge main` does. Instances pick a moved pin up with
-  `newgit pull <tracker>`. For a target without `root`, the files of each
+  `newgit pull <tracker>`, which also takes what is new on the target
+  itself, on the instance's branch, without moving the tracker's `main`. For a target without `root`, the files of each
   tracker it withholds are put back from the parent commit, and a commit
   touching a withheld tracker's mount is refused rather than guessed at.
 - **The import's commit is unsigned,** since newgit writes it and its
@@ -1482,11 +1712,13 @@ What was ugly, and is left that way for now:
 - **No CLI to unlink** other than dropping the definition by hand.
 
 Not found by this experiment, but found while running it: `newgit pull
-<tracker>` in an instance replaces the tracker's files with its `main`
-rather than merging the instance's own change into it. So the conflict
+<tracker>` in an instance replaced the tracker's files with its `main`
+rather than merging the instance's own change into it, so the conflict
 message's advice ("bring `main` into the instance's workspace, resolve
-there") loses the instance's change if followed with `pull`. This is true
-of every tracker in Git, not only links.
+there") lost the instance's change if followed with `pull`. Since #426 a
+pin holding the instance's own commits stays where it is, and `pull` says
+so (and exits non-zero when the tracker was named), rather than dropping
+them; bringing `main` in is still a merge, not a pull.
 
 ## Open questions and known gaps
 
@@ -1499,6 +1731,16 @@ CLI, the narrow-audience warning, `.gitignore` as definition, and
 - **Imported histories.** Import (#140), export as a root (#141), and pull
   back (#142) are built; bringing the real t3code in, and measuring its
   cold start, is #144.
+- **A fork removed and made again under the same name.** `tracker remove`
+  deletes this machine's record of what a fork started at, but `serve`'s
+  record (`refs/newgit/from/<upstream>`) lives as long as the repo does, so
+  a tracker re-added under that name (say `public`) is still capped to the
+  old upstream's audience while the client believes it is what its
+  definition says. It fails closed, but silently: nothing tells the client
+  the server capped it. The server says so only when it refuses a read.
+  Telling the client in its sync and merge output, naming the upstream on
+  record, needs the server to hand the capped facts back on a write, which
+  nothing does yet.
 - **Per-user trackers.** A per-user tracker's `main` reaches the remote only
   as a side effect of some instance's checkpoint (#224).
 - **Sparse checkouts.** Restoring a dirty checkpoint writes files into a
@@ -1510,6 +1752,9 @@ CLI, the narrow-audience warning, `.gitignore` as definition, and
   needing supabase running) cannot be expressed (#54). Reviewing a change
   places each tracker it touched locally or in the preview; settled in
   [remote.md](remote.md), *Reviewing a change* (#229).
+- **Forks on newgit.dev.** The Worker keeps no record of what a fork was
+  made from and doesn't cap it, so there only the client holds the ceiling
+  (#415). `newgit serve` does both (*Binding*).
 - **The model itself.** The rest of #201: every tracker the same kind of
-  thing, rooted at the user. The engine is built; what remains is step 6
+  thing, rooted at the user. The engine is built; what remains is step 7
   above, and the per-remote redesign under *Users, remotes, and trust*.

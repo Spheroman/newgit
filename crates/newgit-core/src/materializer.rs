@@ -58,12 +58,14 @@ impl RealDirMaterializer {
     /// its own rebuild on top of the clone, and should not do that silently.
     ///
     /// `sparse` is the binding's sparse-checkout patterns: what they leave
-    /// out is never written.
+    /// out is never written. `carry` is store refs whose objects the
+    /// workspace should start with (see [`GitSource::clone_via_template`]).
     pub fn materialize_reporting(
         &self,
         source: &GitSource,
         branch: &BranchInstance,
         sparse: &[String],
+        carry: &[String],
     ) -> Result<Option<String>> {
         if branch.workspace_path.exists() {
             return Err(NewgitError::WorkspaceExists(branch.workspace_path.clone()));
@@ -85,6 +87,7 @@ impl RealDirMaterializer {
                 &branch.source_rev,
                 &branch.workspace_path,
                 sparse,
+                carry,
             )
             .err()
             .map(|error| error.to_string());
@@ -98,7 +101,8 @@ impl RealDirMaterializer {
 
 impl Materializer for RealDirMaterializer {
     fn materialize(&self, source: &GitSource, branch: &BranchInstance) -> Result<()> {
-        self.materialize_reporting(source, branch, &[]).map(|_| ())
+        self.materialize_reporting(source, branch, &[], &[])
+            .map(|_| ())
     }
 
     fn remove(&self, branch: &BranchInstance) -> Result<()> {
@@ -108,6 +112,30 @@ impl Materializer for RealDirMaterializer {
         }
         Ok(())
     }
+}
+
+/// Whether `workspace` holds nothing but its marker — what `newgit stop
+/// --evict` leaves at an instance's path — so restoring over it loses
+/// nothing. Anything else there was written after the eviction, by someone.
+pub fn is_evicted_stub(workspace: &Utf8Path) -> bool {
+    let only = |dir: &Utf8Path, allowed: &[&str]| -> bool {
+        std::fs::read_dir(dir).is_ok_and(|entries| {
+            entries.into_iter().all(|entry| {
+                entry.is_ok_and(|entry| {
+                    entry
+                        .file_name()
+                        .to_str()
+                        .is_some_and(|name| allowed.contains(&name))
+                })
+            })
+        })
+    };
+    only(workspace, &[".newgit"])
+        && only(&workspace.join(".newgit"), &["local"])
+        && only(
+            &workspace.join(".newgit/local"),
+            &["instance.toml", ".gitignore"],
+        )
 }
 
 /// Gitignored marker inside a workspace pointing back at the store, so
@@ -242,7 +270,7 @@ pub fn unexclude_tracker_paths(workspace: &Utf8Path, paths: &[Utf8PathBuf]) -> R
     Ok(true)
 }
 
-fn write_workspace_marker(store_root: &Utf8Path, branch: &BranchInstance) -> Result<()> {
+pub fn write_workspace_marker(store_root: &Utf8Path, branch: &BranchInstance) -> Result<()> {
     let marker = WorkspaceMarker {
         branch: branch.name.clone(),
         store_root: store_root.to_path_buf(),

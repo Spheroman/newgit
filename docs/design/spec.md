@@ -243,7 +243,14 @@ The full model is in [`trackers.md`](trackers.md). The short version:
 
 - **Every path has at most one owner.** A tracker is *mounted* at a path
   inside its parent, and claims paths relative to its mount (`!` excludes).
-  The deepest mount wins, then the longest claim. `root` owns `.`,
+  The longest claim that reaches a path owns it. A claim reaches a path
+  under it unless a tracker mounted deeper holds the path and the claim is
+  `.`, or a directory around that mount, or the claiming tracker is in Git.
+  So only a tracker outside Git reaches into another's mount, with a claim
+  inside it: `paths = ["apps/t3code/.env"]` owns that file just as `mount =
+  "apps/t3code"`, `paths = [".env"]` would. A tracker's own `!`
+  exclusions take it out of the running; identical claims are an error,
+  except between role alternatives. `root` owns `.`,
   everything nothing else claims, `.newgit/` included. `access` is mounted
   at `.newgit/trackers/` and holds every tracker's definition, which decides
   who may read what; by default only the project's owner may change it
@@ -261,8 +268,12 @@ The full model is in [`trackers.md`](trackers.md). The short version:
   so no id changes. You commit to a tracker in Git with Git. When work
   leaves the machine, newgit splits each commit into one root commit and a
   commit in each tracker it changed, and composing them back gives the same
-  commit, with the same id. `newgit pull <tracker>` moves a pin to the
-  tracker's `follow` ref; nothing else moves one on your behalf.
+  commit, with the same id. `newgit pull` moves every pin that is
+  behind, at any depth, to the tracker's `follow` ref, after taking what is
+  new on its export target when it has one rooted at it, in one commit on
+  the branch it runs on (a child's moves by a commit in its parent first);
+  `newgit pull t3code ui-kit` only those. No tracker's `main` moves until
+  `newgit merge`, and nothing else moves a pin on your behalf.
 - **A tracker outside Git** (`git = false`, the default) owns files that
   never belong in Git: an `.env.local`, an agent's notes, a SQLite file, a
   public page. They are captured by newgit, never committed.
@@ -273,6 +284,17 @@ The full model is in [`trackers.md`](trackers.md). The short version:
   A negative priority is never bound unless asked. `newgit tracker use` and
   `drop` change a live instance's binding. A tracker brings resources, and
   they run only while it is bound.
+- **Members of a role are forks of each other.** `newgit tracker create
+  staging-db --role db --from local-db` starts a tracker outside Git at
+  `local-db`'s `main` (two refs in the one local store, nothing copied) and
+  records `from = "local-db"`, so the two share history and can merge
+  (merging between members is next). A fork's audience is a ceiling: never
+  wider than its upstream's, even after `from` is dropped or changed. The
+  client refuses a wider one at creation, on every load, and in any commit
+  changing definitions; `newgit serve` records what each fork's repo was made
+  from and serves a wider one with its upstream's audience. Against
+  newgit.dev's Worker only the client checks it. A fork is never detached. A
+  tracker in Git cannot be forked yet.
 
 ### Trackers outside Git
 
@@ -362,6 +384,71 @@ your own `.env.local`, never theirs. `tracker create --storage remote`
 is refused until the project has a remote, rather than quietly behaving as
 local.
 
+**A synced tracker outside Git is encrypted to its audience (#338).** With
+`storage = "remote"` and an audience other than `public` (no opt-out: what a
+server must read, like newgit.dev's `site`, is `public`), each file is
+encrypted whole with age on this machine before anything is sent. The
+recipients are computed, never read back: the members the audience names, as
+the remote lists them now (the remote is the membership authority), by the
+`ssh-ed25519` and `ssh-rsa` keys GitHub publishes for each. The ciphertext is
+an ordinary blob in the tracker's history, so Git's object model is
+untouched; the list is written beside it at `.newgit/recipients` for people
+to read, and no code takes a recipient from it. Capture encrypts (reusing a
+parent's blob when its content is unchanged and its own age header names
+the current keys, exactly, so unchanged content is still no commit),
+projection decrypts with the developer's own SSH key (or `$NEWGIT_IDENTITY`),
+and the workspace holds plaintext, owner-only. Before a checkpoint syncs or
+`tracker merge` or `members add`/`remove` publishes, the member list is read
+again and every commit the remote does not have yet is checked against it:
+those encrypted to anyone else are made again, on the last commit the remote
+has, so nothing encrypted to a member removed since is ever sent. Every send
+checks that every file those commits carry is age ciphertext. A workspace
+path this machine has held encrypted content at is never captured or sent
+unencrypted because a definition (any definition, by any name) now puts it in
+a `public` tracker or a tracker in Git, until `newgit tracker allow-plaintext
+<path>` on this machine: a confirmation, keyed by path, not a boundary (the
+same content copied or moved to another path is not held back). What
+counts as already on the remote is kept per remote and project, and
+forgotten when the project is linked again. `user` is the login `newgit login` saved, never the remote's say. Publishing `main` fetches the
+remote's first and never forces over changes it lacks. Every change to the
+recipient set is printed by fingerprint. A tracker that was plaintext is
+encrypted on its next capture as a new history whose first commit names the
+plaintext rev it replaces; that is the one history replacement. Identities
+for sandboxes and cloud agents are #430. The reference's *Encrypted
+trackers* has the details.
+
+What it guarantees, and its limits:
+
+- The remote, and anyone who controls its deployment, cannot read what was
+  encrypted before it acts: this holds against a remote that only stores
+  and serves.
+- A remote that acts can read what is captured afterwards. It decides
+  membership, so it can add a login whose GitHub keys then become
+  recipients, and the only signal is the fingerprints newgit prints
+  (`CHANGED`, `+ <login>`). A machine encrypting a tracker for the first
+  time has nothing to compare with.
+- The remote also serves tracker definitions, and a definition decides
+  whether a path is encrypted at all. A machine that has held a path's
+  encrypted content (captured it encrypted, or decrypted it into a
+  workspace, as a fresh clone's spawn does) refuses, as an error, to
+  capture or send that path unencrypted, whatever tracker claims it now,
+  until `newgit tracker allow-plaintext <path>` is run there. A machine
+  that has never held the content has nothing to compare against and
+  captures as the definition says. It is a confirmation step, not a
+  boundary: an agent in the workspace can run `allow-plaintext` itself.
+  It knows paths, not content: the same content copied or moved to
+  another path is not held back.
+- GitHub accounts are the key authority.
+- There is no integrity: recipients' keys are public, so the remote can
+  replace a file with content of its choosing that decrypts cleanly (signed
+  tracker commits are [#431](https://github.com/Spheroman/newgit/issues/431)).
+- File names, sizes, link targets, commit messages, authors, and dates are
+  visible.
+- Revs pushed before a tracker was encrypted stay on the remote in
+  plaintext: rotate what they held.
+- A teammate on an older newgit sees ciphertext, and a capture of theirs
+  would push plaintext.
+
 `merge_with_source` is written to every definition but nothing reads it
 yet. `newgit merge` merges trackers in Git, and trackers outside Git move only
 through `tracker merge`. [`trackers.md`](trackers.md) plans to replace it
@@ -412,7 +499,13 @@ leaves trackers out is copied from a template of its own binding,
 `<workspace root>/.source-template-<key>`, sparse from before its first
 checkout: nothing it leaves out is written, so leaving files out makes a spawn
 faster, not slower. The same goes for a plain `git clone`, where there is no
-template. `newgit cleanup` removes a template no live binding uses. Then the copy
+template. On a remote, the template also fetches each export target's
+branch the workspace will get as `refs/remotes/<target>/<branch>` (a
+rooted target's is its tracker's whole history), under
+`refs/newgit-template/`. The copy drops those refs but keeps their
+objects, so the workspace's own fetch of that branch moves nothing; fetched
+into each workspace, t3code's was 17s of a 21s spawn.
+`newgit cleanup` removes a template no live binding uses. Then the copy
 gets its own branch, with the upstream `git clone --branch` would set, and
 `core.checkStat=minimal` plus `core.trustctime=false`. Without those two
 settings Git would re-hash every file on the first `git status`, because
@@ -953,6 +1046,65 @@ per instance. The reference has the table, and the `pnpm` template ships a
 `user`-owned `pnpm-store` resource so newgit never touches the shared
 store.
 
+#### Every key gets an entry, and a miss costs disk only once (planned, #421)
+
+Two gaps in the store as built, and one rule that closes both: **every key
+an instance reaches gets an entry, and every entry shares what it can with
+the entries before it.**
+
+**A key that moves inside a live instance stores an entry.** Today an entry
+is published only when `prepare` finishes. An agent that runs `npm install
+zod` changes the lockfile and the tree, and the store never learns of it:
+the next instance at that lockfile runs a full `npm ci`. So a checkpoint
+whose instance has moved to a key the store has no entry for publishes the
+workspace's tree for it, through the same admission as any other entry.
+That tree is whatever the workspace holds, not a fresh `prepare`'s output,
+and that is the decision, made loudly: an instance that edited its
+`node_modules` by hand publishes the edit. The way back is the one that
+already exists: `newgit action <resource>.prepare` runs the command and
+replaces the entry, and `undo --force-recompute` drops it.
+
+**A miss is deduplicated against the store.** A miss still runs `prepare`
+in full, so `npm ci` stays `npm ci` and its output stays exactly what it
+would have been. What changes is what newgit keeps. Most of a new tree is
+byte-identical to an entry already in the store: a fresh `npm ci` of
+`remote/` matched the existing `node_modules` on 100% of its 290 MB at the
+same paths, apart from two binaries an install script swaps in. So after
+`prepare` finishes, and before the tree is published, newgit walks it, and
+every regular file whose relative path, size, and content hash match a file
+in another entry of the same resource is replaced by a copy-on-write clone
+of that file. The workspace and the new entry then share those blocks with
+every entry before them; only what actually changed takes new disk.
+
+- **Each entry carries a manifest** (path, size, hash) written when it is
+  published, so a dedup pass hashes only the new tree, never the store.
+  Candidates are found by path and size, and confirmed by hash.
+- **The replacement cannot change a byte.** On btrfs and XFS it is
+  `FIDEDUPERANGE`, which compares the ranges itself and shares them
+  atomically. APFS has no such call, so newgit clones the stored file
+  beside the target and renames it over, after checking that the target's
+  size and mtime still match what was hashed; a file that changed is
+  skipped. Hardlinked files (pnpm's) and symlinks are left alone.
+- **It never fails the bind.** It runs after `prepare` succeeded, and a file
+  it cannot replace is simply not shared. Where the filesystem cannot clone
+  at all, there is nothing to do, and newgit says so once.
+
+Together they make the store a set of independent entries, one per key,
+that share blocks as far back as their content agrees. There is no lineage
+to track: the filesystem counts references to each block, so dropping an
+old entry frees only what nothing else uses. Pruning stays what it is,
+entries no live instance keys to.
+
+**Build output is not an install, and this does not reach it.** Measured on
+this repository, a workspace's 5.6 GB `target/` is 2.0 GB of integration
+test executables, 2.2 GB of debug objects, 2.4 GB of `incremental/`, and
+about 0.3 GB of third-party crates. Two workspaces on the same toolchain
+share 5% of `target/debug/deps` byte for byte. The rest is the branch's
+own code compiled for that branch, which no store, clone, or dedup pass can
+share. Its disk comes back by removing instances whose work has landed (see
+*Cleanup*), and by building less of it per branch, which is the project's
+build configuration, not newgit's.
+
 ---
 
 ## An instance's life
@@ -974,12 +1126,15 @@ reported per resource, and a dependent of a resource that did not start is
 not started against it. Starting is not waiting: the dependent starts once
 its dependency's process exists, not once that process answers (#54).
 
-`spawn --from-checkpoint <instance>/<checkpoint>` brings up someone else's
-checkpoint, from the remote: their source and uncommitted work, the
-trackers you may read (your own copy of per-user ones), and resources
-restored from the checkpoint, such as a database loaded from its dump. It
-is built from parts that already exist: fetch, spawn at the checkpoint's
-head, then undo to the checkpoint. Its `autostart` actions start after the
+`spawn --from-checkpoint <instance>/<checkpoint>` brings up a checkpoint
+as a new instance: its source and uncommitted work, its trackers, and
+resources restored from the checkpoint, such as a database loaded from its
+dump. Like a bare branch name in Git, the name means this machine's first:
+a checkpoint taken here (even of an instance since removed) is used as it
+is, with no remote involved. Only one this machine does not have comes from
+the remote, which gives the trackers you may read and your own copy of
+per-user ones. It is built from parts that already exist: (fetch,) spawn at
+the checkpoint's head, then undo to the checkpoint. Its `autostart` actions start after the
 undo, since the restore stops and restarts processes to match the
 checkpoint. The new instance's workspace comes up on its own branch, made
 at the checkpoint's commit, even when the author's was on another branch
@@ -1099,6 +1254,129 @@ comes back on the same ports. Both commands do nothing and exit 0 when
 there is nothing to do, so they can run on every settle and unsettle. Both
 exit 1 if any resource failed.
 
+`newgit stop --evict` also frees the instance's disk, for an instance
+nobody will touch for a while. After the stop, it checkpoints the instance
+(reason `evict`) and saves what neither the checkpoint nor the tracker
+store carries. What Git keeps only in the workspace's `.git/` goes into the
+store under `refs/newgit/evicted/<slug>/`: local branches, tags, every
+stash entry, what is staged, notes (`refs/notes/*`), and the
+remote-tracking refs of remotes other than `origin`. The rest goes into
+`.newgit/state/<slug>/evicted/`: the workspace's `.git/config`, its hooks
+(all but Git's `*.sample` files), its remote token, the mode of every file
+and directory whose mode is not what a fresh checkout gives (`0644`, or
+`0755` when executable; `0755` for a directory), the empty directories,
+and each install store key its trees had. Then it records the checkpoint
+in the binding record as `evicted`, moves the workspace aside, writes its
+marker back at the path, and deletes what it moved. The marker stays so
+that commands run at the path still find the instance, and a tool holding
+the path still finds a directory.
+
+`newgit start` restores first. It clones the workspace again beside the
+path, as `spawn` does, and moves the clone into the directory that is
+there, so a shell sitting in the marker's directory is in the workspace
+afterwards, not in a deleted one. The rest runs at the path itself,
+because resources are path-dependent (`NEWGIT_WORKSPACE`, a venv, a
+rendered `node_modules`). It writes the checkpoint's tracker content, then
+undoes to that checkpoint. That brings back the source with its
+uncommitted work, tracker content (an encrypted tracker decrypted from this
+machine's cache or key), renders, and the trees resources rebuild, filled
+from the install store. Then it puts back the refs, the stash, what was
+staged, the hooks, and the config. A config key the new clone already has
+is newgit's own (its remote, push routing, the sparse checkout) and keeps
+newgit's value, except `branch.*`, which is the user's (upstreams,
+descriptions); every other key comes back as it was (`user.*`, other
+remotes). Last it makes the empty directories again and puts back the
+modes, clears `evicted`, and starts what the stop stopped.
+
+The promise is that the `start` gives back exactly what was there, or that
+the eviction refuses and deletes nothing. So it refuses, before anything is
+stopped, when the workspace holds what would not come back: a merge,
+rebase, cherry-pick, revert, or bisect in the middle, or unresolved
+conflicts; changes in a dropped tracker's paths (as `undo` refuses); hand
+edits to a rendered file; an untracked directory that is a repository of
+its own, which `git add -A` records as a commit id; an initialized
+submodule, recorded the same way and kept in `.git/modules`; a worktree
+linked to the workspace (`git worktree add`), whose Git is in
+`.git/worktrees`; and ignored files that no bound tracker outside Git owns
+and no bound `recompute` resource rebuilds, such as `target/` or a stray
+`.env.local`. It names those, a wholly ignored directory as one entry with
+its file count, and `--discard-ignored` evicts anyway, naming them again
+(`discarded` in `--json`). There is no way yet to declare build output
+such as `target/` disposable, so a plain `--evict` refuses in a Rust
+workspace and `--discard-ignored` is the manual override
+([#447](https://github.com/Spheroman/newgit/issues/447)): a resource
+cannot say it without a destructive `prepare` or an identity that refills
+the tree on `undo`. It also refuses
+while a process other than itself has its working directory in the
+workspace, judged again right before the move: the shell or agent it was
+run from included, since the directory would be deleted under it, so it
+has to run from outside the workspace. `lsof` (on macOS) runs with `-b`,
+so it does not block on a dead network mount, and under a timeout: when it
+does not answer, the eviction refuses, deleting nothing. A refusal names
+each process by pid, command, and directory. And it refuses when a resource
+would not stop, when the checkpoint is degraded, and when the checkpoint
+is not whole in the store: every object its source commit and tracker
+revs reach, checked object by object past what the store's other refs
+already reach (Git keeps those whole). The checkpoint has to be whole on
+this machine, not on the remote: only the workspace is deleted. When the
+remote did not take it, the eviction says so plainly: the only copy of the
+instance's work is then in the project store on this machine.
+
+Not kept, and said before anything is deleted (`not_kept` in `--json`):
+reflogs other than the stash's, intent-to-add (`git add -N`) entries,
+assume-unchanged or skip-worktree flags set by hand (the content of those
+files is kept; only the flag is lost), setuid, setgid, and sticky bits
+(the mode's permission bits are kept, and a mode is put back with `lstat`,
+never through a symlink), and a value set by hand on a config key newgit
+sets itself on restore (`origin`'s URLs and receive-pack, `credential.*`,
+its export remotes), worked out by making newgit's own config in a scratch
+repository. Of every other config key the clone already has, a
+single value comes back as it was and a multi-valued key (an added
+`remote.origin.fetch`) gets the saved values added beside newgit's. Evicting does not free the disk an
+untracked file's content takes, since its blob is in the store with the
+checkpoint, and each cycle adds an evict checkpoint and one or two
+before-undo checkpoints with no retention yet
+([#446](https://github.com/Spheroman/newgit/issues/446)).
+
+A crash or a failure part way loses nothing. A crash after the record says
+`evicted` and before the move leaves the original workspace at the path,
+with `.git/newgit-evicting` naming the checkpoint: `start` recognises it
+and clears `evicted`, and `stop --evict` then evicts again. The move aside
+is one rename, so otherwise the path holds its marker or nothing. The
+moved-aside workspace (`.<name>.evicting`) holds only what the checkpoint
+holds; it is deleted right away, a read-only directory in it made
+writable first. If it cannot be, the eviction says so and how, and the next
+`start` or `stop --evict` tries again: `stop --evict` before it stops or
+records anything, refusing with what to do when it still cannot.
+
+A restore writes `.newgit/state/<slug>/evict-restoring` and keeps
+`evicted` until it is done. A restore never deletes what is at the path,
+since an editor, a language server, or a shell sitting in the marker's
+directory may have written there while it ran. One that fails moves what
+is at the path, whole, to `.<name>.restore-failed` beside it, puts the
+marker back, and keeps `evicted`, so the next `start` runs it again. One
+that is killed part way leaves half a workspace that anyone may have
+worked in since: the next `start` moves it, whole, to
+`.<name>.interrupted-restore`, and then restores. A second one gets `-2`,
+and so on. These are *saved copies*: each carries no instance marker, is recorded in
+the instance's binding record (`saved_copies`) before anything moves into
+it, and is named, with what to do, on stderr the moment it is made and by
+every `start`, `status`, `stop --evict`, and `cleanup` after. `cleanup`
+never takes one for an orphan workspace, and `remove` keeps them and names
+them. Only `newgit cleanup --discard-saved <path>` deletes one. A restore
+refuses when something other than the marker was written at the path since
+an eviction or a failed restore, and so does `stop --evict`, rather than
+report nothing to do. `remove` refuses too, naming what is there, unless
+`--force`. (A `remove` of an instance that is not evicted deletes its
+workspace however dirty it is, as it always has:
+[#448](https://github.com/Spheroman/newgit/issues/448).) While an
+instance is evicted, commands that need its workspace (`checkpoint`,
+`undo`, `run`, `merge`, ...) say it was evicted and to run `newgit start`.
+A second `stop --evict` says it is already evicted to its checkpoint.
+`status` shows it as `evicted`, `cleanup` does not treat it as an instance
+whose workspace is gone and keeps the install store entries its restore
+refills from, and `remove` deletes what the eviction kept.
+
 `suspend` never runs for a `project` or `user` resource, which other
 instances share, nor for one that never came up. The `supabase` template's
 pair is `supabase stop` / `supabase start`, which keeps the data.
@@ -1177,6 +1455,20 @@ binding record, so their checkpoints can never be restored, yet they pin
 revisions forever. `cleanup --purge-archived` discards them, with their
 checkpoint refs. It is opt-in and never touches a live instance. The
 ordinary report says how many retained revisions it would free.
+
+**Landed instances are most of the disk, and cleanup should name them
+(planned, #422).** Workspaces are disposable, but nothing disposes of
+them: instances accumulate after their work merges, each holding a full
+build tree. On this project's own machine, 90 of 122 instances held 321 GB
+of `target/` alone, with the disk 98% full; removing the 61 whose work had
+landed freed 150 GB. An instance has **landed** when its workspace has
+nothing uncommitted and its tip is on the project's default branch or on a
+branch the remote has, or its branch's pull request merged. `cleanup`
+lists landed instances with what each holds on disk, and `cleanup
+--landed` removes them as `remove` would: branch kept when unique,
+checkpoints kept. It stays opt-in, because newgit cannot see what else is
+attached to a workspace: a T3 Code thread or an editor still pointed at
+it.
 
 ### One command per instance at a time
 
