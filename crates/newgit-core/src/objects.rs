@@ -223,7 +223,8 @@ pub struct Objects {
 
 /// Where `repo` keeps its objects, once it is known to use SHA-1 ids: asked
 /// of Git once per repository a process opens (a repository's object format
-/// never changes), and again only if the directory is gone.
+/// never changes), and again only if the directory is gone. A relative path
+/// is asked each time: it names another repository once the process moves.
 fn objects_dir(repo: &Utf8Path) -> Result<Utf8PathBuf> {
     static KNOWN: OnceLock<Mutex<HashMap<Utf8PathBuf, Utf8PathBuf>>> = OnceLock::new();
     let known = KNOWN.get_or_init(Default::default);
@@ -252,10 +253,12 @@ fn objects_dir(repo: &Utf8Path) -> Result<Utf8PathBuf> {
     } else {
         repo.join(path)
     };
-    known
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .insert(repo.to_path_buf(), dir.clone());
+    if repo.is_absolute() {
+        known
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(repo.to_path_buf(), dir.clone());
+    }
     Ok(dir)
 }
 
