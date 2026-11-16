@@ -1607,13 +1607,21 @@ fn prepare(
                 at.insert(tracker.clone(), (view, commit.clone()));
             }
         }
-        policy::load_definitions_at(
+        let after = policy::load_definitions_at(
             &project.app.config.data,
             db,
             &project.id,
             names.iter().map(String::as_str),
             &at,
-        )
+        );
+        // A definition the client would refuse to load never lands.
+        if after.values().any(|facts| facts.mount_refused.is_some()) {
+            let before = project.definitions(db, names.iter().map(String::as_str))?;
+            if let Some(refusal) = policy::mount_refusal(&before, &after) {
+                return fail(400, refusal);
+            }
+        }
+        after
     } else {
         project.definitions(db, names.iter().map(String::as_str))?
     };

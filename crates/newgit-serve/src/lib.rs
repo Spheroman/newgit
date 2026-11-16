@@ -18,6 +18,7 @@ pub mod reparent;
 pub mod repos;
 pub mod rooted;
 pub mod server_merge;
+pub mod status;
 pub mod tokens;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
