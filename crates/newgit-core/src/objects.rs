@@ -200,6 +200,12 @@ pub fn hash(kind: &str, body: &[u8]) -> String {
 /// One `git cat-file` kept running: its stdin and its answers.
 type Batch = (Child, ChildStdin, BufReader<ChildStdout>);
 
+/// An entry's mode and object, to set at a path.
+pub type ModeId = (Vec<u8>, String);
+
+/// A path as its parts, and what to set there.
+type PartsEdit = (Vec<Vec<u8>>, Option<ModeId>);
+
 /// One repository's objects: read through a long-lived `git cat-file
 /// --batch`, written in batches. Objects made here are readable at once,
 /// before they are written.
@@ -214,6 +220,8 @@ pub struct Objects {
     check: Option<Batch>,
     commits: HashMap<String, Commit>,
     trees: HashMap<String, Vec<Entry>>,
+    /// Blobs made here, readable before they are written.
+    blobs: HashMap<String, Vec<u8>>,
     /// Made here, not written yet: `(kind, id, body)`.
     pending: Vec<(&'static str, String, Vec<u8>)>,
     pending_ids: HashSet<String>,
@@ -264,7 +272,7 @@ fn objects_dir(repo: &Utf8Path) -> Result<Utf8PathBuf> {
 
 /// A `git cat-file` with `mode` (`--batch`, `--batch-check`) in `repo`.
 fn start_batch(repo: &Utf8Path, mode: &str) -> Result<Batch> {
-    let mut child = Command::new("git")
+    let mut child = crate::git::command()
         .arg("-C")
         .arg(repo.as_str())
         .args(["cat-file", mode])
@@ -324,6 +332,7 @@ impl Objects {
             check: None,
             commits: HashMap::new(),
             trees: HashMap::new(),
+            blobs: HashMap::new(),
             pending: Vec::new(),
             pending_ids: HashSet::new(),
             durable: false,
@@ -411,6 +420,9 @@ impl Objects {
 
     /// Blob `id`'s bytes, read through the batch (no process of its own).
     pub fn blob(&mut self, id: &str) -> Result<Vec<u8>> {
+        if let Some(body) = self.blobs.get(id) {
+            return Ok(body.clone());
+        }
         match self.read_raw(id)? {
             Some((kind, body)) if kind == "blob" => Ok(body),
             _ => Err(NewgitError::SourceCommand {
@@ -486,6 +498,18 @@ impl Objects {
         }
         if self.pending_ids.insert(id.clone()) {
             self.pending.push(("tree", id.clone(), body));
+        }
+        id
+    }
+
+    /// Make a blob of `body`; returns its id.
+    pub fn make_blob(&mut self, body: &[u8]) -> String {
+        let id = hash("blob", body);
+        self.blobs
+            .entry(id.clone())
+            .or_insert_with(|| body.to_vec());
+        if self.pending_ids.insert(id.clone()) {
+            self.pending.push(("blob", id.clone(), body.to_vec()));
         }
         id
     }
@@ -635,6 +659,104 @@ impl Objects {
         Ok(Some(self.make_tree(entries)))
     }
 
+    /// `tree` with each of `edits` (a path, and what to set there: `None`
+    /// removes it) made, as [`Self::set_path`] one after another would make
+    /// them, each touched directory written once. The paths must be apart,
+    /// as [`split_path`] reads them: none equal to another or inside it, so
+    /// their order does not matter. Paths that are not, or the root, are an
+    /// error, never a panic.
+    pub fn set_paths(
+        &mut self,
+        tree: &str,
+        edits: Vec<(Vec<u8>, Option<ModeId>)>,
+    ) -> Result<String> {
+        if edits.is_empty() {
+            return Ok(tree.to_owned());
+        }
+        let parts: Vec<PartsEdit> = edits
+            .into_iter()
+            .map(|(path, entry)| {
+                (
+                    split_path(&path).into_iter().map(<[u8]>::to_vec).collect(),
+                    entry,
+                )
+            })
+            .collect();
+        if parts.iter().any(|(parts, _)| parts.is_empty()) {
+            return Err(NewgitError::Unsupported(
+                "set_paths takes paths below the root".to_owned(),
+            ));
+        }
+        // Refused (never indexed past) when two paths are equal or one is
+        // inside the other.
+        let updated = self.set_many(Some(tree), &parts)?;
+        Ok(updated.unwrap_or_else(|| self.make_tree(Vec::new())))
+    }
+
+    fn set_many(&mut self, tree: Option<&str>, edits: &[PartsEdit]) -> Result<Option<String>> {
+        let mut by_name: BTreeMap<&Vec<u8>, Vec<usize>> = BTreeMap::new();
+        for (index, (parts, _)) in edits.iter().enumerate() {
+            let Some(first) = parts.first() else {
+                return Err(not_apart());
+            };
+            by_name.entry(first).or_default().push(index);
+        }
+        // A path set here and also edited below (or set twice) is not apart
+        // from the other: its order would matter, so it is refused.
+        if by_name.values().any(|indexes| {
+            indexes.len() > 1 && indexes.iter().any(|index| edits[*index].0.len() == 1)
+        }) {
+            return Err(not_apart());
+        }
+        let mut entries = match tree {
+            Some(tree) => self.tree(tree)?,
+            None => Vec::new(),
+        };
+        for (name, indexes) in by_name {
+            let position = entries.iter().position(|existing| &existing.name == name);
+            let replacement = if let [only] = indexes.as_slice()
+                && edits[*only].0.len() == 1
+            {
+                edits[*only].1.clone().map(|(mode, id)| Entry {
+                    mode,
+                    name: name.clone(),
+                    id,
+                })
+            } else {
+                let below = position
+                    .map(|index| entries[index].clone())
+                    .filter(Entry::is_tree)
+                    .map(|existing| existing.id);
+                let deeper: Vec<PartsEdit> = indexes
+                    .iter()
+                    .map(|index| (edits[*index].0[1..].to_vec(), edits[*index].1.clone()))
+                    .collect();
+                // As `set_in`: removing below something that is not a tree
+                // changes nothing.
+                if below.is_none() && deeper.iter().all(|(_, entry)| entry.is_none()) {
+                    continue;
+                }
+                self.set_many(below.as_deref(), &deeper)?.map(|id| Entry {
+                    mode: TREE_MODE.to_vec(),
+                    name: name.clone(),
+                    id,
+                })
+            };
+            match (position, replacement) {
+                (Some(index), Some(new)) => entries[index] = new,
+                (Some(index), None) => {
+                    entries.remove(index);
+                }
+                (None, Some(new)) => entries.push(new),
+                (None, None) => {}
+            }
+        }
+        if entries.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(self.make_tree(entries)))
+    }
+
     /// `top` laid over `base`: `top`'s entries win, subtrees on both sides
     /// merge. How a tracker mounted at `.` sits beside its parent's files.
     pub fn overlay(&mut self, base: &str, top: &str) -> Result<String> {
@@ -743,6 +865,8 @@ impl Objects {
     pub fn flush(&mut self) -> Result<()> {
         let pending = std::mem::take(&mut self.pending);
         self.pending_ids.clear();
+        // Written below, and read from the repository after that.
+        self.blobs.clear();
         let mut needed = Vec::new();
         for (kind, id, body) in pending {
             if self.loose_path(&id).exists()
@@ -763,8 +887,7 @@ impl Objects {
     /// objects: each compressed into a temporary file in its fan-out
     /// directory, and linked into place only if nothing is there yet (an
     /// object's bytes are its id, so whatever is there is it). When this is
-    /// durable, every
-    /// file is on disk before any is in place, as Git's
+    /// durable, every file is on disk before any is in place, as Git's
     /// `core.fsyncMethod=batch` has it: on macOS each is written out and one
     /// full flush of the device covers them all (a full flush per object
     /// costs as much again each time); elsewhere each is synced.
@@ -948,9 +1071,18 @@ pub fn join_path(prefix: &[u8], name: &[u8]) -> Vec<u8> {
     path
 }
 
+fn not_apart() -> NewgitError {
+    NewgitError::Unsupported(
+        "set_paths takes paths apart: none equal to another or inside it".to_owned(),
+    )
+}
+
 fn git_output(repo: &Utf8Path, args: &[&str]) -> Result<String> {
     let out = run(
-        Command::new("git").arg("-C").arg(repo.as_str()).args(args),
+        crate::git::command()
+            .arg("-C")
+            .arg(repo.as_str())
+            .args(args),
         &format!("git {}", args.join(" ")),
         None,
     )?;

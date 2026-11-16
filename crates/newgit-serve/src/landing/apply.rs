@@ -371,6 +371,7 @@ pub(super) fn write_rows(
             if let Some(epoch) = change.epoch {
                 db::set_epoch(&transaction, home, epoch)?;
             }
+            db::set_landed(&transaction, home, *stamp)?;
             if change.whole {
                 // Its whole state: rows it does not name go (a void's, of
                 // anything a voided landing could have left).

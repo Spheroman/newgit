@@ -363,7 +363,7 @@ fn fetch_project(
     full: bool,
 ) -> Result<Fetched> {
     let git = |args: &[&str]| -> Result<String> {
-        let output = std::process::Command::new("git")
+        let output = newgit_core::git::command()
             .arg("-C")
             .arg(dir.as_str())
             .args(args)
@@ -416,7 +416,7 @@ fn fetch_project(
             Some(&remote::basic_auth_header(&credential)),
         )?;
         // The list is the truth for where `main` is.
-        let output = std::process::Command::new("git")
+        let output = newgit_core::git::command()
             .arg(format!("--git-dir={}", paths.tracker_store))
             .args([
                 "update-ref",
@@ -498,7 +498,7 @@ fn fetch_project(
     ])?;
     let definitions = dir.join(".newgit/trackers");
     std::fs::create_dir_all(&definitions)?;
-    let archive = std::process::Command::new("git")
+    let archive = newgit_core::git::command()
         .arg("-C")
         .arg(dir.as_str())
         .args([
@@ -548,14 +548,14 @@ pub fn init_named_project(root: &camino::Utf8Path, url: &str, key: &str) -> Resu
     let url = url.trim_end_matches('/');
     let store = MetadataStore::at(root);
     let local_git = |args: &[&str]| {
-        std::process::Command::new("git")
+        newgit_core::git::command()
             .arg("-C")
             .arg(root.as_str())
             .args(args)
             .output()
             .context("could not run git")
     };
-    let seeded = std::process::Command::new("git")
+    let seeded = newgit_core::git::command()
         .arg(format!("--git-dir={}", store.paths().tracker_store))
         .args(["rev-parse", "-q", "--verify", "refs/trackers/root/main"])
         .output()
@@ -693,7 +693,7 @@ fn join_from(
     // nothing. Anything else is only here.
     let at_origin = format!("refs/remotes/origin/{branch}");
     let in_root = |args: &[&str]| {
-        std::process::Command::new("git")
+        newgit_core::git::command()
             .arg("-C")
             .arg(root.as_str())
             .args(args)
@@ -731,7 +731,7 @@ fn join_from(
     let tracked = in_root(&["ls-files", "-z"])?;
     let tracked: std::collections::BTreeSet<&[u8]> =
         tracked.stdout.split(|byte| *byte == 0).collect();
-    let tree = std::process::Command::new("git")
+    let tree = newgit_core::git::command()
         .arg("-C")
         .arg(scratch.as_str())
         .args(["ls-tree", "-r", "-z", &fetched.head])
@@ -776,7 +776,7 @@ fn join_from(
     }
 
     let git = |location: &[&str], args: &[&str]| -> Result<()> {
-        let output = std::process::Command::new("git")
+        let output = newgit_core::git::command()
             .args(location)
             .args(args)
             .output()

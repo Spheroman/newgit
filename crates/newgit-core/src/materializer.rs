@@ -114,6 +114,30 @@ impl Materializer for RealDirMaterializer {
     }
 }
 
+/// Whether `workspace` holds nothing but its marker — what `newgit stop
+/// --evict` leaves at an instance's path — so restoring over it loses
+/// nothing. Anything else there was written after the eviction, by someone.
+pub fn is_evicted_stub(workspace: &Utf8Path) -> bool {
+    let only = |dir: &Utf8Path, allowed: &[&str]| -> bool {
+        std::fs::read_dir(dir).is_ok_and(|entries| {
+            entries.into_iter().all(|entry| {
+                entry.is_ok_and(|entry| {
+                    entry
+                        .file_name()
+                        .to_str()
+                        .is_some_and(|name| allowed.contains(&name))
+                })
+            })
+        })
+    };
+    only(workspace, &[".newgit"])
+        && only(&workspace.join(".newgit"), &["local"])
+        && only(
+            &workspace.join(".newgit/local"),
+            &["instance.toml", ".gitignore"],
+        )
+}
+
 /// Gitignored marker inside a workspace pointing back at the store, so
 /// newgit commands run from inside a workspace find the real metadata and
 /// know which instance they are standing in.
@@ -246,7 +270,7 @@ pub fn unexclude_tracker_paths(workspace: &Utf8Path, paths: &[Utf8PathBuf]) -> R
     Ok(true)
 }
 
-fn write_workspace_marker(store_root: &Utf8Path, branch: &BranchInstance) -> Result<()> {
+pub fn write_workspace_marker(store_root: &Utf8Path, branch: &BranchInstance) -> Result<()> {
     let marker = WorkspaceMarker {
         branch: branch.name.clone(),
         store_root: store_root.to_path_buf(),

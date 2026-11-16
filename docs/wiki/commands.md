@@ -22,6 +22,29 @@ inside a workspace):
   `autostart` action that died on its own); ports,
   workspace, trackers, and installs stay as they are. Both exit 0 with
   nothing to do and 1 if any resource failed
+- `newgit stop --evict [--discard-ignored]` — stop, checkpoint, and delete
+  the workspace, leaving its marker; `newgit start` brings it back from that
+  checkpoint into the same directory, with uncommitted and staged work,
+  other branches, the stash, notes, other remotes' refs, local Git config,
+  hooks, file modes, empty directories, tracker content, and rebuilt
+  installs. It refuses, deleting nothing, when something would not come
+  back: ignored files no tracker owns and nothing rebuilds (listed, a
+  directory with its file count; `--discard-ignored` lets them go, and
+  declaring disposable build output such as `target/` is not possible yet,
+  #447), a
+  merge or rebase in the middle, hand edits to a rendered file, an untracked
+  repository, an initialized submodule, a linked worktree, or a process
+  still in the directory (run it from outside the workspace). Not kept, and
+  said first: reflogs other than the stash's, intent-to-add entries,
+  hand-set assume-unchanged/skip-worktree flags, setuid/setgid/sticky bits,
+  and hand-set values on config keys newgit sets itself. Evicting does not
+  free an untracked file's blob, and evict checkpoints are not pruned yet
+  (#446). A restore that fails or is cut short moves what is at the path
+  aside, whole, to `.<name>.restore-failed` or `.<name>.interrupted-restore`
+  and keeps it; `start`, `status`, `stop --evict`, and `cleanup` name each
+  one until `newgit cleanup --discard-saved <path>` deletes it
+- `newgit remove <instance> [--force]` — on an evicted instance whose path
+  holds work written after a failed restore, refuses unless `--force`
 - `newgit checkpoint [instance] [-m <msg>] [--verify]` / `undo [instance]
   [--to <id>] [--only <resource>] [--force-recompute]` / `checkpoints
   [instance]` — `--verify` proves the restore works by running a real undo;
