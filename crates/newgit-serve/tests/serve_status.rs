@@ -138,4 +138,23 @@ fn in_its_own_process() {
     .err()
     .expect("ana does not");
     assert_eq!(refused.status, 403, "{}", refused.message);
+
+    // Garbage collection's last pass is there too, once one has run.
+    assert_eq!(
+        status(&app, "jack").1["gc"]["last"],
+        serde_json::Value::Null
+    );
+    newgit_serve::maintenance::run(&app);
+    let (_, answer) = status(&app, "jack");
+    assert!(
+        answer["gc"]["last"]["stores"]
+            .as_u64()
+            .is_some_and(|n| n >= 1),
+        "{answer}"
+    );
+    assert_eq!(
+        answer["gc"]["last"]["failed"],
+        serde_json::json!({}),
+        "{answer}"
+    );
 }

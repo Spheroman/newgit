@@ -115,6 +115,14 @@ impl Merges {
         merges
     }
 
+    /// Whether `login` has a merge begun in `home` and not expired: its
+    /// landings there may still be written to or read.
+    pub fn in_flight(&self, home: &str, login: &str) -> bool {
+        self.lock()
+            .iter()
+            .any(|((project, _, _), pending)| project == home && pending.by == login)
+    }
+
     fn turns(&self) -> std::sync::MutexGuard<'_, Vec<TurnHeld>> {
         self.turns
             .lock()

@@ -80,7 +80,9 @@ times in a row (`crates/newgit-serve/src/status.rs`).
     instance/<name>.git  a private instance's forks
     tracker/<name>.git   a new tracker's seed, alone until it joins a branch
   homes/<owner>/<project>/landing/<login>/<namespace>.git
-                         a merge's objects until it lands, never served
+                         a merge's objects until it lands, never served;
+                         removed by garbage collection once nothing waits
+                         in it
   homes/<owner>/<project>/scratch/<random>.git
                          the server's merge's composed objects while it
                          runs, never served, removed after it (and at start)
@@ -227,8 +229,9 @@ Resolved loudly; each is reversible.
      one in the way refuses the landing.
    - **What a tracker held before its audience narrowed stays where it
      was.** Its refs leave the wider store, but its objects remain there
-     until gc, and under protocol v2 any reader of that store can still
-     fetch them by id through any repo in it. That content was readable by
+     until its next garbage collection (decision 11), and under protocol v2
+     any reader of that store can still fetch them by id through any repo
+     in it meanwhile. That content was readable by
      that audience already, so this keeps nothing new from anyone; to take
      back something that was public, rewrite it, do not narrow it.
    - **`has_commit` asks the store, not the namespace.** Within one audience
@@ -608,7 +611,68 @@ Resolved loudly; each is reversible.
       128 ms each is about 47 minutes in the background, serving
       meanwhile.
 
+11. **Garbage collection is a pass `newgit serve` runs itself** (#434,
+    `crates/newgit-serve/src/maintenance.rs`), every six hours
+    (`NEWGIT_SERVE_GC_EVERY_SECONDS`; `0` runs none). Stores never collect
+    on their own: `gc.auto = 0` and `receive.autogc = false` are in every
+    store's config (written into older stores at start), since a push's
+    `gc --auto` knows nothing of what merges' landings borrow. A pass:
+    - **The landing log first**, holding the leader's seat
+      (`Log::collect`): no batch's `fast-import` runs while it does, and a
+      landing that arrives waits and lands after it. `git repack -d
+      --geometric=2` rolls up the loose objects and packs the batches
+      wrote (every object of what it rolls up is kept, reachable or not)
+      and `pack-refs` compacts its refs. Nothing is ever dropped: every
+      entry, and the state at every stamp, is where it was.
+    - **Then each home, holding its root** (`Log::hold`, so no landing there
+      moves, copies, or places anything) **and its compose lock** (no stored
+      rooted history is being extended into its stores: that writer skips
+      objects a store has, so an old one it reused would not be fresh). A
+      landing there meanwhile waits the root wait, then is answered 503
+      naming the collection; other projects land as before.
+      - A merge's landing (`landing/<login>/<namespace>.git`) with no ref
+        left, no merge in flight for its login there (`Merges`), and not
+        opened by this process within the grace is renamed aside and
+        removed, under the lock opening it takes, so one opened at that
+        moment is made again whole.
+      - Every store is collected with `git gc`, which keeps everything any
+        ref reaches, in every namespace (trackers, forks, stored rooted
+        histories, landing refs), plus what the landings left still reach
+        through it: a landing borrows its store's objects, and a merge's
+        base may be there only. Each landing's `rev-list --objects <its
+        landing refs> --not --alternate-refs` is handed to
+        `gc.recentObjectsHook`, which keeps those and everything they
+        reach. One that cannot be read refuses its store's collection.
+        Objects nothing reaches go once older than the grace
+        (`NEWGIT_SERVE_GC_GRACE_SECONDS`, an hour): a push, a fork's start,
+        or a merge writes objects before a ref names them, outside the
+        root's lock, and Git keeps fresh ones for exactly that. Never
+        `--prune=now`, which Git runs as `repack -a` without asking the
+        hook.
+    - So **a voided move's objects and a narrowing's old history leave
+      their stores** at the first pass after the grace, and with them
+      what stored rooted histories replaced (each state commit is
+      parentless). `crates/newgit-serve/tests/gc_keeps_reachable.rs` holds
+      a pass to losing nothing reachable (a fork's commit, a landing's base
+      only it reaches, the log at every stamp) and dropping what nothing
+      reaches; `gc_races_no_landing.rs` holds a landing back on both
+      locks. The last pass, and what failed in it (tried again at the
+      next), is in `GET /v1/serve/status`.
+
 ## Known limits
+- **Garbage collection holds a home's landings.** A store's `git gc` runs
+  holding its home's root, so a large store (the 22k-repo home's took
+  143 s) answers that project's landings 503 for as long, every six hours.
+  Collecting each store holding only what lands in it, or repacking
+  geometrically between full collections, would shorten that; neither is
+  done yet.
+- **A merge's objects that reuse an object no ref reaches may lose it.** A
+  server merge writes into the merger's landing outside the home's root,
+  and like the rooted extension skips objects its view already has
+  (through the store). One no ref reached, older than the grace, can be
+  collected before the merge's landing ref names what it wrote; that
+  merge then fails placing its commits (500, naming the object), and the
+  merger runs it again. Nothing landed is lost.
 - **A view for a reader who reads more than its store's audience is
   composed per fetch.** A member who may also read a private tracker
   mounted inside the view gets it composed on each fetch after a landing,
@@ -626,9 +690,10 @@ Resolved loudly; each is reversible.
   landing, flat, because it memoized by subtree and redid only the paths
   that changed; reusing the previous commit's subtrees for the children a
   landing did not touch is the fix, recorded on #440 with these numbers.
-- **What stored histories leave behind stays until gc ([#434]).** Each
-  extension writes a new state commit and map trees, and canonical notes
-  are kept for view commits a branch no longer reaches. (A tracker moving
+- **Canonical notes are kept for view commits a branch no longer
+  reaches.** Each extension writes a new state commit and map trees; what
+  they replace is collected (decision 11), but the notes ref reaches every
+  note it ever had. (A tracker moving
   to another store has its `r/<T>` and state ref removed from the old one
   with its namespace, and an extension still running there when the move
   lands writes nothing back: decision 10, *Layout*.)
@@ -683,9 +748,11 @@ Resolved loudly; each is reversible.
   like any landing, tried again at each landing on its projects and at
   each start, and putting it in place again is safe. A void and a landing
   already voided cannot be voided. **The objects copied stay in that
-  store until its garbage collection, which does not exist yet ([#434]),
-  and under protocol v2 its readers can fetch one by id: voiding a stuck
-  widening leaves its history readable by the wider audience.** Voiding
+  store until its next garbage collection after the grace (decision 11,
+  an hour by default, at most six more until the pass), and under
+  protocol v2 its readers can fetch one by id meanwhile: voiding a stuck
+  widening leaves its history readable by the wider audience until
+  then.** Voiding
   says which stamps it gave up; fixing the cause and retrying leaves
   nothing behind.
 - **A landing in place and not finished has landed, and is never
@@ -785,7 +852,8 @@ Resolved loudly; each is reversible.
 - **`?at=` and startup cost grow with the log.** `?at=` resolves
   `<tip>~<n>`, which walks back `n` commits, and the first start of a data
   directory reads every entry after the applied mark; neither is indexed
-  yet, and the log is never compacted ([#434]).
+  yet. An index (stamp to log commit, beside the applied mark) would make
+  `?at=` constant ([#434]).
 - **Pushes that move no tracker's branch are not landings**: a fork's, a
   seed's, a per-user repo's, a tracker outside Git's. They move their own
   refs, in their own store, as before.
@@ -795,8 +863,7 @@ Resolved loudly; each is reversible.
 
 ## Not yet
 
-- Garbage collection of the stores, of merge landings, and of the landing
-  log ([#434]).
+- An index from stamp to log commit, for `?at=` ([#434]).
 
 - The GitHub webhook (`POST /v1/webhooks/github`) and mirror pulls.
 - The landing page and `/install.sh`.

@@ -389,4 +389,49 @@ impl Log {
         }
         Ok((!list.is_empty()).then_some(list))
     }
+
+    /// Collect the log (#434): roll its packs up (`git repack --geometric=2
+    /// -d`; each batch's `fast-import` writes one) and compact its refs,
+    /// holding the leader's seat, so no batch writes meanwhile: landings
+    /// that arrive wait and land as one batch after. Nothing is dropped. A
+    /// geometric repack writes every object of the packs it rolls up into
+    /// the new one, reachable or not, so every entry, and the state at
+    /// every stamp, is where it was.
+    pub fn collect(&self) -> ApiResult<()> {
+        struct Seat<'l>(&'l Log);
+        impl Drop for Seat<'_> {
+            fn drop(&mut self) {
+                let mut queue = self.0.lock();
+                queue.leading = false;
+                self.0.changed.notify_all();
+            }
+        }
+        let mut queue = self.lock();
+        while queue.leading {
+            queue = self
+                .changed
+                .wait(queue)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+        queue.leading = true;
+        drop(queue);
+        let _seat = Seat(self);
+        // For the test that lands while the log is collected.
+        self.wait_while("hold-log-collect");
+        for args in [
+            &["repack", "-q", "-d", "--geometric=2"][..],
+            &["pack-refs", "--all"][..],
+        ] {
+            let output = repos::git(&self.dir, args)?;
+            if !output.status.success() {
+                return Err(HttpError::internal(format!(
+                    "git {} in the landing log {}: {}",
+                    args.join(" "),
+                    self.dir,
+                    String::from_utf8_lossy(&output.stderr).trim()
+                )));
+            }
+        }
+        Ok(())
+    }
 }
