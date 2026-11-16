@@ -476,7 +476,8 @@ impl BranchManager {
                  so {doing} would publish {} again; nothing moved. An instance with no work \
                  of its own on `{path}` follows the reset with `newgit pull {path}`; one with \
                  work of its own has it on the old line, so redo that work in a new instance \
-                 (`newgit spawn`) and remove this one",
+                 (`newgit spawn`) and remove this one. A reset not published yet is published \
+                 by `newgit merge main`, before anything else merges",
                 short(commit),
                 if found.len() == 1 {
                     "a commit".to_owned()
