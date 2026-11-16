@@ -29,15 +29,16 @@ inside a workspace):
   hooks, file modes, empty directories, tracker content, and rebuilt
   installs. It refuses, deleting nothing, when something would not come
   back: ignored files no tracker owns and nothing rebuilds (listed, a
-  directory with its file count; `--discard-ignored` lets them go, and
-  declaring disposable build output such as `target/` is not possible yet,
-  #447), a
+  directory with its file count; `--discard-ignored` lets them go), a
   merge or rebase in the middle, hand edits to a rendered file, an untracked
   repository, an initialized submodule, a linked worktree, or a process
   still in the directory (run it from outside the workspace). Not kept, and
   said first: reflogs other than the stash's, intent-to-add entries,
   hand-set assume-unchanged/skip-worktree flags, setuid/setgid/sticky bits,
-  and hand-set values on config keys newgit sets itself. Evicting frees an
+  and hand-set values on config keys newgit sets itself. Build output a
+  resource declares `disposable` (`disposable = ["target"]`, #447) is
+  dropped with the workspace instead of refusing, and named (`disposed` in
+  `--json`, and in `status`); the build refills it. Evicting frees an
   untracked file's blob only once a later eviction supersedes the
   checkpoint holding it and `newgit cleanup` collects it (#446). A restore
   that fails or is cut short moves what is at the path aside, whole, to `.<name>.restore-failed` or `.<name>.interrupted-restore`

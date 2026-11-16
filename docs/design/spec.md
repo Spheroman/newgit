@@ -99,7 +99,11 @@ Resources exist for exactly three reasons:
   build) are tied to a machine and a path. The truth is the identity, the
   lockfile, and the artifact is derived from it. Instances whose identity
   agrees can share the derived tree through the install store (see
-  *Installs*); instances whose identity differs never do.
+  *Installs*); instances whose identity differs never do. Build output a
+  tool refills on its own (`target/`, `.next/cache`) is the same kind of
+  state with the rebuild left to the tool: a resource declares it
+  `disposable`, with no hook at all, and an eviction drops it (see
+  *Stop, start, evict*).
 
 If something is just files that copy correctly, it is a tracker.
 
@@ -1301,12 +1305,33 @@ linked to the workspace (`git worktree add`), whose Git is in
 and no bound `recompute` resource rebuilds, such as `target/` or a stray
 `.env.local`. It names those, a wholly ignored directory as one entry with
 its file count, and `--discard-ignored` evicts anyway, naming them again
-(`discarded` in `--json`). There is no way yet to declare build output
-such as `target/` disposable, so a plain `--evict` refuses in a Rust
-workspace and `--discard-ignored` is the manual override
-([#447](https://github.com/Spheroman/newgit/issues/447)): a resource
-cannot say it without a destructive `prepare` or an identity that refills
-the tree on `undo`. It also refuses
+(`discarded` in `--json`). Build output a tool refills on its own is
+declared `disposable` by a resource
+([#447](https://github.com/Spheroman/newgit/issues/447)):
+
+```toml
+# .newgit/resources/build-output.toml
+ownership = "workspace"
+disposable = ["target", ".next/cache"]
+```
+
+A plain `--evict` then drops the ignored files under those paths with the
+workspace, says so (`disposed` in `--json`, each path with its resource and
+file count, and `status` while the instance is evicted), and the `start`
+after it leaves them for the build to refill. The refusal names this
+declaration. It is a resource, not a project-level `[evict]` list, because
+build output is path-dependent state that is recomputed, never copied,
+which is what resources are for, and because a resource is bound per
+instance: one a tracker brings (`resources = [...]`) stops counting in an
+instance that drops that tracker. It has no `prepare`, no identity, and no
+hook, so no `undo`, `tracker use`/`drop`, or `spawn` ever touches the tree:
+a declaration with no lifecycle holds for every instance the moment it is
+written. It only ever drops *ignored* files (anything else is in the
+checkpoint), and a file under it that a tracker outside Git owns is kept.
+The first way tried, an install-shaped resource (`[identity]` on
+`Cargo.lock`, `produces = ["target"]`), had to either empty a live
+`target/` from its `prepare` on an `undo` across `Cargo.lock` or fill the
+install store with gigabytes of build output. It also refuses
 while a process other than itself has its working directory in the
 workspace, judged again right before the move: the shell or agent it was
 run from included, since the directory would be deleted under it, so it

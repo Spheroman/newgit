@@ -745,11 +745,15 @@ pub struct StopStartOutcome {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WorkspaceChange {
     /// Checkpointed to `checkpoint`, then deleted. `discarded` is what went
-    /// with it that no checkpoint carries: ignored paths no tracker owns and
-    /// no resource rebuilds, such as `target/`.
+    /// with it that no checkpoint carries and nothing declared disposable:
+    /// ignored paths no tracker owns and no resource rebuilds (only with
+    /// `--discard-ignored`).
     Evicted {
         checkpoint: String,
         discarded: Vec<crate::evict::Discarded>,
+        /// Ignored paths a resource declares `disposable`, dropped with the
+        /// workspace for its build to refill (#447).
+        disposed: Vec<crate::evict::Disposed>,
         /// What of the workspace's `.git/` no checkpoint and no save keeps
         /// (reflogs, intent-to-add, hand-set index flags), said before the
         /// delete.

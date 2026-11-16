@@ -2027,10 +2027,19 @@ fn stop_start_json(outcome: &StopStartOutcome) -> serde_json::Value {
         Some(WorkspaceChange::Evicted {
             checkpoint,
             discarded,
+            disposed,
             not_kept,
         }) => {
             json["evicted"] = serde_json::json!({
                 "checkpoint": checkpoint,
+                "disposed": disposed
+                    .iter()
+                    .map(|disposed| serde_json::json!({
+                        "path": disposed.path,
+                        "resource": disposed.resource,
+                        "files": disposed.files,
+                    }))
+                    .collect::<Vec<_>>(),
                 "discarded": discarded
                     .iter()
                     .map(|discarded| serde_json::json!({
@@ -2160,6 +2169,7 @@ fn print_stop_start(outcome: &StopStartOutcome, which: StopStart) {
     if let Some(WorkspaceChange::Evicted {
         checkpoint,
         discarded,
+        disposed,
         not_kept,
     }) = &outcome.workspace
     {
@@ -2170,6 +2180,12 @@ fn print_stop_start(outcome: &StopStartOutcome, which: StopStart) {
             "Evicted the workspace for `{instance}` to {checkpoint}; `newgit start {instance}` \
              brings it back"
         );
+        if !disposed.is_empty() {
+            println!("Dropped as disposable (its build refills it):");
+            for disposed in disposed {
+                println!("  {disposed}");
+            }
+        }
         if !discarded.is_empty() {
             println!("Discarded (ignored, and nothing rebuilds them):");
             for path in discarded {
@@ -3290,6 +3306,20 @@ fn status_table(
         println!("\n`{}` is not ready:", report.branch.name);
         for problem in &report.readiness.problems {
             println!("  - {problem}");
+        }
+    }
+    for report in &reports {
+        let disposed = manager.evicted_disposed(&report.branch);
+        if !disposed.is_empty() {
+            println!(
+                "\n`{}` is evicted; dropped as disposable, for its build to refill: {}",
+                report.branch.name,
+                disposed
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
         }
     }
     for report in &reports {

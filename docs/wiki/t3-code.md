@@ -41,9 +41,11 @@ An eviction that would lose something (ignored build output nobody
 declared, a rebase in the middle, a shell still in the directory) refuses
 and leaves the thread stopped, on disk. The server has to run it with its
 working directory outside the workspace: run from inside, it refuses, since
-the directory would be deleted under the caller. Declaring disposable
-build output such as `target/` is not possible yet, so a Rust workspace
-is not freed: `--discard-ignored` is the manual override (#447). Each settle/unsettle
+the directory would be deleted under the caller. A Rust workspace is
+freed once its build output is declared disposable, in a resource such as
+`.newgit/resources/build-output.toml` holding `ownership = "workspace"`
+and `disposable = ["target"]` (#447): the eviction drops `target/` and
+says so, and the build refills it after `start`. Each settle/unsettle
 cycle leaves an evict checkpoint behind, which `newgit cleanup` collects
 once a later eviction supersedes it (#446).
 
