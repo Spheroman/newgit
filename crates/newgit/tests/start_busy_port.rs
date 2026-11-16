@@ -108,29 +108,36 @@ fn db_port(store: &MetadataStore) -> u16 {
     store.find_branch("x").expect("instance").resources["db"].resolved_ports["api"]
 }
 
-/// `db` claims `api`, exports it as `API_URL`, renders it into `.env`, and
-/// has `sleep` standing in for the service.
-const DB: &str = r#"ownership = "branch"
+/// `db` claims `api` scanning up from `start`, exports it as `API_URL`,
+/// renders it into `.env`, and has `sleep` standing in for the service. Each
+/// test scans from its own `start`: they run side by side, each in a store of
+/// its own that cannot see the others' claims, and one test's listener on a
+/// port must not be another's busy port.
+fn db(start: u16) -> String {
+    format!(
+        r#"ownership = "branch"
 
 [ports.api]
-start = 47500
+start = {start}
 
 [exports]
-API_URL = "http://127.0.0.1:{{ports.api}}"
+API_URL = "http://127.0.0.1:{{{{ports.api}}}}"
 
 [[render]]
 path = ".env"
-replace = [{ find = "API=http://127.0.0.1:1", with = "API=http://127.0.0.1:{{ports.api}}" }]
+replace = [{{ find = "API=http://127.0.0.1:1", with = "API=http://127.0.0.1:{{{{ports.api}}}}" }}]
 
 [actions.start]
 command = "sleep 1000"
 long_running = true
-"#;
+"#
+    )
+}
 
-fn spawned() -> (TempDir, Utf8PathBuf, MetadataStore, Utf8PathBuf) {
+fn spawned(start: u16) -> (TempDir, Utf8PathBuf, MetadataStore, Utf8PathBuf) {
     let (guard, temp) = tempdir();
     let store = setup(&temp);
-    std::fs::write(store.paths().resources.join("db.toml"), DB).expect("write resource");
+    std::fs::write(store.paths().resources.join("db.toml"), db(start)).expect("write resource");
     let repo = store.paths().project_root.clone();
     newgit_ok(&repo, &["spawn", "x"]);
     newgit_ok(&repo, &["action", "db.start", "x"]);
@@ -140,7 +147,7 @@ fn spawned() -> (TempDir, Utf8PathBuf, MetadataStore, Utf8PathBuf) {
 
 #[test]
 fn start_moves_a_port_another_program_took() {
-    let (_guard, repo, store, workspace) = spawned();
+    let (_guard, repo, store, workspace) = spawned(47500);
     let claimed = db_port(&store);
     newgit_ok(&repo, &["stop", "x"]);
 
@@ -172,7 +179,7 @@ fn start_moves_a_port_another_program_took() {
 
 #[test]
 fn start_says_so_in_plain_output_too() {
-    let (_guard, repo, store, _) = spawned();
+    let (_guard, repo, store, _) = spawned(47520);
     let claimed = db_port(&store);
     newgit_ok(&repo, &["stop", "x"]);
     let _held = TcpListener::bind(("127.0.0.1", claimed)).expect("another program binds the port");
@@ -190,7 +197,7 @@ fn start_says_so_in_plain_output_too() {
 
 #[test]
 fn start_leaves_a_free_port_alone() {
-    let (_guard, repo, store, _) = spawned();
+    let (_guard, repo, store, _) = spawned(47540);
     let claimed = db_port(&store);
     newgit_ok(&repo, &["stop", "x"]);
 
