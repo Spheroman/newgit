@@ -10,6 +10,7 @@ pub mod db;
 pub mod error;
 pub mod git_http;
 pub mod landing;
+pub mod maintenance;
 pub mod merge;
 pub mod migrate;
 pub mod names;
@@ -73,6 +74,8 @@ pub struct App {
     pub pushes: landing::Pushes,
     /// Stored rooted histories, extended in the background (`rooted`).
     pub rooted: rooted::Worker,
+    /// Garbage collection, in the background (`maintenance`).
+    pub maintenance: maintenance::Maintenance,
     /// `<data>/serve.lock`, locked while this runs: one process per data
     /// directory, since the landing log has one writer.
     _lock: std::fs::File,
@@ -132,6 +135,7 @@ impl App {
             log,
             pushes: landing::Pushes::default(),
             rooted: rooted::Worker::default(),
+            maintenance: maintenance::Maintenance::default(),
             _lock: lock,
         };
         // Landings written down and not yet in place, before anything is
@@ -321,6 +325,7 @@ pub fn serve_on(listener: std::net::TcpListener, config: Config) -> anyhow::Resu
             ..config
         })?);
         rooted::start(&app);
+        maintenance::start(&app);
         println!("newgit serve: listening on http://{address}");
         use std::io::Write as _;
         std::io::stdout().flush()?;

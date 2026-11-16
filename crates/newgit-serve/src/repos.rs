@@ -27,6 +27,11 @@ use crate::policy::{Audience, Facts};
 /// namespace or a landing might still name, and let `newgit clone` filter.
 const STORE_CONFIG: &[(&str, &str)] = &[
     ("receive.fsckObjects", "true"),
+    // Never collected by Git on its own (a push's `gc --auto`): a merge's
+    // landing borrows a store's objects, and only `newgit serve`'s own
+    // collection (`maintenance`) keeps what those name.
+    ("gc.auto", "0"),
+    ("receive.autogc", "false"),
     // A ref a push or a landing moved survives power loss once Git says it
     // moved (`docs/design/serve.md`, *Known limits*).
     ("core.fsync", DURABLE_FSYNC),
@@ -248,6 +253,60 @@ pub(crate) fn run_stdin(dir: &Utf8Path, args: &[&str], input: &str) -> ApiResult
 /// The lock that opening the landing at `dir` takes, one per landing,
 /// holding the alternate refs prefix this process last set there.
 type LandingLock = std::sync::Arc<std::sync::Mutex<Option<String>>>;
+
+/// When this process last opened each merge's landing ([`Repo::open_landing`]):
+/// one opened lately may be written to now, so it is never removed.
+fn landing_opened()
+-> &'static std::sync::Mutex<std::collections::HashMap<Utf8PathBuf, std::time::Instant>> {
+    static OPENED: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<Utf8PathBuf, std::time::Instant>>,
+    > = std::sync::OnceLock::new();
+    OPENED.get_or_init(Default::default)
+}
+
+/// Remove the merge's landing at `dir` when nothing waits in it: no ref in
+/// it, and not opened by this process within `quiet` (a push or an upload
+/// may be writing to it). Taken under the lock opening it takes, so a
+/// landing opened at the same moment is made again, whole, after. Whether a
+/// merge is in flight for its login is the caller's to know (`Merges`).
+/// Returns whether it was removed.
+pub fn remove_landing_if_idle(dir: &Utf8Path, quiet: std::time::Duration) -> ApiResult<bool> {
+    let lock = landing_lock(dir);
+    let _held = lock
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let opened = landing_opened()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(dir)
+        .copied();
+    if opened.is_some_and(|at| at.elapsed() < quiet) || !store_exists(dir) {
+        return Ok(false);
+    }
+    if !checked(dir, &["for-each-ref", "--count=1", "--format=%(refname)"])?
+        .trim()
+        .is_empty()
+    {
+        return Ok(false);
+    }
+    // Renamed out of the way first, so nothing ever opens half of one.
+    let gone = dir.with_file_name(format!(
+        ".{}.gone-{}",
+        dir.file_name().unwrap_or("landing"),
+        crate::tokens::random_hex(6)
+    ));
+    std::fs::rename(dir, &gone)?;
+    std::fs::remove_dir_all(&gone)?;
+    // `landing/<login>/t/<tracker>` left empty goes too.
+    let mut parent = dir.parent();
+    while let Some(dir) = parent {
+        if dir.file_name() == Some("landing") || std::fs::remove_dir(dir).is_err() {
+            break;
+        }
+        parent = dir.parent();
+    }
+    Ok(true)
+}
 
 fn landing_lock(dir: &Utf8Path) -> LandingLock {
     static LOCKS: std::sync::OnceLock<
@@ -1006,6 +1065,10 @@ impl Repo {
         let mut known = lock
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        landing_opened()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(dir.clone(), std::time::Instant::now());
         if !store_exists(&dir) {
             if let Some(parent) = dir.parent() {
                 std::fs::create_dir_all(parent)?;

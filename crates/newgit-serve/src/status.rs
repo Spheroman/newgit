@@ -1,5 +1,6 @@
 //! `GET /v1/serve/status`: what an operator of this server looks at when
-//! something runs in the background and fails there, not in a request.
+//! something runs in the background and fails there, not in a request: the
+//! landing log, stored rooted histories, and garbage collection.
 //! Admins only (`--admin`): it names every project.
 
 use serde_json::{Value, json};
@@ -47,6 +48,15 @@ pub fn status(app: &App, db: DbGuard<'_>, caller: &Caller) -> ApiResult<ApiRespo
         .rooted
         .backfilled
         .load(std::sync::atomic::Ordering::SeqCst);
+    let maintenance = app.maintenance.last().map(|pass| {
+        json!({
+            "started": pass.started,
+            "finished": pass.finished,
+            "stores": pass.stores,
+            "landings_removed": pass.landings_removed,
+            "failed": pass.failed,
+        })
+    });
     Ok(ApiResponse {
         status: 200,
         body: json!({
@@ -56,6 +66,7 @@ pub fn status(app: &App, db: DbGuard<'_>, caller: &Caller) -> ApiResult<ApiRespo
                 "stuck": stuck,
             },
             "rooted": { "backfilled": backfilled, "failing": failing },
+            "gc": { "last": maintenance },
         }),
     })
 }
