@@ -359,7 +359,7 @@ async function route(request: Request, env: Env, deps: Deps): Promise<Response> 
 		});
 
 	// ── The site: the landing page and the wiki ────────────────────────────
-	if ((method === "GET" || method === "HEAD") && path === "")return landingPage(method, site(env), deps.repos);
+	if ((method === "GET" || method === "HEAD") && path === "") return landingPage(method, site(env), deps.repos);
 	if ((method === "GET" || method === "HEAD") && (path === "/docs" || path.startsWith("/docs/"))) {
 		const docs = await docsPage(method, site(env), deps.repos, path.slice("/docs/".length));
 		if (docs) return docs;
