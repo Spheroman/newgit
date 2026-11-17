@@ -9,4 +9,5 @@
   a tracker sat and what it owned. Both now use one check
   (`newgit_core::tracker::mount_problem`). A stored rooted history that
   failed to extend was only in the server's log; the status route also
-  lists stuck landings.
+  lists stuck landings. It names every project, so `--admin '*'` makes
+  every logged-in user an admin of it.

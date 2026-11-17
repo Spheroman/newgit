@@ -152,17 +152,21 @@ pub fn parse_facts(text: &str, source: &str) -> Option<Facts> {
 
 /// Why a landing that leaves `after` as the definitions on `main` is
 /// refused for a mount, where `before` (what `main` defines now) does not
-/// define that tracker so already: the client's own message, so the two
+/// mount that tracker so already: the client's own message, so the two
 /// never disagree about where a tracker sits, and ownership, which follows
-/// the mount, means one thing. A definition already on `main` is not held
-/// against a landing that leaves it as it is.
+/// the mount, means one thing. A refused mount already on `main` is not
+/// held against a landing that leaves it as it is, whatever else of the
+/// definition, or of what is served for it (a fork's `capped`), changes.
 pub fn mount_refusal(
     before: &BTreeMap<String, Facts>,
     after: &BTreeMap<String, Facts>,
 ) -> Option<String> {
     after.iter().find_map(|(name, facts)| {
         let reason = facts.mount_refused.clone()?;
-        (before.get(name) != Some(facts)).then(|| {
+        let kept = before
+            .get(name)
+            .is_some_and(|was| was.mount_refused.is_some() && was.mount == facts.mount);
+        (!kept).then(|| {
             newgit_core::error::NewgitError::InvalidDefinition {
                 kind: "tracker",
                 name: name.clone(),
