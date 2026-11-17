@@ -164,12 +164,16 @@ Remote:
   target rewritten since this machine last exported to it (force-pushed,
   a secret purged, a rewind too) is not merged with: merging keeps what the
   rewrite removed for the next export to push again, so plain `pull
-  --remote` and every export refuse, saying how many commits it removed and
-  naming `--force`. `export --remote --force` refuses to put back what the
-  rewrite removed, naming how many, unless `--republish` is given. Nor is a
-  second target that still has what a reset dropped pulled from. With no
-  record of exporting there (another machine), a rewrite cannot be told
-  apart, and is not refused
+  --remote` refuses, and so does every push to the target that would carry
+  what it removed (`main`'s export, an instance's branch, a tag), saying
+  how many commits it removed and naming `--force`. A branch deleted there
+  counts as a rewrite that removed everything. `export --remote --force`
+  refuses to put back what the rewrite removed, naming how many, unless
+  `--republish` is given. Nor is a second target that still has what a
+  reset dropped pulled from. With no record of exporting there, or a record
+  older than another machine's export
+  ([#473](https://github.com/Spheroman/newgit/issues/473)), a rewrite
+  cannot be told apart, and is not refused
 - `newgit pull --remote <target> --force [--dry-run]` — follow a force-push
   instead (a secret purged on GitHub): the line of the tracker the target is
   rooted at is reset to the target's, as `git fetch` then `git reset --hard`

@@ -78,28 +78,18 @@ impl BranchManager {
         Ok(has)
     }
 
-    /// Refuse `tip`, about to be pushed to `target` at `branch`, when a
-    /// commit of it the target does not have adds a file a tracker outside
-    /// Git owns, or pins a commit a reset dropped. What the target has at
-    /// `branch` and at its own branch is published already, so it is not
-    /// judged again (#444). Returns the commit the target has at `branch`
-    /// now (none when it has no such branch): what a force-push leases on.
+    /// Refuse `tip`, about to be pushed to `target`, when a commit of it the
+    /// target does not have adds a file a tracker outside Git owns, or pins
+    /// a commit a reset dropped. `has` is what [`Self::target_has`] says the
+    /// target has at its own branch and the pushed one: published already,
+    /// so not judged again (#444). Only [`Self::clear_push`] asks this.
     pub(super) fn refuse_new_outside_git(
         &self,
         target: &ExportTarget,
         tip: &str,
-        branch: &str,
-    ) -> Result<Option<String>> {
-        let mut branches = vec![target.branch.as_str()];
-        if branch != target.branch {
-            branches.push(branch);
-        }
-        let has = self.target_has(target, &branches)?;
-        let at_branch = has
-            .iter()
-            .find(|(name, _)| name == branch)
-            .map(|(_, id)| id.clone());
-        let has: Vec<String> = has.into_iter().map(|(_, id)| id).collect();
+        has: &[(String, String)],
+    ) -> Result<()> {
+        let has: Vec<String> = has.iter().map(|(_, id)| id.clone()).collect();
         self.refuse_dropped_pins(target, tip, &has)?;
         let mut rev_list = vec![tip];
         if !has.is_empty() {
@@ -123,7 +113,7 @@ impl BranchManager {
             rooted.as_ref().map(|(_, mount)| mount.as_path()),
         )?
         else {
-            return Ok(at_branch);
+            return Ok(());
         };
         let way_out = match &rooted {
             Some((tracker, mount)) => {

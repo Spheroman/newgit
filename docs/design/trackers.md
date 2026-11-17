@@ -1050,9 +1050,20 @@ Reverting the change in an instance and merging it keeps it out of the tip
 only. So when the target's branch no longer descends from the commit this
 machine last exported there (`refs/newgit/exports/<target>/pushed`), and
 the tracker's line still holds a commit the rewrite removed, plain `pull
---remote` and every export (plain, `--dry-run`, and the one a push makes)
-refuse, saying how many commits the rewrite removed and naming `pull
---remote <target> --force [--dry-run]`. Whether the target is now beside
+--remote` refuses, and so does every push to that target that would carry
+one: `main`'s export (plain, `--dry-run`, and the one a push makes), an
+instance's branch (`branches = true`), and a tag pushed from the project
+root, each saying how many commits the rewrite removed and naming `pull
+--remote <target> --force [--dry-run]`. A branch the target no longer has
+at all, with a record of exporting to it (deleted, perhaps to purge a
+secret), is a rewrite that removed everything: only `export --remote
+--force --republish` makes it again, counted in what it puts back.
+
+These are enforced in one place. Every `git push` to a target goes through
+`clear_push` (`manager/target_push.rs`), which checks it and hands back the
+only thing `push_cleared` will push; a push that skips the check does not
+compile. A push of `main` and a tag together whose export of `main` fails
+does not push the tag to that target either. Whether the target is now beside
 the line (a purge that added a commit) or behind it does not matter: the
 simplest purge, `git reset --hard HEAD~1 && git push --force`, adds no
 commit, so a push of the old line would fast-forward it and put the key
@@ -1071,8 +1082,11 @@ a branch of its own otherwise, and rotating a secret that was published
 whatever happens to the history.
 
 **What this cannot see (decided, #442).** The check stands on this
-machine's record of what it pushed. Another machine that never exported
-to the target, or this one after losing the ref, has no record, and
+machine's record of what it pushed: with no record, or a record older than
+another machine's export, a rewrite is not seen
+([#473](https://github.com/Spheroman/newgit/issues/473)). Another machine
+that never exported to the target, or this one after losing the ref, has
+no record, and
 nothing else here can stand in for it soundly: the tracker's published
 `main` holds both what was exported and what was merged since, which a
 rewrite cannot be told from; the fetched `upstream` ref moves on every
@@ -1083,8 +1097,16 @@ fast-forwards it, putting back what it removed), and a purge that added a
 commit for a target with history of its own: plain `pull --remote` merges
 it, and the export's push is refused as not a fast-forward, naming `pull
 --remote <target> --force --dry-run` first and `--force` only with how
-many commits replacing the branch publishes there. Sharing the record
-through the remote, so every machine has it, is the fix, and not built.
+many commits replacing the branch publishes there. A stale record is the
+same blindness: this machine exported a clean commit, another exported the
+key on top, and a rewind back to the clean commit leaves this machine's
+record equal to the target's tip, so nothing looks rewritten and a plain
+export fast-forwards the key back; a purge that added a commit looks like
+a pull request merged there, and the refusal's advice (`pull --remote`
+merges it in) would keep the key, so that refusal names the dry run first
+and says another machine's export looks exactly like this. Sharing the
+record through the remote, so every machine has it, is the fix (#473), and
+not built.
 
 **Following a force-push (decided, #442).** `newgit pull --remote <target>
 --force` resets the line of the tracker the target is rooted at to the

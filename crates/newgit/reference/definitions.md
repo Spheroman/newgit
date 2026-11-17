@@ -1979,17 +1979,22 @@ refused. `newgit merge main` publishes what came in.
 A target rewritten since this machine last exported to it (force-pushed, a
 secret purged there) is not merged with what the tracker has, as `git
 pull` would: that keeps the removed commits for the next export to push
-again. Plain `pull --remote` and every export (`--dry-run` and the one a
-push makes too) refuse instead, saying how many commits the rewrite
-removed, and name `newgit pull --remote <target> --force`; a rewind (the
-commit dropped, nothing added) counts. `export --remote --force` replaces
+again. Plain `pull --remote` refuses instead, and so does every push to the
+target that would carry one of them: `main`'s export (`--dry-run` and the
+one a push makes too), an instance's branch, and a tag. Each says how many
+commits the rewrite removed and names `newgit pull --remote <target>
+--force`; a rewind (the commit dropped, nothing added) counts, and so does
+a branch deleted there, which only `--force --republish` makes again. A
+tag pushed with `main` is not pushed to a target `main`'s export was
+refused on. `export --remote --force` replaces
 the branch (leased on the commit it checked), but refuses first when that
 would put back commits the rewrite removed, naming how many, unless
 `--republish` is given. The check stands on this machine's record of what
-it pushed there: another machine with no record cannot tell a rewrite
-from a target behind or with history of its own, so it does not refuse,
-and its refused push names `pull --remote <target> --force --dry-run`
-before `--force`.
+it pushed there: with no record, or a record older than another machine's
+export ([#473](https://github.com/Spheroman/newgit/issues/473)), a rewrite
+cannot be told from a target behind or with history of its own, so it is
+not refused; a refused push then names `pull --remote <target> --force
+--dry-run` before `pull --remote` or `--force`.
 `newgit pull --remote <target> --force` follows the rewrite, for a target
 rooted at a tracker: the tracker's line is reset to the target's, as `git
 reset --hard` would, and the project root's pin moves to it; `newgit merge
