@@ -633,6 +633,7 @@ other ledger: a port is free the moment nothing claims it).
 | `depends_on` | array of strings | no | `[]` | resource or tracker names whose *lifecycle* this one depends on. Orders `prepare` at spawn and cleanup hooks in reverse. A name that is neither is an error the graph reports. Needing another resource's *value* is not this — see *Data edges*. |
 | `workdir` | string | no | workspace root | where every command this resource runs is spawned, relative to the workspace root (no `..`), except `[identity] key_command`, which always runs at the workspace root. Overridable per action — see `[actions.<name>]`. |
 | `reads` | array of strings | no | unset | files and directories this resource's running process reads, workspace-relative (a directory covers everything in it). When `tracker use` or `drop` changes the bytes of a rendered file it covers, the process is restarted. See *Rendered files under a running process*. |
+| `disposable` | array of strings | no | `[]` | ignored output this resource's tools refill on their own (`target`, `.next/cache`), which `newgit stop --evict` drops with the workspace instead of refusing. Nothing restores it. Same path rules as `[identity] produces`. See *Disposable build output*. |
 
 `workdir` is applied as the spawned process's working directory, never as a
 `cd` prefix on the command string — so it cannot silently change what `&&`
@@ -656,6 +657,34 @@ This is checked right before each command runs, not when the resource is
 bound — a `workdir` may legitimately be created by an earlier action (a
 `prepare` that clones a submodule into it, say), so it would be wrong to
 require it to exist up front.
+
+### Disposable build output
+
+Build output a tool fills lazily — Rust's `target/`, Next.js's
+`.next/cache` — is often the largest thing in a workspace, and no
+checkpoint holds it: it is ignored, and no tracker owns it. Without a
+declaration, `newgit stop --evict` refuses to delete it. Declare it:
+
+```toml
+# .newgit/resources/build-output.toml
+ownership = "workspace"
+disposable = ["target", ".next/cache"]
+```
+
+That is the whole resource: no actions, no `[identity]`, no hooks. An
+eviction drops the ignored files under those paths with the workspace and
+names them (`disposed` in `stop --evict --json`, and `status` while the
+instance is evicted); the `start` after it leaves them for the build to
+refill. `newgit remove` lists them as dropped, not lost. Nothing else reads it: `undo`, `tracker use`/`drop`, and `spawn`
+never touch the tree. It covers only *ignored* files (anything else is in
+the checkpoint anyway), and a file under it that a tracker outside Git owns
+is kept. It applies to every instance as soon as it is written, except one
+that dropped a tracker bringing it (`resources = ["build-output"]` in that
+tracker).
+
+Do not use `[identity] produces` for this: an install-shaped resource
+empties a live `target/` from its `prepare` on an `undo` across its
+identity, or fills the install store with gigabytes of build output.
 
 ### `[identity]`
 
@@ -890,8 +919,10 @@ stash's, intent-to-add entries, assume-unchanged or skip-worktree flags
 set by hand (the files' content is kept), setuid, setgid, and sticky bits,
 and a value set by hand on a config key newgit sets itself
 (`remote.origin.url`, `credential.*`, its export remotes). An untracked file's blob stays in
-the store with the checkpoint, so evicting does not free that disk, and
-evict checkpoints are not pruned yet (#446).
+the store with the checkpoint, so evicting does not free that disk until a
+restore brought the checkpoint back, a later eviction supersedes it, and
+`newgit cleanup` collects it (#446); the store's own `git gc` then frees
+the objects.
 
 `suspend` / `resume` are for a resource that keeps running without a
 process newgit supervises: a `prepare` that starts a Supabase stack, a

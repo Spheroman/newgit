@@ -70,6 +70,7 @@ fn resource_declaring(name: &str, port_name: &str, start: u16) -> ResourceDefini
         exports: BTreeMap::new(),
         render: Vec::new(),
         reads: None,
+        disposable: Vec::new(),
         actions: BTreeMap::new(),
         checkpoint: None,
         restore: None,
