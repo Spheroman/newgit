@@ -2261,6 +2261,20 @@ fn starting_json(readiness: &Readiness) -> serde_json::Value {
 /// The `left behind:` lines of a spawn (#83): each local-secret-looking
 /// file the project root has and the workspace does not, with the commands
 /// that carry it from now on.
+/// `word` as one word of a shell command: as it is when nothing in it
+/// needs quoting, otherwise in single quotes.
+fn shell_word(word: &str) -> String {
+    let plain = !word.is_empty()
+        && word
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "_-./+@%:,=".contains(c));
+    if plain {
+        word.to_owned()
+    } else {
+        format!("'{}'", word.replace('\'', "'\\''"))
+    }
+}
+
 fn print_left_behind(left_behind: &[Utf8PathBuf]) {
     // Names, not a guess at which tracker: one `local-env` for the lot is
     // the obvious shape, and a project that wants several can split it.
@@ -2273,9 +2287,11 @@ fn print_left_behind(left_behind: &[Utf8PathBuf]) {
              so this workspace does not have it"
         );
     }
+    // Pasted into a shell, so a name with a space or a quote in it is
+    // quoted.
     let paths = left_behind
         .iter()
-        .map(|path| path.as_str())
+        .map(|path| shell_word(path.as_str()))
         .collect::<Vec<_>>()
         .join(" ");
     println!(

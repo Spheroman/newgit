@@ -935,7 +935,8 @@ pub struct InstanceReport {
 pub struct Readiness {
     /// What is wrong, one line each; empty when ready.
     pub problems: Vec<String>,
-    /// Running processes whose ports have not answered yet.
+    /// What is not up yet: a running process whose ports have not
+    /// answered, or a resource whose `[ready]` check does not pass.
     pub starting: Vec<Starting>,
 }
 
@@ -984,8 +985,8 @@ impl Starting {
 
 /// Whether `path` is named the way local secrets and per-machine settings
 /// usually are: `.env`, `.env.local`, `.env.development.local`,
-/// `local.env`, `.envrc`, `*.key`, `*.pem`, or anything with `secret` or
-/// `credential` in its name. A name test, not a content test: it decides
+/// `local.env`, `.envrc`, `.dev.vars`, `.npmrc`, `*.key`, `*.pem`, or
+/// anything with `secret` or `credential` in its name. A name test, not a content test: it decides
 /// only whether a spawn mentions a file it left behind, so the cost of a
 /// miss is the silence there was before (#83).
 fn looks_like_local_secret(path: &Utf8Path) -> bool {
@@ -995,6 +996,8 @@ fn looks_like_local_secret(path: &Utf8Path) -> bool {
     let name = name.to_ascii_lowercase();
     name.starts_with(".env")
         || name.ends_with(".env")
+        || name.starts_with(".dev.vars")
+        || name == ".npmrc"
         || [".key", ".pem", ".p12", ".pfx", ".jks", ".keystore"]
             .iter()
             .any(|suffix| name.ends_with(suffix))
@@ -1019,8 +1022,13 @@ const READY_CHECK_LIMIT: std::time::Duration = std::time::Duration::from_secs(5)
 
 /// Whether a GET of `url` answers 200–399, redirects not followed. `Err`
 /// says what it answered instead.
+///
+/// Asked directly, never through `HTTP_PROXY` / `ALL_PROXY`: the check is of
+/// a server on this machine, and a proxy that cannot reach it would make a
+/// server that is up read as starting.
 fn http_answers(url: &str) -> std::result::Result<(), String> {
     let agent: ureq::Agent = ureq::Agent::config_builder()
+        .proxy(None)
         .http_status_as_error(false)
         .max_redirects(0)
         .timeout_global(Some(std::time::Duration::from_secs(2)))
@@ -1044,7 +1052,8 @@ pub struct BaseReport {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResourceReport {
     pub name: String,
-    /// `running`, `stopped`, `ready`, `pending`, `failed`, or `—` (unbound).
+    /// `running`, `stopped`, `ready`, `not started`, `pending`, `failed`, or
+    /// `—` (unbound).
     pub state: String,
 }
 
@@ -3766,6 +3775,18 @@ impl BranchManager {
                 ));
                 continue;
             }
+            // Never started, though its resource is ready: a spawn or a
+            // `start` held it back behind a dependency that was not up
+            // (#54). It is as down as one that died.
+            if let Some((action_name, _)) = definition.autostart_action()
+                && supervisor.state(name) == ProcessState::NeverStarted
+            {
+                problems.push(format!(
+                    "`{name}.{action_name}` was not started — start it with `newgit start` or \
+                     `newgit action {name}.{action_name}`"
+                ));
+                continue;
+            }
             if self.ready_to_check(branch, definition, &supervisor, &suspended)
                 && let Some(not_yet) = self.not_up_yet(branch, definition, binding)
             {
@@ -3878,14 +3899,23 @@ impl BranchManager {
         let env = self
             .assemble_env(branch)
             .map_err(|error| error.to_string())?;
-        let mut child = std::process::Command::new("sh")
+        let mut check = std::process::Command::new("sh");
+        check
             .arg("-c")
             .arg(&rendered)
             .current_dir(&cwd)
             .envs(env.iter().map(|(key, value)| (key, value)))
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt as _;
+            // Its own group, so a check that hangs is killed with whatever
+            // it started.
+            check.process_group(0);
+        }
+        let mut child = check
             .spawn()
             .map_err(|error| format!("`{rendered}` could not run: {error}"))?;
         let deadline = std::time::Instant::now() + READY_CHECK_LIMIT;
@@ -3902,6 +3932,11 @@ impl BranchManager {
                     std::thread::sleep(std::time::Duration::from_millis(50));
                 }
                 Ok(None) => {
+                    #[cfg(unix)]
+                    let _ = nix::sys::signal::killpg(
+                        nix::unistd::Pid::from_raw(child.id() as i32),
+                        nix::sys::signal::Signal::SIGKILL,
+                    );
                     let _ = child.kill();
                     let _ = child.wait();
                     return Err(format!(
@@ -4169,20 +4204,26 @@ impl BranchManager {
     /// project root, there, named like a secret, and missing from
     /// `workspace` once its trackers are bound. Missing is the test of "no
     /// tracker carries it", so a render or a resource that writes the file
-    /// counts as carrying it too. Only files: a wholly ignored directory is
-    /// build output or an install, which resources rebuild. Best effort: a
-    /// root Git cannot list names nothing.
+    /// counts as carrying it too. A file a tracker other than `root` already
+    /// owns is not named either: that tracker has no content for it yet, or
+    /// this instance does not bind it, and the advice to make a tracker for
+    /// it would be wrong. Only files: a wholly ignored directory is not
+    /// looked into, so a `secrets/` ignored whole is not named. Best
+    /// effort: a root Git cannot list names nothing.
     fn left_behind(&self, workspace: &Utf8Path) -> Vec<Utf8PathBuf> {
         let root = &self.store.paths().project_root;
         let Ok(entries) = crate::evict::ignored_entries(root) else {
             return Vec::new();
         };
+        let definitions = self.all_definitions();
         entries
             .into_iter()
             .filter(|(path, dir)| {
                 !dir && !path.starts_with(".newgit")
                     && looks_like_local_secret(path)
                     && !workspace.join(path).exists()
+                    && crate::tracker::owner_of(&definitions, path)
+                        .is_none_or(|owner| owner.name == self.root.name)
             })
             .map(|(path, _)| path)
             .collect()
@@ -6220,8 +6261,14 @@ impl BranchManager {
         if action.long_running {
             // By hand as at spawn: not against a dependency that is down or
             // not answering yet (#54).
-            self.await_dependencies(&branch, definition, action_name, &supervisor)
-                .map_err(NewgitError::Unsupported)?;
+            self.await_dependencies(
+                &branch,
+                definition,
+                action_name,
+                &supervisor,
+                &mut BTreeSet::new(),
+            )
+            .map_err(NewgitError::Unsupported)?;
             let (command, cwd) =
                 self.action_invocation(&branch, definition, action, action_name)?;
             let env = self.assemble_env(&branch)?;
@@ -8545,6 +8592,10 @@ impl BranchManager {
                                         format!("blocked({})", blocked_by.join(","))
                                     } else if binding.status == ResourceStatus::Pending {
                                         "pending".to_owned()
+                                    } else if definition.autostart_action().is_some() {
+                                        // Ready, and what spawn starts for it
+                                        // never started (#54): not `ready`.
+                                        "not started".to_owned()
                                     } else {
                                         "ready".to_owned()
                                     }
@@ -14569,6 +14620,7 @@ impl BranchManager {
         // running. Failures are collected into a recovery record, not fatal.
         let mut resources = Vec::new();
         let mut failures: Vec<RestoreFailure> = Vec::new();
+        let mut down_dependencies = BTreeSet::new();
         for name in &self.graph.bind_order {
             let Some(state) = restored
                 .resource_states
@@ -14652,7 +14704,7 @@ impl BranchManager {
                 } else {
                     "at checkpoint time"
                 };
-                match self.restart_long_running(&branch, definition) {
+                match self.restart_long_running(&branch, definition, &mut down_dependencies) {
                     Ok(true) => action_label.push_str(" + restarted"),
                     Ok(false) => warnings.push(format!(
                         "resource `{name}` was running {when} but has no long-running action to \
@@ -14971,14 +15023,27 @@ impl BranchManager {
     /// Invoked exactly as `newgit action <resource>.<action>` would invoke
     /// it, `workdir` included: the same process must not come back in a
     /// different directory depending on which path started it (#109).
+    ///
+    /// Once what it depends on answers, as at spawn (#54): undo restarts in
+    /// bind order, dependencies first, and a restored database that is still
+    /// coming up is not one to start a server against.
     fn restart_long_running(
         &self,
         branch: &BranchInstance,
         definition: &ResourceDefinition,
+        down: &mut BTreeSet<String>,
     ) -> Result<bool> {
         let Some((action_name, action)) = long_running_action(definition) else {
             return Ok(false);
         };
+        self.await_dependencies(
+            branch,
+            definition,
+            action_name,
+            &self.supervisor(branch),
+            down,
+        )
+        .map_err(NewgitError::Unsupported)?;
         self.start_supervised(branch, definition, action, action_name)?;
         Ok(true)
     }
@@ -15020,11 +15085,22 @@ impl BranchManager {
         definition: &ResourceDefinition,
         action_name: &str,
         supervisor: &Supervisor,
+        down: &mut BTreeSet<String>,
     ) -> std::result::Result<(), String> {
         for dependency in &definition.depends_on {
             let Some(binding) = branch.resources.get(dependency) else {
                 continue;
             };
+            // Waited for once per command, not once per dependent: one that
+            // did not come up for an earlier dependent is not given its
+            // timeout again.
+            if down.contains(dependency) {
+                return Err(format!(
+                    "resource `{}` depends on `{dependency}`, which did not come up, so \
+                     `{action_name}` was not started",
+                    definition.name
+                ));
+            }
             let Ok(dependency_definition) = self.resource_definition(dependency) else {
                 continue;
             };
@@ -15039,15 +15115,17 @@ impl BranchManager {
                     definition.name
                 ));
             }
-            // Suspended or not, a dependency the dependent needs must be up:
-            // one `start` has not resumed yet fails its check.
-            if !self.ready_to_check(branch, dependency_definition, supervisor, &BTreeSet::new()) {
+            // Suspended or not, started by newgit or by hand, a dependency
+            // the dependent needs must be up: a `[ready]` check it declares
+            // is run whether or not a process of newgit's is behind it.
+            if !running && !dependency_definition.has_ready_check() {
                 continue;
             }
             let wait = dependency_definition.ready_timeout();
             let deadline = std::time::Instant::now() + wait;
             loop {
                 if running && supervisor.running_pid(dependency).is_none() {
+                    down.insert(dependency.clone());
                     return Err(format!(
                         "resource `{}` depends on `{dependency}`, whose process ended before it \
                          was up, so `{action_name}` was not started",
@@ -15069,6 +15147,7 @@ impl BranchManager {
                                 .join(", ")
                         )
                     });
+                    down.insert(dependency.clone());
                     return Err(format!(
                         "resource `{}` depends on `{dependency}`, which is not up after {}s \
                          ({what}), so `{action_name}` was not started — `newgit start` once it \
@@ -15100,6 +15179,7 @@ impl BranchManager {
     ) -> Vec<StopStartResource> {
         let supervisor = self.supervisor(branch);
         let mut failed_here = BTreeSet::new();
+        let mut down_dependencies = BTreeSet::new();
         let mut started = Vec::new();
         for definition in self.lifecycle_definitions() {
             let name = &definition.name;
@@ -15140,12 +15220,18 @@ impl BranchManager {
                     "resource `{name}` {why}, so `{action_name}` was not started"
                 ))
             } else {
-                self.await_dependencies(branch, definition, action_name, &supervisor)
-                    .and_then(|()| {
-                        self.start_supervised(branch, definition, action, action_name)
-                            .map(|_| ())
-                            .map_err(|error| error.to_string())
-                    })
+                self.await_dependencies(
+                    branch,
+                    definition,
+                    action_name,
+                    &supervisor,
+                    &mut down_dependencies,
+                )
+                .and_then(|()| {
+                    self.start_supervised(branch, definition, action, action_name)
+                        .map(|_| ())
+                        .map_err(|error| error.to_string())
+                })
             };
             let (status, error) = match result {
                 Ok(()) => (StopStartStatus::Started, None),
@@ -15440,6 +15526,7 @@ impl BranchManager {
         let mut resources = Vec::new();
         let mut still_stopped = Vec::new();
         let mut failed_here = BTreeSet::new();
+        let mut down_dependencies = BTreeSet::new();
         let mut captured = false;
         let mut probed = BTreeSet::new();
         let mut report = StartReport::default();
@@ -15537,6 +15624,7 @@ impl BranchManager {
                                     definition,
                                     action_name,
                                     &supervisor,
+                                    &mut down_dependencies,
                                 )
                                 .map_err(NewgitError::Unsupported)
                             })

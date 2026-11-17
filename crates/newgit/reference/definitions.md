@@ -910,7 +910,9 @@ lists it under `starting`; `newgit status` shows `starting` until it is up.
 tracker use` starts those of the resources the tracker brings, which `drop`
 stopped. Nothing else autostarts: `newgit start` brings back what `newgit
 stop` stopped, any `autostart` action that died on its own, and any that
-never started though its resource is ready (a spawn withheld it). One that
+never started though its resource is ready (a spawn withheld it behind a
+dependency that was not up; `status` shows it as `not started`, and the
+instance as not ready). One that
 died (it exited, crashed, or was killed, without newgit stopping it) shows
 in `newgit status` as `exited(1)`, `killed(SIGKILL)` or `crashed`, not
 `stopped`, and makes the instance not ready; its log ends with how it
