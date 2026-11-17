@@ -272,7 +272,7 @@ fn landing_opened()
 /// Returns whether it was removed.
 pub fn remove_landing_if_idle(dir: &Utf8Path, quiet: std::time::Duration) -> ApiResult<bool> {
     let lock = landing_lock(dir);
-    let _held = lock
+    let mut known = lock
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let opened = landing_opened()
@@ -296,6 +296,8 @@ pub fn remove_landing_if_idle(dir: &Utf8Path, quiet: std::time::Duration) -> Api
         crate::tokens::random_hex(6)
     ));
     std::fs::rename(dir, &gone)?;
+    // Its config went with it: the next open writes the prefix again.
+    *known = None;
     std::fs::remove_dir_all(&gone)?;
     // `landing/<login>/t/<tracker>` left empty goes too.
     let mut parent = dir.parent();
