@@ -386,6 +386,7 @@ fn check(seed: u64) -> bool {
         newgit_made: None,
         need_history: &|_| Ok(()),
         forks_before: &[],
+        settled: &[],
     };
     compose::split(&dir, &defined, &options)
         .unwrap_or_else(|error| panic!("split the definitions: {error}\n{}", context()));
