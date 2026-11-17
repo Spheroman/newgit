@@ -16,6 +16,7 @@ use newgit_core::compose::view_tree;
 use newgit_core::objects::Objects;
 use newgit_serve::db::List;
 use newgit_serve::error::ApiResult;
+use newgit_serve::readers::Readers;
 use newgit_serve::reparent::{Landings, Touch, remake};
 
 mod support;
@@ -284,14 +285,14 @@ fn git_in(dir: &Utf8Path, args: &[&str], input: Option<&[u8]>) -> std::process::
 }
 
 /// Commits the re-make writes land in the same repository here.
-struct Here<'a>(&'a Utf8Path);
+struct Here(Objects);
 
-impl Landings for Here<'_> {
-    fn open(&mut self, _: &str) -> ApiResult<Objects> {
-        Ok(Objects::open(self.0)?)
+impl Landings for Here {
+    fn open(&mut self, _: &str) -> ApiResult<&mut Objects> {
+        Ok(&mut self.0)
     }
 
-    fn wait(&mut self, _: &Objects, _: &str, _: &str) -> ApiResult<()> {
+    fn wait(&mut self, _: &str, _: &str) -> ApiResult<()> {
         Ok(())
     }
 
@@ -349,15 +350,17 @@ fn view(objects: &mut Objects, root: &str) -> String {
 fn check(repo: &mut Repo, base: &State, head: &State, list: &State) -> Result<Verdict, String> {
     let (b, h, l) = (repo.build(base), repo.build(head), repo.build(list));
     let dir = repo.dir.clone();
-    let mut open = |_: &str| -> ApiResult<Objects> { Ok(Objects::open(&dir)?) };
-    let mine = Touch::read(&mut open, &b, &l, None).map_err(|e| format!("touch: {e:?}"))?;
-    let theirs =
-        Touch::read(&mut open, &b, &h, Some(&mine)).map_err(|e| format!("touch: {e:?}"))?;
+    let mut readers = Readers::new();
+    let mut open = |_: &str| -> ApiResult<Utf8PathBuf> { Ok(dir.clone()) };
+    let mine =
+        Touch::read(&mut readers, &mut open, &b, &l, None).map_err(|e| format!("touch: {e:?}"))?;
+    let theirs = Touch::read(&mut readers, &mut open, &b, &h, Some(&mine))
+        .map_err(|e| format!("touch: {e:?}"))?;
     if mine.overlap(&theirs).is_some() {
         return Ok(Verdict::Overlap);
     }
     let target = remake(
-        &mut Here(&dir),
+        &mut Here(Objects::open(&dir).expect("objects")),
         "ana",
         "main",
         0,

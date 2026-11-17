@@ -3,16 +3,18 @@
 //! Composing a view and splitting it back are only exact if nothing in
 //! between reinterprets a commit: an author in Latin-1, a message without a
 //! final newline, a signature whose continuation lines hold a lone space.
-//! So commits and trees are handled here as the bytes Git stores. Git still
-//! does all the storing: objects are read through one `git cat-file --batch`
-//! and written through `git hash-object --literally`, which checks each id
-//! comes out as worked out here. The only Git format implemented here is the
-//! layout of a commit's headers and a tree's entries, which is what deciding
-//! "is this the same commit" needs; packing, compression, and refs stay Git's.
+//! So commits and trees are handled here as the bytes Git stores. Objects
+//! are read through one `git cat-file --batch` and written here as loose
+//! objects in Git's own format (a zlib stream of `<kind> <size>\0<body>` at
+//! `objects/<2 hex>/<38 hex>`), each id worked out from the bytes written.
+//! The only Git formats implemented here are that, the layout of a commit's
+//! headers, and a tree's entries, which is what deciding "is this the same
+//! commit" needs; packing and refs stay Git's.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{BufRead as _, BufReader, Read as _, Write as _};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::sync::{Mutex, OnceLock};
 
 use camino::{Utf8Path, Utf8PathBuf};
 
@@ -195,6 +197,9 @@ pub fn hash(kind: &str, body: &[u8]) -> String {
     hex(&hasher.finalize())
 }
 
+/// One `git cat-file` kept running: its stdin and its answers.
+type Batch = (Child, ChildStdin, BufReader<ChildStdout>);
+
 /// An entry's mode and object, to set at a path.
 pub type ModeId = (Vec<u8>, String);
 
@@ -206,33 +211,217 @@ type PartsEdit = (Vec<Vec<u8>>, Option<ModeId>);
 /// before they are written.
 pub struct Objects {
     repo: Utf8PathBuf,
-    batch: Option<(Child, ChildStdin, BufReader<ChildStdout>)>,
+    /// Where its loose objects go.
+    objects_dir: Utf8PathBuf,
+    batch: Option<Batch>,
+    /// A `git cat-file --batch-check`, started when first asked: what a
+    /// name resolves to now, or whether an object is here, without reading
+    /// its body.
+    check: Option<Batch>,
     commits: HashMap<String, Commit>,
     trees: HashMap<String, Vec<Entry>>,
     /// Blobs made here, readable before they are written.
     blobs: HashMap<String, Vec<u8>>,
     /// Made here, not written yet: `(kind, id, body)`.
     pending: Vec<(&'static str, String, Vec<u8>)>,
-    pending_ids: std::collections::HashSet<String>,
+    pending_ids: HashSet<String>,
+    /// Each object written is synced to disk before it is in place.
+    durable: bool,
 }
+
+/// Where `repo` keeps its objects, once it is known to use SHA-1 ids, and
+/// whether its config has Git sync each loose object it writes
+/// ([`syncs_loose_objects`]): asked of Git once per repository a process
+/// opens (a repository's object format never changes), and again only if
+/// the directory is gone or its config was written since. A relative path
+/// is asked each time: it names another repository once the process moves.
+fn objects_dir(repo: &Utf8Path) -> Result<(Utf8PathBuf, bool)> {
+    type Known = HashMap<Utf8PathBuf, (Utf8PathBuf, bool, Option<std::time::SystemTime>)>;
+    static KNOWN: OnceLock<Mutex<Known>> = OnceLock::new();
+    // The config beside the objects: a repository's own.
+    let written = |dir: &Utf8Path| {
+        dir.parent()
+            .and_then(|git_dir| std::fs::metadata(git_dir.join("config")).ok())
+            .and_then(|meta| meta.modified().ok())
+    };
+    let known = KNOWN.get_or_init(Default::default);
+    let cached = known
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(repo)
+        .cloned();
+    if let Some((dir, durable, stamp)) = cached
+        && dir.is_dir()
+        && stamp.is_some()
+        && written(&dir) == stamp
+    {
+        return Ok((dir, durable));
+    }
+    let out = git_output(
+        repo,
+        &["rev-parse", "--show-object-format", "--git-path", "objects"],
+    )?;
+    let mut lines = out.lines();
+    let format = lines.next().unwrap_or_default().trim();
+    if format != "sha1" {
+        return Err(NewgitError::Unsupported(format!(
+            "{repo} uses {format} object ids; newgit composes SHA-1 repositories only"
+        )));
+    }
+    let path = Utf8PathBuf::from(lines.next().unwrap_or("objects").trim());
+    let dir = if path.is_absolute() {
+        path
+    } else {
+        repo.join(path)
+    };
+    let config = crate::git::command()
+        .arg("-C")
+        .arg(repo.as_str())
+        .args(["config", "--get-regexp", r"^core\.fsync(objectfiles)?$"])
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|source| NewgitError::io(repo, source))?;
+    let durable = syncs_loose_objects(&String::from_utf8_lossy(&config.stdout));
+    if repo.is_absolute() {
+        let stamp = written(&dir);
+        known
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(repo.to_path_buf(), (dir.clone(), durable, stamp));
+    }
+    Ok((dir, durable))
+}
+
+/// Whether config lines `core.fsync <components>` and
+/// `core.fsyncobjectfiles [<bool>]` (as `git config --get-regexp` prints
+/// them, a key with no value alone on its line) have Git sync each loose
+/// object it writes. As Git reads them (checked against its own fsync
+/// counters in this module's tests), the last of each wins, and either
+/// is enough:
+///
+/// - `core.fsync` adds its components to a default that leaves loose
+///   objects out, then takes away each named with a `-`, but a component
+///   named both ways stays: so loose objects are synced exactly when a
+///   component that covers them (`loose-object`, `objects`, `committed`,
+///   `added`, `all`) is named without one.
+/// - `core.fsyncObjectFiles`, deprecated, syncs them whatever `core.fsync`
+///   says, when it is true as Git reads a boolean: no value, `true`, `yes`,
+///   `on`, or a number other than 0.
+///
+/// How they are synced (`core.fsyncMethod`) is not read: newgit always
+/// syncs them as the `batch` method does ([`Objects::write_loose`]).
+fn syncs_loose_objects(config: &str) -> bool {
+    let mut fsync = None;
+    let mut object_files = false;
+    for line in config.lines() {
+        let (key, value) = line.split_once(' ').unwrap_or((line, ""));
+        match key {
+            "core.fsync" => fsync = Some(value.to_owned()),
+            "core.fsyncobjectfiles" => {
+                let value = value.trim().to_ascii_lowercase();
+                object_files = line == key
+                    || matches!(value.as_str(), "true" | "yes" | "on")
+                    || value.parse::<i64>().is_ok_and(|number| number != 0);
+            }
+            _ => {}
+        }
+    }
+    object_files
+        || fsync.is_some_and(|fsync| {
+            fsync.split(',').map(str::trim).any(|part| {
+                ["loose-object", "objects", "committed", "added", "all"].contains(&part)
+            })
+        })
+}
+
+/// A `git cat-file --batch` (or `--batch-check`) answer line for an object
+/// it found, `<id> <kind> <size>`: `(id, kind, size)`. Anything else is
+/// `None`: `<name> missing` and `<name> ambiguous`, which echo the name as
+/// asked, so one with spaces in it has as many fields as a found object.
+fn parse_found(line: &str) -> Option<(String, String, usize)> {
+    let line = line.strip_suffix('\n').unwrap_or(line);
+    if line.ends_with(" missing") || line.ends_with(" ambiguous") {
+        return None;
+    }
+    let mut fields = line.split(' ');
+    let (Some(id), Some(kind), Some(size), None) =
+        (fields.next(), fields.next(), fields.next(), fields.next())
+    else {
+        return None;
+    };
+    if id.len() != 40 || !id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
+    kind_name(kind)?;
+    Some((id.to_owned(), kind.to_owned(), size.parse().ok()?))
+}
+
+/// A `git cat-file` with `mode` (`--batch`, `--batch-check`) in `repo`.
+fn start_batch(repo: &Utf8Path, mode: &str) -> Result<Batch> {
+    let mut child = crate::git::command()
+        .arg("-C")
+        .arg(repo.as_str())
+        .args(["cat-file", mode])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|source| NewgitError::io(repo, source))?;
+    let stdin = child.stdin.take().expect("piped stdin");
+    let stdout = BufReader::new(child.stdout.take().expect("piped stdout"));
+    Ok((child, stdin, stdout))
+}
+
+/// The entries of a tree object's body.
+fn parse_tree(body: &[u8]) -> Vec<Entry> {
+    let mut entries = Vec::new();
+    let mut rest: &[u8] = body;
+    while !rest.is_empty() {
+        let Some(space) = rest.iter().position(|&byte| byte == b' ') else {
+            break;
+        };
+        let Some(nul) = rest.iter().position(|&byte| byte == 0) else {
+            break;
+        };
+        if nul + 21 > rest.len() {
+            break;
+        }
+        entries.push(Entry {
+            mode: rest[..space].to_vec(),
+            name: rest[space + 1..nul].to_vec(),
+            id: hex(&rest[nul + 1..nul + 21]),
+        });
+        rest = &rest[nul + 21..];
+    }
+    entries
+}
+
+/// The object kinds Git has, as the static names pending objects keep.
+fn kind_name(kind: &str) -> Option<&'static str> {
+    ["blob", "tree", "commit", "tag"]
+        .into_iter()
+        .find(|known| *known == kind)
+}
+
+/// How many objects, and how many bytes of them, [`Objects::copy_reachable`]
+/// copies itself before leaving the copy to Git: past this, a fetch (which
+/// keeps them as one pack) is the better copy.
+pub const COPY_LIMIT: (usize, usize) = (256, 32 << 20);
 
 impl Objects {
     pub fn open(repo: &Utf8Path) -> Result<Self> {
-        let format = git_output(repo, &["rev-parse", "--show-object-format"])?;
-        if format.trim() != "sha1" {
-            return Err(NewgitError::Unsupported(format!(
-                "{repo} uses {} object ids; newgit composes SHA-1 repositories only",
-                format.trim()
-            )));
-        }
+        let (objects_dir, durable) = objects_dir(repo)?;
         Ok(Self {
             repo: repo.to_path_buf(),
+            objects_dir,
             batch: None,
+            check: None,
             commits: HashMap::new(),
             trees: HashMap::new(),
             blobs: HashMap::new(),
             pending: Vec::new(),
-            pending_ids: std::collections::HashSet::new(),
+            pending_ids: HashSet::new(),
+            durable,
         })
     }
 
@@ -240,21 +429,19 @@ impl Objects {
         &self.repo
     }
 
+    /// Sync each object written from here on to disk before putting it in
+    /// place, as Git does under `core.fsync=loose-object` (which a
+    /// repository's own config already asks for, and is followed): for a
+    /// repository whose objects must survive power loss once a log says
+    /// they are there.
+    pub fn set_durable(&mut self, durable: bool) {
+        self.durable = durable;
+    }
+
     /// An object's type and body, or `None` when the repository lacks it.
     fn read_raw(&mut self, id: &str) -> Result<Option<(String, Vec<u8>)>> {
         if self.batch.is_none() {
-            let mut child = crate::git::command()
-                .arg("-C")
-                .arg(self.repo.as_str())
-                .args(["cat-file", "--batch"])
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::null())
-                .spawn()
-                .map_err(|source| NewgitError::io(&self.repo, source))?;
-            let stdin = child.stdin.take().expect("piped stdin");
-            let stdout = BufReader::new(child.stdout.take().expect("piped stdout"));
-            self.batch = Some((child, stdin, stdout));
+            self.batch = Some(start_batch(&self.repo, "--batch")?);
         }
         let (_, stdin, stdout) = self.batch.as_mut().expect("started above");
         let io = |source| NewgitError::SourceCommand {
@@ -267,15 +454,54 @@ impl Objects {
             .map_err(io)?;
         let mut header = String::new();
         stdout.read_line(&mut header).map_err(io)?;
-        let fields: Vec<&str> = header.trim_end().split(' ').collect();
-        if fields.len() < 3 {
+        let Some((_, kind, size)) = parse_found(&header) else {
             return Ok(None);
-        }
-        let size: usize = fields[2].parse().unwrap_or(0);
+        };
         let mut body = vec![0u8; size + 1];
         stdout.read_exact(&mut body).map_err(io)?;
         body.truncate(size);
-        Ok(Some((fields[1].to_owned(), body)))
+        Ok(Some((kind, body)))
+    }
+
+    /// Object `id`'s kind and body as stored, or `None` when the
+    /// repository lacks it.
+    pub fn raw(&mut self, id: &str) -> Result<Option<(String, Vec<u8>)>> {
+        self.read_raw(id)
+    }
+
+    /// What `name` (an object id, or any name Git resolves, such as a ref)
+    /// is in the repository right now: `(id, kind)`, or `None`. Never
+    /// cached: a ref moves.
+    pub fn resolve(&mut self, name: &str) -> Result<Option<(String, String)>> {
+        Ok(self.check(name)?.map(|(id, kind, _)| (id, kind)))
+    }
+
+    /// [`Self::resolve`], with the object's size: `(id, kind, size)`.
+    fn check(&mut self, name: &str) -> Result<Option<(String, String, usize)>> {
+        if name.contains('\n') {
+            return Ok(None);
+        }
+        if self.check.is_none() {
+            self.check = Some(start_batch(&self.repo, "--batch-check")?);
+        }
+        let (_, stdin, stdout) = self.check.as_mut().expect("started above");
+        let io = |source| NewgitError::SourceCommand {
+            command: "git cat-file --batch-check".to_owned(),
+            stderr: format!("{source}"),
+        };
+        stdin
+            .write_all(format!("{name}\n").as_bytes())
+            .and_then(|()| stdin.flush())
+            .map_err(io)?;
+        let mut line = String::new();
+        stdout.read_line(&mut line).map_err(io)?;
+        Ok(parse_found(&line))
+    }
+
+    /// Whether the repository has object `id` (of any kind), without
+    /// reading it.
+    pub fn contains(&mut self, id: &str) -> Result<bool> {
+        Ok(self.resolve(id)?.is_some())
     }
 
     /// Blob `id`'s bytes, read through the batch (no process of its own).
@@ -335,25 +561,7 @@ impl Objects {
         } else {
             body
         };
-        let mut entries = Vec::new();
-        let mut rest: &[u8] = &body;
-        while !rest.is_empty() {
-            let Some(space) = rest.iter().position(|&byte| byte == b' ') else {
-                break;
-            };
-            let Some(nul) = rest.iter().position(|&byte| byte == 0) else {
-                break;
-            };
-            if nul + 21 > rest.len() {
-                break;
-            }
-            entries.push(Entry {
-                mode: rest[..space].to_vec(),
-                name: rest[space + 1..nul].to_vec(),
-                id: hex(&rest[nul + 1..nul + 21]),
-            });
-            rest = &rest[nul + 21..];
-        }
+        let entries = parse_tree(&body);
         self.trees.insert(id.to_owned(), entries.clone());
         Ok(entries)
     }
@@ -737,82 +945,315 @@ impl Objects {
         Ok(())
     }
 
-    /// Write everything made since the last flush. Each object's id is
-    /// checked against the one worked out for it.
+    /// Write everything made since the last flush, as loose objects. One
+    /// the repository has already (loose, packed, or borrowed) is not
+    /// written again.
     pub fn flush(&mut self) -> Result<()> {
-        if self.pending.is_empty() {
-            return Ok(());
-        }
         let pending = std::mem::take(&mut self.pending);
         self.pending_ids.clear();
         // Written below, and read from the repository after that.
         self.blobs.clear();
-        // Objects this repository already has need no writing.
         let mut needed = Vec::new();
         for (kind, id, body) in pending {
-            let present = matches!(self.read_raw(&id)?, Some((found, _)) if found == kind);
-            if !present {
-                needed.push((kind, id, body));
-            }
-        }
-        let dir = tempfile::Builder::new()
-            .prefix("newgit-objects-")
-            .tempdir()
-            .map_err(|source| NewgitError::io(&self.repo, source))?;
-        for kind in ["blob", "tree", "commit"] {
-            let batch: Vec<&(&str, String, Vec<u8>)> = needed
-                .iter()
-                .filter(|(found, _, _)| *found == kind)
-                .collect();
-            if batch.is_empty() {
+            // An object's id is its kind and bytes: one by this id is it.
+            if self.loose_path(&id).exists() || self.contains(&id)? {
                 continue;
             }
-            let mut paths = String::new();
-            for (index, (_, _, body)) in batch.iter().enumerate() {
-                let path = dir.path().join(format!("{kind}-{index}"));
-                std::fs::write(&path, body)
-                    .map_err(|source| NewgitError::io(&self.repo, source))?;
-                paths.push_str(&format!("{}\n", path.display()));
-            }
-            let out = run(
-                crate::git::command()
-                    .arg("-C")
-                    .arg(self.repo.as_str())
-                    .args([
-                        "hash-object",
-                        "--literally",
-                        "-t",
-                        kind,
-                        "-w",
-                        "--no-filters",
-                        "--stdin-paths",
-                    ]),
-                "git hash-object",
-                Some(paths.as_bytes()),
-            )?;
-            let written: Vec<String> = String::from_utf8_lossy(&out)
-                .lines()
-                .map(ToOwned::to_owned)
-                .collect();
-            let expected: Vec<&String> = batch.iter().map(|(_, id, _)| id).collect();
-            if written.iter().collect::<Vec<_>>() != expected {
+            needed.push((kind, id, body));
+        }
+        self.write_loose(&needed)
+    }
+
+    fn loose_path(&self, id: &str) -> Utf8PathBuf {
+        self.objects_dir.join(&id[..2]).join(&id[2..])
+    }
+
+    /// `objects` (each `(kind, id, body)`, any order), written as Git writes
+    /// loose objects: each compressed into a temporary file in its fan-out
+    /// directory, and linked into place only if nothing is there yet (an
+    /// object's bytes are its id, so whatever is there is it).
+    ///
+    /// - **Each in place only after everything it names** that is among
+    ///   them (a commit's tree and parents, a tree's entries, a tag's
+    ///   object): so a repository that has an object has everything it
+    ///   reaches, as Git's own copies leave it, even when this stops part
+    ///   way. [`Self::copy_reachable`] stops at what a repository has, and
+    ///   relies on that.
+    /// - **Durable when asked:** every file is on disk before any is in
+    ///   place, as Git's `core.fsyncMethod=batch` has it: on macOS each is
+    ///   written out and one full flush of the device covers them all (a
+    ///   full flush per object costs as much again each time); elsewhere
+    ///   each is synced.
+    /// - **One file open at a time**, however many there are: each staged
+    ///   file is closed once written, and only the last is kept for the
+    ///   device's flush.
+    fn write_loose(&self, objects: &[(&'static str, String, Vec<u8>)]) -> Result<()> {
+        use std::os::unix::fs::PermissionsExt as _;
+        let io = |source| NewgitError::io(&self.objects_dir, source);
+        for (kind, id, body) in objects {
+            if id.len() != 40 || hash(kind, body) != *id {
                 return Err(NewgitError::SourceCommand {
-                    command: format!("git hash-object -t {kind}"),
+                    command: format!("writing {kind} {id}"),
                     stderr: "an object did not hash to the id worked out for it".to_owned(),
                 });
             }
         }
+        let mut staged: Vec<(tempfile::TempPath, Utf8PathBuf)> = Vec::new();
+        let mut paths = HashSet::new();
+        let mut last = None;
+        for index in post_order(objects) {
+            let (kind, id, body) = &objects[index];
+            let path = self.loose_path(id);
+            if path.exists() || !paths.insert(path.clone()) {
+                continue;
+            }
+            // Made inside its fan-out directory, as Git makes it, so the
+            // directory is never empty while it is written: Git's own
+            // `prune-packed` removes an empty one, and would take it away
+            // from under a file waiting beside it. Made again if it went.
+            let fan_out = path.parent().expect("a fan-out directory");
+            let fan_out_io = |source| NewgitError::io(fan_out, source);
+            let temp = || {
+                tempfile::Builder::new()
+                    .prefix("tmp_obj_")
+                    .tempfile_in(fan_out)
+            };
+            let mut file = match temp() {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    std::fs::create_dir_all(fan_out).map_err(fan_out_io)?;
+                    temp().map_err(fan_out_io)?
+                }
+                found => found.map_err(fan_out_io)?,
+            };
+            {
+                let mut zlib = flate2::write::ZlibEncoder::new(
+                    file.as_file_mut(),
+                    flate2::Compression::fast(),
+                );
+                zlib.write_all(format!("{kind} {}\0", body.len()).as_bytes())
+                    .and_then(|()| zlib.write_all(body))
+                    .and_then(|()| zlib.finish().map(drop))
+                    .map_err(io)?;
+            }
+            if self.durable {
+                written_out(file.as_file()).map_err(io)?;
+            }
+            file.as_file()
+                .set_permissions(std::fs::Permissions::from_mode(0o444))
+                .map_err(io)?;
+            let (file, temp_path) = file.into_parts();
+            // The one before it closes here.
+            last = Some(file);
+            staged.push((temp_path, path));
+        }
+        if self.durable
+            && let Some(last) = &last
+        {
+            flushed(last).map_err(io)?;
+        }
+        drop(last);
+        for (temp_path, path) in staged {
+            stop_point(&path)?;
+            match temp_path.persist_noclobber(&path) {
+                Ok(()) => {}
+                Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(NewgitError::io(&path, error.error)),
+            }
+        }
         Ok(())
+    }
+
+    /// Every object `tip` reaches in `from` that this repository lacks,
+    /// written here as `from` has it, stopping at each object this one has
+    /// (a repository holds everything its objects reach: Git's copies
+    /// leave it so, and [`Self::write_loose`] does). Gitlinks are pins, not
+    /// content: never followed. How many were written; `None`, with nothing
+    /// written, when more are missing than [`COPY_LIMIT`] allows, so many
+    /// being Git's to copy. An object's size is asked before its body is
+    /// read, so one past the limit is never read.
+    pub fn copy_reachable(&mut self, from: &mut Objects, tip: &str) -> Result<Option<usize>> {
+        self.copy_reachable_over(from, tip, &[])
+    }
+
+    /// [`Self::copy_reachable`] of `tip` over `over` (a commit's parents),
+    /// only when this repository has every one of them, and `None` with
+    /// nothing written otherwise. With them here, so is everything they
+    /// reach, so what crosses is what `tip` reaches past them, as `git
+    /// pack-objects --revs tip ^over…` would have it, and never more:
+    /// without them, it could be an object only they reach in `from`.
+    pub fn copy_reachable_over(
+        &mut self,
+        from: &mut Objects,
+        tip: &str,
+        over: &[String],
+    ) -> Result<Option<usize>> {
+        for id in over {
+            if !self.contains(id)? {
+                return Ok(None);
+            }
+        }
+        let (most, most_bytes) = COPY_LIMIT;
+        let missing = |id: &str, from: &Objects| NewgitError::SourceCommand {
+            command: "git cat-file --batch".to_owned(),
+            stderr: format!("object {id} is not in {}", from.repo),
+        };
+        let mut stack = vec![tip.to_owned()];
+        let mut seen = HashSet::new();
+        let mut found: Vec<(&'static str, String, Vec<u8>)> = Vec::new();
+        let mut bytes = 0;
+        while let Some(id) = stack.pop() {
+            if !seen.insert(id.clone()) || self.contains(&id)? {
+                continue;
+            }
+            let Some((_, _, size)) = from.check(&id)? else {
+                return Err(missing(&id, from));
+            };
+            if found.len() == most || bytes + size > most_bytes {
+                return Ok(None);
+            }
+            let Some((kind, body)) = from.raw(&id)? else {
+                return Err(missing(&id, from));
+            };
+            let kind = kind_name(&kind).ok_or_else(|| NewgitError::SourceCommand {
+                command: "git cat-file --batch".to_owned(),
+                stderr: format!("object {id} in {} is a {kind}", from.repo),
+            })?;
+            stack.extend(references(kind, &body));
+            bytes += body.len();
+            found.push((kind, id, body));
+        }
+        let count = found.len();
+        self.write_loose(&found)?;
+        Ok(Some(count))
+    }
+}
+
+/// The objects a `kind` object of `body` names, as Git's connectivity
+/// follows them: a commit's tree and parents, a tree's entries but its
+/// gitlinks (pins, not content), a tag's object.
+fn references(kind: &str, body: &[u8]) -> Vec<String> {
+    match kind {
+        "commit" => {
+            let commit = Commit::parse("", body);
+            std::iter::once(commit.tree).chain(commit.parents).collect()
+        }
+        "tree" => parse_tree(body)
+            .into_iter()
+            .filter(|entry| entry.mode != GITLINK_MODE)
+            .map(|entry| entry.id)
+            .collect(),
+        "tag" => body
+            .split(|&byte| byte == b'\n')
+            .next()
+            .and_then(|line| line.strip_prefix(b"object "))
+            .map(|object| vec![String::from_utf8_lossy(object).into_owned()])
+            .unwrap_or_default(),
+        _ => Vec::new(),
+    }
+}
+
+/// `objects`' indexes, each after every one among them it names
+/// ([`references`]): the order they go into place in.
+fn post_order(objects: &[(&'static str, String, Vec<u8>)]) -> Vec<usize> {
+    let by_id: HashMap<&str, usize> = objects
+        .iter()
+        .enumerate()
+        .map(|(index, (_, id, _))| (id.as_str(), index))
+        .collect();
+    let names: Vec<Vec<usize>> = objects
+        .iter()
+        .map(|(kind, _, body)| {
+            references(kind, body)
+                .iter()
+                .filter_map(|id| by_id.get(id.as_str()).copied())
+                .collect()
+        })
+        .collect();
+    let mut entered = vec![false; objects.len()];
+    let mut order = Vec::with_capacity(objects.len());
+    for start in 0..objects.len() {
+        if entered[start] {
+            continue;
+        }
+        entered[start] = true;
+        let mut stack = vec![(start, 0)];
+        while let Some((index, next)) = stack.last_mut() {
+            let index = *index;
+            if let Some(&named) = names[index].get(*next) {
+                *next += 1;
+                if !entered[named] {
+                    entered[named] = true;
+                    stack.push((named, 0));
+                }
+            } else {
+                order.push(index);
+                stack.pop();
+            }
+        }
+    }
+    order
+}
+
+thread_local! {
+    /// How many more loose objects this thread may put in place before a
+    /// write stops short, as a crash part way would: `None` never stops.
+    static STOP_AFTER: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+/// For tests of a write interrupted part way: on this thread, after
+/// `renames` more loose objects are in place, every write stops with an
+/// error before putting the next in place, as a crash would leave it
+/// (its temporary files aside). `None` writes everything again.
+#[doc(hidden)]
+pub fn stop_writes_after(renames: Option<usize>) {
+    STOP_AFTER.set(renames);
+}
+
+fn stop_point(path: &Utf8Path) -> Result<()> {
+    match STOP_AFTER.get() {
+        None => Ok(()),
+        Some(0) => Err(NewgitError::SourceCommand {
+            command: format!("writing {path}"),
+            stderr: "stopped before putting it in place (stop_writes_after)".to_owned(),
+        }),
+        Some(left) => {
+            STOP_AFTER.set(Some(left - 1));
+            Ok(())
+        }
     }
 }
 
 impl Drop for Objects {
     fn drop(&mut self) {
-        if let Some((mut child, stdin, _)) = self.batch.take() {
+        for (mut child, stdin, _) in [self.batch.take(), self.check.take()].into_iter().flatten() {
             drop(stdin);
             let _ = child.wait();
         }
     }
+}
+
+/// `file`'s data handed to the device: with [`flushed`] after, on disk.
+#[cfg(target_vendor = "apple")]
+fn written_out(file: &std::fs::File) -> std::io::Result<()> {
+    // `fsync(2)` on macOS writes out without flushing the device's cache;
+    // `File::sync_all` is the full flush.
+    nix::unistd::fsync(file).map_err(std::io::Error::from)
+}
+
+#[cfg(not(target_vendor = "apple"))]
+fn written_out(file: &std::fs::File) -> std::io::Result<()> {
+    file.sync_all()
+}
+
+/// Everything written out so far on `file`'s device, on disk.
+#[cfg(target_vendor = "apple")]
+fn flushed(file: &std::fs::File) -> std::io::Result<()> {
+    file.sync_all()
+}
+
+#[cfg(not(target_vendor = "apple"))]
+fn flushed(_: &std::fs::File) -> std::io::Result<()> {
+    Ok(())
 }
 
 /// `a/b/c` as its parts; `.` and the empty path have none. Bytes, as Git
@@ -898,6 +1339,130 @@ pub(crate) fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn loose_objects_are_synced_as_gits_config_says() {
+        assert!(!syncs_loose_objects(""));
+        assert!(syncs_loose_objects("core.fsync committed,reference\n"));
+        assert!(syncs_loose_objects("core.fsync all\n"));
+        assert!(!syncs_loose_objects("core.fsync reference\n"));
+        assert!(!syncs_loose_objects("core.fsync -loose-object\n"));
+        // Named both ways, a component stays.
+        assert!(syncs_loose_objects("core.fsync committed,-loose-object\n"));
+        assert!(syncs_loose_objects("core.fsync -loose-object,objects\n"));
+        assert!(!syncs_loose_objects("core.fsync none\n"));
+        assert!(!syncs_loose_objects(
+            "core.fsync loose-object\ncore.fsync reference\n"
+        ));
+        assert!(syncs_loose_objects("core.fsyncobjectfiles true\n"));
+        assert!(syncs_loose_objects("core.fsyncobjectfiles\n"));
+        assert!(syncs_loose_objects("core.fsyncobjectfiles 2\n"));
+        assert!(!syncs_loose_objects("core.fsyncobjectfiles \n"));
+        assert!(!syncs_loose_objects("core.fsyncobjectfiles off\n"));
+        // The older key syncs them whatever `core.fsync` says.
+        assert!(syncs_loose_objects(
+            "core.fsyncobjectfiles true\ncore.fsync reference\n"
+        ));
+        assert!(syncs_loose_objects(
+            "core.fsyncobjectfiles false\ncore.fsync loose-object\n"
+        ));
+    }
+
+    /// Whether Git syncs a loose object it writes under `config` (`-c`
+    /// pairs), read from its own fsync counters.
+    fn git_syncs(dir: &Utf8Path, config: &[&str]) -> bool {
+        let trace = dir.join("trace.json");
+        let _ = std::fs::remove_file(&trace);
+        let mut command = crate::git::command();
+        command.arg("--git-dir").arg(dir.as_str());
+        for pair in config {
+            command.args(["-c", pair]);
+        }
+        let mut child = command
+            .args(["hash-object", "-w", "--stdin"])
+            .env("GIT_TRACE2_EVENT", trace.as_str())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("git runs");
+        let unique = format!("{config:?} {:?}\n", std::time::SystemTime::now());
+        child
+            .stdin
+            .take()
+            .expect("stdin")
+            .write_all(unique.as_bytes())
+            .expect("writes");
+        assert!(child.wait().expect("waits").success());
+        std::fs::read_to_string(&trace)
+            .expect("trace")
+            .lines()
+            .any(|line| line.contains(r#""category":"fsync""#))
+    }
+
+    #[test]
+    fn loose_objects_are_synced_exactly_when_git_syncs_them() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let dir = Utf8PathBuf::from_path_buf(temp.path().join("a.git")).expect("utf-8");
+        run(
+            crate::git::command().args(["init", "-q", "--bare", dir.as_str()]),
+            "git init",
+            None,
+        )
+        .expect("init");
+        for config in [
+            &[][..],
+            &["core.fsync=loose-object"],
+            &["core.fsync=reference"],
+            &["core.fsync=committed,-loose-object"],
+            &["core.fsync=-loose-object"],
+            &["core.fsync=none"],
+            &["core.fsync=all,-objects"],
+            &["core.fsync=added"],
+            &["core.fsync=derived-metadata,index"],
+            &["core.fsync=loose-object", "core.fsync=reference"],
+            &["core.fsyncObjectFiles=true"],
+            &["core.fsyncObjectFiles"],
+            &["core.fsyncObjectFiles=2"],
+            &["core.fsyncObjectFiles="],
+            &["core.fsyncObjectFiles=true", "core.fsync=none"],
+            &["core.fsyncObjectFiles=false", "core.fsync=loose-object"],
+        ] {
+            let mut command = crate::git::command();
+            command.arg("--git-dir").arg(dir.as_str());
+            for pair in config {
+                command.args(["-c", pair]);
+            }
+            // `--get-regexp` exits 1 when nothing matches.
+            let listed = command
+                .args(["config", "--get-regexp", r"^core\.fsync(objectfiles)?$"])
+                .stderr(Stdio::null())
+                .output()
+                .expect("git config");
+            assert_eq!(
+                syncs_loose_objects(&String::from_utf8_lossy(&listed.stdout)),
+                git_syncs(&dir, config),
+                "{config:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn only_a_found_object_is_found() {
+        let id = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
+        assert_eq!(
+            parse_found(&format!("{id} tree 0\n")),
+            Some((id.to_owned(), "tree".to_owned(), 0))
+        );
+        // A name is echoed as asked: one with spaces has as many fields
+        // as a found object, or more.
+        assert_eq!(parse_found("no such missing\n"), None);
+        assert_eq!(parse_found("refs/heads/a b c missing\n"), None);
+        assert_eq!(parse_found("abc ambiguous\n"), None);
+        assert_eq!(parse_found(&format!("{id} blob missing\n")), None);
+        assert_eq!(parse_found(&format!("{id} blob 12 more\n")), None);
+        assert_eq!(parse_found("missing\n"), None);
+    }
 
     #[test]
     fn a_commit_parses_and_serializes_back_to_its_own_bytes() {

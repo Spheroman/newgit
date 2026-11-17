@@ -525,7 +525,7 @@ impl Workbench {
         let login = login
             .filter(|login| crate::names::is_part(login))
             .unwrap_or("-");
-        let scratch = crate::server_merge::Scratch::open(project, login)?;
+        let scratch = crate::server_merge::Scratch::open_for(project, login)?;
         let dir = scratch.dir().to_owned();
         let mut script = String::from("start\n");
         let mut trackers: Vec<&String> = list.keys().collect();
