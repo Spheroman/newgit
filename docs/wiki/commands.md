@@ -67,7 +67,7 @@ inside a workspace):
   [instance]` — `--verify` proves the restore works by running a real undo;
   `--only` restores one resource and leaves everything else alone
 - `newgit export [instance] --to <dir> [--include <path>] [--exclude <path>]`
-- `newgit export --remote <name> [--dry-run] [--force]` — push the trackers'
+- `newgit export --remote <name> [--dry-run] [--force [--republish]]` — push the trackers'
   `main`s, history and all, to target `<name>` (a GitHub mirror, say), which
   a tracker's `export` declares: that tracker and every tracker inheriting
   its export ship, nothing else. A target is named after its repository
@@ -186,14 +186,37 @@ Remote:
   ([#443](https://github.com/Spheroman/newgit/issues/443))
 - `newgit pull --remote <target>` — bring back what was merged on an export
   target (a pull request on GitHub); `newgit merge main` publishes it. A
-  force-pushed target is merged with the line the tracker already has, as
-  `git pull` would: the commits the force-push removed stay in the
-  tracker's history, and the next export pushes them to the target again.
-  Reverting the change in an instance keeps it out of the tip only: the
-  next export still publishes those commits, so a secret the force-push
-  purged is published again. Nothing in newgit can purge it yet
-  ([#442](https://github.com/Spheroman/newgit/issues/442)); until then,
-  do not export that tracker
+  target rewritten since this machine last exported to it (force-pushed,
+  a secret purged, a rewind too) is not merged with: merging keeps what the
+  rewrite removed for the next export to push again, so plain `pull
+  --remote` refuses, and so does every push to the target that would carry
+  what it removed (`main`'s export, an instance's branch, a tag), saying
+  how many commits it removed and naming `--force`. A branch deleted there
+  counts as a rewrite that removed everything. `export --remote --force`
+  refuses to put back what the rewrite removed, naming how many, unless
+  `--republish` is given. Nor is a second target that still has what a
+  reset dropped pulled from. With no record of exporting there, or a record
+  older than another machine's export
+  ([#473](https://github.com/Spheroman/newgit/issues/473)), a rewrite
+  cannot be told apart, and is not refused
+- `newgit pull --remote <target> --force [--dry-run]` — follow a force-push
+  instead (a secret purged on GitHub): the line of the tracker the target is
+  rooted at is reset to the target's, as `git fetch` then `git reset --hard`
+  would, and the project root's pin moves to it; `newgit merge main`
+  publishes it, replacing the old line on the remote. It lists every commit
+  only the old line had and every instance still holding one, and this
+  machine then refuses to carry them onward from the tracker's line: a
+  merge, a send to the remote (a checkpoint's too), or a push to a target
+  that lacks them. An instance with nothing of its own on the old line
+  follows on `newgit pull`; one with work there redoes it in a new
+  instance. It refuses while the project root has work of its own on the
+  old line, which it would discard. A later reset back onto dropped commits
+  says so and stops refusing them. Not undone: the project's own history,
+  which still pins the old line (and so the remote's copy, its Git
+  endpoint, `newgit clone`, and project tags), and copies others already
+  fetched. Only a target rooted at a tracker; `--dry-run` moves nothing,
+  and writes only the target's fetched branch and each instance's
+  workspace as read
 - `newgit tracker allow-plaintext <path>...` — release workspace paths this
   machine has held encrypted content at, so whatever tracker claims them now
   (a `public` one, or one in Git) may capture, commit, and send them

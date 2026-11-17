@@ -193,7 +193,15 @@ Resolved loudly; each is reversible.
      hand its own commits to readers who never had them. Capping only ever
      narrows. One whose ceiling can't be settled otherwise (an upstream not
      defined, a cycle, a linked fork whose home can't be read) is not
-     defined either.
+     defined either. A writer is told when it is served narrower than its
+     definition says: a write credential carries `capped`, the reason, and
+     `newgit tracker merge` prints it (#437). That is how a fork deleted
+     and re-added under its old name learns it is still held to the
+     upstream its repo was made from, whose record outlives the
+     definition. The client starts a fork's `main` where the server does:
+     when the remote has none for a fork, its first write (the pin) makes
+     the repo at its upstream's `main`, and `main` is fetched again and
+     leased on that.
    - **A private instance, an embargo, has a store of its own**, as does
      each user's content: its shape is the secret.
    - **A new tracker's seed is alone** in `tracker/<name>` until it joins a
@@ -797,6 +805,18 @@ Resolved loudly; each is reversible.
       A pull's commits were split with their originals in their trailers,
       so they compose back to themselves: a pull then an export is a
       fast-forward on GitHub.
+    - **Not yet: a mirror force-pushed to purge a secret (#442).** The
+      client refuses any push that would put back what a rewrite of the
+      target removed (*Following a force-push* in
+      [trackers.md](trackers.md)); this export thread does not check. A
+      forced push to the mirror reaches the webhook as an ordinary push and
+      is pulled as a merge, which keeps the removed commits on `main`, and
+      a rewind is fast-forwarded over by the next export, so either one
+      puts a purged commit back on the mirror. Checking needs a record
+      that outlives the per-export scratch repository (the commit last
+      pushed, kept where its objects stay) and a webhook that follows a
+      forced push rather than merging it. Until then, purge a mirror with
+      its project's exports off (no `--github` token for it).
 
 12. **Garbage collection is a pass `newgit serve` runs itself** (#434,
     `crates/newgit-serve/src/maintenance.rs`): the first a grace after the
@@ -958,12 +978,15 @@ Resolved loudly; each is reversible.
 - **A narrower fork's start is checked, then copied.** Whether the fork
   is within its upstream and whether the caller may read the upstream are
   checked under the db lock, and the upstream's commits are fetched into
-  the narrower store by id after it is let go of (`ForkStart::place`). An
-  upstream narrowed, or a caller who loses access, in between (or a
-  landing that then fails) leaves those commits in the narrower store,
-  whose readers could read them at check time. Re-checking under the
-  landing needs the landing to take a precondition on another tracker's
-  facts, which it does not yet.
+  the narrower store by id after it is let go of (`ForkStart::place`). The
+  landing that makes the fork carries the project's epoch from that check
+  (#437), so a change to the definitions in between (the upstream
+  narrowed) refuses it with a 409 and no fork is made; written again, it is
+  checked against the definitions as they are then. Still open: a caller
+  who loses membership in between is not re-checked (membership is not in
+  the epoch), a per-user fork has no landing to carry the epoch, and a
+  refused or failed start leaves the copied commits in the narrower store,
+  whose readers could read them at check time.
 - **One log per server.** Moving a set of homes to another node means
   splitting the log, which nothing does yet. A landing that touches a
   linked tracker on another server is two landings (landing.md), each in

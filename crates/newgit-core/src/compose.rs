@@ -2633,11 +2633,41 @@ pub fn find_outside_git_under(
     all: &[TrackerDefinition],
     mount: Option<&Utf8Path>,
 ) -> Result<Option<(String, String, String)>> {
+    find_outside_git_walk(repo, rev_list, env, all, mount, "-m")
+}
+
+/// [`find_outside_git_under`] for a `rev_list` whose excluded side is all
+/// published already: what an export target has (#444). A merge is judged
+/// against all its parents at once (`-c`): a path it holds as one parent
+/// has it is that parent's, which is either among these commits (and judged
+/// itself) or published. So a merge bringing a file the target has already
+/// beside new work is not refused, and one whose file differs from every
+/// parent's (an evil merge) still is.
+pub fn find_outside_git_unpublished(
+    repo: &Utf8Path,
+    rev_list: &[&str],
+    all: &[TrackerDefinition],
+    mount: Option<&Utf8Path>,
+) -> Result<Option<(String, String, String)>> {
+    find_outside_git_walk(repo, rev_list, &[], all, mount, "-c")
+}
+
+fn find_outside_git_walk(
+    repo: &Utf8Path,
+    rev_list: &[&str],
+    env: &[(String, String)],
+    all: &[TrackerDefinition],
+    mount: Option<&Utf8Path>,
+    merges: &str,
+) -> Result<Option<(String, String, String)>> {
     // Each commit starts with \x01 — no path holds that byte, so a file
-    // named like a commit id cannot be mistaken for one.
+    // named like a commit id cannot be mistaken for one. `--root`: a root
+    // commit's paths are listed whatever `log.showRoot` the developer's
+    // config sets.
     let mut args = vec![
         "log",
-        "-m",
+        "--root",
+        merges,
         "--no-renames",
         "--name-only",
         "--diff-filter=d",

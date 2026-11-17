@@ -112,6 +112,11 @@ pub struct RepoCredential {
     pub username: String,
     pub password: String,
     pub expires_at: String,
+    /// Why the remote serves this repo's tracker narrower than its
+    /// definition says, when it does (a fork held to its upstream's
+    /// audience): said on a write, so the writer learns who will read it.
+    #[serde(default)]
+    pub capped: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
