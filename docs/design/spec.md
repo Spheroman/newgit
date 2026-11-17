@@ -99,7 +99,11 @@ Resources exist for exactly three reasons:
   build) are tied to a machine and a path. The truth is the identity, the
   lockfile, and the artifact is derived from it. Instances whose identity
   agrees can share the derived tree through the install store (see
-  *Installs*); instances whose identity differs never do.
+  *Installs*); instances whose identity differs never do. Build output a
+  tool refills on its own (`target/`, `.next/cache`) is the same kind of
+  state with the rebuild left to the tool: a resource declares it
+  `disposable`, with no hook at all, and an eviction drops it (see
+  *Stop, start, evict*).
 
 If something is just files that copy correctly, it is a tracker.
 
@@ -1301,12 +1305,33 @@ linked to the workspace (`git worktree add`), whose Git is in
 and no bound `recompute` resource rebuilds, such as `target/` or a stray
 `.env.local`. It names those, a wholly ignored directory as one entry with
 its file count, and `--discard-ignored` evicts anyway, naming them again
-(`discarded` in `--json`). There is no way yet to declare build output
-such as `target/` disposable, so a plain `--evict` refuses in a Rust
-workspace and `--discard-ignored` is the manual override
-([#447](https://github.com/Spheroman/newgit/issues/447)): a resource
-cannot say it without a destructive `prepare` or an identity that refills
-the tree on `undo`. It also refuses
+(`discarded` in `--json`). Build output a tool refills on its own is
+declared `disposable` by a resource
+([#447](https://github.com/Spheroman/newgit/issues/447)):
+
+```toml
+# .newgit/resources/build-output.toml
+ownership = "workspace"
+disposable = ["target", ".next/cache"]
+```
+
+A plain `--evict` then drops the ignored files under those paths with the
+workspace, says so (`disposed` in `--json`, each path with its resource and
+file count, and `status` while the instance is evicted), and the `start`
+after it leaves them for the build to refill. The refusal names this
+declaration. It is a resource, not a project-level `[evict]` list, because
+build output is path-dependent state that is recomputed, never copied,
+which is what resources are for, and because a resource is bound per
+instance: one a tracker brings (`resources = [...]`) stops counting in an
+instance that drops that tracker. It has no `prepare`, no identity, and no
+hook, so no `undo`, `tracker use`/`drop`, or `spawn` ever touches the tree:
+a declaration with no lifecycle holds for every instance the moment it is
+written. It only ever drops *ignored* files (anything else is in the
+checkpoint), and a file under it that a tracker outside Git owns is kept.
+The first way tried, an install-shaped resource (`[identity]` on
+`Cargo.lock`, `produces = ["target"]`), had to either empty a live
+`target/` from its `prepare` on an `undo` across `Cargo.lock` or fill the
+install store with gigabytes of build output. It also refuses
 while a process other than itself has its working directory in the
 workspace, judged again right before the move: the shell or agent it was
 run from included, since the directory would be deleted under it, so it
@@ -1334,9 +1359,11 @@ repository. Of every other config key the clone already has, a
 single value comes back as it was and a multi-valued key (an added
 `remote.origin.fetch`) gets the saved values added beside newgit's. Evicting does not free the disk an
 untracked file's content takes, since its blob is in the store with the
-checkpoint, and each cycle adds an evict checkpoint and one or two
-before-undo checkpoints with no retention yet
-([#446](https://github.com/Spheroman/newgit/issues/446)).
+checkpoint, until a restore brings that checkpoint back, a later eviction
+supersedes it, and `newgit cleanup` collects it (see *Cleanup*). Each cycle
+adds an evict checkpoint and the one or two before-undo checkpoints its
+restore's undo takes; a restore that succeeds stamps the evict checkpoint
+`restored` and marks those `restore_of` it, for `cleanup`.
 
 A crash or a failure part way loses nothing. A crash after the record says
 `evicted` and before the move leaves the original workspace at the path,
@@ -1367,9 +1394,8 @@ them. Only `newgit cleanup --discard-saved <path>` deletes one. A restore
 refuses when something other than the marker was written at the path since
 an eviction or a failed restore, and so does `stop --evict`, rather than
 report nothing to do. `remove` refuses too, naming what is there, unless
-`--force`. (A `remove` of an instance that is not evicted deletes its
-workspace however dirty it is, as it always has:
-[#448](https://github.com/Spheroman/newgit/issues/448).) While an
+`--force`. (A `remove` of an instance that is not evicted checkpoints it
+first; see *Remove*.) While an
 instance is evicted, commands that need its workspace (`checkpoint`,
 `undo`, `run`, `merge`, ...) say it was evicted and to run `newgit start`.
 A second `stop --evict` says it is already evicted to its checkpoint.
@@ -1393,10 +1419,75 @@ a checkpoint that bound less parks the same way.
 
 ### Remove
 
-`newgit remove <name>` stops what is running (dependents first), runs
-`[cleanup]` hooks where ownership allows — for parked bindings too, unless
-their drop already ran it — deletes the workspace (`rm -rf`;
-clones have no registration), and archives the binding record.
+`newgit remove <name>` checkpoints the workspace (reason `remove`), stops
+what is running (dependents first), runs `[cleanup]` hooks where ownership
+allows — for parked bindings too, unless their drop already ran it —
+deletes the workspace (`rm -rf`; clones have no registration), and
+archives the binding record, which names the checkpoint (`removed_to`).
+
+**Remove never deletes work no checkpoint holds**
+([#448](https://github.com/Spheroman/newgit/issues/448)). Before anything
+is stopped, it takes a checkpoint as `stop --evict` does: uncommitted,
+untracked, and staged work, the workspace's commits (which the store then
+holds, so the branch rule below sees them), tracker content, and resource
+state, captured while the resources still run. `newgit spawn <name>
+--from-checkpoint <name>/<id>` brings the workspace back. "Remove, and I
+can undo it" is the obvious reading of a remove that keeps checkpoints,
+and refusing a dirty workspace instead would make every unattended caller
+(T3 Code deletes a thread with a plain `newgit remove`) either fail or
+learn `--force` and lose the work anyway. The checkpoint neither syncs to
+the remote, which the instance leaves a moment later, nor re-encrypts an
+encrypted tracker's rev to a changed audience, so a removal never waits on
+the network.
+
+An evicted instance is not checkpointed again: the checkpoint it was
+evicted to holds its workspace, and is the one the archived record names
+(`removed_to`) and `remove` reports. That is T3 Code's most common path, a
+thread whose workspace was evicted at the end of a turn and then deleted.
+
+What a checkpoint cannot hold is named as lost (`lost` in `--json`), never
+deleted in silence: ignored files no tracker outside Git owns and no
+resource rebuilds (`target/`, with its file count), changes in a dropped
+tracker's paths, hand edits to rendered files, a merge or rebase in
+progress, the stash, branches and tags only the workspace has, staged
+content the working tree has moved past, a Git repository nested in the
+workspace (a checkpoint records only the commit it has checked out, so its
+files go; `lost` says how many uncommitted changes and commits on no
+remote it had). Ignored paths a resource declares `disposable` are listed
+as dropped, not lost.
+
+A resource capture that fails (a `pg_dump` against a database that is
+down) does not refuse the removal: the checkpoint goes ahead without that
+resource, as it does for a resource that is not up. But its state is then
+in no checkpoint, so its `[cleanup]` does not run: a `dropdb` after a
+failed dump would delete the only copy, unattended. The state stays where
+it is, and the removal says so (`left:`, `left` in `--json`, hook status
+`skipped-uncaptured`), with the cleanup command as it would have run,
+which names where the state is and removes it by hand. `--force` runs it,
+and names what that deleted as lost.
+
+A checkpoint that fails refuses the removal, deleting nothing, unless
+`--force`, which removes anyway. So does a nested repository with no
+commit, which `git add` refuses, and a workspace whose Git cannot be read;
+each refusal names `--force`. `--purge` takes no checkpoint (it discards
+them all). With no checkpoint (`--purge`, or `--force` past a failed one)
+`lost` names the uncommitted work it deletes and, per bound tracker
+outside Git, the paths whose content differs from its bound rev (compared
+without capturing). Under `--force` or `--purge` the analysis is
+best-effort: what could not be read is named (`could not inspect ...;
+whatever it held`) rather than refusing.
+
+A removal that fails after its checkpoint leaves that checkpoint; the
+retry takes another, and `cleanup` collects the earlier one. A checkpoint
+that fails partway deletes the store ref it wrote.
+
+Every instance spawned under a name shares its checkpoint history, so
+each checkpoint record names the instance that took it (`instance`, the
+instance id). `cleanup` collects a `remove` checkpoint only when the same
+instance took a later one: a later instance's removal is its own work,
+not a retry. Archived records are never replaced: each claims its name
+(`<slug>-<timestamp>.toml`, `.<n>` added when an earlier removal took it
+in the same second) before the record is moved onto it.
 
 **The source branch** goes too, when it holds nothing unique, and otherwise
 stays with the reason printed. It is deleted only when all of these hold:
@@ -1421,13 +1512,17 @@ silently adopt it. A squash-merged branch whose remote branch was deleted
 looks unique and is kept: the safe miss, named with the command to finish
 the job. `--keep-branch` and `--delete-branch` override.
 
-What `remove` cannot protect is work done since the last checkpoint. When
-no ref holds the workspace's `HEAD`, it says that work is lost, so "nothing
-unique on the branch" never reads as "nothing lost".
+With no checkpoint first (`--purge`, or `--force` past a failed one),
+when no ref holds the workspace's `HEAD`, it says the commits since the
+last checkpoint are lost, so "nothing unique on the branch" never reads as
+"nothing lost".
 
 **Checkpoints outlive removal.** They pin what their undo would need, and
 newgit never breaks an undo on its own initiative. `remove` reports how
-many it kept; `--purge` discards them.
+many it kept; `--purge` discards them: the ones this instance took, never
+an earlier instance's under the same name, nor one an archived record
+names (`removed_to`, `evicted`). `cleanup --purge-archived` discards a
+name's whole history once no live instance has it.
 
 ### Cleanup
 
@@ -1445,14 +1540,49 @@ reports exactly what a real run would do. It:
 - **clears dead process state** and lock files of instances with no record.
 - **prunes tracker revisions nothing references**, and garbage-collects at
   once, so pruned content (possibly a secret) is gone rather than merely
-  unreachable. It never deletes a checkpoint record or a revision a
-  checkpoint points at, and reports how many it kept for that reason, so
-  retained disk is explained.
+  unreachable. It never deletes a revision a checkpoint points at, nor a
+  checkpoint record beyond what retention collects (below), and reports how
+  many it kept for that reason, so retained disk is explained.
 - **prunes the install store** (see *Installs*).
+- **collects what eviction leaves behind**
+  ([#446](https://github.com/Spheroman/newgit/issues/446)), only what is
+  proven to be nobody's only copy. History is kept by slug and outlives an
+  archived record, so a later instance with the same name shares it. In
+  each slug's history, live or archived, it collects an `evict`
+  checkpoint a restore brought back and that succeeded (`restored`), once
+  a later eviction supersedes it; every checkpoint a restore that
+  succeeded took on its way (`restore_of`: the marker and a clone); and a
+  `remove` checkpoint the same instance took a later one after (a removal
+  that failed after its checkpoint, retried). It never collects an `evict` checkpoint nothing
+  restored, since an instance removed while evicted keeps its work only
+  there. Nor does it collect one any live or archived record names
+  (`evicted`, `removed_to`), a before-undo that a person's own `undo` took
+  (its redo point), one a restore that failed took (it may hold what was
+  written at the path meanwhile), or an `explicit` or `push` checkpoint. It
+  also collects checkpoint refs no record names (a checkpoint killed
+  between writing its ref and its record). It deletes each record and the
+  store ref of its source, so the tracker revisions only they held are
+  pruned in the same pass. A collected id is never handed out again. It
+  reports the bytes of store objects only they reached (`git rev-list
+  --disk-usage`) as now unreachable. **newgit does not prune the store**:
+  the publish outbox (`.newgit/local/publish/outbox.git`) borrows the
+  store's objects through alternates, so a prune of the store can corrupt
+  it, and the user's own `gc.pruneExpire`, `gc.auto`, and `git maintenance`
+  decide when unreachable objects go (by default two weeks, which is also
+  how long `git fsck` can recover a dropped stash). Each slug's lock is held
+  only while its records are read or deleted. An evict checkpoint is not
+  always "nobody's work": in T3 Code it is often the only checkpoint of a
+  turn's end state. That is why one is collected only after a restore
+  proved the workspace holds it again and a later eviction moved past it.
+  **A collected checkpoint is gone for `undo --to` too**: that is the
+  decision, since each one is a state the instance was in only on its way
+  somewhere else. A state worth keeping is kept with `newgit checkpoint`,
+  which nothing collects. The copies a checkpoint sync sent to the remote
+  are not touched.
 
 That conservatism is a dead end for archived instances: `undo` needs a
-binding record, so their checkpoints can never be restored, yet they pin
-revisions forever. `cleanup --purge-archived` discards them, with their
+binding record, so their checkpoints come back only through `spawn
+--from-checkpoint`, yet they pin revisions forever. `cleanup --purge-archived` discards them, with their
 checkpoint refs. It is opt-in and never touches a live instance. The
 ordinary report says how many retained revisions it would free.
 

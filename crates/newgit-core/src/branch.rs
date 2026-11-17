@@ -74,6 +74,11 @@ pub struct BranchInstance {
     /// while the workspace is there.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub evicted: Option<String>,
+    /// The checkpoint `newgit remove` took of the workspace just before it
+    /// deleted it. Set only on an archived record: what `newgit spawn
+    /// --from-checkpoint <instance>/<id>` brings back.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub removed_to: Option<String>,
     /// Directories beside the workspace holding what was at its path when a
     /// restore of it was cut short or failed (`.<name>.interrupted-restore`,
     /// `.<name>.restore-failed`): work no checkpoint holds. newgit never
@@ -226,6 +231,7 @@ impl BranchInstance {
             parked: BTreeMap::new(),
             private: false,
             evicted: None,
+            removed_to: None,
             saved_copies: Vec::new(),
             created_at: now,
             remote: None,

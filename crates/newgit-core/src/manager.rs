@@ -50,6 +50,8 @@ use crate::tracker_repo::{
 
 mod encryption;
 mod evict;
+mod remove;
+mod retention;
 pub use encryption::{Reencrypted, describe_recipients};
 mod export_check;
 mod pull;
@@ -748,11 +750,15 @@ pub struct StopStartOutcome {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WorkspaceChange {
     /// Checkpointed to `checkpoint`, then deleted. `discarded` is what went
-    /// with it that no checkpoint carries: ignored paths no tracker owns and
-    /// no resource rebuilds, such as `target/`.
+    /// with it that no checkpoint carries and nothing declared disposable:
+    /// ignored paths no tracker owns and no resource rebuilds (only with
+    /// `--discard-ignored`).
     Evicted {
         checkpoint: String,
         discarded: Vec<crate::evict::Discarded>,
+        /// Ignored paths a resource declares `disposable`, dropped with the
+        /// workspace for its build to refill (#447).
+        disposed: Vec<crate::evict::Disposed>,
         /// What of the workspace's `.git/` no checkpoint and no save keeps
         /// (reflogs, intent-to-add, hand-set index flags), said before the
         /// delete.
@@ -982,21 +988,75 @@ pub struct RemoveOutcome {
     /// How many checkpoints removal left behind instead — retained disk the
     /// caller should be told about, since nothing reaches them any more.
     pub kept_checkpoints: usize,
+    /// The checkpoint that holds the workspace removal deleted, which the
+    /// archived record names as `removed_to`: the one removal took first
+    /// (reason `remove`), or for an evicted instance the one it was evicted
+    /// to. `newgit spawn --from-checkpoint <instance>/<id>` brings it back.
+    /// `None` when there was no workspace to take, with `--purge`, or when
+    /// the checkpoint failed under `--force`.
+    pub checkpoint: Option<String>,
+    /// Ignored paths a resource declares `disposable`, deleted with the
+    /// workspace for its build to refill (#447).
+    pub disposed: Vec<crate::evict::Disposed>,
+    /// What the removal deleted that no checkpoint holds (ignored files
+    /// nothing rebuilds, Git-only state such as the stash, and with
+    /// `--purge` or a failed checkpoint under `--force`, uncommitted work),
+    /// each said for a reader.
+    pub lost: Vec<String>,
+    /// Resource state the removal left in place: its capture failed, so no
+    /// checkpoint holds it, and its `[cleanup]` did not run.
+    pub left: Vec<LeftState>,
+    /// What the checkpoint said along the way.
+    pub warnings: Vec<String>,
     /// Why the instance could not be removed from the remote, when it was on
     /// one: its fork and token outlive it until removed there.
     pub remote_warning: Option<String>,
     /// What happened to the instance's source branch in the store, and why.
     pub source_branch: SourceBranchOutcome,
     /// The workspace's HEAD when no ref in the store contained it: commits
-    /// made after the last checkpoint, deleted with the workspace. `remove`
-    /// does not checkpoint first (the workspace is disposable), but it does
-    /// say so, rather than let "nothing unique" on the branch read as
-    /// "nothing lost".
+    /// made after the last checkpoint, deleted with the workspace. Only
+    /// when no checkpoint was taken first (`--purge`, or `--force` past a
+    /// failed one), since the checkpoint takes them into the store.
     pub unsaved_workspace_head: Option<String>,
     /// Saved copies of what was at the workspace path when a restore was
     /// cut short or failed ([`BranchInstance::saved_copies`]): kept, since
     /// no checkpoint holds them.
     pub saved_copies: Vec<Utf8PathBuf>,
+}
+
+/// One resource's state a removal left where it is, because the
+/// checkpoint taken first could not capture it ([`RemoveOutcome::left`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LeftState {
+    pub resource: String,
+    /// Why its capture failed.
+    pub reason: String,
+    /// Its `[cleanup] command` as it would have run, which names where the
+    /// state is and removes it by hand. `None` when it has none to run (no
+    /// hook, or ownership newgit never tears down): nothing would have
+    /// deleted it anyway.
+    pub cleanup: Option<String>,
+}
+
+/// What [`BranchManager::remove_forced`] left of each resource in
+/// `uncaptured`, from the hooks it did not run.
+fn left_state(hooks: &[HookOutcome], uncaptured: &BTreeMap<String, String>) -> Vec<LeftState> {
+    hooks
+        .iter()
+        .filter_map(|hook| {
+            let reason = uncaptured.get(&hook.resource)?;
+            let cleanup = match &hook.detail {
+                HookDetail::SkippedUncaptured(command) => Some(command.clone()),
+                HookDetail::SkippedUnresolved { command, .. } => Some(command.clone()),
+                _ => None,
+            };
+            Some(LeftState {
+                resource: hook.resource.clone(),
+                reason: reason.clone(),
+                cleanup,
+            })
+        })
+        .collect()
 }
 
 /// What `remove` should do with the instance's source branch.
@@ -1228,6 +1288,21 @@ pub struct CheckpointOutcome {
     pub left_out: Vec<String>,
     /// Resources that were not up, so not captured.
     pub degraded: Vec<String>,
+    /// Why each resource whose capture failed failed, said without
+    /// claiming the checkpoint was aborted (it went ahead without it).
+    pub capture_failures: BTreeMap<String, String>,
+}
+
+/// A resource capture's failure, as a checkpoint that went ahead without
+/// it says it: [`NewgitError::CheckpointCommandFailed`] says the checkpoint
+/// was aborted, which is true only where it refuses the checkpoint.
+fn capture_failure(error: &NewgitError) -> String {
+    match error {
+        NewgitError::CheckpointCommandFailed { code, log, .. } => {
+            format!("its checkpoint command exited with {code}; log: {log}")
+        }
+        other => other.to_string(),
+    }
 }
 
 /// A `git push` from a workspace, published: the checkpoint taken first, and
@@ -4080,6 +4155,11 @@ impl BranchManager {
             false,
         )?;
         let mut branch = spawned.branch.clone();
+        // `spawn_inner` released the slug's lock; take it again before the
+        // record lands, so `newgit cleanup` never sees the ref without its
+        // record (an orphan it would delete) or the record before the undo
+        // stamps what it restored. Re-entrant: the undo takes it too.
+        let _lock = self.lock_instance(&branch.slug, &branch.name)?;
         // Its tracker branches start where the checkpoint's committed work is.
         self.land_tracker_branches(
             trackers
@@ -4093,6 +4173,7 @@ impl BranchManager {
         let log = self.checkpoint_log(&branch);
         record.id = log.next_id()?;
         record.branch = branch.name.clone();
+        record.instance = Some(branch.id.clone());
         // Taken on the new instance's own branch, which `spawn_inner` made at
         // the checkpoint's head. The branch the author's workspace was on, or
         // its detached HEAD, is the author's: the undo below would put this
@@ -8225,7 +8306,8 @@ impl BranchManager {
 
     /// [`Self::remove`]; `force` also deletes what was written at an
     /// evicted instance's workspace path since, which no checkpoint holds
-    /// and which `remove` otherwise refuses to delete.
+    /// and which `remove` otherwise refuses to delete, and removes the
+    /// instance when the checkpoint taken first fails.
     pub fn remove_forced(
         &self,
         name: &str,
@@ -8234,7 +8316,7 @@ impl BranchManager {
         source_branch: SourceBranchPolicy,
         force: bool,
     ) -> Result<RemoveOutcome> {
-        let (_lock, branch) = self.locked_branch(name)?;
+        let (_lock, mut branch) = self.locked_branch(name)?;
 
         if cwd.starts_with(&branch.workspace_path) {
             return Err(NewgitError::Unsupported(format!(
@@ -8282,7 +8364,15 @@ impl BranchManager {
         // Whatever would make the cleanup hooks refuse refuses here, before
         // anything is stopped or deleted: a dry run checks each hook and runs
         // none.
-        self.run_cleanup_hooks(&branch, true)?;
+        self.run_cleanup_hooks(&branch, true, &BTreeMap::new())?;
+
+        // Before anything is stopped: a checkpoint of everything a
+        // checkpoint holds, with what is running still running, so that
+        // removing never deletes work no checkpoint holds. It takes the
+        // workspace's commits into the store, so the branch decision below
+        // sees them.
+        let keeping = checkpoints == ArchivedCheckpoints::Keep;
+        let keep = self.checkpoint_before_remove(&mut branch, keeping, force)?;
 
         let policy = source_branch;
         let (mut source_branch, via_outbox) = self.decide_source_branch(&branch, policy)?;
@@ -8294,7 +8384,11 @@ impl BranchManager {
             supervisor.stop(&definition.name, &definition.stop_signal())?;
         }
 
-        let hooks = self.run_cleanup_hooks(&branch, false)?;
+        // Never the cleanup of a resource the checkpoint could not capture:
+        // its state is in no checkpoint, and its `[cleanup]` (a `dropdb`)
+        // would delete it. It stays where it is, and the outcome says so.
+        let hooks = self.run_cleanup_hooks(&branch, false, &keep.uncaptured)?;
+        let left = left_state(&hooks, &keep.uncaptured);
 
         let state_dir = self.store.instance_state_dir(&branch.slug);
         if state_dir.exists() {
@@ -8355,11 +8449,15 @@ impl BranchManager {
                 let _ = self.source.delete_ref(&name);
             }
         }
+        if let Some(id) = &keep.checkpoint {
+            branch.removed_to = Some(id.clone());
+            branch.updated_at = Utc::now();
+            self.store.save_branch_record(&branch)?;
+        }
         let archived_record = self.store.archive_branch_record(&branch)?;
         // Either way, count what the instance leaves behind: checkpoints kept
         // for an unreachable instance are disk nobody will reclaim by accident.
-        let keeping = checkpoints == ArchivedCheckpoints::Keep;
-        let found = self.purge_checkpoints(&branch.slug, keeping)?;
+        let found = self.purge_checkpoints(&branch.slug, Some(&branch.id), keeping)?;
         let (purged_checkpoints, kept_checkpoints) = match (keeping, found) {
             (true, found) => (None, found.map_or(0, |plan| plan.checkpoints)),
             (false, purged) => (purged, 0),
@@ -8384,6 +8482,11 @@ impl BranchManager {
             hooks,
             purged_checkpoints,
             kept_checkpoints,
+            checkpoint: keep.checkpoint,
+            disposed: keep.disposed,
+            lost: keep.lost,
+            left,
+            warnings: keep.warnings,
             remote_warning,
             source_branch,
             unsaved_workspace_head,
@@ -8599,7 +8702,14 @@ impl BranchManager {
         })
     }
 
-    /// Drop one instance's checkpoint log and the store refs it held.
+    /// Drop a name's checkpoint log and the store refs it held: all of it
+    /// (`cleanup --purge-archived`, for a name no live instance has), or
+    /// with `instance`, only the checkpoints that instance took
+    /// ([`CheckpointRecord::instance`]) — `remove --purge`, which must not
+    /// reach the checkpoints of an earlier instance spawned under the same
+    /// name. Even then, never one another archived record names
+    /// (`removed_to`, `evicted`): that is where an earlier instance's work
+    /// was kept.
     ///
     /// This is the only operation that can break an undo, so nothing calls it
     /// implicitly: a checkpoint is what `newgit undo` restores, and the lane
@@ -8607,28 +8717,81 @@ impl BranchManager {
     /// record is archived the undo is unreachable anyway — but "unreachable"
     /// is still the user's call to make, not a garbage collector's.
     ///
-    /// Returns `None` when the instance has no checkpoints at all.
-    fn purge_checkpoints(&self, slug: &str, dry_run: bool) -> Result<Option<PurgedCheckpoints>> {
+    /// Returns `None` when there are no checkpoints to purge.
+    fn purge_checkpoints(
+        &self,
+        slug: &str,
+        instance: Option<&str>,
+        dry_run: bool,
+    ) -> Result<Option<PurgedCheckpoints>> {
         let dir = self.store.checkpoint_dir(slug);
         if !dir.is_dir() {
             return Ok(None);
         }
-        let checkpoints = CheckpointLog::new(dir.clone(), slug).list()?.len();
-        let refs = self
-            .source
-            .refs_under(&format!("refs/newgit/checkpoints/{slug}"))?;
-
-        if !dry_run {
-            for name in &refs {
-                self.source.delete_ref(name)?;
+        let log = CheckpointLog::new(dir.clone(), slug);
+        let Some(instance) = instance else {
+            let checkpoints = log.list()?.len();
+            let refs = self
+                .source
+                .refs_under(&format!("refs/newgit/checkpoints/{slug}"))?;
+            if !dry_run {
+                for name in &refs {
+                    self.source.delete_ref(name)?;
+                }
+                std::fs::remove_dir_all(&dir).map_err(|source| NewgitError::io(&dir, source))?;
             }
+            return Ok(Some(PurgedCheckpoints {
+                slug: slug.to_owned(),
+                checkpoints,
+                source_refs: refs.len(),
+                dir,
+            }));
+        };
+        // What other instances' archived records name. One that cannot be
+        // read could name anything, so nothing of this name is purged.
+        let mut named = BTreeSet::new();
+        for (archived_slug, record) in self.store.archived_branches()? {
+            match record {
+                Ok(record) if record.slug == slug && record.id != instance => {
+                    named.extend(record.removed_to);
+                    named.extend(record.evicted);
+                }
+                Ok(_) => {}
+                Err(_) if archived_slug == slug => return Ok(None),
+                Err(_) => {}
+            }
+        }
+        let records = log.list()?;
+        let ours: Vec<&CheckpointRecord> = records
+            .iter()
+            .filter(|record| record.instance.as_deref() == Some(instance))
+            .filter(|record| !named.contains(&record.id))
+            .collect();
+        if ours.is_empty() {
+            return Ok(None);
+        }
+        let mut source_refs = 0;
+        for record in &ours {
+            let held = self.source.ref_rev(&record.source.store_ref).is_some();
+            if held {
+                source_refs += 1;
+            }
+            if !dry_run {
+                if held {
+                    self.source.delete_ref(&record.source.store_ref)?;
+                }
+                log.delete(&record.id)?;
+            }
+        }
+        if !dry_run && ours.len() == records.len() {
+            // Nothing of the name's history left: the log goes too, as the
+            // whole-name purge does.
             std::fs::remove_dir_all(&dir).map_err(|source| NewgitError::io(&dir, source))?;
         }
-
         Ok(Some(PurgedCheckpoints {
             slug: slug.to_owned(),
-            checkpoints,
-            source_refs: refs.len(),
+            checkpoints: ours.len(),
+            source_refs,
             dir,
         }))
     }
@@ -8645,10 +8808,15 @@ impl BranchManager {
     /// A binding a tracker drop parked counts too, unless the drop already
     /// ran its `[cleanup]` (#254): it was this instance's, and nothing else
     /// will ever tear it down.
+    ///
+    /// The resources in `uncaptured` (a capture that failed) are not torn
+    /// down: their hook is rendered, not run, and named
+    /// [`HookDetail::SkippedUncaptured`].
     fn run_cleanup_hooks(
         &self,
         branch: &BranchInstance,
         dry_run: bool,
+        uncaptured: &BTreeMap<String, String>,
     ) -> Result<Vec<HookOutcome>> {
         let mut outcomes = Vec::new();
         for name in self.graph.lifecycle_order.iter().rev() {
@@ -8658,7 +8826,13 @@ impl BranchManager {
                 _ => continue,
             };
             let definition = self.resource_definition(name)?;
-            outcomes.push(self.run_cleanup_hook(branch, definition, binding, dry_run)?);
+            let skip = uncaptured.contains_key(name);
+            let mut outcome =
+                self.run_cleanup_hook(branch, definition, binding, dry_run || skip)?;
+            if skip && let HookDetail::WouldRun(command) = outcome.detail {
+                outcome.detail = HookDetail::SkippedUncaptured(command);
+            }
+            outcomes.push(outcome);
         }
         Ok(outcomes)
     }
@@ -8857,7 +9031,7 @@ impl BranchManager {
                 Err(error) => return Err(error),
             };
             let branch = &branch;
-            let hooks = self.run_cleanup_hooks(branch, dry_run)?;
+            let hooks = self.run_cleanup_hooks(branch, dry_run, &BTreeMap::new())?;
             let archived_record = if dry_run {
                 None
             } else {
@@ -8945,15 +9119,28 @@ impl BranchManager {
                 if live_slugs.contains(slug.as_str()) {
                     continue;
                 }
-                if let Some(purged) = self.purge_checkpoints(&slug, dry_run)? {
+                if let Some(purged) = self.purge_checkpoints(&slug, None, dry_run)? {
                     outcome.purged_checkpoints.push(purged);
                 }
             }
         }
 
+        // Retention (#446): evict checkpoints a later eviction superseded,
+        // and what a restore that succeeded took on its way. Collected
+        // before the lane roots are read, so the revs only they held go too.
+        let (superseded, orphans) = self.superseded_checkpoints(&surviving, archived)?;
+        let (collected, collected_bytes) =
+            self.collect_checkpoints(&superseded, &orphans, dry_run)?;
+        let skipped: BTreeSet<(String, String)> = collected
+            .iter()
+            .map(|collected| (collected.slug.clone(), collected.id.clone()))
+            .collect();
+        outcome.collected_checkpoints = collected;
+        outcome.collected_bytes = collected_bytes;
+
         // Lane pruning. Roots come from the records that survive this pass,
         // so a dry run reports exactly what a real run would remove.
-        let roots = SnapshotRoots::collect(&self.store, &surviving, archived)?;
+        let roots = SnapshotRoots::collect_except(&self.store, &surviving, archived, &skipped)?;
         let lanes = self.store.paths().tracker_store.clone();
         for lane_rev in pinned_revs(&lanes)? {
             if roots.contains(&lane_rev.tracker, &lane_rev.rev) {
@@ -11406,6 +11593,31 @@ impl BranchManager {
         message: Option<&str>,
         reason: CheckpointReason,
     ) -> Result<CheckpointOutcome> {
+        // A checkpoint writes its store ref before its record. One that
+        // fails between the two leaves a ref no record names, holding the
+        // workspace's objects: deleted here, so a retry does not pile them up.
+        let log = self.checkpoint_log(branch);
+        let id = log.next_id()?;
+        let taken = self.take_checkpoint(branch, message, reason);
+        if taken.is_err() {
+            let store_ref = format!("refs/newgit/checkpoints/{}/{id}", branch.slug);
+            let recorded = log
+                .list()
+                .map(|records| records.iter().any(|record| record.id == id))
+                .unwrap_or(true);
+            if !recorded && self.source.ref_rev(&store_ref).is_some() {
+                let _ = self.source.delete_ref(&store_ref);
+            }
+        }
+        taken
+    }
+
+    fn take_checkpoint(
+        &self,
+        branch: &mut BranchInstance,
+        message: Option<&str>,
+        reason: CheckpointReason,
+    ) -> Result<CheckpointOutcome> {
         debug_assert!(
             self.held_lock(&branch.slug).is_some(),
             "a checkpoint is taken under the instance's lock"
@@ -11489,6 +11701,7 @@ impl BranchManager {
         // that reads an export is not a claim about capture order (#43).
         let mut resource_states = Vec::new();
         let mut degraded = Vec::new();
+        let mut capture_failures = BTreeMap::new();
         let mut deposits: Vec<(String, String)> = Vec::new();
         for name in self.graph.lifecycle_order.iter().rev() {
             let Some(binding) = branch.resources.get(name) else {
@@ -11521,15 +11734,26 @@ impl BranchManager {
                 ));
                 degraded.push(name.clone());
                 CapturedResource::none()
-            } else if binding.status != ResourceStatus::Ready {
+            } else if binding.status != ResourceStatus::Ready || reason == CheckpointReason::Remove
+            {
+                // And the one `remove` takes: an unattended removal must not
+                // be refused by a database that is down. What it cannot
+                // capture is named as lost instead.
                 match self.checkpoint_resource(branch, definition, "checkpoint") {
                     Ok(captured) => captured,
                     Err(error) => {
-                        warnings.push(format!(
-                            "resource `{name}` is not up and its capture failed ({error}), so \
-                             this checkpoint is degraded — undoing to it leaves `{name}` as it is"
-                        ));
+                        let why = capture_failure(&error);
+                        // `remove` says it itself, with what it did about
+                        // the state (`RemoveOutcome::left`).
+                        if reason != CheckpointReason::Remove {
+                            warnings.push(format!(
+                                "resource `{name}` is not up and its capture failed ({why}), \
+                                 so this checkpoint is degraded — undoing to it leaves `{name}` \
+                                 as it is"
+                            ));
+                        }
                         degraded.push(name.clone());
+                        capture_failures.insert(name.clone(), why);
                         CapturedResource::none()
                     }
                 }
@@ -11612,7 +11836,13 @@ impl BranchManager {
             // (#338). Without the remote it stays as it is, and the sync,
             // which checks again, does not send it.
             let content_rev = match content_rev {
-                Some(rev) if definition.encrypted_to_audience() && self.remote.is_some() => {
+                // Not for `remove`'s checkpoint, which is never synced: a
+                // removal never waits on the network.
+                Some(rev)
+                    if definition.encrypted_to_audience()
+                        && self.remote.is_some()
+                        && reason != CheckpointReason::Remove =>
+                {
                     match self.sealed_to_current(
                         definition,
                         &rev,
@@ -11650,10 +11880,13 @@ impl BranchManager {
         let record = CheckpointRecord {
             id,
             branch: branch.name.clone(),
+            instance: Some(branch.id.clone()),
             created_at: Utc::now(),
             message: message.map(ToOwned::to_owned),
             reason,
             undo_completed: None,
+            restore_of: None,
+            restored: false,
             source: SourceState {
                 head_rev,
                 dirty_rev,
@@ -11674,7 +11907,14 @@ impl BranchManager {
         // it is what lets another machine spawn it.
         let mut left_out = Vec::new();
         let mut sync_refused = false;
-        let sync_error = match self.sync_checkpoint(branch, &record) {
+        // Except the one `remove` takes: the instance leaves the remote
+        // right after, and a removal must not wait on the network.
+        let synced = if reason == CheckpointReason::Remove {
+            Ok(Vec::new())
+        } else {
+            self.sync_checkpoint(branch, &record)
+        };
+        let sync_error = match synced {
             Ok(refused) => {
                 for (tracker, reason) in refused {
                     warnings.push(format!(
@@ -11711,6 +11951,7 @@ impl BranchManager {
             sync_refused,
             left_out,
             degraded,
+            capture_failures,
         })
     }
 

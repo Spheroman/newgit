@@ -170,6 +170,31 @@ impl std::fmt::Display for Discarded {
     }
 }
 
+/// A path a resource declares `disposable`, dropped with an evicted
+/// workspace: the ignored files under it, which its build refills (#447).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Disposed {
+    /// The path as the resource declares it.
+    pub path: Utf8PathBuf,
+    /// The resource that declares it.
+    pub resource: String,
+    /// How many ignored files under it went.
+    pub files: usize,
+}
+
+impl std::fmt::Display for Disposed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "`{}` ({} file{}, `{}`)",
+            self.path,
+            self.files,
+            if self.files == 1 { "" } else { "s" },
+            self.resource
+        )
+    }
+}
+
 /// `lost`, the ignored files an eviction would lose, named by the top-level
 /// ignored directory (`entries`, from [`ignored_entries`]) when every file
 /// `all` lists under it is lost, each file otherwise. Linear in the files

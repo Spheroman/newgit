@@ -270,6 +270,21 @@ fn uncheckpointed_commits_are_named_as_lost() {
     let (workspace, _) = spawn(&fixture, "feature/late");
     commit(&workspace, "late.txt", "late\n");
 
-    let stdout = remove(&fixture, "feature/late", &[]);
+    // `--purge` takes no checkpoint first, so the commit goes with the
+    // workspace. A plain `remove` checkpoints it (#448): the branch keeps it.
+    let stdout = remove(&fixture, "feature/late", &["--purge"]);
     assert!(stdout.contains("was never checkpointed"), "{stdout}");
+}
+
+#[test]
+fn a_plain_remove_checkpoints_late_commits_onto_the_kept_branch() {
+    let (_guard, temp) = tempdir();
+    let fixture = setup(&temp);
+    let (workspace, _) = spawn(&fixture, "feature/later");
+    commit(&workspace, "late.txt", "late\n");
+
+    let stdout = remove(&fixture, "feature/later", &[]);
+    assert!(!stdout.contains("was never checkpointed"), "{stdout}");
+    assert!(stdout.contains("kept:      checkpoint"), "{stdout}");
+    assert!(stdout.contains("`feature/later` kept"), "{stdout}");
 }

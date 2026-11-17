@@ -98,14 +98,29 @@ as it stands, and undo returns to it, but the instance's own branch stays
 where it was until you switch back and commit there. `status` shows
 `` feature-a@1a2b3c4d (workspace on `try-x`) `` while that is the case.
 
-**`cleanup` never breaks an undo.** It finalizes instances whose workspace is
-gone, deletes unclaimed workspaces and dead process state, and prunes tracker
-snapshot revs nothing references — but never a rev a checkpoint still points
-at, and never a checkpoint record. `project`- and `user`-owned resources are
-never torn down by per-branch cleanup.
+**`cleanup` never breaks an undo you could want.** It finalizes instances
+whose workspace is gone, deletes unclaimed workspaces and dead process state,
+and prunes tracker snapshot revs nothing references — but never a rev a
+checkpoint still points at. Of the checkpoints themselves it collects only
+what is proven to be nobody's only copy (#446): an `evict` checkpoint a
+restore brought back, once a later eviction supersedes it; what a restore
+that succeeded took on its way; and a removal's checkpoint a retried
+removal superseded. An `evict` checkpoint nothing restored, any checkpoint
+a live or archived record names, an `explicit` checkpoint, a push's, and
+the redo point of an `undo` you ran are never collected. It deletes refs
+and records only; the store's own `git gc` frees the objects. `project`- and `user`-owned resources
+are never torn down by per-branch cleanup.
+
+**`remove` never deletes work no checkpoint holds.** It checkpoints the
+workspace first; `newgit spawn <name> --from-checkpoint <name>/<id>` brings
+it back, and what no checkpoint can hold is named as lost (#448). A
+resource whose capture failed is not cleaned up: its state is left where
+it is and named, unless `--force`. Removing an evicted instance names the
+checkpoint it was evicted to.
 
 The one exception is one you ask for. An archived instance's checkpoints are
-unreachable — `undo` needs a binding record — yet they go on pinning revs, so
+out of `undo`'s reach — it needs a binding record — and come back only
+through `spawn --from-checkpoint`, yet they go on pinning revs, so
 `newgit remove <name> --purge` and `newgit cleanup --purge-archived` discard
 that history and release what it held. Live instances are never affected, and
 ordinary `cleanup` says how many of its retained revs the flag would free.

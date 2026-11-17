@@ -750,17 +750,67 @@ impl MetadataStore {
             .ok_or_else(|| NewgitError::UnknownBranchInstance(name.to_owned()))
     }
 
+    /// Every archived binding record, as `(slug, record)`: the record is
+    /// `Err` with its path when it cannot be read, so a caller deciding what
+    /// it may delete can stay away from that slug. The slug comes from the
+    /// file name (`<slug>-<timestamp>.toml`, see [`Self::archive_branch_record`]).
+    pub fn archived_branches(
+        &self,
+    ) -> Result<Vec<(String, std::result::Result<BranchInstance, Utf8PathBuf>)>> {
+        if !self.paths.archived_branches.is_dir() {
+            return Ok(Vec::new());
+        }
+        let mut out = Vec::new();
+        for entry in read_dir_sorted(&self.paths.archived_branches)? {
+            if entry.extension() != Some("toml") {
+                continue;
+            }
+            let Some(stem) = entry.file_stem() else {
+                continue;
+            };
+            let slug = stem
+                .rsplit_once('-')
+                .map_or(stem, |(slug, _)| slug)
+                .to_owned();
+            let record = read_toml_at::<BranchInstance>(&entry).map_err(|_| entry.clone());
+            out.push((slug, record));
+        }
+        Ok(out)
+    }
+
     /// The binding record outlives the workspace: removal archives it rather
-    /// than deleting it.
+    /// than deleting it, at `<slug>-<timestamp>.toml`, or
+    /// `<slug>-<timestamp>.<n>.toml` when an earlier removal of the name
+    /// took that one in the same second. The name is claimed with
+    /// `create_new` before the record is moved onto it, so one archived
+    /// record never replaces another: each is what names the checkpoint its
+    /// instance's work was kept in.
     pub fn archive_branch_record(&self, branch: &BranchInstance) -> Result<Utf8PathBuf> {
         create_dir_all(&self.paths.archived_branches)?;
         let record = self.branch_record_path(&branch.slug);
-        let archived = self.paths.archived_branches.join(format!(
-            "{}-{}.toml",
-            branch.slug,
-            Utc::now().format("%Y%m%dT%H%M%SZ")
-        ));
-        std::fs::rename(&record, &archived).map_err(|source| NewgitError::io(record, source))?;
+        let stamp = Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
+        let mut attempt = 0u32;
+        let archived = loop {
+            let name = if attempt == 0 {
+                format!("{}-{stamp}.toml", branch.slug)
+            } else {
+                format!("{}-{stamp}.{attempt}.toml", branch.slug)
+            };
+            let candidate = self.paths.archived_branches.join(name);
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&candidate)
+            {
+                Ok(_) => break candidate,
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => attempt += 1,
+                Err(source) => return Err(NewgitError::io(candidate, source)),
+            }
+        };
+        if let Err(source) = std::fs::rename(&record, &archived) {
+            let _ = std::fs::remove_file(&archived);
+            return Err(NewgitError::io(record, source));
+        }
         Ok(archived)
     }
 
