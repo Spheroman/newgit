@@ -541,6 +541,7 @@ pub fn merge(
         // Each side's forks are read from its own commits, the merge's
         // parents.
         forks_before: &[],
+        settled: &[],
     };
     let split =
         compose::split(&scratch.dir, &merge_view, &options).map_err(|error| match error {

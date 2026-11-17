@@ -1178,6 +1178,9 @@ impl Landing<'_> {
                 newgit_made: None,
                 need_history: &|_| Ok(()),
                 forks_before: &[],
+                // As the endpoint's split: the server makes no root commits
+                // of its own to heal, so every one is taken as it is.
+                settled: &[],
             },
         )
         .map_err(|error| match error {
