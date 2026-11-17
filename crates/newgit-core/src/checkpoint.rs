@@ -15,6 +15,14 @@ use crate::store::{read_dir_sorted, read_toml_at, write_toml_at};
 pub struct CheckpointRecord {
     pub id: String,
     pub branch: String,
+    /// The id of the instance that took it ([`crate::branch::BranchInstance::id`]).
+    /// A name's history is shared by every instance ever spawned under it,
+    /// so this is what tells them apart: `remove --purge` deletes only its
+    /// own instance's, and `cleanup` collects a `remove` checkpoint only
+    /// when the same instance took a later one. Absent in records from
+    /// before it was kept, which neither ever deletes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instance: Option<String>,
     pub created_at: DateTime<Utc>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
@@ -391,8 +399,11 @@ impl CheckpointLog {
 ///   same name shares the history.
 /// - a checkpoint a restore that succeeded took on its way
 ///   ([`CheckpointRecord::restore_of`]): the marker and a clone.
-/// - a `remove` checkpoint a later one superseded: a removal that failed
-///   after its checkpoint, retried.
+/// - a `remove` checkpoint the same instance ([`CheckpointRecord::instance`])
+///   took a later one after: a removal that failed after its checkpoint,
+///   retried. Another instance's later removal supersedes nothing: each
+///   instance under a name is its own work. A record with no instance is
+///   never collected.
 ///
 /// Never one in `named`: what a live or archived record of this slug names
 /// (`evicted`, `removed_to`), which is what `newgit start` or `newgit spawn
@@ -410,14 +421,22 @@ pub fn superseded<'a>(
             .map(|record| record.id.as_str())
     };
     let latest_evict = latest(CheckpointReason::Evict);
-    let latest_remove = latest(CheckpointReason::Remove);
+    let retried = |record: &CheckpointRecord| {
+        record.instance.as_deref().is_some_and(|instance| {
+            records.iter().any(|later| {
+                later.reason == CheckpointReason::Remove
+                    && later.instance.as_deref() == Some(instance)
+                    && numeric_id(&later.id) > numeric_id(&record.id)
+            })
+        })
+    };
     let mut out: Vec<&CheckpointRecord> = records
         .iter()
         .filter(|record| !named.contains(&record.id))
         .filter(|record| match record.reason {
             CheckpointReason::Evict => record.restored && Some(record.id.as_str()) != latest_evict,
             CheckpointReason::BeforeUndo => record.restore_of.is_some(),
-            CheckpointReason::Remove => Some(record.id.as_str()) != latest_remove,
+            CheckpointReason::Remove => retried(record),
             CheckpointReason::Explicit | CheckpointReason::Push => false,
         })
         .collect();
@@ -448,6 +467,7 @@ mod tests {
         let record = CheckpointRecord {
             id: "ckpt_001".to_owned(),
             branch: "feature-a".to_owned(),
+            instance: None,
             created_at: Utc::now(),
             message: Some("before auth refactor".to_owned()),
             reason: CheckpointReason::Explicit,
@@ -483,6 +503,7 @@ mod tests {
                 CheckpointRecord {
                     id: format!("ckpt_{n:03}"),
                     branch: "x".to_owned(),
+                    instance: Some("first".to_owned()),
                     created_at: Utc::now(),
                     message: None,
                     reason,
@@ -522,6 +543,21 @@ mod tests {
             record(11, Remove, None, false),
             // The latest eviction, restored or not, stays.
             record(12, Evict, None, true),
+            // A later instance under the name, removed: the first
+            // instance's last removal stays, and so does this one.
+            CheckpointRecord {
+                instance: Some("second".to_owned()),
+                ..record(13, Remove, None, false)
+            },
+            // From before records named their instance: never collected.
+            CheckpointRecord {
+                instance: None,
+                ..record(14, Remove, None, false)
+            },
+            CheckpointRecord {
+                instance: None,
+                ..record(15, Remove, None, false)
+            },
         ];
         let ids = |records: Vec<&CheckpointRecord>| -> Vec<String> {
             records.iter().map(|record| record.id.clone()).collect()

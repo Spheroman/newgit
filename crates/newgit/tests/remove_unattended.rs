@@ -224,9 +224,14 @@ fn a_resource_whose_capture_fails_does_not_refuse_the_removal() {
     let out = json(&newgit_ok(&root, &["remove", "x", "--json"]));
     let id = out["checkpoint"].as_str().expect("checkpoint").to_owned();
     assert!(
-        lost(&out)
+        out["left"]
+            .as_array()
+            .expect("left")
             .iter()
-            .any(|what| what.contains("resource `snap`") && what.contains("capture failed")),
+            .any(|left| left["resource"] == "snap"
+                && left["reason"]
+                    .as_str()
+                    .is_some_and(|why| why.contains("exited with 3"))),
         "{out}"
     );
     // Fixed: the database is back.

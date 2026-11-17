@@ -4688,6 +4688,11 @@ fn print_hook(hook: &HookOutcome) {
              a literal placeholder to a destructive command",
             hook.resource
         ),
+        HookDetail::SkippedUncaptured(command) => println!(
+            "  cleanup:  {} SKIPPED: did not run `{command}`; its capture failed, so it would \
+             delete state no checkpoint holds",
+            hook.resource
+        ),
     }
 }
 
@@ -4749,6 +4754,9 @@ fn remove(
     }
     for what in &outcome.lost {
         println!("  lost:      {what}");
+    }
+    for left in &outcome.left {
+        println!("  left:      {}", left_line(&outcome.branch.name, left));
     }
     for copy in &outcome.saved_copies {
         println!(
@@ -4836,6 +4844,9 @@ fn remove_json(outcome: &RemoveOutcome) -> serde_json::Value {
                 HookDetail::SkippedUnresolved { command, .. } => {
                     ("skipped-unresolved", Some(command.clone()), None)
                 }
+                HookDetail::SkippedUncaptured(command) => {
+                    ("skipped-uncaptured", Some(command.clone()), None)
+                }
             };
             serde_json::json!({
                 "resource": hook.resource,
@@ -4855,6 +4866,16 @@ fn remove_json(outcome: &RemoveOutcome) -> serde_json::Value {
         "archived_record": outcome.archived_record,
         "checkpoint": outcome.checkpoint,
         "lost": outcome.lost,
+        "left": outcome
+            .left
+            .iter()
+            .map(|left| serde_json::json!({
+                "resource": left.resource,
+                "reason": left.reason,
+                "cleanup": left.cleanup,
+                "explain": left_line(&outcome.branch.name, left),
+            }))
+            .collect::<Vec<_>>(),
         "disposed": outcome
             .disposed
             .iter()
@@ -4877,6 +4898,24 @@ fn remove_json(outcome: &RemoveOutcome) -> serde_json::Value {
         "hooks": hooks,
         "warnings": outcome.warnings,
     })
+}
+
+/// What `remove` did with a resource it could not capture, where its state
+/// is, and how to remove it.
+fn left_line(instance: &str, left: &newgit_core::manager::LeftState) -> String {
+    let what = format!(
+        "resource `{}`'s state, left in place: its capture failed ({}), so no checkpoint holds it",
+        left.resource, left.reason
+    );
+    match &left.cleanup {
+        Some(command) => format!(
+            "{what}, and its `[cleanup]` did not run. That `[cleanup]` is `{command}`: it names \
+             where the state is, and running it by hand deletes it once you have looked \
+             (`newgit remove {instance} --force` runs it as part of the removal, deleting state \
+             no checkpoint holds)"
+        ),
+        None => format!("{what}; it has no `[cleanup]` newgit runs, so nothing deleted it"),
+    }
 }
 
 /// One line on what happened to the source branch, and always the reason —

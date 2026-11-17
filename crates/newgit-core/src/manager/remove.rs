@@ -22,6 +22,10 @@ pub(super) struct RemoveKeep {
     pub(super) disposed: Vec<crate::evict::Disposed>,
     /// What the checkpoint said along the way.
     pub(super) warnings: Vec<String>,
+    /// Resources the checkpoint could not capture, each with why: their
+    /// state is in no checkpoint, so the removal leaves it where it is and
+    /// runs no `[cleanup]` for them. Empty under `force`, which runs it.
+    pub(super) uncaptured: BTreeMap<String, String>,
 }
 
 /// What [`BranchManager::not_checkpointed`] found.
@@ -144,11 +148,15 @@ impl BranchManager {
         }
         match taken {
             Ok(checkpoint) => {
-                for resource in &checkpoint.degraded {
-                    keep.lost.push(format!(
-                        "the state of resource `{resource}`: its capture failed, so the \
-                         checkpoint does not hold it"
-                    ));
+                for (resource, why) in checkpoint.capture_failures {
+                    if force {
+                        keep.lost.push(format!(
+                            "the state of resource `{resource}`: its capture failed ({why}), so \
+                             no checkpoint holds it, and its `[cleanup]` ran anyway (--force)"
+                        ));
+                    } else {
+                        keep.uncaptured.insert(resource, why);
+                    }
                 }
                 keep.warnings = checkpoint
                     .warnings

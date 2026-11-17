@@ -148,6 +148,10 @@ pub enum HookDetail {
         command: String,
         placeholder: String,
     },
+    /// Not run: the checkpoint `remove` took first could not capture the
+    /// resource, so its state is in no checkpoint, and running this (a
+    /// `dropdb`, say) would delete it. `remove --force` runs it.
+    SkippedUncaptured(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
