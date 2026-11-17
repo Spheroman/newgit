@@ -212,8 +212,8 @@ fn an_extension_racing_a_store_move_writes_nothing_back() {
     assert_eq!(rooted_refs(&dir), "", "nothing written back");
 
     // Stored already, and the move lands between two chunks.
-    let data = tempdir("rooted-monotonic-move-chunks");
-    let (app, root, commits) = server(&data, 3);
+    let chunks = tempdir("rooted-monotonic-move-chunks");
+    let (app, root, commits) = server(&chunks, 3);
     let dir = root.dir();
     app.log
         .land(&app, landing(&app, "main", None, &commits[2]))
@@ -231,6 +231,7 @@ fn an_extension_racing_a_store_move_writes_nothing_back() {
     assert!(done.gone, "{done:?}");
     assert_eq!(rooted_refs(&dir), "", "nothing written back");
     let _ = std::fs::remove_dir_all(&data);
+    let _ = std::fs::remove_dir_all(&chunks);
 }
 
 fn head_of(dir: &Utf8Path) -> Option<String> {

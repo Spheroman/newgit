@@ -272,6 +272,7 @@ pub fn handle(app: &App, request: &ApiRequest) -> ApiResult<ApiResponse> {
         ("POST", "/v1/tokens") => return create_agent_token(app, &db, &caller, request),
         ("POST", "/v1/tokens/renew") => return renew_token(app, &db, &caller),
         ("POST", "/v1/projects") => return create_project(app, db, &caller, request),
+        ("GET", "/v1/serve/status") => return crate::status::status(app, db, &caller),
         _ => {}
     }
 
@@ -1939,6 +1940,12 @@ fn create_branch(
     let mut names = project.placed();
     names.extend(list.keys().cloned());
     let after = project.definitions(&db, names.iter().map(String::as_str))?;
+    // `main`'s first list: nothing was defined before it.
+    if branch == "main"
+        && let Some(refusal) = policy::mount_refusal(&BTreeMap::new(), &after)
+    {
+        return fail(400, refusal);
+    }
     let mut change = Change {
         incarnation: project.info.incarnation.clone(),
         branches: [(branch.to_owned(), list.clone())].into(),
