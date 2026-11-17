@@ -94,12 +94,13 @@ fn respawning_a_removed_name_reports_the_numbering_it_continues() {
     let inherited = respawned
         .inherited_checkpoints
         .expect("respawn inherits the archived numbering");
-    assert_eq!(inherited.existing, 3);
-    assert_eq!(inherited.next_id, "ckpt_004");
+    // Three of its own, and the one `remove` took (#448).
+    assert_eq!(inherited.existing, 4);
+    assert_eq!(inherited.next_id, "ckpt_005");
 
     // And the claim is true: the next checkpoint really does get that id.
     let outcome = manager.checkpoint("feature-a", None).expect("checkpoint");
-    assert_eq!(outcome.record.id, "ckpt_004");
+    assert_eq!(outcome.record.id, "ckpt_005");
 }
 
 /// The report is about a *previous* instance, so it must not fire for

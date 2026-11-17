@@ -292,7 +292,8 @@ command = "echo deleting {{{{state_ref}}}} >> {witness}/deleted.txt"
         .remove(
             "feature-a",
             &temp,
-            ArchivedCheckpoints::Keep,
+            // No checkpoint first (#448): `--purge` takes none.
+            ArchivedCheckpoints::Purge,
             SourceBranchPolicy::Auto,
         )
         .expect("remove");
@@ -783,7 +784,8 @@ fn purging_an_archived_instance_releases_what_its_checkpoints_pinned() {
         .expect("dry run");
     assert_eq!(dry.purged_checkpoints.len(), 1);
     assert_eq!(dry.purged_checkpoints[0].slug, doomed.branch.slug);
-    assert_eq!(dry.purged_checkpoints[0].checkpoints, 1);
+    // Its own, and the one `remove` took (#448).
+    assert_eq!(dry.purged_checkpoints[0].checkpoints, 2);
     assert_eq!(
         dry.pruned
             .iter()
@@ -881,7 +883,9 @@ fn remove_reports_the_history_it_keeps() {
         )
         .expect("remove");
     assert!(outcome.purged_checkpoints.is_none());
-    assert_eq!(outcome.kept_checkpoints, 1);
+    // Its own, and the one `remove` took before deleting the workspace (#448).
+    assert_eq!(outcome.kept_checkpoints, 2);
+    assert!(outcome.checkpoint.is_some());
     assert!(
         store.checkpoint_dir(&spawned.branch.slug).is_dir(),
         "keeping is the default: nothing breaks an undo unasked"

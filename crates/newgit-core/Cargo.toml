@@ -20,6 +20,8 @@ age = { version = "0.12", features = ["ssh"] }
 base64 = "0.23"
 camino = { version = "1.2", features = ["serde1"] }
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
+# Loose objects are zlib streams (objects.rs writes them in process).
+flate2 = "1"
 # Process-group signalling and reaping (see supervisor.rs), and low-level
 # socket options (see ports.rs: the port-bind probe needs SO_REUSEADDR
 # off, which std's TcpListener does not expose).
@@ -46,4 +48,6 @@ ureq = { version = "3.4.2", features = ["json"] }
 reflink-copy = "0.1"
 
 [dev-dependencies]
+# `setrlimit`, for the test that a flush of many objects keeps few files open.
+nix = { version = "0.31", features = ["resource"] }
 tempfile = "3"

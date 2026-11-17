@@ -12,6 +12,10 @@
 // - `overlap`: a line each of one file in root, so every merge onto a head
 //   that moved runs Git's merge (cleanly: the lines are apart).
 //
+// `BENCH_TRACKERS=n` adds `n` more trackers (`x0` …) nobody changes, so the
+// project has more to compose: `BENCH_MODE=overlap BENCH_TRACKERS=24` is 27
+// trackers (#440).
+//
 // Every one but the first lands on what landed before it: re-made on the new
 // head when the two changed different paths, merged again when they did not.
 
@@ -34,6 +38,22 @@ fn mode() -> String {
     std::env::var("BENCH_MODE").unwrap_or_else(|_| "mixed".into())
 }
 
+/// The trackers to make before the merges begin: `t0` … for `spread`, and
+/// `BENCH_TRACKERS` more that nobody changes.
+fn extra_trackers() -> Vec<String> {
+    let mut names: Vec<String> = if mode() == "spread" {
+        (0..MERGES).map(|n| format!("t{n}")).collect()
+    } else {
+        Vec::new()
+    };
+    let more: usize = std::env::var("BENCH_TRACKERS")
+        .ok()
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(0);
+    names.extend((0..more).map(|n| format!("x{n}")));
+    names
+}
+
 #[test]
 #[ignore = "a measurement, not a check"]
 fn concurrent_merges_from_one_base_per_second() {
@@ -44,26 +64,27 @@ fn concurrent_merges_from_one_base_per_second() {
     let home = temp.join("jack");
     let token = login(&server, &home, "jack");
     let store = merge_project(&temp, &home, &server);
-    if mode() == "spread" {
-        for n in 0..MERGES {
-            std::fs::create_dir_all(store.join(format!("t{n}"))).expect("mkdir");
-            std::fs::write(store.join(format!("t{n}/keep.md")), "k\n").expect("write");
+    let extra = extra_trackers();
+    if !extra.is_empty() {
+        for name in &extra {
+            std::fs::create_dir_all(store.join(name)).expect("mkdir");
+            std::fs::write(store.join(format!("{name}/keep.md")), "k\n").expect("write");
         }
         git(&home, &store, &["add", "."]);
         git(&home, &store, &["commit", "-q", "-m", "dirs"]);
-        for n in 0..MERGES {
+        for name in &extra {
             newgit(
                 &home,
                 &store,
                 &[
                     "tracker",
                     "create",
-                    &format!("t{n}"),
+                    name,
                     "--git",
                     "--audience",
                     "public",
                     "--path",
-                    &format!("t{n}"),
+                    name,
                 ],
             );
         }

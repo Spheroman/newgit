@@ -633,6 +633,7 @@ other ledger: a port is free the moment nothing claims it).
 | `depends_on` | array of strings | no | `[]` | resource or tracker names whose *lifecycle* this one depends on. Orders `prepare` at spawn and cleanup hooks in reverse. A name that is neither is an error the graph reports. Needing another resource's *value* is not this — see *Data edges*. |
 | `workdir` | string | no | workspace root | where every command this resource runs is spawned, relative to the workspace root (no `..`), except `[identity] key_command`, which always runs at the workspace root. Overridable per action — see `[actions.<name>]`. |
 | `reads` | array of strings | no | unset | files and directories this resource's running process reads, workspace-relative (a directory covers everything in it). When `tracker use` or `drop` changes the bytes of a rendered file it covers, the process is restarted. See *Rendered files under a running process*. |
+| `disposable` | array of strings | no | `[]` | ignored output this resource's tools refill on their own (`target`, `.next/cache`), which `newgit stop --evict` drops with the workspace instead of refusing. Nothing restores it. Same path rules as `[identity] produces`. See *Disposable build output*. |
 
 `workdir` is applied as the spawned process's working directory, never as a
 `cd` prefix on the command string — so it cannot silently change what `&&`
@@ -656,6 +657,34 @@ This is checked right before each command runs, not when the resource is
 bound — a `workdir` may legitimately be created by an earlier action (a
 `prepare` that clones a submodule into it, say), so it would be wrong to
 require it to exist up front.
+
+### Disposable build output
+
+Build output a tool fills lazily — Rust's `target/`, Next.js's
+`.next/cache` — is often the largest thing in a workspace, and no
+checkpoint holds it: it is ignored, and no tracker owns it. Without a
+declaration, `newgit stop --evict` refuses to delete it. Declare it:
+
+```toml
+# .newgit/resources/build-output.toml
+ownership = "workspace"
+disposable = ["target", ".next/cache"]
+```
+
+That is the whole resource: no actions, no `[identity]`, no hooks. An
+eviction drops the ignored files under those paths with the workspace and
+names them (`disposed` in `stop --evict --json`, and `status` while the
+instance is evicted); the `start` after it leaves them for the build to
+refill. `newgit remove` lists them as dropped, not lost. Nothing else reads it: `undo`, `tracker use`/`drop`, and `spawn`
+never touch the tree. It covers only *ignored* files (anything else is in
+the checkpoint anyway), and a file under it that a tracker outside Git owns
+is kept. It applies to every instance as soon as it is written, except one
+that dropped a tracker bringing it (`resources = ["build-output"]` in that
+tracker).
+
+Do not use `[identity] produces` for this: an install-shaped resource
+empties a live `target/` from its `prepare` on an `undo` across its
+identity, or fills the install store with gigabytes of build output.
 
 ### `[identity]`
 
@@ -890,8 +919,10 @@ stash's, intent-to-add entries, assume-unchanged or skip-worktree flags
 set by hand (the files' content is kept), setuid, setgid, and sticky bits,
 and a value set by hand on a config key newgit sets itself
 (`remote.origin.url`, `credential.*`, its export remotes). An untracked file's blob stays in
-the store with the checkpoint, so evicting does not free that disk, and
-evict checkpoints are not pruned yet (#446).
+the store with the checkpoint, so evicting does not free that disk until a
+restore brought the checkpoint back, a later eviction supersedes it, and
+`newgit cleanup` collects it (#446); the store's own `git gc` then frees
+the objects.
 
 `suspend` / `resume` are for a resource that keeps running without a
 process newgit supervises: a `prepare` that starts a Supabase stack, a
@@ -1942,9 +1973,11 @@ is not exported at all. A tracker that inherits a target whose declaring
 tracker's audience is wider than its own (and it is not `public`) refuses
 the export, naming it, rather than send it past its audience; `tracker
 create --git --path` writes no `export` for such a tracker, and says so. A
-history that ever adds a path a tracker outside Git owns, such as a `.env`
-committed before it was tracked, refuses the whole export before anything
-is pushed.
+commit the target does not have yet that adds a path a tracker outside Git
+owns, such as a `.env` committed before it was tracked and never exported,
+refuses the whole export before anything is pushed, and says the way out.
+What the target already has (asked of it at each push, never remembered)
+is published, so it is not judged again.
 
 The export is composed from each tracker's `main`: on a newgit remote, the
 remote's; otherwise this project's. Work committed in the project root
@@ -1974,8 +2007,48 @@ target withholds put back as their parent had them. A commit that touches a
 withheld tracker's mount, or adds a file a tracker outside Git owns, is
 refused. `newgit merge main` publishes what came in.
 
+A target rewritten since this machine last exported to it (force-pushed, a
+secret purged there) is not merged with what the tracker has, as `git
+pull` would: that keeps the removed commits for the next export to push
+again. Plain `pull --remote` refuses instead, and so does every push to the
+target that would carry one of them: `main`'s export (`--dry-run` and the
+one a push makes too), an instance's branch, and a tag. Each says how many
+commits the rewrite removed and names `newgit pull --remote <target>
+--force`; a rewind (the commit dropped, nothing added) counts, and so does
+a branch deleted there, which only `--force --republish` makes again. A
+tag pushed with `main` is not pushed to a target `main`'s export was
+refused on. `export --remote --force` replaces
+the branch (leased on the commit it checked), but refuses first when that
+would put back commits the rewrite removed, naming how many, unless
+`--republish` is given. The check stands on this machine's record of what
+it pushed there: with no record, or a record older than another machine's
+export ([#473](https://github.com/Spheroman/newgit/issues/473)), a rewrite
+cannot be told from a target behind or with history of its own, so it is
+not refused; a refused push then names `pull --remote <target> --force
+--dry-run` before `pull --remote` or `--force`.
+`newgit pull --remote <target> --force` follows the rewrite, for a target
+rooted at a tracker: the tracker's line is reset to the target's, as `git
+reset --hard` would, and the project root's pin moves to it; `newgit merge
+main` publishes it, replacing the old line on the remote. It lists every
+commit only the old line had, and each instance that still holds one, and
+this machine then refuses to carry them onward from the tracker's line: a
+merge, a send to the remote (a checkpoint's sync too), or a push to an
+export target that lacks them. It refuses while the project root has work
+of its own on the old line, which moving its pin would discard. A later
+reset onto a line holding commits an earlier one dropped says so and stops
+refusing them. Plain `pull --remote` from a second target that still has
+a dropped commit is refused too. An instance with nothing of its own on
+the old line follows on `newgit pull`. Not undone: the project's own history, whose older
+commits still pin the old line (so the remote's copy of it, its Git
+endpoint, `newgit clone`, and project tags still have them, and a target of
+the project's view that never had that history is refused), and copies
+others already fetched. `--dry-run` says all of it and moves nothing; it
+writes only the target's fetched branch and each instance's workspace as a
+pull reads it.
+
 On a linked project the same thing happens on the remote when the target's
-repository has the webhook (`docs/design/remote.md`, *The GitHub webhook*),
+repository has the webhook (`docs/design/remote.md`, *The GitHub webhook*; on
+`newgit serve`, `docs/design/serve.md`, decision 11, which also exports),
 and the project root takes it with `git pull`: its `origin` is the remote's
 Git endpoint, set by `newgit remote add` and, for a project linked earlier,
 the next time newgit syncs the project root.
@@ -2042,15 +2115,12 @@ commit and merging both lands one merge. Unsigned, it is rejected by an
 export target that requires signed commits: an export carrying it fails
 there ([#443](https://github.com/Spheroman/newgit/issues/443)).
 
-A force-pushed target is merged with the line the tracker already has, as
-`git pull` would: the commits the force-push removed stay in the tracker's
-history, and the next export pushes them to the target again. Reverting the
-change in an instance and merging it keeps it out of the tip only: the
-removed commits are still in the history, and the next export still
-publishes them. When the force-push was to purge a secret, that publishes
-it again, and nothing in newgit can purge it yet
-([#442](https://github.com/Spheroman/newgit/issues/442): a way to reset a
-tracker's line to its target). Until then, do not export that tracker.
+A force-pushed target is not merged with the line the tracker already has:
+plain `pull --remote` refuses, since merging keeps the commits the
+force-push removed for the next export to push again, and names `newgit
+pull --remote <target> --force`, which resets the tracker's line to the
+target's (above). Reverting the change in an instance and merging it keeps
+it out of the tip only.
 
 ### Pull requests from a workspace: `branches = true`
 
@@ -2061,7 +2131,23 @@ that gap:
 - **Each push from a workspace exports the instance's branch** to the
   target as it sees it (the same trackers as its `main`), after the push
   itself has succeeded. A failure there is a warning in the push's output,
-  not a failed push. A force-push follows a force-push.
+  not a failed push; `newgit export <instance> --remote <target>` exports
+  the branch again as last pushed. A force-push follows a force-push, over
+  what newgit last pushed there only (below).
+- **The branch there is the target's `main` plus the instance's own
+  commits**, whichever of the two was exported first. One whose commits were
+  built on a copy of what the target's `main` holds (exported by a newgit
+  from before that held) is replaced at its next push, and the push says so.
+  Only while the target holds exactly what newgit last pushed there, by
+  newgit's own record in the project repo (never the workspace's
+  `refs/remotes/<target>/<branch>`, which a `git fetch` rewrites): a commit
+  someone else pushed there is not thrown away, and the export is refused
+  instead. Refused too when there is no record (the refusal says so: look at
+  the branch there before forcing), or when the target's trackers changed
+  since. A force-push from the workspace replaces the branch over that
+  record too, and is refused without one. A branch deleted there is pushed
+  again. `newgit export <instance> --remote <target> --force` is the one way
+  to replace the branch whatever it holds.
 - **On a newgit remote, the target is a remote in every workspace**, named
   after it, and `gh` resolves (`gh-resolved = base`) the target the
   instance's work belongs to: the one that ships a tracker the work touched.

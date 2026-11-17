@@ -591,7 +591,12 @@ trackers **(decided)**:
    stays, with no change to its tree, because telling would take the child's
    history. A merge goes the same way only when its sides differ in such
    a child and what is left adds nothing to one parent: the side that moved
-   the pin was dropped, so there is nothing to join. Any other merge stays.
+   the pin was dropped, so there is nothing to join. Any other merge stays,
+   and so does one that comes back as the very commit it was split from
+   (rule 5): that is a merge the reader's own history has, such as a pull
+   request merged on a mirror from an instance's branch whose instance also
+   had work the mirror does not ship. Dropped, the mirror would hold a commit
+   `main` never shows it again, and no export could follow (#451).
    Someone who cannot read a tracker sees different ids from the first commit
    that touched it (see *One name for a commit*).
 
@@ -636,6 +641,71 @@ rooted at `T` **(decided)**:
    the view is a merge in the root, so merges inside the work are kept, and
    an instance commit touching two trackers stays one commit wherever it is
    merged.
+
+**One commit, one root commit (decided 2026-11-16).** A view commit stands
+for one root commit, and a split never makes a second. This is what keeps a
+mirror's ids single: composing is a function of root's history, so two root
+commits made of one view commit compose to two commits there, and everything
+built on the second arrives as a pull request holding commits the mirror's
+`main` already has under other ids.
+
+- **A commit the remote split is the remote's.** A view commit this machine
+  did not make — `main` as an instance's `git pull` brought it, or as the
+  project root fetched it, which is where a Claude Code worktree's instance
+  starts — carries no note here, and its root commit may name something
+  else (a commit merged on a mirror names the mirror's). So before an
+  instance's commits are split, the commit it shares with `origin/main`, as
+  its workspace fetched it and as the project root did, must be noted with a
+  root commit the remote's `main` has. When it is not, the remote's `main`
+  is composed here, which notes all of it.
+- **Composed means with every pin.** Composing leaves out a pin that is not
+  here. So a `main` composed before one of its trackers' commits arrived
+  notes views the remote never served, and the ones it did serve go
+  unnoted. It counts as composed only while its view still holds what its
+  root commit composes to with the pins here now, and a tracker whose commit
+  the remote's list names but its repo did not send is said, and tried again
+  at the next split.
+- **Built on a copy, a commit is split again.** When that still fails (the
+  remote could not be read), the split makes root commits of its own and
+  says a mirror may see them as new. Those are found later by what they are:
+  a view commit whose root commit does not descend from the root commits its
+  parents stand for now. It is split again, onto them, with everything above
+  it. Only root commits that root's `main` — here, and as the remote last
+  had it — does not hold are held to this, so the walk is an instance's own
+  unmerged work, and history is never made again. The view commits are
+  untouched: a workspace sees nothing change.
+- **The mirror's branch follows, over newgit's own commits only.** An
+  instance's branch on a `branches = true` target is newgit's to write, but
+  nothing stops anyone pushing to it there. So newgit keeps its own record of
+  what it last pushed to it, in the project repo
+  (`refs/newgit/exports/<target>/pushed-branches/<slug>`, written only once
+  that push succeeded). When what goes there now does not descend from that
+  record, the branch is replaced with the record as the lease: the push
+  succeeds only while the target holds exactly that commit, so a commit
+  anyone else pushed there is never thrown away, and the export is refused
+  instead. The workspace's `refs/remotes/<target>/<branch>` is never the
+  lease: any `git fetch` of the target rewrites it with whatever is there.
+  A branch the target no longer has (a pull request closed with its branch
+  deleted) is pushed again. With no record (exported by a newgit from before
+  this, or from another copy of the project), the branch is not replaced,
+  and the refusal says there is no record rather than that someone pushed
+  there: look at the branch before forcing. Nor is it replaced when the
+  target's tracker set changed since the record — its root commit no longer
+  composes to it — since every commit there would change, which `main`'s
+  export needs `--force` for too. A force-push from the workspace (an amend,
+  a rebase) replaces the branch the same way, over the record and nothing
+  else, whatever its trackers: a commit someone pushed there stays, and
+  with no record its export is refused, though the push itself succeeds.
+  The record goes with its instance at `newgit remove`, so an instance
+  spawned again under the name is not taken for it. Every refusal names
+  `newgit export <instance> --remote <target> --force`, the one way to
+  replace the branch whatever it holds.
+  Without `--force`, that command exports the branch as last pushed again,
+  splitting the instance's tracker branches again where they stand first,
+  so they heal with it and a merge of the instance brings no copy.
+
+Two root commits that have both reached `main` stay: that is history, and a
+mirror that took both keeps both.
 
 **Split refuses, naming what to do instead:**
 
@@ -978,15 +1048,153 @@ Unsigned, it is rejected by an export target that requires signed commits:
 an export carrying it fails there
 ([#443](https://github.com/Spheroman/newgit/issues/443)).
 
-A force-pushed target is merged with the line the tracker already has, as
-`git pull` would: the commits the force-push removed stay in the tracker's
-history, and the next export pushes them to the target again. Reverting the
-change in an instance and merging it keeps it out of the tip only: the
-removed commits are still in the history, and the next export still
-publishes them. When the force-push was to purge a secret, that publishes
-it again, and nothing in newgit can purge it yet
-([#442](https://github.com/Spheroman/newgit/issues/442): a way to reset a
-tracker's line to its target). Until then, do not export that tracker.
+A force-pushed target is not merged with the line the tracker already has,
+as `git pull` would: that keeps the commits the force-push removed in the
+tracker's history, for the next export to push to the target again.
+Reverting the change in an instance and merging it keeps it out of the tip
+only. So when the target's branch no longer descends from the commit this
+machine last exported there (`refs/newgit/exports/<target>/pushed`), and
+the tracker's line still holds a commit the rewrite removed, plain `pull
+--remote` refuses, and so does every push to that target that would carry
+one: `main`'s export (plain, `--dry-run`, and the one a push makes), an
+instance's branch (`branches = true`), and a tag pushed from the project
+root, each saying how many commits the rewrite removed and naming `pull
+--remote <target> --force [--dry-run]`. A branch the target no longer has
+at all, with a record of exporting to it (deleted, perhaps to purge a
+secret), is a rewrite that removed everything: only `export --remote
+--force --republish` makes it again, counted in what it puts back.
+
+These are enforced in one place. Every `git push` to a target goes through
+`clear_push` (`manager/target_push.rs`), which checks it and hands back the
+only thing `push_cleared` will push; a push that skips the check does not
+compile. That is every push from a client; the remote's own export of its
+GitHub mirrors (#414) does not check yet, and a forced push to a mirror is
+pulled there as a merge ([serve.md](serve.md), *Not yet: a mirror
+force-pushed*). A push of `main` and a tag together whose export of `main` fails
+does not push the tag to that target either. Whether the target is now beside
+the line (a purge that added a commit) or behind it does not matter: the
+simplest purge, `git reset --hard HEAD~1 && git push --force`, adds no
+commit, so a push of the old line would fast-forward it and put the key
+back without a word. A target merely behind (what was pushed is still on
+it, only `main` has moved on) exports as before. `export --remote --force`
+replaces the branch, but when that would put back commits the rewrite
+removed it refuses first, naming how many, unless `--republish` is given
+(`--force --republish`; named for what it does, publishing them again,
+rather than `--restore`, which reads as `git restore`). It is leased on
+the commit it checked (`--force-with-lease=<branch>:<id>`, an empty id
+when the branch is absent), so a target rewritten again in between is
+refused rather than overwritten unseen. A plain export of `main` is
+leased the same way, once it is known locally to be ahead of what the
+target had: a purge resetting the target to an ancestor between the check
+and the push would otherwise make the push a fast-forward, putting back
+what it removed. An instance's branch and a tag pushed onto what is there
+are not leased on the target's `main`, which is what a purge rewrites, so
+a purge landing between their check and their push is not seen; that
+window is open. A workspace's `git push` goes on to the store's `origin`
+as a raw push, uncomposed, with none of these checks, so an export target
+may not be `origin` itself (refused when the targets are read, however the
+URL is spelled, `insteadOf` included, and again before the forward), and
+the forward refuses a ref holding a commit `.newgit/local/resets.json`
+records as dropped that `origin` lacks. The project's own view cannot be
+followed yet, so its refusal names what is left: `--force --republish`
+when what was removed is not a secret, a target rooted at each tracker or
+a branch of its own otherwise, and rotating a secret that was published
+whatever happens to the history.
+
+**What this cannot see (decided, #442).** The check stands on this
+machine's record of what it pushed: with no record, or a record older than
+another machine's export, a rewrite is not seen
+([#473](https://github.com/Spheroman/newgit/issues/473)). Another machine
+that never exported to the target, or this one after losing the ref, has
+no record, and
+nothing else here can stand in for it soundly: the tracker's published
+`main` holds both what was exported and what was merged since, which a
+rewrite cannot be told from; the fetched `upstream` ref moves on every
+fetch, so a check on it would refuse once and pass on the second try; and
+a target keeps no history of its own branch that Git can read. So without
+a record, a rewind is taken for a target that is behind (the export
+fast-forwards it, putting back what it removed), and a purge that added a
+commit for a target with history of its own: plain `pull --remote` merges
+it, and the export's push is refused as not a fast-forward, naming `pull
+--remote <target> --force --dry-run` first and `--force` only with how
+many commits replacing the branch publishes there. A stale record is the
+same blindness: this machine exported a clean commit, another exported the
+key on top, and a rewind back to the clean commit leaves this machine's
+record equal to the target's tip, so nothing looks rewritten and a plain
+export fast-forwards the key back; a purge that added a commit looks like
+a pull request merged there, and the refusal's advice (`pull --remote`
+merges it in) would keep the key, so that refusal names the dry run first
+and says another machine's export looks exactly like this. Sharing the
+record through the remote, so every machine has it, is the fix (#473), and
+not built.
+
+**Following a force-push (decided, #442).** `newgit pull --remote <target>
+--force` resets the line of the tracker the target is rooted at to the
+target's instead of merging with it, as `git fetch` then `git reset --hard
+<remote>/<branch>` would: the tracker's `main` becomes the target's history
+(split, when it mounts trackers in Git, each of those reset too), and the
+project root's pin moves to it in one commit, `Reset t3code to
+github.com/Spheroman/t3code newgit: drops 1 commit`. `--force` because it is
+`export --remote --force` the other way round: each replaces one side's
+branch with the other's, and "force pull" is what a Git user asks for when
+they want the remote's history over theirs. `--dry-run` moves no
+tracker's `main`, no pin, no workspace, and writes no record; what it does
+write is what reading needs, exactly: the target's branch, fetched into
+`refs/newgit/exports/<target>/upstream`, and each instance's workspace,
+read as a pull reads it (`refs/newgit/pull/<instance>`, and its tracker
+branches, which only record what its workspace already holds).
+It says plainly what it drops: every commit only the old line had, by id and
+subject, and every instance whose branch (each workspace split first, so
+uncheckpointed work counts) still holds any, with how much work of its own
+it has there. The project root counts like any instance: while its branch
+has work of its own the target's line lacks, the reset refuses, naming it,
+since moving its pin would discard that work (as plain `newgit pull`
+leaves a pin holding work of its own); merge it first, so the reset drops
+it out loud, or take it off the project root's branch. What it drops is
+written down (`.newgit/local/resets.json`) before anything moves, and taken
+back off when the reset fails with nothing moved (a dirty project root);
+one that stops half way keeps it and says that running it again finishes
+it. A later reset onto a line holding commits an earlier one dropped (the
+purge undone) says so, `brings back`, and takes them off the earlier
+record, so this machine stops refusing them.
+
+From then on this machine refuses to carry a dropped commit onward from its
+tracker's line: a merge whose result holds one in a tracker's own history,
+a send to the remote of one (`refuse_unpublished_trackers`, which a merge
+and a project's first publication pass, and a checkpoint's sync, so an
+instance still on the old line keeps its work here and its push fails), an
+export composed from one, and a push to any export target of a commit the
+target lacks that pins one (the project's own view, or any target that
+ships the tracker inside another), are refused, naming the commits.
+So is plain `pull --remote` from a second target that was never purged:
+it still has the dropped commits, and merging it would bring them back for
+the next export to publish, so it is refused, naming `pull --remote
+<other> --force` (which brings them back out loud, for when they are not a
+secret) or purging them from `<other>` too; `export --remote <other>
+--force` replaces its branch with the reset line, which purges them there.
+The pin check fails closed: a commit about to be pushed whose compose note
+is missing or unreadable is one it cannot identify, so cannot clear, and
+the push is refused.
+`newgit merge main` publishes the reset:
+the remote's `main` of the tracker, the old line, is replaced by the new one
+(a sideways compare-and-swap, which the tracker's maintainers make), never
+merged back in, and a later plain `pull --remote` starts from the new line.
+An instance pinned on the old line with nothing of its own there follows
+the reset on `newgit pull`, as if behind; one with work of its own on the
+old line is refused at its merge, since its work sits on the dropped
+commits, and redoes that work in a new instance. What it cannot undo, and
+says: the project's own history, whose older root commits still pin the old
+line (newgit never rewrites it), so the remote's copy of that history, its
+Git endpoint (`git clone https://newgit.dev/<owner>/<name>.git`), `newgit
+clone`, and project tags made from it still carry the dropped commits, and
+a target of the project's view that never had that history cannot take it;
+copies anyone already fetched (clones, other machines' instances, the
+remote's checkpoints and instance branches); and another machine, which has
+no record of the reset, merging them back, which the remote does not refuse
+yet. Only a target rooted at a tracker can be followed: the project's own
+view (a target root declares) is every tracker's history composed, and
+following a rewrite of it means rewriting the project's history, which
+newgit does not do yet.
 
 Five kinds of tracker stay put, and it says which: a pin holding commits
 its `follow` ref lacks (the instance's own work on it; moving the pin would
@@ -1283,6 +1491,13 @@ export = "inherit"       # ships inside t3code's export, wherever that goes
 - **Exports are owner-governed.** Definitions live in `access`, so widening
   where something ships takes an owner's merge, where `exports/` was
   ordinary root content.
+- **A branch there is newgit's.** With `branches = true`, an instance's
+  push exports its branch, composed for the target; nothing else is meant to
+  write it, though nothing there stops anyone. It is the target's `main` plus
+  the instance's own commits, whichever
+  of the two was exported first: both are composed from the same root
+  commits (*One commit, one root commit*, which also says when the branch is
+  replaced rather than added to).
 - **Tags go only where root's history goes.** A project's tag is pushed to
   the target root declares, which every inheriting tracker ships inside,
   never to one declared by a child: that is the child's own history, with
@@ -1292,6 +1507,26 @@ export = "inherit"       # ships inside t3code's export, wherever that goes
 - **What this gives up:** a child inherits all of its parent's targets, so
   two targets declared by one tracker show the same trackers. A view that
   differs is declared by a different tracker.
+- **An export judges only what it would newly publish (decided, #444).**
+  Before a push (a branch, a tag, or `export --remote`, dry runs too), the
+  target is asked what it has at its branch and the one being pushed
+  (`ls-remote`, and a fetch only of what this store lacks), and only the
+  commits it lacks are checked for a file a tracker outside Git owns. What
+  the target holds is published already, so refusing it again would block
+  the export forever (a commit that added `.env` before a tracker outside
+  Git claimed it) and protect nothing. It is asked every time, never taken
+  from a record here: a target force-pushed to purge a secret no longer has
+  it, so a remembered tip would publish it again. A merge is judged against
+  all its parents at once (`git log -c`): a file it holds as one parent has
+  it is that parent's, which is either new (and judged itself) or
+  published, so a merge bringing published content beside new work passes,
+  and an evil merge whose file differs from every parent's does not. A
+  commit the target lacks still refuses the export, and the error says the
+  way out: rewrite the history the target should have without the file,
+  push it there yourself, and `newgit pull --remote <target> --force`
+  resets the tracker's line to it (*Following a force-push*); or, when the
+  file is no secret, take it out of the claim. An import is still judged
+  whole, since all of it is new to the project, and names the same way out.
 
 A tracker left out leaves no path, no pin, and no history there, and a
 commit that only moved its pin is not shown, so the target's ids differ from
@@ -1502,9 +1737,9 @@ something:
   the view commit rebuilt from it, so its id survives the round trip.
 - **The project root learns what `git pull` brought.** The view commit of
   such a root commit is not what its trailers name, so the first sync after a
-  pull composes the remote's `main` here, which notes it. A workspace that
-  `git pull`s `origin` instead of `newgit pull` does not, and its split makes
-  a commit of its own, which merges.
+  pull composes the remote's `main` here, which notes it. A workspace's split
+  does the same (*One commit, one root commit*); it used not to, and made a
+  commit of its own, which merged but reached a mirror as a second commit.
 - **A mirror's event lands as a merge by whoever pushed it:** they must be a
   member and maintain what it changes (*The GitHub webhook*).
 - **A mirror's commit that holds withheld work is refused.** A pull

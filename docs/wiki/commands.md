@@ -29,33 +29,62 @@ inside a workspace):
   hooks, file modes, empty directories, tracker content, and rebuilt
   installs. It refuses, deleting nothing, when something would not come
   back: ignored files no tracker owns and nothing rebuilds (listed, a
-  directory with its file count; `--discard-ignored` lets them go, and
-  declaring disposable build output such as `target/` is not possible yet,
-  #447), a
+  directory with its file count; `--discard-ignored` lets them go), a
   merge or rebase in the middle, hand edits to a rendered file, an untracked
   repository, an initialized submodule, a linked worktree, or a process
   still in the directory (run it from outside the workspace). Not kept, and
   said first: reflogs other than the stash's, intent-to-add entries,
   hand-set assume-unchanged/skip-worktree flags, setuid/setgid/sticky bits,
-  and hand-set values on config keys newgit sets itself. Evicting does not
-  free an untracked file's blob, and evict checkpoints are not pruned yet
-  (#446). A restore that fails or is cut short moves what is at the path
-  aside, whole, to `.<name>.restore-failed` or `.<name>.interrupted-restore`
+  and hand-set values on config keys newgit sets itself. Build output a
+  resource declares `disposable` (`disposable = ["target"]`, #447) is
+  dropped with the workspace instead of refusing, and named (`disposed` in
+  `--json`, and in `status`); the build refills it. Evicting frees an
+  untracked file's blob only once a restore brought the checkpoint holding
+  it back, a later eviction supersedes it, `newgit cleanup` collects it,
+  and the store's own `git gc` runs (#446). A restore
+  that fails or is cut short moves what is at the path aside, whole, to `.<name>.restore-failed` or `.<name>.interrupted-restore`
   and keeps it; `start`, `status`, `stop --evict`, and `cleanup` name each
   one until `newgit cleanup --discard-saved <path>` deletes it
-- `newgit remove <instance> [--force]` — on an evicted instance whose path
-  holds work written after a failed restore, refuses unless `--force`
+- `newgit remove <instance> [--force] [--purge] [--json]` — checkpoints the
+  workspace first (reason `remove`), so uncommitted, untracked, and staged
+  work comes back with `newgit spawn <instance> --from-checkpoint
+  <instance>/<id>`, and names what no checkpoint holds (ignored files
+  nothing rebuilds, the stash, branches only the workspace has, a nested
+  Git repository) as `lost`, and `disposable` output as dropped. A
+  resource whose capture failed keeps its state: its `[cleanup]` does not
+  run, and `left` names it with that command, unless `--force`. An evicted instance is not checkpointed
+  again: the eviction's checkpoint is the one named (`checkpoint` in
+  `--json`). A checkpoint that fails, a nested repository with no commit,
+  or a workspace whose Git cannot be read refuses unless `--force`;
+  `--purge` takes none and discards this instance's checkpoints (never an
+  earlier same-named instance's), and both then name the uncommitted work
+  and the uncaptured content of trackers outside Git they delete. On an evicted
+  instance whose path holds work written after a failed restore, refuses
+  unless `--force`
+  ([#448](https://github.com/Spheroman/newgit/issues/448))
 - `newgit checkpoint [instance] [-m <msg>] [--verify]` / `undo [instance]
   [--to <id>] [--only <resource>] [--force-recompute]` / `checkpoints
   [instance]` — `--verify` proves the restore works by running a real undo;
   `--only` restores one resource and leaves everything else alone
 - `newgit export [instance] --to <dir> [--include <path>] [--exclude <path>]`
-- `newgit export --remote <name> [--dry-run] [--force]` — push the trackers'
+- `newgit export --remote <name> [--dry-run] [--force [--republish]]` — push the trackers'
   `main`s, history and all, to target `<name>` (a GitHub mirror, say), which
   a tracker's `export` declares: that tracker and every tracker inheriting
   its export ship, nothing else. A target is named after its repository
   unless its `export` gives a `name`
-- `newgit cleanup [--dry-run] [--purge-archived]`
+- `newgit export <instance> --remote <name> [--force]` — push that
+  instance's branch, as last pushed, to a `branches = true` target again.
+  Its `git push` already does this; run it when that export failed.
+  `--force` replaces the branch there whatever it holds
+- `newgit cleanup [--dry-run] [--purge-archived]` — also collects what
+  eviction leaves behind: an `evict` checkpoint a restore brought back,
+  once a later eviction supersedes it, the checkpoints a restore that
+  succeeded took on its way, a `remove` checkpoint the same instance's
+  retried removal superseded, and checkpoint refs no record names. It deletes their records
+  and refs and says how many bytes of store objects became unreachable; the
+  store's own `git gc` frees them (newgit never prunes the store). Never
+  one a live or archived record names, never an `explicit` or `push`
+  checkpoint, and a collected one is gone for `undo --to` too (#446)
 - `newgit ports [--check]` — claimed ports, or detect a listening one nothing
   claims
 - `newgit render [--check]` — resolve every `[[render]]`; `--check` tests
@@ -157,14 +186,37 @@ Remote:
   ([#443](https://github.com/Spheroman/newgit/issues/443))
 - `newgit pull --remote <target>` — bring back what was merged on an export
   target (a pull request on GitHub); `newgit merge main` publishes it. A
-  force-pushed target is merged with the line the tracker already has, as
-  `git pull` would: the commits the force-push removed stay in the
-  tracker's history, and the next export pushes them to the target again.
-  Reverting the change in an instance keeps it out of the tip only: the
-  next export still publishes those commits, so a secret the force-push
-  purged is published again. Nothing in newgit can purge it yet
-  ([#442](https://github.com/Spheroman/newgit/issues/442)); until then,
-  do not export that tracker
+  target rewritten since this machine last exported to it (force-pushed,
+  a secret purged, a rewind too) is not merged with: merging keeps what the
+  rewrite removed for the next export to push again, so plain `pull
+  --remote` refuses, and so does every push to the target that would carry
+  what it removed (`main`'s export, an instance's branch, a tag), saying
+  how many commits it removed and naming `--force`. A branch deleted there
+  counts as a rewrite that removed everything. `export --remote --force`
+  refuses to put back what the rewrite removed, naming how many, unless
+  `--republish` is given. Nor is a second target that still has what a
+  reset dropped pulled from. With no record of exporting there, or a record
+  older than another machine's export
+  ([#473](https://github.com/Spheroman/newgit/issues/473)), a rewrite
+  cannot be told apart, and is not refused
+- `newgit pull --remote <target> --force [--dry-run]` — follow a force-push
+  instead (a secret purged on GitHub): the line of the tracker the target is
+  rooted at is reset to the target's, as `git fetch` then `git reset --hard`
+  would, and the project root's pin moves to it; `newgit merge main`
+  publishes it, replacing the old line on the remote. It lists every commit
+  only the old line had and every instance still holding one, and this
+  machine then refuses to carry them onward from the tracker's line: a
+  merge, a send to the remote (a checkpoint's too), or a push to a target
+  that lacks them. An instance with nothing of its own on the old line
+  follows on `newgit pull`; one with work there redoes it in a new
+  instance. It refuses while the project root has work of its own on the
+  old line, which it would discard. A later reset back onto dropped commits
+  says so and stops refusing them. Not undone: the project's own history,
+  which still pins the old line (and so the remote's copy, its Git
+  endpoint, `newgit clone`, and project tags), and copies others already
+  fetched. Only a target rooted at a tracker; `--dry-run` moves nothing,
+  and writes only the target's fetched branch and each instance's
+  workspace as read
 - `newgit tracker allow-plaintext <path>...` — release workspace paths this
   machine has held encrypted content at, so whatever tracker claims them now
   (a `public` one, or one in Git) may capture, commit, and send them

@@ -738,6 +738,69 @@ impl TrackerRepo {
         git(&self.git_dir, &["rev-parse", &format!("{commit}^{{tree}}")])
     }
 
+    /// The owned paths of `workspace` whose content differs from `rev`
+    /// (added, changed, or gone), `skip` aside: what a capture would record
+    /// that `rev` does not hold, found without writing anything. With no
+    /// `rev`, every owned file. A sealed rev's files are compared decrypted.
+    pub fn changed_since(
+        &self,
+        workspace: &Utf8Path,
+        definition: &TrackerDefinition,
+        rev: Option<&str>,
+        skip: &[Utf8PathBuf],
+    ) -> Result<Vec<Utf8PathBuf>> {
+        let files: Vec<(Utf8PathBuf, Utf8PathBuf)> = collect_owned_files(workspace, definition)?
+            .into_iter()
+            .filter(|(relative, _)| !skip.contains(relative))
+            .collect();
+        let (commit, mut old) = match rev {
+            Some(rev) => {
+                let commit = self.commit_for(rev)?;
+                let mut old = self.listing(&commit)?;
+                old.remove(RECIPIENTS_PATH);
+                (Some(commit), old)
+            }
+            None => (None, std::collections::BTreeMap::new()),
+        };
+        let sealed = commit.as_deref().is_some_and(|commit| self.sealed(commit));
+        let mut changed = Vec::new();
+        for (relative, absolute) in &files {
+            let Some((old_mode, old_oid)) = old.remove(relative.as_str()) else {
+                changed.push(relative.clone());
+                continue;
+            };
+            let metadata = std::fs::symlink_metadata(absolute)
+                .map_err(|source| NewgitError::io(absolute, source))?;
+            let (mode, bytes) = if metadata.is_symlink() {
+                let target = std::fs::read_link(absolute)
+                    .map_err(|source| NewgitError::io(absolute, source))?;
+                ("120000", target.to_string_lossy().into_owned().into_bytes())
+            } else {
+                let bytes =
+                    std::fs::read(absolute).map_err(|source| NewgitError::io(absolute, source))?;
+                (file_mode(&metadata), bytes)
+            };
+            let same = mode == old_mode
+                && self.plaintext(
+                    rev.unwrap_or_default(),
+                    relative.as_str(),
+                    &old_mode,
+                    &old_oid,
+                    sealed,
+                )? == bytes;
+            if !same {
+                changed.push(relative.clone());
+            }
+        }
+        changed.extend(
+            old.into_keys()
+                .map(Utf8PathBuf::from)
+                .filter(|path| !skip.contains(path)),
+        );
+        changed.sort();
+        Ok(changed)
+    }
+
     /// Commit the tracker's owned paths from `workspace`.
     pub fn capture(
         &self,
@@ -1322,6 +1385,38 @@ pub fn pinned_revs(git_dir: &Utf8Path) -> Result<Vec<PinnedRev>> {
         .collect())
 }
 
+/// How long `gc_now` waits before each retry while another `git gc` runs in
+/// the store: about half a minute in all.
+const GC_RUNNING_BACKOFF: [std::time::Duration; 5] = [
+    std::time::Duration::from_secs(1),
+    std::time::Duration::from_secs(2),
+    std::time::Duration::from_secs(4),
+    std::time::Duration::from_secs(8),
+    std::time::Duration::from_secs(16),
+];
+
+/// `git gc --prune=now`, tried again while another gc holds the store: Git
+/// refuses with "gc is already running" rather than wait, and the one running
+/// (an auto-maintenance a fetch detached, most often) prunes only what is two
+/// weeks old, so it does not do this one's job.
+fn gc_now(git_dir: &Utf8Path) -> Result<()> {
+    let mut waits = GC_RUNNING_BACKOFF.iter();
+    loop {
+        let error = match git(git_dir, &["gc", "--quiet", "--prune=now"]) {
+            Ok(_) => return Ok(()),
+            Err(error) => error,
+        };
+        let running = matches!(
+            &error,
+            NewgitError::SourceCommand { stderr, .. } if stderr.contains("gc is already running")
+        );
+        match waits.next() {
+            Some(wait) if running => std::thread::sleep(*wait),
+            _ => return Err(error),
+        }
+    }
+}
+
 /// Delete objects no ref reaches any more. Tracker content can be secrets, so
 /// a forgotten rev is removed now rather than whenever Git's own gc would
 /// have got to it.
@@ -1329,8 +1424,15 @@ pub fn prune_unreferenced(git_dir: &Utf8Path) -> Result<()> {
     if !git_dir.join("HEAD").is_file() {
         return Ok(());
     }
+    // A stepped fetch into the store holds `shallow.lock` for each band, and
+    // `gc`'s repack dies with "failed to run repack" on finding it taken.
+    // Waiting on the stepped fetch's own lock waits it out whole (#441).
+    let _steps = crate::source::steps_lock(
+        &[&format!("--git-dir={git_dir}")],
+        Some("newgit: waiting for a fetch into the tracker store to finish"),
+    )?;
     git(git_dir, &["reflog", "expire", "--expire=now", "--all"])?;
-    git(git_dir, &["gc", "--quiet", "--prune=now"])?;
+    gc_now(git_dir)?;
     // And the plaintext this machine kept of what is gone.
     let present: std::collections::BTreeSet<String> = git(
         git_dir,
