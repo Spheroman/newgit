@@ -157,7 +157,7 @@ fn a_fork_is_never_served_from_a_store_its_audience_does_not_call_for() {
     );
 
     // The store in the way gone, landing again moves `site` and its fork.
-    std::fs::remove_dir_all(&public).expect("remove");
+    remove_store(&public);
     newgit(&home, &store, &["merge", "main"]);
     assert_eq!(
         git(
@@ -179,5 +179,24 @@ fn a_fork_is_never_served_from_a_store_its_audience_does_not_call_for() {
             !by_id.status.success(),
             "root's commit was fetched by id through {url}"
         );
+    }
+}
+
+/// Removes a store the server may still be writing into in the background
+/// (a stored history extending): a file made mid-removal leaves the
+/// directory not empty, so try again until the writer is done.
+fn remove_store(dir: &camino::Utf8Path) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        match std::fs::remove_dir_all(dir) {
+            Ok(()) => return,
+            Err(error)
+                if error.kind() == std::io::ErrorKind::DirectoryNotEmpty
+                    && std::time::Instant::now() < deadline =>
+            {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            Err(error) => panic!("remove {dir}: {error}"),
+        }
     }
 }
