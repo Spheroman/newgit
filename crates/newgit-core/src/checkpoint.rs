@@ -38,6 +38,14 @@ pub struct CheckpointRecord {
     /// checkpoint may hold what was written at the path while it ran.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub restore_of: Option<String>,
+    /// Set on an `evict` checkpoint once a restore brought it back into the
+    /// instance's workspace and succeeded: proof the workspace that came
+    /// back holds what it holds, so `newgit cleanup` may collect it once a
+    /// later eviction supersedes it ([`superseded`]). An evict checkpoint
+    /// nothing restored is never collected: the instance may have been
+    /// removed while evicted, and then it is the only copy of its work.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub restored: bool,
     pub source: SourceState,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tracker_states: Vec<TrackerState>,
@@ -304,13 +312,27 @@ impl CheckpointLog {
     }
 
     /// The id the next `save` should use.
+    /// One past the highest id this log has ever held: a record `cleanup`
+    /// collected leaves its id behind ([`Self::delete`]), so an id is never
+    /// reused for a different state.
     pub fn next_id(&self) -> Result<String> {
         let last = self
             .list()?
             .last()
             .map(|record| numeric_id(&record.id))
-            .unwrap_or(0);
+            .unwrap_or(0)
+            .max(self.highest_deleted());
         Ok(format!("ckpt_{:03}", last + 1))
+    }
+
+    fn highest_deleted_path(&self) -> Utf8PathBuf {
+        self.dir.join("highest-deleted")
+    }
+
+    fn highest_deleted(&self) -> u64 {
+        std::fs::read_to_string(self.highest_deleted_path())
+            .map(|text| numeric_id(text.trim()))
+            .unwrap_or(0)
     }
 
     pub fn save(&self, record: &CheckpointRecord) -> Result<Utf8PathBuf> {
@@ -334,7 +356,13 @@ impl CheckpointLog {
     }
 
     /// Delete a record, and the recovery record beside it if there is one.
+    /// Its id stays taken: [`Self::next_id`] never hands it out again.
     pub fn delete(&self, id: &str) -> Result<()> {
+        if numeric_id(id) > self.highest_deleted() {
+            let path = self.highest_deleted_path();
+            std::fs::write(&path, format!("{id}\n"))
+                .map_err(|source| NewgitError::io(&path, source))?;
+        }
         for path in [
             self.record_path(id),
             self.dir.join(format!("{id}.recovery.toml")),
@@ -353,30 +381,44 @@ impl CheckpointLog {
     }
 }
 
-/// The checkpoints of one instance's history `newgit cleanup` collects
-/// (#446), in id order: every `evict` checkpoint but the latest (each one
-/// before it was brought back by a restore that succeeded, since an instance
-/// is evicted again only once its workspace is back) and every checkpoint a
-/// restore that succeeded took on its way ([`CheckpointRecord::restore_of`]).
-/// Never the one the instance is evicted to now (`evicted_to`), and never a
-/// checkpoint anyone asked for, a push's, or a removal's: an `explicit`
-/// checkpoint is how a state is kept for good.
+/// The checkpoints of one slug's history `newgit cleanup` collects (#446),
+/// in id order. Only what is proven to be nobody's only copy of anything:
+///
+/// - an `evict` checkpoint a restore brought back and that succeeded
+///   ([`CheckpointRecord::restored`]), once a later eviction superseded it.
+///   One nothing restored stays, whatever came after: an instance removed
+///   while evicted keeps its work only there, and a later instance with the
+///   same name shares the history.
+/// - a checkpoint a restore that succeeded took on its way
+///   ([`CheckpointRecord::restore_of`]): the marker and a clone.
+/// - a `remove` checkpoint a later one superseded: a removal that failed
+///   after its checkpoint, retried.
+///
+/// Never one in `named`: what a live or archived record of this slug names
+/// (`evicted`, `removed_to`), which is what `newgit start` or `newgit spawn
+/// --from-checkpoint` brings back. Never a checkpoint anyone asked for or a
+/// push's: an `explicit` checkpoint is how a state is kept for good.
 pub fn superseded<'a>(
     records: &'a [CheckpointRecord],
-    evicted_to: Option<&str>,
+    named: &std::collections::BTreeSet<String>,
 ) -> Vec<&'a CheckpointRecord> {
-    let latest_evict = records
-        .iter()
-        .filter(|record| record.reason == CheckpointReason::Evict)
-        .max_by_key(|record| numeric_id(&record.id))
-        .map(|record| record.id.as_str());
+    let latest = |reason: CheckpointReason| {
+        records
+            .iter()
+            .filter(|record| record.reason == reason)
+            .max_by_key(|record| numeric_id(&record.id))
+            .map(|record| record.id.as_str())
+    };
+    let latest_evict = latest(CheckpointReason::Evict);
+    let latest_remove = latest(CheckpointReason::Remove);
     let mut out: Vec<&CheckpointRecord> = records
         .iter()
-        .filter(|record| Some(record.id.as_str()) != evicted_to)
+        .filter(|record| !named.contains(&record.id))
         .filter(|record| match record.reason {
-            CheckpointReason::Evict => Some(record.id.as_str()) != latest_evict,
+            CheckpointReason::Evict => record.restored && Some(record.id.as_str()) != latest_evict,
             CheckpointReason::BeforeUndo => record.restore_of.is_some(),
-            CheckpointReason::Explicit | CheckpointReason::Push | CheckpointReason::Remove => false,
+            CheckpointReason::Remove => Some(record.id.as_str()) != latest_remove,
+            CheckpointReason::Explicit | CheckpointReason::Push => false,
         })
         .collect();
     out.sort_by_key(|record| numeric_id(&record.id));
@@ -411,6 +453,7 @@ mod tests {
             reason: CheckpointReason::Explicit,
             undo_completed: None,
             restore_of: None,
+            restored: false,
             source: SourceState {
                 head_rev: "abc".to_owned(),
                 dirty_rev: None,
@@ -434,55 +477,65 @@ mod tests {
         ));
     }
     #[test]
-    fn retention_keeps_the_latest_evict_and_what_was_asked_for() {
+    fn retention_collects_only_what_was_restored_or_retried() {
         let record =
-            |n: u64, reason: CheckpointReason, restore_of: Option<&str>| CheckpointRecord {
-                id: format!("ckpt_{n:03}"),
-                branch: "x".to_owned(),
-                created_at: Utc::now(),
-                message: None,
-                reason,
-                undo_completed: None,
-                restore_of: restore_of.map(ToOwned::to_owned),
-                source: SourceState {
-                    head_rev: "abc".to_owned(),
-                    dirty_rev: None,
-                    store_ref: format!("refs/newgit/checkpoints/x/ckpt_{n:03}"),
-                    checked_out: None,
-                    detached: false,
-                },
-                tracker_states: vec![],
-                resource_states: vec![],
-                code: CodeState::default(),
-                dropped: Default::default(),
+            |n: u64, reason: CheckpointReason, restore_of: Option<&str>, restored: bool| {
+                CheckpointRecord {
+                    id: format!("ckpt_{n:03}"),
+                    branch: "x".to_owned(),
+                    created_at: Utc::now(),
+                    message: None,
+                    reason,
+                    undo_completed: None,
+                    restore_of: restore_of.map(ToOwned::to_owned),
+                    restored,
+                    source: SourceState {
+                        head_rev: "abc".to_owned(),
+                        dirty_rev: None,
+                        store_ref: format!("refs/newgit/checkpoints/x/ckpt_{n:03}"),
+                        checked_out: None,
+                        detached: false,
+                    },
+                    tracker_states: vec![],
+                    resource_states: vec![],
+                    code: CodeState::default(),
+                    dropped: Default::default(),
+                }
             };
         use CheckpointReason::*;
         let records = vec![
-            record(1, Explicit, None),
-            record(2, Evict, None),
-            record(3, BeforeUndo, Some("ckpt_002")),
+            record(1, Explicit, None, false),
+            record(2, Evict, None, true),
+            record(3, BeforeUndo, Some("ckpt_002"), false),
             // An undo someone ran: its redo point stays.
-            record(4, BeforeUndo, None),
-            record(5, Evict, None),
+            record(4, BeforeUndo, None, false),
+            // Never restored: the instance was removed while evicted, and
+            // this is the only copy of its work.
+            record(5, Evict, None, false),
             // A restore that failed: no `restore_of`, so it stays.
-            record(6, BeforeUndo, None),
-            record(7, BeforeUndo, Some("ckpt_005")),
-            record(8, Push, None),
-            record(9, Evict, None),
-            record(10, Remove, None),
+            record(6, BeforeUndo, None, false),
+            record(7, Evict, None, true),
+            record(8, BeforeUndo, Some("ckpt_007"), false),
+            record(9, Push, None, false),
+            // A removal that failed after its checkpoint, then retried.
+            record(10, Remove, None, false),
+            record(11, Remove, None, false),
+            // The latest eviction, restored or not, stays.
+            record(12, Evict, None, true),
         ];
         let ids = |records: Vec<&CheckpointRecord>| -> Vec<String> {
             records.iter().map(|record| record.id.clone()).collect()
         };
+        let none = std::collections::BTreeSet::new();
         assert_eq!(
-            ids(superseded(&records, None)),
-            ["ckpt_002", "ckpt_003", "ckpt_005", "ckpt_007"]
+            ids(superseded(&records, &none)),
+            ["ckpt_002", "ckpt_003", "ckpt_007", "ckpt_008", "ckpt_010"]
         );
-        // The checkpoint the record says the instance is evicted to stays,
-        // whatever else the history says.
+        // What a record names stays, whatever else the history says.
+        let named = ["ckpt_007".to_owned(), "ckpt_010".to_owned()].into();
         assert_eq!(
-            ids(superseded(&records, Some("ckpt_005"))),
-            ["ckpt_002", "ckpt_003", "ckpt_007"]
+            ids(superseded(&records, &named)),
+            ["ckpt_002", "ckpt_003", "ckpt_008"]
         );
     }
 

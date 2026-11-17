@@ -39,8 +39,9 @@ inside a workspace):
   resource declares `disposable` (`disposable = ["target"]`, #447) is
   dropped with the workspace instead of refusing, and named (`disposed` in
   `--json`, and in `status`); the build refills it. Evicting frees an
-  untracked file's blob only once a later eviction supersedes the
-  checkpoint holding it and `newgit cleanup` collects it (#446). A restore
+  untracked file's blob only once a restore brought the checkpoint holding
+  it back, a later eviction supersedes it, `newgit cleanup` collects it,
+  and the store's own `git gc` runs (#446). A restore
   that fails or is cut short moves what is at the path aside, whole, to `.<name>.restore-failed` or `.<name>.interrupted-restore`
   and keeps it; `start`, `status`, `stop --evict`, and `cleanup` name each
   one until `newgit cleanup --discard-saved <path>` deletes it
@@ -48,10 +49,16 @@ inside a workspace):
   workspace first (reason `remove`), so uncommitted, untracked, and staged
   work comes back with `newgit spawn <instance> --from-checkpoint
   <instance>/<id>`, and names what no checkpoint holds (ignored files
-  nothing rebuilds, the stash, branches only the workspace has) as `lost`.
-  A checkpoint that fails refuses unless `--force`; `--purge` takes none.
-  On an evicted instance whose path holds work written after a failed
-  restore, refuses unless `--force`
+  nothing rebuilds, the stash, branches only the workspace has, a nested
+  Git repository, a resource whose capture failed) as `lost`, and
+  `disposable` output as dropped. An evicted instance is not checkpointed
+  again: the eviction's checkpoint is the one named (`checkpoint` in
+  `--json`). A checkpoint that fails, a nested repository with no commit,
+  or a workspace whose Git cannot be read refuses unless `--force`;
+  `--purge` takes none, and both then name the uncommitted work and the
+  uncaptured content of trackers outside Git they delete. On an evicted
+  instance whose path holds work written after a failed restore, refuses
+  unless `--force`
   ([#448](https://github.com/Spheroman/newgit/issues/448))
 - `newgit checkpoint [instance] [-m <msg>] [--verify]` / `undo [instance]
   [--to <id>] [--only <resource>] [--force-recompute]` / `checkpoints
@@ -64,11 +71,14 @@ inside a workspace):
   its export ship, nothing else. A target is named after its repository
   unless its `export` gives a `name`
 - `newgit cleanup [--dry-run] [--purge-archived]` — also collects what
-  eviction leaves behind: every `evict` checkpoint but each instance's
-  latest, and the checkpoints a restore that succeeded took on its way,
-  with the store objects only they reach (and says how many bytes); never
-  an `explicit`, `push`, or `remove` checkpoint, and a collected one is
-  gone for `undo --to` too (#446)
+  eviction leaves behind: an `evict` checkpoint a restore brought back,
+  once a later eviction supersedes it, the checkpoints a restore that
+  succeeded took on its way, a `remove` checkpoint a retried removal
+  superseded, and checkpoint refs no record names. It deletes their records
+  and refs and says how many bytes of store objects became unreachable; the
+  store's own `git gc` frees them (newgit never prunes the store). Never
+  one a live or archived record names, never an `explicit` or `push`
+  checkpoint, and a collected one is gone for `undo --to` too (#446)
 - `newgit ports [--check]` — claimed ports, or detect a listening one nothing
   claims
 - `newgit render [--check]` — resolve every `[[render]]`; `--check` tests

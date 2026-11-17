@@ -11,4 +11,5 @@
   touches the tree, and one a tracker brings stops counting in an
   instance that drops the tracker. The eviction names what it dropped
   (`disposed` in `--json`, and `status` while evicted), and the refusal
-  now names the declaration.
+  now names the declaration. `newgit remove` lists what it drops the same
+  way.

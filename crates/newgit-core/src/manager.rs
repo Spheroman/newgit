@@ -983,11 +983,16 @@ pub struct RemoveOutcome {
     /// How many checkpoints removal left behind instead — retained disk the
     /// caller should be told about, since nothing reaches them any more.
     pub kept_checkpoints: usize,
-    /// The checkpoint removal took of the workspace before deleting it
-    /// (reason `remove`), which the archived record names as `removed_to`:
-    /// `newgit spawn --from-checkpoint <instance>/<id>` brings it back.
-    /// `None` when there was no workspace to take, or with `--purge`.
+    /// The checkpoint that holds the workspace removal deleted, which the
+    /// archived record names as `removed_to`: the one removal took first
+    /// (reason `remove`), or for an evicted instance the one it was evicted
+    /// to. `newgit spawn --from-checkpoint <instance>/<id>` brings it back.
+    /// `None` when there was no workspace to take, with `--purge`, or when
+    /// the checkpoint failed under `--force`.
     pub checkpoint: Option<String>,
+    /// Ignored paths a resource declares `disposable`, deleted with the
+    /// workspace for its build to refill (#447).
+    pub disposed: Vec<crate::evict::Disposed>,
     /// What the removal deleted that no checkpoint holds (ignored files
     /// nothing rebuilds, Git-only state such as the stash, and with
     /// `--purge` or a failed checkpoint under `--force`, uncommitted work),
@@ -8280,6 +8285,7 @@ impl BranchManager {
             purged_checkpoints,
             kept_checkpoints,
             checkpoint: keep.checkpoint,
+            disposed: keep.disposed,
             lost: keep.lost,
             warnings: keep.warnings,
             remote_warning,
@@ -8852,12 +8858,13 @@ impl BranchManager {
         // Retention (#446): evict checkpoints a later eviction superseded,
         // and what a restore that succeeded took on its way. Collected
         // before the lane roots are read, so the revs only they held go too.
-        let (_locks, superseded) = self.superseded_checkpoints(&surviving, archived)?;
-        let skipped: BTreeSet<(String, String)> = superseded
+        let (superseded, orphans) = self.superseded_checkpoints(&surviving, archived)?;
+        let (collected, collected_bytes) =
+            self.collect_checkpoints(&superseded, &orphans, dry_run)?;
+        let skipped: BTreeSet<(String, String)> = collected
             .iter()
-            .map(|(record, slug)| (slug.clone(), record.id.clone()))
+            .map(|collected| (collected.slug.clone(), collected.id.clone()))
             .collect();
-        let (collected, collected_bytes) = self.collect_checkpoints(&superseded, dry_run)?;
         outcome.collected_checkpoints = collected;
         outcome.collected_bytes = collected_bytes;
 
@@ -10837,6 +10844,31 @@ impl BranchManager {
         message: Option<&str>,
         reason: CheckpointReason,
     ) -> Result<CheckpointOutcome> {
+        // A checkpoint writes its store ref before its record. One that
+        // fails between the two leaves a ref no record names, holding the
+        // workspace's objects: deleted here, so a retry does not pile them up.
+        let log = self.checkpoint_log(branch);
+        let id = log.next_id()?;
+        let taken = self.take_checkpoint(branch, message, reason);
+        if taken.is_err() {
+            let store_ref = format!("refs/newgit/checkpoints/{}/{id}", branch.slug);
+            let recorded = log
+                .list()
+                .map(|records| records.iter().any(|record| record.id == id))
+                .unwrap_or(true);
+            if !recorded && self.source.ref_rev(&store_ref).is_some() {
+                let _ = self.source.delete_ref(&store_ref);
+            }
+        }
+        taken
+    }
+
+    fn take_checkpoint(
+        &self,
+        branch: &mut BranchInstance,
+        message: Option<&str>,
+        reason: CheckpointReason,
+    ) -> Result<CheckpointOutcome> {
         debug_assert!(
             self.held_lock(&branch.slug).is_some(),
             "a checkpoint is taken under the instance's lock"
@@ -10952,14 +10984,26 @@ impl BranchManager {
                 ));
                 degraded.push(name.clone());
                 CapturedResource::none()
-            } else if binding.status != ResourceStatus::Ready {
+            } else if binding.status != ResourceStatus::Ready || reason == CheckpointReason::Remove
+            {
+                // And the one `remove` takes: an unattended removal must not
+                // be refused by a database that is down. What it cannot
+                // capture is named as lost instead.
                 match self.checkpoint_resource(branch, definition, "checkpoint") {
                     Ok(captured) => captured,
                     Err(error) => {
-                        warnings.push(format!(
-                            "resource `{name}` is not up and its capture failed ({error}), so \
-                             this checkpoint is degraded — undoing to it leaves `{name}` as it is"
-                        ));
+                        warnings.push(if binding.status != ResourceStatus::Ready {
+                            format!(
+                                "resource `{name}` is not up and its capture failed ({error}), \
+                                 so this checkpoint is degraded — undoing to it leaves `{name}` \
+                                 as it is"
+                            )
+                        } else {
+                            format!(
+                                "resource `{name}`'s capture failed ({error}), so this \
+                                 checkpoint does not hold its state"
+                            )
+                        });
                         degraded.push(name.clone());
                         CapturedResource::none()
                     }
@@ -11043,7 +11087,13 @@ impl BranchManager {
             // (#338). Without the remote it stays as it is, and the sync,
             // which checks again, does not send it.
             let content_rev = match content_rev {
-                Some(rev) if definition.encrypted_to_audience() && self.remote.is_some() => {
+                // Not for `remove`'s checkpoint, which is never synced: a
+                // removal never waits on the network.
+                Some(rev)
+                    if definition.encrypted_to_audience()
+                        && self.remote.is_some()
+                        && reason != CheckpointReason::Remove =>
+                {
                     match self.sealed_to_current(
                         definition,
                         &rev,
@@ -11086,6 +11136,7 @@ impl BranchManager {
             reason,
             undo_completed: None,
             restore_of: None,
+            restored: false,
             source: SourceState {
                 head_rev,
                 dirty_rev,

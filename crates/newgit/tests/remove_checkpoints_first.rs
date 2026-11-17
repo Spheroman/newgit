@@ -160,11 +160,17 @@ fn purge_takes_no_checkpoint_and_names_the_uncommitted_work_it_deletes() {
 
 #[test]
 fn a_checkpoint_that_fails_refuses_the_removal_unless_forced() {
-    let (_guard, root, ws) = spawned_with(&[(
-        "snap",
-        "ownership = \"branch\"\n\n[checkpoint]\nmode = \"command\"\ncommand = \"exit 3\"\n",
-    )]);
+    let (_guard, temp) = tempdir("remove-first-fails");
+    let root = setup(&temp).paths().project_root.clone();
+    newgit_ok(&root, &["tracker", "create", "scratch"]);
+    newgit_ok(&root, &["tracker", "track", "scratch", "scratch"]);
+    newgit_ok(&root, &["spawn", "x"]);
+    let ws = temp.join("workspaces/x");
     std::fs::write(ws.join("user.txt"), "untracked work\n").expect("write");
+    // A tracker's capture refuses a link that leaves the workspace, so the
+    // checkpoint fails.
+    std::fs::create_dir_all(ws.join("scratch")).expect("mkdir");
+    std::os::unix::fs::symlink("/etc/hosts", ws.join("scratch/out")).expect("symlink");
 
     let run = refused(
         &root,

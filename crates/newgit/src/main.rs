@@ -68,9 +68,11 @@ enum Command {
     /// The checkpoint (reason `remove`) holds everything a checkpoint can,
     /// uncommitted and untracked work included, so `newgit spawn <name>
     /// --from-checkpoint <name>/<id>` brings the workspace back. What no
-    /// checkpoint holds (ignored files nothing rebuilds, the stash) is named
-    /// as lost. A checkpoint that fails refuses the removal unless
-    /// `--force`; `--purge` takes none.
+    /// checkpoint holds (ignored files nothing rebuilds, the stash, a nested
+    /// Git repository) is named as lost. An evicted instance is not
+    /// checkpointed again: the checkpoint it was evicted to is the one kept.
+    /// A checkpoint that fails refuses the removal unless `--force`;
+    /// `--purge` takes none.
     ///
     /// The source branch goes too when it holds nothing unique: spawn
     /// created it, nothing has it checked out, and its tip is already on
@@ -230,11 +232,14 @@ enum Command {
     /// state, unreferenced tracker snapshots, and the checkpoints eviction
     /// leaves behind
     ///
-    /// Of each instance's history it collects every `evict` checkpoint but
-    /// the latest, and the checkpoints a restore of an evicted workspace
-    /// took on its way once that restore succeeded, with the store objects
-    /// only they reach. `explicit`, `push`, and `remove` checkpoints are
-    /// never collected: `newgit checkpoint` keeps a state for good
+    /// Of each instance's history it collects an `evict` checkpoint a
+    /// restore brought back, once a later eviction supersedes it; the
+    /// checkpoints a restore of an evicted workspace took on its way once
+    /// that restore succeeded; and a `remove` checkpoint a retried removal
+    /// superseded. Never one a live or archived record names (an evicted
+    /// instance's, a removed one's), and never `explicit` or `push`:
+    /// `newgit checkpoint` keeps a state for good. It deletes their records
+    /// and refs only; the store's own `git gc` frees the objects later
     Cleanup {
         /// Report what would be removed without touching anything
         #[arg(long)]
@@ -4561,27 +4566,25 @@ fn cleanup(dry_run: bool, purge_archived: bool) -> Result<()> {
             "Collected"
         };
         println!(
-            "{collect} {}: superseded by a later eviction, or taken by a restore that finished \
-             (an `explicit` checkpoint is never collected)",
+            "{collect} {}: restored and superseded by a later eviction, taken by a restore \
+             that finished, or left by a removal retried (an `explicit` checkpoint is never \
+             collected)",
             plural(outcome.collected_checkpoints.len(), "checkpoint")
         );
         for collected in &outcome.collected_checkpoints {
             let why = match (&collected.reason, &collected.restore_of) {
-                (CheckpointReason::Evict, _) => "evict, superseded".to_owned(),
+                (CheckpointReason::Evict, _) => "evict, restored and superseded".to_owned(),
+                (CheckpointReason::Remove, _) => "remove, retried".to_owned(),
                 (_, Some(of)) => format!("before-undo of the restore from {of}"),
                 _ => "before-undo".to_owned(),
             };
             println!("  {} {} ({why})", collected.slug, collected.id);
         }
         println!(
-            "  {} of store objects only they reached {}; Git deletes them once they are an \
-             hour old",
+            "  {} of store objects only they reached {} unreachable; the store's own `git gc` \
+             frees it on its schedule (newgit does not prune the store)",
             human_bytes(outcome.collected_bytes),
-            if dry_run {
-                "would be released"
-            } else {
-                "released"
-            }
+            if dry_run { "would become" } else { "became" }
         );
     }
     for rev in &outcome.pruned {
@@ -4692,6 +4695,17 @@ fn remove(
             outcome.branch.name, outcome.branch.slug
         );
     }
+    if !outcome.disposed.is_empty() {
+        println!(
+            "  dropped:   {}, declared disposable (its build refills it)",
+            outcome
+                .disposed
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
     for what in &outcome.lost {
         println!("  lost:      {what}");
     }
@@ -4800,6 +4814,15 @@ fn remove_json(outcome: &RemoveOutcome) -> serde_json::Value {
         "archived_record": outcome.archived_record,
         "checkpoint": outcome.checkpoint,
         "lost": outcome.lost,
+        "disposed": outcome
+            .disposed
+            .iter()
+            .map(|disposed| serde_json::json!({
+                "path": disposed.path,
+                "resource": disposed.resource,
+                "files": disposed.files,
+            }))
+            .collect::<Vec<_>>(),
         "unsaved_workspace_head": outcome.unsaved_workspace_head,
         "saved_copies": outcome.saved_copies,
         "kept_checkpoints": outcome.kept_checkpoints,

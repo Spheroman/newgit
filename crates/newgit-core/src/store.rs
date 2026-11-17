@@ -750,6 +750,34 @@ impl MetadataStore {
             .ok_or_else(|| NewgitError::UnknownBranchInstance(name.to_owned()))
     }
 
+    /// Every archived binding record, as `(slug, record)`: the record is
+    /// `Err` with its path when it cannot be read, so a caller deciding what
+    /// it may delete can stay away from that slug. The slug comes from the
+    /// file name (`<slug>-<timestamp>.toml`, see [`Self::archive_branch_record`]).
+    pub fn archived_branches(
+        &self,
+    ) -> Result<Vec<(String, std::result::Result<BranchInstance, Utf8PathBuf>)>> {
+        if !self.paths.archived_branches.is_dir() {
+            return Ok(Vec::new());
+        }
+        let mut out = Vec::new();
+        for entry in read_dir_sorted(&self.paths.archived_branches)? {
+            if entry.extension() != Some("toml") {
+                continue;
+            }
+            let Some(stem) = entry.file_stem() else {
+                continue;
+            };
+            let slug = stem
+                .rsplit_once('-')
+                .map_or(stem, |(slug, _)| slug)
+                .to_owned();
+            let record = read_toml_at::<BranchInstance>(&entry).map_err(|_| entry.clone());
+            out.push((slug, record));
+        }
+        Ok(out)
+    }
+
     /// The binding record outlives the workspace: removal archives it rather
     /// than deleting it.
     pub fn archive_branch_record(&self, branch: &BranchInstance) -> Result<Utf8PathBuf> {

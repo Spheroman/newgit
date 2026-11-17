@@ -9,14 +9,29 @@ use super::*;
 /// removal deletes that nothing keeps.
 #[derive(Debug, Default)]
 pub(super) struct RemoveKeep {
-    /// The checkpoint taken of the workspace, `None` when none was (the
-    /// workspace was evicted or gone, or checkpoints were purged).
+    /// The checkpoint that holds the workspace: the one taken of it, or for
+    /// an evicted instance the one it was evicted to. `None` when there is
+    /// none (the workspace was gone, checkpoints were purged, or the
+    /// checkpoint failed under `--force`).
     pub(super) checkpoint: Option<String>,
     /// What the removal deletes that no checkpoint holds, each said as a
     /// reader would want it.
     pub(super) lost: Vec<String>,
+    /// Ignored paths a resource declares `disposable`, deleted with the
+    /// workspace for its build to refill (#447).
+    pub(super) disposed: Vec<crate::evict::Disposed>,
     /// What the checkpoint said along the way.
     pub(super) warnings: Vec<String>,
+}
+
+/// What [`BranchManager::not_checkpointed`] found.
+#[derive(Debug, Default)]
+struct NotKept {
+    lost: Vec<String>,
+    disposed: Vec<crate::evict::Disposed>,
+    /// Git repositories nested in the workspace with no commit: `git add`
+    /// refuses them, so no checkpoint can be taken while they are there.
+    unborn: Vec<Utf8PathBuf>,
 }
 
 impl BranchManager {
@@ -24,15 +39,22 @@ impl BranchManager {
     /// checkpoints, and work out what the removal deletes all the same:
     /// ignored files no tracker outside Git owns and no resource rebuilds,
     /// changes in a dropped tracker's paths, hand edits to rendered files,
-    /// and what Git keeps only in the workspace's `.git/` (a merge or rebase
-    /// in the middle, the stash, branches and tags the store does not hold,
-    /// staged content the working tree has moved past). Without `keeping`
-    /// (`--purge`) nothing is checkpointed, and the workspace's uncommitted
-    /// work is named too.
+    /// Git repositories nested in the workspace, resource state the
+    /// checkpoint could not capture, and what Git keeps only in the
+    /// workspace's `.git/` (a merge or rebase in the middle, the stash,
+    /// branches and tags the store does not hold, staged content the working
+    /// tree has moved past). Without `keeping` (`--purge`) nothing is
+    /// checkpointed, and the workspace's uncommitted work and what trackers
+    /// outside Git hold uncaptured are named too.
+    ///
+    /// An evicted instance is not checkpointed again: its eviction's
+    /// checkpoint holds the workspace, and is what the removal keeps.
     ///
     /// A checkpoint that fails refuses the removal, before anything is
     /// stopped or deleted, unless `force`: the removal then goes ahead and
-    /// names what it deletes.
+    /// names what it deletes. Under `force` or without `keeping`, a
+    /// workspace whose Git cannot be read is named as lost rather than
+    /// refusing.
     pub(super) fn checkpoint_before_remove(
         &self,
         branch: &mut BranchInstance,
@@ -41,7 +63,26 @@ impl BranchManager {
     ) -> Result<RemoveKeep> {
         let mut keep = RemoveKeep::default();
         let workspace = branch.workspace_path.clone();
-        if branch.evicted.is_some() || !workspace.is_dir() {
+        let name = branch.name.clone();
+        if let Some(evicted) = branch.evicted.clone() {
+            if keeping {
+                keep.checkpoint = Some(evicted);
+            } else {
+                keep.lost.push(format!(
+                    "checkpoint {evicted}, which held the evicted workspace, purged with the \
+                     rest (--purge)"
+                ));
+            }
+            // Only with `force`: `remove_forced` refuses otherwise.
+            if workspace.exists() && !crate::materializer::is_evicted_stub(&workspace) {
+                keep.lost.push(format!(
+                    "what was written at {workspace} after the eviction, which no checkpoint \
+                     holds (--force)"
+                ));
+            }
+            return Ok(keep);
+        }
+        if !workspace.is_dir() {
             return Ok(keep);
         }
         if std::fs::symlink_metadata(workspace.join(".git")).is_err() {
@@ -51,9 +92,40 @@ impl BranchManager {
             ));
             return Ok(keep);
         }
-        keep.lost = self.not_checkpointed(branch)?;
+        let best_effort = force || !keeping;
+        let found = match self.not_checkpointed(branch) {
+            Ok(found) => found,
+            Err(error) if best_effort => {
+                keep.lost.push(could_not_inspect(&workspace, &error));
+                NotKept::default()
+            }
+            Err(error) => {
+                return Err(NewgitError::Unsupported(format!(
+                    "not removing `{name}`: could not tell what its workspace holds that no \
+                     checkpoint would ({error}). Nothing was stopped or deleted. Fix it and \
+                     remove again, or `newgit remove {name} --force` deletes the workspace \
+                     whatever it holds"
+                )));
+            }
+        };
+        keep.lost.extend(found.lost);
+        keep.disposed = found.disposed;
+        if !found.unborn.is_empty() && keeping && !force {
+            return Err(NewgitError::Unsupported(format!(
+                "not removing `{name}`: {} {} a Git repository of its own with no commit, which \
+                 Git refuses to snapshot, so no checkpoint can hold the workspace. Nothing was \
+                 stopped or deleted. Commit in it or move it out of the workspace, or `newgit \
+                 remove {name} --force` removes without a checkpoint and deletes it",
+                super::evict::list_paths(&found.unborn),
+                if found.unborn.len() == 1 {
+                    "is"
+                } else {
+                    "are each"
+                }
+            )));
+        }
         if !keeping {
-            keep.lost.extend(uncommitted(&workspace)?);
+            self.unkept(branch, &mut keep);
             return Ok(keep);
         }
         let drift = self.render_drift(branch);
@@ -72,6 +144,12 @@ impl BranchManager {
         }
         match taken {
             Ok(checkpoint) => {
+                for resource in &checkpoint.degraded {
+                    keep.lost.push(format!(
+                        "the state of resource `{resource}`: its capture failed, so the \
+                         checkpoint does not hold it"
+                    ));
+                }
                 keep.warnings = checkpoint
                     .warnings
                     .into_iter()
@@ -82,7 +160,7 @@ impl BranchManager {
                 keep.checkpoint = Some(checkpoint.record.id);
             }
             Err(error) if force => {
-                keep.lost.extend(uncommitted(&workspace)?);
+                self.unkept(branch, &mut keep);
                 keep.warnings.push(format!(
                     "the checkpoint `remove` takes first failed ({error}); removed anyway \
                      (--force), so no checkpoint holds what the workspace had since the last one"
@@ -93,20 +171,71 @@ impl BranchManager {
                     "not removing `{name}`: the checkpoint that keeps its workspace failed \
                      ({error}), and without it the removal would delete work no checkpoint \
                      holds. Nothing was stopped or deleted. Fix what failed and remove again, \
-                     or `newgit remove {name} --force` deletes the workspace without one",
-                    name = branch.name
+                     or `newgit remove {name} --force` deletes the workspace without one"
                 )));
             }
         }
         Ok(keep)
     }
 
+    /// What a removal with no checkpoint deletes besides what
+    /// [`Self::not_checkpointed`] names: uncommitted work, and what trackers
+    /// outside Git hold uncaptured. Never an error: what could not be read
+    /// is named as lost.
+    fn unkept(&self, branch: &BranchInstance, keep: &mut RemoveKeep) {
+        match uncommitted(&branch.workspace_path) {
+            Ok(lost) => keep.lost.extend(lost),
+            Err(error) => keep
+                .lost
+                .push(could_not_inspect(&branch.workspace_path, &error)),
+        }
+        keep.lost.extend(self.uncaptured_trackers(branch));
+    }
+
+    /// What each bound tracker outside Git holds in the workspace that its
+    /// bound rev does not: what a removal with no checkpoint deletes from
+    /// it. Rendered files aside (`render_drift` names an edit to one).
+    fn uncaptured_trackers(&self, branch: &BranchInstance) -> Vec<String> {
+        let rendered = rendered_paths(branch, |_| true);
+        let mut lost = Vec::new();
+        for definition in &self.trackers {
+            if definition.paths.is_empty() || branch.dropped.contains(&definition.name) {
+                continue;
+            }
+            let bound = branch
+                .trackers
+                .get(&definition.name)
+                .and_then(|binding| binding.content_rev.clone());
+            match self.lane(&definition.name).changed_since(
+                &branch.workspace_path,
+                definition,
+                bound.as_deref(),
+                &rendered,
+            ) {
+                Ok(changed) if changed.is_empty() => {}
+                Ok(changed) => lost.push(format!(
+                    "uncaptured content of tracker `{}` in {}, which its last capture does not \
+                     hold",
+                    definition.name,
+                    super::evict::list_paths(&changed)
+                )),
+                Err(error) => lost.push(format!(
+                    "whatever tracker `{}` holds uncaptured: could not compare it with its last \
+                     capture ({error})",
+                    definition.name
+                )),
+            }
+        }
+        lost
+    }
+
     /// What a checkpoint of `branch`'s workspace leaves out, and a removal
     /// therefore deletes.
-    fn not_checkpointed(&self, branch: &BranchInstance) -> Result<Vec<String>> {
+    fn not_checkpointed(&self, branch: &BranchInstance) -> Result<NotKept> {
         let workspace = &branch.workspace_path;
         let mut lost = Vec::new();
-        let ignored = self.evict_discards(branch)?.discarded;
+        let plan = self.evict_discards(branch)?;
+        let ignored = plan.discarded;
         if !ignored.is_empty() {
             let named: Vec<String> = ignored.iter().map(describe_ignored).collect();
             lost.push(format!(
@@ -206,8 +335,116 @@ impl BranchManager {
                 ));
             }
         }
-        Ok(lost)
+        let mut unborn = Vec::new();
+        for nested in nested_repositories(workspace)? {
+            let held = describe_nested(&workspace.join(&nested));
+            if held.unborn {
+                unborn.push(nested.clone());
+            }
+            lost.push(format!(
+                "`{nested}/`, a Git repository of its own: {}",
+                held.what
+            ));
+        }
+        Ok(NotKept {
+            lost,
+            disposed: plan.disposed,
+            unborn,
+        })
     }
+}
+
+/// Git repositories nested in `workspace` that no ignore rule covers: an
+/// untracked one (`git ls-files --others` names it, with a trailing slash,
+/// rather than walk into it) and a submodule's checkout. A checkpoint
+/// records at most the commit each has checked out, so their files are
+/// not in it.
+fn nested_repositories(workspace: &Utf8Path) -> Result<Vec<Utf8PathBuf>> {
+    let mut found: BTreeSet<Utf8PathBuf> = git_lines(
+        workspace,
+        &["ls-files", "-z", "--others", "--exclude-standard"],
+    )?
+    .into_iter()
+    .filter_map(|path| path.strip_suffix('/').map(Utf8PathBuf::from))
+    .collect();
+    for entry in git_lines(workspace, &["ls-files", "-z", "--stage"])? {
+        if let Some(path) = entry
+            .strip_prefix("160000 ")
+            .and_then(|rest| rest.split_once('\t'))
+            .map(|(_, path)| path)
+        {
+            found.insert(Utf8PathBuf::from(path));
+        }
+    }
+    found.retain(|path| std::fs::symlink_metadata(workspace.join(path).join(".git")).is_ok());
+    Ok(found.into_iter().collect())
+}
+
+/// What a nested repository holds that a checkpoint of the workspace
+/// around it does not.
+struct Nested {
+    what: String,
+    /// No commit: `git add` refuses it, so no checkpoint can be taken.
+    unborn: bool,
+}
+
+fn describe_nested(repo: &Utf8Path) -> Nested {
+    let lines = |args: &[&str]| git_lines(repo, args);
+    if crate::source::run_git_env(
+        &["-C", repo.as_str(), "rev-parse", "--verify", "-q", "HEAD"],
+        &[],
+    )
+    .is_err()
+    {
+        let files = lines(&["ls-files", "-z", "--others", "--exclude-standard"])
+            .map_or(0, |files| files.len());
+        return Nested {
+            what: format!(
+                "it has no commit, so what it holds ({files} file{}) goes with the workspace",
+                if files == 1 { "" } else { "s" }
+            ),
+            unborn: true,
+        };
+    }
+    let mut parts = Vec::new();
+    match lines(&["status", "--porcelain", "-z", "--untracked-files=all"]) {
+        Ok(changes) if changes.is_empty() => {}
+        Ok(changes) => parts.push(format!(
+            "{} uncommitted change{}",
+            changes.len(),
+            if changes.len() == 1 { "" } else { "s" }
+        )),
+        Err(error) => parts.push(format!("whatever it holds uncommitted ({error})")),
+    }
+    // Commits no remote-tracking ref holds: only here, cheap to count.
+    match lines(&["rev-list", "--count", "--all", "--not", "--remotes"]) {
+        Ok(count) => match count.first().and_then(|n| n.parse::<usize>().ok()) {
+            Some(0) | None => {}
+            Some(n) => parts.push(format!(
+                "{n} commit{} on no remote",
+                if n == 1 { "" } else { "s" }
+            )),
+        },
+        Err(error) => parts.push(format!("its commits ({error})")),
+    }
+    Nested {
+        what: if parts.is_empty() {
+            "a checkpoint records only the commit it has checked out, which its remote holds"
+                .to_owned()
+        } else {
+            format!(
+                "a checkpoint records only the commit it has checked out, so {} go with the \
+                 workspace",
+                parts.join(" and ")
+            )
+        },
+        unborn: false,
+    }
+}
+
+/// A `lost` entry for a workspace whose Git could not be read.
+fn could_not_inspect(workspace: &Utf8Path, error: &NewgitError) -> String {
+    format!("could not inspect `{workspace}` ({error}); whatever it held")
 }
 
 /// `` `target/` (3 files) `` or `` `notes.txt` ``.

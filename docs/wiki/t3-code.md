@@ -9,8 +9,13 @@ opens the thread in that workspace, with its trackers bound and its
 resources prepared. Deleting the thread runs `newgit remove`, which
 checkpoints the workspace before deleting it, so a thread deleted with
 work in it can be brought back (`newgit spawn <name> --from-checkpoint
-<name>/<id>`; the id is in the archived record, `removed_to`). Every other
-project gets plain worktrees, as before.
+<name>/<id>`; the id is `checkpoint` in `remove --json` and `removed_to` in
+the archived record). A thread whose workspace was evicted is not
+checkpointed again: the eviction's checkpoint already holds it, and is the
+one named. A resource whose capture fails, such as a dump against a
+database that is down, does not stop the delete; `remove` names what it
+could not keep under `lost`. Every other project gets plain worktrees, as
+before.
 
 `newgit stop <instance>` and `newgit start <instance>` are the pair for
 settling and unsettling a thread
@@ -46,8 +51,11 @@ freed once its build output is declared disposable, in a resource such as
 `.newgit/resources/build-output.toml` holding `ownership = "workspace"`
 and `disposable = ["target"]` (#447): the eviction drops `target/` and
 says so, and the build refills it after `start`. Each settle/unsettle
-cycle leaves an evict checkpoint behind, which `newgit cleanup` collects
-once a later eviction supersedes it (#446).
+cycle leaves an evict checkpoint behind, often the only checkpoint of that
+turn's end state. `newgit cleanup` collects one only after an unsettle
+restored it and a later settle superseded it (#446), never the one a
+deleted thread was evicted to. It deletes the checkpoint's refs; the
+store's own `git gc` frees the disk later.
 
 On macOS it installs as "T3 Code (newgit)", beside upstream T3 Code: its
 own app ID, state in `~/.t3-newgit`, and no auto-update.

@@ -1,7 +1,8 @@
 //! Retention for what eviction leaves behind (#446): `newgit cleanup`
-//! collects every `evict` checkpoint but the latest and the checkpoints a
-//! restore that succeeded took on its way, with the store objects only they
-//! reach, and says what it releases. An `explicit` checkpoint, the latest
+//! collects every `evict` checkpoint a restore brought back but the latest
+//! and the checkpoints a restore that succeeded took on its way, deleting
+//! the refs that held the store objects only they reach, and says how much
+//! the store's own `git gc` frees. An `explicit` checkpoint, the latest
 //! `evict` one, and the one `remove` takes stay.
 
 mod evict_support;
@@ -78,7 +79,7 @@ fn cleanup_collects_superseded_evictions_and_what_their_restores_took() {
     let run = newgit_ok(&repo, &["cleanup"]);
     assert!(
         run.stdout
-            .contains(&format!("x {} (evict, superseded)", evicts[0])),
+            .contains(&format!("x {} (evict, restored and superseded)", evicts[0])),
         "{}",
         run.stdout
     );
@@ -88,7 +89,7 @@ fn cleanup_collects_superseded_evictions_and_what_their_restores_took() {
         "{}",
         run.stdout
     );
-    assert!(run.stdout.contains("released"), "{}", run.stdout);
+    assert!(run.stdout.contains("became unreachable"), "{}", run.stdout);
 
     let after = checkpoints(&repo);
     assert_eq!(

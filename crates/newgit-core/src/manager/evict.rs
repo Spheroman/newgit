@@ -28,7 +28,7 @@ pub(super) struct EvictPlan {
     pub(super) discarded: Vec<crate::evict::Discarded>,
     /// Ignored paths a bound resource declares `disposable`, which go with
     /// the workspace and which its build refills (#447).
-    disposed: Vec<crate::evict::Disposed>,
+    pub(super) disposed: Vec<crate::evict::Disposed>,
     /// The files resources render, which the restore renders again.
     rendered: Vec<Utf8PathBuf>,
     /// Every path the restore does not bring back from what was saved.

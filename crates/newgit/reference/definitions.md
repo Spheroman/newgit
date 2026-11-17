@@ -675,7 +675,7 @@ That is the whole resource: no actions, no `[identity]`, no hooks. An
 eviction drops the ignored files under those paths with the workspace and
 names them (`disposed` in `stop --evict --json`, and `status` while the
 instance is evicted); the `start` after it leaves them for the build to
-refill. Nothing else reads it: `undo`, `tracker use`/`drop`, and `spawn`
+refill. `newgit remove` lists them as dropped, not lost. Nothing else reads it: `undo`, `tracker use`/`drop`, and `spawn`
 never touch the tree. It covers only *ignored* files (anything else is in
 the checkpoint anyway), and a file under it that a tracker outside Git owns
 is kept. It applies to every instance as soon as it is written, except one
@@ -919,8 +919,10 @@ stash's, intent-to-add entries, assume-unchanged or skip-worktree flags
 set by hand (the files' content is kept), setuid, setgid, and sticky bits,
 and a value set by hand on a config key newgit sets itself
 (`remote.origin.url`, `credential.*`, its export remotes). An untracked file's blob stays in
-the store with the checkpoint, so evicting does not free that disk, and
-evict checkpoints are not pruned yet (#446).
+the store with the checkpoint, so evicting does not free that disk until a
+restore brought the checkpoint back, a later eviction supersedes it, and
+`newgit cleanup` collects it (#446); the store's own `git gc` then frees
+the objects.
 
 `suspend` / `resume` are for a resource that keeps running without a
 process newgit supervises: a `prepare` that starts a Supabase stack, a
