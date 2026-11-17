@@ -219,3 +219,52 @@ fn a_pin_the_remote_did_not_send_is_said_and_tried_again() {
     assert_eq!(git(&github, &["rev-parse", "feature~2"]), theirs);
     assert_eq!(own_commits(&github), ["Add first.txt", "Add second.txt"]);
 }
+
+/// The refusal comes before anything is composed: `main`'s view and the
+/// record of where the remote's `main` is are left as they were, rather than
+/// composed without the pin and then refused, which would leave them naming
+/// a `main` the remote never served.
+#[test]
+fn a_pin_the_remote_did_not_send_leaves_main_as_it_was() {
+    let (_guard, temp) = tempdir();
+    let fixture = setup(&temp);
+    let github = mirrored(&fixture);
+    let elsewhere = another_copy(&fixture);
+    let (pin, _) = private_moved_then_merged(&fixture, &github);
+    git_as_user(&fixture, &elsewhere, &["fetch", "-q", "origin"]);
+    let private = private_repo(&fixture);
+    git(
+        &private,
+        &["update-ref", "refs/heads/main", &format!("{pin}^")],
+    );
+    git(&private, &["reflog", "expire", "--expire=now", "--all"]);
+    git(&private, &["gc", "-q", "--prune=now"]);
+
+    let refs = [
+        "refs/newgit/views/branches/main",
+        "refs/newgit/remote-root/main",
+    ];
+    let before: Vec<String> = refs
+        .iter()
+        .map(|name| git(&elsewhere, &["rev-parse", name]))
+        .collect();
+    let workspace = spawned_on_fetched_main(&fixture, &elsewhere);
+    std::fs::write(workspace.join("first.txt"), "mine\n").expect("write");
+    git(&workspace, &["add", "-A"]);
+    git(&workspace, &["commit", "-q", "-m", "Add first.txt"]);
+    let output = fixture.newgit(&elsewhere, &["checkpoint", "feature"]);
+    let said = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let after: Vec<String> = refs
+        .iter()
+        .map(|name| git(&elsewhere, &["rev-parse", name]))
+        .collect();
+    assert!(said.contains("did not send"), "{said}");
+    assert_eq!(
+        before, after,
+        "`main` was composed without the pin:\n{said}"
+    );
+}

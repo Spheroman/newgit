@@ -8308,6 +8308,19 @@ impl BranchManager {
                 &format!("instances/{}", branch.slug),
             ));
         }
+        // And newgit's record of what it last pushed of its branch to each
+        // export target: an instance spawned again under the name is another
+        // instance, and may not replace what this one left there.
+        let pushed = format!("pushed-branches/{}", branch.slug);
+        for name in self.source.refs_under(EXPORTS_REFS)? {
+            let ours = name
+                .strip_prefix(EXPORTS_REFS)
+                .and_then(|rest| rest.split_once('/'))
+                .is_some_and(|(_, rest)| rest == pushed);
+            if ours {
+                let _ = self.source.delete_ref(&name);
+            }
+        }
         let archived_record = self.store.archive_branch_record(&branch)?;
         // Either way, count what the instance leaves behind: checkpoints kept
         // for an unreachable instance are disk nobody will reclaim by accident.
@@ -10053,24 +10066,28 @@ impl BranchManager {
     /// replaced what was there. A lease fails when the target no longer has
     /// the branch at all (a pull request closed with its branch deleted): it
     /// is then pushed as new, which fails in turn if someone made it again
-    /// meanwhile.
+    /// meanwhile. A push the target refused is [`branch_refused`], which
+    /// `recorded` (newgit has a record of its last push there) words.
     fn push_branch_export(
         &self,
         target: &ExportTarget,
         tip: &str,
-        branch: &str,
+        branch: &BranchInstance,
         how: PushExport<'_>,
+        recorded: bool,
     ) -> Result<bool> {
-        let Err(error) = self.push_export(target, tip, branch, how) else {
-            return Ok(matches!(how, PushExport::Replacing(_)));
+        let name = branch.source_ref.as_str();
+        let refused = |unchecked: Option<String>| {
+            branch_refused(branch, &target.name, recorded, unchecked.as_deref())
         };
-        let lease_failed = matches!(how, PushExport::Replacing(_))
-            && matches!(&error, NewgitError::SourceCommand { stderr, .. } if rejected(stderr));
-        if !lease_failed {
-            return Err(error);
+        match self.push_export(target, tip, name, how) {
+            Ok(()) => return Ok(matches!(how, PushExport::Replacing(_))),
+            Err(error) if !is_rejected(&error) => return Err(error),
+            Err(_) if !matches!(how, PushExport::Replacing(_)) => return Err(refused(None)),
+            Err(_) => {}
         }
-        let head = format!("refs/heads/{branch}");
-        let listed = crate::source::run_git_env(
+        let head = format!("refs/heads/{name}");
+        let listed = match crate::source::run_git_env(
             &[
                 "-C",
                 self.store.paths().project_root.as_str(),
@@ -10080,15 +10097,21 @@ impl BranchManager {
                 &head,
             ],
             &[],
-        )?;
+        ) {
+            Ok(listed) => listed,
+            Err(error) => return Err(refused(Some(error.to_string()))),
+        };
         if listed
             .lines()
             .any(|line| line.split_once('\t').is_some_and(|(_, name)| name == head))
         {
-            return Err(error);
+            return Err(refused(None));
         }
-        self.push_export(target, tip, branch, PushExport::Onto)?;
-        Ok(false)
+        match self.push_export(target, tip, name, PushExport::Onto) {
+            Ok(()) => Ok(false),
+            Err(error) if is_rejected(&error) => Err(refused(None)),
+            Err(error) => Err(error),
+        }
     }
 
     /// Refuse to replace `recorded`, what newgit last put on `target` for
@@ -10103,13 +10126,14 @@ impl BranchManager {
         recorded: &str,
     ) -> Result<()> {
         let project = self.store.paths().project_root.clone();
-        let scratch = "replacing";
+        // One per instance: two instances may heal on one target at once.
+        let scratch = format!("replacing/{}", branch.slug);
         let again = crate::compose::read_root(&project, recorded)?
             .filter(|(tracker, _)| tracker == target.declared_by())
             .map(|(tracker, root)| {
                 let composed =
-                    self.compose_export(target, &BTreeMap::from([(tracker, root)]), scratch);
-                let _ = self.source.delete_ref(&export_ref(&target.name, scratch));
+                    self.compose_export(target, &BTreeMap::from([(tracker, root)]), &scratch);
+                let _ = self.source.delete_ref(&export_ref(&target.name, &scratch));
                 composed
             })
             .transpose()?;
@@ -10139,12 +10163,14 @@ impl BranchManager {
     /// target still holds exactly it, so a commit anyone else pushed there is
     /// never thrown away. Not when the target's tracker set changed since,
     /// which `--force` is for, as it is for `main`. A branch the target no
-    /// longer has is pushed again.
+    /// longer has is pushed again. A force-push from the workspace replaces
+    /// it over the record too, whatever composes there, and never without
+    /// one: only [`BranchOver::Force`] replaces it whatever it holds.
     fn export_instance(
         &self,
         branch: &BranchInstance,
         head: &str,
-        forced: bool,
+        over: BranchOver,
         split: Option<BTreeMap<String, String>>,
     ) -> Vec<BranchExport> {
         let targets = match self.export_targets() {
@@ -10193,24 +10219,32 @@ impl BranchManager {
                     let recorded = self.source.rev_parse(&pushed_ref).ok();
                     let (trackers, view) =
                         self.compose_export(target, &list, &format!("instances/{}", branch.slug))?;
-                    let replacing = match &recorded {
-                        Some(recorded)
-                            if !forced
-                                && *recorded != view.tip
-                                && !self.source.is_ancestor(recorded, &view.tip)? =>
-                        {
-                            self.refuse_recomposed(target, branch, recorded)?;
-                            Some(recorded.as_str())
+                    let behind = match &recorded {
+                        Some(recorded) => {
+                            *recorded != view.tip
+                                && !self.source.is_ancestor(recorded, &view.tip)?
                         }
-                        _ => None,
+                        None => false,
                     };
-                    let how = match replacing {
-                        _ if forced => PushExport::Force,
-                        Some(recorded) => PushExport::Replacing(recorded),
-                        None => PushExport::Onto,
+                    let how = match (over, recorded.as_deref()) {
+                        (BranchOver::Force, _) => PushExport::Force,
+                        (_, Some(recorded)) if behind => {
+                            // A force-push here rewrote the branch on purpose,
+                            // so a changed tracker set changes it too.
+                            if over == BranchOver::Push {
+                                self.refuse_recomposed(target, branch, recorded)?;
+                            }
+                            PushExport::Replacing(recorded)
+                        }
+                        _ => PushExport::Onto,
                     };
-                    let replaced =
-                        self.push_branch_export(target, &view.tip, &branch.source_ref, how)?;
+                    let replaced = self.push_branch_export(
+                        target,
+                        &view.tip,
+                        branch,
+                        how,
+                        recorded.is_some(),
+                    )?;
                     self.source.update_ref(&pushed_ref, &view.tip)?;
                     crate::source::run_git_env(
                         &[
@@ -10245,15 +10279,7 @@ impl BranchManager {
                     repo: target.url.clone(),
                     gh_resolved: routing.resolved == Some(target.name.as_str()),
                     branch: branch.source_ref.clone(),
-                    result: result.map_err(|error| match error {
-                        NewgitError::SourceCommand { stderr, .. } if rejected(&stderr) => format!(
-                            "`{}` there is not what newgit last put there (someone pushed to it \
-                             directly?), so it was left as it is. `newgit export {} --remote {} \
-                             --force` replaces it with this branch",
-                            branch.source_ref, branch.name, target.name
-                        ),
-                        other => other.to_string(),
-                    }),
+                    result: result.map_err(|error| error.to_string()),
                 }
             })
             .collect();
@@ -10327,7 +10353,12 @@ impl BranchManager {
         }
         self.learn_before_split(&branch, &pushed);
         let split = self.split_view(&pushed, &branch.dropped)?.index;
-        self.export_instance(&branch, &pushed, force, Some(split))
+        let over = if force {
+            BranchOver::Force
+        } else {
+            BranchOver::Push
+        };
+        self.export_instance(&branch, &pushed, over, Some(split))
             .into_iter()
             .find(|export| export.target == name)
             .ok_or_else(|| {
@@ -10906,7 +10937,12 @@ impl BranchManager {
             Some((old, new)) => {
                 let forced =
                     old.is_some_and(|old| !self.source.is_ancestor(old, new).unwrap_or(true));
-                self.export_instance(&branch, new, forced, None)
+                let over = if forced {
+                    BranchOver::ForcePush
+                } else {
+                    BranchOver::Push
+                };
+                self.export_instance(&branch, new, over, None)
             }
             None => Vec::new(),
         };
@@ -15653,8 +15689,60 @@ enum PushExport<'a> {
     Force,
 }
 
+/// How far an instance's export may move its branch on a target.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BranchOver {
+    /// A `git push`, or `newgit export <instance> --remote`: onto what is
+    /// there, or replacing what newgit last pushed there when its commits
+    /// were split again onto the same root commits.
+    Push,
+    /// A force-push from the workspace: replacing what newgit last pushed
+    /// there, never anything else.
+    ForcePush,
+    /// `newgit export <instance> --remote <target> --force`: over whatever
+    /// is there.
+    Force,
+}
+
+/// The target refused an instance's branch: it holds commits newgit did not
+/// put there by its record, or newgit has no record of putting any there.
+/// `unchecked`: a lease failed and newgit could not ask the target whether
+/// it still has the branch.
+fn branch_refused(
+    branch: &BranchInstance,
+    target: &str,
+    recorded: bool,
+    unchecked: Option<&str>,
+) -> NewgitError {
+    let (on, instance) = (&branch.source_ref, &branch.name);
+    let force = format!("`newgit export {instance} --remote {target} --force`");
+    let mut message = if recorded {
+        format!(
+            "`{on}` on `{target}` is not what newgit last put there (someone pushed to it \
+             directly?), so it was left as it is. {force} replaces it with this branch"
+        )
+    } else {
+        format!(
+            "`{on}` on `{target}` holds commits this branch does not, and this project has no \
+             record of newgit pushing them (they may have come from another machine, from \
+             someone else, or from a newgit older than this one), so it was left as it is. \
+             Look at what `{on}` there holds first: if nothing of it is anyone else's, {force} \
+             replaces it with this branch"
+        )
+    };
+    if let Some(error) = unchecked {
+        message.push_str(&format!(
+            " (newgit could not reach `{target}` to check whether it still has `{on}`: {error})"
+        ));
+    }
+    NewgitError::Unsupported(message)
+}
+
+/// Where every export target's refs live, `<target>/...` under it.
+const EXPORTS_REFS: &str = "refs/newgit/exports/";
+
 fn export_ref(target: &str, branch: &str) -> String {
-    format!("refs/newgit/exports/{target}/{branch}")
+    format!("{EXPORTS_REFS}{target}/{branch}")
 }
 
 /// What newgit last pushed of instance `slug`'s branch to `target`: written
@@ -15666,6 +15754,11 @@ fn pushed_branch_ref(target: &str, slug: &str) -> String {
 /// A push Git refused because it was not a fast-forward.
 fn rejected(stderr: &str) -> bool {
     stderr.contains("non-fast-forward") || stderr.contains("[rejected]")
+}
+
+/// [`rejected`], of a failed Git command.
+fn is_rejected(error: &NewgitError) -> bool {
+    matches!(error, NewgitError::SourceCommand { stderr, .. } if rejected(stderr))
 }
 
 /// Where the project repo keeps the `branch` of a tracker in Git (`main`,

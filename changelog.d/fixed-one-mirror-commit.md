@@ -23,5 +23,9 @@
   there is never thrown away, and a branch deleted there is pushed again.
   `newgit export <instance> --remote <target>` does that without a new
   commit, healing the instance's tracker branches too, and exports a branch
-  again when its export failed; `--force` replaces the branch there
-  whatever it holds.
+  again when its export failed. A force-push from the workspace replaces
+  the branch there the same way, over that record only; with no record
+  (another machine, or an export by an older newgit) the export is refused,
+  saying so, while the push itself succeeds. `newgit remove` drops the
+  record with its instance. `newgit export <instance> --remote <target>
+  --force` is the one way to replace the branch there whatever it holds.

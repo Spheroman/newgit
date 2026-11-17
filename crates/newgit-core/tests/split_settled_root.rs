@@ -90,8 +90,10 @@ fn split(dir: &Utf8Path, tip: &str, settled: &[String]) -> compose::SplitOutcome
     .unwrap_or_else(|error| panic!("split {tip}: {error}"))
 }
 
-#[test]
-fn of_two_root_commits_naming_one_view_commit_the_settled_one_is_it() {
+/// Of two root commits naming one view commit, the settled one is it,
+/// whichever way their ids sort: so an order by id alone, whether its first
+/// or its last candidate wins, fails one of the two tests below.
+fn the_settled_one_is_it(settled_sorts_later: bool) {
     let (_guard, temp) = tempdir();
     let dir = temp.join("project");
     std::fs::create_dir_all(&dir).expect("mkdir");
@@ -144,13 +146,19 @@ fn of_two_root_commits_naming_one_view_commit_the_settled_one_is_it() {
         &env,
     );
     let copy_tree = git_env(&dir, &["write-tree"], &env);
-    let mut copy_env = who("ana", 1_150);
-    copy_env.push(("GIT_INDEX_FILE", index.to_string()));
-    let copy = git_env(
-        &dir,
-        &["commit-tree", &copy_tree, "-p", &parent, "-m", &message],
-        &copy_env,
-    );
+    // Its date picks its id: tried until the two sort the way this run asks.
+    let copy = (1_150..1_190)
+        .map(|time| {
+            let mut copy_env = who("ana", time);
+            copy_env.push(("GIT_INDEX_FILE", index.to_string()));
+            git_env(
+                &dir,
+                &["commit-tree", &copy_tree, "-p", &parent, "-m", &message],
+                &copy_env,
+            )
+        })
+        .find(|copy| (*copy < theirs) == settled_sorts_later)
+        .expect("a copy whose id sorts as asked");
     assert_ne!(copy, theirs);
     git(
         &dir,
@@ -174,4 +182,14 @@ fn of_two_root_commits_naming_one_view_commit_the_settled_one_is_it() {
         "built on the copy's root commit, {copy}:\n{}",
         git(&dir, &["log", "--format=%h %p %s", "-3", &root])
     );
+}
+
+#[test]
+fn the_settled_root_commit_wins_when_its_id_sorts_later() {
+    the_settled_one_is_it(true);
+}
+
+#[test]
+fn the_settled_root_commit_wins_when_its_id_sorts_earlier() {
+    the_settled_one_is_it(false);
 }

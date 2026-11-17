@@ -682,12 +682,19 @@ built on the second arrives as a pull request holding commits the mirror's
   lease: any `git fetch` of the target rewrites it with whatever is there.
   A branch the target no longer has (a pull request closed with its branch
   deleted) is pushed again. With no record (exported by a newgit from before
-  this, or from another copy of the project), the branch is not replaced.
-  Nor is it when the target's tracker set changed since the record — its
-  root commit no longer composes to it — since every commit there would
-  change, which `main`'s export needs `--force` for too. Every refusal names
-  `newgit export <instance> --remote <target> --force`, which replaces the
-  branch whatever it holds, as a force-push from the workspace does.
+  this, or from another copy of the project), the branch is not replaced,
+  and the refusal says there is no record rather than that someone pushed
+  there: look at the branch before forcing. Nor is it replaced when the
+  target's tracker set changed since the record — its root commit no longer
+  composes to it — since every commit there would change, which `main`'s
+  export needs `--force` for too. A force-push from the workspace (an amend,
+  a rebase) replaces the branch the same way, over the record and nothing
+  else, whatever its trackers: a commit someone pushed there stays, and
+  with no record its export is refused, though the push itself succeeds.
+  The record goes with its instance at `newgit remove`, so an instance
+  spawned again under the name is not taken for it. Every refusal names
+  `newgit export <instance> --remote <target> --force`, the one way to
+  replace the branch whatever it holds.
   Without `--force`, that command exports the branch as last pushed again,
   splitting the instance's tracker branches again where they stand first,
   so they heal with it and a merge of the instance brings no copy.
