@@ -591,7 +591,12 @@ trackers **(decided)**:
    stays, with no change to its tree, because telling would take the child's
    history. A merge goes the same way only when its sides differ in such
    a child and what is left adds nothing to one parent: the side that moved
-   the pin was dropped, so there is nothing to join. Any other merge stays.
+   the pin was dropped, so there is nothing to join. Any other merge stays,
+   and so does one that comes back as the very commit it was split from
+   (rule 5): that is a merge the reader's own history has, such as a pull
+   request merged on a mirror from an instance's branch whose instance also
+   had work the mirror does not ship. Dropped, the mirror would hold a commit
+   `main` never shows it again, and no export could follow (#451).
    Someone who cannot read a tracker sees different ids from the first commit
    that touched it (see *One name for a commit*).
 
