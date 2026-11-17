@@ -1649,7 +1649,7 @@ name = "newgit-core"
 version = "0.10.1"
 dependencies = [
  "age",
- "base64 0.22.1",
+ "base64 0.23.1",
  "camino",
  "chrono",
  "flate2",
@@ -1674,7 +1674,7 @@ version = "0.10.1"
 dependencies = [
  "anyhow",
  "axum",
- "base64 0.22.1",
+ "base64 0.23.1",
  "camino",
  "chrono",
  "flate2",

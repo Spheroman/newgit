@@ -17,7 +17,7 @@ workspace = true
 # members' GitHub SSH keys; base64 for key fingerprints and age's key tags;
 # rpassword to ask for an SSH key's passphrase.
 age = { version = "0.12", features = ["ssh"] }
-base64 = "0.22"
+base64 = "0.23"
 camino = { version = "1.2", features = ["serde1"] }
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
 # Loose objects are zlib streams (objects.rs writes them in process).
