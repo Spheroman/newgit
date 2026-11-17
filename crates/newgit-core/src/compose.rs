@@ -731,21 +731,6 @@ impl Composer<'_> {
             }
         }
 
-        // A merge left with nothing of its own by what this reader may not
-        // read: its sides differ in a withheld pin, and the side that only
-        // moved it was dropped, so what is left is one parent, or an
-        // ancestor of it, with this tree.
-        if commit.parents.len() > 1
-            && self.joins_withheld(all_pins, mounts, &parent_commits)?
-            && let Some(parent) = self.empty_merge(&commit.parents, &tree)?
-        {
-            let view = self.views[&parent].clone();
-            let expanded = self.expanded.get(&parent).cloned().unwrap_or_default();
-            self.expanded.insert(commit.id.clone(), expanded);
-            self.views.insert(commit.id.clone(), view);
-            return Ok(());
-        }
-
         let split = parse_split(&commit.message);
 
         // The metadata: the commit's own, or for one split from a view
@@ -794,6 +779,28 @@ impl Composer<'_> {
             ),
         };
         let whole = Objects::commit_id(&tree, &parents, &author, &committer, &headers, &message);
+
+        // A merge left with nothing of its own by what this reader may not
+        // read: its sides differ in a withheld pin, and the side that only
+        // moved it was dropped, so what is left is one parent, or an
+        // ancestor of it, with this tree. Not one that comes back as the
+        // very commit it was split from: that is a merge this reader's own
+        // history has (a pull request merged on a mirror, whose branch was
+        // an instance's with work the mirror does not ship), and dropping
+        // it would leave the mirror holding a commit `main` never shows it
+        // again, so no export could ever follow (#451).
+        if commit.parents.len() > 1
+            && !(split.is_some() && whole == expected)
+            && self.joins_withheld(all_pins, mounts, &parent_commits)?
+            && let Some(parent) = self.empty_merge(&commit.parents, &tree)?
+        {
+            let view = self.views[&parent].clone();
+            let expanded = self.expanded.get(&parent).cloned().unwrap_or_default();
+            self.expanded.insert(commit.id.clone(), expanded);
+            self.views.insert(commit.id.clone(), view);
+            return Ok(());
+        }
+
         let id = if whole == expected {
             self.objects
                 .make_commit(&tree, &parents, &author, &committer, &headers, &message)
@@ -1123,6 +1130,7 @@ pub fn view_definitions(repo: &Utf8Path, root: &str, tree: &str) -> Result<Vec<T
         newgit_made: None,
         need_history: &|_| Ok(()),
         forks_before: &[],
+        settled: &[],
     };
     Splitter::new(Objects::open(repo)?, &options).flattened(tree, Utf8Path::new("."))
 }
@@ -1402,6 +1410,15 @@ pub struct SplitOptions<'a> {
     /// records of what each fork started at): a commit that drops or changes
     /// `from` is held to them as to its parents' (`fork_problems`).
     pub forks_before: &'a [crate::tracker::EarlierFork],
+    /// Root commits whose history is the project's own: root's `main`, here
+    /// and as the remote last had it. A view commit that stands for a root
+    /// commit behind one of them is taken as it is. Any other is held to its
+    /// parents: when its root commit does not descend from the root commits
+    /// they stand for now — one of them turned out to be the remote's, where
+    /// this machine had made one of its own — it is split again, onto them
+    /// (*One commit, one root commit* in docs/design/trackers.md). Empty
+    /// takes every root commit as it is.
+    pub settled: &'a [String],
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1423,6 +1440,10 @@ struct Splitter<'a> {
     notes_loaded: bool,
     root_history: Option<HashSet<String>>,
     by_trailer: Option<HashMap<String, String>>,
+    /// Root commits no settled history has: this instance's own, so far.
+    own: HashSet<String>,
+    /// Root commits found behind a settled one.
+    behind_settled: HashSet<String>,
     view_trees: HashMap<String, String>,
     /// View commit → the blob of its canonical note; read once.
     canonical: Option<HashMap<String, String>>,
@@ -1452,24 +1473,34 @@ pub fn split(
 ) -> std::result::Result<SplitOutcome, SplitError> {
     let mut splitter = Splitter::new(Objects::open(repo)?, options);
     // What is not split yet, oldest first: every parent, not only the first.
-    let mut order: Vec<String> = Vec::new();
+    // With it, what is split into a root commit no settled history has: each
+    // is held to its parents once they are done.
+    let mut order: Vec<(String, bool)> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
-    let mut stack = vec![(tip.to_owned(), false)];
-    while let Some((current, ready)) = stack.pop() {
-        if ready {
-            order.push(current);
+    let mut stack = vec![(tip.to_owned(), None)];
+    while let Some((current, split_already)) = stack.pop() {
+        if let Some(split_already) = split_already {
+            order.push((current, split_already));
             continue;
         }
-        if !seen.insert(current.clone()) || splitter.root_of(&current)?.is_some() {
+        if !seen.insert(current.clone()) {
             continue;
         }
-        stack.push((current.clone(), true));
+        let split_already = match splitter.root_of(&current)? {
+            Some(root) if !splitter.own(&root)? => continue,
+            Some(_) => true,
+            None => false,
+        };
+        stack.push((current.clone(), Some(split_already)));
         let commit = splitter.objects.commit(&current)?;
         for parent in commit.parents.iter().rev() {
-            stack.push((parent.clone(), false));
+            stack.push((parent.clone(), None));
         }
     }
-    for view in &order {
+    for (view, split_already) in &order {
+        if *split_already && splitter.stands(view)? {
+            continue;
+        }
         let root = splitter.split_view(view)?;
         splitter.mapped.insert(view.clone(), root.clone());
         splitter
@@ -1502,6 +1533,8 @@ impl<'a> Splitter<'a> {
             notes_loaded: false,
             root_history: None,
             by_trailer: None,
+            own: HashSet::new(),
+            behind_settled: HashSet::new(),
             view_trees: HashMap::new(),
             canonical: None,
             made: Vec::new(),
@@ -1580,8 +1613,18 @@ impl<'a> Splitter<'a> {
                 .lines()
                 .map(ToOwned::to_owned)
                 .collect();
+            // Two root commits may name one view commit, when this machine
+            // split one the remote had split already: the settled one is it.
+            let mut settled: HashSet<String> = HashSet::new();
+            if !self.options.settled.is_empty() {
+                let mut args = vec!["rev-list"];
+                args.extend(self.options.settled.iter().map(String::as_str));
+                settled.extend(git(&repo, &args)?.lines().map(ToOwned::to_owned));
+            }
             let mut by_trailer = HashMap::new();
-            for commit in &commits {
+            let mut ordered: Vec<&String> = commits.iter().collect();
+            ordered.sort_by_key(|commit| (settled.contains(*commit), *commit));
+            for commit in ordered {
                 let found = self.objects.commit(commit)?;
                 if let Some(split) = parse_split(&found.message) {
                     by_trailer.insert(split.source, commit.clone());
@@ -1610,6 +1653,53 @@ impl<'a> Splitter<'a> {
             return Ok(Some(view.to_owned()));
         }
         Ok(None)
+    }
+
+    /// Whether root commit `root` is this instance's own: behind no settled
+    /// root commit. Never, when none is given.
+    fn own(&mut self, root: &str) -> Result<bool> {
+        if self.options.settled.is_empty() || self.behind_settled.contains(root) {
+            return Ok(false);
+        }
+        if self.own.contains(root) {
+            return Ok(true);
+        }
+        // One walk answers for every root commit behind this one.
+        let repo = self.objects.repo().to_path_buf();
+        let mut args = vec!["rev-list", root, "--not"];
+        args.extend(self.options.settled.iter().map(String::as_str));
+        let listed = git(&repo, &args)?;
+        if listed.trim().is_empty() {
+            self.behind_settled.insert(root.to_owned());
+            return Ok(false);
+        }
+        self.own.extend(listed.lines().map(ToOwned::to_owned));
+        Ok(true)
+    }
+
+    /// Whether the root commit `view` stands for still does: it descends
+    /// from the root commit each of `view`'s parents stands for now. One
+    /// that does not was split onto a root commit this machine made of a
+    /// parent the remote had split already; the parent is the remote's
+    /// again, and this one would carry the other lineage along with it.
+    fn stands(&mut self, view: &str) -> Result<bool> {
+        let Some(root) = self.root_of(view)? else {
+            return Ok(false);
+        };
+        let onto = self.objects.commit(&root)?.parents;
+        for parent in self.objects.commit(view)?.parents {
+            let Some(parent) = self.root_of(&parent)? else {
+                return Ok(false);
+            };
+            // The usual case first, which costs no walk.
+            if parent == root || onto.contains(&parent) {
+                continue;
+            }
+            if !self.is_ancestor(&parent, &root)? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 
     /// A view commit from before roots and mounts — `project` holds

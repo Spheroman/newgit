@@ -1975,7 +1975,8 @@ withheld tracker's mount, or adds a file a tracker outside Git owns, is
 refused. `newgit merge main` publishes what came in.
 
 On a linked project the same thing happens on the remote when the target's
-repository has the webhook (`docs/design/remote.md`, *The GitHub webhook*),
+repository has the webhook (`docs/design/remote.md`, *The GitHub webhook*; on
+`newgit serve`, `docs/design/serve.md`, decision 11, which also exports),
 and the project root takes it with `git pull`: its `origin` is the remote's
 Git endpoint, set by `newgit remote add` and, for a project linked earlier,
 the next time newgit syncs the project root.
@@ -2061,7 +2062,23 @@ that gap:
 - **Each push from a workspace exports the instance's branch** to the
   target as it sees it (the same trackers as its `main`), after the push
   itself has succeeded. A failure there is a warning in the push's output,
-  not a failed push. A force-push follows a force-push.
+  not a failed push; `newgit export <instance> --remote <target>` exports
+  the branch again as last pushed. A force-push follows a force-push, over
+  what newgit last pushed there only (below).
+- **The branch there is the target's `main` plus the instance's own
+  commits**, whichever of the two was exported first. One whose commits were
+  built on a copy of what the target's `main` holds (exported by a newgit
+  from before that held) is replaced at its next push, and the push says so.
+  Only while the target holds exactly what newgit last pushed there, by
+  newgit's own record in the project repo (never the workspace's
+  `refs/remotes/<target>/<branch>`, which a `git fetch` rewrites): a commit
+  someone else pushed there is not thrown away, and the export is refused
+  instead. Refused too when there is no record (the refusal says so: look at
+  the branch there before forcing), or when the target's trackers changed
+  since. A force-push from the workspace replaces the branch over that
+  record too, and is refused without one. A branch deleted there is pushed
+  again. `newgit export <instance> --remote <target> --force` is the one way
+  to replace the branch whatever it holds.
 - **On a newgit remote, the target is a remote in every workspace**, named
   after it, and `gh` resolves (`gh-resolved = base`) the target the
   instance's work belongs to: the one that ships a tracker the work touched.

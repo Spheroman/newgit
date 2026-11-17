@@ -109,6 +109,7 @@ fn in_its_own_process() {
         query: Default::default(),
         bearer,
         dev_login: Some("secret".to_owned()),
+        headers: Default::default(),
         origin: "http://localhost".to_owned(),
         body: body.as_bytes().to_vec(),
     };

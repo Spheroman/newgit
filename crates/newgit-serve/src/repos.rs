@@ -160,10 +160,29 @@ pub fn git_timed(
     input: Option<&[u8]>,
     limit: std::time::Duration,
 ) -> ApiResult<Output> {
+    let mut command = git_command(dir);
+    command.args(args).env("GIT_TERMINAL_PROMPT", "0");
+    run_timed(command, input, limit)?.ok_or_else(|| {
+        HttpError::new(
+            503,
+            format!(
+                "`git {}` ran longer than {} s and was stopped; nothing landed: try again",
+                args.first().copied().unwrap_or_default(),
+                limit.as_secs()
+            ),
+        )
+    })
+}
+
+/// `command` with `input` on its stdin, killed after `limit`: `None` when it
+/// was. Its output whether or not it succeeded.
+pub fn run_timed(
+    mut command: Command,
+    input: Option<&[u8]>,
+    limit: std::time::Duration,
+) -> std::io::Result<Option<Output>> {
     use std::io::Read as _;
-    let mut child = git_command(dir)
-        .args(args)
-        .env("GIT_TERMINAL_PROMPT", "0")
+    let mut child = command
         .stdin(if input.is_some() {
             Stdio::piped()
         } else {
@@ -203,14 +222,7 @@ pub fn git_timed(
         if std::time::Instant::now() >= deadline {
             let _ = child.kill();
             let _ = child.wait();
-            return Err(HttpError::new(
-                503,
-                format!(
-                    "`git {}` ran longer than {} s and was stopped; nothing landed: try again",
-                    args.first().copied().unwrap_or_default(),
-                    limit.as_secs()
-                ),
-            ));
+            return Ok(None);
         }
         std::thread::sleep(pause);
         pause = (pause * 2).min(std::time::Duration::from_millis(20));
@@ -218,11 +230,11 @@ pub fn git_timed(
     if let Some(feeding) = feeding {
         let _ = feeding.join();
     }
-    Ok(Output {
+    Ok(Some(Output {
         status,
         stdout: stdout.join().unwrap_or_default(),
         stderr: stderr.join().unwrap_or_default(),
-    })
+    }))
 }
 
 fn checked(dir: &Utf8Path, args: &[&str]) -> ApiResult<String> {
