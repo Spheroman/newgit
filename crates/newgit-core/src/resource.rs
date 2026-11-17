@@ -38,6 +38,13 @@ pub struct ResourceDefinition {
     /// cannot tell, so a change that rewrote a rendered file names the
     /// process as possibly stale. Workspace-relative, like `[[render]].path`.
     pub reads: Option<Vec<Utf8PathBuf>>,
+    /// Ignored output this resource's tools refill on their own (Rust's
+    /// `target/`, `.next/cache`): `stop --evict` drops it with the
+    /// workspace and nothing brings it back, since the build fills it again
+    /// lazily. No hook reads it. Workspace-relative, like `[identity]
+    /// produces`, and only ever covers ignored files: anything a checkpoint
+    /// holds is held all the same.
+    pub disposable: Vec<Utf8PathBuf>,
     pub actions: BTreeMap<String, ActionSpec>,
     pub checkpoint: Option<CheckpointSpec>,
     pub restore: Option<RestoreSpec>,
@@ -222,6 +229,8 @@ struct ResourceDefinitionFile {
     #[serde(default)]
     reads: Option<Vec<Utf8PathBuf>>,
     #[serde(default)]
+    disposable: Vec<Utf8PathBuf>,
+    #[serde(default)]
     actions: BTreeMap<String, ActionSpec>,
     #[serde(default)]
     checkpoint: Option<CheckpointSpec>,
@@ -257,6 +266,7 @@ impl ResourceDefinition {
             exports: file.exports,
             render: file.render,
             reads: file.reads,
+            disposable: file.disposable,
             actions: file.actions,
             checkpoint: file.checkpoint,
             restore: file.restore,
@@ -422,6 +432,9 @@ impl ResourceDefinition {
 
     fn validate(&self) -> Result<()> {
         self.check_identity_paths()?;
+        for path in &self.disposable {
+            self.check_identity_path(path, "`disposable` path")?;
+        }
         if let Some(checkpoint) = &self.checkpoint {
             match checkpoint.mode {
                 CheckpointMode::None => {}
@@ -1387,6 +1400,7 @@ mod tests {
             exports: BTreeMap::new(),
             render: Vec::new(),
             reads: None,
+            disposable: Vec::new(),
             actions: BTreeMap::new(),
             checkpoint: None,
             restore: None,

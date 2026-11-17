@@ -461,11 +461,14 @@ impl Log {
     ) -> ApiResult<Landed> {
         // What it touches, from the landing alone: no process, no lock.
         let touched = crate::rooted::touched_by(&landing);
+        let homes: Vec<String> = landing.entry.homes.keys().cloned().collect();
         let landed = self.land_waiting(app, landing, token)?;
         // Derived data, after the landing and outside every lock it held:
         // the stored rooted histories it touched are extended in the
         // background (a read before that composes what it needs itself).
         app.rooted.touched(touched);
+        // And the mirrors that may now be behind are exported, the same way.
+        app.mirrors.landed(homes);
         Ok(landed)
     }
 

@@ -16,13 +16,19 @@ struct EvictState {
     /// Resource → its install store key at eviction, for `cleanup`.
     #[serde(default)]
     installs: BTreeMap<String, String>,
+    /// What went as `disposable` (#447), for `status`.
+    #[serde(default)]
+    disposed: Vec<crate::evict::Disposed>,
 }
 
 /// What an eviction leaves behind, judged before it deletes anything.
-struct EvictPlan {
+pub(super) struct EvictPlan {
     /// Ignored paths that go with the workspace (only with
     /// `--discard-ignored`).
-    discarded: Vec<crate::evict::Discarded>,
+    pub(super) discarded: Vec<crate::evict::Discarded>,
+    /// Ignored paths a bound resource declares `disposable`, which go with
+    /// the workspace and which its build refills (#447).
+    pub(super) disposed: Vec<crate::evict::Disposed>,
     /// The files resources render, which the restore renders again.
     rendered: Vec<Utf8PathBuf>,
     /// Every path the restore does not bring back from what was saved.
@@ -63,7 +69,7 @@ fn trash_left_warning(name: &str, trash: &Utf8Path, id: &str, error: &std::io::E
 }
 
 /// `a`, `` `a` and `b` ``, or `` `a`, `b`, and 3 more ``: paths in a refusal.
-fn list_paths(paths: &[Utf8PathBuf]) -> String {
+pub(super) fn list_paths(paths: &[Utf8PathBuf]) -> String {
     const SHOWN: usize = 8;
     let quoted: Vec<String> = paths
         .iter()
@@ -230,6 +236,7 @@ impl BranchManager {
                 git,
                 files,
                 installs,
+                disposed: plan.disposed.clone(),
             })
             .map_err(|error| NewgitError::io(&state, std::io::Error::other(error)))?;
             crate::remote::write_private(&state.join("saved.json"), &text)?;
@@ -276,6 +283,7 @@ impl BranchManager {
         outcome.workspace = Some(WorkspaceChange::Evicted {
             checkpoint: id,
             discarded: plan.discarded,
+            disposed: plan.disposed,
             not_kept,
         });
         Ok(outcome)
@@ -408,12 +416,21 @@ impl BranchManager {
                 .iter()
                 .map(|discarded| Utf8PathBuf::from(discarded.to_string()))
                 .collect();
+            let example = plan
+                .discarded
+                .iter()
+                .find(|discarded| discarded.dir)
+                .unwrap_or(&plan.discarded[0])
+                .path
+                .clone();
             return Err(NewgitError::Unsupported(format!(
                 "not evicting `{name}`: {} {} ignored, owned by no tracker outside Git, and \
                  rebuilt by no resource, so no checkpoint holds {} and it would not come back. \
-                 Keep what should come back in a tracker (`newgit tracker track`), or `newgit \
-                 stop --evict --discard-ignored` evicts anyway and loses {}. Build output such \
-                 as `target/` cannot be declared disposable yet (#447)",
+                 Build output its tool refills is disposable: declare it in a resource, \
+                 `.newgit/resources/build-output.toml` holding `ownership = \"workspace\"` and \
+                 `disposable = [\"{example}\"]` (`newgit reference resource`), and a plain \
+                 `--evict` drops it. Keep what should come back in a tracker (`newgit tracker \
+                 track`), or `newgit stop --evict --discard-ignored` evicts anyway and loses {}",
                 list_paths(&named),
                 if named.len() == 1 { "is" } else { "are" },
                 if named.len() == 1 { "it" } else { "them" },
@@ -430,7 +447,7 @@ impl BranchManager {
     /// that is not rendered, and that is not newgit's own marker. A tracker
     /// in Git does not keep an ignored file: it is not committed. A tree a
     /// resource rebuilds is never walked.
-    fn evict_discards(&self, branch: &BranchInstance) -> Result<EvictPlan> {
+    pub(super) fn evict_discards(&self, branch: &BranchInstance) -> Result<EvictPlan> {
         let bound: Vec<TrackerDefinition> = self
             .all_definitions()
             .into_iter()
@@ -449,6 +466,26 @@ impl BranchManager {
             })
             .flat_map(|definition| definition.identity_produces().iter().cloned())
             .collect();
+        // A declaration, with no lifecycle: it holds for every instance the
+        // moment it is written, except one that dropped the tracker that
+        // brings it.
+        let disposable: Vec<(Utf8PathBuf, String)> = self
+            .resources
+            .iter()
+            .filter(|definition| self.resource_active(branch, &definition.name))
+            .flat_map(|definition| {
+                definition
+                    .disposable
+                    .iter()
+                    .map(|path| (path.clone(), definition.name.clone()))
+            })
+            .collect();
+        let disposable_of = |path: &Utf8Path| {
+            disposable
+                .iter()
+                .find(|(tree, _)| path.starts_with(tree))
+                .map(|(tree, resource)| (tree, resource))
+        };
         let rendered: Vec<Utf8PathBuf> = branch
             .resources
             .values()
@@ -477,7 +514,7 @@ impl BranchManager {
                 .filter(|(_, dir)| !*dir)
                 .map(|(path, _)| path.clone()),
         );
-        let lost: Vec<Utf8PathBuf> = all
+        let gone: Vec<&Utf8PathBuf> = all
             .iter()
             .filter(|path| {
                 !(marker.contains(&path.as_path())
@@ -485,15 +522,34 @@ impl BranchManager {
                     || under_rebuilt(path)
                     || crate::tracker::owner_of(&bound, path).is_some_and(|owner| !owner.git))
             })
-            .cloned()
             .collect();
+        let mut disposed: Vec<crate::evict::Disposed> = Vec::new();
+        let mut lost: Vec<Utf8PathBuf> = Vec::new();
+        for path in gone {
+            match disposable_of(path) {
+                Some((tree, resource)) => {
+                    match disposed.iter_mut().find(|disposed| &disposed.path == tree) {
+                        Some(disposed) => disposed.files += 1,
+                        None => disposed.push(crate::evict::Disposed {
+                            path: tree.clone(),
+                            resource: resource.clone(),
+                            files: 1,
+                        }),
+                    }
+                }
+                None => lost.push(path.clone()),
+            }
+        }
+        disposed.sort_by(|a, b| a.path.cmp(&b.path));
         let discarded = crate::evict::summarize(&entries, &all, &lost);
         let mut skipped: Vec<Utf8PathBuf> = rebuilt;
         skipped.extend(marker.iter().map(|path| path.to_path_buf()));
         skipped.extend(rendered.iter().cloned());
         skipped.extend(discarded.iter().map(|discarded| discarded.path.clone()));
+        skipped.extend(disposed.iter().map(|disposed| disposed.path.clone()));
         Ok(EvictPlan {
             discarded,
+            disposed,
             rendered,
             skipped,
         })
@@ -549,6 +605,17 @@ impl BranchManager {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(EvictState::default()),
             Err(source) => Err(NewgitError::io(&path, source)),
         }
+    }
+
+    /// What `branch`'s eviction dropped as `disposable` (#447), which its
+    /// build refills: for `status`. Empty unless it is evicted.
+    pub fn evicted_disposed(&self, branch: &BranchInstance) -> Vec<crate::evict::Disposed> {
+        if branch.evicted.is_none() {
+            return Vec::new();
+        }
+        self.evict_state(branch)
+            .map(|state| state.disposed)
+            .unwrap_or_default()
     }
 
     /// The install store keys an evicted instance's trees had, for
@@ -956,6 +1023,14 @@ impl BranchManager {
             }
         }
 
+        // What the restore's undo checkpointed on its way is the marker and
+        // a clone, now that it succeeded: `cleanup` collects it (#446).
+        if let Err(error) = self.mark_restore_checkpoints(&branch, checkpoint, &taken_before) {
+            warnings.push(format!(
+                "the workspace is back, but the checkpoints its restore took could not be \
+                 marked for `newgit cleanup` to collect: {error}"
+            ));
+        }
         let mut branch = self.store.find_branch(&branch.slug)?;
         branch.evicted = None;
         branch.updated_at = Utc::now();

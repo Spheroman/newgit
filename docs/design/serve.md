@@ -4,7 +4,7 @@
 every landing committed to a landing log, project state in SQLite, and the
 same API as the Worker (`remote/`), so the CLI talks to either. Tracked in
 [#344]; the stores are [#409], the landing log [#410], the server's own
-merge [#411], stored rooted histories [#412].*
+merge [#411], stored rooted histories [#412], mirrors [#414].*
 
 [#344]: https://github.com/Spheroman/newgit/issues/344
 [#409]: https://github.com/Spheroman/newgit/issues/409
@@ -12,6 +12,8 @@ merge [#411], stored rooted histories [#412].*
 [#411]: https://github.com/Spheroman/newgit/issues/411
 [#412]: https://github.com/Spheroman/newgit/issues/412
 [#440]: https://github.com/Spheroman/newgit/issues/440
+[#414]: https://github.com/Spheroman/newgit/issues/414
+[#453]: https://github.com/Spheroman/newgit/issues/453
 
 ---
 
@@ -44,11 +46,22 @@ newgit serve --data /var/lib/newgit --listen 0.0.0.0:8484 \
 newgit remote add --url https://git.example.com
 ```
 
+`--github <file>` (or `NEWGIT_SERVE_GITHUB`) says what GitHub is to this
+server (decision 11); without it there are no webhooks and no exports.
+
 TLS is for a proxy in front (Caddy, nginx), not the binary. For tests and
 trying changes locally, `--dev-login-secret` (or
 `NEWGIT_SERVE_DEV_LOGIN_SECRET`) lets a caller holding it log in as anyone
 invited, through `POST /v1/dev/login` with `x-dev-login: <secret>`.
 `crates/newgit/tests/serve.rs` runs the whole loop that way.
+
+`GET /v1/serve/status`, for an `--admin` login's token only, says what
+fails in the background rather than in a request: the landing log's tip
+and applied mark, every stuck landing and why, and every project whose
+stored rooted histories failed to extend, with the error and how many
+times in a row (`crates/newgit-serve/src/status.rs`). It names every
+project on the server, so `--admin '*'`, which `--admin` accepts as it
+accepts any login list, makes every logged-in user an admin of it.
 
 ## The shape
 
@@ -74,10 +87,13 @@ invited, through `POST /v1/dev/login` with `x-dev-login: <secret>`.
     instance/<name>.git  a private instance's forks
     tracker/<name>.git   a new tracker's seed, alone until it joins a branch
   homes/<owner>/<project>/landing/<login>/<namespace>.git
-                         a merge's objects until it lands, never served
+                         a merge's objects until it lands, never served;
+                         removed by garbage collection once nothing waits
+                         in it
   homes/<owner>/<project>/scratch/<random>.git
                          the server's merge's composed objects while it
-                         runs, never served, removed after it (and at start)
+                         runs, never served, removed after it (and at start);
+                         a mirror pull's and an export's too
   endpoint/<owner>/<project>/   the composer's stores and cached views
 ```
 
@@ -106,7 +122,15 @@ serve refuses to start on an older one.
 - **The API is the Worker's**, route for route, so the CLI does not change.
   `crates/newgit-serve/src/api.rs` mirrors `remote/src/index.ts`, and
   `policy.rs` ports `names.ts` `decide` and the definitions reader unchanged
-  in meaning.
+  in meaning. One rule is the client's own, not a port: a definition's
+  `mount` is read and checked with `newgit_core::tracker::mount_problem`,
+  which the client loads definitions with, and a landing that would leave
+  `main` defining a tracker at a mount the client refuses (absolute, `..`,
+  empty) is answered 400 with the client's own message
+  (`serve_mount_refused.rs`). What the client normalizes (`./a/`, `a//b`)
+  serve normalizes the same way. A definition on `main` from before this is
+  read as the client would (`/pkgs/a` owns nothing) and not held against a
+  landing that leaves it as it is.
 - **Real Git serves every byte.** `git upload-pack` / `receive-pack
   --stateless-rpc`, streamed; at most `--git-slots` at once.
 
@@ -213,8 +237,9 @@ Resolved loudly; each is reversible.
      one in the way refuses the landing.
    - **What a tracker held before its audience narrowed stays where it
      was.** Its refs leave the wider store, but its objects remain there
-     until gc, and under protocol v2 any reader of that store can still
-     fetch them by id through any repo in it. That content was readable by
+     until its next garbage collection (decision 12), and under protocol v2
+     any reader of that store can still fetch them by id through any repo
+     in it meanwhile. That content was readable by
      that audience already, so this keeps nothing new from anyone; to take
      back something that was public, rewrite it, do not narrow it.
    - **`has_commit` asks the store, not the namespace.** Within one audience
@@ -545,7 +570,8 @@ Resolved loudly; each is reversible.
       (`rooted_lock_wait.rs`: 300 trackers, debug build, the longest of 84
       requests made while the extension ran waited 159 ms, against 3.5 s
       before). A pass that fails or panics is logged, kept in
-      `Worker::failing`, and tried again with backoff (1 s, doubling, at
+      `Worker::failing` (which `GET /v1/serve/status` answers an admin
+      with), and tried again with backoff (1 s, doubling, at
       most 5 minutes) without waiting for another landing; the thread goes
       on (`rooted_worker_panic.rs`). A tracker that has left every list (or
       the default branch, or its store) has its stored history removed by
@@ -593,7 +619,281 @@ Resolved loudly; each is reversible.
       128 ms each is about 47 minutes in the background, serving
       meanwhile.
 
+11. **Mirrors: the webhook lands, exports follow** ([#414];
+    `crates/newgit-serve/src/mirror/`). A mirror is a GitHub repository an
+    export target names, and an audience: whoever can read it.
+    - **Configuration, read at startup, never committed:** `--github
+      <file>` (refused unless only its owner may read it), a TOML file
+      with `api` (GitHub's REST API, `https://api.github.com` by default),
+      `git` (GitHub's Git, `https://github.com/` by default: GitHub
+      Enterprise, or a test's `file:///` stand-in), and per project `[projects."<owner>/<name>"]` a `webhook_secret` and
+      an optional `token`. The Worker has one `GITHUB_WEBHOOK_SECRET` for
+      the whole remote and no GitHub credential at all (it fetches public
+      mirrors anonymously, asks GitHub's API unauthenticated, and the
+      client exports); here the secret is per project, so one project's
+      secret cannot sign another's events, and the token (a fine-grained
+      personal access token, or a GitHub App's installation token, with
+      contents read and write on the mirrors) fetches, pushes, and asks
+      the API. It reaches Git only through its environment
+      (`GIT_CONFIG_*`, after the entries the server's own environment
+      sets), never its arguments, as an `http.<url>.extraHeader` for `git`
+      alone, so Git sends it to no other host, and is cut out of any
+      message that might echo it. Minting short-lived
+      installation tokens from a GitHub App key is not built: an
+      installation token placed in the file works until it expires.
+    - **The server talks to a mirror at
+      `https://github.com/<owner>/<name>.git` and nowhere else** (under
+      `git`, when the file says), the URL made here from the repository's
+      name. A definition's `url` is whatever
+      a maintainer of `access` wrote, and the client pushes to it as written
+      with the developer's own credentials; the server never hands it to
+      Git. As written it could be an `scp`-style address (fetched with the
+      server's own SSH keys, not the project's token), a path (another
+      project's store on the same disk), or text Git takes for an option. A
+      pull also checks, when it runs, that its target still names the
+      repository and branch its signed event did: `main`'s definitions can
+      change while a pull waits, and the event vouched for that
+      repository's commits only. If not, it gives up, having fetched
+      nothing. Mirror Git reads no global or system config file
+      (`GIT_CONFIG_GLOBAL=/dev/null`, `GIT_CONFIG_NOSYSTEM`), so a
+      `url.<base>.insteadOf` or a credential helper the server's user has
+      set cannot send a fetch, or the token, elsewhere; what the
+      environment's `GIT_CONFIG_*` entries say still applies, as it does to
+      all of the server's Git (they are the operator's, per process). It
+      checks what it fetches (`fetch.fsckObjects`; a landing's
+      `index-pack --strict` again), gives up on a transfer slower than
+      1 KB/s for a minute, and is stopped after 10 minutes, a failed
+      attempt. A fetch offers the mirror only the view's commits as what
+      is here (`--negotiation-tip`, and no alternate's refs: the scratch
+      repository borrows every store, whose ids, the withheld trackers'
+      too, are not the mirror's to see, and which it lacks, so offering
+      them would fetch everything again).
+    - **The webhook** (`POST /v1/webhooks/github?project=<owner>/<name>`)
+      verifies `X-Hub-Signature-256` under the project's secret in
+      constant time, as `sha256=` and 64 lowercase hex digits, its one
+      spelling (503 with no secret, 401 unsigned or wrong), answers
+      `ping`, records a merged `pull_request`'s head under its merge
+      commit, and queues a `push` to an export target's branch (403 from a
+      repository no definition on `main` exports to, or pushed by someone
+      who is not a member able to merge root). Who pushed is the event's
+      `pusher.name`, lowercased, as the Worker reads it: a member's login
+      (*Known limits* says what is open about it). A push already queued for
+      that commit, or that delivery, is not queued twice; a delivery whose
+      pull has ended is queued again, which is how a redelivery asks
+      again. The queue is rows in SQLite, so a restart resumes it (#353).
+      The commit this server itself last exported to the target is answered
+      200 before who pushed is asked, and not queued: it was composed from
+      `main`, and GitHub names the token's owner as its pusher, which for an
+      App's token is no member's login.
+    - **A tag made on a mirror is made here** ([#453]), as the Worker does.
+      A push to `refs/tags/*` of a target rooted at root, by someone who
+      may tag (a member maintaining root, the same check as a merge), is
+      queued as a pull of its own, behind every pull queued before it: a
+      pull request merged and then tagged is on `main` when its tag is
+      looked for. A rooted target's tags name its tracker's commits, not
+      the project's, and are ignored; so is a tag deleted there, since tags
+      never move. The pull lands nothing. It fetches the tag, composes
+      `main` as the target sees it, and reads which root commit the tagged
+      commit is the view of (the note the composition writes); an annotated
+      tag keeps its tagger and message, without a signature. The tag is
+      then made by the function a tag pushed from a project root is made by
+      (`api::make_tag`), as whoever pushed it. So it ends `tagged`; or
+      `nothing` when it is there already naming that commit, which is how
+      the client's own export of a tag ends when it comes back as an event;
+      or `refused` (`tag <name>: …`) when it would move, or names a commit
+      that is not on `main` as the target sees it (it lands first, by its
+      own event; then this one is sent again). A tag's ending is kept per
+      tag, beside the branch's: it neither ends a refused pull's trouble
+      nor is ended by a pull that lands, and a refused tag stays said until
+      that tag is made. A view commit that stands for several root commits
+      (the later ones changed only what the target does not ship) names the
+      first of them, and a new tag is made there; but a tag already here
+      at a later one of them, with the same annotation (made in the project
+      root, then exported) is found there and ends `nothing`: its root
+      commit, composed as the target sees it, is the tagged commit.
+    - **A pull lands as a merge.** The pull thread composes `main` as the
+      target sees it in a scratch repository, fetches the mirror into it
+      (offering only that view), and walks what the mirror has beyond it (nothing: our own export, ends
+      `nothing`). The commits are brought in with the withheld trackers'
+      files put back from their parents (`compose::bring_in`, #401's rule
+      included), split by tracker, their new objects put in the pusher's
+      landing, and landed by `merge::begin` and `merge::finish` as the
+      pusher, from the root commit on `main` the mirror's history left:
+      a fast-forward when nothing landed since, the work re-made on what
+      did when it changed other paths, Git's merge over the composed tree
+      otherwise. So #451's first case (a branch rebuilt from `main`
+      changing `crates/newgit-serve`, which is the `serve` tracker) is the
+      server's merge, not a merge of views, and is refused only for a real
+      conflict. Each child's `main` follows, as a member's merge asks. A
+      target rooted at a tracker lands in that tracker, from the root
+      commit that pinned it where the mirror's history left it, each
+      tracker above it given one commit moving its pin: one landing.
+    - **Whose work, by content (#404, #451).** For each instance with a
+      fork of a withheld tracker holding commits `main` does not have, its
+      fork of the target's tracker is composed as the target sees it, in
+      the same composition as `main`. A commit the pull would land that
+      *is* one of those (an exported instance branch merged with a merge
+      commit), or whose pull request's head is one (a squash or rebase:
+      read from the `pull_request` event, or asked of GitHub), is refused
+      when that instance commit pins a withheld tracker at work `main`
+      does not have, naming the instance, the tracker, and both ways on.
+      Nothing is read from a branch's name, so a branch named like an
+      instance whose commits are not its lands. Commits a merge commit in
+      the walk brought in need no question; only new ids on the line of
+      first parents are asked about, at most 20 a pull. While GitHub
+      cannot answer, or lists nothing for up to two minutes, the pull
+      waits, holding nothing and spending no attempt, and `newgit status`
+      says so (#398). An instance's work not yet pushed to this server
+      cannot be seen, and a commit carrying it lands as a commit of
+      nobody's: the check is what the server holds.
+    - **Ends, said where `newgit status` reads them.** `landed`,
+      `nothing`, `refused` (with why and what to do), `gave up` (after 10
+      failed attempts, 15 s doubling to 10 minutes, or two hours; `main`
+      moving under a landing starts it again after 1 s, doubling, and
+      counts as an attempt). `/state` says a waiting pull is `stalled` when
+      the pull thread is gone or has not shown it is moving (a beat it
+      stamps between steps) for 30 minutes, three times what one mirror
+      Git command may run. What is
+      kept is per target: the last pull that settled it, and the trouble
+      since (ten said one by one). A pull that carries an earlier refused
+      pull's commits and is refused for the very same reason is refused
+      with it and said once, on the first, with how many wait on it
+      (#451's third case); those are only counted, so they never push the
+      first out of what is kept, and neither does another target's pull.
+      Refused for a reason of its own (the first's cause is over, and now
+      it conflicts), it says that reason and takes the place of the
+      refusals whose commits it carries: advice already taken is not said
+      again. Trouble stays said until the target is settled: a pull of it
+      lands, or finds the mirror's branch with nothing `main` lacks, or an
+      export reaches the mirror (so `newgit pull --remote <target>` then
+      `newgit merge main` ends it with no event). A pull settles only when
+      the mirror's branch has nothing beyond what it brought in: an old
+      delivery sent again, whose own commit is long on `main` while the
+      mirror holds a refused one, ends `nothing` and settles nothing; and a
+      refused pull sent again, as its refusal says, that lands while later
+      pulls waited on it ends its own refusal but not theirs. Each of those
+      is said on its own then, saying that what it waited on has landed
+      and how to bring the rest in, rather than dropped with the refusal
+      it was counted on.
+    - **Exports are derived data, the one thing that may be behind.** A
+      landing only counts itself for the export thread (no work in its
+      hold). The thread composes each GitHub target's view (the history
+      rooted at its declaring tracker, only the trackers it ships, a pin
+      expanded only when it is in that tracker's own history: the ids the
+      client's `newgit export` makes) and pushes it, never forced. Where
+      the target withholds nothing and ships exactly what the declaring
+      tracker's stored rooted history is composed from, that history's tip
+      is pushed (`rooted::as_of`); otherwise the view is composed per
+      export, O(history) (*Known limits*). Before every push, every commit
+      it adds is checked to hold nothing at the mount of a withheld tracker
+      while that tracker is pinned there, and nothing a tracker outside
+      Git owns (for a rooted target too, each path judged where the
+      project's view has it, under the tracker's mount; a pull from one is
+      checked the same way); failing that, nothing is pushed. A mirror with commits
+      `main` lacks is left as it is: the export waits for the pull, or
+      says how to bring them in. Failures retry with backoff; `/state`
+      says per target `up to date`, `behind` (landings since), or
+      `failing` with the reason, and `newgit status` says the last two.
+      A pull's commits were split with their originals in their trailers,
+      so they compose back to themselves: a pull then an export is a
+      fast-forward on GitHub.
+
+12. **Garbage collection is a pass `newgit serve` runs itself** (#434,
+    `crates/newgit-serve/src/maintenance.rs`): the first a grace after the
+    server starts (so a server restarted more often than every six hours
+    still collects, and what a merge began before the restart may still
+    be sent first), then every six hours (`NEWGIT_SERVE_GC_EVERY_SECONDS`;
+    `0` runs none). Stores never collect on their own: `gc.auto = 0` and
+    `receive.autogc = false` are in every store's config (written into
+    older stores at start), since a push's `gc --auto` knows nothing of
+    what merges' landings borrow. A pass:
+    - **The landing log first**, holding the leader's seat
+      (`Log::collect`): no batch's `fast-import` runs while it does, and a
+      landing that arrives waits and lands after it. `git repack -d
+      --geometric=2` rolls up the loose objects and packs the batches
+      wrote (every object of what it rolls up is kept, reachable or not)
+      and `pack-refs` compacts its refs. Nothing is ever dropped: every
+      entry, and the state at every stamp, is where it was.
+    - **Then each home.** First its merges' landings: one
+      (`landing/<login>/<namespace>.git`) with no ref left and not opened
+      by this process within the grace is renamed aside and removed, under
+      the lock opening it takes, so one opened at that moment is made
+      again whole. That is all a merge in flight needs: it writes into its
+      landing only by opening it, which makes a removed one again, and
+      what it sent is named by a landing ref, which keeps the landing.
+    - **Then each of the home's stores, one at a time, holding the home's
+      root** (`Log::hold`, so no landing there moves, copies, or places
+      anything) **and its compose lock** (no stored rooted history is being
+      extended into it: that writer skips objects a store has, so an old
+      one it reused would not be fresh). Both are let go of between stores.
+      The store is collected with `git gc`, which keeps everything any ref
+      reaches, in every namespace (trackers, forks, stored rooted
+      histories, landing refs), plus what the landings left still reach
+      through it: a landing borrows its store's objects, and a merge's base
+      may be there only. Landings are matched to the store they borrow
+      from by canonical path, read under the hold; one with a ref that
+      borrows from no store of the home refuses the home's collection (said
+      in the pass), since what it needs is not known. Each borrower's
+      `rev-list --objects --missing=allow-any <its landing refs> --not
+      --alternate-refs` is handed to `gc.recentObjectsHook`, which keeps
+      those and everything they reach; a ref on a commit whose history is
+      missing keeps what is there and stops nothing.
+    - **What a pass removes, and when.** An object goes once nothing
+      reaches it and it is older than the grace
+      (`NEWGIT_SERVE_GC_GRACE_SECONDS`, an hour): a push, a fork's start,
+      or a merge writes objects before a ref names them, outside the
+      root's lock, and Git keeps fresh ones for exactly that. Never
+      `--prune=now`, which Git runs as `repack -a` without asking the
+      hook. Stores keep reflogs (`core.logAllRefUpdates = always`), so an
+      operator can see where a ref was, but only for the grace: the pass
+      expires reflog entries older than it (`gc.reflogExpire` and
+      `gc.reflogExpireUnreachable`), so a reflog never keeps anything
+      longer than the grace does. Git's defaults (90 and 30 days) would
+      have kept a force-pushed fork's, a per-user repo's, or a replaced
+      rooted state's old commits readable by id for a month. A deleted
+      ref's reflog goes with it (reftable). So **a voided move's objects,
+      a narrowing's old history, a force push's left-behind commits, and
+      what stored rooted histories replaced (each state commit is
+      parentless) leave their stores** at the first pass at least a grace
+      after nothing reaches them: within the grace plus six hours.
+      Stored rooted histories' maps name view commits in blobs, which Git
+      does not follow, so a deleted branch's views go while the map names
+      them; one asked for again is composed again, to the same commit
+      (`rooted::Line::lookup`; `rooted_after_gc.rs`).
+    - `crates/newgit-serve/tests/gc_keeps_reachable.rs` holds a pass to
+      losing nothing reachable (a fork's commit, a landing's base only it
+      reaches, the log at every stamp) and dropping what nothing reaches;
+      `gc_edges.rs` to dropping a force push's left-behind commit, keeping
+      what a landing with missing history reaches, and matching landings
+      by canonical path; `gc_landing_reopened.rs` to a removed landing
+      reopened whole; `gc_races_no_landing.rs` holds a landing back on
+      both locks. The last pass, and what failed in it (tried again at the
+      next), is in `GET /v1/serve/status`.
+
 ## Known limits
+- **Garbage collection holds a home's landings and rooted fetches, one
+  store at a time.** A store's `git gc` runs holding its home's root and
+  its compose lock, so while a large store is collected (the 22k-repo
+  home's took 143 s) that project's landings are answered 503 after the
+  root wait, and its fetches of a rooted view (`git clone
+  https://<host>/<owner>/<project>.git`, which take the compose lock to
+  bring the stored history up to date) wait, for as long, every six hours.
+  Fetches of a tracker's own repo, pushes outside landings, and other
+  projects do not wait. Holding only what lands in that one store, or
+  repacking geometrically between full collections, would shorten it;
+  neither is done yet.
+- **Not every store is collected.** A pass visits the homes with a
+  `projects` row: stores left under `homes/` by a project gone without its
+  directory are not visited, and the per-fetch composer's stores
+  (`endpoint/<owner>/<project>/`) are never collected ([#470],
+  [#469]).
+- **A merge's objects that reuse an object no ref reaches may lose it.** A
+  server merge writes into the merger's landing outside the home's root,
+  and like the rooted extension skips objects its view already has
+  (through the store). One no ref reached, older than the grace, can be
+  collected before the merge's landing ref names what it wrote; that
+  merge then fails placing its commits (500, naming the object), and the
+  merger runs it again. Nothing landed is lost.
 - **A view for a reader who reads more than its store's audience is
   composed per fetch.** A member who may also read a private tracker
   mounted inside the view gets it composed on each fetch after a landing,
@@ -611,9 +911,36 @@ Resolved loudly; each is reversible.
   landing, flat, because it memoized by subtree and redid only the paths
   that changed; reusing the previous commit's subtrees for the children a
   landing did not touch is the fix, recorded on #440 with these numbers.
-- **What stored histories leave behind stays until gc ([#434]).** Each
-  extension writes a new state commit and map trees, and canonical notes
-  are kept for view commits a branch no longer reaches. (A tracker moving
+- **A pull composes `main` as its target sees it, whole, and an export
+  that cannot use a stored history does too.** O(history × trackers) per
+  pull and per export of a target that withholds something (newgit's own
+  `github` target withholds `t3code`). In the background, outside every
+  hold, but a long history makes mirrors slow to follow. Keeping each
+  target's composition between runs (as decision 10 does for readable
+  sets) is the fix, with #440.
+- **Who pushed to a mirror is the event's `pusher.name`, which is open.**
+  A pull lands as that login, and a tag is made as it, by the rules a
+  member with that login merges by, as the Worker does. GitHub's docs
+  describe `pusher` only as "metaproperties for Git author/committer
+  information", and `sender` as "the user who triggered the event", with
+  the warning not to assume `sender` always identifies the person who
+  caused it (it can be the `ghost` user). Neither says what either holds
+  for a push made with a deploy key (`create` and `delete` events carry a
+  `pusher_type` of `user` or `deploy key`; `push` does not). So it is not
+  settled whether `sender.login` is the better identity, or whether a
+  deploy key's push names something in `pusher.name` that could be
+  mistaken for a member's login. What holds today: the event is signed
+  with the project's secret, so only GitHub, for a repository a
+  definition exports to, can name a pusher; a name that is no member
+  able to merge root is refused (403); and anyone who can push to the
+  mirror at all already holds write on it. Settling it means delivering a
+  deploy key's push and reading the payload; if `sender.login` is then
+  the right identity, a push missing it, or whose `pusher.name` names
+  someone else, is refused.
+- **Canonical notes are kept for view commits a branch no longer
+  reaches.** Each extension writes a new state commit and map trees; what
+  they replace is collected (decision 12), but the notes ref reaches every
+  note it ever had. (A tracker moving
   to another store has its `r/<T>` and state ref removed from the old one
   with its namespace, and an extension still running there when the move
   lands writes nothing back: decision 10, *Layout*.)
@@ -668,9 +995,11 @@ Resolved loudly; each is reversible.
   like any landing, tried again at each landing on its projects and at
   each start, and putting it in place again is safe. A void and a landing
   already voided cannot be voided. **The objects copied stay in that
-  store until its garbage collection, which does not exist yet ([#434]),
-  and under protocol v2 its readers can fetch one by id: voiding a stuck
-  widening leaves its history readable by the wider audience.** Voiding
+  store until its next garbage collection after the grace (decision 12,
+  an hour by default, at most six more until the pass), and under
+  protocol v2 its readers can fetch one by id meanwhile: voiding a stuck
+  widening leaves its history readable by the wider audience until
+  then.** Voiding
   says which stamps it gave up; fixing the cause and retrying leaves
   nothing behind.
 - **A landing in place and not finished has landed, and is never
@@ -686,25 +1015,37 @@ Resolved loudly; each is reversible.
   attempt merges outside the lock, but landings on one project are held one
   at a time, and what each does while held (the recheck, re-making the
   merge on a head that moved, reading the rules again, placing its commits,
-  writing the landing) is a few hundred milliseconds of `git` in a debug
-  build. Measured with `serve_server_merge_bench.rs` (ignored by default;
-  `BENCH_MODE=<mode>`): 24 merges begun from one base, finished at once
-  from 24 threads, debug build, one M5 Pro Mac, landed per second (all 24
-  land in every mode):
+  writing the landing) is a couple of hundred milliseconds in a debug
+  build, most of it the landing's own writes (the log commit and each
+  store's ref transaction, each synced). Measured with
+  `serve_server_merge_bench.rs` (ignored by default; `BENCH_MODE=<mode>`,
+  and `BENCH_TRACKERS=<n>` for that many more trackers nobody changes): 24
+  merges begun from one base, finished at once from 24 threads, debug
+  build, one M5 Pro Mac shared with other builds (load average 10–30, so
+  each pair was run back to back), landed per second:
 
-  | mode | what each merge changes | before | after | Git merges run |
-  |------|-------------------------|--------|-------|----------------|
-  | `mixed` | a new file in `blog` or in root, alternately | 1.0 | 2.8 | 0 |
-  | `same` | a new file in `blog` | 0.9 | 2.1 | 0 |
-  | `spread` | a new file in its own tracker (27 in all) | 0.25, 8–9 answered 503 | 2.1 | 0 |
-  | `overlap` | its own line of one file in root | — | 1.0 | 185 |
+  | mode | what each merge changes | before | now | Git merges run |
+  |------|-------------------------|--------|-----|----------------|
+  | `mixed` | a new file in `blog` or in root, alternately | 1.24–1.42 | 2.9–3.9 | 0 |
+  | `same` | a new file in `blog` | 1.37 | 2.28 | 0 |
+  | `spread` | a new file in its own tracker (27 in all) | 1.03 | 2.73 | 0 |
+  | `overlap` | its own line of one file in root | 0.54, 2 answered 503 | 1.34 | about 175 |
+  | `overlap`, `BENCH_TRACKERS=24` | the same, 27 trackers | 0.32, 11 answered 503 | 0.76 | about 190 |
 
-  "Before" is the whole-branch recheck this replaced, as measured in the
-  review of #436. The three modes whose changes are apart now cost the same
-  per landing whatever the number of trackers (`mixed` is quicker because
-  half its merges move one tracker, not two). Merges whose changes overlap
-  run Git's merge again each time something lands on their paths first,
-  and composing their views is O(trackers) (#440).
+  "Before" is the build before #445 and #440 (with #449's stored rooted
+  histories), "now" is after; the median time a landing holds its project
+  went from 650–900 ms to 250–380 ms. A merge whose
+  changes are apart from what landed runs no Git merge and spawns about 27
+  `git` processes, down from 54: objects are written in process as loose
+  objects, the object format is asked once per repository, one reader per
+  repository serves a whole attempt (what changed, whether a commit is
+  there, ancestry, whether the definitions change), and its commits are
+  copied into their stores in process instead of fetched. Merges whose
+  changes overlap run Git's merge again each time something lands on their
+  paths first; each tracker commit's view is composed once per finish
+  (#440), so an attempt that runs again composes only what landed since.
+  What is left under the hold is mostly the landing's synced writes and a
+  `git update-ref` per store a merge places into.
 - **A member removed after the recheck** (between the recheck's db lock,
   where membership is read for the last time, and the landing's commit,
   which spans placing the merge's commits) is not caught: membership is a
@@ -718,26 +1059,37 @@ Resolved loudly; each is reversible.
   second parent may be behind its first: split makes one commit per
   tracker whose merged tree is neither side's, on both sides' commits.
 - **Not every `git` a merge waits on is timed.** The long-lived
-  `cat-file --batch` that reads objects in process (`Objects`: touches,
-  the re-make, composing), and the authorization's ancestry checks
-  (`merge-base --is-ancestor`), `cat-file -e`, and `diff-tree` reads run
-  without the 60 s limit. Each is a bounded read of objects the server
-  holds, so a hang means a broken repository rather than a slow merge, but
-  one would hold the merge's turn, or its roots, until it ends.
-- **Merges land at about two a second** (a debug build), though a merge
-  apart from what landed runs no Git merge: each spawns about 55 `git`
-  processes, and the re-make, the rules check, placement, and the landing
-  run one after another while the roots are held, about 400 ms a landing.
-  Issue #445 has the counts and the way to milliseconds (objects written
-  in process, the object format cached, re-made objects written straight
-  into the store).
+  `cat-file --batch` and `--batch-check` that read objects in process
+  (`Objects`, through each attempt's `Readers`: touches, ancestry, the
+  re-make, composing, placement), and the `git log` the anchor reads for a
+  tracker whose pins alone moved, run without the 60 s limit. Each is a
+  bounded read of objects the server holds, so a hang means a broken
+  repository rather than a slow merge, but one would hold the merge's turn,
+  or its roots, until it ends. An ancestry walk that goes past 512 commits
+  asks `git merge-base --is-ancestor`, also untimed, and so does every
+  ancestry question in a repository with a `shallow` file or
+  `info/grafts`, where Git reads parents other than as stored (the server
+  makes neither).
 - **A merge's finish holds its projects while it places its commits.**
   From deciding which store each new commit goes into until it has
   landed, a merge's finish holds its projects' locks, and that includes
-  copying its commits from the merger's landing into those stores. A
-  large placement therefore answers every other landing on those projects
-  503 after ten seconds, saying a merge is placing its commits. Other
-  projects, and reads, are not held.
+  copying its commits from the merger's landing into those stores. The
+  copy is in process (what the store lacks, from the commit down, synced
+  before its ref is set) up to 256 objects or 32 MiB (each object's size
+  asked before its body is read), and a `git fetch` past that. It stops
+  at each object the store has, which is sound because every writer
+  leaves a store that has an object holding everything it reaches: Git's
+  own, and newgit's, which puts each loose object in place only after
+  everything it names, so a crash part way leaves objects missing from
+  the top down and the next placement copies the rest. The copy of a
+  merge's new commit into the merger's landing goes the same way only
+  when the landing has all of the commit's parents, so nothing they alone
+  reach crosses; otherwise it is Git's pack of the commit over them. A large placement therefore answers every other landing on
+  those projects 503 after ten seconds, saying a merge is placing its
+  commits. Other projects, and reads, are not held. Placement stays under
+  the hold even for a merge's own commits: the store they go into is the
+  one the landing checked, and a barrier landing in between could narrow
+  it.
 - **`?at=<stamp>`** answers the stamp's own landing, read from one
   resolved log commit. It refuses a stamp not yet in place (409, every
   landing up to the applied mark is), a project state that shows a landing
@@ -748,7 +1100,15 @@ Resolved loudly; each is reversible.
   `core.fsyncMethod=fsync` on the log and on every store, written into a
   store made before this when the server starts, so a push, which runs
   with the store's config, gets them too; and passed on every Git command
-  the server runs), and SQLite's landing transaction (`synchronous=FULL`
+  the server runs; objects newgit writes into a store in process, a
+  merge's commits placed and a stored rooted history's, are synced when
+  the store's config would have Git sync a loose object (`core.fsync`
+  naming a component that covers them, or the older
+  `core.fsyncObjectFiles` true, read as Git reads them), and then always
+  as Git's `core.fsyncMethod=batch` syncs loose objects, each file written
+  out and one flush of the device before any is in place, whatever the
+  store's `core.fsyncMethod` says), and
+  SQLite's landing transaction (`synchronous=FULL`
   for it) are synced, in that order. On macOS a plain `fsync` leaves
   writes in the drive's cache; Git's `fsync` method flushes it
   (`F_FULLFSYNC`), and SQLite does too (`PRAGMA fullfsync`,
@@ -770,20 +1130,22 @@ Resolved loudly; each is reversible.
 - **`?at=` and startup cost grow with the log.** `?at=` resolves
   `<tip>~<n>`, which walks back `n` commits, and the first start of a data
   directory reads every entry after the applied mark; neither is indexed
-  yet, and the log is never compacted ([#434]).
+  yet. An index (stamp to log commit, beside the applied mark) would make
+  `?at=` constant ([#434]).
 - **Pushes that move no tracker's branch are not landings**: a fork's, a
   seed's, a per-user repo's, a tracker outside Git's. They move their own
   refs, in their own store, as before.
 
 [#411]: https://github.com/Spheroman/newgit/issues/411
 [#434]: https://github.com/Spheroman/newgit/issues/434
+[#469]: https://github.com/Spheroman/newgit/issues/469
+[#470]: https://github.com/Spheroman/newgit/issues/470
 
 ## Not yet
 
-- Garbage collection of the stores, of merge landings, and of the landing
-  log ([#434]).
+- An index from stamp to log commit, for `?at=` ([#434]).
 
-- The GitHub webhook (`POST /v1/webhooks/github`) and mirror pulls.
+- Minting GitHub App installation tokens (decision 11).
 - The landing page and `/install.sh`.
 - Moving newgit.dev across: copying every Artifacts repo and the Durable
   Objects' state, with a dry run; backups (Litestream for SQLite, bundles

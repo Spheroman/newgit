@@ -738,6 +738,69 @@ impl TrackerRepo {
         git(&self.git_dir, &["rev-parse", &format!("{commit}^{{tree}}")])
     }
 
+    /// The owned paths of `workspace` whose content differs from `rev`
+    /// (added, changed, or gone), `skip` aside: what a capture would record
+    /// that `rev` does not hold, found without writing anything. With no
+    /// `rev`, every owned file. A sealed rev's files are compared decrypted.
+    pub fn changed_since(
+        &self,
+        workspace: &Utf8Path,
+        definition: &TrackerDefinition,
+        rev: Option<&str>,
+        skip: &[Utf8PathBuf],
+    ) -> Result<Vec<Utf8PathBuf>> {
+        let files: Vec<(Utf8PathBuf, Utf8PathBuf)> = collect_owned_files(workspace, definition)?
+            .into_iter()
+            .filter(|(relative, _)| !skip.contains(relative))
+            .collect();
+        let (commit, mut old) = match rev {
+            Some(rev) => {
+                let commit = self.commit_for(rev)?;
+                let mut old = self.listing(&commit)?;
+                old.remove(RECIPIENTS_PATH);
+                (Some(commit), old)
+            }
+            None => (None, std::collections::BTreeMap::new()),
+        };
+        let sealed = commit.as_deref().is_some_and(|commit| self.sealed(commit));
+        let mut changed = Vec::new();
+        for (relative, absolute) in &files {
+            let Some((old_mode, old_oid)) = old.remove(relative.as_str()) else {
+                changed.push(relative.clone());
+                continue;
+            };
+            let metadata = std::fs::symlink_metadata(absolute)
+                .map_err(|source| NewgitError::io(absolute, source))?;
+            let (mode, bytes) = if metadata.is_symlink() {
+                let target = std::fs::read_link(absolute)
+                    .map_err(|source| NewgitError::io(absolute, source))?;
+                ("120000", target.to_string_lossy().into_owned().into_bytes())
+            } else {
+                let bytes =
+                    std::fs::read(absolute).map_err(|source| NewgitError::io(absolute, source))?;
+                (file_mode(&metadata), bytes)
+            };
+            let same = mode == old_mode
+                && self.plaintext(
+                    rev.unwrap_or_default(),
+                    relative.as_str(),
+                    &old_mode,
+                    &old_oid,
+                    sealed,
+                )? == bytes;
+            if !same {
+                changed.push(relative.clone());
+            }
+        }
+        changed.extend(
+            old.into_keys()
+                .map(Utf8PathBuf::from)
+                .filter(|path| !skip.contains(path)),
+        );
+        changed.sort();
+        Ok(changed)
+    }
+
     /// Commit the tracker's owned paths from `workspace`.
     pub fn capture(
         &self,

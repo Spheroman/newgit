@@ -1652,6 +1652,7 @@ dependencies = [
  "base64 0.22.1",
  "camino",
  "chrono",
+ "flate2",
  "memchr",
  "nix",
  "rayon",

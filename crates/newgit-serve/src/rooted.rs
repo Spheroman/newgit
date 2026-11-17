@@ -684,6 +684,13 @@ struct Line {
 }
 
 impl Line {
+    /// What `commit` composed to, or `None` when it is to be composed: never
+    /// composed for this set, or composed to a view commit the store no
+    /// longer has. The map names view commits in blobs (`view <id>`), which
+    /// Git does not follow, so a view only a deleted branch or tag reached
+    /// goes at the next garbage collection (`maintenance`) while its entry
+    /// stays; one composed again comes out the same commit, byte for byte.
+    /// The map is a cache, never a reason to keep anything.
     fn lookup(&mut self, objects: &mut Objects, commit: &str) -> ApiResult<Option<Composition>> {
         if let Some(found) = self.fresh.get(commit) {
             return Ok(Some(found.clone()));
@@ -694,7 +701,13 @@ impl Line {
         let Some(entry) = objects.entry_at(map, fanout(commit)).map_err(core)? else {
             return Ok(None);
         };
-        Ok(decode(&objects.blob(&entry.id).map_err(core)?))
+        let Some(found) = decode(&objects.blob(&entry.id).map_err(core)?) else {
+            return Ok(None);
+        };
+        Ok(objects
+            .has_commit(&found.view)
+            .map_err(core)?
+            .then_some(found))
     }
 
     /// Record what was composed into the map and notes trees.
@@ -982,7 +995,8 @@ fn refresh_once(
         let from_public = want.store != Store::Public && !publics.is_empty();
         for part in walk.chunks(chunk) {
             // Commits the map has already (a chunk recorded before a stop,
-            // or a branch since deleted) are not composed again.
+            // or a branch since deleted whose views are still there) are
+            // not composed again.
             let mut unknown = Vec::new();
             for commit in part {
                 let line = by_key.get_mut(key).expect("made above");

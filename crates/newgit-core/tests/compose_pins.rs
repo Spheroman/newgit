@@ -127,6 +127,7 @@ impl Repo {
                 newgit_made: None,
                 need_history: &|_| Ok(()),
                 forks_before: &[],
+                settled: &[],
             },
         )
         .unwrap_or_else(|error| panic!("split {tip}: {error}"))

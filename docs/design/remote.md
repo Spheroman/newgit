@@ -41,7 +41,11 @@ anything.
 
 > **2026-11-09:** [`newgit serve`](serve.md) answers this same API as one
 > binary, with repos on local disk and state in SQLite, and is several times
-> faster. What follows is the Worker, which still runs newgit.dev.
+> faster. What follows is the Worker, which still runs newgit.dev. Since
+> #414 `serve` also has the GitHub webhook and exports to mirrors itself,
+> differently in two ways said below (*The GitHub webhook*): whose work a
+> mirror's commit is is read from its content, and the export is the
+> server's own job, not the client's (serve.md, decision 11).
 
 Deployed at `newgit.dev`: the Worker (`remote/`, TypeScript), its Durable
 Objects, the Git endpoint's container, and Artifacts.
@@ -877,6 +881,13 @@ Undo stays as it is in v1, local only.
 ---
 
 ## The GitHub webhook
+
+> On `newgit serve` (serve.md, decision 11) the same event lands through
+> the server's own merge, with a secret per project from `--github`; whose
+> withheld work a commit carries is read from the commits themselves (each
+> instance holding such work composed as the target sees it), not from the
+> branch GitHub names, which refused three good pulls on newgit.dev (#451).
+> What follows is the Worker.
 
 A pull request merged on a mirror lands in `main` on newgit.dev by itself.
 GitHub pushes an event to `POST /v1/webhooks/github?project=<owner>/<name>`,

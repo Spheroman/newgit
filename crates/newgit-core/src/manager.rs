@@ -50,6 +50,8 @@ use crate::tracker_repo::{
 
 mod encryption;
 mod evict;
+mod remove;
+mod retention;
 pub use encryption::{Reencrypted, describe_recipients};
 mod pull;
 pub use pull::{PullOutcome, PulledTracker};
@@ -789,11 +791,15 @@ struct Reclaim {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WorkspaceChange {
     /// Checkpointed to `checkpoint`, then deleted. `discarded` is what went
-    /// with it that no checkpoint carries: ignored paths no tracker owns and
-    /// no resource rebuilds, such as `target/`.
+    /// with it that no checkpoint carries and nothing declared disposable:
+    /// ignored paths no tracker owns and no resource rebuilds (only with
+    /// `--discard-ignored`).
     Evicted {
         checkpoint: String,
         discarded: Vec<crate::evict::Discarded>,
+        /// Ignored paths a resource declares `disposable`, dropped with the
+        /// workspace for its build to refill (#447).
+        disposed: Vec<crate::evict::Disposed>,
         /// What of the workspace's `.git/` no checkpoint and no save keeps
         /// (reflogs, intent-to-add, hand-set index flags), said before the
         /// delete.
@@ -1023,21 +1029,75 @@ pub struct RemoveOutcome {
     /// How many checkpoints removal left behind instead — retained disk the
     /// caller should be told about, since nothing reaches them any more.
     pub kept_checkpoints: usize,
+    /// The checkpoint that holds the workspace removal deleted, which the
+    /// archived record names as `removed_to`: the one removal took first
+    /// (reason `remove`), or for an evicted instance the one it was evicted
+    /// to. `newgit spawn --from-checkpoint <instance>/<id>` brings it back.
+    /// `None` when there was no workspace to take, with `--purge`, or when
+    /// the checkpoint failed under `--force`.
+    pub checkpoint: Option<String>,
+    /// Ignored paths a resource declares `disposable`, deleted with the
+    /// workspace for its build to refill (#447).
+    pub disposed: Vec<crate::evict::Disposed>,
+    /// What the removal deleted that no checkpoint holds (ignored files
+    /// nothing rebuilds, Git-only state such as the stash, and with
+    /// `--purge` or a failed checkpoint under `--force`, uncommitted work),
+    /// each said for a reader.
+    pub lost: Vec<String>,
+    /// Resource state the removal left in place: its capture failed, so no
+    /// checkpoint holds it, and its `[cleanup]` did not run.
+    pub left: Vec<LeftState>,
+    /// What the checkpoint said along the way.
+    pub warnings: Vec<String>,
     /// Why the instance could not be removed from the remote, when it was on
     /// one: its fork and token outlive it until removed there.
     pub remote_warning: Option<String>,
     /// What happened to the instance's source branch in the store, and why.
     pub source_branch: SourceBranchOutcome,
     /// The workspace's HEAD when no ref in the store contained it: commits
-    /// made after the last checkpoint, deleted with the workspace. `remove`
-    /// does not checkpoint first (the workspace is disposable), but it does
-    /// say so, rather than let "nothing unique" on the branch read as
-    /// "nothing lost".
+    /// made after the last checkpoint, deleted with the workspace. Only
+    /// when no checkpoint was taken first (`--purge`, or `--force` past a
+    /// failed one), since the checkpoint takes them into the store.
     pub unsaved_workspace_head: Option<String>,
     /// Saved copies of what was at the workspace path when a restore was
     /// cut short or failed ([`BranchInstance::saved_copies`]): kept, since
     /// no checkpoint holds them.
     pub saved_copies: Vec<Utf8PathBuf>,
+}
+
+/// One resource's state a removal left where it is, because the
+/// checkpoint taken first could not capture it ([`RemoveOutcome::left`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LeftState {
+    pub resource: String,
+    /// Why its capture failed.
+    pub reason: String,
+    /// Its `[cleanup] command` as it would have run, which names where the
+    /// state is and removes it by hand. `None` when it has none to run (no
+    /// hook, or ownership newgit never tears down): nothing would have
+    /// deleted it anyway.
+    pub cleanup: Option<String>,
+}
+
+/// What [`BranchManager::remove_forced`] left of each resource in
+/// `uncaptured`, from the hooks it did not run.
+fn left_state(hooks: &[HookOutcome], uncaptured: &BTreeMap<String, String>) -> Vec<LeftState> {
+    hooks
+        .iter()
+        .filter_map(|hook| {
+            let reason = uncaptured.get(&hook.resource)?;
+            let cleanup = match &hook.detail {
+                HookDetail::SkippedUncaptured(command) => Some(command.clone()),
+                HookDetail::SkippedUnresolved { command, .. } => Some(command.clone()),
+                _ => None,
+            };
+            Some(LeftState {
+                resource: hook.resource.clone(),
+                reason: reason.clone(),
+                cleanup,
+            })
+        })
+        .collect()
 }
 
 /// What `remove` should do with the instance's source branch.
@@ -1185,6 +1245,9 @@ pub struct BranchExported {
     pub same_commits: bool,
     /// Trackers in Git this target does not ship.
     pub withheld: Vec<String>,
+    /// The branch there was replaced, not added to: what newgit last put
+    /// there was built on commits the target has under other ids.
+    pub replaced: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -1257,6 +1320,21 @@ pub struct CheckpointOutcome {
     pub left_out: Vec<String>,
     /// Resources that were not up, so not captured.
     pub degraded: Vec<String>,
+    /// Why each resource whose capture failed failed, said without
+    /// claiming the checkpoint was aborted (it went ahead without it).
+    pub capture_failures: BTreeMap<String, String>,
+}
+
+/// A resource capture's failure, as a checkpoint that went ahead without
+/// it says it: [`NewgitError::CheckpointCommandFailed`] says the checkpoint
+/// was aborted, which is true only where it refuses the checkpoint.
+fn capture_failure(error: &NewgitError) -> String {
+    match error {
+        NewgitError::CheckpointCommandFailed { code, log, .. } => {
+            format!("its checkpoint command exited with {code}; log: {log}")
+        }
+        other => other.to_string(),
+    }
 }
 
 /// A `git push` from a workspace, published: the checkpoint taken first, and
@@ -2870,8 +2948,33 @@ impl BranchManager {
                 newgit_made,
                 need_history: &|tracker| self.need_history(tracker),
                 forks_before: &self.fork_records(),
+                settled: &self.settled_roots(),
             },
         )?)
+    }
+
+    /// Root's `main` wherever this machine has it: its own, and the remote's
+    /// as last fetched and as last composed. What a split takes as the
+    /// project's history, never to be made again.
+    fn settled_roots(&self) -> Vec<String> {
+        let root = &self.root.name;
+        let listed = crate::source::run_git_env(
+            &[
+                "-C",
+                self.store.paths().project_root.as_str(),
+                "for-each-ref",
+                "--format=%(objectname)",
+                &local_tracker_ref(root, "main"),
+                &format!("refs/newgit/remote/{root}/main"),
+                ROOT_MAIN_ON_REMOTE,
+            ],
+            &[],
+        )
+        .unwrap_or_default();
+        let mut roots: Vec<String> = listed.lines().map(ToOwned::to_owned).collect();
+        roots.sort();
+        roots.dedup();
+        roots
     }
 
     /// Split instance `slug`'s commits up to `tip` into its tracker
@@ -2890,14 +2993,7 @@ impl BranchManager {
         } else {
             let branch = self.store.find_branch(slug).ok();
             if let Some(branch) = &branch {
-                // Failing leaves the split to make commits of its own, which
-                // work, but a mirror will see as new.
-                if let Err(error) = self.learn_view_from(&branch.workspace_path, tip) {
-                    eprintln!(
-                        "newgit: could not read what the remote made of `main`, so commits \
-                         exported from `{slug}` may not match a mirror's: {error}"
-                    );
-                }
+                self.learn_before_split(branch, tip);
             }
             branch.map(|branch| branch.dropped).unwrap_or_default()
         };
@@ -2911,6 +3007,21 @@ impl BranchManager {
             &branch,
         )?;
         Ok(outcome.made.len())
+    }
+
+    /// [`Self::learn_view_from`] before `branch`'s commits up to `tip` are
+    /// split. Failing leaves the split to make root commits of its own for
+    /// what the remote has split already, so a mirror sees those commits as
+    /// new, until a later split learns of the remote's and splits this
+    /// instance's again, onto them.
+    fn learn_before_split(&self, branch: &BranchInstance, tip: &str) {
+        if let Err(error) = self.learn_view_from(&branch.workspace_path, tip) {
+            eprintln!(
+                "newgit: could not read what the remote made of `main`, so commits exported \
+                 from `{}` may not match a mirror's until it can: {error}",
+                branch.slug
+            );
+        }
     }
 
     /// Refuse when any commit `rev_list` selects (in `repo`) adds or changes
@@ -3120,7 +3231,12 @@ impl BranchManager {
             return Ok(());
         };
         let main = format!("refs/remotes/{PUBLISH_REMOTE}/{PROJECT_ROOT_INSTANCE}");
-        let Ok(fetched) = crate::source::run_git_env(
+        // The remote's `main` as the workspace fetched it, and as the project
+        // root did: an instance spawned on a `main` the project root fetched
+        // and never pulled (a Claude Code worktree's fresh base) starts there,
+        // in a workspace whose own `origin/main` is the project root's branch.
+        let mut fetched: Vec<String> = Vec::new();
+        if let Ok(commit) = crate::source::run_git_env(
             &[
                 "-C",
                 workspace.as_str(),
@@ -3130,20 +3246,25 @@ impl BranchManager {
                 &main,
             ],
             &[],
-        ) else {
-            return Ok(());
-        };
-        // Not merged yet, so not in anything being split.
-        if self
-            .source
-            .rev_parse(&format!("{fetched}^{{commit}}"))
-            .is_err()
-        {
-            return Ok(());
+        ) {
+            fetched.push(commit.trim().to_owned());
         }
+        fetched.extend(self.source.rev_parse(&main).ok());
+        fetched.dedup();
         let project = self.store.paths().project_root.clone();
-        // As the workspace: a push from it may have no login behind it.
-        self.learn_view(link, Acting::Workspace(workspace), &project, tip, &fetched)
+        for fetched in &fetched {
+            // Not merged yet, so not in anything being split.
+            if self
+                .source
+                .rev_parse(&format!("{fetched}^{{commit}}"))
+                .is_err()
+            {
+                continue;
+            }
+            // As the workspace: a push from it may have no login behind it.
+            self.learn_view(link, Acting::Workspace(workspace), &project, tip, fetched)?;
+        }
+        Ok(())
     }
 
     /// Note the view commits `tip` shares with `fetched`, the remote's `main`,
@@ -3174,6 +3295,11 @@ impl BranchManager {
         // never made) recomposed all of `main` on every push, twice: once in
         // the checkpoint's sync, once in the push. The project's own record
         // says where `main` is; its trackers are fetched only to compose it.
+        //
+        // With every pin this machine has now, too: composing leaves out a
+        // pin that is not here, so a `main` composed before one of its
+        // trackers arrived noted views the remote never served, and the
+        // commits the remote did serve were split again.
         let view = "refs/newgit/views/branches/main";
         let composed = |root: &str| {
             self.source.rev_parse(ROOT_MAIN_ON_REMOTE).ok().as_deref() == Some(root)
@@ -3182,6 +3308,7 @@ impl BranchManager {
                         .ok()
                         .flatten()
                         .is_some_and(|(_, noted)| noted == root)
+                        && self.composed_with_every_pin(project, &commit, root)
                 })
         };
         let recorded = client.project(link.project.as_str())?;
@@ -3200,10 +3327,46 @@ impl BranchManager {
         if let Some(root) = list.get(&self.root.name)
             && !composed(root)
         {
+            // A tracker whose commit did not come would be left out of the
+            // view composed, which is then not the one the remote serves:
+            // said, and tried again at the next split rather than composed
+            // and taken as done.
+            let lacking: Vec<String> = list
+                .iter()
+                .filter(|(_, commit)| {
+                    self.source
+                        .rev_parse(&format!("{commit}^{{commit}}"))
+                        .is_err()
+                })
+                .map(|(tracker, commit)| {
+                    format!(
+                        "`{}` at {}",
+                        crate::tracker::tracker_path(tracker),
+                        &commit[..commit.len().min(12)]
+                    )
+                })
+                .collect();
+            if !lacking.is_empty() {
+                return Err(NewgitError::Unsupported(format!(
+                    "the remote's `main` pins {}, which its repo did not send",
+                    lacking.join(", ")
+                )));
+            }
             self.compose_here(view, root)?;
             self.source.update_ref(ROOT_MAIN_ON_REMOTE, root)?;
         }
         Ok(())
+    }
+
+    /// Whether `view`, composed from root commit `root`, holds what `root`
+    /// composes to with every pin this machine has now.
+    fn composed_with_every_pin(&self, project: &Utf8Path, view: &str, root: &str) -> bool {
+        let trees = || -> Result<(String, String)> {
+            let mut objects = crate::objects::Objects::open(project)?;
+            let composed = objects.commit(view)?.tree;
+            Ok((composed, crate::compose::view_tree(&mut objects, root)?))
+        };
+        trees().is_ok_and(|(composed, now)| composed == now)
     }
 
     /// On a linked project, make the project root's `origin` the remote's
@@ -4009,6 +4172,11 @@ impl BranchManager {
             false,
         )?;
         let mut branch = spawned.branch.clone();
+        // `spawn_inner` released the slug's lock; take it again before the
+        // record lands, so `newgit cleanup` never sees the ref without its
+        // record (an orphan it would delete) or the record before the undo
+        // stamps what it restored. Re-entrant: the undo takes it too.
+        let _lock = self.lock_instance(&branch.slug, &branch.name)?;
         // Its tracker branches start where the checkpoint's committed work is.
         self.land_tracker_branches(
             trackers
@@ -4022,6 +4190,7 @@ impl BranchManager {
         let log = self.checkpoint_log(&branch);
         record.id = log.next_id()?;
         record.branch = branch.name.clone();
+        record.instance = Some(branch.id.clone());
         // Taken on the new instance's own branch, which `spawn_inner` made at
         // the checkpoint's head. The branch the author's workspace was on, or
         // its detached HEAD, is the author's: the undo below would put this
@@ -8149,7 +8318,8 @@ impl BranchManager {
 
     /// [`Self::remove`]; `force` also deletes what was written at an
     /// evicted instance's workspace path since, which no checkpoint holds
-    /// and which `remove` otherwise refuses to delete.
+    /// and which `remove` otherwise refuses to delete, and removes the
+    /// instance when the checkpoint taken first fails.
     pub fn remove_forced(
         &self,
         name: &str,
@@ -8158,7 +8328,7 @@ impl BranchManager {
         source_branch: SourceBranchPolicy,
         force: bool,
     ) -> Result<RemoveOutcome> {
-        let (_lock, branch) = self.locked_branch(name)?;
+        let (_lock, mut branch) = self.locked_branch(name)?;
 
         if cwd.starts_with(&branch.workspace_path) {
             return Err(NewgitError::Unsupported(format!(
@@ -8206,7 +8376,15 @@ impl BranchManager {
         // Whatever would make the cleanup hooks refuse refuses here, before
         // anything is stopped or deleted: a dry run checks each hook and runs
         // none.
-        self.run_cleanup_hooks(&branch, true)?;
+        self.run_cleanup_hooks(&branch, true, &BTreeMap::new())?;
+
+        // Before anything is stopped: a checkpoint of everything a
+        // checkpoint holds, with what is running still running, so that
+        // removing never deletes work no checkpoint holds. It takes the
+        // workspace's commits into the store, so the branch decision below
+        // sees them.
+        let keeping = checkpoints == ArchivedCheckpoints::Keep;
+        let keep = self.checkpoint_before_remove(&mut branch, keeping, force)?;
 
         let policy = source_branch;
         let (mut source_branch, via_outbox) = self.decide_source_branch(&branch, policy)?;
@@ -8218,7 +8396,11 @@ impl BranchManager {
             supervisor.stop(&definition.name, &definition.stop_signal())?;
         }
 
-        let hooks = self.run_cleanup_hooks(&branch, false)?;
+        // Never the cleanup of a resource the checkpoint could not capture:
+        // its state is in no checkpoint, and its `[cleanup]` (a `dropdb`)
+        // would delete it. It stays where it is, and the outcome says so.
+        let hooks = self.run_cleanup_hooks(&branch, false, &keep.uncaptured)?;
+        let left = left_state(&hooks, &keep.uncaptured);
 
         let state_dir = self.store.instance_state_dir(&branch.slug);
         if state_dir.exists() {
@@ -8266,11 +8448,28 @@ impl BranchManager {
                 &format!("instances/{}", branch.slug),
             ));
         }
+        // And newgit's record of what it last pushed of its branch to each
+        // export target: an instance spawned again under the name is another
+        // instance, and may not replace what this one left there.
+        let pushed = format!("pushed-branches/{}", branch.slug);
+        for name in self.source.refs_under(EXPORTS_REFS)? {
+            let ours = name
+                .strip_prefix(EXPORTS_REFS)
+                .and_then(|rest| rest.split_once('/'))
+                .is_some_and(|(_, rest)| rest == pushed);
+            if ours {
+                let _ = self.source.delete_ref(&name);
+            }
+        }
+        if let Some(id) = &keep.checkpoint {
+            branch.removed_to = Some(id.clone());
+            branch.updated_at = Utc::now();
+            self.store.save_branch_record(&branch)?;
+        }
         let archived_record = self.store.archive_branch_record(&branch)?;
         // Either way, count what the instance leaves behind: checkpoints kept
         // for an unreachable instance are disk nobody will reclaim by accident.
-        let keeping = checkpoints == ArchivedCheckpoints::Keep;
-        let found = self.purge_checkpoints(&branch.slug, keeping)?;
+        let found = self.purge_checkpoints(&branch.slug, Some(&branch.id), keeping)?;
         let (purged_checkpoints, kept_checkpoints) = match (keeping, found) {
             (true, found) => (None, found.map_or(0, |plan| plan.checkpoints)),
             (false, purged) => (purged, 0),
@@ -8295,6 +8494,11 @@ impl BranchManager {
             hooks,
             purged_checkpoints,
             kept_checkpoints,
+            checkpoint: keep.checkpoint,
+            disposed: keep.disposed,
+            lost: keep.lost,
+            left,
+            warnings: keep.warnings,
             remote_warning,
             source_branch,
             unsaved_workspace_head,
@@ -8510,7 +8714,14 @@ impl BranchManager {
         })
     }
 
-    /// Drop one instance's checkpoint log and the store refs it held.
+    /// Drop a name's checkpoint log and the store refs it held: all of it
+    /// (`cleanup --purge-archived`, for a name no live instance has), or
+    /// with `instance`, only the checkpoints that instance took
+    /// ([`CheckpointRecord::instance`]) — `remove --purge`, which must not
+    /// reach the checkpoints of an earlier instance spawned under the same
+    /// name. Even then, never one another archived record names
+    /// (`removed_to`, `evicted`): that is where an earlier instance's work
+    /// was kept.
     ///
     /// This is the only operation that can break an undo, so nothing calls it
     /// implicitly: a checkpoint is what `newgit undo` restores, and the lane
@@ -8518,28 +8729,81 @@ impl BranchManager {
     /// record is archived the undo is unreachable anyway — but "unreachable"
     /// is still the user's call to make, not a garbage collector's.
     ///
-    /// Returns `None` when the instance has no checkpoints at all.
-    fn purge_checkpoints(&self, slug: &str, dry_run: bool) -> Result<Option<PurgedCheckpoints>> {
+    /// Returns `None` when there are no checkpoints to purge.
+    fn purge_checkpoints(
+        &self,
+        slug: &str,
+        instance: Option<&str>,
+        dry_run: bool,
+    ) -> Result<Option<PurgedCheckpoints>> {
         let dir = self.store.checkpoint_dir(slug);
         if !dir.is_dir() {
             return Ok(None);
         }
-        let checkpoints = CheckpointLog::new(dir.clone(), slug).list()?.len();
-        let refs = self
-            .source
-            .refs_under(&format!("refs/newgit/checkpoints/{slug}"))?;
-
-        if !dry_run {
-            for name in &refs {
-                self.source.delete_ref(name)?;
+        let log = CheckpointLog::new(dir.clone(), slug);
+        let Some(instance) = instance else {
+            let checkpoints = log.list()?.len();
+            let refs = self
+                .source
+                .refs_under(&format!("refs/newgit/checkpoints/{slug}"))?;
+            if !dry_run {
+                for name in &refs {
+                    self.source.delete_ref(name)?;
+                }
+                std::fs::remove_dir_all(&dir).map_err(|source| NewgitError::io(&dir, source))?;
             }
+            return Ok(Some(PurgedCheckpoints {
+                slug: slug.to_owned(),
+                checkpoints,
+                source_refs: refs.len(),
+                dir,
+            }));
+        };
+        // What other instances' archived records name. One that cannot be
+        // read could name anything, so nothing of this name is purged.
+        let mut named = BTreeSet::new();
+        for (archived_slug, record) in self.store.archived_branches()? {
+            match record {
+                Ok(record) if record.slug == slug && record.id != instance => {
+                    named.extend(record.removed_to);
+                    named.extend(record.evicted);
+                }
+                Ok(_) => {}
+                Err(_) if archived_slug == slug => return Ok(None),
+                Err(_) => {}
+            }
+        }
+        let records = log.list()?;
+        let ours: Vec<&CheckpointRecord> = records
+            .iter()
+            .filter(|record| record.instance.as_deref() == Some(instance))
+            .filter(|record| !named.contains(&record.id))
+            .collect();
+        if ours.is_empty() {
+            return Ok(None);
+        }
+        let mut source_refs = 0;
+        for record in &ours {
+            let held = self.source.ref_rev(&record.source.store_ref).is_some();
+            if held {
+                source_refs += 1;
+            }
+            if !dry_run {
+                if held {
+                    self.source.delete_ref(&record.source.store_ref)?;
+                }
+                log.delete(&record.id)?;
+            }
+        }
+        if !dry_run && ours.len() == records.len() {
+            // Nothing of the name's history left: the log goes too, as the
+            // whole-name purge does.
             std::fs::remove_dir_all(&dir).map_err(|source| NewgitError::io(&dir, source))?;
         }
-
         Ok(Some(PurgedCheckpoints {
             slug: slug.to_owned(),
-            checkpoints,
-            source_refs: refs.len(),
+            checkpoints: ours.len(),
+            source_refs,
             dir,
         }))
     }
@@ -8556,10 +8820,15 @@ impl BranchManager {
     /// A binding a tracker drop parked counts too, unless the drop already
     /// ran its `[cleanup]` (#254): it was this instance's, and nothing else
     /// will ever tear it down.
+    ///
+    /// The resources in `uncaptured` (a capture that failed) are not torn
+    /// down: their hook is rendered, not run, and named
+    /// [`HookDetail::SkippedUncaptured`].
     fn run_cleanup_hooks(
         &self,
         branch: &BranchInstance,
         dry_run: bool,
+        uncaptured: &BTreeMap<String, String>,
     ) -> Result<Vec<HookOutcome>> {
         let mut outcomes = Vec::new();
         for name in self.graph.lifecycle_order.iter().rev() {
@@ -8569,7 +8838,13 @@ impl BranchManager {
                 _ => continue,
             };
             let definition = self.resource_definition(name)?;
-            outcomes.push(self.run_cleanup_hook(branch, definition, binding, dry_run)?);
+            let skip = uncaptured.contains_key(name);
+            let mut outcome =
+                self.run_cleanup_hook(branch, definition, binding, dry_run || skip)?;
+            if skip && let HookDetail::WouldRun(command) = outcome.detail {
+                outcome.detail = HookDetail::SkippedUncaptured(command);
+            }
+            outcomes.push(outcome);
         }
         Ok(outcomes)
     }
@@ -8768,7 +9043,7 @@ impl BranchManager {
                 Err(error) => return Err(error),
             };
             let branch = &branch;
-            let hooks = self.run_cleanup_hooks(branch, dry_run)?;
+            let hooks = self.run_cleanup_hooks(branch, dry_run, &BTreeMap::new())?;
             let archived_record = if dry_run {
                 None
             } else {
@@ -8856,15 +9131,28 @@ impl BranchManager {
                 if live_slugs.contains(slug.as_str()) {
                     continue;
                 }
-                if let Some(purged) = self.purge_checkpoints(&slug, dry_run)? {
+                if let Some(purged) = self.purge_checkpoints(&slug, None, dry_run)? {
                     outcome.purged_checkpoints.push(purged);
                 }
             }
         }
 
+        // Retention (#446): evict checkpoints a later eviction superseded,
+        // and what a restore that succeeded took on its way. Collected
+        // before the lane roots are read, so the revs only they held go too.
+        let (superseded, orphans) = self.superseded_checkpoints(&surviving, archived)?;
+        let (collected, collected_bytes) =
+            self.collect_checkpoints(&superseded, &orphans, dry_run)?;
+        let skipped: BTreeSet<(String, String)> = collected
+            .iter()
+            .map(|collected| (collected.slug.clone(), collected.id.clone()))
+            .collect();
+        outcome.collected_checkpoints = collected;
+        outcome.collected_bytes = collected_bytes;
+
         // Lane pruning. Roots come from the records that survive this pass,
         // so a dry run reports exactly what a real run would remove.
-        let roots = SnapshotRoots::collect(&self.store, &surviving, archived)?;
+        let roots = SnapshotRoots::collect_except(&self.store, &surviving, archived, &skipped)?;
         let lanes = self.store.paths().tracker_store.clone();
         for lane_rev in pinned_revs(&lanes)? {
             if roots.contains(&lane_rev.tracker, &lane_rev.rev) {
@@ -9195,7 +9483,12 @@ impl BranchManager {
 
         let url = target.push_url();
         if !options.dry_run {
-            self.push_export(&target, &view.tip, &target.branch, options.force)
+            let how = if options.force {
+                PushExport::Force
+            } else {
+                PushExport::Onto
+            };
+            self.push_export(&target, &view.tip, &target.branch, how)
                 .map_err(|error| match error {
                     NewgitError::SourceCommand { stderr, .. } if rejected(&stderr) => {
                         NewgitError::Unsupported(format!(
@@ -9479,6 +9772,7 @@ impl BranchManager {
                 newgit_made: None,
                 need_history: &|tracker| self.need_history(tracker),
                 forks_before: &self.fork_records(),
+                settled: &[],
             },
         )?)
     }
@@ -9972,22 +10266,119 @@ impl BranchManager {
         target: &ExportTarget,
         tip: &str,
         branch: &str,
-        force: bool,
+        how: PushExport<'_>,
     ) -> Result<()> {
-        let refspec = format!("{}{tip}:refs/heads/{branch}", if force { "+" } else { "" });
-        crate::source::run_git_env(
+        let refspec = format!(
+            "{}{tip}:refs/heads/{branch}",
+            if matches!(how, PushExport::Force) {
+                "+"
+            } else {
+                ""
+            }
+        );
+        let lease = match how {
+            PushExport::Replacing(held) => {
+                Some(format!("--force-with-lease=refs/heads/{branch}:{held}"))
+            }
+            _ => None,
+        };
+        let url = target.push_url();
+        let mut args = vec![
+            "-C",
+            self.store.paths().project_root.as_str(),
+            "push",
+            "--quiet",
+            "--no-verify",
+        ];
+        args.extend(lease.as_deref());
+        args.extend([url.as_str(), refspec.as_str()]);
+        crate::source::run_git_env(&args, &[]).map(|_| ())
+    }
+
+    /// [`Self::push_export`] of an instance's branch, and whether it
+    /// replaced what was there. A lease fails when the target no longer has
+    /// the branch at all (a pull request closed with its branch deleted): it
+    /// is then pushed as new, which fails in turn if someone made it again
+    /// meanwhile. A push the target refused is [`branch_refused`], which
+    /// `recorded` (newgit has a record of its last push there) words.
+    fn push_branch_export(
+        &self,
+        target: &ExportTarget,
+        tip: &str,
+        branch: &BranchInstance,
+        how: PushExport<'_>,
+        recorded: bool,
+    ) -> Result<bool> {
+        let name = branch.source_ref.as_str();
+        let refused = |unchecked: Option<String>| {
+            branch_refused(branch, &target.name, recorded, unchecked.as_deref())
+        };
+        match self.push_export(target, tip, name, how) {
+            Ok(()) => return Ok(matches!(how, PushExport::Replacing(_))),
+            Err(error) if !is_rejected(&error) => return Err(error),
+            Err(_) if !matches!(how, PushExport::Replacing(_)) => return Err(refused(None)),
+            Err(_) => {}
+        }
+        let head = format!("refs/heads/{name}");
+        let listed = match crate::source::run_git_env(
             &[
                 "-C",
                 self.store.paths().project_root.as_str(),
-                "push",
-                "--quiet",
-                "--no-verify",
+                "ls-remote",
+                "--",
                 &target.push_url(),
-                &refspec,
+                &head,
             ],
             &[],
-        )
-        .map(|_| ())
+        ) {
+            Ok(listed) => listed,
+            Err(error) => return Err(refused(Some(error.to_string()))),
+        };
+        if listed
+            .lines()
+            .any(|line| line.split_once('\t').is_some_and(|(_, name)| name == head))
+        {
+            return Err(refused(None));
+        }
+        match self.push_export(target, tip, name, PushExport::Onto) {
+            Ok(()) => Ok(false),
+            Err(error) if is_rejected(&error) => Err(refused(None)),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Refuse to replace `recorded`, what newgit last put on `target` for
+    /// `branch`, when composing its root commit for `target` now gives
+    /// another commit: the target's tracker set changed, so every commit of
+    /// the branch there would change with it, and `main`'s export needs
+    /// `--force` for that. Refused too when that cannot be told.
+    fn refuse_recomposed(
+        &self,
+        target: &ExportTarget,
+        branch: &BranchInstance,
+        recorded: &str,
+    ) -> Result<()> {
+        let project = self.store.paths().project_root.clone();
+        // One per instance: two instances may heal on one target at once.
+        let scratch = format!("replacing/{}", branch.slug);
+        let again = crate::compose::read_root(&project, recorded)?
+            .filter(|(tracker, _)| tracker == target.declared_by())
+            .map(|(tracker, root)| {
+                let composed =
+                    self.compose_export(target, &BTreeMap::from([(tracker, root)]), &scratch);
+                let _ = self.source.delete_ref(&export_ref(&target.name, &scratch));
+                composed
+            })
+            .transpose()?;
+        if again.is_some_and(|(_, view)| view.tip == recorded) {
+            return Ok(());
+        }
+        Err(NewgitError::Unsupported(format!(
+            "`{}` on `{}` no longer descends from what newgit last put there, and its \
+             trackers are not the ones that composed that, so every commit there would change. \
+             It was left as it is: `newgit export {} --remote {} --force` replaces it",
+            branch.source_ref, target.name, branch.name, target.name
+        )))
     }
 
     /// After a push from instance `branch` reached its remote: its branch,
@@ -9996,11 +10387,24 @@ impl BranchManager {
     /// the commit the target now really holds, so `gh` can tell whether the
     /// agent's `HEAD` is on it. A failure is reported per target; the push
     /// itself already succeeded.
+    ///
+    /// When what goes there now does not descend from what newgit last put
+    /// there (`refs/newgit/exports/<target>/pushed-branches/<slug>`, written
+    /// only once a push succeeded) — the instance's commits were split again,
+    /// onto the root commits the remote made (*One commit, one root commit*) —
+    /// the branch is replaced, with that record as the lease: only while the
+    /// target still holds exactly it, so a commit anyone else pushed there is
+    /// never thrown away. Not when the target's tracker set changed since,
+    /// which `--force` is for, as it is for `main`. A branch the target no
+    /// longer has is pushed again. A force-push from the workspace replaces
+    /// it over the record too, whatever composes there, and never without
+    /// one: only [`BranchOver::Force`] replaces it whatever it holds.
     fn export_instance(
         &self,
         branch: &BranchInstance,
         head: &str,
-        forced: bool,
+        over: BranchOver,
+        split: Option<BTreeMap<String, String>>,
     ) -> Vec<BranchExport> {
         let targets = match self.export_targets() {
             Ok(targets) => targets,
@@ -10016,11 +10420,14 @@ impl BranchManager {
             }
         };
         let routing = self.route_branch(branch, &targets);
-        let mut list = BTreeMap::new();
+        // What `head` was split into when the caller says, the instance's
+        // tracker branches otherwise.
+        let from_branches = split.is_none();
+        let mut list = split.unwrap_or_default();
         for definition in self
             .carved_definitions()
             .into_iter()
-            .filter(|_| !routing.exporting.is_empty())
+            .filter(|_| from_branches && !routing.exporting.is_empty())
         {
             let commit = [format!("instances/{}", branch.slug), "main".to_owned()]
                 .iter()
@@ -10038,9 +10445,40 @@ impl BranchManager {
             .iter()
             .map(|target| {
                 let result = (|| {
+                    // What newgit last put there, by its own record. Never
+                    // what a fetch of the target says it holds: that is
+                    // anyone's, and a lease on it protects nothing.
+                    let pushed_ref = pushed_branch_ref(&target.name, &branch.slug);
+                    let recorded = self.source.rev_parse(&pushed_ref).ok();
                     let (trackers, view) =
                         self.compose_export(target, &list, &format!("instances/{}", branch.slug))?;
-                    self.push_export(target, &view.tip, &branch.source_ref, forced)?;
+                    let behind = match &recorded {
+                        Some(recorded) => {
+                            *recorded != view.tip
+                                && !self.source.is_ancestor(recorded, &view.tip)?
+                        }
+                        None => false,
+                    };
+                    let how = match (over, recorded.as_deref()) {
+                        (BranchOver::Force, _) => PushExport::Force,
+                        (_, Some(recorded)) if behind => {
+                            // A force-push here rewrote the branch on purpose,
+                            // so a changed tracker set changes it too.
+                            if over == BranchOver::Push {
+                                self.refuse_recomposed(target, branch, recorded)?;
+                            }
+                            PushExport::Replacing(recorded)
+                        }
+                        _ => PushExport::Onto,
+                    };
+                    let replaced = self.push_branch_export(
+                        target,
+                        &view.tip,
+                        branch,
+                        how,
+                        recorded.is_some(),
+                    )?;
+                    self.source.update_ref(&pushed_ref, &view.tip)?;
                     crate::source::run_git_env(
                         &[
                             "-C",
@@ -10059,6 +10497,7 @@ impl BranchManager {
                         &[],
                     )?;
                     Ok::<_, NewgitError>(BranchExported {
+                        replaced,
                         same_commits: view.tip == head,
                         withheld: trackers
                             .into_iter()
@@ -10073,14 +10512,7 @@ impl BranchManager {
                     repo: target.url.clone(),
                     gh_resolved: routing.resolved == Some(target.name.as_str()),
                     branch: branch.source_ref.clone(),
-                    result: result.map_err(|error| match error {
-                        NewgitError::SourceCommand { stderr, .. } if rejected(&stderr) => format!(
-                            "`{}` there has commits this branch does not descend from (someone \
-                             pushed to it directly?), so it was left as it is",
-                            branch.source_ref
-                        ),
-                        other => other.to_string(),
-                    }),
+                    result: result.map_err(|error| error.to_string()),
                 }
             })
             .collect();
@@ -10090,6 +10522,84 @@ impl BranchManager {
             let _ = self.point_gh(branch, &targets, routing.resolved);
         }
         exports
+    }
+
+    /// Export instance `instance`'s branch to target `name` again, as its
+    /// `git push` does once the push has reached the remote: the branch as
+    /// last pushed, not whatever the workspace has since, because a mirror
+    /// holds what `git push` sent. For an export that failed, and for a branch
+    /// whose commits there were built on a copy of what the target's `main`
+    /// already has (*One commit, one root commit*), whose tracker branches
+    /// here heal with it. Nothing in the workspace moves but its record of
+    /// what the target holds. `force` replaces whatever the target's branch
+    /// holds, as `main`'s `--force` does.
+    pub fn export_branch_to_remote(
+        &self,
+        instance: &str,
+        name: &str,
+        force: bool,
+    ) -> Result<BranchExport> {
+        self.refuse_unlinked()?;
+        self.require_resolvable_graph()?;
+        let (_lock, branch) = self.locked_branch(instance)?;
+        let target = self.export_target(name)?;
+        if !target.branches {
+            return Err(NewgitError::Unsupported(format!(
+                "`{name}` takes no branches, only `main` (`newgit export --remote {name}`): \
+                 `branches = true` in the `export` that declares it sends each instance's \
+                 branch there too"
+            )));
+        }
+        let outbox = self.outbox();
+        let pushed = crate::source::run_git_env(
+            &[
+                "-C",
+                outbox.as_str(),
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                &format!("refs/heads/{}^{{commit}}", branch.source_ref),
+            ],
+            &[],
+        )
+        .map(|pushed| pushed.trim().to_owned())
+        .map_err(|_| {
+            NewgitError::Unsupported(format!(
+                "`{}` has not been pushed yet, so there is nothing of it to export: `git push \
+                 origin {}` in its workspace pushes and exports it",
+                branch.name, branch.source_ref
+            ))
+        })?;
+        self.prepare_projection()?;
+        // The instance's own tracker branches first, split again where they
+        // stand (its last checkpoint, which may be ahead of the push), so they
+        // heal as the branch there does, and a merge of it brings no copy.
+        let root_ref = local_tracker_ref(&self.root.name, &format!("instances/{}", branch.slug));
+        let standing = self.source.rev_parse(&root_ref).ok().and_then(|root| {
+            let mut objects =
+                crate::objects::Objects::open(&self.store.paths().project_root).ok()?;
+            crate::compose::parse_split(&objects.commit(&root).ok()?.message)
+                .map(|split| split.source)
+        });
+        if let Some(standing) = standing {
+            self.split_instance(&branch.slug, &standing)?;
+        }
+        self.learn_before_split(&branch, &pushed);
+        let split = self.split_view(&pushed, &branch.dropped)?.index;
+        let over = if force {
+            BranchOver::Force
+        } else {
+            BranchOver::Push
+        };
+        self.export_instance(&branch, &pushed, over, Some(split))
+            .into_iter()
+            .find(|export| export.target == name)
+            .ok_or_else(|| {
+                NewgitError::Unsupported(format!(
+                    "`{}` holds nothing `{name}` ships, so it is not exported there",
+                    branch.source_ref
+                ))
+            })
     }
 
     /// Record one coherent snapshot across source, trackers, and resources.
@@ -10660,7 +11170,12 @@ impl BranchManager {
             Some((old, new)) => {
                 let forced =
                     old.is_some_and(|old| !self.source.is_ancestor(old, new).unwrap_or(true));
-                self.export_instance(&branch, new, forced)
+                let over = if forced {
+                    BranchOver::ForcePush
+                } else {
+                    BranchOver::Push
+                };
+                self.export_instance(&branch, new, over, None)
             }
             None => Vec::new(),
         };
@@ -10838,6 +11353,31 @@ impl BranchManager {
         message: Option<&str>,
         reason: CheckpointReason,
     ) -> Result<CheckpointOutcome> {
+        // A checkpoint writes its store ref before its record. One that
+        // fails between the two leaves a ref no record names, holding the
+        // workspace's objects: deleted here, so a retry does not pile them up.
+        let log = self.checkpoint_log(branch);
+        let id = log.next_id()?;
+        let taken = self.take_checkpoint(branch, message, reason);
+        if taken.is_err() {
+            let store_ref = format!("refs/newgit/checkpoints/{}/{id}", branch.slug);
+            let recorded = log
+                .list()
+                .map(|records| records.iter().any(|record| record.id == id))
+                .unwrap_or(true);
+            if !recorded && self.source.ref_rev(&store_ref).is_some() {
+                let _ = self.source.delete_ref(&store_ref);
+            }
+        }
+        taken
+    }
+
+    fn take_checkpoint(
+        &self,
+        branch: &mut BranchInstance,
+        message: Option<&str>,
+        reason: CheckpointReason,
+    ) -> Result<CheckpointOutcome> {
         debug_assert!(
             self.held_lock(&branch.slug).is_some(),
             "a checkpoint is taken under the instance's lock"
@@ -10921,6 +11461,7 @@ impl BranchManager {
         // that reads an export is not a claim about capture order (#43).
         let mut resource_states = Vec::new();
         let mut degraded = Vec::new();
+        let mut capture_failures = BTreeMap::new();
         let mut deposits: Vec<(String, String)> = Vec::new();
         for name in self.graph.lifecycle_order.iter().rev() {
             let Some(binding) = branch.resources.get(name) else {
@@ -10953,15 +11494,26 @@ impl BranchManager {
                 ));
                 degraded.push(name.clone());
                 CapturedResource::none()
-            } else if binding.status != ResourceStatus::Ready {
+            } else if binding.status != ResourceStatus::Ready || reason == CheckpointReason::Remove
+            {
+                // And the one `remove` takes: an unattended removal must not
+                // be refused by a database that is down. What it cannot
+                // capture is named as lost instead.
                 match self.checkpoint_resource(branch, definition, "checkpoint") {
                     Ok(captured) => captured,
                     Err(error) => {
-                        warnings.push(format!(
-                            "resource `{name}` is not up and its capture failed ({error}), so \
-                             this checkpoint is degraded — undoing to it leaves `{name}` as it is"
-                        ));
+                        let why = capture_failure(&error);
+                        // `remove` says it itself, with what it did about
+                        // the state (`RemoveOutcome::left`).
+                        if reason != CheckpointReason::Remove {
+                            warnings.push(format!(
+                                "resource `{name}` is not up and its capture failed ({why}), \
+                                 so this checkpoint is degraded — undoing to it leaves `{name}` \
+                                 as it is"
+                            ));
+                        }
                         degraded.push(name.clone());
+                        capture_failures.insert(name.clone(), why);
                         CapturedResource::none()
                     }
                 }
@@ -11044,7 +11596,13 @@ impl BranchManager {
             // (#338). Without the remote it stays as it is, and the sync,
             // which checks again, does not send it.
             let content_rev = match content_rev {
-                Some(rev) if definition.encrypted_to_audience() && self.remote.is_some() => {
+                // Not for `remove`'s checkpoint, which is never synced: a
+                // removal never waits on the network.
+                Some(rev)
+                    if definition.encrypted_to_audience()
+                        && self.remote.is_some()
+                        && reason != CheckpointReason::Remove =>
+                {
                     match self.sealed_to_current(
                         definition,
                         &rev,
@@ -11082,10 +11640,13 @@ impl BranchManager {
         let record = CheckpointRecord {
             id,
             branch: branch.name.clone(),
+            instance: Some(branch.id.clone()),
             created_at: Utc::now(),
             message: message.map(ToOwned::to_owned),
             reason,
             undo_completed: None,
+            restore_of: None,
+            restored: false,
             source: SourceState {
                 head_rev,
                 dirty_rev,
@@ -11106,7 +11667,14 @@ impl BranchManager {
         // it is what lets another machine spawn it.
         let mut left_out = Vec::new();
         let mut sync_refused = false;
-        let sync_error = match self.sync_checkpoint(branch, &record) {
+        // Except the one `remove` takes: the instance leaves the remote
+        // right after, and a removal must not wait on the network.
+        let synced = if reason == CheckpointReason::Remove {
+            Ok(Vec::new())
+        } else {
+            self.sync_checkpoint(branch, &record)
+        };
+        let sync_error = match synced {
             Ok(refused) => {
                 for (tracker, reason) in refused {
                     warnings.push(format!(
@@ -11143,6 +11711,7 @@ impl BranchManager {
             sync_refused,
             left_out,
             degraded,
+            capture_failures,
         })
     }
 
@@ -15706,13 +16275,88 @@ struct PushedTag {
     annotation: Option<crate::endpoint::TagAnnotation>,
 }
 
+/// How an export moves a target's branch.
+#[derive(Debug, Clone, Copy)]
+enum PushExport<'a> {
+    /// Onto what is there: refused when the export does not descend from it.
+    Onto,
+    /// Over what is there, only while that is this commit: what newgit last
+    /// put there.
+    Replacing(&'a str),
+    /// Over whatever is there.
+    Force,
+}
+
+/// How far an instance's export may move its branch on a target.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BranchOver {
+    /// A `git push`, or `newgit export <instance> --remote`: onto what is
+    /// there, or replacing what newgit last pushed there when its commits
+    /// were split again onto the same root commits.
+    Push,
+    /// A force-push from the workspace: replacing what newgit last pushed
+    /// there, never anything else.
+    ForcePush,
+    /// `newgit export <instance> --remote <target> --force`: over whatever
+    /// is there.
+    Force,
+}
+
+/// The target refused an instance's branch: it holds commits newgit did not
+/// put there by its record, or newgit has no record of putting any there.
+/// `unchecked`: a lease failed and newgit could not ask the target whether
+/// it still has the branch.
+fn branch_refused(
+    branch: &BranchInstance,
+    target: &str,
+    recorded: bool,
+    unchecked: Option<&str>,
+) -> NewgitError {
+    let (on, instance) = (&branch.source_ref, &branch.name);
+    let force = format!("`newgit export {instance} --remote {target} --force`");
+    let mut message = if recorded {
+        format!(
+            "`{on}` on `{target}` is not what newgit last put there (someone pushed to it \
+             directly?), so it was left as it is. {force} replaces it with this branch"
+        )
+    } else {
+        format!(
+            "`{on}` on `{target}` holds commits this branch does not, and this project has no \
+             record of newgit pushing them (they may have come from another machine, from \
+             someone else, or from a newgit older than this one), so it was left as it is. \
+             Look at what `{on}` there holds first: if nothing of it is anyone else's, {force} \
+             replaces it with this branch"
+        )
+    };
+    if let Some(error) = unchecked {
+        message.push_str(&format!(
+            " (newgit could not reach `{target}` to check whether it still has `{on}`: {error})"
+        ));
+    }
+    NewgitError::Unsupported(message)
+}
+
+/// Where every export target's refs live, `<target>/...` under it.
+const EXPORTS_REFS: &str = "refs/newgit/exports/";
+
 fn export_ref(target: &str, branch: &str) -> String {
-    format!("refs/newgit/exports/{target}/{branch}")
+    format!("{EXPORTS_REFS}{target}/{branch}")
+}
+
+/// What newgit last pushed of instance `slug`'s branch to `target`: written
+/// once the push succeeded, and the only lease a replacement of it takes.
+fn pushed_branch_ref(target: &str, slug: &str) -> String {
+    export_ref(target, &format!("pushed-branches/{slug}"))
 }
 
 /// A push Git refused because it was not a fast-forward.
 fn rejected(stderr: &str) -> bool {
     stderr.contains("non-fast-forward") || stderr.contains("[rejected]")
+}
+
+/// [`rejected`], of a failed Git command.
+fn is_rejected(error: &NewgitError) -> bool {
+    matches!(error, NewgitError::SourceCommand { stderr, .. } if rejected(stderr))
 }
 
 /// Where the project repo keeps the `branch` of a tracker in Git (`main`,

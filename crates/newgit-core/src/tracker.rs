@@ -472,11 +472,8 @@ impl TrackerDefinition {
             if path.as_str() == "." || is_project {
                 continue;
             }
-            if path.is_absolute()
-                || path.as_str().is_empty()
-                || path.components().any(|c| c.as_str() == "..")
-            {
-                return Err(self.invalid(format!("path `{path}` must be workspace-relative")));
+            if let Some(problem) = not_relative(path) {
+                return Err(self.invalid(problem));
             }
             // Except a tracker's definition: whoever may change the tracker
             // owning `web.toml` decides who may read `web`, so governance
@@ -760,6 +757,31 @@ pub fn is_default_definition(relative: &Utf8Path, contents: &str) -> bool {
             relative == Utf8Path::new(DEFINITIONS_DIR).join(format!("{}.toml", definition.name))
                 && toml::to_string_pretty(&definition.to_file()).is_ok_and(|text| text == contents)
         })
+}
+
+/// Why `path`, normalized ([`normalize_path`]), is not workspace-relative:
+/// absolute, empty, or reaching out with `..`. Every claim, exclusion, and
+/// mount of a definition is held to it when the definition is loaded.
+pub fn not_relative(path: &Utf8Path) -> Option<String> {
+    (path.is_absolute()
+        || path.as_str().is_empty()
+        || path.components().any(|c| c.as_str() == ".."))
+    .then(|| format!("path `{path}` must be workspace-relative"))
+}
+
+/// Why a definition's `mount`, as its file writes it, is refused when the
+/// definition is loaded, or `None` when it is accepted: normalized
+/// ([`normalize_path`], so `./a/` and `a//b` are `a` and `a/b`), it is `.`
+/// or workspace-relative ([`not_relative`]). `newgit serve` holds a
+/// definition landing on `main` to the same rule, with the same message
+/// ([`crate::error::NewgitError::InvalidDefinition`]), so the two never
+/// disagree about where a tracker sits.
+pub fn mount_problem(written: &str) -> Option<String> {
+    let mount = normalize_path(Utf8Path::new(written));
+    if mount.as_str() == "." {
+        return None;
+    }
+    not_relative(&mount)
 }
 
 /// A tracker path by its components alone, so `./.git`, `.git/` and `.git`

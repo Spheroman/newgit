@@ -119,7 +119,7 @@ fn a_fork_in_a_store_its_tracker_does_not_call_for_is_refused() {
             .contains("refs/namespaces/i/refs/namespaces/feat/refs/heads/main"),
         "the fork's refs are in the members' store"
     );
-    std::fs::remove_dir_all(&public).expect("remove public.git");
+    remove_store(&public);
     let db =
         rusqlite::Connection::open(server.data.join("server.sqlite").as_std_path()).expect("db");
     let changed = db
@@ -142,4 +142,23 @@ fn a_fork_in_a_store_its_tracker_does_not_call_for_is_refused() {
         !by_id.status.success(),
         "root's members-only commit was fetched by id through the fork"
     );
+}
+
+/// Removes a store the server may still be writing into in the background
+/// (a stored history extending): a file made mid-removal leaves the
+/// directory not empty, so try again until the writer is done.
+fn remove_store(dir: &camino::Utf8Path) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        match std::fs::remove_dir_all(dir) {
+            Ok(()) => return,
+            Err(error)
+                if error.kind() == std::io::ErrorKind::DirectoryNotEmpty
+                    && std::time::Instant::now() < deadline =>
+            {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            Err(error) => panic!("remove {dir}: {error}"),
+        }
+    }
 }

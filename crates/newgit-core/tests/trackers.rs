@@ -636,10 +636,13 @@ fn remove_tracker_reverses_the_definition_and_gitignore_and_leaves_snapshots_for
 
     // Not removable while the instance is still bound to it.
     assert!(m.remove_tracker("runtime-env").is_err());
+    // Purged: a kept history (the checkpoint `remove` takes, #448) would
+    // pin the captured rev, and this is about what cleanup does once
+    // nothing does.
     m.remove(
         "feature-a",
         &repo,
-        ArchivedCheckpoints::Keep,
+        ArchivedCheckpoints::Purge,
         SourceBranchPolicy::Auto,
     )
     .expect("remove instance");
