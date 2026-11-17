@@ -1250,12 +1250,28 @@ is not started, and stays owed, so a dev server is not brought up against a
 database that is still down.
 
 The workspace, trackers, installs, and port claims stay, so the instance
-comes back on the same ports, unless another program took one meanwhile:
-`start` probes each port before it starts a resource, and for one that is
-held claims a free port in its place, renders the exports and files again,
-and reports it (`moved_ports` in `--json`) (#441). Both commands do nothing and exit 0 when
-there is nothing to do, so they can run on every settle and unsettle. Both
-exit 1 if any resource failed.
+comes back on the same ports, unless another program took one meanwhile
+(#441). Only newgit respects a claim. So before `start` runs the first
+thing it owes a resource (its `resume`, or else its long-running action),
+it checks each port the resource claimed, once, and only while the
+resource's own process is down: is something listening on it? That is a
+bind with `SO_REUSEADDR` on, as real servers bind, on the loopback and
+wildcard addresses of both families. A port in TIME_WAIT from the
+resource's own server, stopped a moment ago, is free; a Docker wildcard
+listener (#93) is not. Checking before the `resume` means the containers a
+`resume` brings up on the port are not then taken for another program. A
+held port moves to a free one, claimed under the port lock: the binding
+record, the exports, and the rendered files all change to it, and `start`
+says so (a line on stderr, `moved_ports` in `--json`). One that cannot
+move fails the resource, naming the port. A dependent over `depends_on`
+that is still running was started with the old port in its environment,
+which now reaches the other program, so `start` stops it and starts it
+again after the resource, with a warning that says so. A running resource
+that only reads the moved exports, with no `depends_on`, is named in a
+warning instead.
+
+Both commands do nothing and exit 0 when there is nothing to do, so they
+can run on every settle and unsettle. Both exit 1 if any resource failed.
 
 `newgit stop --evict` also frees the instance's disk, for an instance
 nobody will touch for a while. After the stop, it checkpoints the instance

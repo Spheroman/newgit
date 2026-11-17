@@ -1322,6 +1322,38 @@ pub fn pinned_revs(git_dir: &Utf8Path) -> Result<Vec<PinnedRev>> {
         .collect())
 }
 
+/// How long `gc_now` waits before each retry while another `git gc` runs in
+/// the store: about half a minute in all.
+const GC_RUNNING_BACKOFF: [std::time::Duration; 5] = [
+    std::time::Duration::from_secs(1),
+    std::time::Duration::from_secs(2),
+    std::time::Duration::from_secs(4),
+    std::time::Duration::from_secs(8),
+    std::time::Duration::from_secs(16),
+];
+
+/// `git gc --prune=now`, tried again while another gc holds the store: Git
+/// refuses with "gc is already running" rather than wait, and the one running
+/// (an auto-maintenance a fetch detached, most often) prunes only what is two
+/// weeks old, so it does not do this one's job.
+fn gc_now(git_dir: &Utf8Path) -> Result<()> {
+    let mut waits = GC_RUNNING_BACKOFF.iter();
+    loop {
+        let error = match git(git_dir, &["gc", "--quiet", "--prune=now"]) {
+            Ok(_) => return Ok(()),
+            Err(error) => error,
+        };
+        let running = matches!(
+            &error,
+            NewgitError::SourceCommand { stderr, .. } if stderr.contains("gc is already running")
+        );
+        match waits.next() {
+            Some(wait) if running => std::thread::sleep(*wait),
+            _ => return Err(error),
+        }
+    }
+}
+
 /// Delete objects no ref reaches any more. Tracker content can be secrets, so
 /// a forgotten rev is removed now rather than whenever Git's own gc would
 /// have got to it.
@@ -1332,9 +1364,12 @@ pub fn prune_unreferenced(git_dir: &Utf8Path) -> Result<()> {
     // A stepped fetch into the store holds `shallow.lock` for each band, and
     // `gc`'s repack dies with "failed to run repack" on finding it taken.
     // Waiting on the stepped fetch's own lock waits it out whole (#441).
-    let _steps = crate::source::steps_lock(&[&format!("--git-dir={git_dir}")])?;
+    let _steps = crate::source::steps_lock(
+        &[&format!("--git-dir={git_dir}")],
+        Some("newgit: waiting for a fetch into the tracker store to finish"),
+    )?;
     git(git_dir, &["reflog", "expire", "--expire=now", "--all"])?;
-    git(git_dir, &["gc", "--quiet", "--prune=now"])?;
+    gc_now(git_dir)?;
     // And the plaintext this machine kept of what is gone.
     let present: std::collections::BTreeSet<String> = git(
         git_dir,
