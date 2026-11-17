@@ -228,6 +228,7 @@ see what is committed.
 Don't hand it over until a real spawn comes up:
 
 ```sh
+newgit resource check             # every program the hooks start is installed
 newgit spawn newgit-try
 newgit status newgit-try          # every resource ready; if not, it says why
 newgit env newgit-try             # ports and exports, labeled by where they came from
@@ -640,6 +641,18 @@ file content. Start from `newgit resource add <name> --template <template>`
 (`newgit resource templates` lists them; `newgit resource templates --show
 <name>` prints one in full, including any companion resource or tracker it
 creates alongside it, without instantiating anything).
+
+`newgit resource check` looks for every program a definition's commands
+start — each action, `[identity] key_command`, `[checkpoint]`, `[restore]`,
+`[cleanup]`, and `[ready]` command — with no instance and nothing run
+(#87). A `[restore]` calling `psql` on a machine with no Postgres client
+otherwise fails only during the undo you are relying on. It reads the first
+word of each command (past `&&`, `;`, `|`, quotes, here-documents, `VAR=`
+assignments, and `exec`), looks a bare name up on `PATH` and a path with a
+`/` in the project root under the command's `workdir`, and prints `ok` or
+`FAIL` per program; `--json` lists them, `found` null when missing. A word
+a template or variable decides (`{{scripts}}/seed.sh`, `$TOOL`) is skipped,
+and so are shell builtins. Exits 1 when anything is missing.
 
 `newgit resource remove <name>` deletes the definition. It refuses if another
 resource still names it in `depends_on` — always, `--force` included, since
