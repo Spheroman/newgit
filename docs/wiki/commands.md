@@ -19,7 +19,8 @@ inside a workspace):
 - `newgit stop [instance] [--json]` / `start [instance] [--json]` — stop
   every running long-running action and run each `suspend`, dependents
   first, and later bring back exactly what that took down (and any
-  `autostart` action that died on its own); ports,
+  `autostart` action that died on its own or never started), each once
+  what it depends on answers; ports,
   workspace, trackers, and installs stay as they are. Both exit 0 with
   nothing to do and 1 if any resource failed
 - `newgit stop --evict [--discard-ignored]` — stop, checkpoint, and delete

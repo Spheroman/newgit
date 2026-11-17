@@ -844,7 +844,13 @@ first, exactly as `newgit action` would. One that is not ready, is blocked,
 or depends on a resource whose start failed is not started, and the spawn
 says so and exits 1, as it does for a failed `prepare`; `spawn --json`
 lists each attempt under `started`. A dependent starts once its
-dependency's process exists, not once it answers (#54).
+dependencies are up, not merely once their processes exist (#54): each
+dependency whose process runs has five seconds to answer on every port it
+claims, and one whose `autostart` action is not running is down. A
+dependent whose dependency is down or still silent after that is not
+started, and says which; it stays owed, so the next `newgit start` starts
+it. `newgit action <resource>.<action>` of a long-running action by hand
+refuses on the same terms, naming the dependency to start first.
 After starting them, `spawn` waits up to five seconds for the ports of what
 is running to answer. A server still compiling after that is `starting`, not
 a failure: `spawn` exits 0, says so, and `spawn --json` lists it under
@@ -852,7 +858,8 @@ a failure: `spawn` exits 0, says so, and `spawn --json` lists it under
 `spawn --from-checkpoint` starts them after its restore, and `newgit
 tracker use` starts those of the resources the tracker brings, which `drop`
 stopped. Nothing else autostarts: `newgit start` brings back what `newgit
-stop` stopped, and any `autostart` action that died on its own. One that
+stop` stopped, any `autostart` action that died on its own, and any that
+never started though its resource is ready (a spawn withheld it). One that
 died (it exited, crashed, or was killed, without newgit stopping it) shows
 in `newgit status` as `exited(1)`, `killed(SIGKILL)` or `crashed`, not
 `stopped`, and makes the instance not ready; its log ends with how it

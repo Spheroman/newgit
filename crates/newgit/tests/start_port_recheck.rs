@@ -296,12 +296,14 @@ fn db(start: u16) -> String {
 
 [ports.api]
 start = {start}
+env = "DB_PORT"
 
 [exports]
 API_URL = "http://127.0.0.1:{{{{ports.api}}}}"
 
+# Listens, since `app` starts only once `db` answers (#54).
 [actions.start]
-command = "sleep 1000"
+command = "exec python3 -m http.server $DB_PORT --bind 127.0.0.1"
 long_running = true
 autostart = true
 "#

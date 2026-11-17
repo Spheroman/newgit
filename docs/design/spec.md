@@ -1127,8 +1127,14 @@ Autostart comes after every `prepare`, not interleaved with them, because
 `prepare` is a command that finishes and a dependent's `prepare` may need
 its dependency's files but never its process. A start that fails is
 reported per resource, and a dependent of a resource that did not start is
-not started against it. Starting is not waiting: the dependent starts once
-its dependency's process exists, not once that process answers (#54).
+not started against it. Starting is waiting (#54): a dependent starts once
+each dependency's process answers on every port it claims, given five
+seconds, and not at all against a dependency whose `autostart` action is
+not running. A process that has been exec'd is not one that serves, and
+starting against it only moves the race into the dependent. One withheld
+this way stays owed: the next `newgit start` starts it, as it does an
+`autostart` action that died. `newgit action` of a long-running action by
+hand waits and refuses the same way.
 
 `spawn --from-checkpoint <instance>/<checkpoint>` brings up a checkpoint
 as a new instance: its source and uncommitted work, its trackers, and
@@ -1866,10 +1872,11 @@ Git repository per tracker. It gives you:
 
 Open issues that change what this document can promise:
 
-- **#54: starting is not waiting.** `depends_on` orders `prepare`,
-  autostart, and `newgit start`, but a dependent starts once its
-  dependency's process exists, not once it answers. `newgit action
-  app.start` by hand does not start the database it needs.
+- **#54: a dependency is up when its ports answer.** A dependent waits
+  for that, but a server that binds early and serves errors until it has
+  compiled answers too soon, and the wait is a fixed five seconds. `newgit
+  action app.start` by hand refuses while the database it needs is down
+  rather than starting it.
 - **#64: rendered files are hidden, not filtered.** `--skip-worktree` makes
   hand edits to a rendered file die with the workspace. A clean/smudge
   filter would make them ordinary, committable edits.

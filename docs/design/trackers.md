@@ -1983,10 +1983,9 @@ CLI, the narrow-audience warning, `.gitignore` as definition, and
 - **Governance.** A tracker handed one definition can claim `access`'s and
   lock the owner out (#228). No orgs: owners are always logins, and
   `project-devs` is the only group (#227).
-- **Resources.** Nothing orders `start`, so a runtime dependency (functions
-  needing supabase running) cannot be expressed (#54). Reviewing a change
-  places each tracker it touched locally or in the preview; settled in
-  [remote.md](remote.md), *Reviewing a change* (#229).
+- **Resources.** Reviewing a change places each tracker it touched
+  locally or in the preview; settled in [remote.md](remote.md), *Reviewing
+  a change* (#229).
 - **Forks on newgit.dev.** The Worker keeps no record of what a fork was
   made from and doesn't cap it, so there only the client holds the ceiling
   (#415). `newgit serve` does both (*Binding*).

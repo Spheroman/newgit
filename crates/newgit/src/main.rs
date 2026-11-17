@@ -168,7 +168,8 @@ enum Command {
         json: bool,
     },
     /// Start again what the last `newgit stop` stopped, and any `autostart`
-    /// action that died on its own, bringing back an evicted workspace first
+    /// action that died on its own or never started, bringing back an
+    /// evicted workspace first
     ///
     /// A resource nobody had started stays stopped. Exits 0 when there is
     /// nothing to start, and 1 when anything failed to; a failed one is

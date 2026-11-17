@@ -25,7 +25,8 @@ settling and unsettling a thread
 running long-running action, dependents first, and records what it stopped
 in `.newgit/state/<slug>/stopped.toml`; `start` brings back exactly
 that, dependencies first, so a resource nobody had started stays stopped,
-plus any `autostart` action that died on its own (`status` shows it as
+plus any `autostart` action that died on its own or that a spawn
+withheld while a dependency was not answering (a dead one `status` shows as
 `exited(1)`, `killed(SIGKILL)` or `crashed`, not `stopped`).
 Port claims are kept, so the instance returns on the same ports. With
 `--json` each prints `{"instance", "resources": [{"name", "action",
