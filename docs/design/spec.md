@@ -1453,11 +1453,18 @@ progress, the stash, branches and tags only the workspace has, staged
 content the working tree has moved past, a Git repository nested in the
 workspace (a checkpoint records only the commit it has checked out, so its
 files go; `lost` says how many uncommitted changes and commits on no
-remote it had), and the state of a resource whose capture failed. A
-resource capture that fails (a `pg_dump` against a database that is down)
-does not refuse the removal: the checkpoint goes ahead without that
-resource, as it does for a resource that is not up. Ignored paths a
-resource declares `disposable` are listed as dropped, not lost.
+remote it had). Ignored paths a resource declares `disposable` are listed
+as dropped, not lost.
+
+A resource capture that fails (a `pg_dump` against a database that is
+down) does not refuse the removal: the checkpoint goes ahead without that
+resource, as it does for a resource that is not up. But its state is then
+in no checkpoint, so its `[cleanup]` does not run: a `dropdb` after a
+failed dump would delete the only copy, unattended. The state stays where
+it is, and the removal says so (`left:`, `left` in `--json`, hook status
+`skipped-uncaptured`), with the cleanup command as it would have run,
+which names where the state is and removes it by hand. `--force` runs it,
+and names what that deleted as lost.
 
 A checkpoint that fails refuses the removal, deleting nothing, unless
 `--force`, which removes anyway. So does a nested repository with no
@@ -1473,6 +1480,14 @@ whatever it held`) rather than refusing.
 A removal that fails after its checkpoint leaves that checkpoint; the
 retry takes another, and `cleanup` collects the earlier one. A checkpoint
 that fails partway deletes the store ref it wrote.
+
+Every instance spawned under a name shares its checkpoint history, so
+each checkpoint record names the instance that took it (`instance`, the
+instance id). `cleanup` collects a `remove` checkpoint only when the same
+instance took a later one: a later instance's removal is its own work,
+not a retry. Archived records are never replaced: each claims its name
+(`<slug>-<timestamp>.toml`, `.<n>` added when an earlier removal took it
+in the same second) before the record is moved onto it.
 
 **The source branch** goes too, when it holds nothing unique, and otherwise
 stays with the reason printed. It is deleted only when all of these hold:
@@ -1504,7 +1519,10 @@ last checkpoint are lost, so "nothing unique on the branch" never reads as
 
 **Checkpoints outlive removal.** They pin what their undo would need, and
 newgit never breaks an undo on its own initiative. `remove` reports how
-many it kept; `--purge` discards them.
+many it kept; `--purge` discards them: the ones this instance took, never
+an earlier instance's under the same name, nor one an archived record
+names (`removed_to`, `evicted`). `cleanup --purge-archived` discards a
+name's whole history once no live instance has it.
 
 ### Cleanup
 
@@ -1534,8 +1552,8 @@ reports exactly what a real run would do. It:
   checkpoint a restore brought back and that succeeded (`restored`), once
   a later eviction supersedes it; every checkpoint a restore that
   succeeded took on its way (`restore_of`: the marker and a clone); and a
-  `remove` checkpoint a later one superseded (a removal that failed after
-  its checkpoint, retried). It never collects an `evict` checkpoint nothing
+  `remove` checkpoint the same instance took a later one after (a removal
+  that failed after its checkpoint, retried). It never collects an `evict` checkpoint nothing
   restored, since an instance removed while evicted keeps its work only
   there. Nor does it collect one any live or archived record names
   (`evicted`, `removed_to`), a before-undo that a person's own `undo` took

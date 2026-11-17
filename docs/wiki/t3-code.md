@@ -13,8 +13,10 @@ work in it can be brought back (`newgit spawn <name> --from-checkpoint
 the archived record). A thread whose workspace was evicted is not
 checkpointed again: the eviction's checkpoint already holds it, and is the
 one named. A resource whose capture fails, such as a dump against a
-database that is down, does not stop the delete; `remove` names what it
-could not keep under `lost`. Every other project gets plain worktrees, as
+database that is down, does not stop the delete, and its `[cleanup]`
+does not run, so the delete never drops a database nothing kept; `remove`
+names that state under `left`, with the cleanup command that removes it
+by hand, and what else it could not keep under `lost`. Every other project gets plain worktrees, as
 before.
 
 `newgit stop <instance>` and `newgit start <instance>` are the pair for

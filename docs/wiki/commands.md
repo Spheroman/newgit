@@ -50,13 +50,15 @@ inside a workspace):
   work comes back with `newgit spawn <instance> --from-checkpoint
   <instance>/<id>`, and names what no checkpoint holds (ignored files
   nothing rebuilds, the stash, branches only the workspace has, a nested
-  Git repository, a resource whose capture failed) as `lost`, and
-  `disposable` output as dropped. An evicted instance is not checkpointed
+  Git repository) as `lost`, and `disposable` output as dropped. A
+  resource whose capture failed keeps its state: its `[cleanup]` does not
+  run, and `left` names it with that command, unless `--force`. An evicted instance is not checkpointed
   again: the eviction's checkpoint is the one named (`checkpoint` in
   `--json`). A checkpoint that fails, a nested repository with no commit,
   or a workspace whose Git cannot be read refuses unless `--force`;
-  `--purge` takes none, and both then name the uncommitted work and the
-  uncaptured content of trackers outside Git they delete. On an evicted
+  `--purge` takes none and discards this instance's checkpoints (never an
+  earlier same-named instance's), and both then name the uncommitted work
+  and the uncaptured content of trackers outside Git they delete. On an evicted
   instance whose path holds work written after a failed restore, refuses
   unless `--force`
   ([#448](https://github.com/Spheroman/newgit/issues/448))
@@ -77,8 +79,8 @@ inside a workspace):
 - `newgit cleanup [--dry-run] [--purge-archived]` — also collects what
   eviction leaves behind: an `evict` checkpoint a restore brought back,
   once a later eviction supersedes it, the checkpoints a restore that
-  succeeded took on its way, a `remove` checkpoint a retried removal
-  superseded, and checkpoint refs no record names. It deletes their records
+  succeeded took on its way, a `remove` checkpoint the same instance's
+  retried removal superseded, and checkpoint refs no record names. It deletes their records
   and refs and says how many bytes of store objects became unreachable; the
   store's own `git gc` frees them (newgit never prunes the store). Never
   one a live or archived record names, never an `explicit` or `push`

@@ -111,8 +111,10 @@ are never torn down by per-branch cleanup.
 
 **`remove` never deletes work no checkpoint holds.** It checkpoints the
 workspace first; `newgit spawn <name> --from-checkpoint <name>/<id>` brings
-it back, and what no checkpoint can hold is named as lost (#448). Removing
-an evicted instance names the checkpoint it was evicted to.
+it back, and what no checkpoint can hold is named as lost (#448). A
+resource whose capture failed is not cleaned up: its state is left where
+it is and named, unless `--force`. Removing an evicted instance names the
+checkpoint it was evicted to.
 
 The one exception is one you ask for. An archived instance's checkpoints are
 out of `undo`'s reach — it needs a binding record — and come back only
