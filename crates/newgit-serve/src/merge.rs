@@ -34,6 +34,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
 
+use newgit_core::objects::Objects;
+use newgit_core::tracker::{ACCESS_TRACKER, DEFINITIONS_DIR};
 use rusqlite::Connection;
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -44,9 +46,10 @@ use crate::error::{ApiResult, HttpError, fail};
 use crate::landing::{self, Asked, Change, Entry, Hold, Landing};
 use crate::names::{lineage, parent_of, within};
 use crate::policy::{self, Facts};
+use crate::readers::Readers;
 use crate::reparent::{self, Touch};
 use crate::repos::{self, Repo};
-use crate::server_merge::{Made, Seen};
+use crate::server_merge::{Composer, Made, Seen};
 
 /// How long a merge begun may take to finish.
 const PENDING: Duration = Duration::from_secs(70 * 60);
@@ -218,28 +221,13 @@ fn require_list(list: &List) -> ApiResult<()> {
 // ── What the repos say ────────────────────────────────────────────────────
 
 /// Whether `next`'s tree is `old`'s with only `.newgit/pins` changed.
-fn only_pins_moved(dir: &camino::Utf8Path, old: &str, next: &str) -> Option<bool> {
-    let output = repos::git(
-        dir,
-        &[
-            "diff-tree",
-            "-r",
-            "-z",
-            "--name-only",
-            "--no-commit-id",
-            old,
-            next,
-        ],
-    )
-    .ok()?;
-    // `-z`: names as stored, never quoted (a quoted name would start `"`).
-    output.status.success().then(|| {
-        output
-            .stdout
-            .split(|&byte| byte == 0)
-            .filter(|path| !path.is_empty())
-            .all(|path| path.starts_with(b".newgit/pins/"))
-    })
+fn only_pins_moved(objects: &mut Objects, old: &str, next: &str) -> Option<bool> {
+    let (old, next) = (
+        objects.commit(old).ok()?.tree,
+        objects.commit(next).ok()?.tree,
+    );
+    let paths = objects.changed_paths(Some(&old), Some(&next)).ok()?;
+    Some(paths.iter().all(|path| path.starts_with(b".newgit/pins/")))
 }
 
 /// Whether any commit `next` brings in (beyond `base` and every commit that
@@ -321,6 +309,7 @@ fn anchor_of(ids: &[String]) -> String {
 #[allow(clippy::too_many_arguments, reason = "each is one thing a landing is")]
 fn anchor_for(
     project: &ProjectContext<'_>,
+    readers: &mut Readers,
     past: &BTreeMap<String, Vec<String>>,
     by: &str,
     base: &List,
@@ -338,7 +327,7 @@ fn anchor_for(
     for tracker in moved {
         let dir = project.tracker(tracker).view(by)?;
         let (old, new) = (&base[tracker], &list[tracker]);
-        let only = only_pins_moved(&dir, old, new);
+        let only = only_pins_moved(readers.at(&dir)?, old, new);
         let history = match only {
             Some(true) => history_touches(
                 &dir,
@@ -648,6 +637,7 @@ fn members_held(db: &Connection, login: &str, reads: &Reads) -> ApiResult<bool> 
 
 fn authorize_merge(
     project: &ProjectContext<'_>,
+    readers: &mut Readers,
     caller: &Caller,
     base: &List,
     list: &List,
@@ -657,7 +647,16 @@ fn authorize_merge(
     let Reads {
         moved, facts, past, ..
     } = reads;
-    let anchor = anchor_for(project, past, &caller.login, base, list, moved, facts)?;
+    let anchor = anchor_for(
+        project,
+        readers,
+        past,
+        &caller.login,
+        base,
+        list,
+        moved,
+        facts,
+    )?;
     let who = project.who(caller);
     let mut writes = Vec::new();
     for tracker in moved {
@@ -733,10 +732,13 @@ fn authorize_merge(
             let view = repo.view(&caller.login)?;
             let (forward, on_main) = match (tracker.as_str(), list.get(tracker)) {
                 ("root", _) | (_, None) => (false, false),
+                // `main`'s history is the store's: a commit only the landing
+                // holds is not on it.
                 (_, Some(new)) => (
-                    repos::has_commit(&view, new) && repos::is_ancestor(&view, &base[tracker], new),
-                    repo.branch_head("main")
-                        .is_some_and(|main| repos::is_ancestor(&view, new, &main)),
+                    readers.is_ancestor(&view, &base[tracker], new),
+                    readers
+                        .head(&repo.dir(), &repo.full("refs/heads/main"))
+                        .is_some_and(|main| readers.is_ancestor(&repo.dir(), new, &main)),
                 ),
             };
             // Above the anchor nothing is touched, only moved along: approved
@@ -891,8 +893,15 @@ pub fn begin(
         );
     }
     let reads = gather(project, db, caller, branch, &base, &list)?;
-    let Authorized { writes, anchor } =
-        authorize_merge(project, caller, &base, &list, None, &reads)?;
+    let Authorized { writes, anchor } = authorize_merge(
+        project,
+        &mut Readers::new(),
+        caller,
+        &base,
+        &list,
+        None,
+        &reads,
+    )?;
     let until = Instant::now() + PENDING;
     project.app.merges.lock().insert(
         key(&project.key, branch, &list),
@@ -983,9 +992,11 @@ pub fn finish(
         .app
         .log
         .wait_while(&format!("hold-finish-by-{}", caller.login));
+    // What this finish asks of Git before it merges, read in process.
+    let mut readers = Readers::new();
     let landed_already = current
         .as_ref()
-        .is_some_and(|current| landed_in(project, list, current));
+        .is_some_and(|current| landed_in(project, &mut readers, list, current));
     if pending.is_none() && !landed_already {
         return fail(
             400,
@@ -1034,7 +1045,7 @@ pub fn finish(
         if pending.base.get(tracker) == Some(commit) {
             continue;
         }
-        if !repos::has_commit(&project.tracker(tracker).view(&caller.login)?, commit) {
+        if !readers.has_commit(&project.tracker(tracker).view(&caller.login)?, commit) {
             return fail(
                 400,
                 format!(
@@ -1049,7 +1060,7 @@ pub fn finish(
             "root's commit does not pin what this index says: push the root commit the merge made to its landing ref, then finish",
         );
     }
-    if !repos::is_ancestor(
+    if !readers.is_ancestor(
         &project.tracker("root").view(&caller.login)?,
         &pending.base["root"],
         &list["root"],
@@ -1073,8 +1084,9 @@ pub fn finish(
     }
     // Definitions are read from `main`: only there is a change to them a
     // barrier.
-    let mut barrier =
-        branch == "main" && changes_definitions(project, &caller.login, &pending.base, list);
+    let mut barrier = branch == "main"
+        && changes_definitions(project, &mut readers, &caller.login, &pending.base, list);
+    drop(readers);
     let started = Instant::now();
     let until = started + TURN_WAIT;
     // Another merge holding the roots longer than a landing waits is not a
@@ -1085,6 +1097,8 @@ pub fn finish(
     let mut runs = 0;
     let mut touched: Option<Touch> = None;
     let mut turn: Option<Turn<'_>> = None;
+    // What Git's merge composes, kept across the attempts (#440).
+    let mut composer = Composer::new();
     loop {
         if Instant::now() >= until {
             return Err(landing::busy_merging(branch));
@@ -1126,7 +1140,14 @@ pub fn finish(
             roots: &roots,
             barrier,
         };
-        let outcome = attempt.run(project, held.as_ref(), turn.as_ref(), &mut runs, until);
+        let outcome = attempt.run(
+            project,
+            &mut composer,
+            held.as_ref(),
+            turn.as_ref(),
+            &mut runs,
+            until,
+        );
         drop(held);
         match outcome {
             Ok(Outcome::Landed(answered)) => return Ok(answered),
@@ -1158,11 +1179,16 @@ const FAIR: usize = 3;
 
 /// Whether index `list` has landed on a branch now at `current`: it is the
 /// list, or its root commit is behind the branch's.
-fn landed_in(project: &ProjectContext<'_>, list: &List, current: &List) -> bool {
+fn landed_in(
+    project: &ProjectContext<'_>,
+    readers: &mut Readers,
+    list: &List,
+    current: &List,
+) -> bool {
     current == list
         || match (list.get("root"), current.get("root")) {
             (Some(root), Some(now)) => {
-                root != now && project.tracker("root").is_ancestor(root, now)
+                root != now && readers.is_ancestor(&project.tracker("root").dir(), root, now)
             }
             _ => false,
         }
@@ -1172,7 +1198,13 @@ fn landed_in(project: &ProjectContext<'_>, list: &List, current: &List) -> bool 
 /// `access`'s own files, or any tracker's own `.newgit/trackers/`. Such a
 /// merge is a barrier (landing.md, *Landing* 5). One that cannot be read is
 /// taken for one.
-fn changes_definitions(project: &ProjectContext<'_>, by: &str, base: &List, list: &List) -> bool {
+fn changes_definitions(
+    project: &ProjectContext<'_>,
+    readers: &mut Readers,
+    by: &str,
+    base: &List,
+    list: &List,
+) -> bool {
     for (tracker, new) in list {
         let Some(old) = base.get(tracker) else {
             continue;
@@ -1183,36 +1215,22 @@ fn changes_definitions(project: &ProjectContext<'_>, by: &str, base: &List, list
         let Ok(dir) = project.tracker(tracker).view(by) else {
             return true;
         };
-        // `-z`: names as stored. Without it Git quotes a name with bytes
-        // past ASCII, and `".newgit/trackers/caf\351.toml"` would not start
-        // with `.newgit/trackers/`.
-        let Ok(output) = repos::git(
-            &dir,
-            &[
-                "diff-tree",
-                "-r",
-                "-z",
-                "--name-only",
-                "--no-commit-id",
-                old,
-                new,
-            ],
-        ) else {
-            return true;
-        };
-        if !output.status.success() {
-            return true;
-        }
-        let mut paths = output
-            .stdout
-            .split(|&byte| byte == 0)
-            .filter(|path| !path.is_empty());
-        if tracker == "access" {
-            if paths.any(|path| !path.starts_with(b".newgit/pins/")) {
-                return true;
+        let changes = |objects: &mut Objects| -> newgit_core::error::Result<bool> {
+            let (old, new) = (objects.commit(old)?.tree, objects.commit(new)?.tree);
+            if tracker == ACCESS_TRACKER {
+                // Names as stored: a name past ASCII is still under the pins.
+                Ok(objects
+                    .changed_paths(Some(&old), Some(&new))?
+                    .iter()
+                    .any(|path| !path.starts_with(b".newgit/pins/")))
+            } else {
+                Ok(objects.subtree(&old, DEFINITIONS_DIR)?
+                    != objects.subtree(&new, DEFINITIONS_DIR)?)
             }
-        } else if paths.any(|path| path.starts_with(b".newgit/trackers/")) {
-            return true;
+        };
+        match readers.at(&dir).map(changes) {
+            Ok(Ok(false)) => {}
+            _ => return true,
         }
     }
     false
@@ -1283,6 +1301,7 @@ impl Attempt<'_> {
     fn run(
         &self,
         at: &ProjectContext<'_>,
+        composer: &mut Composer,
         held: Option<&Hold<'_>>,
         turn: Option<&Turn<'_>>,
         runs: &mut usize,
@@ -1291,6 +1310,8 @@ impl Attempt<'_> {
         let app = at.app;
         let login = &self.caller.login;
         let branch = self.branch;
+        // One reader per repository for the whole attempt (#445).
+        let readers = &mut Readers::new();
         let db = app.db.lock();
         // The project as it is now: its rows, links, and the caller's
         // membership.
@@ -1298,7 +1319,7 @@ impl Attempt<'_> {
         let Some(head) = db::list_of(&db, &project.key, branch)? else {
             return fail(404, format!("no branch `{branch}` in {}", project.key));
         };
-        if landed_in(&project, self.list, &head) {
+        if landed_in(&project, readers, self.list, &head) {
             return answer(
                 &db,
                 &project,
@@ -1320,8 +1341,15 @@ impl Attempt<'_> {
         )?;
         drop(db);
         // The rules at the head it merges onto, never at its base.
-        let authorized =
-            authorize_merge(&project, self.caller, self.base, self.list, None, &reads)?;
+        let authorized = authorize_merge(
+            &project,
+            readers,
+            self.caller,
+            self.base,
+            self.list,
+            None,
+            &reads,
+        )?;
         if !within(&authorized.anchor, &self.pending.anchor) {
             return fail(
                 409,
@@ -1334,30 +1362,31 @@ impl Attempt<'_> {
         // since changed other paths; Git's merge otherwise.
         let mut made = Made::default();
         let (target, ours) = if head == *self.base {
-            let ours = Touch::between(&project, login, &head, self.list)?;
+            let ours = Touch::between(&project, readers, login, &head, self.list)?;
             (self.list.clone(), ours)
         } else {
-            let mine = Touch::between(&project, login, self.base, self.list)?;
-            let theirs = Touch::meeting(&project, login, self.base, &head, &mine)?;
+            let mine = Touch::between(&project, readers, login, self.base, self.list)?;
+            let theirs = Touch::meeting(&project, readers, login, self.base, &head, &mine)?;
             if mine.overlap(&theirs).is_none() {
                 let target = reparent::onto(
-                    &project, login, branch, self.base, self.list, &head, &mine, &theirs, &mut made,
+                    &project, readers, login, branch, self.base, self.list, &head, &mine, &theirs,
+                    &mut made,
                 )?;
                 (target, mine)
             } else {
                 *runs += 1;
                 let merged = crate::server_merge::merge(
-                    &project, login, branch, self.base, &head, self.list, &seen,
+                    &project, readers, composer, login, branch, self.base, &head, self.list, &seen,
                 )?;
                 made = merged.made;
-                let ours = Touch::between(&project, login, &head, &merged.list)?;
+                let ours = Touch::between(&project, readers, login, &head, &merged.list)?;
                 (merged.list, ours)
             }
         };
         // What lands, authorized at the head it lands on: what the merge
         // made (a file another landing moved into a tracker, carrying the
         // merger's edit) is the merger's change too.
-        let landing = self.lands(&project, &head, &target)?;
+        let landing = self.lands(&project, readers, &head, &target)?;
         app.log.pause(&format!("delay-merge-by-{login}"));
         // Its roots, waited for as long as its turn allows: the merge it
         // made stays good while it waits.
@@ -1399,14 +1428,14 @@ impl Attempt<'_> {
         } else {
             // Something landed since it merged: re-made on it when that
             // changed other paths, merged again when it changed these.
-            let theirs = Touch::meeting(&project, login, &head, &now, &ours)?;
+            let theirs = Touch::meeting(&project, readers, login, &head, &now, &ours)?;
             if theirs.overlap(&ours).is_some() {
                 return Ok(Outcome::Lost(Some(ours)));
             }
             let target = reparent::onto(
-                &project, login, branch, &head, &target, &now, &ours, &theirs, &mut made,
+                &project, readers, login, branch, &head, &target, &now, &ours, &theirs, &mut made,
             )?;
-            let landing = self.lands(&project, &now, &target)?;
+            let landing = self.lands(&project, readers, &now, &target)?;
             (target, landing)
         };
         if landing.bumps && !self.barrier {
@@ -1420,7 +1449,7 @@ impl Attempt<'_> {
             return Ok(Outcome::Lost(Some(ours)));
         }
         let project = ProjectContext::load(app, &db, self.caller, &at.id)?;
-        let asked = follow(&project, login, asked, self.list, &target);
+        let asked = follow(&project, readers, login, asked, self.list, &target);
         let mut prepared = prepare(&project, &db, login, branch, &now, &target, &asked)?;
         if landing.bumps
             && let Some(change) = prepared.landing.entry.homes.get_mut(&project.key)
@@ -1430,12 +1459,17 @@ impl Attempt<'_> {
         prepared.landing.epochs = vec![(project.key.clone(), epoch)];
         drop(db);
         // Each tracker's new commits into a store that may hold them whether
-        // or not this lands, outside the db lock and inside the roots' hold.
+        // or not this lands, outside the db lock and inside the roots' hold:
+        // copied in process, each landing's own ref dropped once the hold is.
+        let mut placed = Vec::new();
         for (target, borrow, commit) in &prepared.placements {
-            target.take_landing(login, commit, borrow)?;
+            placed.extend(target.place(readers, login, commit, borrow)?);
         }
         let landed = app.log.land_holding(app, prepared.landing, hold);
         drop(own);
+        for (landing, reference) in placed {
+            let _ = repos::git(&landing, &["update-ref", "-d", &reference]);
+        }
         let db = app.db.lock();
         let (behind, pending) = match landed {
             Ok(landed) => (
@@ -1502,20 +1536,27 @@ impl Attempt<'_> {
 
     /// The rules for landing `target` on `head`: read under the db lock,
     /// decided without it. A 403 names the tracker the merge would change.
-    fn lands(&self, project: &ProjectContext<'_>, head: &List, target: &List) -> ApiResult<Lands> {
+    fn lands(
+        &self,
+        project: &ProjectContext<'_>,
+        readers: &mut Readers,
+        head: &List,
+        target: &List,
+    ) -> ApiResult<Lands> {
         let db = project.app.db.lock();
         let reads = gather(project, &db, self.caller, self.branch, head, target)?;
         drop(db);
         let rules = authorize_merge(
             project,
+            readers,
             self.caller,
             head,
             target,
             Some(self.branch),
             &reads,
         )?;
-        let bumps =
-            self.branch == "main" && changes_definitions(project, &self.caller.login, head, target);
+        let bumps = self.branch == "main"
+            && changes_definitions(project, readers, &self.caller.login, head, target);
         Ok(Lands {
             rules,
             reads,
@@ -1538,6 +1579,7 @@ struct Lands {
 /// was, and said back as behind when it moved meanwhile.
 fn follow(
     project: &ProjectContext<'_>,
+    readers: &mut Readers,
     by: &str,
     asked: Vec<RefMove>,
     list: &List,
@@ -1554,9 +1596,9 @@ fn follow(
             }
             let repo = project.tracker(&step.tracker);
             let now = repo.branch_head(&step.branch);
-            let after = |now: &String| {
+            let mut after = |now: &String| {
                 repo.view(by)
-                    .is_ok_and(|view| repos::is_ancestor(&view, now, landing))
+                    .is_ok_and(|view| readers.is_ancestor(&view, now, landing))
             };
             if now.as_ref().is_some_and(|now| !after(now)) {
                 return step;
@@ -1619,13 +1661,21 @@ fn prepare(
                 at.insert(tracker.clone(), (view, commit.clone()));
             }
         }
-        policy::load_definitions_at(
+        let after = policy::load_definitions_at(
             &project.app.config.data,
             db,
             &project.id,
             names.iter().map(String::as_str),
             &at,
-        )
+        );
+        // A definition the client would refuse to load never lands.
+        if after.values().any(|facts| facts.mount_refused.is_some()) {
+            let before = project.definitions(db, names.iter().map(String::as_str))?;
+            if let Some(refusal) = policy::mount_refusal(&before, &after) {
+                return fail(400, refusal);
+            }
+        }
+        after
     } else {
         project.definitions(db, names.iter().map(String::as_str))?
     };

@@ -10,15 +10,18 @@ pub mod db;
 pub mod error;
 pub mod git_http;
 pub mod landing;
+pub mod maintenance;
 pub mod merge;
 pub mod migrate;
 pub mod mirror;
 pub mod names;
 pub mod policy;
+pub mod readers;
 pub mod reparent;
 pub mod repos;
 pub mod rooted;
 pub mod server_merge;
+pub mod status;
 pub mod tokens;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -76,6 +79,8 @@ pub struct App {
     pub pushes: landing::Pushes,
     /// Stored rooted histories, extended in the background (`rooted`).
     pub rooted: rooted::Worker,
+    /// Garbage collection, in the background (`maintenance`).
+    pub maintenance: maintenance::Maintenance,
     /// What GitHub is to this server, from `--github`.
     pub github: mirror::GithubConfig,
     /// The mirror threads' wake-ups (`mirror`).
@@ -147,6 +152,7 @@ impl App {
             log,
             pushes: landing::Pushes::default(),
             rooted: rooted::Worker::default(),
+            maintenance: maintenance::Maintenance::default(),
             github,
             mirrors: mirror::Mirrors::default(),
             _lock: lock,
@@ -338,6 +344,7 @@ pub fn serve_on(listener: std::net::TcpListener, config: Config) -> anyhow::Resu
             ..config
         })?);
         rooted::start(&app);
+        maintenance::start(&app);
         mirror::start(&app);
         println!("newgit serve: listening on http://{address}");
         use std::io::Write as _;

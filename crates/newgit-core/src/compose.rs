@@ -961,18 +961,37 @@ fn is_ancestor(repo: &Utf8Path, ancestor: &str, descendant: &str) -> Result<bool
 /// present: its own tree with every pin expanded under its mount. What split
 /// compares a view's subtree against.
 pub fn view_tree(objects: &mut Objects, commit: &str) -> Result<String> {
-    let mut cache = HashMap::new();
-    view_tree_cached(objects, commit, &mut cache, 0)
+    view_tree_in(objects, commit, &mut HashMap::new())
 }
 
+/// [`view_tree`], reusing the views in `views` (by tracker commit) and
+/// keeping each one composed there, for the next view of the same trackers
+/// (#440): a view of a commit never changes while every pin under it is
+/// present, so only those are kept. Its trees are written by `objects`, so
+/// `views` holds for that repository only.
+pub fn view_tree_in(
+    objects: &mut Objects,
+    commit: &str,
+    views: &mut HashMap<String, String>,
+) -> Result<String> {
+    Ok(view_tree_cached(objects, commit, views, &mut HashMap::new(), 0)?.0)
+}
+
+/// The view tree of `commit`, and whether every pin under it was present
+/// (only then is it kept in `kept`; otherwise in `partial`, for this
+/// composing alone).
 fn view_tree_cached(
     objects: &mut Objects,
     commit: &str,
-    cache: &mut HashMap<String, String>,
+    kept: &mut HashMap<String, String>,
+    partial: &mut HashMap<String, String>,
     nesting: usize,
-) -> Result<String> {
-    if let Some(tree) = cache.get(commit) {
-        return Ok(tree.clone());
+) -> Result<(String, bool)> {
+    if let Some(tree) = kept.get(commit) {
+        return Ok((tree.clone(), true));
+    }
+    if let Some(tree) = partial.get(commit) {
+        return Ok((tree.clone(), false));
     }
     if nesting > 32 {
         return Err(NewgitError::Unsupported(format!(
@@ -983,23 +1002,31 @@ fn view_tree_cached(
     let found = objects.commit(commit)?;
     let pins = pins_in(objects, &found.tree)?;
     let mut tree = objects.set_path(&found.tree, PINS_DIR, None)?;
+    let mut complete = true;
     if !pins.is_empty() {
         let present: BTreeMap<String, String> = pins
             .iter()
             .filter(|(_, pin)| objects.has_commit(pin).unwrap_or(false))
             .map(|(name, pin)| (name.clone(), pin.clone()))
             .collect();
+        complete = present.len() == pins.len();
         let mounts = mounts_of(objects, commit, &found.tree, &pins, &present)?;
         let mut ordered: Vec<(String, String)> = mounts.into_iter().collect();
         ordered
             .sort_by(|(_, left), (_, right)| depth(left).cmp(&depth(right)).then(left.cmp(right)));
         for (child, mount) in ordered {
-            let child_tree = view_tree_cached(objects, &present[&child], cache, nesting + 1)?;
+            let (child_tree, whole) =
+                view_tree_cached(objects, &present[&child], kept, partial, nesting + 1)?;
+            complete &= whole;
             tree = graft(objects, &tree, &mount, &child_tree)?;
         }
     }
-    cache.insert(commit.to_owned(), tree.clone());
-    Ok(tree)
+    if complete {
+        kept.insert(commit.to_owned(), tree.clone());
+    } else {
+        partial.insert(commit.to_owned(), tree.clone());
+    }
+    Ok((tree, complete))
 }
 
 /// Where each tracker present sits in [`view_tree`]`(commit)`: the chain of
@@ -1132,7 +1159,7 @@ pub fn view_definitions(repo: &Utf8Path, root: &str, tree: &str) -> Result<Vec<T
         forks_before: &[],
         settled: &[],
     };
-    Splitter::new(Objects::open(repo)?, &options).flattened(tree, Utf8Path::new("."))
+    Splitter::new(&mut Objects::open(repo)?, &options).flattened(tree, Utf8Path::new("."))
 }
 
 /// Bring commits of an export target that did not come from here into this
@@ -1432,7 +1459,7 @@ pub struct SplitOutcome {
 }
 
 struct Splitter<'a> {
-    objects: Objects,
+    objects: &'a mut Objects,
     options: &'a SplitOptions<'a>,
     /// View commit → root commit.
     mapped: HashMap<String, String>,
@@ -1471,7 +1498,23 @@ pub fn split(
     tip: &str,
     options: &SplitOptions<'_>,
 ) -> std::result::Result<SplitOutcome, SplitError> {
-    let mut splitter = Splitter::new(Objects::open(repo)?, options);
+    split_in(&mut Objects::open(repo)?, &HashMap::new(), tip, options)
+}
+
+/// [`split`], in the repository `objects` reads (and with what it has read
+/// already), each tracker commit's view tree taken from `views` where
+/// [`view_tree_in`] kept it: a child whose part of the view is its view on
+/// either side reuses that side's commit without composing it again (#440).
+pub fn split_in(
+    objects: &mut Objects,
+    views: &HashMap<String, String>,
+    tip: &str,
+    options: &SplitOptions<'_>,
+) -> std::result::Result<SplitOutcome, SplitError> {
+    let repo = objects.repo().to_path_buf();
+    let repo = repo.as_path();
+    let mut splitter = Splitter::new(objects, options);
+    splitter.view_trees.clone_from(views);
     // What is not split yet, oldest first: every parent, not only the first.
     // With it, what is split into a root commit no settled history has: each
     // is held to its parents once they are done.
@@ -1515,7 +1558,7 @@ pub fn split(
             short(tip)
         )))
     })?;
-    let index = index_with(&mut splitter.objects, options.root, &root)?;
+    let index = index_with(splitter.objects, options.root, &root)?;
     Ok(SplitOutcome {
         root,
         index,
@@ -1524,7 +1567,7 @@ pub fn split(
 }
 
 impl<'a> Splitter<'a> {
-    fn new(objects: Objects, options: &'a SplitOptions<'a>) -> Self {
+    fn new(objects: &'a mut Objects, options: &'a SplitOptions<'a>) -> Self {
         Splitter {
             objects,
             options,
@@ -1566,7 +1609,7 @@ impl<'a> Splitter<'a> {
             .as_ref()
             .and_then(|notes| notes.get(&commit.id));
         if let Some(blob) = note.cloned() {
-            let text = read_blob_text(&mut self.objects, &blob)?;
+            let text = read_blob_text(self.objects, &blob)?;
             if let Some(original) = text.trim().strip_prefix("canonical ")
                 && let Some(found) = self.objects.try_commit(original)?
             {
@@ -1596,7 +1639,7 @@ impl<'a> Splitter<'a> {
             }
         }
         if let Some(blob) = self.notes.get(view).cloned() {
-            let text = read_blob_text(&mut self.objects, &blob)?;
+            let text = read_blob_text(self.objects, &blob)?;
             if let Some((tracker, root)) = text.lines().find_map(|line| line.split_once(' '))
                 && tracker == self.options.root
                 && self.objects.has_commit(root)?
@@ -1647,7 +1690,7 @@ impl<'a> Splitter<'a> {
             .as_ref()
             .is_some_and(|history| history.contains(view))
             || self.made_before_mounts(view)?)
-            && !defines_mounts_in(&mut self.objects, view)?
+            && !defines_mounts_in(self.objects, view)?
         {
             self.mapped.insert(view.to_owned(), view.to_owned());
             return Ok(Some(view.to_owned()));
@@ -1715,7 +1758,7 @@ impl<'a> Splitter<'a> {
         }
         let access = format!("{DEFINITIONS_DIR}/{}.toml", crate::tracker::ACCESS_TRACKER);
         if let Some(entry) = self.objects.entry_at(&commit.tree, &access)? {
-            let text = read_blob_text(&mut self.objects, &entry.id)?;
+            let text = read_blob_text(self.objects, &entry.id)?;
             return Ok(mount_in(&text).as_deref() == Some("."));
         }
         Ok(false)
@@ -1725,7 +1768,7 @@ impl<'a> Splitter<'a> {
         if let Some(tree) = self.view_trees.get(commit) {
             return Ok(tree.clone());
         }
-        let tree = view_tree(&mut self.objects, commit)?;
+        let tree = view_tree(self.objects, commit)?;
         self.view_trees.insert(commit.to_owned(), tree.clone());
         Ok(tree)
     }
@@ -2024,7 +2067,7 @@ impl<'a> Splitter<'a> {
             if !name_fits_id(tracker) {
                 continue;
             }
-            let text = read_blob_text(&mut self.objects, &entry.id)?;
+            let text = read_blob_text(self.objects, &entry.id)?;
             let path = Utf8PathBuf::from(format!("{DEFINITIONS_DIR}/{name}"));
             let definition = TrackerDefinition::from_text(tracker, &path, &text);
             if !nested {
@@ -2066,7 +2109,7 @@ impl<'a> Splitter<'a> {
         let mut parent_pins: Vec<BTreeMap<String, String>> = Vec::new();
         for parent in parents {
             let found = self.objects.commit(parent)?;
-            parent_pins.push(pins_in(&mut self.objects, &found.tree)?);
+            parent_pins.push(pins_in(self.objects, &found.tree)?);
         }
         let mut own = self.objects.set_path(tree, PINS_DIR, None)?;
         let mut pins = BTreeMap::new();

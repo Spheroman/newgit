@@ -133,9 +133,12 @@ when what landed since its base changed other paths. A directory another
 landing deleted or renamed overlaps every path under it (item 8), and a
 landing that empties a tracker, adds or drops one, or changes a definition
 reruns every merge prepared before it, since its whole directory in the
-view may have moved. Composing
-views is still O(trackers) per Git merge (#440). Item 7's strict merge queue
-is not built.
+view may have moved. A Git merge composes each tracker commit's view once
+per finish (#440): the base, the head, and the merger's index share most of
+their trackers, and an attempt that runs again composes only what landed
+since. Split reuses the same views, so a tracker whose part of the merge is
+its view on either side keeps that side's commit without composing it
+again. Item 7's strict merge queue is not built.
 
 Across servers there is no transaction: two landings, in order (rule 5).
 
@@ -215,7 +218,8 @@ Anchors as a concept, deferred roll-ups, inboxes and outboxes, reservations,
    per tracker both sides moved and the merger's commit second. The recheck
    by path; policy, membership, and the audience rule read against what
    lands; barriers and epochs on `main`; fairness as a turn on the paths a
-   merge changes. Composing views from cached subtrees is #440.
+   merge changes. Views composed from subtrees cached by tracker commit
+   (#440), and what a merge asks of Git answered in process (#445).
 4. **Done (#412).** Stored rooted histories: each tracker's view, composed
    from the trackers its store's readers may all read (its own store's and
    public ones), kept in its store and extended by composing only what is
@@ -223,8 +227,8 @@ Anchors as a concept, deferred roll-ups, inboxes and outboxes, reservations,
    landing in the background, and caught up by any read that finds it
    behind, so no reader sees one behind what landed. A reader who may read
    more (a private tracker mounted inside) is still composed for per
-   fetch; caching those per subtree is #440. [serve.md](serve.md),
-   decision 10.
+   fetch; caching those by tracker commit, as a server merge's views are
+   (#440), is not done yet. [serve.md](serve.md), decision 10.
 5. Dependencies across servers: ordered two-step landings, proposals, resume.
    (Not a dependency, and done: **mirrors (#414).** The GitHub webhook
    lands a mirror's commits as a merge, one landing, and each target's
