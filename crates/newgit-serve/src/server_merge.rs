@@ -72,7 +72,7 @@ pub struct Merged {
 }
 
 /// A repository of one merge's own, removed when dropped.
-struct Scratch {
+pub struct Scratch {
     dir: Utf8PathBuf,
 }
 
@@ -171,6 +171,13 @@ impl Composer {
 }
 
 impl Scratch {
+    /// A new scratch repository in `project`'s home, borrowing what
+    /// [`Scratch::borrowed`] names: for a caller with no attempts to share
+    /// one across (a mirror's pull).
+    pub fn open_for(project: &ProjectContext<'_>, login: &str) -> ApiResult<Self> {
+        Self::open(&project.home(), &Self::borrowed(project, login))
+    }
+
     /// The object directories a scratch repository in `project`'s home
     /// borrows: every store there and `login`'s landings (where the merge's
     /// own commits wait), and each linked tracker's home's stores.
@@ -223,6 +230,12 @@ impl Scratch {
         }
         std::fs::write(scratch.dir.join("objects/info/alternates"), alternates)?;
         Ok(scratch)
+    }
+}
+
+impl Scratch {
+    pub fn dir(&self) -> &Utf8Path {
+        &self.dir
     }
 }
 
@@ -605,6 +618,7 @@ pub fn merge(
         // Each side's forks are read from its own commits, the merge's
         // parents.
         forks_before: &[],
+        settled: &[],
     };
     let split =
         compose::split_in(objects, views, &merge_view, &options).map_err(|error| match error {
