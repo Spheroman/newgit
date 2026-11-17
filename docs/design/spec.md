@@ -1272,7 +1272,10 @@ each `suspend` once that resource's dependents are down, and records what
 it took down in `.newgit/state/<slug>/stopped.toml`. `newgit start`
 brings back exactly that, dependencies first, running `resume` before a
 resource's dependents come back, and with it any `autostart` action that
-died on its own since (#261). A resource nobody had started stays
+died on its own since (#261), or that never started though its resource
+is ready: one a spawn held back behind a dependency that was not up (#54).
+`status` shows such a resource as `not started` and the instance as not
+ready. A long-running action without `autostart` that nobody started stays
 stopped. A resource whose dependency did not come back in the same `start`
 is not started, and stays owed, so a dev server is not brought up against a
 database that is still down.
