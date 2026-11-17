@@ -707,6 +707,20 @@ enum ResourceCommand {
     },
     /// List defined resources
     List,
+    /// Check that every program a definition's commands start is on this
+    /// machine, with no instance and nothing run
+    ///
+    /// Reads the first word of each command in every action, `[identity]
+    /// key_command`, `[checkpoint]`, `[restore]`, `[cleanup]`, and `[ready]`
+    /// command, and looks for it on `PATH` (a path with a `/` relative to
+    /// the project root and the command's `workdir`). A word a template or a
+    /// variable decides is skipped. Exits 1 when any is missing.
+    Check {
+        /// One JSON document: `{"programs": [{"resource", "hook", "program",
+        /// "found"}]}`, `found` null when missing
+        #[arg(long)]
+        json: bool,
+    },
     /// Bind a resource again in an instance, as spawn bound it: ports,
     /// exports, render, `prepare`, then its `autostart` action
     ///
@@ -1865,6 +1879,63 @@ fn resource(command: ResourceCommand) -> Result<()> {
                     .iter()
                     .any(|start| start.status == StopStartStatus::Failed);
             if failed {
+                std::process::exit(1);
+            }
+            Ok(())
+        }
+        ResourceCommand::Check { json } => {
+            let manager = manager_here()?;
+            let path = std::env::var("PATH").unwrap_or_default();
+            let checks = newgit_core::preflight::check(
+                manager.resource_definitions(),
+                &manager.store().paths().project_root,
+                &path,
+            );
+            let missing = checks.iter().filter(|check| check.is_missing()).count();
+            if json {
+                let programs = checks
+                    .iter()
+                    .map(|check| {
+                        serde_json::json!({
+                            "resource": check.resource,
+                            "hook": check.hook,
+                            "program": check.program,
+                            "found": check.found,
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                println!("{}", serde_json::json!({ "programs": programs }));
+            } else if checks.is_empty() {
+                println!("No resource definition starts a program newgit can check.");
+            } else {
+                for check in &checks {
+                    match &check.found {
+                        Some(found) => println!(
+                            "ok    {}: {} `{}` ({found})",
+                            check.resource, check.hook, check.program
+                        ),
+                        None => println!(
+                            "FAIL  {}: {} `{}` — not found{}",
+                            check.resource,
+                            check.hook,
+                            check.program,
+                            if check.program.contains('/') {
+                                " in the project root".to_owned()
+                            } else {
+                                " on PATH".to_owned()
+                            }
+                        ),
+                    }
+                }
+                if missing > 0 {
+                    println!(
+                        "{missing} program{} missing: install {}, or change the definition",
+                        if missing == 1 { "" } else { "s" },
+                        if missing == 1 { "it" } else { "them" }
+                    );
+                }
+            }
+            if missing > 0 {
                 std::process::exit(1);
             }
             Ok(())

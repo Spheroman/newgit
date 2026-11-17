@@ -1901,9 +1901,10 @@ Open issues that change what this document can promise:
   that carry them; nothing carries them by itself.
 - **#85: no reconcile.** A live instance does not pick up a changed
   resource definition (a new port, say), and nothing says it is stale.
-- **#87: no preflight.** A definition that calls a missing binary (`pg_dump`
-  on a host without Postgres) fails at the first checkpoint or, worse, the
-  first restore.
+- **#87: preflight is asked for, not automatic.** `newgit resource check`
+  finds a definition calling a missing binary (`pg_dump` on a host without
+  Postgres); nothing runs it at spawn, so one never checked still fails at
+  the first checkpoint or, worse, the first restore.
 - **#89: a failed `prepare` can destroy its own evidence**, when the tool
   tears down its containers before exiting. newgit shows the command that
   ran and how its log ends, and the reference says how to rerun it by hand
