@@ -1675,8 +1675,9 @@ name `newgit pull --remote <target> --force`, which resets the rooted
 tracker's line to the target's, lists what it drops and who still holds
 it, and refuses to carry it onward from this machine; the project's own
 history still pins it ([trackers.md](trackers.md), *Following a
-force-push*). Every push to a target, of `main`, of an instance's branch,
-or of a tag, passes that check, but it reads this machine's record of what
+force-push*). Every push to a target from a client, of `main`, of an
+instance's branch, or of a tag, passes that check (the remote's own export
+of its GitHub mirrors does not yet, [serve.md](serve.md)), but it reads this machine's record of what
 it last exported there: with no record, or a record older than another
 machine's export, a rewrite cannot be told from history of the target's
 own (#473). With `branches = true`, every push from a workspace exports its

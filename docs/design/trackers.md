@@ -591,7 +591,12 @@ trackers **(decided)**:
    stays, with no change to its tree, because telling would take the child's
    history. A merge goes the same way only when its sides differ in such
    a child and what is left adds nothing to one parent: the side that moved
-   the pin was dropped, so there is nothing to join. Any other merge stays.
+   the pin was dropped, so there is nothing to join. Any other merge stays,
+   and so does one that comes back as the very commit it was split from
+   (rule 5): that is a merge the reader's own history has, such as a pull
+   request merged on a mirror from an instance's branch whose instance also
+   had work the mirror does not ship. Dropped, the mirror would hold a commit
+   `main` never shows it again, and no export could follow (#451).
    Someone who cannot read a tracker sees different ids from the first commit
    that touched it (see *One name for a commit*).
 
@@ -1062,7 +1067,10 @@ secret), is a rewrite that removed everything: only `export --remote
 These are enforced in one place. Every `git push` to a target goes through
 `clear_push` (`manager/target_push.rs`), which checks it and hands back the
 only thing `push_cleared` will push; a push that skips the check does not
-compile. A push of `main` and a tag together whose export of `main` fails
+compile. That is every push from a client; the remote's own export of its
+GitHub mirrors (#414) does not check yet, and a forced push to a mirror is
+pulled there as a merge ([serve.md](serve.md), *Not yet: a mirror
+force-pushed*). A push of `main` and a tag together whose export of `main` fails
 does not push the tag to that target either. Whether the target is now beside
 the line (a purge that added a commit) or behind it does not matter: the
 simplest purge, `git reset --hard HEAD~1 && git push --force`, adds no

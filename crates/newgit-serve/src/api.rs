@@ -34,9 +34,18 @@ pub struct ApiRequest {
     pub query: BTreeMap<String, String>,
     pub bearer: Option<String>,
     pub dev_login: Option<String>,
+    /// The few other headers a route reads (GitHub's webhook headers), by
+    /// lowercase name.
+    pub headers: BTreeMap<String, String>,
     /// `scheme://host`, for the URLs answers name.
     pub origin: String,
     pub body: Vec<u8>,
+}
+
+impl ApiRequest {
+    pub fn header(&self, name: &str) -> Option<&str> {
+        self.headers.get(name).map(String::as_str)
+    }
 }
 
 pub struct ApiResponse {
@@ -133,7 +142,7 @@ fn is_commit_id(value: &str) -> bool {
             .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
 }
 
-fn decode(segment: &str) -> String {
+pub fn decode(segment: &str) -> String {
     let bytes = segment.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut index = 0;
@@ -235,6 +244,7 @@ pub fn handle(app: &App, request: &ApiRequest) -> ApiResult<ApiResponse> {
         ("POST", "/v1/login/device") => return device_start(app),
         ("POST", "/v1/login/poll") => return device_poll(app, request),
         ("POST", "/v1/dev/login") => return dev_login(app, request),
+        ("POST", "/v1/webhooks/github") => return crate::mirror::webhook::receive(app, request),
         _ => {}
     }
 
@@ -1877,7 +1887,14 @@ fn state(project: &ProjectContext<'_>, db: &Connection) -> ApiResult<ApiResponse
         }
         branches.push(entry);
     }
-    ok(json!({ "branches": branches, "pulls": [], "ended": [] }))
+    let running = app_running(project.app);
+    let mut answer =
+        crate::mirror::store::state(db, &project.key, running, crate::db::now_seconds())?;
+    answer["branches"] = json!(branches);
+    if !running {
+        project.app.mirrors.wake_pulls();
+    }
+    ok(answer)
 }
 
 fn create_branch(
@@ -2109,7 +2126,7 @@ fn remove_forks(project: &ProjectContext<'_>, instance: &db::Instance) -> ApiRes
 }
 
 /// Why `name` is not a tag name Git accepts, if it is not.
-fn tag_name_problem(name: &str) -> Option<String> {
+pub(crate) fn tag_name_problem(name: &str) -> Option<String> {
     let bad = name.is_empty()
         || name.len() > 200
         || name.starts_with('-')
@@ -2169,19 +2186,7 @@ fn tag_route(
             None => fail(404, format!("no tag `{name}` in {key}")),
         };
     }
-    caller.require_human("tag")?;
-    caller.require_not_instance("tag")?;
-    let root_facts = project
-        .facts(db, "root")?
-        .or_else(|| policy::implicit_facts("root"))
-        .unwrap_or_else(|| unreachable!());
-    policy::may_maintain(
-        &root_facts.maintainers,
-        &project.who(caller),
-        &project.info.owner,
-        "root",
-    )
-    .map_err(|why| HttpError::new(403, format!("{why}, so may not tag")))?;
+    may_tag(project, db, caller)?;
     match request.method.as_str() {
         "DELETE" => {
             if !db::delete_tag(db, key, name)? {
@@ -2195,57 +2200,94 @@ fn tag_route(
             let Some(root) = put.root.filter(|root| is_commit_id(root)) else {
                 return fail(400, "root must name root's commit by its full id");
             };
-            let annotation = put.annotation;
-            if !annotation.is_null() {
-                let tagger = annotation["tagger"].as_str();
-                if tagger.is_none() || !annotation["message"].is_string() {
-                    return fail(
-                        400,
-                        "annotation is { tagger, message }, or null for a lightweight tag",
-                    );
-                }
-                if tagger.is_some_and(|tagger| tagger.contains('\n') || !valid_tagger(tagger)) {
-                    return fail(
-                        400,
-                        "annotation.tagger is `Name <email> <seconds> <zone>`, as Git writes it",
-                    );
-                }
-            }
-            if let Some(existing) = db::tag(db, key, name)? {
-                if existing["list"]["root"] == root.as_str() && existing["annotation"] == annotation
-                {
-                    return ok(existing);
-                }
-                let at = existing["list"]["root"].as_str().unwrap_or_default();
-                return fail(
-                    409,
-                    format!(
-                        "tag `{name}` names root commit {} already, and a tag never moves: delete it first if it is wrong",
-                        &at[..at.len().min(12)]
-                    ),
-                );
-            }
-            let repo = project.tracker("root");
-            let on_main = repo
-                .branch_head("main")
-                .is_some_and(|main| repo.has_commit(&root) && repo.is_ancestor(&root, &main));
-            if !on_main {
-                return fail(
-                    400,
-                    format!(
-                        "root commit {} is not on root's `main`: a tag names the project's history, so push the commit to `main` first (`git push origin main {name}`, or `git push --follow-tags`)",
-                        &root[..12]
-                    ),
-                );
-            }
-            let list = crate::merge::index_of(project, &root, None)?;
-            db::create_tag(db, key, name, &list, &annotation, &caller.login)?;
-            tagged(project, &list);
-            let made = db::tag(db, key, name)?.unwrap_or(Value::Null);
-            created(made)
+            let (tag, made) = make_tag(project, db, &caller.login, name, &root, &put.annotation)?;
+            if made { created(tag) } else { ok(tag) }
         }
         method => fail(404, format!("no route for {method} {}", request.path)),
     }
+}
+
+/// Whether `caller` may make or delete a tag: a person, from their own
+/// login, who maintains root.
+pub(crate) fn may_tag(
+    project: &ProjectContext<'_>,
+    db: &Connection,
+    caller: &Caller,
+) -> ApiResult<()> {
+    caller.require_human("tag")?;
+    caller.require_not_instance("tag")?;
+    let root_facts = project
+        .facts(db, "root")?
+        .or_else(|| policy::implicit_facts("root"))
+        .unwrap_or_else(|| unreachable!());
+    policy::may_maintain(
+        &root_facts.maintainers,
+        &project.who(caller),
+        &project.info.owner,
+        "root",
+    )
+    .map_err(|why| HttpError::new(403, format!("{why}, so may not tag")))
+}
+
+/// Make tag `name` at root commit `root`, by `by`: the one way a tag is
+/// made, whether pushed from a project root or made on a mirror. The tag,
+/// and whether this made it (`false`: it was there, naming that commit with
+/// that annotation). One that exists naming anything else is refused, since
+/// a tag never moves, and so is a commit that is not on root's `main`.
+pub(crate) fn make_tag(
+    project: &ProjectContext<'_>,
+    db: &Connection,
+    by: &str,
+    name: &str,
+    root: &str,
+    annotation: &Value,
+) -> ApiResult<(Value, bool)> {
+    let key = &project.key;
+    if !annotation.is_null() {
+        let tagger = annotation["tagger"].as_str();
+        if tagger.is_none() || !annotation["message"].is_string() {
+            return fail(
+                400,
+                "annotation is { tagger, message }, or null for a lightweight tag",
+            );
+        }
+        if tagger.is_some_and(|tagger| tagger.contains('\n') || !valid_tagger(tagger)) {
+            return fail(
+                400,
+                "annotation.tagger is `Name <email> <seconds> <zone>`, as Git writes it",
+            );
+        }
+    }
+    if let Some(existing) = db::tag(db, key, name)? {
+        if existing["list"]["root"] == root && existing["annotation"] == *annotation {
+            return Ok((existing, false));
+        }
+        let at = existing["list"]["root"].as_str().unwrap_or_default();
+        return fail(
+            409,
+            format!(
+                "tag `{name}` names root commit {} already, and a tag never moves: delete it first if it is wrong",
+                &at[..at.len().min(12)]
+            ),
+        );
+    }
+    let repo = project.tracker("root");
+    let on_main = repo
+        .branch_head("main")
+        .is_some_and(|main| repo.has_commit(root) && repo.is_ancestor(root, &main));
+    if !on_main {
+        return fail(
+            400,
+            format!(
+                "root commit {} is not on root's `main`: a tag names the project's history, so push the commit to `main` first (`git push origin main {name}`, or `git push --follow-tags`)",
+                &root[..root.len().min(12)]
+            ),
+        );
+    }
+    let list = crate::merge::index_of(project, root, None)?;
+    db::create_tag(db, key, name, &list, annotation, by)?;
+    tagged(project, &list);
+    Ok((db::tag(db, key, name)?.unwrap_or(Value::Null), true))
 }
 
 /// `Name <email> <seconds> <zone>`, as Git's `tagger` line has it.
@@ -2266,4 +2308,11 @@ fn valid_tagger(tagger: &str) -> bool {
         && zone.len() == 5
         && matches!(zone.as_bytes()[0], b'+' | b'-')
         && zone.bytes().skip(1).all(|byte| byte.is_ascii_digit())
+}
+
+/// Whether pulls are moving: `/state` says a pull is stalled when its thread
+/// is gone, or has not stamped its beat for `mirror::STALLED_AFTER`.
+fn app_running(app: &App) -> bool {
+    let off = std::env::var("NEWGIT_SERVE_MIRRORS").is_ok_and(|value| value == "off");
+    off || app.mirrors.pulls_moving()
 }

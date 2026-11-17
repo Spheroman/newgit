@@ -9,6 +9,11 @@
 //! [`BranchManager::push_cleared`] takes nothing else, so a push that skips
 //! the checks does not compile.
 //!
+//! That is every push from a client. The remote's own export of a project
+//! to its GitHub mirrors (`newgit-serve`'s `mirror/export.rs`, #414) is
+//! another process, with no such record, and does not check yet: see
+//! *Not yet* in `docs/design/serve.md`.
+//!
 //! The checks, each asked of the target at that moment:
 //!
 //! - **What a rewrite removed.** When the target's own branch no longer

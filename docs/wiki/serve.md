@@ -133,10 +133,33 @@ What differs is the machinery, and it is the reason to run it:
   move yours. A merge in flight is kept in memory, so restarting the server
   tells its merger to start the merge over.
 
+- GitHub mirrors, with `--github <file>` (only its owner may read it):
+
+  ```toml
+  [projects."jack/store"]
+  webhook_secret = "the secret you give the mirror's webhook"
+  token = "a token that can read and write the mirror's contents"
+  ```
+
+  Each export target on GitHub gets the project's view pushed to it after
+  every landing, without what the target withholds, and `newgit status`
+  says when one is behind or failing. Give the mirror a webhook at
+  `https://<your remote>/v1/webhooks/github?project=<owner>/<name>` with
+  that secret and the *push* and *pull request* events, and a pull request
+  merged there lands in `main` like anyone's merge, as whoever merged it
+  (who must be a member who may merge root). A tag made there (a release
+  cut on GitHub) is made on the remote too, on the commit it names, once
+  that commit is on `main`; a tag never moves. When one is refused,
+  `newgit status` says why and what to do. The server only ever talks to
+  `https://github.com/<owner>/<name>.git`, with that project's token, and
+  its mirror Git ignores your global and system Git config: a target
+  written as an SSH address or on another host is exported by `newgit
+  export` from your machine, not by the server. (GitHub Enterprise, or a
+  test's stand-in: `git = "https://github.example.com/"` at the top of the
+  file.)
+
 What it does not do yet:
 
-- GitHub webhooks and mirror pulls: a pull request merged on a GitHub mirror
-  does not land in `main` by itself.
 - The site: no landing page, no `/install.sh`, and no wiki at `/docs`.
 - The spend kill switch, backups, and replicas.
 - Taking over newgit.dev. That still runs on the Worker, until moving its

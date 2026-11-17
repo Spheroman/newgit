@@ -22,8 +22,10 @@
   rewritten since the last export, a rewind with no new commit included,
   and so does every push to it that would carry what the rewrite removed:
   `main`'s export (plain, `--dry-run`, and the one a push makes), an
-  instance's branch, and a tag. Every push to a target goes through one
-  check, so none can skip it. A branch deleted there, with a record of
+  instance's branch, and a tag. Every push to a target from a client goes
+  through one check, so none can skip it; the remote's own export of its
+  GitHub mirrors does not check yet, and a forced push to a mirror is
+  pulled there as a merge. A branch deleted there, with a record of
   exporting to it, counts as a rewrite that removed everything, and a tag
   pushed with `main` is not pushed to a target `main`'s export was refused
   on. These name `--force` instead of merging back or advising `export
