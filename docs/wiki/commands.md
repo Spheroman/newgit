@@ -55,6 +55,9 @@ inside a workspace):
   a tracker's `export` declares: that tracker and every tracker inheriting
   its export ship, nothing else. A target is named after its repository
   unless its `export` gives a `name`
+- `newgit export <instance> --remote <name>` — push that instance's branch,
+  as last pushed, to a `branches = true` target again. Its `git push`
+  already does this; run it when that export failed
 - `newgit cleanup [--dry-run] [--purge-archived]`
 - `newgit ports [--check]` — claimed ports, or detect a listening one nothing
   claims

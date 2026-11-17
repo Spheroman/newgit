@@ -691,8 +691,9 @@ struct ExportArgs {
     /// Push the trackers' `main`s, history and all, to target NAME, which a
     /// tracker's `export` declares (a GitHub mirror, say). A target is named
     /// after its repository (`widget` for github.com/acme/widget) unless its
-    /// `export` gives a `name`
-    #[arg(long, value_name = "NAME", conflicts_with_all = ["instance", "includes", "excludes"])]
+    /// `export` gives a `name`. With an instance: push that instance's
+    /// branch there again, as last pushed, which its `git push` already does
+    #[arg(long, value_name = "NAME", conflicts_with_all = ["includes", "excludes"])]
     remote: Option<String>,
     /// Include this path regardless of tracker audience; repeatable
     #[arg(long = "include", value_name = "PATH")]
@@ -3683,8 +3684,9 @@ fn push_pre_receive(instance: &str) -> Result<()> {
                         export.branch
                     )
                 };
+                let replaced = if exported.replaced { REPLACED } else { "" };
                 println!(
-                    "newgit: exported `{}` to `{}` ({}){without}; {next}",
+                    "newgit: exported `{}` to `{}` ({}){without}{replaced}; {next}",
                     export.branch, export.target, export.url
                 );
             }
@@ -4016,6 +4018,15 @@ fn checkpoints(instance: Option<String>) -> Result<()> {
 }
 
 fn export(args: ExportArgs) -> Result<()> {
+    if let (Some(name), Some(instance)) = (&args.remote, &args.instance) {
+        if args.force || args.dry_run {
+            bail!(
+                "--force and --dry-run go with `main`'s export (`newgit export --remote \
+                 {name}`): an instance's branch there follows its `git push`"
+            );
+        }
+        return export_branch_to_remote(instance, name);
+    }
     if let Some(name) = &args.remote {
         return export_to_remote(
             name,
@@ -4119,6 +4130,34 @@ fn export(args: ExportArgs) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// What an export that replaced the target's branch says after where it went.
+const REPLACED: &str = ", replacing the branch there: its commits were built on a copy of what \
+                        the target already has, and are now built on the target's own";
+
+/// `newgit export <instance> --remote <name>`: the instance's branch, as last
+/// pushed, exported to a `branches = true` target again.
+fn export_branch_to_remote(instance: &str, name: &str) -> Result<()> {
+    let manager = manager_here()?;
+    let export = manager.export_branch_to_remote(instance, name)?;
+    match &export.result {
+        Ok(exported) => {
+            println!(
+                "Exported `{}` to `{}` ({}){}",
+                export.branch,
+                export.target,
+                export.url,
+                if exported.replaced { REPLACED } else { "" }
+            );
+            Ok(())
+        }
+        Err(error) => bail!(
+            "`{}` was not exported to `{}`: {error}",
+            export.branch,
+            export.target
+        ),
+    }
 }
 
 /// `newgit export --remote <name>`: the trackers' `main`s, composed and

@@ -1139,6 +1139,9 @@ pub struct BranchExported {
     pub same_commits: bool,
     /// Trackers in Git this target does not ship.
     pub withheld: Vec<String>,
+    /// The branch there was replaced, not added to: what newgit last put
+    /// there was built on commits the target has under other ids.
+    pub replaced: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -2824,8 +2827,33 @@ impl BranchManager {
                 newgit_made,
                 need_history: &|tracker| self.need_history(tracker),
                 forks_before: &self.fork_records(),
+                settled: &self.settled_roots(),
             },
         )?)
+    }
+
+    /// Root's `main` wherever this machine has it: its own, and the remote's
+    /// as last fetched and as last composed. What a split takes as the
+    /// project's history, never to be made again.
+    fn settled_roots(&self) -> Vec<String> {
+        let root = &self.root.name;
+        let listed = crate::source::run_git_env(
+            &[
+                "-C",
+                self.store.paths().project_root.as_str(),
+                "for-each-ref",
+                "--format=%(objectname)",
+                &local_tracker_ref(root, "main"),
+                &format!("refs/newgit/remote/{root}/main"),
+                ROOT_MAIN_ON_REMOTE,
+            ],
+            &[],
+        )
+        .unwrap_or_default();
+        let mut roots: Vec<String> = listed.lines().map(ToOwned::to_owned).collect();
+        roots.sort();
+        roots.dedup();
+        roots
     }
 
     /// Split instance `slug`'s commits up to `tip` into its tracker
@@ -2844,14 +2872,7 @@ impl BranchManager {
         } else {
             let branch = self.store.find_branch(slug).ok();
             if let Some(branch) = &branch {
-                // Failing leaves the split to make commits of its own, which
-                // work, but a mirror will see as new.
-                if let Err(error) = self.learn_view_from(&branch.workspace_path, tip) {
-                    eprintln!(
-                        "newgit: could not read what the remote made of `main`, so commits \
-                         exported from `{slug}` may not match a mirror's: {error}"
-                    );
-                }
+                self.learn_before_split(branch, tip);
             }
             branch.map(|branch| branch.dropped).unwrap_or_default()
         };
@@ -2865,6 +2886,21 @@ impl BranchManager {
             &branch,
         )?;
         Ok(outcome.made.len())
+    }
+
+    /// [`Self::learn_view_from`] before `branch`'s commits up to `tip` are
+    /// split. Failing leaves the split to make root commits of its own for
+    /// what the remote has split already, so a mirror sees those commits as
+    /// new, until a later split learns of the remote's and splits this
+    /// instance's again, onto them.
+    fn learn_before_split(&self, branch: &BranchInstance, tip: &str) {
+        if let Err(error) = self.learn_view_from(&branch.workspace_path, tip) {
+            eprintln!(
+                "newgit: could not read what the remote made of `main`, so commits exported \
+                 from `{}` may not match a mirror's until it can: {error}",
+                branch.slug
+            );
+        }
     }
 
     /// Refuse when any commit `rev_list` selects (in `repo`) adds or changes
@@ -3074,7 +3110,12 @@ impl BranchManager {
             return Ok(());
         };
         let main = format!("refs/remotes/{PUBLISH_REMOTE}/{PROJECT_ROOT_INSTANCE}");
-        let Ok(fetched) = crate::source::run_git_env(
+        // The remote's `main` as the workspace fetched it, and as the project
+        // root did: an instance spawned on a `main` the project root fetched
+        // and never pulled (a Claude Code worktree's fresh base) starts there,
+        // in a workspace whose own `origin/main` is the project root's branch.
+        let mut fetched: Vec<String> = Vec::new();
+        if let Ok(commit) = crate::source::run_git_env(
             &[
                 "-C",
                 workspace.as_str(),
@@ -3084,20 +3125,25 @@ impl BranchManager {
                 &main,
             ],
             &[],
-        ) else {
-            return Ok(());
-        };
-        // Not merged yet, so not in anything being split.
-        if self
-            .source
-            .rev_parse(&format!("{fetched}^{{commit}}"))
-            .is_err()
-        {
-            return Ok(());
+        ) {
+            fetched.push(commit.trim().to_owned());
         }
+        fetched.extend(self.source.rev_parse(&main).ok());
+        fetched.dedup();
         let project = self.store.paths().project_root.clone();
-        // As the workspace: a push from it may have no login behind it.
-        self.learn_view(link, Acting::Workspace(workspace), &project, tip, &fetched)
+        for fetched in &fetched {
+            // Not merged yet, so not in anything being split.
+            if self
+                .source
+                .rev_parse(&format!("{fetched}^{{commit}}"))
+                .is_err()
+            {
+                continue;
+            }
+            // As the workspace: a push from it may have no login behind it.
+            self.learn_view(link, Acting::Workspace(workspace), &project, tip, fetched)?;
+        }
+        Ok(())
     }
 
     /// Note the view commits `tip` shares with `fetched`, the remote's `main`,
@@ -3128,6 +3174,11 @@ impl BranchManager {
         // never made) recomposed all of `main` on every push, twice: once in
         // the checkpoint's sync, once in the push. The project's own record
         // says where `main` is; its trackers are fetched only to compose it.
+        //
+        // With every pin this machine has now, too: composing leaves out a
+        // pin that is not here, so a `main` composed before one of its
+        // trackers arrived noted views the remote never served, and the
+        // commits the remote did serve were split again.
         let view = "refs/newgit/views/branches/main";
         let composed = |root: &str| {
             self.source.rev_parse(ROOT_MAIN_ON_REMOTE).ok().as_deref() == Some(root)
@@ -3136,6 +3187,7 @@ impl BranchManager {
                         .ok()
                         .flatten()
                         .is_some_and(|(_, noted)| noted == root)
+                        && self.composed_with_every_pin(project, &commit, root)
                 })
         };
         let recorded = client.project(link.project.as_str())?;
@@ -3155,9 +3207,44 @@ impl BranchManager {
             && !composed(root)
         {
             self.compose_here(view, root)?;
+            // A tracker whose commit did not come is left out of the view
+            // composed, which is then not the one the remote serves: said,
+            // and tried again at the next split rather than taken as done.
+            let lacking: Vec<String> = list
+                .iter()
+                .filter(|(_, commit)| {
+                    self.source
+                        .rev_parse(&format!("{commit}^{{commit}}"))
+                        .is_err()
+                })
+                .map(|(tracker, commit)| {
+                    format!(
+                        "`{}` at {}",
+                        crate::tracker::tracker_path(tracker),
+                        &commit[..commit.len().min(12)]
+                    )
+                })
+                .collect();
+            if !lacking.is_empty() {
+                return Err(NewgitError::Unsupported(format!(
+                    "the remote's `main` pins {}, which its repo did not send",
+                    lacking.join(", ")
+                )));
+            }
             self.source.update_ref(ROOT_MAIN_ON_REMOTE, root)?;
         }
         Ok(())
+    }
+
+    /// Whether `view`, composed from root commit `root`, holds what `root`
+    /// composes to with every pin this machine has now.
+    fn composed_with_every_pin(&self, project: &Utf8Path, view: &str, root: &str) -> bool {
+        let trees = || -> Result<(String, String)> {
+            let mut objects = crate::objects::Objects::open(project)?;
+            let composed = objects.commit(view)?.tree;
+            Ok((composed, crate::compose::view_tree(&mut objects, root)?))
+        };
+        trees().is_ok_and(|(composed, now)| composed == now)
     }
 
     /// On a linked project, make the project root's `origin` the remote's
@@ -9149,7 +9236,12 @@ impl BranchManager {
 
         let url = target.push_url();
         if !options.dry_run {
-            self.push_export(&target, &view.tip, &target.branch, options.force)
+            let how = if options.force {
+                PushExport::Force
+            } else {
+                PushExport::Onto
+            };
+            self.push_export(&target, &view.tip, &target.branch, how)
                 .map_err(|error| match error {
                     NewgitError::SourceCommand { stderr, .. } if rejected(&stderr) => {
                         NewgitError::Unsupported(format!(
@@ -9433,6 +9525,7 @@ impl BranchManager {
                 newgit_made: None,
                 need_history: &|tracker| self.need_history(tracker),
                 forks_before: &self.fork_records(),
+                settled: &[],
             },
         )?)
     }
@@ -9926,22 +10019,33 @@ impl BranchManager {
         target: &ExportTarget,
         tip: &str,
         branch: &str,
-        force: bool,
+        how: PushExport<'_>,
     ) -> Result<()> {
-        let refspec = format!("{}{tip}:refs/heads/{branch}", if force { "+" } else { "" });
-        crate::source::run_git_env(
-            &[
-                "-C",
-                self.store.paths().project_root.as_str(),
-                "push",
-                "--quiet",
-                "--no-verify",
-                &target.push_url(),
-                &refspec,
-            ],
-            &[],
-        )
-        .map(|_| ())
+        let refspec = format!(
+            "{}{tip}:refs/heads/{branch}",
+            if matches!(how, PushExport::Force) {
+                "+"
+            } else {
+                ""
+            }
+        );
+        let lease = match how {
+            PushExport::Replacing(held) => {
+                Some(format!("--force-with-lease=refs/heads/{branch}:{held}"))
+            }
+            _ => None,
+        };
+        let url = target.push_url();
+        let mut args = vec![
+            "-C",
+            self.store.paths().project_root.as_str(),
+            "push",
+            "--quiet",
+            "--no-verify",
+        ];
+        args.extend(lease.as_deref());
+        args.extend([url.as_str(), refspec.as_str()]);
+        crate::source::run_git_env(&args, &[]).map(|_| ())
     }
 
     /// After a push from instance `branch` reached its remote: its branch,
@@ -9950,11 +10054,18 @@ impl BranchManager {
     /// the commit the target now really holds, so `gh` can tell whether the
     /// agent's `HEAD` is on it. A failure is reported per target; the push
     /// itself already succeeded.
+    ///
+    /// The branch there is newgit's: nobody pushes to it straight. So when
+    /// what it holds is what newgit last put there, and that is not behind
+    /// what goes there now — the instance's commits were split again, onto
+    /// the root commits the remote made (*One commit, one root commit*) — it
+    /// is replaced. Anything else there is left as it is.
     fn export_instance(
         &self,
         branch: &BranchInstance,
         head: &str,
         forced: bool,
+        split: Option<BTreeMap<String, String>>,
     ) -> Vec<BranchExport> {
         let targets = match self.export_targets() {
             Ok(targets) => targets,
@@ -9970,11 +10081,14 @@ impl BranchManager {
             }
         };
         let routing = self.route_branch(branch, &targets);
-        let mut list = BTreeMap::new();
+        // What `head` was split into when the caller says, the instance's
+        // tracker branches otherwise.
+        let from_branches = split.is_none();
+        let mut list = split.unwrap_or_default();
         for definition in self
             .carved_definitions()
             .into_iter()
-            .filter(|_| !routing.exporting.is_empty())
+            .filter(|_| from_branches && !routing.exporting.is_empty())
         {
             let commit = [format!("instances/{}", branch.slug), "main".to_owned()]
                 .iter()
@@ -9992,9 +10106,31 @@ impl BranchManager {
             .iter()
             .map(|target| {
                 let result = (|| {
+                    let held = crate::source::run_git_env(
+                        &[
+                            "-C",
+                            branch.workspace_path.as_str(),
+                            "rev-parse",
+                            "--verify",
+                            "--quiet",
+                            &format!("refs/remotes/{}/{}", target.name, branch.source_ref),
+                        ],
+                        &[],
+                    )
+                    .ok()
+                    .map(|held| held.trim().to_owned());
                     let (trackers, view) =
                         self.compose_export(target, &list, &format!("instances/{}", branch.slug))?;
-                    self.push_export(target, &view.tip, &branch.source_ref, forced)?;
+                    let replaced = held.as_deref().filter(|held| {
+                        *held != view.tip
+                            && !self.source.is_ancestor(held, &view.tip).unwrap_or(true)
+                    });
+                    let how = match replaced {
+                        _ if forced => PushExport::Force,
+                        Some(held) => PushExport::Replacing(held),
+                        None => PushExport::Onto,
+                    };
+                    self.push_export(target, &view.tip, &branch.source_ref, how)?;
                     crate::source::run_git_env(
                         &[
                             "-C",
@@ -10013,6 +10149,7 @@ impl BranchManager {
                         &[],
                     )?;
                     Ok::<_, NewgitError>(BranchExported {
+                        replaced: replaced.is_some() && !forced,
                         same_commits: view.tip == head,
                         withheld: trackers
                             .into_iter()
@@ -10044,6 +10181,59 @@ impl BranchManager {
             let _ = self.point_gh(branch, &targets, routing.resolved);
         }
         exports
+    }
+
+    /// Export instance `instance`'s branch to target `name` again, as its
+    /// `git push` does once the push has reached the remote: the branch as
+    /// last pushed, not whatever the workspace has since, because a mirror
+    /// holds what `git push` sent. For an export that failed, and for a branch
+    /// whose commits there were built on a copy of what the target's `main`
+    /// already has (*One commit, one root commit*). Nothing in the workspace
+    /// moves but its record of what the target holds.
+    pub fn export_branch_to_remote(&self, instance: &str, name: &str) -> Result<BranchExport> {
+        self.refuse_unlinked()?;
+        self.require_resolvable_graph()?;
+        let (_lock, branch) = self.locked_branch(instance)?;
+        let target = self.export_target(name)?;
+        if !target.branches {
+            return Err(NewgitError::Unsupported(format!(
+                "`{name}` takes no branches, only `main` (`newgit export --remote {name}`): \
+                 `branches = true` in the `export` that declares it sends each instance's \
+                 branch there too"
+            )));
+        }
+        let outbox = self.outbox();
+        let pushed = crate::source::run_git_env(
+            &[
+                "-C",
+                outbox.as_str(),
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                &format!("refs/heads/{}^{{commit}}", branch.source_ref),
+            ],
+            &[],
+        )
+        .map(|pushed| pushed.trim().to_owned())
+        .map_err(|_| {
+            NewgitError::Unsupported(format!(
+                "`{}` has not been pushed yet, so there is nothing of it to export: `git push \
+                 origin {}` in its workspace pushes and exports it",
+                branch.name, branch.source_ref
+            ))
+        })?;
+        self.prepare_projection()?;
+        self.learn_before_split(&branch, &pushed);
+        let split = self.split_view(&pushed, &branch.dropped)?.index;
+        self.export_instance(&branch, &pushed, false, Some(split))
+            .into_iter()
+            .find(|export| export.target == name)
+            .ok_or_else(|| {
+                NewgitError::Unsupported(format!(
+                    "`{}` holds nothing `{name}` ships, so it is not exported there",
+                    branch.source_ref
+                ))
+            })
     }
 
     /// Record one coherent snapshot across source, trackers, and resources.
@@ -10614,7 +10804,7 @@ impl BranchManager {
             Some((old, new)) => {
                 let forced =
                     old.is_some_and(|old| !self.source.is_ancestor(old, new).unwrap_or(true));
-                self.export_instance(&branch, new, forced)
+                self.export_instance(&branch, new, forced, None)
             }
             None => Vec::new(),
         };
@@ -15347,6 +15537,18 @@ struct PushedTag {
     /// The root commit the tagged commit stands for.
     root: String,
     annotation: Option<crate::endpoint::TagAnnotation>,
+}
+
+/// How an export moves a target's branch.
+#[derive(Debug, Clone, Copy)]
+enum PushExport<'a> {
+    /// Onto what is there: refused when the export does not descend from it.
+    Onto,
+    /// Over what is there, only while that is this commit: what newgit last
+    /// put there.
+    Replacing(&'a str),
+    /// Over whatever is there.
+    Force,
 }
 
 fn export_ref(target: &str, branch: &str) -> String {

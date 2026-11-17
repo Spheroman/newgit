@@ -2061,7 +2061,14 @@ that gap:
 - **Each push from a workspace exports the instance's branch** to the
   target as it sees it (the same trackers as its `main`), after the push
   itself has succeeded. A failure there is a warning in the push's output,
-  not a failed push. A force-push follows a force-push.
+  not a failed push; `newgit export <instance> --remote <target>` exports
+  the branch again as last pushed. A force-push follows a force-push.
+- **The branch there is the target's `main` plus the instance's own
+  commits**, whichever of the two was exported first. One whose commits were
+  built on a copy of what the target's `main` holds (exported by a newgit
+  from before that held) is replaced at its next push, and the push says so.
+  Only while the branch is still what newgit put there: a commit pushed to it
+  straight is never thrown away, and the export is refused instead.
 - **On a newgit remote, the target is a remote in every workspace**, named
   after it, and `gh` resolves (`gh-resolved = base`) the target the
   instance's work belongs to: the one that ships a tracker the work touched.

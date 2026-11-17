@@ -637,6 +637,50 @@ rooted at `T` **(decided)**:
    an instance commit touching two trackers stays one commit wherever it is
    merged.
 
+**One commit, one root commit (decided 2026-11-16).** A view commit stands
+for one root commit, and a split never makes a second. This is what keeps a
+mirror's ids single: composing is a function of root's history, so two root
+commits made of one view commit compose to two commits there, and everything
+built on the second arrives as a pull request holding commits the mirror's
+`main` already has under other ids.
+
+- **A commit the remote split is the remote's.** A view commit this machine
+  did not make — `main` as an instance's `git pull` brought it, or as the
+  project root fetched it, which is where a Claude Code worktree's instance
+  starts — carries no note here, and its root commit may name something
+  else (a commit merged on a mirror names the mirror's). So before an
+  instance's commits are split, the commit it shares with `origin/main`, as
+  its workspace fetched it and as the project root did, must be noted with a
+  root commit the remote's `main` has. When it is not, the remote's `main`
+  is composed here, which notes all of it.
+- **Composed means with every pin.** Composing leaves out a pin that is not
+  here. So a `main` composed before one of its trackers' commits arrived
+  notes views the remote never served, and the ones it did serve go
+  unnoted. It counts as composed only while its view still holds what its
+  root commit composes to with the pins here now, and a tracker whose commit
+  the remote's list names but its repo did not send is said, and tried again
+  at the next split.
+- **Built on a copy, a commit is split again.** When that still fails (the
+  remote could not be read), the split makes root commits of its own and
+  says a mirror may see them as new. Those are found later by what they are:
+  a view commit whose root commit does not descend from the root commits its
+  parents stand for now. It is split again, onto them, with everything above
+  it. Only root commits that root's `main` — here, and as the remote last
+  had it — does not hold are held to this, so the walk is an instance's own
+  unmerged work, and history is never made again. The view commits are
+  untouched: a workspace sees nothing change.
+- **The mirror's branch follows.** An instance's branch on a `branches =
+  true` target is newgit's, since a push straight to it is refused. When
+  what it holds is what newgit last put there
+  (`refs/remotes/<target>/<branch>` in the workspace) and that is not behind
+  what goes there now, the branch is replaced, with that commit as the
+  lease, and the push says so. Anything else there is left as it is.
+  `newgit export <instance> --remote <target>` does the same without a new
+  commit: the branch as last pushed, exported again.
+
+Two root commits that have both reached `main` stay: that is history, and a
+mirror that took both keeps both.
+
 **Split refuses, naming what to do instead:**
 
 - a path whose owner this instance has not bound (`newgit tracker use`);
@@ -1283,6 +1327,12 @@ export = "inherit"       # ships inside t3code's export, wherever that goes
 - **Exports are owner-governed.** Definitions live in `access`, so widening
   where something ships takes an owner's merge, where `exports/` was
   ordinary root content.
+- **A branch there is newgit's.** With `branches = true`, an instance's
+  push exports its branch, composed for the target, and nothing else writes
+  it. It is the target's `main` plus the instance's own commits, whichever
+  of the two was exported first: both are composed from the same root
+  commits (*One commit, one root commit*, which also says when the branch is
+  replaced rather than added to).
 - **Tags go only where root's history goes.** A project's tag is pushed to
   the target root declares, which every inheriting tracker ships inside,
   never to one declared by a child: that is the child's own history, with
@@ -1502,9 +1552,9 @@ something:
   the view commit rebuilt from it, so its id survives the round trip.
 - **The project root learns what `git pull` brought.** The view commit of
   such a root commit is not what its trailers name, so the first sync after a
-  pull composes the remote's `main` here, which notes it. A workspace that
-  `git pull`s `origin` instead of `newgit pull` does not, and its split makes
-  a commit of its own, which merges.
+  pull composes the remote's `main` here, which notes it. A workspace's split
+  does the same (*One commit, one root commit*); it used not to, and made a
+  commit of its own, which merged but reached a mirror as a second commit.
 - **A mirror's event lands as a merge by whoever pushed it:** they must be a
   member and maintain what it changes (*The GitHub webhook*).
 - **A mirror's commit that holds withheld work is refused.** A pull
