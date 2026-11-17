@@ -1900,7 +1900,9 @@ Open issues that change what this document can promise:
   `spawn` names the ones it left behind, by file name, and the commands
   that carry them; nothing carries them by itself.
 - **#85: no reconcile.** A live instance does not pick up a changed
-  resource definition (a new port, say), and nothing says it is stale.
+  resource definition. A port declared since it was bound is named by
+  `status` as unclaimed, with `newgit resource rebind` as the fix; any
+  other change (a command, an export) goes unsaid.
 - **#87: preflight is asked for, not automatic.** `newgit resource check`
   finds a definition calling a missing binary (`pg_dump` on a host without
   Postgres); nothing runs it at spawn, so one never checked still fails at

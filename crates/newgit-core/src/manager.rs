@@ -3723,6 +3723,25 @@ impl BranchManager {
                     continue;
                 }
             }
+            // A port declared since this binding was made: no record claims
+            // it, so the allocator may hand it to another instance, and the
+            // tool here falls back to its shared default (#85).
+            let unclaimed: Vec<String> = definition
+                .ports
+                .keys()
+                .filter(|port| !binding.resolved_ports.contains_key(*port))
+                .map(|port| format!("`{port}`"))
+                .collect();
+            if !unclaimed.is_empty() {
+                problems.push(format!(
+                    "`{name}` was bound before its definition declared port{} {}, so nothing \
+                     claims {} for this instance — bind it again with `newgit resource rebind \
+                     {name}` (after `newgit stop`, if it runs)",
+                    if unclaimed.len() == 1 { "" } else { "s" },
+                    unclaimed.join(", "),
+                    if unclaimed.len() == 1 { "it" } else { "them" },
+                ));
+            }
             for path in definition.identity_produces() {
                 if !branch.workspace_path.join(path).exists() {
                     problems.push(format!(

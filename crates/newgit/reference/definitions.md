@@ -807,7 +807,9 @@ A port is allocated when the resource binds, usually at `spawn` (at
 `tracker use` for a resource a tracker brings), and recorded in the binding
 record. It stays the same through `stop`, `start`, `tracker drop` and `use`.
 Removing the instance frees it, and `newgit resource rebind` allocates
-again.
+again. A port added to the definition after an instance bound the resource
+is claimed by nothing for that instance until it does: `newgit status`
+names it as a problem, with the rebind to run (#85).
 Use it in templates as `{{ports.<name>}}`.
 
 Unlike `[exports]`, order here does matter: `[ports]` is also a map, not a
