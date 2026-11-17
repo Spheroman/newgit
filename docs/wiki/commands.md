@@ -134,20 +134,27 @@ Remote:
   ([#443](https://github.com/Spheroman/newgit/issues/443))
 - `newgit pull --remote <target>` — bring back what was merged on an export
   target (a pull request on GitHub); `newgit merge main` publishes it. A
-  force-pushed target is merged with the line the tracker already has, as
-  `git pull` would: the commits the force-push removed stay in the
-  tracker's history, and the next export pushes them to the target again
+  target rewritten since this machine last exported to it (force-pushed,
+  a secret purged) is not merged with: merging keeps what the rewrite
+  removed for the next export to push again, so plain `pull --remote` and
+  plain `export --remote` refuse, saying how many commits it removed and
+  naming `--force`. `export --remote --force` says how many it puts back
 - `newgit pull --remote <target> --force [--dry-run]` — follow a force-push
   instead (a secret purged on GitHub): the line of the tracker the target is
   rooted at is reset to the target's, as `git fetch` then `git reset --hard`
   would, and the project root's pin moves to it; `newgit merge main`
   publishes it, replacing the old line on the remote. It lists every commit
   only the old line had and every instance still holding one, and this
-  machine then refuses to merge, send, or export them again. An instance
-  with nothing of its own on the old line follows on `newgit pull`; one
-  with work there redoes it in a new instance. Copies others already
-  fetched are not undone. Only a target rooted at a tracker; `--dry-run`
-  moves nothing
+  machine then refuses to carry them onward from the tracker's line: a
+  merge, a send to the remote (a checkpoint's too), or a push to a target
+  that lacks them. An instance with nothing of its own on the old line
+  follows on `newgit pull`; one with work there redoes it in a new
+  instance. It refuses while the project root has work of its own on the
+  old line, which it would discard. A later reset back onto dropped commits
+  says so and stops refusing them. Not undone: the project's own history,
+  which still pins the old line (and so the remote's copy, its Git
+  endpoint, `newgit clone`, and project tags), and copies others already
+  fetched. Only a target rooted at a tracker; `--dry-run` moves nothing
 - `newgit tracker allow-plaintext <path>...` — release workspace paths this
   machine has held encrypted content at, so whatever tracker claims them now
   (a `public` one, or one in Git) may capture, commit, and send them

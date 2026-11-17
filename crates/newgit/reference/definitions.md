@@ -1944,17 +1944,29 @@ target withholds put back as their parent had them. A commit that touches a
 withheld tracker's mount, or adds a file a tracker outside Git owns, is
 refused. `newgit merge main` publishes what came in.
 
-A force-pushed target (a secret purged there) is merged with what the
-tracker has, as `git pull` would, which keeps the removed commits for the
-next export to push again. `newgit pull --remote <target> --force` follows
-it instead, for a target rooted at a tracker: the tracker's line is reset
-to the target's, as `git reset --hard` would, and the project root's pin
-moves to it; `newgit merge main` publishes it, replacing the old line on the
-remote. It lists every commit only the old line had, and each instance that
-still holds one, and this machine then refuses to merge, send, or export
-them again. An instance with nothing of its own on the old line follows on
-`newgit pull`. Copies others already fetched are not undone. `--dry-run`
-says all of it and moves nothing.
+A target rewritten since this machine last exported to it (force-pushed, a
+secret purged there) is not merged with what the tracker has, as `git
+pull` would: that keeps the removed commits for the next export to push
+again. Plain `pull --remote` and plain `export --remote` refuse instead,
+saying how many commits the rewrite removed, and name `newgit pull
+--remote <target> --force`. `export --remote --force` replaces the branch
+(leased on the commit it checked) and says how many of them it puts back.
+`newgit pull --remote <target> --force` follows the rewrite, for a target
+rooted at a tracker: the tracker's line is reset to the target's, as `git
+reset --hard` would, and the project root's pin moves to it; `newgit merge
+main` publishes it, replacing the old line on the remote. It lists every
+commit only the old line had, and each instance that still holds one, and
+this machine then refuses to carry them onward from the tracker's line: a
+merge, a send to the remote (a checkpoint's sync too), or a push to an
+export target that lacks them. It refuses while the project root has work
+of its own on the old line, which moving its pin would discard. A later
+reset onto a line holding commits an earlier one dropped says so and stops
+refusing them. An instance with nothing of its own on the old line follows
+on `newgit pull`. Not undone: the project's own history, whose older
+commits still pin the old line (so the remote's copy of it, its Git
+endpoint, `newgit clone`, and project tags still have them, and a target of
+the project's view that never had that history is refused), and copies
+others already fetched. `--dry-run` says all of it and moves nothing.
 
 On a linked project the same thing happens on the remote when the target's
 repository has the webhook (`docs/design/remote.md`, *The GitHub webhook*),
@@ -2024,15 +2036,12 @@ commit and merging both lands one merge. Unsigned, it is rejected by an
 export target that requires signed commits: an export carrying it fails
 there ([#443](https://github.com/Spheroman/newgit/issues/443)).
 
-A force-pushed target is merged with the line the tracker already has, as
-`git pull` would: the commits the force-push removed stay in the tracker's
-history, and the next export pushes them to the target again. Reverting the
-change in an instance and merging it keeps it out of the tip only: the
-removed commits are still in the history, and the next export still
-publishes them. When the force-push was to purge a secret, that publishes
-it again, and nothing in newgit can purge it yet
-([#442](https://github.com/Spheroman/newgit/issues/442): a way to reset a
-tracker's line to its target). Until then, do not export that tracker.
+A force-pushed target is not merged with the line the tracker already has:
+plain `pull --remote` refuses, since merging keeps the commits the
+force-push removed for the next export to push again, and names `newgit
+pull --remote <target> --force`, which resets the tracker's line to the
+target's (above). Reverting the change in an instance and merging it keeps
+it out of the tip only.
 
 ### Pull requests from a workspace: `branches = true`
 

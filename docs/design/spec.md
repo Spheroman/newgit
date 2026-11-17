@@ -1547,10 +1547,12 @@ has, asked of it each time, is published already and is not judged again
 pushes with your own Git credentials, so GitHub Actions and `gh` keep
 working. When the target's branch has moved ahead (a pull request merged on
 GitHub), export brings that in first. A target force-pushed to purge
-something is followed, not merged with, by `newgit pull --remote <target>
---force`, which resets the rooted tracker's line to the target's, lists
-what it drops and who still holds it, and refuses to bring it back from
-this machine ([trackers.md](trackers.md), *Following a force-push*). With
+something is not merged with: plain `pull --remote` and export refuse and
+name `newgit pull --remote <target> --force`, which resets the rooted
+tracker's line to the target's, lists what it drops and who still holds
+it, and refuses to carry it onward from this machine; the project's own
+history still pins it ([trackers.md](trackers.md), *Following a
+force-push*). With
 `branches = true`, every push from a workspace exports its branch there
 too.
 

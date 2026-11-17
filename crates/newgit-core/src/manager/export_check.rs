@@ -6,6 +6,10 @@
 //! protects nothing. What counts as the target's is asked of the target at
 //! that moment, never taken from a record here: a target force-pushed to
 //! purge a secret no longer has it, so a stale record would publish it again.
+//!
+//! The same commits are checked for a commit a reset dropped (#442): a view
+//! commit the target lacks that stands for a root commit pinning one would
+//! publish its files there.
 
 use super::{BranchManager, short};
 use crate::error::{NewgitError, Result};
@@ -13,13 +17,13 @@ use crate::export_target::ExportTarget;
 
 impl BranchManager {
     /// The commits `target` has now at `branches` (those it has of them),
-    /// fetched here when this store lacks one: one `ls-remote`, and a fetch
-    /// only for what is new.
+    /// as `(branch, commit)`, fetched here when this store lacks one: one
+    /// `ls-remote`, and a fetch only for what is new.
     pub(super) fn target_has(
         &self,
         target: &ExportTarget,
         branches: &[&str],
-    ) -> Result<Vec<String>> {
+    ) -> Result<Vec<(String, String)>> {
         let root = self.store.paths().project_root.clone();
         let url = target.push_url();
         let refs: Vec<String> = branches
@@ -49,14 +53,14 @@ impl BranchManager {
                 &[],
             )
             .is_ok();
+            let branch = name.trim_start_matches("refs/heads/");
             if !here {
-                let branch = name.trim_start_matches("refs/heads/");
                 fetch.push(format!(
                     "+{name}:refs/newgit/exports/{}/has/{branch}",
                     target.name
                 ));
             }
-            has.push(id.to_owned());
+            has.push((branch.to_owned(), id.to_owned()));
         }
         if !fetch.is_empty() {
             let mut args = vec![
@@ -76,19 +80,27 @@ impl BranchManager {
 
     /// Refuse `tip`, about to be pushed to `target` at `branch`, when a
     /// commit of it the target does not have adds a file a tracker outside
-    /// Git owns. What the target has at `branch` and at its own branch is
-    /// published already, so it is not judged again (#444).
+    /// Git owns, or pins a commit a reset dropped. What the target has at
+    /// `branch` and at its own branch is published already, so it is not
+    /// judged again (#444). Returns the commit the target has at `branch`
+    /// now (none when it has no such branch): what a force-push leases on.
     pub(super) fn refuse_new_outside_git(
         &self,
         target: &ExportTarget,
         tip: &str,
         branch: &str,
-    ) -> Result<()> {
+    ) -> Result<Option<String>> {
         let mut branches = vec![target.branch.as_str()];
         if branch != target.branch {
             branches.push(branch);
         }
         let has = self.target_has(target, &branches)?;
+        let at_branch = has
+            .iter()
+            .find(|(name, _)| name == branch)
+            .map(|(_, id)| id.clone());
+        let has: Vec<String> = has.into_iter().map(|(_, id)| id).collect();
+        self.refuse_dropped_pins(target, tip, &has)?;
         let mut rev_list = vec![tip];
         if !has.is_empty() {
             rev_list.push("--not");
@@ -111,7 +123,7 @@ impl BranchManager {
             rooted.as_ref().map(|(_, mount)| mount.as_path()),
         )?
         else {
-            return Ok(());
+            return Ok(at_branch);
         };
         let way_out = match &rooted {
             Some((tracker, mount)) => {

@@ -311,8 +311,9 @@ enum Command {
     /// merging with it: the tracker's line is reset to the target's (as `git
     /// fetch` then `git reset --hard <remote>/<branch>` would), dropping the
     /// commits only the old line had. It lists them, and every instance that
-    /// still holds them, and this machine refuses to merge, send, or export
-    /// them again. --dry-run says all of that and moves nothing
+    /// still holds them, and this machine then refuses to carry them onward
+    /// (a merge, a send to the remote, a push to a target that lacks them).
+    /// --dry-run says all of that and moves nothing
     Pull {
         /// The mounted trackers in Git to bring up to date (every one when
         /// left out)
@@ -4021,6 +4022,16 @@ fn export_to_remote(name: &str, options: RemoteExportOptions) -> Result<()> {
             );
         }
     }
+    if outcome.restored > 0 {
+        let commits = plural(outcome.restored, "commit");
+        println!(
+            "{} {commits} back on {} (branch {}) that a rewrite there removed since the last \
+             export (a force-push, perhaps to purge a secret)",
+            if outcome.pushed { "Put" } else { "Would put" },
+            outcome.url,
+            target.branch
+        );
+    }
     let verb = if outcome.pushed {
         "Exported"
     } else {
@@ -5184,8 +5195,23 @@ fn reset_to_remote(target: &str, dry_run: bool) -> Result<()> {
         for (id, subject) in &line.dropped {
             println!("    drops {} {subject}", short_rev(id));
         }
+        for (id, subject) in &line.restored {
+            println!(
+                "    brings back {} {subject}, which an earlier reset dropped: no longer refused",
+                short_rev(id)
+            );
+        }
     }
-    for held in &outcome.instances {
+    for held in outcome.instances.iter().filter(|held| held.project_root) {
+        println!(
+            "  the project root has {} of its own on `{}` that the target does not: the reset \
+             would discard them, so it refuses until they are merged (`newgit merge main`) or \
+             taken off the project root's branch",
+            plural(held.own, "commit"),
+            held.tracker
+        );
+    }
+    for held in outcome.instances.iter().filter(|held| !held.project_root) {
         let way = if held.own == 0 {
             format!("`newgit pull {}` there follows the reset", held.tracker)
         } else {
@@ -5201,9 +5227,12 @@ fn reset_to_remote(target: &str, dry_run: bool) -> Result<()> {
     }
     if dropped > 0 {
         println!(
-            "  not undone: copies anyone already fetched (clones, other machines' instances, \
-             the remote's checkpoints and instance branches) still have them, and another \
-             machine merging them back is not refused there"
+            "  not undone: the project's own history still pins them (so the remote's copy of \
+             it, its Git endpoint, `newgit clone`, and project tags made from it still have \
+             them, and a target of the project's view that never had them cannot take it); \
+             copies anyone already fetched (clones, other machines' instances, the remote's \
+             checkpoints and instance branches) still have them; and another machine merging \
+             them back is not refused there"
         );
     }
     if outcome.dry_run {
@@ -5211,7 +5240,11 @@ fn reset_to_remote(target: &str, dry_run: bool) -> Result<()> {
         return Ok(());
     }
     if dropped > 0 {
-        println!("  this machine now refuses to merge, send, or export them again");
+        println!(
+            "  this machine now refuses to carry them onward from `{}`'s line: a merge, a \
+             send to the remote, or an export of a commit the target lacks that holds them",
+            outcome.tracker
+        );
     }
     if let Some(view) = &outcome.view {
         println!(

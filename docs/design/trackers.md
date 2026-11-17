@@ -978,10 +978,20 @@ Unsigned, it is rejected by an export target that requires signed commits:
 an export carrying it fails there
 ([#443](https://github.com/Spheroman/newgit/issues/443)).
 
-A force-pushed target is merged with the line the tracker already has, as
-`git pull` would: the commits the force-push removed stay in the tracker's
-history, and the next export pushes them to the target again. Reverting the
-change in an instance and merging it keeps it out of the tip only.
+A force-pushed target is not merged with the line the tracker already has,
+as `git pull` would: that keeps the commits the force-push removed in the
+tracker's history, for the next export to push to the target again.
+Reverting the change in an instance and merging it keeps it out of the tip
+only. So when the target's branch no longer descends from the commit this
+machine last exported there (`refs/newgit/exports/<target>/pushed`), and
+the tracker's line still holds that commit, plain `pull --remote` and plain
+`export --remote` refuse, saying how many commits the rewrite removed and
+naming `pull --remote <target> --force [--dry-run]`. `export --remote
+--force` still replaces the branch, and says how many of the removed
+commits it puts back; it is leased on the commit it checked
+(`--force-with-lease=<branch>:<id>`, an empty id when the branch is
+absent), so a target rewritten again in between is refused rather than
+overwritten unseen.
 
 **Following a force-push (decided, #442).** `newgit pull --remote <target>
 --force` resets the line of the tracker the target is rooted at to the
@@ -996,11 +1006,27 @@ they want the remote's history over theirs. `--dry-run` moves nothing.
 It says plainly what it drops: every commit only the old line had, by id and
 subject, and every instance whose branch (each workspace split first, so
 uncheckpointed work counts) still holds any, with how much work of its own
-it has there. It is written down (`.newgit/local/resets.json`) before anything moves,
-and from then on this machine refuses to bring a dropped commit back: a
-merge whose result holds one, anything sent to the remote holding one
-(`refuse_unpublished_trackers`, the one gate), and an export composed from
-one are refused, naming the commits. `newgit merge main` publishes the reset:
+it has there. The project root counts like any instance: while its branch
+has work of its own the target's line lacks, the reset refuses, naming it,
+since moving its pin would discard that work (as plain `newgit pull`
+leaves a pin holding work of its own); merge it first, so the reset drops
+it out loud, or take it off the project root's branch. What it drops is
+written down (`.newgit/local/resets.json`) before anything moves, and taken
+back off when the reset fails with nothing moved (a dirty project root);
+one that stops half way keeps it and says that running it again finishes
+it. A later reset onto a line holding commits an earlier one dropped (the
+purge undone) says so, `brings back`, and takes them off the earlier
+record, so this machine stops refusing them.
+
+From then on this machine refuses to carry a dropped commit onward from its
+tracker's line: a merge whose result holds one in a tracker's own history,
+a send to the remote of one (`refuse_unpublished_trackers`, which a merge
+and a project's first publication pass, and a checkpoint's sync, so an
+instance still on the old line keeps its work here and its push fails), an
+export composed from one, and a push to any export target of a commit the
+target lacks that pins one (the project's own view, or any target that
+ships the tracker inside another), are refused, naming the commits.
+`newgit merge main` publishes the reset:
 the remote's `main` of the tracker, the old line, is replaced by the new one
 (a sideways compare-and-swap, which the tracker's maintainers make), never
 merged back in, and a later plain `pull --remote` starts from the new line.
@@ -1008,13 +1034,18 @@ An instance pinned on the old line with nothing of its own there follows
 the reset on `newgit pull`, as if behind; one with work of its own on the
 old line is refused at its merge, since its work sits on the dropped
 commits, and redoes that work in a new instance. What it cannot undo, and
-says: copies anyone already fetched (clones, other machines' instances, the
-remote's checkpoints and instance branches) still hold the dropped commits,
-and another machine, which has no record of the reset, merging them back is
-not refused by the remote yet. Only a target rooted at a tracker can be
-followed: the project's own view (a target root declares) is every
-tracker's history composed, and following a rewrite of it means rewriting
-the project's history, which newgit does not do yet.
+says: the project's own history, whose older root commits still pin the old
+line (newgit never rewrites it), so the remote's copy of that history, its
+Git endpoint (`git clone https://newgit.dev/<owner>/<name>.git`), `newgit
+clone`, and project tags made from it still carry the dropped commits, and
+a target of the project's view that never had that history cannot take it;
+copies anyone already fetched (clones, other machines' instances, the
+remote's checkpoints and instance branches); and another machine, which has
+no record of the reset, merging them back, which the remote does not refuse
+yet. Only a target rooted at a tracker can be followed: the project's own
+view (a target root declares) is every tracker's history composed, and
+following a rewrite of it means rewriting the project's history, which
+newgit does not do yet.
 
 Five kinds of tracker stay put, and it says which: a pin holding commits
 its `follow` ref lacks (the instance's own work on it; moving the pin would

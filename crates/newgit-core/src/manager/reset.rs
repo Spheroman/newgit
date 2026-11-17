@@ -7,17 +7,26 @@
 //! reset --hard <remote>/<branch>` would, and says what it drops.
 //!
 //! What it drops is written down here (`.newgit/local/resets.json`), and
-//! this machine then refuses to bring any of it back: a merge, a send to
-//! the remote, or an export holding a dropped commit fails, naming it. A
-//! pin on the old line with nothing of its own on it follows the reset on
-//! `newgit pull`. What it cannot undo: copies others already fetched, and
-//! another machine, which has no record, merging them back.
+//! this machine then refuses to carry a dropped commit onward from its
+//! tracker's line: a merge whose result holds one, a checkpoint or merge
+//! sending one to the remote, and a push to an export target of a commit
+//! the target lacks that holds or pins one fail, naming it. A pin on the
+//! old line with nothing of its own on it follows the reset on `newgit
+//! pull`. A later reset onto a line holding commits an earlier one dropped
+//! says so, and takes them off the record. What it cannot undo: the
+//! project's own history, whose older root commits still pin the old line
+//! (and so the remote's copy of it, its Git endpoint, `newgit clone`, and
+//! project tags made from it), copies others already fetched, and another
+//! machine, which has no record, merging them back.
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
-use super::{BranchManager, PROJECT_ROOT_INSTANCE, local_tracker_ref, recorded_source, short};
+use super::{
+    BranchManager, ExportReason, PROJECT_ROOT_INSTANCE, export_reason, local_tracker_ref,
+    recorded_source, short,
+};
 use crate::error::{NewgitError, Result};
 use crate::export_target::ExportTarget;
 
@@ -63,16 +72,23 @@ pub struct ResetLine {
     pub dropped: Vec<(String, String)>,
     /// How many commits the new line has that the old one did not.
     pub added: usize,
+    /// Commits the new line has that an earlier reset dropped, `(id,
+    /// subject)`: taken back off the record, so this machine stops refusing
+    /// them.
+    pub restored: Vec<(String, String)>,
 }
 
 /// An instance whose branch of `tracker` holds `dropped` of the commits a
-/// reset dropped, and `own` commits of its own besides.
+/// reset dropped, and `own` commits of its own besides. The project root
+/// is listed only with work of its own, which the reset would discard, so
+/// it refuses (`project_root`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HeldBack {
     pub instance: String,
     pub tracker: String,
     pub dropped: usize,
     pub own: usize,
+    pub project_root: bool,
 }
 
 impl BranchManager {
@@ -168,6 +184,7 @@ impl BranchManager {
         // Each instance's branches as its workspace has them now, not as
         // of whenever they were last split.
         self.split_live_instances();
+        let earlier = self.resets()?;
         let mut lines = Vec::new();
         let mut instances = Vec::new();
         for (name, before, after) in &moves {
@@ -186,15 +203,31 @@ impl BranchManager {
                 .unwrap_or(0),
             };
             let ids: BTreeSet<&str> = dropped.iter().map(|(id, _)| id.as_str()).collect();
-            if !ids.is_empty() {
-                instances.extend(self.held_back(name, after, &ids)?);
-            }
+            instances.extend(self.held_back(name, after, &ids)?);
+            let was_dropped: BTreeSet<&str> = earlier
+                .iter()
+                .filter(|reset| &reset.tracker == name)
+                .flat_map(|reset| reset.dropped.iter().map(String::as_str))
+                .collect();
+            let restored = if was_dropped.is_empty() {
+                Vec::new()
+            } else {
+                let mut range = vec![after.as_str()];
+                if let Some(before) = before {
+                    range.extend(["--not", before.as_str()]);
+                }
+                self.subjects(&range)?
+                    .into_iter()
+                    .filter(|(id, _)| was_dropped.contains(id.as_str()))
+                    .collect()
+            };
             lines.push(ResetLine {
                 tracker: name.clone(),
                 from: before.clone(),
                 to: after.clone(),
                 dropped,
                 added,
+                restored,
             });
         }
         let mut outcome = ResetOutcome {
@@ -210,25 +243,41 @@ impl BranchManager {
         if dry_run {
             return Ok(outcome);
         }
+        if let Some(held) = outcome.instances.iter().find(|held| held.project_root) {
+            return Err(self.project_root_has_work(&target, held, &moves)?);
+        }
 
-        // Written down first: if anything after this fails, this machine
-        // still refuses to bring the dropped commits back.
-        self.record_resets(&target, &outcome.lines)?;
-        let mains: Vec<(String, String)> = moves
-            .iter()
-            .map(|(name, _, after)| (name.clone(), after.clone()))
-            .collect();
-        let (slug, _, base) = self.pull_base(None)?;
-        let (pins, _) = self.base_pins(&base)?;
-        let dropped: usize = outcome.lines.iter().map(|line| line.dropped.len()).sum();
-        if pins.get(&tracker) == Some(&new_main) {
-            self.land_tracker_branches(
-                mains
-                    .iter()
-                    .map(|(tracker, main)| (tracker.as_str(), main.as_str())),
-                "main",
-            )?;
-        } else {
+        // Written down before anything moves, so a reset that stops half
+        // way still refuses what it dropped; taken back off when nothing
+        // moved, so a reset that never happened refuses nothing.
+        let project_branch = self
+            .project_branch()
+            .map(|branch| format!("refs/heads/{branch}"));
+        let main_before = self
+            .source
+            .rev_parse(&local_tracker_ref(&tracker, "main"))
+            .ok();
+        let root_before = project_branch
+            .as_deref()
+            .and_then(|branch| self.source.rev_parse(branch).ok());
+        self.write_resets(&Self::recorded(earlier.clone(), &target, &outcome.lines))?;
+        let moved = (|| -> Result<Option<String>> {
+            let mains: Vec<(String, String)> = moves
+                .iter()
+                .map(|(name, _, after)| (name.clone(), after.clone()))
+                .collect();
+            let (slug, _, base) = self.pull_base(None)?;
+            let (pins, _) = self.base_pins(&base)?;
+            let dropped: usize = outcome.lines.iter().map(|line| line.dropped.len()).sum();
+            if pins.get(&tracker) == Some(&new_main) {
+                self.land_tracker_branches(
+                    mains
+                        .iter()
+                        .map(|(tracker, main)| (tracker.as_str(), main.as_str())),
+                    "main",
+                )?;
+                return Ok(None);
+            }
             let message = format!(
                 "Reset {tracker} to {} {}: drops {dropped} commit{}",
                 recorded_source(&target.url),
@@ -236,7 +285,7 @@ impl BranchManager {
                 if dropped == 1 { "" } else { "s" },
             );
             let moved = [(tracker.clone(), new_main.clone())];
-            outcome.view = Some(self.commit_pins(
+            Ok(Some(self.commit_pins(
                 &slug,
                 None,
                 &base,
@@ -245,7 +294,31 @@ impl BranchManager {
                 definition.mount.as_str(),
                 &mains,
                 &moved,
-            )?);
+            )?))
+        })();
+        match moved {
+            Ok(view) => outcome.view = view,
+            Err(error) => {
+                let main_after = self
+                    .source
+                    .rev_parse(&local_tracker_ref(&tracker, "main"))
+                    .ok();
+                let root_after = project_branch
+                    .as_deref()
+                    .and_then(|branch| self.source.rev_parse(branch).ok());
+                if main_after == main_before && root_after == root_before {
+                    self.write_resets(&earlier)?;
+                    return Err(error);
+                }
+                return Err(NewgitError::Unsupported(format!(
+                    "{error}\n\nThe reset of `{}` to `{}` did not finish: part of it moved, and \
+                     what it drops is written down, so this machine refuses those commits \
+                     already. `newgit pull --remote {} --force` again finishes it",
+                    crate::tracker::tracker_path(&tracker),
+                    target.name,
+                    target.name
+                )));
+            }
         }
         Ok(outcome)
     }
@@ -284,19 +357,16 @@ impl BranchManager {
 
     /// The commits `old` has that `new` does not, `(id, subject)`.
     fn only_in(&self, old: &str, new: &str) -> Result<Vec<(String, String)>> {
+        self.subjects(&[old, "--not", new])
+    }
+
+    /// The commits `range` (`git log` arguments) lists, `(id, subject)`,
+    /// newest first.
+    fn subjects(&self, range: &[&str]) -> Result<Vec<(String, String)>> {
         let project = self.store.paths().project_root.clone();
-        let listed = crate::source::run_git_env(
-            &[
-                "-C",
-                project.as_str(),
-                "log",
-                "--format=%H%x00%s",
-                old,
-                "--not",
-                new,
-            ],
-            &[],
-        )?;
+        let mut args = vec!["-C", project.as_str(), "log", "--format=%H%x00%s"];
+        args.extend_from_slice(range);
+        let listed = crate::source::run_git_env(&args, &[])?;
         Ok(listed
             .lines()
             .filter_map(|line| line.split_once('\0'))
@@ -304,8 +374,9 @@ impl BranchManager {
             .collect())
     }
 
-    /// Every instance (but the project root, whose branch the reset moves)
-    /// whose branch of `tracker` holds any of `dropped`.
+    /// Every instance whose branch of `tracker` holds any of `dropped`, and
+    /// the project root when its branch has work of its own the new line
+    /// lacks: the reset moves its pin, so that work would be discarded.
     fn held_back(
         &self,
         tracker: &str,
@@ -334,9 +405,7 @@ impl BranchManager {
         let mut held = Vec::new();
         for reference in refs.lines().map(str::trim).filter(|line| !line.is_empty()) {
             let slug = reference.trim_start_matches(&prefix);
-            if slug == PROJECT_ROOT_INSTANCE {
-                continue;
-            }
+            let project_root = slug == PROJECT_ROOT_INSTANCE;
             let theirs = crate::source::run_git_env(
                 &["-C", project.as_str(), "rev-list", reference, "--not", new],
                 &[],
@@ -353,16 +422,68 @@ impl BranchManager {
                     own += 1;
                 }
             }
-            if dropped_here > 0 {
+            let listed = if project_root {
+                own > 0
+            } else {
+                dropped_here > 0
+            };
+            if listed {
                 held.push(HeldBack {
                     instance: names.get(slug).cloned().unwrap_or_else(|| slug.to_owned()),
                     tracker: tracker.to_owned(),
                     dropped: dropped_here,
                     own,
+                    project_root,
                 });
             }
         }
         Ok(held)
+    }
+
+    /// Why a reset refuses while the project root has work of its own on
+    /// the old line (`held`): moving its pin would discard it, as plain
+    /// `newgit pull` refuses to move a pin holding work of its own.
+    fn project_root_has_work(
+        &self,
+        target: &ExportTarget,
+        held: &HeldBack,
+        moves: &[(String, Option<String>, String)],
+    ) -> Result<NewgitError> {
+        let new = moves
+            .iter()
+            .find(|(name, _, _)| name == &held.tracker)
+            .map(|(_, _, after)| after.clone())
+            .unwrap_or_default();
+        let branch =
+            local_tracker_ref(&held.tracker, &format!("instances/{PROJECT_ROOT_INSTANCE}"));
+        let main = moves
+            .iter()
+            .find(|(name, _, _)| name == &held.tracker)
+            .and_then(|(_, before, _)| before.clone());
+        let mut range = vec![branch.as_str(), "--not", new.as_str()];
+        range.extend(main.as_deref());
+        let own = self.subjects(&range)?;
+        let shown: Vec<String> = own
+            .iter()
+            .take(5)
+            .map(|(id, subject)| format!("{} {subject}", short(id)))
+            .collect();
+        let path = crate::tracker::tracker_path(&held.tracker);
+        Ok(NewgitError::Unsupported(format!(
+            "the project root has {} of its own on `{path}` that the target `{}` does not have ({}{}), and \
+             resetting moves the project root's pin off them, which would discard that work; \
+             nothing moved. Merge it first (`newgit merge main`), so the reset lists it among \
+             the commits it drops and you can redo what should stay in an instance, or take it \
+             off the project root's branch yourself; then reset again",
+            if held.own == 1 {
+                "a commit".to_owned()
+            } else {
+                format!("{} commits", held.own)
+            },
+            target.name,
+            shown.join("; "),
+            if own.len() > shown.len() { "; …" } else { "" },
+        )))
     }
 
     fn resets_file(&self) -> camino::Utf8PathBuf {
@@ -388,8 +509,25 @@ impl BranchManager {
         }
     }
 
-    fn record_resets(&self, target: &ExportTarget, lines: &[ResetLine]) -> Result<()> {
-        let mut resets = self.resets()?;
+    /// `resets` with this reset's `lines` written down: what each dropped,
+    /// and every commit an earlier reset dropped that a new line has again
+    /// taken back off (a record left with nothing dropped goes).
+    fn recorded(
+        mut resets: Vec<ResetRecord>,
+        target: &ExportTarget,
+        lines: &[ResetLine],
+    ) -> Vec<ResetRecord> {
+        for line in lines.iter().filter(|line| !line.restored.is_empty()) {
+            let restored: BTreeSet<&str> =
+                line.restored.iter().map(|(id, _)| id.as_str()).collect();
+            for reset in resets
+                .iter_mut()
+                .filter(|reset| reset.tracker == line.tracker)
+            {
+                reset.dropped.retain(|id| !restored.contains(id.as_str()));
+            }
+        }
+        resets.retain(|reset| !reset.dropped.is_empty());
         let at = chrono::Utc::now().to_rfc3339();
         for line in lines.iter().filter(|line| !line.dropped.is_empty()) {
             let Some(from) = &line.from else { continue };
@@ -402,7 +540,22 @@ impl BranchManager {
                 at: at.clone(),
             });
         }
+        resets
+    }
+
+    fn write_resets(&self, resets: &[ResetRecord]) -> Result<()> {
         let path = self.resets_file();
+        if resets.is_empty() {
+            return match std::fs::remove_file(&path) {
+                Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+                    Err(NewgitError::Io {
+                        path: path.clone(),
+                        source: error,
+                    })
+                }
+                _ => Ok(()),
+            };
+        }
         let text = serde_json::to_string_pretty(&resets).map_err(|error| {
             NewgitError::Unsupported(format!("could not write the resets: {error}"))
         })?;
@@ -421,6 +574,110 @@ impl BranchManager {
             path: path.clone(),
             source,
         })
+    }
+
+    /// Every commit a reset dropped, by tracker, with the target whose
+    /// reset dropped it.
+    fn dropped_by_tracker(&self) -> Result<BTreeMap<String, BTreeMap<String, String>>> {
+        let mut dropped: BTreeMap<String, BTreeMap<String, String>> = BTreeMap::new();
+        for reset in self.resets()? {
+            let ids = dropped.entry(reset.tracker.clone()).or_default();
+            for id in reset.dropped {
+                ids.insert(id, reset.target.clone());
+            }
+        }
+        Ok(dropped)
+    }
+
+    /// Refuse pushing `tip` to `target`, which has `has` already, when a
+    /// commit of it the target lacks stands for a root commit pinning a
+    /// commit a reset dropped, of a tracker the target ships: compose
+    /// expands the pin into that commit's files, so the push would publish
+    /// them there. The project's own history still pins the old line (newgit
+    /// does not rewrite it), so a target that never had that history, and
+    /// ships the tracker, cannot take it.
+    pub(super) fn refuse_dropped_pins(
+        &self,
+        target: &ExportTarget,
+        tip: &str,
+        has: &[String],
+    ) -> Result<()> {
+        if !self.resets_file().exists() {
+            return Ok(());
+        }
+        let dropped = self.dropped_by_tracker()?;
+        if dropped.is_empty() {
+            return Ok(());
+        }
+        let shipped: BTreeSet<String> = self
+            .carved_definitions()
+            .iter()
+            .filter(|definition| export_reason(target, definition) != ExportReason::Withheld)
+            .map(|definition| definition.name.clone())
+            .collect();
+        if !dropped.keys().any(|tracker| shipped.contains(tracker)) {
+            return Ok(());
+        }
+        let project = self.store.paths().project_root.clone();
+        let mut args = vec!["-C", project.as_str(), "rev-list", tip];
+        if !has.is_empty() {
+            args.push("--not");
+            args.extend(has.iter().map(String::as_str));
+        }
+        let new = crate::source::run_git_env(&args, &[])?;
+        // Which root commit each view commit stands for, noted by compose.
+        let listed = crate::source::run_git_env(
+            &[
+                "-C",
+                project.as_str(),
+                "notes",
+                "--ref",
+                crate::compose::NOTES_REF,
+                "list",
+            ],
+            &[],
+        )
+        .unwrap_or_default();
+        let notes: BTreeMap<&str, &str> = listed
+            .lines()
+            .filter_map(|line| line.split_once(' '))
+            .map(|(note, view)| (view.trim(), note.trim()))
+            .collect();
+        let mut objects = crate::objects::Objects::open(&project)?;
+        for view in new.lines().map(str::trim).filter(|line| !line.is_empty()) {
+            let Some(note) = notes.get(view) else {
+                continue;
+            };
+            let text = String::from_utf8_lossy(&objects.blob(note)?).into_owned();
+            let Some((root, commit)) = text.lines().find_map(|line| line.split_once(' ')) else {
+                continue;
+            };
+            let state = crate::compose::index_with(&mut objects, root, commit.trim())?;
+            for (tracker, pinned) in &state {
+                if !shipped.contains(tracker) {
+                    continue;
+                }
+                let Some(reset) = dropped.get(tracker).and_then(|ids| ids.get(pinned)) else {
+                    continue;
+                };
+                let path = crate::tracker::tracker_path(tracker);
+                return Err(NewgitError::SplitRefused(format!(
+                    "the export to `{}` would carry commit {}, which holds `{path}` at {}, a \
+                     commit resetting `{path}`'s line to `{reset}` dropped. `{}` does not have \
+                     that commit, so this would publish what the reset dropped there; nothing \
+                     was pushed. The commit is `{}` {}, and the project's own history still \
+                     pins the old line (newgit does not rewrite it), so a target that ships \
+                     `{path}` and has never had that history cannot take it as it is",
+                    target.name,
+                    short(view),
+                    short(pinned),
+                    target.name,
+                    crate::tracker::tracker_path(root),
+                    short(commit.trim()),
+                )));
+            }
+        }
+        Ok(())
     }
 
     /// The commits a reset of `tracker` dropped that `commit` holds.
@@ -458,8 +715,8 @@ impl BranchManager {
     }
 
     /// Refuse `commits` (`(tracker, commit)`) when one holds a commit a
-    /// reset dropped (#442): `doing` would publish it again. What is
-    /// refused is said, with the way on.
+    /// reset dropped (#442) in its tracker's own history: `doing` would
+    /// carry it onward again. What is refused is said, with the way on.
     pub(super) fn refuse_dropped(&self, commits: &[(&str, &str)], doing: &str) -> Result<()> {
         if !self.resets_file().exists() {
             return Ok(());
@@ -473,7 +730,7 @@ impl BranchManager {
             let path = crate::tracker::tracker_path(tracker);
             return Err(NewgitError::Unsupported(format!(
                 "`{path}` at {} holds {} that resetting its line to `{target}` dropped ({}{}), \
-                 so {doing} would publish {} again; nothing moved. An instance with no work \
+                 so {doing} would carry {} onward again; nothing moved. An instance with no work \
                  of its own on `{path}` follows the reset with `newgit pull {path}`; one with \
                  work of its own has it on the old line, so redo that work in a new instance \
                  (`newgit spawn`) and remove this one. A reset not published yet is published \
