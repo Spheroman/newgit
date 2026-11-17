@@ -5965,6 +5965,10 @@ impl BranchManager {
             .action_log_path(&branch.slug, &format!("{}.{action_name}", definition.name));
 
         if action.long_running {
+            // By hand as at spawn: not against a dependency that is down or
+            // not answering yet (#54).
+            self.await_dependencies(&branch, definition, action_name, &supervisor)
+                .map_err(NewgitError::Unsupported)?;
             let (command, cwd) =
                 self.action_invocation(&branch, definition, action, action_name)?;
             let env = self.assemble_env(&branch)?;
@@ -14744,14 +14748,87 @@ impl BranchManager {
             .start(&definition.name, &command, &cwd, &env, &log)
     }
 
+    /// Wait for what `definition` depends on to be up before its process
+    /// starts (#54): each dependency whose supervised process is running has
+    /// until [`DEFAULT_READY_WAIT`] to answer on every port it claims. A
+    /// started process is not a serving one, and a dependent started against
+    /// a server still compiling only moves the race into the dependent.
+    ///
+    /// A dependency whose `autostart` action is not running is down — that
+    /// action is part of it being up — so the dependent is not started
+    /// against it. One with no process to run has nothing to wait for: it is
+    /// up when its `prepare` succeeded, which the caller has checked. `Err`
+    /// says which dependency is not up, and is the reason the dependent is
+    /// not started.
+    fn await_dependencies(
+        &self,
+        branch: &BranchInstance,
+        definition: &ResourceDefinition,
+        action_name: &str,
+        supervisor: &Supervisor,
+    ) -> std::result::Result<(), String> {
+        for dependency in &definition.depends_on {
+            let Some(binding) = branch.resources.get(dependency) else {
+                continue;
+            };
+            if supervisor.running_pid(dependency).is_none() {
+                let autostart = self
+                    .resource_definition(dependency)
+                    .ok()
+                    .and_then(ResourceDefinition::autostart_action);
+                if let Some((dependency_action, _)) = autostart {
+                    return Err(format!(
+                        "resource `{}` depends on `{dependency}`, whose `{dependency_action}` is \
+                         not running, so `{action_name}` was not started — start it first with \
+                         `newgit start` or `newgit action {dependency}.{dependency_action}`",
+                        definition.name
+                    ));
+                }
+                continue;
+            }
+            let wait = DEFAULT_READY_WAIT;
+            let deadline = std::time::Instant::now() + wait;
+            loop {
+                if supervisor.running_pid(dependency).is_none() {
+                    return Err(format!(
+                        "resource `{}` depends on `{dependency}`, whose process ended before it \
+                         answered, so `{action_name}` was not started",
+                        definition.name
+                    ));
+                }
+                let silent: Vec<String> = binding
+                    .resolved_ports
+                    .iter()
+                    .filter(|(_, port)| !port_answers(**port))
+                    .map(|(port_name, port)| format!("{port_name} ({port})"))
+                    .collect();
+                if silent.is_empty() {
+                    break;
+                }
+                if std::time::Instant::now() >= deadline {
+                    return Err(format!(
+                        "resource `{}` depends on `{dependency}`, which is not answering on {} \
+                         after {}s, so `{action_name}` was not started — `newgit start` once it \
+                         answers",
+                        definition.name,
+                        silent.join(", "),
+                        wait.as_secs()
+                    ));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+        }
+        Ok(())
+    }
+
     /// Start each bound resource's `autostart` action, dependencies first,
     /// as `newgit action <resource>.<action>` would. One already running is
     /// left alone and not reported. One that is not ready, is blocked, or
     /// depends on a resource whose start failed here is not started, and is
     /// reported failed with the reason: it did not come up.
     ///
-    /// Starting is not waiting: a dependent is started once its dependency's
-    /// process exists, not once it answers (#54).
+    /// A dependent starts once its dependencies answer, not merely once their
+    /// processes exist (see [`Self::await_dependencies`]).
     ///
     /// `only`, when given, limits it to those resources.
     fn autostart(
@@ -14801,9 +14878,12 @@ impl BranchManager {
                     "resource `{name}` {why}, so `{action_name}` was not started"
                 ))
             } else {
-                self.start_supervised(branch, definition, action, action_name)
-                    .map(|_| ())
-                    .map_err(|error| error.to_string())
+                self.await_dependencies(branch, definition, action_name, &supervisor)
+                    .and_then(|()| {
+                        self.start_supervised(branch, definition, action, action_name)
+                            .map(|_| ())
+                            .map_err(|error| error.to_string())
+                    })
             };
             let (status, error) = match result {
                 Ok(()) => (StopStartStatus::Started, None),
@@ -15063,10 +15143,18 @@ impl BranchManager {
                     .resources
                     .iter()
                     .any(|entry| entry.name == definition.name && !entry.is_resume());
-                if !owed
-                    && branch.resources.contains_key(&definition.name)
-                    && matches!(supervisor.state(&definition.name), ProcessState::Died(_))
-                {
+                // Never started, too, once its resource is up: a spawn that
+                // withheld it because a dependency was not answering yet
+                // leaves it owed to the next `start` (#54).
+                let owed_by_spawn = match supervisor.state(&definition.name) {
+                    ProcessState::Died(_) => true,
+                    ProcessState::NeverStarted => branch
+                        .resources
+                        .get(&definition.name)
+                        .is_some_and(|binding| binding.status == ResourceStatus::Ready),
+                    ProcessState::Running(_) | ProcessState::Stopped => false,
+                };
+                if !owed && branch.resources.contains_key(&definition.name) && owed_by_spawn {
                     record.resources.push(StoppedResource {
                         name: definition.name.clone(),
                         action: action.to_owned(),
@@ -15180,6 +15268,15 @@ impl BranchManager {
                                     &mut probed,
                                     &mut report,
                                 )
+                            })
+                            .and_then(|()| {
+                                self.await_dependencies(
+                                    &branch,
+                                    definition,
+                                    action_name,
+                                    &supervisor,
+                                )
+                                .map_err(NewgitError::Unsupported)
                             })
                             .and_then(|()| {
                                 self.start_supervised(&branch, definition, action, action_name)
