@@ -711,6 +711,64 @@ impl BranchManager {
         Ok(())
     }
 
+    /// Refuse forwarding a workspace's push to `origin` when a commit it
+    /// sends that `origin` lacks (`rev_list`, in the outbox `repo`, which
+    /// mirrors `origin`) is one a reset dropped: the forward is a raw push,
+    /// so it would publish it there as it is.
+    pub(super) fn refuse_forwarding_dropped(
+        &self,
+        repo: &camino::Utf8Path,
+        rev_list: &[&str],
+        env: &[(String, String)],
+    ) -> Result<()> {
+        if rev_list.is_empty() || !self.resets_file().exists() {
+            return Ok(());
+        }
+        let dropped: BTreeMap<String, (String, String)> = self
+            .dropped_by_tracker()?
+            .into_iter()
+            .flat_map(|(tracker, ids)| {
+                ids.into_iter()
+                    .map(move |(id, target)| (id, (tracker.clone(), target)))
+            })
+            .collect();
+        if dropped.is_empty() {
+            return Ok(());
+        }
+        let mut args = vec!["-C", repo.as_str(), "rev-list"];
+        args.extend_from_slice(rev_list);
+        let new = crate::source::run_git_env(&args, env)?;
+        let found: Vec<&str> = new
+            .lines()
+            .map(str::trim)
+            .filter(|id| dropped.contains_key(*id))
+            .collect();
+        let Some((tracker, target)) = found.first().and_then(|id| dropped.get(*id)) else {
+            return Ok(());
+        };
+        let shown: Vec<&str> = found.iter().take(5).map(|id| short(id)).collect();
+        let path = crate::tracker::tracker_path(tracker);
+        Err(NewgitError::Unsupported(format!(
+            "this push holds {} that resetting `{path}`'s line to `{target}` dropped ({}{}), \
+             and the store's `origin` does not have {}, so forwarding it would publish what the \
+             reset dropped; nothing was pushed. Push a branch that does not hold {}: one made \
+             from `main` after the reset (`newgit spawn`), with the work redone on it",
+            if found.len() == 1 {
+                "a commit".to_owned()
+            } else {
+                format!("{} commits", found.len())
+            },
+            shown.join(", "),
+            if found.len() > shown.len() {
+                ", …"
+            } else {
+                ""
+            },
+            if found.len() == 1 { "it" } else { "them" },
+            if found.len() == 1 { "it" } else { "them" },
+        )))
+    }
+
     /// The commits a reset of `tracker` dropped that `commit` holds.
     fn dropped_in(&self, tracker: &str, commit: &str) -> Result<Vec<(String, String)>> {
         let mut found = Vec::new();

@@ -1083,7 +1083,19 @@ removed it refuses first, naming how many, unless `--republish` is given
 rather than `--restore`, which reads as `git restore`). It is leased on
 the commit it checked (`--force-with-lease=<branch>:<id>`, an empty id
 when the branch is absent), so a target rewritten again in between is
-refused rather than overwritten unseen. The project's own view cannot be
+refused rather than overwritten unseen. A plain export of `main` is
+leased the same way, once it is known locally to be ahead of what the
+target had: a purge resetting the target to an ancestor between the check
+and the push would otherwise make the push a fast-forward, putting back
+what it removed. An instance's branch and a tag pushed onto what is there
+are not leased on the target's `main`, which is what a purge rewrites, so
+a purge landing between their check and their push is not seen; that
+window is open. A workspace's `git push` goes on to the store's `origin`
+as a raw push, uncomposed, with none of these checks, so an export target
+may not be `origin` itself (refused when the targets are read, however the
+URL is spelled, `insteadOf` included, and again before the forward), and
+the forward refuses a ref holding a commit `.newgit/local/resets.json`
+records as dropped that `origin` lacks. The project's own view cannot be
 followed yet, so its refusal names what is left: `--force --republish`
 when what was removed is not a secret, a target rooted at each tracker or
 a branch of its own otherwise, and rotating a secret that was published

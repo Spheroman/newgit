@@ -10103,7 +10103,77 @@ impl BranchManager {
                     .to_owned(),
             });
         }
-        crate::export_target::resolve_targets(&self.all_definitions())
+        let targets = crate::export_target::resolve_targets(&self.all_definitions())?;
+        if let Some((target, origin)) = self.target_at_origin(&targets)? {
+            return Err(self.target_at_origin_error(target, &origin));
+        }
+        Ok(targets)
+    }
+
+    /// Why export target `target` may not be the store's `origin` (at
+    /// `origin`), and what to do instead.
+    fn target_at_origin_error(&self, target: &ExportTarget, origin: &str) -> NewgitError {
+        NewgitError::InvalidDefinition {
+            kind: "tracker",
+            name: crate::tracker::tracker_path(target.declared_by()),
+            reason: format!(
+                "`export` pushes to {}, which is the project's own `{PUBLISH_REMOTE}` \
+                 ({origin}). A push from a workspace goes to `{PUBLISH_REMOTE}` as it is, \
+                 uncomposed and unchecked, so the target would get commits an export never \
+                 sends there (a tracker withheld from it, a commit purged from it by a \
+                 force-push); nothing was pushed. Export to a repository of its own, or point \
+                 `{PUBLISH_REMOTE}` elsewhere (`git -C {} remote set-url {PUBLISH_REMOTE} \
+                 <url>`)",
+                target.url,
+                self.store.paths().project_root,
+            ),
+        }
+    }
+
+    /// The first of `targets` that is the same repository as the store's
+    /// `origin` (fetched from or pushed to), with that `origin` URL. Each
+    /// is compared as written and as Git would use it (`insteadOf`
+    /// applied), so a rewrite of one to the other is seen too.
+    fn target_at_origin<'a>(
+        &self,
+        targets: &'a [ExportTarget],
+    ) -> Result<Option<(&'a ExportTarget, String)>> {
+        let root = self.store.paths().project_root.clone();
+        let git = |args: &[&str]| {
+            let mut full = vec!["-C", root.as_str()];
+            full.extend_from_slice(args);
+            crate::source::run_git_env(&full, &[])
+                .ok()
+                .map(|out| out.trim().to_owned())
+                .filter(|out| !out.is_empty())
+        };
+        let mut origins: Vec<String> = git(&["config", "--get", "remote.origin.url"])
+            .into_iter()
+            .collect();
+        for push in [false, true] {
+            origins.extend(self.source.remote_url(PUBLISH_REMOTE, push)?);
+        }
+        if origins.is_empty() {
+            return Ok(None);
+        }
+        Ok(targets.iter().find_map(|target| {
+            let url = target.push_url();
+            let spellings: Vec<String> = [
+                Some(target.url.clone()),
+                git(&["ls-remote", "--get-url", "--", &url]),
+            ]
+            .into_iter()
+            .flatten()
+            .collect();
+            origins
+                .iter()
+                .find(|origin| {
+                    spellings
+                        .iter()
+                        .any(|spelling| crate::export_target::same_repository(spelling, origin))
+                })
+                .map(|origin| (target, origin.clone()))
+        }))
     }
 
     /// `"inherit"` follows the parent wherever it ships, whoever reads it
@@ -11097,6 +11167,18 @@ impl BranchManager {
             rev_list.extend(history.as_deref());
             self.refuse_outside_git(&outbox, &rev_list, &quarantine)?;
         }
+        if !on_remote {
+            // The forward to `origin` is a raw push, with nothing an export
+            // checks: so never to a target's own repository (refused when
+            // the targets are read; this is the backstop, so it reads them
+            // without that check), and nothing a reset dropped that
+            // `origin` lacks.
+            let targets = crate::export_target::resolve_targets(&self.all_definitions())?;
+            if let Some((target, origin)) = self.target_at_origin(&targets)? {
+                return Err(self.target_at_origin_error(target, &origin));
+            }
+            self.refuse_forwarding_dropped(&outbox, &rev_list, &quarantine)?;
+        }
 
         let mut checkpoint = self.checkpoint_branch(
             &mut branch,
@@ -11124,7 +11206,7 @@ impl BranchManager {
                 )));
             }
         } else {
-            GitSource::forward_push(&self.outbox(), &url, None, updates, admitting)?;
+            GitSource::forward_push(&outbox, &url, None, updates, admitting)?;
         }
 
         // The instance's own branch goes on to each target that takes

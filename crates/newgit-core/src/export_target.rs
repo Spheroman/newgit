@@ -380,6 +380,49 @@ pub fn push_url(url: &str) -> String {
     }
 }
 
+/// Whether `a` and `b` name the same repository, however each is spelled:
+/// `github.com/a/b`, `https://github.com/a/b.git`, `git@github.com:a/b`, and
+/// `ssh://git@github.com/a/b/` are one repository; a path is compared once
+/// made absolute. Errs toward saying they are the same (case is ignored on a
+/// host), since what asks refuses when they are.
+pub fn same_repository(a: &str, b: &str) -> bool {
+    repository_key(a) == repository_key(b)
+}
+
+/// One spelling for every way of writing a repository's address.
+fn repository_key(url: &str) -> String {
+    let url = push_url(url.trim());
+    let bare = |path: &str| {
+        let path = path.trim_end_matches('/');
+        path.strip_suffix(".git").unwrap_or(path).to_owned()
+    };
+    let local = |path: &str| {
+        let path = path.trim_end_matches('/');
+        std::fs::canonicalize(path)
+            .ok()
+            .and_then(|path| path.to_str().map(ToOwned::to_owned))
+            .unwrap_or_else(|| path.to_owned())
+    };
+    if let Some(path) = url.strip_prefix("file://") {
+        return local(path);
+    }
+    if let Some((_, rest)) = url.split_once("://") {
+        // `[user@]host[:port]/path`.
+        let (host, path) = rest.split_once('/').unwrap_or((rest, ""));
+        let host = host.rsplit_once('@').map_or(host, |(_, host)| host);
+        let host = host.split_once(':').map_or(host, |(host, _)| host);
+        return format!("{}/{}", host, bare(path)).to_lowercase();
+    }
+    // `[user@]host:path`, as Git reads it: a colon before any slash.
+    if let Some((host, path)) = url.split_once(':')
+        && !host.contains('/')
+    {
+        let host = host.rsplit_once('@').map_or(host, |(_, host)| host);
+        return format!("{}/{}", host, bare(path.trim_start_matches('/'))).to_lowercase();
+    }
+    local(&url)
+}
+
 /// The `owner/repo` a URL is on GitHub, or `None` when it is elsewhere.
 pub fn github_repo(url: &str) -> Option<String> {
     let rest = push_url(url);
@@ -424,6 +467,37 @@ mod tests {
     fn parsed(text: &str) -> std::result::Result<Vec<ExportEntry>, String> {
         let table: toml::Table = toml::from_str(text).expect("toml");
         parse_export(table.get("export").expect("export"))
+    }
+
+    #[test]
+    fn one_repository_is_one_repository_however_it_is_spelled() {
+        for spelling in [
+            "github.com/Spheroman/newgit",
+            "https://github.com/Spheroman/newgit.git",
+            "https://github.com/spheroman/newgit/",
+            "git@github.com:Spheroman/newgit.git",
+            "ssh://git@github.com/Spheroman/newgit",
+            "ssh://git@github.com:22/Spheroman/newgit.git",
+        ] {
+            assert!(
+                same_repository("github.com/Spheroman/newgit", spelling),
+                "{spelling}"
+            );
+        }
+        assert!(!same_repository(
+            "github.com/Spheroman/newgit",
+            "github.com/Spheroman/other"
+        ));
+        assert!(!same_repository(
+            "github.com/Spheroman/newgit",
+            "gitlab.com/Spheroman/newgit"
+        ));
+        let temp = std::env::temp_dir();
+        let temp = temp
+            .to_str()
+            .expect("a UTF-8 temp dir")
+            .trim_end_matches('/');
+        assert!(same_repository(temp, &format!("file://{temp}/.")));
     }
 
     #[test]

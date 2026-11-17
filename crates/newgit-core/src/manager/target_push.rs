@@ -27,6 +27,18 @@
 //! - **What is new there** ([`BranchManager::refuse_new_outside_git`]): a
 //!   commit the target lacks that adds a file a tracker outside Git owns, or
 //!   pins a commit a reset dropped.
+//!
+//! A push of the target's own branch is leased on what the check saw there,
+//! forced or not (onto it only once it is known to be behind), so a purge
+//! landing between the check and the push is refused by the target rather
+//! than fast-forwarded over. An instance's branch or a tag pushed onto what
+//! is there leases nothing: the purge rewrites `main`, which neither push
+//! moves, so a purge landing in that window is not seen. That gap is open.
+//!
+//! A workspace's `git push` is not an export: it is forwarded to the
+//! store's `origin` as it is (`receive_push`), so an export target may not
+//! be `origin` itself (`export_targets` refuses that, and the forward checks
+//! again), and the forward refuses a commit a reset dropped.
 
 use std::collections::BTreeSet;
 
@@ -149,11 +161,26 @@ impl BranchManager {
             restored = held;
         }
 
-        let lease = match how {
-            PushExport::Onto => None,
-            PushExport::Replacing(held) => Some((refname.clone(), held.to_owned())),
-            PushExport::Force => Some((refname.clone(), theirs.clone().unwrap_or_default())),
+        // Onto the target's own branch, the push is leased on what it was
+        // checked at, once that is known to be behind: a plain push would
+        // also go through onto an ancestor it was reset to in between (a
+        // purge), putting back what that removed unchecked. A dry run is
+        // never pushed, and says what would be refused as it did.
+        let behind = match (pushing, how, &theirs) {
+            (Pushing::Main { .. }, PushExport::Onto, Some(theirs)) => {
+                self.source.is_ancestor(theirs, tip)?
+            }
+            _ => true,
         };
+        if !behind && put_back != PutBack::Count {
+            return Err(NewgitError::Unsupported(format!(
+                "{}; nothing was pushed",
+                self.push_rejected(target, theirs.as_deref(), tip)?
+            )));
+        }
+        let lease = behind
+            .then(|| lease_for(pushing, how, &refname, theirs.as_deref()))
+            .flatten();
         Ok(Cleared {
             url: target.push_url(),
             refspec: format!("{object}:{refname}"),
@@ -173,14 +200,9 @@ impl BranchManager {
                 "a dry run's check of an export is not a push".to_owned(),
             ));
         }
-        let lease = cleared
-            .lease
-            .as_ref()
-            .map(|(refname, expected)| format!("--force-with-lease={refname}:{expected}"));
         let root = self.store.paths().project_root.clone();
-        let mut args = vec!["-C", root.as_str(), "push", "--quiet", "--no-verify"];
-        args.extend(lease.as_deref());
-        args.extend([cleared.url.as_str(), cleared.refspec.as_str()]);
+        let args = push_args(root.as_str(), &cleared);
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
         crate::source::run_git_env(&args, &[]).map(|_| ())
     }
 
@@ -342,5 +364,81 @@ impl BranchManager {
             short(pushed),
             self.follow_way(target),
         )))
+    }
+}
+
+/// The lease a push of `refname` takes, at `theirs` (what the target had
+/// there when it was checked; none: nothing). `Onto` a branch or tag has
+/// none: neither can lease on the target's `main`, which a purge rewrites,
+/// so a purge landing between the check and the push is not seen there.
+fn lease_for(
+    pushing: Pushing<'_>,
+    how: PushExport<'_>,
+    refname: &str,
+    theirs: Option<&str>,
+) -> Option<(String, String)> {
+    match (pushing, how) {
+        (Pushing::Main { .. }, PushExport::Onto) | (_, PushExport::Force) => {
+            Some((refname.to_owned(), theirs.unwrap_or_default().to_owned()))
+        }
+        (_, PushExport::Replacing(held)) => Some((refname.to_owned(), held.to_owned())),
+        (_, PushExport::Onto) => None,
+    }
+}
+
+/// `git push`'s arguments for `cleared`, run in `root`.
+fn push_args(root: &str, cleared: &Cleared) -> Vec<String> {
+    let mut args: Vec<String> = ["-C", root, "push", "--quiet", "--no-verify"]
+        .map(ToOwned::to_owned)
+        .to_vec();
+    args.extend(
+        cleared
+            .lease
+            .as_ref()
+            .map(|(refname, expected)| format!("--force-with-lease={refname}:{expected}")),
+    );
+    args.extend([cleared.url.clone(), cleared.refspec.clone()]);
+    args
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cleared(pushing: Pushing<'_>, how: PushExport<'_>, theirs: Option<&str>) -> Cleared {
+        let refname = "refs/heads/main";
+        Cleared {
+            url: "https://example.com/a.git".to_owned(),
+            refspec: format!("tip:{refname}"),
+            lease: lease_for(pushing, how, refname, theirs),
+            pushable: true,
+            theirs: theirs.map(ToOwned::to_owned),
+            restored: 0,
+        }
+    }
+
+    #[test]
+    fn an_export_onto_main_is_leased_on_what_it_was_checked_at() {
+        let main = Pushing::Main { from_push: false };
+        let args = push_args("/p", &cleared(main, PushExport::Onto, Some("abc")));
+        assert!(
+            args.contains(&"--force-with-lease=refs/heads/main:abc".to_owned()),
+            "{args:?}"
+        );
+        // A branch the target lacks must still not exist when it lands.
+        let args = push_args("/p", &cleared(main, PushExport::Onto, None));
+        assert!(
+            args.contains(&"--force-with-lease=refs/heads/main:".to_owned()),
+            "{args:?}"
+        );
+        let tag = Pushing::Tag {
+            name: "v1",
+            object: "tip",
+        };
+        let args = push_args("/p", &cleared(tag, PushExport::Onto, None));
+        assert!(
+            !args.iter().any(|arg| arg.starts_with("--force-with-lease")),
+            "{args:?}"
+        );
     }
 }
