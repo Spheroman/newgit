@@ -702,7 +702,9 @@ struct ExportArgs {
     #[arg(long = "exclude", value_name = "PATH")]
     excludes: Vec<Utf8PathBuf>,
     /// With --remote: replace the target branch even when the export does not
-    /// descend from it, rather than bringing in what the target has first
+    /// descend from it, rather than bringing in what the target has first.
+    /// With an instance too: replace that instance's branch there, whatever
+    /// it holds
     #[arg(long, requires = "remote")]
     force: bool,
     /// With --remote: compose and check, but push nothing
@@ -4019,13 +4021,13 @@ fn checkpoints(instance: Option<String>) -> Result<()> {
 
 fn export(args: ExportArgs) -> Result<()> {
     if let (Some(name), Some(instance)) = (&args.remote, &args.instance) {
-        if args.force || args.dry_run {
+        if args.dry_run {
             bail!(
-                "--force and --dry-run go with `main`'s export (`newgit export --remote \
-                 {name}`): an instance's branch there follows its `git push`"
+                "--dry-run goes with `main`'s export (`newgit export --remote {name} \
+                 --dry-run`): an instance's branch there follows its `git push`"
             );
         }
-        return export_branch_to_remote(instance, name);
+        return export_branch_to_remote(instance, name, args.force);
     }
     if let Some(name) = &args.remote {
         return export_to_remote(
@@ -4133,14 +4135,14 @@ fn export(args: ExportArgs) -> Result<()> {
 }
 
 /// What an export that replaced the target's branch says after where it went.
-const REPLACED: &str = ", replacing the branch there: its commits were built on a copy of what \
-                        the target already has, and are now built on the target's own";
+const REPLACED: &str = ", replacing the branch there, which no longer descended from what \
+                        newgit last put there";
 
 /// `newgit export <instance> --remote <name>`: the instance's branch, as last
 /// pushed, exported to a `branches = true` target again.
-fn export_branch_to_remote(instance: &str, name: &str) -> Result<()> {
+fn export_branch_to_remote(instance: &str, name: &str, force: bool) -> Result<()> {
     let manager = manager_here()?;
-    let export = manager.export_branch_to_remote(instance, name)?;
+    let export = manager.export_branch_to_remote(instance, name, force)?;
     match &export.result {
         Ok(exported) => {
             println!(

@@ -3206,10 +3206,10 @@ impl BranchManager {
         if let Some(root) = list.get(&self.root.name)
             && !composed(root)
         {
-            self.compose_here(view, root)?;
-            // A tracker whose commit did not come is left out of the view
-            // composed, which is then not the one the remote serves: said,
-            // and tried again at the next split rather than taken as done.
+            // A tracker whose commit did not come would be left out of the
+            // view composed, which is then not the one the remote serves:
+            // said, and tried again at the next split rather than composed
+            // and taken as done.
             let lacking: Vec<String> = list
                 .iter()
                 .filter(|(_, commit)| {
@@ -3231,6 +3231,7 @@ impl BranchManager {
                     lacking.join(", ")
                 )));
             }
+            self.compose_here(view, root)?;
             self.source.update_ref(ROOT_MAIN_ON_REMOTE, root)?;
         }
         Ok(())
@@ -10048,6 +10049,81 @@ impl BranchManager {
         crate::source::run_git_env(&args, &[]).map(|_| ())
     }
 
+    /// [`Self::push_export`] of an instance's branch, and whether it
+    /// replaced what was there. A lease fails when the target no longer has
+    /// the branch at all (a pull request closed with its branch deleted): it
+    /// is then pushed as new, which fails in turn if someone made it again
+    /// meanwhile.
+    fn push_branch_export(
+        &self,
+        target: &ExportTarget,
+        tip: &str,
+        branch: &str,
+        how: PushExport<'_>,
+    ) -> Result<bool> {
+        let Err(error) = self.push_export(target, tip, branch, how) else {
+            return Ok(matches!(how, PushExport::Replacing(_)));
+        };
+        let lease_failed = matches!(how, PushExport::Replacing(_))
+            && matches!(&error, NewgitError::SourceCommand { stderr, .. } if rejected(stderr));
+        if !lease_failed {
+            return Err(error);
+        }
+        let head = format!("refs/heads/{branch}");
+        let listed = crate::source::run_git_env(
+            &[
+                "-C",
+                self.store.paths().project_root.as_str(),
+                "ls-remote",
+                "--",
+                &target.push_url(),
+                &head,
+            ],
+            &[],
+        )?;
+        if listed
+            .lines()
+            .any(|line| line.split_once('\t').is_some_and(|(_, name)| name == head))
+        {
+            return Err(error);
+        }
+        self.push_export(target, tip, branch, PushExport::Onto)?;
+        Ok(false)
+    }
+
+    /// Refuse to replace `recorded`, what newgit last put on `target` for
+    /// `branch`, when composing its root commit for `target` now gives
+    /// another commit: the target's tracker set changed, so every commit of
+    /// the branch there would change with it, and `main`'s export needs
+    /// `--force` for that. Refused too when that cannot be told.
+    fn refuse_recomposed(
+        &self,
+        target: &ExportTarget,
+        branch: &BranchInstance,
+        recorded: &str,
+    ) -> Result<()> {
+        let project = self.store.paths().project_root.clone();
+        let scratch = "replacing";
+        let again = crate::compose::read_root(&project, recorded)?
+            .filter(|(tracker, _)| tracker == target.declared_by())
+            .map(|(tracker, root)| {
+                let composed =
+                    self.compose_export(target, &BTreeMap::from([(tracker, root)]), scratch);
+                let _ = self.source.delete_ref(&export_ref(&target.name, scratch));
+                composed
+            })
+            .transpose()?;
+        if again.is_some_and(|(_, view)| view.tip == recorded) {
+            return Ok(());
+        }
+        Err(NewgitError::Unsupported(format!(
+            "`{}` on `{}` no longer descends from what newgit last put there, and its \
+             trackers are not the ones that composed that, so every commit there would change. \
+             It was left as it is: `newgit export {} --remote {} --force` replaces it",
+            branch.source_ref, target.name, branch.name, target.name
+        )))
+    }
+
     /// After a push from instance `branch` reached its remote: its branch,
     /// composed as each `branches = true` target sees it, pushed there too,
     /// and recorded in the workspace as `refs/remotes/<target>/<branch>` —
@@ -10055,11 +10131,15 @@ impl BranchManager {
     /// agent's `HEAD` is on it. A failure is reported per target; the push
     /// itself already succeeded.
     ///
-    /// The branch there is newgit's: nobody pushes to it straight. So when
-    /// what it holds is what newgit last put there, and that is not behind
-    /// what goes there now — the instance's commits were split again, onto
-    /// the root commits the remote made (*One commit, one root commit*) — it
-    /// is replaced. Anything else there is left as it is.
+    /// When what goes there now does not descend from what newgit last put
+    /// there (`refs/newgit/exports/<target>/pushed-branches/<slug>`, written
+    /// only once a push succeeded) — the instance's commits were split again,
+    /// onto the root commits the remote made (*One commit, one root commit*) —
+    /// the branch is replaced, with that record as the lease: only while the
+    /// target still holds exactly it, so a commit anyone else pushed there is
+    /// never thrown away. Not when the target's tracker set changed since,
+    /// which `--force` is for, as it is for `main`. A branch the target no
+    /// longer has is pushed again.
     fn export_instance(
         &self,
         branch: &BranchInstance,
@@ -10106,31 +10186,32 @@ impl BranchManager {
             .iter()
             .map(|target| {
                 let result = (|| {
-                    let held = crate::source::run_git_env(
-                        &[
-                            "-C",
-                            branch.workspace_path.as_str(),
-                            "rev-parse",
-                            "--verify",
-                            "--quiet",
-                            &format!("refs/remotes/{}/{}", target.name, branch.source_ref),
-                        ],
-                        &[],
-                    )
-                    .ok()
-                    .map(|held| held.trim().to_owned());
+                    // What newgit last put there, by its own record. Never
+                    // what a fetch of the target says it holds: that is
+                    // anyone's, and a lease on it protects nothing.
+                    let pushed_ref = pushed_branch_ref(&target.name, &branch.slug);
+                    let recorded = self.source.rev_parse(&pushed_ref).ok();
                     let (trackers, view) =
                         self.compose_export(target, &list, &format!("instances/{}", branch.slug))?;
-                    let replaced = held.as_deref().filter(|held| {
-                        *held != view.tip
-                            && !self.source.is_ancestor(held, &view.tip).unwrap_or(true)
-                    });
-                    let how = match replaced {
+                    let replacing = match &recorded {
+                        Some(recorded)
+                            if !forced
+                                && *recorded != view.tip
+                                && !self.source.is_ancestor(recorded, &view.tip)? =>
+                        {
+                            self.refuse_recomposed(target, branch, recorded)?;
+                            Some(recorded.as_str())
+                        }
+                        _ => None,
+                    };
+                    let how = match replacing {
                         _ if forced => PushExport::Force,
-                        Some(held) => PushExport::Replacing(held),
+                        Some(recorded) => PushExport::Replacing(recorded),
                         None => PushExport::Onto,
                     };
-                    self.push_export(target, &view.tip, &branch.source_ref, how)?;
+                    let replaced =
+                        self.push_branch_export(target, &view.tip, &branch.source_ref, how)?;
+                    self.source.update_ref(&pushed_ref, &view.tip)?;
                     crate::source::run_git_env(
                         &[
                             "-C",
@@ -10149,7 +10230,7 @@ impl BranchManager {
                         &[],
                     )?;
                     Ok::<_, NewgitError>(BranchExported {
-                        replaced: replaced.is_some() && !forced,
+                        replaced,
                         same_commits: view.tip == head,
                         withheld: trackers
                             .into_iter()
@@ -10166,9 +10247,10 @@ impl BranchManager {
                     branch: branch.source_ref.clone(),
                     result: result.map_err(|error| match error {
                         NewgitError::SourceCommand { stderr, .. } if rejected(&stderr) => format!(
-                            "`{}` there has commits this branch does not descend from (someone \
-                             pushed to it directly?), so it was left as it is",
-                            branch.source_ref
+                            "`{}` there is not what newgit last put there (someone pushed to it \
+                             directly?), so it was left as it is. `newgit export {} --remote {} \
+                             --force` replaces it with this branch",
+                            branch.source_ref, branch.name, target.name
                         ),
                         other => other.to_string(),
                     }),
@@ -10188,9 +10270,16 @@ impl BranchManager {
     /// last pushed, not whatever the workspace has since, because a mirror
     /// holds what `git push` sent. For an export that failed, and for a branch
     /// whose commits there were built on a copy of what the target's `main`
-    /// already has (*One commit, one root commit*). Nothing in the workspace
-    /// moves but its record of what the target holds.
-    pub fn export_branch_to_remote(&self, instance: &str, name: &str) -> Result<BranchExport> {
+    /// already has (*One commit, one root commit*), whose tracker branches
+    /// here heal with it. Nothing in the workspace moves but its record of
+    /// what the target holds. `force` replaces whatever the target's branch
+    /// holds, as `main`'s `--force` does.
+    pub fn export_branch_to_remote(
+        &self,
+        instance: &str,
+        name: &str,
+        force: bool,
+    ) -> Result<BranchExport> {
         self.refuse_unlinked()?;
         self.require_resolvable_graph()?;
         let (_lock, branch) = self.locked_branch(instance)?;
@@ -10223,9 +10312,22 @@ impl BranchManager {
             ))
         })?;
         self.prepare_projection()?;
+        // The instance's own tracker branches first, split again where they
+        // stand (its last checkpoint, which may be ahead of the push), so they
+        // heal as the branch there does, and a merge of it brings no copy.
+        let root_ref = local_tracker_ref(&self.root.name, &format!("instances/{}", branch.slug));
+        let standing = self.source.rev_parse(&root_ref).ok().and_then(|root| {
+            let mut objects =
+                crate::objects::Objects::open(&self.store.paths().project_root).ok()?;
+            crate::compose::parse_split(&objects.commit(&root).ok()?.message)
+                .map(|split| split.source)
+        });
+        if let Some(standing) = standing {
+            self.split_instance(&branch.slug, &standing)?;
+        }
         self.learn_before_split(&branch, &pushed);
         let split = self.split_view(&pushed, &branch.dropped)?.index;
-        self.export_instance(&branch, &pushed, false, Some(split))
+        self.export_instance(&branch, &pushed, force, Some(split))
             .into_iter()
             .find(|export| export.target == name)
             .ok_or_else(|| {
@@ -15553,6 +15655,12 @@ enum PushExport<'a> {
 
 fn export_ref(target: &str, branch: &str) -> String {
     format!("refs/newgit/exports/{target}/{branch}")
+}
+
+/// What newgit last pushed of instance `slug`'s branch to `target`: written
+/// once the push succeeded, and the only lease a replacement of it takes.
+fn pushed_branch_ref(target: &str, slug: &str) -> String {
+    export_ref(target, &format!("pushed-branches/{slug}"))
 }
 
 /// A push Git refused because it was not a fast-forward.

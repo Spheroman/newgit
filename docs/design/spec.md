@@ -1671,9 +1671,11 @@ GitHub), export brings that in first. With `branches = true`, every push
 from a workspace exports its branch there too: the target's `main` plus the
 instance's own commits, whichever was exported first. `newgit export
 <instance> --remote <name>` exports that branch again as last pushed, for an
-export that failed. A branch whose commits there were built on a copy of
-what the target's `main` holds is replaced, while it is still what newgit
-put there ([`trackers.md`](trackers.md), *One commit, one root commit*).
+export that failed, or with `--force` to replace it whatever it holds. A
+branch whose commits there were built on a copy of what the target's `main`
+holds is replaced, only while the target holds exactly what newgit last
+pushed there by its own record, so a commit someone else pushed is never
+thrown away ([`trackers.md`](trackers.md), *One commit, one root commit*).
 
 ### The remote
 

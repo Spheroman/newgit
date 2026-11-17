@@ -669,14 +669,28 @@ built on the second arrives as a pull request holding commits the mirror's
   had it — does not hold are held to this, so the walk is an instance's own
   unmerged work, and history is never made again. The view commits are
   untouched: a workspace sees nothing change.
-- **The mirror's branch follows.** An instance's branch on a `branches =
-  true` target is newgit's, since a push straight to it is refused. When
-  what it holds is what newgit last put there
-  (`refs/remotes/<target>/<branch>` in the workspace) and that is not behind
-  what goes there now, the branch is replaced, with that commit as the
-  lease, and the push says so. Anything else there is left as it is.
-  `newgit export <instance> --remote <target>` does the same without a new
-  commit: the branch as last pushed, exported again.
+- **The mirror's branch follows, over newgit's own commits only.** An
+  instance's branch on a `branches = true` target is newgit's to write, but
+  nothing stops anyone pushing to it there. So newgit keeps its own record of
+  what it last pushed to it, in the project repo
+  (`refs/newgit/exports/<target>/pushed-branches/<slug>`, written only once
+  that push succeeded). When what goes there now does not descend from that
+  record, the branch is replaced with the record as the lease: the push
+  succeeds only while the target holds exactly that commit, so a commit
+  anyone else pushed there is never thrown away, and the export is refused
+  instead. The workspace's `refs/remotes/<target>/<branch>` is never the
+  lease: any `git fetch` of the target rewrites it with whatever is there.
+  A branch the target no longer has (a pull request closed with its branch
+  deleted) is pushed again. With no record (exported by a newgit from before
+  this, or from another copy of the project), the branch is not replaced.
+  Nor is it when the target's tracker set changed since the record — its
+  root commit no longer composes to it — since every commit there would
+  change, which `main`'s export needs `--force` for too. Every refusal names
+  `newgit export <instance> --remote <target> --force`, which replaces the
+  branch whatever it holds, as a force-push from the workspace does.
+  Without `--force`, that command exports the branch as last pushed again,
+  splitting the instance's tracker branches again where they stand first,
+  so they heal with it and a merge of the instance brings no copy.
 
 Two root commits that have both reached `main` stay: that is history, and a
 mirror that took both keeps both.
@@ -1328,8 +1342,9 @@ export = "inherit"       # ships inside t3code's export, wherever that goes
   where something ships takes an owner's merge, where `exports/` was
   ordinary root content.
 - **A branch there is newgit's.** With `branches = true`, an instance's
-  push exports its branch, composed for the target, and nothing else writes
-  it. It is the target's `main` plus the instance's own commits, whichever
+  push exports its branch, composed for the target; nothing else is meant to
+  write it, though nothing there stops anyone. It is the target's `main` plus
+  the instance's own commits, whichever
   of the two was exported first: both are composed from the same root
   commits (*One commit, one root commit*, which also says when the branch is
   replaced rather than added to).

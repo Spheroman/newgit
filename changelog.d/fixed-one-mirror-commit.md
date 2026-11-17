@@ -18,6 +18,10 @@
   has. An instance already built on a copy heals at its next push: its
   commits are split again onto the remote's root commits (the workspace's
   own commits do not change), and its branch on the mirror is replaced,
-  as long as it is still what newgit put there. `newgit export <instance>
-  --remote <target>` does that without a new commit, and exports a branch
-  again when its export failed.
+  only while the mirror holds exactly what newgit last pushed there, by a
+  record newgit keeps in the project repo: a commit someone else pushed
+  there is never thrown away, and a branch deleted there is pushed again.
+  `newgit export <instance> --remote <target>` does that without a new
+  commit, healing the instance's tracker branches too, and exports a branch
+  again when its export failed; `--force` replaces the branch there
+  whatever it holds.

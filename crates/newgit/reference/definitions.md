@@ -2067,8 +2067,14 @@ that gap:
   commits**, whichever of the two was exported first. One whose commits were
   built on a copy of what the target's `main` holds (exported by a newgit
   from before that held) is replaced at its next push, and the push says so.
-  Only while the branch is still what newgit put there: a commit pushed to it
-  straight is never thrown away, and the export is refused instead.
+  Only while the target holds exactly what newgit last pushed there, by
+  newgit's own record in the project repo (never the workspace's
+  `refs/remotes/<target>/<branch>`, which a `git fetch` rewrites): a commit
+  someone else pushed there is not thrown away, and the export is refused
+  instead. Refused too when there is no record, or when the target's
+  trackers changed since. A branch deleted there is pushed again. `newgit
+  export <instance> --remote <target> --force` replaces the branch whatever
+  it holds, as a force-push from the workspace does.
 - **On a newgit remote, the target is a remote in every workspace**, named
   after it, and `gh` resolves (`gh-resolved = base`) the target the
   instance's work belongs to: the one that ships a tracker the work touched.
