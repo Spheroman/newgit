@@ -210,7 +210,9 @@ fn export_force_over_a_rewritten_target_says_what_it_puts_back() {
         .expect("dry run");
     assert_eq!(dry.restored, 1, "{dry:?}");
     assert!(!on_target(&github, &leaked));
-    let forced = manager(&store)
+    // Said before the push, not after it: `--force` alone refuses, naming
+    // how many it would put back and the flag that does.
+    let refused = manager(&store)
         .export_to_remote(
             "t3code",
             RemoteExportOptions {
@@ -218,7 +220,28 @@ fn export_force_over_a_rewritten_target_says_what_it_puts_back() {
                 ..RemoteExportOptions::default()
             },
         )
-        .expect("export --force");
+        .expect_err("putting back what a rewrite removed is asked for by name");
+    let said = refused.to_string();
+    assert!(said.contains("put back 1 commit"), "{said}");
+    assert!(
+        said.contains("newgit export --remote t3code --force --republish"),
+        "{said}"
+    );
+    assert!(
+        said.contains("newgit pull --remote t3code --force --dry-run"),
+        "{said}"
+    );
+    assert!(!on_target(&github, &leaked), "nothing was pushed");
+    let forced = manager(&store)
+        .export_to_remote(
+            "t3code",
+            RemoteExportOptions {
+                force: true,
+                republish: true,
+                ..RemoteExportOptions::default()
+            },
+        )
+        .expect("export --force --republish");
     assert_eq!(forced.restored, 1, "{forced:?}");
     assert!(on_target(&github, &leaked), "asked for, and said");
 }

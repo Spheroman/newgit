@@ -486,6 +486,11 @@ impl BranchManager {
         )))
     }
 
+    /// Whether this machine has a reset written down at all.
+    pub(super) fn has_resets(&self) -> bool {
+        self.resets_file().exists()
+    }
+
     fn resets_file(&self) -> camino::Utf8PathBuf {
         self.store.paths().local.join("resets.json")
     }
@@ -626,6 +631,8 @@ impl BranchManager {
         }
         let new = crate::source::run_git_env(&args, &[])?;
         // Which root commit each view commit stands for, noted by compose.
+        // Fails closed: a commit this cannot identify is one it cannot
+        // clear, so a missing or unreadable note refuses the push.
         let listed = crate::source::run_git_env(
             &[
                 "-C",
@@ -637,20 +644,44 @@ impl BranchManager {
             ],
             &[],
         )
-        .unwrap_or_default();
+        .map_err(|error| {
+            NewgitError::SplitRefused(format!(
+                "the export to `{}` is checked for commits a reset dropped (#442), by the \
+                 root commit each of its commits stands for, and the notes saying which \
+                 ({}) could not be read, so nothing was pushed: {error}",
+                target.name,
+                crate::compose::NOTES_REF,
+            ))
+        })?;
         let notes: BTreeMap<&str, &str> = listed
             .lines()
             .filter_map(|line| line.split_once(' '))
             .map(|(note, view)| (view.trim(), note.trim()))
             .collect();
+        let unidentified = |view: &str, why: &str| {
+            NewgitError::SplitRefused(format!(
+                "the export to `{}` would carry commit {}, which {why}, so whether it pins a \
+                 commit a reset dropped (#442) cannot be checked; nothing was pushed. Every \
+                 commit an export composes here is noted, so this one was not composed here \
+                 or its note was lost",
+                target.name,
+                short(view),
+            ))
+        };
         let mut objects = crate::objects::Objects::open(&project)?;
         for view in new.lines().map(str::trim).filter(|line| !line.is_empty()) {
             let Some(note) = notes.get(view) else {
-                continue;
+                return Err(unidentified(
+                    view,
+                    &format!(
+                        "has no note ({}) saying which root commit it stands for",
+                        crate::compose::NOTES_REF
+                    ),
+                ));
             };
             let text = String::from_utf8_lossy(&objects.blob(note)?).into_owned();
             let Some((root, commit)) = text.lines().find_map(|line| line.split_once(' ')) else {
-                continue;
+                return Err(unidentified(view, "has a note that names no root commit"));
             };
             let state = crate::compose::index_with(&mut objects, root, commit.trim())?;
             for (tracker, pinned) in &state {
@@ -748,6 +779,62 @@ impl BranchManager {
                     ""
                 },
                 if found.len() == 1 { "it" } else { "them" },
+            )));
+        }
+        Ok(())
+    }
+
+    /// Refuse pulling from export target `target` when what the pull makes
+    /// of a tracker's line (`commits`, `(tracker, commit)`) holds a commit a
+    /// reset dropped: `target` still has it (a second target, never
+    /// purged), and merging it in would bring it back for the next export
+    /// to publish again. Names both ways on: follow `target` instead, which
+    /// brings them back out loud, or purge them there too.
+    pub(super) fn refuse_pulling_dropped(
+        &self,
+        target: &ExportTarget,
+        commits: &[(&str, &str)],
+    ) -> Result<()> {
+        if !self.resets_file().exists() {
+            return Ok(());
+        }
+        for (tracker, commit) in commits {
+            let found = self.dropped_in(tracker, commit)?;
+            let Some((_, reset_target)) = found.first() else {
+                continue;
+            };
+            let shown: Vec<&str> = found.iter().take(5).map(|(id, _)| short(id)).collect();
+            let path = crate::tracker::tracker_path(tracker);
+            let follow = if target.root.is_some() {
+                let name = &target.name;
+                format!(
+                    "If they are not a secret and `{name}` is the line to keep, `newgit pull \
+                     --remote {name} --force --dry-run` says what following it does, and \
+                     without `--dry-run` resets `{path}`'s line to `{name}`'s, taking them \
+                     back off the record out loud. "
+                )
+            } else {
+                String::new()
+            };
+            return Err(NewgitError::Unsupported(format!(
+                "`{name}` still has {} that resetting `{path}`'s line to `{reset_target}` \
+                 dropped ({}{}), so pulling from it would merge {} back in, for the next export \
+                 to publish again; nothing moved. {follow}If they are a secret, purge them from \
+                 `{name}` as well (rewrite its branch without them and force-push it), then \
+                 pull again",
+                if found.len() == 1 {
+                    "a commit".to_owned()
+                } else {
+                    format!("{} commits", found.len())
+                },
+                shown.join(", "),
+                if found.len() > shown.len() {
+                    ", …"
+                } else {
+                    ""
+                },
+                if found.len() == 1 { "it" } else { "them" },
+                name = target.name,
             )));
         }
         Ok(())

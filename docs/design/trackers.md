@@ -984,14 +984,42 @@ tracker's history, for the next export to push to the target again.
 Reverting the change in an instance and merging it keeps it out of the tip
 only. So when the target's branch no longer descends from the commit this
 machine last exported there (`refs/newgit/exports/<target>/pushed`), and
-the tracker's line still holds that commit, plain `pull --remote` and plain
-`export --remote` refuse, saying how many commits the rewrite removed and
-naming `pull --remote <target> --force [--dry-run]`. `export --remote
---force` still replaces the branch, and says how many of the removed
-commits it puts back; it is leased on the commit it checked
-(`--force-with-lease=<branch>:<id>`, an empty id when the branch is
-absent), so a target rewritten again in between is refused rather than
-overwritten unseen.
+the tracker's line still holds a commit the rewrite removed, plain `pull
+--remote` and every export (plain, `--dry-run`, and the one a push makes)
+refuse, saying how many commits the rewrite removed and naming `pull
+--remote <target> --force [--dry-run]`. Whether the target is now beside
+the line (a purge that added a commit) or behind it does not matter: the
+simplest purge, `git reset --hard HEAD~1 && git push --force`, adds no
+commit, so a push of the old line would fast-forward it and put the key
+back without a word. A target merely behind (what was pushed is still on
+it, only `main` has moved on) exports as before. `export --remote --force`
+replaces the branch, but when that would put back commits the rewrite
+removed it refuses first, naming how many, unless `--republish` is given
+(`--force --republish`; named for what it does, publishing them again,
+rather than `--restore`, which reads as `git restore`). It is leased on
+the commit it checked (`--force-with-lease=<branch>:<id>`, an empty id
+when the branch is absent), so a target rewritten again in between is
+refused rather than overwritten unseen. The project's own view cannot be
+followed yet, so its refusal names what is left: `--force --republish`
+when what was removed is not a secret, a target rooted at each tracker or
+a branch of its own otherwise, and rotating a secret that was published
+whatever happens to the history.
+
+**What this cannot see (decided, #442).** The check stands on this
+machine's record of what it pushed. Another machine that never exported
+to the target, or this one after losing the ref, has no record, and
+nothing else here can stand in for it soundly: the tracker's published
+`main` holds both what was exported and what was merged since, which a
+rewrite cannot be told from; the fetched `upstream` ref moves on every
+fetch, so a check on it would refuse once and pass on the second try; and
+a target keeps no history of its own branch that Git can read. So without
+a record, a rewind is taken for a target that is behind (the export
+fast-forwards it, putting back what it removed), and a purge that added a
+commit for a target with history of its own: plain `pull --remote` merges
+it, and the export's push is refused as not a fast-forward, naming `pull
+--remote <target> --force --dry-run` first and `--force` only with how
+many commits replacing the branch publishes there. Sharing the record
+through the remote, so every machine has it, is the fix, and not built.
 
 **Following a force-push (decided, #442).** `newgit pull --remote <target>
 --force` resets the line of the tracker the target is rooted at to the
@@ -1002,7 +1030,12 @@ project root's pin moves to it in one commit, `Reset t3code to
 github.com/Spheroman/t3code newgit: drops 1 commit`. `--force` because it is
 `export --remote --force` the other way round: each replaces one side's
 branch with the other's, and "force pull" is what a Git user asks for when
-they want the remote's history over theirs. `--dry-run` moves nothing.
+they want the remote's history over theirs. `--dry-run` moves no
+tracker's `main`, no pin, no workspace, and writes no record; what it does
+write is what reading needs, exactly: the target's branch, fetched into
+`refs/newgit/exports/<target>/upstream`, and each instance's workspace,
+read as a pull reads it (`refs/newgit/pull/<instance>`, and its tracker
+branches, which only record what its workspace already holds).
 It says plainly what it drops: every commit only the old line had, by id and
 subject, and every instance whose branch (each workspace split first, so
 uncheckpointed work counts) still holds any, with how much work of its own
@@ -1026,6 +1059,15 @@ instance still on the old line keeps its work here and its push fails), an
 export composed from one, and a push to any export target of a commit the
 target lacks that pins one (the project's own view, or any target that
 ships the tracker inside another), are refused, naming the commits.
+So is plain `pull --remote` from a second target that was never purged:
+it still has the dropped commits, and merging it would bring them back for
+the next export to publish, so it is refused, naming `pull --remote
+<other> --force` (which brings them back out loud, for when they are not a
+secret) or purging them from `<other>` too; `export --remote <other>
+--force` replaces its branch with the reset line, which purges them there.
+The pin check fails closed: a commit about to be pushed whose compose note
+is missing or unreadable is one it cannot identify, so cannot clear, and
+the push is refused.
 `newgit merge main` publishes the reset:
 the remote's `main` of the tracker, the old line, is replaced by the new one
 (a sideways compare-and-swap, which the tracker's maintainers make), never

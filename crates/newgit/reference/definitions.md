@@ -1947,10 +1947,17 @@ refused. `newgit merge main` publishes what came in.
 A target rewritten since this machine last exported to it (force-pushed, a
 secret purged there) is not merged with what the tracker has, as `git
 pull` would: that keeps the removed commits for the next export to push
-again. Plain `pull --remote` and plain `export --remote` refuse instead,
-saying how many commits the rewrite removed, and name `newgit pull
---remote <target> --force`. `export --remote --force` replaces the branch
-(leased on the commit it checked) and says how many of them it puts back.
+again. Plain `pull --remote` and every export (`--dry-run` and the one a
+push makes too) refuse instead, saying how many commits the rewrite
+removed, and name `newgit pull --remote <target> --force`; a rewind (the
+commit dropped, nothing added) counts. `export --remote --force` replaces
+the branch (leased on the commit it checked), but refuses first when that
+would put back commits the rewrite removed, naming how many, unless
+`--republish` is given. The check stands on this machine's record of what
+it pushed there: another machine with no record cannot tell a rewrite
+from a target behind or with history of its own, so it does not refuse,
+and its refused push names `pull --remote <target> --force --dry-run`
+before `--force`.
 `newgit pull --remote <target> --force` follows the rewrite, for a target
 rooted at a tracker: the tracker's line is reset to the target's, as `git
 reset --hard` would, and the project root's pin moves to it; `newgit merge
@@ -1961,12 +1968,15 @@ merge, a send to the remote (a checkpoint's sync too), or a push to an
 export target that lacks them. It refuses while the project root has work
 of its own on the old line, which moving its pin would discard. A later
 reset onto a line holding commits an earlier one dropped says so and stops
-refusing them. An instance with nothing of its own on the old line follows
-on `newgit pull`. Not undone: the project's own history, whose older
+refusing them. Plain `pull --remote` from a second target that still has
+a dropped commit is refused too. An instance with nothing of its own on
+the old line follows on `newgit pull`. Not undone: the project's own history, whose older
 commits still pin the old line (so the remote's copy of it, its Git
 endpoint, `newgit clone`, and project tags still have them, and a target of
 the project's view that never had that history is refused), and copies
-others already fetched. `--dry-run` says all of it and moves nothing.
+others already fetched. `--dry-run` says all of it and moves nothing; it
+writes only the target's fetched branch and each instance's workspace as a
+pull reads it.
 
 On a linked project the same thing happens on the remote when the target's
 repository has the webhook (`docs/design/remote.md`, *The GitHub webhook*),

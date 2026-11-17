@@ -694,6 +694,12 @@ struct ExportArgs {
     /// With --remote: compose and check, but push nothing
     #[arg(long, requires = "remote")]
     dry_run: bool,
+    /// With --force: replace the branch even when that puts back commits a
+    /// rewrite there removed since this machine last exported to it (a
+    /// force-push, perhaps to purge a secret). Without it, --force refuses,
+    /// saying how many it would put back
+    #[arg(long, requires = "force")]
+    republish: bool,
 }
 
 #[derive(Debug, Args)]
@@ -3898,6 +3904,7 @@ fn export(args: ExportArgs) -> Result<()> {
                 from_push: false,
                 force: args.force,
                 dry_run: args.dry_run,
+                republish: args.republish,
             },
         );
     }
@@ -4026,10 +4033,15 @@ fn export_to_remote(name: &str, options: RemoteExportOptions) -> Result<()> {
         let commits = plural(outcome.restored, "commit");
         println!(
             "{} {commits} back on {} (branch {}) that a rewrite there removed since the last \
-             export (a force-push, perhaps to purge a secret)",
+             export (a force-push, perhaps to purge a secret){}",
             if outcome.pushed { "Put" } else { "Would put" },
             outcome.url,
-            target.branch
+            target.branch,
+            if outcome.pushed {
+                ""
+            } else {
+                "; pushing that takes --republish"
+            }
         );
     }
     let verb = if outcome.pushed {

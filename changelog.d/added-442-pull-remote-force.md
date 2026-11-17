@@ -18,10 +18,16 @@
   refusing them, and a reset that fails with nothing moved leaves no
   record. It says what it cannot undo: the project's own history (so the
   remote's copy, its Git endpoint, `newgit clone`, and project tags) and
-  copies others already fetched. Plain `pull --remote` and plain `export
-  --remote` now refuse a target rewritten since the last export, naming
-  `--force`, instead of merging back or advising `export --force`; `export
-  --remote --force` says how many removed commits it puts back, and leases
-  on the commit it checked. `--dry-run` moves nothing. Only a target rooted
-  at a tracker for now: following a rewrite of the project's own view means
-  rewriting the project's history.
+  copies others already fetched. Plain `pull --remote` and every export
+  (plain, `--dry-run`, and the one a push makes) now refuse a target
+  rewritten since the last export, a rewind with no new commit included,
+  naming `--force`, instead of merging back or advising `export --force`;
+  plain `pull --remote` from a second target still holding a dropped commit
+  is refused too. `export --remote --force` refuses, before pushing, to put
+  back commits a rewrite removed, naming how many, unless `--republish` is
+  given, and leases on the commit it checked. With no record of exporting
+  there (another machine), a rewrite is not detected; the refused push then
+  names `pull --remote --force --dry-run` first. `--dry-run` moves nothing.
+  Only a target rooted at a tracker for now: following a rewrite of the
+  project's own view means rewriting the project's history, and its refusal
+  says what to do instead.
