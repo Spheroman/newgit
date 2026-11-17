@@ -737,14 +737,25 @@ Resolved loudly; each is reversible.
   bounded read of objects the server holds, so a hang means a broken
   repository rather than a slow merge, but one would hold the merge's turn,
   or its roots, until it ends. An ancestry walk that goes past 512 commits
-  asks `git merge-base --is-ancestor`, also untimed.
+  asks `git merge-base --is-ancestor`, also untimed, and so does every
+  ancestry question in a repository with a `shallow` file or
+  `info/grafts`, where Git reads parents other than as stored (the server
+  makes neither).
 - **A merge's finish holds its projects while it places its commits.**
   From deciding which store each new commit goes into until it has
   landed, a merge's finish holds its projects' locks, and that includes
   copying its commits from the merger's landing into those stores. The
   copy is in process (what the store lacks, from the commit down, synced
-  before its ref is set) up to 256 objects or 32 MiB, and a `git fetch`
-  past that. A large placement therefore answers every other landing on
+  before its ref is set) up to 256 objects or 32 MiB (each object's size
+  asked before its body is read), and a `git fetch` past that. It stops
+  at each object the store has, which is sound because every writer
+  leaves a store that has an object holding everything it reaches: Git's
+  own, and newgit's, which puts each loose object in place only after
+  everything it names, so a crash part way leaves objects missing from
+  the top down and the next placement copies the rest. The copy of a
+  merge's new commit into the merger's landing goes the same way only
+  when the landing has all of the commit's parents, so nothing they alone
+  reach crosses; otherwise it is Git's pack of the commit over them. A large placement therefore answers every other landing on
   those projects 503 after ten seconds, saying a merge is placing its
   commits. Other projects, and reads, are not held. Placement stays under
   the hold even for a merge's own commits: the store they go into is the
@@ -761,10 +772,13 @@ Resolved loudly; each is reversible.
   store made before this when the server starts, so a push, which runs
   with the store's config, gets them too; and passed on every Git command
   the server runs; objects newgit writes into a store in process, a
-  merge's commits placed and a stored rooted history's, follow the store's
-  `core.fsync` and are synced as Git's `core.fsyncMethod=batch` syncs
-  loose objects, each file written out and one flush of the device before
-  any is in place), and
+  merge's commits placed and a stored rooted history's, are synced when
+  the store's config would have Git sync a loose object (`core.fsync`
+  naming a component that covers them, or the older
+  `core.fsyncObjectFiles` true, read as Git reads them), and then always
+  as Git's `core.fsyncMethod=batch` syncs loose objects, each file written
+  out and one flush of the device before any is in place, whatever the
+  store's `core.fsyncMethod` says), and
   SQLite's landing transaction (`synchronous=FULL`
   for it) are synced, in that order. On macOS a plain `fsync` leaves
   writes in the drive's cache; Git's `fsync` method flushes it

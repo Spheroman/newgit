@@ -631,16 +631,19 @@ pub fn merge(
     // tree), into the merger's landing for it: nothing composed leaves.
     let mut made = Made::default();
     // Copied in process, from the commit down to what the landing (and the
-    // store it borrows) has: its parents are there, so only its own new
-    // objects are; a copy too large for that is Git's pack.
+    // store it borrows) has, and only when every parent is there: then
+    // everything they reach is too, so what crosses is the commit's own new
+    // objects and nothing else, as Git's pack of the commit over its
+    // parents has it. Otherwise, or when the copy is too large, it is that
+    // pack.
     for (tracker, commit) in &split.made {
         let landing = project.tracker(tracker).open_landing(login)?;
+        let parents = objects.commit(commit)?.parents;
         if readers
             .at(&landing)?
-            .copy_reachable(objects, commit)?
+            .copy_reachable_over(objects, commit, &parents)?
             .is_none()
         {
-            let parents = objects.commit(commit)?.parents;
             let mut revs = format!("{commit}\n");
             for parent in &parents {
                 revs.push_str(&format!("^{parent}\n"));

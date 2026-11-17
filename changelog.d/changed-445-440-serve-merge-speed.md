@@ -29,6 +29,12 @@
   0.32 with 11 of 24 merges answered busy to 0.76 with none. The time a
   landing holds its project went from about 650–900 ms to 250–380 ms.
 
-  Objects newgit writes in process into a repository follow that
-  repository's own `core.fsync`, as Git's `hash-object` did: a store's
-  (stored rooted histories included) are synced, a scratch one's are not.
+  Objects newgit writes in process into a repository are synced when
+  that repository's config would have Git sync a loose object
+  (`core.fsync`, or the older `core.fsyncObjectFiles`, read as Git reads
+  them), as Git's `hash-object` did: a store's (stored rooted histories
+  included) are synced, a scratch one's are not. How they are synced is
+  always Git's `batch` method, whatever `core.fsyncMethod` says. Each goes
+  into place only after everything it names, so a crash part way never
+  leaves a store with an object whose tree or parents are missing, and a
+  write of thousands keeps one file open at a time.

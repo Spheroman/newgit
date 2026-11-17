@@ -12,6 +12,12 @@
 //!   commits on. A walk that runs out of commits without finding the
 //!   ancestor is a no; one that goes on past [`WALK`] asks Git, whose
 //!   commit-graph answers a long history without reading it.
+//! - **The walk takes a commit's parents as it is stored.** Git does not
+//!   always: a repository's `shallow` file cuts a history short at the
+//!   commits it lists, and `info/grafts` gives a commit other parents. The
+//!   server makes neither, but in a repository that has either file every
+//!   ancestry question goes to Git. Replace refs need nothing: `cat-file`
+//!   reads the replacement, as `merge-base` does.
 //! - **Scoped to an attempt.** A repository's alternates are read once by
 //!   its `cat-file`, and a store moves only at a landing that changes the
 //!   definitions (an epoch), which an attempt never outlives.
@@ -103,6 +109,9 @@ impl Readers {
         if ancestor == descendant {
             return true;
         }
+        if rewrites_parents(dir) {
+            return repos::is_ancestor(dir, ancestor, descendant);
+        }
         match self.walk(dir, ancestor, descendant) {
             Some(found) => found,
             None => repos::is_ancestor(dir, ancestor, descendant),
@@ -129,4 +138,13 @@ impl Readers {
         }
         Some(false)
     }
+}
+
+/// Whether Git reads some commit's parents in the repository at `dir`
+/// other than as stored: it is shallow, or has grafts (in its Git
+/// directory, which is `dir` for a bare repository).
+fn rewrites_parents(dir: &Utf8Path) -> bool {
+    [dir.to_owned(), dir.join(".git")]
+        .iter()
+        .any(|git_dir| git_dir.join("shallow").exists() || git_dir.join("info/grafts").exists())
 }

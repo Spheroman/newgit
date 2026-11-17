@@ -48,4 +48,6 @@ ureq = { version = "3.4.2", features = ["json"] }
 reflink-copy = "0.1"
 
 [dev-dependencies]
+# `setrlimit`, for the test that a flush of many objects keeps few files open.
+nix = { version = "0.31", features = ["resource"] }
 tempfile = "3"
