@@ -49,6 +49,8 @@ pub struct ResourceDefinition {
     pub checkpoint: Option<CheckpointSpec>,
     pub restore: Option<RestoreSpec>,
     pub cleanup: Option<CleanupSpec>,
+    /// What "up" means for this resource, when the definition says (#276).
+    pub ready: Option<ReadySpec>,
     /// `sha256:<hex12>` of the definition file contents.
     pub definition_rev: String,
 }
@@ -146,6 +148,40 @@ pub struct ActionSpec {
     pub captures: Vec<String>,
 }
 
+/// What it takes for a resource to count as up (#276): what `spawn`,
+/// `newgit start`, and a dependent's start wait for, and what `status`
+/// shows as `starting` until it holds.
+///
+/// With neither `http` nor `command`, a resource is up when its running
+/// process answers on every port it claims, which is what newgit checked
+/// before there was a `[ready]`.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ReadySpec {
+    /// Up when a GET of this URL answers 200–399, redirects not followed.
+    /// Rendered like an action command, so `{{ports.<name>}}` works. For a
+    /// server that binds early and serves errors until it has compiled.
+    #[serde(default)]
+    pub http: Option<String>,
+    /// Up when this command exits 0. Rendered and run like an action, with
+    /// the command environment. For what newgit does not supervise: a
+    /// Supabase stack a `prepare` started (`supabase status`).
+    #[serde(default)]
+    pub command: Option<String>,
+    /// How long to wait for it to come up, in whole seconds: at the end of
+    /// `spawn`, and before starting what depends on it. Default 5.
+    #[serde(default)]
+    pub timeout_seconds: Option<u64>,
+}
+
+/// How long newgit waits for a resource to come up when its definition
+/// does not say.
+pub const DEFAULT_READY_TIMEOUT_SECONDS: u64 = 5;
+
+/// The longest `[ready] timeout_seconds` accepted: an hour. A wait longer
+/// than that is a hang, not a server compiling.
+pub const MAX_READY_TIMEOUT_SECONDS: u64 = 3600;
+
 /// How a resource tears its concrete instance down. Ownership decides
 /// whether the hook may run at all; this decides what running it means.
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -238,6 +274,8 @@ struct ResourceDefinitionFile {
     restore: Option<RestoreSpec>,
     #[serde(default)]
     cleanup: Option<CleanupSpec>,
+    #[serde(default)]
+    ready: Option<ReadySpec>,
 }
 
 impl ResourceDefinition {
@@ -271,6 +309,7 @@ impl ResourceDefinition {
             checkpoint: file.checkpoint,
             restore: file.restore,
             cleanup: file.cleanup,
+            ready: file.ready,
             definition_rev: format!("sha256:{hex}"),
         };
         definition.validate()?;
@@ -283,6 +322,25 @@ impl ResourceDefinition {
             .get("stop")
             .and_then(|action| action.signal.clone())
             .unwrap_or_else(|| "term".to_owned())
+    }
+
+    /// How long to wait for this resource to come up (`[ready]
+    /// timeout_seconds`, default five seconds).
+    pub fn ready_timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(
+            self.ready
+                .as_ref()
+                .and_then(|ready| ready.timeout_seconds)
+                .unwrap_or(DEFAULT_READY_TIMEOUT_SECONDS),
+        )
+    }
+
+    /// Whether `[ready]` names a check of its own (`http` or `command`)
+    /// rather than leaving "up" to the ports answering.
+    pub fn has_ready_check(&self) -> bool {
+        self.ready
+            .as_ref()
+            .is_some_and(|ready| ready.http.is_some() || ready.command.is_some())
     }
 
     pub fn has_long_running_action(&self) -> bool {
@@ -432,6 +490,30 @@ impl ResourceDefinition {
 
     fn validate(&self) -> Result<()> {
         self.check_identity_paths()?;
+        if let Some(ready) = &self.ready {
+            if ready.http.is_some() && ready.command.is_some() {
+                return Err(self.invalid(
+                    "`[ready]` takes `http` or `command`, not both: name the one check that \
+                     means this resource is up"
+                        .to_owned(),
+                ));
+            }
+            if let Some(url) = &ready.http
+                && !(url.starts_with("http://") || url.starts_with("https://"))
+            {
+                return Err(self.invalid(format!(
+                    "`[ready] http` must be an `http://` or `https://` URL, got `{url}`"
+                )));
+            }
+            if let Some(seconds) = ready.timeout_seconds
+                && !(1..=MAX_READY_TIMEOUT_SECONDS).contains(&seconds)
+            {
+                return Err(self.invalid(format!(
+                    "`[ready] timeout_seconds` must be between 1 and \
+                     {MAX_READY_TIMEOUT_SECONDS}, got {seconds}"
+                )));
+            }
+        }
         for path in &self.disposable {
             self.check_identity_path(path, "`disposable` path")?;
         }
@@ -1405,6 +1487,7 @@ mod tests {
             checkpoint: None,
             restore: None,
             cleanup: None,
+            ready: None,
             definition_rev: "sha256:000000000000".to_owned(),
         }
     }
