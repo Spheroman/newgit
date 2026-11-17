@@ -1007,24 +1007,9 @@ impl Objects {
             if path.exists() || !paths.insert(path.clone()) {
                 continue;
             }
-            // Made inside its fan-out directory, as Git makes it, so the
-            // directory is never empty while it is written: Git's own
-            // `prune-packed` removes an empty one, and would take it away
-            // from under a file waiting beside it. Made again if it went.
             let fan_out = path.parent().expect("a fan-out directory");
-            let fan_out_io = |source| NewgitError::io(fan_out, source);
-            let temp = || {
-                tempfile::Builder::new()
-                    .prefix("tmp_obj_")
-                    .tempfile_in(fan_out)
-            };
-            let mut file = match temp() {
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    std::fs::create_dir_all(fan_out).map_err(fan_out_io)?;
-                    temp().map_err(fan_out_io)?
-                }
-                found => found.map_err(fan_out_io)?,
-            };
+            let mut file =
+                temp_in_fan_out(fan_out).map_err(|source| NewgitError::io(fan_out, source))?;
             {
                 let mut zlib = flate2::write::ZlibEncoder::new(
                     file.as_file_mut(),
@@ -1221,6 +1206,56 @@ fn stop_point(path: &Utf8Path) -> Result<()> {
             Ok(())
         }
     }
+}
+
+/// How many times [`temp_in_fan_out`] makes its directory again. Each
+/// time needs a Git to have removed it once more since the last.
+const FAN_OUT_TRIES: usize = 8;
+
+/// A temporary file for a loose object, made inside its fan-out directory
+/// as Git makes it, so the directory is never empty while the object is
+/// written. Git's `prune-packed` (which `repack -d` runs, and so `gc` and
+/// the detached `maintenance run --auto` that `commit` starts) removes
+/// every empty fan-out directory, and can do it just as the file is made:
+/// then the directory is made again and the file with it, as Git's own
+/// `create_tmpfile` does.
+///
+/// A removal shows as `ENOENT`, and on macOS as `EINVAL` when the `rmdir`
+/// lands between looking the directory up and making the file in it
+/// (#475; Git itself fails there). An `EINVAL` is taken for a removal only
+/// when the directory is not the one the file was made in: gone, or made
+/// again by another writer since. Measured, an `EINVAL` there never leaves
+/// the same directory in place.
+fn temp_in_fan_out(fan_out: &Utf8Path) -> std::io::Result<tempfile::NamedTempFile> {
+    // Only macOS needs the directory's identity, and asks for it.
+    let tells_einval_apart = cfg!(target_vendor = "apple");
+    let mut tries = 0;
+    loop {
+        let before = tells_einval_apart.then(|| dir_id(fan_out)).flatten();
+        let made = tempfile::Builder::new()
+            .prefix("tmp_obj_")
+            .tempfile_in(fan_out);
+        let removed = match &made {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+            Err(error) if error.kind() == std::io::ErrorKind::InvalidInput => {
+                tells_einval_apart && dir_id(fan_out).is_none_or(|now| Some(now) != before)
+            }
+            _ => false,
+        };
+        if !removed || tries == FAN_OUT_TRIES {
+            return made;
+        }
+        tries += 1;
+        std::fs::create_dir_all(fan_out)?;
+    }
+}
+
+/// Which directory is at `dir` (its device and inode), if one is.
+fn dir_id(dir: &Utf8Path) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt as _;
+    std::fs::metadata(dir)
+        .ok()
+        .map(|meta| (meta.dev(), meta.ino()))
 }
 
 impl Drop for Objects {
