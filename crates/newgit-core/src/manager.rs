@@ -409,6 +409,11 @@ pub struct SpawnOutcome {
     /// source template on macOS. The workspace is the same either way; the
     /// spawn was only slower.
     pub template_warning: Option<String>,
+    /// Files that look like local secrets (`.env.local`, `master.key`),
+    /// gitignored in the project root and present there, that the new
+    /// workspace does not have: no tracker carries them, so the instance
+    /// lacks what the root's commands read (#83). Said, never copied.
+    pub left_behind: Vec<Utf8PathBuf>,
 }
 
 /// Checkpoint numbering is per name, and `remove` archives the binding record
@@ -975,6 +980,26 @@ impl Starting {
             self.resource
         )
     }
+}
+
+/// Whether `path` is named the way local secrets and per-machine settings
+/// usually are: `.env`, `.env.local`, `.env.development.local`,
+/// `local.env`, `.envrc`, `*.key`, `*.pem`, or anything with `secret` or
+/// `credential` in its name. A name test, not a content test: it decides
+/// only whether a spawn mentions a file it left behind, so the cost of a
+/// miss is the silence there was before (#83).
+fn looks_like_local_secret(path: &Utf8Path) -> bool {
+    let Some(name) = path.file_name() else {
+        return false;
+    };
+    let name = name.to_ascii_lowercase();
+    name.starts_with(".env")
+        || name.ends_with(".env")
+        || [".key", ".pem", ".p12", ".pfx", ".jks", ".keystore"]
+            .iter()
+            .any(|suffix| name.ends_with(suffix))
+        || name.contains("secret")
+        || name.contains("credential")
 }
 
 /// Whether something accepts connections on `port` of this machine.
@@ -4096,6 +4121,7 @@ impl BranchManager {
         } else {
             Vec::new()
         };
+        let left_behind = self.left_behind(&branch.workspace_path);
 
         // The instance exists locally whatever the remote says: a failure to
         // register is reported, not fatal, and retried at the next checkpoint.
@@ -4116,7 +4142,31 @@ impl BranchManager {
             projection_warning,
             template_warning,
             behind: self.behind(&branch_source_rev).unwrap_or_default(),
+            left_behind,
         })
+    }
+
+    /// The files [`SpawnOutcome::left_behind`] names: ignored in the
+    /// project root, there, named like a secret, and missing from
+    /// `workspace` once its trackers are bound. Missing is the test of "no
+    /// tracker carries it", so a render or a resource that writes the file
+    /// counts as carrying it too. Only files: a wholly ignored directory is
+    /// build output or an install, which resources rebuild. Best effort: a
+    /// root Git cannot list names nothing.
+    fn left_behind(&self, workspace: &Utf8Path) -> Vec<Utf8PathBuf> {
+        let root = &self.store.paths().project_root;
+        let Ok(entries) = crate::evict::ignored_entries(root) else {
+            return Vec::new();
+        };
+        entries
+            .into_iter()
+            .filter(|(path, dir)| {
+                !dir && !path.starts_with(".newgit")
+                    && looks_like_local_secret(path)
+                    && !workspace.join(path).exists()
+            })
+            .map(|(path, _)| path)
+            .collect()
     }
 
     /// Put an instance on the project's remote, if it has one and the instance

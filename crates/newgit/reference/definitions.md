@@ -398,6 +398,29 @@ The paths of a tracker outside Git stay out of Git: `newgit tracker track` adds 
 the store's `.gitignore`, and each workspace's Git is told to ignore them too,
 so their content never lands in source history.
 
+### Local secrets
+
+A workspace is made from source, so a gitignored file in the project root —
+`.env.local`, `.envrc`, `config/master.key` — is not in it unless a tracker
+carries it, and whatever reads it fails later, far from the cause (#83).
+This is what a tracker outside Git is for:
+
+```sh
+newgit tracker create local-env --audience user    # each user their own copy
+newgit tracker track local-env .env.local config/master.key
+newgit tracker capture local-env --from-store      # seed it from the root
+newgit tracker pull local-env <instance>           # for one that exists
+```
+
+New instances get the files from then on. `spawn` names each file it left
+behind, with these commands: one ignored in the project root, there, named
+like a secret (`.env*`, `*.env`, `.envrc`, `*.key`, `*.pem`, `*.p12`,
+`*.pfx`, `*.jks`, `*.keystore`, or `secret` or `credential` in the name),
+and missing from the new workspace. `spawn --json` lists them under
+`left_behind`. It is a name test and only ever a note: a wholly ignored
+directory (`node_modules`, `target`) is something resources rebuild, and
+other ignored files (logs, caches) are not mentioned.
+
 ### Forks
 
 Trackers sharing a role are variants of one thing (`local-db`,
