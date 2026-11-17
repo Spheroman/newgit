@@ -2055,6 +2055,21 @@ fn stop_start_json(outcome: &StopStartOutcome) -> serde_json::Value {
         "instance": outcome.instance,
         "resources": stop_start_resources_json(&outcome.resources),
     });
+    // Only when a port moved, so a start that moved none reads as it always did.
+    if !outcome.moved_ports.is_empty() {
+        json["moved_ports"] = outcome
+            .moved_ports
+            .iter()
+            .map(|moved| {
+                serde_json::json!({
+                    "resource": moved.resource,
+                    "port": moved.port,
+                    "from": moved.from,
+                    "to": moved.to,
+                })
+            })
+            .collect();
+    }
     if !outcome.warnings.is_empty() {
         json["warnings"] = serde_json::json!(outcome.warnings);
     }
@@ -2243,6 +2258,13 @@ fn print_stopped_or_started(outcome: &StopStartOutcome, which: StopStart) {
             ),
         }
         return;
+    }
+    for moved in &outcome.moved_ports {
+        eprintln!(
+            "[newgit] port {} of `{}` moved from {} to {} for `{instance}`: another program \
+             holds {}",
+            moved.port, moved.resource, moved.from, moved.to, moved.from
+        );
     }
     for resource in &outcome.resources {
         let spec = format!("{}.{}", resource.name, resource.action);

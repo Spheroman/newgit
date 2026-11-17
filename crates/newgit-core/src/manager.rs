@@ -738,11 +738,57 @@ pub enum ActionOutcome {
 pub struct StopStartOutcome {
     pub instance: String,
     pub resources: Vec<StopStartResource>,
+    /// Ports `start` moved because another program holds the one the
+    /// binding named (#441).
+    pub moved_ports: Vec<MovedPort>,
     /// What happened to the workspace: evicted by `stop --evict`, or
     /// brought back by the `start` after it. `None` when it stayed put.
     pub workspace: Option<WorkspaceChange>,
     /// Said along the way, as `undo` says them, by the restore.
     pub warnings: Vec<String>,
+}
+
+/// A claimed port `newgit start` found held by a program that is not newgit
+/// and replaced with a free one, so the rendered files and the exports agree
+/// with where the service will actually listen.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MovedPort {
+    pub resource: String,
+    pub port: String,
+    pub from: u16,
+    pub to: u16,
+}
+
+impl MovedPort {
+    /// `` `db`'s `api` from 47600 to 47601 ``.
+    fn describe(&self) -> String {
+        format!(
+            "`{}`'s `{}` from {} to {}",
+            self.resource, self.port, self.from, self.to
+        )
+    }
+}
+
+/// What `newgit start` gathers while it brings resources back, besides
+/// each resource's own result.
+#[derive(Default)]
+struct StartReport {
+    moved_ports: Vec<MovedPort>,
+    warnings: Vec<String>,
+    /// Running dependents of a resource whose port moved, stopped to be
+    /// started again when the walk reaches them.
+    restarts: Vec<StoppedResource>,
+}
+
+/// What [`BranchManager::reclaim_busy_ports`] did to one resource.
+#[derive(Default)]
+struct Reclaim {
+    /// Saved to the binding record, whatever came after.
+    moved: Vec<MovedPort>,
+    warnings: Vec<String>,
+    /// Why the resource cannot start now: a held port that could not move,
+    /// or files that could not be rendered for the new one.
+    error: Option<String>,
 }
 
 /// What `newgit stop --evict`, or the `newgit start` after it, did to an
@@ -14955,6 +15001,7 @@ impl BranchManager {
         Ok(StopStartOutcome {
             instance: branch.name,
             resources,
+            moved_ports: Vec::new(),
             workspace: None,
             warnings: Vec::new(),
         })
@@ -15031,6 +15078,7 @@ impl BranchManager {
             return Ok(StopStartOutcome {
                 instance: branch.name,
                 resources: Vec::new(),
+                moved_ports: Vec::new(),
                 workspace: None,
                 warnings: Vec::new(),
             });
@@ -15043,12 +15091,17 @@ impl BranchManager {
         let mut still_stopped = Vec::new();
         let mut failed_here = BTreeSet::new();
         let mut captured = false;
+        let mut probed = BTreeSet::new();
+        let mut report = StartReport::default();
         for definition in self.lifecycle_definitions() {
             let name = &definition.name;
-            let mut owed: Vec<&StoppedResource> = record
+            // Copies: a port moved below may add a running dependent to the
+            // record, to be restarted when the walk reaches it.
+            let mut owed: Vec<StoppedResource> = record
                 .resources
                 .iter()
                 .filter(|entry| &entry.name == name)
+                .cloned()
                 .collect();
             owed.sort_by_key(|entry| !entry.is_resume());
             for entry in owed {
@@ -15082,6 +15135,15 @@ impl BranchManager {
 
                 let (action, result) = if entry.is_resume() {
                     let result = blocked()
+                        .and_then(|()| {
+                            self.probe_claimed_ports(
+                                &mut branch,
+                                definition,
+                                &supervisor,
+                                &mut probed,
+                                &mut report,
+                            )
+                        })
                         .and_then(|()| self.run_lifecycle_action(&mut branch, definition, "resume"))
                         .map_err(|error| error.to_string())
                         .and_then(|(code, log, changed)| {
@@ -15111,6 +15173,15 @@ impl BranchManager {
                         )),
                         Some((action_name, action)) => blocked()
                             .and_then(|()| {
+                                self.probe_claimed_ports(
+                                    &mut branch,
+                                    definition,
+                                    &supervisor,
+                                    &mut probed,
+                                    &mut report,
+                                )
+                            })
+                            .and_then(|()| {
                                 self.start_supervised(&branch, definition, action, action_name)
                             })
                             .map(|_| ())
@@ -15121,10 +15192,11 @@ impl BranchManager {
                     (action, result)
                 };
 
+                record.resources.append(&mut report.restarts);
                 let (status, error) = match result {
                     Ok(()) => (StopStartStatus::Started, None),
                     Err(error) => {
-                        still_stopped.push(entry.clone());
+                        still_stopped.push(entry);
                         failed_here.insert(name.clone());
                         (StopStartStatus::Failed, Some(error))
                     }
@@ -15146,9 +15218,294 @@ impl BranchManager {
         Ok(StopStartOutcome {
             instance: branch.name,
             resources,
+            moved_ports: report.moved_ports,
             workspace: None,
-            warnings: Vec::new(),
+            warnings: report.warnings,
         })
+    }
+
+    /// Before `start` runs the first thing it owes `definition` — its
+    /// `resume`, or its long-running action when it has none — check the
+    /// ports its binding claimed, once (#441). Nothing has checked them
+    /// since spawn claimed them, and only newgit respects a claim: another
+    /// program may hold one now. One that is held moves to a free port (see
+    /// [`Self::reclaim_busy_ports`]), and what depends on the resource and
+    /// is still running is restarted to pick the new one up (see
+    /// [`Self::restart_dependents`]).
+    ///
+    /// Probed before the `resume` rather than before the process, so a
+    /// `resume` that brings up the resource's own containers on the claimed
+    /// port is not then taken for another program. Skipped while the
+    /// resource's own process runs: the port it holds is its own.
+    ///
+    /// Fails, so the resource is not started, when a held port cannot move
+    /// or the files that name it cannot be rendered again.
+    fn probe_claimed_ports(
+        &self,
+        branch: &mut BranchInstance,
+        definition: &ResourceDefinition,
+        supervisor: &Supervisor,
+        probed: &mut BTreeSet<String>,
+        report: &mut StartReport,
+    ) -> Result<()> {
+        if !probed.insert(definition.name.clone())
+            || supervisor.running_pid(&definition.name).is_some()
+        {
+            return Ok(());
+        }
+        let reclaim = self.reclaim_busy_ports(branch, definition);
+        report.warnings.extend(reclaim.warnings);
+        if !reclaim.moved.is_empty() {
+            self.restart_dependents(definition, supervisor, &reclaim.moved, report);
+        }
+        report.moved_ports.extend(reclaim.moved);
+        reclaim
+            .error
+            .map_or(Ok(()), |error| Err(NewgitError::Unsupported(error)))
+    }
+
+    /// Move each port `definition`'s binding in `branch` claims that
+    /// something is listening on to a free one: written to the binding
+    /// record, with the exports that name it and the files that render it
+    /// made again, so none points at a port whose service is somebody
+    /// else's. A resource whose ports are all free is left alone.
+    ///
+    /// Only for a resource whose process is not running (the caller has
+    /// checked), so the listener is not its own. Asks [`ports::listening`],
+    /// not the stricter [`ports::bindable`]: a port in TIME_WAIT from the
+    /// resource's own server, stopped a moment ago, is not held by anyone.
+    ///
+    /// The ports move all together or not at all, claimed and saved under
+    /// the store's port lock like [`Self::claim_ports`]: when one cannot
+    /// move, `branch` is left as it was. Once they have moved, the move is
+    /// reported even when a re-render then fails.
+    fn reclaim_busy_ports(
+        &self,
+        branch: &mut BranchInstance,
+        definition: &ResourceDefinition,
+    ) -> Reclaim {
+        let mut reclaim = Reclaim::default();
+        let busy: Vec<(String, u16)> = branch
+            .resources
+            .get(&definition.name)
+            .map(|binding| {
+                binding
+                    .resolved_ports
+                    .iter()
+                    .filter(|(_, port)| ports::listening(**port))
+                    .map(|(name, port)| (name.clone(), *port))
+                    .collect()
+            })
+            .unwrap_or_default();
+        if busy.is_empty() {
+            return reclaim;
+        }
+        match self.claim_free_ports(branch, definition, busy) {
+            Ok(moved) => reclaim.moved = moved,
+            Err(error) => {
+                reclaim.error = Some(error.to_string());
+                return reclaim;
+            }
+        }
+
+        // What the ports reach: every export and rendered file, this
+        // resource's and its dependents', in dependency order.
+        let mut problems = Vec::new();
+        for name in self.graph.bind_order.clone() {
+            let Ok(bound_definition) = self.resource_definition(&name) else {
+                continue;
+            };
+            let Some(ports) = branch
+                .resources
+                .get(&name)
+                .map(|binding| binding.resolved_ports.clone())
+            else {
+                continue;
+            };
+            let bound_definition = bound_definition.clone();
+            let bound = self.bound_exports(branch);
+            let (exports, unresolved) =
+                self.resolve_exports(branch, &bound_definition, &ports, &bound);
+            if let Some(binding) = branch.resources.get_mut(&name) {
+                binding.resolved_exports.extend(exports);
+            }
+            if !unresolved.is_empty() {
+                reclaim.warnings.push(format!(
+                    "resource `{name}` keeps its old {}, which did not resolve after the port \
+                     moved: {}",
+                    if unresolved.len() == 1 {
+                        "export"
+                    } else {
+                        "exports"
+                    },
+                    unresolved
+                        .iter()
+                        .map(|(key, placeholder)| format!("`{key}` (`{placeholder}`)"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
+            }
+            if !bound_definition.render.is_empty()
+                && let Err(error) = self.render_resource(branch, &bound_definition)
+            {
+                problems.push(format!("re-rendering resource `{name}` failed: {error}"));
+            }
+        }
+        branch.updated_at = Utc::now();
+        if let Err(error) = self.store.save_branch_record(branch) {
+            problems.push(format!("saving the new exports failed: {error}"));
+        }
+        if !problems.is_empty() {
+            reclaim.error = Some(format!(
+                "{} moved, but {}",
+                reclaim
+                    .moved
+                    .iter()
+                    .map(MovedPort::describe)
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                problems.join("; ")
+            ));
+        }
+        reclaim
+    }
+
+    /// Claim a free port for each of `busy` and save the binding, under the
+    /// port lock, all or nothing: on an error `branch` is unchanged and
+    /// nothing was saved.
+    fn claim_free_ports(
+        &self,
+        branch: &mut BranchInstance,
+        definition: &ResourceDefinition,
+        busy: Vec<(String, u16)>,
+    ) -> Result<Vec<MovedPort>> {
+        let _lock = self.store.lock_ports()?;
+        let mut used = ports::used_ports(&self.store.load_branches()?);
+        let mut claim = branch.clone();
+        let mut moved = Vec::new();
+        for (port_name, from) in busy {
+            let start = definition
+                .ports
+                .get(&port_name)
+                .map_or(from, |request| request.start);
+            let to = ports::allocate(start, &mut used).map_err(|error| {
+                NewgitError::Unsupported(format!(
+                    "port {from} (`{port_name}` of resource `{}`) is held by another \
+                     program, and no other could be claimed: {error}",
+                    definition.name
+                ))
+            })?;
+            if let Some(binding) = claim.resources.get_mut(&definition.name) {
+                binding.resolved_ports.insert(port_name.clone(), to);
+            }
+            moved.push(MovedPort {
+                resource: definition.name.clone(),
+                port: port_name,
+                from,
+                to,
+            });
+        }
+        claim.updated_at = Utc::now();
+        self.store.save_branch_record(&claim)?;
+        *branch = claim;
+        Ok(moved)
+    }
+
+    /// `definition`'s ports moved: stop what depends on it and is still
+    /// running, and owe it a start, so the walk restarts it after
+    /// `definition` with the new exports and files. A running process kept
+    /// the old port in its environment, and that port is now another
+    /// program's. Restarting is what makes the instance agree with itself
+    /// again, the way `docker compose up` recreates a service whose
+    /// configuration changed; a warning would leave it talking to a
+    /// stranger until somebody noticed.
+    ///
+    /// What depends on it is what `depends_on` reaches, as for the rest of
+    /// `start`, and those come after it in the walk. A running resource that
+    /// only reads its exports, with no `depends_on`, is named in a warning
+    /// instead: the walk may already have passed it.
+    fn restart_dependents(
+        &self,
+        definition: &ResourceDefinition,
+        supervisor: &Supervisor,
+        moved: &[MovedPort],
+        report: &mut StartReport,
+    ) {
+        let ports = moved
+            .iter()
+            .map(MovedPort::describe)
+            .collect::<Vec<_>>()
+            .join(", ");
+        // Dependency order, so one pass reaches dependents of dependents.
+        let mut depending = BTreeSet::from([definition.name.as_str()]);
+        for dependent in self.lifecycle_definitions() {
+            if dependent
+                .depends_on
+                .iter()
+                .any(|dependency| depending.contains(dependency.as_str()))
+            {
+                depending.insert(&dependent.name);
+            }
+        }
+        let mut reading = depending.clone();
+        for name in &self.graph.bind_order {
+            if self.graph.data_edges.get(name).is_some_and(|reads| {
+                reads
+                    .keys()
+                    .any(|dependency| reading.contains(dependency.as_str()))
+            }) {
+                reading.insert(name);
+            }
+        }
+
+        for dependent in self.lifecycle_definitions() {
+            let name = &dependent.name;
+            if name == &definition.name || supervisor.running_pid(name).is_none() {
+                continue;
+            }
+            if !depending.contains(name.as_str()) {
+                if reading.contains(name.as_str()) {
+                    report.warnings.push(format!(
+                        "`{name}` reads `{}`'s exports and is still running with the old port \
+                         ({ports}); restart it to pick up the new one",
+                        definition.name
+                    ));
+                }
+                continue;
+            }
+            let Some((action, _)) = long_running_action(dependent) else {
+                report.warnings.push(format!(
+                    "`{name}` depends on `{}` and is still running with the old port \
+                     ({ports}), but it has no long-running action to restart it with",
+                    definition.name
+                ));
+                continue;
+            };
+            let signal = dependent.stop_signal();
+            let why = match supervisor.stop(name, &signal) {
+                Ok(StopOutcome::Stopped(_) | StopOutcome::NotRunning) => None,
+                Ok(StopOutcome::StillRunning(pid)) => Some(format!("pid {pid} ignored `{signal}`")),
+                Err(error) => Some(error.to_string()),
+            };
+            match why {
+                None => {
+                    report.warnings.push(format!(
+                        "`{name}` depends on `{}`, whose port moved ({ports}), so it is \
+                         restarted with the new one",
+                        definition.name
+                    ));
+                    report.restarts.push(StoppedResource {
+                        name: name.clone(),
+                        action: action.to_owned(),
+                    });
+                }
+                Some(why) => report.warnings.push(format!(
+                    "`{name}` depends on `{}`, whose port moved ({ports}), and is still running \
+                     with the old one: it could not be stopped ({why})",
+                    definition.name
+                )),
+            }
+        }
     }
 
     /// Run `suspend` or `resume` quietly, so `--json` keeps stdout to

@@ -1861,9 +1861,28 @@ impl GitSource {
         //
         // A store left shallow by a stepped fetch that stopped part way
         // carries on deepening, even when this fetch went through whole.
+        //
+        // In a store already shallow, this fetch deepens it, and Git's
+        // auto-maintenance, which it detaches afterwards, rewrites `shallow`
+        // in the background under whatever comes next: the likeliest place
+        // for the collision `--no-auto-maintenance` below avoids (#432). A
+        // fetch that deepens takes the stepped-fetch lock, as each band
+        // does, so it waits out another stepped fetch, or a `gc`, rather
+        // than meet its `shallow.lock`.
+        let shallow = left_shallow(location)?;
+        let mut held = if shallow {
+            Some(steps_lock(location, None)?)
+        } else {
+            None
+        };
+        let opening: &[&str] = if shallow {
+            &["--no-auto-maintenance"]
+        } else {
+            &[]
+        };
         let mut tries = WHOLE_FETCH_BACKOFF.iter();
         let mut started = loop {
-            match fetch(&[]) {
+            match fetch(opening) {
                 Ok(()) if !left_shallow(location)? => return Ok(()),
                 Ok(()) => break true,
                 Err(error) if dropped(&error) => match tries.next() {
@@ -1884,13 +1903,17 @@ impl GitSource {
         // One stepped fetch in a store at a time: two deepening at once fail
         // with `shallow file has changed since we read it`. Released when
         // dropped, or when the process dies. Whoever held it may have
-        // finished the job. A whole fetch above needs no lock: Git reads and
-        // rewrites `shallow` only for a fetch that deepens.
+        // finished the job. A whole fetch into a store that is not shallow
+        // needs no lock: Git reads and rewrites `shallow` only for a fetch
+        // that deepens.
         //
         // Each band skips Git's auto-maintenance: its repack rewrites
         // `shallow` in the background, under the next band. The next
         // ordinary fetch into the store runs it.
-        let _lock = steps_lock(location)?;
+        let _lock = match held.take() {
+            Some(lock) => lock,
+            None => steps_lock(location, None)?,
+        };
         if started && !left_shallow(location)? {
             return Ok(());
         }
@@ -2193,7 +2216,10 @@ fn shallow_moved(stderr: &str) -> bool {
 }
 
 /// The lock on stepped fetches into the repository at `location`.
-fn steps_lock(location: &[&str]) -> Result<std::fs::File> {
+///
+/// `waiting`, when given, is said once on stderr if another holds it, before
+/// this waits for it.
+pub(crate) fn steps_lock(location: &[&str], waiting: Option<&str>) -> Result<std::fs::File> {
     let mut args = location.to_vec();
     args.extend([
         "rev-parse",
@@ -2204,6 +2230,15 @@ fn steps_lock(location: &[&str]) -> Result<std::fs::File> {
     let path = run_git_env(&args, &[])?;
     let path = Utf8Path::new(path.trim());
     let lock = std::fs::File::create(path).map_err(|source| NewgitError::io(path, source))?;
+    match lock.try_lock() {
+        Ok(()) => return Ok(lock),
+        Err(std::fs::TryLockError::WouldBlock) => {
+            if let Some(waiting) = waiting {
+                eprintln!("{waiting}");
+            }
+        }
+        Err(std::fs::TryLockError::Error(source)) => return Err(NewgitError::io(path, source)),
+    }
     lock.lock()
         .map_err(|source| NewgitError::io(path, source))?;
     Ok(lock)

@@ -9,9 +9,11 @@
   newgit's can cover Git's own processes, so such a fetch now waits and
   fetches again, as a fetch that finds a ref locked already did, and a
   stepped fetch no longer starts that repack between its own bands. A
-  whole fetch never needed the stepped-fetch lock: Git touches `shallow`
-  only for a fetch that deepens. The same holds for snapshot fetches and
-  the `--unshallow` that brings a tracker's history.
+  whole fetch into a store that is not shallow never needed the
+  stepped-fetch lock: Git touches `shallow` only for a fetch that deepens.
+  Snapshot fetches and the `--unshallow`
+  that brings a tracker's history do deepen, so they now retry the same
+  way.
 
   Tests that picked a free port by binding port 0 and letting go of it now
   read back the port they were given, or hold the listener: on a loaded

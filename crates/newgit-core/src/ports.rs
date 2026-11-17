@@ -82,27 +82,64 @@ pub fn allocate(start: u16, used: &mut BTreeSet<u16>) -> Result<u16> {
 /// this probe returning `true` and the caller actually using it. Neither
 /// gap is new; both existed before this fix as well.
 pub fn bindable(port: u16) -> bool {
+    probe_all(port, false)
+}
+
+/// Whether something is listening on `port` now, so that a server binding
+/// it would fail: the question `newgit start` asks of a port the instance
+/// already claimed (#441), where [`bindable`] is too strict.
+///
+/// It is [`bindable`]'s four probes with `SO_REUSEADDR` on, the way nearly
+/// every real server binds (std, Node, Postgres, Python's `http.server`).
+/// With it on, a port whose last connection sits in TIME_WAIT is free, and
+/// it is: newgit's own server, stopped a moment ago after serving one
+/// request, takes it straight back. With it off, as `bindable` has it, that
+/// port reads as held, and `start` would move a port nobody else has.
+///
+/// A real listener is still seen, #93's Docker wildcard one included.
+/// What `SO_REUSEADDR` lets through on macOS is a *specific* bind beside a
+/// wildcard one; a bind to the very address a listener holds still fails,
+/// and the four probes cover the wildcard and loopback addresses of both
+/// families, so a listener on any of them fails the probe on its own
+/// address. Allocation keeps the strict [`bindable`] all the same: a port
+/// in TIME_WAIT is one to pass over when choosing a new one.
+///
+/// Chosen over `connect()`ing to loopback because it asks what the service
+/// itself will ask, a bind, and touches nobody's server: a probe connection
+/// is accepted by the other program, and may show up in its logs.
+pub fn listening(port: u16) -> bool {
+    !probe_all(port, true)
+}
+
+/// The four probes [`bindable`] describes, with `SO_REUSEADDR` set to
+/// `reuse`.
+fn probe_all(port: u16, reuse: bool) -> bool {
     probe(
         AddressFamily::Inet,
         &SockaddrIn::from(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port)),
+        reuse,
     ) && probe(
         AddressFamily::Inet,
         &SockaddrIn::from(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port)),
+        reuse,
     ) && probe(
         AddressFamily::Inet6,
         &SockaddrIn6::from(SocketAddrV6::new(Ipv6Addr::LOCALHOST, port, 0, 0)),
+        reuse,
     ) && probe(
         AddressFamily::Inet6,
         &SockaddrIn6::from(SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, port, 0, 0)),
+        reuse,
     )
 }
 
-/// Bind (and immediately drop) one probe socket at `family`/`addr` with
-/// `SO_REUSEADDR` off. See `bindable` for why. Returns `true` when the
-/// address is free or the family/address isn't usable on this host at all
-/// (nothing to conflict with); `false` for everything else, including
-/// errors that leave the port's real state unverified.
-fn probe(family: AddressFamily, addr: &dyn nix::sys::socket::SockaddrLike) -> bool {
+/// Bind (and immediately drop) one probe socket at `family`/`addr`, with
+/// `SO_REUSEADDR` set to `reuse`: off for [`bindable`], on for
+/// [`listening`]. Returns `true` when the address is free or the
+/// family/address isn't usable on this host at all (nothing to conflict
+/// with); `false` for everything else, including errors that leave the
+/// port's real state unverified.
+fn probe(family: AddressFamily, addr: &dyn nix::sys::socket::SockaddrLike, reuse: bool) -> bool {
     let fd = match socket(family, SockType::Stream, SockFlag::empty(), None) {
         Ok(fd) => fd,
         // No IPv6 stack (or similar): nothing could be listening on a
@@ -113,7 +150,7 @@ fn probe(family: AddressFamily, addr: &dyn nix::sys::socket::SockaddrLike) -> bo
         // unverified; decline rather than claim it.
         Err(_) => return false,
     };
-    if setsockopt(&fd, sockopt::ReuseAddr, &false).is_err() {
+    if setsockopt(&fd, sockopt::ReuseAddr, &reuse).is_err() {
         return false;
     }
     if let Err(err) = bind(fd.as_raw_fd(), addr) {
