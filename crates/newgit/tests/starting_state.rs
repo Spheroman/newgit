@@ -145,6 +145,11 @@ web = { start = 54750 }
 command = "sleep 1000"
 long_running = true
 autostart = true
+
+# Not the default five: the spawn's wait is what makes these tests slow,
+# and a second is enough to see it end (#276).
+[ready]
+timeout_seconds = 1
 "#;
 
 #[test]

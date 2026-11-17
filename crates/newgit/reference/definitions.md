@@ -845,16 +845,17 @@ or depends on a resource whose start failed is not started, and the spawn
 says so and exits 1, as it does for a failed `prepare`; `spawn --json`
 lists each attempt under `started`. A dependent starts once its
 dependencies are up, not merely once their processes exist (#54): each
-dependency whose process runs has five seconds to answer on every port it
-claims, and one whose `autostart` action is not running is down. A
-dependent whose dependency is down or still silent after that is not
+dependency has its `[ready] timeout_seconds` (five by default) to come up
+(see `[ready]`), and one whose `autostart` action is not running is down.
+A dependent whose dependency is down or still not up after that is not
 started, and says which; it stays owed, so the next `newgit start` starts
 it. `newgit action <resource>.<action>` of a long-running action by hand
 refuses on the same terms, naming the dependency to start first.
-After starting them, `spawn` waits up to five seconds for the ports of what
-is running to answer. A server still compiling after that is `starting`, not
-a failure: `spawn` exits 0, says so, and `spawn --json` lists it under
-`starting`; `newgit status` shows `starting` until the port answers.
+After starting them, `spawn` waits for what is running to come up, for as
+long as the longest `timeout_seconds` among the bound resources (five
+seconds when none says). A server still compiling after that is
+`starting`, not a failure: `spawn` exits 0, says so, and `spawn --json`
+lists it under `starting`; `newgit status` shows `starting` until it is up.
 `spawn --from-checkpoint` starts them after its restore, and `newgit
 tracker use` starts those of the resources the tracker brings, which `drop`
 stopped. Nothing else autostarts: `newgit start` brings back what `newgit
@@ -961,6 +962,50 @@ command = "docker compose -p {{branch.slug}} stop"   # not `down`: that is clean
 [actions.resume]
 command = "docker compose -p {{branch.slug}} start"
 ```
+
+### `[ready]`
+
+What "up" means for this resource (#276), which is what `spawn` waits for
+after starting it, what a dependent's start waits for, and what `newgit
+status` shows as `starting` until it holds.
+
+| key | type | required | default | meaning |
+| --- | --- | --- | --- | --- |
+| `http` | string | no | — | up when a GET of this URL answers 200–399. Redirects are not followed. `http://` or `https://`; rendered like an action `command`, so `{{ports.<name>}}` works. |
+| `command` | string | no | — | up when this command exits 0. Rendered and run like an action, in the resource's `workdir`, with the command environment; each run has five seconds to finish. |
+| `timeout_seconds` | integer | no | `5` | how long to wait for it to come up, 1 to 3600: at the end of `spawn`, and before starting what depends on it. |
+
+At most one of `http` and `command`. With neither, a resource is up when
+its running process answers on every port it claims, which is what newgit
+checks with no `[ready]` at all; a `[ready]` holding only
+`timeout_seconds` just changes how long that is waited for.
+
+```toml
+# A dev server that binds at once and serves 500s until it has compiled.
+[ready]
+http = "http://127.0.0.1:{{ports.web}}/"
+timeout_seconds = 60
+```
+
+A resource newgit does not supervise — a `prepare` that leaves a Supabase
+stack or a Compose project running — has no process to watch. With no
+`[ready]` it is up once its `prepare` exits 0, so a stack that has since
+gone down still reads `ready`. A `command` is how it says otherwise, and
+then it is checked like a process: by `status`, by the end of `spawn`, and
+before its dependents start. One that `newgit stop` suspended is not
+checked until `start` resumes it.
+
+```toml
+# functions.toml depends_on = ["supabase"], and starts once this passes.
+[ready]
+command = "supabase status"
+timeout_seconds = 120
+```
+
+Still not up when the wait ends is `starting`, not a failure, and `status`
+says how the check failed (`GET http://127.0.0.1:5173/ answered 500`,
+`` `supabase status` exited 1 ``); `spawn --json` puts it in `check` beside
+`ports`. Every `status` runs the check again, so keep it cheap.
 
 ### `[checkpoint]`
 

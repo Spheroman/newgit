@@ -1128,9 +1128,10 @@ Autostart comes after every `prepare`, not interleaved with them, because
 its dependency's files but never its process. A start that fails is
 reported per resource, and a dependent of a resource that did not start is
 not started against it. Starting is waiting (#54): a dependent starts once
-each dependency's process answers on every port it claims, given five
-seconds, and not at all against a dependency whose `autostart` action is
-not running. A process that has been exec'd is not one that serves, and
+each dependency is up — its `[ready]` check passes, or with none every
+port its process claims answers — given that dependency's `[ready]
+timeout_seconds` (five by default), and not at all against a dependency
+whose `autostart` action is not running. A process that has been exec'd is not one that serves, and
 starting against it only moves the race into the dependent. One withheld
 this way stays owed: the next `newgit start` starts it, as it does an
 `autostart` action that died. `newgit action` of a long-running action by
@@ -1211,9 +1212,19 @@ starting: `feature-a`
 `status` shows the same state: the STATUS column says `starting` (a real
 problem still says `not ready`, and wins), with the lines under it. It is
 checked at read time, so it clears on its own once the port answers.
-`spawn --json` lists them under `starting` (`resource` and the `ports` that
-have not answered) and exits 0 as for a ready instance. The wait is fixed;
-a server that takes longer simply shows as starting.
+`spawn --json` lists them under `starting` (`resource`, the `ports` that
+have not answered, and `check`) and exits 0 as for a ready instance.
+
+A port that answers is not always a server that serves: some bind at once
+and answer 500 until they have compiled, and a resource newgit does not
+supervise (a Supabase stack a `prepare` left running) has no process to
+watch at all. A definition's `[ready]` says what up means instead (#276):
+a GET that answers 200–399, or a command that exits 0, and
+`timeout_seconds` for how long to wait. The end of `spawn` waits for the
+longest of those among what is bound, and a dependent's start waits its
+dependency's (*Spawn*). With no `[ready]`, up is the ports answering and
+the wait is five seconds; a resource with no process and no check is up
+when its `prepare` exited 0.
 
 #### Died is not stopped
 
@@ -1872,11 +1883,9 @@ Git repository per tracker. It gives you:
 
 Open issues that change what this document can promise:
 
-- **#54: a dependency is up when its ports answer.** A dependent waits
-  for that, but a server that binds early and serves errors until it has
-  compiled answers too soon, and the wait is a fixed five seconds. `newgit
-  action app.start` by hand refuses while the database it needs is down
-  rather than starting it.
+- **#54: `newgit action app.start` by hand does not start what it needs.**
+  It refuses while a dependency is down, naming it, rather than starting
+  it as `docker compose up app` would.
 - **#64: rendered files are hidden, not filtered.** `--skip-worktree` makes
   hand edits to a rendered file die with the workspace. A clean/smudge
   filter would make them ordinary, committable edits.

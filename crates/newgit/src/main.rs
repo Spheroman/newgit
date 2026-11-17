@@ -10,9 +10,9 @@ use newgit_core::export_target::declared_in;
 use newgit_core::exports::unresolved_placeholder;
 use newgit_core::installs::InstallReport;
 use newgit_core::manager::{
-    ActionOutcome, ActionPlan, BaseReport, BindOrigin, BranchManager, DEFAULT_READY_WAIT, DiffPair,
-    ExportReason, InstanceReport, KeptBranch, MismatchCause, Readiness, RemoteExportOptions,
-    RemoveOutcome, ResourceBindOutcome, SourceBranchOutcome, SourceBranchPolicy, StopStartOutcome,
+    ActionOutcome, ActionPlan, BaseReport, BindOrigin, BranchManager, DiffPair, ExportReason,
+    InstanceReport, KeptBranch, MismatchCause, Readiness, RemoteExportOptions, RemoveOutcome,
+    ResourceBindOutcome, SourceBranchOutcome, SourceBranchPolicy, StopStartOutcome,
     StopStartResource, StopStartStatus, TrackerBindOutcome, UndoOptions, VerifyResource,
     WorkspaceChange,
 };
@@ -1554,10 +1554,11 @@ fn spawn(args: SpawnArgs) -> Result<()> {
         },
     )?;
     // After the autostart, which is the only thing that leaves a process up
-    // with its port not yet answering: give it a few seconds, then say what
-    // is still starting. Not worth waiting on a spawn that did not come up.
+    // with its port not yet answering: give it the longest `[ready]
+    // timeout_seconds` of what is bound (five seconds unless one says), then
+    // say what is still starting. Not worth waiting on a spawn that did not come up.
     let readiness = if outcome.is_complete() {
-        manager.readiness_after(&outcome.branch, DEFAULT_READY_WAIT)
+        manager.readiness_after(&outcome.branch, manager.ready_wait(&outcome.branch))
     } else {
         Readiness::default()
     };
@@ -2142,7 +2143,11 @@ fn starting_json(readiness: &Readiness) -> serde_json::Value {
         .starting
         .iter()
         .map(|starting| {
-            serde_json::json!({ "resource": starting.resource, "ports": starting.ports })
+            serde_json::json!({
+                "resource": starting.resource,
+                "ports": starting.ports,
+                "check": starting.check,
+            })
         })
         .collect()
 }
