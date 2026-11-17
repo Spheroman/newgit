@@ -349,13 +349,45 @@ pub fn audience_of(dir: &Utf8Path) -> Option<String> {
 
 /// Whether `store` may be made, or is, at `dir`: nothing there yet, or a
 /// store made for that same audience.
+///
+/// A store found right is remembered, by its config file as it was then
+/// (its inode, size, and modification time): every request served asks
+/// this, and asking Git each time was a process per request (#445). A
+/// config written since, or a store made again, is asked again.
 pub fn check_store(dir: &Utf8Path, store: &Store) -> ApiResult<()> {
+    type Checked = std::collections::HashMap<(Utf8PathBuf, String), (u64, u64, i64, i64)>;
+    static CHECKED: std::sync::OnceLock<std::sync::Mutex<Checked>> = std::sync::OnceLock::new();
     let name = store.name();
     if !store_exists(dir) {
         return Ok(());
     }
+    let stamp = || {
+        use std::os::unix::fs::MetadataExt as _;
+        let meta = std::fs::metadata(dir.join("config")).ok()?;
+        Some((meta.ino(), meta.size(), meta.mtime(), meta.mtime_nsec()))
+    };
+    let key = (dir.to_owned(), name.clone());
+    let checked = CHECKED.get_or_init(Default::default);
+    let before = stamp();
+    if before.is_some()
+        && checked
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&key)
+            == before.as_ref()
+    {
+        return Ok(());
+    }
     match audience_of(dir) {
-        Some(made_for) if made_for == name => Ok(()),
+        Some(made_for) if made_for == name => {
+            if let Some(before) = before.filter(|before| stamp().as_ref() == Some(before)) {
+                checked
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .insert(key, before);
+            }
+            Ok(())
+        }
         made_for => Err(HttpError::internal(format!(
             "{dir} was made for {}, so it never holds {name}'s",
             made_for.as_deref().unwrap_or("no audience")
@@ -1164,37 +1196,69 @@ impl Repo {
     /// is not yet (it is checked to be for its own audience). One already in
     /// the store, or never sent, is left alone.
     pub fn take_landing(&self, login: &str, commit: &str, borrow: &Repo) -> ApiResult<()> {
-        if !self.waits_in_landing(login, commit) {
-            return Ok(());
+        if let Some((landing, reference)) =
+            self.place(&mut crate::readers::Readers::new(), login, commit, borrow)?
+        {
+            git(&landing, &["update-ref", "-d", &reference])?;
         }
+        Ok(())
+    }
+
+    /// [`Self::take_landing`], reading through `readers`, but leaving the
+    /// landing's own ref for the caller to drop (once it holds nothing):
+    /// `(landing, ref)`, when the commit waited there. What the store lacks
+    /// is copied in process, synced before its ref is set; a copy too large
+    /// for that ([`newgit_core::objects::COPY_LIMIT`]) is Git's fetch.
+    pub fn place(
+        &self,
+        readers: &mut crate::readers::Readers,
+        login: &str,
+        commit: &str,
+        borrow: &Repo,
+    ) -> ApiResult<Option<(Utf8PathBuf, String)>> {
         let landing = self.landing_dir(login)?;
         let reference = format!("refs/newgit/landing/{commit}");
-        if !self.has_commit(commit) {
-            create_store(&self.dir(), &self.store)?;
+        if readers.head(&landing, &reference).is_none() {
+            return Ok(None);
+        }
+        let store = self.dir();
+        if !readers.has_commit(&store, commit) {
+            create_store(&store, &self.store)?;
+            let alternates = landing.join("objects/info/alternates");
+            let before = std::fs::read(&alternates).ok();
             self.open_landing_from(login, borrow)?;
+            if std::fs::read(&alternates).ok() != before {
+                readers.forget(&landing);
+            }
+            let copied = {
+                let (into, from) = readers.pair(&store, &landing)?;
+                into.set_durable(true);
+                into.copy_reachable(from, commit)?
+            };
             let refspec = format!("+{reference}:{}", self.full(&reference));
-            let output = git(
-                &self.dir(),
-                &[
-                    "fetch",
-                    "--quiet",
-                    "--no-tags",
-                    "--no-write-fetch-head",
-                    landing.as_str(),
-                    &refspec,
-                ],
-            )?;
+            let output = match copied {
+                Some(_) => git(&store, &["update-ref", &self.full(&reference), commit])?,
+                None => git(
+                    &store,
+                    &[
+                        "fetch",
+                        "--quiet",
+                        "--no-tags",
+                        "--no-write-fetch-head",
+                        landing.as_str(),
+                        &refspec,
+                    ],
+                )?,
+            };
             if !output.status.success() {
                 return Err(HttpError::internal(format!(
-                    "bring {commit} from {landing} into {} ({}): {}",
-                    self.dir(),
+                    "bring {commit} from {landing} into {store} ({}): {}",
                     self.namespace,
                     String::from_utf8_lossy(&output.stderr).trim()
                 )));
             }
         }
-        git(&landing, &["update-ref", "-d", &reference])?;
-        Ok(())
+        Ok(Some((landing, reference)))
     }
 }
 
