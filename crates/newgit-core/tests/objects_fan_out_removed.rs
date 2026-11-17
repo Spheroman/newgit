@@ -76,7 +76,30 @@ fn objects_written_while_git_removes_and_another_writer_remakes_them() {
     write_while_pruned(true);
 }
 
+/// Rounds of writes, each into a new repository, so each starts with no
+/// fan-out directories and the writer has to make every one of them. A
+/// directory only stays removable until its first object is in place, so
+/// one repository gives the pruner about 256 chances, and on a fast machine
+/// it can miss them all. Rounds go on until the pruner has removed some
+/// (and at least `MIN_ROUNDS`), within `MAX_ROUNDS`.
 fn write_while_pruned(remake: bool) {
+    const MIN_ROUNDS: usize = 20;
+    const MAX_ROUNDS: usize = 400;
+    let mut removed = 0;
+    let mut rounds = 0;
+    while rounds < MAX_ROUNDS && (rounds < MIN_ROUNDS || removed == 0) {
+        removed += one_round(remake, rounds);
+        rounds += 1;
+    }
+    assert!(
+        removed > 0,
+        "in {rounds} rounds the fan-out directories were never removed, so this tested nothing"
+    );
+}
+
+/// One repository, 500 objects written in two flushes while its fan-out
+/// directories are pruned; each checked afterwards. How many removals took.
+fn one_round(remake: bool, round: usize) -> usize {
     let temp = tempfile::tempdir().expect("tempdir");
     let repo = Utf8PathBuf::from_path_buf(temp.path().canonicalize().expect("canonical"))
         .expect("utf8")
@@ -91,13 +114,15 @@ fn write_while_pruned(remake: bool) {
     let mut objects = Objects::open(&repo).expect("open");
     let mut written = Vec::new();
     let mut failure = None;
-    'rounds: for round in 0..40 {
+    for flush in 0..2 {
         for n in 0..250 {
-            written.push(objects.make_blob(format!("round {round}, blob {n}\n").as_bytes()));
+            written.push(
+                objects.make_blob(format!("round {round}, flush {flush}, blob {n}\n").as_bytes()),
+            );
         }
         if let Err(error) = objects.flush() {
-            failure = Some(format!("round {round}: {error}"));
-            break 'rounds;
+            failure = Some(format!("round {round}, flush {flush}: {error}"));
+            break;
         }
     }
     stop.store(true, Ordering::Relaxed);
@@ -105,10 +130,6 @@ fn write_while_pruned(remake: bool) {
     assert_eq!(
         failure, None,
         "a write failed while Git removed fan-out directories"
-    );
-    assert!(
-        removed > 0,
-        "the fan-out directories were never removed, so this tested nothing"
     );
 
     // Each is there and is what Git would have written. The ids go in
@@ -130,4 +151,5 @@ fn write_while_pruned(remake: bool) {
         assert_eq!(line, format!("{id} blob"));
     }
     git(&repo, &["fsck", "--strict", "--no-dangling"]);
+    removed
 }
