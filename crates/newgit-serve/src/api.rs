@@ -1435,6 +1435,9 @@ impl Authorized {
                 };
                 match (landing, &fork) {
                     (Some(mut landing), fork) => {
+                        if fork.is_some() {
+                            app.log.wait_while("hold-fork-start");
+                        }
                         if let Some(fork) = fork {
                             landing
                                 .asked
@@ -1577,6 +1580,13 @@ pub fn authorize(
             .into(),
             ..Entry::default()
         },
+        // A fork's start was checked against the definitions as they are
+        // now, and its commits are copied once the lock is let go of: the
+        // landing that makes it stands only if they have not changed since.
+        epochs: match &fork {
+            Some(_) => vec![(project.key.clone(), db::epoch(db, &project.key)?)],
+            None => Vec::new(),
+        },
         ..Landing::default()
     };
     Ok(Authorized::Make {
@@ -1700,12 +1710,23 @@ fn credential(
 ) -> ApiResult<Value> {
     // A repo its first write makes is made by that write, not by asking.
     authorize(project, db, caller, repo, write)?;
-    Ok(credential_json(
+    let mut answer = credential_json(
         origin,
         caller,
         &repo.name(),
         if write { "write" } else { "read" },
-    ))
+    );
+    // A writer is told when what it writes is served narrower than the
+    // definition it believes (a fork re-added under its old name is still
+    // held to the upstream its repo was made from, #437).
+    if write
+        && let Some(capped) = project
+            .facts(db, repo.tracker_name())?
+            .and_then(|facts| facts.capped)
+    {
+        answer["capped"] = Value::String(capped);
+    }
+    Ok(answer)
 }
 
 fn create_tracker(

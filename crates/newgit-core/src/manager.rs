@@ -53,10 +53,15 @@ mod evict;
 mod remove;
 mod retention;
 pub use encryption::{Reencrypted, describe_recipients};
+mod export_check;
 mod pull;
 pub use pull::{PullOutcome, PulledTracker};
+mod reset;
+pub use reset::{HeldBack, ResetLine, ResetOutcome};
 mod stale_render;
 pub use stale_render::{PossiblyStale, StaleRender};
+mod target_push;
+use target_push::{Pushing, PutBack};
 
 /// The store remote a workspace's `git push` is forwarded to.
 const PUBLISH_REMOTE: &str = "origin";
@@ -1259,6 +1264,11 @@ pub struct RemoteExportOptions {
     /// A `git push` from the project root: only if the target's view moved
     /// since the last export, and never pulling from an ahead target.
     pub from_push: bool,
+    /// With `force`: replace the branch even when that puts back commits a
+    /// rewrite there removed since this machine last exported to it (a
+    /// force-push, perhaps to purge a secret). Without it, such a push is
+    /// refused, naming how many it would put back.
+    pub republish: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1279,6 +1289,10 @@ pub struct RemoteExportOutcome {
     /// say, as a pull request — brought into `main` before pushing (or, on a
     /// dry run, that would be). Zero when the target was not ahead.
     pub pulled: u32,
+    /// With `force`, commits this push puts back on the target that a
+    /// rewrite there (a force-push since this machine last exported to it)
+    /// had removed. Zero otherwise.
+    pub restored: usize,
 }
 
 /// What `newgit tracker pull --keep-mine` did: see
@@ -1574,6 +1588,11 @@ pub struct MergeTrackerOutcome {
     /// The remote project whose copy of the tracker's `main` moved too, for
     /// a tracker stored there.
     pub published: Option<String>,
+    /// Why the remote serves the tracker narrower than its definition says,
+    /// when it does: a fork held to its upstream's audience, whatever its
+    /// definition says now (#437). Readers its definition names may be
+    /// refused there.
+    pub capped: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2300,10 +2319,19 @@ impl BranchManager {
                 &all,
                 Some(&mount),
             )? {
+                // All of an import is new to this project, and would be sent
+                // to its remote and its targets, so all of it is judged.
+                let inside = path
+                    .strip_prefix(&format!("{mount}/"))
+                    .unwrap_or(path.as_str());
                 return Err(NewgitError::SplitRefused(format!(
                     "commit {} of {from} adds `{path}`, which belongs to `{tracker}`, a tracker \
                      outside Git: its files (secrets among them) never come in or leave through \
-                     Git, so nothing was imported",
+                     Git, so nothing was imported. Every commit of an import is new here, so \
+                     every one is checked. To import it, take `{inside}` out of that history \
+                     (in a clone, `git filter-repo --invert-paths --path {inside}`) and import \
+                     from the clone; if `{path}` is not a secret, take it out of `{tracker}`'s \
+                     paths instead",
                     short(&commit)
                 )));
             }
@@ -3139,6 +3167,7 @@ impl BranchManager {
     /// `AGENTS.md` is `apps/t3code/AGENTS.md`, not the `AGENTS.md` a tracker
     /// outside Git owns at the top. Everything else is judged as it is.
     fn refuse_unpublished_trackers(&self, commits: &[(&str, &str)]) -> Result<()> {
+        self.refuse_dropped(commits, "sending them to the remote")?;
         let all = self.all_definitions();
         let root = self.store.paths().project_root.clone();
         let mut plain = Vec::new();
@@ -7831,10 +7860,15 @@ impl BranchManager {
         let published =
             self.publish_main(definition, &rev, Acting::Workspace(&branch.workspace_path))?;
         lane.set_main(&rev)?;
+        let (published, capped) = match published {
+            Some((project, capped)) => (Some(project), capped),
+            None => (None, None),
+        };
         Ok(MergeTrackerOutcome {
             tracker: definition.name.clone(),
             rev,
             published,
+            capped,
         })
     }
 
@@ -9432,6 +9466,7 @@ impl BranchManager {
                     pushed: false,
                     project_root_error,
                     pulled: 0,
+                    restored: 0,
                 });
             }
             self.refuse_target_ahead(&target, &view.tip)?;
@@ -9482,26 +9517,41 @@ impl BranchManager {
         }
 
         let url = target.push_url();
+        // Every push to a target is cleared first, a dry run's too, which
+        // says what would be refused, and counts what `--force` puts back.
+        let put_back = if options.dry_run {
+            PutBack::Count
+        } else if options.republish {
+            PutBack::Republish
+        } else {
+            PutBack::Never
+        };
+        let how = if options.force {
+            PushExport::Force
+        } else {
+            PushExport::Onto
+        };
+        let cleared = self.clear_push(
+            &target,
+            &view.tip,
+            Pushing::Main {
+                from_push: options.from_push,
+            },
+            how,
+            put_back,
+        )?;
+        let restored = cleared.restored;
+        let theirs = cleared.theirs.clone();
         if !options.dry_run {
-            let how = if options.force {
-                PushExport::Force
-            } else {
-                PushExport::Onto
-            };
-            self.push_export(&target, &view.tip, &target.branch, how)
-                .map_err(|error| match error {
-                    NewgitError::SourceCommand { stderr, .. } if rejected(&stderr) => {
-                        NewgitError::Unsupported(format!(
-                            "`{}` holds commits the export does not descend from, so the push \
-                             was refused. That is expected the first time, when the target has \
-                             history of its own, or after the target's tracker set changed (a \
-                             different set composes a different history). `--force` replaces \
-                             the branch:\n{stderr}",
-                            target.branch
-                        ))
+            self.push_cleared(cleared).map_err(|error| match error {
+                NewgitError::SourceCommand { stderr, .. } if rejected(&stderr) => {
+                    match self.push_rejected(&target, theirs.as_deref(), &view.tip) {
+                        Ok(why) => NewgitError::Unsupported(format!("{why}:\n{stderr}")),
+                        Err(error) => error,
                     }
-                    other => other,
-                })?;
+                }
+                other => other,
+            })?;
             self.source.update_ref(&pushed_ref, &view.tip)?;
         }
 
@@ -9514,13 +9564,152 @@ impl BranchManager {
             pushed: !options.dry_run,
             project_root_error,
             pulled,
+            restored,
         })
     }
 
+    /// Refuse `tip`, about to be pushed to `target`, when `target`'s branch,
+    /// at `theirs` (none: gone), was rewritten since this machine last
+    /// exported to it and `tip` still holds what the rewrite removed. Asked
+    /// ahead of [`Self::clear_push`], which refuses it anyway, only where
+    /// another refusal would otherwise come first with worse advice.
+    fn refuse_rewritten_at(
+        &self,
+        target: &ExportTarget,
+        theirs: Option<&str>,
+        tip: &str,
+        refused: &str,
+    ) -> Result<()> {
+        let Some(pushed) = self.target_rewritten(target, theirs)? else {
+            return Ok(());
+        };
+        let held = self.removed_held(&pushed, theirs, tip)?;
+        if held == 0 {
+            return Ok(());
+        }
+        Err(self.rewritten_error(target, &pushed, theirs, Some(held), refused)?)
+    }
+
+    /// How to follow a rewrite of `target`, or why it cannot be followed.
+    fn follow_way(&self, target: &ExportTarget) -> String {
+        match &target.root {
+            Some(tracker) => format!(
+                "To follow it, `newgit pull --remote {name} --force --dry-run` says what \
+                 following drops and which instances still hold it, and without `--dry-run` \
+                 resets `{}`'s line to the target's; `newgit merge main` then publishes the \
+                 reset, and exporting again puts nothing it removed back",
+                crate::tracker::tracker_path(tracker),
+                name = target.name,
+            ),
+            None => format!(
+                "`{name}` is the project's own view (root declares it), and following a \
+                 rewrite of it means rewriting the project's history, which newgit cannot do \
+                 yet (`pull --remote --force` follows a target rooted at a tracker). Until it \
+                 can, this line cannot be exported to `{name}` without what the rewrite \
+                 removed: export the trackers to targets rooted at them instead, or point \
+                 `{name}` at a branch of its own; and a secret that was published there is \
+                 public, so rotate it whatever happens to the history",
+                name = target.name,
+            ),
+        }
+    }
+
+    /// Why a push of `tip` to `target`, at `theirs` (none: no such
+    /// branch), was rejected as not a fast-forward, with the way on. A
+    /// target rewritten since this machine's last export is refused before
+    /// the push; this is the rest: the target moved beside the export, or
+    /// this machine has no record of exporting there, so a rewrite cannot be
+    /// told from a target with history of its own.
+    fn push_rejected(
+        &self,
+        target: &ExportTarget,
+        theirs: Option<&str>,
+        tip: &str,
+    ) -> Result<String> {
+        let lacks = match theirs {
+            Some(theirs) => self.source.commit_count(&format!("{theirs}..{tip}"))?,
+            None => self.source.commit_count(tip)?,
+        };
+        let pushed = self
+            .source
+            .rev_parse(&export_ref(&target.name, "pushed"))
+            .ok();
+        let name = &target.name;
+        // Still on a line a reset here dropped (a second target, never
+        // purged): pulling it in is refused, and replacing it purges it.
+        if let (Some(tracker), Some(theirs)) = (&target.root, theirs)
+            && self.has_resets()
+            && let Err(dropped) = self.refuse_pulling_dropped(target, &[(tracker, theirs)])
+        {
+            return Ok(format!(
+                "`{branch}` on `{name}` is still on the line of `{}` a reset here dropped, and \
+                 `main` is not, so the push was refused. {dropped}. Or replace its branch with \
+                 this line, purging them there: `newgit export --remote {name} --force`",
+                crate::tracker::tracker_path(tracker),
+                branch = target.branch,
+            ));
+        }
+        let follow = match &target.root {
+            Some(_) => format!(
+                "`newgit pull --remote {name} --force --dry-run` says what following the \
+                 target's history would drop here"
+            ),
+            None => "following a rewrite of the project's own view is something newgit cannot \
+                     do yet"
+                .to_owned(),
+        };
+        if let (Some(pushed), Some(theirs)) = (pushed.as_deref(), theirs)
+            && (pushed == theirs || self.source.is_ancestor(pushed, theirs)?)
+        {
+            // This machine's record is the only one (#473): another
+            // machine's later export, then a rewrite of it, looks the same.
+            return Ok(format!(
+                "`{branch}` on `{name}` has commits of its own since this machine last exported \
+                 to it (merged there?), and `main` has {} it lacks, so the push was refused. \
+                 `newgit pull --remote {name}` merges them in, then export again; `--force` \
+                 would discard the target's. But if another machine exported to `{name}` after \
+                 this one, a rewrite of that export (a force-push, perhaps to purge a secret) \
+                 looks exactly like this here, and merging it in keeps what the rewrite removed \
+                 for the next export to put back. Check first: {check}",
+                plural_commits(lacks as usize),
+                branch = target.branch,
+                check = match &target.root {
+                    Some(_) => follow.clone(),
+                    None => format!(
+                        "look at what `{}` there holds before pulling it in",
+                        target.branch
+                    ),
+                },
+            ));
+        }
+        Ok(format!(
+            "`{branch}` on `{name}` holds commits the export does not descend from, so the push \
+             was refused. That is expected the first time, when the target has history of its \
+             own, or after the target's tracker set changed (a different set composes a \
+             different history). It is also what a rewrite there looks like (a force-push, \
+             perhaps to purge a secret), and this machine has no record of exporting to \
+             `{name}` to tell them apart. Check before replacing it: {follow}. `--force` \
+             replaces the branch, publishing the {} the export has that the target lacks, \
+             which puts back anything such a rewrite removed",
+            plural_commits(lacks as usize),
+            branch = target.branch,
+        ))
+    }
+
     /// Refuse when `target`'s branch has commits `tip` does not: a push does
-    /// not pull, so it names the command that does.
+    /// not pull, so it names the command that does. A branch rewritten
+    /// since this machine last exported there is refused first, even when
+    /// it is behind `tip` (a rewind), since pushing would put back what the
+    /// rewrite removed.
     fn refuse_target_ahead(&self, target: &ExportTarget, tip: &str) -> Result<()> {
-        let Some(theirs) = self.fetch_target(target)? else {
+        let theirs = self.fetch_target(target)?;
+        self.refuse_rewritten_at(
+            target,
+            theirs.as_deref(),
+            tip,
+            "This push would put them back",
+        )?;
+        let Some(theirs) = theirs else {
             return Ok(());
         };
         if theirs == tip || self.source.is_ancestor(&theirs, tip)? {
@@ -9586,8 +9775,7 @@ impl BranchManager {
             }
             return Err(NewgitError::Unsupported(format!(
                 "`{}` on `{}` has {commits} commit(s) `{tracker}`'s `main` does not (merged \
-                 there?): `newgit pull --remote {}` brings them in, then export again. \
-                 `--force` replaces the branch instead",
+                 there?): `newgit pull --remote {}` brings them in, then export again",
                 target.branch, target.name, target.name
             )));
         }
@@ -9602,7 +9790,7 @@ impl BranchManager {
                  project root's `{branch}` cannot fast-forward to them: it has commits of its \
                  own, or the target withholds a tracker, so its commits are not the project's. \
                  `newgit pull --remote {}` brings them in as work in the project root, then \
-                 `newgit merge main` publishes them; or replace the branch with `--force`",
+                 `newgit merge main` publishes them",
                 target.branch, target.name, target.name
             )));
         }
@@ -9718,6 +9906,34 @@ impl BranchManager {
                 target.name, target.branch
             ))
         })?;
+        if let Some(pushed) = self.target_rewritten(&target, Some(&theirs))? {
+            // Followed already (a reset, or a pull since), nothing is refused.
+            let holds = match &target.root {
+                Some(tracker) => {
+                    let stands_for =
+                        crate::compose::read_root(&self.store.paths().project_root, &pushed)?
+                            .filter(|(root, _)| root == tracker)
+                            .map_or_else(|| pushed.clone(), |(_, commit)| commit);
+                    match self.rooted_ours(tracker)? {
+                        Some(ours) => {
+                            ours == stands_for || self.source.is_ancestor(&stands_for, &ours)?
+                        }
+                        None => false,
+                    }
+                }
+                None => true,
+            };
+            if holds {
+                return Err(self.rewritten_error(
+                    &target,
+                    &pushed,
+                    Some(&theirs),
+                    None,
+                    "Merging it in, as plain `pull --remote` does, would keep them here for \
+                     the next export to put back",
+                )?);
+            }
+        }
         match target.root.clone() {
             Some(tracker) => self.pull_rooted(&target, &tracker, &theirs),
             None => self.pull_view(&target, &theirs),
@@ -9793,6 +10009,15 @@ impl BranchManager {
             })?;
         let ours = self.rooted_ours(tracker)?;
         let rooted = self.rooted_merge(target, tracker, theirs, ours.as_deref())?;
+        // A second target, never purged, still has what a reset dropped.
+        let mut lines = vec![(tracker, rooted.main.as_str())];
+        lines.extend(
+            rooted
+                .children
+                .iter()
+                .map(|(child, commit)| (child.as_str(), commit.as_str())),
+        );
+        self.refuse_pulling_dropped(target, &lines)?;
         // `main` moves with the pin, after the project root has taken it.
         let mut mains: Vec<(String, String)> = if ours.as_deref() != Some(rooted.main.as_str()) {
             vec![(tracker.to_owned(), rooted.main.clone())]
@@ -9825,7 +10050,9 @@ impl BranchManager {
             .ok();
         Ok(match (&published, &here) {
             (Some(published), Some(here))
-                if published != here && self.source.is_ancestor(published, here)? =>
+                if published != here
+                    && (self.source.is_ancestor(published, here)?
+                        || self.reset_replaces(tracker, published, here)?) =>
             {
                 Some(here.clone())
             }
@@ -10039,6 +10266,18 @@ impl BranchManager {
                 }
             }
         };
+        // The target's view may pin a line a reset dropped (a second
+        // target, never purged): judged by every pin the pull moves.
+        if self.has_resets() {
+            let before = crate::compose::index(&project, &self.root.name, &head)?;
+            let after = crate::compose::index(&project, &self.root.name, &new_head)?;
+            let moved: Vec<(&str, &str)> = after
+                .iter()
+                .filter(|(tracker, commit)| before.get(*tracker) != Some(*commit))
+                .map(|(tracker, commit)| (tracker.as_str(), commit.as_str()))
+                .collect();
+            self.refuse_pulling_dropped(target, &moved)?;
+        }
         let checked_out = crate::source::run_git_env(
             &["-C", project.as_str(), "symbolic-ref", "-q", "HEAD"],
             &[],
@@ -10097,7 +10336,77 @@ impl BranchManager {
                     .to_owned(),
             });
         }
-        crate::export_target::resolve_targets(&self.all_definitions())
+        let targets = crate::export_target::resolve_targets(&self.all_definitions())?;
+        if let Some((target, origin)) = self.target_at_origin(&targets)? {
+            return Err(self.target_at_origin_error(target, &origin));
+        }
+        Ok(targets)
+    }
+
+    /// Why export target `target` may not be the store's `origin` (at
+    /// `origin`), and what to do instead.
+    fn target_at_origin_error(&self, target: &ExportTarget, origin: &str) -> NewgitError {
+        NewgitError::InvalidDefinition {
+            kind: "tracker",
+            name: crate::tracker::tracker_path(target.declared_by()),
+            reason: format!(
+                "`export` pushes to {}, which is the project's own `{PUBLISH_REMOTE}` \
+                 ({origin}). A push from a workspace goes to `{PUBLISH_REMOTE}` as it is, \
+                 uncomposed and unchecked, so the target would get commits an export never \
+                 sends there (a tracker withheld from it, a commit purged from it by a \
+                 force-push); nothing was pushed. Export to a repository of its own, or point \
+                 `{PUBLISH_REMOTE}` elsewhere (`git -C {} remote set-url {PUBLISH_REMOTE} \
+                 <url>`)",
+                target.url,
+                self.store.paths().project_root,
+            ),
+        }
+    }
+
+    /// The first of `targets` that is the same repository as the store's
+    /// `origin` (fetched from or pushed to), with that `origin` URL. Each
+    /// is compared as written and as Git would use it (`insteadOf`
+    /// applied), so a rewrite of one to the other is seen too.
+    fn target_at_origin<'a>(
+        &self,
+        targets: &'a [ExportTarget],
+    ) -> Result<Option<(&'a ExportTarget, String)>> {
+        let root = self.store.paths().project_root.clone();
+        let git = |args: &[&str]| {
+            let mut full = vec!["-C", root.as_str()];
+            full.extend_from_slice(args);
+            crate::source::run_git_env(&full, &[])
+                .ok()
+                .map(|out| out.trim().to_owned())
+                .filter(|out| !out.is_empty())
+        };
+        let mut origins: Vec<String> = git(&["config", "--get", "remote.origin.url"])
+            .into_iter()
+            .collect();
+        for push in [false, true] {
+            origins.extend(self.source.remote_url(PUBLISH_REMOTE, push)?);
+        }
+        if origins.is_empty() {
+            return Ok(None);
+        }
+        Ok(targets.iter().find_map(|target| {
+            let url = target.push_url();
+            let spellings: Vec<String> = [
+                Some(target.url.clone()),
+                git(&["ls-remote", "--get-url", "--", &url]),
+            ]
+            .into_iter()
+            .flatten()
+            .collect();
+            origins
+                .iter()
+                .find(|origin| {
+                    spellings
+                        .iter()
+                        .any(|spelling| crate::export_target::same_repository(spelling, origin))
+                })
+                .map(|origin| (target, origin.clone()))
+        }))
     }
 
     /// `"inherit"` follows the parent wherever it ships, whoever reads it
@@ -10167,9 +10476,9 @@ impl BranchManager {
     }
 
     /// Compose `list` (tracker → commit) as `target` sees it — its trackers
-    /// only — at `refs/newgit/exports/<target>/<branch>`, and refuse a
-    /// history that ever adds a path a tracker outside Git owns: a path made
-    /// secret later stays in the commits that once held it.
+    /// only — at `refs/newgit/exports/<target>/<branch>`. Nothing is pushed:
+    /// [`Self::refuse_new_outside_git`] judges what a push would send, a
+    /// file a tracker outside Git owns and a commit a reset dropped alike.
     fn compose_export(
         &self,
         target: &ExportTarget,
@@ -10208,7 +10517,6 @@ impl BranchManager {
 
         self.bring_pins(&root_name, root_commit, &BTreeMap::new())?;
         let root = self.store.paths().project_root.clone();
-        let all = self.all_definitions();
         let may_ship = |tracker: &str| shipped.contains(tracker);
         let view = crate::compose::compose(
             &root,
@@ -10231,24 +10539,6 @@ impl BranchManager {
                 target.name
             ))
         })?;
-        // A rooted view holds the tracker's files at its own root: each is
-        // judged where the project's view has it, under the mount.
-        let mount = target
-            .root
-            .as_ref()
-            .and_then(|_| code.iter().find(|definition| definition.name == root_name))
-            .map(|definition| definition.mount.clone());
-        if let Some((commit, path, tracker)) =
-            crate::compose::find_outside_git_under(&root, &[&tip], &[], &all, mount.as_deref())?
-        {
-            return Err(NewgitError::SplitRefused(format!(
-                "the export to `{}` would carry commit {}, which adds `{path}`, and `{path}` \
-                 belongs to `{tracker}`, a tracker outside Git, whose files (secrets among them) \
-                 never leave this machine through Git, so this history cannot be exported as it is",
-                target.name,
-                &commit[..commit.len().min(12)]
-            )));
-        }
         Ok((
             trackers,
             ComposedExport {
@@ -10258,45 +10548,9 @@ impl BranchManager {
         ))
     }
 
-    /// Push `tip` to `branch` on `target`, with plain `git push` and the
-    /// user's own credentials. `--no-verify`: the project's own pre-push
-    /// hooks are for its work, not for a mirror of it.
-    fn push_export(
-        &self,
-        target: &ExportTarget,
-        tip: &str,
-        branch: &str,
-        how: PushExport<'_>,
-    ) -> Result<()> {
-        let refspec = format!(
-            "{}{tip}:refs/heads/{branch}",
-            if matches!(how, PushExport::Force) {
-                "+"
-            } else {
-                ""
-            }
-        );
-        let lease = match how {
-            PushExport::Replacing(held) => {
-                Some(format!("--force-with-lease=refs/heads/{branch}:{held}"))
-            }
-            _ => None,
-        };
-        let url = target.push_url();
-        let mut args = vec![
-            "-C",
-            self.store.paths().project_root.as_str(),
-            "push",
-            "--quiet",
-            "--no-verify",
-        ];
-        args.extend(lease.as_deref());
-        args.extend([url.as_str(), refspec.as_str()]);
-        crate::source::run_git_env(&args, &[]).map(|_| ())
-    }
-
-    /// [`Self::push_export`] of an instance's branch, and whether it
-    /// replaced what was there. A lease fails when the target no longer has
+    /// An instance's branch pushed to `target`, cleared first as every push
+    /// to a target is ([`Self::clear_push`]), and whether it replaced what
+    /// was there. A lease fails when the target no longer has
     /// the branch at all (a pull request closed with its branch deleted): it
     /// is then pushed as new, which fails in turn if someone made it again
     /// meanwhile. A push the target refused is [`branch_refused`], which
@@ -10313,7 +10567,12 @@ impl BranchManager {
         let refused = |unchecked: Option<String>| {
             branch_refused(branch, &target.name, recorded, unchecked.as_deref())
         };
-        match self.push_export(target, tip, name, how) {
+        let push = |how: PushExport<'_>| {
+            let cleared =
+                self.clear_push(target, tip, Pushing::Branch(branch), how, PutBack::Never)?;
+            self.push_cleared(cleared)
+        };
+        match push(how) {
             Ok(()) => return Ok(matches!(how, PushExport::Replacing(_))),
             Err(error) if !is_rejected(&error) => return Err(error),
             Err(_) if !matches!(how, PushExport::Replacing(_)) => return Err(refused(None)),
@@ -10340,7 +10599,7 @@ impl BranchManager {
         {
             return Err(refused(None));
         }
-        match self.push_export(target, tip, name, PushExport::Onto) {
+        match push(PushExport::Onto) {
             Ok(()) => Ok(false),
             Err(error) if is_rejected(&error) => Err(refused(None)),
             Err(error) => Err(error),
@@ -10838,7 +11097,7 @@ impl BranchManager {
         // with nothing landed.
         let targets = self.export_targets()?;
         if updates.is_empty() {
-            let tags = self.push_tags(&targets, tags)?;
+            let tags = self.push_tags(&targets, tags, &BTreeSet::new())?;
             return Ok(ProjectPushOutcome {
                 merge: None,
                 exports: Vec::new(),
@@ -10846,7 +11105,7 @@ impl BranchManager {
             });
         }
         let merge = self.merge(PROJECT_ROOT_INSTANCE, PROJECT_ROOT_INSTANCE)?;
-        let exports = targets
+        let exports: Vec<ProjectPushExport> = targets
             .iter()
             .map(|target| ProjectPushExport {
                 target: target.name.clone(),
@@ -10864,7 +11123,12 @@ impl BranchManager {
             .collect();
         // After the merge: a tag names a commit on `main`, which the merge
         // may just have put there.
-        let tags = self.push_tags(&targets, tags)?;
+        let refused: BTreeSet<String> = exports
+            .iter()
+            .filter(|export| export.result.is_err())
+            .map(|export| export.target.clone())
+            .collect();
+        let tags = self.push_tags(&targets, tags, &refused)?;
         Ok(ProjectPushOutcome {
             merge: Some(merge),
             exports,
@@ -10932,10 +11196,15 @@ impl BranchManager {
     /// `v0.1.x`), and a tag never moves, so the project's `v0.9.0` there
     /// would take that name from it for good. Tags from such a target are
     /// refused coming in for the same reason.
+    ///
+    /// `refused`: targets this same push's export of `main` failed on. A tag
+    /// is not pushed to one: it names a commit of `main`, which that target
+    /// was just refused (a rewrite there removed what it holds, perhaps).
     fn push_tags(
         &self,
         targets: &[ExportTarget],
         tags: Vec<(String, PushedTag)>,
+        refused: &BTreeSet<String>,
     ) -> Result<Vec<ProjectPushTag>> {
         if tags.is_empty() {
             return Ok(Vec::new());
@@ -10959,11 +11228,17 @@ impl BranchManager {
                 Some(list) => targets
                     .iter()
                     .map(|target| {
-                        (
-                            target.name.clone(),
+                        let result = if refused.contains(&target.name) {
+                            Err(format!(
+                                "the export of `{}` to `{}` failed in this push, so the tag \
+                                 naming it was not pushed there either",
+                                target.branch, target.name
+                            ))
+                        } else {
                             self.export_tag(target, &name, list, tag.annotation.as_ref())
-                                .map_err(|error| error.to_string()),
-                        )
+                                .map_err(|error| error.to_string())
+                        };
+                        (target.name.clone(), result)
                     })
                     .collect(),
                 None => Vec::new(),
@@ -11032,18 +11307,17 @@ impl BranchManager {
             )?,
             None => view.tip.clone(),
         };
-        crate::source::run_git_env(
-            &[
-                "-C",
-                project.as_str(),
-                "push",
-                "--quiet",
-                "--no-verify",
-                &target.push_url(),
-                &format!("{object}:{tag_ref}"),
-            ],
-            &[],
+        let cleared = self.clear_push(
+            target,
+            &view.tip,
+            Pushing::Tag {
+                name,
+                object: &object,
+            },
+            PushExport::Onto,
+            PutBack::Never,
         )?;
+        self.push_cleared(cleared)?;
         Ok(true)
     }
 
@@ -11126,6 +11400,18 @@ impl BranchManager {
             rev_list.extend(history.as_deref());
             self.refuse_outside_git(&outbox, &rev_list, &quarantine)?;
         }
+        if !on_remote {
+            // The forward to `origin` is a raw push, with nothing an export
+            // checks: so never to a target's own repository (refused when
+            // the targets are read; this is the backstop, so it reads them
+            // without that check), and nothing a reset dropped that
+            // `origin` lacks.
+            let targets = crate::export_target::resolve_targets(&self.all_definitions())?;
+            if let Some((target, origin)) = self.target_at_origin(&targets)? {
+                return Err(self.target_at_origin_error(target, &origin));
+            }
+            self.refuse_forwarding_dropped(&outbox, &rev_list, &quarantine)?;
+        }
 
         let mut checkpoint = self.checkpoint_branch(
             &mut branch,
@@ -11153,7 +11439,7 @@ impl BranchManager {
                 )));
             }
         } else {
-            GitSource::forward_push(&self.outbox(), &url, None, updates, admitting)?;
+            GitSource::forward_push(&outbox, &url, None, updates, admitting)?;
         }
 
         // The instance's own branch goes on to each target that takes
@@ -11990,6 +12276,11 @@ impl BranchManager {
         };
         let list = crate::compose::index(&project, &self.root.name, &merged_root)?;
         let incoming = crate::compose::index(&project, &self.root.name, &theirs)?;
+        let pairs: Vec<(&str, &str)> = list
+            .iter()
+            .map(|(tracker, commit)| (tracker.as_str(), commit.as_str()))
+            .collect();
+        self.refuse_dropped(&pairs, &format!("merging `{name}` into `{into}`"))?;
 
         // Each tracker: what happened to it.
         let mut trackers = Vec::new();
@@ -12051,6 +12342,11 @@ impl BranchManager {
                 None => merge.commit.clone(),
                 Some(main) if self.source.is_ancestor(&merge.commit, main)? => continue,
                 Some(main) if self.source.is_ancestor(main, &merge.commit)? => merge.commit.clone(),
+                // Its line was reset here (`pull --remote --force`, #442):
+                // `main` is the old line, replaced, never merged back in.
+                Some(main) if self.reset_replaces(&merge.tracker, main, &merge.commit)? => {
+                    merge.commit.clone()
+                }
                 Some(main) => match self.merge_commits(
                     main,
                     &merge.commit,
@@ -12681,6 +12977,19 @@ impl BranchManager {
 
         let view = remote.project(project)?;
         let main = view.default_list().cloned().unwrap_or_default();
+        // Nothing the remote's `main` lacks that a reset dropped (#442): an
+        // instance still on the old line keeps it here, never sends it.
+        let sending: Vec<(&str, &str)> = tip
+            .iter()
+            .flat_map(|(tracker, tip_commit)| {
+                [Some(tip_commit), head.get(tracker)]
+                    .into_iter()
+                    .flatten()
+                    .filter(|commit| main.get(tracker) != Some(*commit))
+                    .map(move |commit| (tracker.as_str(), commit.as_str()))
+            })
+            .collect();
+        self.refuse_dropped(&sending, "sending this checkpoint to the remote")?;
         let mut shared = None;
         for (tracker, tip_commit) in &tip {
             let head_commit = head.get(tracker).unwrap_or(tip_commit);
@@ -16283,7 +16592,8 @@ enum PushExport<'a> {
     /// Over what is there, only while that is this commit: what newgit last
     /// put there.
     Replacing(&'a str),
-    /// Over whatever is there.
+    /// Over whatever is there when [`BranchManager::clear_push`] checked it,
+    /// leased on that: one rewritten again in between is refused.
     Force,
 }
 
@@ -16423,6 +16733,15 @@ pub fn fork_repo(project: &str, instance: &str, tracker: &str) -> String {
 /// Where a fork keeps a checkpoint's commit for its tracker.
 pub fn fork_checkpoint_ref(id: &str) -> String {
     format!("refs/newgit/checkpoints/{id}")
+}
+
+/// `1 commit`, `3 commits`.
+fn plural_commits(count: usize) -> String {
+    if count == 1 {
+        "1 commit".to_owned()
+    } else {
+        format!("{count} commits")
+    }
 }
 
 fn short(rev: &str) -> &str {

@@ -1812,19 +1812,32 @@ inherits its export, so what leaves fails closed. A target declared by a
 tracker other than root is rooted at it, its files at the top. Definitions
 live in `access`, so widening where something ships takes an owner's merge.
 An inheriting tracker whose audience is narrower than the declaring one's
-is refused rather than sent past it, and a history that ever committed a
-file a tracker outside Git owns is refused. It
+is refused rather than sent past it, and a commit the target does not have
+yet that adds a file a tracker outside Git owns is refused: what the target
+has, asked of it each time, is published already and is not judged again
+(#444). It
 pushes with your own Git credentials, so GitHub Actions and `gh` keep
 working. When the target's branch has moved ahead (a pull request merged on
-GitHub), export brings that in first. With `branches = true`, every push
-from a workspace exports its branch there too: the target's `main` plus the
-instance's own commits, whichever was exported first. `newgit export
-<instance> --remote <name>` exports that branch again as last pushed, for an
-export that failed, or with `--force` to replace it whatever it holds. A
-branch whose commits there were built on a copy of what the target's `main`
-holds is replaced, only while the target holds exactly what newgit last
-pushed there by its own record, so a commit someone else pushed is never
-thrown away ([`trackers.md`](trackers.md), *One commit, one root commit*).
+GitHub), export brings that in first. A target force-pushed to purge
+something is not merged with: plain `pull --remote` and export refuse and
+name `newgit pull --remote <target> --force`, which resets the rooted
+tracker's line to the target's, lists what it drops and who still holds
+it, and refuses to carry it onward from this machine; the project's own
+history still pins it ([trackers.md](trackers.md), *Following a
+force-push*). Every push to a target from a client, of `main`, of an
+instance's branch, or of a tag, passes that check (the remote's own export
+of its GitHub mirrors does not yet, [serve.md](serve.md)), but it reads this machine's record of what
+it last exported there: with no record, or a record older than another
+machine's export, a rewrite cannot be told from history of the target's
+own (#473). With `branches = true`, every push from a workspace exports its
+branch there too: the target's `main` plus the instance's own commits,
+whichever was exported first. `newgit export <instance> --remote <name>`
+exports that branch again as last pushed, for an export that failed, or
+with `--force` to replace it whatever it holds. A branch whose commits
+there were built on a copy of what the target's `main` holds is replaced,
+only while the target holds exactly what newgit last pushed there by its
+own record, so a commit someone else pushed is never thrown away
+([`trackers.md`](trackers.md), *One commit, one root commit*).
 
 ### The remote
 

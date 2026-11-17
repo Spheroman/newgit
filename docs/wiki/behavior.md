@@ -16,8 +16,10 @@ leaves fails closed. `newgit tracker create --git --path <dir>` writes
 mirror. A target declared by a tracker other than root is rooted at it (its
 files at the top), so a library can ship inside the project's mirror and on
 its own (`export = ["inherit", "github.com/acme/lib"]`). Definitions live in
-`access`, so widening where anything ships takes an owner's merge. A history
-that ever committed the file of a tracker outside Git is refused. Exporting again
+`access`, so widening where anything ships takes an owner's merge. A commit
+the target does not have yet that adds the file of a tracker outside Git is
+refused; what the target already has (asked of it each time) is published
+and is not judged again. Exporting again
 fast-forwards, after bringing in whatever was merged on the target since,
 and the push uses your own Git credentials, so `gh`, GitHub
 Actions, and anyone cloning from GitHub keep working. With `branches =

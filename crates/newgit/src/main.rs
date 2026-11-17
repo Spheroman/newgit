@@ -358,6 +358,14 @@ enum Command {
     /// target is rooted at, and its `main`, then its pin in the project root;
     /// otherwise into the project root as work. `newgit merge main` publishes
     /// either
+    ///
+    /// With --remote <target> --force, follow a force-push there instead of
+    /// merging with it: the tracker's line is reset to the target's (as `git
+    /// fetch` then `git reset --hard <remote>/<branch>` would), dropping the
+    /// commits only the old line had. It lists them, and every instance that
+    /// still holds them, and this machine then refuses to carry them onward
+    /// (a merge, a send to the remote, a push to a target that lacks them).
+    /// --dry-run says all of that and moves nothing
     Pull {
         /// The mounted trackers in Git to bring up to date (every one when
         /// left out)
@@ -369,6 +377,13 @@ enum Command {
         /// The export target to pull from (declared by a tracker's `export`)
         #[arg(long, value_name = "TARGET", conflicts_with = "trackers")]
         remote: Option<String>,
+        /// With --remote: reset the tracker's line to the target's instead of
+        /// merging (follow a force-push), dropping what only the old line had
+        #[arg(long, requires = "remote")]
+        force: bool,
+        /// With --remote --force: say what it would drop, and move nothing
+        #[arg(long, requires = "force")]
+        dry_run: bool,
     },
     /// Clone a project from a newgit remote: its default branch composed from
     /// the trackers in Git you may read, set up for newgit
@@ -734,6 +749,12 @@ struct ExportArgs {
     /// With --remote: compose and check, but push nothing
     #[arg(long, requires = "remote")]
     dry_run: bool,
+    /// With --force: replace the branch even when that puts back commits a
+    /// rewrite there removed since this machine last exported to it (a
+    /// force-push, perhaps to purge a secret). Without it, --force refuses,
+    /// saying how many it would put back
+    #[arg(long, requires = "force")]
+    republish: bool,
 }
 
 #[derive(Debug, Args)]
@@ -882,6 +903,12 @@ fn main() -> Result<()> {
             full,
         } => remote_cmd::clone(&project, dir, url, full),
         Command::Merge { instance, into } => merge(instance, &into),
+        Command::Pull {
+            remote: Some(target),
+            force: true,
+            dry_run,
+            ..
+        } => reset_to_remote(&target, dry_run),
         Command::Pull {
             remote: Some(target),
             ..
@@ -3061,6 +3088,9 @@ fn tracker(mut command: TrackerCommand) -> Result<()> {
             if let Some(project) = &outcome.published {
                 println!("  remote:   `main` moved on {project} too");
             }
+            if let Some(capped) = &outcome.capped {
+                println!("  served narrower than defined: {capped}");
+            }
             Ok(())
         }
         TrackerCommand::Checkout {
@@ -4114,6 +4144,7 @@ fn export(args: ExportArgs) -> Result<()> {
                 from_push: false,
                 force: args.force,
                 dry_run: args.dry_run,
+                republish: args.republish,
             },
         );
     }
@@ -4265,6 +4296,21 @@ fn export_to_remote(name: &str, options: RemoteExportOptions) -> Result<()> {
                 outcome.url, target.branch
             );
         }
+    }
+    if outcome.restored > 0 {
+        let commits = plural(outcome.restored, "commit");
+        println!(
+            "{} {commits} back on {} (branch {}) that a rewrite there removed since the last \
+             export (a force-push, perhaps to purge a secret){}",
+            if outcome.pushed { "Put" } else { "Would put" },
+            outcome.url,
+            target.branch,
+            if outcome.pushed {
+                ""
+            } else {
+                "; pushing that takes --republish"
+            }
+        );
     }
     let verb = if outcome.pushed {
         "Exported"
@@ -5585,6 +5631,94 @@ fn pull_remote(target: &str) -> Result<()> {
             plural(outcome.commits, "commit"),
             short_rev(view)
         ),
+    }
+    println!("  publish it with: newgit merge main");
+    Ok(())
+}
+
+fn reset_to_remote(target: &str, dry_run: bool) -> Result<()> {
+    let manager = BranchManager::open(context_here()?.store)?;
+    let outcome = manager.reset_to_remote(target, dry_run)?;
+    let from = format!("{} (branch {})", outcome.url, outcome.branch);
+    let dropped: usize = outcome.lines.iter().map(|line| line.dropped.len()).sum();
+    let verb = if outcome.dry_run {
+        "Would reset"
+    } else {
+        "Reset"
+    };
+    println!(
+        "{verb} `{}`'s line to {from}: {} dropped",
+        outcome.tracker,
+        plural(dropped, "commit")
+    );
+    for line in &outcome.lines {
+        let before = line.from.as_deref().map_or("nothing", short_rev);
+        println!(
+            "  {:<12} {before} -> {} ({} dropped, {} new)",
+            line.tracker,
+            short_rev(&line.to),
+            line.dropped.len(),
+            line.added
+        );
+        for (id, subject) in &line.dropped {
+            println!("    drops {} {subject}", short_rev(id));
+        }
+        for (id, subject) in &line.restored {
+            println!(
+                "    brings back {} {subject}, which an earlier reset dropped: no longer refused",
+                short_rev(id)
+            );
+        }
+    }
+    for held in outcome.instances.iter().filter(|held| held.project_root) {
+        println!(
+            "  the project root has {} of its own on `{}` that the target does not: the reset \
+             would discard them, so it refuses until they are merged (`newgit merge main`) or \
+             taken off the project root's branch",
+            plural(held.own, "commit"),
+            held.tracker
+        );
+    }
+    for held in outcome.instances.iter().filter(|held| !held.project_root) {
+        let way = if held.own == 0 {
+            format!("`newgit pull {}` there follows the reset", held.tracker)
+        } else {
+            format!(
+                "it has {} of its own on the old line; redo them in a new instance",
+                plural(held.own, "commit")
+            )
+        };
+        println!(
+            "  instance `{}` still holds {} of `{}`'s dropped commits: {way}",
+            held.instance, held.dropped, held.tracker
+        );
+    }
+    if dropped > 0 {
+        println!(
+            "  not undone: the project's own history still pins them (so the remote's copy of \
+             it, its Git endpoint, `newgit clone`, and project tags made from it still have \
+             them, and a target of the project's view that never had them cannot take it); \
+             copies anyone already fetched (clones, other machines' instances, the remote's \
+             checkpoints and instance branches) still have them; and another machine merging \
+             them back is not refused there"
+        );
+    }
+    if outcome.dry_run {
+        println!("  nothing moved (--dry-run)");
+        return Ok(());
+    }
+    if dropped > 0 {
+        println!(
+            "  this machine now refuses to carry them onward from `{}`'s line: a merge, a \
+             send to the remote, or an export of a commit the target lacks that holds them",
+            outcome.tracker
+        );
+    }
+    if let Some(view) = &outcome.view {
+        println!(
+            "  pinned:   the project root now pins it ({})",
+            short_rev(view)
+        );
     }
     println!("  publish it with: newgit merge main");
     Ok(())
