@@ -14,8 +14,10 @@ inside a workspace):
 - `newgit run [instance] -- <command>` — run with exports and ports loaded
 - `newgit env [instance]` — the environment `run` and every hook get, each
   variable labeled with the declaration it came from
-- `newgit action <resource>.<action> [instance] [--dry-run]` — `--dry-run`
-  prints the rendered command and its directory, and runs nothing
+- `newgit action <resource>.<action> [instance] [--dry-run] [--quiet]` —
+  `--dry-run` prints the rendered command and its directory, and runs
+  nothing; `--quiet` keeps a one-shot command's output in its log and
+  prints the exit, plus, on failure, the command and the log's end
 - `newgit stop [instance] [--json]` / `start [instance] [--json]` — stop
   every running long-running action and run each `suspend`, dependents
   first, and later bring back exactly what that took down (and any

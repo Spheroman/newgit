@@ -1905,7 +1905,10 @@ Open issues that change what this document can promise:
   on a host without Postgres) fails at the first checkpoint or, worse, the
   first restore.
 - **#89: a failed `prepare` can destroy its own evidence**, when the tool
-  tears down its containers before exiting.
+  tears down its containers before exiting. newgit shows the command that
+  ran and how its log ends, and the reference says how to rerun it by hand
+  with the tool's own keep-it-up flag; it cannot keep the containers
+  itself.
 - **#59: port allocation order within a resource is unspecified**, which
   matters when a tool's default ports are consecutive.
 - **Install store follow-ups:** sub-path exclusions in `produces` for native

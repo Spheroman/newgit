@@ -138,6 +138,12 @@ enum Command {
         /// and run nothing. Refuses for the same reasons a real run would.
         #[arg(long)]
         dry_run: bool,
+        /// Send a one-shot command's output to its log only, and print
+        /// whether it worked: on failure, the command that ran and the
+        /// log's last lines. For a command whose output is long, or an agent
+        /// that should not read all of it.
+        #[arg(long, short)]
+        quiet: bool,
     },
     /// Stop every running long-running action of an instance, dependents
     /// first, and remember what was running for `newgit start`
@@ -812,11 +818,13 @@ fn main() -> Result<()> {
             spec,
             instance,
             dry_run: false,
-        } => action(&spec, instance),
+            quiet,
+        } => action(&spec, instance, quiet),
         Command::Action {
             spec,
             instance,
             dry_run: true,
+            ..
         } => action_dry_run(&spec, instance),
         Command::Stop {
             instance,
@@ -1302,13 +1310,17 @@ fn prepare_label(resource: &ResourceBindOutcome) -> String {
         (None, None) => match &resource.prepare {
             Some((true, _)) => " prepare: ok".to_owned(),
             Some((false, log)) => {
-                // The hook ran quietly; its last lines are usually the why.
+                // The hook ran quietly; its last lines are usually the why,
+                // and the command it ran often is (#89).
+                let ran = newgit_core::supervisor::log_command(log)
+                    .map(|command| format!("\n               ran: {command}"))
+                    .unwrap_or_default();
                 let tail = newgit_core::supervisor::log_tail(log, 8)
                     .into_iter()
                     .map(|line| format!("\n               | {line}"))
                     .collect::<String>();
                 format!(
-                    " prepare: FAILED (log: {log}; re-run with `newgit action {}.prepare`){tail}",
+                    " prepare: FAILED (log: {log}; re-run with `newgit action {}.prepare`){ran}{tail}",
                     resource.name
                 )
             }
@@ -1984,9 +1996,14 @@ fn run(args: RunArgs) -> Result<()> {
     Ok(())
 }
 
-fn action(spec: &str, instance: Option<String>) -> Result<()> {
+fn action(spec: &str, instance: Option<String>, quiet: bool) -> Result<()> {
     let (manager, instance) = manager_and_instance(instance)?;
-    match manager.run_action(&instance, spec)? {
+    let outcome = if quiet {
+        manager.run_action_quiet(&instance, spec)?
+    } else {
+        manager.run_action(&instance, spec)?
+    };
+    match outcome {
         ActionOutcome::Started { pid, log } => {
             println!("Started `{spec}` for `{instance}` (pid {pid})");
             println!("  log: {log}");
@@ -2016,12 +2033,28 @@ fn action(spec: &str, instance: Option<String>) -> Result<()> {
             if let Some(install) = &install {
                 println!("  {}", install.summary());
             }
+            if quiet && code != 0 {
+                print_failed_hook(&log, QUIET_TAIL_LINES);
+            }
             eprintln!("[newgit] `{spec}` exit {code}; log: {log}");
             if code != 0 {
                 std::process::exit(code);
             }
             Ok(())
         }
+    }
+}
+
+/// How much of a failed command's log `action --quiet` shows.
+const QUIET_TAIL_LINES: usize = 20;
+
+/// What a quiet command that failed ran, and how its log ends, on stderr.
+fn print_failed_hook(log: &Utf8Path, lines: usize) {
+    if let Some(command) = newgit_core::supervisor::log_command(log) {
+        eprintln!("[newgit] ran: {command}");
+    }
+    for line in newgit_core::supervisor::log_tail(log, lines) {
+        eprintln!("  | {line}");
     }
 }
 

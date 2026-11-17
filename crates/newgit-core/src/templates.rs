@@ -470,6 +470,12 @@ replace = [
 # (only `--no-backup`, used in `cleanup`, deletes it), so the branch's data
 # comes back on the new ports. Its output and exit code are ignored: there is
 # nothing to stop on a first start.
+#
+# When a container is unhealthy, `supabase start` stops the whole stack
+# before it exits, so the log ends in empty `container logs:` sections. To
+# see why, start it by hand without the teardown, in this instance's
+# environment: `newgit run <instance> -- supabase start
+# --ignore-health-check`, then `docker logs <container>`.
 command = "supabase stop >/dev/null 2>&1; supabase start"
 
 # A convenience command, not a lifecycle hook: nothing runs this for you.

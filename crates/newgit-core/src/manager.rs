@@ -6170,6 +6170,17 @@ impl BranchManager {
 
     /// Run `<resource>.<action>` for an instance.
     pub fn run_action(&self, instance: &str, spec: &str) -> Result<ActionOutcome> {
+        self.run_action_with(instance, spec, false)
+    }
+
+    /// [`Self::run_action`], with a one-shot command's output going to its
+    /// log only rather than to the terminal as well (#89): the caller says
+    /// how it went, as spawn does for a `prepare`.
+    pub fn run_action_quiet(&self, instance: &str, spec: &str) -> Result<ActionOutcome> {
+        self.run_action_with(instance, spec, true)
+    }
+
+    fn run_action_with(&self, instance: &str, spec: &str, quiet: bool) -> Result<ActionOutcome> {
         let (_lock, _) = self.locked_branch(instance)?;
         let (mut branch, definition, action, action_name) = self.resolve_action(instance, spec)?;
         let supervisor = self.supervisor(&branch);
@@ -6200,7 +6211,7 @@ impl BranchManager {
         }
 
         let (code, captured) =
-            self.run_one_shot(&branch, definition, action, action_name, &log, false)?;
+            self.run_one_shot(&branch, definition, action, action_name, &log, quiet)?;
         let missing_captures =
             Self::missing_capture_warnings(&definition.name, action_name, &captured, &log);
         let mut dirty = Self::apply_captures(&mut branch, &definition.name, captured.found);

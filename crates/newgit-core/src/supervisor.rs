@@ -625,11 +625,25 @@ pub fn run_quiet(
     Ok(status.code().unwrap_or(-1))
 }
 
+/// The command a log was written for, from the `[newgit] $ <command>` line
+/// every runner opens it with: what to show beside a failure, since the
+/// rendered command is often the answer (a binary that is not installed, a
+/// port that is not the one expected).
+pub fn log_command(log_path: &Utf8Path) -> Option<String> {
+    let text = std::fs::read_to_string(log_path).ok()?;
+    let command = text.lines().next()?.strip_prefix("[newgit] $ ")?;
+    Some(command.strip_prefix("sh -c ").unwrap_or(command).to_owned())
+}
+
 /// The last `lines` lines of a log, for saying why a quiet hook failed.
+/// Not its opening `[newgit] $` line: [`log_command`] says that.
 pub fn log_tail(log_path: &Utf8Path, lines: usize) -> Vec<String> {
     let text = std::fs::read_to_string(log_path).unwrap_or_default();
     let all: Vec<&str> = text
         .lines()
+        .enumerate()
+        .filter(|(index, line)| !(*index == 0 && line.starts_with("[newgit] $ ")))
+        .map(|(_, line)| line)
         .filter(|line| !line.trim().is_empty())
         .collect();
     all[all.len().saturating_sub(lines)..]

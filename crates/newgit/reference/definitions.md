@@ -859,7 +859,19 @@ clean pass.
 `spawn`, and again for a `recompute` restore — plus the one action a
 resource marks `autostart`. Every other action is something you invoke:
 `newgit action <resource>.<action> [instance]`. Add `--dry-run` to print the
-rendered command and its directory without running it.
+rendered command and its directory without running it, or `--quiet` to keep
+a one-shot command's output in its log only: it then says the exit code,
+and on failure the command that ran and the log's last twenty lines.
+
+**When a hook fails, its log may not hold the why.** A spawn's `prepare`
+runs quietly and its `FAILED` line shows the command that ran and the log's
+last lines. But a tool that cleans up after itself on failure can destroy
+the evidence first: `supabase start` stops every container it started when
+one is unhealthy, so its log ends in empty `container logs:` sections
+(#89). newgit cannot stop a command from tearing itself down. Run its
+steps by hand in the instance's environment instead, `newgit run
+<instance> -- sh`, with whatever flag the tool has for leaving things up
+(`supabase start --ignore-health-check`, then `docker logs <container>`).
 
 **`autostart` starts a process at spawn.** Once every resource is bound and
 prepared, `newgit spawn` starts each `autostart` action, dependencies
