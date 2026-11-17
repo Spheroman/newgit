@@ -1,34 +1,38 @@
 //! Garbage collection on `newgit serve` (#434; docs/design/serve.md,
 //! *Garbage collection*).
 //!
-//! One background thread runs a pass every [`every`]: the landing log
+//! One background thread runs a pass [`grace`] after the server starts
+//! (or [`every`], if that is sooner), so a server restarted more often than
+//! [`every`] still collects, and then every [`every`]: the landing log
 //! first, then each project's home in turn.
 //!
 //! - **The landing log** (`<data>/landing.git`) is collected holding the
 //!   leader's seat ([`crate::landing::Log::collect`]), so no batch's
 //!   `fast-import` runs meanwhile, and nothing in it is ever dropped: its
 //!   entries are what "state at stamp T" reads.
-//! - **A home** is collected holding its root ([`crate::landing::Log::hold`]),
-//!   so no landing there moves, copies, or places anything meanwhile, and
-//!   its compose lock, so no stored rooted history is being extended into
-//!   its stores (that writer skips objects a store already has, so an old
-//!   object it reuses would not be fresh). Then:
-//!   - every merge's landing (`landing/<login>/<namespace>.git`) with no ref
-//!     left in it, no merge in flight for its login there (`Merges`), and
-//!     not opened lately ([`grace`]), is removed;
-//!   - every store is collected with `git gc`, which keeps everything any
-//!     ref in it reaches (every namespace: trackers, forks, stored rooted
-//!     histories), and with `gc.recentObjectsHook` naming what the landings
-//!     left still reach through it: a landing borrows its store's objects
-//!     (its alternates), and its commits' history may be there only.
-//!     Objects nothing reaches go once they are older than [`grace`]: a
-//!     push, a fork's start, or a merge writes objects before a ref names
-//!     them, outside the root's lock, and Git keeps fresh ones for exactly
-//!     that.
+//! - **A home**: first every merge's landing
+//!   (`landing/<login>/<namespace>.git`) with no ref left in it and not
+//!   opened lately ([`grace`]) is removed, under that landing's own lock
+//!   alone. A merge writes into its landing only by opening it, which makes
+//!   one removed again, whole. Then each store, one at a time, holding the
+//!   home's root ([`crate::landing::Log::hold`]), so no landing there moves,
+//!   copies, or places anything meanwhile, and its compose lock, so no
+//!   stored rooted history is being extended into it (that writer skips
+//!   objects a store already has, so an old object it reuses would not be
+//!   fresh). Both are let go of between stores: a landing there, or a fetch
+//!   of a rooted view, waits for one store's `git gc`, never for the whole
+//!   home's. The store is collected with `git gc`, which keeps everything
+//!   any ref in it reaches (every namespace: trackers, forks, stored rooted
+//!   histories), and with `gc.recentObjectsHook` naming what the landings
+//!   left still reach through it: a landing borrows its store's objects
+//!   (its alternates), and its commits' history may be there only. A
+//!   landing with a ref that borrows from no store of the home refuses the
+//!   home's collection. A ref's earlier values (its reflog) are kept for
+//!   [`grace`], then dropped. Objects nothing reaches go once they are older
+//!   than [`grace`]: a push, a fork's start, or a merge writes objects
+//!   before a ref names them, outside the root's lock, and Git keeps fresh
+//!   ones for exactly that.
 //!
-//! Stores never collect on their own (`gc.auto = 0`, `receive.autogc =
-//! false`): a push's `gc --auto` would know nothing of the landings.
-
 use std::collections::BTreeMap;
 use std::sync::Mutex;
 use std::time::Duration;
@@ -101,7 +105,8 @@ pub struct Collected {
     pub landings_removed: usize,
 }
 
-/// Start the background thread, unless [`every`] says none.
+/// Start the background thread, unless [`every`] says none: its first pass
+/// [`grace`] from now (or [`every`], if sooner), then one every [`every`].
 pub fn start(app: &std::sync::Arc<App>) {
     let Some(every) = every() else {
         return;
@@ -110,9 +115,12 @@ pub fn start(app: &std::sync::Arc<App>) {
     let _ = std::thread::Builder::new()
         .name("maintenance".to_owned())
         .spawn(move || {
+            // Not at once: what a merge began before a restart may still be
+            // sent within the grace.
+            std::thread::sleep(grace().min(every));
             loop {
-                std::thread::sleep(every);
                 run(&app);
+                std::thread::sleep(every);
             }
         });
 }
@@ -160,8 +168,9 @@ pub fn run(app: &App) -> Pass {
 }
 
 /// Collect `home`: its merges' landings nothing waits in removed, then
-/// each of its stores, holding its root and its compose lock throughout.
-/// Never called with the db lock held, nor from an async task.
+/// each of its stores, one at a time, holding its root and its compose lock
+/// while that store is collected and no longer. Never called with the db
+/// lock held, nor from an async task.
 pub fn collect_home(app: &App, home: &str) -> ApiResult<Collected> {
     collect_home_within(app, home, grace())
 }
@@ -173,38 +182,71 @@ pub fn collect_home_within(app: &App, home: &str, grace: Duration) -> ApiResult<
         return Err(HttpError::internal(format!("`{home}` is not a home")));
     };
     let dir = id.dir(&app.config.data);
-    let _hold = app
-        .log
-        .hold(app, [home.to_owned()].into(), "garbage collection")?;
-    let compose = app.compose_lock(home);
-    let _composing = compose.blocking_lock();
-    // For the test that lands while a home is collected.
-    app.log.wait_while("hold-home-collect");
-
     let mut collected = Collected::default();
-    let mut borrowing: BTreeMap<Utf8PathBuf, Vec<Utf8PathBuf>> = BTreeMap::new();
-    for (login, landing) in landings(&dir.join("landing")) {
-        if !app.merges.in_flight(home, &login) && repos::remove_landing_if_idle(&landing, grace)? {
+    // No lock but each landing's own: one with a ref in it is never
+    // removed, and one opened again is made again, whole.
+    for landing in landings(&dir.join("landing")) {
+        if repos::remove_landing_if_idle(&landing, grace)? {
             collected.landings_removed += 1;
-            continue;
-        }
-        if let Some(borrowed) = borrowed(&landing) {
-            borrowing.entry(borrowed).or_default().push(landing);
         }
     }
+    let compose = app.compose_lock(home);
     for store in bare_repos(&dir.join("stores")) {
-        let borrowers = borrowing
-            .get(&store.join("objects"))
-            .map_or(&[][..], Vec::as_slice);
-        collect_store(&dir, &store, borrowers, grace)?;
+        let _hold = app
+            .log
+            .hold(app, [home.to_owned()].into(), "garbage collection")?;
+        let _composing = compose.blocking_lock();
+        // For the test that lands while a home is collected.
+        app.log.wait_while("hold-home-collect");
+        // Read under the hold: a tracker's move, which points its landings
+        // at its new store, is a landing.
+        let borrowers = borrowers(&dir, &store)?;
+        collect_store(&dir, &store, &borrowers, grace)?;
         collected.stores += 1;
     }
     Ok(collected)
 }
 
+/// The merges' landings in `home` that borrow the objects of `store` (their
+/// alternates name its objects directory), compared as canonical paths. A
+/// landing with a ref in it that borrows from no store of `home` refuses
+/// the collection: what it reaches through its store is not known, and
+/// collecting could drop it.
+fn borrowers(home: &Utf8Path, store: &Utf8Path) -> ApiResult<Vec<Utf8PathBuf>> {
+    let objects = canonical(&store.join("objects"))
+        .ok_or_else(|| HttpError::internal(format!("{store} has no objects directory")))?;
+    let stores: Vec<Utf8PathBuf> = bare_repos(&home.join("stores"))
+        .iter()
+        .filter_map(|store| canonical(&store.join("objects")))
+        .collect();
+    let mut found = Vec::new();
+    for landing in landings(&home.join("landing")) {
+        let borrowed = borrowed(&landing).and_then(|path| canonical(&path));
+        if borrowed.as_ref() == Some(&objects) {
+            found.push(landing);
+        } else if borrowed.is_none_or(|path| !stores.contains(&path)) && has_refs(&landing)? {
+            return Err(HttpError::internal(format!(
+                "the landing {landing} borrows from no store here, so none is collected"
+            )));
+        }
+    }
+    Ok(found)
+}
+
+fn canonical(path: &Utf8Path) -> Option<Utf8PathBuf> {
+    path.canonicalize_utf8().ok()
+}
+
+fn has_refs(landing: &Utf8Path) -> ApiResult<bool> {
+    Ok(!landing_tips(landing)?.is_empty())
+}
+
 /// `git gc` in the store at `store`, keeping what `borrowers` (merges'
 /// landings whose alternates are this store) still reach through it, and
-/// dropping what nothing reaches once it is older than `grace`.
+/// dropping what nothing reaches once it is older than `grace`. A ref's
+/// earlier values (its reflog) are kept for `grace` too, and no longer: a
+/// commit a force push left behind goes with everything else nothing
+/// reaches.
 fn collect_store(
     home: &Utf8Path,
     store: &Utf8Path,
@@ -218,8 +260,15 @@ fn collect_store(
     // Never `--prune=now`: Git takes that to mean `repack -a`, which drops
     // every packed object no ref reaches and asks no hook. Any other expiry
     // writes a cruft pack, which keeps what the hook names.
-    let prune = format!("--prune={}.seconds.ago", grace.as_secs());
+    let expiry = format!("{}.seconds.ago", grace.as_secs());
+    let prune = format!("--prune={expiry}");
     let mut command = repos::git_command(store);
+    command.args([
+        "-c",
+        &format!("gc.reflogExpire={expiry}"),
+        "-c",
+        &format!("gc.reflogExpireUnreachable={expiry}"),
+    ]);
     // Written beside the stores, never in one, and removed after.
     let keep_file = home.join(format!(".gc-keep-{}", crate::tokens::random_hex(6)));
     if !keep.is_empty() {
@@ -244,12 +293,9 @@ fn collect_store(
     Ok(())
 }
 
-/// Every object the landing at `landing` reaches that its store's branches
-/// (its alternate refs) do not, one id a line: the merge's own objects,
-/// which are in the landing, and any of the store's that only it still
-/// reaches. One that cannot be read refuses the store's collection: what
-/// it needs is not known.
-fn reached_through(landing: &Utf8Path) -> ApiResult<String> {
+/// The commits the landing at `landing` holds for merges
+/// (`refs/newgit/landing/*`).
+fn landing_tips(landing: &Utf8Path) -> ApiResult<Vec<String>> {
     let output = repos::git(
         landing,
         &[
@@ -264,14 +310,24 @@ fn reached_through(landing: &Utf8Path) -> ApiResult<String> {
             String::from_utf8_lossy(&output.stderr).trim()
         )));
     }
-    let tips: Vec<String> = String::from_utf8_lossy(&output.stdout)
+    Ok(String::from_utf8_lossy(&output.stdout)
         .lines()
         .map(str::to_owned)
-        .collect();
+        .collect())
+}
+
+/// Every object the landing at `landing` reaches that its store's branches
+/// (its alternate refs) do not, one id a line: the merge's own objects,
+/// which are in the landing, and any of the store's that only it still
+/// reaches. One missing already (a ref left on a commit whose history went)
+/// is passed over, so what is there is still kept and the store is still
+/// collected.
+fn reached_through(landing: &Utf8Path) -> ApiResult<String> {
+    let tips = landing_tips(landing)?;
     if tips.is_empty() {
         return Ok(String::new());
     }
-    let mut args = vec!["rev-list", "--objects"];
+    let mut args = vec!["rev-list", "--objects", "--missing=allow-any"];
     args.extend(tips.iter().map(String::as_str));
     args.extend(["--not", "--alternate-refs"]);
     let output = repos::git(landing, &args)?;
@@ -292,30 +348,19 @@ fn reached_through(landing: &Utf8Path) -> ApiResult<String> {
 }
 
 /// The objects directory the landing at `dir` borrows, as its alternates
-/// name it.
+/// name it (a relative one is relative to its own objects directory, as Git
+/// reads it).
 fn borrowed(dir: &Utf8Path) -> Option<Utf8PathBuf> {
     let text = std::fs::read_to_string(dir.join("objects/info/alternates")).ok()?;
     text.lines()
         .map(str::trim)
         .find(|line| !line.is_empty())
-        .map(Utf8PathBuf::from)
+        .map(|line| dir.join("objects").join(line))
 }
 
-/// Every merge's landing under `dir` (`<login>/<namespace>.git`), with its
-/// login.
-fn landings(dir: &Utf8Path) -> Vec<(String, Utf8PathBuf)> {
-    let Ok(logins) = dir.read_dir_utf8() else {
-        return Vec::new();
-    };
-    let mut found = Vec::new();
-    for login in logins.flatten() {
-        if login.path().is_dir() {
-            for landing in bare_repos(login.path()) {
-                found.push((login.file_name().to_owned(), landing));
-            }
-        }
-    }
-    found
+/// Every merge's landing under `dir` (`<login>/<namespace>.git`).
+fn landings(dir: &Utf8Path) -> Vec<Utf8PathBuf> {
+    bare_repos(dir)
 }
 
 /// Every bare repository under `dir`, at any depth, skipping ones being

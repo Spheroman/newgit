@@ -267,9 +267,10 @@ fn landing_opened()
 /// Remove the merge's landing at `dir` when nothing waits in it: no ref in
 /// it, and not opened by this process within `quiet` (a push or an upload
 /// may be writing to it). Taken under the lock opening it takes, so a
-/// landing opened at the same moment is made again, whole, after. Whether a
-/// merge is in flight for its login is the caller's to know (`Merges`).
-/// Returns whether it was removed.
+/// landing opened at the same moment is made again, whole, after. A merge
+/// still in flight loses nothing: it writes into its landing only by
+/// opening it ([`Repo::open_landing`]), which makes it again, and what it
+/// sent is named by a ref, which keeps it. Returns whether it was removed.
 pub fn remove_landing_if_idle(dir: &Utf8Path, quiet: std::time::Duration) -> ApiResult<bool> {
     let lock = landing_lock(dir);
     let mut known = lock

@@ -54,7 +54,9 @@ invited, through `POST /v1/dev/login` with `x-dev-login: <secret>`.
 fails in the background rather than in a request: the landing log's tip
 and applied mark, every stuck landing and why, and every project whose
 stored rooted histories failed to extend, with the error and how many
-times in a row (`crates/newgit-serve/src/status.rs`).
+times in a row (`crates/newgit-serve/src/status.rs`). It names every
+project on the server, so `--admin '*'`, which `--admin` accepts as it
+accepts any login list, makes every logged-in user an admin of it.
 
 ## The shape
 
@@ -612,11 +614,14 @@ Resolved loudly; each is reversible.
       meanwhile.
 
 11. **Garbage collection is a pass `newgit serve` runs itself** (#434,
-    `crates/newgit-serve/src/maintenance.rs`), every six hours
-    (`NEWGIT_SERVE_GC_EVERY_SECONDS`; `0` runs none). Stores never collect
-    on their own: `gc.auto = 0` and `receive.autogc = false` are in every
-    store's config (written into older stores at start), since a push's
-    `gc --auto` knows nothing of what merges' landings borrow. A pass:
+    `crates/newgit-serve/src/maintenance.rs`): the first a grace after the
+    server starts (so a server restarted more often than every six hours
+    still collects, and what a merge began before the restart may still
+    be sent first), then every six hours (`NEWGIT_SERVE_GC_EVERY_SECONDS`;
+    `0` runs none). Stores never collect on their own: `gc.auto = 0` and
+    `receive.autogc = false` are in every store's config (written into
+    older stores at start), since a push's `gc --auto` knows nothing of
+    what merges' landings borrow. A pass:
     - **The landing log first**, holding the leader's seat
       (`Log::collect`): no batch's `fast-import` runs while it does, and a
       landing that arrives waits and lands after it. `git repack -d
@@ -624,48 +629,79 @@ Resolved loudly; each is reversible.
       wrote (every object of what it rolls up is kept, reachable or not)
       and `pack-refs` compacts its refs. Nothing is ever dropped: every
       entry, and the state at every stamp, is where it was.
-    - **Then each home, holding its root** (`Log::hold`, so no landing there
-      moves, copies, or places anything) **and its compose lock** (no stored
-      rooted history is being extended into its stores: that writer skips
-      objects a store has, so an old one it reused would not be fresh). A
-      landing there meanwhile waits the root wait, then is answered 503
-      naming the collection; other projects land as before.
-      - A merge's landing (`landing/<login>/<namespace>.git`) with no ref
-        left, no merge in flight for its login there (`Merges`), and not
-        opened by this process within the grace is renamed aside and
-        removed, under the lock opening it takes, so one opened at that
-        moment is made again whole.
-      - Every store is collected with `git gc`, which keeps everything any
-        ref reaches, in every namespace (trackers, forks, stored rooted
-        histories, landing refs), plus what the landings left still reach
-        through it: a landing borrows its store's objects, and a merge's
-        base may be there only. Each landing's `rev-list --objects <its
-        landing refs> --not --alternate-refs` is handed to
-        `gc.recentObjectsHook`, which keeps those and everything they
-        reach. One that cannot be read refuses its store's collection.
-        Objects nothing reaches go once older than the grace
-        (`NEWGIT_SERVE_GC_GRACE_SECONDS`, an hour): a push, a fork's start,
-        or a merge writes objects before a ref names them, outside the
-        root's lock, and Git keeps fresh ones for exactly that. Never
-        `--prune=now`, which Git runs as `repack -a` without asking the
-        hook.
-    - So **a voided move's objects and a narrowing's old history leave
-      their stores** at the first pass after the grace, and with them
+    - **Then each home.** First its merges' landings: one
+      (`landing/<login>/<namespace>.git`) with no ref left and not opened
+      by this process within the grace is renamed aside and removed, under
+      the lock opening it takes, so one opened at that moment is made
+      again whole. That is all a merge in flight needs: it writes into its
+      landing only by opening it, which makes a removed one again, and
+      what it sent is named by a landing ref, which keeps the landing.
+    - **Then each of the home's stores, one at a time, holding the home's
+      root** (`Log::hold`, so no landing there moves, copies, or places
+      anything) **and its compose lock** (no stored rooted history is being
+      extended into it: that writer skips objects a store has, so an old
+      one it reused would not be fresh). Both are let go of between stores.
+      The store is collected with `git gc`, which keeps everything any ref
+      reaches, in every namespace (trackers, forks, stored rooted
+      histories, landing refs), plus what the landings left still reach
+      through it: a landing borrows its store's objects, and a merge's base
+      may be there only. Landings are matched to the store they borrow
+      from by canonical path, read under the hold; one with a ref that
+      borrows from no store of the home refuses the home's collection (said
+      in the pass), since what it needs is not known. Each borrower's
+      `rev-list --objects --missing=allow-any <its landing refs> --not
+      --alternate-refs` is handed to `gc.recentObjectsHook`, which keeps
+      those and everything they reach; a ref on a commit whose history is
+      missing keeps what is there and stops nothing.
+    - **What a pass removes, and when.** An object goes once nothing
+      reaches it and it is older than the grace
+      (`NEWGIT_SERVE_GC_GRACE_SECONDS`, an hour): a push, a fork's start,
+      or a merge writes objects before a ref names them, outside the
+      root's lock, and Git keeps fresh ones for exactly that. Never
+      `--prune=now`, which Git runs as `repack -a` without asking the
+      hook. Stores keep reflogs (`core.logAllRefUpdates = always`), so an
+      operator can see where a ref was, but only for the grace: the pass
+      expires reflog entries older than it (`gc.reflogExpire` and
+      `gc.reflogExpireUnreachable`), so a reflog never keeps anything
+      longer than the grace does. Git's defaults (90 and 30 days) would
+      have kept a force-pushed fork's, a per-user repo's, or a replaced
+      rooted state's old commits readable by id for a month. A deleted
+      ref's reflog goes with it (reftable). So **a voided move's objects,
+      a narrowing's old history, a force push's left-behind commits, and
       what stored rooted histories replaced (each state commit is
-      parentless). `crates/newgit-serve/tests/gc_keeps_reachable.rs` holds
-      a pass to losing nothing reachable (a fork's commit, a landing's base
-      only it reaches, the log at every stamp) and dropping what nothing
-      reaches; `gc_races_no_landing.rs` holds a landing back on both
-      locks. The last pass, and what failed in it (tried again at the
+      parentless) leave their stores** at the first pass at least a grace
+      after nothing reaches them: within the grace plus six hours.
+      Stored rooted histories' maps name view commits in blobs, which Git
+      does not follow, so a deleted branch's views go while the map names
+      them; one asked for again is composed again, to the same commit
+      (`rooted::Line::lookup`; `rooted_after_gc.rs`).
+    - `crates/newgit-serve/tests/gc_keeps_reachable.rs` holds a pass to
+      losing nothing reachable (a fork's commit, a landing's base only it
+      reaches, the log at every stamp) and dropping what nothing reaches;
+      `gc_edges.rs` to dropping a force push's left-behind commit, keeping
+      what a landing with missing history reaches, and matching landings
+      by canonical path; `gc_landing_reopened.rs` to a removed landing
+      reopened whole; `gc_races_no_landing.rs` holds a landing back on
+      both locks. The last pass, and what failed in it (tried again at the
       next), is in `GET /v1/serve/status`.
 
 ## Known limits
-- **Garbage collection holds a home's landings.** A store's `git gc` runs
-  holding its home's root, so a large store (the 22k-repo home's took
-  143 s) answers that project's landings 503 for as long, every six hours.
-  Collecting each store holding only what lands in it, or repacking
-  geometrically between full collections, would shorten that; neither is
-  done yet.
+- **Garbage collection holds a home's landings and rooted fetches, one
+  store at a time.** A store's `git gc` runs holding its home's root and
+  its compose lock, so while a large store is collected (the 22k-repo
+  home's took 143 s) that project's landings are answered 503 after the
+  root wait, and its fetches of a rooted view (`git clone
+  https://<host>/<owner>/<project>.git`, which take the compose lock to
+  bring the stored history up to date) wait, for as long, every six hours.
+  Fetches of a tracker's own repo, pushes outside landings, and other
+  projects do not wait. Holding only what lands in that one store, or
+  repacking geometrically between full collections, would shorten it;
+  neither is done yet.
+- **Not every store is collected.** A pass visits the homes with a
+  `projects` row: stores left under `homes/` by a project gone without its
+  directory are not visited, and the per-fetch composer's stores
+  (`endpoint/<owner>/<project>/`) are never collected ([#470],
+  [#469]).
 - **A merge's objects that reuse an object no ref reaches may lose it.** A
   server merge writes into the merger's landing outside the home's root,
   and like the rooted extension skips objects its view already has
@@ -860,6 +896,8 @@ Resolved loudly; each is reversible.
 
 [#411]: https://github.com/Spheroman/newgit/issues/411
 [#434]: https://github.com/Spheroman/newgit/issues/434
+[#469]: https://github.com/Spheroman/newgit/issues/469
+[#470]: https://github.com/Spheroman/newgit/issues/470
 
 ## Not yet
 
