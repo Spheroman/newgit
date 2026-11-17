@@ -249,6 +249,29 @@ impl Ending<'_> {
 /// so it neither ends the branch's trouble nor is ended with it. A refused
 /// tag stays said until that tag is made (or found made).
 pub fn end(db: &Connection, pull: &Pull, ending: &Ending<'_>, now: i64) -> ApiResult<()> {
+    atomically(db, |db| end_in(db, pull, ending, now))
+}
+
+/// `body` as one transaction: all it writes, or none. A savepoint, so it
+/// nests inside another.
+pub fn atomically<T>(
+    db: &Connection,
+    body: impl FnOnce(&Connection) -> ApiResult<T>,
+) -> ApiResult<T> {
+    db.execute_batch("SAVEPOINT mirror_rows")?;
+    match body(db) {
+        Ok(done) => {
+            db.execute_batch("RELEASE mirror_rows")?;
+            Ok(done)
+        }
+        Err(error) => {
+            let _ = db.execute_batch("ROLLBACK TO mirror_rows; RELEASE mirror_rows");
+            Err(error)
+        }
+    }
+}
+
+fn end_in(db: &Connection, pull: &Pull, ending: &Ending<'_>, now: i64) -> ApiResult<()> {
     db.execute("DELETE FROM mirror_pulls WHERE id = ?", [pull.id])?;
     let target = params![pull.home, pull.target];
     let insert = |db: &Connection| {
@@ -330,6 +353,42 @@ pub fn supersede(db: &Connection, home: &str, target: &str, walk: &[String]) -> 
         }
     }
     Ok(())
+}
+
+/// A pull of `target` landed `landed`, and the mirror's branch has more
+/// beyond it: pulls refused only for carrying one of those commits are not
+/// over, and their own commits have not landed. Each is said on its own now,
+/// as `why` (what to do), rather than counted on a refusal that is gone; and
+/// the trouble kept for the landed commits goes.
+pub fn release(
+    db: &Connection,
+    home: &str,
+    target: &str,
+    landed: &[String],
+    why: &str,
+) -> ApiResult<()> {
+    for ended in ended(db, home)? {
+        if ended.target != target || ended.tag.is_some() {
+            continue;
+        }
+        if ended
+            .blocked_by
+            .as_ref()
+            .is_some_and(|blocked_by| landed.contains(blocked_by))
+            && !landed.contains(&ended.commit)
+        {
+            db.execute(
+                "UPDATE mirror_ended SET blocked_by = NULL, why = ?4 WHERE home = ?1 AND target = ?2 AND tag IS NULL AND commit_id = ?3 AND blocked_by IS NOT NULL",
+                params![home, target, ended.commit, why],
+            )?;
+        }
+    }
+    // One row per commit released, however often it was sent.
+    db.execute(
+        "DELETE FROM mirror_ended WHERE home = ?1 AND target = ?2 AND tag IS NULL AND blocked_by IS NULL AND outcome = 'refused' AND seq NOT IN (SELECT MAX(seq) FROM mirror_ended WHERE home = ?1 AND target = ?2 AND tag IS NULL AND blocked_by IS NULL AND outcome = 'refused' GROUP BY commit_id)",
+        params![home, target],
+    )?;
+    supersede(db, home, target, landed)
 }
 
 /// `target`'s mirror is where `main` is (an export just found or put it

@@ -1,8 +1,10 @@
 // A `newgit serve` that pulls from and exports to a mirror, with GitHub
-// stood in for by bare repositories on disk: `https://github.com/` is
-// rewritten to a directory by Git's own `url.<base>.insteadOf`, for the
-// server and the client alike, and webhook events are signed and sent here.
-// Nothing talks to github.com. `include!`d after `support/serve.rs`.
+// stood in for by bare repositories on disk: the server is told where
+// GitHub's Git is (`git` in its `--github` file, since its mirror Git reads
+// no global config), and the client's `https://github.com/` is rewritten to
+// the same directory by Git's own `url.<base>.insteadOf`. Webhook events are
+// signed and sent here. Nothing talks to github.com. `include!`d after
+// `support/serve.rs`.
 
 const WEBHOOK_SECRET: &str = "test-webhook-secret";
 
@@ -44,14 +46,27 @@ impl Github {
 
 /// `newgit serve` with `--github` naming jack/store's secret and a token,
 /// `api` where GitHub's REST API is (a port nothing listens on, unless a
-/// test stands one up).
+/// test stands one up), and GitHub's Git the stand-in.
+#[allow(dead_code, reason = "not every binary that includes this uses it")]
 fn start_mirrored(temp: &Utf8Path, github: &Github, api: &str) -> Server {
+    start_mirrored_with(temp, github, api, &[])
+}
+
+/// [`start_mirrored`], with `env` set for the server too.
+#[allow(dead_code, reason = "not every binary that includes this uses it")]
+fn start_mirrored_with(
+    temp: &Utf8Path,
+    github: &Github,
+    api: &str,
+    env: &[(&str, &str)],
+) -> Server {
     let data = temp.join("serve");
     let config = temp.join("github.toml");
     std::fs::write(
         &config,
         format!(
-            "api = \"{api}\"\n[projects.\"jack/store\"]\nwebhook_secret = \"{WEBHOOK_SECRET}\"\ntoken = \"test-token\"\n"
+            "api = \"{api}\"\ngit = \"file://{}/\"\n[projects.\"jack/store\"]\nwebhook_secret = \"{WEBHOOK_SECRET}\"\ntoken = \"test-token\"\n",
+            github.root
         ),
     )
     .expect("github.toml");
@@ -59,12 +74,22 @@ fn start_mirrored(temp: &Utf8Path, github: &Github, api: &str) -> Server {
         use std::os::unix::fs::PermissionsExt as _;
         std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o600)).expect("chmod");
     }
+    let decoy = temp.join("server-gitconfig");
+    std::fs::write(
+        &decoy,
+        format!("[url \"file://{temp}/nowhere/\"]\n\tinsteadOf = file://{}/\n", github.root),
+    )
+    .expect("gitconfig");
     let mut child = Command::new(env!("CARGO_BIN_EXE_newgit"))
         .args(["serve", "--data", data.as_str(), "--listen", "127.0.0.1:0", "--allow", "*"])
         .args(["--github", config.as_str()])
         .env("NEWGIT_SERVE_DEV_LOGIN_SECRET", SECRET)
         .env("NEWGIT_SERVE_MIRROR_WAITS", "short")
-        .env("GIT_CONFIG_GLOBAL", github.gitconfig.as_str())
+        // A global config that would send the stand-in nowhere: the
+        // server's mirror Git reads none, so every pull and export here
+        // shows that no `insteadOf` can move them.
+        .env("GIT_CONFIG_GLOBAL", decoy.as_str())
+        .envs(env.iter().copied())
         .stdout(Stdio::piped())
         // What the mirror threads say, for a failing test to show.
         .stderr(std::fs::File::create(temp.join("serve.log")).expect("log"))
@@ -232,6 +257,7 @@ fn mirror_main_until(mirror: &Utf8Path, done: impl Fn(&str) -> bool) -> String {
 }
 
 /// A working clone of the mirror, to make pull requests on.
+#[allow(dead_code, reason = "not every binary that includes this uses it")]
 fn mirror_clone(home: &Utf8Path, temp: &Utf8Path, mirror: &Utf8Path, name: &str) -> Utf8PathBuf {
     let dir = temp.join(name);
     git(home, temp, &["clone", "-q", mirror.as_str(), dir.as_str()]);

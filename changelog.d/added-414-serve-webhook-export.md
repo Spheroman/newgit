@@ -23,13 +23,21 @@
   status`. Configure both with `newgit serve --github <file>`.
 
   The server talks to a mirror only at
-  `https://github.com/<owner>/<name>.git`, and sends the project's token
-  to no other host: a definition's `url` as written is never handed to
-  Git there, and a pull whose target no longer names the repository its
-  event did fetches nothing. Its own export coming back as an event is
-  answered without a pull. A later pull refused for a reason of its own
-  says that reason instead of repeating the first refusal's; a refusal
-  is never pushed out of `newgit status` by the pulls waiting on it or
-  by another mirror's; and it ends when the export next reaches the
-  mirror, so `newgit pull --remote <target>` then `newgit merge main`
-  clears it without an event.
+  `https://github.com/<owner>/<name>.git` (or where the file's `git` key
+  says GitHub's Git is), and sends the project's token to no other host:
+  a definition's `url` as written is never handed to Git there, mirror
+  Git reads no global or system Git config (so no `insteadOf` redirects
+  it), and a pull whose target no longer names the repository its event
+  did fetches nothing. A fetch from a mirror offers it only the view's
+  commits as what the server has, never a tracker's own history, checks
+  what it receives (`fetch.fsckObjects`), and is stopped after ten
+  minutes; `/state` says pulls are stalled when the pull thread is gone
+  or stops moving. Its own export coming back as an event is answered
+  without a pull. A later pull refused for a reason of its own says that
+  reason instead of repeating the first refusal's; a refusal is never
+  pushed out of `newgit status` by the pulls waiting on it or by another
+  mirror's; a refused pull sent again that lands while later pulls
+  waited on it leaves those said, on their own, rather than dropping
+  them; and it ends when the export next reaches the mirror, so `newgit
+  pull --remote <target>` then `newgit merge main` clears it without an
+  event.

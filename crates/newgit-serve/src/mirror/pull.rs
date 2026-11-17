@@ -4,9 +4,10 @@
 //! queue is rows in SQLite, so a restart (a deploy) resumes it where it was
 //! (#353). Each step:
 //!
-//! 1. **Looks.** Fetches the mirror's branch into a scratch repository,
-//!    composes `main` as the target sees it, and walks what the mirror has
-//!    beyond that. Nothing: our own export, or a redelivery; it ends there.
+//! 1. **Looks.** Composes `main` as the target sees it in a scratch
+//!    repository, fetches the mirror's branch into it (offering the mirror
+//!    only that view's commits as what is here), and walks what the mirror
+//!    has beyond that. Nothing: our own export, or a redelivery; it ends there.
 //! 2. **Checks whose work it is, by content** (#404, #451). A branch
 //!    exported for a pull request leaves out what the target withholds, so
 //!    landing its commits alone would drop an instance's work in a withheld
@@ -52,7 +53,7 @@ use crate::names::{RepoRef, lineage, parse_project_key};
 use crate::server_merge::Made;
 
 use super::store::{self, Lookup, Pull};
-use super::{Workbench, core, git_ok, is_ancestor, mirror_git_ok, now};
+use super::{Workbench, core, git_ok, is_ancestor, mirror_git, now};
 
 /// How often the thread looks at the queue when nothing wakes it.
 pub const TICK: Duration = Duration::from_secs(1);
@@ -66,6 +67,9 @@ pub const RETRY_FIRST: i64 = 15;
 pub const RETRY_MAX: i64 = 10 * 60;
 /// How soon GitHub is asked again after it could not answer, doubling.
 pub const ASK_AGAIN: i64 = 30;
+/// How soon a pull starts again after `main` moved under it, doubling; it
+/// counts as an attempt, so a project too busy for it ever to land gives up.
+pub const AGAIN_FIRST: i64 = 1;
 /// How long "no pull request" is not believed: GitHub's list can lag the
 /// push that told us. Past this, a commit with none is a direct push.
 pub const INDEX_WAIT: i64 = 2 * 60;
@@ -96,14 +100,24 @@ pub fn scaled(seconds: i64) -> i64 {
 /// How a step of a pull came out.
 #[derive(Debug)]
 enum Step {
-    Landed,
+    /// `settled`: the mirror's branch has nothing beyond what landed, so the
+    /// target's trouble is over. Not so when later commits there were
+    /// refused with it, waiting on it: they are still to come. `walk`: the
+    /// commits it landed.
+    Landed {
+        settled: bool,
+        walk: Vec<String>,
+    },
     /// A tag's pull made the tag.
     Tagged,
     /// Its commit is on `main` already. `settled`: so is everything else the
     /// mirror's branch has, so the target's trouble is over; not so for an
     /// old delivery sent again while the mirror holds commits `main` lacks.
+    /// `walk`: the commits beyond `main`'s view it found on `main` all the
+    /// same (their work landed another way), as for [`Step::Landed`].
     Nothing {
         settled: bool,
+        walk: Vec<String>,
     },
     Refused {
         why: String,
@@ -114,7 +128,7 @@ enum Step {
     GaveUp(String),
     /// Waiting on GitHub: nothing failed, nothing is spent.
     Wait,
-    /// `main` moved under it: start again at once.
+    /// `main` moved under it: start again soon ([`AGAIN_FIRST`]).
     Again,
 }
 
@@ -125,6 +139,7 @@ pub fn step_all(app: &App) {
         store::heads(&db).unwrap_or_default()
     };
     for pull in heads {
+        app.mirrors.beat();
         let now = now();
         if pull.retry_at.is_some_and(|at| now < at) && now - pull.queued_at <= LIMIT {
             continue;
@@ -159,17 +174,17 @@ fn settle(app: &App, pull: &Pull, outcome: ApiResult<Step>) -> ApiResult<()> {
     let db = app.db.lock();
     let over_time = now - pull.queued_at > LIMIT;
     match outcome {
-        Ok(Step::Landed) => {
+        Ok(Step::Landed { settled, walk }) => {
             log(pull, "landed", None);
-            store::end(&db, pull, &ending("landed", None, true), now)?;
+            landed(&db, pull, "landed", settled, &walk, now)?;
         }
         Ok(Step::Tagged) => {
             log(pull, "tagged", None);
             store::end(&db, pull, &ending("tagged", None, false), now)?;
         }
-        Ok(Step::Nothing { settled }) => {
+        Ok(Step::Nothing { settled, walk }) => {
             log(pull, "nothing to bring in", None);
-            store::end(&db, pull, &ending("nothing", None, settled), now)?;
+            landed(&db, pull, "nothing", settled, &walk, now)?;
         }
         Ok(Step::Refused { why, walk }) => {
             let blocked_by = first_refusal(&db, pull, &walk, &why)?;
@@ -225,7 +240,26 @@ fn settle(app: &App, pull: &Pull, outcome: ApiResult<Step>) -> ApiResult<()> {
             log(pull, "gave up", Some(&why));
             store::end(&db, pull, &ending("gave up", Some(&why), false), now)?;
         }
-        Ok(Step::Wait | Step::Again) => {}
+        Ok(Step::Wait) => {}
+        Ok(Step::Again) => {
+            let why = "`main` moved while it was landing: it starts again";
+            let attempts = store::failed(
+                &db,
+                pull.id,
+                why,
+                now + retry_delay(pull.attempts + 1, AGAIN_FIRST),
+                now,
+            )?;
+            log(pull, "again", Some(why));
+            if attempts >= ATTEMPTS {
+                let why = format!(
+                    "`main` moved under it {attempts} times while it was landing. Nothing moved: {}",
+                    super::bring_it_in(&pull.target)
+                );
+                log(pull, "gave up", Some(&why));
+                store::end(&db, pull, &ending("gave up", Some(&why), false), now)?;
+            }
+        }
         Err(error) => {
             let why = error.cause().to_owned();
             let attempts = store::failed(
@@ -247,6 +281,31 @@ fn settle(app: &App, pull: &Pull, outcome: ApiResult<Step>) -> ApiResult<()> {
         }
     }
     Ok(())
+}
+
+/// A pull's commits (`walk`) are on `main` now. Unless that settles the
+/// target, a later pull refused only for carrying them is still to come:
+/// it is said on its own, with what to do, rather than dropped with the
+/// refusal it waited on.
+fn landed(
+    db: &rusqlite::Connection,
+    pull: &Pull,
+    outcome: &str,
+    settled: bool,
+    walk: &[String],
+    now: i64,
+) -> ApiResult<()> {
+    let released = format!(
+        "it was refused only for carrying commit {}, whose pull has landed since; what it brings beyond that has not. Nothing moved: {}",
+        short(&pull.commit),
+        super::bring_it_in(&pull.target)
+    );
+    store::atomically(db, |db| {
+        if !settled && !walk.is_empty() {
+            store::release(db, &pull.home, &pull.target, walk, &released)?;
+        }
+        store::end(db, pull, &ending(outcome, None, settled), now)
+    })
 }
 
 fn ending<'a>(outcome: &'a str, why: Option<&'a str>, settles: bool) -> store::Ending<'a> {
@@ -329,6 +388,7 @@ fn step(app: &App, pull: &Pull) -> ApiResult<Step> {
         .github
         .project(&pull.home)
         .and_then(|github| github.token.clone());
+    let git = app.github.git_base();
     let bench = Workbench::open(&project, Some(&pull.pusher), list)?;
     let dir = bench.dir().to_owned();
     // The target as `main` declares it now, which may not be what it was
@@ -341,45 +401,20 @@ fn step(app: &App, pull: &Pull) -> ApiResult<Step> {
         .into_iter()
         .find(|target| target.name == pull.target)
         .filter(|target| super::names_repo(target, &pull.repo) && target.branch == pull.branch);
-    let (Some(target), Some(url)) = (target, super::mirror_url(&pull.repo)) else {
+    let (Some(target), Some(url)) = (target, super::mirror_url(git, &pull.repo)) else {
         return Ok(Step::GaveUp(format!(
             "`{}` no longer exports to `{}` of {} on `main`: the event was for that, so nothing was fetched",
             pull.target, pull.branch, pull.repo
         )));
     };
+    let fetch = Fetch {
+        dir: &dir,
+        git,
+        url: &url,
+        token: token.as_deref(),
+    };
     if let Some(tag) = &pull.tag {
-        return tag_pull(
-            app,
-            pull,
-            &caller,
-            &bench,
-            &target,
-            &url,
-            tag,
-            token.as_deref(),
-        );
-    }
-    mirror_git_ok(
-        &dir,
-        token.as_deref(),
-        &[
-            "fetch",
-            "--quiet",
-            "--no-tags",
-            &url,
-            &format!("+refs/heads/{}:refs/mirrors/tip", pull.branch),
-        ],
-    )?;
-    let is_commit =
-        git_ok(&dir, &["cat-file", "-t", &pull.commit]).is_ok_and(|kind| kind == "commit");
-    if !is_commit || !is_ancestor(&dir, &pull.commit, "refs/mirrors/tip") {
-        return Ok(Step::Refused {
-            why: format!(
-                "`{}` on `{}` no longer holds commit {}",
-                pull.branch, target.name, pull.commit
-            ),
-            walk: Vec::new(),
-        });
+        return tag_pull(app, pull, &caller, &bench, &target, &fetch, tag);
     }
     Landing {
         app,
@@ -391,8 +426,59 @@ fn step(app: &App, pull: &Pull) -> ApiResult<Step> {
         target: &target,
         at: target.declared_by().to_owned(),
         token: token.as_deref(),
+        fetch: &fetch,
     }
     .run()
+}
+
+/// A fetch from the mirror into the scratch repository.
+struct Fetch<'a> {
+    dir: &'a Utf8Path,
+    git: &'a str,
+    url: &'a str,
+    token: Option<&'a str>,
+}
+
+impl Fetch<'_> {
+    /// `refspec`, offering as what is here only the commits of the view
+    /// composed at `view`: the scratch repository also holds every tracker's
+    /// own history, the withheld ones' too, whose ids are not the mirror's
+    /// to see (and which it does not have, so offering them would only fetch
+    /// everything again). Checked as it comes in (`fetch.fsckObjects`).
+    fn run(&self, view: &str, refspec: &str) -> ApiResult<std::process::Output> {
+        mirror_git(
+            self.dir,
+            self.git,
+            self.token,
+            &[
+                "fetch",
+                "--quiet",
+                "--no-tags",
+                &format!("--negotiation-tip={view}"),
+                self.url,
+                refspec,
+            ],
+        )
+    }
+
+    /// [`Fetch::run`], failing with Git's message, which never holds the token.
+    fn ok(&self, view: &str, refspec: &str) -> ApiResult<()> {
+        let output = self.run(view, refspec)?;
+        if !output.status.success() {
+            return Err(self.failed(&output));
+        }
+        Ok(())
+    }
+
+    fn failed(&self, output: &std::process::Output) -> HttpError {
+        HttpError::new(
+            502,
+            format!(
+                "git fetch failed: {}",
+                super::redact(String::from_utf8_lossy(&output.stderr).trim(), self.token)
+            ),
+        )
+    }
 }
 
 /// A tag made on the mirror: nothing lands. The root commit on `main` whose
@@ -401,16 +487,14 @@ fn step(app: &App, pull: &Pull) -> ApiResult<Step> {
 /// (`api::make_tag`): never moved, and found made when it is our own export
 /// of a tag coming back as an event. An annotated tag keeps its tagger and
 /// its message.
-#[expect(clippy::too_many_arguments, reason = "one pull's context")]
 fn tag_pull(
     app: &App,
     pull: &Pull,
     caller: &Caller,
     bench: &Workbench,
     target: &ExportTarget,
-    url: &str,
+    fetch: &Fetch<'_>,
     tag: &str,
-    token: Option<&str>,
 ) -> ApiResult<Step> {
     let dir = bench.dir();
     let refused = |why: String| {
@@ -429,26 +513,28 @@ fn tag_pull(
             target.name
         ));
     }
-    let fetched = super::mirror_git(
-        dir,
-        token,
-        &[
-            "fetch",
-            "--quiet",
-            "--no-tags",
-            url,
-            &format!("+refs/tags/{tag}:refs/mirrors/tag"),
-        ],
+
+    // `main` as the target sees it, composed before anything is fetched:
+    // the mirror's commits are in it under the very ids they have there,
+    // each noted with its root commit, and only its commits are offered to
+    // the mirror as what is here.
+    let pin = bench
+        .list
+        .get("root")
+        .cloned()
+        .ok_or_else(|| HttpError::new(409, "`main` names no root commit"))?;
+    let exported = view_of(bench, target, &pin, "refs/mirrors/view/target")?;
+
+    let fetched = fetch.run(
+        "refs/mirrors/view/target",
+        &format!("+refs/tags/{tag}:refs/mirrors/tag"),
     )?;
     if !fetched.status.success() {
         let stderr = String::from_utf8_lossy(&fetched.stderr);
         if stderr.contains("couldn't find remote ref") {
             return refused(format!("`{}` no longer has it", target.name));
         }
-        return Err(HttpError::new(
-            502,
-            format!("git fetch failed: {}", super::redact(stderr.trim(), token)),
-        ));
+        return Err(fetch.failed(&fetched));
     }
     if git_ok(dir, &["rev-parse", "refs/mirrors/tag"])? != pull.commit {
         return refused(format!(
@@ -475,28 +561,6 @@ fn tag_pull(
         serde_json::Value::Null
     };
 
-    // `main` as the target sees it: the mirror's commits are in it under
-    // the very ids they have there, each noted with its root commit.
-    let pin = bench
-        .list
-        .get("root")
-        .cloned()
-        .ok_or_else(|| HttpError::new(409, "`main` names no root commit"))?;
-    let ships = |name: &str| bench.ships(target, name);
-    let exported = compose::compose(
-        dir,
-        "root",
-        &[("refs/mirrors/view/target".to_owned(), pin)],
-        &ComposeOptions {
-            readable: &ships,
-            admit: None,
-        },
-    )
-    .map_err(core)?
-    .into_iter()
-    .next()
-    .and_then(|view| view.tip)
-    .ok_or_else(|| HttpError::new(409, "`root` composes to nothing"))?;
     let root = if is_ancestor(dir, &commit, &exported) {
         compose::read_root(dir, &commit)
             .map_err(core)?
@@ -514,19 +578,75 @@ fn tag_pull(
         ));
     };
 
+    let id = bench_project(pull)?;
+    let existing = {
+        let db = app.db.lock();
+        let project = ProjectContext::load(app, &db, caller, &id)?;
+        match crate::api::may_tag(&project, &db, caller) {
+            Ok(()) => {}
+            Err(error) if matches!(error.status, 400 | 403 | 409) => {
+                return refused(error.message);
+            }
+            Err(error) => return Err(error),
+        }
+        db::tag(&db, &project.key, tag)?
+    };
+    // There already at a later root commit than the one noted, with this
+    // annotation: a view commit stands for each root commit after it that
+    // changed only what the target does not ship, so the tag made here (and
+    // exported) at one of those comes back naming the same commit.
+    if let Some(existing) = &existing
+        && existing["annotation"] == annotation
+        && let Some(at) = existing["list"]["root"].as_str()
+        && at != root
+        && view_of(bench, target, at, "refs/mirrors/view/tagged")? == commit
+    {
+        return Ok(Step::Nothing {
+            settled: false,
+            walk: Vec::new(),
+        });
+    }
+
     let db = app.db.lock();
-    let project = ProjectContext::load(app, &db, caller, &bench_project(pull)?)?;
-    let made = crate::api::may_tag(&project, &db, caller)
-        .and_then(|()| crate::api::make_tag(&project, &db, &pull.pusher, tag, &root, &annotation));
+    let project = ProjectContext::load(app, &db, caller, &id)?;
+    let made = crate::api::make_tag(&project, &db, &pull.pusher, tag, &root, &annotation);
     match made {
         Ok((_, true)) => Ok(Step::Tagged),
         // There already, naming this commit: our own export of it.
-        Ok((_, false)) => Ok(Step::Nothing { settled: false }),
+        Ok((_, false)) => Ok(Step::Nothing {
+            settled: false,
+            walk: Vec::new(),
+        }),
         // A refusal is an answer: a tag that would move, a commit not on
-        // `main`, a pusher who may not tag.
+        // `main`.
         Err(error) if matches!(error.status, 400 | 403 | 409) => refused(error.message),
         Err(error) => Err(error),
     }
+}
+
+/// Root commit `root` as `target` (rooted at root) sees it: its view
+/// commit, set at `reference`.
+fn view_of(
+    bench: &Workbench,
+    target: &ExportTarget,
+    root: &str,
+    reference: &str,
+) -> ApiResult<String> {
+    let ships = |name: &str| bench.ships(target, name);
+    compose::compose(
+        bench.dir(),
+        "root",
+        &[(reference.to_owned(), root.to_owned())],
+        &ComposeOptions {
+            readable: &ships,
+            admit: None,
+        },
+    )
+    .map_err(core)?
+    .into_iter()
+    .next()
+    .and_then(|view| view.tip)
+    .ok_or_else(|| HttpError::new(409, "`root` composes to nothing"))
 }
 
 fn bench_project(pull: &Pull) -> ApiResult<crate::names::ProjectId> {
@@ -546,6 +666,7 @@ struct Landing<'a> {
     /// The tracker the target is rooted at: `root`, or its own.
     at: String,
     token: Option<&'a str>,
+    fetch: &'a Fetch<'a>,
 }
 
 /// An instance holding work in a tracker the target withholds that `main`
@@ -592,6 +713,23 @@ impl Landing<'_> {
             .first()
             .and_then(|view| view.tip.clone())
             .ok_or_else(|| HttpError::new(409, format!("`{}` composes to nothing", self.at)))?;
+
+        // Only now the mirror, offered only the view's commits as ours.
+        self.fetch.ok(
+            "refs/mirrors/view/target",
+            &format!("+refs/heads/{}:refs/mirrors/tip", self.pull.branch),
+        )?;
+        let is_commit =
+            git_ok(dir, &["cat-file", "-t", &self.pull.commit]).is_ok_and(|kind| kind == "commit");
+        if !is_commit || !is_ancestor(dir, &self.pull.commit, "refs/mirrors/tip") {
+            return Ok(Step::Refused {
+                why: format!(
+                    "`{}` on `{}` no longer holds commit {}",
+                    self.pull.branch, self.target.name, self.pull.commit
+                ),
+                walk: Vec::new(),
+            });
+        }
         let walk = lines(&git_ok(
             dir,
             &[
@@ -620,6 +758,7 @@ impl Landing<'_> {
             )?;
             return Ok(Step::Nothing {
                 settled: beyond.is_empty(),
+                walk: Vec::new(),
             });
         }
         let refused = |why: String| Step::Refused {
@@ -693,7 +832,29 @@ impl Landing<'_> {
             let db = self.app.db.lock();
             store::set_step(&db, self.pull.id, "landing", now())?;
         }
+        // Whether the mirror's branch has anything beyond what this lands: a
+        // later pull refused with this one, waiting on it, is still to come.
+        let beyond = git_ok(
+            dir,
+            &[
+                "rev-list",
+                "-n",
+                "1",
+                "refs/mirrors/tip",
+                "--not",
+                &self.pull.commit,
+                &exported,
+            ],
+        )?;
         match self.land(&walk, &withheld, &pin) {
+            Ok(Step::Landed { walk, .. }) => Ok(Step::Landed {
+                settled: beyond.is_empty(),
+                walk,
+            }),
+            Ok(Step::Nothing { walk, .. }) => Ok(Step::Nothing {
+                settled: beyond.is_empty(),
+                walk,
+            }),
             Ok(step) => Ok(step),
             Err(LandError::Refused(Refusal(why))) => Ok(refused(why)),
             Err(LandError::Again) => Ok(Step::Again),
@@ -1027,7 +1188,10 @@ impl Landing<'_> {
             SplitError::Git(error) => LandError::Failed(core(error)),
         })?;
         if split.root == pin || is_ancestor(dir, &split.root, pin) {
-            return Ok(Step::Nothing { settled: true });
+            return Ok(Step::Nothing {
+                settled: true,
+                walk: walk.to_vec(),
+            });
         }
         let Some(base_own) = git_ok(dir, &["merge-base", &split.root, pin])
             .ok()
@@ -1108,7 +1272,10 @@ impl Landing<'_> {
         match finished {
             Ok(_) => {
                 made.landed();
-                Ok(Step::Landed)
+                Ok(Step::Landed {
+                    settled: true,
+                    walk: walk.to_vec(),
+                })
             }
             Err(error) => Err(self.answered(error)),
         }
@@ -1233,7 +1400,7 @@ impl Landing<'_> {
             .open_landing(&self.pull.pusher)?;
         let indexed = crate::repos::git_timed(
             &landing,
-            &["index-pack", "--stdin", "--fix-thin"],
+            &["index-pack", "--stdin", "--fix-thin", "--strict"],
             Some(&pack.stdout),
             crate::server_merge::GIT_LIMIT,
         )?;

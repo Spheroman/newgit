@@ -214,7 +214,8 @@ impl Export<'_> {
         };
         // Only ever GitHub over HTTPS, made from the repository's name: a
         // definition's `url` as written is never handed to Git here.
-        let Some(url) = super::url_of(self.target) else {
+        let git = self.app.github.git_base();
+        let Some(url) = super::url_of(git, self.target) else {
             return Err(HttpError::new(
                 409,
                 format!(
@@ -224,13 +225,19 @@ impl Export<'_> {
             ));
         };
         let branch = &self.target.branch;
+        // Only the view's commits are offered as what is here: the scratch
+        // repository also holds every tracker's own history, the withheld
+        // ones' too, whose ids are not the mirror's to see (and which it
+        // does not have, so offering them would only fetch all again).
         let fetched = mirror_git(
             dir,
+            git,
             self.token,
             &[
                 "fetch",
                 "--quiet",
                 "--no-tags",
+                &format!("--negotiation-tip={tip}"),
                 &url,
                 &format!("+refs/heads/{branch}:refs/export/theirs"),
             ],
@@ -273,6 +280,7 @@ impl Export<'_> {
         self.check(&tip, theirs.as_deref())?;
         mirror_git_ok(
             dir,
+            git,
             self.token,
             &[
                 "push",

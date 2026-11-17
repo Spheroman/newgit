@@ -29,15 +29,20 @@ use crate::policy;
 use super::store::{self, Queued};
 
 /// Whether `header` is GitHub's signature of `body` under `secret`:
-/// `sha256=` and 64 hex digits of the HMAC, compared in constant time.
+/// `sha256=` and 64 lowercase hex digits of the HMAC, compared in constant
+/// time.
 pub fn verify(secret: &str, body: &[u8], header: Option<&str>) -> bool {
     let Some(hex) = header.and_then(|header| header.strip_prefix("sha256=")) else {
         return false;
     };
-    // Exactly 64 hex digits, as GitHub writes them: `from_str_radix` alone
-    // would also take a sign (`+f`), and so more than one spelling of a
-    // signature.
-    if hex.len() != 64 || !hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+    // Exactly 64 lowercase hex digits, as GitHub writes them: one spelling
+    // of a signature. `from_str_radix` alone would also take a sign (`+f`)
+    // and uppercase.
+    if hex.len() != 64
+        || !hex
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+    {
         return false;
     }
     let Some(given) = (0..32)
@@ -219,7 +224,7 @@ pub fn receive(app: &App, request: &ApiRequest) -> ApiResult<ApiResponse> {
             &repo,
         );
     };
-    if super::url_of(&target).is_none() {
+    if super::url_of(app.github.git_base(), &target).is_none() {
         return refused(
             403,
             format!(
@@ -363,8 +368,10 @@ mod tests {
         ));
         assert!(!verify("s3cret", body, Some(&format!("{header}00"))));
         assert!(!verify("s3cret", body, Some(&header[..header.len() - 2])));
+        // One spelling: GitHub's lowercase, never uppercase.
         let upper = header.to_uppercase().replace("SHA256=", "sha256=");
-        assert!(verify("s3cret", body, Some(&upper)));
+        assert_ne!(upper, header);
+        assert!(!verify("s3cret", body, Some(&upper)));
     }
 
     #[test]

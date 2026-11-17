@@ -2289,11 +2289,9 @@ fn valid_tagger(tagger: &str) -> bool {
         && zone.bytes().skip(1).all(|byte| byte.is_ascii_digit())
 }
 
-/// Whether the mirror threads run: `/state` says a pull is stalled when not.
+/// Whether pulls are moving: `/state` says a pull is stalled when its thread
+/// is gone, or has not stamped its beat for `mirror::STALLED_AFTER`.
 fn app_running(app: &App) -> bool {
     let off = std::env::var("NEWGIT_SERVE_MIRRORS").is_ok_and(|value| value == "off");
-    off || app
-        .mirrors
-        .pulling
-        .load(std::sync::atomic::Ordering::SeqCst)
+    off || app.mirrors.pulls_moving()
 }

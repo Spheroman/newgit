@@ -151,9 +151,12 @@ What differs is the machinery, and it is the reason to run it:
   cut on GitHub) is made on the remote too, on the commit it names, once
   that commit is on `main`; a tag never moves. When one is refused,
   `newgit status` says why and what to do. The server only ever talks to
-  `https://github.com/<owner>/<name>.git`, with that project's token: a
-  target written as an SSH address or on another host is exported by
-  `newgit export` from your machine, not by the server.
+  `https://github.com/<owner>/<name>.git`, with that project's token, and
+  its mirror Git ignores your global and system Git config: a target
+  written as an SSH address or on another host is exported by `newgit
+  export` from your machine, not by the server. (GitHub Enterprise, or a
+  test's stand-in: `git = "https://github.example.com/"` at the top of the
+  file.)
 
 What it does not do yet:
 

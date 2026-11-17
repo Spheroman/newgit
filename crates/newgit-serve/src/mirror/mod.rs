@@ -41,6 +41,11 @@ use crate::error::{ApiResult, HttpError};
 /// ```toml
 /// # Where GitHub's REST API is (GitHub Enterprise, or a test's stand-in).
 /// api = "https://api.github.com"
+/// # Where GitHub's Git is: every mirror is `<git><owner>/<name>.git`, and
+/// # the token goes nowhere else (GitHub Enterprise, or a test's stand-in:
+/// # a `file://` directory). Mirror Git reads no global or system config,
+/// # so this, not a `url.<base>.insteadOf`, is how it is pointed elsewhere.
+/// git = "https://github.com/"
 ///
 /// [projects."spheroman/newgit"]
 /// # The secret given to each of this project's mirrors' webhooks.
@@ -55,6 +60,8 @@ use crate::error::{ApiResult, HttpError};
 #[derive(Clone, Default)]
 pub struct GithubConfig {
     pub api: String,
+    /// Where GitHub's Git is, ending in `/`: [`GITHUB`] unless the file says.
+    pub git: String,
     pub projects: BTreeMap<String, ProjectGithub>,
 }
 
@@ -69,6 +76,7 @@ impl std::fmt::Debug for GithubConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("GithubConfig")
             .field("api", &self.api)
+            .field("git", &self.git)
             .field("projects", &self.projects.keys().collect::<Vec<_>>())
             .finish()
     }
@@ -101,6 +109,7 @@ impl GithubConfig {
         #[serde(deny_unknown_fields)]
         struct File {
             api: Option<String>,
+            git: Option<String>,
             #[serde(default)]
             projects: BTreeMap<String, Entry>,
         }
@@ -127,7 +136,20 @@ impl GithubConfig {
                 },
             );
         }
+        let git = match file.git {
+            None => GITHUB.to_owned(),
+            Some(git) => {
+                let git = format!("{}/", git.trim_end_matches('/'));
+                if !(git.starts_with("https://") || git.starts_with("file:///")) {
+                    anyhow::bail!(
+                        "`git` is GitHub's Git over `https://` (or a `file:///` stand-in): {git}"
+                    );
+                }
+                git
+            }
+        };
         Ok(Self {
+            git,
             api: file
                 .api
                 .unwrap_or_else(|| GITHUB_API.to_owned())
@@ -140,6 +162,15 @@ impl GithubConfig {
     pub fn project(&self, home: &str) -> Option<&ProjectGithub> {
         self.projects.get(home)
     }
+
+    /// Where GitHub's Git is: [`GITHUB`] for a config made in code.
+    pub fn git_base(&self) -> &str {
+        if self.git.is_empty() {
+            GITHUB
+        } else {
+            &self.git
+        }
+    }
 }
 
 /// Wakes the background threads: an event queued, a landing made.
@@ -149,12 +180,51 @@ pub struct Mirrors {
     pulled: Condvar,
     exports: Mutex<BTreeMap<String, u64>>,
     exported: Condvar,
-    /// Whether each thread is running: `/state` says when one is not.
+    /// Whether each thread is running: `/state` says when one is not. Each
+    /// is cleared when its thread ends, however it ends.
     pub pulling: std::sync::atomic::AtomicBool,
     pub exporting: std::sync::atomic::AtomicBool,
+    /// When the pull thread last showed it was moving (seconds since the
+    /// epoch): a thread stuck in a step stops stamping it.
+    pub pull_beat: std::sync::atomic::AtomicI64,
+}
+
+/// How long the pull thread may go without stamping [`Mirrors::pull_beat`]
+/// before `/state` says its pulls are stalled: longer than any one network
+/// Git command may run ([`MIRROR_GIT_LIMIT`]) with what a step does around it.
+pub const STALLED_AFTER: i64 = 3 * MIRROR_GIT_LIMIT.as_secs() as i64;
+
+/// Whether pulls are moving: the thread is there, and stamped its beat
+/// within [`STALLED_AFTER`].
+pub fn pulls_moving(pulling: bool, beat: i64, now: i64) -> bool {
+    pulling && now - beat <= STALLED_AFTER
+}
+
+/// Clears its flag when its thread ends, by a panic too.
+struct Running<'a>(&'a std::sync::atomic::AtomicBool);
+
+impl Drop for Running<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
 }
 
 impl Mirrors {
+    /// The pull thread is moving: stamped before each step and between them.
+    pub fn beat(&self) {
+        self.pull_beat
+            .store(now(), std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Whether pulls are moving, as `/state` says it.
+    pub fn pulls_moving(&self) -> bool {
+        pulls_moving(
+            self.pulling.load(std::sync::atomic::Ordering::SeqCst),
+            self.pull_beat.load(std::sync::atomic::Ordering::SeqCst),
+            now(),
+        )
+    }
+
     /// A pull was queued: look at the queue now.
     pub fn wake_pulls(&self) {
         *self
@@ -214,11 +284,14 @@ pub fn start(app: &std::sync::Arc<App>) {
     std::thread::Builder::new()
         .name("mirror-pulls".to_owned())
         .spawn(move || {
+            pulls.mirrors.beat();
             pulls
                 .mirrors
                 .pulling
                 .store(true, std::sync::atomic::Ordering::SeqCst);
+            let _running = Running(&pulls.mirrors.pulling);
             loop {
+                pulls.mirrors.beat();
                 pull::step_all(&pulls);
                 pulls.mirrors.wait_pulls(pull::TICK);
             }
@@ -232,6 +305,7 @@ pub fn start(app: &std::sync::Arc<App>) {
                 .mirrors
                 .exporting
                 .store(true, std::sync::atomic::Ordering::SeqCst);
+            let _running = Running(&exports.mirrors.exporting);
             // At start, every configured project: a landing made while the
             // server was down, or an export that was failing, is not lost.
             exports
@@ -261,14 +335,15 @@ pub(crate) fn now() -> i64 {
 
 // ── Git against a mirror ──────────────────────────────────────────────────
 
-/// Where this server talks to a mirror: `https://github.com/<owner>/<name>.git`,
+/// Where this server talks to a mirror: `<git><owner>/<name>.git`, `git`
+/// being GitHub's Git (`https://github.com/`, [`GithubConfig::git_base`]),
 /// made here from the repository's name and never taken from a definition as
 /// written. A definition's `url` is whatever a maintainer of `access` typed
 /// (an `scp`-style address, a path, text that starts with `-`), and handed to
 /// Git it would be fetched with this server's own SSH keys, read another
 /// project's store off this disk, or be taken for an option. `None` when
 /// `repo` is not `<owner>/<name>` in the letters GitHub allows.
-pub fn mirror_url(repo: &str) -> Option<String> {
+pub fn mirror_url(git: &str, repo: &str) -> Option<String> {
     let (owner, name) = repo.split_once('/')?;
     // GitHub's own letters. Never a leading `-` (an option), never `.` or
     // `..` (a path), and no `.git` to double.
@@ -283,62 +358,111 @@ pub fn mirror_url(repo: &str) -> Option<String> {
                 .bytes()
                 .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
     };
-    (part(owner) && part(name)).then(|| format!("{GITHUB}{owner}/{name}.git"))
+    (part(owner) && part(name)).then(|| format!("{git}{owner}/{name}.git"))
 }
 
-/// Every mirror is under here, and the token goes nowhere else.
+/// Every mirror is under here, unless `--github`'s file says where GitHub's
+/// Git is, and the token goes nowhere else.
 pub const GITHUB: &str = "https://github.com/";
 
 /// The mirror an export target names, as [`mirror_url`] makes it.
-pub fn url_of(target: &ExportTarget) -> Option<String> {
-    mirror_url(&target.github_repo()?)
+pub fn url_of(git: &str, target: &ExportTarget) -> Option<String> {
+    mirror_url(git, &target.github_repo()?)
 }
 
-/// Git in `dir` (a bare repository), talking to a mirror: the token, when
-/// there is one, is handed to Git in its environment (`GIT_CONFIG_*`), never
-/// in its arguments, so no error message or log line that names the command
-/// carries it. It is an `http.<url>.extraHeader` for [`GITHUB`] alone: Git
-/// sends it to no other host, whatever it is asked to fetch.
+/// The longest one network Git command against a mirror may run before it is
+/// stopped (a failed attempt, retried): GitHub stalling must never hold the
+/// pull thread. Git also gives up on its own when the transfer runs below
+/// 1 KB/s for a minute (`http.lowSpeedLimit`).
+pub const MIRROR_GIT_LIMIT: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+
+/// Git in `dir` (a bare repository), talking to a mirror at `git`
+/// ([`GithubConfig::git_base`]). The token, when there is one, is handed to
+/// Git in its environment (`GIT_CONFIG_*`, after whatever entries the
+/// server's own environment sets), never in its arguments, so no error
+/// message or log line that names the command carries it. It is an
+/// `http.<url>.extraHeader` for `git` alone: Git sends it to no other host,
+/// whatever it is asked to fetch.
+///
+/// Git here reads no global or system config file, so nothing there (a
+/// `url.<base>.insteadOf`, a credential helper) can send a mirror's fetch,
+/// or the token, anywhere else; what it fetches is checked
+/// (`fetch.fsckObjects`); and it never offers the mirror its alternates'
+/// refs as what it has (a fetch names what it has with
+/// `--negotiation-tip`, the view's commits alone).
 pub(crate) fn mirror_command(
     dir: &Utf8Path,
+    git: &str,
     token: Option<&str>,
     args: &[&str],
 ) -> std::process::Command {
     let mut command = crate::repos::git_command(dir);
     command
+        .args(["-c", "fetch.fsckObjects=true"])
+        // The scratch repository borrows every store, and Git offers what an
+        // alternate's refs name to the other side as what it has, whatever
+        // `--negotiation-tip` says: tracker commits, the withheld ones'
+        // too. No alternate's ref is listed here.
+        .args(["-c", "core.alternateRefsPrefixes=refs/newgit-none/"])
+        .args([
+            "-c",
+            "http.lowSpeedLimit=1000",
+            "-c",
+            "http.lowSpeedTime=60",
+        ])
         .args(args)
         .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
         .stdin(std::process::Stdio::null());
     if let Some(token) = token {
         use base64::Engine as _;
         let basic =
             base64::engine::general_purpose::STANDARD.encode(format!("x-access-token:{token}"));
-        command
-            .env("GIT_CONFIG_COUNT", "1")
-            .env("GIT_CONFIG_KEY_0", format!("http.{GITHUB}.extraHeader"))
-            .env(
-                "GIT_CONFIG_VALUE_0",
-                format!("Authorization: Basic {basic}"),
-            );
+        let header = format!("Authorization: Basic {basic}");
+        let key = format!("http.{git}.extraHeader");
+        command.envs(newgit_core::source::config_env(&[(&key, &header)]));
+    }
+    // What mirror Git says on the wire, and nothing else's: for an operator
+    // (or a test) asking what GitHub was told. Packets only, never headers.
+    if let Some(file) = std::env::var_os("NEWGIT_SERVE_MIRROR_TRACE_PACKET") {
+        command.env("GIT_TRACE_PACKET", file);
     }
     command
 }
 
+/// [`mirror_command`], stopped after [`MIRROR_GIT_LIMIT`].
 pub(crate) fn mirror_git(
     dir: &Utf8Path,
+    git: &str,
     token: Option<&str>,
     args: &[&str],
 ) -> ApiResult<std::process::Output> {
-    Ok(mirror_command(dir, token, args).output()?)
+    crate::repos::run_timed(
+        mirror_command(dir, git, token, args),
+        None,
+        MIRROR_GIT_LIMIT,
+    )?
+    .ok_or_else(|| {
+        HttpError::new(
+            504,
+            format!(
+                "`git {}` against the mirror ran longer than {} s and was stopped",
+                args.first().copied().unwrap_or_default(),
+                MIRROR_GIT_LIMIT.as_secs()
+            ),
+        )
+    })
 }
 
 /// [`mirror_git`], failing with Git's message, which never holds the token.
 pub(crate) fn mirror_git_ok(
     dir: &Utf8Path,
+    git: &str,
     token: Option<&str>,
     args: &[&str],
 ) -> ApiResult<String> {
-    let output = mirror_git(dir, token, args)?;
+    let output = mirror_git(dir, git, token, args)?;
     if !output.status.success() {
         return Err(HttpError::new(
             502,
@@ -532,11 +656,6 @@ pub fn bring_it_in(target: &str) -> String {
     )
 }
 
-/// Where a project's export repositories are: never a store, never served.
-pub fn exports_dir(home: &Utf8Path) -> Utf8PathBuf {
-    home.join("exports")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -544,29 +663,57 @@ mod tests {
     #[test]
     fn a_mirror_is_only_ever_https_on_github() {
         assert_eq!(
-            mirror_url("Spheroman/newgit").as_deref(),
+            mirror_url(GITHUB, "Spheroman/newgit").as_deref(),
             Some("https://github.com/Spheroman/newgit.git")
         );
         assert_eq!(
-            mirror_url("a-b/c_d.e").as_deref(),
+            mirror_url(GITHUB, "a-b/c_d.e").as_deref(),
             Some("https://github.com/a-b/c_d.e.git")
         );
         assert_eq!(
-            mirror_url("acme/.github").as_deref(),
+            mirror_url(GITHUB, "acme/.github").as_deref(),
             Some("https://github.com/acme/.github.git")
         );
         for not_one in [
             "", "newgit", "a/b/c", "-o/x", "a/-x", "a/..", "../x", "./x", "a/x y", "a/x.git",
             "a/x?y", "a/x#y", "a/%2e%2e",
         ] {
-            assert_eq!(mirror_url(not_one), None, "{not_one}");
+            assert_eq!(mirror_url(GITHUB, not_one), None, "{not_one}");
         }
+    }
+
+    #[test]
+    fn where_githubs_git_is_is_the_operators_to_say() {
+        let config = GithubConfig::parse("").expect("parse");
+        assert_eq!(config.git_base(), GITHUB);
+        let config = GithubConfig::parse("git = \"file:///srv/github\"\n").expect("parse");
+        assert_eq!(config.git_base(), "file:///srv/github/");
+        for not_one in ["http://github.com/", "/srv/github", "git@github.com:", "-o"] {
+            assert!(
+                GithubConfig::parse(&format!("git = \"{not_one}\"\n")).is_err(),
+                "{not_one}"
+            );
+        }
+        assert_eq!(GithubConfig::default().git_base(), GITHUB);
+    }
+
+    fn env_of(command: &std::process::Command) -> BTreeMap<String, String> {
+        command
+            .get_envs()
+            .filter_map(|(key, value)| {
+                Some((
+                    key.to_string_lossy().into_owned(),
+                    value?.to_string_lossy().into_owned(),
+                ))
+            })
+            .collect()
     }
 
     #[test]
     fn the_token_is_in_the_environment_and_for_github_alone() {
         let command = mirror_command(
             Utf8Path::new("/nowhere.git"),
+            GITHUB,
             Some("s3cr3t-token"),
             &["fetch", "https://github.com/a/b.git"],
         );
@@ -579,23 +726,50 @@ mod tests {
                 .all(|arg| !arg.contains("s3cr3t") && !arg.contains("extraHeader")),
             "{said:?}"
         );
-        let env: BTreeMap<String, String> = command
-            .get_envs()
-            .filter_map(|(key, value)| {
-                Some((
-                    key.to_string_lossy().into_owned(),
-                    value?.to_string_lossy().into_owned(),
-                ))
-            })
+        assert!(
+            said.contains(&"fetch.fsckObjects=true".to_owned()),
+            "{said:?}"
+        );
+        let env = env_of(&command);
+        let keys: Vec<&String> = env
+            .iter()
+            .filter(|(key, _)| key.starts_with("GIT_CONFIG_KEY_"))
+            .map(|(_, value)| value)
             .collect();
         assert_eq!(
-            env.get("GIT_CONFIG_KEY_0").map(String::as_str),
-            Some("http.https://github.com/.extraHeader"),
+            keys,
+            ["http.https://github.com/.extraHeader"],
             "scoped to GitHub, never a bare http.extraHeader"
         );
-        assert_eq!(env.get("GIT_CONFIG_COUNT").map(String::as_str), Some("1"));
-        // No token: nothing is configured at all.
-        let bare = mirror_command(Utf8Path::new("/nowhere.git"), None, &["fetch"]);
+        // After whatever the server's own environment sets, never over it.
+        let first: usize = std::env::var("GIT_CONFIG_COUNT")
+            .ok()
+            .and_then(|count| count.parse().ok())
+            .unwrap_or(0);
+        assert_eq!(env.get("GIT_CONFIG_COUNT"), Some(&(first + 1).to_string()));
+        // No global or system config: no `insteadOf` sends it elsewhere.
+        assert_eq!(
+            env.get("GIT_CONFIG_GLOBAL").map(String::as_str),
+            Some("/dev/null")
+        );
+        assert_eq!(
+            env.get("GIT_CONFIG_NOSYSTEM").map(String::as_str),
+            Some("1")
+        );
+        // No token: no config in the environment at all.
+        let bare = mirror_command(Utf8Path::new("/nowhere.git"), GITHUB, None, &["fetch"]);
         assert!(bare.get_envs().all(|(key, _)| key != "GIT_CONFIG_COUNT"));
+        assert_eq!(
+            env_of(&bare).get("GIT_CONFIG_GLOBAL").map(String::as_str),
+            Some("/dev/null")
+        );
+    }
+
+    #[test]
+    fn a_pull_thread_that_stops_stamping_is_stalled() {
+        assert!(pulls_moving(true, 1_000, 1_000));
+        assert!(pulls_moving(true, 1_000, 1_000 + STALLED_AFTER));
+        assert!(!pulls_moving(true, 1_000, 1_001 + STALLED_AFTER));
+        assert!(!pulls_moving(false, 1_000, 1_000), "the thread is gone");
     }
 }
