@@ -335,6 +335,10 @@ export async function handle(request: Request, env: Env, deps: Deps): Promise<Re
 	}
 }
 
+// Every user agent, every path. An empty `Disallow:` is the oldest spelling
+// of "allow everything", so crawlers that predate `Allow:` read it too.
+const ROBOTS_TXT = "User-agent: *\nAllow: /\nDisallow:\n";
+
 async function route(request: Request, env: Env, deps: Deps): Promise<Response> {
 	const url = new URL(request.url);
 	const path = url.pathname.replace(/\/+$/, "");
@@ -346,8 +350,16 @@ async function route(request: Request, env: Env, deps: Deps): Promise<Response> 
 			headers: { "content-type": "text/x-shellscript; charset=utf-8", "cache-control": "public, max-age=300" },
 		});
 
+	// ── robots.txt: anything may index or scrape anything ──────────────────
+	// The site, the docs, and public projects are meant to be read, by people
+	// and by agents alike. Private routes are guarded by auth, not by this file.
+	if ((method === "GET" || method === "HEAD") && path === "/robots.txt")
+		return new Response(method === "HEAD" ? null : ROBOTS_TXT, {
+			headers: { "content-type": "text/plain; charset=utf-8", "cache-control": "public, max-age=3600" },
+		});
+
 	// ── The site: the landing page and the wiki ────────────────────────────
-	if ((method === "GET" || method === "HEAD") && path === "") return landingPage(method, site(env), deps.repos);
+	if ((method === "GET" || method === "HEAD") && path === "")return landingPage(method, site(env), deps.repos);
 	if ((method === "GET" || method === "HEAD") && (path === "/docs" || path.startsWith("/docs/"))) {
 		const docs = await docsPage(method, site(env), deps.repos, path.slice("/docs/".length));
 		if (docs) return docs;
