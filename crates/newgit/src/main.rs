@@ -1590,6 +1590,7 @@ fn spawn(args: SpawnArgs) -> Result<()> {
                     "tracker": tracker, "commits": count, "follow": follow,
                 })).collect::<Vec<_>>(),
                 "template_warning": outcome.template_warning,
+                "left_behind": outcome.left_behind,
                 "resources": resources,
                 "started": stop_start_resources_json(&outcome.started),
                 "starting": starting_json(&readiness),
@@ -1640,6 +1641,7 @@ fn spawn(args: SpawnArgs) -> Result<()> {
         println!("             cloned with `git clone`: the source template failed ({warning})");
     }
     println!("  record:    {}", outcome.record_path);
+    print_left_behind(&outcome.left_behind);
     if let Some(warning) = &outcome.projection_warning {
         println!("  trackers:  the project root's commits were not split ({warning})");
     }
@@ -2150,6 +2152,41 @@ fn starting_json(readiness: &Readiness) -> serde_json::Value {
             })
         })
         .collect()
+}
+
+/// The `left behind:` lines of a spawn (#83): each local-secret-looking
+/// file the project root has and the workspace does not, with the commands
+/// that carry it from now on.
+fn print_left_behind(left_behind: &[Utf8PathBuf]) {
+    // Names, not a guess at which tracker: one `local-env` for the lot is
+    // the obvious shape, and a project that wants several can split it.
+    let Some(first) = left_behind.first() else {
+        return;
+    };
+    for path in left_behind {
+        println!(
+            "  left behind: {path} — gitignored in the project root, and no tracker carries it, \
+             so this workspace does not have it"
+        );
+    }
+    let paths = left_behind
+        .iter()
+        .map(|path| path.as_str())
+        .collect::<Vec<_>>()
+        .join(" ");
+    println!(
+        "             to carry {} to every instance, kept out of Git and per user:",
+        if left_behind.len() == 1 {
+            format!("`{first}`")
+        } else {
+            "them".to_owned()
+        }
+    );
+    println!("               newgit tracker create local-env --audience user");
+    println!("               newgit tracker track local-env {paths}");
+    println!("               newgit tracker capture local-env --from-store");
+    println!("             and for an instance that exists, this one included:");
+    println!("               newgit tracker pull local-env <instance>");
 }
 
 /// A resource's `resource:` line in a spawn or rebind report, with its

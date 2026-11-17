@@ -1123,6 +1123,13 @@ fill from the install store. Then it starts each long-running action marked
 `autostart`, dependencies first, so a dev server is up when the agent
 arrives. With a remote, it registers the instance there.
 
+What the project root has and the workspace does not is said, not copied:
+a gitignored file there named like a local secret (`.env.local`,
+`master.key`) that no tracker brought is named as left behind, with the
+three commands that make a tracker carry it (#83). Copying it would make
+the root's ignored files an undeclared, unversioned tracker; naming it
+turns a service failing hours later into a line at spawn.
+
 Autostart comes after every `prepare`, not interleaved with them, because
 `prepare` is a command that finishes and a dependent's `prepare` may need
 its dependency's files but never its process. A start that fails is
@@ -1889,8 +1896,9 @@ Open issues that change what this document can promise:
 - **#64: rendered files are hidden, not filtered.** `--skip-worktree` makes
   hand edits to a rendered file die with the workspace. A clean/smudge
   filter would make them ordinary, committable edits.
-- **#83: gitignored secrets do not reach a workspace** unless a tracker owns
-  them, and nothing at spawn says so.
+- **#83: gitignored secrets reach a workspace only through a tracker.**
+  `spawn` names the ones it left behind, by file name, and the commands
+  that carry them; nothing carries them by itself.
 - **#85: no reconcile.** A live instance does not pick up a changed
   resource definition (a new port, say), and nothing says it is stale.
 - **#87: no preflight.** A definition that calls a missing binary (`pg_dump`
