@@ -476,6 +476,7 @@ pub fn create_incarnation(
 
 pub fn delete_project(db: &Connection, home: &str) -> ApiResult<()> {
     db.execute("DELETE FROM head_log WHERE home = ?", [home])?;
+    crate::mirror::store::forget(db, home)?;
     db.execute("DELETE FROM projects WHERE home = ?", [home])?;
     db.execute(
         "DELETE FROM grants WHERE repo LIKE ? ESCAPE '\\'",
