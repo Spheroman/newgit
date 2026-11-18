@@ -9513,10 +9513,14 @@ impl BranchManager {
         }
 
         // The workspace is usually still here; when cleanup is finishing
-        // an instance whose workspace is already gone, the hook runs
-        // from the store root so an external teardown can still reach
-        // its own API. `workdir` is workspace-relative, so it has
-        // nothing to resolve against once the workspace itself is gone.
+        // an instance whose workspace is already gone, the hook still
+        // runs, so an external teardown can reach its own API, but from
+        // an empty directory of its own. Never the project root: a hook
+        // written for the workspace (`rm -rf postgres-data`) would then
+        // delete the project's own files of that name. `workdir` is
+        // workspace-relative, so it has nothing to resolve against once
+        // the workspace itself is gone.
+        let nowhere;
         let cwd = if branch.workspace_path.is_dir() {
             resource_cwd(
                 &branch.workspace_path,
@@ -9525,7 +9529,16 @@ impl BranchManager {
                 definition.workdir_for(None),
             )?
         } else {
-            self.store.paths().project_root.clone()
+            nowhere = tempfile::tempdir().map_err(|source| NewgitError::Io {
+                path: std::env::temp_dir().to_string_lossy().into_owned().into(),
+                source,
+            })?;
+            Utf8PathBuf::from_path_buf(nowhere.path().to_path_buf()).map_err(|path| {
+                NewgitError::Unsupported(format!(
+                    "the temporary directory {} is not UTF-8",
+                    path.display()
+                ))
+            })?
         };
 
         let log = self
