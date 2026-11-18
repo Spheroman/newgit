@@ -131,8 +131,11 @@ fn undo_says_what_status_a_resource_is_left_in() {
     let (status, stdout, stderr) = newgit(&repo, &["checkpoint", "x"]);
     assert!(status.success(), "checkpoint:\n{stdout}\n{stderr}");
 
+    // Exit 1, as `spawn` and `start` exit when the instance they leave is
+    // not ready: `deps` is still failed.
     let (status, stdout, stderr) = newgit(&repo, &["undo", "x"]);
-    assert!(status.success(), "undo:\n{stdout}\n{stderr}");
+    assert_eq!(status.code(), Some(1), "undo:\n{stdout}\n{stderr}");
+    assert!(stdout.contains("not ready: `x`"), "{stdout}");
     // Still "Restored": the undo did everything it set out to do, and the
     // restore verdict is still `ok` — it just does not stop there.
     assert!(stdout.contains("Restored `x` to ckpt_001"), "{stdout}");

@@ -1305,9 +1305,10 @@ and answer 500 until they have compiled, and a resource newgit does not
 supervise (a Supabase stack a `prepare` left running) has no process to
 watch at all. A definition's `[ready]` says what up means instead (#276):
 a GET that answers 200–399, or a command that exits 0, and
-`timeout_seconds` for how long that takes. The end of `spawn` and of
-`newgit start` waits for the longest of those among what is bound, and a
-dependent's start waits its dependency's (*Spawn*). With no `[ready]`, up
+`timeout_seconds` for how long that takes. The end of `spawn`, of
+`newgit start` and of `undo` (and so of `spawn --from-checkpoint`) waits
+for the longest of those among what is bound, and a dependent's start
+waits its dependency's (*Spawn*). With no `[ready]`, up
 is the ports answering and the wait is five seconds; a resource with no
 process and no check is up when its `prepare` exited 0. Its declared ports
 are not checked: they are reservations, and the `supabase` template claims
@@ -1320,7 +1321,7 @@ down. So:
 
 - A resource whose definition has a `[ready]` said what up is and how long
   it takes. Past `timeout_seconds` it is not up: a problem, `not ready` in
-  `status`, and `spawn` and `start` exit 1.
+  `status`, and `spawn`, `start` and `undo` exit 1.
 - A resource with no process newgit supervises has nothing alive to tell
   still-starting from gone-down; it has a `[ready]` check, or it is not
   checked at all, so the same holds.
