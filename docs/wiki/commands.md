@@ -260,9 +260,15 @@ Remote:
 - `newgit spawn <name> --from-checkpoint <instance>/<checkpoint>` — one
   taken on this machine is used as it is; any other comes from the remote
 
-Resource templates: `process`, `pnpm`, `install`, `command-snapshot`,
-`command-snapshot-migrations`, `supabase`, `external`. `newgit resource
-templates --show <name>` prints one in full without creating anything. Their
-comments say what to edit: `process` works without a port (delete `[ports]`,
-`[exports]` and `[[render]]`), and `supabase` needs every service's section
-in `config.toml` and has a commented `workdir` for monorepos.
+Resource templates: `process`, `pnpm`, `install`, `postgres`,
+`command-snapshot`, `command-snapshot-migrations`, `compose`, `supabase`,
+`external`. `newgit resource templates --show <name>` prints one in full
+without creating anything. Their comments say what to edit: `process` works
+without a port (delete `[ports]`, `[exports]` and `[[render]]`), and
+`supabase` needs every service's section in `config.toml` and has a
+commented `workdir` for monorepos. For a per-branch database, add
+`postgres` (a cluster per instance, no Docker; needs `/.postgres/` in
+`.gitignore`) or `compose` (a Compose project per instance; its comments
+say how the compose file publishes the port) under the name `database`
+(`newgit resource add database --template postgres`), and each instance's
+`DATABASE_URL` is its own.
