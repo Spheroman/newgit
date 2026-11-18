@@ -20,10 +20,13 @@ nothing kept, and `remove` names that state under `left`, with the
 cleanup command that removes it by hand, and what else it could not keep
 under `lost`. When its state is in the workspace (`ownership =
 "workspace"`, as the `postgres` template's cluster is), deleting the
-workspace would delete it, so `remove` refuses and deletes nothing, and
-the thread is not deleted: start the instance (`newgit start <name>`) so
-the dump can run, then delete again, or `newgit remove <name> --force`. Every other project gets plain worktrees, as
-before.
+workspace would delete it, so `remove` refuses and deletes nothing. The
+fork removes a newgit workspace before its thread, so the thread is not
+deleted either: it starts the instance (`newgit start <name>`) so the dump
+can run, and removes again. If newgit still refuses, the fork stops the
+instance again and shows newgit's reason, and you choose to delete anyway
+(`newgit remove <name> --force`) or keep the thread and its workspace. Every
+other project gets plain worktrees, as before.
 
 `newgit stop <instance>` and `newgit start <instance>` are the pair for
 settling and unsettling a thread
@@ -40,7 +43,11 @@ Port claims are kept, so the instance returns on the same ports. With
 anything failed. `start` then waits, as `spawn` does, for what it brought
 back to pass its `[ready]` check, adds `starting` and `problems` to its
 JSON when there are any, and exits 1 when the instance is not ready; a resource that failed to start stays recorded for the
-next `start`. A resource that is not a process newgit supervises — a
+next `start`. `spawn` exits 1 the same way. The fork reads either as
+started but not ready, not as a failure: the thread opens in the workspace,
+its turn runs, and newgit's `problems` are shown once in the thread. A
+workspace deleted by hand comes back on the thread's next message, since
+`start` rebuilds it. A resource that is not a process newgit supervises — a
 Supabase stack, a Compose project — is taken down only if it defines a
 `suspend` / `resume` pair (`newgit reference actions`); the `supabase`
 template does. The fork runs `stop` when you settle a thread and `start`
@@ -91,6 +98,6 @@ scripts/fork/install-mac.sh
   the branch there too, and the workspace's remote for it is the one `gh`
   uses.
 
-The fork is a small patch stack rebased onto a fast-moving upstream; its
+The fork is a small patch stack that merges a fast-moving upstream in; its
 [`FORK.md`](https://github.com/Spheroman/t3code/blob/newgit/FORK.md) lists
-every change, its limits, and how to rebase.
+every change, its limits, and how to bring upstream in.
