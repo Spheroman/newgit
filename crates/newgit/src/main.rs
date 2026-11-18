@@ -1241,6 +1241,7 @@ fn init(args: InitArgs) -> Result<()> {
     println!("  project:    {project_name}");
     println!("  source:     {}", source_label(&config));
     println!("  workspaces: {}/", config.workspace_root(&repo_root));
+    println!("              (move them with `[workspace] root` in .newgit/config.toml)");
 
     // Adopting newgit in a real project means knowing which half of
     // `.newgit/` belongs in Git. Definitions are the control plane and should
