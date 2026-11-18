@@ -887,8 +887,9 @@ command = "supabase stop --no-backup"
         description: "a resource another system owns; newgit holds only a handle",
         companions: &[],
         companion_trackers: &[],
-        contents: r#"# HOST TOOLS: your provider's CLI. `cloudctl` below is a stand-in and is
-# not a real program — every command here is yours to write.
+        contents: r#"# HOST TOOLS: your provider's CLI. `EDIT_ME_CLI` below stands in for it
+# and is not a real program — every command here is yours to write, and
+# `newgit resource check` fails until none of them names it.
 ownership = "external"
 
 # newgit does not own this resource, so it never assumes deletion semantics
@@ -906,7 +907,7 @@ ownership = "external"
 
 [actions.prepare]
 # Edit to your provisioning command.
-command = "cloudctl preview create --branch {{branch.name}} --json"
+command = "EDIT_ME_CLI preview create --branch {{branch.name}} --json"
 captures = ["RESOURCE_ID", "RESOURCE_URL"]
 
 [checkpoint]
@@ -919,7 +920,7 @@ state_ref = "{{exports.RESOURCE_ID}}"
 mode = "external"
 
 [cleanup]
-command = "cloudctl preview delete {{state_ref}}"
+command = "EDIT_ME_CLI preview delete {{state_ref}}"
 "#,
     },
 ];
