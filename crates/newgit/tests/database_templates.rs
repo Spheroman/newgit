@@ -58,12 +58,16 @@ fn skip(test: &str, why: &str) {
 }
 
 /// Whether a Docker daemon answers, so a machine with the client installed
-/// and Docker Desktop quit skips rather than fails.
+/// and Docker Desktop quit skips rather than fails. A version has to come
+/// back: Docker Desktop with its VM down still answers `docker info`, with
+/// exit 0 and no server version.
 fn docker_answers() -> bool {
     Command::new("docker")
         .args(["info", "--format", "{{.ServerVersion}}"])
         .output()
-        .is_ok_and(|output| output.status.success())
+        .is_ok_and(|output| {
+            output.status.success() && !String::from_utf8_lossy(&output.stdout).trim().is_empty()
+        })
 }
 
 /// One test's project. On drop it removes every instance the test spawned
