@@ -743,8 +743,9 @@ enum ResourceCommand {
     /// instance takes up an edited definition: ports it holds that are
     /// still declared stay, only new ones are allocated. For a resource
     /// whose definition is gone, it releases the binding instead (its
-    /// `[cleanup]` cannot run). Refused while its process is running. Exits
-    /// 1 when it does not come up.
+    /// `[cleanup]` cannot run). Refused while its process is running. Waits
+    /// as `start` does for what it started, then exits 1 when the instance
+    /// it leaves is not ready, saying why.
     Rebind {
         name: String,
         /// Instance (inferred when run inside a workspace)
@@ -1966,6 +1967,15 @@ fn resource(command: ResourceCommand) -> Result<()> {
                     .iter()
                     .any(|start| start.status == StopStartStatus::Failed);
             if failed {
+                std::process::exit(1);
+            }
+            // As `start` does (#276): what the rebind started has its
+            // `[ready] timeout_seconds` to come up, and an instance it leaves
+            // not ready is a failure, not a success to find out about later.
+            let branch = manager.store().find_branch(&outcome.instance)?;
+            let readiness = manager.readiness_after(&branch, manager.ready_wait(&branch));
+            print_readiness(&outcome.instance, &readiness);
+            if !readiness.is_ready() {
                 std::process::exit(1);
             }
             Ok(())
