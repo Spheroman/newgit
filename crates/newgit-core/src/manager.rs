@@ -14980,23 +14980,40 @@ impl BranchManager {
                         "resource `{name}` was running {when} but has no long-running action to \
                          restart"
                     )),
+                    // The process did not come back; the resource did. Its
+                    // binding says whether `prepare` or its restore succeeded,
+                    // and marking it failed for this is a failure no start
+                    // ever clears: `status` went on calling it failed while
+                    // its retried process served. So the process reads as one
+                    // never started, which `status` names and `start` owes,
+                    // until a start succeeds.
                     Err(error) => {
                         restart_failed = true;
-                        if let Some(binding) = branch.resources.get_mut(name) {
-                            binding.status = ResourceStatus::Failed;
-                        }
+                        self.supervisor(&branch).mark_not_restarted(name)?;
+                        let retry_with = match long_running_action(definition) {
+                            Some((action, _))
+                                if definition
+                                    .autostart_action()
+                                    .is_some_and(|(autostart, _)| autostart == action) =>
+                            {
+                                format!("newgit start {}", branch.name)
+                            }
+                            Some((action, _)) => {
+                                format!("newgit action {name}.{action} {}", branch.name)
+                            }
+                            None => format!("newgit start {}", branch.name),
+                        };
                         failures.push(RestoreFailure {
                             resource: name.clone(),
                             detail: format!("restart failed: {error}"),
                             log: None,
-                            retry_with: format!("newgit action {name}.start {}", branch.name),
+                            retry_with,
                         });
                     }
                 }
             }
-            // Read only now, after a failed restore or restart has marked the
-            // resource failed, so the outcome says what the record is saved
-            // with. Dependencies come first in bind order, so theirs are
+            // Read only now, after a failed restore has marked the resource
+            // failed, so the outcome says what the record is saved with. Dependencies come first in bind order, so theirs are
             // already final too.
             resources.push(UndoResourceOutcome {
                 status: branch.resources[name].status,
