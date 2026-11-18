@@ -76,7 +76,7 @@ fn a_port_declared_after_spawn_is_named_until_rebind_claims_it() {
     let (ok, out) = newgit(&repo, &["spawn", "x"]);
     assert!(ok, "{out}");
     let (_, status) = newgit(&repo, &["status", "x"]);
-    assert!(!status.contains("was bound before"), "{status}");
+    assert!(!status.contains("was bound from an older"), "{status}");
 
     std::fs::write(
         &definition,
@@ -85,9 +85,7 @@ fn a_port_declared_after_spawn_is_named_until_rebind_claims_it() {
     .expect("write");
     let (_, status) = newgit(&repo, &["status", "x"]);
     assert!(
-        status.contains(
-            "`stack` was bound before its definition declared ports `analytics`, `inbucket`"
-        ),
+        status.contains("ports `analytics`, `inbucket` declared since, so nothing claims them"),
         "{status}"
     );
     assert!(status.contains("newgit resource rebind stack"), "{status}");
@@ -95,7 +93,7 @@ fn a_port_declared_after_spawn_is_named_until_rebind_claims_it() {
     let (ok, out) = newgit(&repo, &["resource", "rebind", "stack", "x"]);
     assert!(ok, "{out}");
     let (_, status) = newgit(&repo, &["status", "x"]);
-    assert!(!status.contains("was bound before"), "{status}");
+    assert!(!status.contains("was bound from an older"), "{status}");
     let ports = &store.find_branch("x").expect("x").resources["stack"].resolved_ports;
     assert!(ports.contains_key("inbucket") && ports.contains_key("analytics"));
 }

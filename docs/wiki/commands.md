@@ -7,7 +7,11 @@ inside a workspace):
   <tracker>] [--drop <tracker>] [--private] [--json]` / `status [name]` /
   `remove <name> [--purge] [--keep-branch | --delete-branch]` — `status`
   says whether each instance is ready, still starting (a dev server that is
-  not listening yet), or not ready, and why
+  not listening yet), or not ready, and why — including each resource bound
+  from an older definition than the one in the project root, with the
+  commands that apply it
+- `newgit status [name] --json` — `{"instances": [{"name", "workspace",
+  "status", "problems", "starting"}]}`
 - `newgit status <instance> --path` — just the workspace path, for scripts
 - `newgit reference [section | all]` — the definition format, every key and
   default; bare, it lists the sections
@@ -148,7 +152,10 @@ of the project, `repos` inside `apps/t3code`, `..` to go up:
 - `newgit resource remove <name> [--force]` — `--force` drops it from live
   instances and releases their ports instead of refusing
 - `newgit resource rebind <name> [instance]` — bind it again as spawn did,
-  after fixing a render or export that failed
+  after fixing a render or export that failed or editing its definition;
+  keeps the ports it holds that are still declared. Refused while its
+  process runs. For a resource whose definition file is gone, it releases
+  the binding instead (`[cleanup]` cannot run)
 
 Remote:
 

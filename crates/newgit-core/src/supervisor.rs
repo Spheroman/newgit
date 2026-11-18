@@ -350,6 +350,13 @@ impl Supervisor {
         self.state_dir.join(format!("{resource}.exit"))
     }
 
+    /// The log of the run `start` last began for `resource`, whose first
+    /// line is the command it ran.
+    pub fn last_log(&self, resource: &str) -> Option<Utf8PathBuf> {
+        let text = std::fs::read_to_string(self.log_record_path(resource)).ok()?;
+        Some(Utf8PathBuf::from(text.trim()))
+    }
+
     /// The log of the run `start` last began, for `stop`'s line.
     fn log_record_path(&self, resource: &str) -> Utf8PathBuf {
         self.state_dir.join(format!("{resource}.logpath"))

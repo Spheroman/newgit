@@ -220,6 +220,7 @@ http = { start = 47700 }
             restore_proven: false,
             render_error: None,
             export_error: None,
+            prepare_rev: None,
         },
     );
     store

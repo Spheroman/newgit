@@ -138,6 +138,13 @@ pub struct ResourceBinding {
     /// `render_error`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub export_error: Option<String>,
+    /// [`crate::resource::ResourceDefinition::prepare_rev`] of the `prepare`
+    /// this binding last ran, so `status` can say when the definition's has
+    /// changed since (#85). A parked resource brought back through `resume`
+    /// keeps the one it had: `resume` is not `prepare`. `None` in a record
+    /// written before this was kept, which `status` takes as unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prepare_rev: Option<String>,
 }
 
 /// A binding a tracker drop set aside: the binding as it was, and how far
