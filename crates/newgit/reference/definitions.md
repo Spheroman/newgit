@@ -1199,7 +1199,7 @@ command = "docker compose -p {{branch.slug}} start"
 ### `[ready]`
 
 What "up" means for this resource (#276), how long it takes, which is
-what `spawn` and `newgit start` wait for after starting it, what a
+what `spawn`, `newgit start` and `undo` wait for after starting it, what a
 dependent's start waits for, and what `newgit status` shows as `starting`
 until it holds.
 
@@ -1207,7 +1207,7 @@ until it holds.
 | --- | --- | --- | --- | --- |
 | `http` | string | no | — | up when a GET of this URL answers 200–399. Redirects are not followed. `http://` or `https://`; an `https://` certificate must be trusted by this machine's trust store (a local one, by `mkcert -install`). Rendered like an action `command`, so `{{ports.<name>}}` works. |
 | `command` | string | no | — | up when this command exits 0. Rendered and run like an action, in the resource's `workdir`, with the command environment; each run has five seconds to finish. |
-| `timeout_seconds` | integer | no | `5` | how long it takes to come up, 1 to 3600, counted from when its process started (or, with none, from its last `prepare`, `resume` or `restore`): waited for at the end of `spawn` and `start` and before starting what depends on it, and after it, not up. |
+| `timeout_seconds` | integer | no | `5` | how long it takes to come up, 1 to 3600, counted from when its process started (or, with none, from its last `prepare`, `resume` or `restore`): waited for at the end of `spawn`, `start` and `undo` and before starting what depends on it, and after it, not up. |
 
 At most one of `http` and `command`. With neither, a resource is up when
 its running process answers on every port it claims, which is what newgit
@@ -1229,7 +1229,7 @@ it: a port is a reservation, not a promise that something listens (the
 `supabase` template claims the disabled pooler's and the mail server's,
 which a default stack never opens). A `command` or `http` is how it says
 what up is, and then it is checked like a process: by `status`, by the
-end of `spawn` and `start`, and before its dependents start. One that
+end of `spawn`, `start` and `undo`, and before its dependents start. One that
 `newgit stop` suspended is not checked until `start` resumes it.
 
 ```toml
@@ -1244,7 +1244,7 @@ timeout_seconds = 120
 definition has a `[ready]` (it said what up means and how long that
 takes), or one with no process newgit supervises, is `starting` only
 within `timeout_seconds`; after that it is not up, which is a problem:
-`spawn` and `start` exit 1 and `status` says `not ready`. With no process
+`spawn`, `start` and `undo` exit 1 and `status` says `not ready`. With no process
 to watch, still starting and gone down look the same, so past its own
 estimate it is called down. A supervised process with no `[ready]` has no
 deadline: it is `starting` for as long as it runs without answering.
@@ -1264,9 +1264,12 @@ machine does not trust says so.
 (`supabase status`) or the Docker daemon (`docker compose exec`) pays for
 that on every `status`.
 
-`spawn` and `newgit start` wait for this; `undo` does not. It restarts
-what was running and returns, so a command run straight after it can find
-a server still starting (`newgit status` says `starting` until it is up).
+`spawn`, `newgit start` and `undo` wait for this, and end the same way:
+`ready:`, `starting:` with what is still coming up, or `not ready:` with
+each problem, and exit 1 when the instance is not ready. `undo` waits after
+everything it restarted, so SQL run straight after it finds the database
+up; `spawn --from-checkpoint` finishes with an undo and does the same, with
+`starting` and `problems` in its `--json`.
 
 ### `[checkpoint]`
 
