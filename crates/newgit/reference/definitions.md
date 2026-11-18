@@ -1418,8 +1418,38 @@ the instance was ever in, so it is reported as a partial restore and never as
 "restored to <checkpoint>". It exists for iterating on a restore command,
 where rewinding the whole workspace each cycle is the cost.
 
+**What is running when `[restore]` runs.** An undo stops every process
+newgit supervises for the instance before it moves any content (`--only`
+stops only the resources it names), then restores resources dependencies
+first:
+
+- **Its own process is stopped.** Its ports stay claimed, so nothing else
+  takes them. A restore that needs its own server — `psql` loading a dump
+  into the Postgres this resource runs — starts one itself, around the
+  load, on the instance's port, and stops it before it exits; the undo
+  then starts the real one if it was running at checkpoint time. The
+  `postgres` template does that, and does it safely: it builds a fresh
+  cluster beside the live one, loads the dump into it under a temporary
+  `pg_ctl start`, and swaps it in only once the load succeeded, so a
+  failed restore leaves the database as it was.
+- **What it depends on is back.** Each dependency has been restored, and
+  started again if it was running at checkpoint time. A `command` or
+  `recompute` restore waits for a dependency this undo started again to be
+  up (its `[ready]`, or its ports answering), as a dependent's process does;
+  one that was not running before the undo is not running for the restore
+  either.
+- **What depends on it is still stopped**, and is restored after it.
+
 A restore command is not transactional. If one fails, `newgit undo` says the
-undo was incomplete and names the resource, rather than reporting success.
+undo was incomplete and names the resource, rather than reporting success,
+and exits 1. That resource is left down: its process is not started again
+over whatever the restore left half done, and `status` says `failed to
+restore`, with the retry — repair it, then `newgit undo` again, not the
+action that starts its process. Everything that depends on it is restored
+but left down too (`not restarted`, `blocked(<it>)` in `status`), rather
+than started against the wrong data and read as up. The recovery record
+beside the checkpoint lists each, and the next undo that succeeds brings
+them all back.
 
 A restore command runs against whatever state its own reset left behind,
 including rows a migration step already inserted — it is not a fresh

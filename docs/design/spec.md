@@ -1874,6 +1874,25 @@ nothing does not make a resource `ready`: a resource that was failed before
 the undo is still failed after it, and the report says what each resource
 is left as (#211).
 
+What an undo leaves when a restore fails is deliberate: that resource
+down, and everything that depends on it down too. A server started over
+state its restore left half done serves it as if it were fine, and a
+dependent started against it reads as up while it serves the wrong data.
+The binding records why (`restore_error`), so `status` says `failed to
+restore` and names the retry, another undo, rather than the action that
+starts the process. The next undo that succeeds brings them all back.
+
+A restore runs with its own process stopped (every process is stopped
+before content moves) and its dependencies restored and, when they were
+running, started again; a restore that runs something waits for those to
+be up, as a dependent's process does. A restore that needs its own server
+starts one around the load: the `postgres` template loads the dump into a
+fresh cluster under a temporary server on the instance's port and swaps it
+in only once the load succeeded. newgit offers no "restore with the process
+up": loading into the live server is what forces a restore to reset the
+database first, and a reset followed by a failed load is the half-done
+state above.
+
 The safety checkpoint taken before an undo is annotated with whether that
 undo completed. A pre-undo snapshot before a failed undo is not a real
 redo point, and `newgit checkpoints` lists it as `failed-undo` rather than
