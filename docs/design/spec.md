@@ -1959,10 +1959,14 @@ Open issues that change what this document can promise:
   Postgres); nothing runs it at spawn, so one never checked still fails at
   the first checkpoint or, worse, the first restore.
 - **#89: a failed `prepare` can destroy its own evidence**, when the tool
-  tears down its containers before exiting. newgit shows the command that
-  ran and how its log ends, and the reference says how to rerun it by hand
-  with the tool's own keep-it-up flag; it cannot keep the containers
-  itself.
+  tears down its containers before exiting. newgit destroys none of it
+  itself: every run has its own log, and nothing it runs after a failure
+  removes what the command left. It shows the whole command that ran and
+  how its log ends (stderr only when `captures` is set), and the reference
+  says how to rerun the tool by hand with its own keep-it-up flag; it
+  cannot keep the containers itself, and there is no generic
+  `--keep-failed`, since newgit runs nothing after a failure for one to
+  switch off.
 - **#59: port allocation order within a resource is unspecified**, which
   matters when a tool's default ports are consecutive.
 - **Install store follow-ups:** sub-path exclusions in `produces` for native

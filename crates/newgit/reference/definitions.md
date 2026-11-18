@@ -931,16 +931,24 @@ resource marks `autostart`. Every other action is something you invoke:
 rendered command and its directory without running it, or `--quiet` to keep
 a one-shot command's output in its log only: it then says the exit code,
 and on failure the command that ran and the log's last twenty lines.
+`--quiet` moves output, not input: the command still reads what was piped
+to `newgit action`, as it would without it. Hooks newgit runs on its own (a
+spawn's `prepare`, a restore) get no input, since nobody is there to answer.
 
-**When a hook fails, its log may not hold the why.** A spawn's `prepare`
-runs quietly and its `FAILED` line shows the command that ran and the log's
-last lines. But a tool that cleans up after itself on failure can destroy
-the evidence first: `supabase start` stops every container it started when
-one is unhealthy, so its log ends in empty `container logs:` sections
-(#89). newgit cannot stop a command from tearing itself down. Run its
-steps by hand in the instance's environment instead, `newgit run
-<instance> -- sh`, with whatever flag the tool has for leaving things up
-(`supabase start --ignore-health-check`, then `docker logs <container>`).
+**A failed hook keeps its evidence.** A spawn's `prepare` runs quietly and
+its `FAILED` line shows the command that ran, every line of it, and the
+log's last lines. Every run writes a log of its own, named in its own
+report, so a retry never overwrites the log of the run before it. And
+nothing newgit runs afterwards removes what the failed command left in the
+workspace: `[cleanup]` runs only at `newgit remove`, and `start` and the
+retry run nothing but what the definition says. A tool that cleans up after
+itself on failure is another matter: `supabase start` stops every container
+it started when one is unhealthy, so its log ends in empty `container
+logs:` sections (#89). newgit cannot stop a command from tearing itself
+down. Run its steps by hand in the instance's environment instead, `newgit
+run <instance> -- sh`, with whatever flag the tool has for leaving things
+up (`supabase start --ignore-health-check`, then `docker logs
+<container>`).
 
 **`autostart` starts a process at spawn.** Once every resource is bound and
 prepared, `newgit spawn` starts each `autostart` action, dependencies
@@ -1942,6 +1950,13 @@ Only declared names are taken. **When `captures` is set, stdout belongs to
 newgit** — send progress output to stderr, or a chatty CLI's noise is
 interleaved with the values and they will not parse. A declared name the
 command never emitted is a warning, not an error.
+
+The log keeps stdout and stderr apart, under `[newgit] stdout, read for
+captures:` and `[newgit] stderr:`. Since none of a captured run's output
+reaches the terminal, a failure is told from its log, `--quiet` or not: the
+command that ran and the end of its stderr. Only stderr: stdout holds the
+captured values, a database URL with its password among them, which a run
+that succeeded would never have printed either. The log has them.
 
 ---
 

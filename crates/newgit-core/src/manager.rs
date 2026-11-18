@@ -668,6 +668,19 @@ fn long_running_action(
         .map(|(name, action)| (name.as_str(), action))
 }
 
+/// Who a one-shot command runs for, which decides where its input comes
+/// from and where its output goes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OneShot {
+    /// newgit runs it on someone's behalf (a spawn's `prepare`, a restore):
+    /// no input, output to its log only.
+    Hook,
+    /// Asked for by name with `newgit action`: the input newgit was given,
+    /// and output to the terminal and the log, or with `--quiet` the log
+    /// only. Quiet moves output; it does not take input away (#89).
+    Asked { quiet: bool },
+}
+
 /// The action that retries a resource whose own run failed, naming only
 /// actions it defines (#262): the one that builds its tree (`prepare`, or
 /// the recompute action), else its long-running action. `None` when it has
@@ -4891,8 +4904,14 @@ impl BranchManager {
                     let log = self
                         .store
                         .action_log_path(&branch.slug, &format!("{}.prepare", definition.name));
-                    let (code, captured) =
-                        self.run_one_shot(branch, definition, action, "prepare", &log, true)?;
+                    let (code, captured) = self.run_one_shot(
+                        branch,
+                        definition,
+                        action,
+                        "prepare",
+                        &log,
+                        OneShot::Hook,
+                    )?;
                     captured_names = captured.found.keys().cloned().collect();
                     missing_captures = Self::missing_capture_warnings(
                         &definition.name,
@@ -6306,8 +6325,14 @@ impl BranchManager {
             return Ok(ActionOutcome::Started { pid, log });
         }
 
-        let (code, captured) =
-            self.run_one_shot(&branch, definition, action, action_name, &log, quiet)?;
+        let (code, captured) = self.run_one_shot(
+            &branch,
+            definition,
+            action,
+            action_name,
+            &log,
+            OneShot::Asked { quiet },
+        )?;
         let missing_captures =
             Self::missing_capture_warnings(&definition.name, action_name, &captured, &log);
         let mut dirty = Self::apply_captures(&mut branch, &definition.name, captured.found);
@@ -6462,22 +6487,27 @@ impl BranchManager {
         action: &crate::resource::ActionSpec,
         action_name: &str,
         log: &Utf8Path,
-        quiet: bool,
+        run: OneShot,
     ) -> Result<(i32, Captures)> {
         let (command, cwd) = self.action_invocation(branch, definition, action, action_name)?;
         let env = self.assemble_env(branch)?;
+        let input = match run {
+            OneShot::Hook => crate::supervisor::Input::Closed,
+            OneShot::Asked { .. } => crate::supervisor::Input::Inherit,
+        };
 
         if action.captures.is_empty() {
             let command_line = ["sh".to_owned(), "-c".to_owned(), command];
-            let code = if quiet {
-                crate::supervisor::run_quiet(&command_line, &cwd, &env, log)?
-            } else {
+            let code = if run == (OneShot::Asked { quiet: false }) {
                 run_foreground(&command_line, &cwd, &env, log)?
+            } else {
+                crate::supervisor::run_quiet(&command_line, &cwd, &env, log, input)?
             };
             return Ok((code, Captures::default()));
         }
 
-        let (code, stdout) = run_captured(&command, &cwd, &env, log)?;
+        let (code, stdout) =
+            crate::supervisor::run_captured_with(&command, &cwd, &env, log, input)?;
         Ok((code, parse_captures(&stdout, &action.captures)))
     }
 
@@ -7711,7 +7741,7 @@ impl BranchManager {
             .store
             .action_log_path(&branch.slug, &format!("{}.{action_name}", definition.name));
         let (code, captured) =
-            self.run_one_shot(branch, definition, action, action_name, &log, true)?;
+            self.run_one_shot(branch, definition, action, action_name, &log, OneShot::Hook)?;
         Self::apply_captures(branch, &definition.name, captured.found);
         let ok = code == 0;
         let install = match (&install_key, filled) {
@@ -14953,8 +14983,14 @@ impl BranchManager {
                 let log = self
                     .store
                     .action_log_path(&branch.slug, &format!("{}.restore", definition.name));
-                let (code, captured) =
-                    self.run_one_shot(branch, definition, action, action_name, &log, true)?;
+                let (code, captured) = self.run_one_shot(
+                    branch,
+                    definition,
+                    action,
+                    action_name,
+                    &log,
+                    OneShot::Hook,
+                )?;
                 warnings.extend(Self::missing_capture_warnings(
                     &definition.name,
                     action_name,
@@ -16023,7 +16059,7 @@ impl BranchManager {
             .store
             .action_log_path(&branch.slug, &format!("{}.{action_name}", definition.name));
         let (code, found) =
-            self.run_one_shot(branch, definition, action, action_name, &log, true)?;
+            self.run_one_shot(branch, definition, action, action_name, &log, OneShot::Hook)?;
         let changed = code == 0 && Self::apply_captures(branch, &definition.name, found.found);
         Ok((code, log, changed))
     }
