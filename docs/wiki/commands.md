@@ -271,7 +271,11 @@ Remote:
   with no usable SSH key on GitHub; they fail, naming the trackers that were
   not re-encrypted, when any was not. `members reencrypt` runs that again
 - `newgit spawn <name> --from-checkpoint <instance>/<checkpoint>` — one
-  taken on this machine is used as it is; any other comes from the remote
+  taken on this machine is used as it is; any other comes from the remote.
+  One that fails after the instance is made keeps it, as a plain `spawn`
+  that fails does, and names `newgit undo <name> --to <id>` (the
+  checkpoint's copy in the new instance's history) to finish it and
+  `newgit remove <name> --purge` to remove it before running it again
 
 Resource templates: `process`, `pnpm`, `install`, `postgres`,
 `command-snapshot`, `command-snapshot-migrations`, `compose`, `supabase`,

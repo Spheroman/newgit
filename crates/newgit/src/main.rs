@@ -1567,6 +1567,16 @@ fn spawn_from_checkpoint(
     if let Some(recovery) = &outcome.undo.recovery_record {
         eprintln!("warning: some resource restores failed; recovery record at {recovery}");
     }
+    if !outcome.undo.is_complete() {
+        // A restore that failed is retried by the undo that made it, not by
+        // `prepare`, which would start the resource empty.
+        println!(
+            "  retry:     fix what failed, then `newgit undo {name} --to {id}` restores it again; \
+             or `newgit remove {name} --purge` removes it",
+            name = outcome.branch.name,
+            id = outcome.undo.restored.id
+        );
+    }
     if !outcome.is_complete() {
         // As a plain `spawn` exits: the instance and its record stay, exactly
         // as printed above, and exit 1 reports that state rather than
