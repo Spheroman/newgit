@@ -738,8 +738,15 @@ surprise found as a wrong variable in a subprocess.
 ### Ports
 
 **An instance's port never changes once allocated.** At bind time newgit
-takes the first port scanning up from the declared `start` that no other
-instance's record claims and that is free right now. "Free" means it binds
+takes the first of `start`, `start + 100`, `start + 200`, … that no other
+instance's record claims and that is free right now. Instances sit 100
+apart, not 1, because a claim holds nothing until the instance's server
+binds it and only newgit respects it: dev tools that pick an extra port by
+scanning up from a default (`remix dev`: 3001–3100) took the claims of
+instances packed one apart before those instances bound them. The stride
+keeps another instance's claim out of the ports just above each one; the
+real fix is the definition declaring and passing every port its tools
+open, which the reference tells agents to do. "Free" means it binds
 on all of 127.0.0.1, 0.0.0.0, ::1, and ::, with `SO_REUSEADDR` off, so a
 Docker container published on a wildcard address cannot hide behind a
 loopback-only check (#93).

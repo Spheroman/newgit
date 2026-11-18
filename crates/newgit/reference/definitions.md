@@ -223,6 +223,12 @@ are guesses, and a wrong guess shows up as a failed spawn later. `newgit
 reference <section>` has every key. If a resource needs a `[[render]]`, run
 `newgit render --check`.
 
+Give every port the project's dev tools open a `[ports]` entry and pass it
+to the tool explicitly: a `--port` flag, the env variable it reads, or a
+`[[render]]` of its config. That includes a second port a tool picks for
+itself, like `remix dev`'s, which otherwise scans for a free one and can
+take a port newgit claimed for another instance (`newgit reference ports`).
+
 Make sure an install resource declares `[identity] produces`, the directory
 the install writes (`node_modules`, `.venv`). That is what lets later
 instances with the same lockfile be cloned from the install store instead of
@@ -915,7 +921,7 @@ One entry per port the resource needs. `<name>` is yours (`app`, `db`).
 
 | key | type | required | default | meaning |
 | --- | --- | --- | --- | --- |
-| `start` | integer | yes | — | where to start scanning. The allocated port is the first one from `start` upward that is neither promised to another instance nor claimed on 127.0.0.1, 0.0.0.0, ::1, or :: right now (checked with `SO_REUSEADDR` off, so a wildcard bind — e.g. a Docker-published container port — can't hide behind a loopback-only check; see #93). A family the OS doesn't support at all is skipped, not counted as free. This does not see a UDP-only listener on the same port number, and is a point-in-time check like any bind probe: nothing stops another process from claiming the port in the gap before it's actually used. |
+| `start` | integer | yes | — | where allocation starts, and the port the first instance gets. The allocated port is the first of `start`, `start + 100`, `start + 200`, … that is neither promised to another instance nor claimed on 127.0.0.1, 0.0.0.0, ::1, or :: right now (checked with `SO_REUSEADDR` off, so a wildcard bind — e.g. a Docker-published container port — can't hide behind a loopback-only check; see #93). A family the OS doesn't support at all is skipped, not counted as free. This does not see a UDP-only listener on the same port number, and is a point-in-time check like any bind probe: nothing stops another process from claiming the port in the gap before it's actually used. |
 | `env` | string | no | none | environment variable the port is published as to every command newgit runs — `newgit run`, actions, `key_command`, and the `[checkpoint]`, `[restore]` and `[cleanup]` hooks (e.g. `PORT`). |
 
 A port is allocated when the resource binds, usually at `spawn` (at
@@ -928,6 +934,24 @@ a rebind: `newgit status` names it as a problem, with the rebind to run
 (#85). Changing a port's `start` moves nothing: it only says where an
 allocation begins.
 Use it in templates as `{{ports.<name>}}`.
+
+**Instances are 100 apart.** With `start = 3000`, the first instance gets
+3000, the next 3100, then 3200, and a resource whose ports start at
+consecutive numbers (Supabase's 54320–54327) keeps them together in each
+instance: 54420–54427 for the second. Not 3000, 3001, 3002, because of what
+happens next to a claim. A claim is a line in a binding record: nothing holds
+the port until the instance's own server binds it, and only newgit respects
+a claim. Many dev tools pick an extra port of their own by scanning up from
+a default (`remix dev` takes the first free one in 3001–3100), and with
+claims packed one apart, the first instance's tool takes the port claimed
+for the second before the second's server is up. A hundred apart, the
+ninety-nine ports above each claim belong to no other instance.
+
+That narrows the problem; only declaring the port removes it. **A tool that
+picks a port by itself must have every such port declared in `[ports]` and
+passed to it explicitly** — a flag (`--port {{ports.hmr}}`), its env
+variable, or a `[[render]]` of its config file. The scan still starts at
+the bottom of its range, where the first instance's claim may sit unbound.
 
 Unlike `[exports]`, order here does matter: `[ports]` is also a map, not a
 sequence, but two ports whose ranges can reach each other (the normal case

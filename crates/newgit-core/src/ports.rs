@@ -25,9 +25,23 @@ pub fn used_ports(branches: &[BranchInstance]) -> BTreeSet<u16> {
         .collect()
 }
 
-/// First port scanning up from `start` that is neither promised to another
-/// instance nor OS-unbindable right now. The chosen port is added to `used`
-/// so one allocation pass stays self-consistent.
+/// How far apart one port's allocations are: the first instance gets
+/// `start`, the next `start + 100`, then `start + 200`.
+///
+/// Not `start + 1`. A dev tool that picks a second port for itself (`remix
+/// dev` scans 3001-3100 for its own) scans up from its own default, which
+/// is usually the very range a definition's `start` sits in. Packed one
+/// apart, every instance's claim lies in that scan, and only newgit respects
+/// a claim: the first instance's tool took the port claimed for the second
+/// before the second's server bound it. A hundred apart, the ninety-nine
+/// ports above each claim are claimed by no other instance, and the numbers
+/// still read at a glance: instance three of `app` is on 3201.
+pub const PORT_STRIDE: u16 = 100;
+
+/// First port of `start`, `start + PORT_STRIDE`, `start + 2 * PORT_STRIDE`,
+/// … that is neither promised to another instance nor OS-unbindable right
+/// now. The chosen port is added to `used` so one allocation pass stays
+/// self-consistent.
 pub fn allocate(start: u16, used: &mut BTreeSet<u16>) -> Result<u16> {
     let mut candidate = start;
     loop {
@@ -35,14 +49,11 @@ pub fn allocate(start: u16, used: &mut BTreeSet<u16>) -> Result<u16> {
             used.insert(candidate);
             return Ok(candidate);
         }
-        candidate = candidate.checked_add(1).ok_or_else(|| {
-            NewgitError::Unsupported(format!("no free port found scanning up from {start}"))
+        candidate = candidate.checked_add(PORT_STRIDE).ok_or_else(|| {
+            NewgitError::Unsupported(format!(
+                "no free port found from {start} upward in steps of {PORT_STRIDE}"
+            ))
         })?;
-        if candidate - start > 1000 {
-            return Err(NewgitError::Unsupported(format!(
-                "no free port found within 1000 of {start}"
-            )));
-        }
     }
 }
 

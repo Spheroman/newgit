@@ -57,6 +57,11 @@ depends_on = []
 # environment lands in one process environment, so the name has to be unique
 # across the project — it is named after this resource for that reason. If
 # this is your only service and your tool insists on plain `PORT`, rename it.
+#
+# Pass every port explicitly. A dev server that finds its port taken, or a
+# tool that picks a second one for itself (`remix dev`'s, a HMR socket), scans
+# for a free one and can take a port newgit claimed for another instance.
+# Give each such port a line here and hand it over: `--port {{ports.app}}`.
 app = { start = 3100, env = "RESOURCE_PORT" }
 
 [actions.start]
