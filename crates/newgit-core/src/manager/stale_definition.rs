@@ -468,11 +468,21 @@ fn logged_action(log: &Utf8Path, resource: &str) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
-/// Whether the log of a supervised run opens with `command`: its first
-/// line is `[newgit] $ <command>`, and a command may span lines. Only that
-/// much is read, since a server's log can be long.
+/// Whether the log of a supervised run opens with `command`, as the
+/// supervisor writes it: `[newgit] $ ` before its first line and
+/// `[newgit] > ` before each further one (#89). Only that much is read,
+/// since a server's log can be long.
 fn started_with(log: &Utf8Path, command: &str) -> bool {
-    let opening = format!("[newgit] $ {command}\n");
+    let mut opening = String::new();
+    for (index, line) in command.trim_end().lines().enumerate() {
+        opening.push_str(if index == 0 {
+            "[newgit] $ "
+        } else {
+            "[newgit] > "
+        });
+        opening.push_str(line);
+        opening.push('\n');
+    }
     let Ok(file) = std::fs::File::open(log) else {
         // Nothing to compare with is not a difference.
         return true;
