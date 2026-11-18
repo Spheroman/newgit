@@ -336,10 +336,23 @@ impl BranchManager {
 
     /// Problem lines for each resource defined and active in `branch` that
     /// it does not bind: one added (or brought by a bound tracker) after the
-    /// instance bound its resources.
+    /// instance bound its resources. Not one that binding would do nothing
+    /// for: a definition holding only what newgit reads live, such as
+    /// `disposable` (what an eviction may drop), is in effect already.
     pub(super) fn unbound_definition_problems(&self, branch: &BranchInstance) -> Vec<String> {
         self.resources
             .iter()
+            .filter(|definition| {
+                !(definition.ports.is_empty()
+                    && definition.exports.is_empty()
+                    && definition.render.is_empty()
+                    && definition.actions.is_empty()
+                    && definition.identity.is_none()
+                    && definition.checkpoint.is_none()
+                    && definition.restore.is_none()
+                    && definition.cleanup.is_none()
+                    && definition.ready.is_none())
+            })
             .map(|definition| &definition.name)
             .filter(|name| {
                 !branch.resources.contains_key(*name)
