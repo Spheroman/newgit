@@ -268,6 +268,9 @@ newgit status newgit-try          # every resource ready; if not, it says why
 newgit env newgit-try             # ports and exports, labeled by where they came from
 newgit run newgit-try -- <the project's test or health check>
 newgit checkpoint newgit-try --verify
+newgit spawn newgit-try-2          # a second one, side by side
+newgit ports --check              # every claimed port held by its own instance; declare any `warn`
+newgit remove newgit-try-2
 newgit remove newgit-try
 ```
 
@@ -952,6 +955,14 @@ picks a port by itself must have every such port declared in `[ports]` and
 passed to it explicitly** — a flag (`--port {{ports.hmr}}`), its env
 variable, or a `[[render]]` of its config file. The scan still starts at
 the bottom of its range, where the first instance's claim may sit unbound.
+`newgit ports --check` lists, as `warn`, every port an instance's process
+listens on that nothing claims: those are the ones to declare.
+
+When a claimed port is held by a process that is not the instance's own,
+`newgit status`, and the end of `spawn`, `start` and `rebind`, say whose it
+is: its pid, command, working directory, and the instance that directory
+belongs to. `newgit start` moves a held port of a resource that is not
+running to a free one.
 
 Unlike `[exports]`, order here does matter: `[ports]` is also a map, not a
 sequence, but two ports whose ranges can reach each other (the normal case
@@ -967,38 +978,41 @@ Bare `newgit ports` lists every instance's claimed ports straight off its
 binding record — no probing, nothing to go stale, just the ledger newgit
 already keeps.
 
-`newgit ports --check` is the inverse of `render --check`: instead of asking
-whether committed content matches a definition, it asks whether every
-listening host port is claimed. It runs `lsof -nP -iTCP -sTCP:LISTEN`,
-keeps only the ports inside some resource's allocatable range (`start` up to
-the same 1000-port window `allocate` itself scans), and reports any of those
-that no binding record claims:
+`newgit ports --check` judges each of those claims by the process actually
+listening on the port (`lsof -nP -iTCP -sTCP:LISTEN`), never by the claim
+alone:
 
 ```
 $ newgit ports --check
-ok    54321 — claimed by `newgit-trial`
-FAIL  `newgit-trial` publishes 54324, 54327 — claimed by no binding record
-      undeclared ports are not allocated, so another instance may be handed them
+FAIL  3000 — `beta` app.app: held by pid 4242 (`node remix dev`) in /ws/alpha, a process of instance `alpha`
+warn  3001: no instance claims it, and pid 4242 (`node remix dev`) in /ws/alpha, a process of instance `alpha` listens on it. …
+ok    3100 — `alpha` app.app: held by its own process (pid 4242)
+ok    3200 — `gamma` app.app: nothing listens on it
+
+1 of 3 claimed port(s) failed.
 ```
 
-The bind probe `spawn` uses only asks whether a port is free at that
-moment. `lsof` sees the real socket table, so `--check` catches the drift
-after the fact: a port something started listening on later, with no
-binding record claiming it.
+A process belongs to an instance when it descends from a process newgit
+supervises for it, works inside its workspace, or names its workspace in its
+command line. An instance's name appearing in a command line is not enough.
 
-Naming *which* instance publishes an unclaimed port is done honestly, not
-confidently: an instance is named only when its name or workspace path
-genuinely appears in the listening process's command line. On macOS, a
-Docker Desktop container's published port is fronted by Docker's own VM
-proxy, whose command line says nothing about the instance that owns the
-container — most Docker-caused conflicts therefore come back unattributed
-(`FAIL 54330 — claimed by no binding record; could not attribute to an
-instance`) rather than naming a guess. An unattributed conflict is still the
-useful finding; a confidently wrong instance name would not be.
+| verdict | when |
+| --- | --- |
+| `ok` | every listener is the claiming instance's own process, or nothing listens and its resource's process is not running |
+| `FAIL` | another instance's process holds it; or something no instance owns holds the port of a resource whose process newgit supervises; or that process is running and nothing listens yet |
+| `?` | something no instance owns holds the port of a resource that runs no process newgit supervises. Docker Desktop fronts a container's published port with its own proxy, which nothing ties to an instance, so newgit cannot tell its own stack from a stranger. Not a failure |
+| `warn` | no instance claims the port, but an instance's process listens on it: a tool that picked a port by itself (see *Instances are 100 apart* above). Not a failure, since a tool's internal worker on an OS-chosen port cannot be declared |
+
+Every other listener on the machine (AirPlay on 5000, adb on 5037, an
+editor's server) is not judged; it only matters once it sits on a claimed
+port. It exits 1 on any `FAIL`. `--json` prints one document, `{"ok":
+bool, "ports": [{port, verdict, instance, resource, name, holders: [{pid,
+command, cwd, instance}], reason}]}`, with the same exit code; bare `ports
+--json` prints `{"ports": [{instance, resource, name, port, parked}]}`.
 
 If `lsof` is missing, or exits with anything other than its own "nothing
-found" code, `--check` says it could not check rather than reporting a
-clean pass.
+found" code, `--check` says it could not check and exits 1, rather than
+reporting a clean pass.
 
 ### `[actions.<name>]`
 

@@ -757,17 +757,23 @@ the instance's record before its `prepare` runs, under a short lock held
 only while they are chosen, so two spawns installing side by side are never
 handed the same port.
 
-A record can only be as complete as the bind probe, and a container a
-resource starts can publish a port the record never learned about (#92).
-`newgit ports --check` catches that from the other side: it reads the real
-socket table (`lsof`), keeps listening ports inside some resource's range,
-and reports any that no record claims. It names an instance only when the
-instance's name or workspace really appears in the listener's command
-line. On macOS, Docker Desktop fronts container ports with its own proxy,
-so most Docker conflicts come back unattributed. An unattributed conflict is
-still the useful finding; a confidently wrong instance name would not be.
-If `lsof` is missing or fails, `--check` says it could not check rather
-than reporting every port free.
+A claimed port can still be taken, by another instance's tool or by any
+program. So whose a port is gets decided by the process listening on it,
+never by the claim: a listener belongs to an instance when it descends from
+a process newgit supervises for it, works inside its workspace, or names
+its workspace in its command line. `status` (and so the end of `spawn`,
+`start` and `rebind`) names the holder of a claimed port that is not the
+instance's own, with its pid, directory and instance, instead of leaving a
+bind failure in a log, and an instance whose port answers only because
+another instance's process holds it is not ready. `newgit ports --check`
+(#92) judges every claim the same way: ok when the claimant holds it or
+nothing does while its process is down, FAIL when anyone else does, and
+undecided for a resource newgit runs no process of, whose port Docker
+Desktop's proxy may hold for it. A port an instance's process listens on
+that nothing claims is a warning: the tool that will take somebody's claim.
+Unrelated listeners on the machine are not judged. If `lsof` is missing or
+fails, `--check` says it could not check rather than reporting every port
+free.
 
 ### Exports and the command environment
 
