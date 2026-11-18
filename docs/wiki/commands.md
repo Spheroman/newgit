@@ -21,7 +21,9 @@ inside a workspace):
 - `newgit action <resource>.<action> [instance] [--dry-run] [--quiet]` —
   `--dry-run` prints the rendered command and its directory, and runs
   nothing; `--quiet` keeps a one-shot command's output in its log and
-  prints the exit, plus, on failure, the command and the log's end
+  prints the exit, plus, on failure, the whole command and the log's end
+  (stderr only, for an action with `captures`). Input still reaches the
+  command
 - `newgit stop [instance] [--json]` / `start [instance] [--json]` — stop
   every running long-running action and run each `suspend`, dependents
   first, and later bring back exactly what that took down (and any

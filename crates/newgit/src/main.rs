@@ -1341,7 +1341,7 @@ fn prepare_label(resource: &ResourceBindOutcome) -> String {
                 // The hook ran quietly; its last lines are usually the why,
                 // and the command it ran often is (#89).
                 let ran = newgit_core::supervisor::log_command(log)
-                    .map(|command| format!("\n               ran: {command}"))
+                    .map(|command| format!("\n               ran: {}", hang_indent(&command, 20)))
                     .unwrap_or_default();
                 let tail = newgit_core::supervisor::log_tail(log, 8)
                     .into_iter()
@@ -2149,7 +2149,9 @@ fn action(spec: &str, instance: Option<String>, quiet: bool) -> Result<()> {
             if let Some(install) = &install {
                 println!("  {}", install.summary());
             }
-            if quiet && code != 0 {
+            // Quiet, or captured: either way the output went to the log
+            // only, so the log is where the why is.
+            if code != 0 && (quiet || newgit_core::supervisor::log_held_captures(&log)) {
                 print_failed_hook(&log, QUIET_TAIL_LINES);
             }
             eprintln!("[newgit] `{spec}` exit {code}; log: {log}");
@@ -2167,11 +2169,21 @@ const QUIET_TAIL_LINES: usize = 20;
 /// What a quiet command that failed ran, and how its log ends, on stderr.
 fn print_failed_hook(log: &Utf8Path, lines: usize) {
     if let Some(command) = newgit_core::supervisor::log_command(log) {
-        eprintln!("[newgit] ran: {command}");
+        eprintln!(
+            "[newgit] ran: {}",
+            hang_indent(&command, "[newgit] ran: ".len())
+        );
     }
     for line in newgit_core::supervisor::log_tail(log, lines) {
         eprintln!("  | {line}");
     }
+}
+
+/// A multi-line command printed after a label: every line after the first
+/// indented `width` columns, under the first, so the whole command reads as
+/// the command and none of it as output (#89).
+fn hang_indent(command: &str, width: usize) -> String {
+    command.replace('\n', &format!("\n{}", " ".repeat(width)))
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2518,7 +2530,10 @@ fn action_dry_run(spec: &str, instance: Option<String>) -> Result<()> {
             };
             println!("`{spec}` for `{instance}` {verb}:");
             println!("  in:       {cwd}");
-            println!("  command:  {command}");
+            println!(
+                "  command:  {}",
+                hang_indent(&command, "  command:  ".len())
+            );
             if !captures.is_empty() {
                 println!(
                     "  captures: {} (read from stdout into this resource's exports)",
