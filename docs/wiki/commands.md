@@ -33,7 +33,12 @@ inside a workspace):
   what it depends on answers; ports,
   workspace, trackers, and installs stay as they are. Both exit 0 with
   nothing to do and 1 if any resource failed; `start` also exits 1 when
-  what it brought back is not up within its `[ready] timeout_seconds`
+  what it brought back is not up within its `[ready] timeout_seconds`.
+  A workspace deleted by hand (`status` says `ws-missing` and names this)
+  comes back with `start`: it stops what still runs from the deleted
+  directory, rebuilds the workspace from the instance's latest checkpoint
+  (or from its source branch, preparing every resource again, when it has
+  none), and says what did not come back (`rebuilt` in `--json`)
 - `newgit stop --evict [--discard-ignored]` — stop, checkpoint, and delete
   the workspace, leaving its marker; `newgit start` brings it back from that
   checkpoint into the same directory, with uncommitted and staged work,

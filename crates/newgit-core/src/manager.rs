@@ -836,6 +836,9 @@ pub enum WorkspaceChange {
     },
     /// Materialized again and restored to `checkpoint`.
     Restored { checkpoint: String },
+    /// Deleted by hand, and made again: from `checkpoint`, the instance's
+    /// latest, or from its source branch when it had none.
+    Rebuilt { checkpoint: Option<String> },
     /// Already evicted, to `checkpoint`: nothing was deleted.
     AlreadyEvicted { checkpoint: String },
 }
@@ -3759,8 +3762,8 @@ impl BranchManager {
         let mut problems = Vec::new();
         if !branch.workspace_path.is_dir() {
             problems.push(format!(
-                "its workspace is missing ({})",
-                branch.workspace_path
+                "its workspace is missing ({}); `newgit start {}` rebuilds it",
+                branch.workspace_path, branch.name
             ));
             return Readiness {
                 problems,
@@ -15879,6 +15882,17 @@ impl BranchManager {
             .saved_copies
             .retain(|copy| std::fs::symlink_metadata(copy).is_ok());
         let notices = self.saved_copy_notices(&earlier);
+        // Deleted by hand: made again, from the latest checkpoint or the
+        // source branch, before anything is started in it.
+        if branch.evicted.is_none() && std::fs::symlink_metadata(&branch.workspace_path).is_err() {
+            let (checkpoint, warnings) = self.rebuild_deleted(branch)?;
+            let branch = self.store.find_branch(instance)?;
+            let mut outcome = self.start_resources(lock, branch)?;
+            outcome.workspace = Some(WorkspaceChange::Rebuilt { checkpoint });
+            outcome.warnings.splice(0..0, warnings);
+            outcome.warnings.extend(notices);
+            return Ok(outcome);
+        }
         let Some(checkpoint) = branch.evicted.clone() else {
             let mut outcome = self.start_resources(lock, branch)?;
             outcome.warnings.extend(notices);
@@ -16701,8 +16715,9 @@ impl BranchManager {
             Ok(())
         } else {
             Err(NewgitError::Unsupported(format!(
-                "the workspace for `{}` is missing at {}; spawn it again or remove the instance",
-                branch.name, branch.workspace_path
+                "the workspace for `{}` is missing at {}; `newgit start {}` rebuilds it, \
+                 or `newgit remove {}` removes the instance",
+                branch.name, branch.workspace_path, branch.name, branch.name
             )))
         }
     }
