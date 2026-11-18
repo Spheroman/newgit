@@ -245,7 +245,9 @@ action = "prepare"
 # server's owner, not newgit, who decides what cleanup may touch.
 #
 # The cluster lives and dies with the workspace, which is what
-# `ownership = "workspace"` says: `newgit remove` deletes it with the tree,
+# `ownership = "workspace"` says: `newgit remove` dumps it into the
+# checkpoint it takes first and deletes it with the tree, refusing when the
+# dump fails (a stopped server: `newgit start` it first) unless `--force`,
 # and `undo` puts it back from the last dump. `newgit stop --evict` refuses
 # while it is there, since an ignored file no tracker owns is not something
 # eviction brings back. `--discard-ignored` evicts anyway and the cluster is

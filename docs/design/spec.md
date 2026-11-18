@@ -1618,14 +1618,27 @@ remote it had). Ignored paths a resource declares `disposable` are listed
 as dropped, not lost.
 
 A resource capture that fails (a `pg_dump` against a database that is
-down) does not refuse the removal: the checkpoint goes ahead without that
-resource, as it does for a resource that is not up. But its state is then
-in no checkpoint, so its `[cleanup]` does not run: a `dropdb` after a
-failed dump would delete the only copy, unattended. The state stays where
-it is, and the removal says so (`left:`, `left` in `--json`, hook status
+down) does not refuse the removal when the resource's state is outside
+the workspace: the checkpoint goes ahead without that resource, as it
+does for a resource that is not up. But its state is then in no
+checkpoint, so its `[cleanup]` does not run: a `dropdb` after a failed
+dump would delete the only copy, unattended. The state stays where it
+is, and the removal says so (`left:`, `left` in `--json`, hook status
 `skipped-uncaptured`), with the cleanup command as it would have run,
 which names where the state is and removes it by hand. `--force` runs it,
 and names what that deleted as lost.
+
+When the resource's state is in the workspace, it cannot stay where it
+is: the workspace is what the removal deletes. A Postgres cluster whose
+data directory is in the tree is the case. So that failed capture
+refuses the removal, deleting nothing (the checkpoint it took holds the
+rest), unless `--force`, which names the state as lost. Where the state
+is comes from the definition, `ownership = "workspace"`: newgit cannot
+see where a command keeps what it captures, and the ignored files the
+removal deletes cannot be told apart from build output, so a guess from
+them would either refuse every removal with a `build/` in it or let the
+database go. A resource that keeps its data in the tree but declares
+another ownership is taken at its word.
 
 A checkpoint that fails refuses the removal, deleting nothing, unless
 `--force`, which removes anyway. So does a nested repository with no

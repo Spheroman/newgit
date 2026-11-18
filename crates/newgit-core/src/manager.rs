@@ -12068,6 +12068,19 @@ impl BranchManager {
         self.checkpoint_log(&branch).list()
     }
 
+    /// The checkpoints a removed instance named `instance` left, which
+    /// `spawn --from-checkpoint <slug>/<id>` still brings back: its name's
+    /// history, kept past the removal. Errors as an unknown instance would
+    /// when there is neither a live instance nor any checkpoint by the name.
+    pub fn removed_checkpoints(&self, instance: &str) -> Result<Vec<CheckpointRecord>> {
+        let slug = branch_slug(instance);
+        let records = CheckpointLog::new(self.store.checkpoint_dir(&slug), instance).list()?;
+        if records.is_empty() {
+            return Err(NewgitError::UnknownBranchInstance(instance.to_owned()));
+        }
+        Ok(records)
+    }
+
     /// Prove a restore actually works instead of trusting it: checkpoint the
     /// current state, restore it with a real `undo`, checkpoint again, and
     /// compare the two checkpoints' resource state refs. Agreement across

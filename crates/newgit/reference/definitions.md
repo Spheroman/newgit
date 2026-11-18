@@ -1873,11 +1873,18 @@ a security label.
 
 | value | means | per-branch cleanup runs its hook? |
 | --- | --- | --- |
-| `branch` | one per branch instance (a database named after the branch) | yes |
-| `workspace` | one per workspace (`node_modules` in the tree) | yes |
+| `branch` | one per branch instance, kept outside the workspace (a database named after the branch in a shared server) | yes |
+| `workspace` | one per workspace, kept in the tree (`node_modules`, a Postgres data directory in the workspace) | yes |
 | `project` | shared by every instance of this project | no |
 | `user` | shared beyond this project (a pnpm store) | no |
 | `external` | another system owns it; newgit holds a handle | yes — exactly the `[cleanup] command`, nothing else |
+
+`workspace` is also how `newgit remove` knows a resource's state goes with
+the workspace. When its capture fails (a dump of a server that is not
+running), the removal refuses and deletes nothing, unless `--force`; for any
+other ownership the state is left where it is, its `[cleanup]` not run, and
+named under `left`. So a resource whose data directory is in the tree says
+`workspace`, whatever else it is.
 
 ---
 
