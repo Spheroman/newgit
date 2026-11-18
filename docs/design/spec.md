@@ -528,7 +528,9 @@ rooted target's is its tracker's whole history), under
 `refs/newgit-template/`. The copy drops those refs but keeps their
 objects, so the workspace's own fetch of that branch moves nothing; fetched
 into each workspace, t3code's was 17s of a 21s spawn.
-`newgit cleanup` removes a template no live binding uses. Then the copy
+`newgit cleanup` removes a sparse template no live binding uses. The full
+one stays, even after the last instance is removed: it is a cache of the
+project's checkout, and the next spawn would only build it again. Then the copy
 gets its own branch, with the upstream `git clone --branch` would set, and
 `core.checkStat=minimal` plus `core.trustctime=false`. Without those two
 settings Git would re-hash every file on the first `git status`, because

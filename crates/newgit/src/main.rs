@@ -2261,7 +2261,19 @@ fn action(spec: &str, instance: Option<String>, quiet: bool) -> Result<()> {
         }
         ActionOutcome::Stopped(outcome) => {
             match outcome {
-                StopOutcome::Stopped(pid) => println!("Stopped `{spec}` (pid {pid})"),
+                // The run the signal stopped, as `newgit stop` names it:
+                // `web.stop` stops what `web.start` started.
+                StopOutcome::Stopped(pid) => {
+                    let resource = spec.split('.').next().unwrap_or(spec);
+                    match manager.last_started_action(&instance, resource) {
+                        Some(action) => {
+                            println!("Stopped `{resource}.{action}` for `{instance}` (pid {pid})")
+                        }
+                        None => {
+                            println!("Stopped `{resource}`'s process for `{instance}` (pid {pid})")
+                        }
+                    }
+                }
                 StopOutcome::NotRunning => println!("`{spec}`: nothing was running"),
                 StopOutcome::StillRunning(pid) => println!(
                     "`{spec}`: pid {pid} ignored the signal; escalate with `kill -9 -- -{pid}` if needed"
