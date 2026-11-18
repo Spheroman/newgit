@@ -416,6 +416,26 @@ impl Supervisor {
         (!path.is_empty()).then(|| Utf8PathBuf::from(path))
     }
 
+    /// Note that what newgit stopped for `resource` was not started again
+    /// when it should have been: an undo stops every process and restarts
+    /// what was running, and this one's restart failed. From then on it
+    /// reads as [`ProcessState::NeverStarted`], what a start held back
+    /// behind a dependency reads as (#54): down, not stopped on purpose, so
+    /// `status` names it and `start` owes it, and whichever start succeeds
+    /// next is what clears it. Only while nothing is running for it.
+    pub fn mark_not_restarted(&self, resource: &str) -> Result<()> {
+        if self.running_pid(resource).is_some() {
+            return Ok(());
+        }
+        let path = self.pid_path(resource);
+        match std::fs::remove_file(&path) {
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+                Err(NewgitError::io(path, error))
+            }
+            _ => Ok(()),
+        }
+    }
+
     fn mark_stopped(&self, resource: &str) -> Result<()> {
         let path = self.pid_path(resource);
         std::fs::write(&path, "stopped\n").map_err(|source| NewgitError::io(&path, source))

@@ -13,8 +13,8 @@ use newgit_core::manager::{
     ActionOutcome, ActionPlan, BaseReport, BindOrigin, BranchManager, DiffPair, ExportReason,
     InstanceReport, KeptBranch, MismatchCause, Readiness, RemoteExportOptions, RemoveOutcome,
     ResourceBindOutcome, SourceBranchOutcome, SourceBranchPolicy, StopStartOutcome,
-    StopStartResource, StopStartStatus, TrackerBindOutcome, UndoOptions, VerifyResource,
-    WorkspaceChange,
+    StopStartResource, StopStartStatus, TrackerBindOutcome, UndoOptions, UndoResourceOutcome,
+    VerifyResource, WorkspaceChange,
 };
 use newgit_core::preflight::Outcome;
 use newgit_core::resource::{CheckpointMode, ResourceDefinition};
@@ -4365,14 +4365,31 @@ fn undo(instance: Option<String>, options: UndoOptions) -> Result<()> {
             outcome.resources.len() - failed.len(),
             outcome.resources.len()
         );
-        println!(
-            "  {} may be in a partial state — a failed restore command is not rolled back",
-            failed
+        // Two different states: a restore that failed part way, and a
+        // process that was not started again over a restore that worked.
+        let names = |pick: fn(&UndoResourceOutcome) -> bool| {
+            outcome
+                .resources
                 .iter()
-                .map(|name| format!("`{name}`"))
+                .filter(|resource| pick(resource))
+                .map(|resource| format!("`{}`", resource.name))
                 .collect::<Vec<_>>()
                 .join(", ")
-        );
+        };
+        let partial = names(|resource| !resource.ok);
+        if !partial.is_empty() {
+            println!(
+                "  {partial} may be in a partial state — a failed restore command is not rolled \
+                 back"
+            );
+        }
+        let not_restarted = names(|resource| resource.ok && resource.restart_failed);
+        if !not_restarted.is_empty() {
+            println!(
+                "  {not_restarted} restored, but not running: the restart failed (below), and \
+                 the recovery record says how to retry it"
+            );
+        }
     }
     if !outcome.partial {
         let dirty = if restored.source.dirty_rev.is_some() {

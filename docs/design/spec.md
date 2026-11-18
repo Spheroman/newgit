@@ -1383,9 +1383,13 @@ it took down in `.newgit/state/<slug>/stopped.toml`. `newgit start`
 brings back exactly that, dependencies first, running `resume` before a
 resource's dependents come back, and with it any `autostart` action that
 died on its own since (#261), or that never started though its resource
-is ready: one a spawn held back behind a dependency that was not up (#54).
-`status` shows such a resource as `not started` and the instance as not
-ready. A long-running action without `autostart` that nobody started stays
+is ready: one a spawn held back behind a dependency that was not up (#54),
+or one an undo stopped and could not start again. `status` shows such a
+resource as `not started` and the instance as not ready. A failed restart
+is the process's failure, not the binding's: the binding's `failed` says a
+`prepare`, restore, export or render did not succeed, and is cleared by
+that succeeding, while a process that is not running is cleared by any
+start of it that succeeds. A long-running action without `autostart` that nobody started stays
 stopped. A resource whose dependency did not come back in the same `start`
 is not started, and stays owed, so a dev server is not brought up against a
 database that is still down.
