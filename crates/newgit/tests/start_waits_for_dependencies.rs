@@ -104,6 +104,15 @@ fn json(repo: &Utf8Path, args: &[&str]) -> (Option<i32>, Value) {
     (code, value)
 }
 
+/// Where newgit's port search starts: a port the OS just handed out, so
+/// two runs at once do not search the same range (#276).
+fn free_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .and_then(|listener| listener.local_addr())
+        .expect("an OS-assigned port")
+        .port()
+}
+
 fn has_python() -> bool {
     Command::new("python3").arg("--version").output().is_ok()
 }
@@ -176,7 +185,7 @@ fn a_dependent_starts_once_its_dependency_answers() {
     }
     let (_guard, temp) = tempdir();
     let store = setup(&temp);
-    write_resource(&store, "api", &api(54810, 2));
+    write_resource(&store, "api", &api(free_port(), 2));
     write_resource(&store, "web", WEB);
     let repo = store.paths().project_root.clone();
 
@@ -199,7 +208,7 @@ fn a_dependency_that_never_answers_keeps_its_dependent_down_until_start() {
     let (_guard, temp) = tempdir();
     let store = setup(&temp);
     // Past the five seconds a dependent waits.
-    write_resource(&store, "api", &api(54860, 7));
+    write_resource(&store, "api", &api(free_port(), 7));
     write_resource(&store, "web", WEB);
     let repo = store.paths().project_root.clone();
 
@@ -261,7 +270,7 @@ fn starting_a_dependent_by_hand_refuses_while_its_dependency_is_down() {
     }
     let (_guard, temp) = tempdir();
     let store = setup(&temp);
-    write_resource(&store, "api", &api(54910, 0));
+    write_resource(&store, "api", &api(free_port(), 0));
     write_resource(&store, "web", WEB);
     let repo = store.paths().project_root.clone();
 

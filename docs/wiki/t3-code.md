@@ -31,7 +31,9 @@ withheld while a dependency was not answering (a dead one `status` shows as
 Port claims are kept, so the instance returns on the same ports. With
 `--json` each prints `{"instance", "resources": [{"name", "action",
 "status", "error"}]}`, listing only what it acted on, and still exits 1 if
-anything failed; a resource that failed to start stays recorded for the
+anything failed. `start` then waits, as `spawn` does, for what it brought
+back to pass its `[ready]` check, adds `starting` and `problems` to its
+JSON when there are any, and exits 1 when the instance is not ready; a resource that failed to start stays recorded for the
 next `start`. A resource that is not a process newgit supervises — a
 Supabase stack, a Compose project — is taken down only if it defines a
 `suspend` / `resume` pair (`newgit reference actions`); the `supabase`

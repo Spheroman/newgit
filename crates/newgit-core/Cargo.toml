@@ -43,7 +43,7 @@ sha2 = "0.11"
 tempfile = "3"
 thiserror = "2"
 toml = "1.1"
-ureq = { version = "3.4.2", features = ["json"] }
+ureq = { version = "3.4.2", features = ["json", "platform-verifier"] }
 
 # `clonefile(2)` on a whole directory tree (see installs.rs: `cp -c`
 # clones one file at a time, which is slower than the install it replaces).

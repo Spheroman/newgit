@@ -1425,6 +1425,7 @@ fn spawn_from_checkpoint(
             serde_json::json!({
                 "name": outcome.branch.name,
                 "workspace": outcome.branch.workspace_path,
+                "logs": manager.store().paths().logs.join(&outcome.branch.slug),
                 "from": spec,
                 "author": outcome.author,
                 "agent": outcome.agent,
@@ -1476,6 +1477,10 @@ fn spawn_from_checkpoint(
         );
     }
     println!("  workspace: {}", outcome.branch.workspace_path);
+    println!(
+        "  logs:      {}",
+        manager.store().paths().logs.join(&outcome.branch.slug)
+    );
     for tracker in &outcome.undo.trackers {
         match &tracker.rev {
             Some(rev) => {
@@ -1620,6 +1625,7 @@ fn spawn(args: SpawnArgs) -> Result<()> {
             serde_json::json!({
                 "name": outcome.branch.name,
                 "workspace": outcome.branch.workspace_path,
+                "logs": manager.store().paths().logs.join(&outcome.branch.slug),
                 "source_rev": outcome.branch.source_rev,
                 "remote": outcome.branch.remote.as_ref().map(|remote| &remote.project),
                 "private": outcome.branch.private,
@@ -1634,14 +1640,16 @@ fn spawn(args: SpawnArgs) -> Result<()> {
                 "resources": resources,
                 "started": stop_start_resources_json(&outcome.started),
                 "starting": starting_json(&readiness),
+                "problems": readiness.problems,
             })
         );
         // The exit the human-readable summary below gives, for the same
         // reason (#86): a script is the caller most likely to ask for JSON,
         // and the one that goes by the exit code. As there, exit 1 reports
         // the instance's state rather than undoing it — the instance and its
-        // record stay, and the JSON above is all of stdout.
-        if !outcome.is_complete() {
+        // record stay, and the JSON above is all of stdout. Not up once its
+        // wait is over is as much a failure as not bound (#276).
+        if !outcome.is_complete() || !readiness.is_ready() {
             std::process::exit(1);
         }
         return Ok(());
@@ -1681,6 +1689,12 @@ fn spawn(args: SpawnArgs) -> Result<()> {
         println!("             cloned with `git clone`: the source template failed ({warning})");
     }
     println!("  record:    {}", outcome.record_path);
+    // Where every hook's and process's output goes, so a server that is not
+    // up can be looked into without searching for it.
+    println!(
+        "  logs:      {}",
+        manager.store().paths().logs.join(&branch.slug)
+    );
     print_left_behind(&outcome.left_behind);
     if let Some(warning) = &outcome.projection_warning {
         println!("  trackers:  the project root's commits were not split ({warning})");
@@ -1765,12 +1779,22 @@ fn spawn(args: SpawnArgs) -> Result<()> {
             &manager.readiness(branch),
         );
     }
+    print_readiness(&branch.name, &readiness);
+    if !readiness.is_ready() {
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
+/// `ready:`, `starting:`, or `not ready:` and why, as the end of `spawn`
+/// and of `start` say it.
+fn print_readiness(name: &str, readiness: &Readiness) {
     if readiness.is_ready() && !readiness.is_starting() {
-        println!("ready: `{}`", branch.name);
+        println!("ready: `{name}`");
     } else if readiness.is_ready() {
-        println!("starting: `{}`", branch.name);
+        println!("starting: `{name}`");
     } else {
-        println!("not ready: `{}`", branch.name);
+        println!("not ready: `{name}`");
         for problem in &readiness.problems {
             println!("  - {problem}");
         }
@@ -1781,7 +1805,6 @@ fn spawn(args: SpawnArgs) -> Result<()> {
     if readiness.is_starting() {
         println!("  `newgit status` shows when it is up.");
     }
-    Ok(())
 }
 
 /// What a resource does, told from what it declares. Every trait here is
@@ -2204,12 +2227,35 @@ fn stop_start(instance: Option<String>, json: bool, which: StopStart) -> Result<
         }
         StopStart::Start => manager.start_instance(&instance)?,
     };
+    // As the end of `spawn` does (#276): what `start` brought up has its
+    // `[ready] timeout_seconds` to pass its check, and one that does not is
+    // a failure, not a success to find out about later.
+    let readiness = match which {
+        StopStart::Start => {
+            let branch = manager.store().find_branch(&outcome.instance)?;
+            Some(manager.readiness_after(&branch, manager.ready_wait(&branch)))
+        }
+        StopStart::Stop | StopStart::Evict { .. } => None,
+    };
     if json {
-        println!("{}", stop_start_json(&outcome));
+        let mut json = stop_start_json(&outcome);
+        // Only when there is something to say, as for `moved_ports`.
+        if let Some(readiness) = &readiness {
+            if readiness.is_starting() {
+                json["starting"] = starting_json(readiness);
+            }
+            if !readiness.is_ready() {
+                json["problems"] = serde_json::json!(readiness.problems);
+            }
+        }
+        println!("{json}");
     } else {
         print_stop_start(&outcome, which);
+        if let Some(readiness) = &readiness {
+            print_readiness(&outcome.instance, readiness);
+        }
     }
-    if !outcome.ok() {
+    if !outcome.ok() || readiness.is_some_and(|readiness| !readiness.is_ready()) {
         std::process::exit(1);
     }
     Ok(())
@@ -2299,8 +2345,9 @@ fn stop_start_resources_json(resources: &[StopStartResource]) -> serde_json::Val
         .collect()
 }
 
-/// `{"resource", "ports"}` per running resource whose ports have not answered
-/// yet. Not a failure: `spawn` exits 0 with these, as it does for `ready`.
+/// `{"resource", "ports", "check", "log"}` per resource not up yet, within
+/// the time it has (#276). Not a failure: `spawn` and `start` exit 0 with
+/// these, as for `ready`.
 fn starting_json(readiness: &Readiness) -> serde_json::Value {
     readiness
         .starting
@@ -2310,6 +2357,7 @@ fn starting_json(readiness: &Readiness) -> serde_json::Value {
                 "resource": starting.resource,
                 "ports": starting.ports,
                 "check": starting.check,
+                "log": starting.log,
             })
         })
         .collect()
@@ -3537,13 +3585,12 @@ fn status_table(
 ) -> Result<bool> {
     warn_gitignore(manager);
     warn_graph(manager);
-    let mut reports = manager.statuses()?;
-
-    if let Some(name) = name {
-        reports.retain(|report| report.branch.name == name || report.branch.slug == name);
-        if reports.is_empty() {
-            bail!("no branch instance named `{name}`");
-        }
+    // Only the instance asked about is checked, not every one (#276).
+    let reports = manager.statuses_of(name)?;
+    if let Some(name) = name
+        && reports.is_empty()
+    {
+        bail!("no branch instance named `{name}`");
     }
 
     if reports.is_empty() {
