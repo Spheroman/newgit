@@ -665,8 +665,10 @@ something to newgit:
 - **`start` and `stop`** are a convention made real by `long_running =
   true`: the process starts detached in its own process group, its output
   goes to `.newgit/logs/`, its PID to `.newgit/state/`, and `stop` sends the
-  configured signal (TERM by default) to the group. No daemon, no restart
-  policy. `autostart = true` has `spawn` start it; the `process` template
+  configured signal (TERM by default) to the group. Its stdin is a pipe that
+  never delivers data or end-of-file while it runs, held by the wrapper
+  that waits on it (below), so a watcher that quits when stdin closes keeps
+  running. No daemon, no restart policy. `autostart = true` has `spawn` start it; the `process` template
   sets it.
 - **`suspend` and `resume`** take down and bring back something newgit does
   not supervise, such as a Supabase stack or a Compose project. `newgit
