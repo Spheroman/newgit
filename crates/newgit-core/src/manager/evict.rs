@@ -1164,4 +1164,176 @@ impl BranchManager {
         warnings.extend(crate::evict::reapply_files(&workspace, &saved.files));
         Ok(warnings)
     }
+
+    /// The checkpoint `start` rebuilds `branch`'s deleted workspace from:
+    /// the latest this instance took (a name's history also holds earlier
+    /// same-named instances', which are not this one's work). `None` when
+    /// it took none, and the rebuild starts from its source branch.
+    pub fn rebuild_checkpoint(&self, branch: &BranchInstance) -> Option<CheckpointRecord> {
+        self.checkpoint_log(branch)
+            .list()
+            .ok()?
+            .into_iter()
+            .rev()
+            .find(|record| record.instance.as_deref() == Some(branch.id.as_str()))
+    }
+
+    /// What `newgit start` does for an instance whose workspace was deleted
+    /// by hand (`rm -rf`): workspaces are disposable, and the record and the
+    /// checkpoints are enough to make it again. Processes still running
+    /// from the deleted directory are stopped first and recorded for the
+    /// `start` that follows to bring back, as `newgit stop` records them.
+    /// Then, with a checkpoint of this instance, the workspace comes back
+    /// from the latest, as an evicted one does (the record says evicted to
+    /// it until the restore is done, so a restore that fails leaves an
+    /// instance the next `start` tries again); with none, it is made again
+    /// from the source branch, trackers outside Git at their bound revs,
+    /// and every resource bound again on the ports it holds, `prepare`
+    /// included. Either way the warnings say what did not come back:
+    /// whatever was written after that checkpoint, or everything never
+    /// committed. Under the instance's lock, which the caller holds.
+    pub(super) fn rebuild_deleted(
+        &self,
+        mut branch: BranchInstance,
+    ) -> Result<(Option<String>, Vec<String>)> {
+        let supervisor = self.supervisor(&branch);
+        let mut record = self.load_stopped_record(&branch)?;
+        for definition in self.running_resources(&branch) {
+            let name = &definition.name;
+            match supervisor.stop(name, &definition.stop_signal())? {
+                StopOutcome::Stopped(_) | StopOutcome::NotRunning => {}
+                StopOutcome::StillRunning(pid) => {
+                    return Err(NewgitError::Unsupported(format!(
+                        "the workspace of `{}` was deleted, and `{name}`'s process (pid {pid}), \
+                         still running from it, ignored `{}`; nothing was rebuilt. Stop it \
+                         (`kill -9 -- -{pid}`) and `newgit start {}` again",
+                        branch.name,
+                        definition.stop_signal(),
+                        branch.name
+                    )));
+                }
+            }
+            if let Some((action, _)) = long_running_action(definition)
+                && !record
+                    .resources
+                    .iter()
+                    .any(|entry| &entry.name == name && !entry.is_resume())
+            {
+                record.resources.push(StoppedResource {
+                    name: name.clone(),
+                    action: action.to_owned(),
+                });
+            }
+        }
+        for orphan in self.stop_undefined(&branch) {
+            if let Some(error) = orphan.error {
+                return Err(NewgitError::Unsupported(format!(
+                    "`{}`'s process, whose definition is gone, did not stop: {error}",
+                    orphan.name
+                )));
+            }
+        }
+        self.save_stopped_record(&branch, &record)?;
+        self.require_resolvable_graph()?;
+
+        if let Some(checkpoint) = self.rebuild_checkpoint(&branch) {
+            let id = checkpoint.id.clone();
+            branch.evicted = Some(id.clone());
+            branch.updated_at = Utc::now();
+            self.store.save_branch_record(&branch)?;
+            let mut warnings = vec![format!(
+                "the workspace of `{}` was deleted; rebuilt from {id}, its latest checkpoint \
+                 ({}). What was written after it, never checkpointed, did not come back; \
+                 `newgit checkpoints {}` lists the others, and `newgit undo {} --to <id>` \
+                 restores one",
+                branch.name,
+                checkpoint.created_at.format("%Y-%m-%d %H:%M UTC"),
+                branch.name,
+                branch.name
+            )];
+            warnings.extend(self.restore_evicted(branch.clone(), &id)?);
+            if branch.remote.is_some() {
+                warnings.push(lost_token_warning(&branch));
+            }
+            return Ok((Some(id), warnings));
+        }
+
+        let workspace = branch.workspace_path.clone();
+        let mut warnings = vec![format!(
+            "the workspace of `{}` was deleted, and it has no checkpoint; rebuilt from branch \
+             `{}` as the store has it, with trackers outside Git at their last capture. What \
+             was never committed into the store (uncommitted work, commits made in the \
+             workspace since its last checkpoint or push) did not come back",
+            branch.name, branch.source_ref
+        )];
+        if let Some(warning) = self.materializer().materialize_reporting(
+            &self.source,
+            &branch,
+            &self.sparse_patterns(&branch.dropped),
+            &self.export_mains_to_carry(&branch.dropped),
+        )? {
+            warnings.push(warning);
+        }
+        if !branch.dropped.is_empty() {
+            self.apply_sparse_to(&branch, true)?;
+        }
+        self.ensure_workspace_excludes(&branch)?;
+        self.ensure_workspace_push(&branch)?;
+        for definition in &self.trackers {
+            if branch.dropped.contains(&definition.name) {
+                continue;
+            }
+            if let Some(rev) = branch
+                .trackers
+                .get(&definition.name)
+                .and_then(|binding| binding.content_rev.as_deref())
+            {
+                self.lane(&definition.name)
+                    .restore(&workspace, definition, rev)?;
+            }
+        }
+        // Each resource bound again as `resource rebind` binds it: its ports
+        // kept, its files rendered, its `prepare` run, one at a time in
+        // binding order so each sees what it depends on.
+        for name in self.graph.bind_order.clone() {
+            let Some(previous) = branch.resources.remove(&name) else {
+                continue;
+            };
+            let held = previous.resolved_ports.clone();
+            if let Err(error) = self.bind_resources_keeping(&mut branch, Some((&name, &held))) {
+                if !branch.resources.contains_key(&name) {
+                    branch.resources.insert(name.clone(), previous);
+                }
+                self.store.save_branch_record(&branch)?;
+                return Err(error);
+            }
+            if branch
+                .resources
+                .get(&name)
+                .is_some_and(|binding| binding.status != ResourceStatus::Ready)
+            {
+                warnings.push(format!(
+                    "resource `{name}` did not come back ready; `newgit status {}` says why",
+                    branch.name
+                ));
+            }
+        }
+        branch.updated_at = Utc::now();
+        self.store.save_branch_record(&branch)?;
+        if branch.remote.is_some() {
+            warnings.push(lost_token_warning(&branch));
+        }
+        Ok((None, warnings))
+    }
+}
+
+/// What a rebuild of a deleted workspace cannot give back on a remote: the
+/// workspace's own token lived in its `.git/`.
+fn lost_token_warning(branch: &BranchInstance) -> String {
+    format!(
+        "`{}` is on the project's remote, and the workspace's own token for it went with the \
+         deleted `.git/`; newgit commands in the workspace that act on the remote as the \
+         workspace fail until it has one again",
+        branch.name
+    )
 }

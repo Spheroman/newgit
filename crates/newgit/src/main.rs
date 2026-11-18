@@ -189,11 +189,17 @@ enum Command {
     },
     /// Start again what the last `newgit stop` stopped, and any `autostart`
     /// action that died on its own or never started, bringing back an
-    /// evicted workspace first
+    /// evicted or deleted workspace first
     ///
     /// A resource nobody had started stays stopped. Exits 0 when there is
     /// nothing to start, and 1 when anything failed to; a failed one is
     /// tried again by the next `newgit start`.
+    ///
+    /// A workspace deleted by hand is made again: what still runs from the
+    /// deleted directory is stopped, then the workspace comes back from the
+    /// instance's latest checkpoint, or from its source branch when it has
+    /// none (every resource then prepared again on the ports it holds).
+    /// What was never checkpointed does not come back, and `start` says so.
     Start {
         /// Instance (inferred when run inside a workspace)
         instance: Option<String>,
@@ -2412,6 +2418,9 @@ fn stop_start_json(outcome: &StopStartOutcome) -> serde_json::Value {
         Some(WorkspaceChange::Restored { checkpoint }) => {
             json["restored"] = serde_json::json!({ "checkpoint": checkpoint });
         }
+        Some(WorkspaceChange::Rebuilt { checkpoint }) => {
+            json["rebuilt"] = serde_json::json!({ "checkpoint": checkpoint });
+        }
         None => {}
     }
     json
@@ -2567,6 +2576,17 @@ fn print_stop_start(outcome: &StopStartOutcome, which: StopStart) {
     if let Some(WorkspaceChange::Restored { checkpoint }) = &outcome.workspace {
         println!("Restored the workspace for `{instance}` from {checkpoint}");
     }
+    // What did not come back is the first warning, above.
+    match &outcome.workspace {
+        Some(WorkspaceChange::Rebuilt {
+            checkpoint: Some(checkpoint),
+        }) => println!("Rebuilt the deleted workspace of `{instance}` from {checkpoint}"),
+        Some(WorkspaceChange::Rebuilt { checkpoint: None }) => println!(
+            "Rebuilt the deleted workspace of `{instance}` from its source branch (it had no \
+             checkpoint)"
+        ),
+        _ => {}
+    }
     if let Some(WorkspaceChange::AlreadyEvicted { checkpoint }) = &outcome.workspace {
         println!(
             "`{instance}` is already evicted to {checkpoint}; `newgit start {instance}` brings it \
@@ -2611,6 +2631,9 @@ fn print_stopped_or_started(outcome: &StopStartOutcome, which: StopStart) {
             StopStart::Stop | StopStart::Evict { .. } => {
                 println!("Nothing running for `{instance}`")
             }
+            // A workspace brought back has said so; the restore restarted
+            // what its checkpoint had running.
+            StopStart::Start if outcome.workspace.is_some() => {}
             StopStart::Start => println!(
                 "Nothing stopped by `newgit stop`, and no `autostart` action down, for \
                  `{instance}`"
@@ -3732,6 +3755,30 @@ fn status_table(
             println!("  - {problem}");
         }
     }
+    for report in reports
+        .iter()
+        .filter(|report| !report.workspace_exists && report.branch.evicted.is_none())
+    {
+        let name = &report.branch.name;
+        let from = match manager.rebuild_checkpoint(&report.branch) {
+            Some(checkpoint) => format!(
+                "from {}, its latest checkpoint ({}); what was written after it does not \
+                 come back",
+                checkpoint.id,
+                checkpoint.created_at.format("%Y-%m-%d %H:%M UTC")
+            ),
+            None => format!(
+                "from branch `{}`, since it has no checkpoint; what was never committed into \
+                 the store does not come back",
+                report.branch.source_ref
+            ),
+        };
+        println!(
+            "\n`{name}`'s workspace was deleted. `newgit start {name}` stops whatever still runs \
+             from the deleted directory and rebuilds it {from}. `newgit remove {name}` removes \
+             the instance instead."
+        );
+    }
     for report in &reports {
         let disposed = manager.evicted_disposed(&report.branch);
         if !disposed.is_empty() {
@@ -3846,7 +3893,9 @@ fn status_json(manager: &BranchManager, name: Option<&str>) -> Result<()> {
                 "name": report.branch.name,
                 "workspace": report.branch.workspace_path,
                 "status": health(report),
-                "problems": if report.workspace_exists {
+                // A deleted workspace's one problem names the command that
+                // rebuilds it; an evicted one is not a problem.
+                "problems": if report.workspace_exists || report.branch.evicted.is_none() {
                     report.readiness.problems.clone()
                 } else {
                     Vec::new()

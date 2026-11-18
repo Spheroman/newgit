@@ -504,6 +504,11 @@ project repository:
 - The agent gets a fully real repository. `.git` is a directory, and `git
   fsck`, `git log`, and everything else check out.
 - Deleting a workspace is `rm -rf`. Nothing to register, prune, or lock.
+  The binding record outlives it, so `newgit start` makes it again: from
+  the instance's latest checkpoint, as an evicted one comes back, or from
+  its source branch with every resource prepared again when it has none.
+  Processes still running from the deleted directory are stopped first.
+  What was never checkpointed is gone, and `start` says so.
 - Nothing is shared between workspaces, so two instances of the same base
   branch is a non-event.
 
