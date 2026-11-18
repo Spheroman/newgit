@@ -1,5 +1,3 @@
-### Fixed
-
 - **Held-back dependents, after review of #54 and #276.** `newgit status`
   showed an instance as `ready` when a spawn had held an `autostart` action
   back behind a dependency that was not up; it now shows the resource as
