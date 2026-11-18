@@ -469,6 +469,17 @@ impl BranchManager {
     }
 }
 
+impl BranchManager {
+    /// The action whose run of `resource` the supervisor last started in
+    /// `instance`, from that run's log: what a signal action such as
+    /// `web.stop` stopped, which is `web.start`, not itself.
+    pub fn last_started_action(&self, instance: &str, resource: &str) -> Option<String> {
+        let branch = self.store.find_branch(instance).ok()?;
+        let log = self.supervisor(&branch).last_log(resource)?;
+        logged_action(&log, resource)
+    }
+}
+
 /// The action a supervised run's log is for, from its name:
 /// `<resource>.<action>-<YYYYmmddTHHMMSS>-<nanos>Z.log`, as
 /// `MetadataStore::action_log_path` names it.
