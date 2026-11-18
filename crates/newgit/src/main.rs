@@ -4401,8 +4401,8 @@ fn undo(instance: Option<String>, options: UndoOptions) -> Result<()> {
         let not_restarted = names(|resource| resource.ok && resource.restart_failed);
         if !not_restarted.is_empty() {
             println!(
-                "  {not_restarted} restored, but not running: the restart failed (below), and \
-                 the recovery record says how to retry it"
+                "  {not_restarted} restored, but not running (below); the recovery record \
+                 says how to bring it back"
             );
         }
     }
@@ -4440,10 +4440,15 @@ fn undo(instance: Option<String>, options: UndoOptions) -> Result<()> {
         // does not bring a resource up. Under "Restored" a bare `ok` reads
         // as the resource being fine, so when it is not, say the status it
         // is left in, the one `newgit status` will show.
-        let restart = if resource.restart_failed {
+        // Not restarted behind a dependency that is not up is what the
+        // `left blocked by` below says; a restart that failed on its own is
+        // a failure.
+        let restart = if !resource.restart_failed {
+            ""
+        } else if resource.blocked_by.is_empty() {
             ", restart FAILED"
         } else {
-            ""
+            ", not restarted"
         };
         // Derived the way `status` derives it: a resource behind a
         // dependency that is not ready reads as blocked, whatever its own

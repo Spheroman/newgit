@@ -148,7 +148,7 @@ fn a_failed_restart_reads_not_started_and_start_clears_it() {
         "{stdout}"
     );
     assert!(
-        stdout.contains("`web` restored, but not running: the restart failed"),
+        stdout.contains("`web` restored, but not running (below)"),
         "not a failed restore command:\n{stdout}"
     );
     assert!(!stdout.contains("partial state"), "{stdout}");
