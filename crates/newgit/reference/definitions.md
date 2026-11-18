@@ -209,6 +209,12 @@ newgit resource add deps --template pnpm
 newgit resource add app --template process
 ```
 
+**Edit `.newgit/` in the project root, never in a workspace.** newgit reads
+every definition, and every `{{scripts}}` script, from the project root
+where `newgit init` ran. A workspace holds a copy of `.newgit/` like any
+other committed file, and an edit there changes nothing until it reaches
+the project root.
+
 `resource add` lists the lines that hold a template's placeholder (`EDIT
 ME: …`, `EDIT_ME_PROJECT`); replace each, and `newgit resource check` fails
 until you have. Then read the rest of every generated file in
@@ -222,6 +228,24 @@ the install writes (`node_modules`, `.venv`). That is what lets later
 instances with the same lockfile be cloned from the install store instead of
 installing again. The `pnpm` template sets it; the `install` template leaves
 it as `EDIT ME`, and an install without it is never shared.
+
+What no template can guess for you:
+
+- **Give every port explicitly.** A tool that picks its own ports (a
+  live-reload or HMR socket, an inspector, a second server it starts) picks
+  the same ones in every instance, or wanders off the one newgit allocated
+  when that is busy. Give each a `[ports.<name>]` and hand it in: a flag
+  (`--port $WEB_PORT`), a variable the tool reads, or a `[[render]]` into
+  its config.
+- **Build before you serve.** A dev server that needs a build or codegen
+  step first does it in `prepare`, or before `exec` in its action (`npm run
+  build && exec npm run start`).
+- **`[ready]` says what "up" means**, and its `timeout_seconds` is a
+  deadline: past it the resource is down and `spawn` exits 1. Without one,
+  up is its port answering. Set the timeout to a real cold start.
+- **An edit does not reach a live instance.** `newgit status` names each
+  resource bound from an older definition, and the command that applies
+  the new one.
 
 Commit `.newgit/` the way `init` says to, on a branch if the project works
 that way. A spawn reads definitions from the store, but teammates and CI only
@@ -241,7 +265,9 @@ newgit checkpoint newgit-try --verify
 newgit remove newgit-try
 ```
 
-Fix what fails and run it again. A setup that fails on its first spawn is
+Fix what fails and run it again. Every hook's run has its own log in
+`.newgit/logs/<instance>/`; `spawn` prints that directory, and `status`
+names the log of whatever failed. A setup that fails on its first spawn is
 worse than not setting it up at all.
 
 ### Wire up the tools they already use
@@ -983,7 +1009,13 @@ Nothing typed reaches it: `newgit action` returns once it has started.
 **A failed hook keeps its evidence.** A spawn's `prepare` runs quietly and
 its `FAILED` line shows the command that ran, every line of it, and the
 log's last lines. Every run writes a log of its own, named in its own
-report, so a retry never overwrites the log of the run before it. And
+report, so a retry never overwrites the log of the run before it: in the
+project root's `.newgit/logs/<instance>/`, named
+`<resource>.<action>-<UTC time>.log`
+(`db.prepare-20261118T214413-005254000Z.log`; `<resource>.checkpoint-…`
+and `.restore-…` for those hooks). `spawn` prints that directory, and
+`status` names the log of the run behind a resource that failed, died, or
+is not up. And
 nothing newgit runs afterwards removes what the failed command left in the
 workspace: `[cleanup]` runs only at `newgit remove`, and `start` and the
 retry run nothing but what the definition says. A tool that cleans up after
@@ -1798,15 +1830,78 @@ relocatable, naming the file:
 
 ```
   install store: not stored — the built tree names its own workspace in
-  `.../node_modules/sharp/config.json`, so it cannot be shared (key 3ec46aa385bb);
-  a `[[render]]` with `with = "{{workspace}}"` on that file lets the store rewrite it per instance
+  `.../node_modules/sharp/config.json`, so it cannot be shared (key 3ec46aa385bb). If a tool
+  writes the path into that one state file, a `[[render]]` on it ... If it is generated code ...
 ```
 
 That resource just keeps installing per instance, exactly as it did before.
-Nothing fails. When the file only records the path as data — pnpm's
-workspace state, for one — a `[[render]]` on it lets the store rewrite it per
-instance instead; see *Rendering into a built tree*. The `pnpm` template
-declares that one.
+Nothing fails. Which way out depends on what wrote the path:
+
+- **One state file a tool writes** (pnpm's workspace state, for one): it
+  only records the path as data, so a `[[render]]` on it lets the store
+  rewrite it per instance; see *Rendering into a built tree*. The `pnpm`
+  template declares that one.
+- **A generated directory** (a database client, protobuf stubs): the path
+  is all through the generated code. Move the step that generates it out of
+  the install and into a resource of its own, keyed on its own input; see
+  *Generated code*.
+
+### Generated code
+
+An install whose postinstall generates code (`prisma generate` writing
+`node_modules/.prisma`, a GraphQL or protobuf client) mixes two
+derivations: the packages, from the lockfile, and the generated client,
+from a schema. The client usually names its workspace, so the store
+declines the whole tree, and a schema change cannot rebuild the client
+without reinstalling. Make them two resources. With Prisma:
+
+```toml
+# .newgit/resources/deps.toml — the install, with generation skipped
+ownership = "workspace"
+
+[identity]
+paths = ["package.json", "package-lock.json"]
+produces = ["node_modules"]
+key_command = "node -v && uname -sm"
+
+[actions.prepare]
+command = "PRISMA_SKIP_POSTINSTALL_GENERATE=1 npm ci"
+
+[checkpoint]
+mode = "hash"
+
+[restore]
+mode = "recompute"
+action = "prepare"
+
+# .newgit/resources/prisma-client.toml — the client, from the schema
+ownership = "workspace"
+depends_on = ["deps"]
+
+[identity]
+paths = ["prisma/schema.prisma"]
+produces = ["node_modules/.prisma"]
+
+[actions.prepare]
+command = "npx prisma generate"
+
+[checkpoint]
+mode = "hash"
+
+[restore]
+mode = "recompute"
+action = "prepare"
+```
+
+`deps` is now relocatable and shared through the store. `prisma-client`
+is keyed on the schema alone: shared too when its output is relocatable,
+regenerated per instance (in seconds) when it names the workspace. An
+`undo` across a schema change regenerates it; one across a lockfile change
+rebuilds `node_modules` without it, and `status` then names
+`node_modules/.prisma` as missing with the command that regenerates it.
+Any generator fits the same shape: skip it in the install, and give it a
+resource whose `[identity] paths` are its inputs and whose `produces` is
+its output.
 
 **`key_command` is not optional in practice.** A lockfile hash describes what
 was asked for, not what gets built: install scripts compile against the local

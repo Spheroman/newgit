@@ -166,8 +166,12 @@ impl InstallReport {
             }
             Self::Declined { key, path } => format!(
                 "install store: not stored — the built tree names its own workspace in \
-                 `{path}`, so it cannot be shared (key {key}); a `[[render]]` with `with = \
-                 \"{{{{workspace}}}}\"` on that file lets the store rewrite it per instance"
+                 `{path}`, so it cannot be shared (key {key}). If a tool writes the path into \
+                 that one state file, a `[[render]]` on it with `with = \"{{{{workspace}}}}\"` \
+                 lets the store rewrite it per instance, as the pnpm template does. If it is \
+                 generated code (a client like `node_modules/.prisma`), move the step that \
+                 generates it out of this install into its own resource that `depends_on` this \
+                 one and `produces` that directory (`newgit reference generated-code`)"
             ),
             Self::Unavailable { reason } => format!("install store unavailable: {reason}"),
         }

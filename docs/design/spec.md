@@ -1044,7 +1044,9 @@ What keeps sharing safe:
 - **A tree that names its own workspace is not shared**, unless a render
   covers the file. Copy-on-write cannot fix a path already baked into the
   content, so admission scans the tree and declines it, naming the file.
-  That resource keeps installing per instance. Nothing fails.
+  That resource keeps installing per instance. Nothing fails. Generated
+  code (a Prisma client) is moved into a resource of its own instead, keyed
+  on its own input.
 - **`prepare` is the only thing an entry stands in for.** A definition
   where something else builds the tree (a `long_running` or command-less
   `prepare`, `captures` it would stop publishing, a `recompute` restore

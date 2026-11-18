@@ -58,7 +58,9 @@ mod export_check;
 mod pull;
 pub use pull::{PullOutcome, PulledTracker};
 mod reset;
+mod run_logs;
 pub use reset::{HeldBack, ResetLine, ResetOutcome};
+use run_logs::{last_action_log, last_log_line};
 mod stale_render;
 pub use stale_render::{PossiblyStale, StaleRender};
 mod stale_definition;
@@ -3814,14 +3816,15 @@ impl BranchManager {
                     continue;
                 }
                 ResourceStatus::Failed => {
+                    let log = last_log_line(
+                        last_action_log(&logs, name, definition.producing_action()),
+                        &logs,
+                    );
                     problems.push(match retry_command(definition) {
-                        Some(retry) => format!(
-                            "`{name}` failed — retry with `{retry}`; its logs are under {logs}"
-                        ),
-                        None => format!(
-                            "`{name}` failed, and defines no action that retries it; its logs \
-                             are under {logs}"
-                        ),
+                        Some(retry) => format!("`{name}` failed — retry with `{retry}`; {log}"),
+                        None => {
+                            format!("`{name}` failed, and defines no action that retries it; {log}")
+                        }
                     });
                     continue;
                 }
@@ -3869,9 +3872,9 @@ impl BranchManager {
             {
                 problems.push(format!(
                     "`{name}.{action_name}` {} without being stopped — restart it with \
-                     `newgit action {name}.{action_name}` or `newgit start`; its logs are under \
-                     {logs}",
-                    death.describe()
+                     `newgit action {name}.{action_name}` or `newgit start`; {}",
+                    death.describe(),
+                    last_log_line(supervisor.last_log(name), &logs)
                 ));
                 continue;
             }
