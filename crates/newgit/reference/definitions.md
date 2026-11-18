@@ -1372,6 +1372,43 @@ Identity describes the *inputs*, not the tree. Delete half of `node_modules`
 without touching the lockfile and the hash still matches while the tree is
 wrong — `newgit undo --force-recompute` rebuilds anyway.
 
+**A resource that generates into another's tree** — `prisma generate` writing
+`node_modules/.prisma` inside the `node_modules` that `deps` installs —
+declares `depends_on` on it and names what it writes in its own `[identity]
+produces`:
+
+```toml
+# .newgit/resources/prisma-client.toml
+depends_on = ["deps"]
+
+[identity]
+paths    = ["prisma/schema.prisma"]
+produces = ["node_modules/.prisma"]
+
+[actions.prepare]
+command = "npx prisma generate"
+
+[checkpoint]
+mode = "hash"
+
+[restore]
+mode = "recompute"
+```
+
+A tree rebuilt or refilled from its inputs holds nothing a dependent wrote
+into it, so an undo that recomputes a resource recomputes every `recompute`
+dependent after it, whatever their identity says, and says why:
+
+```
+resource: deps recompute(prepare) filled from install store 5d769aee3bb2 (copy-on-write) ok
+resource: prisma-client recompute(prepare) after `deps` was recomputed ok
+```
+
+That is the `depends_on`. The `produces` is what lets the undo see the
+generated output missing when only it went (someone deleted
+`node_modules/.prisma`), and puts it in the install store, so a spawn whose
+schema matches one already built is filled instead of generating again.
+
 `newgit undo --only <resource>` restores one resource and leaves source,
 tracker content, and every other resource untouched. That is not a snapshot
 the instance was ever in, so it is reported as a partial restore and never as
