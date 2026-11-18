@@ -16,6 +16,7 @@ use newgit_core::manager::{
     StopStartResource, StopStartStatus, TrackerBindOutcome, UndoOptions, VerifyResource,
     WorkspaceChange,
 };
+use newgit_core::preflight::Outcome;
 use newgit_core::resource::{CheckpointMode, ResourceDefinition};
 use newgit_core::source::{RefUpdate, find_repo_root};
 use newgit_core::store::Context;
@@ -710,14 +711,18 @@ enum ResourceCommand {
     /// Check that every program a definition's commands start is on this
     /// machine, with no instance and nothing run
     ///
-    /// Reads the first word of each command in every action, `[identity]
-    /// key_command`, `[checkpoint]`, `[restore]`, `[cleanup]`, and `[ready]`
-    /// command, and looks for it on `PATH` (a path with a `/` relative to
-    /// the project root and the command's `workdir`). A word a template or a
-    /// variable decides is skipped. Exits 1 when any is missing.
+    /// Reads every action, `[identity] key_command`, `[checkpoint]`,
+    /// `[restore]`, `[cleanup]`, and `[ready]` command as shell, and looks
+    /// up each program it would run: on `PATH`, or (a path with a `/`) from
+    /// the directory the command's `workdir` and any `cd` put it in. Each is
+    /// `ok`, `FAIL`, or `skip` with why: a word a template or variable
+    /// decides, a `cd` newgit cannot follow, or a program the command checks
+    /// for itself (`command -v`). Exits 1 when any fails; a skip is not a
+    /// failure.
     Check {
         /// One JSON document: `{"programs": [{"resource", "hook", "program",
-        /// "found"}]}`, `found` null when missing
+        /// "status", "found", "reason"}]}`; `status` is `ok`, `fail`, or
+        /// `skip`
         #[arg(long)]
         json: bool,
     },
@@ -1892,15 +1897,27 @@ fn resource(command: ResourceCommand) -> Result<()> {
                 &path,
             );
             let missing = checks.iter().filter(|check| check.is_missing()).count();
+            let skipped = checks
+                .iter()
+                .filter(|check| matches!(check.outcome, Outcome::Unchecked(_)))
+                .count();
             if json {
                 let programs = checks
                     .iter()
                     .map(|check| {
+                        let (found, reason) = match &check.outcome {
+                            Outcome::Found(found) => (Some(found.as_str()), None),
+                            Outcome::Missing(reason) | Outcome::Unchecked(reason) => {
+                                (None, Some(reason.as_str()))
+                            }
+                        };
                         serde_json::json!({
                             "resource": check.resource,
                             "hook": check.hook,
                             "program": check.program,
-                            "found": check.found,
+                            "status": check.outcome.status(),
+                            "found": found,
+                            "reason": reason,
                         })
                     })
                     .collect::<Vec<_>>();
@@ -1909,30 +1926,25 @@ fn resource(command: ResourceCommand) -> Result<()> {
                 println!("No resource definition starts a program newgit can check.");
             } else {
                 for check in &checks {
-                    match &check.found {
-                        Some(found) => println!(
-                            "ok    {}: {} `{}` ({found})",
-                            check.resource, check.hook, check.program
-                        ),
-                        None => println!(
-                            "FAIL  {}: {} `{}` — not found{}",
-                            check.resource,
-                            check.hook,
-                            check.program,
-                            if check.program.contains('/') {
-                                " in the project root".to_owned()
-                            } else {
-                                " on PATH".to_owned()
-                            }
-                        ),
+                    let program = check
+                        .program
+                        .as_ref()
+                        .map(|program| format!(" `{program}`"))
+                        .unwrap_or_default();
+                    let at = format!("{}: {}{program}", check.resource, check.hook);
+                    match &check.outcome {
+                        Outcome::Found(found) => println!("ok    {at} ({found})"),
+                        Outcome::Missing(reason) => println!("FAIL  {at} — {reason}"),
+                        Outcome::Unchecked(reason) => {
+                            println!("skip  {at} — not checked: {reason}")
+                        }
                     }
                 }
                 if missing > 0 {
-                    println!(
-                        "{missing} program{} missing: install {}, or change the definition",
-                        if missing == 1 { "" } else { "s" },
-                        if missing == 1 { "it" } else { "them" }
-                    );
+                    println!("{missing} failed: install what is missing, or change the definition");
+                }
+                if skipped > 0 {
+                    println!("{skipped} not checked: not failures; only running the hook can tell");
                 }
             }
             if missing > 0 {

@@ -18,6 +18,9 @@ workspace = true
 # rpassword to ask for an SSH key's passphrase.
 age = { version = "0.12", features = ["ssh"] }
 base64 = "0.22"
+# Reading hook commands as shell (#87): a real POSIX/bash parser, not a
+# tokenizer of our own.
+brush-parser = "0.4"
 camino = { version = "1.2", features = ["serde1"] }
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
 # Loose objects are zlib streams (objects.rs writes them in process).

@@ -228,7 +228,7 @@ see what is committed.
 Don't hand it over until a real spawn comes up:
 
 ```sh
-newgit resource check             # every program the hooks start is installed
+newgit resource check             # every program the hooks start is installed; fix each FAIL
 newgit spawn newgit-try
 newgit status newgit-try          # every resource ready; if not, it says why
 newgit env newgit-try             # ports and exports, labeled by where they came from
@@ -646,13 +646,39 @@ creates alongside it, without instantiating anything).
 start — each action, `[identity] key_command`, `[checkpoint]`, `[restore]`,
 `[cleanup]`, and `[ready]` command — with no instance and nothing run
 (#87). A `[restore]` calling `psql` on a machine with no Postgres client
-otherwise fails only during the undo you are relying on. It reads the first
-word of each command (past `&&`, `;`, `|`, quotes, here-documents, `VAR=`
-assignments, and `exec`), looks a bare name up on `PATH` and a path with a
-`/` in the project root under the command's `workdir`, and prints `ok` or
-`FAIL` per program; `--json` lists them, `found` null when missing. A word
-a template or variable decides (`{{scripts}}/seed.sh`, `$TOOL`) is skipped,
-and so are shell builtins. Exits 1 when anything is missing.
+otherwise fails only during the undo you are relying on.
+
+It reads each command as shell. `sh -n` (the shell that will run it, told
+not to execute) must accept it, or that command is one `FAIL`. Then every
+program the shell would run is looked up: in `if`/`elif`/`else`, loops,
+`case` arms, `{ }`, subshells, pipelines, function bodies, `$(...)`, and
+behind `exec`, `command`, `env`, `nohup`, `nice`, `timeout`, `xargs`,
+`sh -c`, and `eval`. Case patterns, arithmetic, builtins (bash's too),
+functions the command defines, assignments, redirections, and here-document
+bodies are not programs and are not looked up. A bare name is looked for on
+`PATH`. A path with a `/` is looked for from where the command runs: its
+`workdir` (the project root stands in for the workspace; `key_command`
+always runs at the root), then wherever a `cd` or `pushd` in it moved, and
+it must be executable (`sh script.sh` and `. script.sh` need only the file).
+
+Each program is one line:
+
+- `ok` — found, and where.
+- `FAIL` — it will not run: not on `PATH`, no such file, not executable, a
+  directory, or the command does not parse. Exits 1.
+- `skip` — not checked, and why, because only a running instance can know:
+  a template or variable names it (`{{scripts}}/seed.sh`, `$TOOL`), a glob,
+  a relative path after a `cd` newgit cannot follow (`cd "$DIR"`, a `cd`
+  inside an `if`, a directory a step before it creates), a path Git ignores
+  that is not there yet (`./node_modules/.bin/vite`; the install makes it),
+  or a program the command checks for itself (`command -v X`, `type X`,
+  `which X`, `[ -x ./bin/x ]`) and so has its own answer for. A skip is not
+  a failure and does not change the exit code.
+
+`--json` prints `{"programs": [{"resource", "hook", "program", "status",
+"found", "reason"}]}`: `status` is `ok`, `fail`, or `skip`; `found` is the
+path when `ok`; `reason` says why for the other two; `program` is null when
+the finding is about the whole command.
 
 `newgit resource remove <name>` deletes the definition. It refuses if another
 resource still names it in `depends_on` — always, `--force` included, since

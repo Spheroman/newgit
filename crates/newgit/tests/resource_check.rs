@@ -97,7 +97,7 @@ fn a_missing_program_fails_naming_its_resource_and_hook() {
     );
     assert!(
         stdout.contains(
-            "FAIL  db: [actions.prepare] `./scripts/missing.sh` — not found in the project root"
+            "FAIL  db: [actions.prepare] `./scripts/missing.sh` — scripts/missing.sh does not exist"
         ),
         "{stdout}"
     );
@@ -105,7 +105,7 @@ fn a_missing_program_fails_naming_its_resource_and_hook() {
         stdout.contains("ok    db: [actions.prepare] `sh` ("),
         "{stdout}"
     );
-    assert!(stdout.contains("3 programs missing"), "{stdout}");
+    assert!(stdout.contains("3 failed"), "{stdout}");
 
     let (code, stdout) = newgit(&repo, &["resource", "check", "--json"]);
     assert_eq!(code, Some(1));
@@ -116,7 +116,9 @@ fn a_missing_program_fails_naming_its_resource_and_hook() {
         .find(|entry| entry["program"] == "pg_dump_absent_here")
         .expect("pg_dump listed");
     assert_eq!(pg_dump["hook"], "[checkpoint]");
+    assert_eq!(pg_dump["status"], "fail");
     assert!(pg_dump["found"].is_null());
+    assert_eq!(pg_dump["reason"], "not found on PATH");
 }
 
 #[test]
