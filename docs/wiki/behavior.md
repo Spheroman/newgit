@@ -115,7 +115,10 @@ are never torn down by per-branch cleanup.
 workspace first; `newgit spawn <name> --from-checkpoint <name>/<id>` brings
 it back, and what no checkpoint can hold is named as lost (#448). A
 resource whose capture failed is not cleaned up: its state is left where
-it is and named, unless `--force`. Removing an evicted instance names the
+it is and named, unless `--force`. When that state is in the workspace
+(`ownership = "workspace"`), leaving it is not possible, since the
+workspace is what is deleted, so the removal refuses, deleting nothing,
+unless `--force`. Removing an evicted instance names the
 checkpoint it was evicted to.
 
 The one exception is one you ask for. An archived instance's checkpoints are

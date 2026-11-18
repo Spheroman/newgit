@@ -78,7 +78,13 @@ enum Command {
     /// Git repository) is named as lost. An evicted instance is not
     /// checkpointed again: the checkpoint it was evicted to is the one kept.
     /// A checkpoint that fails refuses the removal unless `--force`;
-    /// `--purge` takes none.
+    /// `--purge` takes none. A resource whose capture fails does not stop
+    /// it when its state is outside the workspace: that state is left
+    /// where it is, its `[cleanup]` not run, and named under `left`. When
+    /// its state is in the workspace (`ownership = "workspace"`), deleting
+    /// the workspace would delete it, so the removal refuses unless
+    /// `--force`. `newgit checkpoints <name>` still lists a removed
+    /// instance's checkpoints.
     ///
     /// The source branch goes too when it holds nothing unique: spawn
     /// created it, nothing has it checked out, and its tip is already on
@@ -98,10 +104,12 @@ enum Command {
         /// branch; removal prints the tip to recover it from
         #[arg(long)]
         delete_branch: bool,
-        /// Remove even when the checkpoint taken first fails, or when an
-        /// evicted instance's workspace path holds more than its marker
-        /// (work written there after a restore failed or was cut short),
-        /// deleting what no checkpoint holds
+        /// Remove even when the checkpoint taken first fails, when a
+        /// resource whose state is in the workspace could not be captured,
+        /// or when an evicted instance's workspace path holds more than its
+        /// marker (work written there after a restore failed or was cut
+        /// short), deleting what no checkpoint holds; and run the `[cleanup]`
+        /// of a resource whose capture failed
         #[arg(long)]
         force: bool,
         /// Print what was removed, kept, and lost as JSON
@@ -4506,14 +4514,32 @@ fn undo(instance: Option<String>, options: UndoOptions) -> Result<()> {
 
 fn checkpoints(instance: Option<String>) -> Result<()> {
     let (manager, instance) = manager_and_instance(instance)?;
-    let records = manager.list_checkpoints(&instance)?;
+    // A removed instance's checkpoints outlive it, and `remove` points at
+    // one: listed here as they are for a live one.
+    let (records, own, removed) = match manager.store().find_branch(&instance) {
+        Ok(branch) => (
+            manager.list_checkpoints(&instance)?,
+            branch.source_ref,
+            None,
+        ),
+        Err(_) => {
+            let records = manager.removed_checkpoints(&instance)?;
+            let slug = newgit_core::branch::branch_slug(&instance);
+            (records, instance.clone(), Some(slug))
+        }
+    };
     if records.is_empty() {
         println!(
             "No checkpoints for `{instance}`. Create one with `newgit checkpoint {instance}`."
         );
         return Ok(());
     }
-    let own = manager.store().find_branch(&instance)?.source_ref;
+    if let Some(slug) = &removed {
+        println!(
+            "`{instance}` was removed; its checkpoints are kept. `newgit spawn <name> \
+             --from-checkpoint {slug}/<id>` brings one back as an instance.\n"
+        );
+    }
     println!(
         "{:<10} {:<17} {:<12} {:<10} MESSAGE",
         "ID", "CREATED", "REASON", "SOURCE"
@@ -4554,9 +4580,13 @@ fn checkpoints(instance: Option<String>) -> Result<()> {
             }
         );
     }
-    println!(
-        "\n+ = the checkpoint carries uncommitted changes; restore one with `newgit undo {instance} --to <id>`"
-    );
+    if removed.is_none() {
+        println!(
+            "\n+ = the checkpoint carries uncommitted changes; restore one with `newgit undo {instance} --to <id>`"
+        );
+    } else {
+        println!("\n+ = the checkpoint carries uncommitted changes");
+    }
     Ok(())
 }
 
@@ -5247,7 +5277,10 @@ fn remove(
     let outcome =
         manager.remove_forced(name, &current_dir()?, checkpoints, source_branch, force)?;
     if json {
-        println!("{}", serde_json::to_string_pretty(&remove_json(&outcome))?);
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&remove_json(&manager, &outcome))?
+        );
         return Ok(());
     }
 
@@ -5281,7 +5314,10 @@ fn remove(
         println!("  lost:      {what}");
     }
     for left in &outcome.left {
-        println!("  left:      {}", left_line(&outcome.branch.name, left));
+        println!(
+            "  left:      {}",
+            left_line(&manager, &outcome.branch.name, left)
+        );
     }
     for copy in &outcome.saved_copies {
         println!(
@@ -5352,7 +5388,7 @@ fn human_bytes(bytes: u64) -> String {
 
 /// `newgit remove --json`: what was removed, the checkpoint that keeps it,
 /// and what is gone that no checkpoint holds.
-fn remove_json(outcome: &RemoveOutcome) -> serde_json::Value {
+fn remove_json(manager: &BranchManager, outcome: &RemoveOutcome) -> serde_json::Value {
     let hooks: Vec<serde_json::Value> = outcome
         .hooks
         .iter()
@@ -5398,7 +5434,7 @@ fn remove_json(outcome: &RemoveOutcome) -> serde_json::Value {
                 "resource": left.resource,
                 "reason": left.reason,
                 "cleanup": left.cleanup,
-                "explain": left_line(&outcome.branch.name, left),
+                "explain": left_line(manager, &outcome.branch.name, left),
             }))
             .collect::<Vec<_>>(),
         "disposed": outcome
@@ -5427,9 +5463,22 @@ fn remove_json(outcome: &RemoveOutcome) -> serde_json::Value {
 
 /// What `remove` did with a resource it could not capture, where its state
 /// is, and how to remove it.
-fn left_line(instance: &str, left: &newgit_core::manager::LeftState) -> String {
+fn left_line(
+    manager: &BranchManager,
+    instance: &str,
+    left: &newgit_core::manager::LeftState,
+) -> String {
+    // Only a resource whose state is outside the workspace is left: one
+    // whose state is in it refuses the removal. Where it is comes from its
+    // `ownership`, so say that is what places it.
+    let ownership = manager
+        .resource_definitions()
+        .iter()
+        .find(|definition| definition.name == left.resource)
+        .map_or("", |definition| definition.ownership.label());
     let what = format!(
-        "resource `{}`'s state, left in place: its capture failed ({}), so no checkpoint holds it",
+        "resource `{}`'s state, left where it is (outside the workspace, as its `ownership = \
+         \"{ownership}\"` says): its capture failed ({}), so no checkpoint holds it",
         left.resource, left.reason
     );
     match &left.cleanup {

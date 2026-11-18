@@ -13,10 +13,16 @@ work in it can be brought back (`newgit spawn <name> --from-checkpoint
 the archived record). A thread whose workspace was evicted is not
 checkpointed again: the eviction's checkpoint already holds it, and is the
 one named. A resource whose capture fails, such as a dump against a
-database that is down, does not stop the delete, and its `[cleanup]`
-does not run, so the delete never drops a database nothing kept; `remove`
-names that state under `left`, with the cleanup command that removes it
-by hand, and what else it could not keep under `lost`. Every other project gets plain worktrees, as
+database that is down, does not stop the delete when its state is
+outside the workspace (a Supabase stack, a shared server's database):
+its `[cleanup]` does not run, so the delete never drops a database
+nothing kept, and `remove` names that state under `left`, with the
+cleanup command that removes it by hand, and what else it could not keep
+under `lost`. When its state is in the workspace (`ownership =
+"workspace"`, as the `postgres` template's cluster is), deleting the
+workspace would delete it, so `remove` refuses and deletes nothing, and
+the thread is not deleted: start the instance (`newgit start <name>`) so
+the dump can run, then delete again, or `newgit remove <name> --force`. Every other project gets plain worktrees, as
 before.
 
 `newgit stop <instance>` and `newgit start <instance>` are the pair for

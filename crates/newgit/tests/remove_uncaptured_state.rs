@@ -49,7 +49,7 @@ fn a_plain_remove_leaves_state_its_capture_missed() {
     // Said plainly: left, where (its cleanup names it), and how to remove it.
     assert!(
         run.stdout
-            .contains("left:      resource `db`'s state, left in place")
+            .contains("left:      resource `db`'s state, left where it is")
             && run.stdout.contains(&format!("`rm -rf {db}`"))
             && run.stdout.contains("--force"),
         "{}",

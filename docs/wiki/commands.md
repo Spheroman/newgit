@@ -63,8 +63,13 @@ inside a workspace):
   <instance>/<id>`, and names what no checkpoint holds (ignored files
   nothing rebuilds, the stash, branches only the workspace has, a nested
   Git repository) as `lost`, and `disposable` output as dropped. A
-  resource whose capture failed keeps its state: its `[cleanup]` does not
-  run, and `left` names it with that command, unless `--force`. An evicted instance is not checkpointed
+  resource whose capture failed keeps its state when that state is
+  outside the workspace: its `[cleanup]` does not run, and `left` names
+  it with that command, unless `--force`. One whose state is in the
+  workspace (`ownership = "workspace"`, a database whose data directory
+  is in the tree) would be deleted with it, so its failed capture refuses
+  the removal, deleting nothing, unless `--force`. `newgit checkpoints
+  <instance>` lists a removed instance's checkpoints. An evicted instance is not checkpointed
   again: the eviction's checkpoint is the one named (`checkpoint` in
   `--json`). A checkpoint that fails, a nested repository with no commit,
   or a workspace whose Git cannot be read refuses unless `--force`;

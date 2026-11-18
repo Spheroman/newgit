@@ -32,6 +32,8 @@ pub(super) struct RemoveKeep {
 #[derive(Debug, Default)]
 struct NotKept {
     lost: Vec<String>,
+    /// Whether `lost` starts with the ignored files the removal deletes.
+    ignored: bool,
     disposed: Vec<crate::evict::Disposed>,
     /// Git repositories nested in the workspace with no commit: `git add`
     /// refuses them, so no checkpoint can be taken while they are there.
@@ -112,6 +114,10 @@ impl BranchManager {
                 )));
             }
         };
+        // The ignored files lead `found.lost` when there are any; what a
+        // resource's own capture took (a dump of a data directory among
+        // them) is said with them once the checkpoint has it.
+        let ignored = (!found.lost.is_empty() && found.ignored).then_some(keep.lost.len());
         keep.lost.extend(found.lost);
         keep.disposed = found.disposed;
         if !found.unborn.is_empty() && keeping && !force {
@@ -148,15 +154,48 @@ impl BranchManager {
         }
         match taken {
             Ok(checkpoint) => {
+                // A resource whose state is in the workspace (`ownership =
+                // "workspace"`: a database whose data directory is in the
+                // tree) cannot be left where it is: the removal deletes it
+                // with the workspace. So its failed capture refuses the
+                // removal, as a failed checkpoint does. One whose state is
+                // elsewhere is left there, and named.
+                let mut inside = Vec::new();
                 for (resource, why) in checkpoint.capture_failures {
+                    let in_workspace = self.state_in_workspace(&resource);
                     if force {
-                        keep.lost.push(format!(
-                            "the state of resource `{resource}`: its capture failed ({why}), so \
-                             no checkpoint holds it, and its `[cleanup]` ran anyway (--force)"
-                        ));
+                        keep.lost.push(if in_workspace {
+                            format!(
+                                "the state of resource `{resource}`, which is in the workspace \
+                                 (`ownership = \"workspace\"`): its capture failed ({why}), so \
+                                 no checkpoint holds it, and it was deleted with the workspace \
+                                 (--force)"
+                            )
+                        } else {
+                            format!(
+                                "the state of resource `{resource}`: its capture failed ({why}), \
+                                 so no checkpoint holds it, and its `[cleanup]` ran anyway \
+                                 (--force)"
+                            )
+                        });
+                    } else if in_workspace {
+                        inside.push(format!("`{resource}` ({why})"));
                     } else {
                         keep.uncaptured.insert(resource, why);
                     }
+                }
+                if !inside.is_empty() {
+                    let id = &checkpoint.record.id;
+                    return Err(NewgitError::Unsupported(format!(
+                        "not removing `{name}`: the capture of {} failed, and {} state is in \
+                         the workspace (`ownership = \"workspace\"`), which the removal would \
+                         delete with no checkpoint holding it. Nothing was stopped or deleted; \
+                         checkpoint {id} holds the rest of the workspace. Fix what failed (a \
+                         dump of a server that is stopped fails: `newgit start {name}` brings it \
+                         back) and remove again, or `newgit remove {name} --force` deletes it",
+                        inside.join(" and "),
+                        if inside.len() == 1 { "its" } else { "their" },
+                    )));
                 }
                 keep.warnings = checkpoint
                     .warnings
@@ -165,6 +204,26 @@ impl BranchManager {
                     .filter(|warning| !drift.contains(warning))
                     .filter(|warning| !warning.contains("has changes in the paths of dropped"))
                     .collect();
+                let captured: Vec<String> = checkpoint
+                    .record
+                    .resource_states
+                    .iter()
+                    // A `command` capture (a dump); `hash` records only
+                    // whether inputs moved, and `external` a handle elsewhere.
+                    .filter(|state| state.mode == "command" && state.state_ref.is_some())
+                    .map(|state| format!("`{}`", state.name))
+                    .collect();
+                if let Some(entry) = ignored.and_then(|at| keep.lost.get_mut(at))
+                    && !captured.is_empty()
+                {
+                    entry.push_str(&format!(
+                        " (what {} captured of {} own state, such as a database dump, is in \
+                         checkpoint {})",
+                        captured.join(", "),
+                        if captured.len() == 1 { "its" } else { "their" },
+                        checkpoint.record.id
+                    ));
+                }
                 keep.checkpoint = Some(checkpoint.record.id);
             }
             Err(error) if force => {
@@ -184,6 +243,15 @@ impl BranchManager {
             }
         }
         Ok(keep)
+    }
+
+    /// Whether resource `name` keeps its state in the workspace, so that
+    /// deleting the workspace deletes it: what its definition declares as
+    /// `ownership = "workspace"`. newgit cannot see where a command keeps
+    /// what it captures, so the declaration is the one honest answer.
+    pub(super) fn state_in_workspace(&self, name: &str) -> bool {
+        self.resource_definition(name)
+            .is_ok_and(|definition| definition.ownership == crate::resource::Ownership::Workspace)
     }
 
     /// What a removal with no checkpoint deletes besides what
@@ -247,7 +315,8 @@ impl BranchManager {
         if !ignored.is_empty() {
             let named: Vec<String> = ignored.iter().map(describe_ignored).collect();
             lost.push(format!(
-                "{}: ignored, owned by no tracker outside Git, and rebuilt by no resource",
+                "{}: ignored, owned by no tracker outside Git, and declared by no resource as \
+                 something it rebuilds, so no checkpoint holds these files",
                 named.join(", ")
             ));
         }
@@ -356,6 +425,7 @@ impl BranchManager {
         }
         Ok(NotKept {
             lost,
+            ignored: !ignored.is_empty(),
             disposed: plan.disposed,
             unborn,
         })
