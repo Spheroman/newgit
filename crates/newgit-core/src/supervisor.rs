@@ -335,6 +335,54 @@ impl Supervisor {
         Ok(retired)
     }
 
+    /// When the process now running for `resource` was started: its pid
+    /// file is written once, right after the fork. `None` when nothing is
+    /// running. The clock its `[ready] timeout_seconds` runs on (#276).
+    pub fn started_at(&self, resource: &str) -> Option<std::time::SystemTime> {
+        self.running_pid(resource)?;
+        std::fs::metadata(self.pid_path(resource))
+            .and_then(|metadata| metadata.modified())
+            .ok()
+    }
+
+    /// Note that `resource`, which runs nothing newgit supervises, was just
+    /// brought up: its `prepare`, `resume` or `restore` exited 0, or it was
+    /// bound with none to run. What [`Self::came_up_at`] reads back.
+    /// Best-effort: without it, a failing `[ready]` check is past its
+    /// timeout at once, which says less but nothing false.
+    pub fn mark_came_up(&self, resource: &str) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis();
+        if create_dir_all(&self.state_dir).is_ok() {
+            let _ = std::fs::write(self.came_up_path(resource), format!("{now}\n"));
+        }
+    }
+
+    /// When `resource` was last brought up, by [`Self::mark_came_up`]
+    /// (milliseconds since the epoch in `<resource>.up`). For one with no
+    /// process to watch, its timeout is counted from here.
+    pub fn came_up_at(&self, resource: &str) -> Option<std::time::SystemTime> {
+        let millis = std::fs::read_to_string(self.came_up_path(resource))
+            .ok()?
+            .trim()
+            .parse::<u64>()
+            .ok()?;
+        Some(std::time::UNIX_EPOCH + std::time::Duration::from_millis(millis))
+    }
+
+    fn came_up_path(&self, resource: &str) -> Utf8PathBuf {
+        self.state_dir.join(format!("{resource}.up"))
+    }
+
+    /// The log of the run `start` last began for `resource`.
+    pub fn log_path(&self, resource: &str) -> Option<Utf8PathBuf> {
+        let text = std::fs::read_to_string(self.log_record_path(resource)).ok()?;
+        let path = text.trim();
+        (!path.is_empty()).then(|| Utf8PathBuf::from(path))
+    }
+
     fn mark_stopped(&self, resource: &str) -> Result<()> {
         let path = self.pid_path(resource);
         std::fs::write(&path, "stopped\n").map_err(|source| NewgitError::io(&path, source))

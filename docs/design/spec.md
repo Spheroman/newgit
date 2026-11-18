@@ -1245,19 +1245,21 @@ fix it. An `autostart` action that did not start counts too: an instance
 whose dev server is down is not up. The instance is not rolled back.
 `--from-checkpoint` judges by the instance the restore leaves (#208).
 
-#### Starting is not failing
+#### Starting is not failing, until its deadline
 
 A dev server that compiles before it listens (Next.js) is doing what it
 should, and a spawn that called it a problem looked like a failure. A running
 process whose port is not answering yet is `starting`, a state of its own:
-not a problem, not "not ready". After the autostart, `spawn` polls the ports
-of what is running for up to five seconds and returns as soon as they answer,
-so a fast server costs nothing. What is still unanswered is then reported as
-starting, not as a failure, with a pointer to `newgit status`:
+not a problem, not "not ready". After the autostart, `spawn` polls what is
+running for up to the longest `timeout_seconds` of what is bound (five
+seconds by default) and returns as soon as everything answers, so a fast
+server costs nothing. A process with no `[ready]` still unanswered is then
+reported as starting, not as a failure, with its log and a pointer to
+`newgit status`:
 
 ```text
 starting: `feature-a`
-  - `app` is still starting: not answering yet on web (3000)
+  - `app` is still starting: not answering yet on web (3000); its log is .newgit/logs/feature-a/app.start-….log
   `newgit status` shows when it is up.
 ```
 
@@ -1265,18 +1267,49 @@ starting: `feature-a`
 problem still says `not ready`, and wins), with the lines under it. It is
 checked at read time, so it clears on its own once the port answers.
 `spawn --json` lists them under `starting` (`resource`, the `ports` that
-have not answered, and `check`) and exits 0 as for a ready instance.
+have not answered, `check`, and `log`) and exits 0 as for a ready instance.
 
 A port that answers is not always a server that serves: some bind at once
 and answer 500 until they have compiled, and a resource newgit does not
 supervise (a Supabase stack a `prepare` left running) has no process to
 watch at all. A definition's `[ready]` says what up means instead (#276):
 a GET that answers 200–399, or a command that exits 0, and
-`timeout_seconds` for how long to wait. The end of `spawn` waits for the
-longest of those among what is bound, and a dependent's start waits its
-dependency's (*Spawn*). With no `[ready]`, up is the ports answering and
-the wait is five seconds; a resource with no process and no check is up
-when its `prepare` exited 0.
+`timeout_seconds` for how long that takes. The end of `spawn` and of
+`newgit start` waits for the longest of those among what is bound, and a
+dependent's start waits its dependency's (*Spawn*). With no `[ready]`, up
+is the ports answering and the wait is five seconds; a resource with no
+process and no check is up when its `prepare` exited 0. Its declared ports
+are not checked: they are reservations, and the `supabase` template claims
+several a default stack never opens.
+
+Starting has a deadline where one was declared. An agent goes by the exit
+code, and exit 0 says the instance works; "starting" forever, with nothing
+alive to say it might still come up, was that lie for a stack that had gone
+down. So:
+
+- A resource whose definition has a `[ready]` said what up is and how long
+  it takes. Past `timeout_seconds` it is not up: a problem, `not ready` in
+  `status`, and `spawn` and `start` exit 1.
+- A resource with no process newgit supervises has nothing alive to tell
+  still-starting from gone-down; it has a `[ready]` check, or it is not
+  checked at all, so the same holds.
+- A supervised process with no `[ready]` has no deadline, because nobody
+  declared one, and most dev servers compile for longer than any default:
+  it is `starting` for as long as it runs. Its line names its log.
+
+The clock is the process's start (when its pid file was written) or, with
+no process, the last `prepare`, `resume` or `restore` that exited 0
+(`.newgit/state/<slug>/<resource>.up`), so `status`, which has no clock of
+its own, gives the same answer `spawn` did. With no record of either, there
+is no grace. A not-up line for a supervised process ends with the last lines
+of its run's log: a dev server that crashed under a wrapper that stayed alive
+(`npm-run-all`) is a running process, and only its log says why. `spawn`
+prints where the instance's logs are (`logs:`; `logs` in `--json`).
+
+`status` runs an instance's checks side by side, one thread each, and
+`status <instance>` runs only that instance's. An `https://` check uses this
+machine's trust store, so a certificate `mkcert -install` made trusted
+passes; one the machine does not trust says so.
 
 #### Died is not stopped
 
@@ -1297,7 +1330,8 @@ or it outlived a reboot). An `autostart` action in that state makes the
 instance `not ready`, with `newgit action <resource>.<action>` as the retry,
 and `newgit start` starts it again along with what `newgit stop` stopped.
 Severity runs ready < starting < not ready: a died process is a problem, a
-process that is up but not answering yet is not. `newgit cleanup` retires a
+process that is up but not answering yet is not, until its `[ready]`
+deadline has passed. `newgit cleanup` retires a
 dead process's pid to `exited`, not `stopped`, so it does not erase a
 crash.
 

@@ -945,7 +945,9 @@ pub struct InstanceReport {
 /// A running process whose port is not answering *yet* is not a problem: a
 /// dev server that compiles before it listens is doing what it should. It is
 /// `starting`, a state of its own that neither fails `is_ready` nor counts as
-/// a problem, and that clears by itself once the port answers.
+/// a problem, and that clears by itself once the port answers. Where a
+/// deadline was declared — a `[ready]`, or no process to watch — it is
+/// starting only within `timeout_seconds`, and a problem after (#276).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Readiness {
     /// What is wrong, one line each; empty when ready.
@@ -977,26 +979,80 @@ pub struct Starting {
     /// How its `[ready]` check failed, when it names one (`GET
     /// http://127.0.0.1:5173/ answered 500`).
     pub check: Option<String>,
+    /// The log of its supervised process's run, when one is running: where
+    /// a server that crashed inside a wrapper that stayed up says why.
+    pub log: Option<Utf8PathBuf>,
 }
 
 impl Starting {
     /// One line, for `status` and the end of `spawn`.
     pub fn message(&self) -> String {
-        if let Some(check) = &self.check {
-            return format!("`{}` is still starting: {check}", self.resource);
+        let log = self
+            .log
+            .as_ref()
+            .map(|log| format!("; its log is {log}"))
+            .unwrap_or_default();
+        match &self.check {
+            Some(check) => format!("`{}` is still starting: {check}{log}", self.resource),
+            None => format!(
+                "`{}` is still starting: not answering yet on {}{log}",
+                self.resource,
+                self.port_list()
+            ),
         }
-        let ports = self
-            .ports
+    }
+
+    fn port_list(&self) -> String {
+        self.ports
             .iter()
             .map(|(name, port)| format!("{name} ({port})"))
             .collect::<Vec<_>>()
-            .join(", ");
+            .join(", ")
+    }
+
+    /// The problem it is once its `[ready] timeout_seconds` has passed
+    /// (#276): what the check answered, what to do about it, and, for a
+    /// supervised process, its log and how that ends. `logs` is the
+    /// instance's log directory, for one with no process of its own.
+    fn overdue(
+        &self,
+        definition: &ResourceDefinition,
+        timeout: std::time::Duration,
+        logs: &Utf8Path,
+    ) -> String {
+        let name = &self.resource;
+        let what = self
+            .check
+            .clone()
+            .unwrap_or_else(|| format!("not answering on {}", self.port_list()));
+        let longer =
+            format!("give it a longer `[ready] timeout_seconds` in .newgit/resources/{name}.toml");
+        if let Some(log) = &self.log {
+            let tail = crate::supervisor::log_tail(log, OVERDUE_TAIL_LINES)
+                .into_iter()
+                .map(|line| format!("\n    | {line}"))
+                .collect::<String>();
+            return format!(
+                "`{name}` is not up after {}s ({what}); its process is running, so either it \
+                 failed inside a wrapper that stayed up (its log says), or it needs longer and \
+                 you can {longer}; its log is {log}{tail}",
+                timeout.as_secs()
+            );
+        }
+        let retry = match retry_command(definition) {
+            Some(retry) => format!("bring it back with `{retry}`, or {longer}"),
+            None => format!("bring it back, or {longer}"),
+        };
         format!(
-            "`{}` is still starting: not answering yet on {ports}",
-            self.resource
+            "`{name}` is not up after {}s ({what}); newgit runs no process of it to watch, so \
+             it may have gone down — {retry}; its logs are under {logs}",
+            timeout.as_secs()
         )
     }
 }
+
+/// How much of a supervised process's log a not-up problem shows.
+const OVERDUE_TAIL_LINES: usize = 8;
 
 /// Whether `path` is named the way local secrets and per-machine settings
 /// usually are: `.env`, `.env.local`, `.env.development.local`,
@@ -1041,8 +1097,16 @@ const READY_CHECK_LIMIT: std::time::Duration = std::time::Duration::from_secs(5)
 /// Asked directly, never through `HTTP_PROXY` / `ALL_PROXY`: the check is of
 /// a server on this machine, and a proxy that cannot reach it would make a
 /// server that is up read as starting.
+///
+/// An `https://` certificate is checked against this machine's trust store,
+/// not a bundled list, so a local one trusted there (mkcert's) passes.
 fn http_answers(url: &str) -> std::result::Result<(), String> {
     let agent: ureq::Agent = ureq::Agent::config_builder()
+        .tls_config(
+            ureq::tls::TlsConfig::builder()
+                .root_certs(ureq::tls::RootCerts::PlatformVerifier)
+                .build(),
+        )
         .proxy(None)
         .http_status_as_error(false)
         .max_redirects(0)
@@ -1052,6 +1116,13 @@ fn http_answers(url: &str) -> std::result::Result<(), String> {
     match agent.get(url).call() {
         Ok(response) if (200..400).contains(&response.status().as_u16()) => Ok(()),
         Ok(response) => Err(format!("GET {url} answered {}", response.status().as_u16())),
+        // Said plainly: a TLS error reads like the server being down, and
+        // it is not. ureq does not expose the rustls error to match on.
+        Err(error) if error.to_string().contains("certificate") => Err(format!(
+            "GET {url}: this machine does not trust its certificate ({error}); a local \
+             certificate has to be trusted by the system, as `mkcert -install` does, or the \
+             check can ask `http://`"
+        )),
         Err(error) => Err(format!("GET {url}: {error}")),
     }
 }
@@ -3686,6 +3757,34 @@ impl BranchManager {
         let mut starting = Vec::new();
         let supervisor = self.supervisor(branch);
         let suspended = self.suspended(branch);
+        // Every check up front, each on a thread of its own: a `[ready]
+        // command` may take seconds waiting on something else, and an
+        // instance's resources do not wait on each other to be asked (#276).
+        // Used below only where the resource gets that far.
+        let mut checked: BTreeMap<String, Option<Starting>> = std::thread::scope(|scope| {
+            let asked: Vec<_> = branch
+                .resources
+                .iter()
+                .filter_map(|(name, binding)| {
+                    let definition = self.resource_definition(name).ok()?;
+                    self.ready_to_check(branch, definition, &supervisor, &suspended)
+                        .then(|| {
+                            let check =
+                                scope.spawn(|| self.not_up_yet(branch, definition, binding));
+                            (name.clone(), check)
+                        })
+                })
+                .collect();
+            asked
+                .into_iter()
+                .map(|(name, check)| {
+                    let not_yet = check
+                        .join()
+                        .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+                    (name, not_yet)
+                })
+                .collect()
+        });
         for (name, binding) in &branch.resources {
             let Ok(definition) = self.resource_definition(name) else {
                 continue;
@@ -3787,10 +3886,37 @@ impl BranchManager {
                 ));
                 continue;
             }
-            if self.ready_to_check(branch, definition, &supervisor, &suspended)
-                && let Some(not_yet) = self.not_up_yet(branch, definition, binding)
-            {
-                starting.push(not_yet);
+            if let Some(Some(not_yet)) = checked.remove(name) {
+                // Starting only within its `[ready] timeout_seconds` of being
+                // started, or, with no process to watch, of being brought up
+                // (#276). Past that, still starting and down look the same
+                // from here, and the definition said how long up takes.
+                //
+                // A deadline only where one was declared: a `[ready]` said
+                // what up means and how long it takes, or there is no process
+                // whose being alive says anything. A supervised process with
+                // no `[ready]` is starting for as long as it runs.
+                let mut not_yet = not_yet;
+                let running = supervisor.running_pid(name).is_some();
+                if running {
+                    not_yet.log = supervisor.log_path(name);
+                }
+                let since = if running {
+                    supervisor.started_at(name)
+                } else {
+                    supervisor.came_up_at(name)
+                };
+                let timeout = definition.ready_timeout();
+                let deadline = definition.ready.is_some() || !running;
+                if !deadline
+                    || since
+                        .and_then(|since| since.elapsed().ok())
+                        .is_some_and(|age| age < timeout)
+                {
+                    starting.push(not_yet);
+                } else {
+                    problems.push(not_yet.overdue(definition, timeout, &logs));
+                }
             }
         }
         problems.extend(self.undefined_binding_problems(branch, &supervisor));
@@ -3854,6 +3980,7 @@ impl BranchManager {
                 resource: name.clone(),
                 ports: BTreeMap::new(),
                 check: Some(check),
+                log: None,
             });
         }
         if let Some(command) = ready.and_then(|ready| ready.command.as_deref()) {
@@ -3864,6 +3991,7 @@ impl BranchManager {
                     resource: name.clone(),
                     ports: BTreeMap::new(),
                     check: Some(check),
+                    log: None,
                 });
         }
         let ports: BTreeMap<String, u16> = binding
@@ -3876,6 +4004,7 @@ impl BranchManager {
             resource: name.clone(),
             ports,
             check: None,
+            log: None,
         })
     }
 
@@ -4936,6 +5065,11 @@ impl BranchManager {
                     (status, Some((code == 0, log)))
                 }
             };
+            // Bound with nothing to run, or filled from the install store:
+            // up from now, as far as its `[ready]` timeout is counted.
+            if status == ResourceStatus::Ready && prepare.is_none() {
+                self.supervisor(branch).mark_came_up(&definition.name);
+            }
 
             outcomes.push(ResourceBindOutcome {
                 name: definition.name.clone(),
@@ -6496,19 +6630,25 @@ impl BranchManager {
             OneShot::Asked { .. } => crate::supervisor::Input::Inherit,
         };
 
-        if action.captures.is_empty() {
+        let (code, captures) = if action.captures.is_empty() {
             let command_line = ["sh".to_owned(), "-c".to_owned(), command];
             let code = if run == (OneShot::Asked { quiet: false }) {
                 run_foreground(&command_line, &cwd, &env, log)?
             } else {
                 crate::supervisor::run_quiet(&command_line, &cwd, &env, log, input)?
             };
-            return Ok((code, Captures::default()));
+            (code, Captures::default())
+        } else {
+            let (code, stdout) =
+                crate::supervisor::run_captured_with(&command, &cwd, &env, log, input)?;
+            (code, parse_captures(&stdout, &action.captures))
+        };
+        // What brings up a resource newgit does not supervise: its
+        // `[ready]` timeout is counted from here (#276).
+        if code == 0 && matches!(action_name, "prepare" | "resume") {
+            self.supervisor(branch).mark_came_up(&definition.name);
         }
-
-        let (code, stdout) =
-            crate::supervisor::run_captured_with(&command, &cwd, &env, log, input)?;
-        Ok((code, parse_captures(&stdout, &action.captures)))
+        Ok((code, captures))
     }
 
     /// One warning per declared capture the command never emitted. The log
@@ -8564,6 +8704,13 @@ impl BranchManager {
     }
 
     pub fn statuses(&self) -> Result<Vec<InstanceReport>> {
+        self.statuses_of(None)
+    }
+
+    /// [`Self::statuses`] of the instance named `name` (by name or slug)
+    /// alone, when given: only its `[ready]` checks run, not every
+    /// instance's (#276).
+    pub fn statuses_of(&self, name: Option<&str>) -> Result<Vec<InstanceReport>> {
         let lane_heads: Vec<(String, Option<String>)> = self
             .trackers
             .iter()
@@ -8574,8 +8721,11 @@ impl BranchManager {
         // independent of every other instance's: done side by side, a project
         // with a hundred instances answers in the time of a few.
         use rayon::prelude::*;
-        self.store
-            .load_branches()?
+        let mut branches = self.store.load_branches()?;
+        if let Some(name) = name {
+            branches.retain(|branch| branch.name == name || branch.slug == name);
+        }
+        branches
             .into_par_iter()
             .map(|branch| {
                 let workspace_exists = branch.workspace_path.is_dir() && branch.evicted.is_none();
@@ -15083,6 +15233,9 @@ impl BranchManager {
                 )?;
                 let (code, _) = run_captured(&command, &cwd, &env, &log)?;
                 let ok = code == 0;
+                if ok {
+                    self.supervisor(branch).mark_came_up(&definition.name);
+                }
                 if !ok {
                     failures.push(RestoreFailure {
                         resource: definition.name.clone(),

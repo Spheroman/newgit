@@ -7,9 +7,11 @@ inside a workspace):
   <tracker>] [--drop <tracker>] [--private] [--json]` / `status [name]` /
   `remove <name> [--purge] [--keep-branch | --delete-branch]` — `status`
   says whether each instance is ready, still starting (a dev server that is
-  not listening yet), or not ready, and why — including each resource bound
-  from an older definition than the one in the project root, with the
-  commands that apply it
+  not listening yet, or a `[ready]` check inside its `timeout_seconds`), or
+  not ready, and why, naming each running process's log — including each
+  resource bound from an older definition than the one in the project root,
+  with the commands that apply it; `spawn` prints where the logs are and
+  exits 1 when the instance is not ready
 - `newgit status [name] --json` — `{"instances": [{"name", "workspace",
   "status", "problems", "starting"}]}`
 - `newgit status <instance> --path` — just the workspace path, for scripts
@@ -30,7 +32,8 @@ inside a workspace):
   `autostart` action that died on its own or never started), each once
   what it depends on answers; ports,
   workspace, trackers, and installs stay as they are. Both exit 0 with
-  nothing to do and 1 if any resource failed
+  nothing to do and 1 if any resource failed; `start` also exits 1 when
+  what it brought back is not up within its `[ready] timeout_seconds`
 - `newgit stop --evict [--discard-ignored]` — stop, checkpoint, and delete
   the workspace, leaving its marker; `newgit start` brings it back from that
   checkpoint into the same directory, with uncommitted and staged work,
