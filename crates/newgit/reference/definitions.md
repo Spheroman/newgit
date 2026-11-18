@@ -972,6 +972,14 @@ and on failure the command that ran and the log's last twenty lines.
 to `newgit action`, as it would without it. Hooks newgit runs on its own (a
 spawn's `prepare`, a restore) get no input, since nobody is there to answer.
 
+**A `long_running` action's stdin stays open.** It is a pipe that never
+delivers data or end-of-file for as long as the process runs, as under a
+process manager, so a watcher that exits when its stdin closes (`esbuild
+--watch`, which says it "stopped automatically because stdin was closed")
+keeps watching. The small `sh` newgit leaves waiting on the process holds
+the pipe; once it is gone, what is left of the group reads end-of-file.
+Nothing typed reaches it: `newgit action` returns once it has started.
+
 **A failed hook keeps its evidence.** A spawn's `prepare` runs quietly and
 its `FAILED` line shows the command that ran, every line of it, and the
 log's last lines. Every run writes a log of its own, named in its own
