@@ -1152,7 +1152,7 @@ impl<'a> Walker<'a> {
         let Ok(relative) = candidate.strip_prefix(self.root) else {
             return false;
         };
-        std::process::Command::new("git")
+        crate::git::command()
             .arg("-C")
             .arg(self.root.as_str())
             .args(["check-ignore", "-q", "--no-index", "--"])
