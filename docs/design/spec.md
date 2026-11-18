@@ -1184,11 +1184,56 @@ fix follows from what failed, and never names an action the resource does
 not define (#262). A failed render or export is fixed in the file or the
 definition, then bound again with `newgit resource rebind <resource>
 [instance]`, which binds it as spawn did (ports, exports, render, `prepare`,
-then its `autostart` action) and refuses while its process runs. A failed
+then its `autostart` action) and refuses while its process runs. A rebind
+keeps every port the binding holds that the definition still declares and
+allocates only one declared since: a port is the instance's for life. A
+failed
 `prepare` is retried with `newgit action <resource>.prepare`; a resource
 with no `prepare` is pointed at the action that builds its tree or its
 long-running action, and one with neither (a `[restore]` alone) at its
 logs.
+
+An instance bound before its definition changed counts too (#85).
+Binding is a moment, not a subscription: an agent that edits
+`.newgit/resources/web.toml` while `web` runs changes nothing in an
+instance bound before, and would otherwise debug behavior that comes from
+the old binding. So `status` holds each ready binding against the
+definition as it stands, one line per resource, naming each difference and
+the commands that apply it:
+
+```text
+  - `web` was bound from an older /repo/.newgit/resources/web.toml: port
+    `extra` declared since, so nothing claims it for this instance; export
+    `APP_URL` changed; `[[render]]` of other.txt added; `prepare` changed
+    since it ran here — apply it with `newgit stop x && newgit resource
+    rebind web x && newgit start x`
+```
+
+What it compares is what newgit would write now against what the record
+says it wrote: the declared ports against the claimed ones, each export
+and each `[[render]]` resolved again as a rebind would resolve it, and the
+`prepare` that last ran (`prepare_rev` on the binding, the one thing the
+record would not otherwise hold). Re-resolving rather than fingerprinting
+the file names the very export or file, and also catches a value that moved
+because a dependency's did, while a comment changes nothing. A running
+process is held against the command its log says it was started with; a
+change to that alone is a restart, `newgit stop x && newgit start x`. The
+rebind line names the stop and start around the rebind only when the
+process runs, since a rebind refuses a running one. What newgit reads each
+time it needs it is never flagged: `[ready]`, `depends_on`, `[identity]
+paths`, ownership, the checkpoint, restore and cleanup hooks, and a port's
+`start`, which only said where its allocation began.
+
+The path in that line is absolute on purpose: definitions are read from the
+project root's `.newgit/resources/`, never from a workspace's copy, so an
+edit made in a workspace takes effect when it reaches the project root.
+Two more cases are named. A resource defined but not bound (added after the
+instance bound its resources) is bound by `newgit resource rebind`. A
+binding whose definition file was deleted by hand, rather than with `newgit
+resource remove`, is named with its process if it runs and the ports it
+still claims; `stop` and `remove` stop that process with `TERM`, and
+`resource rebind` then releases the binding, taking its values out of the
+files it rendered. Its `[cleanup]` went with its definition and cannot run.
 
 A blocked resource counts. Its `prepare` never ran, so it is no more usable
 than one whose `prepare` failed; only where the failure started differs.
@@ -1902,10 +1947,13 @@ Open issues that change what this document can promise:
 - **#83: gitignored secrets reach a workspace only through a tracker.**
   `spawn` names the ones it left behind, by file name, and the commands
   that carry them; nothing carries them by itself.
-- **#85: no reconcile.** A live instance does not pick up a changed
-  resource definition. A port declared since it was bound is named by
-  `status` as unclaimed, with `newgit resource rebind` as the fix; any
-  other change (a command, an export) goes unsaid.
+- **#85: reconcile is asked for, not automatic.** A live instance does not
+  pick up a changed resource definition by itself: `status` names each
+  difference and the commands that apply it, and the agent runs them. A
+  rebind does not rebind what depends on the resource (#289): `status` then
+  names a dependent's export or render that moved with it, but not a
+  process started with an environment that has since changed (another
+  resource's export, a port's `env` name).
 - **#87: preflight is asked for, not automatic.** `newgit resource check`
   finds a definition calling a missing binary (`pg_dump` on a host without
   Postgres); nothing runs it at spawn, so one never checked still fails at

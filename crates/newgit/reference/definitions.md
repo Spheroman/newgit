@@ -687,6 +687,32 @@ instance still has it bound unless `--force` is given, in which case it drops
 the binding from that instance's record and releases its ports (there is no
 other ledger: a port is free the moment nothing claims it).
 
+### Editing a definition under a live instance
+
+Definitions are read from the project root's `.newgit/resources/`, not from
+a workspace's copy: an edit made in a workspace takes effect once it
+reaches the project root.
+
+A live instance does not pick up an edit by itself. `newgit status` (and
+`status --json`, under `problems`) names, one line per resource, each way a
+binding differs from its definition and the commands that apply it (#85):
+
+| what changed | `status` says | apply it with |
+| --- | --- | --- |
+| a port added, removed or renamed; an export added, removed, or resolving to a different value; a `[[render]]` added, removed or changed; `prepare`'s command or `workdir` | `` `web` was bound from an older …/web.toml: `` and each difference | `newgit resource rebind web <instance>`, with `newgit stop` before it and `newgit start` after when its process runs (a rebind refuses a running process) |
+| the command of the running long-running action, or the action itself | `` `web.start` is running a command …/web.toml no longer gives `` | `newgit stop <instance> && newgit start <instance>` |
+| a resource defined since the instance bound its resources | `` `web` is defined in … but not bound here `` | `newgit resource rebind web <instance>` |
+| the definition file deleted by hand | `` `web` is bound here, but …/web.toml is gone ``, with its pid and ports | `newgit stop <instance>` if it runs (`stop` and `remove` stop it), then `newgit resource rebind web <instance>`, which releases the binding; its `[cleanup]` went with the file and cannot run, so use `newgit resource remove` to delete a definition instead |
+
+An export or render is compared by resolving it again, so one that moved
+because a dependency's export did is named too. Nothing is flagged for what
+newgit reads each time it needs it: `[ready]`, `depends_on`, `[identity]
+paths` and `key_command`, `ownership`, `reads`, `disposable`, and the
+`[checkpoint]`, `[restore]` and `[cleanup]` hooks. A changed `[identity]
+produces` shows as its tree missing. Not named: a process started with an
+environment that has since changed (another resource's export, a port's
+`env` name).
+
 ### Top level
 
 | key | type | required | default | meaning |
@@ -831,11 +857,13 @@ One entry per port the resource needs. `<name>` is yours (`app`, `db`).
 
 A port is allocated when the resource binds, usually at `spawn` (at
 `tracker use` for a resource a tracker brings), and recorded in the binding
-record. It stays the same through `stop`, `start`, `tracker drop` and `use`.
-Removing the instance frees it, and `newgit resource rebind` allocates
-again. A port added to the definition after an instance bound the resource
-is claimed by nothing for that instance until it does: `newgit status`
-names it as a problem, with the rebind to run (#85).
+record. It stays the same through `stop`, `start`, `tracker drop` and `use`,
+and through `newgit resource rebind`, which allocates only a port declared
+since. Removing the instance frees it. A port added to the definition after
+an instance bound the resource is claimed by nothing for that instance until
+a rebind: `newgit status` names it as a problem, with the rebind to run
+(#85). Changing a port's `start` moves nothing: it only says where an
+allocation begins.
 Use it in templates as `{{ports.<name>}}`.
 
 Unlike `[exports]`, order here does matter: `[ports]` is also a map, not a

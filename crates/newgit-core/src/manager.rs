@@ -60,6 +60,8 @@ mod reset;
 pub use reset::{HeldBack, ResetLine, ResetOutcome};
 mod stale_render;
 pub use stale_render::{PossiblyStale, StaleRender};
+mod stale_definition;
+pub use stale_definition::UnboundResource;
 mod target_push;
 use target_push::{Pushing, PutBack};
 
@@ -3732,25 +3734,10 @@ impl BranchManager {
                     continue;
                 }
             }
-            // A port declared since this binding was made: no record claims
-            // it, so the allocator may hand it to another instance, and the
-            // tool here falls back to its shared default (#85).
-            let unclaimed: Vec<String> = definition
-                .ports
-                .keys()
-                .filter(|port| !binding.resolved_ports.contains_key(*port))
-                .map(|port| format!("`{port}`"))
-                .collect();
-            if !unclaimed.is_empty() {
-                problems.push(format!(
-                    "`{name}` was bound before its definition declared port{} {}, so nothing \
-                     claims {} for this instance — bind it again with `newgit resource rebind \
-                     {name}` (after `newgit stop`, if it runs)",
-                    if unclaimed.len() == 1 { "" } else { "s" },
-                    unclaimed.join(", "),
-                    if unclaimed.len() == 1 { "it" } else { "them" },
-                ));
-            }
+            // Bound before its definition changed: a port, an export, a
+            // render, a `prepare` or the running command it no longer
+            // matches, with what applies it (#85).
+            problems.extend(self.definition_drift(branch, definition, binding, &supervisor));
             for path in definition.identity_produces() {
                 if !branch.workspace_path.join(path).exists() {
                     problems.push(format!(
@@ -3793,6 +3780,8 @@ impl BranchManager {
                 starting.push(not_yet);
             }
         }
+        problems.extend(self.undefined_binding_problems(branch, &supervisor));
+        problems.extend(self.unbound_definition_problems(branch));
         Readiness { problems, starting }
     }
 
@@ -4621,6 +4610,19 @@ impl BranchManager {
     /// order. Prepare failures are loud but leave the instance spawned —
     /// re-run with `newgit action <resource>.prepare`.
     fn bind_resources(&self, branch: &mut BranchInstance) -> Result<Vec<ResourceBindOutcome>> {
+        self.bind_resources_keeping(branch, None)
+    }
+
+    /// [`Self::bind_resources`], with `rebinding` naming a resource bound
+    /// again and the ports its binding held: each one its definition still
+    /// declares is kept, as a parked binding's are, and only a port declared
+    /// since is allocated. Allocation is for the life of the instance; a
+    /// rebind that moved a port nobody asked to move would be a bug.
+    fn bind_resources_keeping(
+        &self,
+        branch: &mut BranchInstance,
+        rebinding: Option<(&str, &BTreeMap<String, u16>)>,
+    ) -> Result<Vec<ResourceBindOutcome>> {
         let mut outcomes = Vec::new();
 
         for name in &self.graph.bind_order {
@@ -4634,21 +4636,21 @@ impl BranchManager {
 
             // One a drop parked comes back on the ports it had (#255): the
             // files it renders and whatever its `suspend` left on disk or
-            // still running agree on them. Only a definition that has since
-            // changed which ports it declares gets a fresh allocation.
+            // still running agree on them. So does one bound again. Only a
+            // port its definition has declared since is allocated.
             let parked = branch.parked.remove(name);
-            let kept_ports = parked.as_ref().and_then(|parked| {
-                parked
-                    .binding
-                    .resolved_ports
-                    .keys()
-                    .eq(definition.ports.keys())
-                    .then(|| parked.binding.resolved_ports.clone())
-            });
-            let resolved_ports = match kept_ports {
-                Some(ports) => ports,
-                None => self.claim_ports(branch, definition)?,
+            let held = match (&parked, rebinding) {
+                (Some(parked), _) => Some(&parked.binding.resolved_ports),
+                (None, Some((rebound, ports))) if rebound == name => Some(ports),
+                _ => None,
             };
+            let keep: BTreeMap<String, u16> = held
+                .into_iter()
+                .flatten()
+                .filter(|(port, _)| definition.ports.contains_key(*port))
+                .map(|(port, number)| (port.clone(), *number))
+                .collect();
+            let resolved_ports = self.claim_ports(branch, definition, &keep)?;
 
             // An export may compose a dependency's export, the same way a
             // `[[render]]` already can. Bindings happen in dependency order,
@@ -4720,6 +4722,15 @@ impl BranchManager {
                         .is_some_and(|parked| parked.binding.restore_proven),
                     render_error: None,
                     export_error: None,
+                    // `resume` brings it back without running `prepare`, so
+                    // what last ran is still what the parked binding ran.
+                    prepare_rev: if resume {
+                        parked
+                            .as_ref()
+                            .and_then(|parked| parked.binding.prepare_rev.clone())
+                    } else {
+                        Some(definition.prepare_rev())
+                    },
                 },
             );
 
@@ -4944,18 +4955,28 @@ impl BranchManager {
     /// The record is saved as the instance stands, plus this resource bound
     /// `Pending` on the ports just chosen. The caller's own save replaces it
     /// with the finished binding.
+    ///
+    /// `keep` holds ports this instance already claims for the resource
+    /// (a parked or rebound binding's): they are taken as they are, without
+    /// a probe — what holds one may well be this instance's own stack — and
+    /// only the rest are allocated.
     fn claim_ports(
         &self,
         branch: &BranchInstance,
         definition: &ResourceDefinition,
+        keep: &BTreeMap<String, u16>,
     ) -> Result<BTreeMap<String, u16>> {
-        if definition.ports.is_empty() {
-            return Ok(BTreeMap::new());
+        if definition.ports.keys().all(|port| keep.contains_key(port)) {
+            return Ok(keep.clone());
         }
         let _lock = self.store.lock_ports()?;
         let mut used = ports::used_ports(&self.store.load_branches()?);
-        let mut resolved_ports = BTreeMap::new();
+        used.extend(keep.values().copied());
+        let mut resolved_ports = keep.clone();
         for (port_name, request) in &definition.ports {
+            if keep.contains_key(port_name) {
+                continue;
+            }
             resolved_ports.insert(
                 port_name.clone(),
                 ports::allocate(request.start, &mut used)?,
@@ -4973,6 +4994,7 @@ impl BranchManager {
                 restore_proven: false,
                 render_error: None,
                 export_error: None,
+                prepare_rev: None,
             },
         );
         claim.updated_at = Utc::now();
@@ -6166,10 +6188,12 @@ impl BranchManager {
     }
 
     /// `newgit resource rebind`: bind `resource` again in `instance`, as
-    /// spawn bound it: claim its ports, resolve its exports, render its
-    /// files, run its `prepare`, then start its `autostart` action. The
+    /// spawn bound it: keep the ports it holds that its definition still
+    /// declares and claim any declared since, resolve its exports, render
+    /// its files, run its `prepare`, then start its `autostart` action. The
     /// retry for a bind that failed where no action reaches, a render or an
-    /// export, once the file or the definition is fixed (#262).
+    /// export, once the file or the definition is fixed (#262), and how a
+    /// live instance takes up an edited definition (#85).
     ///
     /// Refused while its process runs: binding again moves the values that
     /// process was started with.
@@ -6191,9 +6215,15 @@ impl BranchManager {
             )));
         }
         let autostart = definition.autostart_action().is_some();
+        // Not saved without it: the record on disk goes on claiming its
+        // ports until the bind writes the new claim, so no other spawn can
+        // take one of the ports it keeps in between.
         let previous = branch.resources.remove(resource);
-        self.store.save_branch_record(&branch)?;
-        let bound = match self.bind_resources(&mut branch) {
+        let held = previous
+            .as_ref()
+            .map(|binding| binding.resolved_ports.clone())
+            .unwrap_or_default();
+        let bound = match self.bind_resources_keeping(&mut branch, Some((resource, &held))) {
             Ok(bound) => bound,
             Err(error) => {
                 // Put the old binding back, so a bind that fails before it
@@ -6289,6 +6319,9 @@ impl BranchManager {
             } else {
                 ResourceStatus::Failed
             };
+            if code == 0 {
+                binding.prepare_rev = Some(definition.prepare_rev());
+            }
             dirty = true;
         }
         if dirty {
@@ -8736,6 +8769,16 @@ impl BranchManager {
         let supervisor = self.supervisor(&branch);
         for definition in self.running_resources(&branch) {
             supervisor.stop(&definition.name, &definition.stop_signal())?;
+        }
+        // And one whose definition was deleted by hand: nothing else will
+        // ever stop it, and it holds its ports after the record is gone.
+        for orphan in self.stop_undefined(&branch) {
+            if let Some(error) = orphan.error {
+                return Err(NewgitError::Unsupported(format!(
+                    "`{}`'s process, whose definition is gone, did not stop: {error}",
+                    orphan.name
+                )));
+            }
         }
 
         // Never the cleanup of a resource the checkpoint could not capture:
@@ -15421,6 +15464,9 @@ impl BranchManager {
                 });
             }
         }
+        // A process whose definition was deleted by hand: stopped all the
+        // same, never to be started again.
+        resources.extend(self.stop_undefined(&branch));
         self.save_stopped_record(&branch, &record)?;
         if captured {
             branch.updated_at = Utc::now();

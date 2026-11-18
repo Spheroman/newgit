@@ -62,6 +62,11 @@ enum Command {
         /// Print only that instance's workspace path, for scripts
         #[arg(long)]
         path: bool,
+        /// One JSON document: `{"instances": [{"name", "workspace",
+        /// "status", "problems", "starting"}]}`, `status` one of `ready`,
+        /// `starting`, `not ready`, `evicted`, `ws-missing`
+        #[arg(long, conflicts_with = "path")]
+        json: bool,
     },
     /// Checkpoint an instance, then delete its workspace and archive its
     /// binding record
@@ -730,8 +735,12 @@ enum ResourceCommand {
     /// exports, render, `prepare`, then its `autostart` action
     ///
     /// The retry for a resource that failed to render or to resolve an
-    /// export, once the file or the definition is fixed. Refused while its
-    /// process is running. Exits 1 when it does not come up.
+    /// export, once the file or the definition is fixed, and how a live
+    /// instance takes up an edited definition: ports it holds that are
+    /// still declared stay, only new ones are allocated. For a resource
+    /// whose definition is gone, it releases the binding instead (its
+    /// `[cleanup]` cannot run). Refused while its process is running. Exits
+    /// 1 when it does not come up.
     Rebind {
         name: String,
         /// Instance (inferred when run inside a workspace)
@@ -811,7 +820,7 @@ fn main() -> Result<()> {
     match cli.command {
         Command::Init(args) => init(args),
         Command::Spawn(args) => spawn(args),
-        Command::Status { name, path } => status(name.as_deref(), path),
+        Command::Status { name, path, json } => status(name.as_deref(), path, json),
         Command::Remove {
             name,
             purge,
@@ -1873,6 +1882,30 @@ fn resource(command: ResourceCommand) -> Result<()> {
         }
         ResourceCommand::Rebind { name, instance } => {
             let (manager, instance) = manager_and_instance(instance)?;
+            let defined = manager
+                .resource_definitions()
+                .iter()
+                .any(|definition| definition.name == name);
+            if !defined {
+                let outcome = manager.unbind_undefined(&instance, &name)?;
+                let ports = outcome
+                    .ports
+                    .iter()
+                    .map(|(port, number)| format!("{port}={number}"))
+                    .collect::<Vec<_>>();
+                println!(
+                    "Released `{name}` from `{}`: it is no longer defined, so nothing binds it",
+                    outcome.instance
+                );
+                if !ports.is_empty() {
+                    println!("  ports released: {}", ports.join(" "));
+                }
+                println!(
+                    "  its `[cleanup]` went with its definition and did not run: anything it \
+                     made outside the workspace is still there"
+                );
+                return Ok(());
+            }
             let outcome = manager.rebind_resource(&instance, &name)?;
             println!("Bound `{name}` again in `{}`", outcome.instance);
             print_bound_resource(&outcome.bound);
@@ -3455,12 +3488,15 @@ fn tracker(mut command: TrackerCommand) -> Result<()> {
     }
 }
 
-fn status(name: Option<&str>, path_only: bool) -> Result<()> {
+fn status(name: Option<&str>, path_only: bool, json: bool) -> Result<()> {
     let context = context_here()?;
     if path_only {
         return workspace_path(context, name);
     }
     let manager = BranchManager::open(context.store)?;
+    if json {
+        return status_json(&manager, name);
+    }
     let current_branch = context.current_branch.as_deref();
     // The remote is asked first and answered last: its round trip runs
     // alongside the local work instead of after it.
@@ -3640,20 +3676,60 @@ fn remote_state_notes(asked: AskedState) {
     }
 }
 
-fn status_column(report: &InstanceReport) -> String {
+/// `status --json`: each instance's health and the lines `status` prints
+/// under it, without the table's decoration or the remote's notes.
+fn status_json(manager: &BranchManager, name: Option<&str>) -> Result<()> {
+    let mut reports = manager.statuses()?;
+    if let Some(name) = name {
+        reports.retain(|report| report.branch.name == name || report.branch.slug == name);
+        if reports.is_empty() {
+            bail!("no branch instance named `{name}`");
+        }
+    }
+    let instances = reports
+        .iter()
+        .map(|report| {
+            serde_json::json!({
+                "name": report.branch.name,
+                "workspace": report.branch.workspace_path,
+                "status": health(report),
+                "problems": if report.workspace_exists {
+                    report.readiness.problems.clone()
+                } else {
+                    Vec::new()
+                },
+                "starting": if report.workspace_exists {
+                    starting_json(&report.readiness)
+                } else {
+                    serde_json::json!([])
+                },
+            })
+        })
+        .collect::<Vec<_>>();
+    println!("{}", serde_json::json!({ "instances": instances }));
+    Ok(())
+}
+
+/// An instance's state in one word or two, as the STATUS column starts.
+fn health(report: &InstanceReport) -> &'static str {
     if report.branch.evicted.is_some() {
-        return "evicted".to_owned();
-    }
-    if !report.workspace_exists {
-        return "ws-missing".to_owned();
-    }
-    let health = if !report.readiness.is_ready() {
+        "evicted"
+    } else if !report.workspace_exists {
+        "ws-missing"
+    } else if !report.readiness.is_ready() {
         "not ready"
     } else if report.readiness.is_starting() {
         "starting"
     } else {
         "ready"
-    };
+    }
+}
+
+fn status_column(report: &InstanceReport) -> String {
+    let health = health(report);
+    if report.branch.evicted.is_some() || !report.workspace_exists {
+        return health.to_owned();
+    }
     let health = if report.branch.private {
         format!("{health}, private")
     } else {

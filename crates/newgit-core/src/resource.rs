@@ -343,6 +343,30 @@ impl ResourceDefinition {
             .is_some_and(|ready| ready.http.is_some() || ready.command.is_some())
     }
 
+    /// `sha256:<hex12>` of what `prepare` runs: its command and the
+    /// directory it runs in, as declared. Recorded on a binding when its
+    /// `prepare` runs, so `status` can say when the definition has moved on
+    /// since; a hash of the whole file would also move on a comment or a
+    /// `[ready]` edit, which need nothing done.
+    pub fn prepare_rev(&self) -> String {
+        let action = self.runnable_prepare();
+        let command = action.and_then(|action| action.command.as_deref());
+        let workdir = self.workdir_for(action).map(Utf8Path::as_str);
+        let digest = Sha256::digest(
+            format!(
+                "{}\0{}",
+                command.unwrap_or_default(),
+                workdir.unwrap_or_default()
+            )
+            .as_bytes(),
+        );
+        let hex: String = digest[..6]
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        format!("sha256:{hex}")
+    }
+
     pub fn has_long_running_action(&self) -> bool {
         self.actions.values().any(|action| action.long_running)
     }
