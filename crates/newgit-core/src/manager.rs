@@ -53,6 +53,7 @@ mod evict;
 mod remove;
 mod retention;
 pub use encryption::{Reencrypted, describe_recipients};
+mod definition_problems;
 mod export_check;
 mod pull;
 pub use pull::{PullOutcome, PulledTracker};
@@ -3921,6 +3922,7 @@ impl BranchManager {
         }
         problems.extend(self.undefined_binding_problems(branch, &supervisor));
         problems.extend(self.unbound_definition_problems(branch));
+        problems.extend(self.bound_definition_problems(branch));
         Readiness { problems, starting }
     }
 

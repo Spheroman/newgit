@@ -1886,7 +1886,28 @@ fn resource(command: ResourceCommand) -> Result<()> {
                     "    required by {name}.into_tracker — edit it, or delete the file if this project doesn't need it"
                 );
             }
-            println!("  edit the definition; `newgit spawn` binds it (ports, exports, prepare)");
+            // The template's placeholders, by line: values only this project
+            // can give, which `resource check` and `spawn` fail until they
+            // are replaced.
+            let written = std::fs::read_to_string(&outcome.path).unwrap_or_default();
+            let placeholders = newgit_core::definition_check::placeholder_lines(&written);
+            if placeholders.is_empty() {
+                println!(
+                    "  edit the definition; `newgit spawn` binds it (ports, exports, prepare)"
+                );
+            } else {
+                println!(
+                    "  edit these lines before spawning — they are the template's placeholders \
+                     (`newgit resource check` fails until they are replaced):"
+                );
+                let path = display_path(&root, &outcome.path);
+                for (line, text) in placeholders {
+                    println!("    {path}:{line}: {}", text.trim());
+                }
+                println!(
+                    "  then check the rest of it; `newgit spawn` binds it (ports, exports, prepare)"
+                );
+            }
             println!("  {REFERENCE_POINTER}");
             warn_graph(&manager_here()?);
             Ok(())
@@ -1952,7 +1973,24 @@ fn resource(command: ResourceCommand) -> Result<()> {
                 &manager.store().paths().project_root,
                 &path,
             );
-            let missing = checks.iter().filter(|check| check.is_missing()).count();
+            // What the definitions name that is not there, and placeholders
+            // nobody replaced, before which programs exist: a definition
+            // that is wrong fails here whatever this machine has installed.
+            // (resource or tracker, field, reason); a problem with the
+            // graph as a whole (a cycle, a name claimed twice) has neither.
+            let mut definitions: Vec<(Option<String>, Option<String>, String)> = manager
+                .graph_problems()
+                .iter()
+                .map(|problem| (None, None, problem.to_string()))
+                .collect();
+            definitions.extend(
+                manager
+                    .definition_problems()
+                    .into_iter()
+                    .map(|problem| (Some(problem.name), Some(problem.field), problem.reason)),
+            );
+            let missing =
+                checks.iter().filter(|check| check.is_missing()).count() + definitions.len();
             let skipped = checks
                 .iter()
                 .filter(|check| matches!(check.outcome, Outcome::Unchecked(_)))
@@ -1977,10 +2015,25 @@ fn resource(command: ResourceCommand) -> Result<()> {
                         })
                     })
                     .collect::<Vec<_>>();
-                println!("{}", serde_json::json!({ "programs": programs }));
-            } else if checks.is_empty() {
+                let definitions = definitions
+                    .iter()
+                    .map(|(name, field, reason)| {
+                        serde_json::json!({ "name": name, "field": field, "reason": reason })
+                    })
+                    .collect::<Vec<_>>();
+                println!(
+                    "{}",
+                    serde_json::json!({ "definitions": definitions, "programs": programs })
+                );
+            } else if checks.is_empty() && definitions.is_empty() {
                 println!("No resource definition starts a program newgit can check.");
             } else {
+                for (name, field, reason) in &definitions {
+                    match (name, field) {
+                        (Some(name), Some(field)) => println!("FAIL  {name}: {field} — {reason}"),
+                        _ => println!("FAIL  {reason}"),
+                    }
+                }
                 for check in &checks {
                     let program = check
                         .program
@@ -1997,7 +2050,7 @@ fn resource(command: ResourceCommand) -> Result<()> {
                     }
                 }
                 if missing > 0 {
-                    println!("{missing} failed: install what is missing, or change the definition");
+                    println!("{missing} failed: fix the definition, or install what is missing");
                 }
                 if skipped > 0 {
                     println!("{skipped} not checked: not failures; only running the hook can tell");

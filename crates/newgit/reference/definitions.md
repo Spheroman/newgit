@@ -209,9 +209,11 @@ newgit resource add deps --template pnpm
 newgit resource add app --template process
 ```
 
-Then open every generated file in `.newgit/resources/` and fix the lines
-marked `EDIT ME`, such as the dev command and the lockfile. A template's
-defaults are guesses, and a wrong guess shows up as a failed spawn later. `newgit
+`resource add` lists the lines that hold a template's placeholder (`EDIT
+ME: …`, `EDIT_ME_PROJECT`); replace each, and `newgit resource check` fails
+until you have. Then read the rest of every generated file in
+`.newgit/resources/`, such as the dev command. A template's other defaults
+are guesses, and a wrong guess shows up as a failed spawn later. `newgit
 reference <section>` has every key. If a resource needs a `[[render]]`, run
 `newgit render --check`.
 
@@ -230,7 +232,7 @@ see what is committed.
 Don't hand it over until a real spawn comes up:
 
 ```sh
-newgit resource check             # every program the hooks start is installed; fix each FAIL
+newgit resource check             # nothing named is missing, no placeholder left, every program installed
 newgit spawn newgit-try
 newgit status newgit-try          # every resource ready; if not, it says why
 newgit env newgit-try             # ports and exports, labeled by where they came from
@@ -644,11 +646,41 @@ file content. Start from `newgit resource add <name> --template <template>`
 <name>` prints one in full, including any companion resource or tracker it
 creates alongside it, without instantiating anything).
 
-`newgit resource check` looks for every program a definition's commands
+`newgit resource check` first reads every definition for what it names
+that is not there, and fails each one with its field and the fix, as in
+``FAIL  db: [checkpoint] into_tracker — names `db-snapshots`, which is not
+a tracker: create it with `newgit tracker create db-snapshots` ``:
+
+- a template's placeholder still in a value, in any field: `EDIT ME: …`,
+  `EDIT_ME_PROJECT`, `EDIT_ME_CLI`. `newgit resource add` lists the lines
+  that hold one;
+- `[checkpoint] into_tracker` naming no tracker, and a tracker's
+  `resources` naming no resource;
+- `{{ports.<name>}}` naming no port of this resource; `{{exports.<name>}}`
+  naming nothing any resource exports, or, where it has no value (an action,
+  `key_command`, `[ready]`; another resource's export in a hook), one that
+  should be read as `$<name>` from the environment;
+- `{{scripts}}/<path>` with no such file in the project root's
+  `.newgit/scripts/`;
+- `{{state_ref}}` or `{{snapshot.path}}` where they have no value, and a
+  misspelled `{{branch.*}}`, `{{bound.*}}` or `{{snapshot.*}}` (see
+  *Template variables*), all of which would run as the literal text;
+- what the graph refuses: a `depends_on` naming neither a resource nor a
+  tracker, a cycle, an environment variable claimed twice.
+
+`newgit spawn` and `newgit status` name each of these, except the graph's,
+which `spawn` refuses outright, as a problem of every instance that binds
+the resource or tracker it is in, so the instance is not ready until it is
+fixed. Already refused when a definition loads, so not repeated here: a
+`[restore] action` naming no action, more than one `autostart`, a `hash`
+checkpoint with no `[identity]`.
+
+Then it looks for every program a definition's commands
 start — each action, `[identity] key_command`, `[checkpoint]`, `[restore]`,
 `[cleanup]`, and `[ready]` command — with no instance and nothing run
 (#87). A `[restore]` calling `psql` on a machine with no Postgres client
-otherwise fails only during the undo you are relying on.
+otherwise fails only during the undo you are relying on. A command still
+holding a placeholder is not looked into: the placeholder is its `FAIL`.
 
 It reads each command as shell. `sh -n` (the shell that will run it, told
 not to execute) must accept it, or that command is one `FAIL`. Then every
@@ -677,8 +709,11 @@ Each program is one line:
   `which X`, `[ -x ./bin/x ]`) and so has its own answer for. A skip is not
   a failure and does not change the exit code.
 
-`--json` prints `{"programs": [{"resource", "hook", "program", "status",
-"found", "reason"}]}`: `status` is `ok`, `fail`, or `skip`; `found` is the
+`--json` prints `{"definitions": [{"name", "field", "reason"}],
+"programs": [{"resource", "hook", "program", "status", "found",
+"reason"}]}`. Every entry in `definitions` is a failure; `name` (the
+resource or tracker) and `field` are null for a problem with the graph as a
+whole. In `programs`, `status` is `ok`, `fail`, or `skip`; `found` is the
 path when `ok`; `reason` says why for the other two; `program` is null when
 the finding is about the whole command.
 
