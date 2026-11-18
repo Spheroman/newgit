@@ -1614,6 +1614,12 @@ struct RestoreContext<'a> {
     /// ([`BranchManager::install_binding`]) is not the tree the checkpoint
     /// describes even when its identity paths are unchanged.
     dropped_before: Option<&'a BTreeSet<String>>,
+    /// A resource this one depends on whose recompute rebuilt or refilled
+    /// its tree earlier in this undo. A tree rebuilt from its inputs holds
+    /// none of what a dependent generated into it (`node_modules/.prisma`
+    /// under `node_modules`), so the dependent's own unchanged identity says
+    /// nothing about whether its output is still there.
+    rebuilt_dependency: Option<&'a str>,
     force_recompute: bool,
 }
 
@@ -14868,6 +14874,9 @@ impl BranchManager {
         let mut resources = Vec::new();
         let mut failures: Vec<RestoreFailure> = Vec::new();
         let mut down_dependencies = BTreeSet::new();
+        // What a recompute rebuilt or refilled in this undo: its dependents
+        // recompute too (see `RestoreContext::rebuilt_dependency`).
+        let mut rebuilt: BTreeSet<String> = BTreeSet::new();
         for name in &self.graph.bind_order {
             let Some(state) = restored
                 .resource_states
@@ -14910,18 +14919,32 @@ impl BranchManager {
                     .iter()
                     .find(|pre| &pre.name == name)
                     .and_then(|pre| pre.state_ref.as_deref());
-                self.restore_resource(
+                let rebuilt_dependency = definition
+                    .depends_on
+                    .iter()
+                    .find(|dependency| rebuilt.contains(*dependency))
+                    .map(String::as_str);
+                let outcome = self.restore_resource(
                     &mut branch,
                     definition,
                     state,
                     RestoreContext {
                         pre_undo_state_ref: pre_undo,
                         dropped_before: dropped_before.as_ref(),
+                        rebuilt_dependency,
                         force_recompute: options.force_recompute,
                     },
                     &mut failures,
                     &mut warnings,
-                )?
+                )?;
+                let recompute = definition
+                    .restore
+                    .as_ref()
+                    .is_some_and(|spec| spec.mode == RestoreMode::Recompute);
+                if recompute && outcome.2 {
+                    rebuilt.insert(name.clone());
+                }
+                outcome
             };
             if let Some(binding) = branch.resources.get_mut(name) {
                 // Only a restore that ran something can have brought the
@@ -15092,6 +15115,7 @@ impl BranchManager {
                     });
                 if !undo.force_recompute
                     && !key_moved
+                    && undo.rebuilt_dependency.is_none()
                     && self.produced_present(branch, definition)
                     && let Some(recorded) = state.state_ref.as_deref()
                     && recorded.starts_with(HASH_STATE_REF_PREFIX)
@@ -15187,6 +15211,9 @@ impl BranchManager {
                 // A rebuild during an undo produces the same tree a spawn
                 // would have, so it is worth the same to the next instance.
                 let mut label = format!("recompute({action_name})");
+                if let Some(dependency) = undo.rebuilt_dependency {
+                    label.push_str(&format!(" after `{dependency}` was recomputed"));
+                }
                 if ok && let Some(key) = &install_key {
                     match self.admit_to_install_store(branch, definition, key) {
                         Some(report @ InstallReport::Stored { .. }) => {

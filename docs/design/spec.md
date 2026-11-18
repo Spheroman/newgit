@@ -1842,7 +1842,11 @@ checkpoint taken off the branch with `` [on `try-x`] ``.
 A resource's restore is one of `none`, `command`, `recompute` (re-run an
 action, `prepare` by default, when the identity changed), or `external`.
 `recompute` is correctness for path-dependent artifacts, not an
-optimization, and it fills from the install store when it can.
+optimization, and it fills from the install store when it can. A tree
+recomputed from its inputs holds nothing a dependent generated into it
+(`prisma generate` into `node_modules`), so once an undo recomputes a
+resource, every `recompute` dependent after it recomputes too, whatever its
+own identity says.
 
 A resource the checkpoint holds no state for (one it went ahead without)
 keeps its state when its restore is a `command`. Running the restore with
