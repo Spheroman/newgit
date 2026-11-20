@@ -1184,11 +1184,56 @@ fix follows from what failed, and never names an action the resource does
 not define (#262). A failed render or export is fixed in the file or the
 definition, then bound again with `newgit resource rebind <resource>
 [instance]`, which binds it as spawn did (ports, exports, render, `prepare`,
-then its `autostart` action) and refuses while its process runs. A failed
+then its `autostart` action) and refuses while its process runs. A rebind
+keeps every port the binding holds that the definition still declares and
+allocates only one declared since: a port is the instance's for life. A
+failed
 `prepare` is retried with `newgit action <resource>.prepare`; a resource
 with no `prepare` is pointed at the action that builds its tree or its
 long-running action, and one with neither (a `[restore]` alone) at its
 logs.
+
+An instance bound before its definition changed counts too (#85).
+Binding is a moment, not a subscription: an agent that edits
+`.newgit/resources/web.toml` while `web` runs changes nothing in an
+instance bound before, and would otherwise debug behavior that comes from
+the old binding. So `status` holds each ready binding against the
+definition as it stands, one line per resource, naming each difference and
+the commands that apply it:
+
+```text
+  - `web` was bound from an older /repo/.newgit/resources/web.toml: port
+    `extra` declared since, so nothing claims it for this instance; export
+    `APP_URL` changed; `[[render]]` of other.txt added; `prepare` changed
+    since it ran here — apply it with `newgit stop x && newgit resource
+    rebind web x && newgit start x`
+```
+
+What it compares is what newgit would write now against what the record
+says it wrote: the declared ports against the claimed ones, each export
+and each `[[render]]` resolved again as a rebind would resolve it, and the
+`prepare` that last ran (`prepare_rev` on the binding, the one thing the
+record would not otherwise hold). Re-resolving rather than fingerprinting
+the file names the very export or file, and also catches a value that moved
+because a dependency's did, while a comment changes nothing. A running
+process is held against the command its log says it was started with; a
+change to that alone is a restart, `newgit stop x && newgit start x`. The
+rebind line names the stop and start around the rebind only when the
+process runs, since a rebind refuses a running one. What newgit reads each
+time it needs it is never flagged: `[ready]`, `depends_on`, `[identity]
+paths`, ownership, the checkpoint, restore and cleanup hooks, and a port's
+`start`, which only said where its allocation began.
+
+The path in that line is absolute on purpose: definitions are read from the
+project root's `.newgit/resources/`, never from a workspace's copy, so an
+edit made in a workspace takes effect when it reaches the project root.
+Two more cases are named. A resource defined but not bound (added after the
+instance bound its resources) is bound by `newgit resource rebind`. A
+binding whose definition file was deleted by hand, rather than with `newgit
+resource remove`, is named with its process if it runs and the ports it
+still claims; `stop` and `remove` stop that process with `TERM`, and
+`resource rebind` then releases the binding, taking its values out of the
+files it rendered. Its `[cleanup]` went with its definition and cannot run.
 
 A blocked resource counts. Its `prepare` never ran, so it is no more usable
 than one whose `prepare` failed; only where the failure started differs.
@@ -1200,19 +1245,21 @@ fix it. An `autostart` action that did not start counts too: an instance
 whose dev server is down is not up. The instance is not rolled back.
 `--from-checkpoint` judges by the instance the restore leaves (#208).
 
-#### Starting is not failing
+#### Starting is not failing, until its deadline
 
 A dev server that compiles before it listens (Next.js) is doing what it
 should, and a spawn that called it a problem looked like a failure. A running
 process whose port is not answering yet is `starting`, a state of its own:
-not a problem, not "not ready". After the autostart, `spawn` polls the ports
-of what is running for up to five seconds and returns as soon as they answer,
-so a fast server costs nothing. What is still unanswered is then reported as
-starting, not as a failure, with a pointer to `newgit status`:
+not a problem, not "not ready". After the autostart, `spawn` polls what is
+running for up to the longest `timeout_seconds` of what is bound (five
+seconds by default) and returns as soon as everything answers, so a fast
+server costs nothing. A process with no `[ready]` still unanswered is then
+reported as starting, not as a failure, with its log and a pointer to
+`newgit status`:
 
 ```text
 starting: `feature-a`
-  - `app` is still starting: not answering yet on web (3000)
+  - `app` is still starting: not answering yet on web (3000); its log is .newgit/logs/feature-a/app.start-….log
   `newgit status` shows when it is up.
 ```
 
@@ -1220,18 +1267,49 @@ starting: `feature-a`
 problem still says `not ready`, and wins), with the lines under it. It is
 checked at read time, so it clears on its own once the port answers.
 `spawn --json` lists them under `starting` (`resource`, the `ports` that
-have not answered, and `check`) and exits 0 as for a ready instance.
+have not answered, `check`, and `log`) and exits 0 as for a ready instance.
 
 A port that answers is not always a server that serves: some bind at once
 and answer 500 until they have compiled, and a resource newgit does not
 supervise (a Supabase stack a `prepare` left running) has no process to
 watch at all. A definition's `[ready]` says what up means instead (#276):
 a GET that answers 200–399, or a command that exits 0, and
-`timeout_seconds` for how long to wait. The end of `spawn` waits for the
-longest of those among what is bound, and a dependent's start waits its
-dependency's (*Spawn*). With no `[ready]`, up is the ports answering and
-the wait is five seconds; a resource with no process and no check is up
-when its `prepare` exited 0.
+`timeout_seconds` for how long that takes. The end of `spawn` and of
+`newgit start` waits for the longest of those among what is bound, and a
+dependent's start waits its dependency's (*Spawn*). With no `[ready]`, up
+is the ports answering and the wait is five seconds; a resource with no
+process and no check is up when its `prepare` exited 0. Its declared ports
+are not checked: they are reservations, and the `supabase` template claims
+several a default stack never opens.
+
+Starting has a deadline where one was declared. An agent goes by the exit
+code, and exit 0 says the instance works; "starting" forever, with nothing
+alive to say it might still come up, was that lie for a stack that had gone
+down. So:
+
+- A resource whose definition has a `[ready]` said what up is and how long
+  it takes. Past `timeout_seconds` it is not up: a problem, `not ready` in
+  `status`, and `spawn` and `start` exit 1.
+- A resource with no process newgit supervises has nothing alive to tell
+  still-starting from gone-down; it has a `[ready]` check, or it is not
+  checked at all, so the same holds.
+- A supervised process with no `[ready]` has no deadline, because nobody
+  declared one, and most dev servers compile for longer than any default:
+  it is `starting` for as long as it runs. Its line names its log.
+
+The clock is the process's start (when its pid file was written) or, with
+no process, the last `prepare`, `resume` or `restore` that exited 0
+(`.newgit/state/<slug>/<resource>.up`), so `status`, which has no clock of
+its own, gives the same answer `spawn` did. With no record of either, there
+is no grace. A not-up line for a supervised process ends with the last lines
+of its run's log: a dev server that crashed under a wrapper that stayed alive
+(`npm-run-all`) is a running process, and only its log says why. `spawn`
+prints where the instance's logs are (`logs:`; `logs` in `--json`).
+
+`status` runs an instance's checks side by side, one thread each, and
+`status <instance>` runs only that instance's. An `https://` check uses this
+machine's trust store, so a certificate `mkcert -install` made trusted
+passes; one the machine does not trust says so.
 
 #### Died is not stopped
 
@@ -1252,7 +1330,8 @@ or it outlived a reboot). An `autostart` action in that state makes the
 instance `not ready`, with `newgit action <resource>.<action>` as the retry,
 and `newgit start` starts it again along with what `newgit stop` stopped.
 Severity runs ready < starting < not ready: a died process is a problem, a
-process that is up but not answering yet is not. `newgit cleanup` retires a
+process that is up but not answering yet is not, until its `[ready]`
+deadline has passed. `newgit cleanup` retires a
 dead process's pid to `exited`, not `stopped`, so it does not erase a
 crash.
 
@@ -1902,19 +1981,26 @@ Open issues that change what this document can promise:
 - **#83: gitignored secrets reach a workspace only through a tracker.**
   `spawn` names the ones it left behind, by file name, and the commands
   that carry them; nothing carries them by itself.
-- **#85: no reconcile.** A live instance does not pick up a changed
-  resource definition. A port declared since it was bound is named by
-  `status` as unclaimed, with `newgit resource rebind` as the fix; any
-  other change (a command, an export) goes unsaid.
+- **#85: reconcile is asked for, not automatic.** A live instance does not
+  pick up a changed resource definition by itself: `status` names each
+  difference and the commands that apply it, and the agent runs them. A
+  rebind does not rebind what depends on the resource (#289): `status` then
+  names a dependent's export or render that moved with it, but not a
+  process started with an environment that has since changed (another
+  resource's export, a port's `env` name).
 - **#87: preflight is asked for, not automatic.** `newgit resource check`
   finds a definition calling a missing binary (`pg_dump` on a host without
   Postgres); nothing runs it at spawn, so one never checked still fails at
   the first checkpoint or, worse, the first restore.
 - **#89: a failed `prepare` can destroy its own evidence**, when the tool
-  tears down its containers before exiting. newgit shows the command that
-  ran and how its log ends, and the reference says how to rerun it by hand
-  with the tool's own keep-it-up flag; it cannot keep the containers
-  itself.
+  tears down its containers before exiting. newgit destroys none of it
+  itself: every run has its own log, and nothing it runs after a failure
+  removes what the command left. It shows the whole command that ran and
+  how its log ends (stderr only when `captures` is set), and the reference
+  says how to rerun the tool by hand with its own keep-it-up flag; it
+  cannot keep the containers itself, and there is no generic
+  `--keep-failed`, since newgit runs nothing after a failure for one to
+  switch off.
 - **#59: port allocation order within a resource is unspecified**, which
   matters when a tool's default ports are consecutive.
 - **Install store follow-ups:** sub-path exclusions in `produces` for native

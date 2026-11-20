@@ -687,6 +687,32 @@ instance still has it bound unless `--force` is given, in which case it drops
 the binding from that instance's record and releases its ports (there is no
 other ledger: a port is free the moment nothing claims it).
 
+### Editing a definition under a live instance
+
+Definitions are read from the project root's `.newgit/resources/`, not from
+a workspace's copy: an edit made in a workspace takes effect once it
+reaches the project root.
+
+A live instance does not pick up an edit by itself. `newgit status` (and
+`status --json`, under `problems`) names, one line per resource, each way a
+binding differs from its definition and the commands that apply it (#85):
+
+| what changed | `status` says | apply it with |
+| --- | --- | --- |
+| a port added, removed or renamed; an export added, removed, or resolving to a different value; a `[[render]]` added, removed or changed; `prepare`'s command or `workdir` | `` `web` was bound from an older …/web.toml: `` and each difference | `newgit resource rebind web <instance>`, with `newgit stop` before it and `newgit start` after when its process runs (a rebind refuses a running process) |
+| the command of the running long-running action, or the action itself | `` `web.start` is running a command …/web.toml no longer gives `` | `newgit stop <instance> && newgit start <instance>` |
+| a resource defined since the instance bound its resources | `` `web` is defined in … but not bound here `` | `newgit resource rebind web <instance>` |
+| the definition file deleted by hand | `` `web` is bound here, but …/web.toml is gone ``, with its pid and ports | `newgit stop <instance>` if it runs (`stop` and `remove` stop it), then `newgit resource rebind web <instance>`, which releases the binding; its `[cleanup]` went with the file and cannot run, so use `newgit resource remove` to delete a definition instead |
+
+An export or render is compared by resolving it again, so one that moved
+because a dependency's export did is named too. Nothing is flagged for what
+newgit reads each time it needs it: `[ready]`, `depends_on`, `[identity]
+paths` and `key_command`, `ownership`, `reads`, `disposable`, and the
+`[checkpoint]`, `[restore]` and `[cleanup]` hooks. A changed `[identity]
+produces` shows as its tree missing. Not named: a process started with an
+environment that has since changed (another resource's export, a port's
+`env` name).
+
 ### Top level
 
 | key | type | required | default | meaning |
@@ -831,11 +857,13 @@ One entry per port the resource needs. `<name>` is yours (`app`, `db`).
 
 A port is allocated when the resource binds, usually at `spawn` (at
 `tracker use` for a resource a tracker brings), and recorded in the binding
-record. It stays the same through `stop`, `start`, `tracker drop` and `use`.
-Removing the instance frees it, and `newgit resource rebind` allocates
-again. A port added to the definition after an instance bound the resource
-is claimed by nothing for that instance until it does: `newgit status`
-names it as a problem, with the rebind to run (#85).
+record. It stays the same through `stop`, `start`, `tracker drop` and `use`,
+and through `newgit resource rebind`, which allocates only a port declared
+since. Removing the instance frees it. A port added to the definition after
+an instance bound the resource is claimed by nothing for that instance until
+a rebind: `newgit status` names it as a problem, with the rebind to run
+(#85). Changing a port's `start` moves nothing: it only says where an
+allocation begins.
 Use it in templates as `{{ports.<name>}}`.
 
 Unlike `[exports]`, order here does matter: `[ports]` is also a map, not a
@@ -903,16 +931,24 @@ resource marks `autostart`. Every other action is something you invoke:
 rendered command and its directory without running it, or `--quiet` to keep
 a one-shot command's output in its log only: it then says the exit code,
 and on failure the command that ran and the log's last twenty lines.
+`--quiet` moves output, not input: the command still reads what was piped
+to `newgit action`, as it would without it. Hooks newgit runs on its own (a
+spawn's `prepare`, a restore) get no input, since nobody is there to answer.
 
-**When a hook fails, its log may not hold the why.** A spawn's `prepare`
-runs quietly and its `FAILED` line shows the command that ran and the log's
-last lines. But a tool that cleans up after itself on failure can destroy
-the evidence first: `supabase start` stops every container it started when
-one is unhealthy, so its log ends in empty `container logs:` sections
-(#89). newgit cannot stop a command from tearing itself down. Run its
-steps by hand in the instance's environment instead, `newgit run
-<instance> -- sh`, with whatever flag the tool has for leaving things up
-(`supabase start --ignore-health-check`, then `docker logs <container>`).
+**A failed hook keeps its evidence.** A spawn's `prepare` runs quietly and
+its `FAILED` line shows the command that ran, every line of it, and the
+log's last lines. Every run writes a log of its own, named in its own
+report, so a retry never overwrites the log of the run before it. And
+nothing newgit runs afterwards removes what the failed command left in the
+workspace: `[cleanup]` runs only at `newgit remove`, and `start` and the
+retry run nothing but what the definition says. A tool that cleans up after
+itself on failure is another matter: `supabase start` stops every container
+it started when one is unhealthy, so its log ends in empty `container
+logs:` sections (#89). newgit cannot stop a command from tearing itself
+down. Run its steps by hand in the instance's environment instead, `newgit
+run <instance> -- sh`, with whatever flag the tool has for leaving things
+up (`supabase start --ignore-health-check`, then `docker logs
+<container>`).
 
 **`autostart` starts a process at spawn.** Once every resource is bound and
 prepared, `newgit spawn` starts each `autostart` action, dependencies
@@ -929,9 +965,13 @@ it. `newgit action <resource>.<action>` of a long-running action by hand
 refuses on the same terms, naming the dependency to start first.
 After starting them, `spawn` waits for what is running to come up, for as
 long as the longest `timeout_seconds` among the bound resources (five
-seconds when none says). A server still compiling after that is
-`starting`, not a failure: `spawn` exits 0, says so, and `spawn --json`
-lists it under `starting`; `newgit status` shows `starting` until it is up.
+seconds when none says). A process with no `[ready]` still not answering
+after that is `starting`, not a failure: nobody said how long it takes, so
+`spawn` exits 0, says so, and `spawn --json` lists it under `starting`;
+`newgit status` shows `starting` until it is up. One whose `[ready]` still
+fails is not up, and `spawn` exits 1 (see `[ready]`). Either way the line
+names the log of the process's run, and `spawn` prints where the
+instance's logs are (`logs:`, and `logs` in `spawn --json`).
 `spawn --from-checkpoint` starts them after its restore, and `newgit
 tracker use` starts those of the resources the tracker brings, which `drop`
 stopped. Nothing else autostarts: `newgit start` brings back what `newgit
@@ -1043,15 +1083,16 @@ command = "docker compose -p {{branch.slug}} start"
 
 ### `[ready]`
 
-What "up" means for this resource (#276), which is what `spawn` waits for
-after starting it, what a dependent's start waits for, and what `newgit
-status` shows as `starting` until it holds.
+What "up" means for this resource (#276), how long it takes, which is
+what `spawn` and `newgit start` wait for after starting it, what a
+dependent's start waits for, and what `newgit status` shows as `starting`
+until it holds.
 
 | key | type | required | default | meaning |
 | --- | --- | --- | --- | --- |
-| `http` | string | no | — | up when a GET of this URL answers 200–399. Redirects are not followed. `http://` or `https://`; rendered like an action `command`, so `{{ports.<name>}}` works. |
+| `http` | string | no | — | up when a GET of this URL answers 200–399. Redirects are not followed. `http://` or `https://`; an `https://` certificate must be trusted by this machine's trust store (a local one, by `mkcert -install`). Rendered like an action `command`, so `{{ports.<name>}}` works. |
 | `command` | string | no | — | up when this command exits 0. Rendered and run like an action, in the resource's `workdir`, with the command environment; each run has five seconds to finish. |
-| `timeout_seconds` | integer | no | `5` | how long to wait for it to come up, 1 to 3600: at the end of `spawn`, and before starting what depends on it. |
+| `timeout_seconds` | integer | no | `5` | how long it takes to come up, 1 to 3600, counted from when its process started (or, with none, from its last `prepare`, `resume` or `restore`): waited for at the end of `spawn` and `start` and before starting what depends on it, and after it, not up. |
 
 At most one of `http` and `command`. With neither, a resource is up when
 its running process answers on every port it claims, which is what newgit
@@ -1068,10 +1109,13 @@ timeout_seconds = 60
 A resource newgit does not supervise — a `prepare` that leaves a Supabase
 stack or a Compose project running — has no process to watch. With no
 `[ready]` it is up once its `prepare` exits 0, so a stack that has since
-gone down still reads `ready`. A `command` is how it says otherwise, and
-then it is checked like a process: by `status`, by the end of `spawn`, and
-before its dependents start. One that `newgit stop` suspended is not
-checked until `start` resumes it.
+gone down still reads `ready`. Its declared ports are not checked for
+it: a port is a reservation, not a promise that something listens (the
+`supabase` template claims the disabled pooler's and the mail server's,
+which a default stack never opens). A `command` or `http` is how it says
+what up is, and then it is checked like a process: by `status`, by the
+end of `spawn` and `start`, and before its dependents start. One that
+`newgit stop` suspended is not checked until `start` resumes it.
 
 ```toml
 # functions.toml depends_on = ["supabase"], and starts once this passes.
@@ -1080,10 +1124,26 @@ command = "supabase status"
 timeout_seconds = 120
 ```
 
-Still not up when the wait ends is `starting`, not a failure, and `status`
-says how the check failed (`GET http://127.0.0.1:5173/ answered 500`,
-`` `supabase status` exited 1 ``); `spawn --json` puts it in `check` beside
-`ports`. Every `status` runs the check again, so keep it cheap.
+`timeout_seconds` is a deadline where one was declared. A resource whose
+definition has a `[ready]` (it said what up means and how long that
+takes), or one with no process newgit supervises, is `starting` only
+within `timeout_seconds`; after that it is not up, which is a problem:
+`spawn` and `start` exit 1 and `status` says `not ready`. With no process
+to watch, still starting and gone down look the same, so past its own
+estimate it is called down. A supervised process with no `[ready]` has no
+deadline: it is `starting` for as long as it runs without answering.
+
+Each says how the check failed (`GET http://127.0.0.1:5173/ answered 500`,
+`` `supabase status` exited 1 ``); `spawn --json` puts it in `check`
+beside `ports` while starting, and the not-up line in `problems`. For a
+supervised process the line names the log of its run, and the not-up one
+ends with that log's last lines: a server that crashed inside a wrapper
+that stayed alive (`npm-run-all`, `concurrently`) is running, and only
+its log says why. A not-up `https://` check against a certificate this
+machine does not trust says so.
+
+`status` runs each check again, every resource's at once; `newgit status
+<instance>` runs only that instance's. Keep it cheap all the same.
 
 ### `[checkpoint]`
 
@@ -1914,6 +1974,13 @@ Only declared names are taken. **When `captures` is set, stdout belongs to
 newgit** — send progress output to stderr, or a chatty CLI's noise is
 interleaved with the values and they will not parse. A declared name the
 command never emitted is a warning, not an error.
+
+The log keeps stdout and stderr apart, under `[newgit] stdout, read for
+captures:` and `[newgit] stderr:`. Since none of a captured run's output
+reaches the terminal, a failure is told from its log, `--quiet` or not: the
+command that ran and the end of its stderr. Only stderr: stdout holds the
+captured values, a database URL with its password among them, which a run
+that succeeded would never have printed either. The log has them.
 
 ---
 

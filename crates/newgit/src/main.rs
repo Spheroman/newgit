@@ -62,6 +62,11 @@ enum Command {
         /// Print only that instance's workspace path, for scripts
         #[arg(long)]
         path: bool,
+        /// One JSON document: `{"instances": [{"name", "workspace",
+        /// "status", "problems", "starting"}]}`, `status` one of `ready`,
+        /// `starting`, `not ready`, `evicted`, `ws-missing`
+        #[arg(long, conflicts_with = "path")]
+        json: bool,
     },
     /// Checkpoint an instance, then delete its workspace and archive its
     /// binding record
@@ -730,8 +735,12 @@ enum ResourceCommand {
     /// exports, render, `prepare`, then its `autostart` action
     ///
     /// The retry for a resource that failed to render or to resolve an
-    /// export, once the file or the definition is fixed. Refused while its
-    /// process is running. Exits 1 when it does not come up.
+    /// export, once the file or the definition is fixed, and how a live
+    /// instance takes up an edited definition: ports it holds that are
+    /// still declared stay, only new ones are allocated. For a resource
+    /// whose definition is gone, it releases the binding instead (its
+    /// `[cleanup]` cannot run). Refused while its process is running. Exits
+    /// 1 when it does not come up.
     Rebind {
         name: String,
         /// Instance (inferred when run inside a workspace)
@@ -811,7 +820,7 @@ fn main() -> Result<()> {
     match cli.command {
         Command::Init(args) => init(args),
         Command::Spawn(args) => spawn(args),
-        Command::Status { name, path } => status(name.as_deref(), path),
+        Command::Status { name, path, json } => status(name.as_deref(), path, json),
         Command::Remove {
             name,
             purge,
@@ -1332,7 +1341,7 @@ fn prepare_label(resource: &ResourceBindOutcome) -> String {
                 // The hook ran quietly; its last lines are usually the why,
                 // and the command it ran often is (#89).
                 let ran = newgit_core::supervisor::log_command(log)
-                    .map(|command| format!("\n               ran: {command}"))
+                    .map(|command| format!("\n               ran: {}", hang_indent(&command, 20)))
                     .unwrap_or_default();
                 let tail = newgit_core::supervisor::log_tail(log, 8)
                     .into_iter()
@@ -1416,6 +1425,7 @@ fn spawn_from_checkpoint(
             serde_json::json!({
                 "name": outcome.branch.name,
                 "workspace": outcome.branch.workspace_path,
+                "logs": manager.store().paths().logs.join(&outcome.branch.slug),
                 "from": spec,
                 "author": outcome.author,
                 "agent": outcome.agent,
@@ -1467,6 +1477,10 @@ fn spawn_from_checkpoint(
         );
     }
     println!("  workspace: {}", outcome.branch.workspace_path);
+    println!(
+        "  logs:      {}",
+        manager.store().paths().logs.join(&outcome.branch.slug)
+    );
     for tracker in &outcome.undo.trackers {
         match &tracker.rev {
             Some(rev) => {
@@ -1611,6 +1625,7 @@ fn spawn(args: SpawnArgs) -> Result<()> {
             serde_json::json!({
                 "name": outcome.branch.name,
                 "workspace": outcome.branch.workspace_path,
+                "logs": manager.store().paths().logs.join(&outcome.branch.slug),
                 "source_rev": outcome.branch.source_rev,
                 "remote": outcome.branch.remote.as_ref().map(|remote| &remote.project),
                 "private": outcome.branch.private,
@@ -1625,14 +1640,16 @@ fn spawn(args: SpawnArgs) -> Result<()> {
                 "resources": resources,
                 "started": stop_start_resources_json(&outcome.started),
                 "starting": starting_json(&readiness),
+                "problems": readiness.problems,
             })
         );
         // The exit the human-readable summary below gives, for the same
         // reason (#86): a script is the caller most likely to ask for JSON,
         // and the one that goes by the exit code. As there, exit 1 reports
         // the instance's state rather than undoing it — the instance and its
-        // record stay, and the JSON above is all of stdout.
-        if !outcome.is_complete() {
+        // record stay, and the JSON above is all of stdout. Not up once its
+        // wait is over is as much a failure as not bound (#276).
+        if !outcome.is_complete() || !readiness.is_ready() {
             std::process::exit(1);
         }
         return Ok(());
@@ -1672,6 +1689,12 @@ fn spawn(args: SpawnArgs) -> Result<()> {
         println!("             cloned with `git clone`: the source template failed ({warning})");
     }
     println!("  record:    {}", outcome.record_path);
+    // Where every hook's and process's output goes, so a server that is not
+    // up can be looked into without searching for it.
+    println!(
+        "  logs:      {}",
+        manager.store().paths().logs.join(&branch.slug)
+    );
     print_left_behind(&outcome.left_behind);
     if let Some(warning) = &outcome.projection_warning {
         println!("  trackers:  the project root's commits were not split ({warning})");
@@ -1756,12 +1779,22 @@ fn spawn(args: SpawnArgs) -> Result<()> {
             &manager.readiness(branch),
         );
     }
+    print_readiness(&branch.name, &readiness);
+    if !readiness.is_ready() {
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
+/// `ready:`, `starting:`, or `not ready:` and why, as the end of `spawn`
+/// and of `start` say it.
+fn print_readiness(name: &str, readiness: &Readiness) {
     if readiness.is_ready() && !readiness.is_starting() {
-        println!("ready: `{}`", branch.name);
+        println!("ready: `{name}`");
     } else if readiness.is_ready() {
-        println!("starting: `{}`", branch.name);
+        println!("starting: `{name}`");
     } else {
-        println!("not ready: `{}`", branch.name);
+        println!("not ready: `{name}`");
         for problem in &readiness.problems {
             println!("  - {problem}");
         }
@@ -1772,7 +1805,6 @@ fn spawn(args: SpawnArgs) -> Result<()> {
     if readiness.is_starting() {
         println!("  `newgit status` shows when it is up.");
     }
-    Ok(())
 }
 
 /// What a resource does, told from what it declares. Every trait here is
@@ -1873,6 +1905,30 @@ fn resource(command: ResourceCommand) -> Result<()> {
         }
         ResourceCommand::Rebind { name, instance } => {
             let (manager, instance) = manager_and_instance(instance)?;
+            let defined = manager
+                .resource_definitions()
+                .iter()
+                .any(|definition| definition.name == name);
+            if !defined {
+                let outcome = manager.unbind_undefined(&instance, &name)?;
+                let ports = outcome
+                    .ports
+                    .iter()
+                    .map(|(port, number)| format!("{port}={number}"))
+                    .collect::<Vec<_>>();
+                println!(
+                    "Released `{name}` from `{}`: it is no longer defined, so nothing binds it",
+                    outcome.instance
+                );
+                if !ports.is_empty() {
+                    println!("  ports released: {}", ports.join(" "));
+                }
+                println!(
+                    "  its `[cleanup]` went with its definition and did not run: anything it \
+                     made outside the workspace is still there"
+                );
+                return Ok(());
+            }
             let outcome = manager.rebind_resource(&instance, &name)?;
             println!("Bound `{name}` again in `{}`", outcome.instance);
             print_bound_resource(&outcome.bound);
@@ -2116,7 +2172,9 @@ fn action(spec: &str, instance: Option<String>, quiet: bool) -> Result<()> {
             if let Some(install) = &install {
                 println!("  {}", install.summary());
             }
-            if quiet && code != 0 {
+            // Quiet, or captured: either way the output went to the log
+            // only, so the log is where the why is.
+            if code != 0 && (quiet || newgit_core::supervisor::log_held_captures(&log)) {
                 print_failed_hook(&log, QUIET_TAIL_LINES);
             }
             eprintln!("[newgit] `{spec}` exit {code}; log: {log}");
@@ -2134,11 +2192,21 @@ const QUIET_TAIL_LINES: usize = 20;
 /// What a quiet command that failed ran, and how its log ends, on stderr.
 fn print_failed_hook(log: &Utf8Path, lines: usize) {
     if let Some(command) = newgit_core::supervisor::log_command(log) {
-        eprintln!("[newgit] ran: {command}");
+        eprintln!(
+            "[newgit] ran: {}",
+            hang_indent(&command, "[newgit] ran: ".len())
+        );
     }
     for line in newgit_core::supervisor::log_tail(log, lines) {
         eprintln!("  | {line}");
     }
+}
+
+/// A multi-line command printed after a label: every line after the first
+/// indented `width` columns, under the first, so the whole command reads as
+/// the command and none of it as output (#89).
+fn hang_indent(command: &str, width: usize) -> String {
+    command.replace('\n', &format!("\n{}", " ".repeat(width)))
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2159,12 +2227,35 @@ fn stop_start(instance: Option<String>, json: bool, which: StopStart) -> Result<
         }
         StopStart::Start => manager.start_instance(&instance)?,
     };
+    // As the end of `spawn` does (#276): what `start` brought up has its
+    // `[ready] timeout_seconds` to pass its check, and one that does not is
+    // a failure, not a success to find out about later.
+    let readiness = match which {
+        StopStart::Start => {
+            let branch = manager.store().find_branch(&outcome.instance)?;
+            Some(manager.readiness_after(&branch, manager.ready_wait(&branch)))
+        }
+        StopStart::Stop | StopStart::Evict { .. } => None,
+    };
     if json {
-        println!("{}", stop_start_json(&outcome));
+        let mut json = stop_start_json(&outcome);
+        // Only when there is something to say, as for `moved_ports`.
+        if let Some(readiness) = &readiness {
+            if readiness.is_starting() {
+                json["starting"] = starting_json(readiness);
+            }
+            if !readiness.is_ready() {
+                json["problems"] = serde_json::json!(readiness.problems);
+            }
+        }
+        println!("{json}");
     } else {
         print_stop_start(&outcome, which);
+        if let Some(readiness) = &readiness {
+            print_readiness(&outcome.instance, readiness);
+        }
     }
-    if !outcome.ok() {
+    if !outcome.ok() || readiness.is_some_and(|readiness| !readiness.is_ready()) {
         std::process::exit(1);
     }
     Ok(())
@@ -2254,8 +2345,9 @@ fn stop_start_resources_json(resources: &[StopStartResource]) -> serde_json::Val
         .collect()
 }
 
-/// `{"resource", "ports"}` per running resource whose ports have not answered
-/// yet. Not a failure: `spawn` exits 0 with these, as it does for `ready`.
+/// `{"resource", "ports", "check", "log"}` per resource not up yet, within
+/// the time it has (#276). Not a failure: `spawn` and `start` exit 0 with
+/// these, as for `ready`.
 fn starting_json(readiness: &Readiness) -> serde_json::Value {
     readiness
         .starting
@@ -2265,6 +2357,7 @@ fn starting_json(readiness: &Readiness) -> serde_json::Value {
                 "resource": starting.resource,
                 "ports": starting.ports,
                 "check": starting.check,
+                "log": starting.log,
             })
         })
         .collect()
@@ -2485,7 +2578,10 @@ fn action_dry_run(spec: &str, instance: Option<String>) -> Result<()> {
             };
             println!("`{spec}` for `{instance}` {verb}:");
             println!("  in:       {cwd}");
-            println!("  command:  {command}");
+            println!(
+                "  command:  {}",
+                hang_indent(&command, "  command:  ".len())
+            );
             if !captures.is_empty() {
                 println!(
                     "  captures: {} (read from stdout into this resource's exports)",
@@ -3455,12 +3551,15 @@ fn tracker(mut command: TrackerCommand) -> Result<()> {
     }
 }
 
-fn status(name: Option<&str>, path_only: bool) -> Result<()> {
+fn status(name: Option<&str>, path_only: bool, json: bool) -> Result<()> {
     let context = context_here()?;
     if path_only {
         return workspace_path(context, name);
     }
     let manager = BranchManager::open(context.store)?;
+    if json {
+        return status_json(&manager, name);
+    }
     let current_branch = context.current_branch.as_deref();
     // The remote is asked first and answered last: its round trip runs
     // alongside the local work instead of after it.
@@ -3486,13 +3585,12 @@ fn status_table(
 ) -> Result<bool> {
     warn_gitignore(manager);
     warn_graph(manager);
-    let mut reports = manager.statuses()?;
-
-    if let Some(name) = name {
-        reports.retain(|report| report.branch.name == name || report.branch.slug == name);
-        if reports.is_empty() {
-            bail!("no branch instance named `{name}`");
-        }
+    // Only the instance asked about is checked, not every one (#276).
+    let reports = manager.statuses_of(name)?;
+    if let Some(name) = name
+        && reports.is_empty()
+    {
+        bail!("no branch instance named `{name}`");
     }
 
     if reports.is_empty() {
@@ -3640,20 +3738,60 @@ fn remote_state_notes(asked: AskedState) {
     }
 }
 
-fn status_column(report: &InstanceReport) -> String {
+/// `status --json`: each instance's health and the lines `status` prints
+/// under it, without the table's decoration or the remote's notes.
+fn status_json(manager: &BranchManager, name: Option<&str>) -> Result<()> {
+    let mut reports = manager.statuses()?;
+    if let Some(name) = name {
+        reports.retain(|report| report.branch.name == name || report.branch.slug == name);
+        if reports.is_empty() {
+            bail!("no branch instance named `{name}`");
+        }
+    }
+    let instances = reports
+        .iter()
+        .map(|report| {
+            serde_json::json!({
+                "name": report.branch.name,
+                "workspace": report.branch.workspace_path,
+                "status": health(report),
+                "problems": if report.workspace_exists {
+                    report.readiness.problems.clone()
+                } else {
+                    Vec::new()
+                },
+                "starting": if report.workspace_exists {
+                    starting_json(&report.readiness)
+                } else {
+                    serde_json::json!([])
+                },
+            })
+        })
+        .collect::<Vec<_>>();
+    println!("{}", serde_json::json!({ "instances": instances }));
+    Ok(())
+}
+
+/// An instance's state in one word or two, as the STATUS column starts.
+fn health(report: &InstanceReport) -> &'static str {
     if report.branch.evicted.is_some() {
-        return "evicted".to_owned();
-    }
-    if !report.workspace_exists {
-        return "ws-missing".to_owned();
-    }
-    let health = if !report.readiness.is_ready() {
+        "evicted"
+    } else if !report.workspace_exists {
+        "ws-missing"
+    } else if !report.readiness.is_ready() {
         "not ready"
     } else if report.readiness.is_starting() {
         "starting"
     } else {
         "ready"
-    };
+    }
+}
+
+fn status_column(report: &InstanceReport) -> String {
+    let health = health(report);
+    if report.branch.evicted.is_some() || !report.workspace_exists {
+        return health.to_owned();
+    }
     let health = if report.branch.private {
         format!("{health}, private")
     } else {

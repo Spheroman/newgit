@@ -50,6 +50,7 @@ fn branch(name: &str, workspace: &str, ports: &[(&str, u16)]) -> BranchInstance 
                 restore_proven: false,
                 render_error: None,
                 export_error: None,
+                prepare_rev: None,
             },
         );
     }

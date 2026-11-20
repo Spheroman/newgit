@@ -7,7 +7,13 @@ inside a workspace):
   <tracker>] [--drop <tracker>] [--private] [--json]` / `status [name]` /
   `remove <name> [--purge] [--keep-branch | --delete-branch]` — `status`
   says whether each instance is ready, still starting (a dev server that is
-  not listening yet), or not ready, and why
+  not listening yet, or a `[ready]` check inside its `timeout_seconds`), or
+  not ready, and why, naming each running process's log — including each
+  resource bound from an older definition than the one in the project root,
+  with the commands that apply it; `spawn` prints where the logs are and
+  exits 1 when the instance is not ready
+- `newgit status [name] --json` — `{"instances": [{"name", "workspace",
+  "status", "problems", "starting"}]}`
 - `newgit status <instance> --path` — just the workspace path, for scripts
 - `newgit reference [section | all]` — the definition format, every key and
   default; bare, it lists the sections
@@ -17,14 +23,17 @@ inside a workspace):
 - `newgit action <resource>.<action> [instance] [--dry-run] [--quiet]` —
   `--dry-run` prints the rendered command and its directory, and runs
   nothing; `--quiet` keeps a one-shot command's output in its log and
-  prints the exit, plus, on failure, the command and the log's end
+  prints the exit, plus, on failure, the whole command and the log's end
+  (stderr only, for an action with `captures`). Input still reaches the
+  command
 - `newgit stop [instance] [--json]` / `start [instance] [--json]` — stop
   every running long-running action and run each `suspend`, dependents
   first, and later bring back exactly what that took down (and any
   `autostart` action that died on its own or never started), each once
   what it depends on answers; ports,
   workspace, trackers, and installs stay as they are. Both exit 0 with
-  nothing to do and 1 if any resource failed
+  nothing to do and 1 if any resource failed; `start` also exits 1 when
+  what it brought back is not up within its `[ready] timeout_seconds`
 - `newgit stop --evict [--discard-ignored]` — stop, checkpoint, and delete
   the workspace, leaving its marker; `newgit start` brings it back from that
   checkpoint into the same directory, with uncommitted and staged work,
@@ -148,7 +157,10 @@ of the project, `repos` inside `apps/t3code`, `..` to go up:
 - `newgit resource remove <name> [--force]` — `--force` drops it from live
   instances and releases their ports instead of refusing
 - `newgit resource rebind <name> [instance]` — bind it again as spawn did,
-  after fixing a render or export that failed
+  after fixing a render or export that failed or editing its definition;
+  keeps the ports it holds that are still declared. Refused while its
+  process runs. For a resource whose definition file is gone, it releases
+  the binding instead (`[cleanup]` cannot run)
 
 Remote:
 

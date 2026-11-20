@@ -111,6 +111,15 @@ fn json(repo: &Utf8Path, args: &[&str]) -> (Option<i32>, Value) {
     (code, value)
 }
 
+/// Where newgit's port search starts: a port the OS just handed out, so
+/// two runs at once do not search the same range (#276).
+fn free_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .and_then(|listener| listener.local_addr())
+        .expect("an OS-assigned port")
+        .port()
+}
+
 fn has_python() -> bool {
     Command::new("python3").arg("--version").output().is_ok()
 }
@@ -288,7 +297,7 @@ fn an_http_check_is_not_asked_through_a_proxy_and_undo_waits_too() {
     let (_guard, temp) = tempdir();
     let store = setup(&temp);
     let log = temp.join("starts");
-    write_resource(&store, "api", &api(55110, 2));
+    write_resource(&store, "api", &api(free_port(), 2));
     write_resource(
         &store,
         "web",

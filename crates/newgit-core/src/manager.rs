@@ -60,6 +60,8 @@ mod reset;
 pub use reset::{HeldBack, ResetLine, ResetOutcome};
 mod stale_render;
 pub use stale_render::{PossiblyStale, StaleRender};
+mod stale_definition;
+pub use stale_definition::UnboundResource;
 mod target_push;
 use target_push::{Pushing, PutBack};
 
@@ -666,6 +668,19 @@ fn long_running_action(
         .map(|(name, action)| (name.as_str(), action))
 }
 
+/// Who a one-shot command runs for, which decides where its input comes
+/// from and where its output goes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OneShot {
+    /// newgit runs it on someone's behalf (a spawn's `prepare`, a restore):
+    /// no input, output to its log only.
+    Hook,
+    /// Asked for by name with `newgit action`: the input newgit was given,
+    /// and output to the terminal and the log, or with `--quiet` the log
+    /// only. Quiet moves output; it does not take input away (#89).
+    Asked { quiet: bool },
+}
+
 /// The action that retries a resource whose own run failed, naming only
 /// actions it defines (#262): the one that builds its tree (`prepare`, or
 /// the recompute action), else its long-running action. `None` when it has
@@ -930,7 +945,9 @@ pub struct InstanceReport {
 /// A running process whose port is not answering *yet* is not a problem: a
 /// dev server that compiles before it listens is doing what it should. It is
 /// `starting`, a state of its own that neither fails `is_ready` nor counts as
-/// a problem, and that clears by itself once the port answers.
+/// a problem, and that clears by itself once the port answers. Where a
+/// deadline was declared — a `[ready]`, or no process to watch — it is
+/// starting only within `timeout_seconds`, and a problem after (#276).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Readiness {
     /// What is wrong, one line each; empty when ready.
@@ -962,26 +979,80 @@ pub struct Starting {
     /// How its `[ready]` check failed, when it names one (`GET
     /// http://127.0.0.1:5173/ answered 500`).
     pub check: Option<String>,
+    /// The log of its supervised process's run, when one is running: where
+    /// a server that crashed inside a wrapper that stayed up says why.
+    pub log: Option<Utf8PathBuf>,
 }
 
 impl Starting {
     /// One line, for `status` and the end of `spawn`.
     pub fn message(&self) -> String {
-        if let Some(check) = &self.check {
-            return format!("`{}` is still starting: {check}", self.resource);
+        let log = self
+            .log
+            .as_ref()
+            .map(|log| format!("; its log is {log}"))
+            .unwrap_or_default();
+        match &self.check {
+            Some(check) => format!("`{}` is still starting: {check}{log}", self.resource),
+            None => format!(
+                "`{}` is still starting: not answering yet on {}{log}",
+                self.resource,
+                self.port_list()
+            ),
         }
-        let ports = self
-            .ports
+    }
+
+    fn port_list(&self) -> String {
+        self.ports
             .iter()
             .map(|(name, port)| format!("{name} ({port})"))
             .collect::<Vec<_>>()
-            .join(", ");
+            .join(", ")
+    }
+
+    /// The problem it is once its `[ready] timeout_seconds` has passed
+    /// (#276): what the check answered, what to do about it, and, for a
+    /// supervised process, its log and how that ends. `logs` is the
+    /// instance's log directory, for one with no process of its own.
+    fn overdue(
+        &self,
+        definition: &ResourceDefinition,
+        timeout: std::time::Duration,
+        logs: &Utf8Path,
+    ) -> String {
+        let name = &self.resource;
+        let what = self
+            .check
+            .clone()
+            .unwrap_or_else(|| format!("not answering on {}", self.port_list()));
+        let longer =
+            format!("give it a longer `[ready] timeout_seconds` in .newgit/resources/{name}.toml");
+        if let Some(log) = &self.log {
+            let tail = crate::supervisor::log_tail(log, OVERDUE_TAIL_LINES)
+                .into_iter()
+                .map(|line| format!("\n    | {line}"))
+                .collect::<String>();
+            return format!(
+                "`{name}` is not up after {}s ({what}); its process is running, so either it \
+                 failed inside a wrapper that stayed up (its log says), or it needs longer and \
+                 you can {longer}; its log is {log}{tail}",
+                timeout.as_secs()
+            );
+        }
+        let retry = match retry_command(definition) {
+            Some(retry) => format!("bring it back with `{retry}`, or {longer}"),
+            None => format!("bring it back, or {longer}"),
+        };
         format!(
-            "`{}` is still starting: not answering yet on {ports}",
-            self.resource
+            "`{name}` is not up after {}s ({what}); newgit runs no process of it to watch, so \
+             it may have gone down — {retry}; its logs are under {logs}",
+            timeout.as_secs()
         )
     }
 }
+
+/// How much of a supervised process's log a not-up problem shows.
+const OVERDUE_TAIL_LINES: usize = 8;
 
 /// Whether `path` is named the way local secrets and per-machine settings
 /// usually are: `.env`, `.env.local`, `.env.development.local`,
@@ -1026,8 +1097,16 @@ const READY_CHECK_LIMIT: std::time::Duration = std::time::Duration::from_secs(5)
 /// Asked directly, never through `HTTP_PROXY` / `ALL_PROXY`: the check is of
 /// a server on this machine, and a proxy that cannot reach it would make a
 /// server that is up read as starting.
+///
+/// An `https://` certificate is checked against this machine's trust store,
+/// not a bundled list, so a local one trusted there (mkcert's) passes.
 fn http_answers(url: &str) -> std::result::Result<(), String> {
     let agent: ureq::Agent = ureq::Agent::config_builder()
+        .tls_config(
+            ureq::tls::TlsConfig::builder()
+                .root_certs(ureq::tls::RootCerts::PlatformVerifier)
+                .build(),
+        )
         .proxy(None)
         .http_status_as_error(false)
         .max_redirects(0)
@@ -1037,6 +1116,13 @@ fn http_answers(url: &str) -> std::result::Result<(), String> {
     match agent.get(url).call() {
         Ok(response) if (200..400).contains(&response.status().as_u16()) => Ok(()),
         Ok(response) => Err(format!("GET {url} answered {}", response.status().as_u16())),
+        // Said plainly: a TLS error reads like the server being down, and
+        // it is not. ureq does not expose the rustls error to match on.
+        Err(error) if error.to_string().contains("certificate") => Err(format!(
+            "GET {url}: this machine does not trust its certificate ({error}); a local \
+             certificate has to be trusted by the system, as `mkcert -install` does, or the \
+             check can ask `http://`"
+        )),
         Err(error) => Err(format!("GET {url}: {error}")),
     }
 }
@@ -3671,6 +3757,34 @@ impl BranchManager {
         let mut starting = Vec::new();
         let supervisor = self.supervisor(branch);
         let suspended = self.suspended(branch);
+        // Every check up front, each on a thread of its own: a `[ready]
+        // command` may take seconds waiting on something else, and an
+        // instance's resources do not wait on each other to be asked (#276).
+        // Used below only where the resource gets that far.
+        let mut checked: BTreeMap<String, Option<Starting>> = std::thread::scope(|scope| {
+            let asked: Vec<_> = branch
+                .resources
+                .iter()
+                .filter_map(|(name, binding)| {
+                    let definition = self.resource_definition(name).ok()?;
+                    self.ready_to_check(branch, definition, &supervisor, &suspended)
+                        .then(|| {
+                            let check =
+                                scope.spawn(|| self.not_up_yet(branch, definition, binding));
+                            (name.clone(), check)
+                        })
+                })
+                .collect();
+            asked
+                .into_iter()
+                .map(|(name, check)| {
+                    let not_yet = check
+                        .join()
+                        .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+                    (name, not_yet)
+                })
+                .collect()
+        });
         for (name, binding) in &branch.resources {
             let Ok(definition) = self.resource_definition(name) else {
                 continue;
@@ -3732,25 +3846,10 @@ impl BranchManager {
                     continue;
                 }
             }
-            // A port declared since this binding was made: no record claims
-            // it, so the allocator may hand it to another instance, and the
-            // tool here falls back to its shared default (#85).
-            let unclaimed: Vec<String> = definition
-                .ports
-                .keys()
-                .filter(|port| !binding.resolved_ports.contains_key(*port))
-                .map(|port| format!("`{port}`"))
-                .collect();
-            if !unclaimed.is_empty() {
-                problems.push(format!(
-                    "`{name}` was bound before its definition declared port{} {}, so nothing \
-                     claims {} for this instance — bind it again with `newgit resource rebind \
-                     {name}` (after `newgit stop`, if it runs)",
-                    if unclaimed.len() == 1 { "" } else { "s" },
-                    unclaimed.join(", "),
-                    if unclaimed.len() == 1 { "it" } else { "them" },
-                ));
-            }
+            // Bound before its definition changed: a port, an export, a
+            // render, a `prepare` or the running command it no longer
+            // matches, with what applies it (#85).
+            problems.extend(self.definition_drift(branch, definition, binding, &supervisor));
             for path in definition.identity_produces() {
                 if !branch.workspace_path.join(path).exists() {
                     problems.push(format!(
@@ -3787,12 +3886,41 @@ impl BranchManager {
                 ));
                 continue;
             }
-            if self.ready_to_check(branch, definition, &supervisor, &suspended)
-                && let Some(not_yet) = self.not_up_yet(branch, definition, binding)
-            {
-                starting.push(not_yet);
+            if let Some(Some(not_yet)) = checked.remove(name) {
+                // Starting only within its `[ready] timeout_seconds` of being
+                // started, or, with no process to watch, of being brought up
+                // (#276). Past that, still starting and down look the same
+                // from here, and the definition said how long up takes.
+                //
+                // A deadline only where one was declared: a `[ready]` said
+                // what up means and how long it takes, or there is no process
+                // whose being alive says anything. A supervised process with
+                // no `[ready]` is starting for as long as it runs.
+                let mut not_yet = not_yet;
+                let running = supervisor.running_pid(name).is_some();
+                if running {
+                    not_yet.log = supervisor.log_path(name);
+                }
+                let since = if running {
+                    supervisor.started_at(name)
+                } else {
+                    supervisor.came_up_at(name)
+                };
+                let timeout = definition.ready_timeout();
+                let deadline = definition.ready.is_some() || !running;
+                if !deadline
+                    || since
+                        .and_then(|since| since.elapsed().ok())
+                        .is_some_and(|age| age < timeout)
+                {
+                    starting.push(not_yet);
+                } else {
+                    problems.push(not_yet.overdue(definition, timeout, &logs));
+                }
             }
         }
+        problems.extend(self.undefined_binding_problems(branch, &supervisor));
+        problems.extend(self.unbound_definition_problems(branch));
         Readiness { problems, starting }
     }
 
@@ -3852,6 +3980,7 @@ impl BranchManager {
                 resource: name.clone(),
                 ports: BTreeMap::new(),
                 check: Some(check),
+                log: None,
             });
         }
         if let Some(command) = ready.and_then(|ready| ready.command.as_deref()) {
@@ -3862,6 +3991,7 @@ impl BranchManager {
                     resource: name.clone(),
                     ports: BTreeMap::new(),
                     check: Some(check),
+                    log: None,
                 });
         }
         let ports: BTreeMap<String, u16> = binding
@@ -3874,6 +4004,7 @@ impl BranchManager {
             resource: name.clone(),
             ports,
             check: None,
+            log: None,
         })
     }
 
@@ -4621,6 +4752,19 @@ impl BranchManager {
     /// order. Prepare failures are loud but leave the instance spawned —
     /// re-run with `newgit action <resource>.prepare`.
     fn bind_resources(&self, branch: &mut BranchInstance) -> Result<Vec<ResourceBindOutcome>> {
+        self.bind_resources_keeping(branch, None)
+    }
+
+    /// [`Self::bind_resources`], with `rebinding` naming a resource bound
+    /// again and the ports its binding held: each one its definition still
+    /// declares is kept, as a parked binding's are, and only a port declared
+    /// since is allocated. Allocation is for the life of the instance; a
+    /// rebind that moved a port nobody asked to move would be a bug.
+    fn bind_resources_keeping(
+        &self,
+        branch: &mut BranchInstance,
+        rebinding: Option<(&str, &BTreeMap<String, u16>)>,
+    ) -> Result<Vec<ResourceBindOutcome>> {
         let mut outcomes = Vec::new();
 
         for name in &self.graph.bind_order {
@@ -4634,21 +4778,21 @@ impl BranchManager {
 
             // One a drop parked comes back on the ports it had (#255): the
             // files it renders and whatever its `suspend` left on disk or
-            // still running agree on them. Only a definition that has since
-            // changed which ports it declares gets a fresh allocation.
+            // still running agree on them. So does one bound again. Only a
+            // port its definition has declared since is allocated.
             let parked = branch.parked.remove(name);
-            let kept_ports = parked.as_ref().and_then(|parked| {
-                parked
-                    .binding
-                    .resolved_ports
-                    .keys()
-                    .eq(definition.ports.keys())
-                    .then(|| parked.binding.resolved_ports.clone())
-            });
-            let resolved_ports = match kept_ports {
-                Some(ports) => ports,
-                None => self.claim_ports(branch, definition)?,
+            let held = match (&parked, rebinding) {
+                (Some(parked), _) => Some(&parked.binding.resolved_ports),
+                (None, Some((rebound, ports))) if rebound == name => Some(ports),
+                _ => None,
             };
+            let keep: BTreeMap<String, u16> = held
+                .into_iter()
+                .flatten()
+                .filter(|(port, _)| definition.ports.contains_key(*port))
+                .map(|(port, number)| (port.clone(), *number))
+                .collect();
+            let resolved_ports = self.claim_ports(branch, definition, &keep)?;
 
             // An export may compose a dependency's export, the same way a
             // `[[render]]` already can. Bindings happen in dependency order,
@@ -4720,6 +4864,15 @@ impl BranchManager {
                         .is_some_and(|parked| parked.binding.restore_proven),
                     render_error: None,
                     export_error: None,
+                    // `resume` brings it back without running `prepare`, so
+                    // what last ran is still what the parked binding ran.
+                    prepare_rev: if resume {
+                        parked
+                            .as_ref()
+                            .and_then(|parked| parked.binding.prepare_rev.clone())
+                    } else {
+                        Some(definition.prepare_rev())
+                    },
                 },
             );
 
@@ -4880,8 +5033,14 @@ impl BranchManager {
                     let log = self
                         .store
                         .action_log_path(&branch.slug, &format!("{}.prepare", definition.name));
-                    let (code, captured) =
-                        self.run_one_shot(branch, definition, action, "prepare", &log, true)?;
+                    let (code, captured) = self.run_one_shot(
+                        branch,
+                        definition,
+                        action,
+                        "prepare",
+                        &log,
+                        OneShot::Hook,
+                    )?;
                     captured_names = captured.found.keys().cloned().collect();
                     missing_captures = Self::missing_capture_warnings(
                         &definition.name,
@@ -4906,6 +5065,11 @@ impl BranchManager {
                     (status, Some((code == 0, log)))
                 }
             };
+            // Bound with nothing to run, or filled from the install store:
+            // up from now, as far as its `[ready]` timeout is counted.
+            if status == ResourceStatus::Ready && prepare.is_none() {
+                self.supervisor(branch).mark_came_up(&definition.name);
+            }
 
             outcomes.push(ResourceBindOutcome {
                 name: definition.name.clone(),
@@ -4944,18 +5108,28 @@ impl BranchManager {
     /// The record is saved as the instance stands, plus this resource bound
     /// `Pending` on the ports just chosen. The caller's own save replaces it
     /// with the finished binding.
+    ///
+    /// `keep` holds ports this instance already claims for the resource
+    /// (a parked or rebound binding's): they are taken as they are, without
+    /// a probe — what holds one may well be this instance's own stack — and
+    /// only the rest are allocated.
     fn claim_ports(
         &self,
         branch: &BranchInstance,
         definition: &ResourceDefinition,
+        keep: &BTreeMap<String, u16>,
     ) -> Result<BTreeMap<String, u16>> {
-        if definition.ports.is_empty() {
-            return Ok(BTreeMap::new());
+        if definition.ports.keys().all(|port| keep.contains_key(port)) {
+            return Ok(keep.clone());
         }
         let _lock = self.store.lock_ports()?;
         let mut used = ports::used_ports(&self.store.load_branches()?);
-        let mut resolved_ports = BTreeMap::new();
+        used.extend(keep.values().copied());
+        let mut resolved_ports = keep.clone();
         for (port_name, request) in &definition.ports {
+            if keep.contains_key(port_name) {
+                continue;
+            }
             resolved_ports.insert(
                 port_name.clone(),
                 ports::allocate(request.start, &mut used)?,
@@ -4973,6 +5147,7 @@ impl BranchManager {
                 restore_proven: false,
                 render_error: None,
                 export_error: None,
+                prepare_rev: None,
             },
         );
         claim.updated_at = Utc::now();
@@ -6166,10 +6341,12 @@ impl BranchManager {
     }
 
     /// `newgit resource rebind`: bind `resource` again in `instance`, as
-    /// spawn bound it: claim its ports, resolve its exports, render its
-    /// files, run its `prepare`, then start its `autostart` action. The
+    /// spawn bound it: keep the ports it holds that its definition still
+    /// declares and claim any declared since, resolve its exports, render
+    /// its files, run its `prepare`, then start its `autostart` action. The
     /// retry for a bind that failed where no action reaches, a render or an
-    /// export, once the file or the definition is fixed (#262).
+    /// export, once the file or the definition is fixed (#262), and how a
+    /// live instance takes up an edited definition (#85).
     ///
     /// Refused while its process runs: binding again moves the values that
     /// process was started with.
@@ -6191,9 +6368,15 @@ impl BranchManager {
             )));
         }
         let autostart = definition.autostart_action().is_some();
+        // Not saved without it: the record on disk goes on claiming its
+        // ports until the bind writes the new claim, so no other spawn can
+        // take one of the ports it keeps in between.
         let previous = branch.resources.remove(resource);
-        self.store.save_branch_record(&branch)?;
-        let bound = match self.bind_resources(&mut branch) {
+        let held = previous
+            .as_ref()
+            .map(|binding| binding.resolved_ports.clone())
+            .unwrap_or_default();
+        let bound = match self.bind_resources_keeping(&mut branch, Some((resource, &held))) {
             Ok(bound) => bound,
             Err(error) => {
                 // Put the old binding back, so a bind that fails before it
@@ -6276,8 +6459,14 @@ impl BranchManager {
             return Ok(ActionOutcome::Started { pid, log });
         }
 
-        let (code, captured) =
-            self.run_one_shot(&branch, definition, action, action_name, &log, quiet)?;
+        let (code, captured) = self.run_one_shot(
+            &branch,
+            definition,
+            action,
+            action_name,
+            &log,
+            OneShot::Asked { quiet },
+        )?;
         let missing_captures =
             Self::missing_capture_warnings(&definition.name, action_name, &captured, &log);
         let mut dirty = Self::apply_captures(&mut branch, &definition.name, captured.found);
@@ -6289,6 +6478,9 @@ impl BranchManager {
             } else {
                 ResourceStatus::Failed
             };
+            if code == 0 {
+                binding.prepare_rev = Some(definition.prepare_rev());
+            }
             dirty = true;
         }
         if dirty {
@@ -6429,23 +6621,34 @@ impl BranchManager {
         action: &crate::resource::ActionSpec,
         action_name: &str,
         log: &Utf8Path,
-        quiet: bool,
+        run: OneShot,
     ) -> Result<(i32, Captures)> {
         let (command, cwd) = self.action_invocation(branch, definition, action, action_name)?;
         let env = self.assemble_env(branch)?;
+        let input = match run {
+            OneShot::Hook => crate::supervisor::Input::Closed,
+            OneShot::Asked { .. } => crate::supervisor::Input::Inherit,
+        };
 
-        if action.captures.is_empty() {
+        let (code, captures) = if action.captures.is_empty() {
             let command_line = ["sh".to_owned(), "-c".to_owned(), command];
-            let code = if quiet {
-                crate::supervisor::run_quiet(&command_line, &cwd, &env, log)?
-            } else {
+            let code = if run == (OneShot::Asked { quiet: false }) {
                 run_foreground(&command_line, &cwd, &env, log)?
+            } else {
+                crate::supervisor::run_quiet(&command_line, &cwd, &env, log, input)?
             };
-            return Ok((code, Captures::default()));
+            (code, Captures::default())
+        } else {
+            let (code, stdout) =
+                crate::supervisor::run_captured_with(&command, &cwd, &env, log, input)?;
+            (code, parse_captures(&stdout, &action.captures))
+        };
+        // What brings up a resource newgit does not supervise: its
+        // `[ready]` timeout is counted from here (#276).
+        if code == 0 && matches!(action_name, "prepare" | "resume") {
+            self.supervisor(branch).mark_came_up(&definition.name);
         }
-
-        let (code, stdout) = run_captured(&command, &cwd, &env, log)?;
-        Ok((code, parse_captures(&stdout, &action.captures)))
+        Ok((code, captures))
     }
 
     /// One warning per declared capture the command never emitted. The log
@@ -7678,7 +7881,7 @@ impl BranchManager {
             .store
             .action_log_path(&branch.slug, &format!("{}.{action_name}", definition.name));
         let (code, captured) =
-            self.run_one_shot(branch, definition, action, action_name, &log, true)?;
+            self.run_one_shot(branch, definition, action, action_name, &log, OneShot::Hook)?;
         Self::apply_captures(branch, &definition.name, captured.found);
         let ok = code == 0;
         let install = match (&install_key, filled) {
@@ -8501,6 +8704,13 @@ impl BranchManager {
     }
 
     pub fn statuses(&self) -> Result<Vec<InstanceReport>> {
+        self.statuses_of(None)
+    }
+
+    /// [`Self::statuses`] of the instance named `name` (by name or slug)
+    /// alone, when given: only its `[ready]` checks run, not every
+    /// instance's (#276).
+    pub fn statuses_of(&self, name: Option<&str>) -> Result<Vec<InstanceReport>> {
         let lane_heads: Vec<(String, Option<String>)> = self
             .trackers
             .iter()
@@ -8511,8 +8721,11 @@ impl BranchManager {
         // independent of every other instance's: done side by side, a project
         // with a hundred instances answers in the time of a few.
         use rayon::prelude::*;
-        self.store
-            .load_branches()?
+        let mut branches = self.store.load_branches()?;
+        if let Some(name) = name {
+            branches.retain(|branch| branch.name == name || branch.slug == name);
+        }
+        branches
             .into_par_iter()
             .map(|branch| {
                 let workspace_exists = branch.workspace_path.is_dir() && branch.evicted.is_none();
@@ -8736,6 +8949,16 @@ impl BranchManager {
         let supervisor = self.supervisor(&branch);
         for definition in self.running_resources(&branch) {
             supervisor.stop(&definition.name, &definition.stop_signal())?;
+        }
+        // And one whose definition was deleted by hand: nothing else will
+        // ever stop it, and it holds its ports after the record is gone.
+        for orphan in self.stop_undefined(&branch) {
+            if let Some(error) = orphan.error {
+                return Err(NewgitError::Unsupported(format!(
+                    "`{}`'s process, whose definition is gone, did not stop: {error}",
+                    orphan.name
+                )));
+            }
         }
 
         // Never the cleanup of a resource the checkpoint could not capture:
@@ -14910,8 +15133,14 @@ impl BranchManager {
                 let log = self
                     .store
                     .action_log_path(&branch.slug, &format!("{}.restore", definition.name));
-                let (code, captured) =
-                    self.run_one_shot(branch, definition, action, action_name, &log, true)?;
+                let (code, captured) = self.run_one_shot(
+                    branch,
+                    definition,
+                    action,
+                    action_name,
+                    &log,
+                    OneShot::Hook,
+                )?;
                 warnings.extend(Self::missing_capture_warnings(
                     &definition.name,
                     action_name,
@@ -15004,6 +15233,9 @@ impl BranchManager {
                 )?;
                 let (code, _) = run_captured(&command, &cwd, &env, &log)?;
                 let ok = code == 0;
+                if ok {
+                    self.supervisor(branch).mark_came_up(&definition.name);
+                }
                 if !ok {
                     failures.push(RestoreFailure {
                         resource: definition.name.clone(),
@@ -15421,6 +15653,9 @@ impl BranchManager {
                 });
             }
         }
+        // A process whose definition was deleted by hand: stopped all the
+        // same, never to be started again.
+        resources.extend(self.stop_undefined(&branch));
         self.save_stopped_record(&branch, &record)?;
         if captured {
             branch.updated_at = Utc::now();
@@ -15977,7 +16212,7 @@ impl BranchManager {
             .store
             .action_log_path(&branch.slug, &format!("{}.{action_name}", definition.name));
         let (code, found) =
-            self.run_one_shot(branch, definition, action, action_name, &log, true)?;
+            self.run_one_shot(branch, definition, action, action_name, &log, OneShot::Hook)?;
         let changed = code == 0 && Self::apply_captures(branch, &definition.name, found.found);
         Ok((code, log, changed))
     }

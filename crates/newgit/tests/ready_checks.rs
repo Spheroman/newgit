@@ -1,7 +1,8 @@
 //! #276: readiness a definition controls. `[ready]` names what "up" means
 //! (a GET that answers 200-399, or a command that exits 0) and how long to
 //! wait for it; spawn, `start`, and a dependent's start wait for that, and
-//! `status` shows `starting` until it holds.
+//! `status` shows `starting` until it holds or that wait is over, when it is
+//! a problem.
 //!
 //! These drive the binary, since what is under test is what it prints.
 
@@ -108,14 +109,44 @@ fn has_python() -> bool {
     Command::new("python3").arg("--version").output().is_ok()
 }
 
+/// Where newgit's port search starts: a port the OS just handed out, so
+/// two runs at once do not search the same range.
+fn free_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .and_then(|listener| listener.local_addr())
+        .expect("an OS-assigned port")
+        .port()
+}
+
+/// A server in this test process that answers every request with `status`,
+/// for as long as the test runs. Its port is the OS's choice. No Python to
+/// start, so nothing to wait for: it answers before the spawn begins.
+fn answering(status: u16) -> u16 {
+    use std::io::{Read as _, Write as _};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let mut request = [0_u8; 1024];
+            let _ = stream.read(&mut request);
+            let _ = write!(
+                stream,
+                "HTTP/1.1 {status} Whatever\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+            );
+        }
+    });
+    port
+}
+
 /// Answers 503 until `delay` seconds after it started, then 200: a server
 /// that binds early and serves errors while it compiles.
-fn compiling_server(start: u16, delay: u32, ready: &str) -> String {
+fn compiling_server(delay: u32, ready: &str) -> String {
     format!(
         r#"ownership = "branch"
 
 [ports]
-web = {{ start = {start}, env = "WEB_PORT" }}
+web = {{ start = {}, env = "WEB_PORT" }}
 
 [actions.serve]
 command = """python3 -c '
@@ -134,7 +165,8 @@ long_running = true
 autostart = true
 
 {ready}
-"#
+"#,
+        free_port()
     )
 }
 
@@ -150,7 +182,6 @@ fn an_http_check_waits_past_a_server_that_answers_errors() {
         &store,
         "web",
         &compiling_server(
-            55010,
             6,
             "[ready]\nhttp = \"http://127.0.0.1:{{ports.web}}/\"\ntimeout_seconds = 20\n",
         ),
@@ -170,38 +201,35 @@ fn an_http_check_waits_past_a_server_that_answers_errors() {
 }
 
 #[test]
-fn a_failing_http_check_is_starting_and_says_what_it_answered() {
-    if !has_python() {
-        return;
-    }
+fn a_failing_http_check_fails_spawn_and_says_what_it_answered() {
     let (_guard, temp) = tempdir();
     let store = setup(&temp);
+    let port = answering(503);
     write_resource(
         &store,
         "web",
-        &compiling_server(
-            55060,
-            3600,
-            "[ready]\nhttp = \"http://127.0.0.1:{{ports.web}}/health\"\ntimeout_seconds = 2\n",
+        &format!(
+            "ownership = \"branch\"\n\n[ready]\nhttp = \"http://127.0.0.1:{port}/health\"\ntimeout_seconds = 1\n"
         ),
     );
     let repo = store.paths().project_root.clone();
 
     let (code, spawned) = json(&repo, &["spawn", "x", "--json"]);
-    // Still starting is not a failure, as for a port that is not answering.
-    assert_eq!(code, Some(0), "{spawned}");
-    let starting = spawned["starting"].as_array().expect("starting");
-    assert_eq!(starting.len(), 1, "{spawned}");
-    assert_eq!(starting[0]["resource"], "web");
-    let check = starting[0]["check"].as_str().expect("check");
-    assert!(check.contains("/health answered 503"), "{check}");
-
-    let (_, status, _) = newgit(&repo, &["status"]);
+    // Still failing once its wait is over is a failure.
+    assert_eq!(code, Some(1), "{spawned}");
+    assert_eq!(spawned["starting"], serde_json::json!([]), "{spawned}");
+    let problem = spawned["problems"][0].as_str().expect("a problem");
     assert!(
-        status.contains("`web` is still starting: GET http://127.0.0.1:")
-            && status.contains("answered 503"),
-        "{status}"
+        problem.contains(&format!(
+            "`web` is not up after 1s (GET http://127.0.0.1:{port}/health answered 503)"
+        )),
+        "{problem}"
     );
+
+    let (code, status, _) = newgit(&repo, &["status"]);
+    assert_eq!(code, Some(0), "{status}");
+    assert!(status.contains(" not ready "), "{status}");
+    assert!(status.contains("/health answered 503"), "{status}");
 }
 
 /// No process newgit supervises: `prepare` brings something up in the
@@ -246,7 +274,7 @@ fn a_dependent_waits_for_an_unsupervised_stack_to_pass_its_check() {
 }
 
 #[test]
-fn an_unsupervised_resource_that_fails_its_check_is_starting_in_status() {
+fn an_unsupervised_resource_still_failing_its_check_after_its_timeout_fails_spawn() {
     let (_guard, temp) = tempdir();
     let store = setup(&temp);
     write_resource(
@@ -257,10 +285,21 @@ fn an_unsupervised_resource_that_fails_its_check_is_starting_in_status() {
     let repo = store.paths().project_root.clone();
 
     let (code, spawned) = json(&repo, &["spawn", "x", "--json"]);
-    assert_eq!(code, Some(0), "{spawned}");
-    let starting = &spawned["starting"][0];
-    assert_eq!(starting["resource"], "stack", "{spawned}");
-    assert_eq!(starting["check"], "`exit 3` exited 3", "{spawned}");
+    // With no process to watch, still starting and gone down look alike;
+    // past the time its definition gives it, it is down.
+    assert_eq!(code, Some(1), "{spawned}");
+    assert_eq!(spawned["starting"], serde_json::json!([]), "{spawned}");
+    let problem = spawned["problems"][0].as_str().expect("a problem");
+    assert!(
+        problem.contains("`stack` is not up after 1s (`exit 3` exited 3)")
+            && problem.contains("newgit runs no process of it to watch")
+            && problem.contains("`newgit action stack.prepare`"),
+        "{problem}"
+    );
+
+    let (_, status, _) = newgit(&repo, &["status"]);
+    assert!(status.contains(" not ready "), "{status}");
+    assert!(status.contains("`exit 3` exited 3"), "{status}");
 }
 
 #[test]
