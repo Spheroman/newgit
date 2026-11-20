@@ -154,7 +154,7 @@ start = {start}
 API_URL = "http://127.0.0.1:{{{{ports.api}}}}"
 
 [actions.start]
-command = "exec python3 -m http.server {{{{ports.api}}}} --bind 127.0.0.1"
+command = "exec python3 -c 'import http.server as h, socketserver as s, sys; s.ThreadingTCPServer.allow_reuse_address = True; s.ThreadingTCPServer((sys.argv[2], int(sys.argv[1])), h.SimpleHTTPRequestHandler).serve_forever()' {{{{ports.api}}}} 127.0.0.1"
 long_running = true
 "#
     )
@@ -213,7 +213,7 @@ start = {start}
 API_URL = "http://127.0.0.1:{{{{ports.api}}}}"
 
 [actions.resume]
-command = "echo {{{{ports.api}}}} > resumed-on; python3 -m http.server {{{{ports.api}}}} --bind 127.0.0.1 </dev/null >/dev/null 2>&1 & echo $! > stack.pid; for i in $(seq 100); do python3 -c 'import socket,sys; socket.create_connection((\"127.0.0.1\", {{{{ports.api}}}}))' 2>/dev/null && exit 0; sleep 0.1; done; exit 1"
+command = "echo {{{{ports.api}}}} > resumed-on; python3 -c 'import http.server as h, socketserver as s, sys; s.ThreadingTCPServer.allow_reuse_address = True; s.ThreadingTCPServer((sys.argv[2], int(sys.argv[1])), h.SimpleHTTPRequestHandler).serve_forever()' {{{{ports.api}}}} 127.0.0.1 </dev/null >/dev/null 2>&1 & echo $! > stack.pid; for i in $(seq 100); do python3 -c 'import socket,sys; socket.create_connection((\"127.0.0.1\", {{{{ports.api}}}}))' 2>/dev/null && exit 0; sleep 0.1; done; exit 1"
 
 [actions.suspend]
 command = "if [ -f stack.pid ]; then kill $(cat stack.pid); rm stack.pid; fi"
@@ -303,7 +303,7 @@ API_URL = "http://127.0.0.1:{{{{ports.api}}}}"
 
 # Listens, since `app` starts only once `db` answers (#54).
 [actions.start]
-command = "exec python3 -m http.server $DB_PORT --bind 127.0.0.1"
+command = "exec python3 -c 'import http.server as h, socketserver as s, sys; s.ThreadingTCPServer.allow_reuse_address = True; s.ThreadingTCPServer((sys.argv[2], int(sys.argv[1])), h.SimpleHTTPRequestHandler).serve_forever()' $DB_PORT 127.0.0.1"
 long_running = true
 autostart = true
 "#
