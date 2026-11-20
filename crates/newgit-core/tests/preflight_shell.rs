@@ -113,13 +113,11 @@ const POSITIONS: &[&str] = &[
     "until PROG; do sleep 1; done",
     "case \"$1\" in prod|staging) PROG ;; *) ;; esac",
     "f() { PROG; }; f",
-    "function g { PROG; }; g",
     "have | PROG",
     "PROG &",
     "x=$(PROG)",
     "have \"$(PROG --json)\"",
     "have `PROG`",
-    "have <(PROG)",
     "time PROG",
     "FOO=1 PROG",
     "exec PROG",
@@ -191,7 +189,6 @@ fn what_is_not_a_program_is_not_looked_up() {
         // Here-document bodies are input.
         "psql_x <<'SQL'\ndo $$ begin truncate t; end $$;\nSQL\nhave",
         "psql_x <<-SQL\n\tnot_a_command\n\tSQL",
-        "have <<< \"not a command\"",
         // Redirection targets are files.
         "have > out.log 2>&1 < /dev/null",
         // Comments.
@@ -398,4 +395,54 @@ fn each_program_is_reported_once_per_command() {
         statuses(&findings),
         [("have".to_owned(), "ok"), ("nope".to_owned(), "fail")]
     );
+}
+
+/// What only bash parses, in a position bash runs a program or in input bash
+/// does not run. Hooks run under `sh`: where `sh` is bash (macOS) these
+/// read like any other command, and where it is dash (Debian, Ubuntu) the
+/// command cannot run at all, which is what the check must say instead.
+const BASH_ONLY: &[(&str, Option<&str>)] = &[
+    ("function g { have; }; g", Some("have")),
+    ("have <(have)", Some("have")),
+    ("have <<< \"not a command\"", None),
+];
+
+fn sh_parses(command: &str) -> bool {
+    Command::new("sh")
+        .args(["-n", "-c", command])
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+#[test]
+fn bash_only_syntax_is_read_where_sh_is_bash_and_refused_where_it_is_not() {
+    let fixture = fixture();
+    for &(command, program) in BASH_ONLY {
+        let findings = fixture.check(command);
+        if sh_parses(command) {
+            assert!(
+                findings
+                    .iter()
+                    .all(|finding| finding.outcome.status() == "ok"),
+                "{command:?}: {:?}",
+                statuses(&findings)
+            );
+            if let Some(program) = program {
+                assert_eq!(status_of(&findings, program), "ok", "{command:?}");
+                let missing = command.replace(program, "nope_prog");
+                let findings = fixture.check(&missing);
+                assert_eq!(status_of(&findings, "nope_prog"), "fail", "{missing:?}");
+            }
+        } else {
+            assert_eq!(findings.len(), 1, "{command:?}: {:?}", statuses(&findings));
+            assert_eq!(findings[0].program, None, "{command:?}");
+            match &findings[0].outcome {
+                Outcome::Missing(reason) => {
+                    assert!(reason.starts_with("sh cannot parse it"), "{reason}");
+                }
+                other => panic!("{command:?}: {other:?}"),
+            }
+        }
+    }
 }
