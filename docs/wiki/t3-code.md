@@ -20,7 +20,9 @@ nothing kept, and `remove` names that state under `left`, with the
 cleanup command that removes it by hand, and what else it could not keep
 under `lost`. When its state is in the workspace (`ownership =
 "workspace"`, as the `postgres` template's cluster is), deleting the
-workspace would delete it, so `remove` refuses and deletes nothing. The
+workspace would delete it, so `remove` refuses and deletes nothing
+(`remove --json` then prints `refused`, with a `reason` and, when starting
+the instance would let the capture run, `next`). The
 fork removes a newgit workspace before its thread, so the thread is not
 deleted either: it starts the instance (`newgit start <name>`) so the dump
 can run, and removes again. If newgit still refuses, the fork stops the

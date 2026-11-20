@@ -63,8 +63,10 @@ enum Command {
         #[arg(long)]
         path: bool,
         /// One JSON document: `{"instances": [{"name", "workspace",
-        /// "status", "problems", "starting"}]}`, `status` one of `ready`,
-        /// `starting`, `not ready`, `evicted`, `ws-missing`
+        /// "status", "resources", "problems", "starting"}]}`, `status` one
+        /// of `ready`, `starting`, `stopped`, `not ready`, `evicted`,
+        /// `ws-missing`; `resources` is each one's name and state, as the
+        /// RESOURCES column shows them
         #[arg(long, conflicts_with = "path")]
         json: bool,
     },
@@ -112,7 +114,9 @@ enum Command {
         /// of a resource whose capture failed
         #[arg(long)]
         force: bool,
-        /// Print what was removed, kept, and lost as JSON
+        /// Print what was removed, kept, and lost as JSON. A refusal prints
+        /// `{"instance", "removed": false, "refused": {"reason", "message",
+        /// "resources", "checkpoint", "next"}}` and still exits 1
         #[arg(long)]
         json: bool,
     },
@@ -3915,6 +3919,13 @@ fn status_json(manager: &BranchManager, name: Option<&str>) -> Result<()> {
                 "name": report.branch.name,
                 "workspace": report.branch.workspace_path,
                 "status": health(report),
+                "resources": report
+                    .resources
+                    .iter()
+                    .map(|resource| {
+                        serde_json::json!({ "name": resource.name, "state": resource.state })
+                    })
+                    .collect::<Vec<_>>(),
                 // A deleted workspace's one problem names the command that
                 // rebuilds it; an evicted one is not a problem.
                 "problems": if report.workspace_exists || report.branch.evicted.is_none() {
@@ -3942,6 +3953,10 @@ fn health(report: &InstanceReport) -> &'static str {
         "ws-missing"
     } else if !report.readiness.is_ready() {
         "not ready"
+    } else if report.stopped {
+        // Taken down by `newgit stop`, on purpose: nothing is wrong, and
+        // nothing is serving either, so not `ready`.
+        "stopped"
     } else if report.readiness.is_starting() {
         "starting"
     } else {
@@ -5346,7 +5361,31 @@ fn remove(
         ArchivedCheckpoints::Keep
     };
     let outcome =
-        manager.remove_forced(name, &current_dir()?, checkpoints, source_branch, force)?;
+        match manager.remove_forced(name, &current_dir()?, checkpoints, source_branch, force) {
+            Ok(outcome) => outcome,
+            // A refusal is an answer too: `--json` says why, so a caller
+            // can tell a removal `newgit start` would unblock from one only
+            // `--force` gets past. Still an error: the message goes to
+            // stderr and the exit code is 1.
+            Err(newgit_core::NewgitError::RemoveRefused { message, refusal }) if json => {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "instance": name,
+                        "removed": false,
+                        "refused": {
+                            "reason": refusal.reason.as_str(),
+                            "message": message,
+                            "resources": refusal.resources,
+                            "checkpoint": refusal.checkpoint,
+                            "next": refusal.next,
+                        },
+                    }))?
+                );
+                bail!(message);
+            }
+            Err(error) => return Err(error.into()),
+        };
     if json {
         println!(
             "{}",
@@ -5494,6 +5533,7 @@ fn remove_json(manager: &BranchManager, outcome: &RemoveOutcome) -> serde_json::
     );
     serde_json::json!({
         "instance": outcome.branch.name,
+        "removed": true,
         "workspace": outcome.branch.workspace_path,
         "archived_record": outcome.archived_record,
         "checkpoint": outcome.checkpoint,

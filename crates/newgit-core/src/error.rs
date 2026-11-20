@@ -3,6 +3,65 @@ use thiserror::Error;
 
 pub type Result<T> = std::result::Result<T, NewgitError>;
 
+/// Why `newgit remove` deleted nothing, for a caller to act on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoveRefusal {
+    pub reason: RemoveRefusalReason,
+    /// The resources whose capture failed, for `capture_failed`.
+    pub resources: Vec<String>,
+    /// The checkpoint the removal took before it refused, which holds the
+    /// rest of the workspace.
+    pub checkpoint: Option<String>,
+    /// A command that would let the same removal go through, when newgit
+    /// knows one: `newgit start <name>` when a resource whose capture
+    /// failed has a process that is not running.
+    pub next: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemoveRefusalReason {
+    /// The command was run from inside the workspace it would delete.
+    InsideWorkspace,
+    /// An evicted instance's path holds files written since the eviction.
+    EvictedPathDirty,
+    /// What the workspace holds that no checkpoint would could not be read.
+    InspectFailed,
+    /// A Git repository with no commit is nested in the workspace.
+    UnbornRepos,
+    /// A resource whose state is in the workspace failed its capture.
+    CaptureFailed,
+    /// The checkpoint that keeps the workspace failed.
+    CheckpointFailed,
+}
+
+impl RemoveRefusalReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::InsideWorkspace => "inside_workspace",
+            Self::EvictedPathDirty => "evicted_path_dirty",
+            Self::InspectFailed => "inspect_failed",
+            Self::UnbornRepos => "unborn_repos",
+            Self::CaptureFailed => "capture_failed",
+            Self::CheckpointFailed => "checkpoint_failed",
+        }
+    }
+}
+
+impl NewgitError {
+    /// A refused removal with nothing more to say than its reason.
+    pub fn remove_refused(reason: RemoveRefusalReason, message: String) -> Self {
+        Self::RemoveRefused {
+            message,
+            refusal: Box::new(RemoveRefusal {
+                reason,
+                resources: Vec::new(),
+                checkpoint: None,
+                next: None,
+            }),
+        }
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum NewgitError {
     #[error("I/O error at {path}: {source}")]
@@ -369,6 +428,15 @@ pub enum NewgitError {
 
     #[error("{0}")]
     Unsupported(String),
+
+    /// `newgit remove` deleted nothing. `message` is what a person reads;
+    /// `refusal` says the same to a caller that has to decide what to do
+    /// next (`remove --json` prints it).
+    #[error("{message}")]
+    RemoveRefused {
+        message: String,
+        refusal: Box<RemoveRefusal>,
+    },
 
     /// Work that may not leave this machine as it is: a file of a tracker
     /// outside Git committed, or a path whose tracker the instance has not bound.

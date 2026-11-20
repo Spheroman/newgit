@@ -4,6 +4,7 @@
 //! checkpoint holds, named rather than deleted in silence (#448).
 
 use super::*;
+use crate::error::{RemoveRefusal, RemoveRefusalReason};
 
 /// What [`BranchManager::checkpoint_before_remove`] kept, and what the
 /// removal deletes that nothing keeps.
@@ -106,12 +107,15 @@ impl BranchManager {
                 NotKept::default()
             }
             Err(error) => {
-                return Err(NewgitError::Unsupported(format!(
-                    "not removing `{name}`: could not tell what its workspace holds that no \
-                     checkpoint would ({error}). Nothing was stopped or deleted. Fix it and \
-                     remove again, or `newgit remove {name} --force` deletes the workspace \
-                     whatever it holds"
-                )));
+                return Err(NewgitError::remove_refused(
+                    RemoveRefusalReason::InspectFailed,
+                    format!(
+                        "not removing `{name}`: could not tell what its workspace holds that no \
+                         checkpoint would ({error}). Nothing was stopped or deleted. Fix it and \
+                         remove again, or `newgit remove {name} --force` deletes the workspace \
+                         whatever it holds"
+                    ),
+                ));
             }
         };
         // The ignored files lead `found.lost` when there are any; what a
@@ -121,18 +125,22 @@ impl BranchManager {
         keep.lost.extend(found.lost);
         keep.disposed = found.disposed;
         if !found.unborn.is_empty() && keeping && !force {
-            return Err(NewgitError::Unsupported(format!(
-                "not removing `{name}`: {} {} a Git repository of its own with no commit, which \
-                 Git refuses to snapshot, so no checkpoint can hold the workspace. Nothing was \
-                 stopped or deleted. Commit in it or move it out of the workspace, or `newgit \
-                 remove {name} --force` removes without a checkpoint and deletes it",
-                super::evict::list_paths(&found.unborn),
-                if found.unborn.len() == 1 {
-                    "is"
-                } else {
-                    "are each"
-                }
-            )));
+            return Err(NewgitError::remove_refused(
+                RemoveRefusalReason::UnbornRepos,
+                format!(
+                    "not removing `{name}`: {} {} a Git repository of its own with no commit, \
+                     which Git refuses to snapshot, so no checkpoint can hold the workspace. \
+                     Nothing was stopped or deleted. Commit in it or move it out of the \
+                     workspace, or `newgit remove {name} --force` removes without a checkpoint \
+                     and deletes it",
+                    super::evict::list_paths(&found.unborn),
+                    if found.unborn.len() == 1 {
+                        "is"
+                    } else {
+                        "are each"
+                    }
+                ),
+            ));
         }
         if !keeping {
             self.unkept(branch, &mut keep);
@@ -161,6 +169,7 @@ impl BranchManager {
                 // removal, as a failed checkpoint does. One whose state is
                 // elsewhere is left there, and named.
                 let mut inside = Vec::new();
+                let mut inside_names = Vec::new();
                 for (resource, why) in checkpoint.capture_failures {
                     let in_workspace = self.state_in_workspace(&resource);
                     if force {
@@ -180,22 +189,41 @@ impl BranchManager {
                         });
                     } else if in_workspace {
                         inside.push(format!("`{resource}` ({why})"));
+                        inside_names.push(resource);
                     } else {
                         keep.uncaptured.insert(resource, why);
                     }
                 }
                 if !inside.is_empty() {
                     let id = &checkpoint.record.id;
-                    return Err(NewgitError::Unsupported(format!(
-                        "not removing `{name}`: the capture of {} failed, and {} state is in \
-                         the workspace (`ownership = \"workspace\"`), which the removal would \
-                         delete with no checkpoint holding it. Nothing was stopped or deleted; \
-                         checkpoint {id} holds the rest of the workspace. Fix what failed (a \
-                         dump of a server that is stopped fails: `newgit start {name}` brings it \
-                         back) and remove again, or `newgit remove {name} --force` deletes it",
-                        inside.join(" and "),
-                        if inside.len() == 1 { "its" } else { "their" },
-                    )));
+                    // `newgit start` helps only where something is down: a
+                    // resource whose capture failed has a process of its
+                    // own, and it is not running.
+                    let supervisor = self.supervisor(branch);
+                    let down = inside_names.iter().any(|resource| {
+                        self.resource_definition(resource)
+                            .is_ok_and(|definition| definition.has_long_running_action())
+                            && supervisor.running_pid(resource).is_none()
+                    });
+                    return Err(NewgitError::RemoveRefused {
+                        message: format!(
+                            "not removing `{name}`: the capture of {} failed, and {} state is \
+                             in the workspace (`ownership = \"workspace\"`), which the removal \
+                             would delete with no checkpoint holding it. Nothing was stopped or \
+                             deleted; checkpoint {id} holds the rest of the workspace. Fix what \
+                             failed (a dump of a server that is stopped fails: `newgit start \
+                             {name}` brings it back) and remove again, or `newgit remove {name} \
+                             --force` deletes it",
+                            inside.join(" and "),
+                            if inside.len() == 1 { "its" } else { "their" },
+                        ),
+                        refusal: Box::new(RemoveRefusal {
+                            reason: RemoveRefusalReason::CaptureFailed,
+                            resources: inside_names,
+                            checkpoint: Some(id.clone()),
+                            next: down.then(|| format!("newgit start {name}")),
+                        }),
+                    });
                 }
                 keep.warnings = checkpoint
                     .warnings
@@ -234,12 +262,16 @@ impl BranchManager {
                 ));
             }
             Err(error) => {
-                return Err(NewgitError::Unsupported(format!(
-                    "not removing `{name}`: the checkpoint that keeps its workspace failed \
-                     ({error}), and without it the removal would delete work no checkpoint \
-                     holds. Nothing was stopped or deleted. Fix what failed and remove again, \
-                     or `newgit remove {name} --force` deletes the workspace without one"
-                )));
+                return Err(NewgitError::remove_refused(
+                    RemoveRefusalReason::CheckpointFailed,
+                    format!(
+                        "not removing `{name}`: the checkpoint that keeps its workspace failed \
+                         ({error}), and without it the removal would delete work no checkpoint \
+                         holds. Nothing was stopped or deleted. Fix what failed and remove \
+                         again, or `newgit remove {name} --force` deletes the workspace without \
+                         one"
+                    ),
+                ));
             }
         }
         Ok(keep)

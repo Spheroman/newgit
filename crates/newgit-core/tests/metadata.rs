@@ -163,7 +163,7 @@ fn remove_refuses_from_inside_the_workspace() {
             ArchivedCheckpoints::Keep,
             SourceBranchPolicy::Auto
         ),
-        Err(NewgitError::Unsupported(_))
+        Err(NewgitError::RemoveRefused { .. })
     ));
     assert!(inside.exists());
 }

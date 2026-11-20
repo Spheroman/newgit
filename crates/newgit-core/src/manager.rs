@@ -943,6 +943,10 @@ pub struct InstanceReport {
     /// exists in the store to compare against.
     pub base: Option<BaseReport>,
     pub readiness: Readiness,
+    /// `newgit stop` took something of this instance down and `newgit
+    /// start` has not brought it back: down on purpose, which is not
+    /// `ready` and not a problem either.
+    pub stopped: bool,
 }
 
 /// Whether an instance works right now — checked, not remembered: each
@@ -8904,6 +8908,9 @@ impl BranchManager {
                     .collect();
                 let base = self.base_report(&branch);
                 let readiness = self.readiness(&branch);
+                let stopped = self
+                    .load_stopped_record(&branch)
+                    .is_ok_and(|record| !record.resources.is_empty());
                 Ok(InstanceReport {
                     branch,
                     workspace_exists,
@@ -8913,6 +8920,7 @@ impl BranchManager {
                     resources,
                     base,
                     readiness,
+                    stopped,
                 })
             })
             .collect()
@@ -8967,11 +8975,14 @@ impl BranchManager {
         let (_lock, mut branch) = self.locked_branch(name)?;
 
         if cwd.starts_with(&branch.workspace_path) {
-            return Err(NewgitError::Unsupported(format!(
-                "the current directory is inside the workspace of `{}`; step out of it before \
-                 removing",
-                branch.name
-            )));
+            return Err(NewgitError::remove_refused(
+                crate::error::RemoveRefusalReason::InsideWorkspace,
+                format!(
+                    "the current directory is inside the workspace of `{}`; step out of it \
+                     before removing",
+                    branch.name
+                ),
+            ));
         }
         // An evicted instance's workspace path holds only its marker, unless
         // something was written there after a restore failed or was cut
@@ -8991,23 +9002,26 @@ impl BranchManager {
                 })
                 .unwrap_or_default();
             held.sort();
-            return Err(NewgitError::Unsupported(format!(
-                "not removing `{}`: it is evicted, and {} holds more than its marker ({}), \
+            return Err(NewgitError::remove_refused(
+                crate::error::RemoveRefusalReason::EvictedPathDirty,
+                format!(
+                    "not removing `{}`: it is evicted, and {} holds more than its marker ({}), \
                  written since and in no checkpoint, which `remove` would delete. Move what you \
                  want to keep out of it, or `newgit remove {} --force` deletes it",
-                branch.name,
-                branch.workspace_path,
-                if held.is_empty() {
-                    "under `.newgit/`".to_owned()
-                } else {
-                    held.iter()
-                        .take(8)
-                        .map(|name| format!("`{name}`"))
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                },
-                branch.name
-            )));
+                    branch.name,
+                    branch.workspace_path,
+                    if held.is_empty() {
+                        "under `.newgit/`".to_owned()
+                    } else {
+                        held.iter()
+                            .take(8)
+                            .map(|name| format!("`{name}`"))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    },
+                    branch.name
+                ),
+            ));
         }
         // Whatever would make the cleanup hooks refuse refuses here, before
         // anything is stopped or deleted: a dry run checks each hook and runs

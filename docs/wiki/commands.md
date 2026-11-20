@@ -13,7 +13,10 @@ inside a workspace):
   with the commands that apply it; `spawn` prints where the logs are and
   exits 1 when the instance is not ready
 - `newgit status [name] --json` — `{"instances": [{"name", "workspace",
-  "status", "problems", "starting"}]}`
+  "status", "resources", "problems", "starting"}]}`. `status` is `ready`,
+  `starting`, `stopped` (what `newgit stop` took down is still down), `not
+  ready`, `evicted` or `ws-missing`; `resources` is each one's `name` and
+  `state`, as the RESOURCES column shows them
 - `newgit status <instance> --path` — just the workspace path, for scripts
 - `newgit reference [section | all]` — the definition format, every key and
   default; bare, it lists the sections
@@ -77,7 +80,14 @@ inside a workspace):
   <instance>` lists a removed instance's checkpoints. An evicted instance is not checkpointed
   again: the eviction's checkpoint is the one named (`checkpoint` in
   `--json`). A checkpoint that fails, a nested repository with no commit,
-  or a workspace whose Git cannot be read refuses unless `--force`;
+  or a workspace whose Git cannot be read refuses unless `--force`. A
+  refusal exits 1 and, with `--json`, prints `{"instance", "removed":
+  false, "refused": {"reason", "message", "resources", "checkpoint",
+  "next"}}`: `reason` is `capture_failed`, `checkpoint_failed`,
+  `unborn_repos`, `inspect_failed`, `evicted_path_dirty` or
+  `inside_workspace`, and `next` is `newgit start <instance>` when a
+  resource whose capture failed has a process that is not running (a
+  removal that goes through has `"removed": true`);
   `--purge` takes none and discards this instance's checkpoints (never an
   earlier same-named instance's), and both then name the uncommitted work
   and the uncaptured content of trackers outside Git they delete. On an evicted
