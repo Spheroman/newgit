@@ -141,8 +141,10 @@ of the project, `repos` inside `apps/t3code`, `..` to go up:
   history: an instance's branch as of its last checkpoint, or the project
   root's
 - `newgit resource add <name> --template <template>` / `list` / `templates`
-- `newgit resource check [--json]` — every program the definitions'
-  commands start, found on `PATH` or not; exits 1 when one is missing
+- `newgit resource check [--json]` — reads every hook command as shell and
+  looks up each program it would run: `ok`, `FAIL` (exits 1), or `skip`
+  with why when only a running instance could know (a template or variable
+  names it, a `cd` newgit cannot follow, a `command -v` guard)
 - `newgit resource remove <name> [--force]` — `--force` drops it from live
   instances and releases their ports instead of refusing
 - `newgit resource rebind <name> [instance]` — bind it again as spawn did,
