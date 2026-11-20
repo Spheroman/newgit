@@ -1317,7 +1317,7 @@ against an instance you can afford to spend, not one you are mid-task on.
 
 | key | type | required | default | meaning |
 | --- | --- | --- | --- | --- |
-| `command` | string | no | none | tears the concrete resource down. Runs at `newgit remove`, and at `newgit cleanup` for an instance whose workspace is gone, dependents before dependencies — for resources a tracker drop parked too. A `tracker drop` runs it for a resource it parks that has no `suspend`. A `[cleanup]` section without one means there is nothing to do, and teardown says so. |
+| `command` | string | no | none | tears the concrete resource down. Runs at `newgit remove`, and at `newgit cleanup` for an instance whose workspace is gone (then from an empty directory, never the project root, so a relative path in it names nothing), dependents before dependencies — for resources a tracker drop parked too. A `tracker drop` runs it for a resource it parks that has no `suspend`. A `[cleanup]` section without one means there is nothing to do, and teardown says so. |
 
 Three rules constrain it, all deliberately:
 
