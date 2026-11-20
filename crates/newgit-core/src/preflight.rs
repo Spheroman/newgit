@@ -140,6 +140,13 @@ pub fn check(definitions: &[ResourceDefinition], root: &Utf8Path, path: &str) ->
     let mut checks = Vec::new();
     for definition in definitions {
         for (hook, command, workdir) in commands(definition) {
+            // `EDIT ME: your install command` names no program. The
+            // definition check reports it as the placeholder it is
+            // ([`crate::definition_check`]), rather than this as `EDIT`
+            // missing from `PATH`.
+            if crate::definition_check::is_placeholder(&command) {
+                continue;
+            }
             for finding in check_command(&command, root, workdir.as_deref(), path) {
                 checks.push(ProgramCheck {
                     resource: definition.name.clone(),

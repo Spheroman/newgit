@@ -665,8 +665,10 @@ something to newgit:
 - **`start` and `stop`** are a convention made real by `long_running =
   true`: the process starts detached in its own process group, its output
   goes to `.newgit/logs/`, its PID to `.newgit/state/`, and `stop` sends the
-  configured signal (TERM by default) to the group. No daemon, no restart
-  policy. `autostart = true` has `spawn` start it; the `process` template
+  configured signal (TERM by default) to the group. Its stdin is a pipe that
+  never delivers data or end-of-file while it runs, held by the wrapper
+  that waits on it (below), so a watcher that quits when stdin closes keeps
+  running. No daemon, no restart policy. `autostart = true` has `spawn` start it; the `process` template
   sets it.
 - **`suspend` and `resume`** take down and bring back something newgit does
   not supervise, such as a Supabase stack or a Compose project. `newgit
@@ -1042,7 +1044,9 @@ What keeps sharing safe:
 - **A tree that names its own workspace is not shared**, unless a render
   covers the file. Copy-on-write cannot fix a path already baked into the
   content, so admission scans the tree and declines it, naming the file.
-  That resource keeps installing per instance. Nothing fails.
+  That resource keeps installing per instance. Nothing fails. Generated
+  code (a Prisma client) is moved into a resource of its own instead, keyed
+  on its own input.
 - **`prepare` is the only thing an entry stands in for.** A definition
   where something else builds the tree (a `long_running` or command-less
   `prepare`, `captures` it would stop publishing, a `recompute` restore

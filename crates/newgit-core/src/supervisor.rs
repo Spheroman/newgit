@@ -90,6 +90,20 @@ impl Death {
 /// not `exec` the command: it stays to wait on it, writes how it ended, and
 /// exits.
 ///
+/// It also holds the command's stdin open. A dev server's file watcher
+/// (`esbuild --watch`, `vite`, `tsc --watch` under some wrappers) reads
+/// end-of-file on stdin as "the terminal went away" and exits, and a
+/// wrapper process in front of it (`npm run`, `concurrently`) stays alive,
+/// so the resource reads as running while nothing serves. So the command's
+/// stdin is a pipe that never delivers data or end-of-file, the way a
+/// process manager gives one: `start` makes a FIFO, the wrapper opens it
+/// read-write on fd 3 (a writer that lives as long as the wrapper does) and
+/// read-only on fd 4, deletes it, and hands the command fd 4 as stdin with
+/// 3 and 4 closed. newgit itself does not stay running, so the wrapper,
+/// which does, is what holds the write end. When the wrapper goes (the
+/// command ended, or the group was stopped), whatever is left of the
+/// group reads end-of-file.
+///
 /// It sets no `trap`, so every process in the group keeps the default
 /// disposition for the signal `stop` sends, and the group goes down as it
 /// did before the wrapper existed. A trap would break `stop`: a signal that
@@ -108,8 +122,11 @@ impl Death {
 const WRAPPER: &str = r#"c=$NEWGIT_SUPERVISED_COMMAND
 f=$NEWGIT_SUPERVISED_EXIT
 m=$NEWGIT_SUPERVISED_STOPPING
-unset NEWGIT_SUPERVISED_COMMAND NEWGIT_SUPERVISED_EXIT NEWGIT_SUPERVISED_STOPPING
-sh -c "$c"
+i=$NEWGIT_SUPERVISED_STDIN
+unset NEWGIT_SUPERVISED_COMMAND NEWGIT_SUPERVISED_EXIT NEWGIT_SUPERVISED_STOPPING NEWGIT_SUPERVISED_STDIN
+exec 3<>"$i" 4<"$i"
+rm -f "$i"
+sh -c "$c" <&4 3>&- 4<&-
 s=$?
 if [ -e "$m" ]; then
   :
@@ -227,6 +244,21 @@ impl Supervisor {
             }
         }
 
+        // The command's stdin, which the wrapper holds open (see
+        // [`WRAPPER`]). One a crashed run left behind is replaced.
+        let stdin_fifo = self.stdin_path(resource);
+        match std::fs::remove_file(&stdin_fifo) {
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+                return Err(NewgitError::io(stdin_fifo, error));
+            }
+            _ => {}
+        }
+        nix::unistd::mkfifo(
+            stdin_fifo.as_std_path(),
+            nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
+        )
+        .map_err(|errno| NewgitError::io(&stdin_fifo, std::io::Error::from(errno)))?;
+
         let mut cmd = Command::new("sh");
         cmd.arg("-c")
             .arg(WRAPPER)
@@ -240,7 +272,8 @@ impl Supervisor {
             .env(
                 "NEWGIT_SUPERVISED_STOPPING",
                 self.stopping_path(resource).as_str(),
-            );
+            )
+            .env("NEWGIT_SUPERVISED_STDIN", stdin_fifo.as_str());
         #[cfg(unix)]
         {
             use std::os::unix::process::CommandExt as _;
@@ -426,6 +459,12 @@ impl Supervisor {
     /// Left by `stop` before it signals: newgit asked for this ending.
     fn stopping_path(&self, resource: &str) -> Utf8PathBuf {
         self.state_dir.join(format!("{resource}.stopping"))
+    }
+
+    /// The FIFO `start` makes for the command's stdin; the wrapper opens and
+    /// deletes it.
+    fn stdin_path(&self, resource: &str) -> Utf8PathBuf {
+        self.state_dir.join(format!("{resource}.stdin"))
     }
 }
 
@@ -953,10 +992,17 @@ mod tests {
         let dir = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).expect("utf8");
         let script = WRAPPER.replacen("sh -c \"$c\"", "kill -TERM $$\nsh -c \"$c\"", 1);
         assert_ne!(script, WRAPPER, "the wrapper still runs the command");
+        let stdin = dir.join("app.stdin");
+        nix::unistd::mkfifo(
+            stdin.as_std_path(),
+            nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
+        )
+        .expect("mkfifo");
         let mut cmd = Command::new("sh");
         cmd.arg("-c")
             .arg(script)
             .env("NEWGIT_SUPERVISED_COMMAND", "sleep 30")
+            .env("NEWGIT_SUPERVISED_STDIN", stdin.as_str())
             .env("NEWGIT_SUPERVISED_EXIT", dir.join("app.exit").as_str())
             .env(
                 "NEWGIT_SUPERVISED_STOPPING",
