@@ -292,10 +292,21 @@ DB_URL = "postgres://x"
         ),
         "{problems:#?}"
     );
+    // The checkpoint has no `into_tracker`, so its `{{snapshot.path}}` has
+    // no directory to name.
+    assert!(
+        problems.iter().any(|(resource, place, problem)| {
+            resource == "web"
+                && place == "[checkpoint] command"
+                && problem.contains("`{{snapshot.path}}`")
+                && problem.contains("into_tracker")
+        }),
+        "{problems:#?}"
+    );
     // Nothing else: the script that exists, the ports that are declared,
     // its own export in its checkpoint, `{{state_ref}}` in `[restore]`, and
     // Docker's own `{{.State.Status}}` are all fine.
-    assert_eq!(problems.len(), 9, "{problems:#?}");
+    assert_eq!(problems.len(), 10, "{problems:#?}");
 
     // A `depends_on` naming nothing is the graph's to refuse, and the check
     // fails on it too.

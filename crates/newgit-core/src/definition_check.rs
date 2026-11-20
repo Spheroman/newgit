@@ -352,6 +352,19 @@ impl Context<'_> {
                         "names `{shown}`, which has a value only in `[checkpoint] command`; here \
                          it stays the literal text"
                     ));
+                } else if self
+                    .resource
+                    .checkpoint
+                    .as_ref()
+                    .is_none_or(|checkpoint| checkpoint.into_tracker.is_none())
+                {
+                    // The directory exists to be deposited: with no tracker
+                    // to deposit into, newgit makes none.
+                    problems.push(format!(
+                        "names `{shown}`, which has a value only when `[checkpoint] \
+                         into_tracker` names the tracker its contents go into; without one it \
+                         stays the literal text"
+                    ));
                 }
             } else if variable == "state_ref" {
                 if scope != Scope::Restore {

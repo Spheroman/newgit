@@ -697,7 +697,9 @@ a tracker: create it with `newgit tracker create db-snapshots` ``:
   should be read as `$<name>` from the environment;
 - `{{scripts}}/<path>` with no such file in the project root's
   `.newgit/scripts/`;
-- `{{state_ref}}` or `{{snapshot.path}}` where they have no value, and a
+- `{{state_ref}}` or `{{snapshot.path}}` where they have no value
+  (`{{snapshot.path}}` in a `[checkpoint] command` with no `into_tracker`
+  included), and a
   misspelled `{{branch.*}}`, `{{bound.*}}` or `{{snapshot.*}}` (see
   *Template variables*), all of which would run as the literal text;
 - what the graph refuses: a `depends_on` naming neither a resource nor a
@@ -2182,7 +2184,7 @@ environment variable handed to every later process.
 | `{{scripts}}` | absolute path to `.newgit/scripts/` in the store — use `{{scripts}}/<name>` so a hook's script is read from the store, like the definition calling it |
 | `{{ports.<name>}}` | an allocated port |
 | `{{exports.<name>}}` | a rendered export: in `[exports]` and `[[render]]`, any bound so far; in hooks, this resource's own |
-| `{{snapshot.path}}` | directory to write checkpoint output into |
+| `{{snapshot.path}}` | directory to write checkpoint output into, when `[checkpoint] into_tracker` names the tracker it is deposited in; without one it has no value |
 | `{{state_ref}}` | the handle the last checkpoint recorded, or the path of the snapshot it deposited. A `hash` checkpoint records neither, so it has no value |
 | `{{bound.trackers}}` | the trackers the instance binds, space-separated — every selectable tracker it has not dropped (`root` and `access` are always bound and not listed) |
 | `{{bound.paths}}` | the paths those trackers own, trackers in Git only, space-separated — what a shared install should build |
