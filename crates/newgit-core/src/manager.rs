@@ -1614,6 +1614,12 @@ struct RestoreContext<'a> {
     /// ([`BranchManager::install_binding`]) is not the tree the checkpoint
     /// describes even when its identity paths are unchanged.
     dropped_before: Option<&'a BTreeSet<String>>,
+    /// A resource this one depends on whose recompute rebuilt or refilled
+    /// its tree earlier in this undo. A tree rebuilt from its inputs holds
+    /// none of what a dependent generated into it (`node_modules/.prisma`
+    /// under `node_modules`), so the dependent's own unchanged identity says
+    /// nothing about whether its output is still there.
+    rebuilt_dependency: Option<&'a str>,
     force_recompute: bool,
 }
 
@@ -1690,12 +1696,15 @@ pub struct UndoResourceOutcome {
     /// The status the resource is left in, as `newgit status` will report
     /// it. A restore that ran nothing leaves the status it found, so a
     /// `prepare` that failed before the undo is still `Failed` after it,
-    /// with `ok` true; a restart that failed after an ok restore is
-    /// `Failed` too.
+    /// with `ok` true. A restart that failed leaves it as the restore did:
+    /// that is the process's failure, not the binding's.
     pub status: ResourceStatus,
     /// The resource was running at checkpoint time and its restore was ok,
-    /// but starting it again failed. `ok` stays true — the restore did what
-    /// it set out to — and `status` is `Failed`.
+    /// but its process is not running again: starting it failed, or it was
+    /// held back behind a dependency whose restore failed (then
+    /// `blocked_by` names it). `ok` stays true — the restore did what it
+    /// set out to — and the process reads as never started until a start
+    /// succeeds.
     pub restart_failed: bool,
     /// Dependencies not `Ready` once the undo is done, as `newgit status`
     /// derives `blocked(..)` from them.
@@ -3816,6 +3825,14 @@ impl BranchManager {
                     ));
                     continue;
                 }
+                ResourceStatus::Failed if binding.restore_error.is_some() => {
+                    problems.push(format!(
+                        "`{name}` failed to restore: {} — repair it, then `newgit undo` again; \
+                         its logs are under {logs}",
+                        binding.restore_error.as_deref().unwrap_or_default()
+                    ));
+                    continue;
+                }
                 ResourceStatus::Failed => {
                     let log = last_log_line(
                         last_action_log(&logs, name, definition.producing_action()),
@@ -4875,6 +4892,7 @@ impl BranchManager {
                         .is_some_and(|parked| parked.binding.restore_proven),
                     render_error: None,
                     export_error: None,
+                    restore_error: None,
                     // `resume` brings it back without running `prepare`, so
                     // what last ran is still what the parked binding ran.
                     prepare_rev: if resume {
@@ -5158,6 +5176,7 @@ impl BranchManager {
                 restore_proven: false,
                 render_error: None,
                 export_error: None,
+                restore_error: None,
                 prepare_rev: None,
             },
         );
@@ -6491,6 +6510,7 @@ impl BranchManager {
             };
             if code == 0 {
                 binding.prepare_rev = Some(definition.prepare_rev());
+                binding.restore_error = None;
             }
             dirty = true;
         }
@@ -7858,6 +7878,9 @@ impl BranchManager {
             };
             if let Some(binding) = branch.resources.get_mut(name) {
                 binding.status = status;
+                // Its state is now what this rebuild made, whatever an
+                // earlier restore failed to make.
+                binding.restore_error = None;
             }
             branch.updated_at = Utc::now();
             self.store.save_branch_record(&branch)?;
@@ -14868,6 +14891,14 @@ impl BranchManager {
         let mut resources = Vec::new();
         let mut failures: Vec<RestoreFailure> = Vec::new();
         let mut down_dependencies = BTreeSet::new();
+        // What a recompute rebuilt or refilled in this undo: its dependents
+        // recompute too (see `RestoreContext::rebuilt_dependency`).
+        let mut rebuilt: BTreeSet<String> = BTreeSet::new();
+        // What this undo started again, which a dependent's restore waits
+        // for; and what it did not bring back — a restore that failed, and
+        // what depends on one — which stays down.
+        let mut restarted: BTreeSet<String> = BTreeSet::new();
+        let mut not_restored: BTreeSet<String> = BTreeSet::new();
         for name in &self.graph.bind_order {
             let Some(state) = restored
                 .resource_states
@@ -14910,18 +14941,70 @@ impl BranchManager {
                     .iter()
                     .find(|pre| &pre.name == name)
                     .and_then(|pre| pre.state_ref.as_deref());
-                self.restore_resource(
-                    &mut branch,
-                    definition,
-                    state,
-                    RestoreContext {
-                        pre_undo_state_ref: pre_undo,
-                        dropped_before: dropped_before.as_ref(),
-                        force_recompute: options.force_recompute,
-                    },
-                    &mut failures,
-                    &mut warnings,
-                )?
+                let rebuilt_dependency = definition
+                    .depends_on
+                    .iter()
+                    .find(|dependency| rebuilt.contains(*dependency))
+                    .map(String::as_str);
+                // A restore that runs something may talk to what it depends
+                // on — a seed loading rows into the database — and that was
+                // just started again, not yet up. So it waits as a
+                // dependent's process does (#54), for what this undo
+                // restarted only: one that was not running before the undo
+                // is not running for its restore either, as it never was.
+                let runs_something = definition.restore.as_ref().is_some_and(|spec| {
+                    matches!(spec.mode, RestoreMode::Command | RestoreMode::Recompute)
+                });
+                let mut waits_for = definition.clone();
+                waits_for
+                    .depends_on
+                    .retain(|dependency| restarted.contains(dependency));
+                let dependencies_up = if runs_something && !waits_for.depends_on.is_empty() {
+                    self.await_dependencies(
+                        &branch,
+                        &waits_for,
+                        "restore",
+                        &supervisor,
+                        &mut down_dependencies,
+                    )
+                } else {
+                    Ok(())
+                };
+                let outcome = match dependencies_up {
+                    Err(why) => {
+                        failures.push(RestoreFailure {
+                            resource: name.clone(),
+                            detail: why,
+                            log: None,
+                            retry_with: format!(
+                                "`newgit undo {}` again once what it depends on is up",
+                                branch.name
+                            ),
+                        });
+                        ("not run: a dependency is not up".to_owned(), false, false)
+                    }
+                    Ok(()) => self.restore_resource(
+                        &mut branch,
+                        definition,
+                        state,
+                        RestoreContext {
+                            pre_undo_state_ref: pre_undo,
+                            dropped_before: dropped_before.as_ref(),
+                            rebuilt_dependency,
+                            force_recompute: options.force_recompute,
+                        },
+                        &mut failures,
+                        &mut warnings,
+                    )?,
+                };
+                let recompute = definition
+                    .restore
+                    .as_ref()
+                    .is_some_and(|spec| spec.mode == RestoreMode::Recompute);
+                if recompute && outcome.2 {
+                    rebuilt.insert(name.clone());
+                }
+                outcome
             };
             if let Some(binding) = branch.resources.get_mut(name) {
                 // Only a restore that ran something can have brought the
@@ -14930,10 +15013,21 @@ impl BranchManager {
                 // left it as it found it, so it keeps the status it came in
                 // with: a `prepare` that failed, or never ran behind a failed
                 // dependency, has still not succeeded.
+                // A failed restore says so in the record, so `status` can tell
+                // it from a failed `prepare` and name its retry: not the
+                // action that starts the process, which would serve whatever
+                // the restore left half done, but another undo.
                 if !ok {
                     binding.status = ResourceStatus::Failed;
+                    binding.restore_error = failures
+                        .iter()
+                        .rev()
+                        .find(|failure| &failure.resource == name)
+                        .map(|failure| failure.detail.clone())
+                        .or_else(|| Some("its restore failed".to_owned()));
                 } else if exercised {
                     binding.status = ResourceStatus::Ready;
+                    binding.restore_error = None;
                 }
                 // Sticky once true: this answers "has restore ever
                 // completed", not "would it complete right now". A skip (no
@@ -14945,35 +15039,88 @@ impl BranchManager {
             }
 
             let mut restart_failed = false;
-            if was_left_alone || (ok && state.was_running) {
+            // What an undo leaves when a restore fails: that resource down,
+            // and everything that depends on it down too, on purpose. A
+            // server started over state its restore left half done serves
+            // it as if it were fine, and a dependent started against it
+            // reads as up while it serves the wrong data. Each reads as not
+            // started, so `status` says so, and the next undo that restores
+            // them brings both back.
+            let held_by = definition
+                .depends_on
+                .iter()
+                .find(|dependency| not_restored.contains(*dependency))
+                .cloned();
+            if !ok {
+                not_restored.insert(name.clone());
+                if state.was_running {
+                    supervisor.mark_not_restarted(name)?;
+                }
+            } else if let Some(dependency) = held_by.filter(|_| was_left_alone || state.was_running)
+            {
+                restart_failed = true;
+                not_restored.insert(name.clone());
+                supervisor.mark_not_restarted(name)?;
+                failures.push(RestoreFailure {
+                    resource: name.clone(),
+                    detail: format!(
+                        "not restarted: `{dependency}`, which it depends on, was not restored"
+                    ),
+                    log: None,
+                    retry_with: format!(
+                        "repair `{dependency}`, then `newgit undo {}` again",
+                        branch.name
+                    ),
+                });
+            } else if was_left_alone || (ok && state.was_running) {
                 let when = if was_left_alone {
                     "before this undo"
                 } else {
                     "at checkpoint time"
                 };
                 match self.restart_long_running(&branch, definition, &mut down_dependencies) {
-                    Ok(true) => action_label.push_str(" + restarted"),
+                    Ok(true) => {
+                        restarted.insert(name.clone());
+                        action_label.push_str(" + restarted");
+                    }
                     Ok(false) => warnings.push(format!(
                         "resource `{name}` was running {when} but has no long-running action to \
                          restart"
                     )),
+                    // The process did not come back; the resource did. Its
+                    // binding says whether `prepare` or its restore succeeded,
+                    // and marking it failed for this is a failure no start
+                    // ever clears: `status` went on calling it failed while
+                    // its retried process served. So the process reads as one
+                    // never started, which `status` names and `start` owes,
+                    // until a start succeeds.
                     Err(error) => {
                         restart_failed = true;
-                        if let Some(binding) = branch.resources.get_mut(name) {
-                            binding.status = ResourceStatus::Failed;
-                        }
+                        self.supervisor(&branch).mark_not_restarted(name)?;
+                        let retry_with = match long_running_action(definition) {
+                            Some((action, _))
+                                if definition
+                                    .autostart_action()
+                                    .is_some_and(|(autostart, _)| autostart == action) =>
+                            {
+                                format!("newgit start {}", branch.name)
+                            }
+                            Some((action, _)) => {
+                                format!("newgit action {name}.{action} {}", branch.name)
+                            }
+                            None => format!("newgit start {}", branch.name),
+                        };
                         failures.push(RestoreFailure {
                             resource: name.clone(),
                             detail: format!("restart failed: {error}"),
                             log: None,
-                            retry_with: format!("newgit action {name}.start {}", branch.name),
+                            retry_with,
                         });
                     }
                 }
             }
-            // Read only now, after a failed restore or restart has marked the
-            // resource failed, so the outcome says what the record is saved
-            // with. Dependencies come first in bind order, so theirs are
+            // Read only now, after a failed restore has marked the resource
+            // failed, so the outcome says what the record is saved with. Dependencies come first in bind order, so theirs are
             // already final too.
             resources.push(UndoResourceOutcome {
                 status: branch.resources[name].status,
@@ -15092,6 +15239,7 @@ impl BranchManager {
                     });
                 if !undo.force_recompute
                     && !key_moved
+                    && undo.rebuilt_dependency.is_none()
                     && self.produced_present(branch, definition)
                     && let Some(recorded) = state.state_ref.as_deref()
                     && recorded.starts_with(HASH_STATE_REF_PREFIX)
@@ -15187,6 +15335,9 @@ impl BranchManager {
                 // A rebuild during an undo produces the same tree a spawn
                 // would have, so it is worth the same to the next instance.
                 let mut label = format!("recompute({action_name})");
+                if let Some(dependency) = undo.rebuilt_dependency {
+                    label.push_str(&format!(" after `{dependency}` was recomputed"));
+                }
                 if ok && let Some(key) = &install_key {
                     match self.admit_to_install_store(branch, definition, key) {
                         Some(report @ InstallReport::Stored { .. }) => {

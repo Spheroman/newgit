@@ -13,8 +13,8 @@ use newgit_core::manager::{
     ActionOutcome, ActionPlan, BaseReport, BindOrigin, BranchManager, DiffPair, ExportReason,
     InstanceReport, KeptBranch, MismatchCause, Readiness, RemoteExportOptions, RemoveOutcome,
     ResourceBindOutcome, SourceBranchOutcome, SourceBranchPolicy, StopStartOutcome,
-    StopStartResource, StopStartStatus, TrackerBindOutcome, UndoOptions, VerifyResource,
-    WorkspaceChange,
+    StopStartResource, StopStartStatus, TrackerBindOutcome, UndoOptions, UndoResourceOutcome,
+    VerifyResource, WorkspaceChange,
 };
 use newgit_core::preflight::Outcome;
 use newgit_core::resource::{CheckpointMode, ResourceDefinition};
@@ -208,6 +208,9 @@ enum Command {
         verify: bool,
     },
     /// Restore an instance to a checkpoint (the latest unless --to is given)
+    ///
+    /// Waits for what it restarted to come up, as `spawn` and `start` do,
+    /// and exits 1 when a restore failed or the instance is not ready.
     Undo {
         /// Instance (inferred when run inside a workspace)
         instance: Option<String>,
@@ -1394,6 +1397,12 @@ fn spawn_from_checkpoint(
         format!("`{spec}` is not `<instance>/<checkpoint>`, e.g. `fix-login/ckpt_003`")
     })?;
     let outcome = manager.spawn_from_checkpoint(name, instance, checkpoint)?;
+    // As a plain `spawn` waits (#276), and on the same terms.
+    let readiness = if outcome.is_complete() {
+        manager.readiness_after(&outcome.branch, manager.ready_wait(&outcome.branch))
+    } else {
+        Readiness::default()
+    };
     // A checkpoint from the remote says who took it; one from this machine
     // was taken here.
     let by = match (&outcome.author, &outcome.agent) {
@@ -1440,13 +1449,15 @@ fn spawn_from_checkpoint(
                 })).collect::<Vec<_>>(),
                 "resources": resources,
                 "started": stop_start_resources_json(&outcome.started),
+                "starting": starting_json(&readiness),
+                "problems": readiness.problems,
                 "recovery_record": outcome.undo.recovery_record,
                 "warnings": outcome.warnings,
             })
         );
         // Exits 1 for the reason `spawn --json` below does, and the same way:
         // after printing, leaving the instance and its record in place.
-        if !outcome.is_complete() {
+        if !outcome.is_complete() || !readiness.is_ready() {
             std::process::exit(1);
         }
         return Ok(());
@@ -1555,6 +1566,10 @@ fn spawn_from_checkpoint(
             ),
             &manager.readiness(&outcome.branch),
         );
+    }
+    print_readiness(&outcome.branch.name, &readiness);
+    if !readiness.is_ready() {
+        std::process::exit(1);
     }
     Ok(())
 }
@@ -1792,8 +1807,8 @@ fn spawn(args: SpawnArgs) -> Result<()> {
     Ok(())
 }
 
-/// `ready:`, `starting:`, or `not ready:` and why, as the end of `spawn`
-/// and of `start` say it.
+/// `ready:`, `starting:`, or `not ready:` and why, as the end of `spawn`,
+/// of `start` and of `undo` say it.
 fn print_readiness(name: &str, readiness: &Readiness) {
     if readiness.is_ready() && !readiness.is_starting() {
         println!("ready: `{name}`");
@@ -4365,14 +4380,31 @@ fn undo(instance: Option<String>, options: UndoOptions) -> Result<()> {
             outcome.resources.len() - failed.len(),
             outcome.resources.len()
         );
-        println!(
-            "  {} may be in a partial state — a failed restore command is not rolled back",
-            failed
+        // Two different states: a restore that failed part way, and a
+        // process that was not started again over a restore that worked.
+        let names = |pick: fn(&UndoResourceOutcome) -> bool| {
+            outcome
+                .resources
                 .iter()
-                .map(|name| format!("`{name}`"))
+                .filter(|resource| pick(resource))
+                .map(|resource| format!("`{}`", resource.name))
                 .collect::<Vec<_>>()
                 .join(", ")
-        );
+        };
+        let partial = names(|resource| !resource.ok);
+        if !partial.is_empty() {
+            println!(
+                "  {partial} may be in a partial state — a failed restore command is not rolled \
+                 back"
+            );
+        }
+        let not_restarted = names(|resource| resource.ok && resource.restart_failed);
+        if !not_restarted.is_empty() {
+            println!(
+                "  {not_restarted} restored, but not running (below); the recovery record \
+                 says how to bring it back"
+            );
+        }
     }
     if !outcome.partial {
         let dirty = if restored.source.dirty_rev.is_some() {
@@ -4408,10 +4440,15 @@ fn undo(instance: Option<String>, options: UndoOptions) -> Result<()> {
         // does not bring a resource up. Under "Restored" a bare `ok` reads
         // as the resource being fine, so when it is not, say the status it
         // is left in, the one `newgit status` will show.
-        let restart = if resource.restart_failed {
+        // Not restarted behind a dependency that is not up is what the
+        // `left blocked by` below says; a restart that failed on its own is
+        // a failure.
+        let restart = if !resource.restart_failed {
+            ""
+        } else if resource.blocked_by.is_empty() {
             ", restart FAILED"
         } else {
-            ""
+            ", not restarted"
         };
         // Derived the way `status` derives it: a resource behind a
         // dependency that is not ready reads as blocked, whatever its own
@@ -4447,6 +4484,21 @@ fn undo(instance: Option<String>, options: UndoOptions) -> Result<()> {
             "  pre-undo state saved as {} (marked incomplete-undo; not a redo point)",
             outcome.safety.id
         );
+    }
+    // As the end of `spawn` and `start` do (#276): what the undo restarted
+    // has its `[ready] timeout_seconds` to answer, so a command run straight
+    // after it does not meet a database still starting, and an instance
+    // that is not up exits 1 like an undo that did not finish. Not worth
+    // waiting on an undo that did not finish, as on a spawn that did not
+    // come up; what is wrong is said all the same.
+    let branch = manager.store().find_branch(&instance)?;
+    let readiness = if outcome.is_complete() {
+        manager.readiness_after(&branch, manager.ready_wait(&branch))
+    } else {
+        manager.readiness(&branch)
+    };
+    print_readiness(&instance, &readiness);
+    if !outcome.is_complete() || !readiness.is_ready() {
         std::process::exit(1);
     }
     Ok(())

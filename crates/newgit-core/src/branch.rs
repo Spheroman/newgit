@@ -138,6 +138,13 @@ pub struct ResourceBinding {
     /// `render_error`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub export_error: Option<String>,
+    /// Why this resource's restore failed in the last undo, when it did; as
+    /// `render_error`. A failed restore is retried by another undo, not by
+    /// the action that starts its process, which would serve whatever the
+    /// restore left half done. Cleared when a restore or its `prepare`
+    /// succeeds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restore_error: Option<String>,
     /// [`crate::resource::ResourceDefinition::prepare_rev`] of the `prepare`
     /// this binding last ran, so `status` can say when the definition's has
     /// changed since (#85). A parked resource brought back through `resume`

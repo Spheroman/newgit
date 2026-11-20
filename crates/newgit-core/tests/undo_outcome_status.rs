@@ -125,9 +125,11 @@ fn an_ok_restore_that_ran_nothing_reports_the_status_it_left() {
     }
 }
 
-/// A restore that is ok can still leave its resource failed: one running at
-/// checkpoint time whose start then fails. The outcome's status is read
-/// after that failure marks it, so it says `Failed`, not `Ready`.
+/// A restore that is ok can still leave its process down: one running at
+/// checkpoint time whose start then fails. That is the process's failure,
+/// not the binding's — a binding marked failed for it was one no later
+/// start ever cleared — so the resource keeps its status and the undo is
+/// incomplete.
 #[test]
 fn an_ok_restore_whose_restart_fails_reports_failed() {
     let (_guard, temp) = tempdir();
@@ -164,9 +166,9 @@ signal = "term"
     assert_eq!(app.name, "app");
     assert!(app.ok, "the restore itself ran nothing: {app:?}");
     assert!(app.restart_failed, "{app:?}");
-    assert_eq!(app.status, ResourceStatus::Failed, "{app:?}");
+    assert_eq!(app.status, ResourceStatus::Ready, "{app:?}");
     assert!(!undo.is_complete());
     assert!(undo.recovery_record.is_some());
     let branch = m.store().find_branch("feature-a").expect("instance");
-    assert_eq!(branch.resources["app"].status, ResourceStatus::Failed);
+    assert_eq!(branch.resources["app"].status, ResourceStatus::Ready);
 }

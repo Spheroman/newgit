@@ -252,11 +252,12 @@ signal = "term"
     assert_eq!(db.status, ResourceStatus::Failed, "as it was found: {db:?}");
 }
 
-/// A restart that fails is one like any other: the resource is marked failed
-/// where it happens, and the undo is not complete. Here the database came up
-/// after the checkpoint went ahead without it, so it is `Ready` going in.
+/// A restart that fails is one like any other: the undo is not complete,
+/// and the resource keeps the status it came in with, since its process is
+/// what failed. Here the database came up after the checkpoint went ahead
+/// without it, so it is `Ready` going in.
 #[test]
-fn a_left_alone_resource_whose_restart_fails_is_marked_failed() {
+fn a_left_alone_resource_whose_restart_fails_makes_the_undo_incomplete() {
     let (_guard, temp) = tempdir();
     let store = setup(&temp);
     let restored = temp.join("restored.txt");
@@ -310,10 +311,10 @@ command = "echo state_ref={{{{state_ref}}}} >> {restored}"
         .find(|resource| resource.name == "db")
         .expect("reported");
     assert!(db.ok && db.restart_failed, "{db:?}");
-    assert_eq!(db.status, ResourceStatus::Failed, "{db:?}");
+    assert_eq!(db.status, ResourceStatus::Ready, "{db:?}");
     assert!(!undo.is_complete());
     assert!(undo.recovery_record.is_some());
-    assert_eq!(status_of(&m, "feature-a", "db"), ResourceStatus::Failed);
+    assert_eq!(status_of(&m, "feature-a", "db"), ResourceStatus::Ready);
 }
 
 /// `checkpoint --verify` restores with a real undo, so it leaves the resource

@@ -1305,9 +1305,10 @@ and answer 500 until they have compiled, and a resource newgit does not
 supervise (a Supabase stack a `prepare` left running) has no process to
 watch at all. A definition's `[ready]` says what up means instead (#276):
 a GET that answers 200–399, or a command that exits 0, and
-`timeout_seconds` for how long that takes. The end of `spawn` and of
-`newgit start` waits for the longest of those among what is bound, and a
-dependent's start waits its dependency's (*Spawn*). With no `[ready]`, up
+`timeout_seconds` for how long that takes. The end of `spawn`, of
+`newgit start` and of `undo` (and so of `spawn --from-checkpoint`) waits
+for the longest of those among what is bound, and a dependent's start
+waits its dependency's (*Spawn*). With no `[ready]`, up
 is the ports answering and the wait is five seconds; a resource with no
 process and no check is up when its `prepare` exited 0. Its declared ports
 are not checked: they are reservations, and the `supabase` template claims
@@ -1320,7 +1321,7 @@ down. So:
 
 - A resource whose definition has a `[ready]` said what up is and how long
   it takes. Past `timeout_seconds` it is not up: a problem, `not ready` in
-  `status`, and `spawn` and `start` exit 1.
+  `status`, and `spawn`, `start` and `undo` exit 1.
 - A resource with no process newgit supervises has nothing alive to tell
   still-starting from gone-down; it has a `[ready]` check, or it is not
   checked at all, so the same holds.
@@ -1383,9 +1384,13 @@ it took down in `.newgit/state/<slug>/stopped.toml`. `newgit start`
 brings back exactly that, dependencies first, running `resume` before a
 resource's dependents come back, and with it any `autostart` action that
 died on its own since (#261), or that never started though its resource
-is ready: one a spawn held back behind a dependency that was not up (#54).
-`status` shows such a resource as `not started` and the instance as not
-ready. A long-running action without `autostart` that nobody started stays
+is ready: one a spawn held back behind a dependency that was not up (#54),
+or one an undo stopped and could not start again. `status` shows such a
+resource as `not started` and the instance as not ready. A failed restart
+is the process's failure, not the binding's: the binding's `failed` says a
+`prepare`, restore, export or render did not succeed, and is cleared by
+that succeeding, while a process that is not running is cleared by any
+start of it that succeeds. A long-running action without `autostart` that nobody started stays
 stopped. A resource whose dependency did not come back in the same `start`
 is not started, and stays owed, so a dev server is not brought up against a
 database that is still down.
@@ -1842,7 +1847,11 @@ checkpoint taken off the branch with `` [on `try-x`] ``.
 A resource's restore is one of `none`, `command`, `recompute` (re-run an
 action, `prepare` by default, when the identity changed), or `external`.
 `recompute` is correctness for path-dependent artifacts, not an
-optimization, and it fills from the install store when it can.
+optimization, and it fills from the install store when it can. A tree
+recomputed from its inputs holds nothing a dependent generated into it
+(`prisma generate` into `node_modules`), so once an undo recomputes a
+resource, every `recompute` dependent after it recomputes too, whatever its
+own identity says.
 
 A resource the checkpoint holds no state for (one it went ahead without)
 keeps its state when its restore is a `command`. Running the restore with
@@ -1864,6 +1873,25 @@ and a retry command next to the checkpoint, and exits 1. A restore that ran
 nothing does not make a resource `ready`: a resource that was failed before
 the undo is still failed after it, and the report says what each resource
 is left as (#211).
+
+What an undo leaves when a restore fails is deliberate: that resource
+down, and everything that depends on it down too. A server started over
+state its restore left half done serves it as if it were fine, and a
+dependent started against it reads as up while it serves the wrong data.
+The binding records why (`restore_error`), so `status` says `failed to
+restore` and names the retry, another undo, rather than the action that
+starts the process. The next undo that succeeds brings them all back.
+
+A restore runs with its own process stopped (every process is stopped
+before content moves) and its dependencies restored and, when they were
+running, started again; a restore that runs something waits for those to
+be up, as a dependent's process does. A restore that needs its own server
+starts one around the load: the `postgres` template loads the dump into a
+fresh cluster under a temporary server on the instance's port and swaps it
+in only once the load succeeded. newgit offers no "restore with the process
+up": loading into the live server is what forces a restore to reset the
+database first, and a reset followed by a failed load is the half-done
+state above.
 
 The safety checkpoint taken before an undo is annotated with whether that
 undo completed. A pre-undo snapshot before a failed undo is not a real

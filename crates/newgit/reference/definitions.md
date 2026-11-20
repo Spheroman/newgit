@@ -1199,7 +1199,7 @@ command = "docker compose -p {{branch.slug}} start"
 ### `[ready]`
 
 What "up" means for this resource (#276), how long it takes, which is
-what `spawn` and `newgit start` wait for after starting it, what a
+what `spawn`, `newgit start` and `undo` wait for after starting it, what a
 dependent's start waits for, and what `newgit status` shows as `starting`
 until it holds.
 
@@ -1207,7 +1207,7 @@ until it holds.
 | --- | --- | --- | --- | --- |
 | `http` | string | no | — | up when a GET of this URL answers 200–399. Redirects are not followed. `http://` or `https://`; an `https://` certificate must be trusted by this machine's trust store (a local one, by `mkcert -install`). Rendered like an action `command`, so `{{ports.<name>}}` works. |
 | `command` | string | no | — | up when this command exits 0. Rendered and run like an action, in the resource's `workdir`, with the command environment; each run has five seconds to finish. |
-| `timeout_seconds` | integer | no | `5` | how long it takes to come up, 1 to 3600, counted from when its process started (or, with none, from its last `prepare`, `resume` or `restore`): waited for at the end of `spawn` and `start` and before starting what depends on it, and after it, not up. |
+| `timeout_seconds` | integer | no | `5` | how long it takes to come up, 1 to 3600, counted from when its process started (or, with none, from its last `prepare`, `resume` or `restore`): waited for at the end of `spawn`, `start` and `undo` and before starting what depends on it, and after it, not up. |
 
 At most one of `http` and `command`. With neither, a resource is up when
 its running process answers on every port it claims, which is what newgit
@@ -1229,7 +1229,7 @@ it: a port is a reservation, not a promise that something listens (the
 `supabase` template claims the disabled pooler's and the mail server's,
 which a default stack never opens). A `command` or `http` is how it says
 what up is, and then it is checked like a process: by `status`, by the
-end of `spawn` and `start`, and before its dependents start. One that
+end of `spawn`, `start` and `undo`, and before its dependents start. One that
 `newgit stop` suspended is not checked until `start` resumes it.
 
 ```toml
@@ -1244,7 +1244,7 @@ timeout_seconds = 120
 definition has a `[ready]` (it said what up means and how long that
 takes), or one with no process newgit supervises, is `starting` only
 within `timeout_seconds`; after that it is not up, which is a problem:
-`spawn` and `start` exit 1 and `status` says `not ready`. With no process
+`spawn`, `start` and `undo` exit 1 and `status` says `not ready`. With no process
 to watch, still starting and gone down look the same, so past its own
 estimate it is called down. A supervised process with no `[ready]` has no
 deadline: it is `starting` for as long as it runs without answering.
@@ -1264,9 +1264,12 @@ machine does not trust says so.
 (`supabase status`) or the Docker daemon (`docker compose exec`) pays for
 that on every `status`.
 
-`spawn` and `newgit start` wait for this; `undo` does not. It restarts
-what was running and returns, so a command run straight after it can find
-a server still starting (`newgit status` says `starting` until it is up).
+`spawn`, `newgit start` and `undo` wait for this, and end the same way:
+`ready:`, `starting:` with what is still coming up, or `not ready:` with
+each problem, and exit 1 when the instance is not ready. `undo` waits after
+everything it restarted, so SQL run straight after it finds the database
+up; `spawn --from-checkpoint` finishes with an undo and does the same, with
+`starting` and `problems` in its `--json`.
 
 ### `[checkpoint]`
 
@@ -1372,14 +1375,81 @@ Identity describes the *inputs*, not the tree. Delete half of `node_modules`
 without touching the lockfile and the hash still matches while the tree is
 wrong — `newgit undo --force-recompute` rebuilds anyway.
 
+**A resource that generates into another's tree** — `prisma generate` writing
+`node_modules/.prisma` inside the `node_modules` that `deps` installs —
+declares `depends_on` on it and names what it writes in its own `[identity]
+produces`:
+
+```toml
+# .newgit/resources/prisma-client.toml
+depends_on = ["deps"]
+
+[identity]
+paths    = ["prisma/schema.prisma"]
+produces = ["node_modules/.prisma"]
+
+[actions.prepare]
+command = "npx prisma generate"
+
+[checkpoint]
+mode = "hash"
+
+[restore]
+mode = "recompute"
+```
+
+A tree rebuilt or refilled from its inputs holds nothing a dependent wrote
+into it, so an undo that recomputes a resource recomputes every `recompute`
+dependent after it, whatever their identity says, and says why:
+
+```
+resource: deps recompute(prepare) filled from install store 5d769aee3bb2 (copy-on-write) ok
+resource: prisma-client recompute(prepare) after `deps` was recomputed ok
+```
+
+That is the `depends_on`. The `produces` is what lets the undo see the
+generated output missing when only it went (someone deleted
+`node_modules/.prisma`), and puts it in the install store, so a spawn whose
+schema matches one already built is filled instead of generating again.
+
 `newgit undo --only <resource>` restores one resource and leaves source,
 tracker content, and every other resource untouched. That is not a snapshot
 the instance was ever in, so it is reported as a partial restore and never as
 "restored to <checkpoint>". It exists for iterating on a restore command,
 where rewinding the whole workspace each cycle is the cost.
 
+**What is running when `[restore]` runs.** An undo stops every process
+newgit supervises for the instance before it moves any content (`--only`
+stops only the resources it names), then restores resources dependencies
+first:
+
+- **Its own process is stopped.** Its ports stay claimed, so nothing else
+  takes them. A restore that needs its own server — `psql` loading a dump
+  into the Postgres this resource runs — starts one itself, around the
+  load, on the instance's port, and stops it before it exits; the undo
+  then starts the real one if it was running at checkpoint time. The
+  `postgres` template does that, and does it safely: it builds a fresh
+  cluster beside the live one, loads the dump into it under a temporary
+  `pg_ctl start`, and swaps it in only once the load succeeded, so a
+  failed restore leaves the database as it was.
+- **What it depends on is back.** Each dependency has been restored, and
+  started again if it was running at checkpoint time. A `command` or
+  `recompute` restore waits for a dependency this undo started again to be
+  up (its `[ready]`, or its ports answering), as a dependent's process does;
+  one that was not running before the undo is not running for the restore
+  either.
+- **What depends on it is still stopped**, and is restored after it.
+
 A restore command is not transactional. If one fails, `newgit undo` says the
-undo was incomplete and names the resource, rather than reporting success.
+undo was incomplete and names the resource, rather than reporting success,
+and exits 1. That resource is left down: its process is not started again
+over whatever the restore left half done, and `status` says `failed to
+restore`, with the retry — repair it, then `newgit undo` again, not the
+action that starts its process. Everything that depends on it is restored
+but left down too (`not restarted`, `blocked(<it>)` in `status`), rather
+than started against the wrong data and read as up. The recovery record
+beside the checkpoint lists each, and the next undo that succeeds brings
+them all back.
 
 A restore command runs against whatever state its own reset left behind,
 including rows a migration step already inserted — it is not a fresh
