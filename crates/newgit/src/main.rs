@@ -10,9 +10,9 @@ use newgit_core::export_target::declared_in;
 use newgit_core::exports::unresolved_placeholder;
 use newgit_core::installs::InstallReport;
 use newgit_core::manager::{
-    ActionOutcome, ActionPlan, BaseReport, BindOrigin, BranchManager, DEFAULT_READY_WAIT, DiffPair,
-    ExportReason, InstanceReport, KeptBranch, MismatchCause, Readiness, RemoteExportOptions,
-    RemoveOutcome, ResourceBindOutcome, SourceBranchOutcome, SourceBranchPolicy, StopStartOutcome,
+    ActionOutcome, ActionPlan, BaseReport, BindOrigin, BranchManager, DiffPair, ExportReason,
+    InstanceReport, KeptBranch, MismatchCause, Readiness, RemoteExportOptions, RemoveOutcome,
+    ResourceBindOutcome, SourceBranchOutcome, SourceBranchPolicy, StopStartOutcome,
     StopStartResource, StopStartStatus, TrackerBindOutcome, UndoOptions, VerifyResource,
     WorkspaceChange,
 };
@@ -138,6 +138,12 @@ enum Command {
         /// and run nothing. Refuses for the same reasons a real run would.
         #[arg(long)]
         dry_run: bool,
+        /// Send a one-shot command's output to its log only, and print
+        /// whether it worked: on failure, the command that ran and the
+        /// log's last lines. For a command whose output is long, or an agent
+        /// that should not read all of it.
+        #[arg(long, short)]
+        quiet: bool,
     },
     /// Stop every running long-running action of an instance, dependents
     /// first, and remember what was running for `newgit start`
@@ -168,7 +174,8 @@ enum Command {
         json: bool,
     },
     /// Start again what the last `newgit stop` stopped, and any `autostart`
-    /// action that died on its own, bringing back an evicted workspace first
+    /// action that died on its own or never started, bringing back an
+    /// evicted workspace first
     ///
     /// A resource nobody had started stays stopped. Exits 0 when there is
     /// nothing to start, and 1 when anything failed to; a failed one is
@@ -700,6 +707,20 @@ enum ResourceCommand {
     },
     /// List defined resources
     List,
+    /// Check that every program a definition's commands start is on this
+    /// machine, with no instance and nothing run
+    ///
+    /// Reads the first word of each command in every action, `[identity]
+    /// key_command`, `[checkpoint]`, `[restore]`, `[cleanup]`, and `[ready]`
+    /// command, and looks for it on `PATH` (a path with a `/` relative to
+    /// the project root and the command's `workdir`). A word a template or a
+    /// variable decides is skipped. Exits 1 when any is missing.
+    Check {
+        /// One JSON document: `{"programs": [{"resource", "hook", "program",
+        /// "found"}]}`, `found` null when missing
+        #[arg(long)]
+        json: bool,
+    },
     /// Bind a resource again in an instance, as spawn bound it: ports,
     /// exports, render, `prepare`, then its `autostart` action
     ///
@@ -811,11 +832,13 @@ fn main() -> Result<()> {
             spec,
             instance,
             dry_run: false,
-        } => action(&spec, instance),
+            quiet,
+        } => action(&spec, instance, quiet),
         Command::Action {
             spec,
             instance,
             dry_run: true,
+            ..
         } => action_dry_run(&spec, instance),
         Command::Stop {
             instance,
@@ -1301,13 +1324,17 @@ fn prepare_label(resource: &ResourceBindOutcome) -> String {
         (None, None) => match &resource.prepare {
             Some((true, _)) => " prepare: ok".to_owned(),
             Some((false, log)) => {
-                // The hook ran quietly; its last lines are usually the why.
+                // The hook ran quietly; its last lines are usually the why,
+                // and the command it ran often is (#89).
+                let ran = newgit_core::supervisor::log_command(log)
+                    .map(|command| format!("\n               ran: {command}"))
+                    .unwrap_or_default();
                 let tail = newgit_core::supervisor::log_tail(log, 8)
                     .into_iter()
                     .map(|line| format!("\n               | {line}"))
                     .collect::<String>();
                 format!(
-                    " prepare: FAILED (log: {log}; re-run with `newgit action {}.prepare`){tail}",
+                    " prepare: FAILED (log: {log}; re-run with `newgit action {}.prepare`){ran}{tail}",
                     resource.name
                 )
             }
@@ -1553,10 +1580,11 @@ fn spawn(args: SpawnArgs) -> Result<()> {
         },
     )?;
     // After the autostart, which is the only thing that leaves a process up
-    // with its port not yet answering: give it a few seconds, then say what
-    // is still starting. Not worth waiting on a spawn that did not come up.
+    // with its port not yet answering: give it the longest `[ready]
+    // timeout_seconds` of what is bound (five seconds unless one says), then
+    // say what is still starting. Not worth waiting on a spawn that did not come up.
     let readiness = if outcome.is_complete() {
-        manager.readiness_after(&outcome.branch, DEFAULT_READY_WAIT)
+        manager.readiness_after(&outcome.branch, manager.ready_wait(&outcome.branch))
     } else {
         Readiness::default()
     };
@@ -1588,6 +1616,7 @@ fn spawn(args: SpawnArgs) -> Result<()> {
                     "tracker": tracker, "commits": count, "follow": follow,
                 })).collect::<Vec<_>>(),
                 "template_warning": outcome.template_warning,
+                "left_behind": outcome.left_behind,
                 "resources": resources,
                 "started": stop_start_resources_json(&outcome.started),
                 "starting": starting_json(&readiness),
@@ -1638,6 +1667,7 @@ fn spawn(args: SpawnArgs) -> Result<()> {
         println!("             cloned with `git clone`: the source template failed ({warning})");
     }
     println!("  record:    {}", outcome.record_path);
+    print_left_behind(&outcome.left_behind);
     if let Some(warning) = &outcome.projection_warning {
         println!("  trackers:  the project root's commits were not split ({warning})");
     }
@@ -1853,6 +1883,63 @@ fn resource(command: ResourceCommand) -> Result<()> {
             }
             Ok(())
         }
+        ResourceCommand::Check { json } => {
+            let manager = manager_here()?;
+            let path = std::env::var("PATH").unwrap_or_default();
+            let checks = newgit_core::preflight::check(
+                manager.resource_definitions(),
+                &manager.store().paths().project_root,
+                &path,
+            );
+            let missing = checks.iter().filter(|check| check.is_missing()).count();
+            if json {
+                let programs = checks
+                    .iter()
+                    .map(|check| {
+                        serde_json::json!({
+                            "resource": check.resource,
+                            "hook": check.hook,
+                            "program": check.program,
+                            "found": check.found,
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                println!("{}", serde_json::json!({ "programs": programs }));
+            } else if checks.is_empty() {
+                println!("No resource definition starts a program newgit can check.");
+            } else {
+                for check in &checks {
+                    match &check.found {
+                        Some(found) => println!(
+                            "ok    {}: {} `{}` ({found})",
+                            check.resource, check.hook, check.program
+                        ),
+                        None => println!(
+                            "FAIL  {}: {} `{}` — not found{}",
+                            check.resource,
+                            check.hook,
+                            check.program,
+                            if check.program.contains('/') {
+                                " in the project root".to_owned()
+                            } else {
+                                " on PATH".to_owned()
+                            }
+                        ),
+                    }
+                }
+                if missing > 0 {
+                    println!(
+                        "{missing} program{} missing: install {}, or change the definition",
+                        if missing == 1 { "" } else { "s" },
+                        if missing == 1 { "it" } else { "them" }
+                    );
+                }
+            }
+            if missing > 0 {
+                std::process::exit(1);
+            }
+            Ok(())
+        }
         ResourceCommand::List => {
             let manager = manager_here()?;
             warn_graph(&manager);
@@ -1980,9 +2067,14 @@ fn run(args: RunArgs) -> Result<()> {
     Ok(())
 }
 
-fn action(spec: &str, instance: Option<String>) -> Result<()> {
+fn action(spec: &str, instance: Option<String>, quiet: bool) -> Result<()> {
     let (manager, instance) = manager_and_instance(instance)?;
-    match manager.run_action(&instance, spec)? {
+    let outcome = if quiet {
+        manager.run_action_quiet(&instance, spec)?
+    } else {
+        manager.run_action(&instance, spec)?
+    };
+    match outcome {
         ActionOutcome::Started { pid, log } => {
             println!("Started `{spec}` for `{instance}` (pid {pid})");
             println!("  log: {log}");
@@ -2012,12 +2104,28 @@ fn action(spec: &str, instance: Option<String>) -> Result<()> {
             if let Some(install) = &install {
                 println!("  {}", install.summary());
             }
+            if quiet && code != 0 {
+                print_failed_hook(&log, QUIET_TAIL_LINES);
+            }
             eprintln!("[newgit] `{spec}` exit {code}; log: {log}");
             if code != 0 {
                 std::process::exit(code);
             }
             Ok(())
         }
+    }
+}
+
+/// How much of a failed command's log `action --quiet` shows.
+const QUIET_TAIL_LINES: usize = 20;
+
+/// What a quiet command that failed ran, and how its log ends, on stderr.
+fn print_failed_hook(log: &Utf8Path, lines: usize) {
+    if let Some(command) = newgit_core::supervisor::log_command(log) {
+        eprintln!("[newgit] ran: {command}");
+    }
+    for line in newgit_core::supervisor::log_tail(log, lines) {
+        eprintln!("  | {line}");
     }
 }
 
@@ -2141,9 +2249,64 @@ fn starting_json(readiness: &Readiness) -> serde_json::Value {
         .starting
         .iter()
         .map(|starting| {
-            serde_json::json!({ "resource": starting.resource, "ports": starting.ports })
+            serde_json::json!({
+                "resource": starting.resource,
+                "ports": starting.ports,
+                "check": starting.check,
+            })
         })
         .collect()
+}
+
+/// The `left behind:` lines of a spawn (#83): each local-secret-looking
+/// file the project root has and the workspace does not, with the commands
+/// that carry it from now on.
+/// `word` as one word of a shell command: as it is when nothing in it
+/// needs quoting, otherwise in single quotes.
+fn shell_word(word: &str) -> String {
+    let plain = !word.is_empty()
+        && word
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "_-./+@%:,=".contains(c));
+    if plain {
+        word.to_owned()
+    } else {
+        format!("'{}'", word.replace('\'', "'\\''"))
+    }
+}
+
+fn print_left_behind(left_behind: &[Utf8PathBuf]) {
+    // Names, not a guess at which tracker: one `local-env` for the lot is
+    // the obvious shape, and a project that wants several can split it.
+    let Some(first) = left_behind.first() else {
+        return;
+    };
+    for path in left_behind {
+        println!(
+            "  left behind: {path} — gitignored in the project root, and no tracker carries it, \
+             so this workspace does not have it"
+        );
+    }
+    // Pasted into a shell, so a name with a space or a quote in it is
+    // quoted.
+    let paths = left_behind
+        .iter()
+        .map(|path| shell_word(path.as_str()))
+        .collect::<Vec<_>>()
+        .join(" ");
+    println!(
+        "             to carry {} to every instance, kept out of Git and per user:",
+        if left_behind.len() == 1 {
+            format!("`{first}`")
+        } else {
+            "them".to_owned()
+        }
+    );
+    println!("               newgit tracker create local-env --audience user");
+    println!("               newgit tracker track local-env {paths}");
+    println!("               newgit tracker capture local-env --from-store");
+    println!("             and for an instance that exists, this one included:");
+    println!("               newgit tracker pull local-env <instance>");
 }
 
 /// A resource's `resource:` line in a spawn or rebind report, with its

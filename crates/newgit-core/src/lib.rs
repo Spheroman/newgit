@@ -20,6 +20,7 @@ pub mod manager;
 pub mod materializer;
 pub mod objects;
 pub mod ports;
+pub mod preflight;
 pub mod remote;
 pub mod render;
 pub mod resource;

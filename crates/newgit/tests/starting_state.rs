@@ -128,7 +128,7 @@ web = {{ start = 54700 }}
 WEB_PORT = "{{{{ports.web}}}}"
 
 [actions.serve]
-command = "sleep {delay}; exec python3 -m http.server $WEB_PORT --bind 127.0.0.1"
+command = "sleep {delay}; exec python3 -c 'import http.server as h, socketserver as s, sys; s.ThreadingTCPServer.allow_reuse_address = True; s.ThreadingTCPServer((sys.argv[2], int(sys.argv[1])), h.SimpleHTTPRequestHandler).serve_forever()' $WEB_PORT 127.0.0.1"
 long_running = true
 autostart = true
 "#
@@ -145,6 +145,11 @@ web = { start = 54750 }
 command = "sleep 1000"
 long_running = true
 autostart = true
+
+# Not the default five: the spawn's wait is what makes these tests slow,
+# and a second is enough to see it end (#276).
+[ready]
+timeout_seconds = 1
 "#;
 
 #[test]

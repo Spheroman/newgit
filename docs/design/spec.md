@@ -1123,12 +1123,26 @@ fill from the install store. Then it starts each long-running action marked
 `autostart`, dependencies first, so a dev server is up when the agent
 arrives. With a remote, it registers the instance there.
 
+What the project root has and the workspace does not is said, not copied:
+a gitignored file there named like a local secret (`.env.local`,
+`master.key`) that no tracker brought is named as left behind, with the
+three commands that make a tracker carry it (#83). Copying it would make
+the root's ignored files an undeclared, unversioned tracker; naming it
+turns a service failing hours later into a line at spawn.
+
 Autostart comes after every `prepare`, not interleaved with them, because
 `prepare` is a command that finishes and a dependent's `prepare` may need
 its dependency's files but never its process. A start that fails is
 reported per resource, and a dependent of a resource that did not start is
-not started against it. Starting is not waiting: the dependent starts once
-its dependency's process exists, not once that process answers (#54).
+not started against it. Starting is waiting (#54): a dependent starts once
+each dependency is up — its `[ready]` check passes, or with none every
+port its process claims answers — given that dependency's `[ready]
+timeout_seconds` (five by default), and not at all against a dependency
+whose `autostart` action is not running. A process that has been exec'd is not one that serves, and
+starting against it only moves the race into the dependent. One withheld
+this way stays owed: the next `newgit start` starts it, as it does an
+`autostart` action that died. `newgit action` of a long-running action by
+hand waits and refuses the same way.
 
 `spawn --from-checkpoint <instance>/<checkpoint>` brings up a checkpoint
 as a new instance: its source and uncommitted work, its trackers, and
@@ -1205,9 +1219,19 @@ starting: `feature-a`
 `status` shows the same state: the STATUS column says `starting` (a real
 problem still says `not ready`, and wins), with the lines under it. It is
 checked at read time, so it clears on its own once the port answers.
-`spawn --json` lists them under `starting` (`resource` and the `ports` that
-have not answered) and exits 0 as for a ready instance. The wait is fixed;
-a server that takes longer simply shows as starting.
+`spawn --json` lists them under `starting` (`resource`, the `ports` that
+have not answered, and `check`) and exits 0 as for a ready instance.
+
+A port that answers is not always a server that serves: some bind at once
+and answer 500 until they have compiled, and a resource newgit does not
+supervise (a Supabase stack a `prepare` left running) has no process to
+watch at all. A definition's `[ready]` says what up means instead (#276):
+a GET that answers 200–399, or a command that exits 0, and
+`timeout_seconds` for how long to wait. The end of `spawn` waits for the
+longest of those among what is bound, and a dependent's start waits its
+dependency's (*Spawn*). With no `[ready]`, up is the ports answering and
+the wait is five seconds; a resource with no process and no check is up
+when its `prepare` exited 0.
 
 #### Died is not stopped
 
@@ -1248,7 +1272,10 @@ each `suspend` once that resource's dependents are down, and records what
 it took down in `.newgit/state/<slug>/stopped.toml`. `newgit start`
 brings back exactly that, dependencies first, running `resume` before a
 resource's dependents come back, and with it any `autostart` action that
-died on its own since (#261). A resource nobody had started stays
+died on its own since (#261), or that never started though its resource
+is ready: one a spawn held back behind a dependency that was not up (#54).
+`status` shows such a resource as `not started` and the instance as not
+ready. A long-running action without `autostart` that nobody started stays
 stopped. A resource whose dependency did not come back in the same `start`
 is not started, and stays owed, so a dev server is not brought up against a
 database that is still down.
@@ -1866,22 +1893,28 @@ Git repository per tracker. It gives you:
 
 Open issues that change what this document can promise:
 
-- **#54: starting is not waiting.** `depends_on` orders `prepare`,
-  autostart, and `newgit start`, but a dependent starts once its
-  dependency's process exists, not once it answers. `newgit action
-  app.start` by hand does not start the database it needs.
+- **#54: `newgit action app.start` by hand does not start what it needs.**
+  It refuses while a dependency is down, naming it, rather than starting
+  it as `docker compose up app` would.
 - **#64: rendered files are hidden, not filtered.** `--skip-worktree` makes
   hand edits to a rendered file die with the workspace. A clean/smudge
   filter would make them ordinary, committable edits.
-- **#83: gitignored secrets do not reach a workspace** unless a tracker owns
-  them, and nothing at spawn says so.
+- **#83: gitignored secrets reach a workspace only through a tracker.**
+  `spawn` names the ones it left behind, by file name, and the commands
+  that carry them; nothing carries them by itself.
 - **#85: no reconcile.** A live instance does not pick up a changed
-  resource definition (a new port, say), and nothing says it is stale.
-- **#87: no preflight.** A definition that calls a missing binary (`pg_dump`
-  on a host without Postgres) fails at the first checkpoint or, worse, the
-  first restore.
+  resource definition. A port declared since it was bound is named by
+  `status` as unclaimed, with `newgit resource rebind` as the fix; any
+  other change (a command, an export) goes unsaid.
+- **#87: preflight is asked for, not automatic.** `newgit resource check`
+  finds a definition calling a missing binary (`pg_dump` on a host without
+  Postgres); nothing runs it at spawn, so one never checked still fails at
+  the first checkpoint or, worse, the first restore.
 - **#89: a failed `prepare` can destroy its own evidence**, when the tool
-  tears down its containers before exiting.
+  tears down its containers before exiting. newgit shows the command that
+  ran and how its log ends, and the reference says how to rerun it by hand
+  with the tool's own keep-it-up flag; it cannot keep the containers
+  itself.
 - **#59: port allocation order within a resource is unspecified**, which
   matters when a tool's default ports are consecutive.
 - **Install store follow-ups:** sub-path exclusions in `produces` for native

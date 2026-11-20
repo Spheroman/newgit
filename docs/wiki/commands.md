@@ -14,12 +14,15 @@ inside a workspace):
 - `newgit run [instance] -- <command>` — run with exports and ports loaded
 - `newgit env [instance]` — the environment `run` and every hook get, each
   variable labeled with the declaration it came from
-- `newgit action <resource>.<action> [instance] [--dry-run]` — `--dry-run`
-  prints the rendered command and its directory, and runs nothing
+- `newgit action <resource>.<action> [instance] [--dry-run] [--quiet]` —
+  `--dry-run` prints the rendered command and its directory, and runs
+  nothing; `--quiet` keeps a one-shot command's output in its log and
+  prints the exit, plus, on failure, the command and the log's end
 - `newgit stop [instance] [--json]` / `start [instance] [--json]` — stop
   every running long-running action and run each `suspend`, dependents
   first, and later bring back exactly what that took down (and any
-  `autostart` action that died on its own); ports,
+  `autostart` action that died on its own or never started), each once
+  what it depends on answers; ports,
   workspace, trackers, and installs stay as they are. Both exit 0 with
   nothing to do and 1 if any resource failed
 - `newgit stop --evict [--discard-ignored]` — stop, checkpoint, and delete
@@ -138,6 +141,8 @@ of the project, `repos` inside `apps/t3code`, `..` to go up:
   history: an instance's branch as of its last checkpoint, or the project
   root's
 - `newgit resource add <name> --template <template>` / `list` / `templates`
+- `newgit resource check [--json]` — every program the definitions'
+  commands start, found on `PATH` or not; exits 1 when one is missing
 - `newgit resource remove <name> [--force]` — `--force` drops it from live
   instances and releases their ports instead of refusing
 - `newgit resource rebind <name> [instance]` — bind it again as spawn did,

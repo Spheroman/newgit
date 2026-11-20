@@ -75,6 +75,7 @@ fn resource_declaring(name: &str, port_name: &str, start: u16) -> ResourceDefini
         checkpoint: None,
         restore: None,
         cleanup: None,
+        ready: None,
         definition_rev: "sha256:bbbbbbbbbbbb".to_owned(),
     }
 }
