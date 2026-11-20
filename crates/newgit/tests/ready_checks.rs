@@ -119,7 +119,7 @@ web = {{ start = {start}, env = "WEB_PORT" }}
 
 [actions.serve]
 command = """python3 -c '
-import http.server, os, time
+import http.server, os, socketserver, time
 began = time.time()
 class H(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
@@ -127,7 +127,8 @@ class H(http.server.BaseHTTPRequestHandler):
         self.end_headers()
     def log_message(self, *args):
         pass
-http.server.HTTPServer(("127.0.0.1", int(os.environ["WEB_PORT"])), H).serve_forever()
+socketserver.TCPServer.allow_reuse_address = True
+socketserver.ThreadingTCPServer(("127.0.0.1", int(os.environ["WEB_PORT"])), H).serve_forever()
 '"""
 long_running = true
 autostart = true

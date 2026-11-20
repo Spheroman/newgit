@@ -233,7 +233,7 @@ api = {{ start = {start} }}
 API_PORT = "{{{{ports.api}}}}"
 
 [actions.serve]
-command = "sleep {delay}; exec python3 -m http.server $API_PORT --bind 127.0.0.1"
+command = "sleep {delay}; exec python3 -c 'import http.server as h, socketserver as s, sys; s.ThreadingTCPServer.allow_reuse_address = True; s.ThreadingTCPServer((sys.argv[2], int(sys.argv[1])), h.SimpleHTTPRequestHandler).serve_forever()' $API_PORT 127.0.0.1"
 long_running = true
 autostart = true
 
