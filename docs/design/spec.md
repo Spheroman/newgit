@@ -127,10 +127,10 @@ The test of the design:
 > Can a user model a tracker or resource the newgit authors did not
 > anticipate?
 
-The starter templates (`process`, `pnpm`, `install`, `command-snapshot`,
-`command-snapshot-migrations`, `supabase`, `external`) are definitions like
-any other, written to `.newgit/resources/` and owned by the project from
-then on. Each states the host tools it assumes, since "ready to adapt" and
+The starter templates (`process`, `pnpm`, `install`, `postgres`,
+`command-snapshot`, `command-snapshot-migrations`, `compose`, `supabase`,
+`external`) are definitions like any other, written to
+`.newgit/resources/` and owned by the project from then on. Each states the host tools it assumes, since "ready to adapt" and
 "ready to adapt if your database runs on the host" are different claims. A
 template may bring the companions it needs, such as the `pnpm-store`
 resource it depends on or the `db-snapshots` tracker its checkpoint
@@ -146,6 +146,20 @@ that `[[render]] path` changes with it). A render `find` that matches 0 times
 often means the file lacks that setting, so the tool uses its own default and
 every instance shares it; the error says so, and the fix is to add the line,
 not to delete the rule.
+
+Four templates give a branch its own database, and they differ in what the
+instance owns. `postgres` gives each instance a whole cluster: a supervised
+`postgres` process on a claimed port over a data directory in the workspace
+(`ownership = "workspace"`), so nothing is shared and teardown is the
+workspace going away. `compose` gives each instance its own Compose project
+(`COMPOSE_PROJECT_NAME`), with suspend and resume as `stop` and `start` and
+cleanup as `down --volumes`. `command-snapshot` and
+`command-snapshot-migrations` make a database per instance inside one
+server everybody shares, which is lighter but shares that server's roles,
+settings and uptime. There is no generic checkpoint for Compose: a stack's
+state is in volumes that cannot be copied consistently while it runs, so
+`compose` checkpoints through the database service's own dump tool and
+says so. Each is added as `database`, so its export is `DATABASE_URL`.
 
 ### Committed definitions, local state
 

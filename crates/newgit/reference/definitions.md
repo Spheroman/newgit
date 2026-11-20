@@ -68,7 +68,9 @@ newgit resource templates           # what each template is for
 | a lockfile (`pnpm-lock.yaml`, `package-lock.json`, `uv.lock`, `Cargo.lock`, …) | an install resource: `--template pnpm` for pnpm, `--template install` for anything else |
 | a `dev` / `start` script, a server entry point | `--template process`: its own port, started for each instance |
 | `supabase/` | `--template supabase`: its own stack and ports per instance, with snapshots on checkpoint |
-| Postgres/MySQL in Docker or Compose, migrations | `--template command-snapshot` or `command-snapshot-migrations` |
+| Postgres installed on the host (`brew services`, apt), no Docker | `newgit resource add database --template postgres`: a cluster of its own per instance, `DATABASE_URL` |
+| a `compose.yaml` / `docker-compose.yml` with a database service | `newgit resource add database --template compose`: a Compose project per instance, `DATABASE_URL` |
+| one shared host Postgres every instance must use, or a schema from migrations | `--template command-snapshot` or `command-snapshot-migrations`: a database per instance inside it |
 | two env files for one thing (`.env.staging`, `.env.local-db`) | two trackers sharing a `role`, so each spawn picks one (`--use`) |
 | an app or package in a monorepo that only some branches touch | a tracker in Git (`--git --path apps/x`), dropped from a spawn with `--drop` |
 | local agent notes or settings (`CLAUDE.local.md`, scratch plans) | a `user` tracker, so the notes go with each branch and come back on undo |
@@ -1118,9 +1120,10 @@ end of `spawn` and `start`, and before its dependents start. One that
 `newgit stop` suspended is not checked until `start` resumes it.
 
 ```toml
-# functions.toml depends_on = ["supabase"], and starts once this passes.
+# supabase.toml, as the template ships it. functions.toml depends_on =
+# ["supabase"], and starts once this passes.
 [ready]
-command = "supabase status"
+http = "http://127.0.0.1:{{ports.api}}/auth/v1/health"   # Kong, then Auth; no API key
 timeout_seconds = 120
 ```
 
@@ -1143,7 +1146,14 @@ its log says why. A not-up `https://` check against a certificate this
 machine does not trust says so.
 
 `status` runs each check again, every resource's at once; `newgit status
-<instance>` runs only that instance's. Keep it cheap all the same.
+<instance>` runs only that instance's. Keep it cheap all the same: an
+`http` check is one local request, while a `command` that asks a CLI
+(`supabase status`) or the Docker daemon (`docker compose exec`) pays for
+that on every `status`.
+
+`spawn` and `newgit start` wait for this; `undo` does not. It restarts
+what was running and returns, so a command run straight after it can find
+a server still starting (`newgit status` says `starting` until it is up).
 
 ### `[checkpoint]`
 
@@ -1169,8 +1179,8 @@ landed where it started, so a command that stamps each run differently makes
 every verify fail. Common dump tools do this by default: `pg_dump` since
 17.6 (and the matching back-branch releases) opens and closes every dump with
 `\restrict <token>` / `\unrestrict <token>`, a fresh random token per run.
-Pass `--restrict-key=<fixed>` to make it stable, as the bundled Postgres
-templates do (their comments say what a fixed key gives up). `supabase db
+Pass `--restrict-key=<fixed>` to make it stable (`pg_dumpall` takes it too),
+as the bundled Postgres templates do (their comments say what a fixed key gives up). `supabase db
 dump` cannot pass it, and writes the pair as SQL comments (`-- \restrict
 <token>`), so the `supabase` template swaps the token for a fixed one after
 dumping. Anything else that stamps a run does the same: a timestamp in the
@@ -2109,6 +2119,16 @@ or `DATABASE_URL`. Two services in one project cannot both publish `PORT`,
 so `newgit resource add web --template process` writes `WEB_PORT` and
 `WEB_URL`, naming them after the resource. Rename them if you have one
 service and your tool insists on `PORT` — the generated file says so.
+
+The database templates (`postgres`, `compose`, `command-snapshot`,
+`command-snapshot-migrations`) get the conventional name by the same
+rule rather than by an exception: they export `<NAME>_URL`, and their
+first line says to add them as `database`, which makes it `DATABASE_URL`
+(and the port `DATABASE_PORT`), the variable most frameworks already
+read. `compose` also exports `COMPOSE_PROJECT_NAME`, a name Compose itself
+reads, so every `docker compose` run through `newgit run` reaches the
+instance's own stack; a project has one Compose project, so it has one
+resource from that template.
 
 ---
 
