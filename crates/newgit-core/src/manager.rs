@@ -50,6 +50,7 @@ use crate::tracker_repo::{
 
 mod encryption;
 mod evict;
+mod held_ports;
 mod remove;
 mod retention;
 pub use encryption::{Reencrypted, describe_recipients};
@@ -3923,6 +3924,11 @@ impl BranchManager {
                 }
             }
         }
+        // A claimed port somebody else holds: what answers there is not this
+        // instance, so it is not up and not starting either.
+        let held = self.ports_held_elsewhere(branch, &supervisor, &suspended);
+        starting.retain(|not_yet| !held.contains_key(&not_yet.resource));
+        problems.extend(held.into_values().flatten());
         problems.extend(self.undefined_binding_problems(branch, &supervisor));
         problems.extend(self.unbound_definition_problems(branch));
         problems.extend(self.bound_definition_problems(branch));

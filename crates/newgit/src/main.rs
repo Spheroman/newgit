@@ -278,15 +278,19 @@ enum Command {
         #[arg(long)]
         check: bool,
     },
-    /// Show ports claimed by binding records, or detect ones that are not
+    /// Show the ports every instance claims, or check who holds them
     Ports {
-        /// Compare what is actually listening (`lsof`) against every
-        /// binding record: the inverse of `render --check`. Non-zero exit,
-        /// naming the port and — only when honestly attributable — the
-        /// instance, on any listening port inside a declared range that no
-        /// binding record claims.
+        /// Judge every claimed port by the process listening on it (`lsof`):
+        /// ok when that is the claiming instance's own process, or nothing
+        /// listens and its process is not running. FAIL, naming the holder's
+        /// pid, directory and instance, when it is anybody else's. A port an
+        /// instance's process listens on that nothing claims is a warning;
+        /// other listeners on the machine are not judged. Exits 1 on any FAIL
         #[arg(long)]
         check: bool,
+        /// One JSON document on stdout; the exit code is the same
+        #[arg(long)]
+        json: bool,
     },
     /// Print the definition format reference: every key in a tracker or
     /// resource definition, and the template variables each hook may use
@@ -739,8 +743,9 @@ enum ResourceCommand {
     /// instance takes up an edited definition: ports it holds that are
     /// still declared stay, only new ones are allocated. For a resource
     /// whose definition is gone, it releases the binding instead (its
-    /// `[cleanup]` cannot run). Refused while its process is running. Exits
-    /// 1 when it does not come up.
+    /// `[cleanup]` cannot run). Refused while its process is running. Waits
+    /// as `start` does for what it started, then exits 1 when the instance
+    /// it leaves is not ready, saying why.
     Rebind {
         name: String,
         /// Instance (inferred when run inside a workspace)
@@ -914,7 +919,7 @@ fn main() -> Result<()> {
             discard_saved: None,
         } => cleanup(dry_run, purge_archived),
         Command::Render { check } => render_command(check),
-        Command::Ports { check } => ports_command(check),
+        Command::Ports { check, json } => ports_command(check, json),
         Command::Reference { section } => reference(section.as_deref()),
         Command::PushReceivePack {
             store,
@@ -1962,6 +1967,15 @@ fn resource(command: ResourceCommand) -> Result<()> {
                     .iter()
                     .any(|start| start.status == StopStartStatus::Failed);
             if failed {
+                std::process::exit(1);
+            }
+            // As `start` does (#276): what the rebind started has its
+            // `[ready] timeout_seconds` to come up, and an instance it leaves
+            // not ready is a failure, not a success to find out about later.
+            let branch = manager.store().find_branch(&outcome.instance)?;
+            let readiness = manager.readiness_after(&branch, manager.ready_wait(&branch));
+            print_readiness(&outcome.instance, &readiness);
+            if !readiness.is_ready() {
                 std::process::exit(1);
             }
             Ok(())
@@ -4847,110 +4861,134 @@ fn render_command(check: bool) -> Result<()> {
 
 /// `newgit ports` / `newgit ports --check`.
 ///
-/// Bare `newgit ports` lists what every binding record already claims — the
-/// ledger newgit itself keeps, no probing involved. That is useful on its
-/// own (which instance owns which port, without reading every binding
-/// record by hand) and costs nothing, so it is the default rather than a
-/// refusal: unlike `render`, which only does one thing and explains why,
-/// `ports` has a second, cheaper thing worth doing without `--check`.
+/// Bare `newgit ports` lists what every binding record claims: the ledger
+/// newgit itself keeps, no probing involved.
 ///
-/// `--check` is the inverse of `render --check` (#56): it compares what is
-/// actually listening on the host against that same ledger, and reports any
-/// listening port inside a declared range that nothing claims — the drift
-/// `render --check` cannot see because it never asks the OS anything. See
-/// the comment above `check_ports` in `newgit-core/src/ports.rs` for why
-/// attribution is honest-but-partial rather than complete.
-fn ports_command(check: bool) -> Result<()> {
+/// `--check` asks the OS who holds each of those ports, and judges each by
+/// that listener, never by the claim alone (see `check_ports` in
+/// `newgit-core/src/ports.rs`). Exits 1 on any FAIL, with `--json` too.
+fn ports_command(check: bool, json: bool) -> Result<()> {
     let manager = manager_here()?;
-    let branches = manager.store().load_branches()?;
-
     if !check {
-        return list_claimed_ports(&branches);
+        let branches = manager.store().load_branches()?;
+        return list_claimed_ports(&branches, json);
     }
-
-    let resources = manager.resource_definitions();
-    let listening = match newgit_core::ports::probe_listening_ports() {
-        Ok(listening) => listening,
+    let checks = match manager.check_claimed_ports() {
+        Ok(checks) => checks,
         Err(err) => {
-            println!("could not check: {err}");
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({ "ok": false, "error": err.to_string() })
+                );
+            } else {
+                println!("could not check: {err}");
+            }
             std::process::exit(1);
         }
     };
-
-    let checks = newgit_core::ports::check_ports(&branches, resources, &listening);
-    if checks.is_empty() {
-        println!("No listening ports fall inside any resource's declared range.");
+    let failed = checks
+        .iter()
+        .filter(|check| check.verdict == newgit_core::ports::Verdict::Fail)
+        .count();
+    if json {
+        let ports = checks
+            .iter()
+            .map(|check| {
+                serde_json::json!({
+                    "port": check.port,
+                    "verdict": check.verdict.as_str(),
+                    "instance": check.claim.as_ref().map(|claim| &claim.instance),
+                    "resource": check.claim.as_ref().map(|claim| &claim.resource),
+                    "name": check.claim.as_ref().map(|claim| &claim.name),
+                    "holders": check.holders.iter().map(|(listener, owner)| serde_json::json!({
+                        "pid": listener.pid,
+                        "command": listener.command,
+                        "cwd": listener.cwd,
+                        "instance": owner,
+                    })).collect::<Vec<_>>(),
+                    "reason": check.reason,
+                })
+            })
+            .collect::<Vec<_>>();
+        println!(
+            "{}",
+            serde_json::json!({ "ok": failed == 0, "ports": ports })
+        );
+    } else if checks.is_empty() {
+        println!("No instance claims a port, and none listens on one it did not claim.");
         return Ok(());
-    }
-
-    let mut failed = 0usize;
-    // Unclaimed ports are grouped by attribution, matching the issue's
-    // sample output: one FAIL line per instance honestly implicated, naming
-    // every port it publishes, plus one line for ports that are real but
-    // could not be attributed to anything — never a guess.
-    let mut unclaimed_attributed: std::collections::BTreeMap<String, Vec<u16>> =
-        std::collections::BTreeMap::new();
-    let mut unclaimed_unattributed: Vec<u16> = Vec::new();
-
-    for result in &checks {
-        if result.claimed {
-            let owner = result
-                .claimed_by
-                .as_deref()
-                .map(|name| format!(" — claimed by `{name}`"))
+    } else {
+        for check in &checks {
+            let label = match check.verdict {
+                newgit_core::ports::Verdict::Ok => "ok   ",
+                newgit_core::ports::Verdict::Fail => "FAIL ",
+                newgit_core::ports::Verdict::Undecided => "?    ",
+                newgit_core::ports::Verdict::Undeclared => "warn ",
+            };
+            let claim = check
+                .claim
+                .as_ref()
+                .map(|claim| format!(" — `{}` {}.{}", claim.instance, claim.resource, claim.name))
                 .unwrap_or_default();
-            println!("ok    {}{owner}", result.port);
+            println!("{label} {}{claim}: {}", check.port, check.reason);
+        }
+        let count = |verdict| {
+            checks
+                .iter()
+                .filter(|check| check.verdict == verdict)
+                .count()
+        };
+        let undecided = count(newgit_core::ports::Verdict::Undecided);
+        let undeclared = count(newgit_core::ports::Verdict::Undeclared);
+        let total = checks.len() - undeclared;
+        if failed == 0 {
+            println!("\n{total} claimed port(s) checked, none failed.");
         } else {
-            failed += 1;
-            match &result.attributed_to {
-                Some(name) => unclaimed_attributed
-                    .entry(name.clone())
-                    .or_default()
-                    .push(result.port),
-                None => unclaimed_unattributed.push(result.port),
-            }
+            println!("\n{failed} of {total} claimed port(s) failed.");
+        }
+        if undeclared > 0 {
+            println!(
+                "{undeclared} warning(s): a port an instance's process listens on that it never \
+                 claimed"
+            );
+        }
+        if undecided > 0 {
+            println!(
+                "{undecided} undecided: held by something newgit cannot tie to an instance, on a \
+                 resource that runs no process newgit supervises"
+            );
         }
     }
-    for (name, mut ports) in unclaimed_attributed {
-        ports.sort_unstable();
-        let ports = ports
-            .iter()
-            .map(u16::to_string)
-            .collect::<Vec<_>>()
-            .join(", ");
-        println!("FAIL  `{name}` publishes {ports} — claimed by no binding record");
-        println!(
-            "      undeclared ports are not allocated, so another instance may be handed them"
-        );
-    }
-    if !unclaimed_unattributed.is_empty() {
-        unclaimed_unattributed.sort_unstable();
-        let ports = unclaimed_unattributed
-            .iter()
-            .map(u16::to_string)
-            .collect::<Vec<_>>()
-            .join(", ");
-        println!(
-            "FAIL  {ports} — claimed by no binding record; could not attribute to an instance"
-        );
-        println!(
-            "      undeclared ports are not allocated, so another instance may be handed them"
-        );
-    }
-
-    let total = checks.len();
-    if failed == 0 {
-        println!("\n{total} check(s) passed.");
-        Ok(())
-    } else {
-        println!("\n{failed} of {total} check(s) failed.");
+    if failed > 0 {
         std::process::exit(1);
     }
+    Ok(())
 }
 
 /// Bare `newgit ports`: every instance's claimed ports, read straight off
 /// its binding record. A parked resource's ports are claimed too, and say so.
-fn list_claimed_ports(branches: &[newgit_core::BranchInstance]) -> Result<()> {
+fn list_claimed_ports(branches: &[newgit_core::BranchInstance], json: bool) -> Result<()> {
+    if json {
+        let claims = branches
+            .iter()
+            .flat_map(|branch| {
+                branch.port_claims().flat_map(move |(resource, binding)| {
+                    binding.resolved_ports.iter().map(move |(name, port)| {
+                        serde_json::json!({
+                            "instance": branch.name,
+                            "resource": resource,
+                            "name": name,
+                            "port": port,
+                            "parked": branch.parked.contains_key(resource),
+                        })
+                    })
+                })
+            })
+            .collect::<Vec<_>>();
+        println!("{}", serde_json::json!({ "ports": claims }));
+        return Ok(());
+    }
     if branches.is_empty() {
         println!("No branch instances yet. Create one with `newgit spawn <name>`.");
         return Ok(());
