@@ -836,6 +836,9 @@ pub enum WorkspaceChange {
     },
     /// Materialized again and restored to `checkpoint`.
     Restored { checkpoint: String },
+    /// Deleted by hand, and made again: from `checkpoint`, the instance's
+    /// latest, or from its source branch when it had none.
+    Rebuilt { checkpoint: Option<String> },
     /// Already evicted, to `checkpoint`: nothing was deleted.
     AlreadyEvicted { checkpoint: String },
 }
@@ -3759,8 +3762,8 @@ impl BranchManager {
         let mut problems = Vec::new();
         if !branch.workspace_path.is_dir() {
             problems.push(format!(
-                "its workspace is missing ({})",
-                branch.workspace_path
+                "its workspace is missing ({}); `newgit start {}` rebuilds it",
+                branch.workspace_path, branch.name
             ));
             return Readiness {
                 problems,
@@ -4461,21 +4464,65 @@ impl BranchManager {
     ) -> Result<SpawnFromCheckpointOutcome> {
         validate_name(name)?;
         let from_slug = branch_slug(from_instance);
+        // Whether a failure below left an instance behind, or failed before
+        // making one (or refused because one by the name exists).
+        let existed = self.store.branch_record_path(&branch_slug(name)).exists();
         let local = CheckpointLog::new(self.store.checkpoint_dir(&from_slug), from_instance);
-        if local
+        let spawned = if local
             .list()?
             .iter()
             .any(|record| record.id == checkpoint_id)
         {
-            return self.spawn_from_local_checkpoint(name, &from_slug, local.load(checkpoint_id)?);
-        }
-        if self.remote.is_none() {
+            self.spawn_from_local_checkpoint(name, &from_slug, local.load(checkpoint_id)?)
+        } else if self.remote.is_none() {
             return Err(NewgitError::UnknownCheckpoint {
                 instance: from_instance.to_owned(),
                 id: checkpoint_id.to_owned(),
             });
-        }
-        self.spawn_from_remote_checkpoint(name, &from_slug, checkpoint_id)
+        } else {
+            self.spawn_from_remote_checkpoint(name, &from_slug, checkpoint_id)
+        };
+        spawned.map_err(|error| {
+            if existed {
+                return error;
+            }
+            self.half_built(name, &format!("{from_slug}/{checkpoint_id}"), error)
+        })
+    }
+
+    /// A spawn from a checkpoint that failed after the instance was made:
+    /// kept as far as it got, for inspection, as a plain spawn that fails
+    /// midway is, and `error` extended with the commands that finish it
+    /// (the undo to the checkpoint's copy in its own history) or remove
+    /// it, so the spawn can be run again. `error` as it is when no instance
+    /// was made.
+    fn half_built(&self, name: &str, from: &str, error: NewgitError) -> NewgitError {
+        let Ok(branch) = self.store.find_branch(name) else {
+            return error;
+        };
+        let copy = self
+            .checkpoint_log(&branch)
+            .list()
+            .ok()
+            .and_then(|records| {
+                records
+                    .into_iter()
+                    .find(|record| record.instance.as_deref() == Some(branch.id.as_str()))
+                    .map(|record| record.id)
+            });
+        let finish = match copy {
+            Some(id) => format!(
+                "Fix what failed, then `newgit undo {} --to {id}` restores it to {from}; or ",
+                branch.name
+            ),
+            None => String::new(),
+        };
+        NewgitError::Unsupported(format!(
+            "{error}\n`{}` was spawned but not restored to {from}, and is kept as it is for \
+             inspection (its workspace is {}). {finish}`newgit remove {} --purge` removes it, \
+             so `newgit spawn {} --from-checkpoint {from}` can run again",
+            branch.name, branch.workspace_path, branch.name, branch.name
+        ))
     }
 
     /// [`Self::spawn_from_checkpoint`] of a checkpoint on this machine: its
@@ -12068,6 +12115,19 @@ impl BranchManager {
         self.checkpoint_log(&branch).list()
     }
 
+    /// The checkpoints a removed instance named `instance` left, which
+    /// `spawn --from-checkpoint <slug>/<id>` still brings back: its name's
+    /// history, kept past the removal. Errors as an unknown instance would
+    /// when there is neither a live instance nor any checkpoint by the name.
+    pub fn removed_checkpoints(&self, instance: &str) -> Result<Vec<CheckpointRecord>> {
+        let slug = branch_slug(instance);
+        let records = CheckpointLog::new(self.store.checkpoint_dir(&slug), instance).list()?;
+        if records.is_empty() {
+            return Err(NewgitError::UnknownBranchInstance(instance.to_owned()));
+        }
+        Ok(records)
+    }
+
     /// Prove a restore actually works instead of trusting it: checkpoint the
     /// current state, restore it with a real `undo`, checkpoint again, and
     /// compare the two checkpoints' resource state refs. Agreement across
@@ -15866,6 +15926,17 @@ impl BranchManager {
             .saved_copies
             .retain(|copy| std::fs::symlink_metadata(copy).is_ok());
         let notices = self.saved_copy_notices(&earlier);
+        // Deleted by hand: made again, from the latest checkpoint or the
+        // source branch, before anything is started in it.
+        if branch.evicted.is_none() && std::fs::symlink_metadata(&branch.workspace_path).is_err() {
+            let (checkpoint, warnings) = self.rebuild_deleted(branch)?;
+            let branch = self.store.find_branch(instance)?;
+            let mut outcome = self.start_resources(lock, branch)?;
+            outcome.workspace = Some(WorkspaceChange::Rebuilt { checkpoint });
+            outcome.warnings.splice(0..0, warnings);
+            outcome.warnings.extend(notices);
+            return Ok(outcome);
+        }
         let Some(checkpoint) = branch.evicted.clone() else {
             let mut outcome = self.start_resources(lock, branch)?;
             outcome.warnings.extend(notices);
@@ -16688,8 +16759,9 @@ impl BranchManager {
             Ok(())
         } else {
             Err(NewgitError::Unsupported(format!(
-                "the workspace for `{}` is missing at {}; spawn it again or remove the instance",
-                branch.name, branch.workspace_path
+                "the workspace for `{}` is missing at {}; `newgit start {}` rebuilds it, \
+                 or `newgit remove {}` removes the instance",
+                branch.name, branch.workspace_path, branch.name, branch.name
             )))
         }
     }

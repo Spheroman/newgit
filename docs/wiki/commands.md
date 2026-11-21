@@ -33,7 +33,12 @@ inside a workspace):
   what it depends on answers; ports,
   workspace, trackers, and installs stay as they are. Both exit 0 with
   nothing to do and 1 if any resource failed; `start` also exits 1 when
-  what it brought back is not up within its `[ready] timeout_seconds`
+  what it brought back is not up within its `[ready] timeout_seconds`.
+  A workspace deleted by hand (`status` says `ws-missing` and names this)
+  comes back with `start`: it stops what still runs from the deleted
+  directory, rebuilds the workspace from the instance's latest checkpoint
+  (or from its source branch, preparing every resource again, when it has
+  none), and says what did not come back (`rebuilt` in `--json`)
 - `newgit stop --evict [--discard-ignored]` — stop, checkpoint, and delete
   the workspace, leaving its marker; `newgit start` brings it back from that
   checkpoint into the same directory, with uncommitted and staged work,
@@ -63,8 +68,13 @@ inside a workspace):
   <instance>/<id>`, and names what no checkpoint holds (ignored files
   nothing rebuilds, the stash, branches only the workspace has, a nested
   Git repository) as `lost`, and `disposable` output as dropped. A
-  resource whose capture failed keeps its state: its `[cleanup]` does not
-  run, and `left` names it with that command, unless `--force`. An evicted instance is not checkpointed
+  resource whose capture failed keeps its state when that state is
+  outside the workspace: its `[cleanup]` does not run, and `left` names
+  it with that command, unless `--force`. One whose state is in the
+  workspace (`ownership = "workspace"`, a database whose data directory
+  is in the tree) would be deleted with it, so its failed capture refuses
+  the removal, deleting nothing, unless `--force`. `newgit checkpoints
+  <instance>` lists a removed instance's checkpoints. An evicted instance is not checkpointed
   again: the eviction's checkpoint is the one named (`checkpoint` in
   `--json`). A checkpoint that fails, a nested repository with no commit,
   or a workspace whose Git cannot be read refuses unless `--force`;
@@ -261,7 +271,11 @@ Remote:
   with no usable SSH key on GitHub; they fail, naming the trackers that were
   not re-encrypted, when any was not. `members reencrypt` runs that again
 - `newgit spawn <name> --from-checkpoint <instance>/<checkpoint>` — one
-  taken on this machine is used as it is; any other comes from the remote
+  taken on this machine is used as it is; any other comes from the remote.
+  One that fails after the instance is made keeps it, as a plain `spawn`
+  that fails does, and names `newgit undo <name> --to <id>` (the
+  checkpoint's copy in the new instance's history) to finish it and
+  `newgit remove <name> --purge` to remove it before running it again
 
 Resource templates: `process`, `pnpm`, `install`, `postgres`,
 `command-snapshot`, `command-snapshot-migrations`, `compose`, `supabase`,
