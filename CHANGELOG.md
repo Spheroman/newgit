@@ -12,6 +12,1213 @@ time by `scripts/release-changelog.sh`, which then deletes the fragments.
 Two changes never touch the same lines, so nothing queues behind whichever
 branch landed first.
 
+## [0.11.0] — 2026-11-20
+
+Branch instances come up in order and say whether they are actually up.
+`newgit start` and spawn start a dependent only once what it depends on
+answers, and a resource's `[ready]` says what answering means (a GET or a
+command, with its own deadline); `status` shows what is still starting and
+why. `newgit resource check` reads hook commands as shell and names the
+programs that are missing before anything runs. The `postgres` and
+`compose` templates give each instance a database of its own. Ports are
+allocated 100 apart, and `newgit ports --check` names the process that
+actually holds each one. Undo restores what it says it restored and waits
+for it to be ready, remove refuses to delete workspace state no checkpoint
+holds, and `start` rebuilds a workspace that was deleted. Trackers outside Git that sync are now
+encrypted to their audience before they leave the machine, and `newgit
+serve` keeps one store per audience with each tracker's view stored and
+extended as things land.
+
+### Added
+
+- A resource's `[ready]` says what "up" means for it: a GET that answers
+  200–399 (`http`), or a command that exits 0 (`command`), and how long to
+  wait for it (`timeout_seconds`)
+  ([#276](https://github.com/Spheroman/newgit/issues/276)).
+
+  Up used to mean the ports of a running process answering, waited for
+  five seconds whatever the server. A dev server that binds at once and
+  serves 500s until it compiles was up too early, one that takes twenty
+  seconds just read `starting`, and a Supabase stack a `prepare` left
+  running had no readiness at all, so it read `ready` after it had gone
+  down. The end of `spawn` now waits for the longest `timeout_seconds`
+  among what is bound, a dependent's start waits for its dependency's
+  check, and `status` shows how a failing check failed (`check` in
+  `spawn --json`). With no `[ready]`, nothing changes.
+
+- Every `starting` line and every not-up problem for a running process
+  names the log of its run, and the not-up one ends with that log's last
+  lines; `spawn` prints where the instance's logs are (`logs:`, and `logs`
+  in `--json`) ([#276](https://github.com/Spheroman/newgit/issues/276)).
+
+  A dev server that crashed under a wrapper that stayed alive
+  (`npm-run-all`) read `running` and still starting, and nothing said
+  where to look; an agent found the log only by searching `.newgit/logs/`.
+
+- `newgit pull` with no arguments brings every mounted tracker up to date
+  ([#345](https://github.com/Spheroman/newgit/issues/345)), as `nix flake
+  update` does: each tracker in Git that root mounts moves its pin to its
+  `follow` ref, in one commit, `Update trackers: t3code (14 commits),
+  ui-kit (2 commits)`, instead of one `newgit pull <tracker>` per tracker.
+  The commit lands on the branch it ran on (in the project root, its own
+  instance branch, which `newgit merge main` publishes), so `main` and
+  other instances keep their pins until it merges. A tracker the remote
+  won't let you read is named and skipped rather than failing the rest; if
+  none can be read, it fails rather than report everything up to date.
+  Nothing behind, no commit. A pin holding commits its ref lacks stays put
+  rather than lose them, and trackers outside Git are left alone: they
+  have no pins.
+
+- `newgit serve` lands what is merged on a GitHub mirror, and exports to
+  its mirrors ([#414](https://github.com/Spheroman/newgit/issues/414)).
+
+  `POST /v1/webhooks/github?project=<owner>/<name>` verifies each event
+  against the project's own secret, queues a push in SQLite (a restart
+  resumes it), and a background thread lands what the mirror has beyond
+  `main` as a merge: the same `merge` path a member's merge takes, as one
+  landing, by the rules of whoever pushed there. A target rooted at a
+  tracker (`t3code`) lands in that tracker and moves its pin in the same
+  landing. Whose work a commit is, for a tracker the mirror withholds, is
+  read from what the commits contain, never from a branch's name: a pull
+  request from a branch named like an instance with unrelated withheld
+  work lands (#451). A later pull carrying a refused one's commits is said
+  once, on the first. A squash's pull request is read from GitHub's
+  `pull_request` event, or asked; while GitHub cannot say, the pull waits.
+
+  After every landing each target's view is pushed to its mirror, with
+  the same ids the client's `newgit export` composes: a pull followed by
+  an export is a fast-forward there. Exports never block a landing, are
+  retried with backoff, never overwrite a mirror, are checked commit by
+  commit to carry nothing of a withheld tracker or one outside Git, and
+  say how they stand (up to date, behind, failing and why) in `newgit
+  status`. Configure both with `newgit serve --github <file>`.
+
+  The server talks to a mirror only at
+  `https://github.com/<owner>/<name>.git` (or where the file's `git` key
+  says GitHub's Git is), and sends the project's token to no other host:
+  a definition's `url` as written is never handed to Git there, mirror
+  Git reads no global or system Git config (so no `insteadOf` redirects
+  it), and a pull whose target no longer names the repository its event
+  did fetches nothing. A fetch from a mirror offers it only the view's
+  commits as what the server has, never a tracker's own history, checks
+  what it receives (`fetch.fsckObjects`), and is stopped after ten
+  minutes; `/state` says pulls are stalled when the pull thread is gone
+  or stops moving. Its own export coming back as an event is answered
+  without a pull. A later pull refused for a reason of its own says that
+  reason instead of repeating the first refusal's; a refusal is never
+  pushed out of `newgit status` by the pulls waiting on it or by another
+  mirror's; a refused pull sent again that lands while later pulls
+  waited on it leaves those said, on their own, rather than dropping
+  them; and it ends when the export next reaches the mirror, so `newgit
+  pull --remote <target>` then `newgit merge main` clears it without an
+  event.
+
+- `newgit tracker create <name> --from <tracker>` makes a fork: a tracker
+  outside Git whose history starts at another's `main`, claiming the same
+  paths and filling the same role, with `from = "<tracker>"` in its
+  definition. `--role` names the role when the upstream has none yet
+  ([#415](https://github.com/Spheroman/newgit/issues/415)).
+
+  Members of a role (`local-db`, `staging-db`) had no shared history, so
+  there was nothing to merge between them. Locally a fork is two refs in the
+  one store, and on `newgit serve` a namespace in its upstream's store, so
+  nothing is copied. A fork's audience can't be wider than its upstream's,
+  and dropping or changing `from` doesn't lift that. The client refuses it at
+  creation, in every command but `tracker list` and `tracker remove` (which
+  show and fix it), and in any commit that changes definitions, merges
+  included. `serve` records what each fork's repo was made from and never serves
+  the fork wider than that upstream, whatever its definition says: a wider
+  fork is served with the upstream's audience, and one the upstream isn't
+  ordered with (`user:jack` under `user:bob`) isn't defined, so nothing
+  moves to readers who never had it.
+  Against newgit.dev's Worker only the client checks. A fork of an
+  encrypted tracker is encrypted to its own audience: a narrower one's first
+  sync encrypts it again to its own recipients. `tracker list` shows what
+  each fork came from. Only trackers outside Git can be forked yet.
+  `tracker create` also takes `--role` for a plain tracker outside Git.
+
+- `newgit pull` now updates everything "update" means
+  ([#426](https://github.com/Spheroman/newgit/issues/426)):
+  - A tracker exported to a target rooted at it (t3code →
+    Spheroman/t3code) first takes what is new there, as `newgit pull
+    --remote` would: a fast-forward of its `follow` ref, or a real merge.
+    That is one more fetch per such tracker. The pin moves on the branch it
+    ran on; the tracker's `main` moves only when `newgit merge` lands it,
+    in an instance and in the project root alike. A target that can't be
+    reached, or conflicts, is named and skipped with everything below it;
+    the other trackers still move.
+  - Trackers mounted inside another are pulled too: a commit in the
+    tracker that mounts them (`Update trackers: repos (1 commit)`), whose
+    pin then moves, up to root. `newgit pull t3code/repos` does it for one.
+    A child of a tracker the instance doesn't bind stays, and is named
+    when it was asked for or is behind.
+  - Every argument is a tracker: `newgit pull t3code ui-kit` pulls those
+    two. The instance moved to `--instance <name>` (it is still inferred in
+    a workspace); naming an instance where a tracker goes says so and gives
+    the `--instance` form. A named tracker that stays exits non-zero.
+  - Two instances pulling the same two diverged tips make the same merge
+    commit (newgit's identity, dates from its parents), so merging both
+    lands one merge, not three. It is unsigned, so a target requiring
+    signed commits rejects an export carrying it (#443).
+  - `newgit pull <tracker>` writes `Update trackers: <tracker> (N
+    commits)`, like plain `newgit pull`, and no longer moves a pin holding
+    the instance's own commits back to its `follow` ref: that pin stays
+    and is named.
+
+- `newgit serve` collects its own garbage: the landing log, every store,
+  and merges' landings nothing waits in, every six hours
+  ([#434](https://github.com/Spheroman/newgit/issues/434)).
+
+  A voided move's copied history, a narrowing's old history, and a force
+  push's left-behind commits used to stay in their store for good,
+  fetchable by id under protocol v2; they now go at the first pass a grace
+  (an hour) after nothing reaches them, so within seven hours. Stores keep
+  reflogs, but the pass expires their entries after the grace too, so a
+  reflog never keeps anything for Git's default 30 days. The first pass
+  runs a grace after start, so a server restarted often still collects.
+  Each store is collected holding its home's root and compose lock and
+  nothing else, so a landing there (answered 503 naming the collection
+  after the root wait) or a fetch of a rooted view waits for one store's
+  `git gc`, not the whole home's; the log is collected holding its
+  leader's seat. Whatever any ref or waiting merge still reaches is kept,
+  a landing-log entry is never dropped, and a stored rooted history whose
+  views were collected composes them again. Stores no longer collect on
+  their own (`gc.auto = 0`, `receive.autogc = false`), since a push's
+  `gc --auto` knew nothing of what merges borrow. The last pass is in
+  `GET /v1/serve/status`; `NEWGIT_SERVE_GC_EVERY_SECONDS` and
+  `NEWGIT_SERVE_GC_GRACE_SECONDS` tune it.
+
+- `newgit pull --remote <target> --force` follows a force-pushed export
+  target instead of merging with it
+  ([#442](https://github.com/Spheroman/newgit/issues/442)). Merging, as
+  plain `pull --remote` does, kept what the force-push removed in the
+  tracker's history, so the next export pushed it back: a secret purged on
+  GitHub was published again. Now the line of the tracker the target is
+  rooted at is reset to the target's (as `git fetch` then `git reset --hard`
+  would), the project root's pin moves to it, and `newgit merge main`
+  replaces the old line on the remote instead of merging it back. It lists
+  every commit it drops and every instance still holding one, and this
+  machine then refuses to carry them onward from the tracker's line: a
+  merge, a send to the remote (a checkpoint's sync included), or a push to
+  any export target that lacks them, the project's own view included,
+  whose older root commits still pin them. An instance with nothing of its
+  own on the old line follows on `newgit pull`; the reset refuses while the
+  project root has work of its own on the old line, which it would
+  discard. A later reset back onto dropped commits says so and stops
+  refusing them, and a reset that fails with nothing moved leaves no
+  record. It says what it cannot undo: the project's own history (so the
+  remote's copy, its Git endpoint, `newgit clone`, and project tags) and
+  copies others already fetched. Plain `pull --remote` now refuses a target
+  rewritten since the last export, a rewind with no new commit included,
+  and so does every push to it that would carry what the rewrite removed:
+  `main`'s export (plain, `--dry-run`, and the one a push makes), an
+  instance's branch, and a tag. Every push to a target from a client goes
+  through one check, so none can skip it; the remote's own export of its
+  GitHub mirrors does not check yet, and a forced push to a mirror is
+  pulled there as a merge. A branch deleted there, with a record of
+  exporting to it, counts as a rewrite that removed everything, and a tag
+  pushed with `main` is not pushed to a target `main`'s export was refused
+  on. These name `--force` instead of merging back or advising `export
+  --force`;
+  plain `pull --remote` from a second target still holding a dropped commit
+  is refused too. `export --remote --force` refuses, before pushing, to put
+  back commits a rewrite removed, naming how many, unless `--republish` is
+  given, and leases on the commit it checked. With no record of exporting
+  there, or a record older than another machine's export, a rewrite is not
+  detected ([#473](https://github.com/Spheroman/newgit/issues/473)); the
+  refused push then names `pull --remote --force --dry-run` first. `--dry-run` moves nothing.
+  Only a target rooted at a tracker for now: following a rewrite of the
+  project's own view means rewriting the project's history, and its refusal
+  says what to do instead.
+
+- `newgit cleanup` collects what eviction leaves behind, only what is
+  proven to be nobody's only copy: an `evict` checkpoint a restore brought
+  back, once a later eviction supersedes it; the checkpoints a restore that
+  succeeded took on its way; a `remove` checkpoint a retried removal
+  superseded; and checkpoint refs no record names
+  ([#446](https://github.com/Spheroman/newgit/issues/446)).
+
+  Each `stop --evict` / `start` cycle used to add an evict checkpoint and
+  one or two before-undo checkpoints that nothing ever pruned, and a large
+  untracked file stayed in the store for as long as any of them reached
+  it, so a machine where T3 Code evicts on every settle grew without
+  bound. `cleanup` now names each one it collects, deletes its record and
+  store ref, prunes the tracker revisions only they held, and says how
+  many bytes of store objects became unreachable. An `evict` checkpoint
+  nothing restored is never collected (an instance removed while evicted
+  keeps its work only there, and a later instance with the same name
+  shares its history), and neither is any checkpoint a live or archived
+  record names, an `explicit` or `push` checkpoint, the redo point of an
+  `undo` you ran, or what a failed restore took. A collected checkpoint is
+  gone for `undo --to` too: keep a state with `newgit checkpoint`. A
+  collected id is never reused.
+
+  **`cleanup` does not prune or `git gc` the store.** The publish outbox
+  (`.newgit/local/publish/outbox.git`) borrows the store's objects through
+  alternates, so pruning the store can corrupt it. The store's own `git
+  gc` frees the unreachable objects on its schedule, under your
+  `gc.pruneExpire`, `gc.auto`, and `git maintenance` (two weeks by
+  default, which is also how long `git fsck` can recover a dropped stash).
+  `cleanup` holds each instance's lock only while it reads or deletes that
+  instance's records.
+
+- A resource can declare ignored build output `disposable`
+  (`disposable = ["target", ".next/cache"]`), and a plain `newgit stop
+  --evict` then drops it with the workspace instead of refusing
+  ([#447](https://github.com/Spheroman/newgit/issues/447)).
+
+  Every Rust workspace held a `target/` no tracker owns and nothing
+  rebuilds, so eviction refused there, and `--discard-ignored` was the
+  only way through: it discarded every undeclared ignored file, a stray
+  `.env.local` included. The declaration is a resource with no actions,
+  identity, or hooks, so no `undo`, `tracker use`/`drop`, or `spawn`
+  touches the tree, and one a tracker brings stops counting in an
+  instance that drops the tracker. The eviction names what it dropped
+  (`disposed` in `--json`, and `status` while evicted), and the refusal
+  now names the declaration. `newgit remove` lists what it drops the same
+  way.
+
+- `newgit serve` brings in tags made on a GitHub mirror
+  ([#453](https://github.com/Spheroman/newgit/issues/453)).
+
+  A release tagged on GitHub now appears on the remote, as it does on the
+  Worker: without this, moving a remote to `serve` would have lost it. The
+  tag's event is queued behind any pull of the same mirror, so a pull
+  request merged and then tagged is on `main` when its tag is looked for.
+  Nothing lands: the root commit whose view is the tagged commit is found,
+  and the tag is made there the way a tag pushed from the project root is,
+  with an annotated tag's message and tagger. A tag made in the project
+  root at a root commit that changed only what the mirror does not ship
+  comes back as there already. A tag never moves, so one that exists at
+  another commit is refused, and one naming a commit that
+  is not on `main` yet is refused until it lands and the event is sent
+  again; `newgit status` says both. Only for a mirror of the project's own
+  history: a rooted target's tags are its tracker's.
+
+- `newgit spawn` names the local secrets it left behind
+  ([#83](https://github.com/Spheroman/newgit/issues/83)).
+
+  A workspace is made from source, so a gitignored `.env.local` or
+  `config/master.key` in the project root never reached it unless a
+  tracker carried it, and nothing said so: every resource came up `ok`,
+  and the service that read the file failed hours later. `spawn` now
+  names each such file (ignored in the root, present there, named like a
+  secret, and missing from the new workspace) with the commands that
+  carry it, `tracker create`, `track`, and `capture --from-store`, and
+  `spawn --json` lists them under `left_behind`. It is a note: nothing is
+  copied. The reference has a *Local secrets* section with the recipe.
+
+- `newgit resource check` finds the programs a definition's commands
+  start that this machine does not have
+  ([#87](https://github.com/Spheroman/newgit/issues/87)).
+
+  A `[checkpoint]` calling `pg_dump` on a host with no Postgres client
+  failed at the first checkpoint, and a `[restore]` calling `psql` only
+  during the undo someone was relying on. The check reads every action and
+  hook command as shell (`sh -n` must accept it; a real parser walks it),
+  looks up each program the shell would run (inside `if`, loops, `case`
+  arms, groups, functions, `$(...)`, and past `env`, `exec`, `timeout`,
+  `xargs`, `sh -c`, `eval`) on `PATH`, or, for a path, from where the
+  command's `workdir` and any `cd` put it, and requires it to be
+  executable. Each is `ok`, `FAIL`, or `skip` with the reason it cannot be
+  known before an instance runs (a template or variable names it, a `cd`
+  it cannot follow, a `command -v` guard, an ignored path a build makes).
+  Exits 1 only on a `FAIL`; `--json` for scripts.
+
+- `newgit action --quiet`, and a failed hook says the command it ran
+  ([#89](https://github.com/Spheroman/newgit/issues/89)).
+
+  A failing `prepare` could print a hundred thousand lines through
+  `newgit action`, and the part that mattered was the rendered command
+  at the top of the log and the end of it. `--quiet` keeps a one-shot
+  command's output in its log and prints the exit code, plus, on
+  failure, the command that ran and the log's last twenty lines. Spawn's
+  `prepare: FAILED` line now shows the command too. A tool that tears
+  itself down on failure can still empty its own log; the reference and
+  the `supabase` template say how to rerun it by hand with its
+  keep-it-up flag (`supabase start --ignore-health-check`).
+
+- Two resource templates for a per-branch database: `postgres` and
+  `compose`. Add either as `database` (`newgit resource add database
+  --template postgres`) and each instance's `DATABASE_URL` is its own.
+
+  `postgres` gives every instance a whole Postgres cluster without Docker:
+  its own supervised server on its own port, data in a gitignored
+  `.postgres/` in the workspace, `pg_isready` as its `[ready]` check, a
+  `pg_dumpall` of the whole cluster on checkpoint, and a restore that
+  builds a fresh cluster beside the live one and swaps it in only once the
+  load succeeds. `compose` gives every instance its own Compose project
+  (`COMPOSE_PROJECT_NAME`, which `docker compose` under `newgit run` then
+  reaches with no `-p`), ports passed in as variables the compose file
+  reads, suspend and resume as `stop` and `start`, and `down --volumes` on
+  removal. It checkpoints a Postgres service through its own `pg_dump` and
+  says plainly that Compose has no generic checkpoint. Before these, the
+  only database templates assumed a server on the host that every instance
+  shared, or Supabase.
+
+- `newgit resource check` fails a definition that names something that is
+  not there, and `spawn` and `status` name it, with the command that fixes
+  it, for every instance that binds it.
+
+  A `[checkpoint] into_tracker` naming a tracker nobody created passed
+  `resource check`, `spawn` and `status`, and failed only at the first
+  `checkpoint`. The same went for `{{ports.x}}` naming no port,
+  `{{exports.X}}` naming no export or used where it has no value,
+  `{{scripts}}/x` with no such script in the project root, `{{state_ref}}`
+  or `{{snapshot.path}}` outside the hooks that give them a value, a
+  misspelled `{{branch.*}}`, and a tracker's `resources` naming no
+  resource: each ran with the literal text or was silently skipped. They
+  are read from the definitions in one place now. `resource check` also
+  fails what the graph refuses (`depends_on` naming nothing, a cycle, an
+  environment name claimed twice), and `--json` reports all of it under
+  `definitions`.
+
+- `newgit stop --evict` frees an idle instance's disk: it stops the
+  instance, checkpoints it, and deletes its workspace, leaving only the
+  marker at its path. `newgit start` brings the workspace back from that
+  checkpoint, into the same directory: uncommitted and staged work,
+  untracked files, other local branches, tags, the stash, notes, other
+  remotes' refs, local Git config, hooks, file modes, empty directories,
+  tracker content (encrypted ones decrypted here), renders, and installs
+  refilled from the install store. It refuses, deleting nothing, when
+  something would not come back: ignored files no tracker owns and no
+  resource rebuilds (listed, a directory with its file count;
+  `--discard-ignored` evicts anyway), a merge or rebase in the middle,
+  hand edits to a rendered file, an untracked repository, an initialized
+  submodule, a linked worktree, a process still in the workspace (the
+  shell it was run from included), or a degraded checkpoint. An eviction
+  or restore that fails or is cut short never deletes what is at the path:
+  it is moved aside whole (`.<name>.restore-failed`,
+  `.<name>.interrupted-restore`), recorded, and named by `start`, `status`,
+  `stop --evict`, and `cleanup` until `newgit cleanup --discard-saved
+  <path>` deletes it. Declaring disposable build output such as `target/`
+  is not possible yet (#447), so a plain `--evict` refuses in a Rust
+  workspace; `--discard-ignored` is the manual override. T3 Code evicts a
+  settled thread's workspace this way once its settle action finishes and
+  no terminal still runs there, unless **Free disk when a newgit thread settles** is off in
+  Settings → Threads.
+
+- newgit.dev serves a `robots.txt` that lets every crawler index and
+  scrape every path. It used to answer `/robots.txt` with a 401, which
+  some crawlers read as "stay out".
+
+- `newgit resource add` lists the lines of a template that are yours to
+  fill in, and `resource check`, `spawn` and `status` report a placeholder
+  left in any field as exactly that.
+
+  `resource check` on an unedited `install` template said `` `EDIT` — not
+  found on PATH ``, which reads as a missing program, and said nothing of
+  the `EDIT ME` in `[identity] paths` and `produces`. Every bundled
+  template's placeholder is now spelled `EDIT ME` or `EDIT_ME_*`, including
+  the `external` template's stand-in CLI (`EDIT_ME_CLI`, was `cloudctl`).
+
+
+### Changed
+
+- A `[ready]` check still failing once its `timeout_seconds` has passed is
+  a problem, not `starting`: `spawn` and `newgit start` exit 1 and `status`
+  says `not ready`, naming the check and what it answered
+  ([#276](https://github.com/Spheroman/newgit/issues/276)).
+
+  A resource newgit does not supervise (a Supabase stack a `prepare` left
+  running) read `starting` forever with `spawn` exiting 0, though with no
+  process to watch, still starting and gone down look the same. The
+  timeout is now a deadline wherever a definition declares `[ready]`,
+  counted from the process's start, or, with none, from the last
+  `prepare`, `resume` or `restore`, so `status` gives the answer `spawn`
+  did. A supervised process with no `[ready]` has no deadline and stays
+  `starting`. `newgit start` now waits for what it brought back, as `spawn`
+  does, and adds `starting` and `problems` to its JSON when there are any;
+  `spawn` exits 1 whenever the instance it leaves is not ready, and
+  `spawn --json` has `problems`. Declared ports of an unsupervised
+  resource are still not checked: they are reservations.
+
+- `newgit serve` keeps one Git store per audience, each tracker a namespace
+  in it with refs in reftable, instead of a repository per tracker
+  ([#409](https://github.com/Spheroman/newgit/issues/409)).
+
+  A repository per tracker does not survive a large project: nixpkgs as
+  22k trackers was 424k files, a 57 s tree-wide change, and a 143 s gc,
+  against 19 files, 7 s, and 4–15 s pooled. Pooling across audiences is
+  never safe, since Git serves any object in a repository by id to anyone
+  who can reach it, so a store is made for one audience and never takes a
+  second; a private instance and each user's content keep stores of their
+  own, and a new tracker's seed stays alone until it joins a branch. A
+  merge's objects wait in a landing of the merger's own until it lands, then
+  go to the store its definitions call for, so a merge that narrows a
+  tracker never leaves what it adds readable by the wider audience. An
+  existing data directory is moved over the first time the server starts
+  on it. The server now needs Git 2.45 or newer, and says so if it finds
+  an older one.
+
+- `newgit serve` commits every landing to a landing log first, and puts
+  the rest in place from it
+  ([#410](https://github.com/Spheroman/newgit/issues/410)).
+
+  Before, a merge wrote its new list to SQLite and then moved each
+  repository's refs one by one, and a tracker changing audience moved
+  between stores as a side effect of whichever request reached it next. A
+  crash in between, or a move that failed part way, could leave readers
+  seeing half a landing, or a widening's history readable by its new
+  audience although the landing never happened. Now each landing is one
+  commit in `<data>/landing.git`, and its place there is its stamp. Refs
+  (one transaction per store), SQLite (one transaction), and store moves
+  follow it, are repaired from it when the server starts, and nothing is
+  shown until all of it is in place. Landings that arrive together are
+  written as one batch, each still its own entry: about 280 a second on
+  one machine for the simplest landing (one ref, one store, no objects;
+  merges are slower). A branch's list at any earlier landing in place is
+  `GET …/branches/<branch>?at=<stamp>`. An existing data directory gets a
+  log that starts from what its database says; a log that is damaged, or
+  missing once landings were put in place from it, stops the server.
+
+  Nothing is written down that cannot be put in place: every ref change
+  records its old value and is applied by compare-and-swap, every commit
+  is checked to be in its store, and every project is an incarnation, so a
+  landing never acts on a project deleted and made again under its name. A
+  landing that is written down and still cannot be put in place answers
+  503 with its real cause on its projects only, is tried again at each
+  landing there and at each start, and can be given up with
+  `newgit serve --void-landing <stamp>`, which appends a compensating
+  landing. Once a void is written down, the landings it gives up are never
+  put in place, even if the void itself is interrupted. A store move whose
+  rows are in place has landed: its merger is told so, with the removal
+  from the old store pending, and it is finished by trying again, never
+  voided. Stores made before this get their fsync config when the server
+  starts.
+
+- `newgit serve` merges on the server instead of answering "merge again"
+  ([#411](https://github.com/Spheroman/newgit/issues/411)).
+
+  Before, a merge landed only onto the exact state it began from, so two
+  merges begun from one base conflicted even at different trackers, and
+  the second was told to merge again. Now a branch that did not move
+  fast-forwards to the merger's own commits, ids and signatures kept. One
+  that moved since, on other paths, gets the merger's work laid onto it
+  without running Git's merge: a new commit in each tracker both sides
+  moved (root, and the parents along the mount chain), the merger's commit
+  its second parent. One that moved on the same paths is merged by Git
+  (`merge-tree`) over the composed tree and split back into each tracker's
+  history. A file moved between trackers, or added under a directory
+  another landing renamed, is followed. A landing that empties a tracker,
+  adds or drops one, or changes a definition always goes through Git's
+  merge, since a whole directory of the view may have moved. File names
+  are kept as the bytes Git stores, so a name that is not UTF-8 lands
+  like any other. Only a real conflict is refused, naming each file the
+  merger may read and only that there are others.
+
+  What lands is authorized at the state it lands on, membership read again
+  at the last moment, so a merge that would carry the merger's edit into a
+  tracker they may not change is refused, naming it. Nothing is carried
+  into a tracker some may read who could not read where it was, unless
+  someone chose to move it there. The base is
+  what the server reads from root's commit, never a list the client sent.
+  A change to the definitions on `main` is a barrier that bumps the
+  project's epoch; a merge that loses its recheck three times takes a turn
+  on the paths it changes, and merges on other paths land beside it.
+  Composed objects live only in a scratch repository no one is served
+  from, and an attempt that lost leaves nothing waiting. `newgit merge`
+  says when the server merged, and with which commit.
+
+- `newgit serve` stores each tracker's rooted history and extends it as
+  things land ([#412](https://github.com/Spheroman/newgit/issues/412)).
+
+  A view rooted at a tracker (`/<owner>/<project>/<path>.git`, and the
+  project's own view at root) used to be composed per fetch, its whole
+  history again each time anything landed. Now each tracker's view, as
+  everyone who reads its store may read it (its own store's trackers and
+  public ones mounted inside), is kept in its store and extended by
+  composing only the new commits: after each landing in the background,
+  and by any fetch that finds it behind, so a fetch never sees a view
+  behind what landed. Its commit ids are exactly what composing gives.
+  A reader who may read more than that (a private tracker mounted inside)
+  is still composed for per fetch. A data directory from before this gets
+  its stored histories at start, in the background and resumably, and any
+  fetch before that composes what it needs itself.
+
+  A stored view never moves back to older lists, and its refs move in one
+  compare-and-swap with its state, so a tracker moving to another store
+  never gets its view written back into the one it left. `newgit serve`
+  now needs Git 2.46 or newer.
+
+- `newgit serve` lands concurrent merges two to three times as fast, and
+  overlapping merges in a project with many trackers no longer time out
+  ([#445](https://github.com/Spheroman/newgit/issues/445),
+  [#440](https://github.com/Spheroman/newgit/issues/440)).
+
+  A merge spawned about 54 `git` processes, and most of the ones that
+  mattered ran while the project's landings were held, so merges landed
+  one after another at about two a second. Now objects are written in
+  process as loose objects in Git's own format (synced the way Git's
+  `core.fsyncMethod=batch` does, one device flush for a batch), the
+  object format is asked once per repository, and one reader per
+  repository serves a whole attempt: what changed, whether a commit is
+  there, ancestry, and whether a merge changes the definitions are read
+  in process. A merge's commits are copied into their store in process
+  rather than by `git fetch` (a copy of more than a few hundred objects
+  is still Git's), and whether a store is for its audience is asked once,
+  not on every request. About 27 processes a merge are left, most outside
+  the hold.
+
+  Merges whose changes overlap compose each tracker's view once per
+  finish instead of once per view and attempt, in one scratch repository
+  kept across attempts, and split reuses those views.
+
+  Measured with `serve_server_merge_bench.rs` (24 merges from one base,
+  finished at once, debug build, on a shared and busy machine, before
+  and after run back to back), merges landed a second: `mixed` 1.2–1.4
+  to 2.9–3.9, `same` 1.4 to 2.3, `spread` 1.0 to 2.7, and `overlap` 0.54
+  (2 of 24 answered busy) to 1.3. With 27 trackers, `overlap` went from
+  0.32 with 11 of 24 merges answered busy to 0.76 with none. The time a
+  landing holds its project went from about 650–900 ms to 250–380 ms.
+
+  Objects newgit writes in process into a repository are synced when
+  that repository's config would have Git sync a loose object
+  (`core.fsync`, or the older `core.fsyncObjectFiles`, read as Git reads
+  them), as Git's `hash-object` did: a store's (stored rooted histories
+  included) are synced, a scratch one's are not. How they are synced is
+  always Git's `batch` method, whatever `core.fsyncMethod` says. Each goes
+  into place only after everything it names, so a crash part way never
+  leaves a store with an object whose tree or parents are missing, and a
+  write of thousands keeps one file open at a time.
+
+- `newgit remove` checkpoints the workspace before it deletes it, so it
+  never deletes work no checkpoint holds
+  ([#448](https://github.com/Spheroman/newgit/issues/448)).
+
+  It used to delete a dirty workspace whatever was in it and report only
+  `kept: N checkpoints`, which read as though the work were kept. Now
+  uncommitted, untracked, and staged work is in a checkpoint (reason
+  `remove`) that the archived record names as `removed_to`, and `newgit
+  spawn <name> --from-checkpoint <name>/<id>` brings it back. Removing an
+  evicted instance takes no new checkpoint: it names the one the instance
+  was evicted to, in `removed_to`, `checkpoint` in `--json`, and the
+  `kept:` line. What no checkpoint holds (ignored files nothing rebuilds,
+  the stash, branches only the workspace has, a Git repository nested in
+  the workspace) is named as `lost:`, and `disposable` build output as
+  `dropped:`. A resource capture that fails, such as a `pg_dump` against a
+  database that is down, no longer refuses the removal, and its
+  `[cleanup]` (a `dropdb`) no longer runs: the state is left in place,
+  named as `left:` with the cleanup command, unless `--force`. `--purge`
+  discards only the removed instance's checkpoints, never an earlier
+  instance's of the same name, and archived records are never replaced
+  by one archived in the same second. A checkpoint that fails, a nested repository
+  with no commit, or a workspace whose Git cannot be read refuses the
+  removal, deleting nothing, unless `--force`. `--purge` takes no
+  checkpoint. Either way, the removal then names the uncommitted work it
+  deletes and, per tracker outside Git, the paths that differ from its
+  last capture. What it could not read is named as lost instead of
+  refusing. `remove --json` is new, and reports `checkpoint`, `lost`, `left`, and
+  `disposed`. Callers such as T3 Code's thread deletion need no change: a
+  dirty workspace no longer fails or prompts, it is checkpointed, and the
+  checkpoint never waits on the remote, not even to re-encrypt a tracker.
+
+- What an agent setting up a real project had to search for is said where
+  it already looks.
+
+  `status` names the log of the run behind a failed or died resource, not
+  only the logs directory, and the reference says where logs live and how
+  they are named. `newgit init` says the workspaces directory moves with
+  `[workspace] root`. The install store's "not stored" message offers both
+  fixes and when each fits: a `[[render]]` for one state file a tool
+  writes, or a resource of its own for generated code, with a Prisma
+  recipe under `newgit reference generated-code`. `newgit reference
+  agents` says that definitions are read from the project root and not a
+  workspace's copy, to give a tool that picks its own ports every port,
+  to build before serving, that `[ready]` is a deadline, and that `status`
+  names stale definitions.
+
+- A port's instances are allocated 100 apart, `start`, `start + 100`,
+  `start + 200`, instead of one apart.
+
+  A claim holds nothing until the instance's server binds it, and only
+  newgit respects one. Dev tools that pick an extra port for themselves
+  scan up from a default (`remix dev` takes the first free one in
+  3001-3100), so with three instances on 3001-3003 the first one's tool
+  took the second's port before its server was up, and only one app came
+  up. A hundred apart, the ports just above each claim belong to no other
+  instance. The reference and the `process` template now tell an agent to
+  declare every port a tool opens in `[ports]` and pass it explicitly,
+  which is the real fix; existing instances keep the ports they have.
+
+- `status` is several times faster in a project with many instances.
+
+  It ran every instance's `git` queries one after another, and only then
+  asked the remote what it has not written down yet. With about 130
+  instances that came to 3–8 seconds, and the table waited on all of it.
+  Now each instance's queries run in parallel, the remote is asked while
+  that happens, and the remote's `/state` loads tracker definitions once
+  per request instead of once per tracker. The tracker-path gitignore
+  check that runs before most commands is also one `git` call per check
+  instead of one per path.
+
+  Two commands decrypting the same tracker file at once no longer trip
+  over each other's half-written copy in the local plaintext cache;
+  before, the loser failed, and `status` could mark an instance `~`
+  (differs from `main`) when it did not.
+
+
+### Fixed
+
+- A `[ready] http` check of an `https://` URL trusts what this machine
+  trusts, so a local certificate from `mkcert -install` passes; one the
+  machine does not trust says so instead of reading like a server that is
+  down. `status` runs an instance's checks side by side, and `status
+  <instance>` runs only that instance's: 30 instances with three
+  one-second checks each went from 6.5 s to 2.8 s, and one of them from
+  6.5 s to 1.1 s ([#276](https://github.com/Spheroman/newgit/issues/276)).
+
+- A file of a tracker outside Git defined with project-relative `paths`
+  inside another tracker's mount (`paths = ["apps/t3code/.env"]`, what
+  `newgit tracker track` writes) is now refused like one defined with a
+  `mount`. Before, a commit on an export target adding that file passed the
+  check: `newgit pull` and `newgit pull --remote` took it in, overwriting
+  the local secret and putting it into the tracker's history. One rule
+  decides ownership for both spellings, everywhere (the gates, split, the
+  workspace): the longest claim that reaches a path owns it, and only a
+  tracker outside Git's claim reaches into a deeper mount. A claim of a
+  tracker in Git inside a deeper mount owns nothing, and `newgit tracker
+  list` says so. The refusal on a pull now says the file is not taken in,
+  rather than "refusing to send this work anywhere".
+- Split no longer drops a tracker's longer claim inside a shorter claim of
+  a tracker sharing its mount (`x/sec` inside another's `x`): the file
+  stayed in the parent instead.
+
+- A fetch that deepens a store no longer fails when another Git rewrites
+  the store's `shallow` file at the same moment
+  ([#432](https://github.com/Spheroman/newgit/issues/432)).
+
+  Git's own auto-maintenance, which it detaches after every fetch, runs a
+  `git repack` that rewrites `shallow` in a shallow repository. A stepped
+  fetch's next band could meet it and fail with `shallow file has changed
+  since we read it`, or on finding `shallow.lock` taken. No lock of
+  newgit's can cover Git's own processes, so such a fetch now waits and
+  fetches again, as a fetch that finds a ref locked already did, and a
+  stepped fetch no longer starts that repack between its own bands. A
+  whole fetch into a store that is not shallow never needed the
+  stepped-fetch lock: Git touches `shallow` only for a fetch that deepens.
+  Snapshot fetches and the `--unshallow`
+  that brings a tracker's history do deepen, so they now retry the same
+  way.
+
+  Tests that picked a free port by binding port 0 and letting go of it now
+  read back the port they were given, or hold the listener: on a loaded
+  machine something else took the port in between (#354).
+
+- `newgit tracker merge <fork>` works before the fork's first checkpoint
+  on `newgit serve`
+  ([#437](https://github.com/Spheroman/newgit/issues/437)). The server
+  makes a fork's repo on its first write, starting it at its upstream's
+  `main`, while the client pushed expecting no `main` at all and was
+  rejected with `(stale info)`. The client now fetches the fork's `main`
+  again after that first write, holds the merge to it, and leases on it.
+- A tracker the remote serves narrower than its definition says (a fork
+  deleted and re-added under its old name is still held to the upstream
+  its repo was made from) now says so on `newgit tracker merge`: a write
+  credential carries the reason. It failed closed before, without a word.
+- On `newgit serve`, the landing that makes a fork carries the epoch its
+  start was checked at, so a change to the definitions between the check
+  and the landing (its upstream narrowed) refuses the fork instead of
+  making it on stale facts.
+
+- `newgit start` checks the ports an instance claimed, and `newgit gc` no
+  longer fails while a fetch deepens the tracker store
+  ([#441](https://github.com/Spheroman/newgit/issues/441)).
+
+  A port is claimed once, at spawn, and only other newgit processes
+  respect it. Another program could take it while the instance was
+  stopped, and the service then failed to bind it, or moved quietly to the
+  next port (Vite does) while the rendered `.env` files and the exported
+  `APP_URL` still named the old one. `start` now checks each port a
+  resource claimed before the first thing it runs for it, its `resume`
+  included, and for one something is listening on it claims a free port,
+  writes it to the binding record, renders the exports and files again,
+  and says so: a line on stderr, and `moved_ports` in `--json`. One that
+  cannot find a free port fails that resource, naming the port. A port in
+  TIME_WAIT from the resource's own stopped server is not taken for a
+  listener, and a running dependent started with the old port is restarted
+  with the new one, with a warning.
+
+  `gc` died with "failed to run repack" when it met the `shallow.lock` a
+  stepped fetch holds for each band. It now takes the stepped fetch's own
+  lock first, saying so if it has to wait, and waits for the fetch to
+  finish; when another `git gc` is running it tries again for about half
+  a minute. The opening whole fetch into an already shallow store, which
+  deepens it, now takes that lock too and skips Git's auto-maintenance, as
+  each band does.
+
+- An export no longer refuses forever over one old commit
+  ([#444](https://github.com/Spheroman/newgit/issues/444)). It checked a
+  tracker's whole history for a file a tracker outside Git owns, so a
+  commit that added `.env` before anything claimed it blocked every export
+  after, and deleting the file did not help. Now only the commits the
+  target does not have are checked, asked of the target at each push
+  (never a record here, so a target force-pushed to purge a secret is not
+  trusted to still have it); what it has is published already. A merge
+  bringing published content beside new work passes; a commit the target
+  lacks that adds such a file is still refused, and the error says the way
+  out: rewrite the history without it on the target and `newgit pull
+  --remote <target> --force`, or take the file out of the claim. An import
+  is still checked whole (all of it is new to the project) and now names
+  the same way out. The outside-Git check also lists a root commit's files
+  whatever `log.showRoot` says.
+
+- `newgit serve` refuses a landing on `main` that defines a tracker at a
+  mount the client refuses to load (absolute, `..`, empty), with the
+  client's own message, and admins can read background failures at
+  `GET /v1/serve/status`
+  ([#450](https://github.com/Spheroman/newgit/issues/450)).
+
+  Serve used to only normalize the mount, so `mount = "/pkgs/a"` meant
+  `pkgs/a` to it and nothing to the client: the two disagreed about where
+  a tracker sat and what it owned. Both now use one check
+  (`newgit_core::tracker::mount_problem`). A stored rooted history that
+  failed to extend was only in the server's log; the status route also
+  lists stuck landings. It names every project, so `--admin '*'` makes
+  every logged-in user an admin of it.
+
+- A pull request merged on a mirror from an instance's branch is no longer
+  dropped from the view exported back to that mirror
+  ([#451](https://github.com/Spheroman/newgit/issues/451)).
+
+  When the instance also had work in a tracker the mirror does not ship,
+  the merge commit's two sides differed in that tracker's pin, and a view
+  that leaves the tracker out dropped the merge as one that joined
+  nothing. But the mirror made that merge and still holds it, so from then
+  on the mirror had a commit `main` never showed it again: `newgit export`
+  and the server's export both said the mirror was ahead, `newgit pull
+  --remote` brought in nothing new, and only `--force` got past it. A
+  merge that composes back to the very commit it was split from now stays.
+  Views composed before this keep their old ids until composed again.
+
+- Writing objects no longer fails now and then on macOS with `Invalid
+  argument (os error 22)` while Git cleans up the same repository
+  ([#475](https://github.com/Spheroman/newgit/issues/475)).
+
+  `git repack -d`, which `gc` and the detached `maintenance run --auto`
+  after every `git commit` run, removes each empty fan-out directory under
+  `objects/`. When that `rmdir` lands just as a file is made in the
+  directory, macOS answers `EINVAL` rather than `ENOENT`, which the
+  in-process writer did not take for a removal (Git itself fails the same
+  way). It now treats either as one, makes the directory again, and tries
+  again, a few times over: an `EINVAL` counts only when the directory is
+  gone or is a different one afterwards, so a real `EINVAL` still fails.
+
+- **Held-back dependents, after review of #54 and #276.** `newgit status`
+  showed an instance as `ready` when a spawn had held an `autostart` action
+  back behind a dependency that was not up; it now shows the resource as
+  `not started` and the instance as not ready. A dependency that did not
+  come up is waited for once per command, not once for each of its
+  dependents. A dependency's `[ready]` check is run when its process is
+  started by hand, not only when newgit starts it. `undo` and `spawn
+  --from-checkpoint` wait for a dependency to answer before restarting what
+  depends on it, as spawn does. A `[ready] http` check is no longer sent
+  through `HTTP_PROXY` or `ALL_PROXY`, and a `[ready] command` that runs
+  out of time is killed with whatever it started.
+- **`left behind:` after review of #83.** The `newgit tracker track`
+  command a spawn prints quotes a path with a space in it; a file some
+  tracker already owns is no longer named as carried by none; `.dev.vars`
+  and `.npmrc` are named too.
+
+- A resource's `autostart` process starts once what it depends on is up,
+  not merely once that process exists
+  ([#54](https://github.com/Spheroman/newgit/issues/54)).
+
+  `depends_on` ordered the starts, but a dependent was started the moment
+  its dependency's process had been exec'd, so `functions serve` raced a
+  Supabase stack or API server that was still coming up, and the race
+  just moved into the dependent. Now `spawn`, `newgit start`, and `newgit
+  action` of a long-running action by hand give each running dependency
+  five seconds to answer on every port it claims, and do not start a
+  dependent against one whose `autostart` action is not running. A
+  dependent withheld this way says which dependency it waited on, and
+  stays owed: the next `newgit start` starts it, as it does an `autostart`
+  action that died.
+
+- `newgit resource rebind` keeps the ports a resource holds, and a
+  definition deleted by hand no longer leaves its process running
+  ([#85](https://github.com/Spheroman/newgit/issues/85)).
+
+  A rebind allocated every port again, and right after `newgit stop` the
+  old one was often not free yet, so the port moved under every file and
+  export that named it. It now keeps each port the definition still
+  declares and allocates only new ones; a resource a tracker brings back
+  after a drop does the same, rather than starting over when one port was
+  added. A definition file deleted while its process ran left that process
+  out of reach of `stop` and `remove`, still holding its port after the
+  instance was gone. Both now stop it, and `resource rebind` on a resource
+  with no definition releases its binding (its `[cleanup]` cannot run).
+
+- `newgit status` names every way a live instance differs from its
+  resource definitions, with the commands that apply it
+  ([#85](https://github.com/Spheroman/newgit/issues/85)).
+
+  An instance bound before a definition was edited silently kept the old
+  shape: an export, a `[[render]]`, a `prepare`, a removed port, or the
+  running command all went unsaid, so an agent iterating on a definition
+  debugged a stale binding. `status` now holds each ready binding against
+  the definition (re-resolving exports and renders, and comparing the
+  `prepare` that ran and the command the process started with) and prints
+  one line per resource ending in `newgit resource rebind`, wrapped in
+  `newgit stop` / `newgit start` when its process runs, or a stop and start
+  alone for a changed command. What newgit reads live (`[ready]`,
+  `depends_on`, hooks) is not flagged. A resource defined since the
+  instance bound, and a binding whose definition was deleted by hand, are
+  named too. The line gives the definition's absolute path: definitions
+  are read from the project root, not a workspace. `status --json` is new.
+
+- `newgit status` names a port declared after an instance bound its
+  resource ([#85](https://github.com/Spheroman/newgit/issues/85)).
+
+  Adding `inbucket` to a definition left every live instance's record
+  claiming only the old ports while its tool used the new one, so the
+  allocator's ledger was silently incomplete and could hand that port to
+  another instance. `status` now reports such a resource as not ready,
+  naming the ports, with `newgit resource rebind <resource>` as the fix.
+
+- A failed hook shows its whole command, `--quiet` keeps a command's
+  input, and a failed capture is not echoed
+  ([#89](https://github.com/Spheroman/newgit/issues/89)).
+
+  A multi-line command printed only its first line after `ran:`, and the
+  rest turned up in the `|` lines as though the command had printed it;
+  the log now marks every line of the command, and `ran:` and `--dry-run`
+  show all of it. `newgit action --quiet` gave the command no input, so
+  `echo yes | newgit action db.ask --quiet` failed where it passed
+  without the flag; it now reads what was piped to newgit, with captures
+  or without. A failed action with `captures` showed its stdout, the
+  captured values and any password in them, on the terminal; the tail is
+  now stderr only, and the log keeps stdout apart under a marker. Without
+  `--quiet`, such a failure showed nothing but its exit code, since its
+  output never reaches the terminal; it now shows the command and that
+  stderr tail too. newgit itself destroys none of a failed hook's
+  evidence, and a test now holds it to that: each run has its own log, a
+  retry included, and nothing newgit runs after a failure removes what
+  the command left.
+
+- `newgit action web.stop` says it stopped `web.start`, the run it
+  stopped, as `newgit stop` does. It printed "Stopped `web.stop`", naming
+  the signal action as though it had been running.
+
+- **`[cleanup]` no longer runs in the project root.** For an instance whose
+  workspace was already gone, `newgit remove` and `newgit cleanup` ran its
+  `[cleanup]` hook from the project root, so a hook written for the
+  workspace, such as `rm -rf postgres-data`, deleted the project's own
+  directory of that name. It now runs from an empty directory.
+
+- The bundled database templates say what "up" means and fail loudly
+  where they used to pass quietly.
+
+  `supabase` has a `[ready]` check, a GET of Auth's health endpoint through
+  Kong that needs no key, so something that `depends_on` it waits for the
+  stack and `status` stops calling a stack that went down `ready`.
+  `command-snapshot` and `command-snapshot-migrations` checked nothing at
+  spawn: `createdb … || true` passed with the server down, and the instance
+  read `ready` with no database. They now connect or create, and check the
+  server with `pg_isready`. Every restore that loads a dump stops on the
+  first error instead of reporting a half-loaded database as restored, and
+  `command-snapshot`'s restore ends sessions still open on the database
+  rather than failing the drop. The `process` template carries a commented
+  `[ready] http` for a dev server that binds before it serves.
+
+- newgit's retries for racing Git now work under a non-English locale.
+
+  newgit recognises some Git failures by Git's message: losing a race for
+  a ref (`not updating`, `cannot lock ref`), or a fetch meeting another
+  Git's repack (`shallow file has changed since we read it`). Git
+  translates those messages, so with a German or Japanese locale the match
+  never fired and the retry never ran. Every Git newgit and `newgit serve`
+  run for themselves now go through one helper that sets `LC_ALL=C`; Git
+  output meant for you, like `newgit log`, keeps your locale. A test fails
+  on any new Git started another way.
+
+- `newgit merge` names a conflicting file with a non-ASCII name as it is
+  called (`résumé.txt`), not as Git quotes it (`"r\303\251sum\303\251.txt"`).
+
+- Two merges writing notes into the same store at once no longer fail on
+  Git versions that capitalise the warning.
+
+  When `git fast-import` loses the race for the notes ref, newgit builds
+  its notes again on the other writer's and retries. It recognised the
+  lost race by matching `not updating` in Git's output, but some Git
+  versions (2.45.2, for one) print `warning: Not updating refs/notes/...`
+  with a capital N, so the retry never ran and the second merge failed
+  instead. The match is now case-insensitive.
+
+- A branch exported to a mirror is the mirror's `main` plus its own
+  commits, whichever of the two was exported first.
+
+  A commit merged on a mirror comes back as a root commit naming the
+  mirror's own. An instance started on the remote's `main` as the project
+  root had fetched it (where a Claude Code worktree starts) was never told
+  that commit was the remote's, and neither was any instance when `main`
+  had been composed here before one of its trackers' commits arrived. Its
+  split then made a second root commit of the same commit, without the
+  signature, and the export composed that into a second commit on the
+  mirror, with a second copy of everything above it. The pull request
+  showed commits that were not its own, by `newgit@localhost`, and merging
+  it would have put both copies in the mirror's `main`.
+
+  A split now finds the remote's root commit for anything the remote's
+  `main` holds, whether the workspace or the project root fetched it, and
+  only counts `main` as composed while it holds every pin this machine
+  has. An instance already built on a copy heals at its next push: its
+  commits are split again onto the remote's root commits (the workspace's
+  own commits do not change), and its branch on the mirror is replaced,
+  only while the mirror holds exactly what newgit last pushed there, by a
+  record newgit keeps in the project repo: a commit someone else pushed
+  there is never thrown away, and a branch deleted there is pushed again.
+  `newgit export <instance> --remote <target>` does that without a new
+  commit, healing the instance's tracker branches too, and exports a branch
+  again when its export failed. A force-push from the workspace replaces
+  the branch there the same way, over that record only; with no record
+  (another machine, or an export by an older newgit) the export is refused,
+  saying so, while the push itself succeeds. `newgit remove` drops the
+  record with its instance. `newgit export <instance> --remote <target>
+  --force` is the one way to replace the branch there whatever it holds.
+
+- Whose a claimed port is gets decided by the process listening on it,
+  not by the claim.
+
+  `newgit ports --check` said "ok 3001 — claimed by `gamma`" while
+  `beta`'s process held 3001, and failed on AirPlay, adb and an editor,
+  which no instance claims (AirPlay twice, once per address family). It now
+  judges only claimed ports: ok when the claimant's own process holds it or
+  nothing does while its process is down, FAIL naming the holder's pid,
+  directory and instance otherwise, `?` for a holder nothing ties to an
+  instance on a resource newgit runs no process of (Docker's proxy), and a
+  `warn` for a port an instance's process listens on that nothing claims.
+  `ports` takes `--json`, with the same exit code. `status`, and so the end
+  of `spawn`, `start` and `rebind`, names a claimed port's holder when it
+  is another instance's process, instead of leaving a bind failure in a
+  log, and no longer calls an instance up because somebody else answers on
+  its port.
+
+- `newgit resource rebind` waits for what it started, as `spawn` and
+  `start` do, and exits 1 when the instance it leaves is not ready.
+
+  Its help already said it exited 1 when the resource did not come up, but
+  it returned 0 at once, so an agent rebinding a server that never came up
+  was told it had.
+
+- `newgit remove` no longer deletes a database whose dump failed when the
+  database lives in the workspace.
+
+  A resource whose capture fails does not stop a removal, and its
+  `[cleanup]` does not run, so state outside the workspace (a Supabase
+  stack, a shared server's database) is left where it is and named under
+  `left`. That cannot work for state inside the workspace: deleting the
+  workspace deleted it, and `remove` exited 0 while saying the database was
+  "left in place". Now a failed capture of a resource with `ownership =
+  "workspace"` (the `postgres` template's cluster) refuses the removal,
+  deleting nothing, unless `--force`, which names the state as lost.
+  Ownership is the signal because newgit cannot see where a command keeps
+  what it captures; the reference's ownership table now says `workspace`
+  means kept in the tree. The `left` line says the state is outside the
+  workspace because its `ownership` says so, and the ignored files a
+  removal deletes are no longer described as "rebuilt by no resource" when
+  a resource's own capture (a dump) is in the checkpoint. `newgit
+  checkpoints <name>` now lists a removed instance's checkpoints, which
+  `remove` points at, instead of saying there is no such instance.
+
+- Spawning an instance that binds a tracker with its own export, such as
+  t3code, takes about 3s instead of 21–25s, and its workspace no longer
+  needs its own 400 MB of Git objects.
+
+  Each workspace fetched the export target's branch, which is that
+  tracker's whole history (236,000 objects for t3code), so that
+  `gh pr create --fill` could list a pull request's commits. That fetch
+  packed the whole history again for every spawn and wrote it as new
+  files that no other workspace shared. Now the macOS source template
+  fetches the branch once, at the cost of only what is new each time. Its
+  objects reach the workspace through the same copy-on-write clone as
+  everything else, so the workspace's own fetch has nothing to move.
+
+- A `newgit spawn --from-checkpoint` that fails after the instance is made
+  says how to finish it or remove it.
+
+  It exited 1 with one error line and left the workspace, the record, and
+  a prepared database behind, so running it again was refused with no
+  word of why. The instance is still kept for inspection, as a plain
+  `spawn` that fails midway keeps it, and the error now says so and names
+  `newgit undo <name> --to <id>`, which restores it to the checkpoint once
+  what failed is fixed, and `newgit remove <name> --purge`, which removes
+  it so the spawn can run again. A spawn whose restore failed (exit 1 with
+  the full report) names the same two commands on a `retry:` line, since
+  the `prepare` the readiness advice suggests would start the resource
+  empty.
+
+- `newgit spawn --from-checkpoint` works with a checkpoint taken on this
+  machine, with or without a remote.
+
+  It used to go to the project's remote every time, so a project with no
+  remote could not spawn from its own checkpoints. Now a checkpoint this
+  machine has, even of an instance since removed, is used as it is, and
+  only one it lacks is fetched from the remote. Text output says "taken on
+  this machine" for a local one; `--json` reports `author` as `null`.
+
+- `newgit start` rebuilds a workspace deleted by hand instead of leaving
+  `remove` as the only way out.
+
+  With the workspace directory gone, `status` said `ws-missing` and
+  nothing else, `start` said there was nothing to do while the old
+  processes kept running from the deleted folder, and `spawn` refused
+  because the record existed. Workspaces are disposable and the binding
+  record is not, so now `status` names `newgit start <name>` (and `status
+  --json` lists it under `problems`), and `start` stops what still runs
+  from the deleted directory, then rebuilds the workspace from the
+  instance's latest checkpoint the way it brings back an evicted one, or,
+  with no checkpoint, from its source branch with trackers at their bound
+  revs and every resource prepared again on the ports it holds. It says
+  what did not come back (whatever was never checkpointed), and `--json`
+  reports `rebuilt` with the checkpoint, `null` when there was none.
+
+- A `long_running` action's stdin is a pipe that stays open for as long as
+  it runs, instead of `/dev/null`.
+
+  A watcher that exits when stdin reaches end-of-file (`esbuild --watch`:
+  "stopped automatically because stdin was closed") exited at once, while
+  the wrapper in front of it (`npm run dev`) stayed alive, so the resource
+  read as running and nothing was built or served. The small `sh` newgit
+  leaves waiting on the process holds the pipe's write end, as a process
+  manager would. One-shot hooks still get no input.
+
+- An undo whose restore fails leaves that resource and what depends on it
+  down on purpose, and says how to retry. A failed database restore left
+  `web` stopped with a restart error pointing at `newgit action db.serve`,
+  and `status` suggested the same: starting the server over a restore
+  that did not finish. Now the dependent's line says `not restarted, left
+  blocked by db`, `status` says `failed to restore` with the retry (repair,
+  then `newgit undo` again), `start` does not bring either back over it,
+  and the next undo that succeeds restores both. A dependent's restore
+  (a seed loading rows) also waits for a dependency the undo just started
+  again, instead of running while it is still coming up. The reference
+  says what is running when `[restore]` runs: its own process is stopped,
+  its dependencies are back, its dependents are stopped.
+
+- `undo` recomputes what depends on a tree it just rebuilt or refilled.
+  Setting up Remix + Prisma, an undo refilled `node_modules` from the
+  install store, skipped `prisma-client` as "identity unchanged", printed
+  `ok`, and the app crashed on `Cannot find module '.prisma/client'`: a
+  tree rebuilt from its inputs holds nothing a dependent generated into it.
+  Now every `recompute` dependent of a resource the undo recomputed runs
+  again, and its line says which dependency it followed. `start` after
+  `stop --evict`, which restores through the same undo, does the same.
+  The reference says a resource that generates into another's tree
+  declares `depends_on` on it and names its output in `produces`.
+
+- A process an undo could not start again reads `not started`, and the
+  next start that succeeds clears it. The undo used to mark the resource's
+  binding `failed`, which no start ever touched: a retried undo printed
+  `restarted ok, left failed`, `status` called the instance not ready while
+  it served, and suggested an action that was refused as already running.
+  Only a rebind cleared it, and that moved a port. Now `status` says
+  `` `web.serve` was not started — start it with `newgit start` ``, `start`
+  brings it back, and the undo says the resource was restored but not
+  running instead of calling it a failed restore command. Its recovery
+  record names the action that really retries it (it said `.start`
+  whatever the action was called).
+
+- `undo` waits for what it restarted and exits by whether the instance is
+  up, as `spawn` and `start` do. It used to restart a database and return
+  at once, so SQL run straight after it got "connection refused", and exit
+  0 over an instance that was not up. It now ends with the same `ready:`,
+  `starting:` or `not ready:` lines and exits 1 when the instance is not
+  ready, including one a restore left as it found it (a `prepare` that
+  failed before the undo). `spawn --from-checkpoint`, which finishes with
+  an undo, waits too, and its `--json` gains `starting` and `problems`.
+
+
+### Security
+
+- Trackers outside Git that sync (`storage = "remote"`) and are not
+  `public` are encrypted to their audience before anything leaves the
+  machine ([#338](https://github.com/Spheroman/newgit/issues/338)).
+
+  Until now the remote stored their content in plaintext, so the audience
+  on a `.env` tracker held against other users but not against whoever runs
+  the remote. Each file is now encrypted whole with age, to the
+  `ssh-ed25519` and `ssh-rsa` keys GitHub publishes for each member of the
+  audience as the remote lists them, and committed as an ordinary blob. The
+  recipients are computed, never read from the history; a record of them
+  sits beside the files at `.newgit/recipients` for people to read. The
+  workspace holds plaintext, owner-only, decrypted with `~/.ssh/id_ed25519`,
+  `id_rsa`, or `$NEWGIT_IDENTITY`. Every recipient is printed by key
+  fingerprint the first time and whenever the set changes. `members add`
+  and `remove` re-encrypt `main` and fail when they could not (`members
+  reencrypt` retries); removing someone does not take back what they could
+  already read, and says so. Membership is read again before anything is
+  published, and every commit the remote does not have yet that is
+  encrypted to anyone else is made again first, so nothing captured after
+  a member's removal (or captured before it and not yet sent) reaches the
+  remote encrypted to them. Publishing a tracker's `main` no longer forces
+  over a `main` merged elsewhere: it is refused, and `newgit tracker pull
+  <tracker> --keep-mine` puts your version on top of theirs (file by file,
+  your deletions included, no content merge) so merging again publishes it. A workspace path this
+  machine has held encrypted content at is never captured or sent
+  unencrypted because a definition now puts it in a `public` tracker or a
+  tracker in Git, under any name, until `newgit tracker allow-plaintext
+  <path>` on this machine (a confirmation, not a boundary; it knows paths,
+  compared ignoring case, not content, so the same content copied or moved
+  to another path is not held back; a machine that never held the content
+  has nothing to compare against). `newgit
+  checkpoint` exits non-zero when its sync is refused for a security reason,
+  keeping the checkpoint locally. A per-user tracker is encrypted to the login `newgit login` saved,
+  never to whoever the remote says you are. There is no opt-out:
+  newgit.dev's `site` is now `public`. An existing tracker is encrypted on
+  its next capture, as a new history.
+
+  What it does not do: the remote cannot read what was encrypted before it
+  acts, but a remote that acts can read what is captured afterwards. It
+  decides membership, so it can add a login whose keys then become
+  recipients, and the printed fingerprints are the only signal; it serves
+  the definitions, which a machine that never held a path's content takes
+  as they are; GitHub
+  accounts are the key authority; nothing is signed, so the remote can
+  replace a file with content that decrypts cleanly
+  ([#431](https://github.com/Spheroman/newgit/issues/431)); file names,
+  sizes, commit messages, authors, and dates are visible; revs sent before
+  encryption stay on the remote in plaintext, so rotate what they held; and
+  a teammate on an older newgit sees ciphertext and would push plaintext, so
+  everyone sharing a tracker has to upgrade.
+
+- A resource may not export any name starting with `NEWGIT_`
+  ([#338](https://github.com/Spheroman/newgit/issues/338)).
+
+  Only `NEWGIT_BRANCH`, `NEWGIT_WORKSPACE`, and `NEWGIT_LOCKED` were refused
+  before, so an export named `NEWGIT_KEYS_URL` or `NEWGIT_IDENTITY` would
+  have changed whose keys a `newgit` run inside `newgit run` encrypts to, or
+  which key it decrypts with. `$NEWGIT_KEYS_URL` itself now takes only an
+  `https://` base or a `file://` directory, never `http://`.
+
+- A workspace's `git push` could put a commit purged from an export target
+  back there, when that target was the project's own `origin`: the push is
+  forwarded to `origin` as it is, with none of an export's checks
+  ([#442](https://github.com/Spheroman/newgit/issues/442)). An export
+  target may no longer be `origin` (compared however either URL is
+  spelled, `insteadOf` included); reading the targets refuses it, saying
+  why and what to do, and the forward refuses it again. The forward to
+  `origin` also refuses a ref holding a commit a reset (`newgit pull
+  --remote --force`) dropped that `origin` does not have yet. A plain
+  export of `main` is now leased on what the target had when it was
+  checked, so a purge resetting it to an ancestor in between is refused
+  rather than fast-forwarded over; an instance's branch or a tag pushed
+  onto what is there still is not, and that window is open.
+
+
+### Documentation
+
+- The design now covers the disk that parallel instances pile up: the
+  install store keeps an entry for every key an instance reaches and
+  deduplicates a miss against the entries it already has
+  ([#421](https://github.com/Spheroman/newgit/issues/421)), and `cleanup`
+  names instances whose work has landed and can remove them
+  ([#422](https://github.com/Spheroman/newgit/issues/422)).
+
+- **Codex.** A wiki page on using newgit with Codex: it has no hook that
+  lets newgit make its worktrees, so spawn the instance and start Codex in
+  its workspace (`codex -C <workspace>`).
+
 ## [0.10.1] — 2026-11-10
 
 A documentation release: what ships inside the binary (`newgit reference`,
@@ -4109,6 +5316,16 @@ Binding records and checkpoints are the exception worth caring about: they
 are the only local state that is not reconstructible. A release that changes
 their format will say so here explicitly.
 
+**0.11.0 changes no formats you need to act on, with three exceptions to
+read first.** Trackers outside Git that sync (`storage = "remote"`) and are
+not `public` are encrypted on their next capture, as a new history, and a
+teammate on an older newgit would see ciphertext and push plaintext:
+everyone sharing such a tracker has to upgrade together. Revs sent before
+this stay on the remote in plaintext, so rotate what they held. `newgit
+serve` now needs Git 2.46 or newer, and moves an existing data directory to
+one store per audience the first time it starts on it. Ports are allocated
+100 apart only for new instances; existing ones keep the ports they have.
+
 **0.8.0 changes no formats you need to act on.** Binding records and
 checkpoints gain fields that older ones simply lack. A few things cost a
 little once. The install store re-keys again, on only what of the binding
@@ -4190,7 +5407,8 @@ themselves and neither of which is a reason to re-spawn:
   fresh field it has not. One successful `undo`, or one `newgit checkpoint
   --verify`, clears it for good.
 
-[Unreleased]: https://github.com/Spheroman/newgit/compare/v0.10.1...HEAD
+[Unreleased]: https://github.com/Spheroman/newgit/compare/v0.11.0...HEAD
+[0.11.0]: https://github.com/Spheroman/newgit/compare/v0.10.1...v0.11.0
 [0.10.1]: https://github.com/Spheroman/newgit/compare/v0.10.0...v0.10.1
 [0.10.0]: https://github.com/Spheroman/newgit/compare/v0.9.0...v0.10.0
 [0.9.0]: https://github.com/Spheroman/newgit/compare/v0.8.1...v0.9.0
