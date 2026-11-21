@@ -1929,7 +1929,7 @@ dependencies = [
 
 [[package]]
 name = "newgit"
-version = "0.10.1"
+version = "0.11.0"
 dependencies = [
  "age",
  "anyhow",
@@ -1943,7 +1943,7 @@ dependencies = [
 
 [[package]]
 name = "newgit-core"
-version = "0.10.1"
+version = "0.11.0"
 dependencies = [
  "age",
  "base64 0.23.1",
@@ -1968,7 +1968,7 @@ dependencies = [
 
 [[package]]
 name = "newgit-serve"
-version = "0.10.1"
+version = "0.11.0"
 dependencies = [
  "anyhow",
  "axum",
