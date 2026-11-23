@@ -31,7 +31,7 @@ flate2 = "1"
 # Substring search for the path scan (see installs.rs): SIMD where the
 # platform has it, against a byte-by-byte window compare.
 memchr = "2"
-nix = { version = "0.31", features = ["signal", "process", "net", "fs"] }
+nix = { version = "0.32", features = ["signal", "process", "net", "fs"] }
 # The path scan reads every produced tree in full; one thread over 3.8 GB
 # took longer than the install it was vetting.
 rayon = "1"
@@ -52,5 +52,5 @@ reflink-copy = "0.1"
 
 [dev-dependencies]
 # `setrlimit`, for the test that a flush of many objects keeps few files open.
-nix = { version = "0.31", features = ["resource"] }
+nix = { version = "0.32", features = ["resource"] }
 tempfile = "3"
